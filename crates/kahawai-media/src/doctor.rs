@@ -33,49 +33,56 @@ impl Check {
     }
 }
 
-/// capability → (any-of elements, essential, cost when missing)
-const MATRIX: &[(&str, &[&str], bool, &str)] = &[
-    ("typefind", &["typefind"], true, "media discovery is impossible"),
-    ("stream parsing", &["parsebin"], true, "discovery and remux are impossible"),
-    ("demux mkv", &["matroskademux"], true, "MKV/WebM sources unusable"),
-    ("demux mp4", &["qtdemux"], true, "MP4/MOV sources unusable"),
-    ("parse h264", &["h264parse"], true, "H.264 streams cannot be handled"),
-    ("parse hevc", &["h265parse"], false, "HEVC streams cannot be parsed"),
-    ("hls sink", &["hlssink2", "hlssink3"], false, "in-hub HLS remux unavailable"),
+/// capability → (elements in preference order, essential, cost when missing,
+/// recommend-preferred: if matched by a fallback, suggest installing the
+/// first-listed element)
+const MATRIX: &[(&str, &[&str], bool, &str, bool)] = &[
+    ("typefind", &["typefind"], true, "media discovery is impossible", false),
+    ("stream parsing", &["parsebin"], true, "discovery and remux are impossible", false),
+    ("demux mkv", &["matroskademux"], true, "MKV/WebM sources unusable", false),
+    ("demux mp4", &["qtdemux"], true, "MP4/MOV sources unusable", false),
+    ("parse h264", &["h264parse"], true, "H.264 streams cannot be handled", false),
+    ("parse hevc", &["h265parse"], false, "HEVC streams cannot be parsed", false),
+    ("hls sink", &["hlssink3", "hlssink2"], false, "in-hub HLS remux unavailable", true),
     (
         "mux fmp4/cmaf",
         &["cmafmux", "isofmp4mux"],
         false,
         "HLS uses TS segments only (install gst-plugins-rs for fMP4/CMAF)",
-    ),
+        false,
+     ),
     (
         "decode h264",
         &["vah264dec", "nvh264dec", "avdec_h264", "openh264dec"],
         false,
         "H.264 sources cannot be transcoded (direct play only)",
-    ),
+        false,
+     ),
     (
         "decode hevc",
         &["vah265dec", "nvh265dec", "avdec_h265"],
         false,
         "HEVC sources will always fail to transcode",
-    ),
+        false,
+     ),
     (
         "encode h264",
         &["vah264enc", "vaapih264enc", "nvh264enc", "qsvh264enc", "x264enc", "openh264enc"],
         false,
         "no video transcoding to H.264",
-    ),
+        false,
+     ),
     (
         "encode aac",
         &["fdkaacenc", "avenc_aac", "voaacenc"],
         false,
         "no audio transcoding to AAC",
-    ),
-    ("decode aac", &["fdkaacdec", "avdec_aac"], false, "AAC audio cannot be transcoded"),
-    ("decode vorbis/opus", &["vorbisdec", "opusdec"], false, "ogg audio cannot be transcoded"),
-    ("subtitle parse", &["subparse"], false, "text subtitle conversion unavailable"),
-    ("ass burn-in", &["assrender"], false, "ASS burn-in unavailable (flatten only, HUB-32a)"),
+        false,
+     ),
+    ("decode aac", &["fdkaacdec", "avdec_aac"], false, "AAC audio cannot be transcoded", false),
+    ("decode vorbis/opus", &["vorbisdec", "opusdec"], false, "ogg audio cannot be transcoded", false),
+    ("subtitle parse", &["subparse"], false, "text subtitle conversion unavailable", false),
+    ("ass burn-in", &["assrender"], false, "ASS burn-in unavailable (flatten only, HUB-32a)", false),
 ];
 
 /// GStreamer version + feature-matrix inventory. Reused by `doctor` and by
@@ -89,8 +96,12 @@ pub fn gstreamer_checks() -> Vec<Check> {
     let (maj, min, micro, _) = gst::version();
     out.push(Check::ok("gstreamer", format!("{maj}.{min}.{micro}")));
 
-    for (name, elements, essential, cost) in MATRIX {
+    for (name, elements, essential, cost, recommend) in MATRIX {
         match elements.iter().find(|e| gst::ElementFactory::find(e).is_some()) {
+            Some(found) if *recommend && *found != elements[0] => out.push(Check::ok(
+                *name,
+                format!("via {found} — {} preferred, consider installing it", elements[0]),
+            )),
             Some(found) => out.push(Check::ok(*name, format!("via {found}"))),
             None if *essential => out.push(Check::fail(
                 *name,
@@ -128,6 +139,17 @@ mod tests {
             if c.status != Status::Ok {
                 assert!(c.detail.contains('—'), "no cost message: {c:?}");
             }
+        }
+
+        // Fallback rows are OK but recommend the preferred element.
+        let hls = checks.iter().find(|c| c.name == "hls sink").unwrap();
+        assert_eq!(hls.status, Status::Ok);
+        let has_preferred = gst::ElementFactory::find("hlssink3").is_some();
+        if !has_preferred {
+            assert!(
+                hls.detail.contains("hlssink3 preferred"),
+                "fallback should recommend the preferred element: {hls:?}"
+            );
         }
     }
 }

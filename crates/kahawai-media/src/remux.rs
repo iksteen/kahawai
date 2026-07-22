@@ -1,10 +1,10 @@
 //! In-hub remuxer (AR-10, §4.6): repackage supported streams into HLS with
-//! **no re-encoding and no transcoder** — `appsrc ! parsebin ! hlssink2`.
+//! **no re-encoding and no transcoder** — `appsrc ! parsebin ! <hls sink>`.
 //! Parsing and repackaging elementary streams costs a few % CPU.
 //!
-//! ponytail: TS segments via hlssink2 (the HLS baseline, HUB-17). fMP4/CMAF
-//! needs gst-plugins-rs (cmafmux/hlssink3), absent here — upgrade when
-//! present.
+//! The HLS sink follows the plugin-fallback strategy (see HLS_SINKS):
+//! hlssink3 when installed, hlssink2 otherwise. TS segments either way
+//! (the HLS baseline, HUB-17); fMP4/CMAF via cmafmux is a future upgrade.
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -60,15 +60,48 @@ pub struct RemuxJob {
     finished: Arc<std::sync::atomic::AtomicBool>,
 }
 
+/// HLS sink elements in preference order: hlssink3 (gst-plugins-rs, better
+/// maintained, richer playlist control) over hlssink2 (plugins-bad).
+/// Plugin-fallback strategy: pick the best available at runtime, set
+/// properties guarded by existence so element/version differences degrade
+/// instead of panicking, and let `doctor` recommend the preferred one.
+pub const HLS_SINKS: &[&str] = &["hlssink3", "hlssink2"];
+
+/// Set a property only if this element (version) has it.
+fn set_prop_if_present<V: Into<gst::glib::Value>>(el: &gst::Element, name: &str, value: V) {
+    use gst::glib::prelude::ObjectExt;
+    if el.find_property(name).is_some() {
+        el.set_property_from_value(name, &value.into());
+    } else {
+        tracing::debug!(element = %el.name(), property = name, "property not present; skipped");
+    }
+}
+
+/// Best available HLS sink, configured for `out_dir`. Returns the element
+/// and its factory name (for logs/tests).
+fn make_hls_sink(out_dir: &Path) -> Result<(gst::Element, &'static str)> {
+    let name = HLS_SINKS
+        .iter()
+        .find(|n| gst::ElementFactory::find(n).is_some())
+        .context("no HLS sink element (hlssink3/hlssink2) — see `kahawai doctor`")?;
+    let sink = gst::ElementFactory::make(name).build()?;
+    set_prop_if_present(&sink, "location", out_dir.join("segment%05d.ts").to_str().unwrap());
+    set_prop_if_present(&sink, "playlist-location", out_dir.join("master.m3u8").to_str().unwrap());
+    set_prop_if_present(&sink, "target-duration", 4u32);
+    // Keep every segment and playlist entry (VOD-style growing playlist).
+    set_prop_if_present(&sink, "playlist-length", 0u32);
+    set_prop_if_present(&sink, "max-files", 0u32); // hlssink2
+    set_prop_if_present(&sink, "max-num-segment-files", 0u32); // hlssink3
+    tracing::info!(sink = name, "HLS sink selected");
+    Ok((sink, name))
+}
+
 /// Start a remux writing `master.m3u8` + `segment*.ts` into `out_dir`.
 /// `has_video`/`has_audio` come from discovery — the muxer pads must be
 /// requested before the pipeline starts, and an unfed pad would stall it.
 /// Feed source-container bytes with [`RemuxJob::push`], then [`RemuxJob::finish`].
 pub fn start(out_dir: &Path, has_video: bool, has_audio: bool) -> Result<RemuxJob> {
     crate::init()?;
-    if gst::ElementFactory::find("hlssink2").is_none() {
-        anyhow::bail!("hlssink2 missing — in-hub HLS remux unavailable (see `kahawai doctor`)");
-    }
 
     let pipeline = gst::Pipeline::new();
     let appsrc = AppSrc::builder()
@@ -77,13 +110,7 @@ pub fn start(out_dir: &Path, has_video: bool, has_audio: bool) -> Result<RemuxJo
         .max_bytes(8 * 1024 * 1024)
         .build();
     let parsebin = gst::ElementFactory::make("parsebin").build()?;
-    let hlssink = gst::ElementFactory::make("hlssink2")
-        .property("location", out_dir.join("segment%05d.ts").to_str().unwrap())
-        .property("playlist-location", out_dir.join("master.m3u8").to_str().unwrap())
-        .property("target-duration", 4u32)
-        .property("playlist-length", 0u32)
-        .property("max-files", 0u32)
-        .build()?;
+    let (hlssink, _sink_name) = make_hls_sink(out_dir)?;
 
     pipeline.add_many([appsrc.upcast_ref::<gst::Element>(), &parsebin, &hlssink])?;
     gst::Element::link_many([appsrc.upcast_ref::<gst::Element>(), &parsebin])?;
@@ -192,6 +219,19 @@ impl Drop for RemuxJob {
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn hls_sink_selection_prefers_best_available() {
+        crate::init().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let (_, name) = make_hls_sink(dir.path()).unwrap();
+        let expected = if gst::ElementFactory::find("hlssink3").is_some() {
+            "hlssink3"
+        } else {
+            "hlssink2"
+        };
+        assert_eq!(name, expected);
+    }
 
     #[test]
     fn remuxes_mkv_to_hls_without_reencoding() {
