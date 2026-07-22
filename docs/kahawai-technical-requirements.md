@@ -1,0 +1,177 @@
+# Kahawai — Technical Requirements Document
+
+**Version:** 0.1 (draft)
+**Status:** For review
+**Scope:** Backend (hub, mediahost, transcoder), its client-facing and inter-module contracts, and the hub's bundled web interface (admin UI + MVP web player, §6.5). Native client applications remain out of scope except where their needs constrain the backend.
+
+---
+
+## 1. Overview
+
+Kahawai — Hawaiian for *stream*; also the Māori name of a New Zealand fish, from *kaha* (strong) + *wai* (water) — is a self-hosted media streaming platform for personal backups of series, movies, music, and anime. Users rip or back up media they own, place it on storage they control, and stream it to their own devices. The backend is written in Rust and uses GStreamer for all media handling: metadata and stream inspection, capability negotiation, and transcoding.
+
+The system ships in two deployment shapes built from the same codebase:
+
+1. **All-in-one binary** — a single executable that embeds the hub, one mediahost, and one transcoder, suitable for a NAS or a single home server.
+2. **Modular deployment** — the hub, one or more mediahosts, and zero or more transcoders run as separate processes, potentially on separate machines, connected over the network.
+
+The functional behavior visible to clients must be identical in both shapes.
+
+## 2. Goals and non-goals
+
+**Goals.** Reliable local-first streaming of personal media; correct handling of heterogeneous rips (varied containers, codecs, subtitle formats); direct play whenever the client can handle the source; transcoding only on capability mismatch; horizontal distribution of storage (mediahosts) and compute (transcoders); metadata enrichment from public databases; a stable, versioned client API.
+
+**Non-goals (v1).** Acquiring media (no downloaders/indexers — subtitle acquisition per HUB-21..24 is the sole, deliberate exception); DRM; live TV/DVR; multi-tenant SaaS operation; federation between independent hubs; editing or re-muxing source files on disk (sources are treated as read-only).
+
+## 3. Terminology
+
+**Collection** — a unit announced by a mediahost: a media type (`series`, `movies`, `music`, or `anime`) plus a set of files with their on-disk metadata (paths, sizes, mtimes, and GStreamer-extracted stream info). `anime` is a first-class type spanning both episodic content and films, because its naming conventions, metadata ecosystem, and subtitle handling differ enough from western series/movies to warrant a dedicated pipeline (§6.6).
+**Library** — a hub-side construct combining one or more collections of the same media type into a single browsable entity presented to clients.
+**Item** — a logical media entity in a library: a movie, an episode, a track.
+**Media source** — a concrete file backing an item. An item may have multiple sources (e.g., 4K and 1080p copies of the same movie, possibly on different mediahosts).
+**Capability profile** — a structured description of what a client can play: containers, video/audio codecs with profiles and levels, max resolution/bitrate/framerate, subtitle formats, HDR support, streaming protocols.
+**Play session** — the hub-managed lifecycle of one playback: negotiation, source selection, delivery (direct or transcoded), progress reporting, teardown.
+
+## 4. Architecture requirements
+
+### 4.1 Modules
+
+**AR-1** The system shall consist of three modules: **hub**, **mediahost**, and **transcoder**, plus a shared core library.
+**AR-2** The hub shall be the only module clients communicate with. Mediahosts and transcoders shall never be directly addressable by clients; all media bytes reaching a client are proxied or brokered by the hub (see AR-8 for the delegated-delivery exception).
+**AR-3** Mediahosts and transcoders shall initiate connections *to* the hub (outbound registration), so they can live behind NAT or firewalls without inbound port forwarding.
+**AR-4** A hub shall support multiple simultaneously connected mediahosts and transcoders. A mediahost shall be able to announce multiple collections.
+**AR-5** The all-in-one binary shall run all three modules in one process, replacing the network transport between them with an in-process transport, with no change in module logic.
+**AR-6** Modules shall tolerate disconnects: a mediahost dropping shall mark its collections unavailable (not deleted); a transcoder dropping shall fail over active sessions to another transcoder where possible, otherwise terminate those sessions with a client-visible error.
+**AR-7** All inter-module protocol messages shall be versioned; a hub shall reject or degrade gracefully when a module speaks an incompatible protocol version.
+**AR-8** *(Optional, v1.x)* The hub may issue signed, expiring delegation tokens allowing a client to fetch stream bytes directly from a mediahost or transcoder when network topology permits, to take the hub out of the data path. This must be opt-in per deployment.
+
+### 4.2 Data flow
+
+**AR-9** Control plane (browse, search, negotiate, session management) always flows client ↔ hub.
+**AR-10** For direct play, media bytes flow mediahost → hub → client with byte-range support end to end. Remuxing (repackaging supported streams into a supported container, no re-encoding) is performed by the hub itself in this same path; a remux session shall never require or engage a transcoder, and shall be fully functional in deployments with zero transcoders attached.
+**AR-11** For transcoded play, the transcoder pulls source bytes from the owning mediahost via the hub's brokered channel (or directly, in all-in-one), produces segmented output, and the hub serves those segments to the client.
+
+### 4.3 Trust and enrollment
+
+The hub is the certificate authority for its deployment. Mediahosts and transcoders (collectively "satellites") are admitted through a one-time, admin-confirmed certificate enrollment and thereafter authenticate with mutual TLS.
+
+**SEC-1** The hub shall operate an internal CA: it generates a CA keypair and self-signed CA certificate on first start and stores the private key locally with restrictive permissions. The CA private key shall never leave the hub.
+**SEC-2** A satellite without a certificate shall, on first start, generate a keypair locally (the private key never leaves the satellite), build a CSR identifying its module type and name, submit the CSR to the hub's enrollment endpoint, and print a short verification code to its console. The code shall be derived from a cryptographic fingerprint of the CSR so that it commits to the satellite's public key.
+**SEC-3** The hub shall hold submitted CSRs as pending enrollments and shall not sign any of them automatically. An administrator approves an enrollment by entering the satellite's console code on the hub (CLI or admin UI); the hub shall verify the entered code against the pending CSR's fingerprint and reject on mismatch. Pending enrollments shall expire after a configurable timeout, and enrollment submissions shall be rate-limited and logged.
+**SEC-4** On approval, the hub shall sign the CSR and return to the satellite: its signed certificate and the hub's CA certificate. The satellite shall persist both and shall pin the CA certificate for all future connections.
+**SEC-5** All subsequent inter-module connections (control plane and byte plane) shall use mutual TLS: the hub accepts a connection only if the satellite presents a certificate chaining to the hub CA whose fingerprint is not on the revocation blocklist; the satellite accepts a connection only if the hub's certificate validates against the pinned CA, so satellites can positively identify the hub.
+**SEC-6** Revocation shall be coupled to satellite deletion: a certificate is revoked if and only if the administrator deletes the satellite from the hub. Deletion revokes the certificate fingerprint, immediately terminates the satellite's active connections and sessions, and refuses reconnection at the TLS layer. Deleting a mediahost additionally deletes its collections (cascade per HUB-20); deleting a transcoder removes it from the scheduler. A deleted machine can only be re-admitted through a fresh enrollment (SEC-2). Transient disconnects remain governed by AR-6 and never trigger revocation or data removal.
+**SEC-7** Satellite certificates shall have bounded validity and be renewed automatically before expiry over the existing mutually authenticated channel, without a new console code.
+
+## 5. Mediahost requirements
+
+**MH-1** A mediahost shall be configured with one or more collections, each defined by a media type and one or more root directories.
+**MH-2** On startup and on demand, a mediahost shall scan its roots, and it shall watch them for changes (filesystem notification where available, with periodic rescan as fallback) and push incremental updates to the hub.
+**MH-3** For every media file, the mediahost shall extract technical metadata using GStreamer's discovery facilities: container format; per-stream codec, profile/level, resolution, framerate, pixel format, bit depth, HDR metadata (HDR10/HLG/Dolby Vision presence), audio channel layout and sample rate, embedded subtitle streams and their formats, chapters, duration, and container-level tags (including music tags: artist, album, track number, disc number, embedded art).
+**MH-4** The mediahost shall detect external companion files: sidecar subtitles (`.srt`, `.ass`, `.sub/.idx`, `.vtt`), external audio, local artwork (`poster.jpg`, `cover.jpg`, `folder.jpg`), and NFO files, and associate them with the correct media file. It shall additionally enumerate MKV attachments and extract font attachments (TTF/OTF), which are required to render ASS/SSA subtitles correctly (HUB-32).
+**MH-5** The mediahost shall compute a stable content identity per file (path + size + mtime fast path; content hash of head/tail segments for move/rename detection) so the hub can preserve item identity and watch state across renames and moves. For video files it shall additionally compute the OpenSubtitles moviehash (file size + 64-bit sum of the first and last 64 KiB) in the same read pass and include it in the file record for subtitle matching (HUB-22).
+**MH-6** The mediahost shall serve byte-range read requests for its files to authorized peers (hub, brokered transcoder) and shall never expose write operations on media files.
+**MH-7** Scanning shall be rate-limited and resumable so that a scan of a large library (100k+ files) does not saturate disk I/O and survives restarts without starting over.
+**MH-8** Unreadable or corrupt files shall be reported to the hub with a diagnostic rather than silently skipped.
+**MH-9** For collections where the hub requests it (anime exact matching, HUB-30), the mediahost shall compute full-file ED2K hashes as a low-priority background job separate from the scan (full-file reads are expensive), report them incrementally, and persist them in its local journal so they are computed at most once per content identity. If the filename carries a CRC32 tag, the mediahost may verify it during the same pass and report mismatches as integrity warnings.
+
+## 6. Hub requirements
+
+### 6.1 Registry, libraries, and identity
+
+**HUB-1** The hub shall maintain a registry of connected mediahosts, their collections, and connected transcoders with their capability reports.
+**HUB-2** Administrators shall be able to compose libraries from any set of same-typed collections, including collections from different mediahosts, and set per-library settings (name, artwork, preferred metadata language, enrichment providers, user visibility).
+**HUB-3** The hub shall deduplicate: when two collections contain sources that resolve to the same logical item (same movie, same episode, same track/release), the hub shall present one item with multiple sources ranked by quality, and shall select among available sources at play time based on availability and negotiation outcome.
+**HUB-4** The hub shall parse file and directory names into candidate identities (title, year, season/episode numbering including multi-episode files and specials, absolute numbering for anime, artist/album/track for music) as input to enrichment, with per-item manual override.
+**HUB-20** Deleting a mediahost (SEC-6) shall cascade: its collections are deleted, removed from all libraries, and their sources detached from items; items left with no remaining source are removed from browse. Watch state and manual metadata bindings for affected items shall be archived keyed to content identity (MH-5) so that if the same media returns later — via re-enrollment of the machine or another mediahost — item identity, manual matches, and per-user watch state are restored on import. This is distinct from a disconnect, which only marks collections unavailable (AR-6).
+
+### 6.2 Metadata enrichment
+
+**HUB-5** The hub shall enrich items via pluggable providers behind a common trait: TheTVDB and TMDB for series/movies, MusicBrainz (plus Cover Art Archive) for music, with the provider set extensible without touching core code.
+**HUB-6** Enrichment shall fetch descriptive metadata (titles, plots, cast, genres, ratings, air/release dates, artwork, season/episode structure, album/release structure) and store it locally; the system shall remain fully browsable and playable when providers are unreachable.
+**HUB-7** Provider access shall respect per-provider rate limits, cache responses with TTLs, support API keys supplied by the administrator, and support scheduled refresh of mutable metadata (e.g., ongoing series).
+**HUB-8** Ambiguous matches shall be flagged for manual resolution rather than guessed above a confidence threshold; manual matches shall be sticky across rescans (keyed to content identity from MH-5).
+**HUB-9** Local metadata (NFO, local artwork, embedded tags) shall be usable as an authoritative provider ordered ahead of or behind online providers per library.
+
+#### Subtitle acquisition
+
+**HUB-21** The hub shall support downloading subtitles from external subtitle services behind a pluggable provider trait, with OpenSubtitles (REST API) as the first implementation. The feature shall be disabled by default and activated by the administrator supplying provider credentials (API key and, where the provider requires it, a user account).
+**HUB-22** Subtitle matching shall prefer exact file identification via the provider's file hash (for OpenSubtitles: the moviehash, computed by the mediahost during scan and carried in the file record) and fall back to metadata search (external IDs from enrichment, then title/year/season/episode). Preferred subtitle languages shall be configurable per user and per library and act as the default search filter.
+**HUB-23** Downloaded subtitles shall be stored exclusively on the hub, in its own data store — never written to a mediahost or next to the media files (mediahost roots are read-only per MH-6) — versioned per item source and language, and registered as additional external subtitle streams so they participate in capability negotiation exactly like sidecar files (pass-through, format conversion, or burn-in per HUB-15). A downloaded subtitle attaches to the item source, not to the requesting user: it is automatically available to every user with access to that item, with the initiating user recorded for auditability.
+**HUB-24** Subtitle downloads shall always be user-initiated: a user searches candidates for an item (filtered by their language preferences by default), sees language/release/rating/uploader and whether the match is hash-exact, and explicitly picks one to download. The hub shall never download subtitles automatically — not on import, not on a schedule, and not as a side effect of playback. The hub shall respect provider rate limits and download quotas and surface remaining quota to the user, cache search results, retain uploader attribution with each stored subtitle, and allow users to delete or replace a mismatched subtitle.
+
+### 6.3 Users, auth, and API
+
+**HUB-10** The hub shall support multiple user accounts with per-library access grants, per-user watch state (played/unplayed, resume positions, play counts), and an admin role for configuration.
+**HUB-11** The client API shall be a versioned HTTP/JSON API plus a real-time channel (WebSocket or SSE) for session events and library-change notifications, with token-based auth (short-lived access tokens, revocable refresh tokens) and optional reverse-proxy/OIDC-friendly operation.
+**HUB-12** The API shall expose browse (hierarchical: library → show → season → episode; artist → album → track), search across libraries, item detail with full technical stream info, image serving with server-side resizing and caching, playback endpoints, and admin endpoints (module registry, library composition, enrichment control, session monitoring).
+**HUB-13** All state owned by the hub (registry, libraries, items, users, watch state, enrichment cache index) shall persist in an embedded database requiring no external services by default.
+
+### 6.4 Playback and capability negotiation
+
+**HUB-14** A play request shall include the client's capability profile. The hub shall compare it against each candidate source's streams and decide, per elementary stream, one of: **direct play** (container and all selected streams supported → byte-range serve), **remux** (streams supported, container not → the hub repackages without re-encoding, using its own GStreamer pipeline and no transcoder, per AR-10), or **transcode** (re-encode the mismatching stream(s) only, dispatched to a transcoder).
+**HUB-15** Negotiation shall account for: container support; video codec/profile/level; resolution, framerate and bitrate ceilings; HDR capability with tone-mapping fallback to SDR; audio codec and channel-count downmix; subtitle handling (pass-through of text formats the client supports, conversion between text formats, burn-in for image-based subtitles when the client cannot render them); and an explicit client- or user-imposed bandwidth cap.
+**HUB-16** The hub shall always prefer the cheapest sufficient path: direct play > remux > audio-only transcode > video transcode, and among sources prefer one that avoids transcoding entirely.
+**HUB-17** Transcoded delivery shall use an adaptive segmented protocol (HLS as baseline; LL-HLS and DASH as extensions), support seeking into not-yet-transcoded regions (session restart at seek point), and support mid-stream quality switching.
+**HUB-18** The hub shall track play sessions: concurrent stream limits per user, progress checkpoints (resume state written at a fixed interval and on teardown), idle timeout and orphan cleanup, and administrator visibility into active sessions (who, what, direct/transcoded, which transcoder, throughput).
+**HUB-19** Music playback shall support gapless-capable delivery, ReplayGain/loudness metadata pass-through, and transcoding to formats and bitrates suitable for mobile clients.
+
+### 6.5 Bundled web interface
+
+**HUB-25** The hub shall ship with an embedded web interface — static assets compiled into the hub binary and served on the same listener as the client API — requiring no separate deployment, web server, or build step for the operator. It shall consist of two areas behind one login: an admin UI and an MVP web player.
+**HUB-26** The admin UI shall cover the full admin API surface: pending enrollments with code entry and live updates (a newly submitted CSR appears without a page refresh), the satellite list with fingerprints, status, and delete (revoke + cascade per SEC-6/HUB-20), library composition from announced collections, enrichment configuration and the manual-match review queue (HUB-8), subtitle provider configuration, user and grant management, and an active-sessions dashboard (who, what, direct/remux/transcode, which transcoder, throughput per HUB-18).
+**HUB-27** The MVP web player shall support: login; library browse and search; item detail with technical stream info and the negotiation verdict; video playback (direct, remuxed, and transcoded HLS) with seek, resume from watch state, audio-track and subtitle selection including the user-initiated subtitle search/download flow (HUB-24); and music playback with queue and album playback. The player shall derive and submit an honest capability profile from the browser's actual decode capabilities rather than a hardcoded one.
+**HUB-28** The web interface shall be a pure client of the versioned public API (HUB-11/12) with no privileged private endpoints, so that third-party clients can achieve full feature parity. It shall target current evergreen browsers; broader compatibility is a non-goal for the MVP.
+
+### 6.6 Anime
+
+Anime is a differentiating pillar, not a skin over `series`: its metadata ecosystem (AniDB, AniList, MyAnimeList, Kitsu) is far more precise than TheTVDB/TMDB for this content, and its file conventions demand their own handling.
+
+**HUB-29** Anime libraries shall use anime-native metadata providers behind the same provider trait: AniDB and AniList as first implementations (MyAnimeList/Kitsu as candidates), with cross-service ID mapping (including to TheTVDB/TMDB via the community anime-lists mapping) so artwork or descriptions can fall back to western providers where the anime services are sparse.
+**HUB-30** Anime filename parsing shall understand fansub/release conventions: `[ReleaseGroup]`-prefixed names, absolute episode numbering as the norm, version tags (`v2`), CRC32 suffixes, batch markers, and specials/OVA/ONA/movie designations. Where ED2K hashes are available (MH-9), the hub shall use AniDB exact-file identification — hash → precise episode, release group, and version — as the highest-confidence match, above all name-based heuristics.
+**HUB-31** The hub shall model anime structure natively — AniDB-style per-series entries with absolute numbering, plus the relations graph (sequel, prequel, side story, alternative version) — and offer per-library presentation as either native structure or TVDB-style seasons via the ID mapping. The relations graph shall be exposed to clients as a suggested watch order on the item detail.
+**HUB-32** ASS/SSA subtitles shall be first-class: styling and typesetting preserved (never silently flattened to SRT), extracted font attachments (MH-4) stored and served alongside the subtitle stream, client-side ASS rendering supported where the client declares the capability (the bundled web player shall, per HUB-27), and burn-in via the transcoder — with the correct fonts supplied to it — as the fidelity fallback for clients that cannot.
+**HUB-32a** For clients without ASS rendering, the fallback shall be a policy choice between **burn-in** (full fidelity, but requires a video encode and is memory-bandwidth heavy on low-power hardware even when the encode itself is hardware-accelerated) and **flattening** (dialogue extracted to a plain text format such as WebVTT — typesetting, signs, and karaoke are lost, but no video encode is required for the subtitles). The policy shall be configurable as a server default with per-library and per-user override, and the negotiation verdict shall state which was applied and why. When flattening is selected and video would otherwise have been encoded *only* for burn-in, the plan shall degrade to remux or direct play with the flattened text track — playable with no transcoder at all (AR-10). "Never silently flattened" stands: flattening happens only under this explicit policy or an explicit per-session user choice, and capability profiles shall carry ASS rendering as an explicit capability so negotiation can distinguish all four paths (pass-through, client render, burn-in, flatten).
+**HUB-33** Anime libraries shall support dual-audio conventions: default audio selection by user preference (original + subtitles vs dub), remembered per user per library.
+
+## 7. Transcoder requirements
+
+**TC-1** On registration, a transcoder shall report its capabilities: available GStreamer encoders/decoders, hardware acceleration (VA-API, NVENC/NVDEC, V4L2, QSV, VideoToolbox), max concurrent sessions, and supported filters (scaling, tone mapping, deinterlacing, subtitle burn-in, audio downmix/resample).
+**TC-2** The hub shall schedule sessions onto transcoders using reported capabilities and live load, preferring hardware-accelerated paths that satisfy the negotiated output, and shall never schedule a job a transcoder cannot perform.
+**TC-3** A transcode session shall be fully specified by the hub (input source reference, stream selection, per-stream decision: copy/encode with codec+parameters, filters, segment format and duration, start offset) — the transcoder makes no policy decisions.
+**TC-4** The transcoder shall build GStreamer pipelines dynamically from the session spec, stream segments and playlists back as they are produced, honor seek (restart at offset) and quality-change commands, and report progress, throughput (realtime multiple), and errors.
+**TC-5** Sessions shall be cancellable with prompt resource release; a configurable transcode-ahead window shall bound how far past the play head a session runs.
+**TC-6** The transcoder shall enforce resource ceilings (CPU shares, GPU session count, scratch-disk quota with eviction of stale segments) and shall degrade predictably to software encoding when hardware acceleration fails at runtime.
+**TC-7** *(Optional, v1.x)* Offline pre-transcode: administrators may queue background conversion of items into a chosen profile stored as an additional source.
+
+## 8. Non-functional requirements
+
+**NFR-1 Performance.** Direct-play start ≤ 2 s and transcoded start ≤ 6 s on reference hardware (4-core x86 with VA-API, local disk, LAN client); browse responses ≤ 200 ms at 50k items; a hub shall handle ≥ 100 concurrent direct-play sessions on reference hardware, transcode concurrency bounded only by transcoder resources.
+**NFR-2 Scale.** Support ≥ 250k files across all collections, ≥ 10 mediahosts, ≥ 5 transcoders per hub without architectural change.
+**NFR-3 Reliability.** No data loss of user state on crash (durable writes for watch state); media files opened read-only always; clean recovery of all module connections after hub restart without rescan.
+**NFR-4 Security.** All inter-module links use mutual TLS under the hub's internal CA per §4.3; client API over TLS (native or via reverse proxy); path traversal impossible by construction (mediahosts resolve only IDs, never client-supplied paths); secrets and private keys never logged.
+**NFR-5 Portability.** Linux x86_64 and aarch64 as tier-1 targets (NAS-class hardware included); macOS and Windows tier-2 for the all-in-one binary; distribution as static-ish binaries with bundled or clearly-declared GStreamer plugin dependencies, plus container images per module and all-in-one.
+**NFR-6 Operability.** Structured logging, Prometheus-compatible metrics, health endpoints per module, single-file TOML configuration with environment-variable overrides, and online reload for non-structural settings.
+**NFR-7 Compatibility.** The client API is versioned; breaking changes only in a new major API version, with at least one prior version served concurrently during a deprecation window.
+**NFR-8 Licensing.** Codec support is delegated to the system/bundled GStreamer plugin sets; builds shall make the plugin tier (base/good/bad/ugly) explicit so distributors can make patent/licensing choices deliberately.
+
+## 9. Operational readiness
+
+Gaps identified in review that would block a real first release despite not appearing in the feature surface:
+
+**OPS-1 First-run bootstrap.** On first start with an empty database, the hub shall enter setup mode: the web UI presents a one-time flow to create the initial admin account (and nothing else is reachable until it completes); a printed one-time setup token gates the flow so a race on a freshly exposed port can't claim the instance. A CLI password-reset command (`kahawai hub reset-password <user>`) shall exist, since a self-hosted system has no email escape hatch.
+**OPS-2 Login hardening.** The client API shall throttle authentication attempts (per account and per source address, with exponential backoff) and log failures; this is the front door of a system people expose to the internet.
+**OPS-3 Environment self-check.** Every module shall provide a `doctor` command and run the same checks at startup: required GStreamer version and plugin inventory against the feature matrix (naming exactly which capability each missing plugin costs, e.g. "no `libde265`/`vah265` → HEVC sources will always transcode-fail"), hardware-acceleration device access, filesystem permissions on configured directories, and clock sanity. Missing optional capabilities degrade with a logged warning; missing essentials fail fast with actionable output.
+**OPS-4 Clock skew tolerance.** Satellites on RTC-less hardware (Raspberry Pi class NAS boxes) boot with wrong clocks and would fail certificate validation. Certificate validity checks shall tolerate bounded skew (leaf `notBefore` backdated at issuance; verifier allows a small grace window), and a satellite whose clock is out of tolerance shall log a specific, self-diagnosing error rather than a bare TLS failure.
+**OPS-5 Backup and restore.** The hub shall provide an online backup command producing a consistent snapshot of everything needed to rebuild it: database, PKI material, downloaded subtitles, and configuration (image and provider caches are excluded as re-derivable). Restore onto a fresh install shall reconnect existing satellites without re-enrollment, since the CA and satellite records are part of the snapshot.
+**OPS-6 Disk growth bounds.** All hub-side caches and stores shall be quota-bounded with defined eviction: image cache and provider cache (LRU under a configured cap), transcoder scratch (already TC-6). The subtitle store is deliberately not evicted (user-initiated content), but its size shall be reported.
+**OPS-7 Upgrade compatibility.** A hub shall accept satellites speaking the current or previous minor protocol version (N-1), so the supported rolling upgrade is hub first, satellites after, with mixed versions functional in between. Modules shall refuse to run against an incompatible version with a clear message, and the all-in-one binary is exempt (always self-consistent).
+**OPS-8 Reverse-proxy operation.** Since most deployments will sit behind a reverse proxy, the hub shall document and support: WebSocket upgrade for `/api/v1/events`, `X-Forwarded-For`/`X-Forwarded-Proto` trust configuration (needed for OPS-2 throttling to see real client addresses), and a configurable CORS allowlist for third-party web clients (HUB-28 parity).
+
+## 10. Acceptance criteria (v1)
+
+1. All-in-one binary on a single machine: scan a mixed library (H.264/HEVC/AV1 video, FLAC/MP3/AAC audio, PGS+SRT subtitles), enrich from TheTVDB/TMDB/MusicBrainz, then browse, search, and play from the bundled web player, with library composition and match review done in the bundled admin UI. Additionally: an anime collection with fansub-convention filenames matches correctly via AniDB/AniList (hash-exact where ED2K hashes have been computed), presents a watch order, and plays with ASS subtitles rendered client-side in the web player with correct fonts.
+2. Direct play of a compatible file with seek via byte ranges; remux of a compatible-codec MKV to fMP4/HLS without re-encoding, performed by the hub with **no transcoder attached**; HEVC→H.264 hardware transcode with PGS burn-in and AC-3→AAC stereo downmix, with seek and quality switch.
+3. Modular deployment across three machines (hub / mediahost / transcoder) passes the same client-visible test suite as the all-in-one deployment.
+4. Kill the mediahost mid-playback: session errors surface cleanly, library shows unavailable, reconnection restores availability without rescan. Kill the transcoder mid-playback with a second transcoder attached: session resumes on the second within 10 s.
+5. Enrollment, deletion, and restore: a fresh satellite prints its code, is approved by entering the code on the hub, and connects over mTLS; entering a wrong code rejects the enrollment. Deleting an enrolled mediahost revokes its certificate, drops its connection within 5 s, refuses reconnection, and removes its collections from all libraries; re-enrolling the machine and rescanning restores its items with prior manual matches and watch state intact.
