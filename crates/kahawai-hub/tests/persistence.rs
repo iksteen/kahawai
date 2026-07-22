@@ -45,6 +45,14 @@ async fn files_and_items_survive_restart() {
     let db = kahawai_hub::db::open(dir.path()).await.unwrap();
     let reg = Arc::new(Registry::new(db.clone()));
 
+    // The DB (password hashes, sessions) must not be world-readable.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(dir.path().join("hub.db")).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "hub.db must be 0600");
+    }
+
     let cols = reg.collections().await.unwrap();
     assert_eq!(cols.len(), 1);
     assert_eq!(cols[0].file_count, 3);

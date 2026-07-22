@@ -21,6 +21,18 @@ pub async fn open(data_dir: &Path) -> Result<SqlitePool> {
         .connect_with(opts)
         .await
         .with_context(|| format!("opening {}", path.display()))?;
+    // The DB holds password hashes and session state; SQLite gives -wal/-shm
+    // the same mode as the main file, so 0600 here covers all three.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for suffix in ["", "-wal", "-shm"] {
+            let p = data_dir.join(format!("hub.db{suffix}"));
+            if p.exists() {
+                std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600))?;
+            }
+        }
+    }
     sqlx::migrate!("./migrations")
         .run(&pool)
         .await

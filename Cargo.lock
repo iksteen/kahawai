@@ -1469,6 +1469,7 @@ dependencies = [
  "kahawai-media",
  "kahawai-mediahost",
  "kahawai-transport",
+ "libc",
  "serde",
  "serde_json",
  "sqlx",

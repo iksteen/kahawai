@@ -10,9 +10,11 @@ mod config;
 #[derive(Parser)]
 #[command(name = "kahawai", version, about = "Self-hosted media streaming server")]
 struct Cli {
-    /// Path to the TOML config file (env overrides: KAHAWAI_<SECTION>__<KEY>).
-    #[arg(short, long, global = true, default_value = "kahawai.toml")]
-    config: PathBuf,
+    /// Path to the TOML config file. Default: ./kahawai.toml, else
+    /// $XDG_CONFIG_HOME/kahawai/kahawai.toml for non-system users.
+    /// Env overrides: KAHAWAI_<SECTION>__<KEY>.
+    #[arg(short, long, global = true)]
+    config: Option<PathBuf>,
 
     #[command(subcommand)]
     command: Cmd,
@@ -55,7 +57,11 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
-    let cfg = config::load(&cli.config)?;
+    let (cfg, config_used) = config::load(cli.config.as_deref())?;
+    match &config_used {
+        Some(p) => tracing::info!(config = %p.display(), "loaded config"),
+        None => tracing::info!("no config file found; using built-in defaults"),
+    }
 
     match &cli.command {
         Cmd::Hub { cmd: None } | Cmd::Mediahost => startup_checks(&cfg)?,
@@ -103,10 +109,16 @@ fn doctor_checks(cfg: &config::Config) -> Vec<kahawai_media::doctor::Check> {
                 }
             }
             _ if must_write => {
-                // Will be created on first run — only fail if the parent is unusable.
-                match dir.parent().map(std::fs::metadata) {
-                    Some(Ok(_)) => Check::ok(name, format!("{} (will be created)", dir.display())),
-                    _ => Check::fail(name, format!("{} unusable", dir.display()), true),
+                // Created recursively on first run — fine as long as the
+                // nearest existing ancestor is a directory.
+                let ancestor_ok = dir
+                    .ancestors()
+                    .find(|a| a.exists())
+                    .is_some_and(|a| a.is_dir());
+                if ancestor_ok {
+                    Check::ok(name, format!("{} (will be created)", dir.display()))
+                } else {
+                    Check::fail(name, format!("{} unusable", dir.display()), true)
                 }
             }
             _ => Check::warn(name, format!("{} does not exist", dir.display())),
