@@ -82,7 +82,7 @@ async fn files_and_items_survive_restart() {
             .body(axum::body::Body::empty())
             .unwrap()
     };
-    let api = kahawai_hub::api::router(reg.clone(), auth, Arc::new(kahawai_hub::sessions::Sessions::default()));
+    let api = kahawai_hub::api::router(reg.clone(), auth, Arc::new(kahawai_hub::sessions::Sessions::new(tempfile::tempdir().unwrap().keep())));
     let resp = api
         .clone()
         .oneshot(get("/api/v1/items".into()))

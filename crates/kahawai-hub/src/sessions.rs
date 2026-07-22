@@ -1,11 +1,12 @@
-//! Play sessions (HUB-18 minimal): direct play only for now — source
-//! selection, lease establishment, range serving state.
+//! Play sessions (HUB-18 minimal): direct play and in-hub remux (AR-10).
 //!
 //! ponytail: sessions are in-memory (lost on hub restart, clients reopen);
 //! idle timeout and per-user concurrency limits land with HUB-18 proper.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use kahawai_proto::v1::{hub_to_host, HubToHost, OpenRead};
@@ -14,6 +15,11 @@ use sqlx::Row;
 use crate::leases::{new_lease_token, Lease, Leases};
 use crate::registry::Registry;
 
+pub enum Mode {
+    Direct { lease: Lease },
+    Remux { dir: PathBuf, job: Arc<kahawai_media::remux::RemuxJob> },
+}
+
 pub struct Session {
     pub id: String,
     pub user_id: String,
@@ -21,23 +27,31 @@ pub struct Session {
     pub module_id: String,
     pub size: u64,
     pub container: Option<String>,
-    pub lease: Lease,
+    pub mode: Mode,
 }
 
-#[derive(Default)]
 pub struct Sessions {
     pub leases: Leases,
+    /// Scratch space for remux sessions (`<data_dir>/sessions`).
+    scratch_root: PathBuf,
     active: Mutex<HashMap<String, Arc<Session>>>,
 }
 
 impl Sessions {
-    /// Start a direct-play session for an item: pick the best available
-    /// source, open a read lease on its mediahost.
+    pub fn new(scratch_root: PathBuf) -> Self {
+        // Sessions never survive a restart; stale scratch is garbage.
+        let _ = std::fs::remove_dir_all(&scratch_root);
+        Self { leases: Leases::default(), scratch_root, active: Mutex::new(HashMap::new()) }
+    }
+
+    /// Start a session for an item: pick the best available source, open a
+    /// read lease on its mediahost, and for remux start the in-hub pipeline.
     pub async fn start(
         self: &Arc<Self>,
         registry: &Registry,
         user_id: &str,
         item_id: &str,
+        mode: &str,
     ) -> Result<Arc<Session>> {
         let rows = sqlx::query(
             "SELECT s.module_id, s.collection_id, s.path_rel, f.size, f.streams_json
@@ -61,11 +75,9 @@ impl Sessions {
         let collection_id: String = source.get("collection_id");
         let path_rel: String = source.get("path_rel");
         let size = source.get::<i64, _>("size") as u64;
-        let container = serde_json::from_str::<serde_json::Value>(
-            source.get::<String, _>("streams_json").as_str(),
-        )
-        .ok()
-        .and_then(|v| v["container"].as_str().map(String::from));
+        let info: kahawai_core::media::MediaInfo =
+            serde_json::from_str(source.get::<String, _>("streams_json").as_str())
+                .unwrap_or_default();
 
         let token = new_lease_token();
         let msg = HubToHost {
@@ -80,31 +92,106 @@ impl Sessions {
             .establish(&token, registry.send_to_host(&module_id, msg))
             .await?;
 
+        let id = ulid::Ulid::new().to_string();
+        let session_mode = match mode {
+            "direct" => Mode::Direct { lease },
+            "remux" => Mode::Remux {
+                job: self.start_remux(&id, &info, lease, size).await?,
+                dir: self.scratch_root.join(&id),
+            },
+            other => bail!("unknown mode {other:?} (direct|remux)"),
+        };
+
         let session = Arc::new(Session {
-            id: ulid::Ulid::new().to_string(),
+            id,
             user_id: user_id.to_string(),
             item_id: item_id.to_string(),
             module_id,
             size,
-            container,
-            lease,
+            container: info.container.clone(),
+            mode: session_mode,
         });
         self.active.lock().unwrap().insert(session.id.clone(), session.clone());
-        tracing::info!(session = %session.id, item = item_id, path = %path_rel, "direct-play session started");
+        tracing::info!(session = %session.id, item = item_id, path = %path_rel, mode, "session started");
         Ok(session)
+    }
+
+    /// Spin up the remux pipeline, feed it from the lease, and wait for the
+    /// playlist to materialize so the returned URL is immediately playable.
+    async fn start_remux(
+        &self,
+        session_id: &str,
+        info: &kahawai_core::media::MediaInfo,
+        lease: Lease,
+        size: u64,
+    ) -> Result<Arc<kahawai_media::remux::RemuxJob>> {
+        // The muxer stalls on unfed pads, so only claim what TS can carry.
+        let has_video = info.video.iter().any(|v| matches!(v.codec.as_str(), "h264" | "hevc"));
+        let has_audio = info
+            .audio
+            .iter()
+            .any(|a| matches!(a.codec.as_str(), "aac" | "ac3" | "eac3" | "mp3"));
+        if !has_video && !has_audio {
+            bail!("no TS-compatible streams — this source needs a transcoder");
+        }
+
+        let dir = self.scratch_root.join(session_id);
+        std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+        let job = Arc::new(kahawai_media::remux::start(&dir, has_video, has_audio)?);
+
+        // Feed the whole source through the pipeline; appsrc backpressure
+        // (block=true) caps memory, so this runs on the blocking pool.
+        let feeder_job = job.clone();
+        let mut rx = lease.read_range(0, size).into_inner();
+        tokio::task::spawn_blocking(move || {
+            while let Some(item) = rx.blocking_recv() {
+                match item {
+                    Ok(bytes) => {
+                        if feeder_job.push(bytes.to_vec()).is_err() {
+                            return; // pipeline failed; error is recorded
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "remux feed interrupted");
+                        break;
+                    }
+                }
+            }
+            feeder_job.finish();
+        });
+
+        // Return once the playlist exists (or the pipeline died).
+        let playlist = dir.join("master.m3u8");
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            if let Some(e) = job.failed() {
+                bail!("remux failed to start: {e}");
+            }
+            if playlist.exists() {
+                return Ok(job);
+            }
+            if std::time::Instant::now() > deadline {
+                bail!("remux produced no playlist in time");
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     }
 
     pub fn get(&self, id: &str) -> Option<Arc<Session>> {
         self.active.lock().unwrap().get(id).cloned()
     }
 
-    /// Remove a session; the lease drops with the last reference, closing
-    /// the byte channel.
+    /// Remove a session: direct leases drop (closing the byte channel);
+    /// remux pipelines stop and their scratch dir is deleted.
     pub fn end(&self, id: &str) -> bool {
-        let removed = self.active.lock().unwrap().remove(id).is_some();
-        if removed {
-            tracing::info!(session = id, "session ended");
+        let Some(session) = self.active.lock().unwrap().remove(id) else {
+            return false;
+        };
+        if let Mode::Remux { dir, job } = &session.mode {
+            job.stop();
+            let _ = std::fs::remove_dir_all(dir);
         }
-        removed
+        tracing::info!(session = id, "session ended");
+        true
     }
 }

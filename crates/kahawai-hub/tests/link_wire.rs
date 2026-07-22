@@ -35,7 +35,7 @@ async fn spawn_hub() -> Hub {
     let registry = Arc::new(Registry::new(db));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = format!("localhost:{}", listener.local_addr().unwrap().port());
-    let sessions = Arc::new(kahawai_hub::sessions::Sessions::default());
+    let sessions = Arc::new(kahawai_hub::sessions::Sessions::new(tempfile::tempdir().unwrap().keep()));
     let svc = MediahostLinkService::new(registry.clone(), sessions.clone());
     tokio::spawn(async move {
         tonic::transport::Server::builder()

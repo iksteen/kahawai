@@ -2,6 +2,9 @@
 //! stream model. Blocking — call from `spawn_blocking` in async contexts.
 
 pub mod doctor;
+pub mod remux;
+#[doc(hidden)]
+pub mod testutil;
 
 use std::path::Path;
 use std::sync::OnceLock;

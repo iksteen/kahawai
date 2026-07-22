@@ -37,6 +37,7 @@ pub fn router(
         .route("/api/v1/playback/sessions", post(start_session))
         .route("/api/v1/playback/sessions/{id}", axum::routing::delete(end_session))
         .route("/api/v1/playback/sessions/{id}/stream", get(stream_session))
+        .route("/api/v1/playback/sessions/{id}/{file}", get(session_file))
         .route_layer(axum::middleware::from_fn_with_state(state.clone(), require_auth));
     Router::new()
         .route("/api/v1/setup", post(setup))
@@ -135,6 +136,12 @@ async fn refresh(
 #[derive(Deserialize)]
 struct StartSessionRequest {
     item_id: String,
+    #[serde(default = "default_mode")]
+    mode: String,
+}
+
+fn default_mode() -> String {
+    "direct".into()
 }
 
 async fn start_session(
@@ -144,17 +151,29 @@ async fn start_session(
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     let session = state
         .sessions
-        .start(&state.registry, &claims.sub, &body.item_id)
+        .start(&state.registry, &claims.sub, &body.item_id, &body.mode)
         .await
         .map_err(|e| (StatusCode::CONFLICT, format!("{e:#}")))?;
+    let (mode, stream_url, ctype) = match &session.mode {
+        crate::sessions::Mode::Direct { .. } => (
+            "direct",
+            format!("/api/v1/playback/sessions/{}/stream", session.id),
+            content_type(session.container.as_deref()).to_string(),
+        ),
+        crate::sessions::Mode::Remux { .. } => (
+            "remux",
+            format!("/api/v1/playback/sessions/{}/master.m3u8", session.id),
+            "application/vnd.apple.mpegurl".to_string(),
+        ),
+    };
     Ok((
         StatusCode::CREATED,
         Json(json!({
             "session_id": session.id,
-            "mode": "direct",
+            "mode": mode,
             "size": session.size,
-            "content_type": content_type(session.container.as_deref()),
-            "stream_url": format!("/api/v1/playback/sessions/{}/stream", session.id),
+            "content_type": ctype,
+            "stream_url": stream_url,
         })),
     ))
 }
@@ -235,6 +254,9 @@ async fn stream_session(
         .sessions
         .get(&id)
         .ok_or((StatusCode::NOT_FOUND, "no such session".to_string()))?;
+    let crate::sessions::Mode::Direct { lease } = &session.mode else {
+        return Err((StatusCode::CONFLICT, "not a direct-play session".into()));
+    };
     let range = headers.get(axum::http::header::RANGE).and_then(|v| v.to_str().ok());
 
     let (status, offset, len) = match parse_range(range, session.size) {
@@ -249,7 +271,7 @@ async fn stream_session(
         }
     };
 
-    let body = axum::body::Body::from_stream(session.lease.read_range(offset, len));
+    let body = axum::body::Body::from_stream(lease.read_range(offset, len));
     let mut resp = axum::response::Response::builder()
         .status(status)
         .header("accept-ranges", "bytes")
@@ -339,6 +361,44 @@ async fn item_detail(
         "year": item.get::<Option<i64>, _>("year"),
         "sources": sources,
     })))
+}
+
+
+/// Serve remux artifacts (playlist + segments) from the session's scratch
+/// dir. Only plain filenames are accepted — no separators, no dotfiles —
+/// so traversal is impossible by construction.
+async fn session_file(
+    State(state): State<AppState>,
+    Path((id, file)): Path<(String, String)>,
+) -> Result<Response, ApiError> {
+    let session = state
+        .sessions
+        .get(&id)
+        .ok_or((StatusCode::NOT_FOUND, "no such session".to_string()))?;
+    let crate::sessions::Mode::Remux { dir, .. } = &session.mode else {
+        return Err((StatusCode::NOT_FOUND, "not a remux session".into()));
+    };
+    let valid = !file.starts_with('.')
+        && file.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+    if !valid {
+        return Err((StatusCode::BAD_REQUEST, "invalid file name".into()));
+    }
+    let ctype = if file.ends_with(".m3u8") {
+        "application/vnd.apple.mpegurl"
+    } else if file.ends_with(".ts") {
+        "video/mp2t"
+    } else {
+        return Err((StatusCode::NOT_FOUND, "unknown file type".into()));
+    };
+    let bytes = tokio::fs::read(dir.join(&file))
+        .await
+        .map_err(|_| (StatusCode::NOT_FOUND, "no such file".to_string()))?;
+    Ok(axum::response::Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", ctype)
+        .header("cache-control", "no-store")
+        .body(axum::body::Body::from(bytes))
+        .unwrap())
 }
 
 #[cfg(test)]

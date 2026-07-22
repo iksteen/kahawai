@@ -50,7 +50,7 @@ async fn direct_play_ranges_end_to_end() {
     .unwrap();
     let db = kahawai_hub::db::open_in_memory().await.unwrap();
     let registry = Arc::new(Registry::new(db.clone()));
-    let sessions = Arc::new(kahawai_hub::sessions::Sessions::default());
+    let sessions = Arc::new(kahawai_hub::sessions::Sessions::new(tempfile::tempdir().unwrap().keep()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let hub_addr = format!("localhost:{}", listener.local_addr().unwrap().port());
     let link_svc = MediahostLinkService::new(registry.clone(), sessions.clone());

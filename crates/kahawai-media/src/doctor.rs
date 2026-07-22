@@ -41,11 +41,12 @@ const MATRIX: &[(&str, &[&str], bool, &str)] = &[
     ("demux mp4", &["qtdemux"], true, "MP4/MOV sources unusable"),
     ("parse h264", &["h264parse"], true, "H.264 streams cannot be handled"),
     ("parse hevc", &["h265parse"], false, "HEVC streams cannot be parsed"),
+    ("hls sink", &["hlssink2", "hlssink3"], false, "in-hub HLS remux unavailable"),
     (
         "mux fmp4/cmaf",
-        &["cmafmux", "isofmp4mux", "mp4mux"],
+        &["cmafmux", "isofmp4mux"],
         false,
-        "in-hub remux to fMP4/HLS unavailable",
+        "HLS uses TS segments only (install gst-plugins-rs for fMP4/CMAF)",
     ),
     (
         "decode h264",
