@@ -73,7 +73,9 @@ impl MediahostLink for MediahostLinkService {
             loop {
                 match inbound.message().await {
                     Ok(Some(HostToHub { msg: Some(msg) })) => {
-                        handle_host_msg(&registry, &module_id, msg)
+                        if let Err(e) = handle_host_msg(&registry, &module_id, msg).await {
+                            tracing::error!(%module_id, error = format!("{e:#}"), "handling link message");
+                        }
                     }
                     Ok(Some(HostToHub { msg: None })) => {} // newer kind: ignore (OPS-7)
                     Ok(None) => break,
@@ -90,31 +92,34 @@ impl MediahostLink for MediahostLinkService {
     }
 }
 
-fn handle_host_msg(registry: &Registry, module_id: &str, msg: host_to_hub::Msg) {
-    use crate::registry::FileEntry;
+async fn handle_host_msg(
+    registry: &Registry,
+    module_id: &str,
+    msg: host_to_hub::Msg,
+) -> anyhow::Result<()> {
+    use crate::registry::FileUpsertRecord;
     match msg {
         host_to_hub::Msg::Heartbeat(_) => registry.seen(module_id),
         host_to_hub::Msg::AnnounceCollection(a) => {
-            registry.announce_collection(module_id, &a.id, &a.media_type, a.roots)
+            registry
+                .announce_collection(module_id, &a.id, &a.media_type, &a.roots)
+                .await?
         }
         host_to_hub::Msg::FileUpsert(u) => {
-            let n = registry.upsert_files(
-                module_id,
-                &u.collection_id,
-                u.files.into_iter().map(|f| {
-                    (
-                        f.path_rel,
-                        FileEntry {
-                            size: f.size,
-                            mtime_unix: f.mtime_unix,
-                            head_xxh3: f.head_xxh3,
-                            tail_xxh3: f.tail_xxh3,
-                            oshash: f.oshash,
-                            streams_json: f.streams_json,
-                        },
-                    )
-                }),
-            );
+            let files = u
+                .files
+                .into_iter()
+                .map(|f| FileUpsertRecord {
+                    path_rel: f.path_rel,
+                    size: f.size,
+                    mtime_unix: f.mtime_unix,
+                    head_xxh3: f.head_xxh3,
+                    tail_xxh3: f.tail_xxh3,
+                    oshash: f.oshash,
+                    streams_json: f.streams_json,
+                })
+                .collect();
+            let n = registry.upsert_files(module_id, &u.collection_id, files).await?;
             tracing::debug!(%module_id, collection = %u.collection_id, files = n, "file upsert");
         }
         host_to_hub::Msg::FileError(e) => {
@@ -128,4 +133,5 @@ fn handle_host_msg(registry: &Registry, module_id: &str, msg: host_to_hub::Msg) 
         }
         host_to_hub::Msg::ScanProgress(_) | host_to_hub::Msg::Hello(_) => {}
     }
+    Ok(())
 }

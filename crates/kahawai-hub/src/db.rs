@@ -1,0 +1,39 @@
+//! Embedded SQLite (HUB-13): WAL mode, migrations on open, no external
+//! services.
+
+use std::path::Path;
+
+use anyhow::{Context, Result};
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
+use sqlx::SqlitePool;
+
+pub async fn open(data_dir: &Path) -> Result<SqlitePool> {
+    std::fs::create_dir_all(data_dir)
+        .with_context(|| format!("creating {}", data_dir.display()))?;
+    let path = data_dir.join("hub.db");
+    let opts = SqliteConnectOptions::new()
+        .filename(&path)
+        .create_if_missing(true)
+        .journal_mode(SqliteJournalMode::Wal)
+        .foreign_keys(true);
+    let pool = SqlitePoolOptions::new()
+        .max_connections(8)
+        .connect_with(opts)
+        .await
+        .with_context(|| format!("opening {}", path.display()))?;
+    sqlx::migrate!("./migrations")
+        .run(&pool)
+        .await
+        .context("running migrations")?;
+    Ok(pool)
+}
+
+/// In-memory DB for tests.
+pub async fn open_in_memory() -> Result<SqlitePool> {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await?;
+    sqlx::migrate!("./migrations").run(&pool).await?;
+    Ok(pool)
+}

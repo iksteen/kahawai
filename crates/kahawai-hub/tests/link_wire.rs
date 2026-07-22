@@ -30,7 +30,8 @@ async fn spawn_hub() -> Hub {
         revoked.clone(),
     )
     .unwrap();
-    let registry = Arc::new(Registry::default());
+    let db = kahawai_hub::db::open_in_memory().await.unwrap();
+    let registry = Arc::new(Registry::new(db));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = format!("localhost:{}", listener.local_addr().unwrap().port());
     let svc = MediahostLinkService::new(registry.clone());
@@ -147,15 +148,22 @@ async fn enrolled_mediahost_links_and_disconnect_is_tracked() {
 
     // The announced collection and its file arrive in the registry.
     let registry = hub.registry.clone();
-    wait_until(
-        || {
-            registry.collections_snapshot().iter().any(|((h, c), s)| {
-                h == "01LINK" && c == "movies" && s.available && s.files.len() == 1
-            })
-        },
-        "collection with one file",
-    )
-    .await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let cols = registry.collections().await.unwrap();
+            if cols.iter().any(|c| {
+                c.module_id == "01LINK"
+                    && c.collection_id == "movies"
+                    && c.available
+                    && c.file_count == 1
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("collection with one file");
 
     // Drop the client: AR-6 — satellite and collection marked unavailable,
     // nothing deleted.
@@ -168,10 +176,10 @@ async fn enrolled_mediahost_links_and_disconnect_is_tracked() {
         "mediahost to be marked disconnected",
     )
     .await;
-    let cols = hub.registry.collections_snapshot();
-    let (_, col) = cols.iter().find(|((h, _), _)| h == "01LINK").unwrap();
+    let cols = hub.registry.collections().await.unwrap();
+    let col = cols.iter().find(|c| c.module_id == "01LINK").unwrap();
     assert!(!col.available, "collection must be unavailable after disconnect");
-    assert_eq!(col.files.len(), 1, "files must survive a disconnect (AR-6)");
+    assert_eq!(col.file_count, 1, "files must survive a disconnect (AR-6)");
 }
 
 #[tokio::test]

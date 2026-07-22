@@ -44,7 +44,9 @@ async fn full_enrollment_flow() {
     let pki = tempfile::tempdir().unwrap();
     let state = tempfile::tempdir().unwrap();
     let ca = Arc::new(HubCa::load_or_create(pki.path()).unwrap());
-    let svc = EnrollmentService::new(ca.clone(), Duration::from_secs(900), 90);
+    let db = kahawai_hub::db::open_in_memory().await.unwrap();
+    let registry = Arc::new(kahawai_hub::registry::Registry::new(db));
+    let svc = EnrollmentService::new(ca.clone(), registry.clone(), Duration::from_secs(900), 90);
     let addr = spawn_hub(svc.clone(), &ca).await;
 
     // Satellite enrolls in the background.
@@ -63,11 +65,17 @@ async fn full_enrollment_flow() {
     assert_eq!(pending[0].name, "nas");
 
     // A wrong code approves nothing and (sole pending) rejects the CSR…
-    assert!(svc.approve("AAAA-AAAA").is_err());
+    assert!(svc.approve("AAAA-AAAA").await.is_err());
     // …after which the satellite resubmits the same CSR on its own.
     let pending = wait_for_pending(&svc).await;
     let code = enrollment_code(&pending[0].csr_der);
-    svc.approve(&code).unwrap();
+    svc.approve(&code).await.unwrap();
+    // Approval records the satellite row (SEC-4 bookkeeping).
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM satellites WHERE module_type = 'mediahost'")
+        .fetch_one(registry.db())
+        .await
+        .unwrap();
+    assert_eq!(n, 1);
 
     let id = tokio::time::timeout(Duration::from_secs(15), satellite)
         .await

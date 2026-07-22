@@ -11,6 +11,8 @@ kahawai-transport = { workspace = true }
 anyhow = { workspace = true }
 tokio = { workspace = true }
 tonic = { workspace = true }
+sqlx = { workspace = true }
+axum = { workspace = true }
 clap = { workspace = true }
 figment = { workspace = true }
 serde = { workspace = true }

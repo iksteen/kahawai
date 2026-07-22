@@ -21,7 +21,8 @@ pub struct Config {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct HubConfig {
-    /// Client API listener (not served yet).
+    /// Client API listener. Defaults to loopback until authentication
+    /// (HUB-10/11) lands — override deliberately if you must.
     pub bind: SocketAddr,
     /// Satellite listener: enrollment + (later) mTLS control/byte plane.
     pub satellite_bind: SocketAddr,
@@ -35,7 +36,7 @@ pub struct HubConfig {
 impl Default for HubConfig {
     fn default() -> Self {
         Self {
-            bind: "0.0.0.0:8420".parse().unwrap(),
+            bind: "127.0.0.1:8420".parse().unwrap(),
             satellite_bind: "0.0.0.0:8421".parse().unwrap(),
             data_dir: "/var/lib/kahawai".into(),
             hostnames: vec!["localhost".into()],
@@ -81,7 +82,7 @@ mod tests {
     #[test]
     fn defaults_without_file() {
         let cfg = load(Path::new("/nonexistent/kahawai.toml")).unwrap();
-        assert_eq!(cfg.hub.bind, "0.0.0.0:8420".parse().unwrap());
+        assert_eq!(cfg.hub.bind, "127.0.0.1:8420".parse().unwrap());
         assert_eq!(cfg.hub.satellite_bind, "0.0.0.0:8421".parse().unwrap());
         assert_eq!(cfg.hub.data_dir, PathBuf::from("/var/lib/kahawai"));
         assert_eq!(cfg.mediahost.hub, "localhost:8421");

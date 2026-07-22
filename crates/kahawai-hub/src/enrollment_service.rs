@@ -35,18 +35,25 @@ struct Inner {
 pub struct EnrollmentService {
     inner: Arc<Mutex<Inner>>,
     ca: Arc<HubCa>,
+    registry: Arc<crate::registry::Registry>,
     ttl: Duration,
     validity_days: u32,
 }
 
 impl EnrollmentService {
-    pub fn new(ca: Arc<HubCa>, ttl: Duration, validity_days: u32) -> Self {
+    pub fn new(
+        ca: Arc<HubCa>,
+        registry: Arc<crate::registry::Registry>,
+        ttl: Duration,
+        validity_days: u32,
+    ) -> Self {
         Self {
             inner: Arc::new(Mutex::new(Inner {
                 enrollments: Enrollments::new(ttl),
                 approved: HashMap::new(),
             })),
             ca,
+            registry,
             ttl,
             validity_days,
         }
@@ -56,23 +63,30 @@ impl EnrollmentService {
         EnrollmentServer::new(self)
     }
 
-    /// Admin entry point (SEC-3): approve by console code.
-    pub fn approve(&self, code: &str) -> anyhow::Result<String> {
-        let mut inner = self.inner.lock().unwrap();
-        let approved = inner
-            .enrollments
-            .approve(code, &self.ca, self.validity_days)?;
-        let summary = format!(
-            "{} \"{}\" ({}) cert {}",
-            approved.pending.module_type,
-            approved.pending.name,
-            approved.pending.module_id,
-            &approved.signed.fingerprint[..16],
-        );
-        inner.approved.insert(
-            approved.pending.csr_fingerprint.clone(),
-            (approved.signed.cert_pem, Instant::now()),
-        );
+    /// Admin entry point (SEC-3): approve by console code. Records the
+    /// satellite row (module id, name, cert fingerprint) on success.
+    pub async fn approve(&self, code: &str) -> anyhow::Result<String> {
+        let (summary, pending, fingerprint) = {
+            let mut inner = self.inner.lock().unwrap();
+            let approved = inner
+                .enrollments
+                .approve(code, &self.ca, self.validity_days)?;
+            let summary = format!(
+                "{} \"{}\" ({}) cert {}",
+                approved.pending.module_type,
+                approved.pending.name,
+                approved.pending.module_id,
+                &approved.signed.fingerprint[..16],
+            );
+            inner.approved.insert(
+                approved.pending.csr_fingerprint.clone(),
+                (approved.signed.cert_pem, Instant::now()),
+            );
+            (summary, approved.pending, approved.signed.fingerprint)
+        };
+        self.registry
+            .record_satellite(&pending.module_id, &pending.module_type, &pending.name, &fingerprint)
+            .await?;
         Ok(summary)
     }
 

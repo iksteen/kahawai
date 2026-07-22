@@ -44,3 +44,5 @@ gstreamer-pbutils = "0.25"
 serde_json = "1"
 walkdir = "2"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "macros", "migrate"] }
+axum = "0.8"

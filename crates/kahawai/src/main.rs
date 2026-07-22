@@ -55,18 +55,29 @@ async fn run_hub(cfg: config::HubConfig) -> Result<()> {
     let ca = Arc::new(kahawai_hub::pki::HubCa::load_or_create(
         &kahawai_hub::pki::pki_dir(&cfg.data_dir),
     )?);
-    let (cert_pem, key_pem) = ca.issue_server_cert(&cfg.hostnames)?;
+    let db = kahawai_hub::db::open(&cfg.data_dir).await?;
+    let registry = Arc::new(kahawai_hub::registry::Registry::new(db.clone()));
+
+    // Revocations persist across restarts (SEC-6).
     let revoked = kahawai_transport::mtls::RevocationList::default();
+    let fps: Vec<String> = sqlx::query_scalar("SELECT fingerprint FROM revoked_certs")
+        .fetch_all(&db)
+        .await?;
+    for fp in fps {
+        revoked.revoke(&fp);
+    }
+
+    let (cert_pem, key_pem) = ca.issue_server_cert(&cfg.hostnames)?;
     let tls = kahawai_transport::mtls::mtls_server_config(
         &cert_pem,
         &key_pem,
         ca.ca_cert_pem(),
         revoked.clone(),
     )?;
-    let registry = Arc::new(kahawai_hub::registry::Registry::default());
 
     let svc = kahawai_hub::enrollment_service::EnrollmentService::new(
         ca.clone(),
+        registry.clone(),
         Duration::from_secs(cfg.enrollment_ttl_minutes * 60),
         cfg.satellite_cert_days,
     );
@@ -82,10 +93,21 @@ async fn run_hub(cfg: config::HubConfig) -> Result<()> {
             if code.is_empty() {
                 continue;
             }
-            match approver.approve(code) {
+            match approver.approve(code).await {
                 Ok(summary) => eprintln!("approved: {summary}"),
                 Err(e) => eprintln!("rejected: {e}"),
             }
+        }
+    });
+
+    // Client API (browse). No auth yet — keep it on loopback (see config).
+    let api_listener = tokio::net::TcpListener::bind(cfg.bind)
+        .await
+        .with_context(|| format!("binding client API on {}", cfg.bind))?;
+    let api = kahawai_hub::api::router(registry.clone());
+    tokio::spawn(async move {
+        if let Err(e) = axum::serve(api_listener, api).await {
+            tracing::error!(error = %e, "client API server failed");
         }
     });
 
@@ -93,9 +115,10 @@ async fn run_hub(cfg: config::HubConfig) -> Result<()> {
         .await
         .with_context(|| format!("binding satellite listener on {}", cfg.satellite_bind))?;
     tracing::info!(
+        bind = %cfg.bind,
         satellite_bind = %cfg.satellite_bind,
         ca_fingerprint = ca.ca_fingerprint(),
-        "hub up; enrollment listener ready"
+        "hub up"
     );
 
     tonic::transport::Server::builder()
