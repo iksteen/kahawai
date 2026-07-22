@@ -55,6 +55,21 @@ impl HubCa {
         &self.ca_fingerprint
     }
 
+    /// Issue the hub's own leaf server certificate (§7.1), used on the
+    /// enrollment/control/byte listeners. Ephemeral per boot — satellites
+    /// validate it against the pinned CA, not by fingerprint.
+    pub fn issue_server_cert(&self, hostnames: &[String]) -> Result<(String, String)> {
+        let key = KeyPair::generate()?;
+        let mut params = CertificateParams::new(hostnames.to_vec())?;
+        params.distinguished_name.push(DnType::CommonName, "Kahawai Hub");
+        let now = OffsetDateTime::now_utc();
+        params.not_before = now - LEAF_BACKDATE;
+        params.not_after = now + Duration::days(90);
+        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        let cert = params.signed_by(&key, &self.issuer)?;
+        Ok((cert.pem(), key.serialize_pem()))
+    }
+
     /// Sign an approved satellite CSR (SEC-4). Identity (CN, URI SAN) is taken
     /// from the CSR; validity and EKUs are imposed here — the satellite does
     /// not get a say in them.

@@ -6,7 +6,10 @@ edition.workspace = true
 [dependencies]
 kahawai-core = { workspace = true }
 kahawai-hub = { workspace = true }
+kahawai-transport = { workspace = true }
 anyhow = { workspace = true }
+tokio = { workspace = true }
+tonic = { workspace = true }
 clap = { workspace = true }
 figment = { workspace = true }
 serde = { workspace = true }

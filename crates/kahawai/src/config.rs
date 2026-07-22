@@ -14,29 +14,54 @@ use serde::Deserialize;
 pub struct Config {
     #[serde(default)]
     pub hub: HubConfig,
+    #[serde(default)]
+    pub mediahost: MediahostConfig,
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields, default)]
 pub struct HubConfig {
-    #[serde(default = "default_bind")]
+    /// Client API listener (not served yet).
     pub bind: SocketAddr,
-    #[serde(default = "default_data_dir")]
+    /// Satellite listener: enrollment + (later) mTLS control/byte plane.
+    pub satellite_bind: SocketAddr,
     pub data_dir: PathBuf,
+    /// Hostnames/IPs put in the hub's server-cert SANs.
+    pub hostnames: Vec<String>,
+    pub satellite_cert_days: u32,
+    pub enrollment_ttl_minutes: u64,
 }
 
 impl Default for HubConfig {
     fn default() -> Self {
-        Self { bind: default_bind(), data_dir: default_data_dir() }
+        Self {
+            bind: "0.0.0.0:8420".parse().unwrap(),
+            satellite_bind: "0.0.0.0:8421".parse().unwrap(),
+            data_dir: "/var/lib/kahawai".into(),
+            hostnames: vec!["localhost".into()],
+            satellite_cert_days: 90,
+            enrollment_ttl_minutes: 15,
+        }
     }
 }
 
-fn default_bind() -> SocketAddr {
-    "0.0.0.0:8420".parse().unwrap()
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct MediahostConfig {
+    /// Hub satellite address, `host:port`.
+    pub hub: String,
+    pub state_dir: PathBuf,
+    pub name: String,
 }
 
-fn default_data_dir() -> PathBuf {
-    "/var/lib/kahawai".into()
+impl Default for MediahostConfig {
+    fn default() -> Self {
+        Self {
+            hub: "localhost:8421".into(),
+            state_dir: "/var/lib/kahawai-mediahost".into(),
+            name: "mediahost".into(),
+        }
+    }
 }
 
 pub fn load(path: &Path) -> Result<Config> {
@@ -54,8 +79,10 @@ mod tests {
     #[test]
     fn defaults_without_file() {
         let cfg = load(Path::new("/nonexistent/kahawai.toml")).unwrap();
-        assert_eq!(cfg.hub.bind, default_bind());
-        assert_eq!(cfg.hub.data_dir, default_data_dir());
+        assert_eq!(cfg.hub.bind, "0.0.0.0:8420".parse().unwrap());
+        assert_eq!(cfg.hub.satellite_bind, "0.0.0.0:8421".parse().unwrap());
+        assert_eq!(cfg.hub.data_dir, PathBuf::from("/var/lib/kahawai"));
+        assert_eq!(cfg.mediahost.hub, "localhost:8421");
     }
 
     #[test]

@@ -1,0 +1,44 @@
+// Enrollment (SEC-2..4, §7.2): the only service reachable without a client
+// certificate. Accepts nothing but Submit/Status.
+syntax = "proto3";
+package kahawai.v1;
+
+service Enrollment {
+  rpc Submit(SubmitRequest) returns (SubmitResponse);
+  rpc Status(StatusRequest) returns (StatusResponse);
+}
+
+message SubmitRequest {
+  bytes csr_der = 1;
+}
+
+message SubmitResponse {
+  // sha256(csr_DER) hex — the satellite's polling handle.
+  string csr_fingerprint = 1;
+  uint64 ttl_seconds = 2;
+}
+
+message StatusRequest {
+  string csr_fingerprint = 1;
+}
+
+message StatusResponse {
+  oneof state {
+    Pending pending = 1;
+    Approved approved = 2;
+    Rejected rejected = 3;
+  }
+  // Hub wall clock, for satellite clock-skew self-diagnosis (OPS-4).
+  int64 hub_unix_time = 4;
+}
+
+message Pending {}
+
+message Approved {
+  string cert_pem = 1;
+  string ca_cert_pem = 2;
+}
+
+message Rejected {
+  string reason = 1;
+}

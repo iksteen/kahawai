@@ -1,6 +1,8 @@
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 mod config;
@@ -28,7 +30,8 @@ enum Cmd {
     Transcoder,
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -40,21 +43,70 @@ fn main() -> Result<()> {
     let cfg = config::load(&cli.config)?;
 
     match cli.command {
-        Cmd::Hub => run_hub(cfg.hub),
-        Cmd::AllInOne | Cmd::Mediahost | Cmd::Transcoder => {
-            anyhow::bail!("not implemented yet — only `kahawai hub` bootstraps so far")
+        Cmd::Hub => run_hub(cfg.hub).await,
+        Cmd::Mediahost => run_mediahost(cfg.mediahost).await,
+        Cmd::AllInOne | Cmd::Transcoder => {
+            anyhow::bail!("not implemented yet — `kahawai hub` and `kahawai mediahost` work so far")
         }
     }
 }
 
-fn run_hub(cfg: config::HubConfig) -> Result<()> {
-    let ca = kahawai_hub::pki::HubCa::load_or_create(&kahawai_hub::pki::pki_dir(&cfg.data_dir))?;
-    tracing::info!(
-        bind = %cfg.bind,
-        data_dir = %cfg.data_dir.display(),
-        ca_fingerprint = ca.ca_fingerprint(),
-        "hub bootstrapped"
+async fn run_hub(cfg: config::HubConfig) -> Result<()> {
+    let ca = Arc::new(kahawai_hub::pki::HubCa::load_or_create(
+        &kahawai_hub::pki::pki_dir(&cfg.data_dir),
+    )?);
+    let (cert_pem, key_pem) = ca.issue_server_cert(&cfg.hostnames)?;
+    let tls = kahawai_transport::tls::server_config(&cert_pem, &key_pem)?;
+
+    let svc = kahawai_hub::enrollment_service::EnrollmentService::new(
+        ca.clone(),
+        Duration::from_secs(cfg.enrollment_ttl_minutes * 60),
+        cfg.satellite_cert_days,
     );
-    tracing::warn!("hub server not implemented yet; exiting after CA bootstrap");
+
+    // SEC-3 CLI approval: type a satellite's console code + Enter.
+    let approver = svc.clone();
+    tokio::spawn(async move {
+        use tokio::io::AsyncBufReadExt;
+        let mut lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();
+        eprintln!("Type an enrollment code + Enter to approve a satellite.");
+        while let Ok(Some(line)) = lines.next_line().await {
+            let code = line.trim();
+            if code.is_empty() {
+                continue;
+            }
+            match approver.approve(code) {
+                Ok(summary) => eprintln!("approved: {summary}"),
+                Err(e) => eprintln!("rejected: {e}"),
+            }
+        }
+    });
+
+    let listener = tokio::net::TcpListener::bind(cfg.satellite_bind)
+        .await
+        .with_context(|| format!("binding satellite listener on {}", cfg.satellite_bind))?;
+    tracing::info!(
+        satellite_bind = %cfg.satellite_bind,
+        ca_fingerprint = ca.ca_fingerprint(),
+        "hub up; enrollment listener ready"
+    );
+
+    tonic::transport::Server::builder()
+        .add_service(svc.into_server())
+        .serve_with_incoming(kahawai_transport::tls::tls_incoming(listener, tls))
+        .await
+        .context("enrollment listener failed")
+}
+
+async fn run_mediahost(cfg: config::MediahostConfig) -> Result<()> {
+    let id = kahawai_transport::enroll::ensure_identity(
+        &cfg.hub,
+        &cfg.state_dir,
+        "mediahost",
+        &cfg.name,
+    )
+    .await?;
+    tracing::info!(module_id = %id.module_id, hub = %cfg.hub, "mediahost enrolled");
+    tracing::warn!("mediahost link not implemented yet; exiting after enrollment");
     Ok(())
 }

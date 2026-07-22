@@ -9,6 +9,8 @@ edition = "2024"
 [workspace.dependencies]
 kahawai-core = { path = "crates/kahawai-core" }
 kahawai-hub = { path = "crates/kahawai-hub" }
+kahawai-proto = { path = "crates/kahawai-proto" }
+kahawai-transport = { path = "crates/kahawai-transport" }
 
 anyhow = "1"
 thiserror = "2"
@@ -24,3 +26,14 @@ sha2 = "0.10"
 data-encoding = "2"
 time = "0.3"
 tempfile = "3"
+tonic = { version = "0.14", features = ["tls-ring"] }
+tonic-prost = "0.14"
+tonic-prost-build = "0.14"
+prost = "0.14"
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+rustls-pki-types = "1.12"
+tokio-stream = "0.1"
+tower = "0.5"
+hyper-util = "0.1"
+ulid = "1"
