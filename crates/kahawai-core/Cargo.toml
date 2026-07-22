@@ -1,0 +1,9 @@
+[package]
+name = "kahawai-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+sha2 = { workspace = true }
+data-encoding = { workspace = true }
+rcgen = { workspace = true }

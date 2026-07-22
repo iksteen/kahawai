@@ -1,0 +1,17 @@
+[package]
+name = "kahawai"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+kahawai-core = { workspace = true }
+kahawai-hub = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+figment = { workspace = true }
+serde = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+figment = { workspace = true, features = ["test"] }
