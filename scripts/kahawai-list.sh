@@ -43,7 +43,13 @@ for i in items:
     year = i["year"] or "----"
     n = i["sources"]
     srcs = " [%d sources]" % n if n != 1 else ""
-    print("%s  %s (%s)%s" % (i["id"], title, year, srcs))
+    mark = ""
+    if i.get("played"):
+        mark = "  [seen]"
+    elif i.get("resume_position_ms"):
+        pos = i["resume_position_ms"] // 1000
+        mark = "  [resume %d:%02d]" % (pos // 60, pos % 60)
+    print("%s  %s (%s)%s%s" % (i["id"], title, year, srcs, mark))
     shown += 1
 print("-- %d/%d items" % (shown, len(items)), file=sys.stderr)
 ' "$FILTER"

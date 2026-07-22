@@ -116,3 +116,48 @@ async fn files_and_items_survive_restart() {
     let resp = api.oneshot(get("/api/v1/items/nope".into())).await.unwrap();
     assert_eq!(resp.status(), 404);
 }
+
+#[tokio::test]
+async fn reconcile_drops_files_missing_from_scan() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    let reg = Registry::new(db.clone());
+    reg.announce_collection("01H", "movies", "movies", &[]).await.unwrap();
+    reg.upsert_files(
+        "01H",
+        "movies",
+        vec![rec("Heat (1995).mkv", 100), rec("Ronin (1998).mkv", 50)],
+    )
+    .await
+    .unwrap();
+
+    // A user watched Ronin; its state must die with the item.
+    sqlx::query("INSERT INTO users (id, username, password_hash) VALUES ('u1','u','x')")
+        .execute(&db)
+        .await
+        .unwrap();
+    let ronin: String = sqlx::query_scalar("SELECT id FROM items WHERE title = 'Ronin'")
+        .fetch_one(&db)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO watch_state (user_id, item_id, position_ms) VALUES ('u1', ?, 1234)")
+        .bind(&ronin)
+        .execute(&db)
+        .await
+        .unwrap();
+
+    // Rescan saw only Heat.
+    let seen: std::collections::HashSet<String> = ["Heat (1995).mkv".to_string()].into();
+    let removed = reg.reconcile_files("01H", "movies", &seen).await.unwrap();
+    assert_eq!(removed, 1);
+
+    let files: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM files").fetch_one(&db).await.unwrap();
+    let items: Vec<String> = sqlx::query_scalar("SELECT title FROM items").fetch_all(&db).await.unwrap();
+    let watch: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM watch_state").fetch_one(&db).await.unwrap();
+    assert_eq!(files, 1);
+    assert_eq!(items, vec!["Heat".to_string()]);
+    assert_eq!(watch, 0, "watch state cascades with the removed item");
+
+    // Idempotent when nothing changed.
+    assert_eq!(reg.reconcile_files("01H", "movies", &seen).await.unwrap(), 0);
+}

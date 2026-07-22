@@ -199,6 +199,7 @@ async fn run_hub(cfg: config::HubConfig) -> Result<()> {
     let registry = Arc::new(kahawai_hub::registry::Registry::new(db.clone()));
     let auth = Arc::new(kahawai_hub::auth::Auth::new(db.clone(), &cfg.data_dir).await?);
     let sessions = Arc::new(kahawai_hub::sessions::Sessions::new(cfg.data_dir.join("sessions")));
+    sessions.spawn_janitor();
 
     // Revocations persist across restarts (SEC-6).
     let revoked = kahawai_transport::mtls::RevocationList::default();

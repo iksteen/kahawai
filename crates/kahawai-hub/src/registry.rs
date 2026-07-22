@@ -269,6 +269,53 @@ impl Registry {
         Ok(n)
     }
 
+    /// After a completed scan, drop files the scan no longer reported and
+    /// items left without any source (their watch state cascades away —
+    /// the content-identity archive arrives with HUB-20).
+    pub async fn reconcile_files(
+        &self,
+        module_id: &str,
+        collection_id: &str,
+        seen: &std::collections::HashSet<String>,
+    ) -> Result<usize> {
+        let known: Vec<String> = sqlx::query_scalar(
+            "SELECT path_rel FROM files WHERE module_id = ? AND collection_id = ?",
+        )
+        .bind(module_id)
+        .bind(collection_id)
+        .fetch_all(&self.db)
+        .await?;
+        let stale: Vec<&String> = known.iter().filter(|p| !seen.contains(*p)).collect();
+        if stale.is_empty() {
+            return Ok(0);
+        }
+        let mut tx = self.db.begin().await?;
+        for path in &stale {
+            for table in ["item_sources", "files"] {
+                sqlx::query(&format!(
+                    "DELETE FROM {table} WHERE module_id = ? AND collection_id = ? AND path_rel = ?"
+                ))
+                .bind(module_id)
+                .bind(collection_id)
+                .bind(path)
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
+        sqlx::query(
+            "DELETE FROM items WHERE id IN (
+                SELECT i.id FROM items i
+                LEFT JOIN item_sources s ON s.item_id = i.id
+                WHERE s.item_id IS NULL)",
+        )
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        tracing::info!(%module_id, collection = collection_id, removed = stale.len(),
+            "reconciled files gone from disk");
+        Ok(stale.len())
+    }
+
     pub async fn collections(&self) -> Result<Vec<CollectionRow>> {
         let rows = sqlx::query(
             "SELECT c.module_id, c.collection_id, c.media_type,

@@ -37,6 +37,7 @@ pub fn router(
         .route("/api/v1/playback/sessions", post(start_session))
         .route("/api/v1/playback/sessions/{id}", axum::routing::delete(end_session))
         .route("/api/v1/playback/sessions/{id}/stream", get(stream_session))
+        .route("/api/v1/playback/sessions/{id}/progress", post(post_progress))
         .route("/api/v1/playback/sessions/{id}/{file}", get(session_file))
         .route_layer(axum::middleware::from_fn_with_state(state.clone(), require_auth));
     Router::new()
@@ -254,6 +255,7 @@ async fn stream_session(
         .sessions
         .get(&id)
         .ok_or((StatusCode::NOT_FOUND, "no such session".to_string()))?;
+    session.touch();
     let crate::sessions::Mode::Direct { lease } = &session.mode else {
         return Err((StatusCode::CONFLICT, "not a direct-play session".into()));
     };
@@ -271,7 +273,15 @@ async fn stream_session(
         }
     };
 
-    let body = axum::body::Body::from_stream(lease.read_range(offset, len));
+    // Long-running transfers count as activity chunk by chunk (HUB-18).
+    let keepalive = session.clone();
+    let body = axum::body::Body::from_stream(tokio_stream::StreamExt::map(
+        lease.read_range(offset, len),
+        move |chunk| {
+            keepalive.touch();
+            chunk
+        },
+    ));
     let mut resp = axum::response::Response::builder()
         .status(status)
         .header("accept-ranges", "bytes")
@@ -291,34 +301,52 @@ async fn list_collections(State(state): State<AppState>) -> Result<Json<Value>, 
     Ok(Json(json!({ "collections": cols })))
 }
 
-async fn list_items(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+async fn list_items(
+    State(state): State<AppState>,
+    axum::Extension(claims): axum::Extension<crate::auth::Claims>,
+) -> Result<Json<Value>, ApiError> {
     let rows = sqlx::query(
-        "SELECT i.id, i.title, i.year, COUNT(s.item_id) AS sources
-         FROM items i LEFT JOIN item_sources s ON s.item_id = i.id
+        "SELECT i.id, i.title, i.year, COUNT(s.item_id) AS sources,
+                w.position_ms, w.played, w.play_count
+         FROM items i
+         LEFT JOIN item_sources s ON s.item_id = i.id
+         LEFT JOIN watch_state w ON w.item_id = i.id AND w.user_id = ?
          GROUP BY i.id ORDER BY i.title, i.year",
     )
+    .bind(&claims.sub)
     .fetch_all(state.registry.db())
     .await
     .map_err(internal)?;
-    let items: Vec<Value> = rows
-        .iter()
-        .map(|r| {
-            json!({
-                "id": r.get::<String, _>("id"),
-                "title": r.get::<String, _>("title"),
-                "year": r.get::<Option<i64>, _>("year"),
-                "sources": r.get::<i64, _>("sources"),
-            })
-        })
-        .collect();
+    let items: Vec<Value> = rows.iter().map(item_row_json).collect();
     Ok(Json(json!({ "items": items })))
+}
+
+fn item_row_json(r: &sqlx::sqlite::SqliteRow) -> Value {
+    json!({
+        "id": r.get::<String, _>("id"),
+        "title": r.get::<String, _>("title"),
+        "year": r.get::<Option<i64>, _>("year"),
+        "sources": r.get::<i64, _>("sources"),
+        "resume_position_ms": r.get::<Option<i64>, _>("position_ms"),
+        "played": r.get::<Option<i64>, _>("played").unwrap_or(0) != 0,
+        "play_count": r.get::<Option<i64>, _>("play_count").unwrap_or(0),
+    })
 }
 
 async fn item_detail(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    axum::Extension(claims): axum::Extension<crate::auth::Claims>,
 ) -> Result<Json<Value>, ApiError> {
-    let item = sqlx::query("SELECT id, title, year FROM items WHERE id = ?")
+    let item = sqlx::query(
+        "SELECT i.id, i.title, i.year,
+                (SELECT COUNT(*) FROM item_sources s WHERE s.item_id = i.id) AS sources,
+                w.position_ms, w.played, w.play_count
+         FROM items i
+         LEFT JOIN watch_state w ON w.item_id = i.id AND w.user_id = ?
+         WHERE i.id = ?",
+    )
+        .bind(&claims.sub)
         .bind(&id)
         .fetch_optional(state.registry.db())
         .await
@@ -355,14 +383,61 @@ async fn item_detail(
         })
         .collect();
 
-    Ok(Json(json!({
-        "id": item.get::<String, _>("id"),
-        "title": item.get::<String, _>("title"),
-        "year": item.get::<Option<i64>, _>("year"),
-        "sources": sources,
-    })))
+    let mut out = item_row_json(&item);
+    out["sources"] = json!(sources);
+    Ok(Json(out))
 }
 
+
+#[derive(Deserialize)]
+struct ProgressRequest {
+    position_ms: u64,
+}
+
+/// Record playback progress (HUB-10/18): durable resume position, played
+/// flag + play count on crossing 90%, and a session keep-alive.
+async fn post_progress(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    axum::Extension(claims): axum::Extension<crate::auth::Claims>,
+    Json(body): Json<ProgressRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let session = state
+        .sessions
+        .get(&id)
+        .ok_or((StatusCode::NOT_FOUND, "no such session".to_string()))?;
+    if session.user_id != claims.sub {
+        return Err((StatusCode::FORBIDDEN, "not your session".into()));
+    }
+    session.touch();
+
+    let duration = session.duration_ms;
+    let finished = duration.is_some_and(|d| d > 0 && body.position_ms * 10 >= d * 9);
+    let row = sqlx::query(
+        "INSERT INTO watch_state (user_id, item_id, position_ms, duration_ms, played, play_count, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?5, unixepoch())
+         ON CONFLICT (user_id, item_id) DO UPDATE SET
+           position_ms = excluded.position_ms,
+           duration_ms = excluded.duration_ms,
+           play_count = play_count + (excluded.played AND NOT played),
+           played = MAX(played, excluded.played),
+           updated_at = unixepoch()
+         RETURNING played, play_count",
+    )
+    .bind(&claims.sub)
+    .bind(&session.item_id)
+    .bind(body.position_ms as i64)
+    .bind(duration.map(|d| d as i64))
+    .bind(finished)
+    .fetch_one(state.registry.db())
+    .await
+    .map_err(internal)?;
+    Ok(Json(json!({
+        "position_ms": body.position_ms,
+        "played": row.get::<i64, _>("played") != 0,
+        "play_count": row.get::<i64, _>("play_count"),
+    })))
+}
 
 /// Serve remux artifacts (playlist + segments) from the session's scratch
 /// dir. Only plain filenames are accepted — no separators, no dotfiles —
@@ -375,6 +450,7 @@ async fn session_file(
         .sessions
         .get(&id)
         .ok_or((StatusCode::NOT_FOUND, "no such session".to_string()))?;
+    session.touch();
     let crate::sessions::Mode::Remux { dir, .. } = &session.mode else {
         return Err((StatusCode::NOT_FOUND, "not a remux session".into()));
     };

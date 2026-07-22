@@ -27,21 +27,73 @@ pub struct Session {
     pub module_id: String,
     pub size: u64,
     pub container: Option<String>,
+    pub duration_ms: Option<u64>,
     pub mode: Mode,
+    touched: Mutex<std::time::Instant>,
+}
+
+impl Session {
+    /// Any client activity (stream chunks, playlist/segment fetches,
+    /// progress pings) keeps the session alive (HUB-18).
+    pub fn touch(&self) {
+        *self.touched.lock().unwrap() = std::time::Instant::now();
+    }
+
+    pub fn idle_for(&self) -> Duration {
+        self.touched.lock().unwrap().elapsed()
+    }
 }
 
 pub struct Sessions {
     pub leases: Leases,
     /// Scratch space for remux sessions (`<data_dir>/sessions`).
     scratch_root: PathBuf,
+    max_per_user: usize,
+    idle_timeout: Duration,
     active: Mutex<HashMap<String, Arc<Session>>>,
 }
 
 impl Sessions {
     pub fn new(scratch_root: PathBuf) -> Self {
+        Self::with_limits(scratch_root, 4, Duration::from_secs(90))
+    }
+
+    pub fn with_limits(scratch_root: PathBuf, max_per_user: usize, idle_timeout: Duration) -> Self {
         // Sessions never survive a restart; stale scratch is garbage.
         let _ = std::fs::remove_dir_all(&scratch_root);
-        Self { leases: Leases::default(), scratch_root, active: Mutex::new(HashMap::new()) }
+        Self {
+            leases: Leases::default(),
+            scratch_root,
+            max_per_user,
+            idle_timeout,
+            active: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Reap idle sessions (HUB-18: no fetch or progress ping → teardown).
+    pub fn spawn_janitor(self: &Arc<Self>) {
+        let sessions = self.clone();
+        // Check at half the timeout (tests use tiny timeouts), capped at 15 s.
+        let period = (sessions.idle_timeout / 2)
+            .clamp(Duration::from_millis(50), Duration::from_secs(15));
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(period);
+            loop {
+                tick.tick().await;
+                let idle: Vec<String> = sessions
+                    .active
+                    .lock()
+                    .unwrap()
+                    .values()
+                    .filter(|s| s.idle_for() > sessions.idle_timeout)
+                    .map(|s| s.id.clone())
+                    .collect();
+                for id in idle {
+                    tracing::info!(session = %id, "ending idle session");
+                    sessions.end(&id);
+                }
+            }
+        });
     }
 
     /// Start a session for an item: pick the best available source, open a
@@ -65,6 +117,16 @@ impl Sessions {
         .await?;
         if rows.is_empty() {
             bail!("no sources for item");
+        }
+        let user_active = self
+            .active
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|s| s.user_id == user_id)
+            .count();
+        if user_active >= self.max_per_user {
+            bail!("too many concurrent streams ({user_active}); close one first");
         }
         let source = rows
             .iter()
@@ -109,7 +171,9 @@ impl Sessions {
             module_id,
             size,
             container: info.container.clone(),
+            duration_ms: info.duration_ms,
             mode: session_mode,
+            touched: Mutex::new(std::time::Instant::now()),
         });
         self.active.lock().unwrap().insert(session.id.clone(), session.clone());
         tracing::info!(session = %session.id, item = item_id, path = %path_rel, mode, "session started");

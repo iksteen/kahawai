@@ -64,6 +64,8 @@ impl MediahostLink for MediahostLinkService {
         registry.connected(&module_id, &peer.module_type, &hello.name, &peer.fingerprint);
         registry.register_link(&module_id, tx.clone());
 
+        let mut seen: std::collections::HashMap<String, std::collections::HashSet<String>> =
+            std::collections::HashMap::new();
         tokio::spawn(async move {
             let ack = HubToHost {
                 msg: Some(hub_to_host::Msg::HelloAck(HelloAck {
@@ -79,7 +81,8 @@ impl MediahostLink for MediahostLinkService {
             loop {
                 match inbound.message().await {
                     Ok(Some(HostToHub { msg: Some(msg) })) => {
-                        if let Err(e) = handle_host_msg(&registry, &module_id, msg).await {
+                        if let Err(e) = handle_host_msg(&registry, &module_id, msg, &mut seen).await
+                        {
                             tracing::error!(%module_id, error = format!("{e:#}"), "handling link message");
                         }
                     }
@@ -131,20 +134,28 @@ impl MediahostLink for MediahostLinkService {
     }
 }
 
+/// `seen` accumulates upserted paths per collection between its announce
+/// and its scan-complete, at which point files missing from the scan are
+/// reconciled away (deletions on disk propagate on every rescan).
 async fn handle_host_msg(
     registry: &Registry,
     module_id: &str,
     msg: host_to_hub::Msg,
+    seen: &mut std::collections::HashMap<String, std::collections::HashSet<String>>,
 ) -> anyhow::Result<()> {
     use crate::registry::FileUpsertRecord;
     match msg {
         host_to_hub::Msg::Heartbeat(_) => registry.seen(module_id),
         host_to_hub::Msg::AnnounceCollection(a) => {
+            seen.insert(a.id.clone(), Default::default());
             registry
                 .announce_collection(module_id, &a.id, &a.media_type, &a.roots)
                 .await?
         }
         host_to_hub::Msg::FileUpsert(u) => {
+            if let Some(paths) = seen.get_mut(&u.collection_id) {
+                paths.extend(u.files.iter().map(|f| f.path_rel.clone()));
+            }
             let files = u
                 .files
                 .into_iter()
@@ -162,13 +173,20 @@ async fn handle_host_msg(
             tracing::debug!(%module_id, collection = %u.collection_id, files = n, "file upsert");
         }
         host_to_hub::Msg::FileError(e) => {
-            // MH-8: reported, not silently skipped.
+            // MH-8: reported, not silently skipped. The file stays known
+            // (it exists on disk), so keep it out of reconciliation.
+            if let Some(paths) = seen.get_mut(&e.collection_id) {
+                paths.insert(e.path_rel.clone());
+            }
             tracing::warn!(%module_id, collection = %e.collection_id, path = %e.path_rel,
                 error = %e.error, "mediahost reported unreadable file");
         }
         host_to_hub::Msg::ScanProgress(p) if p.complete => {
             tracing::info!(%module_id, collection = %p.collection_id,
                 scanned = p.scanned, failed = p.failed, "scan complete");
+            if let Some(paths) = seen.remove(&p.collection_id) {
+                registry.reconcile_files(module_id, &p.collection_id, &paths).await?;
+            }
         }
         host_to_hub::Msg::ScanProgress(_) | host_to_hub::Msg::Hello(_) => {}
     }
