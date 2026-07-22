@@ -72,10 +72,10 @@ impl MediahostLink for MediahostLinkService {
             }
             loop {
                 match inbound.message().await {
-                    Ok(Some(HostToHub { msg: Some(host_to_hub::Msg::Heartbeat(_)) })) => {
-                        registry.seen(&module_id);
+                    Ok(Some(HostToHub { msg: Some(msg) })) => {
+                        handle_host_msg(&registry, &module_id, msg)
                     }
-                    Ok(Some(_)) => {} // unknown/newer message kinds: ignore (OPS-7)
+                    Ok(Some(HostToHub { msg: None })) => {} // newer kind: ignore (OPS-7)
                     Ok(None) => break,
                     Err(e) => {
                         tracing::debug!(%module_id, error = %e, "link stream error");
@@ -87,5 +87,45 @@ impl MediahostLink for MediahostLinkService {
         });
 
         Ok(Response::new(ReceiverStream::new(rx)))
+    }
+}
+
+fn handle_host_msg(registry: &Registry, module_id: &str, msg: host_to_hub::Msg) {
+    use crate::registry::FileEntry;
+    match msg {
+        host_to_hub::Msg::Heartbeat(_) => registry.seen(module_id),
+        host_to_hub::Msg::AnnounceCollection(a) => {
+            registry.announce_collection(module_id, &a.id, &a.media_type, a.roots)
+        }
+        host_to_hub::Msg::FileUpsert(u) => {
+            let n = registry.upsert_files(
+                module_id,
+                &u.collection_id,
+                u.files.into_iter().map(|f| {
+                    (
+                        f.path_rel,
+                        FileEntry {
+                            size: f.size,
+                            mtime_unix: f.mtime_unix,
+                            head_xxh3: f.head_xxh3,
+                            tail_xxh3: f.tail_xxh3,
+                            oshash: f.oshash,
+                            streams_json: f.streams_json,
+                        },
+                    )
+                }),
+            );
+            tracing::debug!(%module_id, collection = %u.collection_id, files = n, "file upsert");
+        }
+        host_to_hub::Msg::FileError(e) => {
+            // MH-8: reported, not silently skipped.
+            tracing::warn!(%module_id, collection = %e.collection_id, path = %e.path_rel,
+                error = %e.error, "mediahost reported unreadable file");
+        }
+        host_to_hub::Msg::ScanProgress(p) if p.complete => {
+            tracing::info!(%module_id, collection = %p.collection_id,
+                scanned = p.scanned, failed = p.failed, "scan complete");
+        }
+        host_to_hub::Msg::ScanProgress(_) | host_to_hub::Msg::Hello(_) => {}
     }
 }

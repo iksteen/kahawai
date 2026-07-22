@@ -11,7 +11,52 @@ message HostToHub {
   oneof msg {
     Hello hello = 1;
     Heartbeat heartbeat = 2;
+    AnnounceCollection announce_collection = 3;
+    FileUpsert file_upsert = 4;
+    FileError file_error = 5;
+    ScanProgress scan_progress = 6;
   }
+}
+
+// A collection this mediahost serves (MH-1). Announced after Hello and
+// whenever configuration changes.
+message AnnounceCollection {
+  // Stable per-mediahost collection identifier (the configured name).
+  string id = 1;
+  string media_type = 2; // series|movies|music|anime
+  repeated string roots = 3;
+}
+
+message FileUpsert {
+  string collection_id = 1;
+  repeated FileRecord files = 2;
+}
+
+message FileRecord {
+  string path_rel = 1;
+  uint64 size = 2;
+  int64 mtime_unix = 3;
+  // Content identity (MH-5): xxh3 of first/last 64 KiB.
+  uint64 head_xxh3 = 4;
+  uint64 tail_xxh3 = 5;
+  // OpenSubtitles moviehash, same read pass (MH-5/HUB-22).
+  uint64 oshash = 6;
+  // kahawai_core::media::MediaInfo as JSON (schema evolves without proto churn).
+  string streams_json = 7;
+}
+
+// Unreadable/corrupt file diagnostic (MH-8).
+message FileError {
+  string collection_id = 1;
+  string path_rel = 2;
+  string error = 3;
+}
+
+message ScanProgress {
+  string collection_id = 1;
+  uint32 scanned = 2;
+  uint32 failed = 3;
+  bool complete = 4;
 }
 
 message HubToHost {

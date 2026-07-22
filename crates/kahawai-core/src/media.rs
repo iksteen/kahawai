@@ -1,0 +1,52 @@
+//! Normalized technical stream model (MH-3) — what a mediahost reports per
+//! file and what capability negotiation later consumes. Codec names are
+//! lowercase normalized strings ("h264", "hevc", "aac", …).
+
+use std::collections::BTreeMap;
+
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct MediaInfo {
+    /// Container format, normalized ("matroska", "mp4", "webm", …).
+    pub container: Option<String>,
+    pub duration_ms: Option<u64>,
+    #[serde(default)]
+    pub video: Vec<VideoStream>,
+    #[serde(default)]
+    pub audio: Vec<AudioStream>,
+    #[serde(default)]
+    pub subtitles: Vec<SubtitleStream>,
+    /// Container-level tags (title, artist, album, track number, …).
+    #[serde(default)]
+    pub tags: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct VideoStream {
+    pub codec: String,
+    pub width: u32,
+    pub height: u32,
+    /// Frames per second as (numerator, denominator).
+    pub fps: Option<(u32, u32)>,
+    pub bit_depth: Option<u32>,
+    pub interlaced: bool,
+    // ponytail: HDR metadata (HDR10/HLG/DoVi, MH-3) not extracted yet — add
+    // when negotiation grows tone-mapping decisions.
+    pub hdr: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct AudioStream {
+    pub codec: String,
+    pub channels: u32,
+    pub sample_rate: u32,
+    pub language: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct SubtitleStream {
+    /// "srt", "ass", "pgs", "vobsub", "webvtt", …
+    pub format: String,
+    pub language: Option<String>,
+}

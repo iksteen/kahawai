@@ -98,6 +98,36 @@ async fn enrolled_mediahost_links_and_disconnect_is_tracked() {
             first.msg,
             Some(kahawai_proto::v1::hub_to_host::Msg::HelloAck(_))
         ));
+        // Announce a collection and push one file record.
+        tx.send(kahawai_proto::v1::HostToHub {
+            msg: Some(kahawai_proto::v1::host_to_hub::Msg::AnnounceCollection(
+                kahawai_proto::v1::AnnounceCollection {
+                    id: "movies".into(),
+                    media_type: "movies".into(),
+                    roots: vec!["/tank/movies".into()],
+                },
+            )),
+        })
+        .await
+        .unwrap();
+        tx.send(kahawai_proto::v1::HostToHub {
+            msg: Some(kahawai_proto::v1::host_to_hub::Msg::FileUpsert(
+                kahawai_proto::v1::FileUpsert {
+                    collection_id: "movies".into(),
+                    files: vec![kahawai_proto::v1::FileRecord {
+                        path_rel: "Heat (1995)/Heat.mkv".into(),
+                        size: 123,
+                        mtime_unix: 456,
+                        head_xxh3: 1,
+                        tail_xxh3: 2,
+                        oshash: 3,
+                        streams_json: "{}".into(),
+                    }],
+                },
+            )),
+        })
+        .await
+        .unwrap();
         // Keep the link open until the test drops us.
         (tx, inbound)
     });
@@ -115,7 +145,20 @@ async fn enrolled_mediahost_links_and_disconnect_is_tracked() {
     assert_eq!(state.module_type, "mediahost");
     assert_eq!(state.name, "nas");
 
-    // Drop the client: AR-6 — marked disconnected, not deleted.
+    // The announced collection and its file arrive in the registry.
+    let registry = hub.registry.clone();
+    wait_until(
+        || {
+            registry.collections_snapshot().iter().any(|((h, c), s)| {
+                h == "01LINK" && c == "movies" && s.available && s.files.len() == 1
+            })
+        },
+        "collection with one file",
+    )
+    .await;
+
+    // Drop the client: AR-6 — satellite and collection marked unavailable,
+    // nothing deleted.
     let (tx, inbound) = link.await.unwrap();
     drop(tx);
     drop(inbound);
@@ -125,6 +168,10 @@ async fn enrolled_mediahost_links_and_disconnect_is_tracked() {
         "mediahost to be marked disconnected",
     )
     .await;
+    let cols = hub.registry.collections_snapshot();
+    let (_, col) = cols.iter().find(|((h, _), _)| h == "01LINK").unwrap();
+    assert!(!col.available, "collection must be unavailable after disconnect");
+    assert_eq!(col.files.len(), 1, "files must survive a disconnect (AR-6)");
 }
 
 #[tokio::test]

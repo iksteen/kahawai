@@ -9,6 +9,7 @@ edition = "2024"
 [workspace.dependencies]
 kahawai-core = { path = "crates/kahawai-core" }
 kahawai-hub = { path = "crates/kahawai-hub" }
+kahawai-media = { path = "crates/kahawai-media" }
 kahawai-mediahost = { path = "crates/kahawai-mediahost" }
 kahawai-proto = { path = "crates/kahawai-proto" }
 kahawai-transport = { path = "crates/kahawai-transport" }
@@ -38,3 +39,8 @@ tokio-stream = "0.1"
 tower = "0.5"
 hyper-util = "0.1"
 ulid = "1"
+gstreamer = "0.25"
+gstreamer-pbutils = "0.25"
+serde_json = "1"
+walkdir = "2"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }

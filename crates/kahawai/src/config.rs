@@ -52,6 +52,7 @@ pub struct MediahostConfig {
     pub hub: String,
     pub state_dir: PathBuf,
     pub name: String,
+    pub collections: Vec<kahawai_mediahost::scan::CollectionConfig>,
 }
 
 impl Default for MediahostConfig {
@@ -60,6 +61,7 @@ impl Default for MediahostConfig {
             hub: "localhost:8421".into(),
             state_dir: "/var/lib/kahawai-mediahost".into(),
             name: "mediahost".into(),
+            collections: Vec::new(),
         }
     }
 }

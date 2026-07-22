@@ -7,3 +7,4 @@ edition.workspace = true
 sha2 = { workspace = true }
 data-encoding = { workspace = true }
 rcgen = { workspace = true }
+serde = { workspace = true }
