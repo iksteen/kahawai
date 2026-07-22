@@ -1,0 +1,13 @@
+[package]
+name = "kahawai-mediahost"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+kahawai-proto = { workspace = true }
+kahawai-transport = { workspace = true }
+anyhow = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+tracing = { workspace = true }
+rustls = { workspace = true }

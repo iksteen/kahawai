@@ -6,7 +6,10 @@ edition.workspace = true
 [dependencies]
 kahawai-core = { workspace = true }
 kahawai-proto = { workspace = true }
+kahawai-transport = { workspace = true }
 tonic = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 rcgen = { workspace = true }
@@ -17,5 +20,3 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-kahawai-transport = { workspace = true }
-tokio = { workspace = true }

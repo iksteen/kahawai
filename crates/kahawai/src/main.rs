@@ -56,7 +56,14 @@ async fn run_hub(cfg: config::HubConfig) -> Result<()> {
         &kahawai_hub::pki::pki_dir(&cfg.data_dir),
     )?);
     let (cert_pem, key_pem) = ca.issue_server_cert(&cfg.hostnames)?;
-    let tls = kahawai_transport::tls::server_config(&cert_pem, &key_pem)?;
+    let revoked = kahawai_transport::mtls::RevocationList::default();
+    let tls = kahawai_transport::mtls::mtls_server_config(
+        &cert_pem,
+        &key_pem,
+        ca.ca_cert_pem(),
+        revoked.clone(),
+    )?;
+    let registry = Arc::new(kahawai_hub::registry::Registry::default());
 
     let svc = kahawai_hub::enrollment_service::EnrollmentService::new(
         ca.clone(),
@@ -93,20 +100,12 @@ async fn run_hub(cfg: config::HubConfig) -> Result<()> {
 
     tonic::transport::Server::builder()
         .add_service(svc.into_server())
+        .add_service(kahawai_hub::link_service::MediahostLinkService::new(registry).into_server())
         .serve_with_incoming(kahawai_transport::tls::tls_incoming(listener, tls))
         .await
-        .context("enrollment listener failed")
+        .context("satellite listener failed")
 }
 
 async fn run_mediahost(cfg: config::MediahostConfig) -> Result<()> {
-    let id = kahawai_transport::enroll::ensure_identity(
-        &cfg.hub,
-        &cfg.state_dir,
-        "mediahost",
-        &cfg.name,
-    )
-    .await?;
-    tracing::info!(module_id = %id.module_id, hub = %cfg.hub, "mediahost enrolled");
-    tracing::warn!("mediahost link not implemented yet; exiting after enrollment");
-    Ok(())
+    kahawai_mediahost::run(&cfg.hub, &cfg.state_dir, &cfg.name).await
 }

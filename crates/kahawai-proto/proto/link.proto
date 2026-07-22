@@ -1,0 +1,35 @@
+// Satellite control-plane links (AR-3, AR-7). Requires mTLS; the client
+// certificate's URI SAN is the identity — no token in any message.
+syntax = "proto3";
+package kahawai.v1;
+
+service MediahostLink {
+  rpc Link(stream HostToHub) returns (stream HubToHost);
+}
+
+message HostToHub {
+  oneof msg {
+    Hello hello = 1;
+    Heartbeat heartbeat = 2;
+  }
+}
+
+message HubToHost {
+  oneof msg {
+    HelloAck hello_ack = 1;
+  }
+}
+
+// First message on every link (AR-7): version negotiation input.
+message Hello {
+  uint32 protocol_major = 1;
+  uint32 protocol_minor = 2;
+  string name = 3;
+}
+
+message HelloAck {
+  uint32 protocol_major = 1;
+  uint32 protocol_minor = 2;
+}
+
+message Heartbeat {}

@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 kahawai-core = { workspace = true }
 kahawai-hub = { workspace = true }
+kahawai-mediahost = { workspace = true }
 kahawai-transport = { workspace = true }
 anyhow = { workspace = true }
 tokio = { workspace = true }
