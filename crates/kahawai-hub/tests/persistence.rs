@@ -63,11 +63,21 @@ async fn files_and_items_survive_restart() {
         vec![("Heat".into(), Some(1995), 2), ("Ronin".into(), Some(1998), 1)]
     );
 
-    // Browse API over the same state.
-    let api = kahawai_hub::api::router(reg.clone());
+    // Browse API over the same state (setup + login first).
+    let auth = Arc::new(kahawai_hub::auth::Auth::new(db.clone(), dir.path()).await.unwrap());
+    let token = auth.setup_token().unwrap();
+    let pair = auth.complete_setup(&token, "admin", "password-123").await.unwrap();
+    let bearer = format!("Bearer {}", pair.access_token);
+    let get = |uri: String| {
+        axum::http::Request::get(uri)
+            .header("authorization", bearer.clone())
+            .body(axum::body::Body::empty())
+            .unwrap()
+    };
+    let api = kahawai_hub::api::router(reg.clone(), auth);
     let resp = api
         .clone()
-        .oneshot(axum::http::Request::get("/api/v1/items").body(axum::body::Body::empty()).unwrap())
+        .oneshot(get("/api/v1/items".into()))
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
@@ -82,11 +92,7 @@ async fn files_and_items_survive_restart() {
     let id = items[0]["id"].as_str().unwrap();
     let resp = api
         .clone()
-        .oneshot(
-            axum::http::Request::get(format!("/api/v1/items/{id}"))
-                .body(axum::body::Body::empty())
-                .unwrap(),
-        )
+        .oneshot(get(format!("/api/v1/items/{id}")))
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
@@ -99,13 +105,6 @@ async fn files_and_items_survive_restart() {
     assert_eq!(sources[0]["available"], false);
 
     // Unknown item → 404.
-    let resp = api
-        .oneshot(
-            axum::http::Request::get("/api/v1/items/nope")
-                .body(axum::body::Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    let resp = api.oneshot(get("/api/v1/items/nope".into())).await.unwrap();
     assert_eq!(resp.status(), 404);
 }

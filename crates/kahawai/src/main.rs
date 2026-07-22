@@ -23,11 +23,26 @@ enum Cmd {
     /// Run hub, mediahost, and transcoder in a single process.
     AllInOne,
     /// Run the hub (the module clients talk to).
-    Hub,
+    Hub {
+        #[command(subcommand)]
+        cmd: Option<HubCmd>,
+    },
     /// Run a mediahost (announces collections from local disks).
     Mediahost,
     /// Run a transcoder.
     Transcoder,
+    /// Check the environment: GStreamer inventory, directories, clock (OPS-3).
+    Doctor {
+        /// Machine-readable output.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum HubCmd {
+    /// Overwrite a user's password (reads the new password from stdin).
+    ResetPassword { username: String },
 }
 
 #[tokio::main]
@@ -42,13 +57,126 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let cfg = config::load(&cli.config)?;
 
+    match &cli.command {
+        Cmd::Hub { cmd: None } | Cmd::Mediahost => startup_checks(&cfg)?,
+        _ => {}
+    }
     match cli.command {
-        Cmd::Hub => run_hub(cfg.hub).await,
+        Cmd::Hub { cmd: None } => run_hub(cfg.hub).await,
+        Cmd::Hub { cmd: Some(HubCmd::ResetPassword { username }) } => {
+            reset_password(cfg.hub, &username).await
+        }
         Cmd::Mediahost => run_mediahost(cfg.mediahost).await,
+        Cmd::Doctor { json } => doctor(&cfg, json),
         Cmd::AllInOne | Cmd::Transcoder => {
             anyhow::bail!("not implemented yet — `kahawai hub` and `kahawai mediahost` work so far")
         }
     }
+}
+
+/// Environment checks (OPS-3): shared GStreamer inventory plus per-module
+/// filesystem and clock checks from the loaded config.
+fn doctor_checks(cfg: &config::Config) -> Vec<kahawai_media::doctor::Check> {
+    use kahawai_media::doctor::Check;
+    let mut checks = kahawai_media::doctor::gstreamer_checks();
+
+    // Clock sanity: satellites on RTC-less boxes boot in the past (OPS-4).
+    let year_2025 = 1735689600;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    checks.push(if now > year_2025 {
+        Check::ok("system clock", "sane")
+    } else {
+        Check::fail("system clock", "before 2025 — fix NTP or certificates will fail", true)
+    });
+
+    let dir_check = |name: &str, dir: &std::path::Path, must_write: bool| {
+        let meta = std::fs::metadata(dir);
+        match meta {
+            Ok(m) if m.is_dir() => {
+                if !must_write || !m.permissions().readonly() {
+                    Check::ok(name, dir.display().to_string())
+                } else {
+                    Check::fail(name, format!("{} is read-only", dir.display()), true)
+                }
+            }
+            _ if must_write => {
+                // Will be created on first run — only fail if the parent is unusable.
+                match dir.parent().map(std::fs::metadata) {
+                    Some(Ok(_)) => Check::ok(name, format!("{} (will be created)", dir.display())),
+                    _ => Check::fail(name, format!("{} unusable", dir.display()), true),
+                }
+            }
+            _ => Check::warn(name, format!("{} does not exist", dir.display())),
+        }
+    };
+    checks.push(dir_check("hub data dir", &cfg.hub.data_dir, true));
+    checks.push(dir_check("mediahost state dir", &cfg.mediahost.state_dir, true));
+    for c in &cfg.mediahost.collections {
+        for root in &c.roots {
+            checks.push(dir_check(&format!("collection \"{}\" root", c.name), root, false));
+        }
+    }
+
+    // Hardware acceleration is optional but worth surfacing.
+    checks.push(if std::path::Path::new("/dev/dri").exists() {
+        kahawai_media::doctor::Check::ok("/dev/dri", "present (VA-API possible)")
+    } else {
+        kahawai_media::doctor::Check::warn("/dev/dri", "absent — hardware acceleration unavailable")
+    });
+    checks
+}
+
+fn doctor(cfg: &config::Config, json: bool) -> Result<()> {
+    use kahawai_media::doctor::Status;
+    let checks = doctor_checks(cfg);
+    if json {
+        println!("{}", serde_json::to_string_pretty(&checks)?);
+    } else {
+        for c in &checks {
+            let tag = match c.status {
+                Status::Ok => "OK  ",
+                Status::Warn => "WARN",
+                Status::Fail => "FAIL",
+            };
+            println!("{tag} {:<28} {}", c.name, c.detail);
+        }
+    }
+    if kahawai_media::doctor::has_essential_failure(&checks) {
+        anyhow::bail!("essential checks failed");
+    }
+    Ok(())
+}
+
+/// Startup gate: log warnings, abort on essential failures (OPS-3).
+fn startup_checks(cfg: &config::Config) -> Result<()> {
+    use kahawai_media::doctor::Status;
+    let checks = doctor_checks(cfg);
+    for c in &checks {
+        match c.status {
+            Status::Ok => {}
+            Status::Warn => tracing::warn!(check = %c.name, "{}", c.detail),
+            Status::Fail => tracing::error!(check = %c.name, "{}", c.detail),
+        }
+    }
+    if kahawai_media::doctor::has_essential_failure(&checks) {
+        anyhow::bail!("environment not usable — run `kahawai doctor` for details");
+    }
+    Ok(())
+}
+
+async fn reset_password(cfg: config::HubConfig, username: &str) -> Result<()> {
+    let db = kahawai_hub::db::open(&cfg.data_dir).await?;
+    eprint!("New password for {username}: ");
+    let mut pw = String::new();
+    std::io::stdin().read_line(&mut pw)?;
+    let pw = pw.trim_end_matches ('\n');
+    anyhow::ensure!(pw.len() >= 8, "password must be at least 8 characters");
+    kahawai_hub::auth::reset_password(&db, username, pw).await?;
+    println!("password updated; existing sessions revoked");
+    Ok(())
 }
 
 async fn run_hub(cfg: config::HubConfig) -> Result<()> {
@@ -57,6 +185,7 @@ async fn run_hub(cfg: config::HubConfig) -> Result<()> {
     )?);
     let db = kahawai_hub::db::open(&cfg.data_dir).await?;
     let registry = Arc::new(kahawai_hub::registry::Registry::new(db.clone()));
+    let auth = Arc::new(kahawai_hub::auth::Auth::new(db.clone(), &cfg.data_dir).await?);
 
     // Revocations persist across restarts (SEC-6).
     let revoked = kahawai_transport::mtls::RevocationList::default();
@@ -104,7 +233,7 @@ async fn run_hub(cfg: config::HubConfig) -> Result<()> {
     let api_listener = tokio::net::TcpListener::bind(cfg.bind)
         .await
         .with_context(|| format!("binding client API on {}", cfg.bind))?;
-    let api = kahawai_hub::api::router(registry.clone());
+    let api = kahawai_hub::api::router(registry.clone(), auth);
     tokio::spawn(async move {
         if let Err(e) = axum::serve(api_listener, api).await {
             tracing::error!(error = %e, "client API server failed");

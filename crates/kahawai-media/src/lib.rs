@@ -1,6 +1,8 @@
 //! GStreamer wrappers (MH-3): file discovery mapped into the normalized
 //! stream model. Blocking — call from `spawn_blocking` in async contexts.
 
+pub mod doctor;
+
 use std::path::Path;
 use std::sync::OnceLock;
 use std::time::Duration;

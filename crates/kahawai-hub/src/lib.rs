@@ -1,4 +1,5 @@
 pub mod api;
+pub mod auth;
 pub mod db;
 pub mod enrollment;
 pub mod enrollment_service;
