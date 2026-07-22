@@ -175,6 +175,16 @@ fn set_prop_if_present<V: Into<gst::glib::Value>>(el: &gst::Element, name: &str,
     }
 }
 
+/// Same, for enum properties set by nick.
+fn set_prop_str_if_present(el: &gst::Element, name: &str, value: &str) {
+    use gst::glib::prelude::ObjectExt;
+    if el.find_property(name).is_some() {
+        el.set_property_from_str(name, value);
+    } else {
+        tracing::debug!(element = %el.name(), property = name, "property not present; skipped");
+    }
+}
+
 /// Best available HLS sink, configured for `out_dir`. Returns the element
 /// and its factory name (for logs/tests).
 fn make_hls_sink(out_dir: &Path) -> Result<(gst::Element, &'static str)> {
@@ -190,6 +200,9 @@ fn make_hls_sink(out_dir: &Path) -> Result<(gst::Element, &'static str)> {
     set_prop_if_present(&sink, "playlist-length", 0u32);
     set_prop_if_present(&sink, "max-files", 0u32); // hlssink2
     set_prop_if_present(&sink, "max-num-segment-files", 0u32); // hlssink3
+    // EVENT: players may seek within already-produced segments while the
+    // remux is still running (ENDLIST still lands at EOS). hlssink3 only.
+    set_prop_str_if_present(&sink, "playlist-type", "event");
     tracing::info!(sink = name, "HLS sink selected");
     Ok((sink, name))
 }
@@ -415,6 +428,12 @@ mod tests {
         let playlist = std::fs::read_to_string(out.path().join("master.m3u8")).unwrap();
         assert!(playlist.contains("segment00000.ts"), "playlist:\n{playlist}");
         assert!(playlist.contains("#EXT-X-ENDLIST"), "playlist not finalized");
+        if gst::ElementFactory::find("hlssink3").is_some() {
+            assert!(
+                playlist.contains("#EXT-X-PLAYLIST-TYPE:EVENT"),
+                "hlssink3 playlists must be EVENT for in-flight seeking:\n{playlist}"
+            );
+        }
 
         // The segment still carries h264 — remux, not transcode.
         let info = crate::discover(
