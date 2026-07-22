@@ -5,21 +5,25 @@
 use std::sync::Arc;
 
 use kahawai_proto::v1::mediahost_link_server::{MediahostLink, MediahostLinkServer};
-use kahawai_proto::v1::{host_to_hub, hub_to_host, HelloAck, HostToHub, HubToHost};
+use kahawai_proto::v1::{
+    host_to_hub, hub_to_host, ByteChunk, HelloAck, HostToHub, HubToHost, ReadRequest,
+};
 use kahawai_proto::{PROTOCOL_MAJOR, PROTOCOL_MINOR};
 use kahawai_transport::mtls::peer_identity;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::registry::Registry;
+use crate::sessions::Sessions;
 
 pub struct MediahostLinkService {
     registry: Arc<Registry>,
+    sessions: Arc<Sessions>,
 }
 
 impl MediahostLinkService {
-    pub fn new(registry: Arc<Registry>) -> Self {
-        Self { registry }
+    pub fn new(registry: Arc<Registry>, sessions: Arc<Sessions>) -> Self {
+        Self { registry, sessions }
     }
 
     pub fn into_server(self) -> MediahostLinkServer<Self> {
@@ -58,6 +62,7 @@ impl MediahostLink for MediahostLinkService {
         let registry = self.registry.clone();
         let module_id = peer.module_id.clone();
         registry.connected(&module_id, &peer.module_type, &hello.name, &peer.fingerprint);
+        registry.register_link(&module_id, tx.clone());
 
         tokio::spawn(async move {
             let ack = HubToHost {
@@ -67,6 +72,7 @@ impl MediahostLink for MediahostLinkService {
                 })),
             };
             if tx.send(Ok(ack)).await.is_err() {
+                registry.unregister_link(&module_id);
                 registry.disconnected(&module_id);
                 return;
             }
@@ -85,10 +91,43 @@ impl MediahostLink for MediahostLinkService {
                     }
                 }
             }
+            registry.unregister_link(&module_id);
             registry.disconnected(&module_id);
         });
 
         Ok(Response::new(ReceiverStream::new(rx)))
+    }
+
+    type ByteChannelStream = ReceiverStream<Result<ReadRequest, Status>>;
+
+    async fn byte_channel(
+        &self,
+        request: Request<Streaming<ByteChunk>>,
+    ) -> Result<Response<Self::ByteChannelStream>, Status> {
+        let peer = peer_identity(&request)
+            .ok_or_else(|| Status::unauthenticated("client certificate required"))?;
+        if peer.module_type != "mediahost" {
+            return Err(Status::permission_denied("not a mediahost certificate"));
+        }
+        let mut inbound = request.into_inner();
+        let first = inbound
+            .message()
+            .await?
+            .ok_or_else(|| Status::invalid_argument("empty byte channel"))?;
+        let (req_stream, chunk_tx) = self
+            .sessions
+            .leases
+            .fulfill(&first.lease_token)
+            .ok_or_else(|| Status::not_found("unknown or expired lease token"))?;
+
+        tokio::spawn(async move {
+            while let Ok(Some(chunk)) = inbound.message().await {
+                if chunk_tx.send(chunk).await.is_err() {
+                    break; // lease dropped
+                }
+            }
+        });
+        Ok(Response::new(req_stream))
     }
 }
 

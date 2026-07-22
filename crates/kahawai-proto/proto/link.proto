@@ -5,6 +5,12 @@ package kahawai.v1;
 
 service MediahostLink {
   rpc Link(stream HostToHub) returns (stream HubToHost);
+  // Byte plane (AR-10): opened by the host in response to OpenRead, bound
+  // to a lease by the first chunk's token. The hub sends ReadRequests down;
+  // the host answers each with data chunks ending in an eof marker.
+  // ponytail: rides gRPC instead of the doc's raw framed-TCP listener —
+  // same shapes, one less port; swap the transport if profiling demands.
+  rpc ByteChannel(stream ByteChunk) returns (stream ReadRequest);
 }
 
 message HostToHub {
@@ -62,7 +68,31 @@ message ScanProgress {
 message HubToHost {
   oneof msg {
     HelloAck hello_ack = 1;
+    // Ask the host to open a ByteChannel for this file (MH-6). The lease
+    // ends when the hub closes the channel's request stream.
+    OpenRead open_read = 2;
   }
+}
+
+message OpenRead {
+  string lease_token = 1;
+  string collection_id = 2;
+  string path_rel = 3;
+}
+
+message ByteChunk {
+  // Set on the first chunk only: binds the channel to a lease.
+  string lease_token = 1;
+  uint64 offset = 2;
+  bytes data = 3;
+  // Marks the end of one ReadRequest's data.
+  bool eof = 4;
+  string error = 5;
+}
+
+message ReadRequest {
+  uint64 offset = 1;
+  uint64 len = 2;
 }
 
 // First message on every link (AR-7): version negotiation input.

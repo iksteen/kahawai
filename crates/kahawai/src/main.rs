@@ -198,6 +198,7 @@ async fn run_hub(cfg: config::HubConfig) -> Result<()> {
     let db = kahawai_hub::db::open(&cfg.data_dir).await?;
     let registry = Arc::new(kahawai_hub::registry::Registry::new(db.clone()));
     let auth = Arc::new(kahawai_hub::auth::Auth::new(db.clone(), &cfg.data_dir).await?);
+    let sessions = Arc::new(kahawai_hub::sessions::Sessions::default());
 
     // Revocations persist across restarts (SEC-6).
     let revoked = kahawai_transport::mtls::RevocationList::default();
@@ -245,7 +246,7 @@ async fn run_hub(cfg: config::HubConfig) -> Result<()> {
     let api_listener = tokio::net::TcpListener::bind(cfg.bind)
         .await
         .with_context(|| format!("binding client API on {}", cfg.bind))?;
-    let api = kahawai_hub::api::router(registry.clone(), auth);
+    let api = kahawai_hub::api::router(registry.clone(), auth, sessions.clone());
     tokio::spawn(async move {
         if let Err(e) = axum::serve(api_listener, api).await {
             tracing::error!(error = %e, "client API server failed");
@@ -264,7 +265,7 @@ async fn run_hub(cfg: config::HubConfig) -> Result<()> {
 
     tonic::transport::Server::builder()
         .add_service(svc.into_server())
-        .add_service(kahawai_hub::link_service::MediahostLinkService::new(registry).into_server())
+        .add_service(kahawai_hub::link_service::MediahostLinkService::new(registry, sessions).into_server())
         .serve_with_incoming(kahawai_transport::tls::tls_incoming(listener, tls))
         .await
         .context("satellite listener failed")

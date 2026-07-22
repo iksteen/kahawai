@@ -34,7 +34,7 @@ async fn setup_then_auth_flow() {
     let registry = Arc::new(Registry::new(db.clone()));
     let auth = Arc::new(Auth::new(db.clone(), dir.path()).await.unwrap());
     let setup_token = auth.setup_token().expect("fresh hub must be in setup mode");
-    let api = kahawai_hub::api::router(registry, auth.clone());
+    let api = kahawai_hub::api::router(registry, auth.clone(), Arc::new(kahawai_hub::sessions::Sessions::default()));
 
     // Setup mode: nothing else is reachable (OPS-1)…
     let resp = api

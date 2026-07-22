@@ -2,6 +2,7 @@
 //! (AR-3: always dials out) and scan collections up to it.
 
 pub mod scan;
+pub mod serve;
 
 use std::path::Path;
 use std::time::Duration;
@@ -45,7 +46,7 @@ async fn link_once(
     collections: &[CollectionConfig],
 ) -> Result<()> {
     let channel = kahawai_transport::tls::grpc_channel_with(hub_addr, tls).await?;
-    let mut client = MediahostLinkClient::new(channel);
+    let mut client = MediahostLinkClient::new(channel.clone());
 
     let (tx, rx) = tokio::sync::mpsc::channel::<HostToHub>(16);
     tx.send(HostToHub {
@@ -73,7 +74,7 @@ async fn link_once(
                     "link established"
                 );
             }
-            None => bail!("hub sent an empty first message"),
+            _ => bail!("hub did not open with HelloAck"),
         },
         None => bail!("hub closed the link before HelloAck"),
     }
@@ -105,7 +106,22 @@ async fn link_once(
             }
             msg = inbound.message() => {
                 match msg {
-                    Ok(Some(_)) => {} // no hub→host commands defined yet
+                    Ok(Some(m)) => {
+                        if let Some(hub_to_host::Msg::OpenRead(req)) = m.msg {
+                            let path = serve::resolve_path(collections, &req);
+                            if let Err(e) = &path {
+                                tracing::warn!(error = format!("{e:#}"), "refusing OpenRead");
+                            }
+                            let ch = channel.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) =
+                                    serve::serve_lease(ch, req.lease_token, path).await
+                                {
+                                    tracing::warn!(error = format!("{e:#}"), "byte channel failed");
+                                }
+                            });
+                        }
+                    }
                     Ok(None) => return Ok(()),
                     Err(e) => bail!("link stream error: {e}"),
                 }

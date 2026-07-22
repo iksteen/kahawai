@@ -40,11 +40,41 @@ pub struct CollectionRow {
 pub struct Registry {
     db: SqlitePool,
     connected: Mutex<HashMap<String, SatelliteState>>,
+    /// Command senders for connected hosts' Link streams.
+    links: Mutex<HashMap<String, tokio::sync::mpsc::Sender<Result<kahawai_proto::v1::HubToHost, tonic::Status>>>>,
 }
 
 impl Registry {
     pub fn new(db: SqlitePool) -> Self {
-        Self { db, connected: Mutex::new(HashMap::new()) }
+        Self { db, connected: Mutex::new(HashMap::new()), links: Mutex::new(HashMap::new()) }
+    }
+
+    pub fn register_link(
+        &self,
+        module_id: &str,
+        tx: tokio::sync::mpsc::Sender<Result<kahawai_proto::v1::HubToHost, tonic::Status>>,
+    ) {
+        self.links.lock().unwrap().insert(module_id.to_string(), tx);
+    }
+
+    pub fn unregister_link(&self, module_id: &str) {
+        self.links.lock().unwrap().remove(module_id);
+    }
+
+    /// Send a command down a connected host's Link stream.
+    pub async fn send_to_host(
+        &self,
+        module_id: &str,
+        msg: kahawai_proto::v1::HubToHost,
+    ) -> Result<()> {
+        let tx = self
+            .links
+            .lock()
+            .unwrap()
+            .get(module_id)
+            .cloned()
+            .with_context(|| format!("mediahost {module_id} is not connected"))?;
+        tx.send(Ok(msg)).await.map_err(|_| anyhow::anyhow!("link to {module_id} closed"))
     }
 
     pub fn db(&self) -> &SqlitePool {

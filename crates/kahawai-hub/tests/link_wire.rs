@@ -12,6 +12,7 @@ use kahawai_transport::mtls::RevocationList;
 
 struct Hub {
     addr: String,
+    _sessions: Arc<kahawai_hub::sessions::Sessions>,
     registry: Arc<Registry>,
     revoked: RevocationList,
     ca: Arc<HubCa>,
@@ -34,7 +35,8 @@ async fn spawn_hub() -> Hub {
     let registry = Arc::new(Registry::new(db));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = format!("localhost:{}", listener.local_addr().unwrap().port());
-    let svc = MediahostLinkService::new(registry.clone());
+    let sessions = Arc::new(kahawai_hub::sessions::Sessions::default());
+    let svc = MediahostLinkService::new(registry.clone(), sessions.clone());
     tokio::spawn(async move {
         tonic::transport::Server::builder()
             .add_service(svc.into_server())
@@ -42,7 +44,7 @@ async fn spawn_hub() -> Hub {
             .await
             .unwrap();
     });
-    Hub { addr, registry, revoked, ca, _pki: pki }
+    Hub { addr, _sessions: sessions, registry, revoked, ca, _pki: pki }
 }
 
 /// Enroll a satellite directly against the CA (the wire flow has its own test).
