@@ -14,31 +14,129 @@ use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app::AppSrc;
 
-/// Streams mpegtsmux can carry without re-encoding.
+/// Caps structure names mpegtsmux can actually carry, read from its own
+/// sink pad templates. Never hand-list what the element can tell us: a
+/// hardcoded list shipped eac3 (which mpegtsmux rejects at runtime →
+/// opaque not-negotiated) and omitted dts/opus (which it happily muxes).
+fn ts_muxable_names() -> &'static std::collections::HashSet<String> {
+    static NAMES: std::sync::OnceLock<std::collections::HashSet<String>> =
+        std::sync::OnceLock::new();
+    NAMES.get_or_init(|| {
+        let mut names = std::collections::HashSet::new();
+        let _ = crate::init();
+        let Some(factory) = gst::ElementFactory::find("mpegtsmux") else {
+            return names; // doctor already warns; remux will bail cleanly
+        };
+        for tmpl in factory.static_pad_templates() {
+            if tmpl.direction() == gst::PadDirection::Sink {
+                for s in tmpl.caps().iter() {
+                    names.insert(s.name().to_string());
+                }
+            }
+        }
+        names
+    })
+}
+
+/// Which muxer pad kind a parsed stream belongs on, if TS can carry it.
 fn ts_compatible(caps_name: &str) -> Option<&'static str> {
-    match caps_name {
-        "video/x-h264" | "video/x-h265" => Some("video"),
-        "audio/mpeg" | "audio/x-ac3" | "audio/x-eac3" => Some("audio"),
-        _ => None,
+    if !ts_muxable_names().contains(caps_name) {
+        return None;
     }
+    if caps_name.starts_with("video/") {
+        Some("video")
+    } else if caps_name.starts_with("audio/") {
+        Some("audio")
+    } else {
+        None
+    }
+}
+
+/// Normalized codec name (from discovery) → caps structure name.
+fn codec_to_caps_name(kind: &str, codec: &str) -> Option<&'static str> {
+    Some(match (kind, codec) {
+        ("video", "h264") => "video/x-h264",
+        ("video", "hevc") => "video/x-h265",
+        ("video", "av1") => "video/x-av1",
+        ("video", "vp9") => "video/x-vp9",
+        ("video", "mpeg") => "video/mpeg",
+        ("audio", "aac" | "mp3" | "mpeg-audio") => "audio/mpeg",
+        ("audio", "ac3") => "audio/x-ac3",
+        ("audio", "dts") => "audio/x-dts",
+        ("audio", "opus") => "audio/x-opus",
+        _ => return None,
+    })
+}
+
+/// `(has_video, has_audio)` for a remux of this source — the single source
+/// of truth shared with session planning, so the muxer pads requested
+/// up front always match the streams that will actually be linked.
+pub fn ts_stream_flags(info: &kahawai_core::media::MediaInfo) -> (bool, bool) {
+    let names = ts_muxable_names();
+    let has_video = info
+        .video
+        .iter()
+        .any(|v| codec_to_caps_name("video", &v.codec).is_some_and(|n| names.contains(n)));
+    let has_audio = info
+        .audio
+        .iter()
+        .any(|a| codec_to_caps_name("audio", &a.codec).is_some_and(|n| names.contains(n)));
+    (has_video, has_audio)
+}
+
+/// TS muxing needs specific stream-formats (h26x as Annex-B byte-stream,
+/// AAC as ADTS) while containers store avc/hvc1/raw. A per-stream parser
+/// between demux and muxer converts during caps negotiation — pure
+/// repackaging, still no re-encoding.
+fn parser_for(caps: &gst::CapsRef) -> Option<&'static str> {
+    let s = caps.structure(0)?;
+    let element = match s.name().as_str() {
+        "video/x-h264" => "h264parse",
+        "video/x-h265" => "h265parse",
+        "video/mpeg" => "mpegvideoparse",
+        "video/x-av1" => "av1parse",
+        "video/x-vp9" => "vp9parse",
+        "audio/mpeg" => match s.get::<i32>("mpegversion").ok() {
+            Some(1) => "mpegaudioparse",
+            _ => "aacparse",
+        },
+        "audio/x-ac3" | "audio/x-eac3" => "ac3parse",
+        "audio/x-dts" => "dcaparse",
+        "audio/x-opus" => "opusparse",
+        _ => return None,
+    };
+    // Availability-guarded (plugin-fallback strategy): missing parser →
+    // try a direct link rather than failing outright.
+    gst::ElementFactory::find(element).is_some().then_some(element)
 }
 
 /// hlssink2 pads requested up front (splitmuxsink wants them before start);
 /// each is taken by the first matching parsed stream.
 type WaitingPads = Arc<Mutex<std::collections::HashMap<&'static str, gst::Pad>>>;
 
-fn link_parsed_pad(pipe: &gst::Pipeline, waiting: &WaitingPads, pad: &gst::Pad, caps_name: &str) {
-    let target = ts_compatible(caps_name).and_then(|kind| waiting.lock().unwrap().remove(kind));
+fn link_parsed_pad(pipe: &gst::Pipeline, waiting: &WaitingPads, pad: &gst::Pad, caps: &gst::Caps) {
+    let caps_name = caps.structure(0).map(|s| s.name().to_string()).unwrap_or_default();
+    let target = ts_compatible(&caps_name).and_then(|kind| waiting.lock().unwrap().remove(kind));
     match target {
         Some(sinkpad) => {
-            // A queue per stream decouples the muxer from parsebin's
-            // threads — without it the aggregator deadlocks.
+            // queue: decouples the muxer from parsebin's threads (the
+            // aggregator deadlocks without it). parser: converts
+            // stream-format (avc/hvc1 → byte-stream, raw AAC → ADTS) for
+            // the TS muxer during negotiation.
             let queue = gst::ElementFactory::make("queue").build().unwrap();
             pipe.add(&queue).unwrap();
             queue.sync_state_with_parent().unwrap();
+            let mut tail = queue.clone();
+            if let Some(parser_name) = parser_for(caps) {
+                let parser = gst::ElementFactory::make(parser_name).build().unwrap();
+                pipe.add(&parser).unwrap();
+                parser.sync_state_with_parent().unwrap();
+                queue.link(&parser).unwrap();
+                tail = parser;
+            }
             let ok = pad
                 .link(&queue.static_pad("sink").unwrap())
-                .and_then(|_| queue.static_pad("src").unwrap().link(&sinkpad));
+                .and_then(|_| tail.static_pad("src").unwrap().link(&sinkpad));
             if let Err(e) = ok {
                 tracing::warn!(caps = %caps_name, error = %e, "remux: pad link failed");
             }
@@ -135,13 +233,12 @@ pub fn start(out_dir: &Path, has_video: bool, has_audio: bool) -> Result<RemuxJo
     let pipe = pipeline.clone();
     let waiting2 = waiting.clone();
     parsebin.connect_pad_added(move |_, pad| {
-        let caps_name = pad
+        let caps = pad
             .stream()
             .and_then(|s| s.caps())
             .or_else(|| pad.current_caps())
-            .and_then(|c| c.structure(0).map(|s| s.name().to_string()))
-            .unwrap_or_default();
-        link_parsed_pad(&pipe, &waiting2, pad, &caps_name);
+            .unwrap_or_else(gst::Caps::new_empty);
+        link_parsed_pad(&pipe, &waiting2, pad, &caps);
     });
 
     let error = Arc::new(Mutex::new(None::<String>));
@@ -219,6 +316,65 @@ impl Drop for RemuxJob {
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    /// Manual repro: REMUX_SRC=/path/to/file cargo test -p kahawai-media \
+    ///   remux_file_from_env -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn remux_file_from_env() {
+        let src = std::path::PathBuf::from(std::env::var("REMUX_SRC").expect("set REMUX_SRC"));
+        let out = tempfile::tempdir().unwrap();
+        let info = crate::discover(&src, Duration::from_secs(30)).unwrap();
+        let (has_video, has_audio) = ts_stream_flags(&info);
+        eprintln!("flags: video={has_video} audio={has_audio}");
+        let job = start(out.path(), has_video, has_audio).unwrap();
+        let mut f = std::fs::File::open(&src).unwrap();
+        let mut buf = vec![0u8; 256 * 1024];
+        use std::io::Read;
+        loop {
+            let n = f.read(&mut buf).unwrap();
+            if n == 0 {
+                break;
+            }
+            if let Err(e) = job.push(buf[..n].to_vec()) {
+                panic!("push failed: {e:#} / pipeline: {:?}", job.failed());
+            }
+        }
+        job.finish();
+        let deadline = Instant::now() + Duration::from_secs(120);
+        while !job.finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(job.failed().is_none(), "remux failed: {:?}", job.failed());
+        assert!(job.finished(), "did not finish");
+        let playlist = std::fs::read_to_string(out.path().join("master.m3u8")).unwrap();
+        let segs = std::fs::read_dir(out.path()).unwrap().count();
+        eprintln!("OK: {} entries in dir, ENDLIST={}", segs, playlist.contains("#EXT-X-ENDLIST"));
+    }
+
+    #[test]
+    fn ts_compat_follows_muxer_templates() {
+        crate::init().unwrap();
+        // Basics that any mpegtsmux supports.
+        assert_eq!(ts_compatible("video/x-h264"), Some("video"));
+        assert_eq!(ts_compatible("audio/mpeg"), Some("audio"));
+        assert_eq!(ts_compatible("text/x-raw"), None);
+        // Every answer must agree with the muxer's own template.
+        let names = ts_muxable_names();
+        assert_eq!(ts_compatible("audio/x-eac3").is_some(), names.contains("audio/x-eac3"));
+        assert_eq!(ts_compatible("audio/x-dts").is_some(), names.contains("audio/x-dts"));
+
+        // Flags derive from the same truth: eac3-only audio yields
+        // has_audio only if the muxer takes eac3 (it does not, today).
+        let info = kahawai_core::media::MediaInfo {
+            video: vec![kahawai_core::media::VideoStream { codec: "hevc".into(), ..Default::default() }],
+            audio: vec![kahawai_core::media::AudioStream { codec: "eac3".into(), ..Default::default() }],
+            ..Default::default()
+        };
+        let (v, a) = ts_stream_flags(&info);
+        assert!(v, "hevc is TS-muxable");
+        assert_eq!(a, names.contains("audio/x-eac3"));
+    }
 
     #[test]
     fn hls_sink_selection_prefers_best_available() {

@@ -125,12 +125,10 @@ impl Sessions {
         lease: Lease,
         size: u64,
     ) -> Result<Arc<kahawai_media::remux::RemuxJob>> {
-        // The muxer stalls on unfed pads, so only claim what TS can carry.
-        let has_video = info.video.iter().any(|v| matches!(v.codec.as_str(), "h264" | "hevc"));
-        let has_audio = info
-            .audio
-            .iter()
-            .any(|a| matches!(a.codec.as_str(), "aac" | "ac3" | "eac3" | "mp3"));
+        // The muxer stalls on unfed pads, so only claim what TS can carry —
+        // decided by the muxer's own templates (single source of truth
+        // with the pipeline's link logic).
+        let (has_video, has_audio) = kahawai_media::remux::ts_stream_flags(info);
         if !has_video && !has_audio {
             bail!("no TS-compatible streams — this source needs a transcoder");
         }
