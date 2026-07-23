@@ -142,8 +142,11 @@ pub fn encoder_capabilities() -> Vec<(&'static str, &'static str)> {
 }
 
 fn dry_run_video_encoder(name: &str) -> bool {
+    // No forced pixel format: encoders differ (x264enc takes I420,
+    // nvh264enc only NV12/RGBA-family) — videoconvert lets negotiation
+    // pick whatever the encoder accepts, exactly like the real pipeline.
     dry_run(&format!(
-        "videotestsrc num-buffers=5 ! video/x-raw,format=I420,width=320,height=240 ! {name} ! fakesink"
+        "videotestsrc num-buffers=5 ! video/x-raw,width=320,height=240 ! videoconvert ! {name} ! fakesink"
     ))
 }
 
