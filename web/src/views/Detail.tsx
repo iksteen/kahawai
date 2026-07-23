@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import {
+  fetchChildren,
   fetchItem,
   startSession,
   type Item,
@@ -55,21 +56,87 @@ export default function Detail({
   id,
   onBack,
   onPlay,
+  onOpenEpisode,
 }: {
   id: string
   onBack: () => void
   onPlay: (item: Item, session: Session, resumeMs: number) => void
+  onOpenEpisode: (id: string) => void
 }) {
   const [item, setItem] = useState<ItemDetail | null>(null)
+  const [episodes, setEpisodes] = useState<Item[]>([])
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
 
   useEffect(() => {
+    setItem(null)
+    setEpisodes([])
     fetchItem(id).then(setItem).catch((e) => setError(String(e)))
   }, [id])
+  useEffect(() => {
+    if (item?.kind === 'show') {
+      fetchChildren(item.id)
+        .then((c) => setEpisodes(c.children))
+        .catch((e) => setError(String(e)))
+    }
+  }, [item?.id, item?.kind])
 
   if (error) return <div className="error page-pad">{error}</div>
   if (!item) return null
+
+  if (item.kind === 'show') {
+    const seasons = [...new Set(episodes.map((e) => e.season ?? 0))]
+    // First unwatched (or in-progress) episode = the continue point.
+    const next = episodes.find((e) => !e.played)
+    return (
+      <main>
+        <button className="btn ghost small" onClick={onBack}>
+          ← Library
+        </button>
+        <div className="detail-head">
+          <h1>
+            {item.title} {item.year && <span className="year">({item.year})</span>}
+          </h1>
+          <div className="detail-sub mono">
+            {episodes.length} episodes
+            {next && (
+              <>
+                {' · next: '}
+                <button className="btn ghost small" onClick={() => onOpenEpisode(next.id)}>
+                  S{String(next.season ?? 0).padStart(2, '0')}E
+                  {String(next.episode ?? 0).padStart(2, '0')} {next.title}
+                </button>
+              </>
+            )}
+          </div>
+        </div>
+        {seasons.map((s) => (
+          <section key={s}>
+            <h2>{s === 0 ? 'Specials' : `Season ${s}`}</h2>
+            <ul className="rows">
+              {episodes
+                .filter((e) => (e.season ?? 0) === s)
+                .map((e) => (
+                  <li key={e.id}>
+                    <button className="card episode" onClick={() => onOpenEpisode(e.id)}>
+                      <span className="mono dim">
+                        E{String(e.episode ?? 0).padStart(2, '0')}
+                      </span>{' '}
+                      {e.title}
+                      {e.played && <span className="seen"> ✓</span>}
+                      {!e.played && e.resume_position_ms ? (
+                        <span className="dim"> · resume</span>
+                      ) : null}
+                    </button>
+                  </li>
+                ))}
+            </ul>
+          </section>
+        ))}
+        {error && <div className="error">{error}</div>}
+      </main>
+    )
+  }
 
   const best = item.sources_detail[0]
   const duration = best?.streams?.duration_ms
@@ -103,6 +170,10 @@ export default function Detail({
       </button>
       <div className="detail-head">
         <h1>
+          {item.kind === 'episode' && item.show_title ? `${item.show_title} · ` : ''}
+          {item.kind === 'episode'
+            ? `S${String(item.season ?? 0).padStart(2, '0')}E${String(item.episode ?? 0).padStart(2, '0')} · `
+            : ''}
           {item.title} {item.year && <span className="year">({item.year})</span>}
         </h1>
         <div className="detail-sub mono">

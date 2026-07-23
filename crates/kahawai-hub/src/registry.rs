@@ -269,6 +269,7 @@ impl Registry {
         .fetch_optional(&self.db)
         .await?;
         let resolve_movies = media_type.as_deref() == Some("movies");
+        let resolve_series = media_type.as_deref() == Some("series");
 
         let mut tx = self.db.begin().await?;
         let n = files.len();
@@ -295,7 +296,9 @@ impl Registry {
             .execute(&mut *tx)
             .await?;
 
-            if resolve_movies {
+            // Resolve to a playable item: movies map straight to a
+            // movie item; series files map to an episode under a show.
+            let resolved_item: Option<String> = if resolve_movies {
                 let filename = f.path_rel.rsplit('/').next().unwrap_or(&f.path_rel);
                 let guess = names::parse_movie(filename);
                 let norm = names::normalize_title(&guess.title);
@@ -306,7 +309,7 @@ impl Registry {
                 .bind(guess.year)
                 .fetch_optional(&mut *tx)
                 .await?;
-                let item_id = match existing {
+                Some(match existing {
                     Some(id) => id,
                     None => {
                         let id = ulid::Ulid::new().to_string();
@@ -322,7 +325,84 @@ impl Registry {
                         .await?;
                         id
                     }
-                };
+                })
+            } else if resolve_series {
+                match names::parse_episode(&f.path_rel) {
+                    None => {
+                        // Unparseable stays a bare file (review queue,
+                        // later) — never guess an identity.
+                        tracing::debug!(path = %f.path_rel, "no episode parse; unresolved");
+                        None
+                    }
+                    Some(g) => {
+                        let norm = names::normalize_title(&g.show_title);
+                        let show: Option<String> = sqlx::query_scalar(
+                            "SELECT id FROM items
+                             WHERE kind = 'show' AND norm_title = ? AND year IS ?",
+                        )
+                        .bind(&norm)
+                        .bind(g.show_year)
+                        .fetch_optional(&mut *tx)
+                        .await?;
+                        let show_id = match show {
+                            Some(id) => id,
+                            None => {
+                                let id = ulid::Ulid::new().to_string();
+                                sqlx::query(
+                                    "INSERT INTO items (id, kind, title, norm_title, year)
+                                     VALUES (?, 'show', ?, ?, ?)",
+                                )
+                                .bind(&id)
+                                .bind(&g.show_title)
+                                .bind(&norm)
+                                .bind(g.show_year)
+                                .execute(&mut *tx)
+                                .await?;
+                                id
+                            }
+                        };
+                        let ep: Option<String> = sqlx::query_scalar(
+                            "SELECT id FROM items
+                             WHERE kind = 'episode' AND parent_id = ?
+                               AND season = ? AND episode = ?",
+                        )
+                        .bind(&show_id)
+                        .bind(g.season)
+                        .bind(g.episode)
+                        .fetch_optional(&mut *tx)
+                        .await?;
+                        Some(match ep {
+                            Some(id) => id,
+                            None => {
+                                let id = ulid::Ulid::new().to_string();
+                                let title = g
+                                    .episode_title
+                                    .clone()
+                                    .unwrap_or_else(|| format!("Episode {}", g.episode));
+                                sqlx::query(
+                                    "INSERT INTO items
+                                       (id, kind, title, norm_title, year,
+                                        parent_id, season, episode)
+                                     VALUES (?, 'episode', ?, ?, NULL, ?, ?, ?)",
+                                )
+                                .bind(&id)
+                                .bind(&title)
+                                .bind(names::normalize_title(&title))
+                                .bind(&show_id)
+                                .bind(g.season)
+                                .bind(g.episode)
+                                .execute(&mut *tx)
+                                .await?;
+                                id
+                            }
+                        })
+                    }
+                }
+            } else {
+                None
+            };
+
+            if let Some(item_id) = resolved_item {
                 sqlx::query(
                     "INSERT INTO item_sources (module_id, collection_id, path_rel, item_id)
                      VALUES (?, ?, ?, ?)
@@ -408,10 +488,17 @@ impl Registry {
             }
         }
         sqlx::query(
-            "DELETE FROM items WHERE id IN (
+            "DELETE FROM items WHERE kind != 'show' AND id IN (
                 SELECT i.id FROM items i
                 LEFT JOIN item_sources s ON s.item_id = i.id
                 WHERE s.item_id IS NULL)",
+        )
+        .execute(&mut *tx)
+        .await?;
+        // Shows never have direct sources; they die of childlessness.
+        sqlx::query(
+            "DELETE FROM items WHERE kind = 'show' AND id NOT IN (
+                SELECT DISTINCT parent_id FROM items WHERE parent_id IS NOT NULL)",
         )
         .execute(&mut *tx)
         .await?;
@@ -618,10 +705,17 @@ impl Registry {
             sqlx::query(sql).bind(module_id).execute(&mut *tx).await?;
         }
         sqlx::query(
-            "DELETE FROM items WHERE id IN (
+            "DELETE FROM items WHERE kind != 'show' AND id IN (
                 SELECT i.id FROM items i
                 LEFT JOIN item_sources s ON s.item_id = i.id
                 WHERE s.item_id IS NULL)",
+        )
+        .execute(&mut *tx)
+        .await?;
+        // Shows never have direct sources; they die of childlessness.
+        sqlx::query(
+            "DELETE FROM items WHERE kind = 'show' AND id NOT IN (
+                SELECT DISTINCT parent_id FROM items WHERE parent_id IS NOT NULL)",
         )
         .execute(&mut *tx)
         .await?;

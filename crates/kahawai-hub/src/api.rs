@@ -36,6 +36,7 @@ pub fn router(
         .route("/api/v1/collections", get(list_collections))
         .route("/api/v1/items", get(list_items))
         .route("/api/v1/items/{id}", get(item_detail))
+        .route("/api/v1/items/{id}/children", get(item_children))
         .route("/api/v1/playback/sessions", post(start_session))
         .route("/api/v1/playback/sessions/{id}", axum::routing::delete(end_session))
         .route("/api/v1/playback/sessions/{id}/stream", get(stream_session))
@@ -497,11 +498,13 @@ async fn list_items(
     axum::Extension(claims): axum::Extension<crate::auth::Claims>,
 ) -> Result<Json<Value>, ApiError> {
     let rows = sqlx::query(
-        "SELECT i.id, i.title, i.year, COUNT(s.item_id) AS sources,
+        "SELECT i.id, i.kind, i.title, i.year, i.season, i.episode,
+                COUNT(s.item_id) AS sources,
                 w.position_ms, w.played, w.play_count
          FROM items i
          LEFT JOIN item_sources s ON s.item_id = i.id
          LEFT JOIN watch_state w ON w.item_id = i.id AND w.user_id = ?
+         WHERE i.kind != 'episode'
          GROUP BY i.id ORDER BY i.title, i.year",
     )
     .bind(&claims.sub)
@@ -515,13 +518,42 @@ async fn list_items(
 fn item_row_json(r: &sqlx::sqlite::SqliteRow) -> Value {
     json!({
         "id": r.get::<String, _>("id"),
+        "kind": r.get::<String, _>("kind"),
         "title": r.get::<String, _>("title"),
         "year": r.get::<Option<i64>, _>("year"),
+        "season": r.get::<Option<i64>, _>("season"),
+        "episode": r.get::<Option<i64>, _>("episode"),
         "sources": r.get::<i64, _>("sources"),
         "resume_position_ms": r.get::<Option<i64>, _>("position_ms"),
         "played": r.get::<Option<i64>, _>("played").unwrap_or(0) != 0,
         "play_count": r.get::<Option<i64>, _>("play_count").unwrap_or(0),
     })
+}
+
+/// Episodes of a show (docs: /items/{id}/children — seasons are a
+/// projection of the season column, not items).
+async fn item_children(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    axum::Extension(claims): axum::Extension<crate::auth::Claims>,
+) -> Result<Json<Value>, ApiError> {
+    let rows = sqlx::query(
+        "SELECT i.id, i.kind, i.title, i.year, i.season, i.episode,
+                COUNT(s.item_id) AS sources,
+                w.position_ms, w.played, w.play_count
+         FROM items i
+         LEFT JOIN item_sources s ON s.item_id = i.id
+         LEFT JOIN watch_state w ON w.item_id = i.id AND w.user_id = ?
+         WHERE i.parent_id = ?
+         GROUP BY i.id ORDER BY i.season, i.episode",
+    )
+    .bind(&claims.sub)
+    .bind(&id)
+    .fetch_all(state.registry.db())
+    .await
+    .map_err(internal)?;
+    let children: Vec<Value> = rows.iter().map(item_row_json).collect();
+    Ok(Json(json!({ "children": children })))
 }
 
 async fn item_detail(
@@ -530,10 +562,12 @@ async fn item_detail(
     axum::Extension(claims): axum::Extension<crate::auth::Claims>,
 ) -> Result<Json<Value>, ApiError> {
     let item = sqlx::query(
-        "SELECT i.id, i.title, i.year,
+        "SELECT i.id, i.kind, i.title, i.year, i.season, i.episode,
+                p.title AS show_title,
                 (SELECT COUNT(*) FROM item_sources s WHERE s.item_id = i.id) AS sources,
                 w.position_ms, w.played, w.play_count
          FROM items i
+         LEFT JOIN items p ON p.id = i.parent_id
          LEFT JOIN watch_state w ON w.item_id = i.id AND w.user_id = ?
          WHERE i.id = ?",
     )
@@ -575,6 +609,7 @@ async fn item_detail(
         .collect();
 
     let mut out = item_row_json(&item);
+    out["show_title"] = json!(item.get::<Option<String>, _>("show_title"));
     out["sources"] = json!(sources);
     Ok(Json(out))
 }

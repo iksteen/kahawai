@@ -84,8 +84,11 @@ export async function json<T>(path: string, init?: RequestInit): Promise<T> {
 
 export type Item = {
   id: string
+  kind: 'movie' | 'show' | 'episode'
   title: string
   year: number | null
+  season: number | null
+  episode: number | null
   sources: number
   resume_position_ms: number | null
   played: boolean
@@ -107,7 +110,10 @@ export type Source = {
   streams: StreamInfo | null
 }
 
-export type ItemDetail = Item & { sources_detail: Source[] }
+export type ItemDetail = Item & { sources_detail: Source[]; show_title?: string | null }
+
+export const fetchChildren = (id: string) =>
+  json<{ children: Item[] }>(`/api/v1/items/${id}/children`)
 
 export async function fetchItem(id: string): Promise<ItemDetail> {
   const raw = await json<Item & { sources: Source[] | number }>(`/api/v1/items/${id}`)

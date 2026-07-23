@@ -74,6 +74,7 @@ export default function App() {
           onPlay={(item, session, resumeMs) =>
             setRoute({ view: 'player', item, session, resumeMs })
           }
+          onOpenEpisode={(id) => setRoute({ view: 'detail', id })}
         />
       )}
       {route.view === 'player' && (

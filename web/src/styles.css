@@ -192,3 +192,9 @@ h2 { font-size: 14px; font-weight: 650; color: var(--dim); letter-spacing: 0.08e
   font-size: 12px;
   pointer-events: none;
 }
+
+.card.episode {
+  width: 100%;
+  text-align: left;
+  padding: 8px 12px;
+}

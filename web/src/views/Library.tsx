@@ -47,6 +47,7 @@ export default function Library({ onOpen }: { onOpen: (id: string) => void }) {
         {shown.map((i) => (
           <li key={i.id}>
             <button className="card" onClick={() => onOpen(i.id)}>
+              {i.kind === 'show' && <span className="chip dim">series</span>}
               <span className="card-title">{i.title}</span>
               <span className="card-meta mono">
                 {i.year ?? '—'}
