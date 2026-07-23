@@ -110,6 +110,20 @@ fn parser_for(caps: &gst::CapsRef) -> Option<&'static str> {
     gst::ElementFactory::find(element).is_some().then_some(element)
 }
 
+/// H.26x streams with B-frames need PTS/DTS recomputed from picture order
+/// count, or mpegtsmux emits one frame out of decode order at each segment
+/// boundary. mpv tolerates the DTS glitch; hls.js's MSE transmuxer rejects
+/// the segment (`bufferAppendError`) and the browser shows garbage. The
+/// timestamper fixes it at zero re-encode cost. Availability-guarded.
+fn timestamper_for(caps: &gst::CapsRef) -> Option<&'static str> {
+    let element = match caps.structure(0)?.name().as_str() {
+        "video/x-h264" => "h264timestamper",
+        "video/x-h265" => "h265timestamper",
+        _ => return None,
+    };
+    gst::ElementFactory::find(element).is_some().then_some(element)
+}
+
 /// hlssink2 pads requested up front (splitmuxsink wants them before start);
 /// each is taken by the first matching parsed stream.
 type WaitingPads = Arc<Mutex<std::collections::HashMap<&'static str, gst::Pad>>>;
@@ -127,12 +141,14 @@ fn link_parsed_pad(pipe: &gst::Pipeline, waiting: &WaitingPads, pad: &gst::Pad, 
             pipe.add(&queue).unwrap();
             queue.sync_state_with_parent().unwrap();
             let mut tail = queue.clone();
-            if let Some(parser_name) = parser_for(caps) {
-                let parser = gst::ElementFactory::make(parser_name).build().unwrap();
-                pipe.add(&parser).unwrap();
-                parser.sync_state_with_parent().unwrap();
-                queue.link(&parser).unwrap();
-                tail = parser;
+            // queue → parser → timestamper, each present only when it
+            // applies; every hop is pure repackaging, no decode.
+            for name in [parser_for(caps), timestamper_for(caps)].into_iter().flatten() {
+                let el = gst::ElementFactory::make(name).build().unwrap();
+                pipe.add(&el).unwrap();
+                el.sync_state_with_parent().unwrap();
+                tail.link(&el).unwrap();
+                tail = el;
             }
             let ok = pad
                 .link(&queue.static_pad("sink").unwrap())
@@ -445,5 +461,54 @@ mod tests {
         assert_eq!(info.video.len(), 1);
         assert_eq!(info.video[0].codec, "h264");
         assert_eq!(info.audio.first().map(|a| a.codec.as_str()), Some("aac"));
+
+        // Every segment's video DTS must be monotonic. The bug (one frame
+        // out of decode order) appears at segment boundaries *after* the
+        // first, so all segments are checked — hls.js rejects the segment
+        // otherwise (`bufferAppendError`). The fixture has B-frames so the
+        // timestamper is genuinely exercised.
+        let segs: Vec<_> = std::fs::read_dir(out.path())
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|e| e == "ts"))
+            .collect();
+        assert!(segs.len() >= 2, "need multiple segments to test boundaries");
+        for seg in &segs {
+            let (missing, non_mono) = video_dts_defects(seg);
+            // Without the timestamper the first frames of a segment carry no
+            // DTS (N/A); with B-frames the muxer can also emit them out of
+            // decode order. Either makes hls.js reject the segment
+            // (`bufferAppendError`) while mpv tolerates it.
+            assert_eq!(missing, 0, "{}: {missing} video packets with no DTS", seg.display());
+            assert_eq!(non_mono, 0, "{}: {non_mono} non-monotonic video DTS", seg.display());
+        }
+    }
+
+    /// Ffprobe a segment's video packets; return `(missing_dts, non_monotonic)`.
+    fn video_dts_defects(seg: &std::path::Path) -> (usize, usize) {
+        let out = std::process::Command::new("ffprobe")
+            .args(["-v", "error", "-select_streams", "v", "-show_entries",
+                   "packet=dts", "-of", "csv=p=0"])
+            .arg(seg)
+            .output()
+            .expect("ffprobe required for the remux DTS test");
+        let (mut missing, mut non_mono) = (0usize, 0usize);
+        let mut prev: Option<i64> = None;
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            let field = line.trim().trim_end_matches(',');
+            if field.is_empty() {
+                continue;
+            }
+            match field.parse::<i64>() {
+                Ok(dts) => {
+                    if prev.is_some_and(|p| dts < p) {
+                        non_mono += 1;
+                    }
+                    prev = Some(dts);
+                }
+                Err(_) => missing += 1, // "N/A"
+            }
+        }
+        (missing, non_mono)
     }
 }

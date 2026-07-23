@@ -45,6 +45,20 @@ const MATRIX: &[(&str, &[&str], bool, &str, bool)] = &[
     ("parse hevc", &["h265parse"], false, "HEVC streams cannot be parsed", false),
     ("hls sink", &["hlssink3", "hlssink2"], false, "in-hub HLS remux unavailable", true),
     (
+        "h264 dts fix",
+        &["h264timestamper"],
+        false,
+        "remuxed H.264 with B-frames will corrupt in browser (hls.js), OK in mpv",
+        false,
+    ),
+    (
+        "hevc dts fix",
+        &["h265timestamper"],
+        false,
+        "remuxed HEVC with B-frames will corrupt in browser (hls.js), OK in mpv",
+        false,
+    ),
+    (
         "mux fmp4/cmaf",
         &["cmafmux", "isofmp4mux"],
         false,
