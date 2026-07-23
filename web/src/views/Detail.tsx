@@ -11,6 +11,12 @@ import {
 
 const GB = 1024 * 1024 * 1024
 
+// S01E02 for seasoned episodes; E11 for absolute numbering (anime).
+function seLabel(season: number | null, episode: number | null) {
+  const e = `E${String(episode ?? 0).padStart(2, '0')}`
+  return season === null ? e : `S${String(season).padStart(2, '0')}${e}`
+}
+
 function fmtDuration(ms?: number) {
   if (!ms) return null
   const m = Math.round(ms / 60000)
@@ -106,8 +112,7 @@ export default function Detail({
               <>
                 {' · next: '}
                 <button className="btn ghost small" onClick={() => onOpenEpisode(next.id)}>
-                  S{String(next.season ?? 0).padStart(2, '0')}E
-                  {String(next.episode ?? 0).padStart(2, '0')} {next.title}
+                  {seLabel(next.season, next.episode)} {next.title}
                 </button>
               </>
             )}
@@ -175,7 +180,7 @@ export default function Detail({
         <h1>
           {item.kind === 'episode' && item.show_title ? `${item.show_title} · ` : ''}
           {item.kind === 'episode'
-            ? `S${String(item.season ?? 0).padStart(2, '0')}E${String(item.episode ?? 0).padStart(2, '0')} · `
+            ? `${seLabel(item.season, item.episode)} · `
             : ''}
           {item.title} {item.year && <span className="year">({item.year})</span>}
         </h1>

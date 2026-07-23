@@ -77,6 +77,7 @@ async fn require_auth(
 ) -> Result<Response, ApiError> {
     if state.auth.setup_required() {
         // OPS-1: nothing else is reachable until setup completes.
+        tracing::warn!(path = %req.uri(), "503: setup_required returned true");
         return Err((StatusCode::SERVICE_UNAVAILABLE, "setup required".into()));
     }
     // Bearer header first; the kahawai_token cookie is the fallback for
