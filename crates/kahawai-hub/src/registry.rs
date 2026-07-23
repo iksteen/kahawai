@@ -55,13 +55,22 @@ pub struct Registry {
     /// The live mTLS allowlist (SEC-5), mirrored from the satellites table.
     allowed: kahawai_transport::mtls::AllowedCerts,
     connected: Mutex<HashMap<String, SatelliteState>>,
+    /// Live capability reports from connected transcoders (TC-1); cleared
+    /// on disconnect — a report is only valid while the link is up.
+    transcoder_caps: Mutex<HashMap<String, serde_json::Value>>,
     /// Command senders for connected hosts' Link streams.
     links: Mutex<HashMap<String, tokio::sync::mpsc::Sender<Result<kahawai_proto::v1::HubToHost, tonic::Status>>>>,
 }
 
 impl Registry {
     pub fn new(db: SqlitePool, allowed: kahawai_transport::mtls::AllowedCerts) -> Self {
-        Self { db, allowed, connected: Mutex::new(HashMap::new()), links: Mutex::new(HashMap::new()) }
+        Self {
+            db,
+            allowed,
+            connected: Mutex::new(HashMap::new()),
+            links: Mutex::new(HashMap::new()),
+            transcoder_caps: Mutex::new(HashMap::new()),
+        }
     }
 
     /// Populate the allowlist from the satellites table (hub startup).
@@ -386,6 +395,20 @@ impl Registry {
         Ok(stale.len())
     }
 
+    pub fn set_transcoder_caps(&self, module_id: &str, caps: &kahawai_proto::v1::CapabilityReport) {
+        let json = serde_json::json!({
+            "encoders": caps.encoders.iter()
+                .map(|e| serde_json::json!({ "codec": e.codec, "element": e.element }))
+                .collect::<Vec<_>>(),
+            "max_sessions": caps.max_sessions,
+        });
+        self.transcoder_caps.lock().unwrap().insert(module_id.to_string(), json);
+    }
+
+    pub fn clear_transcoder_caps(&self, module_id: &str) {
+        self.transcoder_caps.lock().unwrap().remove(module_id);
+    }
+
     /// Enrolled satellites (DB) merged with live connection state.
     pub async fn satellites_overview(&self) -> Result<Vec<serde_json::Value>> {
         let rows = sqlx::query(
@@ -395,6 +418,7 @@ impl Registry {
         .fetch_all(&self.db)
         .await?;
         let connected = self.connected.lock().unwrap().clone();
+        let caps = self.transcoder_caps.lock().unwrap().clone();
         Ok(rows
             .iter()
             .map(|r| {
@@ -407,6 +431,7 @@ impl Registry {
                     "cert_fingerprint": r.get::<String, _>("cert_fingerprint"),
                     "enrolled_at": r.get::<i64, _>("enrolled_at"),
                     "connected": state.is_some_and(|s| s.connected),
+                    "capabilities": caps.get(&id),
                 })
             })
             .collect())

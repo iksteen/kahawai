@@ -102,10 +102,59 @@ pub fn aac_encoder() -> Option<&'static str> {
     })
 }
 
+/// H.264 encoders in preference order: hardware first (VA-API, NVENC,
+/// QSV), then software. Dry-run verification is what makes this list
+/// safe — a hw element on a box without the driver fails the probe and
+/// the next one wins (TC-1/TC-6).
+pub const H264_ENCODERS: &[&str] =
+    &["vah264enc", "vaapih264enc", "nvh264enc", "qsvh264enc", "x264enc", "openh264enc"];
+
+/// Best available H.264 encoder, dry-run-verified once. None → this box
+/// cannot transcode video.
+pub fn h264_encoder() -> Option<&'static str> {
+    static VERIFIED: std::sync::OnceLock<Option<&'static str>> = std::sync::OnceLock::new();
+    *VERIFIED.get_or_init(|| {
+        let _ = crate::init();
+        H264_ENCODERS.iter().copied().find(|name| {
+            if gst::ElementFactory::find(name).is_none() {
+                return false;
+            }
+            let ok = dry_run_video_encoder(name);
+            if !ok {
+                tracing::warn!(encoder = name, "H.264 encoder failed dry-run; trying next");
+            }
+            ok
+        })
+    })
+}
+
+/// Verified encoder capabilities for the transcoder's registration
+/// report (TC-1): (codec, element) pairs that survived a dry run.
+pub fn encoder_capabilities() -> Vec<(&'static str, &'static str)> {
+    let mut caps = Vec::new();
+    if let Some(el) = h264_encoder() {
+        caps.push(("h264", el));
+    }
+    if let Some(el) = aac_encoder() {
+        caps.push(("aac", el));
+    }
+    caps
+}
+
+fn dry_run_video_encoder(name: &str) -> bool {
+    dry_run(&format!(
+        "videotestsrc num-buffers=5 ! video/x-raw,format=I420,width=320,height=240 ! {name} ! fakesink"
+    ))
+}
+
 fn dry_run_encoder(name: &str) -> bool {
-    let Ok(p) = gst::parse::launch(&format!(
+    dry_run(&format!(
         "audiotestsrc num-buffers=5 ! audioconvert ! audioresample ! {name} ! fakesink"
-    )) else {
+    ))
+}
+
+fn dry_run(launch: &str) -> bool {
+    let Ok(p) = gst::parse::launch(launch) else {
         return false;
     };
     if p.set_state(gst::State::Playing).is_err() {

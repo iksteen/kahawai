@@ -76,7 +76,7 @@ async fn main() -> Result<()> {
     }
 
     match &cli.command {
-        Cmd::Hub { cmd: None } | Cmd::Mediahost => startup_checks(&cfg)?,
+        Cmd::Hub { cmd: None } | Cmd::Mediahost | Cmd::Transcoder => startup_checks(&cfg)?,
         _ => {}
     }
     match cli.command {
@@ -96,8 +96,17 @@ async fn main() -> Result<()> {
                 kahawai_media::worker::parse_audio_mode(&audio),
             )
         }
-        Cmd::AllInOne | Cmd::Transcoder => {
-            anyhow::bail!("not implemented yet — `kahawai hub` and `kahawai mediahost` work so far")
+        Cmd::Transcoder => {
+            kahawai_transcoder::run(
+                &cfg.transcoder.hub,
+                &cfg.transcoder.state_dir,
+                &cfg.transcoder.name,
+                cfg.transcoder.max_sessions,
+            )
+            .await
+        }
+        Cmd::AllInOne => {
+            anyhow::bail!("not implemented yet — hub, mediahost and transcoder run separately")
         }
     }
 }
@@ -290,7 +299,13 @@ async fn run_hub(cfg: config::HubConfig) -> Result<()> {
 
     tonic::transport::Server::builder()
         .add_service(svc.into_server())
-        .add_service(kahawai_hub::link_service::MediahostLinkService::new(registry, sessions).into_server())
+        .add_service(
+            kahawai_hub::link_service::MediahostLinkService::new(registry.clone(), sessions)
+                .into_server(),
+        )
+        .add_service(
+            kahawai_hub::transcoder_link::TranscoderLinkService::new(registry).into_server(),
+        )
         .serve_with_incoming(kahawai_transport::tls::tls_incoming(listener, tls))
         .await
         .context("satellite listener failed")

@@ -146,15 +146,21 @@ pub fn gstreamer_checks() -> Vec<Check> {
     }
 
     // TC-1: encoders that will actually run sessions are dry-run-verified,
-    // not just present — a broken element surfaces here, not mid-session.
-    if let Some(c) = out.iter_mut().find(|c| c.name == "encode aac")
-        && c.status == Status::Ok
-    {
-        match crate::remux::aac_encoder() {
-            Some(name) => c.detail = format!("via {name} (dry-run verified)"),
-            None => {
-                c.status = Status::Warn;
-                c.detail = "installed but dry-run failed — audio transcode disabled".into();
+    // not just present — a broken element (or a hw element without its
+    // driver) surfaces here, not mid-session.
+    for (row, verified, disabled) in [
+        ("encode aac", crate::remux::aac_encoder(), "audio transcode disabled"),
+        ("encode h264", crate::remux::h264_encoder(), "video transcode disabled"),
+    ] {
+        if let Some(c) = out.iter_mut().find(|c| c.name == row)
+            && c.status == Status::Ok
+        {
+            match verified {
+                Some(name) => c.detail = format!("via {name} (dry-run verified)"),
+                None => {
+                    c.status = Status::Warn;
+                    c.detail = format!("installed but dry-run failed — {disabled}");
+                }
             }
         }
     }

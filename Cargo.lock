@@ -1549,11 +1549,13 @@ dependencies = [
  "kahawai-hub",
  "kahawai-media",
  "kahawai-mediahost",
+ "kahawai-transcoder",
  "kahawai-transport",
  "libc",
  "serde",
  "serde_json",
  "sqlx",
+ "tempfile",
  "tokio",
  "tonic",
  "tracing",
@@ -1646,6 +1648,21 @@ dependencies = [
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
+]
+
+[[package]]
+name = "kahawai-transcoder"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "kahawai-media",
+ "kahawai-proto",
+ "kahawai-transport",
+ "rustls",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tracing",
 ]
 
 [[package]]

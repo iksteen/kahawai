@@ -1,0 +1,15 @@
+[package]
+name = "kahawai-transcoder"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+kahawai-media = { workspace = true }
+kahawai-proto = { workspace = true }
+kahawai-transport = { workspace = true }
+anyhow = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+tonic = { workspace = true }
+tracing = { workspace = true }
+rustls = { workspace = true }

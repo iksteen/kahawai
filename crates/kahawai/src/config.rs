@@ -39,10 +39,14 @@ fn default_hub_data_dir() -> PathBuf {
 }
 
 fn default_mediahost_state_dir() -> PathBuf {
+    default_state_dir("kahawai-mediahost")
+}
+
+fn default_state_dir(name: &str) -> PathBuf {
     if is_system_user() {
-        "/var/lib/kahawai-mediahost".into()
+        PathBuf::from("/var/lib").join(name)
     } else {
-        xdg_dir("XDG_DATA_HOME", ".local/share").unwrap().join("kahawai-mediahost")
+        xdg_dir("XDG_DATA_HOME", ".local/share").unwrap().join(name)
     }
 }
 
@@ -63,6 +67,8 @@ pub struct Config {
     pub hub: HubConfig,
     #[serde(default)]
     pub mediahost: MediahostConfig,
+    #[serde(default)]
+    pub transcoder: TranscoderConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -101,6 +107,28 @@ pub struct MediahostConfig {
     pub state_dir: PathBuf,
     pub name: String,
     pub collections: Vec<kahawai_mediahost::scan::CollectionConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct TranscoderConfig {
+    /// Hub satellite address, `host:port`.
+    pub hub: String,
+    pub state_dir: PathBuf,
+    pub name: String,
+    /// Concurrent encode sessions this box offers (TC-6).
+    pub max_sessions: u32,
+}
+
+impl Default for TranscoderConfig {
+    fn default() -> Self {
+        Self {
+            hub: "localhost:8421".into(),
+            state_dir: default_state_dir("kahawai-transcoder"),
+            name: "transcoder".into(),
+            max_sessions: 2,
+        }
+    }
 }
 
 impl Default for MediahostConfig {

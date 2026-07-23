@@ -8,6 +8,7 @@ kahawai-core = { workspace = true }
 kahawai-hub = { workspace = true }
 kahawai-media = { workspace = true }
 kahawai-mediahost = { workspace = true }
+kahawai-transcoder = { workspace = true }
 kahawai-transport = { workspace = true }
 anyhow = { workspace = true }
 tokio = { workspace = true }

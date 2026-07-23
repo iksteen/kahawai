@@ -108,3 +108,36 @@ message HelloAck {
 }
 
 message Heartbeat {}
+
+// ---- Transcoder control link (§6, M3) ------------------------------------
+
+service TranscoderLink {
+  rpc Link(stream TcToHub) returns (stream HubToTc);
+}
+
+message TcToHub {
+  oneof msg {
+    Hello hello = 1;
+    Heartbeat heartbeat = 2;
+    // Sent once after HelloAck (TC-1): what this box can actually do,
+    // every element dry-run-verified at startup.
+    CapabilityReport capabilities = 3;
+  }
+}
+
+message CapabilityReport {
+  repeated EncoderCap encoders = 1;
+  uint32 max_sessions = 2;
+}
+
+message EncoderCap {
+  string codec = 1;   // h264 | aac | ...
+  string element = 2; // the verified GStreamer element
+}
+
+message HubToTc {
+  oneof msg {
+    HelloAck hello_ack = 1;
+    // Session dispatch arrives in the next slice.
+  }
+}
