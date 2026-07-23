@@ -1,0 +1,138 @@
+// Same-origin client for the kahawai API. Access tokens ride the
+// Authorization header for fetches and a cookie for <video>/HLS requests
+// (media elements cannot set headers). 401s trigger one refresh + retry.
+
+const LS_ACCESS = 'kahawai.access'
+const LS_REFRESH = 'kahawai.refresh'
+
+export type Tokens = { access_token: string; refresh_token: string }
+
+function syncCookie(token: string | null) {
+  document.cookie = token
+    ? `kahawai_token=${token}; path=/; SameSite=Lax`
+    : 'kahawai_token=; path=/; Max-Age=0'
+}
+
+export function storeTokens(t: Tokens | null) {
+  if (t) {
+    localStorage.setItem(LS_ACCESS, t.access_token)
+    localStorage.setItem(LS_REFRESH, t.refresh_token)
+    syncCookie(t.access_token)
+  } else {
+    localStorage.removeItem(LS_ACCESS)
+    localStorage.removeItem(LS_REFRESH)
+    syncCookie(null)
+  }
+}
+
+export function accessToken(): string | null {
+  return localStorage.getItem(LS_ACCESS)
+}
+
+export function username(): string {
+  const t = accessToken()
+  if (!t) return ''
+  try {
+    return JSON.parse(atob(t.split('.')[1])).username ?? ''
+  } catch {
+    return ''
+  }
+}
+
+export async function refreshTokens(): Promise<boolean> {
+  const rt = localStorage.getItem(LS_REFRESH)
+  if (!rt) return false
+  const r = await fetch('/api/v1/auth/refresh', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ refresh_token: rt }),
+  })
+  if (!r.ok) {
+    storeTokens(null)
+    return false
+  }
+  storeTokens(await r.json())
+  return true
+}
+
+export async function api(path: string, init?: RequestInit): Promise<Response> {
+  const go = () => {
+    const headers: Record<string, string> = { ...(init?.headers as Record<string, string>) }
+    const t = accessToken()
+    if (t) headers['Authorization'] = `Bearer ${t}`
+    if (init?.body) headers['content-type'] = 'application/json'
+    return fetch(path, { ...init, headers })
+  }
+  let r = await go()
+  if (r.status === 401 && (await refreshTokens())) r = await go()
+  return r
+}
+
+export async function json<T>(path: string, init?: RequestInit): Promise<T> {
+  const r = await api(path, init)
+  if (!r.ok) throw new Error((await r.text()) || `${r.status}`)
+  return r.json()
+}
+
+export type Item = {
+  id: string
+  title: string
+  year: number | null
+  sources: number
+  resume_position_ms: number | null
+  played: boolean
+  play_count: number
+}
+
+export type StreamInfo = {
+  container?: string
+  duration_ms?: number
+  video?: { codec: string; width: number; height: number }[]
+  audio?: { codec: string; channels: number; language?: string | null }[]
+  subtitles?: { format: string; language?: string | null }[]
+}
+
+export type Source = {
+  path_rel: string
+  size: number
+  available: boolean
+  streams: StreamInfo | null
+}
+
+export type ItemDetail = Item & { sources_detail: Source[] }
+
+export async function fetchItem(id: string): Promise<ItemDetail> {
+  const raw = await json<Item & { sources: Source[] | number }>(`/api/v1/items/${id}`)
+  const sources = Array.isArray(raw.sources) ? raw.sources : []
+  return { ...(raw as Item), sources: sources.length, sources_detail: sources }
+}
+
+export type Session = {
+  session_id: string
+  mode: 'direct' | 'remux'
+  stream_url: string
+  content_type: string
+  size: number
+}
+
+export function startSession(itemId: string, mode: string): Promise<Session> {
+  return json('/api/v1/playback/sessions', {
+    method: 'POST',
+    body: JSON.stringify({ item_id: itemId, mode }),
+  })
+}
+
+export function postProgress(sessionId: string, positionMs: number, keepalive = false) {
+  return api(`/api/v1/playback/sessions/${sessionId}/progress`, {
+    method: 'POST',
+    body: JSON.stringify({ position_ms: Math.round(positionMs) }),
+    keepalive,
+  }).catch(() => undefined)
+}
+
+export function endSession(sessionId: string, keepalive = false) {
+  return api(`/api/v1/playback/sessions/${sessionId}`, {
+    method: 'DELETE',
+    keepalive,
+  }).catch(() => undefined)
+}

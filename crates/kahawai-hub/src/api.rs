@@ -46,6 +46,7 @@ pub fn router(
         .route("/api/v1/auth/refresh", post(refresh))
         .merge(protected)
         .with_state(state)
+        .merge(crate::web::router())
 }
 
 type ApiError = (StatusCode, String);
@@ -63,12 +64,27 @@ async fn require_auth(
         // OPS-1: nothing else is reachable until setup completes.
         return Err((StatusCode::SERVICE_UNAVAILABLE, "setup required".into()));
     }
-    let claims = req
+    // Bearer header first; the kahawai_token cookie is the fallback for
+    // <video>/HLS requests, which cannot set headers (HUB-27).
+    let header_token = req
         .headers()
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
-        .and_then(|t| state.auth.verify(t).ok())
+        .map(str::to_string);
+    let cookie_token = req
+        .headers()
+        .get(axum::http::header::COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|c| {
+            c.split(';')
+                .filter_map(|kv| kv.trim().split_once('='))
+                .find(|(k, _)| *k == "kahawai_token")
+                .map(|(_, v)| v.to_string())
+        });
+    let claims = header_token
+        .or(cookie_token)
+        .and_then(|t| state.auth.verify(&t).ok())
         .ok_or((StatusCode::UNAUTHORIZED, "invalid or missing token".to_string()))?;
     req.extensions_mut().insert(claims);
     Ok(next.run(req).await)

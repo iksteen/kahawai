@@ -8,3 +8,4 @@ pub mod link_service;
 pub mod pki;
 pub mod registry;
 pub mod sessions;
+pub mod web;

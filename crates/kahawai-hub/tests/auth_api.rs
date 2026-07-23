@@ -146,4 +146,49 @@ async fn setup_then_auth_flow() {
     // Restarted hub with existing users skips setup mode.
     let auth2 = Auth::new(db.clone(), dir.path()).await.unwrap();
     assert!(!auth2.setup_required());
+
+    // Cookie auth: media elements can't set headers, so the kahawai_token
+    // cookie must satisfy the middleware too.
+    let resp = api
+        .clone()
+        .oneshot(
+            Request::get("/api/v1/items")
+                .header("cookie", format!("other=1; kahawai_token={access}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = api
+        .clone()
+        .oneshot(
+            Request::get("/api/v1/items")
+                .header("cookie", "kahawai_token=garbage")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // Embedded SPA: / redirects, /app/ serves the shell, client routes
+    // fall back to it, hashed assets are immutable.
+    let resp = api
+        .clone()
+        .oneshot(Request::get("/").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::PERMANENT_REDIRECT);
+    for uri in ["/app/", "/app/some/client/route"] {
+        let resp = api
+            .clone()
+            .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+        assert_eq!(resp.headers()["content-type"], "text/html; charset=utf-8");
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("kahawai"));
+    }
 }
