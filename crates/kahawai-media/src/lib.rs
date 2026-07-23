@@ -19,9 +19,24 @@ use kahawai_core::media::{AudioStream, MediaInfo, SubtitleStream, VideoStream};
 
 pub fn init() -> Result<()> {
     static INIT: OnceLock<Result<(), String>> = OnceLock::new();
-    INIT.get_or_init(|| gst::init().map_err(|e| e.to_string()))
-        .clone()
-        .map_err(|e| anyhow::anyhow!("gstreamer init failed: {e}"))
+    INIT.get_or_init(|| {
+        gst::init().map_err(|e| e.to_string())?;
+        // macOS: vtdec builds a GL texture cache at start and SIGSEGVs
+        // without an AppKit main loop — which a headless worker never
+        // has. Demote it so decodebin picks software decoders; vtenc
+        // (encode) is headless-safe and stays preferred.
+        // ponytail: re-enable under gst_macos_main if hw decode matters.
+        #[cfg(target_os = "macos")]
+        for name in ["vtdec_hw", "vtdec"] {
+            if let Some(f) = gst::ElementFactory::find(name) {
+                use gst::prelude::PluginFeatureExt;
+                f.set_rank(gst::Rank::NONE);
+            }
+        }
+        Ok(())
+    })
+    .clone()
+    .map_err(|e| anyhow::anyhow!("gstreamer init failed: {e}"))
 }
 
 /// Discover a media file's technical metadata.
