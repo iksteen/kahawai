@@ -139,13 +139,19 @@ fn timestamper_for(caps: &gst::CapsRef) -> Option<&'static str> {
 /// each is taken by the first matching parsed stream.
 type WaitingPads = Arc<Mutex<std::collections::HashMap<&'static str, gst::Pad>>>;
 
-/// Plumb a fresh parsebin pad: an unconditional queue absorbs data while
-/// routing waits for the *real* caps. The stream caps advertised at
-/// pad-added can lie — mislabeled tracks (E-AC-3 tag, AC-3 bitstream) are
-/// re-typed by parsebin's internal parser only once data flows, and
-/// routing on the advertised caps starved the muxer pad forever
-/// (corpus-sweep finding). The caps event precedes the first buffer in
-/// the same streaming thread, so deciding in the probe is race-free.
+/// Plumb a fresh parsebin pad. Muxable-looking streams are routed right
+/// here, synchronously — elements built before data flows behave
+/// differently from elements inserted mid-stream (h264parse merges
+/// parameter-set AUs when added mid-flow and drains a timestampless PPS
+/// runt at EOS; corpus-sweep regression), so the pre-roll path must stay
+/// the pre-roll path. But advertised caps can also lie: mislabeled
+/// tracks (E-AC-3 tag, AC-3 bitstream) are re-typed by parsebin's
+/// internal parser only once data flows, and fakesinking them on the
+/// advertised caps starved the muxer pad forever (corpus-sweep finding).
+/// So only apparently-unmuxable streams defer routing to the real caps
+/// event; the queue absorbs data while the decision waits, and the caps
+/// event precedes the first buffer in the same streaming thread, so
+/// deciding in the probe is race-free.
 fn plumb_parsed_pad(pipe: &gst::Pipeline, waiting: &WaitingPads, pad: &gst::Pad) {
     // queue: decouples the muxer from parsebin's threads (the aggregator
     // deadlocks without it). Default queue limits (1 MiB / 1 s) are far
@@ -162,8 +168,19 @@ fn plumb_parsed_pad(pipe: &gst::Pipeline, waiting: &WaitingPads, pad: &gst::Pad)
     pipe.add(&queue).unwrap();
     queue.sync_state_with_parent().unwrap();
     pad.link(&queue.static_pad("sink").unwrap()).unwrap();
-
     let qsrc = queue.static_pad("src").unwrap();
+
+    let advertised = pad
+        .stream()
+        .and_then(|s| s.caps())
+        .or_else(|| pad.current_caps())
+        .unwrap_or_else(gst::Caps::new_empty);
+    let name = advertised.structure(0).map(|s| s.name().to_string()).unwrap_or_default();
+    if ts_compatible(&name).is_some() {
+        route_stream(pipe, waiting, &qsrc, &advertised);
+        return;
+    }
+
     let pipe = pipe.clone();
     let waiting = waiting.clone();
     qsrc.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |qpad, info| {
