@@ -37,6 +37,19 @@ pub struct CollectionRow {
     pub file_count: i64,
 }
 
+/// Archive the watch state reachable through one file, keyed by that
+/// file's content identity.
+const ARCHIVE_WATCH_FOR_FILE_SQL: &str = "
+    INSERT OR REPLACE INTO watch_state_archive
+      (user_id, size, head_xxh3, tail_xxh3, position_ms, duration_ms, played, play_count)
+    SELECT w.user_id, f.size, f.head_xxh3, f.tail_xxh3,
+           w.position_ms, w.duration_ms, w.played, w.play_count
+    FROM files f
+    JOIN item_sources s ON (s.module_id, s.collection_id, s.path_rel)
+                         = (f.module_id, f.collection_id, f.path_rel)
+    JOIN watch_state w ON w.item_id = s.item_id
+    WHERE f.module_id = ? AND f.collection_id = ? AND f.path_rel = ?";
+
 pub struct Registry {
     db: SqlitePool,
     connected: Mutex<HashMap<String, SatelliteState>>,
@@ -263,6 +276,32 @@ impl Registry {
                 .bind(&item_id)
                 .execute(&mut *tx)
                 .await?;
+
+                // HUB-20/MH-5: the same bytes came back (any host, any
+                // path) — restore archived watch state. Live rows win.
+                sqlx::query(
+                    "INSERT INTO watch_state
+                       (user_id, item_id, position_ms, duration_ms, played, play_count)
+                     SELECT user_id, ?, position_ms, duration_ms, played, play_count
+                     FROM watch_state_archive
+                     WHERE size = ? AND head_xxh3 = ? AND tail_xxh3 = ?
+                     ON CONFLICT (user_id, item_id) DO NOTHING",
+                )
+                .bind(&item_id)
+                .bind(f.size as i64)
+                .bind(f.head_xxh3 as i64)
+                .bind(f.tail_xxh3 as i64)
+                .execute(&mut *tx)
+                .await?;
+                sqlx::query(
+                    "DELETE FROM watch_state_archive
+                     WHERE size = ? AND head_xxh3 = ? AND tail_xxh3 = ?",
+                )
+                .bind(f.size as i64)
+                .bind(f.head_xxh3 as i64)
+                .bind(f.tail_xxh3 as i64)
+                .execute(&mut *tx)
+                .await?;
             }
         }
         tx.commit().await?;
@@ -270,8 +309,9 @@ impl Registry {
     }
 
     /// After a completed scan, drop files the scan no longer reported and
-    /// items left without any source (their watch state cascades away —
-    /// the content-identity archive arrives with HUB-20).
+    /// items left without any source. Watch state is archived keyed to
+    /// content identity first (HUB-20), so moves/renames and returning
+    /// media keep their history.
     pub async fn reconcile_files(
         &self,
         module_id: &str,
@@ -291,6 +331,12 @@ impl Registry {
         }
         let mut tx = self.db.begin().await?;
         for path in &stale {
+            sqlx::query(ARCHIVE_WATCH_FOR_FILE_SQL)
+                .bind(module_id)
+                .bind(collection_id)
+                .bind(path)
+                .execute(&mut *tx)
+                .await?;
             for table in ["item_sources", "files"] {
                 sqlx::query(&format!(
                     "DELETE FROM {table} WHERE module_id = ? AND collection_id = ? AND path_rel = ?"
@@ -314,6 +360,92 @@ impl Registry {
         tracing::info!(%module_id, collection = collection_id, removed = stale.len(),
             "reconciled files gone from disk");
         Ok(stale.len())
+    }
+
+    /// Enrolled satellites (DB) merged with live connection state.
+    pub async fn satellites_overview(&self) -> Result<Vec<serde_json::Value>> {
+        let rows = sqlx::query(
+            "SELECT module_id, module_type, name, cert_fingerprint, enrolled_at
+             FROM satellites ORDER BY enrolled_at",
+        )
+        .fetch_all(&self.db)
+        .await?;
+        let connected = self.connected.lock().unwrap().clone();
+        Ok(rows
+            .iter()
+            .map(|r| {
+                let id: String = r.get("module_id");
+                let state = connected.get(&id);
+                serde_json::json!({
+                    "module_id": id,
+                    "module_type": r.get::<String, _>("module_type"),
+                    "name": r.get::<String, _>("name"),
+                    "cert_fingerprint": r.get::<String, _>("cert_fingerprint"),
+                    "enrolled_at": r.get::<i64, _>("enrolled_at"),
+                    "connected": state.is_some_and(|s| s.connected),
+                })
+            })
+            .collect())
+    }
+
+    /// Delete a satellite (SEC-6/HUB-20): revoke its certificate, close its
+    /// link, archive watch state by content identity, cascade-delete its
+    /// collections/files/sources and orphaned items. Returns the revoked
+    /// fingerprint. Transient disconnects never come here.
+    pub async fn delete_satellite(&self, module_id: &str) -> Result<String> {
+        let fingerprint: String = sqlx::query_scalar(
+            "SELECT cert_fingerprint FROM satellites WHERE module_id = ?",
+        )
+        .bind(module_id)
+        .fetch_optional(&self.db)
+        .await?
+        .with_context(|| format!("no such satellite: {module_id}"))?;
+
+        let mut tx = self.db.begin().await?;
+        sqlx::query("INSERT OR IGNORE INTO revoked_certs (fingerprint) VALUES (?)")
+            .bind(&fingerprint)
+            .execute(&mut *tx)
+            .await?;
+        // Archive watch state for every file this host serves (identity-
+        // keyed; restore drops it again if the item still has live sources).
+        sqlx::query(
+            "INSERT OR REPLACE INTO watch_state_archive
+               (user_id, size, head_xxh3, tail_xxh3, position_ms, duration_ms, played, play_count)
+             SELECT w.user_id, f.size, f.head_xxh3, f.tail_xxh3,
+                    w.position_ms, w.duration_ms, w.played, w.play_count
+             FROM files f
+             JOIN item_sources s ON (s.module_id, s.collection_id, s.path_rel)
+                                  = (f.module_id, f.collection_id, f.path_rel)
+             JOIN watch_state w ON w.item_id = s.item_id
+             WHERE f.module_id = ?",
+        )
+        .bind(module_id)
+        .execute(&mut *tx)
+        .await?;
+        for sql in [
+            "DELETE FROM item_sources WHERE module_id = ?",
+            "DELETE FROM files WHERE module_id = ?",
+            "DELETE FROM collections WHERE module_id = ?",
+            "DELETE FROM satellites WHERE module_id = ?",
+        ] {
+            sqlx::query(sql).bind(module_id).execute(&mut *tx).await?;
+        }
+        sqlx::query(
+            "DELETE FROM items WHERE id IN (
+                SELECT i.id FROM items i
+                LEFT JOIN item_sources s ON s.item_id = i.id
+                WHERE s.item_id IS NULL)",
+        )
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+
+        // Close the live link (the satellite's reconnect dies at the TLS
+        // layer once the fingerprint is revoked) and forget runtime state.
+        self.links.lock().unwrap().remove(module_id);
+        self.connected.lock().unwrap().remove(module_id);
+        tracing::info!(%module_id, fingerprint = %fingerprint, "satellite deleted and revoked");
+        Ok(fingerprint)
     }
 
     pub async fn collections(&self) -> Result<Vec<CollectionRow>> {

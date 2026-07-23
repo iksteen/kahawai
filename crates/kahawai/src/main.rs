@@ -247,7 +247,7 @@ async fn run_hub(cfg: config::HubConfig) -> Result<()> {
     let api_listener = tokio::net::TcpListener::bind(cfg.bind)
         .await
         .with_context(|| format!("binding client API on {}", cfg.bind))?;
-    let api = kahawai_hub::api::router(registry.clone(), auth, sessions.clone());
+    let api = kahawai_hub::api::router(registry.clone(), auth, sessions.clone(), Arc::new(svc.clone()), revoked.clone());
     tokio::spawn(async move {
         if let Err(e) = axum::serve(api_listener, api).await {
             tracing::error!(error = %e, "client API server failed");

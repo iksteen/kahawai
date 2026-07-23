@@ -151,3 +151,14 @@ h2 { font-size: 14px; font-weight: 650; color: var(--dim); letter-spacing: 0.08e
   .library-head { flex-wrap: wrap; }
   .filter { width: 100%; margin-left: 0; }
 }
+
+/* -------- admin -------- */
+.rows { list-style: none; margin: 0 0 8px; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+.rows li {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  border: 1px solid var(--line); border-radius: 6px; padding: 10px 14px;
+}
+.rows .chips { align-items: center; }
+.approve-row { display: flex; gap: 10px; max-width: 420px; margin-top: 10px; }
+.notice { color: var(--teal); font-size: 13.5px; }
+.btn.danger { background: var(--warn); border-color: var(--warn); color: #2a120b; }

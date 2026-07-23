@@ -239,6 +239,30 @@ impl Sessions {
         }
     }
 
+    /// Active sessions for the admin dashboard (HUB-18).
+    pub fn list(&self) -> Vec<Arc<Session>> {
+        let mut v: Vec<_> = self.active.lock().unwrap().values().cloned().collect();
+        v.sort_by(|a, b| a.id.cmp(&b.id));
+        v
+    }
+
+    /// End every session backed by a given mediahost (satellite deletion).
+    pub fn end_for_module(&self, module_id: &str) -> usize {
+        let ids: Vec<String> = self
+            .active
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|s| s.module_id == module_id)
+            .map(|s| s.id.clone())
+            .collect();
+        let n = ids.len();
+        for id in ids {
+            self.end(&id);
+        }
+        n
+    }
+
     pub fn get(&self, id: &str) -> Option<Arc<Session>> {
         self.active.lock().unwrap().get(id).cloned()
     }

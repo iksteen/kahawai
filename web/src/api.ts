@@ -29,14 +29,22 @@ export function accessToken(): string | null {
   return localStorage.getItem(LS_ACCESS)
 }
 
-export function username(): string {
+function claims(): { username?: string; admin?: boolean } {
   const t = accessToken()
-  if (!t) return ''
+  if (!t) return {}
   try {
-    return JSON.parse(atob(t.split('.')[1])).username ?? ''
+    return JSON.parse(atob(t.split('.')[1]))
   } catch {
-    return ''
+    return {}
   }
+}
+
+export function username(): string {
+  return claims().username ?? ''
+}
+
+export function isAdmin(): boolean {
+  return claims().admin === true
 }
 
 export async function refreshTokens(): Promise<boolean> {
@@ -136,3 +144,45 @@ export function endSession(sessionId: string, keepalive = false) {
     keepalive,
   }).catch(() => undefined)
 }
+
+// ---- admin ----
+
+export type PendingEnrollment = {
+  csr_fingerprint: string
+  module_type: string
+  module_id: string
+  name: string
+}
+
+export type Satellite = {
+  module_id: string
+  module_type: string
+  name: string
+  cert_fingerprint: string
+  connected: boolean
+}
+
+export type AdminSession = {
+  session_id: string
+  username: string | null
+  title: string | null
+  mode: string
+  module_id: string
+  idle_secs: number
+}
+
+export const adminEnrollments = () =>
+  json<{ pending: PendingEnrollment[] }>('/admin/v1/enrollments')
+export const adminApprove = (code: string) =>
+  json<{ approved: string }>('/admin/v1/enrollments/approve', {
+    method: 'POST',
+    body: JSON.stringify({ code }),
+  })
+export const adminSatellites = () =>
+  json<{ satellites: Satellite[] }>('/admin/v1/satellites')
+export const adminDeleteSatellite = (id: string) =>
+  json<unknown>(`/admin/v1/satellites/${id}`, { method: 'DELETE' })
+export const adminSessions = () =>
+  json<{ sessions: AdminSession[] }>('/admin/v1/sessions')
+export const adminEndSession = (id: string) =>
+  api(`/admin/v1/sessions/${id}`, { method: 'DELETE' })

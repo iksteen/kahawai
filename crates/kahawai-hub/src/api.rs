@@ -22,14 +22,18 @@ pub struct AppState {
     pub registry: Arc<Registry>,
     pub auth: Arc<Auth>,
     pub sessions: Arc<crate::sessions::Sessions>,
+    pub enrollments: Arc<crate::enrollment_service::EnrollmentService>,
+    pub revoked: kahawai_transport::mtls::RevocationList,
 }
 
 pub fn router(
     registry: Arc<Registry>,
     auth: Arc<Auth>,
     sessions: Arc<crate::sessions::Sessions>,
+    enrollments: Arc<crate::enrollment_service::EnrollmentService>,
+    revoked: kahawai_transport::mtls::RevocationList,
 ) -> Router {
-    let state = AppState { registry, auth, sessions };
+    let state = AppState { registry, auth, sessions, enrollments, revoked };
     let protected = Router::new()
         .route("/api/v1/collections", get(list_collections))
         .route("/api/v1/items", get(list_items))
@@ -40,7 +44,17 @@ pub fn router(
         .route("/api/v1/playback/sessions/{id}/progress", post(post_progress))
         .route("/api/v1/playback/sessions/{id}/{file}", get(session_file))
         .route_layer(axum::middleware::from_fn_with_state(state.clone(), require_auth));
+    let admin = Router::new()
+        .route("/admin/v1/enrollments", get(admin_enrollments))
+        .route("/admin/v1/enrollments/approve", post(admin_approve))
+        .route("/admin/v1/satellites", get(admin_satellites))
+        .route("/admin/v1/satellites/{id}", axum::routing::delete(admin_delete_satellite))
+        .route("/admin/v1/sessions", get(admin_sessions))
+        .route("/admin/v1/sessions/{id}", axum::routing::delete(admin_end_session))
+        .route_layer(axum::middleware::from_fn(require_admin))
+        .route_layer(axum::middleware::from_fn_with_state(state.clone(), require_auth));
     Router::new()
+        .merge(admin)
         .route("/api/v1/setup", post(setup))
         .route("/api/v1/auth/token", post(login))
         .route("/api/v1/auth/refresh", post(refresh))
@@ -88,6 +102,112 @@ async fn require_auth(
         .ok_or((StatusCode::UNAUTHORIZED, "invalid or missing token".to_string()))?;
     req.extensions_mut().insert(claims);
     Ok(next.run(req).await)
+}
+
+/// Layered after require_auth: the Claims extension is already present.
+async fn require_admin(req: Request, next: Next) -> Result<Response, ApiError> {
+    let is_admin = req
+        .extensions()
+        .get::<crate::auth::Claims>()
+        .is_some_and(|c| c.admin);
+    if !is_admin {
+        return Err((StatusCode::FORBIDDEN, "admin only".into()));
+    }
+    Ok(next.run(req).await)
+}
+
+async fn admin_enrollments(State(state): State<AppState>) -> Json<Value> {
+    let pending: Vec<Value> = state
+        .enrollments
+        .pending()
+        .iter()
+        .map(|p| {
+            json!({
+                "csr_fingerprint": p.csr_fingerprint,
+                "module_type": p.module_type,
+                "module_id": p.module_id,
+                "name": p.name,
+            })
+        })
+        .collect();
+    Json(json!({ "pending": pending }))
+}
+
+#[derive(Deserialize)]
+struct ApproveRequest {
+    code: String,
+}
+
+async fn admin_approve(
+    State(state): State<AppState>,
+    Json(body): Json<ApproveRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let summary = state
+        .enrollments
+        .approve(&body.code)
+        .await
+        .map_err(|e| (StatusCode::FORBIDDEN, format!("{e:#}")))?;
+    Ok(Json(json!({ "approved": summary })))
+}
+
+async fn admin_satellites(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+    let sats = state.registry.satellites_overview().await.map_err(internal)?;
+    Ok(Json(json!({ "satellites": sats })))
+}
+
+/// SEC-6/HUB-20: revoke + end sessions + cascade. Refusal of reconnection
+/// happens at the TLS layer via the revocation list.
+async fn admin_delete_satellite(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let ended = state.sessions.end_for_module(&id);
+    let fingerprint = state
+        .registry
+        .delete_satellite(&id)
+        .await
+        .map_err(|e| (StatusCode::NOT_FOUND, format!("{e:#}")))?;
+    state.revoked.revoke(&fingerprint);
+    Ok(Json(json!({ "deleted": id, "revoked": fingerprint, "sessions_ended": ended })))
+}
+
+async fn admin_sessions(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+    let mut out = Vec::new();
+    for s in state.sessions.list() {
+        let title: Option<String> = sqlx::query_scalar("SELECT title FROM items WHERE id = ?")
+            .bind(&s.item_id)
+            .fetch_optional(state.registry.db())
+            .await
+            .map_err(internal)?;
+        let username: Option<String> = sqlx::query_scalar("SELECT username FROM users WHERE id = ?")
+            .bind(&s.user_id)
+            .fetch_optional(state.registry.db())
+            .await
+            .map_err(internal)?;
+        out.push(json!({
+            "session_id": s.id,
+            "username": username,
+            "title": title,
+            "mode": match &s.mode {
+                crate::sessions::Mode::Direct { .. } => "direct",
+                crate::sessions::Mode::Remux { .. } => "remux",
+            },
+            "module_id": s.module_id,
+            "idle_secs": s.idle_for().as_secs(),
+        }));
+    }
+    Ok(Json(json!({ "sessions": out })))
+}
+
+async fn admin_end_session(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    if state.sessions.end(&id) {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err((StatusCode::NOT_FOUND, "no such session".into()))
+    }
 }
 
 #[derive(Deserialize)]

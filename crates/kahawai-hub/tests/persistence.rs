@@ -82,7 +82,7 @@ async fn files_and_items_survive_restart() {
             .body(axum::body::Body::empty())
             .unwrap()
     };
-    let api = kahawai_hub::api::router(reg.clone(), auth, Arc::new(kahawai_hub::sessions::Sessions::new(tempfile::tempdir().unwrap().keep())));
+    let api = test_router(reg.clone(), auth, Arc::new(kahawai_hub::sessions::Sessions::new(tempfile::tempdir().unwrap().keep())));
     let resp = api
         .clone()
         .oneshot(get("/api/v1/items".into()))
@@ -160,4 +160,23 @@ async fn reconcile_drops_files_missing_from_scan() {
 
     // Idempotent when nothing changed.
     assert_eq!(reg.reconcile_files("01H", "movies", &seen).await.unwrap(), 0);
+}
+
+/// Router with default admin plumbing for tests that don't exercise it.
+fn test_router(
+    registry: std::sync::Arc<kahawai_hub::registry::Registry>,
+    auth: std::sync::Arc<kahawai_hub::auth::Auth>,
+    sessions: std::sync::Arc<kahawai_hub::sessions::Sessions>,
+) -> axum::Router {
+    let ca = std::sync::Arc::new(
+        kahawai_hub::pki::HubCa::load_or_create(tempfile::tempdir().unwrap().keep().as_path())
+            .unwrap(),
+    );
+    let enrollments = std::sync::Arc::new(kahawai_hub::enrollment_service::EnrollmentService::new(
+        ca,
+        registry.clone(),
+        std::time::Duration::from_secs(900),
+        90,
+    ));
+    kahawai_hub::api::router(registry, auth, sessions, enrollments, Default::default())
 }

@@ -34,7 +34,7 @@ async fn setup_then_auth_flow() {
     let registry = Arc::new(Registry::new(db.clone()));
     let auth = Arc::new(Auth::new(db.clone(), dir.path()).await.unwrap());
     let setup_token = auth.setup_token().expect("fresh hub must be in setup mode");
-    let api = kahawai_hub::api::router(registry, auth.clone(), Arc::new(kahawai_hub::sessions::Sessions::new(tempfile::tempdir().unwrap().keep())));
+    let api = test_router(registry, auth.clone(), Arc::new(kahawai_hub::sessions::Sessions::new(tempfile::tempdir().unwrap().keep())));
 
     // Setup mode: nothing else is reachable (OPS-1)…
     let resp = api
@@ -191,4 +191,23 @@ async fn setup_then_auth_flow() {
         let body = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
         assert!(String::from_utf8_lossy(&body).contains("kahawai"));
     }
+}
+
+/// Router with default admin plumbing for tests that don't exercise it.
+fn test_router(
+    registry: std::sync::Arc<kahawai_hub::registry::Registry>,
+    auth: std::sync::Arc<kahawai_hub::auth::Auth>,
+    sessions: std::sync::Arc<kahawai_hub::sessions::Sessions>,
+) -> axum::Router {
+    let ca = std::sync::Arc::new(
+        kahawai_hub::pki::HubCa::load_or_create(tempfile::tempdir().unwrap().keep().as_path())
+            .unwrap(),
+    );
+    let enrollments = std::sync::Arc::new(kahawai_hub::enrollment_service::EnrollmentService::new(
+        ca,
+        registry.clone(),
+        std::time::Duration::from_secs(900),
+        90,
+    ));
+    kahawai_hub::api::router(registry, auth, sessions, enrollments, Default::default())
 }

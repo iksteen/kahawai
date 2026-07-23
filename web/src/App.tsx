@@ -1,12 +1,14 @@
 import { useEffect, useState } from 'react'
-import { api, refreshTokens, storeTokens, username, type Item, type Session } from './api'
+import { api, isAdmin, refreshTokens, storeTokens, username, type Item, type Session } from './api'
 import Auth from './views/Auth'
 import Library from './views/Library'
 import Detail from './views/Detail'
 import Player from './views/Player'
+import Admin from './views/Admin'
 
 type Route =
   | { view: 'library' }
+  | { view: 'admin' }
   | { view: 'detail'; id: string }
   | { view: 'player'; item: Item; session: Session; resumeMs: number }
 
@@ -44,6 +46,11 @@ export default function App() {
           kahawai<span className="tilde">~</span>
         </button>
         <div className="topbar-right">
+          {isAdmin() && (
+            <button className="btn ghost small" onClick={() => setRoute({ view: 'admin' })}>
+              Admin
+            </button>
+          )}
           <span className="whoami">{username()}</span>
           <button
             className="btn ghost small"
@@ -56,6 +63,7 @@ export default function App() {
           </button>
         </div>
       </header>
+      {route.view === 'admin' && <Admin />}
       {route.view === 'library' && (
         <Library onOpen={(id) => setRoute({ view: 'detail', id })} />
       )}

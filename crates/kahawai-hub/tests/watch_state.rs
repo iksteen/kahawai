@@ -129,7 +129,7 @@ async fn progress_resume_played_caps_and_idle() {
         .await
         .unwrap();
     let bearer = format!("Bearer {}", pair.access_token);
-    let api = kahawai_hub::api::router(registry.clone(), auth, sessions.clone());
+    let api = test_router(registry.clone(), auth, sessions.clone());
     let get = |uri: String| {
         Request::get(uri).header("authorization", bearer.clone()).body(Body::empty()).unwrap()
     };
@@ -229,4 +229,23 @@ async fn progress_resume_played_caps_and_idle() {
     // Room again after reaping.
     let resp = start_session().await.unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);
+}
+
+/// Router with default admin plumbing for tests that don't exercise it.
+fn test_router(
+    registry: std::sync::Arc<kahawai_hub::registry::Registry>,
+    auth: std::sync::Arc<kahawai_hub::auth::Auth>,
+    sessions: std::sync::Arc<kahawai_hub::sessions::Sessions>,
+) -> axum::Router {
+    let ca = std::sync::Arc::new(
+        kahawai_hub::pki::HubCa::load_or_create(tempfile::tempdir().unwrap().keep().as_path())
+            .unwrap(),
+    );
+    let enrollments = std::sync::Arc::new(kahawai_hub::enrollment_service::EnrollmentService::new(
+        ca,
+        registry.clone(),
+        std::time::Duration::from_secs(900),
+        90,
+    ));
+    kahawai_hub::api::router(registry, auth, sessions, enrollments, Default::default())
 }
