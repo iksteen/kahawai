@@ -1,6 +1,9 @@
 [workspace]
 resolver = "3"
 members = ["crates/*"]
+# Bare `cargo run` / `cargo build` target the kahawai binary; use
+# --workspace for the full build/test sweep.
+default-members = ["crates/kahawai"]
 
 [workspace.package]
 version = "0.1.0"
