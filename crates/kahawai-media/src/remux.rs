@@ -597,6 +597,13 @@ fn route_stream(
             // every hop is pure repackaging, no decode.
             for name in [parser_for(caps), timestamper_for(caps)].into_iter().flatten() {
                 let el = gst::ElementFactory::make(name).build().unwrap();
+                // HLS requires independently decodable segments: h26x
+                // parameter sets must ride every keyframe, or only the
+                // first segment can start a decoder (players stall on
+                // transitions and cold seeks).
+                if name.ends_with("parse") {
+                    set_prop_if_present(&el, "config-interval", -1i32);
+                }
                 pipe.add(&el).unwrap();
                 el.sync_state_with_parent().unwrap();
                 tail.link(&el.static_pad("sink").unwrap()).unwrap();
@@ -673,6 +680,8 @@ fn build_video_encode_chain(
     // nvh264enc/x264enc take kbit/s.
     set_prop_str_if_present(&enc, "bitrate", "6000");
     let parse = gst::ElementFactory::make("h264parse").build().unwrap();
+    // Parameter sets on every keyframe (independently decodable segments).
+    set_prop_if_present(&parse, "config-interval", -1i32);
 
     let mut chain: Vec<&gst::Element> = converters.iter().collect();
     chain.push(&enc);

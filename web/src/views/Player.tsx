@@ -51,6 +51,16 @@ export default function Player({
           const t = accessToken()
           if (t) xhr.setRequestHeader('Authorization', `Bearer ${t}`)
         },
+        // Our EVENT playlists are growing recordings, not live TV: the
+        // pipeline paces itself a window ahead of THIS player, so the
+        // default live-edge sync creates a feedback loop — hls.js chases
+        // the edge, the edge moves with it, playback lives at the
+        // starved frontier and buffers on every segment. Watch from the
+        // beginning and never chase.
+        startPosition: 0,
+        liveSyncDurationCount: 1e6,
+        liveMaxLatencyDurationCount: Infinity,
+        maxBufferLength: 60,
       })
       hls.loadSource(session.stream_url)
       hls.attachMedia(video)
