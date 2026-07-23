@@ -171,10 +171,37 @@ fn doctor_checks(cfg: &config::Config) -> Vec<kahawai_media::doctor::Check> {
     }
 
     // Hardware acceleration is optional but worth surfacing.
-    checks.push(if std::path::Path::new("/dev/dri").exists() {
-        kahawai_media::doctor::Check::ok("/dev/dri", "present (VA-API possible)")
-    } else {
-        kahawai_media::doctor::Check::warn("/dev/dri", "absent — hardware acceleration unavailable")
+    // Linux-only: DRI render nodes are how VA-API reaches the GPU, and
+    // the classic failure is a service user missing the render/video
+    // group — the encoder dry-run then fails with no hint why. Other
+    // platforms (VideoToolbox, NVENC-on-Windows) have no device node;
+    // the dry-run-verified encoder rows are the whole story there.
+    #[cfg(target_os = "linux")]
+    checks.push({
+        use kahawai_media::doctor::Check;
+        let nodes: Vec<std::path::PathBuf> = std::fs::read_dir("/dev/dri")
+            .map(|rd| {
+                rd.filter_map(|e| e.ok().map(|e| e.path()))
+                    .filter(|p| {
+                        p.file_name()
+                            .and_then(|n| n.to_str())
+                            .is_some_and(|n| n.starts_with("renderD"))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if nodes.is_empty() {
+            Check::warn("/dev/dri", "no render nodes — VA-API/GPU encode unavailable")
+        } else if let Some(node) = nodes.iter().find(|n| {
+            std::fs::OpenOptions::new().read(true).write(true).open(n).is_ok()
+        }) {
+            Check::ok("/dev/dri", format!("{} accessible", node.display()))
+        } else {
+            Check::warn(
+                "/dev/dri",
+                "render nodes exist but are not accessible — add this user to the render/video group",
+            )
+        }
     });
     checks
 }
