@@ -47,7 +47,7 @@ fn worker_remuxes_over_socket() {
         .arg(&sock)
         .arg(&out)
         .arg(size.to_string())
-        .arg("--video")
+        .args(["--video", "copy"])
         .args(["--audio", "copy"])
         .spawn()
         .unwrap();
