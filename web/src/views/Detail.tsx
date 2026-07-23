@@ -60,11 +60,13 @@ function Chips({ s }: { s: Source }) {
 
 export default function Detail({
   id,
+  autoPlay,
   onBack,
   onPlay,
   onOpenEpisode,
 }: {
   id: string
+  autoPlay?: boolean
   onBack: () => void
   onPlay: (item: Item, session: Session, resumeMs: number) => void
   onOpenEpisode: (id: string) => void
@@ -86,6 +88,17 @@ export default function Detail({
         .catch((e) => setError(String(e)))
     }
   }, [item?.id, item?.kind])
+  // Deep-linked or history-forwarded /play URLs: start playback once
+  // the item is loaded (shows have nothing to autoplay).
+  const [autoPlayed, setAutoPlayed] = useState(false)
+  useEffect(() => {
+    if (autoPlay && !autoPlayed && item && item.kind !== 'show') {
+      setAutoPlayed(true)
+      const best = item.sources_detail[0]
+      if (best?.available) void play(autoMode(best))
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [autoPlay, autoPlayed, item?.id])
 
   if (error) return <div className="error page-pad">{error}</div>
   if (!item) return null

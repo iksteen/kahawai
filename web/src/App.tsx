@@ -9,14 +9,60 @@ import Admin from './views/Admin'
 type Route =
   | { view: 'library' }
   | { view: 'admin' }
-  | { view: 'detail'; id: string }
+  | { view: 'detail'; id: string; autoPlay?: boolean }
   | { view: 'player'; item: Item; session: Session; resumeMs: number }
 
 type Phase = 'boot' | 'setup' | 'login' | 'app'
 
+const BASE = '/app'
+
+// URL ↔ route. The player itself is transient (sessions die with it),
+// so it lives at the item's /play URL: deep-loading or forward-ing onto
+// it re-enters the detail view with autoplay instead.
+function routeToPath(route: Route): string {
+  switch (route.view) {
+    case 'library':
+      return `${BASE}/`
+    case 'admin':
+      return `${BASE}/admin`
+    case 'detail':
+      return `${BASE}/item/${route.id}`
+    case 'player':
+      return `${BASE}/item/${route.item.id}/play`
+  }
+}
+
+function pathToRoute(pathname: string): Route {
+  const rel = pathname.startsWith(BASE) ? pathname.slice(BASE.length) : pathname
+  const parts = rel.split('/').filter(Boolean)
+  if (parts[0] === 'admin') return { view: 'admin' }
+  if (parts[0] === 'item' && parts[1]) {
+    return { view: 'detail', id: parts[1], autoPlay: parts[2] === 'play' }
+  }
+  return { view: 'library' }
+}
+
 export default function App() {
   const [phase, setPhase] = useState<Phase>('boot')
-  const [route, setRoute] = useState<Route>({ view: 'library' })
+  const [route, setRoute] = useState<Route>(() => pathToRoute(window.location.pathname))
+
+  // Forward navigation: push a history entry and switch views.
+  const navigate = (r: Route) => {
+    const path = routeToPath(r)
+    if (path !== window.location.pathname) {
+      window.history.pushState(null, '', path)
+    }
+    setRoute(r)
+  }
+
+  // Back/forward: rebuild the view from the URL. Session state cannot
+  // ride history (it holds live server objects), so landing back on a
+  // /play URL becomes detail-with-autoplay.
+  useEffect(() => {
+    const onPop = () => setRoute(pathToRoute(window.location.pathname))
+    window.addEventListener('popstate', onPop)
+    return () => window.removeEventListener('popstate', onPop)
+  }, [])
 
   useEffect(() => {
     ;(async () => {
@@ -42,12 +88,12 @@ export default function App() {
   return (
     <div className="shell">
       <header className="topbar">
-        <button className="wordmark" onClick={() => setRoute({ view: 'library' })}>
+        <button className="wordmark" onClick={() => navigate({ view: 'library' })}>
           kahawai<span className="tilde">~</span>
         </button>
         <div className="topbar-right">
           {isAdmin() && (
-            <button className="btn ghost small" onClick={() => setRoute({ view: 'admin' })}>
+            <button className="btn ghost small" onClick={() => navigate({ view: 'admin' })}>
               Admin
             </button>
           )}
@@ -65,16 +111,17 @@ export default function App() {
       </header>
       {route.view === 'admin' && <Admin />}
       {route.view === 'library' && (
-        <Library onOpen={(id) => setRoute({ view: 'detail', id })} />
+        <Library onOpen={(id) => navigate({ view: 'detail', id })} />
       )}
       {route.view === 'detail' && (
         <Detail
           id={route.id}
-          onBack={() => setRoute({ view: 'library' })}
+          autoPlay={route.autoPlay}
+          onBack={() => navigate({ view: 'library' })}
           onPlay={(item, session, resumeMs) =>
-            setRoute({ view: 'player', item, session, resumeMs })
+            navigate({ view: 'player', item, session, resumeMs })
           }
-          onOpenEpisode={(id) => setRoute({ view: 'detail', id })}
+          onOpenEpisode={(id) => navigate({ view: 'detail', id })}
         />
       )}
       {route.view === 'player' && (
@@ -82,7 +129,7 @@ export default function App() {
           item={route.item}
           session={route.session}
           resumeMs={route.resumeMs}
-          onClose={() => setRoute({ view: 'detail', id: route.item.id })}
+          onClose={() => window.history.back()}
         />
       )}
     </div>
