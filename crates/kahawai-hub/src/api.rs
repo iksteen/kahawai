@@ -48,6 +48,7 @@ pub fn router(
         .route("/admin/v1/satellites", get(admin_satellites))
         .route("/admin/v1/satellites/{id}", axum::routing::delete(admin_delete_satellite))
         .route("/admin/v1/satellites/{id}/disabled", post(admin_set_disabled))
+        .route("/api/v1/playback/sessions/{id}/seek", post(seek_session))
         .route("/admin/v1/sessions", get(admin_sessions))
         .route("/admin/v1/sessions/{id}", axum::routing::delete(admin_end_session))
         .route_layer(axum::middleware::from_fn(require_admin))
@@ -295,6 +296,10 @@ struct StartSessionRequest {
     item_id: String,
     #[serde(default = "default_mode")]
     mode: String,
+    /// Begin playback here (resume without waiting for a transcode to
+    /// catch up) — keyframe-snapped by the pipeline.
+    #[serde(default)]
+    start_ms: u64,
 }
 
 fn default_mode() -> String {
@@ -308,7 +313,7 @@ async fn start_session(
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     let session = state
         .sessions
-        .start(&state.registry, &claims.sub, &body.item_id, &body.mode)
+        .start(&state.registry, &claims.sub, &body.item_id, &body.mode, body.start_ms)
         .await
         .map_err(|e| (StatusCode::CONFLICT, format!("{e:#}")))?;
     let (mode, stream_url, ctype) = match &session.mode {
@@ -334,6 +339,7 @@ async fn start_session(
             "session_id": session.id,
             "mode": mode,
             "size": session.size,
+            "duration_ms": session.duration_ms,
             "content_type": ctype,
             "stream_url": stream_url,
             "streams": session.verdict.as_ref().map(|(video, audio)| json!({
@@ -342,6 +348,26 @@ async fn start_session(
             })),
         })),
     ))
+}
+
+#[derive(Deserialize)]
+struct SeekRequest {
+    position_ms: u64,
+}
+
+/// Seek-restart (§6): restart the session's pipeline at the offset.
+/// Same session id and URLs; the client re-attaches to the playlist.
+async fn seek_session(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<SeekRequest>,
+) -> Result<StatusCode, ApiError> {
+    state
+        .sessions
+        .seek(&state.registry, &id, body.position_ms)
+        .await
+        .map_err(|e| (StatusCode::CONFLICT, format!("{e:#}")))?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn end_session(

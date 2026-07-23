@@ -162,3 +162,33 @@ h2 { font-size: 14px; font-weight: 650; color: var(--dim); letter-spacing: 0.08e
 .approve-row { display: flex; gap: 10px; max-width: 420px; margin-top: 10px; }
 .notice { color: var(--teal); font-size: 13.5px; }
 .btn.danger { background: var(--warn); border-color: var(--warn); color: #2a120b; }
+
+/* Full-timeline seek bar (remux/transcode): click anywhere; beyond the
+   produced range the hub restarts the pipeline at the target. */
+.seekbar {
+  position: relative;
+  height: 22px;
+  margin-top: 6px;
+  background: color-mix(in srgb, var(--teal) 12%, transparent);
+  border: 1px solid color-mix(in srgb, var(--teal) 30%, transparent);
+  border-radius: 4px;
+  cursor: pointer;
+  overflow: hidden;
+}
+.seekbar.busy {
+  opacity: 0.5;
+  cursor: progress;
+}
+.seekbar-fill {
+  height: 100%;
+  background: color-mix(in srgb, var(--teal) 45%, transparent);
+}
+.seekbar-time {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  pointer-events: none;
+}

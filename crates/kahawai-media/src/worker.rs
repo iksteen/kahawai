@@ -69,11 +69,12 @@ pub fn run(
     size: u64,
     video: StreamMode,
     audio: StreamMode,
+    start_ms: u64,
 ) -> Result<()> {
     let stream = UnixStream::connect(socket)
         .with_context(|| format!("connecting to {}", socket.display()))?;
     let plan = RemuxPlan { video, audio };
-    let job = remux::start(out_dir, plan, Box::new(SocketSource { stream, size }))?;
+    let job = remux::start_at(out_dir, plan, Box::new(SocketSource { stream, size }), start_ms)?;
     while !job.finished() {
         std::thread::sleep(std::time::Duration::from_millis(100));
     }

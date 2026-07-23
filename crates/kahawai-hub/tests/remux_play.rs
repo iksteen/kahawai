@@ -216,6 +216,48 @@ async fn remux_to_hls_end_to_end() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
+    // Seek-restart (§6): the same session restarts its pipeline at an
+    // offset; the playlist regenerates covering only the tail.
+    let resp = api
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/v1/playback/sessions/{session_id}/seek"))
+                .header("authorization", bearer.clone())
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"position_ms":6000}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    let tail_playlist = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let resp = api
+                .clone()
+                .oneshot(get(format!("/api/v1/playback/sessions/{session_id}/master.m3u8")))
+                .await
+                .unwrap();
+            if resp.status() == StatusCode::OK {
+                let text = String::from_utf8(body_bytes(resp).await).unwrap();
+                if text.contains("#EXT-X-ENDLIST") {
+                    return text;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("post-seek playlist never finalized");
+    let total: f64 = tail_playlist
+        .lines()
+        .filter_map(|l| l.strip_prefix("#EXTINF:"))
+        .filter_map(|l| l.trim_end_matches(',').parse::<f64>().ok())
+        .sum();
+    assert!(
+        total > 2.0 && total < 6.5,
+        "post-seek playlist should cover ~4s tail, got {total}s:\n{tail_playlist}"
+    );
+
     // Teardown removes the scratch files.
     let resp = api
         .clone()

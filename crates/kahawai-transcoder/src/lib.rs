@@ -133,7 +133,7 @@ async fn link_loop(
                         Some(hub_to_tc::Msg::StartSession(s)) => {
                             let runner = runner.clone();
                             tokio::spawn(async move {
-                                runner.start(s.session_id, s.size, &s.video, &s.audio).await;
+                                runner.start(s.session_id, s.size, &s.video, &s.audio, s.start_ms).await;
                             });
                         }
                         Some(hub_to_tc::Msg::EndSession(e)) => runner.end(&e.session_id),

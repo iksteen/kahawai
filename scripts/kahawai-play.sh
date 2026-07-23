@@ -4,6 +4,7 @@
 #   kahawai-play.sh [-r] [-a host:port] <username> <password> <item-id> [-- mpv args...]
 #
 #   -r            remux to HLS in the hub (default: direct play)
+#   -s SECONDS    start at this offset (remux: pipeline starts there, §6)
 #   -a host:port  API address (default: $KAHAWAI_API or localhost:8420)
 #   password "-"  prompt for it instead of passing on the command line
 #
@@ -13,9 +14,10 @@ set -euo pipefail
 API="${KAHAWAI_API:-localhost:8420}"
 MODE="direct"
 
-while getopts "ra:h" opt; do
+while getopts "rs:a:h" opt; do
     case $opt in
         r) MODE="remux" ;;
+        s) START_MS=$((OPTARG * 1000)) ;;
         a) API="$OPTARG" ;;
         h|*) grep '^#' "$0" | sed 's/^# \{0,1\}//' | head -9; exit 0 ;;
     esac
@@ -39,7 +41,7 @@ TOKEN=$(python3 -c 'import json,sys;print(json.dumps({"username":sys.argv[1],"pa
 
 SESSION=$(curl -sf -X POST "http://$API/api/v1/playback/sessions" \
     -H "Authorization: Bearer $TOKEN" -H content-type:application/json \
-    -d "{\"item_id\":\"$ITEM\",\"mode\":\"$MODE\"}") \
+    -d "{\"item_id\":\"$ITEM\",\"mode\":\"$MODE\",\"start_ms\":${START_MS:-0}}") \
     || { echo "session failed (bad item id, source offline, or codecs need a transcoder?)" >&2; exit 1; }
 
 SESSION_ID=$(printf '%s' "$SESSION" | json_field session_id)

@@ -83,8 +83,12 @@ export default function Detail({
     setBusy(true)
     setError('')
     try {
-      const session = await startSession(item!.id, mode)
-      onPlay(item!, session, fromStart ? 0 : resumeMs)
+      // Remux/transcode sessions start their pipeline at the resume
+      // point (§6) — no waiting for a transcode to catch up. Direct
+      // sessions resume client-side.
+      const start = fromStart ? 0 : resumeMs
+      const session = await startSession(item!.id, mode, mode === 'direct' ? 0 : start)
+      onPlay(item!, session, start)
     } catch (e) {
       setError(String(e))
     } finally {

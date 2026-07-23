@@ -788,7 +788,19 @@ fn make_hls_sink(out_dir: &Path) -> Result<(gst::Element, &'static str)> {
 /// The plan comes from discovery via [`plan_streams`] — the muxer pads
 /// must be requested before the pipeline starts, and an unfed pad would
 /// stall it.
-pub fn start(out_dir: &Path, plan: RemuxPlan, mut source: Box<dyn RemuxSource>) -> Result<RemuxJob> {
+pub fn start(out_dir: &Path, plan: RemuxPlan, source: Box<dyn RemuxSource>) -> Result<RemuxJob> {
+    start_at(out_dir, plan, source, 0)
+}
+
+/// Like [`start`], seeking to `start_ms` (nearest keyframe at or before
+/// it) before rolling — the §6 seek story: a seek beyond produced
+/// segments is a pipeline restart at the target offset.
+pub fn start_at(
+    out_dir: &Path,
+    plan: RemuxPlan,
+    mut source: Box<dyn RemuxSource>,
+    start_ms: u64,
+) -> Result<RemuxJob> {
     crate::init()?;
 
     let pipeline = gst::Pipeline::new();
@@ -909,6 +921,20 @@ pub fn start(out_dir: &Path, plan: RemuxPlan, mut source: Box<dyn RemuxSource>) 
         }
     });
 
+    if start_ms > 0 {
+        // Preroll paused, seek (flushing, snap to keyframe), then roll.
+        // The appsrc is Seekable and the demuxer owns index lookup —
+        // the same machinery that makes moov-at-end MP4s work.
+        pipeline.set_state(gst::State::Paused)?;
+        let (res, _, _) = pipeline.state(gst::ClockTime::from_seconds(15));
+        res.map_err(|_| anyhow::anyhow!("pipeline failed to preroll for seek"))?;
+        pipeline
+            .seek_simple(
+                gst::SeekFlags::FLUSH | gst::SeekFlags::KEY_UNIT,
+                gst::ClockTime::from_mseconds(start_ms),
+            )
+            .context("seeking to start offset")?;
+    }
     pipeline.set_state(gst::State::Playing)?;
     Ok(RemuxJob { pipeline, error, finished })
 }
@@ -1124,6 +1150,43 @@ mod tests {
             crate::discover(&out.path().join("segment00000.ts"), Duration::from_secs(30)).unwrap();
         assert_eq!(seg.video.first().map(|v| v.codec.as_str()), Some("h264"), "{seg:?}");
         assert_eq!(seg.audio.first().map(|a| a.codec.as_str()), Some("aac"), "{seg:?}");
+    }
+
+    /// §6 seek story: starting at an offset produces only the tail.
+    #[test]
+    fn starts_at_offset() {
+        crate::init().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let src_path = dir.path().join("in.mkv");
+        crate::testutil::render_h264_aac_mkv(&src_path); // 10 s fixture
+
+        let out = tempfile::tempdir().unwrap();
+        let job = start_at(
+            out.path(),
+            COPY_AV,
+            Box::new(FileSource::open(&src_path).unwrap()),
+            6_000,
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !job.finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(job.finished(), "offset remux did not finish");
+        assert!(job.failed().is_none(), "offset remux failed: {:?}", job.failed());
+        let playlist = std::fs::read_to_string(out.path().join("master.m3u8")).unwrap();
+        assert!(playlist.contains("#EXT-X-ENDLIST"));
+        let total: f64 = playlist
+            .lines()
+            .filter_map(|l| l.strip_prefix("#EXTINF:"))
+            .filter_map(|l| l.trim_end_matches(',').parse::<f64>().ok())
+            .sum();
+        // 10 s source, started at 6 s (snapped to a keyframe at or
+        // before): expect roughly the tail, never the whole file.
+        assert!(
+            total > 2.0 && total < 6.5,
+            "expected ~4s tail, playlist covers {total}s:\n{playlist}"
+        );
     }
 
     #[test]

@@ -61,8 +61,9 @@ impl Runner {
         size: u64,
         video: &str,
         audio: &str,
+        start_ms: u64,
     ) {
-        let result = self.start_inner(&session_id, size, video, audio).await;
+        let result = self.start_inner(&session_id, size, video, audio, start_ms).await;
         let msg = match result {
             Ok(()) => {
                 tracing::info!(session = %session_id, "session ready");
@@ -92,6 +93,7 @@ impl Runner {
         size: u64,
         video: &str,
         audio: &str,
+        start_ms: u64,
     ) -> Result<()> {
         let dir = self.scratch_root.join(session_id);
         std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
@@ -122,6 +124,7 @@ impl Runner {
                     .arg(size.to_string())
                     .args(["--video", video])
                     .args(["--audio", audio])
+                    .args(["--start-ms", &start_ms.to_string()])
                     .stderr(std::process::Stdio::from(log))
                     .kill_on_drop(true)
                     .spawn()
@@ -136,7 +139,7 @@ impl Runner {
                 );
                 let (sock, dir) = (sock.clone(), dir.clone());
                 tokio::task::spawn_blocking(move || {
-                    if let Err(e) = kahawai_media::worker::run(&sock, &dir, size, v, a) {
+                    if let Err(e) = kahawai_media::worker::run(&sock, &dir, size, v, a, start_ms) {
                         tracing::warn!(error = format!("{e:#}"), "in-process worker failed");
                     }
                 });

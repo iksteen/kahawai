@@ -123,13 +123,26 @@ export type Session = {
   stream_url: string
   content_type: string
   size: number
+  duration_ms: number | null
   streams: StreamVerdict | null
 }
 
-export function startSession(itemId: string, mode: string): Promise<Session> {
+export function startSession(
+  itemId: string,
+  mode: string,
+  startMs = 0,
+): Promise<Session> {
   return json('/api/v1/playback/sessions', {
     method: 'POST',
-    body: JSON.stringify({ item_id: itemId, mode }),
+    body: JSON.stringify({ item_id: itemId, mode, start_ms: Math.round(startMs) }),
+  })
+}
+
+/// Seek-restart: the pipeline restarts at the offset; re-attach the player.
+export function seekSession(sessionId: string, positionMs: number) {
+  return api(`/api/v1/playback/sessions/${sessionId}/seek`, {
+    method: 'POST',
+    body: JSON.stringify({ position_ms: Math.round(positionMs) }),
   })
 }
 

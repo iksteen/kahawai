@@ -191,6 +191,8 @@ message StartSession {
   uint64 size = 2;
   string video = 3; // copy | encode | off
   string audio = 4;
+  // Seek-restart (§6): begin at this offset (keyframe-snapped).
+  uint64 start_ms = 5;
 }
 
 message EndSession {

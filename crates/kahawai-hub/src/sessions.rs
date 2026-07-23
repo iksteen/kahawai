@@ -17,7 +17,7 @@ use crate::registry::Registry;
 
 pub enum Mode {
     Direct { lease: Lease },
-    Remux { dir: PathBuf, runner: RemuxRunner },
+    Remux { dir: PathBuf, runner: Mutex<RemuxRunner> },
     /// Dispatched to a transcoder module; artifacts proxied on demand.
     Transcode { transcoder: String },
 }
@@ -54,6 +54,8 @@ pub struct Session {
     /// Per-kind stream verdict (remux sessions): what happened to video
     /// and audio, for the player's playback-info overlay.
     pub verdict: Option<(String, String)>,
+    /// The negotiated plan (remux/transcode) — reused on seek-restarts.
+    plan: Option<kahawai_media::remux::RemuxPlan>,
     touched: Mutex<std::time::Instant>,
 }
 
@@ -221,15 +223,14 @@ impl Sessions {
         });
     }
 
-    /// Start a session for an item: pick the best available source, open a
-    /// read lease on its mediahost, and for remux start the in-hub pipeline.
-    pub async fn start(
-        self: &Arc<Self>,
+    /// Pick the best available source for an item and open a read lease
+    /// on its mediahost. Used at session start and on seek-restarts of
+    /// local remux sessions (whose lease died with the old worker).
+    async fn open_source(
+        &self,
         registry: &Registry,
-        user_id: &str,
         item_id: &str,
-        mode: &str,
-    ) -> Result<Arc<Session>> {
+    ) -> Result<(String, String, u64, kahawai_core::media::MediaInfo, Lease)> {
         let rows = sqlx::query(
             "SELECT s.module_id, s.collection_id, s.path_rel, f.size, f.streams_json
              FROM item_sources s
@@ -242,16 +243,6 @@ impl Sessions {
         .await?;
         if rows.is_empty() {
             bail!("no sources for item");
-        }
-        let user_active = self
-            .active
-            .lock()
-            .unwrap()
-            .values()
-            .filter(|s| s.user_id == user_id)
-            .count();
-        if user_active >= self.max_per_user {
-            bail!("too many concurrent streams ({user_active}); close one first");
         }
         let source = rows
             .iter()
@@ -278,9 +269,36 @@ impl Sessions {
             .leases
             .establish(&token, registry.send_to_host(&module_id, msg))
             .await?;
+        Ok((module_id, path_rel, size, info, lease))
+    }
+
+    /// Start a session for an item: pick the best available source, open a
+    /// read lease on its mediahost, and for remux start the in-hub pipeline
+    /// (from `start_ms` when resuming into the middle of the file).
+    pub async fn start(
+        self: &Arc<Self>,
+        registry: &Registry,
+        user_id: &str,
+        item_id: &str,
+        mode: &str,
+        start_ms: u64,
+    ) -> Result<Arc<Session>> {
+        let user_active = self
+            .active
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|s| s.user_id == user_id)
+            .count();
+        if user_active >= self.max_per_user {
+            bail!("too many concurrent streams ({user_active}); close one first");
+        }
+        let (module_id, path_rel, size, info, lease) =
+            self.open_source(registry, item_id).await?;
 
         let id = ulid::Ulid::new().to_string();
         let mut verdict = None;
+        let mut session_plan = None;
         let session_mode = match mode {
             "direct" => Mode::Direct { lease },
             "remux" => {
@@ -295,6 +313,7 @@ impl Sessions {
                     bail!("no playable streams — this source needs the video transcoder");
                 }
                 verdict = Some(kahawai_media::remux::plan_summary(&info, &plan));
+                session_plan = Some(plan);
                 use kahawai_media::remux::StreamMode;
                 let needs_encode =
                     plan.video == StreamMode::Encode || plan.audio == StreamMode::Encode;
@@ -311,11 +330,14 @@ impl Sessions {
                 };
                 match placed {
                     Some(tc) => {
-                        self.start_transcode(registry, &tc, &id, plan, lease, size).await?;
+                        self.start_transcode(registry, &tc, &id, plan, lease, size, start_ms)
+                            .await?;
                         Mode::Transcode { transcoder: tc }
                     }
                     None => Mode::Remux {
-                        runner: self.start_remux(&id, plan, lease, size).await?,
+                        runner: Mutex::new(
+                            self.start_remux(&id, plan, lease, size, start_ms).await?,
+                        ),
                         dir: self.scratch_root.join(&id),
                     },
                 }
@@ -333,6 +355,7 @@ impl Sessions {
             duration_ms: info.duration_ms,
             mode: session_mode,
             verdict,
+            plan: session_plan,
             touched: Mutex::new(std::time::Instant::now()),
         });
         self.active.lock().unwrap().insert(session.id.clone(), session.clone());
@@ -349,6 +372,7 @@ impl Sessions {
         plan: kahawai_media::remux::RemuxPlan,
         lease: Lease,
         size: u64,
+        start_ms: u64,
     ) -> Result<RemuxRunner> {
         let dir = self.scratch_root.join(session_id);
         std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
@@ -378,6 +402,7 @@ impl Sessions {
                     .arg(size.to_string())
                     .args(["--video", kahawai_media::worker::mode_arg(plan.video)])
                     .args(["--audio", kahawai_media::worker::mode_arg(plan.audio)])
+                    .args(["--start-ms", &start_ms.to_string()])
                     .stderr(std::process::Stdio::from(log))
                     .kill_on_drop(true)
                     .spawn()
@@ -390,7 +415,17 @@ impl Sessions {
                 // MP4 moov-at-end needs it) from the lease via a blocking
                 // adapter on the remux feeder thread.
                 let source = LeaseSource { lease, size, handle: tokio::runtime::Handle::current() };
-                RemuxRunner::InProcess(Arc::new(kahawai_media::remux::start(&dir, plan, Box::new(source))?))
+                // start_at blocks while prerolling for an offset seek —
+                // off the async runtime with it, or the preroll's own
+                // lease reads can never be driven (single-thread runtimes
+                // deadlock outright).
+                let dir2 = dir.clone();
+                let job = tokio::task::spawn_blocking(move || {
+                    kahawai_media::remux::start_at(&dir2, plan, Box::new(source), start_ms)
+                })
+                .await
+                .map_err(|e| anyhow::anyhow!("worker task panicked: {e}"))??;
+                RemuxRunner::InProcess(Arc::new(job))
             }
         };
 
@@ -424,6 +459,7 @@ impl Sessions {
     }
 
     /// Dispatch a session to a transcoder and wait for its playlist.
+    #[allow(clippy::too_many_arguments)] // private plumbing, one call site per mode
     async fn start_transcode(
         &self,
         registry: &Registry,
@@ -432,6 +468,7 @@ impl Sessions {
         plan: kahawai_media::remux::RemuxPlan,
         lease: Lease,
         size: u64,
+        start_ms: u64,
     ) -> Result<()> {
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         self.tc_leases.lock().unwrap().insert(session_id.to_string(), (lease, size));
@@ -444,6 +481,7 @@ impl Sessions {
                     size,
                     video: kahawai_media::worker::mode_arg(plan.video).into(),
                     audio: kahawai_media::worker::mode_arg(plan.audio).into(),
+                    start_ms,
                 },
             )),
         };
@@ -597,6 +635,58 @@ impl Sessions {
         }
     }
 
+    /// Seek-restart (§6): tear the session's pipeline down and start it
+    /// again at `position_ms` (keyframe-snapped by the demuxer). Same
+    /// session id, same URLs — the client re-attaches to a playlist that
+    /// now begins at the offset.
+    pub async fn seek(
+        self: &Arc<Self>,
+        registry: &Registry,
+        id: &str,
+        position_ms: u64,
+    ) -> Result<()> {
+        let session = self.get(id).context("no such session")?;
+        let plan = session.plan.context("session has no restartable pipeline")?;
+        session.touch();
+        match &session.mode {
+            Mode::Remux { dir, runner } => {
+                runner.lock().unwrap().stop();
+                let _ = std::fs::remove_dir_all(dir);
+                // The old worker's lease died with it; open a fresh one.
+                let (_, _, size, _, lease) =
+                    self.open_source(registry, &session.item_id).await?;
+                let fresh = self.start_remux(&session.id, plan, lease, size, position_ms).await?;
+                *runner.lock().unwrap() = fresh;
+                Ok(())
+            }
+            Mode::Transcode { transcoder } => {
+                // The hub-held lease survives restarts; reuse it.
+                let (lease, size) = self
+                    .tc_leases
+                    .lock()
+                    .unwrap()
+                    .get(&session.id)
+                    .cloned()
+                    .context("dispatched session lost its source lease")?;
+                let _ = registry
+                    .send_to_tc(
+                        transcoder,
+                        kahawai_proto::v1::HubToTc {
+                            msg: Some(kahawai_proto::v1::hub_to_tc::Msg::EndSession(
+                                kahawai_proto::v1::EndSession { session_id: session.id.clone() },
+                            )),
+                        },
+                    )
+                    .await;
+                registry.tc_session_ended(transcoder);
+                self.tc_leases.lock().unwrap().remove(&session.id);
+                self.start_transcode(registry, transcoder, &session.id, plan, lease, size, position_ms)
+                    .await
+            }
+            Mode::Direct { .. } => bail!("direct sessions seek with range requests"),
+        }
+    }
+
     /// End every session dispatched to a given transcoder (link loss —
     /// AR-6 minimal: sessions fail, clients restart; reschedule later).
     pub fn end_for_transcoder(&self, transcoder: &str) -> usize {
@@ -651,7 +741,7 @@ impl Sessions {
         };
         match &session.mode {
             Mode::Remux { dir, runner } => {
-                runner.stop();
+                runner.lock().unwrap().stop();
                 let _ = std::fs::remove_dir_all(dir);
             }
             Mode::Transcode { transcoder } => {
