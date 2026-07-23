@@ -227,12 +227,13 @@ impl Sessions {
         lease: Lease,
         size: u64,
     ) -> Result<Arc<kahawai_media::remux::RemuxJob>> {
-        // The muxer stalls on unfed pads, so only claim what TS can carry —
-        // decided by the muxer's own templates (single source of truth
-        // with the pipeline's link logic).
-        let (has_video, has_audio) = kahawai_media::remux::ts_stream_flags(info);
-        if !has_video && !has_audio {
-            bail!("no TS-compatible streams — this source needs a transcoder");
+        // The muxer stalls on unfed pads, so only claim what the plan
+        // will actually feed — decided by the muxer's own templates and
+        // the installed decoders/encoders (single source of truth with
+        // the pipeline's link logic).
+        let plan = kahawai_media::remux::plan_streams(info);
+        if !plan.playable() {
+            bail!("no playable streams — this source needs the video transcoder");
         }
 
         let dir = self.scratch_root.join(session_id);
@@ -240,7 +241,7 @@ impl Sessions {
         // The pipeline pulls (and seeks — MP4 moov-at-end needs it) from
         // the lease via a blocking adapter on the remux feeder thread.
         let source = LeaseSource { lease, size, handle: tokio::runtime::Handle::current() };
-        let job = Arc::new(kahawai_media::remux::start(&dir, has_video, has_audio, Box::new(source))?);
+        let job = Arc::new(kahawai_media::remux::start(&dir, plan, Box::new(source))?);
 
         // Return once the playlist exists (or the pipeline died).
         let playlist = dir.join("master.m3u8");

@@ -94,6 +94,22 @@ const MATRIX: &[(&str, &[&str], bool, &str, bool)] = &[
         false,
      ),
     ("decode aac", &["fdkaacdec", "avdec_aac"], false, "AAC audio cannot be transcoded", false),
+    ("decode ac3", &["a52dec", "avdec_ac3"], false, "AC-3 audio cannot be transcoded", false),
+    (
+        "decode eac3",
+        &["avdec_eac3"],
+        false,
+        "E-AC-3 audio cannot be transcoded (silent in browsers) — install gst-libav",
+        false,
+    ),
+    ("decode dts", &["dcadec", "avdec_dca"], false, "DTS audio cannot be transcoded", false),
+    (
+        "decode truehd",
+        &["avdec_truehd"],
+        false,
+        "TrueHD audio cannot be transcoded — install gst-libav",
+        false,
+    ),
     ("decode vorbis/opus", &["vorbisdec", "opusdec"], false, "ogg audio cannot be transcoded", false),
     ("subtitle parse", &["subparse"], false, "text subtitle conversion unavailable", false),
     ("ass burn-in", &["assrender"], false, "ASS burn-in unavailable (flatten only, HUB-32a)", false),
@@ -126,6 +142,20 @@ pub fn gstreamer_checks() -> Vec<Check> {
                 *name,
                 format!("missing {} — {cost}", elements.join("/")),
             )),
+        }
+    }
+
+    // TC-1: encoders that will actually run sessions are dry-run-verified,
+    // not just present — a broken element surfaces here, not mid-session.
+    if let Some(c) = out.iter_mut().find(|c| c.name == "encode aac")
+        && c.status == Status::Ok
+    {
+        match crate::remux::aac_encoder() {
+            Some(name) => c.detail = format!("via {name} (dry-run verified)"),
+            None => {
+                c.status = Status::Warn;
+                c.detail = "installed but dry-run failed — audio transcode disabled".into();
+            }
         }
     }
     out

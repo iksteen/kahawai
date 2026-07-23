@@ -67,26 +67,123 @@ fn codec_to_caps_name(kind: &str, codec: &str) -> Option<&'static str> {
         ("video", "mpeg") => "video/mpeg",
         ("audio", "aac" | "mp3" | "mpeg-audio") => "audio/mpeg",
         ("audio", "ac3") => "audio/x-ac3",
+        ("audio", "eac3") => "audio/x-eac3",
         ("audio", "dts") => "audio/x-dts",
         ("audio", "opus") => "audio/x-opus",
+        ("audio", "flac") => "audio/x-flac",
+        ("audio", "truehd") => "audio/x-true-hd",
+        ("audio", "vorbis") => "audio/x-vorbis",
         _ => return None,
     })
 }
 
-/// `(has_video, has_audio)` for a remux of this source — the single source
-/// of truth shared with session planning, so the muxer pads requested
-/// up front always match the streams that will actually be linked.
-pub fn ts_stream_flags(info: &kahawai_core::media::MediaInfo) -> (bool, bool) {
+/// AAC encoders in preference order (fdk has the best quality). Used via
+/// [`aac_encoder`], which also dry-run-verifies the winner (TC-1: a broken
+/// element is discovered at startup, not mid-session).
+pub const AAC_ENCODERS: &[&str] = &["fdkaacenc", "avenc_aac", "voaacenc"];
+
+/// Best available AAC encoder, verified once by a dry-run pipeline
+/// (`audiotestsrc ! ... ! encoder ! fakesink` to EOS). None → no audio
+/// transcoding on this machine.
+pub fn aac_encoder() -> Option<&'static str> {
+    static VERIFIED: std::sync::OnceLock<Option<&'static str>> = std::sync::OnceLock::new();
+    *VERIFIED.get_or_init(|| {
+        let _ = crate::init();
+        AAC_ENCODERS.iter().copied().find(|name| {
+            if gst::ElementFactory::find(name).is_none() {
+                return false;
+            }
+            let ok = dry_run_encoder(name);
+            if !ok {
+                tracing::warn!(encoder = name, "AAC encoder failed dry-run; trying next");
+            }
+            ok
+        })
+    })
+}
+
+fn dry_run_encoder(name: &str) -> bool {
+    let Ok(p) = gst::parse::launch(&format!(
+        "audiotestsrc num-buffers=5 ! audioconvert ! audioresample ! {name} ! fakesink"
+    )) else {
+        return false;
+    };
+    if p.set_state(gst::State::Playing).is_err() {
+        return false;
+    }
+    let ok = p
+        .bus()
+        .and_then(|bus| {
+            bus.timed_pop_filtered(
+                gst::ClockTime::from_seconds(5),
+                &[gst::MessageType::Eos, gst::MessageType::Error],
+            )
+        })
+        .is_some_and(|msg| msg.type_() == gst::MessageType::Eos);
+    let _ = p.set_state(gst::State::Null);
+    ok
+}
+
+/// Can any installed decoder take this stream? Derived from the element
+/// registry (never hand-list what it can tell us).
+fn can_decode(caps_name: &str) -> bool {
+    let caps = gst::Caps::new_empty_simple(caps_name);
+    gst::ElementFactory::factories_with_type(
+        gst::ElementFactoryType::DECODER,
+        gst::Rank::MARGINAL,
+    )
+    .iter()
+    .any(|f| f.can_sink_any_caps(&caps))
+}
+
+/// What happens to the audio in a session (HUB-16 decision order: copy
+/// what the muxer takes, encode what it doesn't but we can decode, drop
+/// the rest).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AudioMode {
+    Copy,
+    /// Decode → AAC. Cheap (a few % CPU) — video still passes through.
+    Encode,
+    Off,
+}
+
+/// Per-kind session plan — the single source of truth shared between
+/// session planning and pipeline routing, so the muxer pads requested up
+/// front always match the streams that will actually be linked.
+/// Video is copy-or-drop today (video encode is the transcoder module's
+/// job); audio can be transcoded to AAC in-hub.
+#[derive(Debug, Clone, Copy)]
+pub struct RemuxPlan {
+    pub video: bool,
+    pub audio: AudioMode,
+}
+
+impl RemuxPlan {
+    pub fn has_audio(&self) -> bool {
+        self.audio != AudioMode::Off
+    }
+    /// Anything to produce at all?
+    pub fn playable(&self) -> bool {
+        self.video || self.has_audio()
+    }
+}
+
+pub fn plan_streams(info: &kahawai_core::media::MediaInfo) -> RemuxPlan {
     let names = ts_muxable_names();
-    let has_video = info
+    let video = info
         .video
         .iter()
         .any(|v| codec_to_caps_name("video", &v.codec).is_some_and(|n| names.contains(n)));
-    let has_audio = info
-        .audio
-        .iter()
-        .any(|a| codec_to_caps_name("audio", &a.codec).is_some_and(|n| names.contains(n)));
-    (has_video, has_audio)
+    let audio_caps: Vec<&str> =
+        info.audio.iter().filter_map(|a| codec_to_caps_name("audio", &a.codec)).collect();
+    let audio = if audio_caps.iter().any(|n| names.contains(*n)) {
+        AudioMode::Copy
+    } else if aac_encoder().is_some() && audio_caps.iter().any(|n| can_decode(n)) {
+        AudioMode::Encode
+    } else {
+        AudioMode::Off
+    };
+    RemuxPlan { video, audio }
 }
 
 /// TS muxing needs specific stream-formats (h26x as Annex-B byte-stream,
@@ -152,7 +249,13 @@ type WaitingPads = Arc<Mutex<std::collections::HashMap<&'static str, gst::Pad>>>
 /// event; the queue absorbs data while the decision waits, and the caps
 /// event precedes the first buffer in the same streaming thread, so
 /// deciding in the probe is race-free.
-fn plumb_parsed_pad(pipe: &gst::Pipeline, waiting: &WaitingPads, pad: &gst::Pad) {
+/// Would route_stream do something useful with a stream of these caps?
+fn routable(caps_name: &str, encode_audio: bool) -> bool {
+    ts_compatible(caps_name).is_some()
+        || (encode_audio && caps_name.starts_with("audio/") && can_decode(caps_name))
+}
+
+fn plumb_parsed_pad(pipe: &gst::Pipeline, waiting: &WaitingPads, pad: &gst::Pad, encode_audio: bool) {
     // queue: decouples the muxer from parsebin's threads (the aggregator
     // deadlocks without it). Default queue limits (1 MiB / 1 s) are far
     // too small: the HLS sink holds one branch back while waiting for a
@@ -176,8 +279,8 @@ fn plumb_parsed_pad(pipe: &gst::Pipeline, waiting: &WaitingPads, pad: &gst::Pad)
         .or_else(|| pad.current_caps())
         .unwrap_or_else(gst::Caps::new_empty);
     let name = advertised.structure(0).map(|s| s.name().to_string()).unwrap_or_default();
-    if ts_compatible(&name).is_some() {
-        route_stream(pipe, waiting, &qsrc, &advertised);
+    if routable(&name, encode_audio) {
+        route_stream(pipe, waiting, &qsrc, &advertised, encode_audio);
         return;
     }
 
@@ -188,7 +291,7 @@ fn plumb_parsed_pad(pipe: &gst::Pipeline, waiting: &WaitingPads, pad: &gst::Pad)
             && let gst::EventView::Caps(c) = ev.view()
             && qpad.peer().is_none()
         {
-            route_stream(&pipe, &waiting, qpad, &c.caps_owned());
+            route_stream(&pipe, &waiting, qpad, &c.caps_owned(), encode_audio);
         }
         gst::PadProbeReturn::Ok
     });
@@ -196,9 +299,27 @@ fn plumb_parsed_pad(pipe: &gst::Pipeline, waiting: &WaitingPads, pad: &gst::Pad)
 
 /// Route a stream to the muxer (via parser/timestamper) or a fakesink,
 /// now that its negotiated caps are known.
-fn route_stream(pipe: &gst::Pipeline, waiting: &WaitingPads, from: &gst::Pad, caps: &gst::Caps) {
+fn route_stream(
+    pipe: &gst::Pipeline,
+    waiting: &WaitingPads,
+    from: &gst::Pad,
+    caps: &gst::Caps,
+    encode_audio: bool,
+) {
     let caps_name = caps.structure(0).map(|s| s.name().to_string()).unwrap_or_default();
     let target = ts_compatible(&caps_name).and_then(|kind| waiting.lock().unwrap().remove(kind));
+    // Not directly muxable, but the plan says transcode audio and a
+    // decoder exists: claim the audio pad for the decode→AAC branch.
+    if target.is_none()
+        && encode_audio
+        && caps_name.starts_with("audio/")
+        && can_decode(&caps_name)
+        && let Some(sinkpad) = waiting.lock().unwrap().remove("audio")
+    {
+        tracing::info!(caps = %caps_name, "remux: transcoding audio stream to AAC");
+        build_audio_encode_chain(pipe, from, sinkpad);
+        return;
+    }
     match target {
         Some(sinkpad) => {
             let mut tail = from.clone();
@@ -250,6 +371,45 @@ fn route_stream(pipe: &gst::Pipeline, waiting: &WaitingPads, from: &gst::Pad, ca
                 tracing::warn!(caps = %caps_name, error = %e, "remux: fakesink link failed");
             }
         }
+    }
+}
+
+/// decodebin (auto-picks the best-ranked decoder — registry-derived, per
+/// the fallback strategy) → audioconvert → audioresample → AAC encoder →
+/// aacparse (raw→ADTS for the TS muxer) → muxer pad. The only decode/
+/// encode work in the hub, and audio-only by design: a few % CPU.
+fn build_audio_encode_chain(pipe: &gst::Pipeline, from: &gst::Pad, sinkpad: gst::Pad) {
+    let Some(enc_name) = aac_encoder() else {
+        // Planner guarantees this; guard anyway (fakesink beats a stall).
+        tracing::error!("audio encode routed with no verified AAC encoder");
+        return;
+    };
+    let decode = gst::ElementFactory::make("decodebin").build().unwrap();
+    let convert = gst::ElementFactory::make("audioconvert").build().unwrap();
+    let resample = gst::ElementFactory::make("audioresample").build().unwrap();
+    let enc = gst::ElementFactory::make(enc_name).build().unwrap();
+    set_prop_str_if_present(&enc, "bitrate", "192000");
+    let parse = gst::ElementFactory::make("aacparse").build().unwrap();
+
+    pipe.add_many([&decode, &convert, &resample, &enc, &parse]).unwrap();
+    gst::Element::link_many([&convert, &resample, &enc, &parse]).unwrap();
+    for el in [&decode, &convert, &resample, &enc, &parse] {
+        el.sync_state_with_parent().unwrap();
+    }
+    if let Err(e) = parse.static_pad("src").unwrap().link(&sinkpad) {
+        tracing::warn!(error = %e, "remux: encode chain → muxer link failed");
+    }
+    let convert_sink = convert.static_pad("sink").unwrap();
+    decode.connect_pad_added(move |_, pad| {
+        if convert_sink.is_linked() {
+            return; // first decoded stream wins
+        }
+        if let Err(e) = pad.link(&convert_sink) {
+            tracing::warn!(error = %e, "remux: decodebin → encode chain link failed");
+        }
+    });
+    if let Err(e) = from.link(&decode.static_pad("sink").unwrap()) {
+        tracing::warn!(error = %e, "remux: → decodebin link failed");
     }
 }
 
@@ -349,16 +509,12 @@ fn make_hls_sink(out_dir: &Path) -> Result<(gst::Element, &'static str)> {
     Ok((sink, name))
 }
 
-/// Start a remux writing `master.m3u8` + `segment*.ts` into `out_dir`,
-/// pulling bytes from `source` on demand (seeks included). `has_video`/
-/// `has_audio` come from discovery — the muxer pads must be requested
-/// before the pipeline starts, and an unfed pad would stall it.
-pub fn start(
-    out_dir: &Path,
-    has_video: bool,
-    has_audio: bool,
-    mut source: Box<dyn RemuxSource>,
-) -> Result<RemuxJob> {
+/// Start a remux/transcode writing `master.m3u8` + `segment*.ts` into
+/// `out_dir`, pulling bytes from `source` on demand (seeks included).
+/// The plan comes from discovery via [`plan_streams`] — the muxer pads
+/// must be requested before the pipeline starts, and an unfed pad would
+/// stall it.
+pub fn start(out_dir: &Path, plan: RemuxPlan, mut source: Box<dyn RemuxSource>) -> Result<RemuxJob> {
     crate::init()?;
 
     let pipeline = gst::Pipeline::new();
@@ -431,13 +587,13 @@ pub fn start(
 
     // Request the muxer pads *now* — splitmuxsink inside hlssink2 must see
     // them before starting or it never leaves Ready.
-    anyhow::ensure!(has_video || has_audio, "nothing to remux");
+    anyhow::ensure!(plan.playable(), "nothing to remux");
     let waiting: WaitingPads = Arc::new(Mutex::new(std::collections::HashMap::new()));
-    if has_video {
+    if plan.video {
         let pad = hlssink.request_pad_simple("video").context("requesting video pad")?;
         waiting.lock().unwrap().insert("video", pad);
     }
-    if has_audio {
+    if plan.has_audio() {
         let pad = hlssink.request_pad_simple("audio").context("requesting audio pad")?;
         waiting.lock().unwrap().insert("audio", pad);
     }
@@ -447,8 +603,9 @@ pub fn start(
     // stream once its real caps flow (see plumb_parsed_pad).
     let pipe = pipeline.clone();
     let waiting2 = waiting.clone();
+    let encode_audio = plan.audio == AudioMode::Encode;
     parsebin.connect_pad_added(move |_, pad| {
-        plumb_parsed_pad(&pipe, &waiting2, pad);
+        plumb_parsed_pad(&pipe, &waiting2, pad, encode_audio);
     });
 
     let error = Arc::new(Mutex::new(None::<String>));
@@ -510,6 +667,8 @@ mod tests {
     use super::*;
     use std::time::{Duration, Instant};
 
+    const COPY_AV: RemuxPlan = RemuxPlan { video: true, audio: AudioMode::Copy };
+
     /// Manual repro: REMUX_SRC=/path/to/file cargo test -p kahawai-media \
     ///   remux_file_from_env -- --ignored --nocapture
     #[test]
@@ -518,15 +677,9 @@ mod tests {
         let src = std::path::PathBuf::from(std::env::var("REMUX_SRC").expect("set REMUX_SRC"));
         let out = tempfile::tempdir().unwrap();
         let info = crate::discover(&src, Duration::from_secs(30)).unwrap();
-        let (has_video, has_audio) = ts_stream_flags(&info);
-        eprintln!("flags: video={has_video} audio={has_audio}");
-        let job = start(
-            out.path(),
-            has_video,
-            has_audio,
-            Box::new(FileSource::open(&src).unwrap()),
-        )
-        .unwrap();
+        let plan = plan_streams(&info);
+        eprintln!("plan: {plan:?}");
+        let job = start(out.path(), plan, Box::new(FileSource::open(&src).unwrap())).unwrap();
         let deadline = Instant::now() + Duration::from_secs(120);
         while !job.finished() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(100));
@@ -557,9 +710,14 @@ mod tests {
             audio: vec![kahawai_core::media::AudioStream { codec: "eac3".into(), ..Default::default() }],
             ..Default::default()
         };
-        let (v, a) = ts_stream_flags(&info);
-        assert!(v, "hevc is TS-muxable");
-        assert_eq!(a, names.contains("audio/x-eac3"));
+        let plan = plan_streams(&info);
+        assert!(plan.video, "hevc is TS-muxable");
+        if names.contains("audio/x-eac3") {
+            assert_eq!(plan.audio, AudioMode::Copy);
+        } else {
+            // eac3 not muxable: transcode when possible, else drop.
+            assert_ne!(plan.audio, AudioMode::Copy);
+        }
     }
 
     /// Corpus-sweep catch #2: one track ending well before the other used
@@ -579,7 +737,7 @@ mod tests {
         p.set_state(gst::State::Null).unwrap();
 
         let out = tempfile::tempdir().unwrap();
-        let job = start(out.path(), true, true, Box::new(FileSource::open(&src_path).unwrap())).unwrap();
+        let job = start(out.path(), COPY_AV, Box::new(FileSource::open(&src_path).unwrap())).unwrap();
         let deadline = Instant::now() + Duration::from_secs(30);
         while !job.finished() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(50));
@@ -600,13 +758,7 @@ mod tests {
         crate::testutil::render_h264_aac_mp4(&src_path);
 
         let out = tempfile::tempdir().unwrap();
-        let job = start(
-            out.path(),
-            true,
-            true,
-            Box::new(FileSource::open(&src_path).unwrap()),
-        )
-        .unwrap();
+        let job = start(out.path(), COPY_AV, Box::new(FileSource::open(&src_path).unwrap())).unwrap();
         let deadline = Instant::now() + Duration::from_secs(30);
         while !job.finished() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(50));
@@ -616,6 +768,53 @@ mod tests {
         let playlist = std::fs::read_to_string(out.path().join("master.m3u8")).unwrap();
         assert!(playlist.contains("#EXT-X-ENDLIST"));
         assert!(playlist.contains("segment00000.ts"));
+    }
+
+    /// M3 slice 1: audio that TS cannot carry (E-AC-3) is transcoded to
+    /// AAC in-hub while video passes through untouched.
+    #[test]
+    fn transcodes_eac3_audio_to_aac() {
+        crate::init().unwrap();
+        if !crate::testutil::has_element("avenc_eac3") {
+            eprintln!("skipping: no avenc_eac3 to build the fixture");
+            return;
+        }
+        if ts_muxable_names().contains("audio/x-eac3") {
+            eprintln!("skipping: this mpegtsmux muxes eac3 natively");
+            return;
+        }
+        if aac_encoder().is_none() {
+            eprintln!("skipping: no verified AAC encoder");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let src_path = dir.path().join("eac3.mkv");
+        crate::testutil::render_h264_eac3_mkv(&src_path);
+
+        let info = crate::discover(&src_path, Duration::from_secs(30)).unwrap();
+        let plan = plan_streams(&info);
+        assert_eq!(plan.audio, AudioMode::Encode, "eac3 should plan as Encode: {info:?}");
+        assert!(plan.video);
+
+        let out = tempfile::tempdir().unwrap();
+        let job = start(out.path(), plan, Box::new(FileSource::open(&src_path).unwrap())).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !job.finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(job.finished(), "transcode did not finish");
+        assert!(job.failed().is_none(), "transcode failed: {:?}", job.failed());
+        assert!(std::fs::read_to_string(out.path().join("master.m3u8"))
+            .unwrap()
+            .contains("#EXT-X-ENDLIST"));
+
+        // The produced segment must carry AAC audio and h264 video.
+        let seg = crate::discover(&out.path().join("segment00000.ts"), Duration::from_secs(30))
+            .unwrap();
+        assert_eq!(seg.video.len(), 1, "video missing from transcoded segment: {seg:?}");
+        assert_eq!(seg.video[0].codec, "h264");
+        assert_eq!(seg.audio.len(), 1, "audio missing from transcoded segment: {seg:?}");
+        assert_eq!(seg.audio[0].codec, "aac", "audio not transcoded to AAC: {seg:?}");
     }
 
     #[test]
@@ -640,13 +839,7 @@ mod tests {
         crate::testutil::render_h264_aac_mkv(&src_path);
 
         let out = tempfile::tempdir().unwrap();
-        let job = start(
-            out.path(),
-            true,
-            true,
-            Box::new(FileSource::open(&src_path).unwrap()),
-        )
-        .unwrap();
+        let job = start(out.path(), COPY_AV, Box::new(FileSource::open(&src_path).unwrap())).unwrap();
 
         let deadline = Instant::now() + Duration::from_secs(30);
         while !job.finished() && Instant::now() < deadline {

@@ -238,12 +238,17 @@ fn sweep_one(path: &Path, full: bool, has_ffprobe: bool) -> (Verdict, String) {
     let codecs = describe(&info);
 
     // 2. Plan, as the hub would.
-    let (has_video, has_audio) = kahawai_media::remux::ts_stream_flags(&info);
-    if !has_video && !has_audio {
+    let plan = kahawai_media::remux::plan_streams(&info);
+    if !plan.playable() {
         return (Verdict::Skip, format!("[needs transcoder] {codecs}"));
     }
-    let video_dropped = !has_video && !info.video.is_empty();
-    let audio_dropped = !has_audio && !info.audio.is_empty();
+    let video_dropped = !plan.video && !info.video.is_empty();
+    let audio_dropped = !plan.has_audio() && !info.audio.is_empty();
+    let codecs = if plan.audio == kahawai_media::remux::AudioMode::Encode {
+        format!("{codecs} [audio→aac]")
+    } else {
+        codecs
+    };
 
     // 3. Remux through the real pipeline.
     let out = match tempfile::tempdir() {
@@ -256,7 +261,7 @@ fn sweep_one(path: &Path, full: bool, has_ffprobe: bool) -> (Verdict, String) {
     };
     let budget = BudgetSource::new(src, if full { u64::MAX } else { HEAD_BYTES });
     let truncated = budget.exhausted.clone();
-    let job = match kahawai_media::remux::start(out.path(), has_video, has_audio, Box::new(budget))
+    let job = match kahawai_media::remux::start(out.path(), plan, Box::new(budget))
     {
         Ok(j) => j,
         Err(e) => return (Verdict::Fail, format!("[start] {e:#}")),
@@ -294,7 +299,7 @@ fn sweep_one(path: &Path, full: bool, has_ffprobe: bool) -> (Verdict, String) {
     if !playlist_ok || segments.is_empty() {
         return (Verdict::Fail, format!("[no output] {codecs}"));
     }
-    if has_ffprobe && has_video {
+    if has_ffprobe && plan.video {
         for seg in &segments {
             let (missing, ooo) = video_dts_defects(seg);
             if missing + ooo > 0 {
@@ -305,6 +310,21 @@ fn sweep_one(path: &Path, full: bool, has_ffprobe: bool) -> (Verdict, String) {
                         seg.file_name().unwrap_or_default().to_string_lossy()
                     ),
                 );
+            }
+        }
+    }
+    // Every stream the plan promised must actually be in the output —
+    // a silently-dropped track would otherwise sweep as OK.
+    if has_ffprobe {
+        let mut sorted = segments.clone();
+        sorted.sort();
+        if let Some(first) = sorted.first() {
+            let (has_v, has_a) = segment_stream_kinds(first);
+            if plan.video && !has_v {
+                return (Verdict::Fail, format!("[missing video] planned but absent — {codecs}"));
+            }
+            if plan.has_audio() && !has_a {
+                return (Verdict::Fail, format!("[missing audio] planned but absent — {codecs}"));
             }
         }
     }
@@ -333,6 +353,19 @@ fn describe(info: &kahawai_core::media::MediaInfo) -> String {
         if v.is_empty() { "-".into() } else { v.join(",") },
         if a.is_empty() { "-".into() } else { a.join(",") },
     )
+}
+
+/// Which stream kinds a segment actually contains, via ffprobe.
+fn segment_stream_kinds(seg: &Path) -> (bool, bool) {
+    let Ok(out) = std::process::Command::new("ffprobe")
+        .args(["-v", "error", "-show_entries", "stream=codec_type", "-of", "csv=p=0"])
+        .arg(seg)
+        .output()
+    else {
+        return (true, true); // ffprobe hiccup: don't fail the file on it
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    (text.contains("video"), text.contains("audio"))
 }
 
 /// (missing_dts, non_monotonic) video packets per segment, via ffprobe.
