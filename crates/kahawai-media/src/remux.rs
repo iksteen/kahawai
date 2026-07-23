@@ -861,6 +861,8 @@ pub struct RemuxJob {
     pipeline: gst::Pipeline,
     error: Arc<Mutex<Option<String>>>,
     finished: Arc<std::sync::atomic::AtomicBool>,
+    /// Unblocks pacing probes on teardown.
+    stopping: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// HLS sink elements in preference order: hlssink3 (gst-plugins-rs, better
@@ -937,13 +939,75 @@ pub fn start_at(
     start_full(out_dir, plan, source, start_ms, None)
 }
 
-/// Full-control variant: offset plus an HLS sink override (TC-6 retry).
+/// Pacing window (§4.6): hold muxer-bound buffers whose media time runs
+/// more than `window_ms` past the viewer's position (read from
+/// `viewer_file`, absolute ms; absent = `floor_ms`). In-band and
+/// deterministic — polling pause/resume loses to pipelines that finish
+/// a file between two polls.
+pub struct PaceConfig {
+    pub window_ms: u64,
+    pub floor_ms: u64,
+    pub viewer_file: std::path::PathBuf,
+}
+
+fn install_pace_probe(
+    pad: &gst::Pad,
+    cfg: Arc<PaceConfig>,
+    stopping: Arc<std::sync::atomic::AtomicBool>,
+) {
+    pad.add_probe(gst::PadProbeType::BUFFER, move |pad, info| {
+        if let Some(gst::PadProbeData::Buffer(b)) = &info.data
+            && let Some(pts) = b.pts()
+        {
+            // Raw PTS can carry arbitrary bases (x264's 1000-hour
+            // epoch); running time is the honest produced-position —
+            // it starts at zero for the run, so add the start offset.
+            let Some(rt) = pad
+                .sticky_event::<gst::event::Segment>(0)
+                .and_then(|e| e.segment().downcast_ref::<gst::ClockTime>().cloned())
+                .and_then(|seg| seg.to_running_time(pts))
+            else {
+                return gst::PadProbeReturn::Ok;
+            };
+            let produced_ms = cfg.floor_ms + rt.mseconds();
+            loop {
+                if stopping.load(std::sync::atomic::Ordering::SeqCst) {
+                    break;
+                }
+                let viewer = std::fs::read_to_string(&cfg.viewer_file)
+                    .ok()
+                    .and_then(|v| v.trim().parse::<u64>().ok())
+                    .unwrap_or(cfg.floor_ms)
+                    .max(cfg.floor_ms);
+                if produced_ms <= viewer + cfg.window_ms {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+        }
+        gst::PadProbeReturn::Ok
+    });
+}
+
+/// Full-control variant: offset plus an HLS sink override (TC-6 retry)
+/// and an optional pacing window.
 pub fn start_full(
+    out_dir: &Path,
+    plan: RemuxPlan,
+    source: Box<dyn RemuxSource>,
+    start_ms: u64,
+    sink: Option<&str>,
+) -> Result<RemuxJob> {
+    start_paced(out_dir, plan, source, start_ms, sink, None)
+}
+
+pub fn start_paced(
     out_dir: &Path,
     plan: RemuxPlan,
     mut source: Box<dyn RemuxSource>,
     start_ms: u64,
     sink: Option<&str>,
+    pace: Option<PaceConfig>,
 ) -> Result<RemuxJob> {
     crate::init()?;
 
@@ -1045,13 +1109,21 @@ pub fn start_full(
     // Request the muxer pads *now* — splitmuxsink inside hlssink2 must see
     // them before starting or it never leaves Ready.
     anyhow::ensure!(plan.playable(), "nothing to remux");
+    let stopping = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let pace = pace.map(Arc::new);
     let waiting: WaitingPads = Arc::new(Mutex::new(std::collections::HashMap::new()));
     if plan.has_video() {
         let pad = hlssink.request_pad_simple("video").context("requesting video pad")?;
+        if let Some(cfg) = &pace {
+            install_pace_probe(&pad, cfg.clone(), stopping.clone());
+        }
         waiting.lock().unwrap().insert("video", pad);
     }
     if plan.has_audio() {
         let pad = hlssink.request_pad_simple("audio").context("requesting audio pad")?;
+        if let Some(cfg) = &pace {
+            install_pace_probe(&pad, cfg.clone(), stopping.clone());
+        }
         waiting.lock().unwrap().insert("audio", pad);
     }
 
@@ -1127,7 +1199,7 @@ pub fn start_full(
         gate.open();
     }
     pipeline.set_state(gst::State::Playing)?;
-    Ok(RemuxJob { pipeline, error, finished })
+    Ok(RemuxJob { pipeline, error, finished, stopping })
 }
 
 impl RemuxJob {
@@ -1142,7 +1214,25 @@ impl RemuxJob {
 
     /// Hard stop (session teardown).
     pub fn stop(&self) {
+        self.stopping.store(true, std::sync::atomic::Ordering::SeqCst);
         let _ = self.pipeline.set_state(gst::State::Null);
+    }
+
+    /// Pacing (§4.6): hold the pipeline while the viewer catches up.
+    pub fn pause(&self) {
+        let _ = self.pipeline.set_state(gst::State::Paused);
+    }
+
+    pub fn resume(&self) {
+        let _ = self.pipeline.set_state(gst::State::Playing);
+    }
+
+    /// Media-time position of the output (absolute — reflects offset
+    /// starts), for the pacing window.
+    pub fn position_ms(&self) -> Option<u64> {
+        self.pipeline
+            .query_position::<gst::ClockTime>()
+            .map(|p| p.mseconds())
     }
 }
 

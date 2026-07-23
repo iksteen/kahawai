@@ -364,6 +364,14 @@ impl Runner {
     /// End one run and WAIT for its pipeline to be truly gone before
     /// removing its scratch — deleting files under a draining pipeline
     /// trips C-level asserts in splitmuxsink (observed: abort).
+    /// Pacing: persist the viewer's position where this session's
+    /// worker polls it.
+    pub fn viewer_position(&self, session_id: &str, position_ms: u64) {
+        if let Some(s) = self.sessions.lock().unwrap().get(session_id) {
+            let _ = std::fs::write(s.dir.join("viewer.pos"), position_ms.to_string());
+        }
+    }
+
     pub async fn end(&self, session_id: &str) {
         let Some(mut s) = self.sessions.lock().unwrap().remove(session_id) else {
             return;

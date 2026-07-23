@@ -146,6 +146,9 @@ async fn link_loop(
                         Some(hub_to_tc::Msg::SourceData(d)) => {
                             runner.source_data(d.req, d.data);
                         }
+                        Some(hub_to_tc::Msg::ViewerPosition(v)) => {
+                            runner.viewer_position(&v.session_id, v.position_ms);
+                        }
                         Some(hub_to_tc::Msg::FetchArtifact(f)) => {
                             let runner = runner.clone();
                             tokio::spawn(async move {

@@ -76,8 +76,27 @@ pub fn run(
     let stream = UnixStream::connect(socket)
         .with_context(|| format!("connecting to {}", socket.display()))?;
     let plan = RemuxPlan { video, audio };
-    let job =
-        remux::start_full(out_dir, plan, Box::new(SocketSource { stream, size }), start_ms, sink)?;
+    // Pacing window (§4.6): transcode ahead of the viewer, but not the
+    // whole film. The supervisor keeps `viewer.pos` fresh (absolute ms,
+    // from the client's progress pings); muxer-bound buffers beyond
+    // viewer+window block in-band until the viewer catches up.
+    // ponytail: fixed window, env-tunable; per-session config later.
+    let pace = remux::PaceConfig {
+        window_ms: std::env::var("KAHAWAI_PACE_WINDOW_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(120_000),
+        floor_ms: start_ms,
+        viewer_file: out_dir.join("viewer.pos"),
+    };
+    let job = remux::start_paced(
+        out_dir,
+        plan,
+        Box::new(SocketSource { stream, size }),
+        start_ms,
+        sink,
+        Some(pace),
+    )?;
     while !job.finished() {
         std::thread::sleep(std::time::Duration::from_millis(100));
     }

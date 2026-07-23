@@ -591,6 +591,39 @@ impl Sessions {
         }
     }
 
+    /// Pacing (§4.6): forward the viewer's position to wherever the
+    /// session's worker runs. Fire-and-forget — a missed update only
+    /// delays a pause/resume by one ping.
+    pub fn viewer_position(self: &Arc<Self>, registry: &Arc<Registry>, id: &str, position_ms: u64) {
+        let Some(session) = self.get(id) else { return };
+        match &session.mode {
+            Mode::Remux { dir, .. } => {
+                let _ = std::fs::write(dir.join("viewer.pos"), position_ms.to_string());
+            }
+            Mode::Transcode { transcoder } => {
+                let tc = transcoder.lock().unwrap().clone();
+                let registry = registry.clone();
+                let sid = id.to_string();
+                tokio::spawn(async move {
+                    let _ = registry
+                        .send_to_tc(
+                            &tc,
+                            kahawai_proto::v1::HubToTc {
+                                msg: Some(kahawai_proto::v1::hub_to_tc::Msg::ViewerPosition(
+                                    kahawai_proto::v1::ViewerPosition {
+                                        session_id: sid,
+                                        position_ms,
+                                    },
+                                )),
+                            },
+                        )
+                        .await;
+                });
+            }
+            Mode::Direct { .. } => {}
+        }
+    }
+
     /// Link-facing: the transcoder reported the session ready or failed.
     /// Returns whether a pending start consumed the verdict (false → the
     /// session was already running; the caller may reschedule).

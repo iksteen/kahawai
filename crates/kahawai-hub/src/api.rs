@@ -601,6 +601,8 @@ async fn post_progress(
         return Err((StatusCode::FORBIDDEN, "not your session".into()));
     }
     session.touch();
+    // Pacing (§4.6): the worker throttles its lead over this position.
+    state.sessions.viewer_position(&state.registry, &id, body.position_ms);
 
     let duration = session.duration_ms;
     let finished = duration.is_some_and(|d| d > 0 && body.position_ms * 10 >= d * 9);

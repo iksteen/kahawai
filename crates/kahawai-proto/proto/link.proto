@@ -192,7 +192,15 @@ message HubToTc {
     EndSession end_session = 3;
     SourceData source_data = 4;
     FetchArtifact fetch_artifact = 5;
+    // Pacing (§4.6): the viewer's last reported position, forwarded so
+    // the worker can throttle its lead.
+    ViewerPosition viewer_position = 6;
   }
+}
+
+message ViewerPosition {
+  string session_id = 1;
+  uint64 position_ms = 2;
 }
 
 message StartSession {

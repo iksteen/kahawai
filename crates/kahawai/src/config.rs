@@ -157,7 +157,10 @@ pub fn load(explicit: Option<&Path>) -> Result<(Config, Option<PathBuf>)> {
     let used = path.exists().then(|| path.clone());
     let cfg = Figment::new()
         .merge(Toml::file(&path))
-        .merge(Env::prefixed("KAHAWAI_").split("__"))
+        // Only KAHAWAI_<SECTION>__<KEY> shapes are config; other
+        // KAHAWAI_* vars (worker knobs like KAHAWAI_PACE_WINDOW_MS)
+        // must not crash the loader as unknown fields.
+        .merge(Env::prefixed("KAHAWAI_").filter(|k| k.as_str().contains('.') || k.as_str().contains("__")).split("__"))
         .extract()
         .with_context(|| format!("loading config from {}", path.display()))?;
     Ok((cfg, used))
