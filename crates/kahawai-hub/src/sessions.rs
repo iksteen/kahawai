@@ -44,6 +44,44 @@ impl Session {
     }
 }
 
+/// Adapts a mediahost read lease to the remuxer's random-access source
+/// trait; runs on the remux feeder thread, bridging into the runtime.
+struct LeaseSource {
+    lease: Lease,
+    size: u64,
+    handle: tokio::runtime::Handle,
+}
+
+impl kahawai_media::remux::RemuxSource for LeaseSource {
+    fn size(&self) -> u64 {
+        self.size
+    }
+
+    fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> std::io::Result<usize> {
+        if offset >= self.size {
+            return Ok(0);
+        }
+        let len = (buf.len() as u64).min(self.size - offset);
+        let _guard = self.handle.enter();
+        let mut stream = self.lease.read_range(offset, len).into_inner();
+        self.handle.block_on(async {
+            let mut filled = 0usize;
+            while filled < len as usize {
+                match stream.recv().await {
+                    Some(Ok(bytes)) => {
+                        let n = bytes.len().min(buf.len() - filled);
+                        buf[filled..filled + n].copy_from_slice(&bytes[..n]);
+                        filled += n;
+                    }
+                    Some(Err(e)) => return Err(std::io::Error::other(e)),
+                    None => break,
+                }
+            }
+            Ok(filled)
+        })
+    }
+}
+
 pub struct Sessions {
     pub leases: Leases,
     /// Scratch space for remux sessions (`<data_dir>/sessions`).
@@ -199,28 +237,10 @@ impl Sessions {
 
         let dir = self.scratch_root.join(session_id);
         std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-        let job = Arc::new(kahawai_media::remux::start(&dir, has_video, has_audio)?);
-
-        // Feed the whole source through the pipeline; appsrc backpressure
-        // (block=true) caps memory, so this runs on the blocking pool.
-        let feeder_job = job.clone();
-        let mut rx = lease.read_range(0, size).into_inner();
-        tokio::task::spawn_blocking(move || {
-            while let Some(item) = rx.blocking_recv() {
-                match item {
-                    Ok(bytes) => {
-                        if feeder_job.push(bytes.to_vec()).is_err() {
-                            return; // pipeline failed; error is recorded
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "remux feed interrupted");
-                        break;
-                    }
-                }
-            }
-            feeder_job.finish();
-        });
+        // The pipeline pulls (and seeks — MP4 moov-at-end needs it) from
+        // the lease via a blocking adapter on the remux feeder thread.
+        let source = LeaseSource { lease, size, handle: tokio::runtime::Handle::current() };
+        let job = Arc::new(kahawai_media::remux::start(&dir, has_video, has_audio, Box::new(source))?);
 
         // Return once the playlist exists (or the pipeline died).
         let playlist = dir.join("master.m3u8");

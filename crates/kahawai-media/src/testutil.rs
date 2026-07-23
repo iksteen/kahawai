@@ -6,11 +6,21 @@ use std::path::Path;
 use gstreamer as gst;
 use gstreamer::prelude::*;
 
+/// Render a short MP4 (moov atom at the end — mp4mux default) with
+/// h264 + AAC.
+pub fn render_h264_aac_mp4(path: &Path) {
+    render_av(path, "mp4mux");
+}
+
 /// Render a short MKV with TS-compatible streams: h264 (I420) + AAC.
 pub fn render_h264_aac_mkv(path: &Path) {
+    render_av(path, "matroskamux");
+}
+
+fn render_av(path: &Path, muxer: &str) {
     crate::init().unwrap();
     let p = gst::parse::launch(&format!(
-        "videotestsrc num-buffers=250 ! video/x-raw,format=I420,width=320,height=240,framerate=25/1 ! x264enc bframes=3 b-adapt=false key-int-max=25 ! h264parse ! matroskamux name=m audiotestsrc num-buffers=430 ! audioconvert ! fdkaacenc ! m. m. ! filesink location=\"{}\"",
+        "videotestsrc num-buffers=250 ! video/x-raw,format=I420,width=320,height=240,framerate=25/1 ! x264enc bframes=3 b-adapt=false key-int-max=25 ! h264parse ! {muxer} name=m audiotestsrc num-buffers=430 ! audioconvert ! fdkaacenc ! m. m. ! filesink location=\"{}\"",
         path.display()
     ))
     .unwrap();

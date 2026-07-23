@@ -134,10 +134,18 @@ fn link_parsed_pad(pipe: &gst::Pipeline, waiting: &WaitingPads, pad: &gst::Pad, 
     match target {
         Some(sinkpad) => {
             // queue: decouples the muxer from parsebin's threads (the
-            // aggregator deadlocks without it). parser: converts
-            // stream-format (avc/hvc1 → byte-stream, raw AAC → ADTS) for
-            // the TS muxer during negotiation.
-            let queue = gst::ElementFactory::make("queue").build().unwrap();
+            // aggregator deadlocks without it). Default queue limits
+            // (1 MiB / 1 s) are far too small: the HLS sink holds one
+            // branch back while waiting for a keyframe-aligned cut on the
+            // other, and files with uneven track ends or high bitrates
+            // deadlock (corpus-sweep finding). Bound by bytes only —
+            // generous enough for real interleave skew, still OOM-safe.
+            let queue = gst::ElementFactory::make("queue")
+                .property("max-size-bytes", 64u32 * 1024 * 1024)
+                .property("max-size-buffers", 0u32)
+                .property("max-size-time", 0u64)
+                .build()
+                .unwrap();
             pipe.add(&queue).unwrap();
             queue.sync_state_with_parent().unwrap();
             let mut tail = queue.clone();
@@ -167,9 +175,49 @@ fn link_parsed_pad(pipe: &gst::Pipeline, waiting: &WaitingPads, pad: &gst::Pad, 
     }
 }
 
+/// Byte source for a remux: sized and random-access, because real-world
+/// containers demand seeks (MP4 with the moov atom at the end cannot be
+/// demuxed as a forward-only stream — the demuxer must jump to the tail
+/// for its index before streaming the data). The hub backs this with a
+/// mediahost read lease; tools back it with a local file.
+pub trait RemuxSource: Send + 'static {
+    fn size(&self) -> u64;
+    fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> std::io::Result<usize>;
+}
+
+/// Local-file source (sweep tool, tests).
+pub struct FileSource {
+    file: std::fs::File,
+    size: u64,
+}
+
+impl FileSource {
+    pub fn open(path: &Path) -> std::io::Result<Self> {
+        let file = std::fs::File::open(path)?;
+        let size = file.metadata()?.len();
+        Ok(Self { file, size })
+    }
+}
+
+impl RemuxSource for FileSource {
+    fn size(&self) -> u64 {
+        self.size
+    }
+
+    fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> std::io::Result<usize> {
+        use std::io::{Read, Seek, SeekFrom};
+        self.file.seek(SeekFrom::Start(offset))?;
+        self.file.read(buf)
+    }
+}
+
+enum FeedCmd {
+    Need(u32),
+    Seek(u64),
+}
+
 pub struct RemuxJob {
     pipeline: gst::Pipeline,
-    appsrc: AppSrc,
     error: Arc<Mutex<Option<String>>>,
     finished: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -223,19 +271,80 @@ fn make_hls_sink(out_dir: &Path) -> Result<(gst::Element, &'static str)> {
     Ok((sink, name))
 }
 
-/// Start a remux writing `master.m3u8` + `segment*.ts` into `out_dir`.
-/// `has_video`/`has_audio` come from discovery — the muxer pads must be
-/// requested before the pipeline starts, and an unfed pad would stall it.
-/// Feed source-container bytes with [`RemuxJob::push`], then [`RemuxJob::finish`].
-pub fn start(out_dir: &Path, has_video: bool, has_audio: bool) -> Result<RemuxJob> {
+/// Start a remux writing `master.m3u8` + `segment*.ts` into `out_dir`,
+/// pulling bytes from `source` on demand (seeks included). `has_video`/
+/// `has_audio` come from discovery — the muxer pads must be requested
+/// before the pipeline starts, and an unfed pad would stall it.
+pub fn start(
+    out_dir: &Path,
+    has_video: bool,
+    has_audio: bool,
+    mut source: Box<dyn RemuxSource>,
+) -> Result<RemuxJob> {
     crate::init()?;
 
     let pipeline = gst::Pipeline::new();
     let appsrc = AppSrc::builder()
-        .stream_type(gstreamer_app::AppStreamType::Stream)
+        .stream_type(gstreamer_app::AppStreamType::Seekable)
         .block(true)
         .max_bytes(8 * 1024 * 1024)
         .build();
+    appsrc.set_size(source.size() as i64);
+
+    // appsrc callbacks run on GStreamer threads and must not block on I/O;
+    // they forward commands to a feeder thread that owns the source.
+    let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<FeedCmd>();
+    let seek_tx = cmd_tx.clone();
+    appsrc.set_callbacks(
+        gstreamer_app::AppSrcCallbacks::builder()
+            .need_data(move |_, length| {
+                let _ = cmd_tx.send(FeedCmd::Need(length));
+            })
+            .seek_data(move |_, offset| seek_tx.send(FeedCmd::Seek(offset)).is_ok())
+            .build(),
+    );
+    let feeder_src = appsrc.clone();
+    std::thread::spawn(move || {
+        let mut pos: u64 = 0;
+        let mut at_eos = false;
+        while let Ok(cmd) = cmd_rx.recv() {
+            match cmd {
+                FeedCmd::Seek(offset) => {
+                    pos = offset;
+                    at_eos = false;
+                }
+                FeedCmd::Need(length) => {
+                    if at_eos {
+                        continue;
+                    }
+                    let want = (length as usize).clamp(256 * 1024, 4 * 1024 * 1024);
+                    let mut buf = vec![0u8; want];
+                    match source.read_at(pos, &mut buf) {
+                        Ok(0) => {
+                            at_eos = true;
+                            let _ = feeder_src.end_of_stream();
+                        }
+                        Ok(n) => {
+                            buf.truncate(n);
+                            let mut b = gst::Buffer::from_mut_slice(buf);
+                            b.get_mut().unwrap().set_offset(pos);
+                            pos += n as u64;
+                            if feeder_src.push_buffer(b).is_err() {
+                                // Flushing (seek in progress) or shutdown;
+                                // either a Seek command follows or recv fails.
+                                continue;
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "remux source read failed; ending stream");
+                            at_eos = true;
+                            let _ = feeder_src.end_of_stream();
+                        }
+                    }
+                }
+            }
+        }
+    });
     let parsebin = gst::ElementFactory::make("parsebin").build()?;
     let (hlssink, _sink_name) = make_hls_sink(out_dir)?;
 
@@ -299,27 +408,10 @@ pub fn start(out_dir: &Path, has_video: bool, has_audio: bool) -> Result<RemuxJo
     });
 
     pipeline.set_state(gst::State::Playing)?;
-    Ok(RemuxJob { pipeline, appsrc, error, finished })
+    Ok(RemuxJob { pipeline, error, finished })
 }
 
 impl RemuxJob {
-    /// Push source bytes. Blocks (appsrc backpressure) — call off the
-    /// async runtime. Errors once the pipeline has failed.
-    pub fn push(&self, data: Vec<u8>) -> Result<()> {
-        if let Some(e) = self.error.lock().unwrap().clone() {
-            anyhow::bail!("remux failed: {e}");
-        }
-        self.appsrc
-            .push_buffer(gst::Buffer::from_mut_slice(data))
-            .map(|_| ())
-            .map_err(|e| anyhow::anyhow!("appsrc push: {e}"))
-    }
-
-    /// Signal end of input; the pipeline finalizes the playlist.
-    pub fn finish(&self) {
-        let _ = self.appsrc.end_of_stream();
-    }
-
     pub fn failed(&self) -> Option<String> {
         self.error.lock().unwrap().clone()
     }
@@ -356,20 +448,13 @@ mod tests {
         let info = crate::discover(&src, Duration::from_secs(30)).unwrap();
         let (has_video, has_audio) = ts_stream_flags(&info);
         eprintln!("flags: video={has_video} audio={has_audio}");
-        let job = start(out.path(), has_video, has_audio).unwrap();
-        let mut f = std::fs::File::open(&src).unwrap();
-        let mut buf = vec![0u8; 256 * 1024];
-        use std::io::Read;
-        loop {
-            let n = f.read(&mut buf).unwrap();
-            if n == 0 {
-                break;
-            }
-            if let Err(e) = job.push(buf[..n].to_vec()) {
-                panic!("push failed: {e:#} / pipeline: {:?}", job.failed());
-            }
-        }
-        job.finish();
+        let job = start(
+            out.path(),
+            has_video,
+            has_audio,
+            Box::new(FileSource::open(&src).unwrap()),
+        )
+        .unwrap();
         let deadline = Instant::now() + Duration::from_secs(120);
         while !job.finished() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(100));
@@ -405,6 +490,62 @@ mod tests {
         assert_eq!(a, names.contains("audio/x-eac3"));
     }
 
+    /// Corpus-sweep catch #2: one track ending well before the other used
+    /// to deadlock the HLS sink against undersized queues.
+    #[test]
+    fn remuxes_uneven_track_ends() {
+        crate::init().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let src_path = dir.path().join("uneven.mkv");
+        let p = gst::parse::launch(&format!(
+            "videotestsrc num-buffers=100 ! video/x-raw,format=I420,width=320,height=240 ! x264enc speed-preset=ultrafast ! h264parse ! matroskamux name=m audiotestsrc num-buffers=200 ! audioconvert ! fdkaacenc ! m. m. ! filesink location=\"{}\"",
+            src_path.display()
+        ))
+        .unwrap();
+        p.set_state(gst::State::Playing).unwrap();
+        p.bus().unwrap().timed_pop_filtered(gst::ClockTime::from_seconds(30), &[gst::MessageType::Eos]).unwrap();
+        p.set_state(gst::State::Null).unwrap();
+
+        let out = tempfile::tempdir().unwrap();
+        let job = start(out.path(), true, true, Box::new(FileSource::open(&src_path).unwrap())).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !job.finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(job.finished(), "uneven-track remux deadlocked (queue-sizing regression)");
+        assert!(job.failed().is_none(), "remux failed: {:?}", job.failed());
+        assert!(std::fs::read_to_string(out.path().join("master.m3u8")).unwrap().contains("#EXT-X-ENDLIST"));
+    }
+
+    /// The corpus sweep's first catch: MP4 with the moov atom at the end
+    /// (the mp4mux default, and common in the wild) cannot be demuxed as a
+    /// forward-only stream — the seekable source is what makes it work.
+    #[test]
+    fn remuxes_nonfaststart_mp4() {
+        crate::init().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let src_path = dir.path().join("in.mp4");
+        crate::testutil::render_h264_aac_mp4(&src_path);
+
+        let out = tempfile::tempdir().unwrap();
+        let job = start(
+            out.path(),
+            true,
+            true,
+            Box::new(FileSource::open(&src_path).unwrap()),
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !job.finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(job.finished(), "moov-at-end mp4 remux did not finish (push-mode regression)");
+        assert!(job.failed().is_none(), "remux failed: {:?}", job.failed());
+        let playlist = std::fs::read_to_string(out.path().join("master.m3u8")).unwrap();
+        assert!(playlist.contains("#EXT-X-ENDLIST"));
+        assert!(playlist.contains("segment00000.ts"));
+    }
+
     #[test]
     fn hls_sink_selection_prefers_best_available() {
         crate::init().unwrap();
@@ -427,12 +568,13 @@ mod tests {
         crate::testutil::render_h264_aac_mkv(&src_path);
 
         let out = tempfile::tempdir().unwrap();
-        let job = start(out.path(), true, true).unwrap();
-        let data = std::fs::read(&src_path).unwrap();
-        for chunk in data.chunks(64 * 1024) {
-            job.push(chunk.to_vec()).unwrap();
-        }
-        job.finish();
+        let job = start(
+            out.path(),
+            true,
+            true,
+            Box::new(FileSource::open(&src_path).unwrap()),
+        )
+        .unwrap();
 
         let deadline = Instant::now() + Duration::from_secs(30);
         while !job.finished() && Instant::now() < deadline {

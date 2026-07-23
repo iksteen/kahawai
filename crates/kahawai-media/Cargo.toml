@@ -10,7 +10,6 @@ gstreamer = { workspace = true }
 gstreamer-pbutils = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
+tempfile = { workspace = true }
 gstreamer-app = "0.25.2"
 
-[dev-dependencies]
-tempfile = { workspace = true }
