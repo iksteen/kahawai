@@ -478,7 +478,7 @@ fn route_stream(
             if kind == "video" {
                 build_video_encode_chain(pipe, from, sinkpad);
             } else {
-                build_audio_encode_chain(pipe, from, sinkpad);
+                build_audio_encode_chain(pipe, from, sinkpad, &caps_name);
             }
             return;
         }
@@ -540,7 +540,12 @@ fn build_video_encode_chain(pipe: &gst::Pipeline, from: &gst::Pad, sinkpad: gst:
     // Other targets: cudadownload first (passthrough for system memory),
     // then videoconvert. All availability-guarded.
     let converter_names: Vec<&str> = if enc_name.starts_with("nv") {
-        vec!["cudaupload", "cudaconvert"]
+        // videoconvert first: exotic decoder outputs (palettized RGB8P
+        // from msrle-era AVIs) never reach the CUDA elements, which only
+        // take common formats; it is passthrough for anything sane. Costs
+        // NVDEC→NVENC zero-copy (CUDA output can't cross videoconvert, so
+        // hw decoders fall back to system memory) — measured acceptable.
+        vec!["videoconvert", "cudaupload", "cudaconvert"]
     } else {
         vec!["cudadownload", "videoconvert"]
     }
@@ -590,12 +595,30 @@ fn build_video_encode_chain(pipe: &gst::Pipeline, from: &gst::Pad, sinkpad: gst:
 /// the fallback strategy) → audioconvert → audioresample → AAC encoder →
 /// aacparse (raw→ADTS for the TS muxer) → muxer pad. The only decode/
 /// encode work in the hub, and audio-only by design: a few % CPU.
-fn build_audio_encode_chain(pipe: &gst::Pipeline, from: &gst::Pad, sinkpad: gst::Pad) {
+fn build_audio_encode_chain(pipe: &gst::Pipeline, from: &gst::Pad, sinkpad: gst::Pad, caps_name: &str) {
     let Some(enc_name) = aac_encoder() else {
         // Planner guarantees this; guard anyway (fakesink beats a stall).
         tracing::error!("audio encode routed with no verified AAC encoder");
         return;
     };
+    // The AC-3 family's caps cannot be trusted: ac3parse labels E-AC-3
+    // dependent-substream tracks (DD+ 7.1) as plain AC-3, and decodebin
+    // then plugs a52dec, which dies on every block (corpus finding:
+    // Despicable Me 3 / Super Mario). libav's eac3 decoder handles both
+    // syntaxes, so for ac3/eac3 caps force it via a caps rewrite instead
+    // of trusting autoplug. Availability-guarded; decodebin otherwise.
+    let ac3_family = matches!(caps_name, "audio/x-ac3" | "audio/x-eac3");
+    if ac3_family && gst::ElementFactory::find("avdec_eac3").is_some() {
+        let setter = gst::ElementFactory::make("capssetter")
+            .property("caps", gst::Caps::new_empty_simple("audio/x-eac3"))
+            .property("join", false)
+            .property("replace", true)
+            .build()
+            .unwrap();
+        let dec = gst::ElementFactory::make("avdec_eac3").build().unwrap();
+        build_audio_tail(pipe, from, sinkpad, enc_name, &[setter, dec]);
+        return;
+    }
     let decode = gst::ElementFactory::make("decodebin").build().unwrap();
     let convert = gst::ElementFactory::make("audioconvert").build().unwrap();
     let resample = gst::ElementFactory::make("audioresample").build().unwrap();
@@ -624,6 +647,40 @@ fn build_audio_encode_chain(pipe: &gst::Pipeline, from: &gst::Pad, sinkpad: gst:
     });
     if let Err(e) = from.link(&decode.static_pad("sink").unwrap()) {
         tracing::warn!(error = %e, "remux: → decodebin link failed");
+    }
+}
+
+/// Static front-end variant of the audio encode chain: `from` →
+/// front elements → audioconvert → audioresample → encoder → aacparse →
+/// muxer pad. Used when the decoder must be chosen explicitly instead of
+/// trusting decodebin's caps-based autoplug.
+fn build_audio_tail(
+    pipe: &gst::Pipeline,
+    from: &gst::Pad,
+    sinkpad: gst::Pad,
+    enc_name: &str,
+    front: &[gst::Element],
+) {
+    let convert = gst::ElementFactory::make("audioconvert").build().unwrap();
+    let resample = gst::ElementFactory::make("audioresample").build().unwrap();
+    let enc = gst::ElementFactory::make(enc_name).build().unwrap();
+    set_prop_str_if_present(&enc, "bitrate", "192000");
+    let parse = gst::ElementFactory::make("aacparse").build().unwrap();
+
+    let mut chain: Vec<&gst::Element> = front.iter().collect();
+    chain.extend([&convert, &resample, &enc, &parse]);
+    pipe.add_many(chain.iter().copied()).unwrap();
+    gst::Element::link_many(chain.iter().copied()).unwrap();
+    for el in &chain {
+        el.sync_state_with_parent().unwrap();
+    }
+    let out = parse.static_pad("src").unwrap();
+    guard_pts(&out);
+    if let Err(e) = out.link(&sinkpad) {
+        tracing::warn!(error = %e, "remux: encode chain → muxer link failed");
+    }
+    if let Err(e) = from.link(&chain[0].static_pad("sink").unwrap()) {
+        tracing::warn!(error = %e, "remux: → decoder link failed");
     }
 }
 
