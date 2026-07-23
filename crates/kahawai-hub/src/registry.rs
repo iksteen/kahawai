@@ -269,7 +269,9 @@ impl Registry {
         .fetch_optional(&self.db)
         .await?;
         let resolve_movies = media_type.as_deref() == Some("movies");
-        let resolve_series = media_type.as_deref() == Some("series");
+        let resolve_series =
+            matches!(media_type.as_deref(), Some("series") | Some("anime"));
+        let anime = media_type.as_deref() == Some("anime");
 
         let mut tx = self.db.begin().await?;
         let n = files.len();
@@ -327,7 +329,12 @@ impl Registry {
                     }
                 })
             } else if resolve_series {
-                match names::parse_episode(&f.path_rel) {
+                let guess = if anime {
+                    names::parse_anime(&f.path_rel)
+                } else {
+                    names::parse_episode(&f.path_rel)
+                };
+                match guess {
                     None => {
                         // Unparseable stays a bare file (review queue,
                         // later) — never guess an identity.
@@ -364,7 +371,7 @@ impl Registry {
                         let ep: Option<String> = sqlx::query_scalar(
                             "SELECT id FROM items
                              WHERE kind = 'episode' AND parent_id = ?
-                               AND season = ? AND episode = ?",
+                               AND season IS ? AND episode = ?",
                         )
                         .bind(&show_id)
                         .bind(g.season)

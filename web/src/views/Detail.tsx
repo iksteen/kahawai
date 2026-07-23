@@ -85,7 +85,10 @@ export default function Detail({
   if (!item) return null
 
   if (item.kind === 'show') {
-    const seasons = [...new Set(episodes.map((e) => e.season ?? 0))]
+    // null season = absolute numbering (anime); distinct from Specials.
+    const seasonLabel = (s: number | null) =>
+      s === null ? 'Episodes' : s === 0 ? 'Specials' : `Season ${s}`
+    const seasons = [...new Set(episodes.map((e) => e.season))]
     // First unwatched (or in-progress) episode = the continue point.
     const next = episodes.find((e) => !e.played)
     return (
@@ -111,11 +114,11 @@ export default function Detail({
           </div>
         </div>
         {seasons.map((s) => (
-          <section key={s}>
-            <h2>{s === 0 ? 'Specials' : `Season ${s}`}</h2>
+          <section key={String(s)}>
+            <h2>{seasonLabel(s)}</h2>
             <ul className="rows">
               {episodes
-                .filter((e) => (e.season ?? 0) === s)
+                .filter((e) => e.season === s)
                 .map((e) => (
                   <li key={e.id}>
                     <button className="card episode" onClick={() => onOpenEpisode(e.id)}>

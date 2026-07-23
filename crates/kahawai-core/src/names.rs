@@ -55,7 +55,9 @@ fn parse_year_token(tok: &str) -> Option<u16> {
 pub struct EpisodeGuess {
     pub show_title: String,
     pub show_year: Option<u16>,
-    pub season: u32,
+    /// None = absolute numbering (anime): the episode number is the
+    /// whole identity, season views are a later projection (HUB-31).
+    pub season: Option<u32>,
     pub episode: u32,
     pub episode_title: Option<String>,
 }
@@ -75,8 +77,10 @@ pub fn parse_episode(path_rel: &str) -> Option<EpisodeGuess> {
         .map(|c| if matches!(c, '.' | '_') { ' ' } else { c })
         .collect();
     let tokens: Vec<&str> = cleaned.split_whitespace().collect();
-    let (idx, season, episode) =
-        tokens.iter().enumerate().find_map(|(i, t)| parse_sxxeyy(t).map(|(s, e)| (i, s, e)))?;
+    let (idx, season, episode) = tokens
+        .iter()
+        .enumerate()
+        .find_map(|(i, t)| parse_sxxeyy(t).or_else(|| parse_nnxnn(t)).map(|(s, e)| (i, s, e)))?;
 
     // Show identity: the top-level directory when there is one (skipping
     // season dirs), else the filename tokens before SxxEyy.
@@ -108,10 +112,105 @@ pub fn parse_episode(path_rel: &str) -> Option<EpisodeGuess> {
     Some(EpisodeGuess {
         show_title,
         show_year: show_guess.year,
-        season,
+        season: Some(season),
         episode,
         episode_title: (!ep_title.is_empty()).then_some(ep_title),
     })
+}
+
+/// `01x02` / `1x02` season-x-episode (Pokemon-style library naming).
+fn parse_nnxnn(tok: &str) -> Option<(u32, u32)> {
+    let t = tok.trim_matches(|c: char| !c.is_ascii_alphanumeric());
+    let (s, e) = t.split_once(['x', 'X'])?;
+    if s.is_empty() || e.is_empty() || s.len() > 2 || e.len() > 3 {
+        return None;
+    }
+    Some((s.parse().ok()?, e.parse().ok()?))
+}
+
+/// Fansub tokenizer (HUB-30, first slice): `[Group]_Title_-_01v2_(tags)_
+/// [CRC].mkv` → title + absolute episode. Falls back to the standard
+/// series parser first (plenty of anime is named SxxEyy). Providers and
+/// the season-view mapping come later; group/version/CRC are parsed
+/// past, not yet stored.
+pub fn parse_anime(path_rel: &str) -> Option<EpisodeGuess> {
+    if let Some(mut g) = parse_episode(path_rel) {
+        // Standard-named anime, but prefer the top-level dir identity
+        // (release subdirs like "Title (720p) [Group]" mislead).
+        if let Some(top) = top_dir(path_rel) {
+            let tg = parse_movie(top);
+            g.show_title = tg.title;
+            g.show_year = tg.year.or(g.show_year);
+        }
+        return Some(g);
+    }
+
+    let parts: Vec<&str> = path_rel.split('/').collect();
+    let filename = parts.last()?;
+    let stem = filename.rsplit_once('.').map_or(*filename, |(s, _)| s);
+
+    // Strip bracket/paren tag groups: [Group] [720p] [A1B2C3D4] (BD FLAC).
+    let mut cleaned = String::with_capacity(stem.len());
+    let mut depth = 0u32;
+    for c in stem.chars() {
+        match c {
+            '[' | '(' => depth += 1,
+            ']' | ')' => depth = depth.saturating_sub(1),
+            _ if depth == 0 => {
+                cleaned.push(if matches!(c, '.' | '_') { ' ' } else { c })
+            }
+            _ => {}
+        }
+    }
+    let tokens: Vec<&str> = cleaned.split_whitespace().filter(|t| *t != "-").collect();
+
+    // Absolute episode: an explicit E01/EP01 token wins; otherwise the
+    // LAST standalone number (optional vN) that isn't a plausible year.
+    let e_token = tokens.iter().enumerate().find_map(|(i, t)| {
+        let rest = t
+            .strip_prefix(['e', 'E'])
+            .map(|r| r.strip_prefix(['p', 'P']).unwrap_or(r))?;
+        if rest.is_empty() || rest.len() > 4 || !rest.chars().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        Some((i, rest.parse().ok()?))
+    });
+    let (idx, episode) = e_token.or_else(|| {
+        tokens.iter().enumerate().rev().find_map(|(i, t)| {
+            let num = t.split(['v', 'V']).next()?;
+            if num.is_empty() || num.len() > 4 || !num.chars().all(|c| c.is_ascii_digit()) {
+                return None;
+            }
+            let n: u32 = num.parse().ok()?;
+            if (1900..=2099).contains(&n) {
+                return None; // year, not an episode
+            }
+            Some((i, n))
+        })
+    })?;
+
+    let mut title = tokens[..idx].join(" ");
+    if title.is_empty() {
+        title = top_dir(path_rel).unwrap_or("Unknown Show").to_string();
+    }
+    let show_guess = match top_dir(path_rel) {
+        Some(top) => parse_movie(top),
+        None => parse_movie(&title),
+    };
+    let ep_title = tokens[idx + 1..].join(" ");
+    Some(EpisodeGuess {
+        show_title: if show_guess.title.is_empty() { title } else { show_guess.title },
+        show_year: show_guess.year,
+        season: None, // absolute numbering is authoritative
+        episode,
+        episode_title: (!ep_title.is_empty()).then_some(ep_title),
+    })
+}
+
+fn top_dir(path_rel: &str) -> Option<&str> {
+    let mut parts = path_rel.split('/');
+    let first = parts.next()?;
+    parts.next().map(|_| first) // only when there IS a directory
 }
 
 fn parse_sxxeyy(tok: &str) -> Option<(u32, u32)> {
@@ -175,10 +274,50 @@ mod tests {
             let g = parse_episode(path).unwrap_or_else(|| panic!("no parse: {path}"));
             assert_eq!(g.show_title, show, "{path}");
             assert_eq!(g.show_year, year, "{path}");
-            assert_eq!((g.season, g.episode), (s, e), "{path}");
+            assert_eq!((g.season, g.episode), (Some(s), e), "{path}");
             assert_eq!(g.episode_title.as_deref(), ep_title, "{path}");
         }
         assert!(parse_episode("Movies/Heat (1995).mkv").is_none());
+    }
+
+    #[test]
+    fn parses_anime_shapes() {
+        #[allow(clippy::type_complexity)]
+        let cases: &[(&str, &str, Option<u16>, Option<u32>, u32)] = &[
+            (
+                "Ao No Exorcist/Ao no Exorcist (720p, BluRay) [Coalgirls]/[Coalgirls]_Ao_no_Exorcist_11_(1280x720_Blu-Ray_FLAC)_[865A19CF].mkv",
+                "Ao No Exorcist", None, None, 11,
+            ),
+            (
+                "Dragon Ball Super/[AnimeRG] Dragon Ball Super - 001 [720p] [x264] [pseudo].mkv",
+                "Dragon Ball Super", None, None, 1,
+            ),
+            (
+                "Hellsing Ultimate/[CBM]_Hellsing_Ultimate_-_01_-_[1080p-AC3]_[7B4A1D84].mkv",
+                "Hellsing Ultimate", None, None, 1,
+            ),
+            (
+                "Pokemon/Season 01/Pokemon 01x01 Pokemon! I Choose You!.mkv",
+                "Pokemon", None, Some(1), 1,
+            ),
+            (
+                "Rozen Maiden (2013)/Rozen Maiden (2013) - S01E01 - Alice Game.mkv",
+                "Rozen Maiden", Some(2013), Some(1), 1,
+            ),
+            (
+                "Serial Experiments Lain/Serial.Experiments.Lain.E01.1080p.Bluray.AV1.Opus.DualAudio-AeTHER.mkv",
+                "Serial Experiments Lain", None, None, 1,
+            ),
+            // Episode version markers.
+            ("Show/[Grp] Show - 05v2 [720p].mkv", "Show", None, None, 5),
+        ];
+        for (path, show, year, season, ep) in cases {
+            let g = parse_anime(path).unwrap_or_else(|| panic!("no parse: {path}"));
+            assert_eq!(g.show_title, *show, "{path}");
+            assert_eq!(g.show_year, *year, "{path}");
+            assert_eq!(g.season, *season, "{path}");
+            assert_eq!(g.episode, *ep, "{path}");
+        }
     }
 
     #[test]
