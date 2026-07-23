@@ -3,6 +3,7 @@
 
 pub mod doctor;
 pub mod remux;
+pub mod worker;
 #[doc(hidden)]
 pub mod testutil;
 

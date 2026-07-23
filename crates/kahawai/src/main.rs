@@ -39,6 +39,18 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Internal: per-session pipeline worker, spawned by the hub (§1.1
+    /// crash isolation). Reads source bytes from the parent's socket.
+    #[command(hide = true)]
+    RemuxWorker {
+        socket: PathBuf,
+        out_dir: PathBuf,
+        size: u64,
+        #[arg(long)]
+        video: bool,
+        #[arg(long, default_value = "off")]
+        audio: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -74,6 +86,16 @@ async fn main() -> Result<()> {
         }
         Cmd::Mediahost => run_mediahost(cfg.mediahost).await,
         Cmd::Doctor { json } => doctor(&cfg, json),
+        Cmd::RemuxWorker { socket, out_dir, size, video, audio } => {
+            // Blocking by design: this process exists only for the pipeline.
+            kahawai_media::worker::run(
+                &socket,
+                &out_dir,
+                size,
+                video,
+                kahawai_media::worker::parse_audio_mode(&audio),
+            )
+        }
         Cmd::AllInOne | Cmd::Transcoder => {
             anyhow::bail!("not implemented yet — `kahawai hub` and `kahawai mediahost` work so far")
         }
@@ -203,7 +225,13 @@ async fn run_hub(cfg: config::HubConfig) -> Result<()> {
     let admitted = registry.load_allowlist().await?;
     tracing::info!(admitted, "mTLS allowlist loaded");
     let auth = Arc::new(kahawai_hub::auth::Auth::new(db.clone(), &cfg.data_dir).await?);
-    let sessions = Arc::new(kahawai_hub::sessions::Sessions::new(cfg.data_dir.join("sessions")));
+    let sessions = Arc::new(
+        kahawai_hub::sessions::Sessions::new(cfg.data_dir.join("sessions"))
+            // Pipelines run in a supervised child of this same binary
+            // (hidden `remux-worker` subcommand): a GStreamer crash kills
+            // one session, never the hub (§1.1).
+            .with_worker_exe(std::env::current_exe().ok()),
+    );
     sessions.spawn_janitor();
 
     let (cert_pem, key_pem) = ca.issue_server_cert(&cfg.hostnames)?;

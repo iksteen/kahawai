@@ -17,7 +17,27 @@ use crate::registry::Registry;
 
 pub enum Mode {
     Direct { lease: Lease },
-    Remux { dir: PathBuf, job: Arc<kahawai_media::remux::RemuxJob> },
+    Remux { dir: PathBuf, runner: RemuxRunner },
+}
+
+/// How a remux/transcode pipeline runs. The hub always spawns the
+/// supervised worker (§1.1: a GStreamer crash kills one session, not the
+/// process — observed twice on a real library via hlssink3 panics).
+/// ponytail: in-process kept for tests, which have no worker binary.
+pub enum RemuxRunner {
+    InProcess(Arc<kahawai_media::remux::RemuxJob>),
+    Worker(Mutex<tokio::process::Child>),
+}
+
+impl RemuxRunner {
+    fn stop(&self) {
+        match self {
+            RemuxRunner::InProcess(job) => job.stop(),
+            RemuxRunner::Worker(child) => {
+                let _ = child.lock().unwrap().start_kill();
+            }
+        }
+    }
 }
 
 pub struct Session {
@@ -82,12 +102,46 @@ impl kahawai_media::remux::RemuxSource for LeaseSource {
     }
 }
 
+/// Serve RemuxSource reads to a worker over its Unix socket.
+/// Wire format: see kahawai_media::worker.
+async fn serve_reads(mut conn: tokio::net::UnixStream, lease: Lease, size: u64) -> Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut req = [0u8; 16];
+    loop {
+        if conn.read_exact(&mut req).await.is_err() {
+            return Ok(()); // worker closed the socket (EOS or teardown)
+        }
+        let offset = u64::from_le_bytes(req[..8].try_into().unwrap());
+        let len = u64::from_le_bytes(req[8..].try_into().unwrap())
+            .min(kahawai_media::worker::MAX_READ);
+        let want = if offset >= size { 0 } else { len.min(size - offset) };
+        let mut buf = Vec::with_capacity(want as usize);
+        if want > 0 {
+            let mut stream = lease.read_range(offset, want).into_inner();
+            while (buf.len() as u64) < want {
+                match stream.recv().await {
+                    Some(Ok(bytes)) => buf.extend_from_slice(&bytes),
+                    Some(Err(e)) => anyhow::bail!("lease read failed: {e}"),
+                    None => break,
+                }
+            }
+            buf.truncate(want as usize);
+        }
+        conn.write_all(&(buf.len() as u64).to_le_bytes()).await?;
+        conn.write_all(&buf).await?;
+    }
+}
+
 pub struct Sessions {
     pub leases: Leases,
     /// Scratch space for remux sessions (`<data_dir>/sessions`).
     scratch_root: PathBuf,
     max_per_user: usize,
     idle_timeout: Duration,
+    /// The binary to spawn as the per-session pipeline worker (the hub
+    /// passes its own executable; the worker is a hidden subcommand).
+    /// None → pipelines run in-process (tests only).
+    worker_exe: Option<PathBuf>,
     active: Mutex<HashMap<String, Arc<Session>>>,
 }
 
@@ -104,8 +158,15 @@ impl Sessions {
             scratch_root,
             max_per_user,
             idle_timeout,
+            worker_exe: None,
             active: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Run pipelines in a supervised child process (crash isolation).
+    pub fn with_worker_exe(mut self, exe: Option<PathBuf>) -> Self {
+        self.worker_exe = exe;
+        self
     }
 
     /// Reap idle sessions (HUB-18: no fetch or progress ping → teardown).
@@ -196,7 +257,7 @@ impl Sessions {
         let session_mode = match mode {
             "direct" => Mode::Direct { lease },
             "remux" => Mode::Remux {
-                job: self.start_remux(&id, &info, lease, size).await?,
+                runner: self.start_remux(&id, &info, lease, size).await?,
                 dir: self.scratch_root.join(&id),
             },
             other => bail!("unknown mode {other:?} (direct|remux)"),
@@ -218,7 +279,8 @@ impl Sessions {
         Ok(session)
     }
 
-    /// Spin up the remux pipeline, feed it from the lease, and wait for the
+    /// Spin up the remux/transcode pipeline — in a supervised worker
+    /// process when configured — feed it from the lease, and wait for the
     /// playlist to materialize so the returned URL is immediately playable.
     async fn start_remux(
         &self,
@@ -226,7 +288,7 @@ impl Sessions {
         info: &kahawai_core::media::MediaInfo,
         lease: Lease,
         size: u64,
-    ) -> Result<Arc<kahawai_media::remux::RemuxJob>> {
+    ) -> Result<RemuxRunner> {
         // The muxer stalls on unfed pads, so only claim what the plan
         // will actually feed — decided by the muxer's own templates and
         // the installed decoders/encoders (single source of truth with
@@ -238,22 +300,71 @@ impl Sessions {
 
         let dir = self.scratch_root.join(session_id);
         std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-        // The pipeline pulls (and seeks — MP4 moov-at-end needs it) from
-        // the lease via a blocking adapter on the remux feeder thread.
-        let source = LeaseSource { lease, size, handle: tokio::runtime::Handle::current() };
-        let job = Arc::new(kahawai_media::remux::start(&dir, plan, Box::new(source))?);
+
+        let runner = match &self.worker_exe {
+            Some(exe) => {
+                let sock = dir.join("worker.sock");
+                let listener = tokio::net::UnixListener::bind(&sock)
+                    .with_context(|| format!("binding {}", sock.display()))?;
+                // Serve source reads to the worker for the session's life;
+                // the task ends when the worker closes its socket.
+                tokio::spawn(async move {
+                    match listener.accept().await {
+                        Ok((conn, _)) => {
+                            if let Err(e) = serve_reads(conn, lease, size).await {
+                                tracing::debug!(error = %e, "worker read channel closed");
+                            }
+                        }
+                        Err(e) => tracing::warn!(error = %e, "worker never connected"),
+                    }
+                });
+                let log = std::fs::File::create(dir.join("worker.log"))?;
+                let child = tokio::process::Command::new(exe)
+                    .arg("remux-worker")
+                    .arg(&sock)
+                    .arg(&dir)
+                    .arg(size.to_string())
+                    .args(plan.video.then_some("--video"))
+                    .args(["--audio", kahawai_media::worker::audio_mode_arg(plan.audio)])
+                    .stderr(std::process::Stdio::from(log))
+                    .kill_on_drop(true)
+                    .spawn()
+                    .with_context(|| format!("spawning worker {}", exe.display()))?;
+                tracing::info!(session = session_id, pid = child.id(), "pipeline worker spawned");
+                RemuxRunner::Worker(Mutex::new(child))
+            }
+            None => {
+                // In-process (tests): the pipeline pulls (and seeks —
+                // MP4 moov-at-end needs it) from the lease via a blocking
+                // adapter on the remux feeder thread.
+                let source = LeaseSource { lease, size, handle: tokio::runtime::Handle::current() };
+                RemuxRunner::InProcess(Arc::new(kahawai_media::remux::start(&dir, plan, Box::new(source))?))
+            }
+        };
 
         // Return once the playlist exists (or the pipeline died).
         let playlist = dir.join("master.m3u8");
-        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
         loop {
-            if let Some(e) = job.failed() {
-                bail!("remux failed to start: {e}");
+            match &runner {
+                RemuxRunner::InProcess(job) => {
+                    if let Some(e) = job.failed() {
+                        bail!("remux failed to start: {e}");
+                    }
+                }
+                RemuxRunner::Worker(child) => {
+                    if let Some(status) = child.lock().unwrap().try_wait()? {
+                        let log = std::fs::read_to_string(dir.join("worker.log")).unwrap_or_default();
+                        let tail: String = log.lines().rev().take(4).collect::<Vec<_>>().join(" | ");
+                        bail!("pipeline worker exited at start ({status}): {tail}");
+                    }
+                }
             }
             if playlist.exists() {
-                return Ok(job);
+                return Ok(runner);
             }
             if std::time::Instant::now() > deadline {
+                runner.stop();
                 bail!("remux produced no playlist in time");
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -294,8 +405,8 @@ impl Sessions {
         let Some(session) = self.active.lock().unwrap().remove(id) else {
             return false;
         };
-        if let Mode::Remux { dir, job } = &session.mode {
-            job.stop();
+        if let Mode::Remux { dir, runner } = &session.mode {
+            runner.stop();
             let _ = std::fs::remove_dir_all(dir);
         }
         tracing::info!(session = id, "session ended");
