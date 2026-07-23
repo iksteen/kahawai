@@ -265,7 +265,9 @@ impl Sessions {
                 // plan will actually feed — decided by the muxer's own
                 // templates and the installed decoders/encoders (single
                 // source of truth with the pipeline's link logic).
-                let plan = kahawai_media::remux::plan_streams(&info);
+                // ponytail: every remux client gets the web target profile; real
+                // per-client capability probes (HUB-14) select profiles later.
+                let plan = kahawai_media::remux::plan_streams(&info, &kahawai_media::remux::WEB_TARGET);
                 if !plan.playable() {
                     bail!("no playable streams — this source needs the video transcoder");
                 }
@@ -331,8 +333,8 @@ impl Sessions {
                     .arg(&sock)
                     .arg(&dir)
                     .arg(size.to_string())
-                    .args(plan.video.then_some("--video"))
-                    .args(["--audio", kahawai_media::worker::audio_mode_arg(plan.audio)])
+                    .args(["--video", kahawai_media::worker::mode_arg(plan.video)])
+                    .args(["--audio", kahawai_media::worker::mode_arg(plan.audio)])
                     .stderr(std::process::Stdio::from(log))
                     .kill_on_drop(true)
                     .spawn()

@@ -46,8 +46,8 @@ enum Cmd {
         socket: PathBuf,
         out_dir: PathBuf,
         size: u64,
-        #[arg(long)]
-        video: bool,
+        #[arg(long, default_value = "off")]
+        video: String,
         #[arg(long, default_value = "off")]
         audio: String,
     },
@@ -92,8 +92,8 @@ async fn main() -> Result<()> {
                 &socket,
                 &out_dir,
                 size,
-                video,
-                kahawai_media::worker::parse_audio_mode(&audio),
+                kahawai_media::worker::parse_mode(&video),
+                kahawai_media::worker::parse_mode(&audio),
             )
         }
         Cmd::Transcoder => {

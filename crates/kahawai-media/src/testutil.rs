@@ -39,7 +39,7 @@ fn render_av(path: &Path, muxer: &str) {
     ));
 }
 
-fn render(launch: &str) {
+pub fn render(launch: &str) {
     crate::init().unwrap();
     let p = gst::parse::launch(launch).unwrap();
     p.set_state(gst::State::Playing).unwrap();

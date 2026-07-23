@@ -58,7 +58,13 @@ fn ts_compatible(caps_name: &str) -> Option<&'static str> {
 }
 
 /// Normalized codec name (from discovery) → caps structure name.
-fn codec_to_caps_name(kind: &str, codec: &str) -> Option<&'static str> {
+/// Codecs discovery couldn't normalize pass through as raw caps names
+/// (`video/x-divx`, `video/x-msmpeg`, …) — usable directly for decoder
+/// lookups, so old exotics still plan as Encode instead of dropping.
+fn codec_to_caps_name<'a>(kind: &str, codec: &'a str) -> Option<&'a str> {
+    if codec.contains('/') {
+        return Some(codec);
+    }
     Some(match (kind, codec) {
         ("video", "h264") => "video/x-h264",
         ("video", "hevc") => "video/x-h265",
@@ -188,52 +194,79 @@ fn can_decode(caps_name: &str) -> bool {
     .any(|f| f.can_sink_any_caps(&caps))
 }
 
-/// What happens to the audio in a session (HUB-16 decision order: copy
-/// what the muxer takes, encode what it doesn't but we can decode, drop
-/// the rest).
+/// What happens to one stream kind in a session (HUB-16 decision order:
+/// copy what the client and muxer both take, encode what they don't but
+/// a decoder can read, drop the rest).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AudioMode {
+pub enum StreamMode {
     Copy,
-    /// Decode → AAC. Cheap (a few % CPU) — video still passes through.
+    /// Decode → re-encode to the target codec (h264 video / AAC audio).
     Encode,
     Off,
 }
 
+/// What the receiving client can actually decode (HUB-14). Muxability
+/// alone lies: mpegtsmux happily carries MPEG-4 Part 2 and DTS, but no
+/// browser plays either — copy must satisfy the client AND the muxer.
+pub struct Target {
+    pub video: &'static [&'static str],
+    pub audio: &'static [&'static str],
+}
+
+/// hls.js/MSE baseline: H.264 video; AAC or MP3 audio.
+pub const WEB_TARGET: Target = Target { video: &["h264"], audio: &["aac", "mp3"] };
+
 /// Per-kind session plan — the single source of truth shared between
 /// session planning and pipeline routing, so the muxer pads requested up
 /// front always match the streams that will actually be linked.
-/// Video is copy-or-drop today (video encode is the transcoder module's
-/// job); audio can be transcoded to AAC in-hub.
 #[derive(Debug, Clone, Copy)]
 pub struct RemuxPlan {
-    pub video: bool,
-    pub audio: AudioMode,
+    pub video: StreamMode,
+    pub audio: StreamMode,
 }
 
 impl RemuxPlan {
+    pub fn has_video(&self) -> bool {
+        self.video != StreamMode::Off
+    }
     pub fn has_audio(&self) -> bool {
-        self.audio != AudioMode::Off
+        self.audio != StreamMode::Off
     }
     /// Anything to produce at all?
     pub fn playable(&self) -> bool {
-        self.video || self.has_audio()
+        self.has_video() || self.has_audio()
     }
 }
 
-pub fn plan_streams(info: &kahawai_core::media::MediaInfo) -> RemuxPlan {
+pub fn plan_streams(info: &kahawai_core::media::MediaInfo, target: &Target) -> RemuxPlan {
     let names = ts_muxable_names();
-    let video = info
-        .video
-        .iter()
-        .any(|v| codec_to_caps_name("video", &v.codec).is_some_and(|n| names.contains(n)));
-    let audio_caps: Vec<&str> =
-        info.audio.iter().filter_map(|a| codec_to_caps_name("audio", &a.codec)).collect();
-    let audio = if audio_caps.iter().any(|n| names.contains(*n)) {
-        AudioMode::Copy
-    } else if aac_encoder().is_some() && audio_caps.iter().any(|n| can_decode(n)) {
-        AudioMode::Encode
+    let copyable = |kind: &str, codec: &str, accepted: &[&str]| {
+        accepted.contains(&codec)
+            && codec_to_caps_name(kind, codec).is_some_and(|n| names.contains(n))
+    };
+    let video = if info.video.iter().any(|v| copyable("video", &v.codec, target.video)) {
+        StreamMode::Copy
+    } else if h264_encoder().is_some()
+        && info
+            .video
+            .iter()
+            .any(|v| codec_to_caps_name("video", &v.codec).is_some_and(can_decode))
+    {
+        StreamMode::Encode
     } else {
-        AudioMode::Off
+        StreamMode::Off
+    };
+    let audio = if info.audio.iter().any(|a| copyable("audio", &a.codec, target.audio)) {
+        StreamMode::Copy
+    } else if aac_encoder().is_some()
+        && info
+            .audio
+            .iter()
+            .any(|a| codec_to_caps_name("audio", &a.codec).is_some_and(can_decode))
+    {
+        StreamMode::Encode
+    } else {
+        StreamMode::Off
     };
     RemuxPlan { video, audio }
 }
@@ -246,42 +279,37 @@ pub fn plan_summary(
     plan: &RemuxPlan,
 ) -> (String, String) {
     let names = ts_muxable_names();
-    let video = if plan.video {
-        info.video
-            .iter()
-            .find(|v| codec_to_caps_name("video", &v.codec).is_some_and(|n| names.contains(n)))
-            .map(|v| format!("{} copy", v.codec))
-            .unwrap_or_else(|| "copy".into())
-    } else if info.video.is_empty() {
-        "none".into()
-    } else {
-        format!("{} dropped (needs transcoder)", info.video[0].codec)
-    };
-    let audio = match plan.audio {
-        AudioMode::Copy => info
-            .audio
-            .iter()
-            .find(|a| codec_to_caps_name("audio", &a.codec).is_some_and(|n| names.contains(n)))
-            .map(|a| format!("{} copy", a.codec))
-            .unwrap_or_else(|| "copy".into()),
-        AudioMode::Encode => {
-            let src = info
-                .audio
+    let kind_summary = |kind: &str,
+                        codecs: Vec<&str>,
+                        mode: StreamMode,
+                        target_codec: &str| {
+        match mode {
+            StreamMode::Copy => codecs
                 .iter()
-                .find(|a| codec_to_caps_name("audio", &a.codec).is_some_and(can_decode))
-                .map(|a| a.codec.as_str())
-                .unwrap_or("audio");
-            format!("{src} → aac (transcoded)")
-        }
-        AudioMode::Off => {
-            if info.audio.is_empty() {
-                "none".into()
-            } else {
-                format!("{} dropped (needs transcoder)", info.audio[0].codec)
+                .find(|c| codec_to_caps_name(kind, c).is_some_and(|n| names.contains(n)))
+                .map(|c| format!("{c} copy"))
+                .unwrap_or_else(|| "copy".into()),
+            StreamMode::Encode => {
+                let src = codecs
+                    .iter()
+                    .find(|c| codec_to_caps_name(kind, c).is_some_and(can_decode))
+                    .copied()
+                    .unwrap_or(kind);
+                format!("{src} → {target_codec} (transcoded)")
+            }
+            StreamMode::Off => {
+                if codecs.is_empty() {
+                    "none".into()
+                } else {
+                    format!("{} dropped (needs transcoder)", codecs[0])
+                }
             }
         }
     };
-    (video, audio)
+    (
+        kind_summary("video", info.video.iter().map(|v| v.codec.as_str()).collect(), plan.video, "h264"),
+        kind_summary("audio", info.audio.iter().map(|a| a.codec.as_str()).collect(), plan.audio, "aac"),
+    )
 }
 
 /// TS muxing needs specific stream-formats (h26x as Annex-B byte-stream,
@@ -347,13 +375,27 @@ type WaitingPads = Arc<Mutex<std::collections::HashMap<&'static str, gst::Pad>>>
 /// event; the queue absorbs data while the decision waits, and the caps
 /// event precedes the first buffer in the same streaming thread, so
 /// deciding in the probe is race-free.
-/// Would route_stream do something useful with a stream of these caps?
-fn routable(caps_name: &str, encode_audio: bool) -> bool {
-    ts_compatible(caps_name).is_some()
-        || (encode_audio && caps_name.starts_with("audio/") && can_decode(caps_name))
+/// The plan's mode for a stream of these caps.
+fn mode_for(caps_name: &str, plan: &RemuxPlan) -> StreamMode {
+    if caps_name.starts_with("video/") {
+        plan.video
+    } else if caps_name.starts_with("audio/") {
+        plan.audio
+    } else {
+        StreamMode::Off
+    }
 }
 
-fn plumb_parsed_pad(pipe: &gst::Pipeline, waiting: &WaitingPads, pad: &gst::Pad, encode_audio: bool) {
+/// Would route_stream do something useful with a stream of these caps?
+fn routable(caps_name: &str, plan: &RemuxPlan) -> bool {
+    match mode_for(caps_name, plan) {
+        StreamMode::Copy => ts_compatible(caps_name).is_some(),
+        StreamMode::Encode => can_decode(caps_name),
+        StreamMode::Off => false,
+    }
+}
+
+fn plumb_parsed_pad(pipe: &gst::Pipeline, waiting: &WaitingPads, pad: &gst::Pad, plan: RemuxPlan) {
     // queue: decouples the muxer from parsebin's threads (the aggregator
     // deadlocks without it). Default queue limits (1 MiB / 1 s) are far
     // too small: the HLS sink holds one branch back while waiting for a
@@ -377,8 +419,8 @@ fn plumb_parsed_pad(pipe: &gst::Pipeline, waiting: &WaitingPads, pad: &gst::Pad,
         .or_else(|| pad.current_caps())
         .unwrap_or_else(gst::Caps::new_empty);
     let name = advertised.structure(0).map(|s| s.name().to_string()).unwrap_or_default();
-    if routable(&name, encode_audio) {
-        route_stream(pipe, waiting, &qsrc, &advertised, encode_audio);
+    if routable(&name, &plan) {
+        route_stream(pipe, waiting, &qsrc, &advertised, plan);
         return;
     }
 
@@ -389,7 +431,7 @@ fn plumb_parsed_pad(pipe: &gst::Pipeline, waiting: &WaitingPads, pad: &gst::Pad,
             && let gst::EventView::Caps(c) = ev.view()
             && qpad.peer().is_none()
         {
-            route_stream(&pipe, &waiting, qpad, &c.caps_owned(), encode_audio);
+            route_stream(&pipe, &waiting, qpad, &c.caps_owned(), plan);
         }
         gst::PadProbeReturn::Ok
     });
@@ -397,27 +439,53 @@ fn plumb_parsed_pad(pipe: &gst::Pipeline, waiting: &WaitingPads, pad: &gst::Pad,
 
 /// Route a stream to the muxer (via parser/timestamper) or a fakesink,
 /// now that its negotiated caps are known.
+/// hlssink3 (≤0.15.3, imp.rs:304) unwraps the PTS of each fragment's
+/// first buffer; a PTS-less frame (old AVI streams, parser EOS drains)
+/// aborts the whole process — a Rust panic in an FFI callback cannot
+/// unwind. Guard every pad that feeds the sink: borrow the DTS, or drop
+/// the buffer.
+fn guard_pts(pad: &gst::Pad) {
+    pad.add_probe(gst::PadProbeType::BUFFER, |_, info| {
+        if let Some(gst::PadProbeData::Buffer(buffer)) = &mut info.data {
+            // ponytail: pts=dts misorders B-frames on the copy path
+            // (sweep flags those [bad dts] → they plan as Encode now);
+            // dropping instead starves fragments and trips more panics.
+            if buffer.pts().is_none() {
+                match buffer.dts() {
+                    Some(dts) => buffer.make_mut().set_pts(dts),
+                    None => return gst::PadProbeReturn::Drop,
+                }
+            }
+        }
+        gst::PadProbeReturn::Ok
+    });
+}
+
 fn route_stream(
     pipe: &gst::Pipeline,
     waiting: &WaitingPads,
     from: &gst::Pad,
     caps: &gst::Caps,
-    encode_audio: bool,
+    plan: RemuxPlan,
 ) {
     let caps_name = caps.structure(0).map(|s| s.name().to_string()).unwrap_or_default();
-    let target = ts_compatible(&caps_name).and_then(|kind| waiting.lock().unwrap().remove(kind));
-    // Not directly muxable, but the plan says transcode audio and a
-    // decoder exists: claim the audio pad for the decode→AAC branch.
-    if target.is_none()
-        && encode_audio
-        && caps_name.starts_with("audio/")
-        && can_decode(&caps_name)
-        && let Some(sinkpad) = waiting.lock().unwrap().remove("audio")
-    {
-        tracing::info!(caps = %caps_name, "remux: transcoding audio stream to AAC");
-        build_audio_encode_chain(pipe, from, sinkpad);
-        return;
+    let mode = mode_for(&caps_name, &plan);
+    // Encode: claim the kind's muxer pad for the decode→re-encode branch.
+    if mode == StreamMode::Encode && can_decode(&caps_name) {
+        let kind = if caps_name.starts_with("video/") { "video" } else { "audio" };
+        if let Some(sinkpad) = waiting.lock().unwrap().remove(kind) {
+            tracing::info!(caps = %caps_name, kind, "transcoding stream");
+            if kind == "video" {
+                build_video_encode_chain(pipe, from, sinkpad);
+            } else {
+                build_audio_encode_chain(pipe, from, sinkpad);
+            }
+            return;
+        }
     }
+    let target = (mode == StreamMode::Copy)
+        .then(|| ts_compatible(&caps_name).and_then(|kind| waiting.lock().unwrap().remove(kind)))
+        .flatten();
     match target {
         Some(sinkpad) => {
             let mut tail = from.clone();
@@ -430,24 +498,7 @@ fn route_stream(
                 tail.link(&el.static_pad("sink").unwrap()).unwrap();
                 tail = el.static_pad("src").unwrap();
             }
-            // hlssink3 (≤0.15.3, imp.rs:304) unwraps the PTS of each
-            // fragment's first buffer; a PTS-less frame (old AVI streams)
-            // aborts the whole process — a Rust panic in an FFI callback
-            // cannot unwind. Guard: borrow the DTS, or drop the buffer.
-            tail.add_probe(gst::PadProbeType::BUFFER, |_, info| {
-                if let Some(gst::PadProbeData::Buffer(buffer)) = &mut info.data {
-                    // ponytail: pts=dts misorders B-frames (sweep flags
-                    // those [bad dts] → transcoder work list); dropping
-                    // instead starves fragments and trips more panics.
-                    if buffer.pts().is_none() {
-                        match buffer.dts() {
-                            Some(dts) => buffer.make_mut().set_pts(dts),
-                            None => return gst::PadProbeReturn::Drop,
-                        }
-                    }
-                }
-                gst::PadProbeReturn::Ok
-            });
+            guard_pts(&tail);
             if let Err(e) = tail.link(&sinkpad) {
                 tracing::warn!(caps = %caps_name, error = %e, "remux: pad link failed");
             }
@@ -469,6 +520,69 @@ fn route_stream(
                 tracing::warn!(caps = %caps_name, error = %e, "remux: fakesink link failed");
             }
         }
+    }
+}
+
+/// decodebin → videoconvert → H.264 encoder → h264parse (byte-stream
+/// for the TS muxer). Rescues codecs no browser decodes (MPEG-4 Part 2,
+/// AV1/VP9-in-TS). videoconvert costs one GPU→CPU hop with hw decoders;
+/// ponytail: cudaconvert zero-copy path when both ends are NVENC/NVDEC.
+fn build_video_encode_chain(pipe: &gst::Pipeline, from: &gst::Pad, sinkpad: gst::Pad) {
+    let Some(enc_name) = h264_encoder() else {
+        tracing::error!("video encode routed with no verified H.264 encoder");
+        return;
+    };
+    let decode = gst::ElementFactory::make("decodebin").build().unwrap();
+    // Hardware decoders output device memory (nvav1dec → CUDAMemory,
+    // 10-bit P010) that videoconvert cannot take. NVENC target: stay on
+    // the GPU end to end (cudaupload passes CUDA through, uploads system
+    // memory; cudaconvert handles format — zero copy for NVDEC→NVENC).
+    // Other targets: cudadownload first (passthrough for system memory),
+    // then videoconvert. All availability-guarded.
+    let converter_names: Vec<&str> = if enc_name.starts_with("nv") {
+        vec!["cudaupload", "cudaconvert"]
+    } else {
+        vec!["cudadownload", "videoconvert"]
+    }
+    .into_iter()
+    .filter(|n| gst::ElementFactory::find(n).is_some())
+    .collect();
+    let converters: Vec<gst::Element> = converter_names
+        .iter()
+        .map(|n| gst::ElementFactory::make(n).build().unwrap())
+        .collect();
+    let enc = gst::ElementFactory::make(enc_name).build().unwrap();
+    // Sane defaults, guarded per element (props differ across encoders).
+    // nvh264enc/x264enc take kbit/s.
+    set_prop_str_if_present(&enc, "bitrate", "6000");
+    let parse = gst::ElementFactory::make("h264parse").build().unwrap();
+
+    let mut chain: Vec<&gst::Element> = converters.iter().collect();
+    chain.push(&enc);
+    chain.push(&parse);
+    pipe.add(&decode).unwrap();
+    pipe.add_many(chain.iter().copied()).unwrap();
+    gst::Element::link_many(chain.iter().copied()).unwrap();
+    decode.sync_state_with_parent().unwrap();
+    for el in &chain {
+        el.sync_state_with_parent().unwrap();
+    }
+    let out = parse.static_pad("src").unwrap();
+    guard_pts(&out);
+    if let Err(e) = out.link(&sinkpad) {
+        tracing::warn!(error = %e, "video encode chain → muxer link failed");
+    }
+    let convert_sink = chain[0].static_pad("sink").unwrap();
+    decode.connect_pad_added(move |_, pad| {
+        if convert_sink.is_linked() {
+            return; // first decoded stream wins
+        }
+        if let Err(e) = pad.link(&convert_sink) {
+            tracing::warn!(error = %e, "decodebin → video encode chain link failed");
+        }
+    });
+    if let Err(e) = from.link(&decode.static_pad("sink").unwrap()) {
+        tracing::warn!(error = %e, "→ decodebin link failed");
     }
 }
 
@@ -494,7 +608,9 @@ fn build_audio_encode_chain(pipe: &gst::Pipeline, from: &gst::Pad, sinkpad: gst:
     for el in [&decode, &convert, &resample, &enc, &parse] {
         el.sync_state_with_parent().unwrap();
     }
-    if let Err(e) = parse.static_pad("src").unwrap().link(&sinkpad) {
+    let out = parse.static_pad("src").unwrap();
+    guard_pts(&out);
+    if let Err(e) = out.link(&sinkpad) {
         tracing::warn!(error = %e, "remux: encode chain → muxer link failed");
     }
     let convert_sink = convert.static_pad("sink").unwrap();
@@ -687,7 +803,7 @@ pub fn start(out_dir: &Path, plan: RemuxPlan, mut source: Box<dyn RemuxSource>) 
     // them before starting or it never leaves Ready.
     anyhow::ensure!(plan.playable(), "nothing to remux");
     let waiting: WaitingPads = Arc::new(Mutex::new(std::collections::HashMap::new()));
-    if plan.video {
+    if plan.has_video() {
         let pad = hlssink.request_pad_simple("video").context("requesting video pad")?;
         waiting.lock().unwrap().insert("video", pad);
     }
@@ -701,9 +817,8 @@ pub fn start(out_dir: &Path, plan: RemuxPlan, mut source: Box<dyn RemuxSource>) 
     // stream once its real caps flow (see plumb_parsed_pad).
     let pipe = pipeline.clone();
     let waiting2 = waiting.clone();
-    let encode_audio = plan.audio == AudioMode::Encode;
     parsebin.connect_pad_added(move |_, pad| {
-        plumb_parsed_pad(&pipe, &waiting2, pad, encode_audio);
+        plumb_parsed_pad(&pipe, &waiting2, pad, plan);
     });
 
     let error = Arc::new(Mutex::new(None::<String>));
@@ -765,7 +880,7 @@ mod tests {
     use super::*;
     use std::time::{Duration, Instant};
 
-    const COPY_AV: RemuxPlan = RemuxPlan { video: true, audio: AudioMode::Copy };
+    const COPY_AV: RemuxPlan = RemuxPlan { video: StreamMode::Copy, audio: StreamMode::Copy };
 
     /// Manual repro: REMUX_SRC=/path/to/file cargo test -p kahawai-media \
     ///   remux_file_from_env -- --ignored --nocapture
@@ -775,7 +890,7 @@ mod tests {
         let src = std::path::PathBuf::from(std::env::var("REMUX_SRC").expect("set REMUX_SRC"));
         let out = tempfile::tempdir().unwrap();
         let info = crate::discover(&src, Duration::from_secs(30)).unwrap();
-        let plan = plan_streams(&info);
+        let plan = plan_streams(&info, &WEB_TARGET);
         eprintln!("plan: {plan:?}");
         let job = start(out.path(), plan, Box::new(FileSource::open(&src).unwrap())).unwrap();
         let deadline = Instant::now() + Duration::from_secs(120);
@@ -808,14 +923,11 @@ mod tests {
             audio: vec![kahawai_core::media::AudioStream { codec: "eac3".into(), ..Default::default() }],
             ..Default::default()
         };
-        let plan = plan_streams(&info);
-        assert!(plan.video, "hevc is TS-muxable");
-        if names.contains("audio/x-eac3") {
-            assert_eq!(plan.audio, AudioMode::Copy);
-        } else {
-            // eac3 not muxable: transcode when possible, else drop.
-            assert_ne!(plan.audio, AudioMode::Copy);
-        }
+        let plan = plan_streams(&info, &WEB_TARGET);
+        // hevc is muxable but not in the web target: transcode or drop.
+        assert_ne!(plan.video, StreamMode::Copy);
+        // eac3 is neither web-playable nor muxable: never Copy.
+        assert_ne!(plan.audio, StreamMode::Copy);
     }
 
     /// Corpus-sweep catch #2: one track ending well before the other used
@@ -890,9 +1002,9 @@ mod tests {
         crate::testutil::render_h264_eac3_mkv(&src_path);
 
         let info = crate::discover(&src_path, Duration::from_secs(30)).unwrap();
-        let plan = plan_streams(&info);
-        assert_eq!(plan.audio, AudioMode::Encode, "eac3 should plan as Encode: {info:?}");
-        assert!(plan.video);
+        let plan = plan_streams(&info, &WEB_TARGET);
+        assert_eq!(plan.audio, StreamMode::Encode, "eac3 should plan as Encode: {info:?}");
+        assert_eq!(plan.video, StreamMode::Copy);
 
         let out = tempfile::tempdir().unwrap();
         let job = start(out.path(), plan, Box::new(FileSource::open(&src_path).unwrap())).unwrap();
@@ -913,6 +1025,45 @@ mod tests {
         assert_eq!(seg.video[0].codec, "h264");
         assert_eq!(seg.audio.len(), 1, "audio missing from transcoded segment: {seg:?}");
         assert_eq!(seg.audio[0].codec, "aac", "audio not transcoded to AAC: {seg:?}");
+    }
+
+    /// M3: video no browser decodes (MPEG-4 Part 2) is transcoded to
+    /// H.264; the web target profile drives the plan (HUB-14/16).
+    #[test]
+    fn transcodes_mpeg4_video_to_h264() {
+        crate::init().unwrap();
+        if !crate::testutil::has_element("avenc_mpeg4") {
+            eprintln!("skipping: no avenc_mpeg4 to build the fixture");
+            return;
+        }
+        if h264_encoder().is_none() {
+            eprintln!("skipping: no verified H.264 encoder");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let src_path = dir.path().join("divx.mkv");
+        crate::testutil::render(&format!(
+            "videotestsrc num-buffers=125 ! video/x-raw,format=I420,width=320,height=240,framerate=25/1 ! avenc_mpeg4 ! matroskamux name=m audiotestsrc num-buffers=215 ! audioconvert ! fdkaacenc ! m. m. ! filesink location=\"{}\"",
+            src_path.display()
+        ));
+
+        let info = crate::discover(&src_path, Duration::from_secs(30)).unwrap();
+        let plan = plan_streams(&info, &WEB_TARGET);
+        assert_eq!(plan.video, StreamMode::Encode, "mpeg4 should plan as Encode: {info:?}");
+        assert_eq!(plan.audio, StreamMode::Copy, "aac should copy: {info:?}");
+
+        let out = tempfile::tempdir().unwrap();
+        let job = start(out.path(), plan, Box::new(FileSource::open(&src_path).unwrap())).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !job.finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(job.finished(), "video transcode did not finish");
+        assert!(job.failed().is_none(), "video transcode failed: {:?}", job.failed());
+        let seg =
+            crate::discover(&out.path().join("segment00000.ts"), Duration::from_secs(30)).unwrap();
+        assert_eq!(seg.video.first().map(|v| v.codec.as_str()), Some("h264"), "{seg:?}");
+        assert_eq!(seg.audio.first().map(|a| a.codec.as_str()), Some("aac"), "{seg:?}");
     }
 
     #[test]

@@ -238,17 +238,19 @@ fn sweep_one(path: &Path, full: bool, has_ffprobe: bool) -> (Verdict, String) {
     let codecs = describe(&info);
 
     // 2. Plan, as the hub would.
-    let plan = kahawai_media::remux::plan_streams(&info);
+    let plan = kahawai_media::remux::plan_streams(&info, &kahawai_media::remux::WEB_TARGET);
     if !plan.playable() {
         return (Verdict::Skip, format!("[needs transcoder] {codecs}"));
     }
-    let video_dropped = !plan.video && !info.video.is_empty();
+    let video_dropped = !plan.has_video() && !info.video.is_empty();
     let audio_dropped = !plan.has_audio() && !info.audio.is_empty();
-    let codecs = if plan.audio == kahawai_media::remux::AudioMode::Encode {
-        format!("{codecs} [audio→aac]")
-    } else {
-        codecs
-    };
+    let mut codecs = codecs;
+    if plan.video == kahawai_media::remux::StreamMode::Encode {
+        codecs = format!("{codecs} [video→h264]");
+    }
+    if plan.audio == kahawai_media::remux::StreamMode::Encode {
+        codecs = format!("{codecs} [audio→aac]");
+    }
 
     // 3. Remux through the real pipeline.
     let out = match tempfile::tempdir() {
@@ -299,7 +301,7 @@ fn sweep_one(path: &Path, full: bool, has_ffprobe: bool) -> (Verdict, String) {
     if !playlist_ok || segments.is_empty() {
         return (Verdict::Fail, format!("[no output] {codecs}"));
     }
-    if has_ffprobe && plan.video {
+    if has_ffprobe && plan.has_video() {
         for seg in &segments {
             let (missing, ooo) = video_dts_defects(seg);
             if missing + ooo > 0 {
@@ -320,7 +322,7 @@ fn sweep_one(path: &Path, full: bool, has_ffprobe: bool) -> (Verdict, String) {
         sorted.sort();
         if let Some(first) = sorted.first() {
             let (has_v, has_a) = segment_stream_kinds(first);
-            if plan.video && !has_v {
+            if plan.has_video() && !has_v {
                 return (Verdict::Fail, format!("[missing video] planned but absent — {codecs}"));
             }
             if plan.has_audio() && !has_a {

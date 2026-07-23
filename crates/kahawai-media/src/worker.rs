@@ -12,7 +12,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
-use crate::remux::{self, AudioMode, RemuxPlan, RemuxSource};
+use crate::remux::{self, RemuxPlan, RemuxSource, StreamMode};
 
 /// Cap on a single read request, both sides (sanity, not throughput —
 /// the remux feeder already reads in ≤4 MiB chunks).
@@ -44,26 +44,32 @@ impl RemuxSource for SocketSource {
     }
 }
 
-pub fn parse_audio_mode(s: &str) -> AudioMode {
+pub fn parse_mode(s: &str) -> StreamMode {
     match s {
-        "copy" => AudioMode::Copy,
-        "encode" => AudioMode::Encode,
-        _ => AudioMode::Off,
+        "copy" => StreamMode::Copy,
+        "encode" => StreamMode::Encode,
+        _ => StreamMode::Off,
     }
 }
 
-pub fn audio_mode_arg(mode: AudioMode) -> &'static str {
+pub fn mode_arg(mode: StreamMode) -> &'static str {
     match mode {
-        AudioMode::Copy => "copy",
-        AudioMode::Encode => "encode",
-        AudioMode::Off => "off",
+        StreamMode::Copy => "copy",
+        StreamMode::Encode => "encode",
+        StreamMode::Off => "off",
     }
 }
 
 /// Child entry point: connect to the parent's socket, run the pipeline
 /// to EOS, exit. Errors (including pipeline errors) return Err — the
 /// binary maps that to a non-zero exit the supervisor can see.
-pub fn run(socket: &Path, out_dir: &Path, size: u64, video: bool, audio: AudioMode) -> Result<()> {
+pub fn run(
+    socket: &Path,
+    out_dir: &Path,
+    size: u64,
+    video: StreamMode,
+    audio: StreamMode,
+) -> Result<()> {
     let stream = UnixStream::connect(socket)
         .with_context(|| format!("connecting to {}", socket.display()))?;
     let plan = RemuxPlan { video, audio };
