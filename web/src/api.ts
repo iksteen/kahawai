@@ -115,12 +115,15 @@ export async function fetchItem(id: string): Promise<ItemDetail> {
   return { ...(raw as Item), sources: sources.length, sources_detail: sources }
 }
 
+export type StreamVerdict = { video: string; audio: string }
+
 export type Session = {
   session_id: string
   mode: 'direct' | 'remux'
   stream_url: string
   content_type: string
   size: number
+  streams: StreamVerdict | null
 }
 
 export function startSession(itemId: string, mode: string): Promise<Session> {
@@ -169,6 +172,7 @@ export type AdminSession = {
   mode: string
   module_id: string
   idle_secs: number
+  streams: StreamVerdict | null
 }
 
 export const adminEnrollments = () =>

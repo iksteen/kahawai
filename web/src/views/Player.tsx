@@ -75,8 +75,10 @@ export default function Player({
       <video ref={videoRef} controls playsInline />
       <div className="playback-info mono">
         {item.title} · {session.mode}
-        {session.mode === 'remux' ? ' (repackaged in the hub, no re-encoding)' : ''} ·{' '}
-        {session.content_type}
+        {session.streams
+          ? ` · video: ${session.streams.video} · audio: ${session.streams.audio}`
+          : ''}{' '}
+        · {session.content_type}
       </div>
     </main>
   )

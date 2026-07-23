@@ -49,6 +49,9 @@ pub struct Session {
     pub container: Option<String>,
     pub duration_ms: Option<u64>,
     pub mode: Mode,
+    /// Per-kind stream verdict (remux sessions): what happened to video
+    /// and audio, for the player's playback-info overlay.
+    pub verdict: Option<(String, String)>,
     touched: Mutex<std::time::Instant>,
 }
 
@@ -254,12 +257,24 @@ impl Sessions {
             .await?;
 
         let id = ulid::Ulid::new().to_string();
+        let mut verdict = None;
         let session_mode = match mode {
             "direct" => Mode::Direct { lease },
-            "remux" => Mode::Remux {
-                runner: self.start_remux(&id, &info, lease, size).await?,
-                dir: self.scratch_root.join(&id),
-            },
+            "remux" => {
+                // The muxer stalls on unfed pads, so only claim what the
+                // plan will actually feed — decided by the muxer's own
+                // templates and the installed decoders/encoders (single
+                // source of truth with the pipeline's link logic).
+                let plan = kahawai_media::remux::plan_streams(&info);
+                if !plan.playable() {
+                    bail!("no playable streams — this source needs the video transcoder");
+                }
+                verdict = Some(kahawai_media::remux::plan_summary(&info, &plan));
+                Mode::Remux {
+                    runner: self.start_remux(&id, plan, lease, size).await?,
+                    dir: self.scratch_root.join(&id),
+                }
+            }
             other => bail!("unknown mode {other:?} (direct|remux)"),
         };
 
@@ -272,6 +287,7 @@ impl Sessions {
             container: info.container.clone(),
             duration_ms: info.duration_ms,
             mode: session_mode,
+            verdict,
             touched: Mutex::new(std::time::Instant::now()),
         });
         self.active.lock().unwrap().insert(session.id.clone(), session.clone());
@@ -285,19 +301,10 @@ impl Sessions {
     async fn start_remux(
         &self,
         session_id: &str,
-        info: &kahawai_core::media::MediaInfo,
+        plan: kahawai_media::remux::RemuxPlan,
         lease: Lease,
         size: u64,
     ) -> Result<RemuxRunner> {
-        // The muxer stalls on unfed pads, so only claim what the plan
-        // will actually feed — decided by the muxer's own templates and
-        // the installed decoders/encoders (single source of truth with
-        // the pipeline's link logic).
-        let plan = kahawai_media::remux::plan_streams(info);
-        if !plan.playable() {
-            bail!("no playable streams — this source needs the video transcoder");
-        }
-
         let dir = self.scratch_root.join(session_id);
         std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
 

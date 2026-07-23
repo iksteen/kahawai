@@ -123,7 +123,7 @@ export default function Detail({
         )}
         <span className="dim small-note">
           {autoMode(best) === 'remux'
-            ? 'remuxed to HLS in the hub — no re-encoding'
+            ? 'remuxed to HLS in the hub — streams converted only when needed'
             : 'direct play'}
         </span>
       </div>

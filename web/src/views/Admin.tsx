@@ -144,6 +144,11 @@ export default function Admin() {
             <span className="chips">
               <span className="chip">{s.mode}</span>
               <span>{s.title ?? s.session_id}</span>
+              {s.streams && (
+                <span className="mono dim">
+                  v: {s.streams.video} · a: {s.streams.audio}
+                </span>
+              )}
               <span className="dim">{s.username ?? '?'}</span>
               <span className="mono dim">idle {s.idle_secs}s</span>
             </span>

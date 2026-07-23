@@ -191,6 +191,10 @@ async fn admin_sessions(State(state): State<AppState>) -> Result<Json<Value>, Ap
             },
             "module_id": s.module_id,
             "idle_secs": s.idle_for().as_secs(),
+            "streams": s.verdict.as_ref().map(|(video, audio)| json!({
+                "video": video,
+                "audio": audio,
+            })),
         }));
     }
     Ok(Json(json!({ "sessions": out })))
@@ -308,6 +312,10 @@ async fn start_session(
             "size": session.size,
             "content_type": ctype,
             "stream_url": stream_url,
+            "streams": session.verdict.as_ref().map(|(video, audio)| json!({
+                "video": video,
+                "audio": audio,
+            })),
         })),
     ))
 }

@@ -186,6 +186,52 @@ pub fn plan_streams(info: &kahawai_core::media::MediaInfo) -> RemuxPlan {
     RemuxPlan { video, audio }
 }
 
+/// Human-readable per-kind verdict for the playback-info overlay
+/// (§4.3b spirit: the player reports which path was taken and why —
+/// nothing converts silently).
+pub fn plan_summary(
+    info: &kahawai_core::media::MediaInfo,
+    plan: &RemuxPlan,
+) -> (String, String) {
+    let names = ts_muxable_names();
+    let video = if plan.video {
+        info.video
+            .iter()
+            .find(|v| codec_to_caps_name("video", &v.codec).is_some_and(|n| names.contains(n)))
+            .map(|v| format!("{} copy", v.codec))
+            .unwrap_or_else(|| "copy".into())
+    } else if info.video.is_empty() {
+        "none".into()
+    } else {
+        format!("{} dropped (needs transcoder)", info.video[0].codec)
+    };
+    let audio = match plan.audio {
+        AudioMode::Copy => info
+            .audio
+            .iter()
+            .find(|a| codec_to_caps_name("audio", &a.codec).is_some_and(|n| names.contains(n)))
+            .map(|a| format!("{} copy", a.codec))
+            .unwrap_or_else(|| "copy".into()),
+        AudioMode::Encode => {
+            let src = info
+                .audio
+                .iter()
+                .find(|a| codec_to_caps_name("audio", &a.codec).is_some_and(can_decode))
+                .map(|a| a.codec.as_str())
+                .unwrap_or("audio");
+            format!("{src} → aac (transcoded)")
+        }
+        AudioMode::Off => {
+            if info.audio.is_empty() {
+                "none".into()
+            } else {
+                format!("{} dropped (needs transcoder)", info.audio[0].codec)
+            }
+        }
+    };
+    (video, audio)
+}
+
 /// TS muxing needs specific stream-formats (h26x as Annex-B byte-stream,
 /// AAC as ADTS) while containers store avc/hvc1/raw. A per-stream parser
 /// between demux and muxer converts during caps negotiation — pure
