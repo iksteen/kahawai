@@ -45,7 +45,11 @@ fn map_info(info: &DiscovererInfo) -> MediaInfo {
         ..Default::default()
     };
 
-    for s in info.video_streams() {
+    // The *_streams() lists flatten parse chains: a mislabeled track
+    // (E-AC-3 tag, AC-3 bitstream) yields one entry per link. Keep only
+    // terminal entries — the real bitstream type, and the caps the remux
+    // pipeline will actually see.
+    for s in info.video_streams().into_iter().filter(is_terminal) {
         let caps = s.caps();
         let name = caps
             .as_ref()
@@ -65,7 +69,7 @@ fn map_info(info: &DiscovererInfo) -> MediaInfo {
         });
     }
 
-    for s in info.audio_streams() {
+    for s in info.audio_streams().into_iter().filter(is_terminal) {
         let caps = s.caps();
         let name = caps
             .as_ref()
@@ -85,7 +89,7 @@ fn map_info(info: &DiscovererInfo) -> MediaInfo {
         });
     }
 
-    for s in info.subtitle_streams() {
+    for s in info.subtitle_streams().into_iter().filter(is_terminal) {
         let name = s
             .caps()
             .and_then(|c| c.structure(0).map(|st| st.name().to_string()))
@@ -117,6 +121,12 @@ fn map_info(info: &DiscovererInfo) -> MediaInfo {
     }
 
     out
+}
+
+/// A stream info is terminal when nothing further re-types it (its
+/// `next()` is the end of the parse chain).
+fn is_terminal<T: gst::glib::prelude::IsA<DiscovererStreamInfo>>(s: &T) -> bool {
+    s.as_ref().next().is_none()
 }
 
 fn caps_name(s: &DiscovererStreamInfo) -> Option<String> {

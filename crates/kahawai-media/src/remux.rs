@@ -139,42 +139,66 @@ fn timestamper_for(caps: &gst::CapsRef) -> Option<&'static str> {
 /// each is taken by the first matching parsed stream.
 type WaitingPads = Arc<Mutex<std::collections::HashMap<&'static str, gst::Pad>>>;
 
-fn link_parsed_pad(pipe: &gst::Pipeline, waiting: &WaitingPads, pad: &gst::Pad, caps: &gst::Caps) {
+/// Plumb a fresh parsebin pad: an unconditional queue absorbs data while
+/// routing waits for the *real* caps. The stream caps advertised at
+/// pad-added can lie — mislabeled tracks (E-AC-3 tag, AC-3 bitstream) are
+/// re-typed by parsebin's internal parser only once data flows, and
+/// routing on the advertised caps starved the muxer pad forever
+/// (corpus-sweep finding). The caps event precedes the first buffer in
+/// the same streaming thread, so deciding in the probe is race-free.
+fn plumb_parsed_pad(pipe: &gst::Pipeline, waiting: &WaitingPads, pad: &gst::Pad) {
+    // queue: decouples the muxer from parsebin's threads (the aggregator
+    // deadlocks without it). Default queue limits (1 MiB / 1 s) are far
+    // too small: the HLS sink holds one branch back while waiting for a
+    // keyframe-aligned cut on the other, and files with uneven track ends
+    // or high bitrates deadlock (corpus-sweep finding). Bound by bytes
+    // only — generous enough for real interleave skew, still OOM-safe.
+    let queue = gst::ElementFactory::make("queue")
+        .property("max-size-bytes", 64u32 * 1024 * 1024)
+        .property("max-size-buffers", 0u32)
+        .property("max-size-time", 0u64)
+        .build()
+        .unwrap();
+    pipe.add(&queue).unwrap();
+    queue.sync_state_with_parent().unwrap();
+    pad.link(&queue.static_pad("sink").unwrap()).unwrap();
+
+    let qsrc = queue.static_pad("src").unwrap();
+    let pipe = pipe.clone();
+    let waiting = waiting.clone();
+    qsrc.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |qpad, info| {
+        if let Some(gst::PadProbeData::Event(ev)) = &info.data
+            && let gst::EventView::Caps(c) = ev.view()
+            && qpad.peer().is_none()
+        {
+            route_stream(&pipe, &waiting, qpad, &c.caps_owned());
+        }
+        gst::PadProbeReturn::Ok
+    });
+}
+
+/// Route a stream to the muxer (via parser/timestamper) or a fakesink,
+/// now that its negotiated caps are known.
+fn route_stream(pipe: &gst::Pipeline, waiting: &WaitingPads, from: &gst::Pad, caps: &gst::Caps) {
     let caps_name = caps.structure(0).map(|s| s.name().to_string()).unwrap_or_default();
     let target = ts_compatible(&caps_name).and_then(|kind| waiting.lock().unwrap().remove(kind));
     match target {
         Some(sinkpad) => {
-            // queue: decouples the muxer from parsebin's threads (the
-            // aggregator deadlocks without it). Default queue limits
-            // (1 MiB / 1 s) are far too small: the HLS sink holds one
-            // branch back while waiting for a keyframe-aligned cut on the
-            // other, and files with uneven track ends or high bitrates
-            // deadlock (corpus-sweep finding). Bound by bytes only —
-            // generous enough for real interleave skew, still OOM-safe.
-            let queue = gst::ElementFactory::make("queue")
-                .property("max-size-bytes", 64u32 * 1024 * 1024)
-                .property("max-size-buffers", 0u32)
-                .property("max-size-time", 0u64)
-                .build()
-                .unwrap();
-            pipe.add(&queue).unwrap();
-            queue.sync_state_with_parent().unwrap();
-            let mut tail = queue.clone();
-            // queue → parser → timestamper, each present only when it
-            // applies; every hop is pure repackaging, no decode.
+            let mut tail = from.clone();
+            // parser → timestamper, each present only when it applies;
+            // every hop is pure repackaging, no decode.
             for name in [parser_for(caps), timestamper_for(caps)].into_iter().flatten() {
                 let el = gst::ElementFactory::make(name).build().unwrap();
                 pipe.add(&el).unwrap();
                 el.sync_state_with_parent().unwrap();
-                tail.link(&el).unwrap();
-                tail = el;
+                tail.link(&el.static_pad("sink").unwrap()).unwrap();
+                tail = el.static_pad("src").unwrap();
             }
             // hlssink3 (≤0.15.3, imp.rs:304) unwraps the PTS of each
             // fragment's first buffer; a PTS-less frame (old AVI streams)
             // aborts the whole process — a Rust panic in an FFI callback
             // cannot unwind. Guard: borrow the DTS, or drop the buffer.
-            let src = tail.static_pad("src").unwrap();
-            src.add_probe(gst::PadProbeType::BUFFER, |_, info| {
+            tail.add_probe(gst::PadProbeType::BUFFER, |_, info| {
                 if let Some(gst::PadProbeData::Buffer(buffer)) = &mut info.data {
                     // ponytail: pts=dts misorders B-frames (sweep flags
                     // those [bad dts] → transcoder work list); dropping
@@ -188,19 +212,26 @@ fn link_parsed_pad(pipe: &gst::Pipeline, waiting: &WaitingPads, pad: &gst::Pad, 
                 }
                 gst::PadProbeReturn::Ok
             });
-            let ok = pad
-                .link(&queue.static_pad("sink").unwrap())
-                .and_then(|_| src.link(&sinkpad));
-            if let Err(e) = ok {
+            if let Err(e) = tail.link(&sinkpad) {
                 tracing::warn!(caps = %caps_name, error = %e, "remux: pad link failed");
             }
         }
         None => {
             tracing::info!(caps = %caps_name, "remux: dropping stream (not TS-compatible or duplicate)");
-            let fake = gst::ElementFactory::make("fakesink").build().unwrap();
+            // sync=false: don't pace the dropped stream at realtime speed;
+            // async=false: don't hold pipeline preroll hostage to a sparse
+            // track (subtitles) that may not produce a buffer for minutes
+            // (sweep finding: multi-track files deadlocked in PAUSED).
+            let fake = gst::ElementFactory::make("fakesink")
+                .property("sync", false)
+                .property("async", false)
+                .build()
+                .unwrap();
             pipe.add(&fake).unwrap();
             fake.sync_state_with_parent().unwrap();
-            pad.link(&fake.static_pad("sink").unwrap()).unwrap();
+            if let Err(e) = from.link(&fake.static_pad("sink").unwrap()) {
+                tracing::warn!(caps = %caps_name, error = %e, "remux: fakesink link failed");
+            }
         }
     }
 }
@@ -394,19 +425,13 @@ pub fn start(
         waiting.lock().unwrap().insert("audio", pad);
     }
 
-    // Link parsed elementary streams to the pre-requested pads; one per
-    // kind, linked synchronously inside pad-added so no buffer ever hits an
-    // unlinked pad. Pad caps may not be set yet at this point, but the
-    // GstStream parsebin attaches to the pad already knows them.
+    // Every parsed stream gets a queue immediately (no buffer ever hits an
+    // unlinked pad); routing to the pre-requested muxer pads happens per
+    // stream once its real caps flow (see plumb_parsed_pad).
     let pipe = pipeline.clone();
     let waiting2 = waiting.clone();
     parsebin.connect_pad_added(move |_, pad| {
-        let caps = pad
-            .stream()
-            .and_then(|s| s.caps())
-            .or_else(|| pad.current_caps())
-            .unwrap_or_else(gst::Caps::new_empty);
-        link_parsed_pad(&pipe, &waiting2, pad, &caps);
+        plumb_parsed_pad(&pipe, &waiting2, pad);
     });
 
     let error = Arc::new(Mutex::new(None::<String>));
