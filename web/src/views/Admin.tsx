@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import {
   adminApprove,
+  adminSetSatelliteDisabled,
   adminDeleteSatellite,
   adminEndSession,
   adminEnrollments,
@@ -124,14 +125,27 @@ export default function Admin() {
               <span>{s.name}</span>
               <span className="mono dim">{s.module_id}</span>
               <span className="mono dim">{s.cert_fingerprint.slice(0, 16)}…</span>
+              {s.disabled && <span className="chip warn">disabled</span>}
             </span>
-            <button
-              className={confirming === s.module_id ? 'btn danger small' : 'btn ghost small'}
-              onClick={() => deleteSatellite(s.module_id)}
-              onBlur={() => setConfirming(null)}
-            >
-              {confirming === s.module_id ? 'Really delete + revoke?' : 'Delete'}
-            </button>
+            <span>
+              {s.module_type === 'transcoder' && (
+                <button
+                  className="btn ghost small"
+                  onClick={() =>
+                    adminSetSatelliteDisabled(s.module_id, !s.disabled).then(reload)
+                  }
+                >
+                  {s.disabled ? 'Enable' : 'Disable'}
+                </button>
+              )}
+              <button
+                className={confirming === s.module_id ? 'btn danger small' : 'btn ghost small'}
+                onClick={() => deleteSatellite(s.module_id)}
+                onBlur={() => setConfirming(null)}
+              >
+                {confirming === s.module_id ? 'Really delete + revoke?' : 'Delete'}
+              </button>
+            </span>
           </li>
         ))}
       </ul>

@@ -61,6 +61,10 @@ pub struct Registry {
     tc_links: Mutex<HashMap<String, tokio::sync::mpsc::Sender<Result<kahawai_proto::v1::HubToTc, tonic::Status>>>>,
     /// Dispatched sessions per transcoder (inverse-load placement).
     tc_load: Mutex<HashMap<String, usize>>,
+    /// Admin-disabled satellites: placement skips them; active sessions
+    /// finish. ponytail: in-memory (an ops/testing toggle) — persist in
+    /// the satellites table if drain-across-restarts is ever needed.
+    disabled: Mutex<std::collections::HashSet<String>>,
     /// Command senders for connected hosts' Link streams.
     links: Mutex<HashMap<String, tokio::sync::mpsc::Sender<Result<kahawai_proto::v1::HubToHost, tonic::Status>>>>,
 }
@@ -75,6 +79,7 @@ impl Registry {
             transcoder_caps: Mutex::new(HashMap::new()),
             tc_links: Mutex::new(HashMap::new()),
             tc_load: Mutex::new(HashMap::new()),
+            disabled: Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -454,6 +459,16 @@ impl Registry {
         }
     }
 
+    /// Admin toggle: a disabled satellite is skipped by placement.
+    pub fn set_disabled(&self, module_id: &str, disabled: bool) {
+        let mut set = self.disabled.lock().unwrap();
+        if disabled {
+            set.insert(module_id.to_string());
+        } else {
+            set.remove(module_id);
+        }
+    }
+
     /// Placement (§4.5): capability fit ≥ hw-accel ≥ inverse load.
     /// ponytail: per-box decode capability and max_sessions enforcement
     /// come with the negotiation-aware capability report.
@@ -461,9 +476,10 @@ impl Registry {
         let caps = self.transcoder_caps.lock().unwrap().clone();
         let links = self.tc_links.lock().unwrap();
         let load = self.tc_load.lock().unwrap();
+        let disabled = self.disabled.lock().unwrap();
         let mut candidates: Vec<(bool, usize, String)> = caps
             .iter()
-            .filter(|(id, _)| links.contains_key(*id))
+            .filter(|(id, _)| links.contains_key(*id) && !disabled.contains(*id))
             .filter_map(|(id, c)| {
                 let encoders = c.get("encoders")?.as_array()?;
                 let has = |codec: &str| encoders.iter().any(|e| e["codec"] == codec);
@@ -504,6 +520,7 @@ impl Registry {
                     "enrolled_at": r.get::<i64, _>("enrolled_at"),
                     "connected": state.is_some_and(|s| s.connected),
                     "capabilities": caps.get(&id),
+                    "disabled": self.disabled.lock().unwrap().contains(&id),
                 })
             })
             .collect())

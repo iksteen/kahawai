@@ -163,6 +163,7 @@ export type Satellite = {
   name: string
   cert_fingerprint: string
   connected: boolean
+  disabled: boolean
 }
 
 export type AdminSession = {
@@ -186,6 +187,12 @@ export const adminSatellites = () =>
   json<{ satellites: Satellite[] }>('/admin/v1/satellites')
 export const adminDeleteSatellite = (id: string) =>
   json<unknown>(`/admin/v1/satellites/${id}`, { method: 'DELETE' })
+
+export const adminSetSatelliteDisabled = (id: string, disabled: boolean) =>
+  api(`/admin/v1/satellites/${id}/disabled`, {
+    method: 'POST',
+    body: JSON.stringify({ disabled }),
+  })
 export const adminSessions = () =>
   json<{ sessions: AdminSession[] }>('/admin/v1/sessions')
 export const adminEndSession = (id: string) =>

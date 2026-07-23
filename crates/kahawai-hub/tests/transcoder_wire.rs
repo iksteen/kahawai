@@ -128,8 +128,8 @@ async fn transcoder_registers_capabilities_and_clears_on_disconnect() {
     tx.send(TcToHub {
         msg: Some(tc_to_hub::Msg::Capabilities(CapabilityReport {
             encoders: vec![
-                EncoderCap { codec: "h264".into(), element: "x264enc".into() },
-                EncoderCap { codec: "aac".into(), element: "fdkaacenc".into() },
+                EncoderCap { codec: "h264".into(), element: "x264enc".into(), hardware: false },
+                EncoderCap { codec: "aac".into(), element: "fdkaacenc".into(), hardware: false },
             ],
             max_sessions: 2,
         })),
@@ -150,6 +150,13 @@ async fn transcoder_registers_capabilities_and_clears_on_disconnect() {
         "capability report in overview",
     )
     .await;
+
+    // Placement finds it — until the admin disables it.
+    assert_eq!(hub.registry.pick_transcoder(true, true).as_deref(), Some("01TC"));
+    hub.registry.set_disabled("01TC", true);
+    assert_eq!(hub.registry.pick_transcoder(true, true), None);
+    hub.registry.set_disabled("01TC", false);
+    assert_eq!(hub.registry.pick_transcoder(true, true).as_deref(), Some("01TC"));
 
     // Disconnect: capabilities must not outlive the link.
     drop(tx);

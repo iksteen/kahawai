@@ -47,6 +47,7 @@ pub fn router(
         .route("/admin/v1/enrollments/approve", post(admin_approve))
         .route("/admin/v1/satellites", get(admin_satellites))
         .route("/admin/v1/satellites/{id}", axum::routing::delete(admin_delete_satellite))
+        .route("/admin/v1/satellites/{id}/disabled", post(admin_set_disabled))
         .route("/admin/v1/sessions", get(admin_sessions))
         .route("/admin/v1/sessions/{id}", axum::routing::delete(admin_end_session))
         .route_layer(axum::middleware::from_fn(require_admin))
@@ -166,6 +167,23 @@ async fn admin_delete_satellite(
         .await
         .map_err(|e| (StatusCode::NOT_FOUND, format!("{e:#}")))?;
     Ok(Json(json!({ "deleted": id, "removed": fingerprint, "sessions_ended": ended })))
+}
+
+#[derive(serde::Deserialize)]
+struct SetDisabled {
+    disabled: bool,
+}
+
+/// Admin drain toggle: placement skips a disabled satellite; running
+/// sessions finish on their own.
+async fn admin_set_disabled(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<SetDisabled>,
+) -> Result<StatusCode, ApiError> {
+    state.registry.set_disabled(&id, body.disabled);
+    tracing::info!(module_id = %id, disabled = body.disabled, "satellite placement toggle");
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn admin_sessions(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
