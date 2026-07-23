@@ -109,11 +109,20 @@ pub fn aac_encoder() -> Option<&'static str> {
 }
 
 /// H.264 encoders in preference order: hardware first (VA-API, NVENC,
-/// QSV), then software. Dry-run verification is what makes this list
+/// QSV, VideoToolbox), then software. Dry-run verification is what makes this list
 /// safe — a hw element on a box without the driver fails the probe and
 /// the next one wins (TC-1/TC-6).
 pub const H264_ENCODERS: &[&str] =
-    &["vah264enc", "vaapih264enc", "nvh264enc", "qsvh264enc", "x264enc", "openh264enc"];
+    &[
+    "vah264enc",
+    "vaapih264enc",
+    "nvh264enc",
+    "qsvh264enc",
+    "vtenc_h264_hw", // VideoToolbox (Apple Silicon)
+    "vtenc_h264",
+    "x264enc",
+    "openh264enc",
+];
 
 /// Best available H.264 encoder, dry-run-verified once. None → this box
 /// cannot transcode video.

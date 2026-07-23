@@ -81,7 +81,7 @@ const MATRIX: &[(&str, &[&str], bool, &str, bool)] = &[
      ),
     (
         "encode h264",
-        &["vah264enc", "vaapih264enc", "nvh264enc", "qsvh264enc", "x264enc", "openh264enc"],
+        &["vah264enc", "vaapih264enc", "nvh264enc", "qsvh264enc", "vtenc_h264_hw", "vtenc_h264", "x264enc", "openh264enc"],
         false,
         "no video transcoding to H.264",
         false,
