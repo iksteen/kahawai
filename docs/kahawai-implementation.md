@@ -22,6 +22,30 @@
 | IDs | ULID (`ulid` crate) for all entities | Sortable, opaque |
 | Web UI | TypeScript + Vite + React, `hls.js` for playback; assets embedded via `rust-embed` | HUB-25..28; single-binary distribution preserved |
 
+### 1.1 Media framework: why GStreamer, not FFmpeg
+
+Every incumbent in this space (Jellyfin, Plex, Emby) is built on FFmpeg, so this choice is deliberate and should be understood — and periodically re-examined — against the reasoning below.
+
+**Rationale.**
+1. **The architecture is a pipeline graph.** The negotiation engine emits a per-stream plan (copy / encode / overlay / mux), and GStreamer's programming model is dynamically constructed graphs of exactly those operations. The FFmpeg alternatives are string-typed CLI construction (the Jellyfin approach — fragile, unstructured, hard to test) or the low-level libav* C APIs. `TranscodeSpec → gst pipeline` is a direct, typed mapping.
+2. **Rust bindings quality.** `gstreamer-rs` is maintained upstream by the GStreamer project itself and is among the best multimedia bindings in the Rust ecosystem; FFmpeg's Rust bindings are community-run, unsafe-heavy, and chase API churn.
+3. **Feature synergies.** `GstDiscoverer` *is* the mediahost scanner (MH-3); runtime element enumeration *is* the transcoder capability report (TC-1) and the `doctor` plugin inventory (OPS-3); `appsrc`/`appsink` make the byte-plane feed and the in-hub remuxer (§4.6) natural; caps negotiation inside pipelines mirrors the hub's own client negotiation model.
+4. **Licensing structure.** The base/good/bad/ugly plugin tiers give distributors a deliberate, per-plugin patent posture (NFR-8) that FFmpeg's monolithic build does not.
+5. **FFmpeg isn't actually excluded.** Builds ship the `gst-libav` plugin set, wrapping FFmpeg's demuxers/decoders inside GStreamer elements — most of libav's famed tolerance for malformed rips is retained, behind the better API.
+
+**Risk register.**
+
+| Risk | Assessment | Mitigation |
+|---|---|---|
+| Robustness on broken/weird rips (libavformat is the gold standard) | High likelihood, medium impact | Ship `gst-libav`; discovery failures surface per-file (MH-8) instead of failing scans; fixture corpus (§9) grows a "hostile files" set from real-world bug reports |
+| In-process pipeline crash takes down the transcoder (FFmpeg-CLI designs get process isolation free) | Medium likelihood, high impact | Each transcode session's pipeline runs in a supervised child process (see §6); a segfault kills one session, the supervisor reports `SessionError`, hub reschedules per AR-6 |
+| HDR→SDR tone mapping maturity (libplacebo, FFmpeg-adjacent, currently leads) | Medium | Dedicated test matrix for HDR10/HLG sources in M3; acceptable-quality bar defined before GA; shader-based path as fallback; revisit if GStreamer's libplacebo integration matures |
+| Smaller prior-art corpus: hwaccel quirks per driver generation are folklore in FFmpeg land, undocumented for GStreamer | High likelihood, medium impact | Encoder dry-run verification at registration (§6) catches broken drivers early; `doctor` output designed to make hardware bug reports actionable; maintain our own driver-quirk notes in-repo |
+| Pipeline debugging is arcane (`not-negotiated` errors) | Certain, low impact | `GST_DEBUG` category presets and pipeline-graph (`.dot`) dumps wired into transcoder diagnostics; every `SessionError` carries the source element and its last error/state |
+| Framework lock-in if a specific path underperforms | Low | The `PlayPlan → pipeline` mapping is confined to `kahawai-media`'s pipeline builder; a per-path alternative backend (e.g., spawning FFmpeg for one problematic conversion) would be an isolated change, not a rewrite |
+
+The standing decision: GStreamer, with `gst-libav` bundled, per-session process isolation, and the pipeline-construction layer kept thin enough to hedge. Revisit trigger: if M3 hardware-transcoding validation on the reference targets (VA-API Gemini Lake/Alder Lake, NVENC) reveals quirks that cost more than two weeks of unplanned work, evaluate an FFmpeg-CLI fallback for the affected paths before GA.
+
 ## 2. Workspace layout
 
 ```
@@ -98,7 +122,7 @@ Fast-path change detection uses `(path, size, mtime)`; `ContentId` resolves rena
 
 ### 4.1 Data model (SQLite)
 
-Core tables: `mediahosts`, `collections`, `files` (technical metadata as JSON column + indexed scalar columns), `libraries`, `library_collections`, `items` (logical entities; `kind` = movie|show|season|episode|artist|album|track), `item_sources` (item ↔ file, quality rank), `item_metadata` (per-provider, per-language), `subtitles` (downloaded/registered external subtitle streams, §4.3a), `images` (cached artwork, size variants), `users`, `grants`, `watch_state (user, item, position_ms, play_count, updated_at)`, `watch_state_archive` and `binding_archive` (content-identity-keyed survivors of mediahost deletion, §7.4), `sessions`, `revoked_certs (fingerprint, revoked_at)`, `provider_cache (key, body, expires_at)`.
+Core tables: `mediahosts`, `collections`, `files` (technical metadata as JSON column + indexed scalar columns), `libraries`, `library_collections`, `items` (logical entities; `kind` = movie|show|season|episode|artist|album|track), `item_sources` (item ↔ file, quality rank), `item_metadata` (per-provider, per-language), `subtitles` (downloaded/registered external subtitle streams, §4.3a), `images` (cached artwork, size variants), `users`, `grants`, `watch_state (user, item, position_ms, play_count, updated_at)`, `watch_state_archive` and `binding_archive` (content-identity-keyed survivors of mediahost deletion, §7.4), `sessions`, `satellites (module_id, type, name, cert_fingerprint(s), enrolled_at)` — this table *is* the mTLS allowlist — plus append-only `satellite_audit`, `provider_cache (key, body, expires_at)`.
 
 Watch-state writes are batched but flushed on session teardown and every 10 s (NFR-3).
 
@@ -192,7 +216,7 @@ GET  /admin/v1/...                          # registry, libraries, matching queu
 GET  /admin/v1/enrollments                  # pending CSRs (fingerprint, type, name, age)
 POST /admin/v1/enrollments/approve          # body: { code }
 GET  /admin/v1/satellites                   # enrolled modules + cert fingerprints + status
-DELETE /admin/v1/satellites/{id}            # delete = revoke cert + cascade (see §7.4)
+DELETE /admin/v1/satellites/{id}            # delete = allowlist removal + cascade (see §7.4)
 ```
 
 `/playback/decisions` is side-effect-free and returns the full negotiation verdict (per-stream direct/remux/transcode + reasons) so clients can display "why is this transcoding".
@@ -257,7 +281,7 @@ appsrc ! parsebin ! streamselect
 
 Streams marked `Copy` bypass decode: `parse ! queue` straight into the muxer. Segment duration 4 s (2 s for LL-HLS later). Seek = teardown + rebuild with `segment start` at target keyframe (accurate seek via `parsebin` index when available), playlist continues with `EXT-X-DISCONTINUITY` (TC-4). Transcode-ahead window: pause pipeline (`appsink` backpressure on segment sink) when > N minutes ahead of last-fetched segment (TC-5).
 
-**Resource control.** Session slots = min(configured, hw session limit); scratch dir with LRU eviction of segments already fetched by the hub; cgroup-friendly CPU shares documented for containerized runs (TC-6).
+**Resource control.** Each session's pipeline runs in a supervised child process (§1.1 risk register): the transcoder main process holds the control-plane connection and spawns one worker per session communicating over a local socket, so a decoder crash on a corrupt file kills that session only — the supervisor reaps it, emits `SessionError` with the captured GStreamer diagnostics, and the hub reschedules or fails the session per AR-6. Session slots = min(configured, hw session limit); scratch dir with LRU eviction of segments already fetched by the hub; cgroup-friendly CPU shares documented for containerized runs (TC-6).
 
 ## 7. Security implementation — hub as CA
 
@@ -293,13 +317,15 @@ The code commits to the CSR (and therefore the satellite's public key), so a mac
 
 Satellite leaf certs: `extendedKeyUsage = clientAuth, serverAuth` (serverAuth reserved for future delegated delivery, AR-8), URI SAN `kahawai://<mediahost|transcoder>/<module_id>`, 90-day validity. The hub reads module type and ID from the SAN on every connection — the certificate is the identity; no separate token database. When less than 30 days of validity remain, the satellite submits a fresh CSR over the already-authenticated control channel and the hub signs it automatically (SEC-7); renewal keeps or rotates the keypair per config.
 
-### 7.4 Validation and revocation (SEC-5..6)
+### 7.4 Validation and deletion (SEC-5..6)
 
-Both mTLS listeners use a custom `rustls` `ClientCertVerifier`: verify chain to the hub CA, reject expired certs, then check `sha256(cert_DER)` against the `revoked_certs` table (kept in memory, backed by SQLite; also consulted by the enrollment service to stop re-submission spam from revoked keys). Satellites use a `ServerCertVerifier` that requires the hub chain to terminate at the *pinned* CA cert byte-for-byte — a different CA with the same name fails.
+Admission is **allow-list based**. Both mTLS listeners use a custom `rustls` `ClientCertVerifier`: verify chain to the hub CA and expiry, then require `sha256(cert_DER)` to be present in the in-memory allowlist — the set of `cert_fingerprint` values from the `satellites` table (SQLite-backed, reloaded on change). A certificate that chains perfectly but isn't the currently registered cert of an enrolled satellite is refused: fail closed, no separate deny list to maintain, and a leaked or mis-issued CA-signed cert is inert unless its fingerprint was explicitly admitted. Satellites use a `ServerCertVerifier` that requires the hub chain to terminate at the *pinned* CA cert byte-for-byte — a different CA with the same name fails.
 
-Revocation only happens through satellite deletion. `DELETE /admin/v1/satellites/{id}` runs one transaction-plus-teardown sequence:
+Renewal (§7.3) interacts with the allowlist atomically: the hub inserts the new fingerprint in the same transaction that issues the renewed certificate, and the satellite row keeps both fingerprints until the satellite reconnects with the new cert (or a 24 h grace elapses), at which point the old one is dropped — a satellite can't lock itself out mid-renewal.
 
-1. insert cert fingerprint into `revoked_certs`;
+Allowlist removal only happens through satellite deletion. `DELETE /admin/v1/satellites/{id}` runs one transaction-plus-teardown sequence:
+
+1. delete the satellite row — its fingerprint leaves the allowlist, and the fingerprint is recorded in an append-only `satellite_audit` log (used to rate-limit re-enrollment spam from known-deleted keys and for forensics);
 2. registry closes the satellite's control and byte-plane connections; active sessions fail over (transcoder) or terminate with a client-visible error (mediahost, AR-6);
 3. mediahost only — cascade: archive `watch_state` rows and manual match bindings for affected items into `watch_state_archive (user_id, content_id, position_ms, play_count)` / `binding_archive (content_id, ext_id)`, then delete `item_sources` for the host's files, delete items with zero remaining sources, delete `files`, `collections`, and `library_collections` rows;
 4. emit a library-changed event on `/api/v1/events`.
@@ -365,7 +391,7 @@ All-in-one reads the same file with all three sections present and `hub`-address
 
 ## 9. Testing strategy
 
-Negotiation engine: exhaustive table-driven unit tests (capability × source matrix). Media layer: fixture corpus generated by `gst-launch` scripts (each codec/container/subtitle permutation, tiny durations) committed via Git LFS; discovery snapshots asserted. Integration: `LocalTransport` lets the full three-module flow run in one test process; a second suite runs the same client-visible tests against a docker-compose modular topology (acceptance criterion 3). Chaos tests: kill/reconnect mediahost and transcoder mid-session (criterion 4). PKI tests: full enrollment happy path, wrong/expired code, CSR substitution (fingerprint mismatch), renewal near expiry, satellite refusing a hub presenting a foreign CA, and the deletion path — delete a mediahost, assert connection drop + collection removal + TLS-level reconnection refusal, then re-enroll, rescan, and assert manual matches and watch state are restored from the archives (criterion 5). Web UI: Playwright end-to-end suite driven against the all-in-one binary (login, enrollment approval, library composition, direct/remux/transcode playback with the real capability probe, subtitle search+download), run in Chromium and WebKit to cover both the MSE and native-HLS player paths. Performance: `criterion` micro-benches for negotiation and scan throughput; k6 scripts for API latency targets (NFR-1).
+Negotiation engine: exhaustive table-driven unit tests (capability × source matrix). Media layer: fixture corpus generated by `gst-launch` scripts (each codec/container/subtitle permutation, tiny durations) committed via Git LFS; discovery snapshots asserted. Integration: `LocalTransport` lets the full three-module flow run in one test process; a second suite runs the same client-visible tests against a docker-compose modular topology (acceptance criterion 3). Chaos tests: kill/reconnect mediahost and transcoder mid-session (criterion 4). PKI tests: full enrollment happy path, wrong/expired code, CSR substitution (fingerprint mismatch), a CA-signed certificate *not* on the allowlist refused at handshake (fail-closed), renewal near expiry including the old/new fingerprint overlap window, satellite refusing a hub presenting a foreign CA, and the deletion path — delete a mediahost, assert connection drop + collection removal + TLS-level reconnection refusal, then re-enroll, rescan, and assert manual matches and watch state are restored from the archives (criterion 5). Web UI: Playwright end-to-end suite driven against the all-in-one binary (login, enrollment approval, library composition, direct/remux/transcode playback with the real capability probe, subtitle search+download), run in Chromium and WebKit to cover both the MSE and native-HLS player paths. Performance: `criterion` micro-benches for negotiation and scan throughput; k6 scripts for API latency targets (NFR-1).
 
 ## 10. Operational readiness (OPS-1..8)
 

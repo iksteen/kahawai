@@ -31,7 +31,7 @@ fn get_authed(uri: &str, token: &str) -> Request<Body> {
 async fn setup_then_auth_flow() {
     let dir = tempfile::tempdir().unwrap();
     let db = kahawai_hub::db::open(dir.path()).await.unwrap();
-    let registry = Arc::new(Registry::new(db.clone()));
+    let registry = Arc::new(Registry::new(db.clone(), Default::default()));
     let auth = Arc::new(Auth::new(db.clone(), dir.path()).await.unwrap());
     let setup_token = auth.setup_token().expect("fresh hub must be in setup mode");
     let api = test_router(registry, auth.clone(), Arc::new(kahawai_hub::sessions::Sessions::new(tempfile::tempdir().unwrap().keep())));
@@ -209,5 +209,5 @@ fn test_router(
         std::time::Duration::from_secs(900),
         90,
     ));
-    kahawai_hub::api::router(registry, auth, sessions, enrollments, Default::default())
+    kahawai_hub::api::router(registry, auth, sessions, enrollments)
 }

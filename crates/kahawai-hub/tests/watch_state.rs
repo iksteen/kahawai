@@ -32,15 +32,16 @@ async fn progress_resume_played_caps_and_idle() {
     let pki = tempfile::tempdir().unwrap();
     let ca = Arc::new(HubCa::load_or_create(pki.path()).unwrap());
     let (cert_pem, key_pem) = ca.issue_server_cert(&["localhost".into()]).unwrap();
+    let allowed = kahawai_transport::mtls::AllowedCerts::default();
     let tls = kahawai_transport::mtls::mtls_server_config(
         &cert_pem,
         &key_pem,
         ca.ca_cert_pem(),
-        Default::default(),
+        allowed.clone(),
     )
     .unwrap();
     let db = kahawai_hub::db::open_in_memory().await.unwrap();
-    let registry = Arc::new(Registry::new(db.clone()));
+    let registry = Arc::new(Registry::new(db.clone(), allowed.clone()));
     // Tight limits so this test can see them: 2 sessions/user, 700 ms idle.
     let sessions = Arc::new(kahawai_hub::sessions::Sessions::with_limits(
         tempfile::tempdir().unwrap().keep(),
@@ -63,6 +64,7 @@ async fn progress_resume_played_caps_and_idle() {
     // threshold), serve OpenReads with the real code.
     let bundle = kahawai_core::pki::new_satellite_csr("mediahost", "01HOST", "nas").unwrap();
     let signed = ca.sign_satellite_csr(&bundle.csr_der, 90).unwrap();
+    allowed.insert(&signed.fingerprint);
     let id = SatelliteIdentity {
         module_id: "01HOST".into(),
         key_pem: bundle.key_pem,
@@ -247,5 +249,5 @@ fn test_router(
         std::time::Duration::from_secs(900),
         90,
     ));
-    kahawai_hub::api::router(registry, auth, sessions, enrollments, Default::default())
+    kahawai_hub::api::router(registry, auth, sessions, enrollments)
 }

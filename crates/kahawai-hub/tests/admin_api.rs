@@ -12,7 +12,7 @@ use kahawai_hub::enrollment_service::EnrollmentService;
 use kahawai_hub::pki::HubCa;
 use kahawai_hub::registry::{FileUpsertRecord, Registry};
 use kahawai_proto::v1::enrollment_server::Enrollment as _;
-use kahawai_transport::mtls::RevocationList;
+use kahawai_transport::mtls::AllowedCerts;
 use tower::ServiceExt;
 
 async fn body_json(resp: axum::response::Response) -> serde_json::Value {
@@ -37,7 +37,8 @@ async fn admin_flow_enrollments_satellites_archive_restore() {
     let dir = tempfile::tempdir().unwrap();
     let db = kahawai_hub::db::open(dir.path()).await.unwrap();
     let ca = Arc::new(HubCa::load_or_create(dir.path()).unwrap());
-    let registry = Arc::new(Registry::new(db.clone()));
+    let allowed = AllowedCerts::default();
+    let registry = Arc::new(Registry::new(db.clone(), allowed.clone()));
     let sessions =
         Arc::new(kahawai_hub::sessions::Sessions::new(tempfile::tempdir().unwrap().keep()));
     let enrollments = Arc::new(EnrollmentService::new(
@@ -46,7 +47,6 @@ async fn admin_flow_enrollments_satellites_archive_restore() {
         Duration::from_secs(900),
         90,
     ));
-    let revoked = RevocationList::default();
     let auth = Arc::new(Auth::new(db.clone(), dir.path()).await.unwrap());
     let pair = auth
         .complete_setup(&auth.setup_token().unwrap(), "admin", "password-123")
@@ -63,13 +63,7 @@ async fn admin_flow_enrollments_satellites_archive_restore() {
     let pleb = auth.login("pleb", "pleb-password").await.unwrap();
     let pleb_bearer = format!("Bearer {}", pleb.access_token);
 
-    let api = kahawai_hub::api::router(
-        registry.clone(),
-        auth,
-        sessions,
-        enrollments.clone(),
-        revoked.clone(),
-    );
+    let api = kahawai_hub::api::router(registry.clone(), auth, sessions, enrollments.clone());
     let get = |uri: &str, bearer: &str| {
         Request::get(uri).header("authorization", bearer.to_string()).body(Body::empty()).unwrap()
     };
@@ -132,6 +126,7 @@ async fn admin_flow_enrollments_satellites_archive_restore() {
     assert_eq!(sat["module_id"], "01ADM");
     assert_eq!(sat["connected"], false);
     let fp = sat["cert_fingerprint"].as_str().unwrap().to_string();
+    assert!(allowed.contains(&fp), "approval must admit the cert (SEC-5)");
 
     // Give it a collection, a file, and admin watch state on the item.
     registry.announce_collection("01ADM", "movies", "movies", &[]).await.unwrap();
@@ -164,7 +159,7 @@ async fn admin_flow_enrollments_satellites_archive_restore() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    assert!(revoked.contains(&fp), "fingerprint must be on the TLS blocklist");
+    assert!(!allowed.contains(&fp), "deletion must remove the cert from the allowlist (SEC-6)");
     let counts: (i64, i64, i64, i64) = (
         sqlx::query_scalar("SELECT COUNT(*) FROM files").fetch_one(&db).await.unwrap(),
         sqlx::query_scalar("SELECT COUNT(*) FROM items").fetch_one(&db).await.unwrap(),
@@ -172,9 +167,12 @@ async fn admin_flow_enrollments_satellites_archive_restore() {
         sqlx::query_scalar("SELECT COUNT(*) FROM watch_state_archive").fetch_one(&db).await.unwrap(),
     );
     assert_eq!(counts, (0, 0, 0, 1), "cascade deleted, watch state archived");
-    let db_revoked: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM revoked_certs").fetch_one(&db).await.unwrap();
-    assert_eq!(db_revoked, 1, "revocation persists");
+    let audit: Vec<String> =
+        sqlx::query_scalar("SELECT action FROM satellite_audit ORDER BY id")
+            .fetch_all(&db)
+            .await
+            .unwrap();
+    assert_eq!(audit, vec!["enrolled".to_string(), "deleted".to_string()], "audit trail");
 
     // The same bytes return on a DIFFERENT host: watch state restored.
     registry.announce_collection("01NEW", "movies", "movies", &[]).await.unwrap();

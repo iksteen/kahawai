@@ -24,7 +24,7 @@ async fn files_and_items_survive_restart() {
 
     {
         let db = kahawai_hub::db::open(dir.path()).await.unwrap();
-        let reg = Registry::new(db.clone());
+        let reg = Registry::new(db.clone(), Default::default());
         reg.announce_collection("01H", "movies", "movies", &[]).await.unwrap();
         reg.upsert_files(
             "01H",
@@ -43,7 +43,7 @@ async fn files_and_items_survive_restart() {
 
     // "Restart": fresh pool over the same directory.
     let db = kahawai_hub::db::open(dir.path()).await.unwrap();
-    let reg = Arc::new(Registry::new(db.clone()));
+    let reg = Arc::new(Registry::new(db.clone(), Default::default()));
 
     // The DB (password hashes, sessions) must not be world-readable.
     #[cfg(unix)]
@@ -121,7 +121,7 @@ async fn files_and_items_survive_restart() {
 async fn reconcile_drops_files_missing_from_scan() {
     let dir = tempfile::tempdir().unwrap();
     let db = kahawai_hub::db::open(dir.path()).await.unwrap();
-    let reg = Registry::new(db.clone());
+    let reg = Registry::new(db.clone(), Default::default());
     reg.announce_collection("01H", "movies", "movies", &[]).await.unwrap();
     reg.upsert_files(
         "01H",
@@ -178,5 +178,5 @@ fn test_router(
         std::time::Duration::from_secs(900),
         90,
     ));
-    kahawai_hub::api::router(registry, auth, sessions, enrollments, Default::default())
+    kahawai_hub::api::router(registry, auth, sessions, enrollments)
 }

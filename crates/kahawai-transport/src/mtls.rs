@@ -1,10 +1,12 @@
-//! Mutual TLS (SEC-5/6, §7.4).
+//! Mutual TLS (SEC-5/6, §7.4) with allow-list admission.
 //!
 //! One satellite listener serves everything: connections *may* present a
 //! client certificate (enrollment needs none); services that require an
-//! identity get it from [`peer_identity`]. A certificate that fails chain
-//! validation or is on the revocation blocklist kills the handshake itself,
-//! so deleted satellites are refused at the TLS layer (SEC-6).
+//! identity get it from [`peer_identity`]. When a certificate IS presented,
+//! it must chain to the hub CA *and* its fingerprint must be on the
+//! allowlist of enrolled satellites — chain validity alone is never
+//! sufficient (fail closed). Deleting a satellite removes its fingerprint,
+//! so reconnects die at the handshake (SEC-6).
 //!
 //! Satellite-side pinning needs no custom verifier: the client's root store
 //! contains exactly one anchor — the pinned hub CA — so a foreign CA with
@@ -22,19 +24,30 @@ use rustls::{ClientConfig, DistinguishedName, RootCertStore, ServerConfig};
 
 use crate::identity::SatelliteIdentity;
 
-/// Shared revocation blocklist of cert fingerprints (sha256 hex), consulted
-/// on every handshake. Will be backed by the hub's `revoked_certs` table.
+/// The mTLS allowlist: fingerprints (sha256 hex) of every enrolled
+/// satellite's current certificate, mirrored from the hub's `satellites`
+/// table. Consulted on every handshake; absence means refusal (SEC-5).
 #[derive(Clone, Default, Debug)]
-pub struct RevocationList(Arc<RwLock<HashSet<String>>>);
+pub struct AllowedCerts(Arc<RwLock<HashSet<String>>>);
 
-impl RevocationList {
-    pub fn revoke(&self, fingerprint: &str) {
+impl AllowedCerts {
+    pub fn insert(&self, fingerprint: &str) {
         self.0.write().unwrap().insert(fingerprint.to_string());
+    }
+
+    pub fn remove(&self, fingerprint: &str) {
+        self.0.write().unwrap().remove(fingerprint);
     }
 
     pub fn contains(&self, fingerprint: &str) -> bool {
         self.0.read().unwrap().contains(fingerprint)
     }
+}
+
+/// Fingerprint of the first certificate in a PEM bundle.
+pub fn cert_fingerprint_pem(pem: &str) -> Result<String> {
+    let der = CertificateDer::from_pem_slice(pem.as_bytes()).context("parsing cert PEM")?;
+    Ok(kahawai_core::pki::cert_fingerprint(der.as_ref()))
 }
 
 fn certs_from_pem(pem: &str) -> Result<Vec<CertificateDer<'static>>> {
@@ -44,12 +57,12 @@ fn certs_from_pem(pem: &str) -> Result<Vec<CertificateDer<'static>>> {
 }
 
 /// Hub-side listener config: server cert + optional client auth chained to
-/// the hub CA, with revocation checked per handshake.
+/// the hub CA, with allowlist membership required per handshake.
 pub fn mtls_server_config(
     cert_pem: &str,
     key_pem: &str,
     ca_pem: &str,
-    revoked: RevocationList,
+    allowed: AllowedCerts,
 ) -> Result<Arc<ServerConfig>> {
     crate::tls::init_crypto();
     let mut roots = RootCertStore::empty();
@@ -60,7 +73,7 @@ pub fn mtls_server_config(
         .allow_unauthenticated()
         .build()
         .context("building client cert verifier")?;
-    let verifier = Arc::new(RevocationCheckingVerifier { inner, revoked });
+    let verifier = Arc::new(AllowlistVerifier { inner, allowed });
 
     let certs = certs_from_pem(cert_pem)?;
     let key = PrivateKeyDer::from_pem_slice(key_pem.as_bytes()).context("parsing server key")?;
@@ -88,14 +101,16 @@ pub fn mtls_client_config(id: &SatelliteIdentity) -> Result<Arc<ClientConfig>> {
     Ok(Arc::new(cfg))
 }
 
-/// Delegates chain validation to webpki, then rejects revoked fingerprints.
+/// Delegates chain validation to webpki, then requires the fingerprint to
+/// be on the allowlist — a CA-signed cert that isn't the currently
+/// registered cert of an enrolled satellite is refused (fail closed).
 #[derive(Debug)]
-struct RevocationCheckingVerifier {
+struct AllowlistVerifier {
     inner: Arc<dyn ClientCertVerifier>,
-    revoked: RevocationList,
+    allowed: AllowedCerts,
 }
 
-impl ClientCertVerifier for RevocationCheckingVerifier {
+impl ClientCertVerifier for AllowlistVerifier {
     fn offer_client_auth(&self) -> bool {
         self.inner.offer_client_auth()
     }
@@ -116,10 +131,10 @@ impl ClientCertVerifier for RevocationCheckingVerifier {
     ) -> Result<ClientCertVerified, rustls::Error> {
         let verified = self.inner.verify_client_cert(end_entity, intermediates, now)?;
         let fp = kahawai_core::pki::cert_fingerprint(end_entity.as_ref());
-        if self.revoked.contains(&fp) {
-            tracing::warn!(fingerprint = %fp, "rejected revoked certificate");
+        if !self.allowed.contains(&fp) {
+            tracing::warn!(fingerprint = %fp, "refusing certificate not on the allowlist");
             return Err(rustls::Error::InvalidCertificate(
-                rustls::CertificateError::Revoked,
+                rustls::CertificateError::ApplicationVerificationFailure,
             ));
         }
         Ok(verified)

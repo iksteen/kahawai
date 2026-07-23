@@ -52,14 +52,27 @@ const ARCHIVE_WATCH_FOR_FILE_SQL: &str = "
 
 pub struct Registry {
     db: SqlitePool,
+    /// The live mTLS allowlist (SEC-5), mirrored from the satellites table.
+    allowed: kahawai_transport::mtls::AllowedCerts,
     connected: Mutex<HashMap<String, SatelliteState>>,
     /// Command senders for connected hosts' Link streams.
     links: Mutex<HashMap<String, tokio::sync::mpsc::Sender<Result<kahawai_proto::v1::HubToHost, tonic::Status>>>>,
 }
 
 impl Registry {
-    pub fn new(db: SqlitePool) -> Self {
-        Self { db, connected: Mutex::new(HashMap::new()), links: Mutex::new(HashMap::new()) }
+    pub fn new(db: SqlitePool, allowed: kahawai_transport::mtls::AllowedCerts) -> Self {
+        Self { db, allowed, connected: Mutex::new(HashMap::new()), links: Mutex::new(HashMap::new()) }
+    }
+
+    /// Populate the allowlist from the satellites table (hub startup).
+    pub async fn load_allowlist(&self) -> Result<usize> {
+        let fps: Vec<String> =
+            sqlx::query_scalar("SELECT cert_fingerprint FROM satellites").fetch_all(&self.db).await?;
+        let n = fps.len();
+        for fp in fps {
+            self.allowed.insert(&fp);
+        }
+        Ok(n)
     }
 
     pub fn register_link(
@@ -148,7 +161,8 @@ impl Registry {
 
     // ---- persistent state ----
 
-    /// Record an approved satellite (SEC-4 bookkeeping).
+    /// Record an approved satellite and admit its certificate (SEC-4/5):
+    /// the DB row and the live allowlist change together, with an audit row.
     pub async fn record_satellite(
         &self,
         module_id: &str,
@@ -156,6 +170,7 @@ impl Registry {
         name: &str,
         cert_fingerprint: &str,
     ) -> Result<()> {
+        let mut tx = self.db.begin().await?;
         sqlx::query(
             "INSERT INTO satellites (module_id, module_type, name, cert_fingerprint)
              VALUES (?, ?, ?, ?)
@@ -166,9 +181,18 @@ impl Registry {
         .bind(module_type)
         .bind(name)
         .bind(cert_fingerprint)
-        .execute(&self.db)
+        .execute(&mut *tx)
         .await
         .context("recording satellite")?;
+        sqlx::query(
+            "INSERT INTO satellite_audit (module_id, fingerprint, action) VALUES (?, ?, 'enrolled')",
+        )
+        .bind(module_id)
+        .bind(cert_fingerprint)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        self.allowed.insert(cert_fingerprint);
         Ok(())
     }
 
@@ -388,10 +412,11 @@ impl Registry {
             .collect())
     }
 
-    /// Delete a satellite (SEC-6/HUB-20): revoke its certificate, close its
-    /// link, archive watch state by content identity, cascade-delete its
-    /// collections/files/sources and orphaned items. Returns the revoked
-    /// fingerprint. Transient disconnects never come here.
+    /// Delete a satellite (SEC-6/HUB-20): remove its cert from the
+    /// allowlist, close its link, archive watch state by content identity,
+    /// cascade-delete its collections/files/sources and orphaned items.
+    /// Returns the removed fingerprint. Transient disconnects never come
+    /// here.
     pub async fn delete_satellite(&self, module_id: &str) -> Result<String> {
         let fingerprint: String = sqlx::query_scalar(
             "SELECT cert_fingerprint FROM satellites WHERE module_id = ?",
@@ -402,10 +427,13 @@ impl Registry {
         .with_context(|| format!("no such satellite: {module_id}"))?;
 
         let mut tx = self.db.begin().await?;
-        sqlx::query("INSERT OR IGNORE INTO revoked_certs (fingerprint) VALUES (?)")
-            .bind(&fingerprint)
-            .execute(&mut *tx)
-            .await?;
+        sqlx::query(
+            "INSERT INTO satellite_audit (module_id, fingerprint, action) VALUES (?, ?, 'deleted')",
+        )
+        .bind(module_id)
+        .bind(&fingerprint)
+        .execute(&mut *tx)
+        .await?;
         // Archive watch state for every file this host serves (identity-
         // keyed; restore drops it again if the item still has live sources).
         sqlx::query(
@@ -440,11 +468,12 @@ impl Registry {
         .await?;
         tx.commit().await?;
 
-        // Close the live link (the satellite's reconnect dies at the TLS
-        // layer once the fingerprint is revoked) and forget runtime state.
+        // Off the allowlist and off the wire: the satellite's reconnects
+        // die at the TLS handshake from here on (SEC-6).
+        self.allowed.remove(&fingerprint);
         self.links.lock().unwrap().remove(module_id);
         self.connected.lock().unwrap().remove(module_id);
-        tracing::info!(%module_id, fingerprint = %fingerprint, "satellite deleted and revoked");
+        tracing::info!(%module_id, fingerprint = %fingerprint, "satellite deleted; cert no longer admitted");
         Ok(fingerprint)
     }
 

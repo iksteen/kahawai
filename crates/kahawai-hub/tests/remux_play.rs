@@ -46,15 +46,16 @@ async fn remux_to_hls_end_to_end() {
     let pki = tempfile::tempdir().unwrap();
     let ca = Arc::new(HubCa::load_or_create(pki.path()).unwrap());
     let (cert_pem, key_pem) = ca.issue_server_cert(&["localhost".into()]).unwrap();
+    let allowed = kahawai_transport::mtls::AllowedCerts::default();
     let tls = kahawai_transport::mtls::mtls_server_config(
         &cert_pem,
         &key_pem,
         ca.ca_cert_pem(),
-        Default::default(),
+        allowed.clone(),
     )
     .unwrap();
     let db = kahawai_hub::db::open_in_memory().await.unwrap();
-    let registry = Arc::new(Registry::new(db.clone()));
+    let registry = Arc::new(Registry::new(db.clone(), allowed.clone()));
     let sessions =
         Arc::new(kahawai_hub::sessions::Sessions::new(tempfile::tempdir().unwrap().keep()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -71,6 +72,7 @@ async fn remux_to_hls_end_to_end() {
     // Fake-host: link, announce, upsert, answer OpenReads with real code.
     let bundle = kahawai_core::pki::new_satellite_csr("mediahost", "01HOST", "nas").unwrap();
     let signed = ca.sign_satellite_csr(&bundle.csr_der, 90).unwrap();
+    allowed.insert(&signed.fingerprint);
     let id = SatelliteIdentity {
         module_id: "01HOST".into(),
         key_pem: bundle.key_pem,
@@ -246,5 +248,5 @@ fn test_router(
         std::time::Duration::from_secs(900),
         90,
     ));
-    kahawai_hub::api::router(registry, auth, sessions, enrollments, Default::default())
+    kahawai_hub::api::router(registry, auth, sessions, enrollments)
 }

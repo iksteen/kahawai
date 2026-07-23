@@ -196,26 +196,22 @@ async fn run_hub(cfg: config::HubConfig) -> Result<()> {
         &kahawai_hub::pki::pki_dir(&cfg.data_dir),
     )?);
     let db = kahawai_hub::db::open(&cfg.data_dir).await?;
-    let registry = Arc::new(kahawai_hub::registry::Registry::new(db.clone()));
+    // The satellites table IS the mTLS allowlist (SEC-5): load it, then
+    // the registry keeps it in sync on approve/delete.
+    let allowed = kahawai_transport::mtls::AllowedCerts::default();
+    let registry = Arc::new(kahawai_hub::registry::Registry::new(db.clone(), allowed.clone()));
+    let admitted = registry.load_allowlist().await?;
+    tracing::info!(admitted, "mTLS allowlist loaded");
     let auth = Arc::new(kahawai_hub::auth::Auth::new(db.clone(), &cfg.data_dir).await?);
     let sessions = Arc::new(kahawai_hub::sessions::Sessions::new(cfg.data_dir.join("sessions")));
     sessions.spawn_janitor();
-
-    // Revocations persist across restarts (SEC-6).
-    let revoked = kahawai_transport::mtls::RevocationList::default();
-    let fps: Vec<String> = sqlx::query_scalar("SELECT fingerprint FROM revoked_certs")
-        .fetch_all(&db)
-        .await?;
-    for fp in fps {
-        revoked.revoke(&fp);
-    }
 
     let (cert_pem, key_pem) = ca.issue_server_cert(&cfg.hostnames)?;
     let tls = kahawai_transport::mtls::mtls_server_config(
         &cert_pem,
         &key_pem,
         ca.ca_cert_pem(),
-        revoked.clone(),
+        allowed.clone(),
     )?;
 
     let svc = kahawai_hub::enrollment_service::EnrollmentService::new(
@@ -247,7 +243,7 @@ async fn run_hub(cfg: config::HubConfig) -> Result<()> {
     let api_listener = tokio::net::TcpListener::bind(cfg.bind)
         .await
         .with_context(|| format!("binding client API on {}", cfg.bind))?;
-    let api = kahawai_hub::api::router(registry.clone(), auth, sessions.clone(), Arc::new(svc.clone()), revoked.clone());
+    let api = kahawai_hub::api::router(registry.clone(), auth, sessions.clone(), Arc::new(svc.clone()));
     tokio::spawn(async move {
         if let Err(e) = axum::serve(api_listener, api).await {
             tracing::error!(error = %e, "client API server failed");

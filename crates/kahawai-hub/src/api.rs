@@ -23,7 +23,6 @@ pub struct AppState {
     pub auth: Arc<Auth>,
     pub sessions: Arc<crate::sessions::Sessions>,
     pub enrollments: Arc<crate::enrollment_service::EnrollmentService>,
-    pub revoked: kahawai_transport::mtls::RevocationList,
 }
 
 pub fn router(
@@ -31,9 +30,8 @@ pub fn router(
     auth: Arc<Auth>,
     sessions: Arc<crate::sessions::Sessions>,
     enrollments: Arc<crate::enrollment_service::EnrollmentService>,
-    revoked: kahawai_transport::mtls::RevocationList,
 ) -> Router {
-    let state = AppState { registry, auth, sessions, enrollments, revoked };
+    let state = AppState { registry, auth, sessions, enrollments };
     let protected = Router::new()
         .route("/api/v1/collections", get(list_collections))
         .route("/api/v1/items", get(list_items))
@@ -155,8 +153,8 @@ async fn admin_satellites(State(state): State<AppState>) -> Result<Json<Value>, 
     Ok(Json(json!({ "satellites": sats })))
 }
 
-/// SEC-6/HUB-20: revoke + end sessions + cascade. Refusal of reconnection
-/// happens at the TLS layer via the revocation list.
+/// SEC-6/HUB-20: allowlist removal + end sessions + cascade. Refusal of
+/// reconnection happens at the TLS layer (fingerprint no longer admitted).
 async fn admin_delete_satellite(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -167,8 +165,7 @@ async fn admin_delete_satellite(
         .delete_satellite(&id)
         .await
         .map_err(|e| (StatusCode::NOT_FOUND, format!("{e:#}")))?;
-    state.revoked.revoke(&fingerprint);
-    Ok(Json(json!({ "deleted": id, "revoked": fingerprint, "sessions_ended": ended })))
+    Ok(Json(json!({ "deleted": id, "removed": fingerprint, "sessions_ended": ended })))
 }
 
 async fn admin_sessions(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
