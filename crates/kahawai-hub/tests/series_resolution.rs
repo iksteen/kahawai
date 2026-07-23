@@ -112,3 +112,48 @@ async fn resolves_series_into_shows_and_episodes() {
             .unwrap();
     assert_eq!(titles, ["Andor"], "childless show should be swept");
 }
+
+#[tokio::test]
+async fn libraries_auto_provision_and_enforce_types() {
+    let db = kahawai_hub::db::open_in_memory().await.unwrap();
+    let registry = Registry::new(db.clone(), Default::default());
+    registry.record_satellite("01HOST", "mediahost", "nas", "fp").await.unwrap();
+    registry
+        .announce_collection("01HOST", "movies", "movies", &["/srv/movies".into()])
+        .await
+        .unwrap();
+    registry
+        .announce_collection("01HOST", "anime", "anime", &["/srv/anime".into()])
+        .await
+        .unwrap();
+
+    // One auto-library per collection, matching name + type.
+    let libs = registry.libraries_overview().await.unwrap();
+    assert_eq!(libs.len(), 2, "{libs:?}");
+    let anime = libs.iter().find(|l| l["name"] == "anime").unwrap();
+    assert_eq!(anime["media_type"], "anime");
+    assert_eq!(anime["collections"].as_array().unwrap().len(), 1);
+
+    // Re-announce (reconnect) must not duplicate memberships.
+    registry
+        .announce_collection("01HOST", "movies", "movies", &["/srv/movies".into()])
+        .await
+        .unwrap();
+    assert_eq!(registry.libraries_overview().await.unwrap().len(), 2);
+
+    // Type enforcement: a movies collection cannot join an anime library.
+    let anime_id = anime["id"].as_str().unwrap();
+    let err = registry
+        .attach_collection(anime_id, "01HOST", "movies")
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("type mismatch"), "{err:#}");
+
+    // Manual library of the right type accepts it.
+    let extra = registry.create_library("everything-movies", "movies").await.unwrap();
+    registry.attach_collection(&extra, "01HOST", "movies").await.unwrap();
+    // Bad media type rejected outright.
+    assert!(registry.create_library("nope", "podcasts").await.is_err());
+    // Delete cascades memberships.
+    assert!(registry.delete_library(&extra).await.unwrap());
+}

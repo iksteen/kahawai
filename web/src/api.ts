@@ -207,6 +207,55 @@ export const adminSatellites = () =>
 export const adminDeleteSatellite = (id: string) =>
   json<unknown>(`/admin/v1/satellites/${id}`, { method: 'DELETE' })
 
+export type LibraryCollection = {
+  module_id: string
+  collection_id: string
+  host_name: string | null
+}
+
+export type Library = {
+  id: string
+  name: string
+  media_type: string
+  collections: LibraryCollection[]
+}
+
+export type CollectionInfo = LibraryCollection & { media_type: string }
+
+export const adminLibraries = () =>
+  json<{ libraries: Library[] }>('/admin/v1/libraries')
+
+export const adminCollections = () =>
+  json<{ collections: CollectionInfo[] }>('/admin/v1/collections')
+
+export const adminCreateLibrary = (name: string, mediaType: string) =>
+  json<{ id: string }>('/admin/v1/libraries', {
+    method: 'POST',
+    body: JSON.stringify({ name, media_type: mediaType }),
+  })
+
+export const adminDeleteLibrary = (id: string) =>
+  api(`/admin/v1/libraries/${id}`, { method: 'DELETE' })
+
+export const adminAttachCollection = (
+  id: string,
+  moduleId: string,
+  collectionId: string,
+) =>
+  api(`/admin/v1/libraries/${id}/collections`, {
+    method: 'POST',
+    body: JSON.stringify({ module_id: moduleId, collection_id: collectionId }),
+  })
+
+export const adminDetachCollection = (
+  id: string,
+  moduleId: string,
+  collectionId: string,
+) =>
+  api(`/admin/v1/libraries/${id}/collections/${moduleId}/${collectionId}`, {
+    method: 'DELETE',
+  })
+
 export const adminSetSatelliteDisabled = (id: string, disabled: boolean) =>
   api(`/admin/v1/satellites/${id}/disabled`, {
     method: 'POST',

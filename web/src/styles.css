@@ -198,3 +198,16 @@ h2 { font-size: 14px; font-weight: 650; color: var(--dim); letter-spacing: 0.08e
   text-align: left;
   padding: 8px 12px;
 }
+
+.row-form {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+.chip-x {
+  background: none;
+  border: none;
+  color: inherit;
+  cursor: pointer;
+  padding: 0 2px;
+}

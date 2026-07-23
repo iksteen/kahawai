@@ -49,6 +49,17 @@ pub fn router(
         .route("/admin/v1/satellites", get(admin_satellites))
         .route("/admin/v1/satellites/{id}", axum::routing::delete(admin_delete_satellite))
         .route("/admin/v1/satellites/{id}/disabled", post(admin_set_disabled))
+        .route("/admin/v1/libraries", get(admin_libraries).post(admin_create_library))
+        .route("/admin/v1/libraries/{id}", axum::routing::delete(admin_delete_library))
+        .route(
+            "/admin/v1/libraries/{id}/collections",
+            post(admin_attach_collection),
+        )
+        .route(
+            "/admin/v1/libraries/{id}/collections/{module_id}/{collection_id}",
+            axum::routing::delete(admin_detach_collection),
+        )
+        .route("/admin/v1/collections", get(admin_collections))
         .route("/api/v1/playback/sessions/{id}/seek", post(seek_session))
         .route("/admin/v1/sessions", get(admin_sessions))
         .route("/admin/v1/sessions/{id}", axum::routing::delete(admin_end_session))
@@ -179,6 +190,84 @@ struct SetDisabled {
 
 /// Admin drain toggle: placement skips a disabled satellite; running
 /// sessions finish on their own.
+async fn admin_libraries(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+    let libraries = state.registry.libraries_overview().await.map_err(internal)?;
+    Ok(Json(json!({ "libraries": libraries })))
+}
+
+async fn admin_collections(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+    let collections = state.registry.collections_overview().await.map_err(internal)?;
+    Ok(Json(json!({ "collections": collections })))
+}
+
+#[derive(Deserialize)]
+struct CreateLibraryRequest {
+    name: String,
+    media_type: String,
+}
+
+async fn admin_create_library(
+    State(state): State<AppState>,
+    Json(body): Json<CreateLibraryRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let name = body.name.trim();
+    if name.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "library name required".into()));
+    }
+    let id = state
+        .registry
+        .create_library(name, &body.media_type)
+        .await
+        .map_err(|e| (StatusCode::CONFLICT, format!("{e:#}")))?;
+    Ok(Json(json!({ "id": id })))
+}
+
+async fn admin_delete_library(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    if state.registry.delete_library(&id).await.map_err(internal)? {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err((StatusCode::NOT_FOUND, "no such library".into()))
+    }
+}
+
+#[derive(Deserialize)]
+struct AttachCollectionRequest {
+    module_id: String,
+    collection_id: String,
+}
+
+async fn admin_attach_collection(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<AttachCollectionRequest>,
+) -> Result<StatusCode, ApiError> {
+    state
+        .registry
+        .attach_collection(&id, &body.module_id, &body.collection_id)
+        .await
+        .map_err(|e| (StatusCode::CONFLICT, format!("{e:#}")))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn admin_detach_collection(
+    State(state): State<AppState>,
+    Path((id, module_id, collection_id)): Path<(String, String, String)>,
+) -> Result<StatusCode, ApiError> {
+    if state
+        .registry
+        .detach_collection(&id, &module_id, &collection_id)
+        .await
+        .map_err(internal)?
+    {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err((StatusCode::NOT_FOUND, "not attached".into()))
+    }
+}
+
 async fn admin_set_disabled(
     State(state): State<AppState>,
     Path(id): Path<String>,

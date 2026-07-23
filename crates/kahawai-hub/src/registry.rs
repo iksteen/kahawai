@@ -251,7 +251,188 @@ impl Registry {
         .execute(&self.db)
         .await?;
         tracing::info!(%module_id, collection = collection_id, media_type, "collection announced");
+        self.ensure_library(module_id, collection_id, media_type).await?;
         Ok(())
+    }
+
+    /// Every collection lives in at least one library: on first sight,
+    /// create (or reuse) a same-named library of its type and attach.
+    async fn ensure_library(
+        &self,
+        module_id: &str,
+        collection_id: &str,
+        media_type: &str,
+    ) -> Result<()> {
+        let assigned: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM library_collections WHERE module_id = ? AND collection_id = ?",
+        )
+        .bind(module_id)
+        .bind(collection_id)
+        .fetch_one(&self.db)
+        .await?;
+        if assigned > 0 {
+            return Ok(());
+        }
+        let lib: Option<(String, String)> = sqlx::query_as(
+            "SELECT id, media_type FROM libraries WHERE name = ?",
+        )
+        .bind(collection_id)
+        .fetch_optional(&self.db)
+        .await?;
+        let lib_id = match lib {
+            Some((id, ty)) if ty == media_type => id,
+            Some(_) => {
+                // Name taken by a different type: disambiguate.
+                self.create_library(&format!("{collection_id} ({media_type})"), media_type)
+                    .await?
+            }
+            None => self.create_library(collection_id, media_type).await?,
+        };
+        self.attach_collection(&lib_id, module_id, collection_id).await?;
+        Ok(())
+    }
+
+    pub async fn create_library(&self, name: &str, media_type: &str) -> Result<String> {
+        anyhow::ensure!(
+            matches!(media_type, "movies" | "series" | "anime" | "music"),
+            "unknown media type {media_type:?}"
+        );
+        let id = ulid::Ulid::new().to_string();
+        sqlx::query("INSERT INTO libraries (id, name, media_type) VALUES (?, ?, ?)")
+            .bind(&id)
+            .bind(name)
+            .bind(media_type)
+            .execute(&self.db)
+            .await
+            .context("library name already in use")?;
+        tracing::info!(library = name, media_type, "library created");
+        Ok(id)
+    }
+
+    pub async fn delete_library(&self, id: &str) -> Result<bool> {
+        let n = sqlx::query("DELETE FROM libraries WHERE id = ?")
+            .bind(id)
+            .execute(&self.db)
+            .await?
+            .rows_affected();
+        Ok(n > 0)
+    }
+
+    /// Attach a collection — only if the types match (a movies library
+    /// never contains a series collection).
+    pub async fn attach_collection(
+        &self,
+        library_id: &str,
+        module_id: &str,
+        collection_id: &str,
+    ) -> Result<()> {
+        let lib_type: Option<String> =
+            sqlx::query_scalar("SELECT media_type FROM libraries WHERE id = ?")
+                .bind(library_id)
+                .fetch_optional(&self.db)
+                .await?;
+        let lib_type = lib_type.context("no such library")?;
+        let col_type: Option<String> = sqlx::query_scalar(
+            "SELECT media_type FROM collections WHERE module_id = ? AND collection_id = ?",
+        )
+        .bind(module_id)
+        .bind(collection_id)
+        .fetch_optional(&self.db)
+        .await?;
+        let col_type = col_type.context("no such collection")?;
+        anyhow::ensure!(
+            lib_type == col_type,
+            "type mismatch: library is {lib_type}, collection is {col_type}"
+        );
+        sqlx::query(
+            "INSERT OR IGNORE INTO library_collections (library_id, module_id, collection_id)
+             VALUES (?, ?, ?)",
+        )
+        .bind(library_id)
+        .bind(module_id)
+        .bind(collection_id)
+        .execute(&self.db)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn detach_collection(
+        &self,
+        library_id: &str,
+        module_id: &str,
+        collection_id: &str,
+    ) -> Result<bool> {
+        let n = sqlx::query(
+            "DELETE FROM library_collections
+             WHERE library_id = ? AND module_id = ? AND collection_id = ?",
+        )
+        .bind(library_id)
+        .bind(module_id)
+        .bind(collection_id)
+        .execute(&self.db)
+        .await?
+        .rows_affected();
+        Ok(n > 0)
+    }
+
+    /// Libraries with their member collections, for the admin UI.
+    pub async fn libraries_overview(&self) -> Result<Vec<serde_json::Value>> {
+        let libs = sqlx::query("SELECT id, name, media_type FROM libraries ORDER BY name")
+            .fetch_all(&self.db)
+            .await?;
+        let members = sqlx::query(
+            "SELECT lc.library_id, lc.module_id, lc.collection_id, s.name AS host_name
+             FROM library_collections lc
+             LEFT JOIN satellites s ON s.module_id = lc.module_id
+             ORDER BY lc.collection_id",
+        )
+        .fetch_all(&self.db)
+        .await?;
+        Ok(libs
+            .iter()
+            .map(|l| {
+                let id: String = l.get("id");
+                let cols: Vec<serde_json::Value> = members
+                    .iter()
+                    .filter(|m| m.get::<String, _>("library_id") == id)
+                    .map(|m| {
+                        serde_json::json!({
+                            "module_id": m.get::<String, _>("module_id"),
+                            "collection_id": m.get::<String, _>("collection_id"),
+                            "host_name": m.get::<Option<String>, _>("host_name"),
+                        })
+                    })
+                    .collect();
+                serde_json::json!({
+                    "id": id,
+                    "name": l.get::<String, _>("name"),
+                    "media_type": l.get::<String, _>("media_type"),
+                    "collections": cols,
+                })
+            })
+            .collect())
+    }
+
+    /// All known collections (for the admin attach picker).
+    pub async fn collections_overview(&self) -> Result<Vec<serde_json::Value>> {
+        let rows = sqlx::query(
+            "SELECT c.module_id, c.collection_id, c.media_type, s.name AS host_name
+             FROM collections c LEFT JOIN satellites s ON s.module_id = c.module_id
+             ORDER BY c.collection_id",
+        )
+        .fetch_all(&self.db)
+        .await?;
+        Ok(rows
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "module_id": r.get::<String, _>("module_id"),
+                    "collection_id": r.get::<String, _>("collection_id"),
+                    "media_type": r.get::<String, _>("media_type"),
+                    "host_name": r.get::<Option<String>, _>("host_name"),
+                })
+            })
+            .collect())
     }
 
     /// Upsert file records and resolve them to items (movies for now).

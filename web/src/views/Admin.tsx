@@ -1,13 +1,21 @@
 import { useEffect, useState } from 'react'
 import {
   adminApprove,
+  adminAttachCollection,
+  adminCollections,
+  adminCreateLibrary,
+  adminDeleteLibrary,
+  adminDetachCollection,
   adminSetSatelliteDisabled,
   adminDeleteSatellite,
   adminEndSession,
   adminEnrollments,
+  adminLibraries,
   adminSatellites,
   adminSessions,
   type AdminSession,
+  type CollectionInfo,
+  type Library,
   type PendingEnrollment,
   type Satellite,
 } from '../api'
@@ -23,17 +31,25 @@ export default function Admin() {
   const [notice, setNotice] = useState('')
   const [error, setError] = useState('')
   const [confirming, setConfirming] = useState<string | null>(null)
+  const [libraries, setLibraries] = useState<Library[]>([])
+  const [collections, setCollections] = useState<CollectionInfo[]>([])
+  const [newLibName, setNewLibName] = useState('')
+  const [newLibType, setNewLibType] = useState('movies')
 
   async function reload() {
     try {
-      const [e, s, x] = await Promise.all([
+      const [e, s, x, l, c] = await Promise.all([
         adminEnrollments(),
         adminSatellites(),
         adminSessions(),
+        adminLibraries(),
+        adminCollections(),
       ])
       setPending(e.pending)
       setSatellites(s.satellites)
       setSessions(x.sessions)
+      setLibraries(l.libraries)
+      setCollections(c.collections)
     } catch (err) {
       setError(String(err))
     }
@@ -148,6 +164,97 @@ export default function Admin() {
             </span>
           </li>
         ))}
+      </ul>
+
+      <h2>Libraries</h2>
+      <form
+        className="row-form"
+        onSubmit={(e) => {
+          e.preventDefault()
+          adminCreateLibrary(newLibName, newLibType)
+            .then(() => {
+              setNewLibName('')
+              return reload()
+            })
+            .catch((err) => setError(String(err)))
+        }}
+      >
+        <input
+          placeholder="new library name"
+          value={newLibName}
+          onChange={(e) => setNewLibName(e.target.value)}
+        />
+        <select value={newLibType} onChange={(e) => setNewLibType(e.target.value)}>
+          <option value="movies">movies</option>
+          <option value="series">series</option>
+          <option value="anime">anime</option>
+          <option value="music">music</option>
+        </select>
+        <button className="btn small" disabled={!newLibName.trim()}>
+          Create
+        </button>
+      </form>
+      <ul className="rows">
+        {libraries.map((l) => {
+          const attachable = collections.filter(
+            (c) =>
+              c.media_type === l.media_type &&
+              !l.collections.some(
+                (m) => m.module_id === c.module_id && m.collection_id === c.collection_id,
+              ),
+          )
+          return (
+            <li key={l.id}>
+              <span className="chips">
+                <span className="chip">{l.media_type}</span>
+                <span>{l.name}</span>
+                {l.collections.map((m) => (
+                  <span className="chip dim" key={`${m.module_id}/${m.collection_id}`}>
+                    {m.host_name ?? m.module_id}/{m.collection_id}{' '}
+                    <button
+                      className="chip-x"
+                      title="detach"
+                      onClick={() =>
+                        adminDetachCollection(l.id, m.module_id, m.collection_id)
+                          .then(reload)
+                          .catch((err) => setError(String(err)))
+                      }
+                    >
+                      ×
+                    </button>
+                  </span>
+                ))}
+                {attachable.length > 0 && (
+                  <select
+                    value=""
+                    onChange={(e) => {
+                      const c = attachable[Number(e.target.value)]
+                      if (c)
+                        adminAttachCollection(l.id, c.module_id, c.collection_id)
+                          .then(reload)
+                          .catch((err) => setError(String(err)))
+                    }}
+                  >
+                    <option value="">attach…</option>
+                    {attachable.map((c, i) => (
+                      <option key={`${c.module_id}/${c.collection_id}`} value={i}>
+                        {c.host_name ?? c.module_id}/{c.collection_id}
+                      </option>
+                    ))}
+                  </select>
+                )}
+              </span>
+              <button
+                className="btn ghost small"
+                onClick={() =>
+                  adminDeleteLibrary(l.id).then(reload).catch((err) => setError(String(err)))
+                }
+              >
+                Delete
+              </button>
+            </li>
+          )
+        })}
       </ul>
 
       <h2>Active sessions</h2>
