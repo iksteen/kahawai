@@ -119,7 +119,7 @@ export type StreamVerdict = { video: string; audio: string }
 
 export type Session = {
   session_id: string
-  mode: 'direct' | 'remux'
+  mode: 'direct' | 'remux' | 'transcode'
   stream_url: string
   content_type: string
   size: number

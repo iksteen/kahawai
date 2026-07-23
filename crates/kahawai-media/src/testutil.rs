@@ -27,6 +27,16 @@ pub fn render_h264_eac3_mkv(path: &Path) {
     ));
 }
 
+/// Render a short MKV with h264 video and FLAC audio (web target plans
+/// audio as Encode — flacenc/flacdec ship with gst-plugins-good, so this
+/// fixture needs no optional packages).
+pub fn render_h264_flac_mkv(path: &Path) {
+    render(&format!(
+        "videotestsrc num-buffers=125 ! video/x-raw,format=I420,width=320,height=240,framerate=25/1 ! x264enc bframes=3 b-adapt=false key-int-max=25 ! h264parse ! matroskamux name=m audiotestsrc num-buffers=215 ! audioconvert ! flacenc ! m. m. ! filesink location=\"{}\"",
+        path.display()
+    ));
+}
+
 pub fn has_element(name: &str) -> bool {
     crate::init().unwrap();
     gst::ElementFactory::find(name).is_some()

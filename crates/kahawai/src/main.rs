@@ -102,6 +102,7 @@ async fn main() -> Result<()> {
                 &cfg.transcoder.state_dir,
                 &cfg.transcoder.name,
                 cfg.transcoder.max_sessions,
+                std::env::current_exe().ok(),
             )
             .await
         }
@@ -242,6 +243,7 @@ async fn run_hub(cfg: config::HubConfig) -> Result<()> {
             .with_worker_exe(std::env::current_exe().ok()),
     );
     sessions.spawn_janitor();
+    sessions.attach_registry(registry.clone());
 
     let (cert_pem, key_pem) = ca.issue_server_cert(&cfg.hostnames)?;
     let tls = kahawai_transport::mtls::mtls_server_config(
@@ -300,11 +302,12 @@ async fn run_hub(cfg: config::HubConfig) -> Result<()> {
     tonic::transport::Server::builder()
         .add_service(svc.into_server())
         .add_service(
-            kahawai_hub::link_service::MediahostLinkService::new(registry.clone(), sessions)
+            kahawai_hub::link_service::MediahostLinkService::new(registry.clone(), sessions.clone())
                 .into_server(),
         )
         .add_service(
-            kahawai_hub::transcoder_link::TranscoderLinkService::new(registry).into_server(),
+            kahawai_hub::transcoder_link::TranscoderLinkService::new(registry, sessions)
+                .into_server(),
         )
         .serve_with_incoming(kahawai_transport::tls::tls_incoming(listener, tls))
         .await

@@ -30,6 +30,7 @@ rand_core = { version = "0.6", features = ["std"] }
 jsonwebtoken = { version = "10.4.0", default-features = false, features = ["rust_crypto"] }
 
 [dev-dependencies]
+kahawai-transcoder = { workspace = true }
 tempfile = { workspace = true }
 tower = { workspace = true, features = ["util"] }
 kahawai-mediahost = { workspace = true }

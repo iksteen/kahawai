@@ -38,7 +38,10 @@ async fn spawn_hub() -> Hub {
     let registry = Arc::new(Registry::new(db, allowed.clone()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = format!("localhost:{}", listener.local_addr().unwrap().port());
-    let svc = TranscoderLinkService::new(registry.clone());
+    let sessions = Arc::new(kahawai_hub::sessions::Sessions::new(
+        tempfile::tempdir().unwrap().keep(),
+    ));
+    let svc = TranscoderLinkService::new(registry.clone(), sessions);
     tokio::spawn(async move {
         tonic::transport::Server::builder()
             .add_service(svc.into_server())

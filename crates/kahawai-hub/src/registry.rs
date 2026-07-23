@@ -58,6 +58,9 @@ pub struct Registry {
     /// Live capability reports from connected transcoders (TC-1); cleared
     /// on disconnect — a report is only valid while the link is up.
     transcoder_caps: Mutex<HashMap<String, serde_json::Value>>,
+    tc_links: Mutex<HashMap<String, tokio::sync::mpsc::Sender<Result<kahawai_proto::v1::HubToTc, tonic::Status>>>>,
+    /// Dispatched sessions per transcoder (inverse-load placement).
+    tc_load: Mutex<HashMap<String, usize>>,
     /// Command senders for connected hosts' Link streams.
     links: Mutex<HashMap<String, tokio::sync::mpsc::Sender<Result<kahawai_proto::v1::HubToHost, tonic::Status>>>>,
 }
@@ -70,6 +73,8 @@ impl Registry {
             connected: Mutex::new(HashMap::new()),
             links: Mutex::new(HashMap::new()),
             transcoder_caps: Mutex::new(HashMap::new()),
+            tc_links: Mutex::new(HashMap::new()),
+            tc_load: Mutex::new(HashMap::new()),
         }
     }
 
@@ -398,7 +403,9 @@ impl Registry {
     pub fn set_transcoder_caps(&self, module_id: &str, caps: &kahawai_proto::v1::CapabilityReport) {
         let json = serde_json::json!({
             "encoders": caps.encoders.iter()
-                .map(|e| serde_json::json!({ "codec": e.codec, "element": e.element }))
+                .map(|e| serde_json::json!({
+                    "codec": e.codec, "element": e.element, "hardware": e.hardware,
+                }))
                 .collect::<Vec<_>>(),
             "max_sessions": caps.max_sessions,
         });
@@ -407,6 +414,71 @@ impl Registry {
 
     pub fn clear_transcoder_caps(&self, module_id: &str) {
         self.transcoder_caps.lock().unwrap().remove(module_id);
+    }
+
+    pub fn register_tc_link(
+        &self,
+        module_id: &str,
+        tx: tokio::sync::mpsc::Sender<Result<kahawai_proto::v1::HubToTc, tonic::Status>>,
+    ) {
+        self.tc_links.lock().unwrap().insert(module_id.to_string(), tx);
+    }
+
+    pub fn unregister_tc_link(&self, module_id: &str) {
+        self.tc_links.lock().unwrap().remove(module_id);
+        self.tc_load.lock().unwrap().remove(module_id);
+    }
+
+    pub async fn send_to_tc(
+        &self,
+        module_id: &str,
+        msg: kahawai_proto::v1::HubToTc,
+    ) -> anyhow::Result<()> {
+        let tx = self
+            .tc_links
+            .lock()
+            .unwrap()
+            .get(module_id)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("transcoder {module_id} not connected"))?;
+        tx.send(Ok(msg)).await.map_err(|_| anyhow::anyhow!("transcoder link closed"))
+    }
+
+    pub fn tc_session_started(&self, module_id: &str) {
+        *self.tc_load.lock().unwrap().entry(module_id.to_string()).or_insert(0) += 1;
+    }
+
+    pub fn tc_session_ended(&self, module_id: &str) {
+        if let Some(n) = self.tc_load.lock().unwrap().get_mut(module_id) {
+            *n = n.saturating_sub(1);
+        }
+    }
+
+    /// Placement (§4.5): capability fit ≥ hw-accel ≥ inverse load.
+    /// ponytail: per-box decode capability and max_sessions enforcement
+    /// come with the negotiation-aware capability report.
+    pub fn pick_transcoder(&self, need_h264: bool, need_aac: bool) -> Option<String> {
+        let caps = self.transcoder_caps.lock().unwrap().clone();
+        let links = self.tc_links.lock().unwrap();
+        let load = self.tc_load.lock().unwrap();
+        let mut candidates: Vec<(bool, usize, String)> = caps
+            .iter()
+            .filter(|(id, _)| links.contains_key(*id))
+            .filter_map(|(id, c)| {
+                let encoders = c.get("encoders")?.as_array()?;
+                let has = |codec: &str| encoders.iter().any(|e| e["codec"] == codec);
+                if (need_h264 && !has("h264")) || (need_aac && !has("aac")) {
+                    return None;
+                }
+                let hw = encoders
+                    .iter()
+                    .any(|e| e["codec"] == "h264" && e["hardware"] == true);
+                Some((hw, load.get(id).copied().unwrap_or(0), id.clone()))
+            })
+            .collect();
+        // Most hardware, least loaded.
+        candidates.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        candidates.first().map(|(_, _, id)| id.clone())
     }
 
     /// Enrolled satellites (DB) merged with live connection state.

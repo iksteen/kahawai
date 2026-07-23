@@ -135,14 +135,17 @@ pub fn h264_encoder() -> Option<&'static str> {
 }
 
 /// Verified encoder capabilities for the transcoder's registration
-/// report (TC-1): (codec, element) pairs that survived a dry run.
-pub fn encoder_capabilities() -> Vec<(&'static str, &'static str)> {
+/// report (TC-1): (codec, element, hardware) triples that survived a
+/// dry run. Hardware = anything before the software entries in the
+/// preference lists (placement prefers hw boxes).
+pub fn encoder_capabilities() -> Vec<(&'static str, &'static str, bool)> {
+    const SW_VIDEO: &[&str] = &["x264enc", "openh264enc"];
     let mut caps = Vec::new();
     if let Some(el) = h264_encoder() {
-        caps.push(("h264", el));
+        caps.push(("h264", el, !SW_VIDEO.contains(&el)));
     }
     if let Some(el) = aac_encoder() {
-        caps.push(("aac", el));
+        caps.push(("aac", el, false));
     }
     caps
 }

@@ -7,7 +7,7 @@ use std::sync::Arc;
 use axum::extract::{Path, Request, State};
 use axum::http::StatusCode;
 use axum::middleware::Next;
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
@@ -188,6 +188,7 @@ async fn admin_sessions(State(state): State<AppState>) -> Result<Json<Value>, Ap
             "mode": match &s.mode {
                 crate::sessions::Mode::Direct { .. } => "direct",
                 crate::sessions::Mode::Remux { .. } => "remux",
+                crate::sessions::Mode::Transcode { .. } => "transcode",
             },
             "module_id": s.module_id,
             "idle_secs": s.idle_for().as_secs(),
@@ -300,6 +301,11 @@ async fn start_session(
         ),
         crate::sessions::Mode::Remux { .. } => (
             "remux",
+            format!("/api/v1/playback/sessions/{}/master.m3u8", session.id),
+            "application/vnd.apple.mpegurl".to_string(),
+        ),
+        crate::sessions::Mode::Transcode { .. } => (
+            "transcode",
             format!("/api/v1/playback/sessions/{}/master.m3u8", session.id),
             "application/vnd.apple.mpegurl".to_string(),
         ),
@@ -580,9 +586,38 @@ async fn post_progress(
     })))
 }
 
-/// Serve remux artifacts (playlist + segments) from the session's scratch
-/// dir. Only plain filenames are accepted — no separators, no dotfiles —
-/// so traversal is impossible by construction.
+/// Proxy one artifact of a dispatched session from its transcoder.
+async fn transcode_file(
+    state: &AppState,
+    session: &std::sync::Arc<crate::sessions::Session>,
+    file: &str,
+) -> Result<Response, ApiError> {
+    let valid = !file.starts_with('.')
+        && file.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+    if !valid {
+        return Err((StatusCode::BAD_REQUEST, "invalid file name".into()));
+    }
+    let bytes = state
+        .sessions
+        .fetch_artifact(&state.registry, session, file)
+        .await
+        .map_err(|e| (StatusCode::NOT_FOUND, format!("{e:#}")))?;
+    let ctype = if file.ends_with(".m3u8") {
+        "application/vnd.apple.mpegurl"
+    } else {
+        "video/mp2t"
+    };
+    Ok((
+        [(axum::http::header::CONTENT_TYPE, ctype)],
+        axum::body::Bytes::from(bytes),
+    )
+        .into_response())
+}
+
+/// Serve session artifacts (playlist + segments): remux sessions from
+/// local scratch, dispatched sessions via the transcoder proxy. Only
+/// plain filenames are accepted — no separators, no dotfiles — so
+/// traversal is impossible by construction.
 async fn session_file(
     State(state): State<AppState>,
     Path((id, file)): Path<(String, String)>,
@@ -592,9 +627,16 @@ async fn session_file(
         .get(&id)
         .ok_or((StatusCode::NOT_FOUND, "no such session".to_string()))?;
     session.touch();
-    let crate::sessions::Mode::Remux { dir, .. } = &session.mode else {
-        return Err((StatusCode::NOT_FOUND, "not a remux session".into()));
+    let dir = match &session.mode {
+        crate::sessions::Mode::Remux { dir, .. } => dir.clone(),
+        crate::sessions::Mode::Transcode { .. } => {
+            return transcode_file(&state, &session, &file).await;
+        }
+        crate::sessions::Mode::Direct { .. } => {
+            return Err((StatusCode::NOT_FOUND, "not a remux session".into()));
+        }
     };
+    let dir = &dir;
     let valid = !file.starts_with('.')
         && file.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
     if !valid {

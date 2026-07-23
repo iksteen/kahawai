@@ -18,6 +18,8 @@ use crate::registry::Registry;
 pub enum Mode {
     Direct { lease: Lease },
     Remux { dir: PathBuf, runner: RemuxRunner },
+    /// Dispatched to a transcoder module; artifacts proxied on demand.
+    Transcode { transcoder: String },
 }
 
 /// How a remux/transcode pipeline runs. The hub always spawns the
@@ -146,6 +148,17 @@ pub struct Sessions {
     /// None → pipelines run in-process (tests only).
     worker_exe: Option<PathBuf>,
     active: Mutex<HashMap<String, Arc<Session>>>,
+    /// Source leases for dispatched sessions (the transcoder pulls bytes
+    /// over its link; lives from dispatch to session end).
+    tc_leases: Mutex<HashMap<String, (Lease, u64)>>,
+    /// Sessions awaiting the transcoder's ready/error verdict.
+    pending_ready: Mutex<HashMap<String, tokio::sync::oneshot::Sender<Result<(), String>>>>,
+    /// In-flight artifact fetches, keyed by (session, name).
+    artifact_waiting:
+        Mutex<HashMap<(String, String), tokio::sync::mpsc::Sender<kahawai_proto::v1::ArtifactData>>>,
+    /// Registry handle for teardown messages from the sync `end()` path
+    /// (set once at startup; None only in tests without dispatch).
+    registry_for_teardown: Mutex<Option<Arc<Registry>>>,
 }
 
 impl Sessions {
@@ -163,7 +176,17 @@ impl Sessions {
             idle_timeout,
             worker_exe: None,
             active: Mutex::new(HashMap::new()),
+            tc_leases: Mutex::new(HashMap::new()),
+            pending_ready: Mutex::new(HashMap::new()),
+            artifact_waiting: Mutex::new(HashMap::new()),
+            registry_for_teardown: Mutex::new(None),
         }
+    }
+
+    /// Give the sync teardown path a registry handle for EndSession
+    /// notifications to transcoders.
+    pub fn attach_registry(&self, registry: Arc<Registry>) {
+        *self.registry_for_teardown.lock().unwrap() = Some(registry);
     }
 
     /// Run pipelines in a supervised child process (crash isolation).
@@ -272,9 +295,29 @@ impl Sessions {
                     bail!("no playable streams — this source needs the video transcoder");
                 }
                 verdict = Some(kahawai_media::remux::plan_summary(&info, &plan));
-                Mode::Remux {
-                    runner: self.start_remux(&id, plan, lease, size).await?,
-                    dir: self.scratch_root.join(&id),
+                use kahawai_media::remux::StreamMode;
+                let needs_encode =
+                    plan.video == StreamMode::Encode || plan.audio == StreamMode::Encode;
+                // Encode work goes to the fleet when one is available
+                // (§4.5); pure remux — and encode with no fleet — stays
+                // in the local supervised worker.
+                let placed = if needs_encode {
+                    registry.pick_transcoder(
+                        plan.video == StreamMode::Encode,
+                        plan.audio == StreamMode::Encode,
+                    )
+                } else {
+                    None
+                };
+                match placed {
+                    Some(tc) => {
+                        self.start_transcode(registry, &tc, &id, plan, lease, size).await?;
+                        Mode::Transcode { transcoder: tc }
+                    }
+                    None => Mode::Remux {
+                        runner: self.start_remux(&id, plan, lease, size).await?,
+                        dir: self.scratch_root.join(&id),
+                    },
                 }
             }
             other => bail!("unknown mode {other:?} (direct|remux)"),
@@ -380,6 +423,198 @@ impl Sessions {
         }
     }
 
+    /// Dispatch a session to a transcoder and wait for its playlist.
+    async fn start_transcode(
+        &self,
+        registry: &Registry,
+        transcoder: &str,
+        session_id: &str,
+        plan: kahawai_media::remux::RemuxPlan,
+        lease: Lease,
+        size: u64,
+    ) -> Result<()> {
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        self.tc_leases.lock().unwrap().insert(session_id.to_string(), (lease, size));
+        self.pending_ready.lock().unwrap().insert(session_id.to_string(), ready_tx);
+
+        let start = kahawai_proto::v1::HubToTc {
+            msg: Some(kahawai_proto::v1::hub_to_tc::Msg::StartSession(
+                kahawai_proto::v1::StartSession {
+                    session_id: session_id.to_string(),
+                    size,
+                    video: kahawai_media::worker::mode_arg(plan.video).into(),
+                    audio: kahawai_media::worker::mode_arg(plan.audio).into(),
+                },
+            )),
+        };
+        let cleanup = |sessions: &Self| {
+            sessions.tc_leases.lock().unwrap().remove(session_id);
+            sessions.pending_ready.lock().unwrap().remove(session_id);
+        };
+        if let Err(e) = registry.send_to_tc(transcoder, start).await {
+            cleanup(self);
+            return Err(e);
+        }
+        match tokio::time::timeout(Duration::from_secs(40), ready_rx).await {
+            Ok(Ok(Ok(()))) => {
+                registry.tc_session_started(transcoder);
+                tracing::info!(session = session_id, transcoder, "session dispatched");
+                Ok(())
+            }
+            Ok(Ok(Err(e))) => {
+                cleanup(self);
+                bail!("transcoder rejected session: {e}");
+            }
+            Ok(Err(_)) | Err(_) => {
+                cleanup(self);
+                let _ = registry
+                    .send_to_tc(
+                        transcoder,
+                        kahawai_proto::v1::HubToTc {
+                            msg: Some(kahawai_proto::v1::hub_to_tc::Msg::EndSession(
+                                kahawai_proto::v1::EndSession {
+                                    session_id: session_id.to_string(),
+                                },
+                            )),
+                        },
+                    )
+                    .await;
+                bail!("transcoder produced no playlist in time");
+            }
+        }
+    }
+
+    /// Link-facing: the transcoder reported the session ready or failed.
+    pub fn transcode_verdict(&self, session_id: &str, result: Result<(), String>) {
+        if let Some(tx) = self.pending_ready.lock().unwrap().remove(session_id) {
+            let _ = tx.send(result);
+        }
+    }
+
+    /// Link-facing: serve one source read for a dispatched session.
+    pub async fn source_read(
+        &self,
+        registry: &Registry,
+        transcoder: &str,
+        session_id: &str,
+        offset: u64,
+        len: u64,
+    ) {
+        let Some((lease, size)) = self.tc_leases.lock().unwrap().get(session_id).cloned() else {
+            tracing::debug!(session = session_id, "source read for unknown session");
+            return;
+        };
+        let len = len.min(kahawai_media::worker::MAX_READ);
+        let want = if offset >= size { 0 } else { len.min(size - offset) };
+        let mut buf = Vec::with_capacity(want as usize);
+        if want > 0 {
+            let mut stream = lease.read_range(offset, want).into_inner();
+            while (buf.len() as u64) < want {
+                match stream.recv().await {
+                    Some(Ok(bytes)) => buf.extend_from_slice(&bytes),
+                    Some(Err(e)) => {
+                        tracing::warn!(session = session_id, error = %e, "lease read failed");
+                        break;
+                    }
+                    None => break,
+                }
+            }
+            buf.truncate(want as usize);
+        }
+        let msg = kahawai_proto::v1::HubToTc {
+            msg: Some(kahawai_proto::v1::hub_to_tc::Msg::SourceData(
+                kahawai_proto::v1::SourceData {
+                    session_id: session_id.to_string(),
+                    offset,
+                    data: buf,
+                },
+            )),
+        };
+        if let Err(e) = registry.send_to_tc(transcoder, msg).await {
+            tracing::debug!(session = session_id, error = format!("{e:#}"), "source data undeliverable");
+        }
+    }
+
+    /// Link-facing: a chunk of a requested artifact arrived.
+    pub fn artifact_chunk(&self, data: kahawai_proto::v1::ArtifactData) {
+        let key = (data.session_id.clone(), data.name.clone());
+        let tx = self.artifact_waiting.lock().unwrap().get(&key).cloned();
+        if let Some(tx) = tx {
+            let _ = tx.try_send(data);
+        }
+    }
+
+    /// Fetch one artifact (playlist/segment) from the session's
+    /// transcoder. ponytail: no cache — playlist polls and one-shot
+    /// segment fetches are cheap on a LAN; add LRU when profiling says.
+    pub async fn fetch_artifact(
+        &self,
+        registry: &Registry,
+        session: &Session,
+        name: &str,
+    ) -> Result<Vec<u8>> {
+        let Mode::Transcode { transcoder } = &session.mode else {
+            bail!("not a transcode session");
+        };
+        let key = (session.id.clone(), name.to_string());
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        self.artifact_waiting.lock().unwrap().insert(key.clone(), tx);
+        let cleanup = || {
+            self.artifact_waiting.lock().unwrap().remove(&key);
+        };
+        let req = kahawai_proto::v1::HubToTc {
+            msg: Some(kahawai_proto::v1::hub_to_tc::Msg::FetchArtifact(
+                kahawai_proto::v1::FetchArtifact {
+                    session_id: session.id.clone(),
+                    name: name.to_string(),
+                },
+            )),
+        };
+        if let Err(e) = registry.send_to_tc(transcoder, req).await {
+            cleanup();
+            return Err(e);
+        }
+        let mut out = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Some(chunk)) => {
+                    if !chunk.error.is_empty() {
+                        cleanup();
+                        bail!("{}", chunk.error);
+                    }
+                    out.extend_from_slice(&chunk.data);
+                    if chunk.eof {
+                        cleanup();
+                        return Ok(out);
+                    }
+                }
+                Ok(None) | Err(_) => {
+                    cleanup();
+                    bail!("artifact fetch timed out");
+                }
+            }
+        }
+    }
+
+    /// End every session dispatched to a given transcoder (link loss —
+    /// AR-6 minimal: sessions fail, clients restart; reschedule later).
+    pub fn end_for_transcoder(&self, transcoder: &str) -> usize {
+        let ids: Vec<String> = self
+            .active
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|s| matches!(&s.mode, Mode::Transcode { transcoder: t } if t == transcoder))
+            .map(|s| s.id.clone())
+            .collect();
+        let n = ids.len();
+        for id in ids {
+            self.end(&id);
+        }
+        n
+    }
+
     /// Active sessions for the admin dashboard (HUB-18).
     pub fn list(&self) -> Vec<Arc<Session>> {
         let mut v: Vec<_> = self.active.lock().unwrap().values().cloned().collect();
@@ -414,9 +649,33 @@ impl Sessions {
         let Some(session) = self.active.lock().unwrap().remove(id) else {
             return false;
         };
-        if let Mode::Remux { dir, runner } = &session.mode {
-            runner.stop();
-            let _ = std::fs::remove_dir_all(dir);
+        match &session.mode {
+            Mode::Remux { dir, runner } => {
+                runner.stop();
+                let _ = std::fs::remove_dir_all(dir);
+            }
+            Mode::Transcode { transcoder } => {
+                self.tc_leases.lock().unwrap().remove(id);
+                self.pending_ready.lock().unwrap().remove(id);
+                if let Some(registry) = self.registry_for_teardown.lock().unwrap().clone() {
+                    registry.tc_session_ended(transcoder);
+                    let transcoder = transcoder.clone();
+                    let sid = id.to_string();
+                    tokio::spawn(async move {
+                        let _ = registry
+                            .send_to_tc(
+                                &transcoder,
+                                kahawai_proto::v1::HubToTc {
+                                    msg: Some(kahawai_proto::v1::hub_to_tc::Msg::EndSession(
+                                        kahawai_proto::v1::EndSession { session_id: sid },
+                                    )),
+                                },
+                            )
+                            .await;
+                    });
+                }
+            }
+            Mode::Direct { .. } => {}
         }
         tracing::info!(session = id, "session ended");
         true

@@ -122,7 +122,47 @@ message TcToHub {
     // Sent once after HelloAck (TC-1): what this box can actually do,
     // every element dry-run-verified at startup.
     CapabilityReport capabilities = 3;
+    SessionReady session_ready = 4;
+    SessionError session_error = 5;
+    // Source byte plane and artifact delivery ride the control link
+    // (ponytail: same shapes as a dedicated channel, one less stream;
+    // split out if profiling demands).
+    SourceRead source_read = 6;
+    ArtifactData artifact_data = 7;
   }
+}
+
+message SessionReady {
+  string session_id = 1;
+}
+
+message SessionError {
+  string session_id = 1;
+  string error = 2;
+}
+
+// Transcoder pulls source bytes; one outstanding read per session (the
+// worker blocks on each), so session_id correlates request/response.
+message SourceRead {
+  string session_id = 1;
+  uint64 offset = 2;
+  uint64 len = 3;
+}
+
+message SourceData {
+  string session_id = 1;
+  uint64 offset = 2;
+  // Shorter than requested (including empty) = EOF at that offset.
+  bytes data = 3;
+}
+
+// One artifact (playlist/segment) streamed in chunks, eof-terminated.
+message ArtifactData {
+  string session_id = 1;
+  string name = 2;
+  bytes data = 3;
+  bool eof = 4;
+  string error = 5;
 }
 
 message CapabilityReport {
@@ -133,11 +173,31 @@ message CapabilityReport {
 message EncoderCap {
   string codec = 1;   // h264 | aac | ...
   string element = 2; // the verified GStreamer element
+  bool hardware = 3;  // hw-accelerated (placement prefers these)
 }
 
 message HubToTc {
   oneof msg {
     HelloAck hello_ack = 1;
-    // Session dispatch arrives in the next slice.
+    StartSession start_session = 2;
+    EndSession end_session = 3;
+    SourceData source_data = 4;
+    FetchArtifact fetch_artifact = 5;
   }
+}
+
+message StartSession {
+  string session_id = 1;
+  uint64 size = 2;
+  string video = 3; // copy | encode | off
+  string audio = 4;
+}
+
+message EndSession {
+  string session_id = 1;
+}
+
+message FetchArtifact {
+  string session_id = 1;
+  string name = 2;
 }

@@ -1585,6 +1585,7 @@ dependencies = [
  "kahawai-media",
  "kahawai-mediahost",
  "kahawai-proto",
+ "kahawai-transcoder",
  "kahawai-transport",
  "rand_core 0.6.4",
  "rcgen",

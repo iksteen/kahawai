@@ -3,8 +3,7 @@
 //! every element dry-run-verified at startup (TC-1), so a broken driver
 //! is discovered at registration, not mid-session.
 //!
-//! ponytail: this slice is registration only; session dispatch and the
-//! video pipeline land next.
+pub mod sessions;
 
 use std::path::Path;
 use std::time::Duration;
@@ -19,15 +18,24 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 const RECONNECT_DELAY: Duration = Duration::from_secs(5);
 
 /// Enroll (or load identity) and keep the hub link up forever.
-pub async fn run(hub_addr: &str, state_dir: &Path, name: &str, max_sessions: u32) -> Result<()> {
+pub async fn run(
+    hub_addr: &str,
+    state_dir: &Path,
+    name: &str,
+    max_sessions: u32,
+    worker_exe: Option<std::path::PathBuf>,
+) -> Result<()> {
     let id =
         kahawai_transport::enroll::ensure_identity(hub_addr, state_dir, "transcoder", name).await?;
     let tls = kahawai_transport::mtls::mtls_client_config(&id)?;
 
     let capabilities = probe_capabilities(max_sessions)?;
+    let scratch = state_dir.join("sessions");
 
     loop {
-        match link_once(hub_addr, tls.clone(), name, capabilities.clone()).await {
+        match link_once(hub_addr, tls.clone(), name, capabilities.clone(), &scratch, &worker_exe)
+            .await
+        {
             Ok(()) => tracing::warn!("hub closed the link; reconnecting"),
             Err(e) => tracing::warn!(error = format!("{e:#}"), "link failed; reconnecting"),
         }
@@ -39,9 +47,9 @@ pub async fn run(hub_addr: &str, state_dir: &Path, name: &str, max_sessions: u32
 fn probe_capabilities(max_sessions: u32) -> Result<CapabilityReport> {
     let encoders: Vec<EncoderCap> = kahawai_media::remux::encoder_capabilities()
         .into_iter()
-        .map(|(codec, element)| {
-            tracing::info!(codec, element, "encoder verified");
-            EncoderCap { codec: codec.into(), element: element.into() }
+        .map(|(codec, element, hardware)| {
+            tracing::info!(codec, element, hardware, "encoder verified");
+            EncoderCap { codec: codec.into(), element: element.into(), hardware }
         })
         .collect();
     if encoders.is_empty() {
@@ -52,11 +60,13 @@ fn probe_capabilities(max_sessions: u32) -> Result<CapabilityReport> {
 
 /// One link session: Hello/HelloAck, capability registration, then
 /// heartbeats until the stream dies.
-async fn link_once(
+pub async fn link_once(
     hub_addr: &str,
     tls: std::sync::Arc<rustls::ClientConfig>,
     name: &str,
     capabilities: CapabilityReport,
+    scratch: &Path,
+    worker_exe: &Option<std::path::PathBuf>,
 ) -> Result<()> {
     let channel = kahawai_transport::tls::grpc_channel_with(hub_addr, tls).await?;
     let mut client = TranscoderLinkClient::new(channel);
@@ -95,6 +105,17 @@ async fn link_once(
         .await
         .context("link closed before capability report")?;
 
+    let runner = sessions::Runner::new(scratch.to_path_buf(), worker_exe.clone(), tx.clone());
+    let result = link_loop(&tx, &mut inbound, &runner).await;
+    runner.end_all();
+    result
+}
+
+async fn link_loop(
+    tx: &tokio::sync::mpsc::Sender<TcToHub>,
+    inbound: &mut tonic::Streaming<kahawai_proto::v1::HubToTc>,
+    runner: &std::sync::Arc<sessions::Runner>,
+) -> Result<()> {
     let mut ticker = tokio::time::interval(HEARTBEAT_INTERVAL);
     loop {
         tokio::select! {
@@ -108,7 +129,25 @@ async fn link_once(
             }
             msg = inbound.message() => {
                 match msg {
-                    Ok(Some(_)) => {} // session dispatch: next slice
+                    Ok(Some(m)) => match m.msg {
+                        Some(hub_to_tc::Msg::StartSession(s)) => {
+                            let runner = runner.clone();
+                            tokio::spawn(async move {
+                                runner.start(s.session_id, s.size, &s.video, &s.audio).await;
+                            });
+                        }
+                        Some(hub_to_tc::Msg::EndSession(e)) => runner.end(&e.session_id),
+                        Some(hub_to_tc::Msg::SourceData(d)) => {
+                            runner.source_data(&d.session_id, d.data);
+                        }
+                        Some(hub_to_tc::Msg::FetchArtifact(f)) => {
+                            let runner = runner.clone();
+                            tokio::spawn(async move {
+                                runner.fetch_artifact(&f.session_id, &f.name).await;
+                            });
+                        }
+                        _ => {} // HelloAck handled above; newer kinds (OPS-7)
+                    },
                     Ok(None) => return Ok(()),
                     Err(e) => bail!("link stream error: {e}"),
                 }
