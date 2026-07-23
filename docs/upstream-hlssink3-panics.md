@@ -1,8 +1,19 @@
-# Draft upstream reports — gst-plugins-rs hlssink3 process aborts
+# Upstream status — gst-plugins-rs hlssink3 process aborts
 
-File against gstreamer/gst-plugins-rs (GitLab). Version observed:
-0.15.3 (Arch `gst-plugin-hlssink3 0.15.3-1`), GStreamer 1.28.5.
-Reproducers: `scripts/repro/` (videotestsrc-only, no media files needed).
+Version observed: 0.15.3 (Arch `gst-plugin-hlssink3 0.15.3-1`),
+GStreamer 1.28.5. Reproducers: `scripts/repro/` (videotestsrc-only).
+
+**Status 2026-07-23:**
+- Issue 2 is already fixed on upstream main (`86d7e33` "hlsbasesink:
+  Don't unwrap() running_time when a segment is added") — do not file;
+  instead ask for a 0.15 branch backport.
+- Issue 1 is still present on main. Fix written and verified:
+  `docs/0001-hlssink3-don-t-unwrap-PTS-of-a-fragment-s-first-buff.patch`
+  (branch `hlssink3-no-pts-panic` in ~/src/gst-plugins-rs). Both
+  reproducers run to EOS with the patched plugin; upstream hlssink3
+  tests pass; The Heroes of Telemark (1965).mp4 transcodes clean.
+  Submit as MR to gitlab.freedesktop.org/gstreamer/gst-plugins-rs with
+  the reproducer attached, and mention the 0.15 backport of both fixes.
 
 ---
 

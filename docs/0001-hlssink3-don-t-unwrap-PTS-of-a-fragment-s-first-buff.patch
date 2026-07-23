@@ -1,0 +1,43 @@
+From 6e58940f59db026061af1c7d13f8c985118fa8e2 Mon Sep 17 00:00:00 2001
+From: Ingmar Steen <iksteen@gmail.com>
+Date: Thu, 23 Jul 2026 20:43:41 +0200
+Subject: [PATCH] hlssink3: don't unwrap() PTS of a fragment's first buffer
+
+A buffer without PTS (as produced by e.g. avidemux for timestamp-less
+AVI streams) reaching a fragment boundary panicked in the
+format-location-full handler. The panic happens inside an FFI callback
+and cannot unwind, aborting the whole process.
+
+Handle it like the existing buffer-less branch: warn and store no
+running time (which the hls-segment-added emission already tolerates
+since 86d7e33).
+---
+ net/hlssink3/src/hlssink3/imp.rs | 12 +++++++++++-
+ 1 file changed, 11 insertions(+), 1 deletion(-)
+
+diff --git a/net/hlssink3/src/hlssink3/imp.rs b/net/hlssink3/src/hlssink3/imp.rs
+index e410520..1b2902b 100644
+--- a/net/hlssink3/src/hlssink3/imp.rs
++++ b/net/hlssink3/src/hlssink3/imp.rs
+@@ -301,7 +301,17 @@ impl ObjectImpl for HlsSink3 {
+                             .expect("segment not available")
+                             .downcast_ref::<gst::ClockTime>()
+                             .expect("no time segment");
+-                        segment.to_running_time(buffer.pts().unwrap())
++                        if let Some(pts) = buffer.pts() {
++                            segment.to_running_time(pts)
++                        } else {
++                            gst::warning!(
++                                CAT,
++                                imp = imp,
++                                "no PTS on first buffer of fragment-id: {}",
++                                fragment_id
++                            );
++                            None
++                        }
+                     } else {
+                         gst::warning!(
+                             CAT,
+-- 
+2.55.0
+
