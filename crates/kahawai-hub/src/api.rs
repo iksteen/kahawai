@@ -182,7 +182,7 @@ async fn admin_set_disabled(
     Path(id): Path<String>,
     Json(body): Json<SetDisabled>,
 ) -> Result<StatusCode, ApiError> {
-    state.registry.set_disabled(&id, body.disabled);
+    state.registry.set_disabled(&id, body.disabled).await.map_err(internal)?;
     tracing::info!(module_id = %id, disabled = body.disabled, "satellite placement toggle");
     Ok(StatusCode::NO_CONTENT)
 }

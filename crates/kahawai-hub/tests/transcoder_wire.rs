@@ -153,9 +153,20 @@ async fn transcoder_registers_capabilities_and_clears_on_disconnect() {
 
     // Placement finds it — until the admin disables it.
     assert_eq!(hub.registry.pick_transcoder(true, true).as_deref(), Some("01TC"));
-    hub.registry.set_disabled("01TC", true);
+    hub.registry.set_disabled("01TC", true).await.unwrap();
     assert_eq!(hub.registry.pick_transcoder(true, true), None);
-    hub.registry.set_disabled("01TC", false);
+
+    // The drain survives a hub restart: a fresh registry over the same
+    // database loads the flag.
+    let reborn = Registry::new(hub.registry.db().clone(), Default::default());
+    reborn.load_allowlist().await.unwrap();
+    let sats = reborn.satellites_overview().await.unwrap();
+    assert!(
+        sats.iter().any(|s| s["module_id"] == "01TC" && s["disabled"] == true),
+        "disabled flag not persisted: {sats:?}"
+    );
+
+    hub.registry.set_disabled("01TC", false).await.unwrap();
     assert_eq!(hub.registry.pick_transcoder(true, true).as_deref(), Some("01TC"));
 
     // Disconnect: capabilities must not outlive the link.

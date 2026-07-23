@@ -85,11 +85,16 @@ impl Registry {
 
     /// Populate the allowlist from the satellites table (hub startup).
     pub async fn load_allowlist(&self) -> Result<usize> {
-        let fps: Vec<String> =
-            sqlx::query_scalar("SELECT cert_fingerprint FROM satellites").fetch_all(&self.db).await?;
-        let n = fps.len();
-        for fp in fps {
-            self.allowed.insert(&fp);
+        let rows = sqlx::query("SELECT cert_fingerprint, module_id, disabled FROM satellites")
+            .fetch_all(&self.db)
+            .await?;
+        let n = rows.len();
+        let mut disabled = self.disabled.lock().unwrap();
+        for row in rows {
+            self.allowed.insert(&row.get::<String, _>("cert_fingerprint"));
+            if row.get::<i64, _>("disabled") != 0 {
+                disabled.insert(row.get::<String, _>("module_id"));
+            }
         }
         Ok(n)
     }
@@ -104,6 +109,7 @@ impl Registry {
 
     pub fn unregister_link(&self, module_id: &str) {
         self.links.lock().unwrap().remove(module_id);
+        self.disabled.lock().unwrap().remove(module_id);
     }
 
     /// Send a command down a connected host's Link stream.
@@ -460,13 +466,20 @@ impl Registry {
     }
 
     /// Admin toggle: a disabled satellite is skipped by placement.
-    pub fn set_disabled(&self, module_id: &str, disabled: bool) {
+    /// Persisted — a drained box must not rejoin because the hub bounced.
+    pub async fn set_disabled(&self, module_id: &str, disabled: bool) -> Result<()> {
+        sqlx::query("UPDATE satellites SET disabled = ? WHERE module_id = ?")
+            .bind(disabled as i64)
+            .bind(module_id)
+            .execute(&self.db)
+            .await?;
         let mut set = self.disabled.lock().unwrap();
         if disabled {
             set.insert(module_id.to_string());
         } else {
             set.remove(module_id);
         }
+        Ok(())
     }
 
     /// Placement (§4.5): capability fit ≥ hw-accel ≥ inverse load.
