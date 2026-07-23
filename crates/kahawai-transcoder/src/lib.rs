@@ -107,7 +107,7 @@ pub async fn link_once(
 
     let runner = sessions::Runner::new(scratch.to_path_buf(), worker_exe.clone(), tx.clone());
     let result = link_loop(&tx, &mut inbound, &runner).await;
-    runner.end_all();
+    runner.end_all().await;
     result
 }
 
@@ -136,9 +136,13 @@ async fn link_loop(
                                 runner.start(s.session_id, s.size, &s.video, &s.audio, s.start_ms).await;
                             });
                         }
-                        Some(hub_to_tc::Msg::EndSession(e)) => runner.end(&e.session_id),
+                        // Inline, not spawned: EndSession→StartSession
+                        // ordering on the link is the seek-restart
+                        // contract — a spawned end can outrun the new
+                        // run's registration and kill it.
+                        Some(hub_to_tc::Msg::EndSession(e)) => runner.end(&e.session_id).await,
                         Some(hub_to_tc::Msg::SourceData(d)) => {
-                            runner.source_data(&d.session_id, d.data);
+                            runner.source_data(d.req, d.data);
                         }
                         Some(hub_to_tc::Msg::FetchArtifact(f)) => {
                             let runner = runner.clone();

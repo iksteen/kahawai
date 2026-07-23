@@ -365,6 +365,55 @@ fn timestamper_for(caps: &gst::CapsRef) -> Option<&'static str> {
 /// each is taken by the first matching parsed stream.
 type WaitingPads = Arc<Mutex<std::collections::HashMap<&'static str, gst::Pad>>>;
 
+/// Offset-start gate: splitmuxsink is not flush-safe once it has seen
+/// data (g_assert !ctx->is_reference aborts on a mid-GOP flush), so for
+/// start_ms > 0 every pad feeding the HLS sink is blocked until the
+/// initial seek has flushed through a still-virgin muxer.
+struct SeekGate {
+    blocked: Mutex<Vec<(gst::Pad, gst::PadProbeId)>>,
+    triggered: std::sync::atomic::AtomicUsize,
+    expected: usize,
+}
+
+impl SeekGate {
+    fn new(expected: usize) -> Arc<Self> {
+        Arc::new(Self {
+            blocked: Mutex::new(Vec::new()),
+            triggered: std::sync::atomic::AtomicUsize::new(0),
+            expected,
+        })
+    }
+
+    /// Block `pad` (a muxer feed) until [`open`]; counts the first
+    /// arrival so the seek can wait for all branches to be negotiated.
+    fn install(self: &Arc<Self>, pad: &gst::Pad) {
+        let gate = self.clone();
+        let counted = std::sync::atomic::AtomicBool::new(false);
+        let id = pad
+            .add_probe(
+                gst::PadProbeType::BLOCK | gst::PadProbeType::BUFFER,
+                move |_, _| {
+                    if !counted.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                        gate.triggered.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    gst::PadProbeReturn::Ok
+                },
+            )
+            .unwrap();
+        self.blocked.lock().unwrap().push((pad.clone(), id));
+    }
+
+    fn all_triggered(&self) -> bool {
+        self.triggered.load(std::sync::atomic::Ordering::SeqCst) >= self.expected
+    }
+
+    fn open(&self) {
+        for (pad, id) in self.blocked.lock().unwrap().drain(..) {
+            pad.remove_probe(id);
+        }
+    }
+}
+
 /// Plumb a fresh parsebin pad. Muxable-looking streams are routed right
 /// here, synchronously — elements built before data flows behave
 /// differently from elements inserted mid-stream (h264parse merges
@@ -398,7 +447,13 @@ fn routable(caps_name: &str, plan: &RemuxPlan) -> bool {
     }
 }
 
-fn plumb_parsed_pad(pipe: &gst::Pipeline, waiting: &WaitingPads, pad: &gst::Pad, plan: RemuxPlan) {
+fn plumb_parsed_pad(
+    pipe: &gst::Pipeline,
+    waiting: &WaitingPads,
+    pad: &gst::Pad,
+    plan: RemuxPlan,
+    gate: &Option<Arc<SeekGate>>,
+) {
     // queue: decouples the muxer from parsebin's threads (the aggregator
     // deadlocks without it). Default queue limits (1 MiB / 1 s) are far
     // too small: the HLS sink holds one branch back while waiting for a
@@ -423,18 +478,19 @@ fn plumb_parsed_pad(pipe: &gst::Pipeline, waiting: &WaitingPads, pad: &gst::Pad,
         .unwrap_or_else(gst::Caps::new_empty);
     let name = advertised.structure(0).map(|s| s.name().to_string()).unwrap_or_default();
     if routable(&name, &plan) {
-        route_stream(pipe, waiting, &qsrc, &advertised, plan);
+        route_stream(pipe, waiting, &qsrc, &advertised, plan, gate);
         return;
     }
 
     let pipe = pipe.clone();
     let waiting = waiting.clone();
+    let gate = gate.clone();
     qsrc.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |qpad, info| {
         if let Some(gst::PadProbeData::Event(ev)) = &info.data
             && let gst::EventView::Caps(c) = ev.view()
             && qpad.peer().is_none()
         {
-            route_stream(&pipe, &waiting, qpad, &c.caps_owned(), plan);
+            route_stream(&pipe, &waiting, qpad, &c.caps_owned(), plan, &gate);
         }
         gst::PadProbeReturn::Ok
     });
@@ -470,6 +526,7 @@ fn route_stream(
     from: &gst::Pad,
     caps: &gst::Caps,
     plan: RemuxPlan,
+    gate: &Option<Arc<SeekGate>>,
 ) {
     let caps_name = caps.structure(0).map(|s| s.name().to_string()).unwrap_or_default();
     let mode = mode_for(&caps_name, &plan);
@@ -479,9 +536,9 @@ fn route_stream(
         if let Some(sinkpad) = waiting.lock().unwrap().remove(kind) {
             tracing::info!(caps = %caps_name, kind, "transcoding stream");
             if kind == "video" {
-                build_video_encode_chain(pipe, from, sinkpad);
+                build_video_encode_chain(pipe, from, sinkpad, gate);
             } else {
-                build_audio_encode_chain(pipe, from, sinkpad, &caps_name);
+                build_audio_encode_chain(pipe, from, sinkpad, &caps_name, gate);
             }
             return;
         }
@@ -502,6 +559,9 @@ fn route_stream(
                 tail = el.static_pad("src").unwrap();
             }
             guard_pts(&tail);
+            if let Some(g) = gate {
+                g.install(&tail);
+            }
             if let Err(e) = tail.link(&sinkpad) {
                 tracing::warn!(caps = %caps_name, error = %e, "remux: pad link failed");
             }
@@ -530,7 +590,12 @@ fn route_stream(
 /// for the TS muxer). Rescues codecs no browser decodes (MPEG-4 Part 2,
 /// AV1/VP9-in-TS). videoconvert costs one GPU→CPU hop with hw decoders;
 /// ponytail: cudaconvert zero-copy path when both ends are NVENC/NVDEC.
-fn build_video_encode_chain(pipe: &gst::Pipeline, from: &gst::Pad, sinkpad: gst::Pad) {
+fn build_video_encode_chain(
+    pipe: &gst::Pipeline,
+    from: &gst::Pad,
+    sinkpad: gst::Pad,
+    gate: &Option<Arc<SeekGate>>,
+) {
     let Some(enc_name) = h264_encoder() else {
         tracing::error!("video encode routed with no verified H.264 encoder");
         return;
@@ -577,6 +642,9 @@ fn build_video_encode_chain(pipe: &gst::Pipeline, from: &gst::Pad, sinkpad: gst:
     }
     let out = parse.static_pad("src").unwrap();
     guard_pts(&out);
+    if let Some(g) = gate {
+        g.install(&out);
+    }
     if let Err(e) = out.link(&sinkpad) {
         tracing::warn!(error = %e, "video encode chain → muxer link failed");
     }
@@ -598,7 +666,13 @@ fn build_video_encode_chain(pipe: &gst::Pipeline, from: &gst::Pad, sinkpad: gst:
 /// the fallback strategy) → audioconvert → audioresample → AAC encoder →
 /// aacparse (raw→ADTS for the TS muxer) → muxer pad. The only decode/
 /// encode work in the hub, and audio-only by design: a few % CPU.
-fn build_audio_encode_chain(pipe: &gst::Pipeline, from: &gst::Pad, sinkpad: gst::Pad, caps_name: &str) {
+fn build_audio_encode_chain(
+    pipe: &gst::Pipeline,
+    from: &gst::Pad,
+    sinkpad: gst::Pad,
+    caps_name: &str,
+    gate: &Option<Arc<SeekGate>>,
+) {
     let Some(enc_name) = aac_encoder() else {
         // Planner guarantees this; guard anyway (fakesink beats a stall).
         tracing::error!("audio encode routed with no verified AAC encoder");
@@ -619,7 +693,7 @@ fn build_audio_encode_chain(pipe: &gst::Pipeline, from: &gst::Pad, sinkpad: gst:
             .build()
             .unwrap();
         let dec = gst::ElementFactory::make("avdec_eac3").build().unwrap();
-        build_audio_tail(pipe, from, sinkpad, enc_name, &[setter, dec]);
+        build_audio_tail(pipe, from, sinkpad, enc_name, &[setter, dec], gate);
         return;
     }
     let decode = gst::ElementFactory::make("decodebin").build().unwrap();
@@ -636,6 +710,9 @@ fn build_audio_encode_chain(pipe: &gst::Pipeline, from: &gst::Pad, sinkpad: gst:
     }
     let out = parse.static_pad("src").unwrap();
     guard_pts(&out);
+    if let Some(g) = gate {
+        g.install(&out);
+    }
     if let Err(e) = out.link(&sinkpad) {
         tracing::warn!(error = %e, "remux: encode chain → muxer link failed");
     }
@@ -663,6 +740,7 @@ fn build_audio_tail(
     sinkpad: gst::Pad,
     enc_name: &str,
     front: &[gst::Element],
+    gate: &Option<Arc<SeekGate>>,
 ) {
     let convert = gst::ElementFactory::make("audioconvert").build().unwrap();
     let resample = gst::ElementFactory::make("audioresample").build().unwrap();
@@ -679,6 +757,9 @@ fn build_audio_tail(
     }
     let out = parse.static_pad("src").unwrap();
     guard_pts(&out);
+    if let Some(g) = gate {
+        g.install(&out);
+    }
     if let Err(e) = out.link(&sinkpad) {
         tracing::warn!(error = %e, "remux: encode chain → muxer link failed");
     }
@@ -724,8 +805,12 @@ impl RemuxSource for FileSource {
 }
 
 enum FeedCmd {
-    Need(u32),
-    Seek(u64),
+    /// (bytes wanted, feed generation at request time) — a Need stamped
+    /// before a seek must never be served after it: with slow sources
+    /// (lease/socket) a stale read can land after flush-stop and push
+    /// old-position bytes into the new segment, which the demuxer then
+    /// parses as garbage ("large block, file might be corrupt").
+    Need(u32, u64),
 }
 
 pub struct RemuxJob {
@@ -814,26 +899,53 @@ pub fn start_at(
     // appsrc callbacks run on GStreamer threads and must not block on I/O;
     // they forward commands to a feeder thread that owns the source.
     let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<FeedCmd>();
-    let seek_tx = cmd_tx.clone();
+    // Seeks apply synchronously in the callback (generation bump + new
+    // position); the feeder picks both up before serving any Need.
+    let generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let seek_to: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
+    // Held by the feeder for the duration of each Need. seek_data takes
+    // it after bumping the generation: any in-flight feed then finishes
+    // inside the flush (its push fails Flushing — appsrc unblocks
+    // producers before invoking seek_data), so a slow source read can
+    // never land pre-seek bytes after flush-stop.
+    let busy: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
+    let gen_need = generation.clone();
+    let gen_seek = generation.clone();
+    let seek_cb = seek_to.clone();
+    let busy_seek = busy.clone();
     appsrc.set_callbacks(
         gstreamer_app::AppSrcCallbacks::builder()
             .need_data(move |_, length| {
-                let _ = cmd_tx.send(FeedCmd::Need(length));
+                let _ = cmd_tx.send(FeedCmd::Need(
+                    length,
+                    gen_need.load(std::sync::atomic::Ordering::SeqCst),
+                ));
             })
-            .seek_data(move |_, offset| seek_tx.send(FeedCmd::Seek(offset)).is_ok())
+            .seek_data(move |_, offset| {
+                *seek_cb.lock().unwrap() = Some(offset);
+                gen_seek.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                drop(busy_seek.lock().unwrap());
+                true
+            })
             .build(),
     );
     let feeder_src = appsrc.clone();
+    let gen_feed = generation;
+    let seek_feed = seek_to;
     std::thread::spawn(move || {
         let mut pos: u64 = 0;
         let mut at_eos = false;
         while let Ok(cmd) = cmd_rx.recv() {
             match cmd {
-                FeedCmd::Seek(offset) => {
-                    pos = offset;
-                    at_eos = false;
-                }
-                FeedCmd::Need(length) => {
+                FeedCmd::Need(length, stamp) => {
+                    let _busy = busy.lock().unwrap();
+                    if let Some(target) = seek_feed.lock().unwrap().take() {
+                        pos = target;
+                        at_eos = false;
+                    }
+                    if stamp != gen_feed.load(std::sync::atomic::Ordering::SeqCst) {
+                        continue; // stamped before a seek: stale, drop
+                    }
                     if at_eos {
                         continue;
                     }
@@ -887,10 +999,13 @@ pub fn start_at(
     // Every parsed stream gets a queue immediately (no buffer ever hits an
     // unlinked pad); routing to the pre-requested muxer pads happens per
     // stream once its real caps flow (see plumb_parsed_pad).
+    let gate = (start_ms > 0)
+        .then(|| SeekGate::new(plan.has_video() as usize + plan.has_audio() as usize));
     let pipe = pipeline.clone();
     let waiting2 = waiting.clone();
+    let gate2 = gate.clone();
     parsebin.connect_pad_added(move |_, pad| {
-        plumb_parsed_pad(&pipe, &waiting2, pad, plan);
+        plumb_parsed_pad(&pipe, &waiting2, pad, plan, &gate2);
     });
 
     let error = Arc::new(Mutex::new(None::<String>));
@@ -921,19 +1036,36 @@ pub fn start_at(
         }
     });
 
-    if start_ms > 0 {
-        // Preroll paused, seek (flushing, snap to keyframe), then roll.
-        // The appsrc is Seekable and the demuxer owns index lookup —
-        // the same machinery that makes moov-at-end MP4s work.
+    if let Some(gate) = &gate {
+        // Offset start. splitmuxsink cannot survive a flush once it has
+        // seen data (C assert aborts on mid-GOP flushes), so every muxer
+        // feed is gated: roll toward PAUSED until all branches have data
+        // blocked at the gates (source, demuxer and parsers are then
+        // negotiated), seek through the still-virgin muxer, then open.
         pipeline.set_state(gst::State::Paused)?;
-        let (res, _, _) = pipeline.state(gst::ClockTime::from_seconds(15));
-        res.map_err(|_| anyhow::anyhow!("pipeline failed to preroll for seek"))?;
-        pipeline
-            .seek_simple(
-                gst::SeekFlags::FLUSH | gst::SeekFlags::KEY_UNIT,
-                gst::ClockTime::from_mseconds(start_ms),
-            )
-            .context("seeking to start offset")?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !gate.all_triggered() {
+            if let Some(e) = error.lock().unwrap().clone() {
+                anyhow::bail!("pipeline failed before offset seek: {e}");
+            }
+            anyhow::ensure!(
+                std::time::Instant::now() < deadline,
+                "streams never reached the seek gate"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        // Straight at the demuxer: a pipeline-level seek routes through
+        // the sinks, and the gated (unprerolled) HLS sink refuses it.
+        let seek = gst::event::Seek::new(
+            1.0,
+            gst::SeekFlags::FLUSH | gst::SeekFlags::KEY_UNIT,
+            gst::SeekType::Set,
+            gst::ClockTime::from_mseconds(start_ms),
+            gst::SeekType::None,
+            gst::ClockTime::NONE,
+        );
+        anyhow::ensure!(parsebin.send_event(seek), "demuxer refused the start-offset seek");
+        gate.open();
     }
     pipeline.set_state(gst::State::Playing)?;
     Ok(RemuxJob { pipeline, error, finished })
@@ -1186,6 +1318,46 @@ mod tests {
         assert!(
             total > 2.0 && total < 6.5,
             "expected ~4s tail, playlist covers {total}s:\n{playlist}"
+        );
+    }
+
+    /// The crashing combo from the field: offset start + encode branch.
+    /// splitmuxsink aborts on flushes after data; the seek gate must
+    /// keep it virgin until the initial seek lands.
+    #[test]
+    fn starts_at_offset_with_encode_branch() {
+        crate::init().unwrap();
+        if aac_encoder().is_none() {
+            eprintln!("skipping: no verified AAC encoder");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let src_path = dir.path().join("in.mkv");
+        crate::testutil::render_h264_flac_mkv(&src_path); // ~10 s
+
+        let info = crate::discover(&src_path, Duration::from_secs(30)).unwrap();
+        let plan = plan_streams(&info, &WEB_TARGET);
+        assert_eq!(plan.audio, StreamMode::Encode, "flac should plan Encode: {info:?}");
+
+        let out = tempfile::tempdir().unwrap();
+        // The flac fixture is ~5 s; start at 2.5 s → expect a ~2.5 s tail.
+        let job = start_at(out.path(), plan, Box::new(FileSource::open(&src_path).unwrap()), 2_500)
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !job.finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(job.finished(), "offset encode remux did not finish");
+        assert!(job.failed().is_none(), "offset encode remux failed: {:?}", job.failed());
+        let playlist = std::fs::read_to_string(out.path().join("master.m3u8")).unwrap();
+        let total: f64 = playlist
+            .lines()
+            .filter_map(|l| l.strip_prefix("#EXTINF:"))
+            .filter_map(|l| l.trim_end_matches(',').parse::<f64>().ok())
+            .sum();
+        assert!(
+            total > 1.5 && total < 4.0,
+            "expected only the tail, playlist covers {total}s:\n{playlist}"
         );
     }
 

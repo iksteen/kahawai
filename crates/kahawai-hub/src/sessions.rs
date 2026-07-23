@@ -29,6 +29,8 @@ pub enum Mode {
 pub enum RemuxRunner {
     InProcess(Arc<kahawai_media::remux::RemuxJob>),
     Worker(Mutex<tokio::process::Child>),
+    /// Placeholder while a seek-restart swaps runners.
+    Stopped,
 }
 
 impl RemuxRunner {
@@ -37,6 +39,27 @@ impl RemuxRunner {
             RemuxRunner::InProcess(job) => job.stop(),
             RemuxRunner::Worker(child) => {
                 let _ = child.lock().unwrap().start_kill();
+            }
+            RemuxRunner::Stopped => {}
+        }
+    }
+
+    /// Stop and wait until the pipeline is really gone — a seek-restart
+    /// recreates the scratch dir, and a still-dying worker writing into
+    /// it corrupts the new run.
+    async fn stop_and_wait(&self) {
+        self.stop();
+        if let RemuxRunner::Worker(child) = self {
+            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            loop {
+                if matches!(child.lock().unwrap().try_wait(), Ok(Some(_)) | Err(_)) {
+                    return;
+                }
+                if std::time::Instant::now() > deadline {
+                    tracing::warn!("old worker did not exit in time; proceeding");
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
             }
         }
     }
@@ -446,6 +469,7 @@ impl Sessions {
                         bail!("pipeline worker exited at start ({status}): {tail}");
                     }
                 }
+                RemuxRunner::Stopped => unreachable!("start_remux never yields Stopped"),
             }
             if playlist.exists() {
                 return Ok(runner);
@@ -530,6 +554,7 @@ impl Sessions {
     }
 
     /// Link-facing: serve one source read for a dispatched session.
+    #[allow(clippy::too_many_arguments)] // wire-shaped plumbing
     pub async fn source_read(
         &self,
         registry: &Registry,
@@ -537,6 +562,7 @@ impl Sessions {
         session_id: &str,
         offset: u64,
         len: u64,
+        req: u64,
     ) {
         let Some((lease, size)) = self.tc_leases.lock().unwrap().get(session_id).cloned() else {
             tracing::debug!(session = session_id, "source read for unknown session");
@@ -565,6 +591,7 @@ impl Sessions {
                     session_id: session_id.to_string(),
                     offset,
                     data: buf,
+                    req,
                 },
             )),
         };
@@ -650,7 +677,9 @@ impl Sessions {
         session.touch();
         match &session.mode {
             Mode::Remux { dir, runner } => {
-                runner.lock().unwrap().stop();
+                let old =
+                    std::mem::replace(&mut *runner.lock().unwrap(), RemuxRunner::Stopped);
+                old.stop_and_wait().await;
                 let _ = std::fs::remove_dir_all(dir);
                 // The old worker's lease died with it; open a fresh one.
                 let (_, _, size, _, lease) =

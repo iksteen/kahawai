@@ -101,7 +101,7 @@ impl TranscoderLink for TranscoderLinkService {
                             let module_id = module_id.clone();
                             tokio::spawn(async move {
                                 sessions
-                                    .source_read(&registry, &module_id, &r.session_id, r.offset, r.len)
+                                    .source_read(&registry, &module_id, &r.session_id, r.offset, r.len, r.req)
                                     .await;
                             });
                         }

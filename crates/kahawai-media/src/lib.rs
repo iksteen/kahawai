@@ -33,6 +33,13 @@ pub fn discover(path: &Path, timeout: Duration) -> Result<MediaInfo> {
     let info = discoverer
         .discover_uri(&uri)
         .with_context(|| format!("discovering {}", path.display()))?;
+    // discover_uri returns Ok even on timeout/missing-plugin results —
+    // don't let those masquerade as valid-but-empty media (a slow NAS
+    // would scan whole libraries as streamless files).
+    let result = info.result();
+    if result != gstreamer_pbutils::DiscovererResult::Ok {
+        anyhow::bail!("discovering {}: {result:?}", path.display());
+    }
     Ok(map_info(&info))
 }
 

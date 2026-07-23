@@ -141,12 +141,16 @@ message SessionError {
   string error = 2;
 }
 
-// Transcoder pulls source bytes; one outstanding read per session (the
-// worker blocks on each), so session_id correlates request/response.
+// Transcoder pulls source bytes. `req` correlates request/response:
+// session_id alone is NOT enough — a seek-restart reuses the session id,
+// and a read left in flight by the killed worker must never satisfy the
+// new worker's first read (observed: avidemux fed mid-file bytes as a
+// header).
 message SourceRead {
   string session_id = 1;
   uint64 offset = 2;
   uint64 len = 3;
+  uint64 req = 4;
 }
 
 message SourceData {
@@ -154,6 +158,7 @@ message SourceData {
   uint64 offset = 2;
   // Shorter than requested (including empty) = EOF at that offset.
   bytes data = 3;
+  uint64 req = 4;
 }
 
 // One artifact (playlist/segment) streamed in chunks, eof-terminated.

@@ -267,6 +267,50 @@ async fn dispatches_encode_session_to_transcoder() {
     assert_eq!(seg_info.audio.first().map(|a| a.codec.as_str()), Some("aac"), "{seg_info:?}");
     assert_eq!(seg_info.video.first().map(|v| v.codec.as_str()), Some("h264"), "{seg_info:?}");
 
+    // Seek-restart a dispatched session (the stale-read regression:
+    // the old worker's in-flight source read must not poison the new
+    // worker's header read — correlation is by request id, not session).
+    let resp = api
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/v1/playback/sessions/{session_id}/seek"))
+                .header("authorization", bearer.clone())
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"position_ms":2500}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    if status != StatusCode::NO_CONTENT {
+        let body = String::from_utf8_lossy(&body_bytes(resp).await).to_string();
+        panic!("seek-restart failed: {status} — {body}");
+    }
+    let tail_playlist = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let resp = api.clone().oneshot(get(stream_url.clone())).await.unwrap();
+            if resp.status() == StatusCode::OK {
+                let text = String::from_utf8(body_bytes(resp).await).unwrap();
+                if text.contains("#EXT-X-ENDLIST") {
+                    return text;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("post-seek playlist never finalized");
+    let total: f64 = tail_playlist
+        .lines()
+        .filter_map(|l| l.strip_prefix("#EXTINF:"))
+        .filter_map(|l| l.trim_end_matches(',').parse::<f64>().ok())
+        .sum();
+    // ~5 s fixture sought to 2.5 s: expect roughly the tail.
+    assert!(
+        total > 1.5 && total < 4.0,
+        "post-seek playlist should cover the tail, got {total}s:\n{tail_playlist}"
+    );
+
     // Teardown ends the dispatched session.
     let resp = api
         .clone()
