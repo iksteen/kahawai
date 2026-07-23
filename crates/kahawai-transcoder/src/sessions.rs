@@ -66,6 +66,7 @@ impl Runner {
         })
     }
 
+    #[allow(clippy::too_many_arguments)] // wire-shaped plumbing
     pub async fn start(
         self: &Arc<Self>,
         session_id: String,
@@ -73,8 +74,9 @@ impl Runner {
         video: &str,
         audio: &str,
         start_ms: u64,
+        sink: &str,
     ) {
-        let result = self.start_inner(&session_id, size, video, audio, start_ms).await;
+        let result = self.start_inner(&session_id, size, video, audio, start_ms, sink).await;
         let msg = match result {
             Ok(()) => {
                 tracing::info!(session = %session_id, "session ready");
@@ -98,6 +100,7 @@ impl Runner {
         let _ = self.link.send(msg).await;
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn start_inner(
         self: &Arc<Self>,
         session_id: &str,
@@ -105,6 +108,7 @@ impl Runner {
         video: &str,
         audio: &str,
         start_ms: u64,
+        sink: &str,
     ) -> Result<()> {
         // Replace any previous run first (seek-restart reuses the id).
         self.end(session_id).await;
@@ -139,6 +143,7 @@ impl Runner {
                     .args(["--video", video])
                     .args(["--audio", audio])
                     .args(["--start-ms", &start_ms.to_string()])
+                    .args(if sink.is_empty() { vec![] } else { vec!["--sink".into(), sink.to_string()] })
                     .stderr(std::process::Stdio::from(log))
                     .kill_on_drop(true)
                     .spawn()
@@ -152,10 +157,13 @@ impl Runner {
                     kahawai_media::worker::parse_mode(audio),
                 );
                 let (sock, dir) = (sock.clone(), dir.clone());
+                let sink_owned = (!sink.is_empty()).then(|| sink.to_string());
                 let err = Arc::new(Mutex::new(None));
                 let err2 = err.clone();
                 let handle = tokio::task::spawn_blocking(move || {
-                    if let Err(e) = kahawai_media::worker::run(&sock, &dir, size, v, a, start_ms) {
+                    if let Err(e) = kahawai_media::worker::run(
+                        &sock, &dir, size, v, a, start_ms, sink_owned.as_deref(),
+                    ) {
                         tracing::warn!(error = format!("{e:#}"), "in-process worker failed");
                         *err2.lock().unwrap() = Some(format!("{e:#}"));
                     }
@@ -167,6 +175,54 @@ impl Runner {
             .lock()
             .unwrap()
             .insert(session_id.to_string(), Session { dir: dir.clone(), worker, bridge });
+
+        // Post-ready supervision: a worker dying mid-session becomes a
+        // SessionError so the hub can reschedule (AR-6).
+        {
+            let runner = self.clone();
+            let sid = session_id.to_string();
+            let run_dir = dir.clone();
+            tokio::spawn(async move {
+                // Poll: the child handle lives in the sessions map.
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    let gone = {
+                        let mut sessions = runner.sessions.lock().unwrap();
+                        match sessions.get_mut(&sid) {
+                            // Replaced or ended: this watcher is obsolete.
+                            Some(s) if s.dir != run_dir => return,
+                            None => return,
+                            Some(s) => match &mut s.worker {
+                                Worker::Child(child) => {
+                                    matches!(child.try_wait(), Ok(Some(_)) | Err(_))
+                                }
+                                Worker::InProcess(handle, _) => handle.is_finished(),
+                            },
+                        }
+                    };
+                    if gone {
+                        // EOS is also "gone" — only report if the playlist
+                        // never finalized (ENDLIST = clean finish).
+                        let done = std::fs::read_to_string(run_dir.join("master.m3u8"))
+                            .map(|p| p.contains("#EXT-X-ENDLIST"))
+                            .unwrap_or(false);
+                        if !done {
+                            tracing::warn!(session = %sid, "worker died mid-session");
+                            let _ = runner
+                                .link
+                                .send(TcToHub {
+                                    msg: Some(tc_to_hub::Msg::SessionError(SessionError {
+                                        session_id: sid.clone(),
+                                        error: "worker died mid-session".into(),
+                                    })),
+                                })
+                                .await;
+                        }
+                        return;
+                    }
+                }
+            });
+        }
 
         // Ready once the playlist exists; failed if the worker dies first.
         let playlist = dir.join("master.m3u8");

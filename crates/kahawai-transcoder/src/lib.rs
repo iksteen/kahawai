@@ -55,7 +55,9 @@ fn probe_capabilities(max_sessions: u32) -> Result<CapabilityReport> {
     if encoders.is_empty() {
         bail!("no working encoders on this machine — see `kahawai doctor`");
     }
-    Ok(CapabilityReport { encoders, max_sessions })
+    let decode_caps = kahawai_media::remux::decoder_caps_names();
+    tracing::info!(decoders = decode_caps.len(), "decoder inventory");
+    Ok(CapabilityReport { encoders, max_sessions, decode_caps })
 }
 
 /// One link session: Hello/HelloAck, capability registration, then
@@ -133,7 +135,7 @@ async fn link_loop(
                         Some(hub_to_tc::Msg::StartSession(s)) => {
                             let runner = runner.clone();
                             tokio::spawn(async move {
-                                runner.start(s.session_id, s.size, &s.video, &s.audio, s.start_ms).await;
+                                runner.start(s.session_id, s.size, &s.video, &s.audio, s.start_ms, &s.sink).await;
                             });
                         }
                         // Inline, not spawned: EndSession→StartSession

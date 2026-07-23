@@ -42,6 +42,7 @@ fn enroll(
 
 #[tokio::test]
 async fn dispatches_encode_session_to_transcoder() {
+    let _ = tracing_subscriber::fmt().with_env_filter("info,kahawai_hub=debug").try_init();
     if kahawai_media::remux::aac_encoder().is_none() {
         eprintln!("skipping: no verified AAC encoder");
         return;
@@ -157,7 +158,7 @@ async fn dispatches_encode_session_to_transcoder() {
     let tc_scratch = tempfile::tempdir().unwrap();
     let hub_addr2 = hub_addr.clone();
     let scratch_path = tc_scratch.path().join("sessions");
-    tokio::spawn(async move {
+    let tc1_task = tokio::spawn(async move {
         let caps = pb::CapabilityReport {
             encoders: vec![pb::EncoderCap {
                 codec: "aac".into(),
@@ -165,6 +166,7 @@ async fn dispatches_encode_session_to_transcoder() {
                 hardware: false,
             }],
             max_sessions: 2,
+            decode_caps: vec![], // empty = assume capable (OPS-7)
         };
         let _ = kahawai_transcoder::link_once(
             &hub_addr2,
@@ -203,7 +205,14 @@ async fn dispatches_encode_session_to_transcoder() {
     .await
     .expect("item never resolved");
     tokio::time::timeout(Duration::from_secs(10), async {
-        while registry.pick_transcoder(false, true).is_none() {
+        while registry
+            .pick_transcoder(&kahawai_hub::registry::PlacementNeed {
+                encode_audio: true,
+                audio_caps: vec!["audio/x-flac".into()],
+                ..Default::default()
+            })
+            .is_none()
+        {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     })
@@ -309,6 +318,62 @@ async fn dispatches_encode_session_to_transcoder() {
     assert!(
         total > 1.5 && total < 4.0,
         "post-seek playlist should cover the tail, got {total}s:\n{tail_playlist}"
+    );
+
+    // AR-6: a second transcoder joins, the first dies mid-session —
+    // the hub reschedules onto the survivor and playback recovers.
+    let tc2_id = enroll(&ca, &allowed, "transcoder", "02TC", "backup-box");
+    registry.record_satellite("02TC", "transcoder", "backup-box", "fp-02tc").await.unwrap();
+    let tc2_tls = kahawai_transport::mtls::mtls_client_config(&tc2_id).unwrap();
+    let tc2_scratch = tempfile::tempdir().unwrap();
+    let hub_addr3 = hub_addr.clone();
+    let tc2_path = tc2_scratch.path().join("sessions");
+    tokio::spawn(async move {
+        let caps = pb::CapabilityReport {
+            encoders: vec![pb::EncoderCap {
+                codec: "aac".into(),
+                element: "fdkaacenc".into(),
+                hardware: false,
+            }],
+            max_sessions: 2,
+            decode_caps: vec![],
+        };
+        let _ = kahawai_transcoder::link_once(
+            &hub_addr3, tc2_tls, "backup-box", caps, &tc2_path, &None,
+        )
+        .await;
+    });
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let sats = registry.satellites_overview().await.unwrap();
+            if sats.iter().any(|s| s["module_id"] == "02TC" && s["connected"] == true) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("backup transcoder never connected");
+
+    tc1_task.abort(); // the box running the session vanishes
+    let recovered = tokio::time::timeout(Duration::from_secs(70), async {
+        loop {
+            let resp = api.clone().oneshot(get(stream_url.clone())).await.unwrap();
+            if resp.status() == StatusCode::OK {
+                let text = String::from_utf8(body_bytes(resp).await).unwrap();
+                if text.contains("#EXT-X-ENDLIST") {
+                    return text;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .expect("session never recovered on the backup transcoder");
+    assert!(recovered.contains("segment"), "recovered playlist empty:\n{recovered}");
+    assert!(
+        sessions.get(&session_id).is_some(),
+        "session should survive the transcoder loss"
     );
 
     // Teardown ends the dispatched session.

@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use kahawai_hub::pki::HubCa;
-use kahawai_hub::registry::Registry;
+use kahawai_hub::registry::{PlacementNeed, Registry};
 use kahawai_hub::transcoder_link::TranscoderLinkService;
 use kahawai_proto::v1::transcoder_link_client::TranscoderLinkClient;
 use kahawai_proto::v1::{tc_to_hub, CapabilityReport, EncoderCap, Hello, TcToHub};
@@ -132,6 +132,7 @@ async fn transcoder_registers_capabilities_and_clears_on_disconnect() {
                 EncoderCap { codec: "aac".into(), element: "fdkaacenc".into(), hardware: false },
             ],
             max_sessions: 2,
+            decode_caps: vec!["video/x-av1".into(), "audio/x-flac".into()],
         })),
     })
     .await
@@ -152,9 +153,25 @@ async fn transcoder_registers_capabilities_and_clears_on_disconnect() {
     .await;
 
     // Placement finds it — until the admin disables it.
-    assert_eq!(hub.registry.pick_transcoder(true, true).as_deref(), Some("01TC"));
+    let need = |video_caps: &[&str]| PlacementNeed {
+        encode_video: true,
+        encode_audio: true,
+        video_caps: video_caps.iter().map(|s| s.to_string()).collect(),
+        audio_caps: vec!["audio/x-flac".into()],
+    };
+    let av1 = need(&["video/x-av1"]);
+    assert_eq!(hub.registry.pick_transcoder(&av1).as_deref(), Some("01TC"));
+    // Decode fit: a source this box cannot decode is not placeable here.
+    assert_eq!(hub.registry.pick_transcoder(&need(&["video/x-daala"])), None);
+    // Capacity: max_sessions = 2 is a hard cap.
+    hub.registry.tc_session_started("01TC");
+    hub.registry.tc_session_started("01TC");
+    assert_eq!(hub.registry.pick_transcoder(&av1), None, "at capacity");
+    hub.registry.tc_session_ended("01TC");
+    assert_eq!(hub.registry.pick_transcoder(&av1).as_deref(), Some("01TC"));
+
     hub.registry.set_disabled("01TC", true).await.unwrap();
-    assert_eq!(hub.registry.pick_transcoder(true, true), None);
+    assert_eq!(hub.registry.pick_transcoder(&av1), None);
 
     // The drain survives a hub restart: a fresh registry over the same
     // database loads the flag.
@@ -167,7 +184,7 @@ async fn transcoder_registers_capabilities_and_clears_on_disconnect() {
     );
 
     hub.registry.set_disabled("01TC", false).await.unwrap();
-    assert_eq!(hub.registry.pick_transcoder(true, true).as_deref(), Some("01TC"));
+    assert_eq!(hub.registry.pick_transcoder(&av1).as_deref(), Some("01TC"));
 
     // Disconnect: capabilities must not outlive the link.
     drop(tx);

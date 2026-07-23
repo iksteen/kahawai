@@ -52,6 +52,8 @@ enum Cmd {
         audio: String,
         #[arg(long, default_value_t = 0)]
         start_ms: u64,
+        #[arg(long)]
+        sink: Option<String>,
     },
 }
 
@@ -88,7 +90,7 @@ async fn main() -> Result<()> {
         }
         Cmd::Mediahost => run_mediahost(cfg.mediahost).await,
         Cmd::Doctor { json } => doctor(&cfg, json),
-        Cmd::RemuxWorker { socket, out_dir, size, video, audio, start_ms } => {
+        Cmd::RemuxWorker { socket, out_dir, size, video, audio, start_ms, sink } => {
             // Blocking by design: this process exists only for the pipeline.
             kahawai_media::worker::run(
                 &socket,
@@ -97,6 +99,7 @@ async fn main() -> Result<()> {
                 kahawai_media::worker::parse_mode(&video),
                 kahawai_media::worker::parse_mode(&audio),
                 start_ms,
+                sink.as_deref(),
             )
         }
         Cmd::Transcoder => {

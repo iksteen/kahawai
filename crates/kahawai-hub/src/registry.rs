@@ -50,6 +50,16 @@ const ARCHIVE_WATCH_FOR_FILE_SQL: &str = "
     JOIN watch_state w ON w.item_id = s.item_id
     WHERE f.module_id = ? AND f.collection_id = ? AND f.path_rel = ?";
 
+/// What a session needs from a transcoder (derived from plan + source).
+#[derive(Debug, Clone, Default)]
+pub struct PlacementNeed {
+    pub encode_video: bool,
+    pub encode_audio: bool,
+    /// Source caps names per kind (any one must be decodable).
+    pub video_caps: Vec<String>,
+    pub audio_caps: Vec<String>,
+}
+
 pub struct Registry {
     db: SqlitePool,
     /// The live mTLS allowlist (SEC-5), mirrored from the satellites table.
@@ -419,6 +429,7 @@ impl Registry {
                 }))
                 .collect::<Vec<_>>(),
             "max_sessions": caps.max_sessions,
+            "decode_caps": caps.decode_caps,
         });
         self.transcoder_caps.lock().unwrap().insert(module_id.to_string(), json);
     }
@@ -482,10 +493,9 @@ impl Registry {
         Ok(())
     }
 
-    /// Placement (§4.5): capability fit ≥ hw-accel ≥ inverse load.
-    /// ponytail: per-box decode capability and max_sessions enforcement
-    /// come with the negotiation-aware capability report.
-    pub fn pick_transcoder(&self, need_h264: bool, need_aac: bool) -> Option<String> {
+    /// Placement (§4.5): capability fit (encoders AND source decoders)
+    /// ≥ capacity ≥ hw-accel ≥ inverse load.
+    pub fn pick_transcoder(&self, need: &PlacementNeed) -> Option<String> {
         let caps = self.transcoder_caps.lock().unwrap().clone();
         let links = self.tc_links.lock().unwrap();
         let load = self.tc_load.lock().unwrap();
@@ -496,13 +506,35 @@ impl Registry {
             .filter_map(|(id, c)| {
                 let encoders = c.get("encoders")?.as_array()?;
                 let has = |codec: &str| encoders.iter().any(|e| e["codec"] == codec);
-                if (need_h264 && !has("h264")) || (need_aac && !has("aac")) {
+                if (need.encode_video && !has("h264")) || (need.encode_audio && !has("aac")) {
                     return None;
+                }
+                // Decode fit: the box must decode at least one source
+                // stream of each kind it will encode. Empty inventory =
+                // older satellite that didn't report; assume capable
+                // (OPS-7 tolerance).
+                let decoders: Vec<&str> = c
+                    .get("decode_caps")
+                    .and_then(|d| d.as_array())
+                    .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+                    .unwrap_or_default();
+                let can = |wanted: &[String]| {
+                    decoders.is_empty() || wanted.iter().any(|w| decoders.contains(&w.as_str()))
+                };
+                if (need.encode_video && !can(&need.video_caps))
+                    || (need.encode_audio && !can(&need.audio_caps))
+                {
+                    return None;
+                }
+                let current = load.get(id).copied().unwrap_or(0);
+                let max = c.get("max_sessions").and_then(|m| m.as_u64()).unwrap_or(0) as usize;
+                if max > 0 && current >= max {
+                    return None; // at capacity (TC-6)
                 }
                 let hw = encoders
                     .iter()
                     .any(|e| e["codec"] == "h264" && e["hardware"] == true);
-                Some((hw, load.get(id).copied().unwrap_or(0), id.clone()))
+                Some((hw, current, id.clone()))
             })
             .collect();
         // Most hardware, least loaded.

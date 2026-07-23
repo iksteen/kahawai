@@ -185,6 +185,41 @@ fn dry_run(launch: &str) -> bool {
     ok
 }
 
+/// Source caps names of one kind, for decode-fit placement.
+pub fn source_caps_names(kind: &str, info: &kahawai_core::media::MediaInfo) -> Vec<String> {
+    let codecs: Vec<&str> = match kind {
+        "video" => info.video.iter().map(|v| v.codec.as_str()).collect(),
+        _ => info.audio.iter().map(|a| a.codec.as_str()).collect(),
+    };
+    codecs
+        .into_iter()
+        .filter_map(|c| codec_to_caps_name(kind, c))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Every caps name the installed decoders can sink, for the transcoder
+/// capability report (registry-derived, never hand-listed).
+pub fn decoder_caps_names() -> Vec<String> {
+    let _ = crate::init();
+    let mut names: Vec<String> = gst::ElementFactory::factories_with_type(
+        gst::ElementFactoryType::DECODER,
+        gst::Rank::MARGINAL,
+    )
+    .iter()
+    .flat_map(|f| {
+        f.static_pad_templates()
+            .into_iter()
+            .filter(|t| t.direction() == gst::PadDirection::Sink)
+            .flat_map(|t| t.caps().iter().map(|s| s.name().to_string()).collect::<Vec<_>>())
+            .collect::<Vec<_>>()
+    })
+    .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
 /// Can any installed decoder take this stream? Derived from the element
 /// registry (never hand-list what it can tell us).
 fn can_decode(caps_name: &str) -> bool {
@@ -848,10 +883,14 @@ fn set_prop_str_if_present(el: &gst::Element, name: &str, value: &str) {
 
 /// Best available HLS sink, configured for `out_dir`. Returns the element
 /// and its factory name (for logs/tests).
-fn make_hls_sink(out_dir: &Path) -> Result<(gst::Element, &'static str)> {
-    let name = HLS_SINKS
-        .iter()
-        .find(|n| gst::ElementFactory::find(n).is_some())
+fn make_hls_sink(out_dir: &Path, prefer: Option<&str>) -> Result<(gst::Element, &'static str)> {
+    // An explicit preference (retry-after-sink-crash, TC-6) wins if the
+    // element exists; otherwise the usual best-available order.
+    let name = prefer
+        .and_then(|p| {
+            HLS_SINKS.iter().find(|n| **n == p && gst::ElementFactory::find(n).is_some())
+        })
+        .or_else(|| HLS_SINKS.iter().find(|n| gst::ElementFactory::find(n).is_some()))
         .context("no HLS sink element (hlssink3/hlssink2) — see `kahawai doctor`")?;
     let sink = gst::ElementFactory::make(name).build()?;
     set_prop_if_present(&sink, "location", out_dir.join("segment%05d.ts").to_str().unwrap());
@@ -874,7 +913,7 @@ fn make_hls_sink(out_dir: &Path) -> Result<(gst::Element, &'static str)> {
 /// must be requested before the pipeline starts, and an unfed pad would
 /// stall it.
 pub fn start(out_dir: &Path, plan: RemuxPlan, source: Box<dyn RemuxSource>) -> Result<RemuxJob> {
-    start_at(out_dir, plan, source, 0)
+    start_full(out_dir, plan, source, 0, None)
 }
 
 /// Like [`start`], seeking to `start_ms` (nearest keyframe at or before
@@ -883,8 +922,19 @@ pub fn start(out_dir: &Path, plan: RemuxPlan, source: Box<dyn RemuxSource>) -> R
 pub fn start_at(
     out_dir: &Path,
     plan: RemuxPlan,
+    source: Box<dyn RemuxSource>,
+    start_ms: u64,
+) -> Result<RemuxJob> {
+    start_full(out_dir, plan, source, start_ms, None)
+}
+
+/// Full-control variant: offset plus an HLS sink override (TC-6 retry).
+pub fn start_full(
+    out_dir: &Path,
+    plan: RemuxPlan,
     mut source: Box<dyn RemuxSource>,
     start_ms: u64,
+    sink: Option<&str>,
 ) -> Result<RemuxJob> {
     crate::init()?;
 
@@ -978,7 +1028,7 @@ pub fn start_at(
         }
     });
     let parsebin = gst::ElementFactory::make("parsebin").build()?;
-    let (hlssink, _sink_name) = make_hls_sink(out_dir)?;
+    let (hlssink, _sink_name) = make_hls_sink(out_dir, sink)?;
 
     pipeline.add_many([appsrc.upcast_ref::<gst::Element>(), &parsebin, &hlssink])?;
     gst::Element::link_many([appsrc.upcast_ref::<gst::Element>(), &parsebin])?;
@@ -1365,7 +1415,13 @@ mod tests {
     fn hls_sink_selection_prefers_best_available() {
         crate::init().unwrap();
         let dir = tempfile::tempdir().unwrap();
-        let (_, name) = make_hls_sink(dir.path()).unwrap();
+        let (_, name) = make_hls_sink(dir.path(), None).unwrap();
+        // An explicit preference wins when installed.
+        if gst::ElementFactory::find("hlssink2").is_some() {
+            let d2 = tempfile::tempdir().unwrap();
+            let (_, forced) = make_hls_sink(d2.path(), Some("hlssink2")).unwrap();
+            assert_eq!(forced, "hlssink2");
+        }
         let expected = if gst::ElementFactory::find("hlssink3").is_some() {
             "hlssink3"
         } else {

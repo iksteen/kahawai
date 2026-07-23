@@ -63,6 +63,7 @@ pub fn mode_arg(mode: StreamMode) -> &'static str {
 /// Child entry point: connect to the parent's socket, run the pipeline
 /// to EOS, exit. Errors (including pipeline errors) return Err — the
 /// binary maps that to a non-zero exit the supervisor can see.
+#[allow(clippy::too_many_arguments)] // CLI-shaped plumbing
 pub fn run(
     socket: &Path,
     out_dir: &Path,
@@ -70,11 +71,13 @@ pub fn run(
     video: StreamMode,
     audio: StreamMode,
     start_ms: u64,
+    sink: Option<&str>,
 ) -> Result<()> {
     let stream = UnixStream::connect(socket)
         .with_context(|| format!("connecting to {}", socket.display()))?;
     let plan = RemuxPlan { video, audio };
-    let job = remux::start_at(out_dir, plan, Box::new(SocketSource { stream, size }), start_ms)?;
+    let job =
+        remux::start_full(out_dir, plan, Box::new(SocketSource { stream, size }), start_ms, sink)?;
     while !job.finished() {
         std::thread::sleep(std::time::Duration::from_millis(100));
     }

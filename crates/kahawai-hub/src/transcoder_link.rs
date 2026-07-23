@@ -75,8 +75,23 @@ impl TranscoderLink for TranscoderLinkService {
                 registry.disconnected(&module_id);
                 return;
             }
+            // Heartbeats arrive every 10 s; three missed = dead link.
+            // (A vanished peer does not always surface as a stream error
+            // — the byte-plane keepalive is ours to enforce.)
             loop {
-                match inbound.message().await {
+                let msg = tokio::time::timeout(
+                    std::time::Duration::from_secs(35),
+                    inbound.message(),
+                )
+                .await;
+                let msg = match msg {
+                    Ok(m) => m,
+                    Err(_) => {
+                        tracing::warn!(%module_id, "no heartbeat in 35s; declaring link dead");
+                        break;
+                    }
+                };
+                match msg {
                     Ok(Some(TcToHub { msg: Some(msg) })) => match msg {
                         tc_to_hub::Msg::Capabilities(caps) => {
                             tracing::info!(
@@ -93,7 +108,28 @@ impl TranscoderLink for TranscoderLinkService {
                             sessions.transcode_verdict(&r.session_id, Ok(()));
                         }
                         tc_to_hub::Msg::SessionError(e) => {
-                            sessions.transcode_verdict(&e.session_id, Err(e.error));
+                            // Pre-ready: fail the pending start. Post-ready
+                            // (worker died mid-session): reschedule (AR-6).
+                            if !sessions.transcode_verdict(&e.session_id, Err(e.error.clone())) {
+                                let sessions = sessions.clone();
+                                let registry = registry.clone();
+                                tokio::spawn(async move {
+                                    match sessions.reschedule(&registry, &e.session_id).await {
+                                        Ok(tc) => tracing::info!(
+                                            session = %e.session_id, to = %tc,
+                                            "mid-session failure rescheduled"
+                                        ),
+                                        Err(err) => {
+                                            tracing::warn!(
+                                                session = %e.session_id,
+                                                error = format!("{err:#}"),
+                                                "mid-session reschedule failed; ending"
+                                            );
+                                            sessions.end(&e.session_id);
+                                        }
+                                    }
+                                });
+                            }
                         }
                         tc_to_hub::Msg::SourceRead(r) => {
                             let sessions = sessions.clone();
@@ -116,13 +152,14 @@ impl TranscoderLink for TranscoderLinkService {
                     }
                 }
             }
-            let ended = sessions.end_for_transcoder(&module_id);
-            if ended > 0 {
-                tracing::warn!(%module_id, ended, "transcoder lost; sessions ended");
-            }
+            // Unregister FIRST so rescheduling never re-picks the dead box.
             registry.unregister_tc_link(&module_id);
             registry.clear_transcoder_caps(&module_id);
             registry.disconnected(&module_id);
+            let (moved, ended) = sessions.reschedule_for_transcoder(&registry, &module_id).await;
+            if moved + ended > 0 {
+                tracing::warn!(%module_id, moved, ended, "transcoder lost; sessions rescheduled/ended");
+            }
         });
 
         Ok(Response::new(ReceiverStream::new(rx)))

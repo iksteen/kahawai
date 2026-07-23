@@ -78,8 +78,21 @@ impl MediahostLink for MediahostLinkService {
                 registry.disconnected(&module_id);
                 return;
             }
+            // Heartbeats arrive every 10 s; three missed = dead link.
             loop {
-                match inbound.message().await {
+                let msg = tokio::time::timeout(
+                    std::time::Duration::from_secs(35),
+                    inbound.message(),
+                )
+                .await;
+                let msg = match msg {
+                    Ok(m) => m,
+                    Err(_) => {
+                        tracing::warn!(%module_id, "no heartbeat in 35s; declaring link dead");
+                        break;
+                    }
+                };
+                match msg {
                     Ok(Some(HostToHub { msg: Some(msg) })) => {
                         if let Err(e) = handle_host_msg(&registry, &module_id, msg, &mut seen).await
                         {

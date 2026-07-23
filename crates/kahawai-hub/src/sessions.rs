@@ -19,7 +19,8 @@ pub enum Mode {
     Direct { lease: Lease },
     Remux { dir: PathBuf, runner: Mutex<RemuxRunner> },
     /// Dispatched to a transcoder module; artifacts proxied on demand.
-    Transcode { transcoder: String },
+    /// The module can change: AR-6 reschedules onto a new box.
+    Transcode { transcoder: Mutex<String> },
 }
 
 /// How a remux/transcode pipeline runs. The hub always spawns the
@@ -79,6 +80,8 @@ pub struct Session {
     pub verdict: Option<(String, String)>,
     /// The negotiated plan (remux/transcode) — reused on seek-restarts.
     plan: Option<kahawai_media::remux::RemuxPlan>,
+    /// Placement requirements — reused when rescheduling (AR-6).
+    needs: crate::registry::PlacementNeed,
     touched: Mutex<std::time::Instant>,
 }
 
@@ -322,6 +325,7 @@ impl Sessions {
         let id = ulid::Ulid::new().to_string();
         let mut verdict = None;
         let mut session_plan = None;
+        let mut session_needs = crate::registry::PlacementNeed::default();
         let session_mode = match mode {
             "direct" => Mode::Direct { lease },
             "remux" => {
@@ -338,31 +342,60 @@ impl Sessions {
                 verdict = Some(kahawai_media::remux::plan_summary(&info, &plan));
                 session_plan = Some(plan);
                 use kahawai_media::remux::StreamMode;
-                let needs_encode =
-                    plan.video == StreamMode::Encode || plan.audio == StreamMode::Encode;
+                session_needs = crate::registry::PlacementNeed {
+                    encode_video: plan.video == StreamMode::Encode,
+                    encode_audio: plan.audio == StreamMode::Encode,
+                    video_caps: kahawai_media::remux::source_caps_names("video", &info),
+                    audio_caps: kahawai_media::remux::source_caps_names("audio", &info),
+                };
                 // Encode work goes to the fleet when one is available
                 // (§4.5); pure remux — and encode with no fleet — stays
                 // in the local supervised worker.
-                let placed = if needs_encode {
-                    registry.pick_transcoder(
-                        plan.video == StreamMode::Encode,
-                        plan.audio == StreamMode::Encode,
-                    )
+                let placed = if session_needs.encode_video || session_needs.encode_audio {
+                    registry.pick_transcoder(&session_needs)
                 } else {
                     None
                 };
                 match placed {
                     Some(tc) => {
-                        self.start_transcode(registry, &tc, &id, plan, lease, size, start_ms)
-                            .await?;
-                        Mode::Transcode { transcoder: tc }
+                        // TC-6: one retry on the fallback HLS sink — two
+                        // library files crash hlssink3 but mux fine on
+                        // hlssink2 (upstream fix pending).
+                        if let Err(first) = self
+                            .start_transcode(registry, &tc, &id, plan, lease.clone(), size, start_ms, "")
+                            .await
+                        {
+                            tracing::warn!(session = %id, error = format!("{first:#}"),
+                                "start failed; retrying with fallback sink");
+                            self.start_transcode(
+                                registry, &tc, &id, plan, lease, size, start_ms, "hlssink2",
+                            )
+                            .await
+                            .with_context(|| format!("first attempt: {first:#}"))?;
+                        }
+                        Mode::Transcode { transcoder: Mutex::new(tc) }
                     }
-                    None => Mode::Remux {
-                        runner: Mutex::new(
-                            self.start_remux(&id, plan, lease, size, start_ms).await?,
-                        ),
-                        dir: self.scratch_root.join(&id),
-                    },
+                    None => {
+                        let runner = match self
+                            .start_remux(&id, plan, lease, size, start_ms, "")
+                            .await
+                        {
+                            Ok(r) => r,
+                            Err(first) => {
+                                tracing::warn!(session = %id, error = format!("{first:#}"),
+                                    "start failed; retrying with fallback sink");
+                                let (_, _, size2, _, lease2) =
+                                    self.open_source(registry, item_id).await?;
+                                self.start_remux(&id, plan, lease2, size2, start_ms, "hlssink2")
+                                    .await
+                                    .with_context(|| format!("first attempt: {first:#}"))?
+                            }
+                        };
+                        Mode::Remux {
+                            runner: Mutex::new(runner),
+                            dir: self.scratch_root.join(&id),
+                        }
+                    }
                 }
             }
             other => bail!("unknown mode {other:?} (direct|remux)"),
@@ -379,6 +412,7 @@ impl Sessions {
             mode: session_mode,
             verdict,
             plan: session_plan,
+            needs: session_needs,
             touched: Mutex::new(std::time::Instant::now()),
         });
         self.active.lock().unwrap().insert(session.id.clone(), session.clone());
@@ -396,6 +430,7 @@ impl Sessions {
         lease: Lease,
         size: u64,
         start_ms: u64,
+        sink: &str,
     ) -> Result<RemuxRunner> {
         let dir = self.scratch_root.join(session_id);
         std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
@@ -426,6 +461,7 @@ impl Sessions {
                     .args(["--video", kahawai_media::worker::mode_arg(plan.video)])
                     .args(["--audio", kahawai_media::worker::mode_arg(plan.audio)])
                     .args(["--start-ms", &start_ms.to_string()])
+                    .args(if sink.is_empty() { vec![] } else { vec!["--sink".into(), sink.to_string()] })
                     .stderr(std::process::Stdio::from(log))
                     .kill_on_drop(true)
                     .spawn()
@@ -443,8 +479,15 @@ impl Sessions {
                 // lease reads can never be driven (single-thread runtimes
                 // deadlock outright).
                 let dir2 = dir.clone();
+                let sink_owned = (!sink.is_empty()).then(|| sink.to_string());
                 let job = tokio::task::spawn_blocking(move || {
-                    kahawai_media::remux::start_at(&dir2, plan, Box::new(source), start_ms)
+                    kahawai_media::remux::start_full(
+                        &dir2,
+                        plan,
+                        Box::new(source),
+                        start_ms,
+                        sink_owned.as_deref(),
+                    )
                 })
                 .await
                 .map_err(|e| anyhow::anyhow!("worker task panicked: {e}"))??;
@@ -493,6 +536,7 @@ impl Sessions {
         lease: Lease,
         size: u64,
         start_ms: u64,
+        sink: &str,
     ) -> Result<()> {
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         self.tc_leases.lock().unwrap().insert(session_id.to_string(), (lease, size));
@@ -506,6 +550,7 @@ impl Sessions {
                     video: kahawai_media::worker::mode_arg(plan.video).into(),
                     audio: kahawai_media::worker::mode_arg(plan.audio).into(),
                     start_ms,
+                    sink: sink.into(),
                 },
             )),
         };
@@ -547,9 +592,14 @@ impl Sessions {
     }
 
     /// Link-facing: the transcoder reported the session ready or failed.
-    pub fn transcode_verdict(&self, session_id: &str, result: Result<(), String>) {
+    /// Returns whether a pending start consumed the verdict (false → the
+    /// session was already running; the caller may reschedule).
+    pub fn transcode_verdict(&self, session_id: &str, result: Result<(), String>) -> bool {
         if let Some(tx) = self.pending_ready.lock().unwrap().remove(session_id) {
             let _ = tx.send(result);
+            true
+        } else {
+            false
         }
     }
 
@@ -621,6 +671,8 @@ impl Sessions {
         let Mode::Transcode { transcoder } = &session.mode else {
             bail!("not a transcode session");
         };
+        let transcoder = transcoder.lock().unwrap().clone();
+        let transcoder = transcoder.as_str();
         let key = (session.id.clone(), name.to_string());
         let (tx, mut rx) = tokio::sync::mpsc::channel(64);
         self.artifact_waiting.lock().unwrap().insert(key.clone(), tx);
@@ -684,11 +736,13 @@ impl Sessions {
                 // The old worker's lease died with it; open a fresh one.
                 let (_, _, size, _, lease) =
                     self.open_source(registry, &session.item_id).await?;
-                let fresh = self.start_remux(&session.id, plan, lease, size, position_ms).await?;
+                let fresh =
+                    self.start_remux(&session.id, plan, lease, size, position_ms, "").await?;
                 *runner.lock().unwrap() = fresh;
                 Ok(())
             }
             Mode::Transcode { transcoder } => {
+                let tc = transcoder.lock().unwrap().clone();
                 // The hub-held lease survives restarts; reuse it.
                 let (lease, size) = self
                     .tc_leases
@@ -699,7 +753,7 @@ impl Sessions {
                     .context("dispatched session lost its source lease")?;
                 let _ = registry
                     .send_to_tc(
-                        transcoder,
+                        &tc,
                         kahawai_proto::v1::HubToTc {
                             msg: Some(kahawai_proto::v1::hub_to_tc::Msg::EndSession(
                                 kahawai_proto::v1::EndSession { session_id: session.id.clone() },
@@ -707,31 +761,86 @@ impl Sessions {
                         },
                     )
                     .await;
-                registry.tc_session_ended(transcoder);
+                registry.tc_session_ended(&tc);
                 self.tc_leases.lock().unwrap().remove(&session.id);
-                self.start_transcode(registry, transcoder, &session.id, plan, lease, size, position_ms)
+                self.start_transcode(registry, &tc, &session.id, plan, lease, size, position_ms, "")
                     .await
             }
             Mode::Direct { .. } => bail!("direct sessions seek with range requests"),
         }
     }
 
-    /// End every session dispatched to a given transcoder (link loss —
-    /// AR-6 minimal: sessions fail, clients restart; reschedule later).
-    pub fn end_for_transcoder(&self, transcoder: &str) -> usize {
+    /// A transcoder vanished (link loss): reschedule its sessions onto
+    /// the remaining fleet at the viewer's last position (AR-6); end the
+    /// ones nobody can take.
+    pub async fn reschedule_for_transcoder(
+        self: &Arc<Self>,
+        registry: &Registry,
+        transcoder: &str,
+    ) -> (usize, usize) {
         let ids: Vec<String> = self
             .active
             .lock()
             .unwrap()
             .values()
-            .filter(|s| matches!(&s.mode, Mode::Transcode { transcoder: t } if t == transcoder))
+            .filter(|s| {
+                matches!(&s.mode, Mode::Transcode { transcoder: t }
+                    if *t.lock().unwrap() == transcoder)
+            })
             .map(|s| s.id.clone())
             .collect();
-        let n = ids.len();
+        let (mut moved, mut ended) = (0, 0);
         for id in ids {
-            self.end(&id);
+            match self.reschedule(registry, &id).await {
+                Ok(new_tc) => {
+                    tracing::info!(session = %id, from = transcoder, to = %new_tc, "session rescheduled");
+                    moved += 1;
+                }
+                Err(e) => {
+                    tracing::warn!(session = %id, error = format!("{e:#}"), "reschedule failed; ending");
+                    self.end(&id);
+                    ended += 1;
+                }
+            }
         }
-        n
+        (moved, ended)
+    }
+
+    /// Re-dispatch one session (its transcoder died or its worker
+    /// crashed) at the viewer's last reported position.
+    pub async fn reschedule(self: &Arc<Self>, registry: &Registry, id: &str) -> Result<String> {
+        let session = self.get(id).context("no such session")?;
+        let plan = session.plan.context("not a pipeline session")?;
+        let Mode::Transcode { transcoder } = &session.mode else {
+            bail!("not a dispatched session");
+        };
+        let old_tc = transcoder.lock().unwrap().clone();
+        registry.tc_session_ended(&old_tc);
+        let new_tc = registry
+            .pick_transcoder(&session.needs)
+            .context("no capable transcoder left")?;
+        let (lease, size) = self
+            .tc_leases
+            .lock()
+            .unwrap()
+            .get(id)
+            .cloned()
+            .context("session lost its source lease")?;
+        self.tc_leases.lock().unwrap().remove(id);
+        // Resume where the viewer was: the player posts progress every
+        // 10 s, which is exactly the doc's start_offset for AR-6.
+        let position_ms: i64 = sqlx::query_scalar(
+            "SELECT position_ms FROM watch_state WHERE user_id = ? AND item_id = ?",
+        )
+        .bind(&session.user_id)
+        .bind(&session.item_id)
+        .fetch_optional(registry.db())
+        .await?
+        .unwrap_or(0);
+        self.start_transcode(registry, &new_tc, id, plan, lease, size, position_ms.max(0) as u64, "")
+            .await?;
+        *transcoder.lock().unwrap() = new_tc.clone();
+        Ok(new_tc)
     }
 
     /// Active sessions for the admin dashboard (HUB-18).
@@ -774,11 +883,11 @@ impl Sessions {
                 let _ = std::fs::remove_dir_all(dir);
             }
             Mode::Transcode { transcoder } => {
+                let transcoder = transcoder.lock().unwrap().clone();
                 self.tc_leases.lock().unwrap().remove(id);
                 self.pending_ready.lock().unwrap().remove(id);
                 if let Some(registry) = self.registry_for_teardown.lock().unwrap().clone() {
-                    registry.tc_session_ended(transcoder);
-                    let transcoder = transcoder.clone();
+                    registry.tc_session_ended(&transcoder);
                     let sid = id.to_string();
                     tokio::spawn(async move {
                         let _ = registry

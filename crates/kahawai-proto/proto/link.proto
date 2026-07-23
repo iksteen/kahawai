@@ -173,6 +173,10 @@ message ArtifactData {
 message CapabilityReport {
   repeated EncoderCap encoders = 1;
   uint32 max_sessions = 2;
+  // Caps names this box can decode (registry-derived). Placement must
+  // match the SOURCE codec too: a box can own a great encoder and still
+  // decode AV1 at 0.3x realtime in software (observed on a J5005).
+  repeated string decode_caps = 3;
 }
 
 message EncoderCap {
@@ -198,6 +202,9 @@ message StartSession {
   string audio = 4;
   // Seek-restart (§6): begin at this offset (keyframe-snapped).
   uint64 start_ms = 5;
+  // HLS sink override (empty = preference order). Set on retry after a
+  // sink crash (TC-6 fallback: hlssink3 bugs, hlssink2 works).
+  string sink = 6;
 }
 
 message EndSession {
