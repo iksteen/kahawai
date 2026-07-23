@@ -10,6 +10,12 @@
 //! Verdicts: OK, OK(head) — errored after producing segments when fed a
 //! truncated head, which healthy files may do — DEGRADED (a stream needs a
 //! transcoder and is dropped), SKIP (nothing TS-muxable), FAIL.
+//!
+//! Each file runs in a child process (`--one`): GStreamer plugins can
+//! abort outright on hostile input (a gst-plugins-rs panic in an FFI
+//! callback is non-unwinding), and a crash must become that file's FAIL
+//! verdict, not the end of the sweep. The parent enforces a watchdog and
+//! kills hung children.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -21,7 +27,9 @@ const MEDIA_EXTS: &[&str] = &[
     "flac", "mp3", "ogg", "oga", "opus", "m4a", "aac", "wav",
 ];
 const HEAD_BYTES: u64 = 48 * 1024 * 1024;
-const PIPELINE_DEADLINE: Duration = Duration::from_secs(300);
+/// In-child pipeline deadline; the parent's watchdog is the backstop.
+const PIPELINE_DEADLINE: Duration = Duration::from_secs(120);
+const CHILD_WATCHDOG: Duration = Duration::from_secs(180);
 
 #[derive(PartialEq, Clone, Copy)]
 enum Verdict {
@@ -50,25 +58,32 @@ fn main() {
     let mut full = false;
     let mut limit = usize::MAX;
     let mut jobs = 4usize;
+    let mut one = None;
     while let Some(a) = args.next() {
         match a.as_str() {
             "--full" => full = true,
+            "--one" => one = args.next().map(PathBuf::from),
             "--limit" => limit = args.next().and_then(|v| v.parse().ok()).expect("--limit N"),
             "--jobs" => jobs = args.next().and_then(|v| v.parse().ok()).expect("--jobs N"),
             other => dir = Some(PathBuf::from(other)),
         }
     }
+
+    // Child mode: sweep exactly one file, print "<tag>\t<detail>", exit 0.
+    if let Some(path) = one {
+        kahawai_media::init().expect("gstreamer init");
+        let has_ffprobe = std::process::Command::new("ffprobe").arg("-version").output().is_ok();
+        let (verdict, detail) = sweep_one(&path, full, has_ffprobe);
+        println!("{}\t{}", verdict.tag().trim_end(), detail);
+        return;
+    }
+
     let Some(dir) = dir else {
         eprintln!("usage: kahawai-sweep <dir> [--full] [--limit N] [--jobs N]");
         std::process::exit(2);
     };
 
-    kahawai_media::init().expect("gstreamer init");
-    let has_ffprobe = std::process::Command::new("ffprobe")
-        .arg("-version")
-        .output()
-        .is_ok();
-    if !has_ffprobe {
+    if std::process::Command::new("ffprobe").arg("-version").output().is_err() {
         eprintln!("note: ffprobe not found — segment DTS checks skipped");
     }
 
@@ -79,6 +94,7 @@ fn main() {
     eprintln!("sweeping {} files with {} jobs ({})", files.len(), jobs,
         if full { "full files" } else { "first 48 MiB" });
 
+    let exe = std::env::current_exe().expect("current_exe");
     let next = AtomicUsize::new(0);
     let counts = Mutex::new([0usize; 5]);
     let started = Instant::now();
@@ -87,7 +103,7 @@ fn main() {
             scope.spawn(|| loop {
                 let i = next.fetch_add(1, Ordering::Relaxed);
                 let Some(path) = files.get(i) else { break };
-                let (verdict, detail) = sweep_one(path, full, has_ffprobe);
+                let (verdict, detail) = sweep_in_child(&exe, path, full);
                 let rel = path.strip_prefix(&dir).unwrap_or(path);
                 println!("{} {} {}", verdict.tag(), rel.display(), detail);
                 counts.lock().unwrap()[verdict as usize] += 1;
@@ -108,6 +124,56 @@ fn main() {
     );
     if c[Verdict::Fail as usize] > 0 {
         std::process::exit(1);
+    }
+}
+
+/// Run one file in a child process; crashes and hangs become verdicts.
+fn sweep_in_child(exe: &Path, path: &Path, full: bool) -> (Verdict, String) {
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("--one").arg(path);
+    if full {
+        cmd.arg("--full");
+    }
+    cmd.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null());
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => return (Verdict::Fail, format!("[spawn] {e}")),
+    };
+    let deadline = Instant::now() + CHILD_WATCHDOG;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() > deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return (Verdict::Fail, "[watchdog] killed after 180s".into());
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(100)),
+            Err(e) => return (Verdict::Fail, format!("[wait] {e}")),
+        }
+    };
+    let mut out = String::new();
+    if let Some(mut stdout) = child.stdout.take() {
+        use std::io::Read;
+        let _ = stdout.read_to_string(&mut out);
+    }
+    if !status.success() {
+        // Signal or abort: the pipeline (often a plugin bug) took the
+        // child down. Exactly what isolation is for.
+        return (Verdict::Fail, format!("[crashed] {status}"));
+    }
+    match out.trim_end().split_once('\t') {
+        Some((tag, detail)) => {
+            let verdict = match tag {
+                "OK" => Verdict::Ok,
+                "OK(head)" => Verdict::OkHead,
+                "DEGRADED" => Verdict::Degraded,
+                "SKIP" => Verdict::Skip,
+                _ => Verdict::Fail,
+            };
+            (verdict, detail.to_string())
+        }
+        None => (Verdict::Fail, "[protocol] child printed no verdict".into()),
     }
 }
 
