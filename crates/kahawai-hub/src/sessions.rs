@@ -165,6 +165,15 @@ async fn serve_reads(mut conn: tokio::net::UnixStream, lease: Lease, size: u64) 
     }
 }
 
+/// A playlist is client-ready with ≥3 segments (~10 s of runway) or an
+/// ENDLIST (short source: whatever exists is all there is).
+fn playlist_ready(path: &std::path::Path) -> bool {
+    match std::fs::read_to_string(path) {
+        Ok(p) => p.contains("#EXT-X-ENDLIST") || p.matches("#EXTINF").count() >= 3,
+        Err(_) => false,
+    }
+}
+
 pub struct Sessions {
     pub leases: Leases,
     /// Scratch space for remux sessions (`<data_dir>/sessions`).
@@ -495,9 +504,12 @@ impl Sessions {
             }
         };
 
-        // Return once the playlist exists (or the pipeline died).
+        // Return once the playlist has enough runway (or ended): a
+        // playlist handed over with one ~3 s segment guarantees a stall
+        // right after it — hls.js only discovers more segments on its
+        // next live reload (~target duration later).
         let playlist = dir.join("master.m3u8");
-        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
         loop {
             match &runner {
                 RemuxRunner::InProcess(job) => {
@@ -514,7 +526,7 @@ impl Sessions {
                 }
                 RemuxRunner::Stopped => unreachable!("start_remux never yields Stopped"),
             }
-            if playlist.exists() {
+            if playlist_ready(&playlist) {
                 return Ok(runner);
             }
             if std::time::Instant::now() > deadline {

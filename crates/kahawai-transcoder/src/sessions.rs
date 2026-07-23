@@ -224,11 +224,17 @@ impl Runner {
             });
         }
 
-        // Ready once the playlist exists; failed if the worker dies first.
+        // Ready once the playlist has runway (≥3 segments or ENDLIST) —
+        // a one-segment playlist stalls the client right after segment 0;
+        // failed if the worker dies first.
         let playlist = dir.join("master.m3u8");
+        let ready = |p: &std::path::Path| match std::fs::read_to_string(p) {
+            Ok(t) => t.contains("#EXT-X-ENDLIST") || t.matches("#EXTINF").count() >= 3,
+            Err(_) => false,
+        };
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
-            if playlist.exists() {
+            if ready(&playlist) {
                 return Ok(());
             }
             {
