@@ -34,6 +34,11 @@ fn ts_muxable_names() -> &'static std::collections::HashSet<String> {
                 }
             }
         }
+        // The templates advertise these, but at runtime the muxer refuses
+        // them unless enable-custom-mappings=true — and no browser plays
+        // AV1/VP9-in-TS anyway. Treat as needs-transcoder, not muxable.
+        names.remove("video/x-av1");
+        names.remove("video/x-vp9");
         names
     })
 }
@@ -93,7 +98,13 @@ fn parser_for(caps: &gst::CapsRef) -> Option<&'static str> {
     let element = match s.name().as_str() {
         "video/x-h264" => "h264parse",
         "video/x-h265" => "h265parse",
-        "video/mpeg" => "mpegvideoparse",
+        // mpegvideoparse only takes MPEG-1/2; Part 2 (DivX/XviD-era AVIs)
+        // needs mpeg4videoparse or the muxer pad starves and the pipeline
+        // hangs forever.
+        "video/mpeg" => match s.get::<i32>("mpegversion").ok() {
+            Some(4) => "mpeg4videoparse",
+            _ => "mpegvideoparse",
+        },
         "video/x-av1" => "av1parse",
         "video/x-vp9" => "vp9parse",
         "audio/mpeg" => match s.get::<i32>("mpegversion").ok() {
@@ -158,9 +169,28 @@ fn link_parsed_pad(pipe: &gst::Pipeline, waiting: &WaitingPads, pad: &gst::Pad, 
                 tail.link(&el).unwrap();
                 tail = el;
             }
+            // hlssink3 (≤0.15.3, imp.rs:304) unwraps the PTS of each
+            // fragment's first buffer; a PTS-less frame (old AVI streams)
+            // aborts the whole process — a Rust panic in an FFI callback
+            // cannot unwind. Guard: borrow the DTS, or drop the buffer.
+            let src = tail.static_pad("src").unwrap();
+            src.add_probe(gst::PadProbeType::BUFFER, |_, info| {
+                if let Some(gst::PadProbeData::Buffer(buffer)) = &mut info.data {
+                    // ponytail: pts=dts misorders B-frames (sweep flags
+                    // those [bad dts] → transcoder work list); dropping
+                    // instead starves fragments and trips more panics.
+                    if buffer.pts().is_none() {
+                        match buffer.dts() {
+                            Some(dts) => buffer.make_mut().set_pts(dts),
+                            None => return gst::PadProbeReturn::Drop,
+                        }
+                    }
+                }
+                gst::PadProbeReturn::Ok
+            });
             let ok = pad
                 .link(&queue.static_pad("sink").unwrap())
-                .and_then(|_| tail.static_pad("src").unwrap().link(&sinkpad));
+                .and_then(|_| src.link(&sinkpad));
             if let Err(e) = ok {
                 tracing::warn!(caps = %caps_name, error = %e, "remux: pad link failed");
             }
