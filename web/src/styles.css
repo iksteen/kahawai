@@ -396,3 +396,10 @@ h2 { font-size: 14px; font-weight: 650; color: var(--dim); letter-spacing: 0.08e
 .dialog-weak {
   margin-bottom: 0.6rem;
 }
+
+.episode-still {
+  width: 220px;
+  aspect-ratio: 16 / 9;
+  object-fit: cover;
+  flex: none;
+}

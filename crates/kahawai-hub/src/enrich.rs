@@ -259,6 +259,155 @@ impl Enricher {
             .collect())
     }
 
+    /// One episode's provider data, normalized across TMDB/TVDB.
+    async fn tmdb_season(
+        &self,
+        key: &str,
+        show_id: &str,
+        season: i64,
+    ) -> Result<Vec<EpisodeData>> {
+        #[derive(Deserialize)]
+        struct Ep {
+            episode_number: i64,
+            #[serde(default)]
+            name: Option<String>,
+            #[serde(default)]
+            overview: Option<String>,
+            #[serde(default)]
+            still_path: Option<String>,
+            #[serde(default)]
+            air_date: Option<String>,
+            #[serde(default)]
+            vote_average: Option<f64>,
+            id: u64,
+        }
+        #[derive(Deserialize)]
+        struct Season {
+            #[serde(default)]
+            episodes: Vec<Ep>,
+        }
+        let mut req = self
+            .http
+            .get(format!("https://api.themoviedb.org/3/tv/{show_id}/season/{season}"));
+        if key.starts_with("eyJ") {
+            req = req.bearer_auth(key);
+        } else {
+            req = req.query(&[("api_key", key)]);
+        }
+        let s: Season = req.send().await?.error_for_status()?.json().await?;
+        Ok(s.episodes
+            .into_iter()
+            .map(|e| EpisodeData {
+                provider_id: e.id.to_string(),
+                season: Some(season),
+                episode: e.episode_number,
+                absolute: None,
+                title: e.name,
+                overview: e.overview,
+                image: e.still_path, // relative: poster pipeline prefixes
+                aired: e.air_date,
+                rating: e.vote_average,
+            })
+            .collect())
+    }
+
+    /// TMDB show's season list: (season_number, episode_count) — used to
+    /// map absolute numbering onto seasons cumulatively.
+    async fn tmdb_seasons(&self, key: &str, show_id: &str) -> Result<Vec<(i64, i64)>> {
+        #[derive(Deserialize)]
+        struct S {
+            season_number: i64,
+            #[serde(default)]
+            episode_count: i64,
+        }
+        #[derive(Deserialize)]
+        struct Show {
+            #[serde(default)]
+            seasons: Vec<S>,
+        }
+        let mut req = self.http.get(format!("https://api.themoviedb.org/3/tv/{show_id}"));
+        if key.starts_with("eyJ") {
+            req = req.bearer_auth(key);
+        } else {
+            req = req.query(&[("api_key", key)]);
+        }
+        let s: Show = req.send().await?.error_for_status()?.json().await?;
+        Ok(s.seasons
+            .into_iter()
+            .filter(|s| s.season_number > 0)
+            .map(|s| (s.season_number, s.episode_count))
+            .collect())
+    }
+
+    /// TVDB episodes in a given order ("default" or "absolute"), all pages.
+    async fn tvdb_episodes(
+        &self,
+        token: &str,
+        series_id: &str,
+        order: &str,
+    ) -> Result<Vec<EpisodeData>> {
+        #[derive(Deserialize)]
+        struct Ep {
+            id: u64,
+            #[serde(default)]
+            #[serde(rename = "seasonNumber")]
+            season_number: Option<i64>,
+            #[serde(default)]
+            number: Option<i64>,
+            #[serde(default)]
+            #[serde(rename = "absoluteNumber")]
+            absolute_number: Option<i64>,
+            #[serde(default)]
+            name: Option<String>,
+            #[serde(default)]
+            overview: Option<String>,
+            #[serde(default)]
+            image: Option<String>,
+            #[serde(default)]
+            aired: Option<String>,
+        }
+        #[derive(Deserialize)]
+        struct Data {
+            #[serde(default)]
+            episodes: Vec<Ep>,
+        }
+        #[derive(Deserialize)]
+        struct Resp {
+            data: Data,
+        }
+        let mut out = Vec::new();
+        for page in 0..20 {
+            let resp = self
+                .http
+                .get(format!(
+                    "https://api4.thetvdb.com/v4/series/{series_id}/episodes/{order}"
+                ))
+                .bearer_auth(token)
+                .query(&[("page", page.to_string())])
+                .send()
+                .await?;
+            if !resp.status().is_success() {
+                break;
+            }
+            let r: Resp = resp.json().await?;
+            if r.data.episodes.is_empty() {
+                break;
+            }
+            out.extend(r.data.episodes.into_iter().map(|e| EpisodeData {
+                provider_id: e.id.to_string(),
+                season: e.season_number,
+                episode: e.number.unwrap_or(0),
+                absolute: e.absolute_number,
+                title: e.name,
+                overview: e.overview,
+                image: e.image, // absolute URL
+                aired: e.aired,
+                rating: None,
+            }));
+        }
+        Ok(out)
+    }
+
     /// Enrich every movie/show item without metadata. Returns
     /// (matched, weak, missed); a second concurrent call is a no-op.
     pub async fn run_once(self: &Arc<Self>, registry: &Registry) -> Result<(usize, usize, usize)> {
@@ -456,7 +605,188 @@ impl Enricher {
             self.progress.2.load(Ordering::SeqCst),
         );
         tracing::info!(matched = m, weak = w, missed = x, "enrichment run complete");
+        if let Err(e) = self.enrich_episodes(registry, &key, tvdb_token.as_ref()).await {
+            tracing::warn!(error = format!("{e:#}"), "episode enrichment failed");
+        }
         Ok((m, w, x))
+    }
+
+    /// Phase two: episode-level metadata for every matched show that
+    /// still has metadata-less episodes. Seasoned shows map by
+    /// (season, episode); absolute-numbered shows (anime) use TVDB's
+    /// absolute order when the show matched there, else TMDB seasons
+    /// concatenated cumulatively.
+    async fn enrich_episodes(
+        self: &Arc<Self>,
+        registry: &Registry,
+        tmdb_key: &str,
+        tvdb_token: Option<&std::sync::Arc<String>>,
+    ) -> Result<()> {
+        let shows = sqlx::query(
+            "SELECT i.id, m.provider, m.provider_id FROM items i
+             JOIN item_metadata m ON m.item_id = i.id
+             WHERE i.kind = 'show' AND m.provider_id != ''
+               AND m.confidence != 'rejected'
+               AND EXISTS (
+                 SELECT 1 FROM items e
+                 LEFT JOIN item_metadata em ON em.item_id = e.id
+                 WHERE e.parent_id = i.id AND em.item_id IS NULL)",
+        )
+        .fetch_all(registry.db())
+        .await?;
+        if shows.is_empty() {
+            return Ok(());
+        }
+        tracing::info!(shows = shows.len(), "episode enrichment starting");
+        let sem = Arc::new(tokio::sync::Semaphore::new(3));
+        let mut tasks = tokio::task::JoinSet::new();
+        for row in shows {
+            let (show_id, provider, pid) = (
+                row.get::<String, _>("id"),
+                row.get::<String, _>("provider"),
+                row.get::<String, _>("provider_id"),
+            );
+            let this = self.clone();
+            let key = tmdb_key.to_string();
+            let token = tvdb_token.cloned();
+            let db = registry.db().clone();
+            let sem = sem.clone();
+            tasks.spawn(async move {
+                let _permit = sem.acquire().await;
+                if let Err(e) =
+                    this.enrich_show_episodes(&db, &show_id, &provider, &pid, &key, token.as_deref())
+                        .await
+                {
+                    tracing::warn!(show = %show_id, error = format!("{e:#}"), "episode fetch failed");
+                }
+            });
+        }
+        while tasks.join_next().await.is_some() {}
+        tracing::info!("episode enrichment complete");
+        Ok(())
+    }
+
+    async fn enrich_show_episodes(
+        &self,
+        db: &sqlx::SqlitePool,
+        show_id: &str,
+        provider: &str,
+        pid: &str,
+        tmdb_key: &str,
+        tvdb_token: Option<&String>,
+    ) -> Result<()> {
+        // Our episode items: (item_id, season, episode). season NULL =
+        // absolute numbering.
+        let eps = sqlx::query(
+            "SELECT id, season, episode FROM items WHERE parent_id = ? AND kind = 'episode'",
+        )
+        .bind(show_id)
+        .fetch_all(db)
+        .await?;
+        let absolute = eps.iter().any(|r| r.get::<Option<i64>, _>("season").is_none());
+
+        // Provider episodes, keyed however our items are keyed.
+        let mut by_key: std::collections::HashMap<(Option<i64>, i64), EpisodeData> =
+            Default::default();
+        match (provider, absolute) {
+            ("tvdb", false) => {
+                let token = tvdb_token.context("tvdb-matched show but no tvdb token")?;
+                for e in self.tvdb_episodes(token, pid, "default").await? {
+                    if let (Some(s), n) = (e.season, e.episode) {
+                        by_key.insert((Some(s), n), e);
+                    }
+                }
+            }
+            ("tvdb", true) => {
+                let token = tvdb_token.context("tvdb-matched show but no tvdb token")?;
+                let eps_abs = self.tvdb_episodes(token, pid, "absolute").await?;
+                for (i, e) in eps_abs.into_iter().enumerate() {
+                    let n = e.absolute.unwrap_or(i as i64 + 1);
+                    by_key.insert((None, n), e);
+                }
+            }
+            (_, false) => {
+                let seasons: Vec<i64> = eps
+                    .iter()
+                    .filter_map(|r| r.get::<Option<i64>, _>("season"))
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .into_iter()
+                    .collect();
+                for s in seasons {
+                    match self.tmdb_season(tmdb_key, pid, s).await {
+                        Ok(list) => {
+                            for e in list {
+                                by_key.insert((Some(s), e.episode), e);
+                            }
+                        }
+                        Err(e) => tracing::debug!(show = pid, season = s, error = %e, "season fetch failed"),
+                    }
+                }
+            }
+            (_, true) => {
+                // Absolute over TMDB: concatenate seasons in order.
+                let seasons = self.tmdb_seasons(tmdb_key, pid).await?;
+                let max_abs = eps
+                    .iter()
+                    .map(|r| r.get::<i64, _>("episode"))
+                    .max()
+                    .unwrap_or(0);
+                let mut fetched: std::collections::HashMap<i64, Vec<EpisodeData>> =
+                    Default::default();
+                for abs in 1..=max_abs {
+                    if let Some((s, n)) = absolute_to_seasoned(&seasons, abs) {
+                        if !fetched.contains_key(&s) {
+                            let list =
+                                self.tmdb_season(tmdb_key, pid, s).await.unwrap_or_default();
+                            fetched.insert(s, list);
+                        }
+                        if let Some(e) =
+                            fetched[&s].iter().find(|e| e.episode == n).cloned()
+                        {
+                            by_key.insert((None, abs), e);
+                        }
+                    }
+                }
+            }
+        }
+        if by_key.is_empty() {
+            return Ok(());
+        }
+
+        let mut wrote = 0;
+        for r in &eps {
+            let key = (r.get::<Option<i64>, _>("season"), r.get::<i64, _>("episode"));
+            let Some(e) = by_key.get(&key) else { continue };
+            let item_id: String = r.get("id");
+            sqlx::query(
+                "INSERT INTO item_metadata
+                   (item_id, provider, provider_id, title, overview, poster_path,
+                    rating, premiered, genres, confidence, updated_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, 'auto', unixepoch())
+                 ON CONFLICT (item_id) DO UPDATE SET
+                   provider = excluded.provider,
+                   provider_id = excluded.provider_id,
+                   title = excluded.title,
+                   overview = excluded.overview,
+                   poster_path = excluded.poster_path,
+                   rating = excluded.rating,
+                   premiered = excluded.premiered,
+                   updated_at = excluded.updated_at",
+            )
+            .bind(&item_id)
+            .bind(provider)
+            .bind(&e.provider_id)
+            .bind(e.title.as_deref())
+            .bind(e.overview.as_deref())
+            .bind(e.image.as_deref())
+            .bind(e.rating)
+            .bind(e.aired.as_deref())
+            .execute(db)
+            .await?;
+            wrote += 1;
+        }
+        tracing::info!(show = show_id, episodes = wrote, "episode metadata stored");
+        Ok(())
     }
 
     /// Provider search for the review queue (HUB-8): TMDB first, TVDB
@@ -519,6 +849,36 @@ impl Enricher {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct EpisodeData {
+    pub provider_id: String,
+    pub season: Option<i64>,
+    pub episode: i64,
+    pub absolute: Option<i64>,
+    pub title: Option<String>,
+    pub overview: Option<String>,
+    pub image: Option<String>,
+    pub aired: Option<String>,
+    pub rating: Option<f64>,
+}
+
+/// Map an absolute episode number onto (season, episode) given ordered
+/// (season, episode_count) pairs — sequential-numbered shows only, which
+/// is exactly the absolute-numbered-fansub convention.
+pub fn absolute_to_seasoned(seasons: &[(i64, i64)], absolute: i64) -> Option<(i64, i64)> {
+    let mut remaining = absolute;
+    for &(season, count) in seasons {
+        if count <= 0 {
+            continue;
+        }
+        if remaining <= count {
+            return Some((season, remaining));
+        }
+        remaining -= count;
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -533,6 +893,17 @@ mod tests {
             vote_average: None,
             release_date: Some(date.into()),
         }
+    }
+
+    #[test]
+    fn maps_absolute_numbering() {
+        let seasons = [(1i64, 12i64), (2, 13), (3, 12)];
+        assert_eq!(absolute_to_seasoned(&seasons, 1), Some((1, 1)));
+        assert_eq!(absolute_to_seasoned(&seasons, 12), Some((1, 12)));
+        assert_eq!(absolute_to_seasoned(&seasons, 13), Some((2, 1)));
+        assert_eq!(absolute_to_seasoned(&seasons, 25), Some((2, 13)));
+        assert_eq!(absolute_to_seasoned(&seasons, 26), Some((3, 1)));
+        assert_eq!(absolute_to_seasoned(&seasons, 38), None); // beyond the end
     }
 
     #[test]

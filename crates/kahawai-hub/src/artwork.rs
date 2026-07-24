@@ -83,7 +83,7 @@ impl Artwork {
             "SELECT m.poster_path FROM items i
              JOIN item_metadata m ON m.item_id IN (i.id, i.parent_id)
              WHERE i.id = ? AND m.poster_path IS NOT NULL
-             LIMIT 1",
+             ORDER BY m.item_id = i.id DESC LIMIT 1",
         )
         .bind(item_id)
         .fetch_optional(registry.db())

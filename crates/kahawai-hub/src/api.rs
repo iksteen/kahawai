@@ -1040,6 +1040,7 @@ fn item_row_json(r: &sqlx::sqlite::SqliteRow) -> Value {
         "title": r.get::<String, _>("title"),
         "artist": r.try_get::<Option<String>, _>("artist").ok().flatten(),
         "match_confidence": r.try_get::<Option<String>, _>("match_confidence").ok().flatten(),
+        "premiered": r.try_get::<Option<String>, _>("premiered").ok().flatten(),
         "file_title": r.try_get::<Option<String>, _>("file_title").ok().flatten(),
         "file_year": r.try_get::<Option<i64>, _>("file_year").ok().flatten(),
         "matched_title": r.try_get::<Option<String>, _>("matched_title").ok().flatten(),
@@ -1061,12 +1062,15 @@ async fn item_children(
     axum::Extension(claims): axum::Extension<crate::auth::Claims>,
 ) -> Result<Json<Value>, ApiError> {
     let rows = sqlx::query(
-        "SELECT i.id, i.kind, i.title, i.year, i.season, i.episode, i.artist,
+        "SELECT i.id, i.kind, i.year, i.season, i.episode, i.artist,
+                COALESCE(md.title, i.title) AS title,
+                md.premiered AS premiered,
                 COUNT(s.item_id) AS sources,
                 w.position_ms, w.played, w.play_count
          FROM items i
          LEFT JOIN item_sources s ON s.item_id = i.id
          LEFT JOIN watch_state w ON w.item_id = i.id AND w.user_id = ?
+         LEFT JOIN item_metadata md ON md.item_id = i.id AND md.provider_id != ''
          WHERE i.parent_id = ?
          GROUP BY i.id ORDER BY i.season, i.episode",
     )
@@ -1145,7 +1149,8 @@ async fn item_detail(
     let meta = sqlx::query(
         "SELECT m.overview, m.rating, m.premiered, m.confidence, m.provider FROM items i
          JOIN item_metadata m ON m.item_id IN (i.id, i.parent_id)
-         WHERE i.id = ? AND m.provider_id != '' LIMIT 1",
+         WHERE i.id = ? AND m.provider_id != ''
+         ORDER BY m.item_id = i.id DESC LIMIT 1",
     )
     .bind(&id)
     .fetch_optional(state.registry.db())

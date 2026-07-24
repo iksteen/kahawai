@@ -115,6 +115,7 @@ export type Item = {
   file_title?: string | null
   file_year?: number | null
   matched_title?: string | null
+  premiered?: string | null
   resume_position_ms: number | null
   played: boolean
   play_count: number

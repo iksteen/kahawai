@@ -262,7 +262,19 @@ export default function Detail({
       <button className="btn ghost small" onClick={goUp}>
         {upLabel}
       </button>
-      <div className="detail-head">
+      <div className="detail-head album-head">
+        {item.kind === 'episode' && item.metadata && (
+          <img
+            className="card-art episode-still"
+            src={artworkUrl(item.id)}
+            alt=""
+            onError={(e) => {
+              e.currentTarget.onerror = null
+              e.currentTarget.src = placeholder
+            }}
+          />
+        )}
+        <div>
         <h1>
           {item.kind === 'episode' && item.show_title ? `${item.show_title} · ` : ''}
           {item.kind === 'episode'
@@ -279,6 +291,7 @@ export default function Detail({
             <div className="waterline-fill" style={{ width: `${progress}%` }} />
           </div>
         )}
+        </div>
       </div>
 
       {item.metadata?.overview && (
