@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use kahawai_proto::v1::transcoder_link_server::{TranscoderLink, TranscoderLinkServer};
-use kahawai_proto::v1::{hub_to_tc, tc_to_hub, HelloAck, HubToTc, TcToHub};
+use kahawai_proto::v1::{hub_to_tc, tc_to_hub, HelloAck, HubToTc, TcToHub, Ping};
 use kahawai_proto::{PROTOCOL_MAJOR, PROTOCOL_MINOR};
 use kahawai_transport::mtls::peer_identity;
 use tokio_stream::wrappers::ReceiverStream;
@@ -14,6 +14,13 @@ use tonic::{Request, Response, Status, Streaming};
 
 use crate::registry::Registry;
 use crate::sessions::Sessions;
+
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
 
 pub struct TranscoderLinkService {
     registry: Arc<Registry>,
@@ -78,6 +85,20 @@ impl TranscoderLink for TranscoderLinkService {
             // Heartbeats arrive every 10 s; three missed = dead link.
             // (A vanished peer does not always surface as a stream error
             // — the byte-plane keepalive is ours to enforce.)
+            // We also ping: a napped macOS transcoder's own ticker stalls,
+            // but it answers inbound traffic promptly.
+            let ping_tx = tx.clone();
+            let pinger = tokio::spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(10));
+                loop {
+                    tick.tick().await;
+                    let ping = HubToTc { msg: Some(hub_to_tc::Msg::Ping(Ping {})) };
+                    if ping_tx.send(Ok(ping)).await.is_err() {
+                        return;
+                    }
+                }
+            });
+            let _abort_pinger = AbortOnDrop(pinger);
             loop {
                 let msg = tokio::time::timeout(
                     std::time::Duration::from_secs(35),

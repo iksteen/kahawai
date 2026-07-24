@@ -149,6 +149,16 @@ async fn link_loop(
                         Some(hub_to_tc::Msg::ViewerPosition(v)) => {
                             runner.viewer_position(&v.session_id, v.position_ms);
                         }
+                        // Reactive liveness: our own ticker stalls under
+                        // macOS App Nap, but inbound traffic wakes us.
+                        Some(hub_to_tc::Msg::Ping(_)) => {
+                            if tx.send(TcToHub { msg: Some(tc_to_hub::Msg::Heartbeat(Heartbeat {})) })
+                                .await
+                                .is_err()
+                            {
+                                bail!("link sender closed");
+                            }
+                        }
                         Some(hub_to_tc::Msg::FetchArtifact(f)) => {
                             let runner = runner.clone();
                             tokio::spawn(async move {

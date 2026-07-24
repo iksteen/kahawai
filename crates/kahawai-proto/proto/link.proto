@@ -195,8 +195,14 @@ message HubToTc {
     // Pacing (§4.6): the viewer's last reported position, forwarded so
     // the worker can throttle its lead.
     ViewerPosition viewer_position = 6;
+    // Liveness probe: macOS App Nap defers idle processes' timers (their
+    // own heartbeat ticker stalls) but socket reads always wake them, so
+    // the hub pings and the transcoder answers with a Heartbeat.
+    Ping ping = 7;
   }
 }
+
+message Ping {}
 
 message ViewerPosition {
   string session_id = 1;
