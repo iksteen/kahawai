@@ -320,13 +320,18 @@ export default function Detail({
           </li>
         ))}
       </ul>
-      {item.metadata && (
+      {item.metadata?.provider === 'tmdb' && (
         <footer className="tmdb-attrib">
           <img src={tmdbLogo} alt="TMDB" />
           <span>
             This product uses TMDB and the TMDB APIs but is not endorsed, certified, or
             otherwise approved by TMDB.
           </span>
+        </footer>
+      )}
+      {item.metadata?.provider === 'tvdb' && (
+        <footer className="tmdb-attrib">
+          <span>Metadata provided by TheTVDB. Please consider contributing missing data.</span>
         </footer>
       )}
     </main>

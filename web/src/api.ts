@@ -312,7 +312,12 @@ export const adminCollections = () =>
   json<{ collections: CollectionInfo[] }>('/admin/v1/collections')
 
 export const adminProviders = () =>
-  json<{ tmdb: { configured: boolean } }>('/admin/v1/providers')
+  json<{ tmdb: { configured: boolean }; tvdb: { configured: boolean } }>('/admin/v1/providers')
+export const adminSetTvdbKey = (apiKey: string, pin?: string) =>
+  json<{ saved: boolean }>('/admin/v1/providers/tvdb', {
+    method: 'POST',
+    body: JSON.stringify({ api_key: apiKey, pin: pin || null }),
+  })
 export const adminSetTmdbKey = (apiKey: string) =>
   json<{ saved: boolean }>('/admin/v1/providers/tmdb', {
     method: 'POST',

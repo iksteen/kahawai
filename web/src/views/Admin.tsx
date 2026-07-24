@@ -5,6 +5,7 @@ import {
   adminEnrichStatus,
   adminProviders,
   adminSetTmdbKey,
+  adminSetTvdbKey,
   adminAttachCollection,
   adminCollections,
   adminCreateLibrary,
@@ -29,7 +30,10 @@ const POLL_MS = 3000
 
 function TmdbSection({ onNotice }: { onNotice: (s: string) => void }) {
   const [configured, setConfigured] = useState(false)
+  const [tvdbConfigured, setTvdbConfigured] = useState(false)
   const [key, setKey] = useState('')
+  const [tvdbKey, setTvdbKey] = useState('')
+  const [tvdbPin, setTvdbPin] = useState('')
   const [status, setStatus] = useState<{
     running: boolean
     matched: number
@@ -38,7 +42,12 @@ function TmdbSection({ onNotice }: { onNotice: (s: string) => void }) {
   } | null>(null)
 
   const refresh = () => {
-    adminProviders().then((p) => setConfigured(p.tmdb.configured)).catch(() => {})
+    adminProviders()
+      .then((p) => {
+        setConfigured(p.tmdb.configured)
+        setTvdbConfigured(p.tvdb.configured)
+      })
+      .catch(() => {})
     adminEnrichStatus().then(setStatus).catch(() => {})
   }
   useEffect(() => {
@@ -50,7 +59,7 @@ function TmdbSection({ onNotice }: { onNotice: (s: string) => void }) {
 
   return (
     <>
-      <h2>Metadata (TMDB)</h2>
+      <h2>Metadata providers</h2>
       <div className="row-form">
         <input
           type="password"
@@ -83,6 +92,35 @@ function TmdbSection({ onNotice }: { onNotice: (s: string) => void }) {
             {status.matched} matched · {status.weak} weak · {status.missed} missed
           </span>
         )}
+      </div>
+      <div className="row-form">
+        <input
+          type="password"
+          placeholder={tvdbConfigured ? 'TVDB key configured — paste to replace' : 'TheTVDB API key (backup resolver)'}
+          value={tvdbKey}
+          onChange={(e) => setTvdbKey(e.target.value)}
+        />
+        <input
+          type="password"
+          placeholder="TVDB PIN (if your key needs one)"
+          value={tvdbPin}
+          onChange={(e) => setTvdbPin(e.target.value)}
+          style={{ width: '14rem' }}
+        />
+        <button
+          className="btn small"
+          disabled={!tvdbKey.trim()}
+          onClick={() => {
+            void adminSetTvdbKey(tvdbKey.trim(), tvdbPin.trim() || undefined).then(() => {
+              setTvdbKey('')
+              setTvdbPin('')
+              onNotice('TVDB key saved — enrichment started')
+              refresh()
+            })
+          }}
+        >
+          Save
+        </button>
       </div>
     </>
   )

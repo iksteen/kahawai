@@ -15,6 +15,8 @@ use sqlx::Row;
 use crate::registry::Registry;
 
 pub const TMDB_KEY_SETTING: &str = "tmdb_api_key";
+pub const TVDB_KEY_SETTING: &str = "tvdb_api_key";
+pub const TVDB_PIN_SETTING: &str = "tvdb_pin";
 
 pub struct Enricher {
     http: reqwest::Client,
@@ -164,6 +166,88 @@ impl Enricher {
         Ok(resp.json::<SearchResponse>().await.context("tmdb json")?.results)
     }
 
+    /// TheTVDB v4: login yields a bearer token (valid for weeks; we
+    /// fetch one per run).
+    async fn tvdb_login(&self, key: &str, pin: Option<&str>) -> Result<String> {
+        #[derive(Deserialize)]
+        struct LoginData {
+            token: String,
+        }
+        #[derive(Deserialize)]
+        struct LoginResp {
+            data: LoginData,
+        }
+        let mut body = serde_json::json!({ "apikey": key });
+        if let Some(pin) = pin {
+            body["pin"] = serde_json::json!(pin);
+        }
+        let resp = self
+            .http
+            .post("https://api4.thetvdb.com/v4/login")
+            .json(&body)
+            .send()
+            .await
+            .context("tvdb login request")?
+            .error_for_status()
+            .context("tvdb login rejected (key/pin?)")?;
+        Ok(resp.json::<LoginResp>().await.context("tvdb login json")?.data.token)
+    }
+
+    async fn tvdb_search(
+        &self,
+        token: &str,
+        kind: &str,
+        title: &str,
+    ) -> Result<Vec<Candidate>> {
+        #[derive(Deserialize)]
+        struct SearchResult {
+            #[serde(default)]
+            tvdb_id: Option<String>,
+            #[serde(default)]
+            name: Option<String>,
+            #[serde(default)]
+            year: Option<String>,
+            #[serde(default)]
+            image_url: Option<String>,
+            #[serde(default)]
+            overview: Option<String>,
+        }
+        #[derive(Deserialize)]
+        struct SearchResp {
+            #[serde(default)]
+            data: Vec<SearchResult>,
+        }
+        let media_type = if kind == "movie" { "movie" } else { "series" };
+        let resp = self
+            .http
+            .get("https://api4.thetvdb.com/v4/search")
+            .bearer_auth(token)
+            .query(&[("query", title), ("type", media_type), ("limit", "10")])
+            .send()
+            .await
+            .context("tvdb search")?
+            .error_for_status()?
+            .json::<SearchResp>()
+            .await
+            .context("tvdb search json")?;
+        Ok(resp
+            .data
+            .into_iter()
+            .filter_map(|r| {
+                Some(Candidate {
+                    id: r.tvdb_id.as_deref()?.parse().ok()?,
+                    title: r.name?,
+                    original_title: None,
+                    overview: r.overview,
+                    // Absolute URL: the artwork store fetches it as-is.
+                    poster_path: r.image_url,
+                    vote_average: None,
+                    release_date: r.year.map(|y| format!("{y}-01-01")),
+                })
+            })
+            .collect())
+    }
+
     /// Enrich every movie/show item without metadata. Returns
     /// (matched, weak, missed); a second concurrent call is a no-op.
     pub async fn run_once(self: &Arc<Self>, registry: &Registry) -> Result<(usize, usize, usize)> {
@@ -178,6 +262,21 @@ impl Enricher {
     async fn run_inner(self: &Arc<Self>, registry: &Registry) -> Result<(usize, usize, usize)> {
         let Some(key) = registry.get_setting(TMDB_KEY_SETTING).await? else {
             anyhow::bail!("no TMDB API key configured");
+        };
+        // TVDB is the backup resolver: only consulted when the TMDB
+        // ladder comes up empty, same strict verifier.
+        let tvdb_token = match registry.get_setting(TVDB_KEY_SETTING).await? {
+            Some(tk) => {
+                let pin = registry.get_setting(TVDB_PIN_SETTING).await?;
+                match self.tvdb_login(&tk, pin.as_deref()).await {
+                    Ok(tok) => Some(std::sync::Arc::new(tok)),
+                    Err(e) => {
+                        tracing::warn!(error = format!("{e:#}"), "TVDB login failed; skipping");
+                        None
+                    }
+                }
+            }
+            None => None,
         };
         for c in [&self.progress.0, &self.progress.1, &self.progress.2] {
             c.store(0, Ordering::SeqCst);
@@ -207,6 +306,7 @@ impl Enricher {
             );
             let this = self.clone();
             let key = key.clone();
+            let tvdb_token = tvdb_token.clone();
             let db = registry.db().clone();
             let sem = sem.clone();
             tasks.spawn(async move {
@@ -245,7 +345,24 @@ impl Enricher {
                         }
                     }
                 }
-                let picked = picked_owned;
+                let mut picked = picked_owned;
+                let mut provider = "tmdb";
+                if picked.is_none()
+                    && let Some(token) = &tvdb_token
+                {
+                    match this.tvdb_search(token, &kind, &title, ).await {
+                        Ok(cands) => {
+                            if let Some((c, conf)) = pick_candidate(&cands, &title, year) {
+                                picked = Some((c.clone(), conf));
+                                provider = "tvdb";
+                                tracing::debug!(title, "matched via TVDB fallback");
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(title, error = format!("{e:#}"), "tvdb search failed")
+                        }
+                    }
+                }
                 let (provider_id, confidence, c) = match &picked {
                     Some((c, conf)) => (c.id.to_string(), *conf, Some(c)),
                     None => (String::new(), "miss", None),
@@ -259,8 +376,9 @@ impl Enricher {
                     "INSERT INTO item_metadata
                        (item_id, provider, provider_id, title, overview, poster_path,
                         rating, premiered, genres, confidence, updated_at)
-                     VALUES (?, 'tmdb', ?, ?, ?, ?, ?, ?, NULL, ?, unixepoch())
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, unixepoch())
                      ON CONFLICT (item_id) DO UPDATE SET
+                       provider = excluded.provider,
                        provider_id = excluded.provider_id,
                        title = excluded.title,
                        overview = excluded.overview,
@@ -271,6 +389,7 @@ impl Enricher {
                        updated_at = excluded.updated_at",
                 )
                 .bind(&id)
+                .bind(provider)
                 .bind(&provider_id)
                 .bind(c.map(|c| c.title.clone()))
                 .bind(c.and_then(|c| c.overview.clone()))
@@ -298,7 +417,12 @@ impl Enricher {
     /// Fetch a TMDB poster (used by the artwork store when an item has
     /// no local artwork).
     pub async fn fetch_poster(&self, poster_path: &str) -> Result<Vec<u8>> {
-        let url = format!("https://image.tmdb.org/t/p/w500{poster_path}");
+        // TMDB stores relative paths; TVDB image URLs are absolute.
+        let url = if poster_path.starts_with("http") {
+            poster_path.to_string()
+        } else {
+            format!("https://image.tmdb.org/t/p/w500{poster_path}")
+        };
         let resp = self.http.get(&url).send().await?.error_for_status()?;
         Ok(resp.bytes().await?.to_vec())
     }

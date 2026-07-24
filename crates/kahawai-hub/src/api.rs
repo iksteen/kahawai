@@ -75,6 +75,7 @@ pub fn router(
         .route("/admin/v1/users", post(admin_create_user))
         .route("/admin/v1/providers", get(admin_providers))
         .route("/admin/v1/providers/tmdb", post(admin_set_tmdb))
+        .route("/admin/v1/providers/tvdb", post(admin_set_tvdb))
         .route("/admin/v1/enrich", get(admin_enrich_status).post(admin_enrich_run))
         .route("/admin/v1/sessions", get(admin_sessions))
         .route("/admin/v1/sessions/{id}", axum::routing::delete(admin_end_session))
@@ -179,13 +180,59 @@ async fn admin_approve(
 }
 
 async fn admin_providers(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
-    let configured = state
+    let tmdb = state
         .registry
         .get_setting(crate::enrich::TMDB_KEY_SETTING)
         .await
         .map_err(internal)?
         .is_some();
-    Ok(Json(json!({ "tmdb": { "configured": configured } })))
+    let tvdb = state
+        .registry
+        .get_setting(crate::enrich::TVDB_KEY_SETTING)
+        .await
+        .map_err(internal)?
+        .is_some();
+    Ok(Json(json!({
+        "tmdb": { "configured": tmdb },
+        "tvdb": { "configured": tvdb },
+    })))
+}
+
+#[derive(Deserialize)]
+struct SetTvdb {
+    api_key: String,
+    #[serde(default)]
+    pin: Option<String>,
+}
+
+async fn admin_set_tvdb(
+    State(state): State<AppState>,
+    Json(body): Json<SetTvdb>,
+) -> Result<Json<Value>, ApiError> {
+    let key = body.api_key.trim();
+    if key.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "api_key required".into()));
+    }
+    state
+        .registry
+        .set_setting(crate::enrich::TVDB_KEY_SETTING, key)
+        .await
+        .map_err(internal)?;
+    if let Some(pin) = body.pin.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
+        state
+            .registry
+            .set_setting(crate::enrich::TVDB_PIN_SETTING, pin)
+            .await
+            .map_err(internal)?;
+    }
+    let enricher = state.enricher.clone();
+    let registry = state.registry.clone();
+    tokio::spawn(async move {
+        if let Err(e) = enricher.run_once(&registry).await {
+            tracing::warn!(error = format!("{e:#}"), "enrichment run failed");
+        }
+    });
+    Ok(Json(json!({ "saved": true })))
 }
 
 #[derive(Deserialize)]
@@ -915,7 +962,7 @@ async fn item_detail(
     out["sources"] = json!(sources);
     // Enrichment (own metadata, or the parent show's for episodes).
     let meta = sqlx::query(
-        "SELECT m.overview, m.rating, m.premiered, m.confidence FROM items i
+        "SELECT m.overview, m.rating, m.premiered, m.confidence, m.provider FROM items i
          JOIN item_metadata m ON m.item_id IN (i.id, i.parent_id)
          WHERE i.id = ? AND m.provider_id != '' LIMIT 1",
     )
@@ -929,7 +976,7 @@ async fn item_detail(
             "rating": m.get::<Option<f64>, _>("rating"),
             "premiered": m.get::<Option<String>, _>("premiered"),
             "confidence": m.get::<String, _>("confidence"),
-            "provider": "tmdb",
+            "provider": m.get::<String, _>("provider"),
         });
     }
     Ok(Json(out))
