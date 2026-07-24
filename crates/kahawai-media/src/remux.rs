@@ -590,9 +590,9 @@ fn plumb_parsed_pad(
         || name.starts_with("subpicture/")
     {
         let idx = subs_seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        if name.contains("ssa") || name.contains("ass") {
-            tap_ass_track(pipe, &qsrc, &advertised, subs_dir, idx);
-        } else {
+        if name.starts_with("subpicture/") {
+            // Image subs: counted for stable e{n} keys, rendered in a
+            // later milestone.
             let fake = gst::ElementFactory::make("fakesink")
                 .property("sync", false)
                 .property("async", false)
@@ -601,6 +601,8 @@ fn plumb_parsed_pad(
             pipe.add(&fake).unwrap();
             fake.sync_state_with_parent().unwrap();
             let _ = qsrc.link(&fake.static_pad("sink").unwrap());
+        } else {
+            tap_text_track(pipe, &qsrc, &advertised, subs_dir, idx, &name);
         }
         return;
     }
@@ -648,23 +650,21 @@ fn plumb_parsed_pad(
     });
 }
 
-/// Tee an ASS subtitle stream into `subs-e{idx}.ass` in the session
-/// dir: composed script header immediately (codec_data carries it),
-/// then one re-timed Dialogue line per event as it is demuxed. Sparse
-/// and text-sized — a flush per line is nothing.
-fn tap_ass_track(
+/// Tee a text subtitle stream into the session dir as it is demuxed:
+/// ASS/SSA → `subs-e{idx}.ass` (composed script header immediately —
+/// codec_data carries it — then re-timed Dialogue lines); every other
+/// text codec → `subs-e{idx}.jsonl` (one `{"s","e","t"}` cue per
+/// line). Sparse and text-sized — a flush per line is nothing.
+fn tap_text_track(
     pipe: &gst::Pipeline,
     from: &gst::Pad,
     caps: &gst::Caps,
     dir: &std::path::Path,
     idx: usize,
+    caps_name: &str,
 ) {
-    let path = dir.join(format!("subs-e{idx}.ass"));
-    let header = caps
-        .structure(0)
-        .and_then(|s| s.get::<gst::Buffer>("codec_data").ok())
-        .and_then(|b| b.map_readable().ok().map(|m| crate::subtitles::decode_text(m.as_slice())))
-        .unwrap_or_default();
+    let is_ass = caps_name.contains("ssa") || caps_name.contains("ass");
+    let path = dir.join(format!("subs-e{idx}.{}", if is_ass { "ass" } else { "jsonl" }));
     let mut file = match std::fs::File::create(&path) {
         Ok(f) => f,
         Err(e) => {
@@ -681,7 +681,16 @@ fn tap_ass_track(
         }
     };
     use std::io::Write;
-    let _ = file.write_all(crate::subtitles::compose_header(&header).as_bytes());
+    if is_ass {
+        let header = caps
+            .structure(0)
+            .and_then(|s| s.get::<gst::Buffer>("codec_data").ok())
+            .and_then(|b| {
+                b.map_readable().ok().map(|m| crate::subtitles::decode_text(m.as_slice()))
+            })
+            .unwrap_or_default();
+        let _ = file.write_all(crate::subtitles::compose_header(&header).as_bytes());
+    }
     let file = std::sync::Mutex::new(file);
 
     let appsink = gstreamer_app::AppSink::builder().sync(false).build();
@@ -698,9 +707,18 @@ fn tap_ass_track(
                     let end =
                         start + buffer.duration().map(|d| d.mseconds()).unwrap_or(3000);
                     let raw = crate::subtitles::decode_text(map.as_slice());
-                    if let Some(line) = crate::subtitles::ass_dialogue(&raw, start, end) {
-                        let mut f = file.lock().unwrap();
-                        let _ = writeln!(f, "{line}");
+                    if is_ass {
+                        if let Some(line) = crate::subtitles::ass_dialogue(&raw, start, end) {
+                            let mut f = file.lock().unwrap();
+                            let _ = writeln!(f, "{line}");
+                        }
+                    } else {
+                        let text = crate::subtitles::clean_cue_text(&raw);
+                        if !text.is_empty() {
+                            let line = serde_json::json!({"s": start, "e": end, "t": text});
+                            let mut f = file.lock().unwrap();
+                            let _ = writeln!(f, "{line}");
+                        }
                     }
                 }
                 Ok(gst::FlowSuccess::Ok)
@@ -712,7 +730,7 @@ fn tap_ass_track(
     if let Err(e) = from.link(&appsink.static_pad("sink").unwrap()) {
         tracing::warn!(error = %e, "subtitle tap link failed");
     }
-    tracing::info!(path = %path.display(), "tapping ASS subtitle track");
+    tracing::info!(path = %path.display(), "tapping text subtitle track");
 }
 
 /// Route a stream to the muxer (via parser/timestamper) or a fakesink,

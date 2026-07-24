@@ -108,6 +108,80 @@ export default function Player({
 
   const selected = subs.find((s) => s.key === subKey)
   const useAss = !!selected && (selected.format === 'ass' || selected.format === 'ssa')
+  // Embedded non-ASS on an HLS session rides the live session tap and
+  // feeds cues via the TextTrack API (a <track> can't consume a
+  // growing document). Falls back to the item-level .vtt <track> when
+  // the tap yields nothing (old satellite, no pipeline).
+  const [vttFallback, setVttFallback] = useState(false)
+  const liveText =
+    isHls && !!selected && !useAss && selected.kind === 'embedded' && !vttFallback
+  const jsTrackRef = useRef<TextTrack | null>(null)
+
+  useEffect(() => setVttFallback(false), [subKey])
+
+  // Live cue feed for embedded non-ASS tracks: tail the session's
+  // .jsonl tap and append cues to a JS-managed TextTrack. Cue times
+  // are absolute file ms; the video timeline starts at the playlist
+  // origin, so cues shift by -offset.
+  useEffect(() => {
+    const video = videoRef.current
+    if (!video || !liveText || !selected) return
+    let dead = false
+    const ac = new AbortController()
+    if (!jsTrackRef.current) {
+      // addTextTrack is permanent on the element; create once, reuse.
+      jsTrackRef.current = video.addTextTrack('subtitles', 'kahawai', '')
+    }
+    const track = jsTrackRef.current
+    track.mode = 'showing'
+    const clear = () => {
+      while (track.cues && track.cues.length > 0) track.removeCue(track.cues[0])
+    }
+    clear()
+    ;(async () => {
+      const base = session.stream_url.replace(/[^/]*$/, '')
+      const resp = await fetch(`${base}subs-${selected.key}.jsonl`, { signal: ac.signal })
+      if (!resp.ok || !resp.body) {
+        setVttFallback(true)
+        return
+      }
+      const reader = resp.body.getReader()
+      const dec = new TextDecoder()
+      let buf = ''
+      let got = false
+      for (;;) {
+        const { done, value } = await reader.read()
+        if (dead) return
+        if (value) buf += dec.decode(value, { stream: true })
+        const cut = buf.lastIndexOf('\n')
+        if (cut >= 0) {
+          for (const line of buf.slice(0, cut).split('\n')) {
+            if (!line.trim()) continue
+            try {
+              const c = JSON.parse(line)
+              const off = offsetRef.current
+              track.addCue(new VTTCue((c.s - off) / 1000, (c.e - off) / 1000, c.t))
+              got = true
+            } catch {
+              /* partial or malformed line */
+            }
+          }
+          buf = buf.slice(cut + 1)
+        }
+        if (done) break
+      }
+      if (!got && !dead) setVttFallback(true)
+    })().catch(() => {
+      if (!dead) setVttFallback(true)
+    })
+    return () => {
+      dead = true
+      ac.abort()
+      clear()
+      track.mode = 'disabled'
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [liveText, subKey, trackEpoch, item.id])
 
   // Faithful ASS rendering (HUB-32): JASSUB draws with libass on a
   // canvas over the video, fed the original script and the source's
@@ -361,7 +435,7 @@ export default function Player({
           playsInline
           crossOrigin="use-credentials"
         >
-          {subKey && !useAss && (
+          {subKey && !useAss && !liveText && (
             <track
               key={`${subKey}-${trackEpoch}`}
               default

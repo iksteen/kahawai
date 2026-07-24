@@ -1705,6 +1705,7 @@ dependencies = [
  "gstreamer-pbutils",
  "kahawai-core",
  "serde",
+ "serde_json",
  "tempfile",
  "tracing",
 ]

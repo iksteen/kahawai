@@ -1331,11 +1331,16 @@ async fn session_file(
     // origin. Follow the file's growth until the client leaves, the
     // session dies, or a seek-restart truncates it (the player then
     // re-opens against the new origin).
-    if file.starts_with("subs-") && file.ends_with(".ass") {
+    if file.starts_with("subs-") && (file.ends_with(".ass") || file.ends_with(".jsonl")) {
         let valid = file[5..].chars().all(|c| c.is_ascii_alphanumeric() || c == '.');
         if !valid {
             return Err((StatusCode::BAD_REQUEST, "invalid file name".into()));
         }
+        let ctype = if file.ends_with(".ass") {
+            "text/x-ssa; charset=utf-8"
+        } else {
+            "application/x-ndjson; charset=utf-8"
+        };
         let sessions = state.sessions.clone();
         let registry = state.registry.clone();
         let sid = id.clone();
@@ -1379,7 +1384,7 @@ async fn session_file(
             axum::body::Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx));
         return Ok(axum::response::Response::builder()
             .status(StatusCode::OK)
-            .header("content-type", "text/x-ssa; charset=utf-8")
+            .header("content-type", ctype)
             .header("cache-control", "no-store")
             .body(body)
             .unwrap());

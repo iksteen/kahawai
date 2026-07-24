@@ -85,7 +85,7 @@ fn parse_timestamp(s: &str) -> Option<u64> {
 
 /// Strip markup a VTT renderer would choke on or show literally: keep
 /// i/b/u tags, drop font/anything else, unescape ASS line breaks.
-fn clean_cue_text(text: &str) -> String {
+pub(crate) fn clean_cue_text(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
     while let Some(c) = chars.next() {
