@@ -135,10 +135,25 @@ async fn link_once(
     {
         let (etx, mut erx) = tokio::sync::mpsc::unbounded_channel::<std::path::PathBuf>();
         let watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-            if let Ok(ev) = res {
-                for p in ev.paths {
-                    let _ = etx.send(p);
-                }
+            let Ok(ev) = res else { return };
+            // Only content changes. Access and metadata events fire for
+            // MERE READS on fuse mounts — forwarding those made the
+            // scanner's own discovery reads re-trigger scans forever
+            // (77 self-inflicted rescans before this filter existed).
+            // Unknown/Any kinds are dropped too: the periodic sweep is
+            // the safety net, a feedback loop has none.
+            use notify::event::{EventKind, ModifyKind};
+            let relevant = matches!(
+                ev.kind,
+                EventKind::Create(_)
+                    | EventKind::Remove(_)
+                    | EventKind::Modify(ModifyKind::Data(_) | ModifyKind::Name(_))
+            );
+            if !relevant {
+                return;
+            }
+            for p in ev.paths {
+                let _ = etx.send(p);
             }
         });
         match watcher {
