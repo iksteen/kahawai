@@ -65,6 +65,7 @@ pub fn router(
             axum::routing::delete(admin_detach_collection),
         )
         .route("/admin/v1/collections", get(admin_collections))
+        .route("/admin/v1/users", post(admin_create_user))
         .route("/api/v1/playback/sessions/{id}/seek", post(seek_session))
         .route("/admin/v1/sessions", get(admin_sessions))
         .route("/admin/v1/sessions/{id}", axum::routing::delete(admin_end_session))
@@ -166,6 +167,26 @@ async fn admin_approve(
         .await
         .map_err(|e| (StatusCode::FORBIDDEN, format!("{e:#}")))?;
     Ok(Json(json!({ "approved": summary })))
+}
+
+#[derive(Deserialize)]
+struct CreateUser {
+    username: String,
+    password: String,
+    #[serde(default)]
+    admin: bool,
+}
+
+async fn admin_create_user(
+    State(state): State<AppState>,
+    Json(body): Json<CreateUser>,
+) -> Result<Json<Value>, ApiError> {
+    let id = state
+        .auth
+        .create_user(&body.username, &body.password, body.admin)
+        .await
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    Ok(Json(json!({ "id": id, "username": body.username, "admin": body.admin })))
 }
 
 async fn admin_satellites(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {

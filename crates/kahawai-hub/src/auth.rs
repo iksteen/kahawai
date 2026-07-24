@@ -155,6 +155,30 @@ impl Auth {
         self.issue_tokens(&id, username.trim(), true).await
     }
 
+    /// Admin user creation (HUB-26 first cut).
+    pub async fn create_user(&self, username: &str, password: &str, admin: bool) -> Result<String> {
+        if username.trim().is_empty() || password.len() < 8 {
+            bail!("username required and password must be at least 8 characters");
+        }
+        let id = ulid::Ulid::new().to_string();
+        let hash = hash_password(password)?;
+        sqlx::query("INSERT INTO users (id, username, password_hash, is_admin) VALUES (?, ?, ?, ?)")
+            .bind(&id)
+            .bind(username.trim())
+            .bind(&hash)
+            .bind(admin)
+            .execute(&self.db)
+            .await
+            .map_err(|e| match e {
+                sqlx::Error::Database(ref db) if db.is_unique_violation() => {
+                    anyhow::anyhow!("username already exists")
+                }
+                e => e.into(),
+            })?;
+        tracing::info!(username, admin, "user created");
+        Ok(id)
+    }
+
     pub async fn login(&self, username: &str, password: &str) -> Result<TokenPair> {
         let row = sqlx::query("SELECT id, username, password_hash, is_admin FROM users WHERE username = ?")
             .bind(username.trim())

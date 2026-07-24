@@ -317,3 +317,75 @@ async fn items_filter_by_library() {
     .await;
     assert_eq!(titles(&none), Vec::<String>::new());
 }
+
+#[tokio::test]
+async fn admin_creates_users() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    let registry = Arc::new(Registry::new(db.clone(), Default::default()));
+    let auth = Arc::new(Auth::new(db.clone(), dir.path()).await.unwrap());
+    let setup_token = auth.setup_token().unwrap();
+    let api = test_router(
+        registry,
+        auth,
+        Arc::new(kahawai_hub::sessions::Sessions::new(tempfile::tempdir().unwrap().keep())),
+    );
+    let resp = api
+        .clone()
+        .oneshot(post(
+            "/api/v1/setup",
+            serde_json::json!({"token": setup_token, "username": "root", "password": "hunter22222"}),
+        ))
+        .await
+        .unwrap();
+    let admin_token = body_json(resp).await["access_token"].as_str().unwrap().to_string();
+
+    let create = |token: String, body: serde_json::Value| {
+        let api = api.clone();
+        async move {
+            api.oneshot(
+                Request::post("/admin/v1/users")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        }
+    };
+
+    // Admin creates a plain user; the new user can log in but not create.
+    let resp = create(
+        admin_token.clone(),
+        serde_json::json!({"username": "tester", "password": "longenough"}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = api
+        .clone()
+        .oneshot(post(
+            "/api/v1/auth/token",
+            serde_json::json!({"username": "tester", "password": "longenough"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let user_token = body_json(resp).await["access_token"].as_str().unwrap().to_string();
+    let resp = create(
+        user_token,
+        serde_json::json!({"username": "sneaky", "password": "longenough"}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    // Duplicates and short passwords are rejected cleanly.
+    let resp = create(
+        admin_token.clone(),
+        serde_json::json!({"username": "tester", "password": "longenough"}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let resp =
+        create(admin_token, serde_json::json!({"username": "shorty", "password": "short"})).await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
