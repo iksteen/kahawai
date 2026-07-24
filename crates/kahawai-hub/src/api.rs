@@ -25,6 +25,7 @@ pub struct AppState {
     pub enrollments: Arc<crate::enrollment_service::EnrollmentService>,
     pub subtitles: Arc<crate::subtitles::Subtitles>,
     pub artwork: Arc<crate::artwork::Artwork>,
+    pub enricher: Arc<crate::enrich::Enricher>,
 }
 
 pub fn router(
@@ -34,8 +35,10 @@ pub fn router(
     enrollments: Arc<crate::enrollment_service::EnrollmentService>,
     subtitles: Arc<crate::subtitles::Subtitles>,
     artwork: Arc<crate::artwork::Artwork>,
+    enricher: Arc<crate::enrich::Enricher>,
 ) -> Router {
-    let state = AppState { registry, auth, sessions, enrollments, subtitles, artwork };
+    let state =
+        AppState { registry, auth, sessions, enrollments, subtitles, artwork, enricher };
     let protected = Router::new()
         .route("/api/v1/collections", get(list_collections))
         .route("/api/v1/libraries", get(list_libraries))
@@ -69,6 +72,9 @@ pub fn router(
         )
         .route("/admin/v1/collections", get(admin_collections))
         .route("/admin/v1/users", post(admin_create_user))
+        .route("/admin/v1/providers", get(admin_providers))
+        .route("/admin/v1/providers/tmdb", post(admin_set_tmdb))
+        .route("/admin/v1/enrich", get(admin_enrich_status).post(admin_enrich_run))
         .route("/api/v1/playback/sessions/{id}/seek", post(seek_session))
         .route("/admin/v1/sessions", get(admin_sessions))
         .route("/admin/v1/sessions/{id}", axum::routing::delete(admin_end_session))
@@ -170,6 +176,60 @@ async fn admin_approve(
         .await
         .map_err(|e| (StatusCode::FORBIDDEN, format!("{e:#}")))?;
     Ok(Json(json!({ "approved": summary })))
+}
+
+async fn admin_providers(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+    let configured = state
+        .registry
+        .get_setting(crate::enrich::TMDB_KEY_SETTING)
+        .await
+        .map_err(internal)?
+        .is_some();
+    Ok(Json(json!({ "tmdb": { "configured": configured } })))
+}
+
+#[derive(Deserialize)]
+struct SetTmdb {
+    api_key: String,
+}
+
+async fn admin_set_tmdb(
+    State(state): State<AppState>,
+    Json(body): Json<SetTmdb>,
+) -> Result<Json<Value>, ApiError> {
+    let key = body.api_key.trim();
+    if key.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "api_key required".into()));
+    }
+    state
+        .registry
+        .set_setting(crate::enrich::TMDB_KEY_SETTING, key)
+        .await
+        .map_err(internal)?;
+    // Kick a run right away — saving the key is the natural trigger.
+    let enricher = state.enricher.clone();
+    let registry = state.registry.clone();
+    tokio::spawn(async move {
+        if let Err(e) = enricher.run_once(&registry).await {
+            tracing::warn!(error = format!("{e:#}"), "enrichment run failed");
+        }
+    });
+    Ok(Json(json!({ "saved": true })))
+}
+
+async fn admin_enrich_status(State(state): State<AppState>) -> Json<Value> {
+    Json(state.enricher.status())
+}
+
+async fn admin_enrich_run(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+    let enricher = state.enricher.clone();
+    let registry = state.registry.clone();
+    tokio::spawn(async move {
+        if let Err(e) = enricher.run_once(&registry).await {
+            tracing::warn!(error = format!("{e:#}"), "enrichment run failed");
+        }
+    });
+    Ok(Json(json!({ "started": true })))
 }
 
 #[derive(Deserialize)]
@@ -843,6 +903,25 @@ async fn item_detail(
     // Hierarchical navigation (episode → its show):
     out["parent_id"] = json!(item.get::<Option<String>, _>("parent_id"));
     out["sources"] = json!(sources);
+    // Enrichment (own metadata, or the parent show's for episodes).
+    let meta = sqlx::query(
+        "SELECT m.overview, m.rating, m.premiered, m.confidence FROM items i
+         JOIN item_metadata m ON m.item_id IN (i.id, i.parent_id)
+         WHERE i.id = ? AND m.provider_id != '' LIMIT 1",
+    )
+    .bind(&id)
+    .fetch_optional(state.registry.db())
+    .await
+    .map_err(internal)?;
+    if let Some(m) = meta {
+        out["metadata"] = json!({
+            "overview": m.get::<Option<String>, _>("overview"),
+            "rating": m.get::<Option<f64>, _>("rating"),
+            "premiered": m.get::<Option<String>, _>("premiered"),
+            "confidence": m.get::<String, _>("confidence"),
+            "provider": "tmdb",
+        });
+    }
     Ok(Json(out))
 }
 

@@ -127,10 +127,19 @@ export type Source = {
   streams: StreamInfo | null
 }
 
+export type ItemMetadata = {
+  overview: string | null
+  rating: number | null
+  premiered: string | null
+  confidence: 'auto' | 'weak'
+  provider: string
+}
+
 export type ItemDetail = Item & {
   sources_detail: Source[]
   show_title?: string | null
   parent_id?: string | null
+  metadata?: ItemMetadata
 }
 
 /// Local artwork (cover.jpg etc). <img> requests authenticate with the
@@ -297,6 +306,18 @@ export const adminLibraries = () =>
 
 export const adminCollections = () =>
   json<{ collections: CollectionInfo[] }>('/admin/v1/collections')
+
+export const adminProviders = () =>
+  json<{ tmdb: { configured: boolean } }>('/admin/v1/providers')
+export const adminSetTmdbKey = (apiKey: string) =>
+  json<{ saved: boolean }>('/admin/v1/providers/tmdb', {
+    method: 'POST',
+    body: JSON.stringify({ api_key: apiKey }),
+  })
+export const adminEnrichStatus = () =>
+  json<{ running: boolean; matched: number; weak: number; missed: number }>('/admin/v1/enrich')
+export const adminEnrichRun = () =>
+  json<{ started: boolean }>('/admin/v1/enrich', { method: 'POST' })
 
 export const adminCreateLibrary = (name: string, mediaType: string) =>
   json<{ id: string }>('/admin/v1/libraries', {

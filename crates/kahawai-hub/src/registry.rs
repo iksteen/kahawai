@@ -733,6 +733,25 @@ impl Registry {
     /// items left without any source. Watch state is archived keyed to
     /// content identity first (HUB-20), so moves/renames and returning
     /// media keep their history.
+    pub async fn get_setting(&self, key: &str) -> Result<Option<String>> {
+        Ok(sqlx::query_scalar("SELECT value FROM settings WHERE key = ?")
+            .bind(key)
+            .fetch_optional(&self.db)
+            .await?)
+    }
+
+    pub async fn set_setting(&self, key: &str, value: &str) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO settings (key, value) VALUES (?, ?)
+             ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+        )
+        .bind(key)
+        .bind(value)
+        .execute(&self.db)
+        .await?;
+        Ok(())
+    }
+
     /// (path, size, mtime) for every known file of a collection — the
     /// incremental-rescan manifest (MH-5).
     pub async fn file_stats(

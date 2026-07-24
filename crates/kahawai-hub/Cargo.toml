@@ -25,6 +25,8 @@ serde_json = { workspace = true }
 ulid = { workspace = true }
 bytes = "1"
 xxhash-rust = { workspace = true }
+reqwest = { workspace = true }
+unicode-normalization = "0.1"
 rust-embed = { workspace = true }
 argon2 = "0.5.3"
 rand_core = { version = "0.6", features = ["std"] }

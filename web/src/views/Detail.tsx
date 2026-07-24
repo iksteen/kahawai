@@ -10,6 +10,7 @@ import {
   type Source,
 } from '../api'
 import AlbumPlayer from './AlbumPlayer'
+import tmdbLogo from '../assets/tmdb.svg'
 
 const GB = 1024 * 1024 * 1024
 
@@ -276,6 +277,19 @@ export default function Detail({
         )}
       </div>
 
+      {item.metadata?.overview && (
+        <section className="meta-block">
+          <p className="overview">{item.metadata.overview}</p>
+          <div className="detail-sub mono">
+            {item.metadata.premiered && <span>{item.metadata.premiered}</span>}
+            {item.metadata.rating ? <span> · ★ {item.metadata.rating.toFixed(1)}</span> : null}
+            {item.metadata.confidence === 'weak' && (
+              <span className="dim"> · uncertain match</span>
+            )}
+          </div>
+        </section>
+      )}
+
       <div className="play-row">
         <button className="btn" disabled={busy || !best?.available} onClick={() => play(autoMode(best))}>
           {resumeMs ? `Resume` : 'Play'}
@@ -302,6 +316,15 @@ export default function Detail({
           </li>
         ))}
       </ul>
+      {item.metadata && (
+        <footer className="tmdb-attrib">
+          <img src={tmdbLogo} alt="TMDB" />
+          <span>
+            This product uses TMDB and the TMDB APIs but is not endorsed, certified, or
+            otherwise approved by TMDB.
+          </span>
+        </footer>
+      )}
     </main>
   )
 }

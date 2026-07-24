@@ -323,8 +323,24 @@ async fn run_hub(cfg: config::HubConfig) -> Result<()> {
         .with_context(|| format!("binding client API on {}", cfg.bind))?;
     let subtitles =
         Arc::new(kahawai_hub::subtitles::Subtitles::new(cfg.data_dir.join("subtitles")));
-    let artwork = Arc::new(kahawai_hub::artwork::Artwork::new(cfg.data_dir.join("artwork")));
-    let api = kahawai_hub::api::router(registry.clone(), auth, sessions.clone(), Arc::new(svc.clone()), subtitles, artwork);
+    let enricher = Arc::new(kahawai_hub::enrich::Enricher::new());
+    let artwork = Arc::new(kahawai_hub::artwork::Artwork::new(
+        cfg.data_dir.join("artwork"),
+        enricher.clone(),
+    ));
+    // Enrich whatever resolution has produced since last time.
+    {
+        let enricher = enricher.clone();
+        let registry = registry.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(15)).await;
+            match enricher.run_once(&registry).await {
+                Ok(_) => {}
+                Err(e) => tracing::debug!(error = format!("{e:#}"), "startup enrichment skipped"),
+            }
+        });
+    }
+    let api = kahawai_hub::api::router(registry.clone(), auth, sessions.clone(), Arc::new(svc.clone()), subtitles, artwork, enricher);
     tokio::spawn(async move {
         if let Err(e) = axum::serve(api_listener, api).await {
             tracing::error!(error = %e, "client API server failed");

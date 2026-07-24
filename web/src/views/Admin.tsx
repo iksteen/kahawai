@@ -1,6 +1,10 @@
 import { useEffect, useState } from 'react'
 import {
   adminApprove,
+  adminEnrichRun,
+  adminEnrichStatus,
+  adminProviders,
+  adminSetTmdbKey,
   adminAttachCollection,
   adminCollections,
   adminCreateLibrary,
@@ -22,6 +26,67 @@ import {
 
 // ponytail: 3 s polling; the /api/v1/events channel replaces this later.
 const POLL_MS = 3000
+
+function TmdbSection({ onNotice }: { onNotice: (s: string) => void }) {
+  const [configured, setConfigured] = useState(false)
+  const [key, setKey] = useState('')
+  const [status, setStatus] = useState<{
+    running: boolean
+    matched: number
+    weak: number
+    missed: number
+  } | null>(null)
+
+  const refresh = () => {
+    adminProviders().then((p) => setConfigured(p.tmdb.configured)).catch(() => {})
+    adminEnrichStatus().then(setStatus).catch(() => {})
+  }
+  useEffect(() => {
+    refresh()
+    const t = setInterval(refresh, POLL_MS)
+    return () => clearInterval(t)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  return (
+    <>
+      <h2>Metadata (TMDB)</h2>
+      <div className="row-form">
+        <input
+          type="password"
+          placeholder={configured ? 'key configured — paste to replace' : 'TMDB API key'}
+          value={key}
+          onChange={(e) => setKey(e.target.value)}
+        />
+        <button
+          className="btn small"
+          disabled={!key.trim()}
+          onClick={() => {
+            void adminSetTmdbKey(key.trim()).then(() => {
+              setKey('')
+              onNotice('TMDB key saved — enrichment started')
+              refresh()
+            })
+          }}
+        >
+          Save
+        </button>
+        <button
+          className="btn ghost small"
+          disabled={!configured || status?.running}
+          onClick={() => void adminEnrichRun().then(refresh)}
+        >
+          {status?.running ? 'Enriching…' : 'Enrich now'}
+        </button>
+        {status && (
+          <span className="dim mono">
+            {status.matched} matched · {status.weak} weak · {status.missed} missed
+          </span>
+        )}
+      </div>
+    </>
+  )
+}
 
 export default function Admin() {
   const [pending, setPending] = useState<PendingEnrollment[]>([])
@@ -96,6 +161,8 @@ export default function Admin() {
       <h1>Admin</h1>
       {notice && <p className="notice">{notice}</p>}
       {error && <div className="error">{error}</div>}
+
+      <TmdbSection onNotice={setNotice} />
 
       <h2>Pending enrollments</h2>
       {pending.length === 0 ? (

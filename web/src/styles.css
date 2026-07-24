@@ -284,3 +284,30 @@ h2 { font-size: 14px; font-weight: 650; color: var(--dim); letter-spacing: 0.08e
   aspect-ratio: 1;
   flex: none;
 }
+
+.meta-block {
+  max-width: 46rem;
+  margin: 0.75rem 0;
+}
+.overview {
+  line-height: 1.55;
+  color: #cdd8da;
+}
+.tmdb-attrib {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  margin-top: 2.5rem;
+  font-size: 0.72rem;
+  color: #5a6d72;
+}
+.tmdb-attrib img {
+  height: 0.8rem;
+  opacity: 0.7;
+}
+.row-form {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+  flex-wrap: wrap;
+}

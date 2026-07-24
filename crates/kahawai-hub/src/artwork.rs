@@ -15,13 +15,14 @@ use crate::sessions::Sessions;
 
 pub struct Artwork {
     dir: PathBuf,
+    enricher: Arc<crate::enrich::Enricher>,
     /// Per-key locks so concurrent requests fetch once.
     inflight: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl Artwork {
-    pub fn new(dir: PathBuf) -> Self {
-        Self { dir, inflight: Default::default() }
+    pub fn new(dir: PathBuf, enricher: Arc<crate::enrich::Enricher>) -> Self {
+        Self { dir, enricher, inflight: Default::default() }
     }
 
     /// Image bytes + content type for an item, or None when it has no
@@ -36,7 +37,8 @@ impl Artwork {
         let Some((module_id, collection_id, art_rel)) =
             find_artwork_source(registry, item_id).await?
         else {
-            return Ok(None);
+            // No local artwork: fall back to the enrichment poster.
+            return self.tmdb_poster(registry, item_id).await;
         };
 
         let ctype = match art_rel.rsplit('.').next().map(str::to_ascii_lowercase).as_deref() {
@@ -66,6 +68,44 @@ impl Artwork {
         std::fs::create_dir_all(&self.dir)?;
         std::fs::write(&cache_path, &bytes)?;
         Ok(Some((bytes, ctype)))
+    }
+}
+
+impl Artwork {
+    /// Enrichment poster (TMDB), cached like local artwork. The item's
+    /// own metadata first, its parent's (episodes) as fallback.
+    async fn tmdb_poster(
+        &self,
+        registry: &Registry,
+        item_id: &str,
+    ) -> Result<Option<(Vec<u8>, &'static str)>> {
+        let poster: Option<String> = sqlx::query_scalar(
+            "SELECT m.poster_path FROM items i
+             JOIN item_metadata m ON m.item_id IN (i.id, i.parent_id)
+             WHERE i.id = ? AND m.poster_path IS NOT NULL
+             LIMIT 1",
+        )
+        .bind(item_id)
+        .fetch_optional(registry.db())
+        .await?
+        .flatten();
+        let Some(poster) = poster else { return Ok(None) };
+
+        let cache_key =
+            format!("tmdb-{:016x}", xxhash_rust::xxh3::xxh3_64(poster.as_bytes()));
+        let lock = {
+            let mut map = self.inflight.lock().unwrap();
+            map.entry(cache_key.clone()).or_default().clone()
+        };
+        let _guard = lock.lock().await;
+        let cache_path = self.dir.join(&cache_key);
+        if let Ok(bytes) = std::fs::read(&cache_path) {
+            return Ok(Some((bytes, "image/jpeg")));
+        }
+        let bytes = self.enricher.fetch_poster(&poster).await?;
+        std::fs::create_dir_all(&self.dir)?;
+        std::fs::write(&cache_path, &bytes)?;
+        Ok(Some((bytes, "image/jpeg")))
     }
 }
 
