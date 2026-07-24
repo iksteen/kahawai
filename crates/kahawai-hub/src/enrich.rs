@@ -60,9 +60,14 @@ pub fn pick_candidate<'c>(
     year: Option<i64>,
 ) -> Option<(&'c Candidate, &'static str)> {
     let norm = fold(title);
+    // Spaceless tier: acronym titles compare as "s h i e l d" vs
+    // "shield" depending on where the dots got normalized away.
+    let squash = |s: &str| s.replace(' ', "");
+    let norm_sq = squash(&norm);
     let title_eq = |c: &Candidate| {
         fold(&c.title) == norm
             || c.original_title.as_deref().is_some_and(|t| fold(t) == norm)
+            || squash(&fold(&c.title)) == norm_sq
     };
     let year_ok = |c: &Candidate| match (year, c.year()) {
         (Some(w), Some(h)) => (w - h).abs() <= 1,
@@ -338,6 +343,10 @@ mod tests {
         let tm = vec![cand(7, "Twelve Monkeys", "1995-12-29"), cand(8, "12 Rounds", "2009-03-19")];
         let (c, conf) = pick_candidate(&tm, "12 Monkeys", None).unwrap();
         assert_eq!((c.id, conf), (7, "auto"));
+        // Acronym spacing: "S H I E L D" == "S.H.I.E.L.D.".
+        let sh = vec![cand(12, "Marvel's Agents of S.H.I.E.L.D.", "2013-09-24")];
+        let (c, conf) = pick_candidate(&sh, "Marvels Agents of S H I E L D", None).unwrap();
+        assert_eq!((c.id, conf), (12, "auto"));
         // '&' and 'and' are the same word.
         let oo = vec![cand(11, "Iliza Shlesinger: Over & Over", "2019-07-02")];
         let (c, conf) = pick_candidate(&oo, "Iliza Shlesinger Over And Over", None).unwrap();
