@@ -311,3 +311,23 @@ h2 { font-size: 14px; font-weight: 650; color: var(--dim); letter-spacing: 0.08e
   align-items: center;
   flex-wrap: wrap;
 }
+
+.review-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+.review-row .card.episode {
+  flex: 1;
+}
+.chip.warn {
+  color: var(--warn);
+  border-color: var(--warn);
+}
+.review-search {
+  margin: 0.4rem 0 0.8rem 1rem;
+}
+.grid.candidates {
+  grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
+  margin-top: 0.6rem;
+}

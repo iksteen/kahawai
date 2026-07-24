@@ -30,7 +30,7 @@ struct SearchResponse {
     results: Vec<Candidate>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
 pub struct Candidate {
     id: u64,
     #[serde(alias = "name")]
@@ -457,6 +457,52 @@ impl Enricher {
         );
         tracing::info!(matched = m, weak = w, missed = x, "enrichment run complete");
         Ok((m, w, x))
+    }
+
+    /// Provider search for the review queue (HUB-8): TMDB first, TVDB
+    /// appended when configured. Raw candidates, human judges.
+    pub async fn search_candidates(
+        &self,
+        registry: &Registry,
+        kind: &str,
+        query: &str,
+        year: Option<i64>,
+    ) -> Result<serde_json::Value> {
+        let mut out: Vec<serde_json::Value> = Vec::new();
+        if let Some(key) = registry.get_setting(TMDB_KEY_SETTING).await? {
+            match self.search(&key, kind, query, year).await {
+                Ok(cands) => out.extend(cands.iter().map(|c| {
+                    let mut v = serde_json::to_value(c).unwrap();
+                    v["provider"] = serde_json::json!("tmdb");
+                    // Absolute preview URL for the admin UI.
+                    if let Some(p) = c.poster_path.as_deref() {
+                        v["poster_url"] =
+                            serde_json::json!(format!("https://image.tmdb.org/t/p/w154{p}"));
+                    }
+                    v
+                })),
+                Err(e) => tracing::warn!(error = format!("{e:#}"), "review tmdb search failed"),
+            }
+        }
+        if let Some(tk) = registry.get_setting(TVDB_KEY_SETTING).await? {
+            let pin = registry.get_setting(TVDB_PIN_SETTING).await?;
+            if let Ok(token) = self.tvdb_login(&tk, pin.as_deref()).await {
+                match self.tvdb_search(&token, kind, query).await {
+                    Ok(cands) => out.extend(cands.iter().map(|c| {
+                        let mut v = serde_json::to_value(c).unwrap();
+                        v["provider"] = serde_json::json!("tvdb");
+                        if let Some(p) = c.poster_path.as_deref() {
+                            v["poster_url"] = serde_json::json!(p);
+                        }
+                        v
+                    })),
+                    Err(e) => {
+                        tracing::warn!(error = format!("{e:#}"), "review tvdb search failed")
+                    }
+                }
+            }
+        }
+        Ok(serde_json::json!(out))
     }
 
     /// Fetch a TMDB poster (used by the artwork store when an item has

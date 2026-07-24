@@ -77,6 +77,9 @@ pub fn router(
         .route("/admin/v1/providers/tmdb", post(admin_set_tmdb))
         .route("/admin/v1/providers/tvdb", post(admin_set_tvdb))
         .route("/admin/v1/enrich", get(admin_enrich_status).post(admin_enrich_run))
+        .route("/admin/v1/enrich/review", get(admin_review_list))
+        .route("/admin/v1/enrich/search", post(admin_review_search))
+        .route("/admin/v1/items/{id}/match", post(admin_apply_match))
         .route("/admin/v1/sessions", get(admin_sessions))
         .route("/admin/v1/sessions/{id}", axum::routing::delete(admin_end_session))
         .route_layer(axum::middleware::from_fn(require_admin))
@@ -277,6 +280,140 @@ async fn admin_enrich_run(State(state): State<AppState>) -> Result<Json<Value>, 
         }
     });
     Ok(Json(json!({ "started": true })))
+}
+
+/// HUB-8 review queue: everything not matched confidently — misses,
+/// weak matches (with their current guess for confirm/reject), and
+/// rejected items.
+async fn admin_review_list(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+    let rows = sqlx::query(
+        "SELECT i.id, i.kind, i.title, i.year, m.confidence,
+                m.title AS matched_title, m.premiered, m.provider, m.provider_id,
+                (SELECT s.path_rel FROM item_sources s WHERE s.item_id = i.id LIMIT 1) AS path
+         FROM items i
+         JOIN item_metadata m ON m.item_id = i.id
+         WHERE m.confidence IN ('miss', 'weak', 'rejected')
+         ORDER BY m.confidence != 'miss', i.title",
+    )
+    .fetch_all(state.registry.db())
+    .await
+    .map_err(internal)?;
+    let entries: Vec<Value> = rows
+        .iter()
+        .map(|r| {
+            json!({
+                "item_id": r.get::<String, _>("id"),
+                "kind": r.get::<String, _>("kind"),
+                "title": r.get::<String, _>("title"),
+                "year": r.get::<Option<i64>, _>("year"),
+                "path": r.get::<Option<String>, _>("path"),
+                "confidence": r.get::<String, _>("confidence"),
+                "matched_title": r.get::<Option<String>, _>("matched_title"),
+                "premiered": r.get::<Option<String>, _>("premiered"),
+                "provider": r.get::<String, _>("provider"),
+            })
+        })
+        .collect();
+    Ok(Json(json!({ "entries": entries })))
+}
+
+#[derive(Deserialize)]
+struct ReviewSearch {
+    kind: String,
+    query: String,
+    year: Option<i64>,
+}
+
+async fn admin_review_search(
+    State(state): State<AppState>,
+    Json(body): Json<ReviewSearch>,
+) -> Result<Json<Value>, ApiError> {
+    let candidates = state
+        .enricher
+        .search_candidates(&state.registry, &body.kind, &body.query, body.year)
+        .await
+        .map_err(internal)?;
+    Ok(Json(json!({ "candidates": candidates })))
+}
+
+#[derive(Deserialize)]
+struct ApplyMatch {
+    /// "pick": store the supplied candidate; "confirm": promote the
+    /// current weak match; "reject": clear the match, excluded from
+    /// auto-retries.
+    action: String,
+    provider: Option<String>,
+    candidate: Option<Value>,
+}
+
+async fn admin_apply_match(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<ApplyMatch>,
+) -> Result<Json<Value>, ApiError> {
+    let db = state.registry.db();
+    match body.action.as_str() {
+        "confirm" => {
+            sqlx::query(
+                "UPDATE item_metadata SET confidence = 'manual', updated_at = unixepoch()
+                 WHERE item_id = ? AND provider_id != ''",
+            )
+            .bind(&id)
+            .execute(db)
+            .await
+            .map_err(internal)?;
+        }
+        "reject" => {
+            sqlx::query(
+                "UPDATE item_metadata SET provider_id = '', title = NULL, overview = NULL,
+                        poster_path = NULL, rating = NULL, premiered = NULL,
+                        confidence = 'rejected', updated_at = unixepoch()
+                 WHERE item_id = ?",
+            )
+            .bind(&id)
+            .execute(db)
+            .await
+            .map_err(internal)?;
+        }
+        "pick" => {
+            let c = body.candidate.ok_or((StatusCode::BAD_REQUEST, "candidate required".into()))?;
+            let provider = body
+                .provider
+                .ok_or((StatusCode::BAD_REQUEST, "provider required".into()))?;
+            let pid = c["id"]
+                .as_u64()
+                .ok_or((StatusCode::BAD_REQUEST, "candidate.id required".into()))?;
+            sqlx::query(
+                "INSERT INTO item_metadata
+                   (item_id, provider, provider_id, title, overview, poster_path,
+                    rating, premiered, genres, confidence, updated_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, 'manual', unixepoch())
+                 ON CONFLICT (item_id) DO UPDATE SET
+                   provider = excluded.provider,
+                   provider_id = excluded.provider_id,
+                   title = excluded.title,
+                   overview = excluded.overview,
+                   poster_path = excluded.poster_path,
+                   rating = excluded.rating,
+                   premiered = excluded.premiered,
+                   confidence = 'manual',
+                   updated_at = excluded.updated_at",
+            )
+            .bind(&id)
+            .bind(&provider)
+            .bind(pid.to_string())
+            .bind(c["title"].as_str())
+            .bind(c["overview"].as_str())
+            .bind(c["poster_path"].as_str())
+            .bind(c["vote_average"].as_f64())
+            .bind(c["release_date"].as_str())
+            .execute(db)
+            .await
+            .map_err(internal)?;
+        }
+        other => return Err((StatusCode::BAD_REQUEST, format!("unknown action {other}"))),
+    }
+    Ok(Json(json!({ "ok": true })))
 }
 
 #[derive(Deserialize)]

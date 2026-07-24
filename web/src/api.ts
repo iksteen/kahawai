@@ -325,6 +325,50 @@ export const adminSetTmdbKey = (apiKey: string) =>
   })
 export const adminEnrichStatus = () =>
   json<{ running: boolean; matched: number; weak: number; missed: number }>('/admin/v1/enrich')
+export type ReviewEntry = {
+  item_id: string
+  kind: 'movie' | 'show'
+  title: string
+  year: number | null
+  path: string | null
+  confidence: 'miss' | 'weak' | 'rejected'
+  matched_title: string | null
+  premiered: string | null
+  provider: string
+}
+
+export type MatchCandidate = {
+  id: number
+  title: string
+  overview?: string | null
+  poster_path?: string | null
+  poster_url?: string
+  release_date?: string | null
+  vote_average?: number | null
+  provider: 'tmdb' | 'tvdb'
+}
+
+export const adminReviewList = () =>
+  json<{ entries: ReviewEntry[] }>('/admin/v1/enrich/review')
+export const adminReviewSearch = (kind: string, query: string, year?: number | null) =>
+  json<{ candidates: MatchCandidate[] }>('/admin/v1/enrich/search', {
+    method: 'POST',
+    body: JSON.stringify({ kind, query, year: year ?? null }),
+  })
+export const adminApplyMatch = (
+  itemId: string,
+  action: 'pick' | 'confirm' | 'reject',
+  candidate?: MatchCandidate,
+) =>
+  json<{ ok: boolean }>(`/admin/v1/items/${itemId}/match`, {
+    method: 'POST',
+    body: JSON.stringify({
+      action,
+      provider: candidate?.provider ?? null,
+      candidate: candidate ?? null,
+    }),
+  })
+
 export const adminEnrichRun = () =>
   json<{ started: boolean }>('/admin/v1/enrich', { method: 'POST' })
 
