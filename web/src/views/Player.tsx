@@ -114,11 +114,17 @@ export default function Player({
   // embedded fonts. ASS times are absolute file times; timeOffset
   // bridges to the (possibly mid-file) HLS timeline. Re-created on
   // seek-restarts (trackEpoch) to pick up the new offset.
+  //
+  // The .ass endpoint STREAMS on first extraction (header, then
+  // Dialogue lines as the demux pass reaches them): the instance is
+  // created as soon as the header is in and later lines feed libass
+  // incrementally — no waiting out a full-file read.
   useEffect(() => {
     const video = videoRef.current
     if (!video || !useAss || !selected) return
     let dead = false
     let instance: JASSUB | null = null
+    const ac = new AbortController()
     ;(async () => {
       let fonts: string[] = []
       try {
@@ -128,16 +134,55 @@ export default function Player({
         /* no fonts — libass falls back */
       }
       if (dead) return
-      instance = new JASSUB({
-        video,
-        subUrl: `/api/v1/items/${item.id}/subtitles/${selected.key}.ass`,
-        fonts,
-        timeOffset: offsetRef.current / 1000,
+      const resp = await fetch(`/api/v1/items/${item.id}/subtitles/${selected.key}.ass`, {
+        signal: ac.signal,
       })
-      jassubRef.current = instance
-    })()
+      if (!resp.ok || !resp.body) return
+      const reader = resp.body.getReader()
+      const dec = new TextDecoder()
+      let buf = ''
+      for (;;) {
+        const { done, value } = await reader.read()
+        if (dead) return
+        if (value) buf += dec.decode(value, { stream: true })
+        if (!instance) {
+          // Wait for the complete header: everything up to and
+          // including the [Events] Format line.
+          const ev = buf.toLowerCase().indexOf('[events]')
+          const fm = ev >= 0 ? buf.indexOf('Format:', ev) : -1
+          const nl = fm >= 0 ? buf.indexOf('\n', fm) : -1
+          if (nl >= 0) {
+            instance = new JASSUB({
+              video,
+              subContent: buf.slice(0, nl + 1),
+              fonts,
+              timeOffset: offsetRef.current / 1000,
+            })
+            jassubRef.current = instance
+            buf = buf.slice(nl + 1)
+          }
+        }
+        if (instance && buf) {
+          const cut = buf.lastIndexOf('\n')
+          if (cut >= 0) {
+            const lines = buf.slice(0, cut + 1)
+            buf = buf.slice(cut + 1)
+            await instance.ready
+            if (dead) return
+            // renderer is the worker proxy; processData appends events.
+            // The section header keeps libass's line parser in [Events]
+            // regardless of its state after the initial track load.
+            void (instance as any).renderer.processData('[Events]\n' + lines)
+          }
+        }
+        if (done) break
+      }
+    })().catch(() => {
+      /* aborted or stream error; VTT fallback stays available */
+    })
     return () => {
       dead = true
+      ac.abort()
       instance?.destroy()
       if (jassubRef.current === instance) jassubRef.current = null
     }

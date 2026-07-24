@@ -261,12 +261,41 @@ fn ass_dialogue(raw: &str, start_ms: u64, end_ms: u64) -> Option<String> {
     Some(format!("Dialogue: {layer},{},{},{rest}", ts(start_ms), ts(end_ms)))
 }
 
+/// One streamed extraction event (HUB-32 streaming: subtitles usable
+/// while the demux pass is still running). ASS tracks only.
+pub enum SubStreamEvent {
+    /// Script header (+ a completed [Events]/Format section), once, early.
+    Header(String),
+    /// One re-timed Dialogue line, in demux (≈chronological) order.
+    Dialogue(String),
+}
+
+/// The script header normalized for appending Dialogue lines.
+fn compose_header(h: &str) -> String {
+    let mut out = h.trim_end().to_string();
+    if !out.to_lowercase().contains("[events]") {
+        out.push_str("\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text");
+    }
+    out.push('\n');
+    out
+}
+
 /// Extract the `index`-th text subtitle track (0-based, counting only
 /// subtitle pads in demux order) from a media source. No A/V decoding —
 /// everything except the chosen track goes to fakesinks.
 pub fn extract_embedded(
     source: Box<dyn crate::remux::RemuxSource>,
     index: usize,
+) -> Result<Extracted> {
+    extract_embedded_stream(source, index, |_| {})
+}
+
+/// [`extract_embedded`], streaming ASS material through `sink` as it is
+/// demuxed — the caller can serve subtitles long before EOS.
+pub fn extract_embedded_stream(
+    source: Box<dyn crate::remux::RemuxSource>,
+    index: usize,
+    mut sink: impl FnMut(SubStreamEvent),
 ) -> Result<Extracted> {
     crate::init()?;
 
@@ -340,9 +369,21 @@ pub fn extract_embedded(
     let mut cues = Vec::new();
     let mut raw_events: Vec<(u64, u64, String)> = Vec::new();
     let mut result = Ok(());
+    let mut header_sent = false;
     let mut take = |sample: &gst::Sample, ass: bool| {
         if let Some((start, end, raw)) = raw_from_sample(sample) {
             if ass {
+                if !header_sent
+                    && let Some(h) = header.lock().unwrap().as_deref()
+                {
+                    sink(SubStreamEvent::Header(compose_header(h)));
+                    header_sent = true;
+                }
+                if header_sent
+                    && let Some(line) = ass_dialogue(&raw, start, end)
+                {
+                    sink(SubStreamEvent::Dialogue(line));
+                }
                 raw_events.push((start, end, raw.clone()));
             }
             let text = if ass {
@@ -389,11 +430,7 @@ pub fn extract_embedded(
         if raw_events.is_empty() {
             return None;
         }
-        let mut out = h.trim_end().to_string();
-        if !out.to_lowercase().contains("[events]") {
-            out.push_str("\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text");
-        }
-        out.push('\n');
+        let mut out = compose_header(&h);
         let mut evs = raw_events;
         evs.sort_by_key(|(s, _, _)| *s);
         for (s, e, raw) in &evs {

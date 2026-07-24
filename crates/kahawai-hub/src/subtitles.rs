@@ -30,6 +30,13 @@ pub struct SubtitleEntry {
     pub flattened: bool,
 }
 
+/// A served ASS script: complete (cache/sidecar) or streamed while the
+/// extraction pass runs.
+pub enum AssBody {
+    Full(String),
+    Stream(tokio::sync::mpsc::Receiver<String>),
+}
+
 pub struct Subtitles {
     dir: PathBuf,
     /// Per-cache-key locks so concurrent requests extract once.
@@ -66,15 +73,94 @@ impl Subtitles {
     /// original sidecar bytes, or the reconstructed embedded track.
     /// Times are absolute file times; ASS renderers offset via the
     /// player clock, not the script.
-    pub async fn ass(
-        &self,
+    ///
+    /// Embedded tracks not yet cached come back as a STREAM: header first,
+    /// Dialogue lines as the demux pass reaches them (≈18× realtime), so
+    /// the player renders subtitles seconds after the toggle instead of
+    /// waiting out a full-file read. The full extraction still completes
+    /// (and is cached) even if the client goes away.
+    pub async fn ass_body(
+        self: &Arc<Self>,
         registry: &Registry,
         sessions: &Sessions,
         item_id: &str,
         key: &str,
-    ) -> Result<String> {
-        let ex = self.load(registry, sessions, item_id, key).await?;
-        ex.ass.context("subtitle has no ASS form")
+    ) -> Result<AssBody> {
+        let (module_id, collection_id, path_rel, info) = source_row(registry, item_id).await?;
+        let entry = entries(&info)
+            .into_iter()
+            .find(|e| e.key == key)
+            .with_context(|| format!("no subtitle {key} on this item"))?;
+        anyhow::ensure!(
+            matches!(entry.format.as_str(), "ass" | "ssa"),
+            "subtitle has no ASS form"
+        );
+
+        // Sidecars are one small read; no streaming needed.
+        let Some(n) = key.strip_prefix('e') else {
+            let ex = self.load(registry, sessions, item_id, key).await?;
+            return Ok(AssBody::Full(ex.ass.context("subtitle has no ASS form")?));
+        };
+        let idx: usize = n.parse().context("bad embedded key")?;
+
+        let cache_key = format!(
+            "v2-{:016x}-{key}",
+            xxhash_rust::xxh3::xxh3_64(
+                format!("{module_id}\n{collection_id}\n{path_rel}").as_bytes()
+            )
+        );
+        let lock = {
+            let mut map = self.inflight.lock().unwrap();
+            map.entry(cache_key.clone()).or_default().clone()
+        };
+        let guard = lock.lock_owned().await;
+        let cache_path = self.dir.join(format!("{cache_key}.json"));
+        if let Ok(bytes) = std::fs::read(&cache_path) {
+            let ex: Extracted = serde_json::from_slice(&bytes)?;
+            return Ok(AssBody::Full(ex.ass.context("subtitle has no ASS form")?));
+        }
+
+        let (_, _, size, _, lease) = sessions.open_source(registry, item_id).await?;
+        let source = crate::sessions::LeaseSource {
+            lease,
+            size,
+            handle: tokio::runtime::Handle::current(),
+        };
+        let (tx, rx) = tokio::sync::mpsc::channel::<String>(256);
+        let this = self.clone();
+        tokio::spawn(async move {
+            let _guard = guard; // held until the cache is written
+            let extraction = tokio::task::spawn_blocking(move || {
+                kahawai_media::subtitles::extract_embedded_stream(
+                    Box::new(source),
+                    idx,
+                    // A gone client never stops the pass: the read is
+                    // already paid for, the cache makes it count.
+                    |ev| match ev {
+                        kahawai_media::subtitles::SubStreamEvent::Header(h)
+                        | kahawai_media::subtitles::SubStreamEvent::Dialogue(h) => {
+                            let _ = tx.blocking_send(h);
+                        }
+                    },
+                )
+            })
+            .await;
+            match extraction {
+                Ok(Ok(ex)) => {
+                    let write = std::fs::create_dir_all(&this.dir).and_then(|_| {
+                        std::fs::write(&cache_path, serde_json::to_vec(&ex).unwrap_or_default())
+                    });
+                    if let Err(e) = write {
+                        tracing::warn!(error = %e, "subtitle cache write failed");
+                    }
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!(error = format!("{e:#}"), "streamed subtitle extraction failed")
+                }
+                Err(e) => tracing::warn!(error = %e, "subtitle extraction task panicked"),
+            }
+        });
+        Ok(AssBody::Stream(rx))
     }
 
     async fn load(

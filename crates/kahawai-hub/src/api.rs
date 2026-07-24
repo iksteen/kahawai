@@ -958,19 +958,25 @@ async fn item_subtitle_file(
     Query(q): Query<VttQuery>,
 ) -> Result<Response, ApiError> {
     if let Some(key) = file.strip_suffix(".ass") {
-        let ass = state
+        let body = state
             .subtitles
-            .ass(&state.registry, &state.sessions, &id, key)
+            .ass_body(&state.registry, &state.sessions, &id, key)
             .await
             .map_err(internal)?;
-        return Ok((
-            [
-                (axum::http::header::CONTENT_TYPE, "text/x-ssa; charset=utf-8"),
-                (axum::http::header::CACHE_CONTROL, "private, max-age=3600"),
-            ],
-            ass,
-        )
-            .into_response());
+        let headers = [
+            (axum::http::header::CONTENT_TYPE, "text/x-ssa; charset=utf-8"),
+            (axum::http::header::CACHE_CONTROL, "private, max-age=3600"),
+        ];
+        return Ok(match body {
+            crate::subtitles::AssBody::Full(ass) => (headers, ass).into_response(),
+            crate::subtitles::AssBody::Stream(rx) => {
+                let stream = tokio_stream::StreamExt::map(
+                    tokio_stream::wrappers::ReceiverStream::new(rx),
+                    |s| Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(s)),
+                );
+                (headers, axum::body::Body::from_stream(stream)).into_response()
+            }
+        });
     }
     let key = file.strip_suffix(".vtt").unwrap_or(&file);
     let vtt = state
