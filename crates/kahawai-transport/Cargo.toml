@@ -22,3 +22,5 @@ x509-parser = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+rcgen = { workspace = true }
+time = { workspace = true }

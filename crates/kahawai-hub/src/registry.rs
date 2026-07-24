@@ -60,6 +60,13 @@ pub struct PlacementNeed {
     pub audio_caps: Vec<String>,
 }
 
+/// SEC-7: how long a renewed-but-unused fingerprint stays admitted.
+pub const RENEWAL_GRACE_SECS: i64 = 24 * 3600;
+
+fn unix_now() -> i64 {
+    SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64
+}
+
 pub struct Registry {
     db: SqlitePool,
     /// The live mTLS allowlist (SEC-5), mirrored from the satellites table.
@@ -94,19 +101,127 @@ impl Registry {
     }
 
     /// Populate the allowlist from the satellites table (hub startup).
+    /// Pending renewal fingerprints (SEC-7) are admitted while their grace
+    /// holds; lapsed ones are swept here. Grace: [`RENEWAL_GRACE_SECS`].
     pub async fn load_allowlist(&self) -> Result<usize> {
-        let rows = sqlx::query("SELECT cert_fingerprint, module_id, disabled FROM satellites")
-            .fetch_all(&self.db)
-            .await?;
+        sqlx::query(
+            "UPDATE satellites SET pending_fingerprint = NULL, pending_issued_at = NULL
+             WHERE pending_issued_at IS NOT NULL AND pending_issued_at < unixepoch() - ?",
+        )
+        .bind(RENEWAL_GRACE_SECS)
+        .execute(&self.db)
+        .await?;
+        let rows = sqlx::query(
+            "SELECT cert_fingerprint, pending_fingerprint, module_id, disabled FROM satellites",
+        )
+        .fetch_all(&self.db)
+        .await?;
         let n = rows.len();
         let mut disabled = self.disabled.lock().unwrap();
         for row in rows {
             self.allowed.insert(&row.get::<String, _>("cert_fingerprint"));
+            if let Some(pending) = row.get::<Option<String>, _>("pending_fingerprint") {
+                self.allowed.insert(&pending);
+            }
             if row.get::<i64, _>("disabled") != 0 {
                 disabled.insert(row.get::<String, _>("module_id"));
             }
         }
         Ok(n)
+    }
+
+    /// SEC-7: admit a freshly renewed certificate alongside the current one.
+    /// The new fingerprint is in the DB and the live allowlist before this
+    /// returns — i.e. before the certificate ever leaves the hub.
+    pub async fn record_renewal(&self, module_id: &str, new_fingerprint: &str) -> Result<()> {
+        let mut tx = self.db.begin().await?;
+        let old_pending: Option<Option<String>> = sqlx::query_scalar(
+            "SELECT pending_fingerprint FROM satellites WHERE module_id = ?",
+        )
+        .bind(module_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        anyhow::ensure!(old_pending.is_some(), "unknown satellite {module_id}");
+        sqlx::query(
+            "UPDATE satellites SET pending_fingerprint = ?, pending_issued_at = unixepoch()
+             WHERE module_id = ?",
+        )
+        .bind(new_fingerprint)
+        .bind(module_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO satellite_audit (module_id, fingerprint, action) VALUES (?, ?, 'renewed')",
+        )
+        .bind(module_id)
+        .bind(new_fingerprint)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        self.allowed.insert(new_fingerprint);
+        // A superseded pending renewal (satellite retried) is dead weight.
+        if let Some(Some(old)) = old_pending {
+            if old != new_fingerprint {
+                self.allowed.remove(&old);
+            }
+        }
+        Ok(())
+    }
+
+    /// SEC-7 settlement, called on every satellite connection: reconnecting
+    /// with the renewed cert retires the old fingerprint; reconnecting on
+    /// the old cert after the grace lapsed retires the unused renewal.
+    pub async fn settle_renewal(&self, module_id: &str, presented: &str) -> Result<()> {
+        let Some(row) = sqlx::query(
+            "SELECT cert_fingerprint, pending_fingerprint, pending_issued_at
+             FROM satellites WHERE module_id = ?",
+        )
+        .bind(module_id)
+        .fetch_optional(&self.db)
+        .await?
+        else {
+            return Ok(());
+        };
+        let current: String = row.get("cert_fingerprint");
+        let Some(pending) = row.get::<Option<String>, _>("pending_fingerprint") else {
+            return Ok(());
+        };
+        let issued_at: i64 = row.get::<Option<i64>, _>("pending_issued_at").unwrap_or(0);
+
+        if pending == presented {
+            let mut tx = self.db.begin().await?;
+            sqlx::query(
+                "UPDATE satellites SET cert_fingerprint = pending_fingerprint,
+                 pending_fingerprint = NULL, pending_issued_at = NULL WHERE module_id = ?",
+            )
+            .bind(module_id)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "INSERT INTO satellite_audit (module_id, fingerprint, action)
+                 VALUES (?, ?, 'renewal-promoted')",
+            )
+            .bind(module_id)
+            .bind(&pending)
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            self.allowed.remove(&current);
+            tracing::info!(%module_id, retired = %current, "renewed certificate in use; old fingerprint retired");
+        } else if issued_at < unix_now() - RENEWAL_GRACE_SECS {
+            // Still on the old cert, grace lapsed: the renewal never landed
+            // (the satellite will simply renew again while in the window).
+            sqlx::query(
+                "UPDATE satellites SET pending_fingerprint = NULL, pending_issued_at = NULL
+                 WHERE module_id = ?",
+            )
+            .bind(module_id)
+            .execute(&self.db)
+            .await?;
+            self.allowed.remove(&pending);
+            tracing::warn!(%module_id, "renewal grace lapsed without reconnect; pending fingerprint retired");
+        }
+        Ok(())
     }
 
     pub fn register_link(

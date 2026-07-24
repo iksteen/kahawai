@@ -360,6 +360,14 @@ async fn run_hub(cfg: config::HubConfig) -> Result<()> {
     tonic::transport::Server::builder()
         .add_service(svc.into_server())
         .add_service(
+            kahawai_hub::renewal_service::RenewalService::new(
+                ca.clone(),
+                registry.clone(),
+                cfg.satellite_cert_days,
+            )
+            .into_server(),
+        )
+        .add_service(
             kahawai_hub::link_service::MediahostLinkService::new(registry.clone(), sessions.clone())
                 .into_server(),
         )

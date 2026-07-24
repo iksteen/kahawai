@@ -74,19 +74,32 @@ pub async fn run(
 ) -> Result<()> {
     #[cfg(target_os = "macos")]
     prevent_app_nap();
-    let id =
+    let mut id =
         kahawai_transport::enroll::ensure_identity(hub_addr, state_dir, "transcoder", name).await?;
-    let tls = kahawai_transport::mtls::mtls_client_config(&id)?;
 
     let capabilities = probe_capabilities(max_sessions)?;
     let scratch = state_dir.join("sessions");
 
     loop {
-        match link_once(hub_addr, tls.clone(), name, capabilities.clone(), &scratch, &worker_exe)
-            .await
-        {
-            Ok(()) => tracing::warn!("hub closed the link; reconnecting"),
-            Err(e) => tracing::warn!(error = format!("{e:#}"), "link failed; reconnecting"),
+        // SEC-7: renew before (re)connecting when inside the window, and
+        // bound the link's lifetime so a long-lived link still renews.
+        match kahawai_transport::renew::maybe_renew(hub_addr, state_dir, "transcoder", name).await {
+            Ok(Some(renewed)) => id = renewed,
+            Ok(None) => {}
+            Err(e) => tracing::warn!(error = format!("{e:#}"), "certificate renewal failed; retrying later"),
+        }
+        let tls = kahawai_transport::mtls::mtls_client_config(&id)?;
+        let renewal_due = kahawai_transport::renew::seconds_until_renewal_due(&id.cert_pem)
+            .unwrap_or(i64::MAX)
+            .max(3600) as u64;
+        tokio::select! {
+            r = link_once(hub_addr, tls.clone(), name, capabilities.clone(), &scratch, &worker_exe) => match r {
+                Ok(()) => tracing::warn!("hub closed the link; reconnecting"),
+                Err(e) => tracing::warn!(error = format!("{e:#}"), "link failed; reconnecting"),
+            },
+            _ = tokio::time::sleep(std::time::Duration::from_secs(renewal_due)) => {
+                tracing::info!("certificate renewal due; cycling the link");
+            }
         }
         tokio::time::sleep(RECONNECT_DELAY).await;
     }

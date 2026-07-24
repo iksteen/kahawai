@@ -3,6 +3,21 @@
 syntax = "proto3";
 package kahawai.v1;
 
+// SEC-7: certificate renewal over the already-authenticated channel. The
+// hub admits the new fingerprint (DB + live allowlist) before the renewed
+// certificate is returned, so a satellite can never lock itself out.
+service Renewal {
+  rpc Renew(RenewRequest) returns (RenewResponse);
+}
+
+message RenewRequest {
+  bytes csr_der = 1;
+}
+
+message RenewResponse {
+  string cert_pem = 1;
+}
+
 service MediahostLink {
   rpc Link(stream HostToHub) returns (stream HubToHost);
   // Byte plane (AR-10): opened by the host in response to OpenRead, bound

@@ -92,6 +92,18 @@ impl HubCa {
     }
 }
 
+/// The `kahawai://` URI SAN a CSR claims, if any. Renewal (SEC-7) compares
+/// this against the mTLS peer's identity — a satellite can only renew
+/// itself.
+pub fn csr_module_uri(csr_der: &[u8]) -> Result<Option<String>> {
+    let csr = CertificateSigningRequestParams::from_der(&csr_der.into())
+        .context("parsing CSR")?;
+    Ok(csr.params.subject_alt_names.iter().find_map(|san| match san {
+        rcgen::SanType::URI(u) => Some(u.as_str().to_string()),
+        _ => None,
+    }))
+}
+
 /// Generate the CA keypair + self-signed cert and persist them (first start).
 fn create(pki_dir: &Path, key_path: &Path, cert_path: &Path) -> Result<()> {
     fs::create_dir_all(pki_dir).with_context(|| format!("creating {}", pki_dir.display()))?;
@@ -138,6 +150,14 @@ pub fn pki_dir(data_dir: &Path) -> PathBuf {
 mod tests {
     use super::*;
     use x509_parser::prelude::*;
+
+    #[test]
+    fn csr_uri_is_extracted_and_verifiable() {
+        let bundle =
+            kahawai_core::pki::new_satellite_csr("mediahost", "01ABC", "nas").unwrap();
+        let uri = csr_module_uri(&bundle.csr_der).unwrap();
+        assert_eq!(uri.as_deref(), Some("kahawai://mediahost/01ABC"));
+    }
 
     #[test]
     fn ca_creates_persists_and_reloads() {

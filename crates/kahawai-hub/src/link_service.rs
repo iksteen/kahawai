@@ -62,6 +62,9 @@ impl MediahostLink for MediahostLinkService {
         let registry = self.registry.clone();
         let module_id = peer.module_id.clone();
         registry.connected(&module_id, &peer.module_type, &hello.name, &peer.fingerprint);
+        if let Err(e) = registry.settle_renewal(&module_id, &peer.fingerprint).await {
+            tracing::warn!(%module_id, error = format!("{e:#}"), "renewal settlement failed");
+        }
         registry.register_link(&module_id, tx.clone());
 
         tokio::spawn(async move {
