@@ -206,7 +206,13 @@ async fn manifest_and_files_seen_survive_rescan() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let hub_addr = format!("localhost:{}", listener.local_addr().unwrap().port());
     let link_svc =
-        kahawai_hub::link_service::MediahostLinkService::new(registry.clone(), sessions.clone());
+        kahawai_hub::link_service::MediahostLinkService::new(
+        registry.clone(),
+        sessions.clone(),
+        std::sync::Arc::new(kahawai_hub::subtitles::Subtitles::new(
+            tempfile::tempdir().unwrap().keep(),
+        )),
+    );
     tokio::spawn(async move {
         tonic::transport::Server::builder()
             .add_service(link_svc.into_server())

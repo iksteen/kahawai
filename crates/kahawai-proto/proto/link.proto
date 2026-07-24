@@ -42,7 +42,28 @@ message HostToHub {
     FilesSeen files_seen = 8;
     // ED2K results (MH-9), trickled in as the idle hasher finishes files.
     FileHashes file_hashes = 9;
+    // Extracted subtitle tracks of one file (efficiency ladder step 2).
+    FileSubtitles file_subtitles = 10;
   }
+}
+
+message FileSubtitles {
+  string collection_id = 1;
+  string path_rel = 2;
+  // Size at extraction time: the hub drops the result if the row moved on.
+  uint64 size = 3;
+  repeated SubTrack tracks = 4;
+  // Whole-file failure (unreadable, no text tracks despite discovery…).
+  string error = 5;
+}
+
+message SubTrack {
+  // "e{n}" — same demux-order indexing as discovery and the session tap.
+  string key = 1;
+  // Faithful ASS script (ASS/SSA tracks), empty otherwise.
+  string ass = 2;
+  // Flattened cues as JSON [{start_ms,end_ms,text}…] (hub cache shape).
+  string cues_json = 3;
 }
 
 message FileHashes {
@@ -149,7 +170,21 @@ message HubToHost {
     // Files the hub wants ED2K hashes for (MH-9, anime collections).
     // Consumed by the host's idle hasher; chunked, no ordering contract.
     Hashlist hashlist = 5;
+    // Subtitle extraction: urgent single file (a viewer is waiting) …
+    ExtractSubs extract_subs = 6;
+    // … or background pre-warm, drained below the ED2K queue.
+    SubsWorklist subs_worklist = 7;
   }
+}
+
+message ExtractSubs {
+  string collection_id = 1;
+  string path_rel = 2;
+}
+
+message SubsWorklist {
+  string collection_id = 1;
+  repeated string paths = 2;
 }
 
 message Hashlist {

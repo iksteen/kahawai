@@ -37,6 +37,17 @@ pub enum AssBody {
     Stream(tokio::sync::mpsc::Receiver<String>),
 }
 
+/// Cache key for one subtitle track of one source file — shared by the
+/// lazy extractors and the mediahost ingestion path.
+fn cache_key(module_id: &str, collection_id: &str, path_rel: &str, key: &str) -> String {
+    format!(
+        "v2-{:016x}-{key}",
+        xxhash_rust::xxh3::xxh3_64(
+            format!("{module_id}\n{collection_id}\n{path_rel}").as_bytes()
+        )
+    )
+}
+
 pub struct Subtitles {
     dir: PathBuf,
     /// Per-cache-key locks so concurrent requests extract once.
@@ -103,12 +114,7 @@ impl Subtitles {
         };
         let idx: usize = n.parse().context("bad embedded key")?;
 
-        let cache_key = format!(
-            "v2-{:016x}-{key}",
-            xxhash_rust::xxh3::xxh3_64(
-                format!("{module_id}\n{collection_id}\n{path_rel}").as_bytes()
-            )
-        );
+        let cache_key = cache_key(&module_id, &collection_id, &path_rel, key);
         let lock = {
             let mut map = self.inflight.lock().unwrap();
             map.entry(cache_key.clone()).or_default().clone()
@@ -120,6 +126,12 @@ impl Subtitles {
             return Ok(AssBody::Full(ex.ass.context("subtitle has no ASS form")?));
         }
 
+        if let Some(ex) = self
+            .request_extraction(registry, &module_id, &collection_id, &path_rel, key)
+            .await
+        {
+            return Ok(AssBody::Full(ex.ass.context("subtitle has no ASS form")?));
+        }
         let (_, _, size, _, lease) = sessions.open_source(registry, item_id).await?;
         let source = crate::sessions::LeaseSource {
             lease,
@@ -177,12 +189,7 @@ impl Subtitles {
             .with_context(|| format!("no subtitle {key} on this item"))?;
 
         // v2: the cache holds cues + optional faithful ASS.
-        let cache_key = format!(
-            "v2-{:016x}-{key}",
-            xxhash_rust::xxh3::xxh3_64(
-                format!("{module_id}\n{collection_id}\n{path_rel}").as_bytes()
-            )
-        );
+        let cache_key = cache_key(&module_id, &collection_id, &path_rel, key);
         let lock = {
             let mut map = self.inflight.lock().unwrap();
             map.entry(cache_key.clone()).or_default().clone()
@@ -207,6 +214,12 @@ impl Subtitles {
             Extracted { cues, ass }
         } else if let Some(n) = key.strip_prefix('e') {
             let idx: usize = n.parse().context("bad embedded key")?;
+            if let Some(ex) = self
+                .request_extraction(registry, &module_id, &collection_id, &path_rel, key)
+                .await
+            {
+                return Ok(ex);
+            }
             let (_, _, size, _, lease) = sessions.open_source(registry, item_id).await?;
             let source = crate::sessions::LeaseSource {
                 lease,
@@ -223,6 +236,60 @@ impl Subtitles {
         std::fs::create_dir_all(&self.dir)?;
         std::fs::write(&cache_path, serde_json::to_vec(&ex)?)?;
         Ok(ex)
+    }
+
+    /// Ingest a mediahost-extracted track into the cache (ladder step 2).
+    pub fn store_extracted(
+        &self,
+        module_id: &str,
+        collection_id: &str,
+        path_rel: &str,
+        key: &str,
+        ex: &Extracted,
+    ) -> Result<()> {
+        std::fs::create_dir_all(&self.dir)?;
+        let path = self.dir.join(format!("{}.json", cache_key(module_id, collection_id, path_rel, key)));
+        std::fs::write(&path, serde_json::to_vec(ex)?)?;
+        Ok(())
+    }
+
+    /// Ladder step 2, urgent: ask the file's mediahost to extract (local
+    /// reads, no lease traffic) and wait for the cache to land. Returns
+    /// the cached result, or None on timeout/disconnect — the caller
+    /// falls back to hub-side lease extraction.
+    async fn request_extraction(
+        &self,
+        registry: &Registry,
+        module_id: &str,
+        collection_id: &str,
+        path_rel: &str,
+        key: &str,
+    ) -> Option<Extracted> {
+        if !registry.is_connected(module_id) {
+            return None;
+        }
+        let msg = kahawai_proto::v1::HubToHost {
+            msg: Some(kahawai_proto::v1::hub_to_host::Msg::ExtractSubs(
+                kahawai_proto::v1::ExtractSubs {
+                    collection_id: collection_id.to_string(),
+                    path_rel: path_rel.to_string(),
+                },
+            )),
+        };
+        registry.send_to_host(module_id, msg).await.ok()?;
+        tracing::info!(collection = %collection_id, path = %path_rel,
+            "urgent subtitle extraction requested from mediahost");
+        let cache_path =
+            self.dir.join(format!("{}.json", cache_key(module_id, collection_id, path_rel, key)));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while std::time::Instant::now() < deadline {
+            if let Ok(bytes) = tokio::fs::read(&cache_path).await {
+                return serde_json::from_slice(&bytes).ok();
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        }
+        tracing::warn!(path = %path_rel, "mediahost extraction timed out; falling back to lease");
+        None
     }
 
     /// Font attachments of the item's source (HUB-32), extracted once

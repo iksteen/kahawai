@@ -340,7 +340,7 @@ async fn run_hub(cfg: config::HubConfig) -> Result<()> {
             }
         });
     }
-    let api = kahawai_hub::api::router(registry.clone(), auth, sessions.clone(), Arc::new(svc.clone()), subtitles, artwork, enricher);
+    let api = kahawai_hub::api::router(registry.clone(), auth, sessions.clone(), Arc::new(svc.clone()), subtitles.clone(), artwork, enricher);
     tokio::spawn(async move {
         if let Err(e) = axum::serve(api_listener, api).await {
             tracing::error!(error = %e, "client API server failed");
@@ -368,8 +368,12 @@ async fn run_hub(cfg: config::HubConfig) -> Result<()> {
             .into_server(),
         )
         .add_service(
-            kahawai_hub::link_service::MediahostLinkService::new(registry.clone(), sessions.clone())
-                .into_server(),
+            kahawai_hub::link_service::MediahostLinkService::new(
+                registry.clone(),
+                sessions.clone(),
+                subtitles.clone(),
+            )
+            .into_server(),
         )
         .add_service(
             kahawai_hub::transcoder_link::TranscoderLinkService::new(registry, sessions)

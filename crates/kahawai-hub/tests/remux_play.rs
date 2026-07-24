@@ -60,7 +60,13 @@ async fn remux_to_hls_end_to_end() {
         Arc::new(kahawai_hub::sessions::Sessions::new(tempfile::tempdir().unwrap().keep()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let hub_addr = format!("localhost:{}", listener.local_addr().unwrap().port());
-    let link_svc = MediahostLinkService::new(registry.clone(), sessions.clone());
+    let link_svc = MediahostLinkService::new(
+        registry.clone(),
+        sessions.clone(),
+        std::sync::Arc::new(kahawai_hub::subtitles::Subtitles::new(
+            tempfile::tempdir().unwrap().keep(),
+        )),
+    );
     tokio::spawn(async move {
         tonic::transport::Server::builder()
             .add_service(link_svc.into_server())

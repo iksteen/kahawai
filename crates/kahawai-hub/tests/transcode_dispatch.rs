@@ -88,7 +88,13 @@ async fn dispatches_encode_session_to_transcoder() {
     sessions.attach_registry(registry.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let hub_addr = format!("localhost:{}", listener.local_addr().unwrap().port());
-    let mh_svc = MediahostLinkService::new(registry.clone(), sessions.clone());
+    let mh_svc = MediahostLinkService::new(
+        registry.clone(),
+        sessions.clone(),
+        std::sync::Arc::new(kahawai_hub::subtitles::Subtitles::new(
+            tempfile::tempdir().unwrap().keep(),
+        )),
+    );
     let tc_svc = TranscoderLinkService::new(registry.clone(), sessions.clone());
     tokio::spawn(async move {
         tonic::transport::Server::builder()

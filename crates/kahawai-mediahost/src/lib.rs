@@ -194,7 +194,7 @@ async fn link_once(
     let mut triggers: std::collections::HashMap<String, TriggerSink> = Default::default();
     let activity = Activity::default();
     // ED2K hasher (MH-9): consumes hub Hashlists, chugs only when idle.
-    let (hash_tx, hash_rx) = tokio::sync::mpsc::channel::<kahawai_proto::v1::Hashlist>(16);
+    let (hash_tx, hash_rx) = tokio::sync::mpsc::channel::<hasher::JobMsg>(32);
     guards.push(tokio::spawn(hasher::run(
         hash_rx,
         tx.clone(),
@@ -403,7 +403,15 @@ async fn link_once(
                             continue;
                         }
                         if let Some(hub_to_host::Msg::Hashlist(h)) = &m.msg {
-                            let _ = hash_tx.try_send(h.clone());
+                            let _ = hash_tx.try_send(hasher::JobMsg::Hashlist(h.clone()));
+                            continue;
+                        }
+                        if let Some(hub_to_host::Msg::SubsWorklist(w)) = &m.msg {
+                            let _ = hash_tx.try_send(hasher::JobMsg::SubsWorklist(w.clone()));
+                            continue;
+                        }
+                        if let Some(hub_to_host::Msg::ExtractSubs(e)) = &m.msg {
+                            let _ = hash_tx.try_send(hasher::JobMsg::Urgent(e.clone()));
                             continue;
                         }
                         if let Some(hub_to_host::Msg::OpenRead(req)) = m.msg {

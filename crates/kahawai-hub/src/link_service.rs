@@ -19,11 +19,16 @@ use crate::sessions::Sessions;
 pub struct MediahostLinkService {
     registry: Arc<Registry>,
     sessions: Arc<Sessions>,
+    subtitles: Arc<crate::subtitles::Subtitles>,
 }
 
 impl MediahostLinkService {
-    pub fn new(registry: Arc<Registry>, sessions: Arc<Sessions>) -> Self {
-        Self { registry, sessions }
+    pub fn new(
+        registry: Arc<Registry>,
+        sessions: Arc<Sessions>,
+        subtitles: Arc<crate::subtitles::Subtitles>,
+    ) -> Self {
+        Self { registry, sessions, subtitles }
     }
 
     pub fn into_server(self) -> MediahostLinkServer<Self> {
@@ -60,6 +65,7 @@ impl MediahostLink for MediahostLinkService {
 
         let (tx, rx) = tokio::sync::mpsc::channel(16);
         let registry = self.registry.clone();
+        let outer_subtitles = self.subtitles.clone();
         let module_id = peer.module_id.clone();
         registry.connected(&module_id, &peer.module_type, &hello.name, &peer.fingerprint);
         if let Err(e) = registry.settle_renewal(&module_id, &peer.fingerprint).await {
@@ -89,6 +95,7 @@ impl MediahostLink for MediahostLinkService {
             let worker = {
                 let registry = registry.clone();
                 let module_id = module_id.clone();
+                let subtitles = outer_subtitles.clone();
                 tokio::spawn(async move {
                     let mut seen: std::collections::HashMap<
                         String,
@@ -96,7 +103,8 @@ impl MediahostLink for MediahostLinkService {
                     > = std::collections::HashMap::new();
                     while let Some(msg) = work_rx.recv().await {
                         if let Err(e) =
-                            handle_host_msg(&registry, &module_id, msg, &mut seen).await
+                            handle_host_msg(&registry, &subtitles, &module_id, msg, &mut seen)
+                                .await
                         {
                             tracing::error!(%module_id, error = format!("{e:#}"), "handling link message");
                         }
@@ -200,6 +208,7 @@ fn kind_name(m: &host_to_hub::Msg) -> &'static str {
         host_to_hub::Msg::ManifestRequest(_) => "manifest_request",
         host_to_hub::Msg::FilesSeen(_) => "files_seen",
         host_to_hub::Msg::FileHashes(_) => "file_hashes",
+        host_to_hub::Msg::FileSubtitles(_) => "file_subtitles",
     }
 }
 
@@ -208,6 +217,7 @@ fn kind_name(m: &host_to_hub::Msg) -> &'static str {
 /// reconciled away (deletions on disk propagate on every rescan).
 async fn handle_host_msg(
     registry: &Registry,
+    subtitles: &crate::subtitles::Subtitles,
     module_id: &str,
     msg: host_to_hub::Msg,
     seen: &mut std::collections::HashMap<String, std::collections::HashSet<String>>,
@@ -272,6 +282,7 @@ async fn handle_host_msg(
                 tracing::info!(%module_id, collection = %r.collection_id,
                     version = r.sync_version, "collection in sync; scan skipped");
                 push_ed2k_worklist(registry, module_id, &r.collection_id).await;
+                push_subs_worklist(registry, module_id, &r.collection_id).await;
                 return Ok(());
             }
             // Incremental rescan (MH-5): what we already know, so the
@@ -319,6 +330,37 @@ async fn handle_host_msg(
                     .await?;
             }
             push_ed2k_worklist(registry, module_id, &p.collection_id).await;
+            push_subs_worklist(registry, module_id, &p.collection_id).await;
+        }
+        host_to_hub::Msg::FileSubtitles(fs) => {
+            if !fs.error.is_empty() {
+                tracing::warn!(%module_id, collection = %fs.collection_id, path = %fs.path_rel,
+                    error = %fs.error, "mediahost subtitle extraction failed");
+                registry
+                    .set_subs_extracted(module_id, &fs.collection_id, &fs.path_rel, None)
+                    .await?;
+                return Ok(());
+            }
+            for t in &fs.tracks {
+                let cues: Vec<kahawai_media::subtitles::Cue> =
+                    serde_json::from_str(&t.cues_json).unwrap_or_default();
+                let ex = kahawai_media::subtitles::Extracted {
+                    cues,
+                    ass: (!t.ass.is_empty()).then(|| t.ass.clone()),
+                };
+                subtitles.store_extracted(
+                    module_id,
+                    &fs.collection_id,
+                    &fs.path_rel,
+                    &t.key,
+                    &ex,
+                )?;
+            }
+            let stored = registry
+                .set_subs_extracted(module_id, &fs.collection_id, &fs.path_rel, Some(fs.size))
+                .await?;
+            tracing::info!(%module_id, collection = %fs.collection_id, path = %fs.path_rel,
+                tracks = fs.tracks.len(), stored, "subtitles cached from mediahost");
         }
         host_to_hub::Msg::FileHashes(fh) => {
             for h in fh.hashes {
@@ -371,6 +413,42 @@ async fn push_ed2k_worklist(
         };
         if let Err(e) = registry.send_to_host(module_id, msg).await {
             tracing::warn!(%module_id, error = format!("{e:#}"), "ed2k worklist send failed");
+            return;
+        }
+    }
+}
+
+/// Efficiency ladder step 2: send the collection's subtitle pre-warm
+/// worklist (video collections; empty = no-op). Best-effort.
+async fn push_subs_worklist(
+    registry: &crate::registry::Registry,
+    module_id: &str,
+    collection_id: &str,
+) {
+    let paths = match registry.subs_worklist(module_id, collection_id).await {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(%module_id, collection = %collection_id,
+                error = format!("{e:#}"), "subs worklist failed");
+            return;
+        }
+    };
+    if paths.is_empty() {
+        return;
+    }
+    tracing::info!(%module_id, collection = %collection_id, files = paths.len(),
+        "sending subtitle worklist");
+    for chunk in paths.chunks(5000) {
+        let msg = kahawai_proto::v1::HubToHost {
+            msg: Some(kahawai_proto::v1::hub_to_host::Msg::SubsWorklist(
+                kahawai_proto::v1::SubsWorklist {
+                    collection_id: collection_id.to_string(),
+                    paths: chunk.to_vec(),
+                },
+            )),
+        };
+        if let Err(e) = registry.send_to_host(module_id, msg).await {
+            tracing::warn!(%module_id, error = format!("{e:#}"), "subs worklist send failed");
             return;
         }
     }

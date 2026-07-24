@@ -452,6 +452,145 @@ fn raw_from_sample(sample: &gst::Sample) -> Option<(u64, u64, String)> {
     Some((start_ms, end_ms, decode_text(map.as_slice())))
 }
 
+/// Extract EVERY text subtitle track in one demux pass: (track index,
+/// result) pairs, indexes matching discovery/tap `e{n}` keys. Used by
+/// the mediahost extraction facility, where the source is a local file
+/// and one sequential walk is the whole cost.
+pub fn extract_embedded_all(
+    source: Box<dyn crate::remux::RemuxSource>,
+) -> Result<Vec<(usize, Extracted)>> {
+    crate::init()?;
+
+    struct Tap {
+        idx: usize,
+        sink: gstreamer_app::AppSink,
+        is_ass: bool,
+        header: Option<String>,
+        cues: Vec<Cue>,
+        raw_events: Vec<(u64, u64, String)>,
+    }
+
+    let pipeline = gst::Pipeline::new();
+    let appsrc = crate::remux::seekable_appsrc(source);
+    let parsebin = gst::ElementFactory::make("parsebin").build()?;
+    pipeline.add_many([appsrc.upcast_ref::<gst::Element>(), &parsebin])?;
+    gst::Element::link_many([appsrc.upcast_ref::<gst::Element>(), &parsebin])?;
+
+    let taps: std::sync::Arc<std::sync::Mutex<Vec<Tap>>> = Default::default();
+    let sub_seen = std::sync::atomic::AtomicUsize::new(0);
+    let pipeline_pa = pipeline.clone();
+    let taps_pa = taps.clone();
+    parsebin.connect_pad_added(move |_, pad| {
+        let caps = pad.current_caps().or_else(|| pad.allowed_caps());
+        let caps_name = caps
+            .as_ref()
+            .and_then(|c| c.structure(0).map(|s| s.name().to_string()))
+            .unwrap_or_default();
+        let is_text = caps_name.starts_with("application/x-subtitle")
+            || caps_name.starts_with("application/x-ssa")
+            || caps_name.starts_with("application/x-ass")
+            || caps_name.starts_with("text/");
+        let is_sub = is_text || caps_name.starts_with("subpicture/");
+        if is_sub && is_text {
+            let idx = sub_seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let sink = gstreamer_app::AppSink::builder().sync(false).build();
+            sink.set_property("async", false);
+            let header = caps
+                .as_ref()
+                .and_then(|c| c.structure(0))
+                .and_then(|s| s.get::<gst::Buffer>("codec_data").ok())
+                .and_then(|b| b.map_readable().ok().map(|m| decode_text(m.as_slice())));
+            pipeline_pa.add(sink.upcast_ref::<gst::Element>()).ok();
+            sink.sync_state_with_parent().ok();
+            if pad.link(&sink.static_pad("sink").unwrap()).is_ok() {
+                taps_pa.lock().unwrap().push(Tap {
+                    idx,
+                    sink,
+                    is_ass: caps_name.contains("ssa") || caps_name.contains("ass"),
+                    header,
+                    cues: Vec::new(),
+                    raw_events: Vec::new(),
+                });
+                return;
+            }
+        } else if is_sub {
+            sub_seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        let fake = gst::ElementFactory::make("fakesink")
+            .property("sync", false)
+            .property("async", false)
+            .build()
+            .unwrap();
+        pipeline_pa.add(&fake).ok();
+        fake.sync_state_with_parent().ok();
+        pad.link(&fake.static_pad("sink").unwrap()).ok();
+    });
+
+    pipeline.set_state(gst::State::Playing).context("starting subtitle extraction")?;
+    let bus = pipeline.bus().unwrap();
+    let mut result = Ok(());
+    let drain = |taps: &mut Vec<Tap>| {
+        for tap in taps.iter_mut() {
+            while let Some(sample) = tap.sink.try_pull_sample(gst::ClockTime::ZERO) {
+                if let Some((start, end, raw)) = raw_from_sample(&sample) {
+                    let text = if tap.is_ass {
+                        tap.raw_events.push((start, end, raw.clone()));
+                        clean_cue_text(raw.splitn(9, ',').last().unwrap_or(""))
+                    } else {
+                        clean_cue_text(&raw)
+                    };
+                    if !text.is_empty() {
+                        tap.cues.push(Cue { start_ms: start, end_ms: end, text });
+                    }
+                }
+            }
+        }
+    };
+    'outer: loop {
+        drain(&mut taps.lock().unwrap());
+        let Some(msg) = bus.timed_pop(gst::ClockTime::from_mseconds(100)) else {
+            continue;
+        };
+        match msg.view() {
+            gst::MessageView::Eos(_) => break 'outer,
+            gst::MessageView::Error(e) => {
+                result = Err(anyhow::anyhow!("extraction failed: {}", e.error()));
+                break 'outer;
+            }
+            _ => {}
+        }
+    }
+    // The pad-added closure keeps a clone of `taps` alive as long as
+    // the pipeline exists; take the contents out under the lock.
+    let mut final_taps = {
+        let mut guard = taps.lock().unwrap();
+        drain(&mut guard);
+        std::mem::take(&mut *guard)
+    };
+    drain(&mut final_taps);
+    pipeline.set_state(gst::State::Null).ok();
+    result?;
+
+    Ok(final_taps
+        .into_iter()
+        .map(|mut tap| {
+            tap.cues.sort_by_key(|c| c.start_ms);
+            let ass = tap.header.filter(|_| !tap.raw_events.is_empty()).map(|h| {
+                let mut out = compose_header(&h);
+                tap.raw_events.sort_by_key(|(s, _, _)| *s);
+                for (s, e, raw) in &tap.raw_events {
+                    if let Some(line) = ass_dialogue(raw, *s, *e) {
+                        out.push_str(&line);
+                        out.push('\n');
+                    }
+                }
+                out
+            });
+            (tap.idx, Extracted { cues: tap.cues, ass })
+        })
+        .collect())
+}
+
 /// Font attachments from a matroska source (HUB-32): matroskademux
 /// exposes attachments as `attachment` tag samples during header parse,
 /// so a short preroll suffices — no full read.

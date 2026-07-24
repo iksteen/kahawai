@@ -241,6 +241,77 @@ impl Registry {
         Ok(n > 0)
     }
 
+    /// Efficiency ladder step 2: video-collection files with embedded
+    /// text subtitle tracks not yet extracted — the background pre-warm
+    /// worklist, drained below ED2K on the mediahost.
+    pub async fn subs_worklist(
+        &self,
+        module_id: &str,
+        collection_id: &str,
+    ) -> Result<Vec<String>> {
+        let media_type: Option<String> = sqlx::query_scalar(
+            "SELECT media_type FROM collections WHERE module_id = ? AND collection_id = ?",
+        )
+        .bind(module_id)
+        .bind(collection_id)
+        .fetch_optional(&self.db)
+        .await?;
+        if !matches!(media_type.as_deref(), Some("movies") | Some("series") | Some("anime")) {
+            return Ok(Vec::new());
+        }
+        let paths = sqlx::query_scalar(
+            "SELECT path_rel FROM files
+             WHERE module_id = ? AND collection_id = ? AND subs_extracted = 0
+               AND EXISTS (
+                 SELECT 1 FROM json_each(json_extract(streams_json, '$.subtitles')) je
+                 WHERE json_extract(je.value, '$.format')
+                       IN ('ass','ssa','srt','subrip','text','vtt','webvtt'))
+             ORDER BY path_rel",
+        )
+        .bind(module_id)
+        .bind(collection_id)
+        .fetch_all(&self.db)
+        .await?;
+        Ok(paths)
+    }
+
+    /// Mark a file's subtitles extracted. `size` Some → guarded like
+    /// ED2K results (stale reports dropped); None → unconditional
+    /// (extraction errors: retrying an identical file fails identically,
+    /// and a content change resets the flag via upsert).
+    pub async fn set_subs_extracted(
+        &self,
+        module_id: &str,
+        collection_id: &str,
+        path_rel: &str,
+        size: Option<u64>,
+    ) -> Result<bool> {
+        let n = match size {
+            Some(size) => sqlx::query(
+                "UPDATE files SET subs_extracted = 1
+                 WHERE module_id = ? AND collection_id = ? AND path_rel = ? AND size = ?",
+            )
+            .bind(module_id)
+            .bind(collection_id)
+            .bind(path_rel)
+            .bind(size as i64)
+            .execute(&self.db)
+            .await?
+            .rows_affected(),
+            None => sqlx::query(
+                "UPDATE files SET subs_extracted = 1
+                 WHERE module_id = ? AND collection_id = ? AND path_rel = ?",
+            )
+            .bind(module_id)
+            .bind(collection_id)
+            .bind(path_rel)
+            .execute(&self.db)
+            .await?
+            .rows_affected(),
+        };
+        Ok(n > 0)
+    }
+
     /// SEC-7 settlement, called on every satellite connection: reconnecting
     /// with the renewed cert retires the old fingerprint; reconnecting on
     /// the old cert after the grace lapsed retires the unused renewal.
@@ -655,6 +726,9 @@ impl Registry {
                    ed2k = CASE WHEN excluded.size = files.size
                                 AND excluded.mtime_unix = files.mtime_unix
                                THEN files.ed2k ELSE NULL END,
+                   subs_extracted = CASE WHEN excluded.size = files.size
+                                          AND excluded.mtime_unix = files.mtime_unix
+                                         THEN files.subs_extracted ELSE 0 END,
                    size = excluded.size, mtime_unix = excluded.mtime_unix,
                    head_xxh3 = excluded.head_xxh3, tail_xxh3 = excluded.tail_xxh3,
                    oshash = excluded.oshash, streams_json = excluded.streams_json",
