@@ -47,20 +47,36 @@ export function isAdmin(): boolean {
   return claims().admin === true
 }
 
-export async function refreshTokens(): Promise<boolean> {
-  const rt = localStorage.getItem(LS_REFRESH)
-  if (!rt) return false
-  const r = await fetch('/api/v1/auth/refresh', {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ refresh_token: rt }),
-  })
-  if (!r.ok) {
-    storeTokens(null)
-    return false
-  }
-  storeTokens(await r.json())
-  return true
+// Single-flight: refresh tokens rotate server-side, so concurrent 401s
+// must share ONE refresh — the losers of the race would otherwise send
+// the already-rotated token, fail, and wipe the fresh session.
+let refreshInFlight: Promise<boolean> | null = null
+
+export function refreshTokens(): Promise<boolean> {
+  refreshInFlight ??= (async () => {
+    try {
+      const rt = localStorage.getItem(LS_REFRESH)
+      if (!rt) return false
+      const r = await fetch('/api/v1/auth/refresh', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ refresh_token: rt }),
+      })
+      if (!r.ok) {
+        // Only a definitive rejection means the session is dead;
+        // transient failures keep the tokens for a later retry.
+        if (r.status === 401 || r.status === 403) storeTokens(null)
+        return false
+      }
+      storeTokens(await r.json())
+      return true
+    } catch {
+      return false
+    } finally {
+      refreshInFlight = null
+    }
+  })()
+  return refreshInFlight
 }
 
 export async function api(path: string, init?: RequestInit): Promise<Response> {

@@ -598,8 +598,9 @@ async fn item_subtitles(
 
 #[derive(Deserialize)]
 struct VttQuery {
+    /// f64 so a client that computed a fractional shift still works.
     #[serde(default)]
-    shift_ms: i64,
+    shift_ms: f64,
 }
 
 async fn item_subtitle_vtt(
@@ -610,7 +611,7 @@ async fn item_subtitle_vtt(
     let key = file.strip_suffix(".vtt").unwrap_or(&file);
     let vtt = state
         .subtitles
-        .vtt(&state.registry, &state.sessions, &id, key, q.shift_ms)
+        .vtt(&state.registry, &state.sessions, &id, key, q.shift_ms.round() as i64)
         .await
         .map_err(internal)?;
     Ok((
