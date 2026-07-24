@@ -11,8 +11,8 @@ type Route =
   | { view: 'libraries' }
   | { view: 'library'; id: string }
   | { view: 'admin' }
-  | { view: 'detail'; id: string; autoPlay?: boolean }
-  | { view: 'player'; item: Item; session: Session; resumeMs: number }
+  | { view: 'detail'; id: string; autoPlay?: boolean; fromLib?: string }
+  | { view: 'player'; item: Item; session: Session; resumeMs: number; fromLib?: string }
 
 type Phase = 'boot' | 'setup' | 'login' | 'app'
 
@@ -36,20 +36,30 @@ function routeToPath(route: Route): string {
   }
 }
 
-function pathToRoute(pathname: string): Route {
+function pathToRoute(pathname: string, state?: unknown): Route {
   const rel = pathname.startsWith(BASE) ? pathname.slice(BASE.length) : pathname
   const parts = rel.split('/').filter(Boolean)
   if (parts[0] === 'admin') return { view: 'admin' }
   if (parts[0] === 'lib' && parts[1]) return { view: 'library', id: parts[1] }
   if (parts[0] === 'item' && parts[1]) {
-    return { view: 'detail', id: parts[1], autoPlay: parts[2] === 'play' }
+    // Which library "back" returns to is navigation context, not item
+    // data (collections are many-to-many with libraries): it rides
+    // history.state so back/forward restore it; deep links fall back
+    // to the item's own library server-side.
+    const fromLib =
+      state && typeof state === 'object' && 'fromLib' in state
+        ? ((state as { fromLib?: string }).fromLib ?? undefined)
+        : undefined
+    return { view: 'detail', id: parts[1], autoPlay: parts[2] === 'play', fromLib }
   }
   return { view: 'libraries' }
 }
 
 export default function App() {
   const [phase, setPhase] = useState<Phase>('boot')
-  const [route, setRoute] = useState<Route>(() => pathToRoute(window.location.pathname))
+  const [route, setRoute] = useState<Route>(() =>
+    pathToRoute(window.location.pathname, window.history.state)
+  )
 
   // Forward navigation: push a history entry and switch views.
   // `replace` swaps the current entry instead — closing the player uses
@@ -57,9 +67,12 @@ export default function App() {
   // autoplay on browser-back.
   const navigate = (r: Route, opts?: { replace?: boolean }) => {
     const path = routeToPath(r)
+    const state = 'fromLib' in r && r.fromLib ? { fromLib: r.fromLib } : null
     if (path !== window.location.pathname) {
-      if (opts?.replace) window.history.replaceState(null, '', path)
-      else window.history.pushState(null, '', path)
+      if (opts?.replace) window.history.replaceState(state, '', path)
+      else window.history.pushState(state, '', path)
+    } else {
+      window.history.replaceState(state, '', path)
     }
     setRoute(r)
   }
@@ -68,7 +81,8 @@ export default function App() {
   // ride history (it holds live server objects), so landing back on a
   // /play URL becomes detail-with-autoplay.
   useEffect(() => {
-    const onPop = () => setRoute(pathToRoute(window.location.pathname))
+    const onPop = (e: PopStateEvent) =>
+      setRoute(pathToRoute(window.location.pathname, e.state))
     window.addEventListener('popstate', onPop)
     return () => window.removeEventListener('popstate', onPop)
   }, [])
@@ -125,18 +139,20 @@ export default function App() {
       {route.view === 'library' && (
         <Library
           libraryId={route.id}
-          onOpen={(id) => navigate({ view: 'detail', id })}
+          onOpen={(id) => navigate({ view: 'detail', id, fromLib: route.id })}
         />
       )}
       {route.view === 'detail' && (
         <Detail
           id={route.id}
           autoPlay={route.autoPlay}
+          fromLib={route.fromLib}
           onBack={() => navigate({ view: 'libraries' })}
           onPlay={(item, session, resumeMs) =>
-            navigate({ view: 'player', item, session, resumeMs })
+            navigate({ view: 'player', item, session, resumeMs, fromLib: route.fromLib })
           }
-          onOpenEpisode={(id) => navigate({ view: 'detail', id })}
+          onOpenEpisode={(id) => navigate({ view: 'detail', id, fromLib: route.fromLib })}
+          onOpenLibrary={(id) => navigate({ view: 'library', id })}
         />
       )}
       {route.view === 'player' && (
@@ -145,7 +161,12 @@ export default function App() {
           item={route.item}
           session={route.session}
           resumeMs={route.resumeMs}
-          onClose={() => navigate({ view: 'detail', id: route.item.id }, { replace: true })}
+          onClose={() =>
+            navigate(
+              { view: 'detail', id: route.item.id, fromLib: route.fromLib },
+              { replace: true }
+            )
+          }
         />
       )}
     </div>

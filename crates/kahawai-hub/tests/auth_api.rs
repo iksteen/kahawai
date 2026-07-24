@@ -316,6 +316,33 @@ async fn items_filter_by_library() {
     )
     .await;
     assert_eq!(titles(&none), Vec::<String>::new());
+
+    // Item detail carries navigation lineage: movie → its library;
+    // show → its library; episode → its parent show.
+    let movie_id = movies["items"][0]["id"].as_str().unwrap();
+    let detail =
+        body_json(api.clone().oneshot(get_authed(&format!("/api/v1/items/{movie_id}"), &token)).await.unwrap())
+            .await;
+    assert_eq!(detail["library_id"].as_str().unwrap(), lib_id("movies"));
+    assert!(detail["parent_id"].is_null());
+    let show_id = series["items"][0]["id"].as_str().unwrap();
+    let detail =
+        body_json(api.clone().oneshot(get_authed(&format!("/api/v1/items/{show_id}"), &token)).await.unwrap())
+            .await;
+    assert_eq!(detail["library_id"].as_str().unwrap(), lib_id("series"));
+    let children = body_json(
+        api.clone()
+            .oneshot(get_authed(&format!("/api/v1/items/{show_id}/children"), &token))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let ep_id = children["children"][0]["id"].as_str().unwrap();
+    let detail =
+        body_json(api.clone().oneshot(get_authed(&format!("/api/v1/items/{ep_id}"), &token)).await.unwrap())
+            .await;
+    assert_eq!(detail["parent_id"].as_str().unwrap(), show_id);
+    assert_eq!(detail["library_id"].as_str().unwrap(), lib_id("series"));
 }
 
 #[tokio::test]

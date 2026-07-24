@@ -61,15 +61,19 @@ function Chips({ s }: { s: Source }) {
 export default function Detail({
   id,
   autoPlay,
+  fromLib,
   onBack,
   onPlay,
   onOpenEpisode,
+  onOpenLibrary,
 }: {
   id: string
   autoPlay?: boolean
+  fromLib?: string
   onBack: () => void
   onPlay: (item: Item, session: Session, resumeMs: number) => void
   onOpenEpisode: (id: string) => void
+  onOpenLibrary: (id: string) => void
 }) {
   const [item, setItem] = useState<ItemDetail | null>(null)
   const [episodes, setEpisodes] = useState<Item[]>([])
@@ -103,6 +107,17 @@ export default function Detail({
   if (error) return <div className="error page-pad">{error}</div>
   if (!item) return null
 
+  // Hierarchical back: episode → its series page, series/movie → its
+  // library, and the chooser as the fallback when nothing is known.
+  const goUp = () => {
+    if (item.kind === 'episode' && item.parent_id) onOpenEpisode(item.parent_id)
+    else if (fromLib) onOpenLibrary(fromLib) // the library we navigated from
+    else if (item.library_id) onOpenLibrary(item.library_id) // deep link: any library it's in
+    else onBack()
+  }
+  const upLabel =
+    item.kind === 'episode' && item.parent_id ? `← ${item.show_title ?? 'Series'}` : '← Library'
+
   if (item.kind === 'show') {
     // null season = absolute numbering (anime); distinct from Specials.
     const seasonLabel = (s: number | null) =>
@@ -112,8 +127,8 @@ export default function Detail({
     const next = episodes.find((e) => !e.played)
     return (
       <main>
-        <button className="btn ghost small" onClick={onBack}>
-          ← Library
+        <button className="btn ghost small" onClick={goUp}>
+          {upLabel}
         </button>
         <div className="detail-head">
           <h1>
@@ -186,8 +201,8 @@ export default function Detail({
 
   return (
     <main>
-      <button className="btn ghost small" onClick={onBack}>
-        ← Library
+      <button className="btn ghost small" onClick={goUp}>
+        {upLabel}
       </button>
       <div className="detail-head">
         <h1>

@@ -750,8 +750,15 @@ async fn item_detail(
 ) -> Result<Json<Value>, ApiError> {
     let item = sqlx::query(
         "SELECT i.id, i.kind, i.title, i.year, i.season, i.episode,
-                p.title AS show_title,
+                p.id AS parent_id, p.title AS show_title,
                 (SELECT COUNT(*) FROM item_sources s WHERE s.item_id = i.id) AS sources,
+                (SELECT lc.library_id FROM item_sources ls
+                 JOIN library_collections lc
+                   ON lc.module_id = ls.module_id AND lc.collection_id = ls.collection_id
+                 WHERE ls.item_id = i.id
+                    OR ls.item_id IN (SELECT c.id FROM items c WHERE c.parent_id = i.id)
+                    OR ls.item_id = i.parent_id
+                 ORDER BY lc.library_id LIMIT 1) AS library_id,
                 w.position_ms, w.played, w.play_count
          FROM items i
          LEFT JOIN items p ON p.id = i.parent_id
@@ -797,6 +804,9 @@ async fn item_detail(
 
     let mut out = item_row_json(&item);
     out["show_title"] = json!(item.get::<Option<String>, _>("show_title"));
+    // Hierarchical navigation (episode → its show → its library):
+    out["parent_id"] = json!(item.get::<Option<String>, _>("parent_id"));
+    out["library_id"] = json!(item.get::<Option<String>, _>("library_id"));
     out["sources"] = json!(sources);
     Ok(Json(out))
 }

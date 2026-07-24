@@ -126,7 +126,12 @@ export type Source = {
   streams: StreamInfo | null
 }
 
-export type ItemDetail = Item & { sources_detail: Source[]; show_title?: string | null }
+export type ItemDetail = Item & {
+  sources_detail: Source[]
+  show_title?: string | null
+  parent_id?: string | null
+  library_id?: string | null
+}
 
 export const fetchChildren = (id: string) =>
   json<{ children: Item[] }>(`/api/v1/items/${id}/children`)
