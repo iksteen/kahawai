@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { artworkUrl, fetchItems, fetchLibraries, type Item } from '../api'
+import placeholder from '../assets/placeholder.svg'
 
 function fmtResume(ms: number) {
   const s = Math.floor(ms / 1000)
@@ -63,7 +64,10 @@ export default function Library({
                 src={artworkUrl(i.id)}
                 loading="lazy"
                 alt=""
-                onError={(e) => (e.currentTarget.style.display = 'none')}
+                onError={(e) => {
+                  e.currentTarget.onerror = null
+                  e.currentTarget.src = placeholder
+                }}
               />
               {i.kind === 'show' && <span className="chip dim">series</span>}
               <span className="card-title">{i.title}</span>

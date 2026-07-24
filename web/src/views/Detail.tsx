@@ -11,6 +11,7 @@ import {
 } from '../api'
 import AlbumPlayer from './AlbumPlayer'
 import tmdbLogo from '../assets/tmdb.svg'
+import placeholder from '../assets/placeholder.svg'
 
 const GB = 1024 * 1024 * 1024
 
@@ -130,7 +131,10 @@ export default function Detail({
             className="card-art album-art"
             src={artworkUrl(item.id)}
             alt=""
-            onError={(e) => (e.currentTarget.style.display = 'none')}
+            onError={(e) => {
+              e.currentTarget.onerror = null
+              e.currentTarget.src = placeholder
+            }}
           />
           <div>
             <h1>
