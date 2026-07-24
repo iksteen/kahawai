@@ -780,7 +780,8 @@ async fn list_items(
     // Shows carry no item_sources of their own; their library membership
     // flows up from their episodes' sources.
     let rows = sqlx::query(
-        "SELECT i.id, i.kind, i.title, i.season, i.episode, i.artist,
+        "SELECT i.id, i.kind, i.season, i.episode, i.artist,
+                COALESCE(md.title, i.title) AS title,
                 COALESCE(i.year, CAST(substr(md.premiered, 1, 4) AS INTEGER)) AS year,
                 COUNT(s.item_id) AS sources,
                 w.position_ms, w.played, w.play_count
@@ -797,7 +798,7 @@ async fn list_items(
              JOIN items ci ON ci.id = ls.item_id
              WHERE lc.library_id = ?2
            ))
-         GROUP BY i.id ORDER BY i.title, i.year",
+         GROUP BY i.id ORDER BY title, year",
     )
     .bind(&claims.sub)
     .bind(&q.library)
@@ -856,15 +857,18 @@ async fn item_detail(
     axum::Extension(claims): axum::Extension<crate::auth::Claims>,
 ) -> Result<Json<Value>, ApiError> {
     let item = sqlx::query(
-        "SELECT i.id, i.kind, i.title, i.season, i.episode, i.artist,
+        "SELECT i.id, i.kind, i.season, i.episode, i.artist,
+                COALESCE(md.title, i.title) AS title,
                 COALESCE(i.year, CAST(substr(md.premiered, 1, 4) AS INTEGER)) AS year,
-                p.id AS parent_id, p.title AS show_title,
+                p.id AS parent_id,
+                COALESCE(pmd.title, p.title) AS show_title,
                 (SELECT COUNT(*) FROM item_sources s WHERE s.item_id = i.id) AS sources,
                 w.position_ms, w.played, w.play_count
          FROM items i
          LEFT JOIN items p ON p.id = i.parent_id
          LEFT JOIN watch_state w ON w.item_id = i.id AND w.user_id = ?
          LEFT JOIN item_metadata md ON md.item_id = i.id AND md.provider_id != ''
+         LEFT JOIN item_metadata pmd ON pmd.item_id = p.id AND pmd.provider_id != ''
          WHERE i.id = ?",
     )
         .bind(&claims.sub)
