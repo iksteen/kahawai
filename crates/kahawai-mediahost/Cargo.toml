@@ -5,6 +5,8 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+md4 = { workspace = true }
+crc32fast = { workspace = true }
 kahawai-core = { workspace = true }
 kahawai-media = { workspace = true }
 kahawai-proto = { workspace = true }

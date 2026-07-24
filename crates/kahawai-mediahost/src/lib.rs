@@ -1,6 +1,8 @@
 //! Mediahost module: enroll once, then keep a control link to the hub
 //! (AR-3: always dials out) and scan collections up to it.
 
+pub mod ed2k;
+pub mod hasher;
 pub mod scan;
 pub mod serve;
 
@@ -16,6 +18,38 @@ use tokio_stream::wrappers::ReceiverStream;
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 const RECONNECT_DELAY: Duration = Duration::from_secs(5);
+
+/// What the ED2K hasher must yield to (MH-9): scans and lease serving.
+/// Busy while either count is nonzero; the hasher pauses between chunks.
+#[derive(Clone, Default)]
+pub struct Activity {
+    scans: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    leases: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+pub struct ActivityGuard(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+impl Drop for ActivityGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl Activity {
+    fn enter(counter: &std::sync::Arc<std::sync::atomic::AtomicUsize>) -> ActivityGuard {
+        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        ActivityGuard(counter.clone())
+    }
+    pub fn scan(&self) -> ActivityGuard {
+        Self::enter(&self.scans)
+    }
+    pub fn lease(&self) -> ActivityGuard {
+        Self::enter(&self.leases)
+    }
+    pub fn busy(&self) -> bool {
+        self.scans.load(std::sync::atomic::Ordering::Relaxed) != 0
+            || self.leases.load(std::sync::atomic::Ordering::Relaxed) != 0
+    }
+}
 
 /// Enroll (or load identity) and keep the hub link up forever.
 pub async fn run(
@@ -158,12 +192,22 @@ async fn link_once(
     > = Default::default();
     let mut guards: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     let mut triggers: std::collections::HashMap<String, TriggerSink> = Default::default();
+    let activity = Activity::default();
+    // ED2K hasher (MH-9): consumes hub Hashlists, chugs only when idle.
+    let (hash_tx, hash_rx) = tokio::sync::mpsc::channel::<kahawai_proto::v1::Hashlist>(16);
+    guards.push(tokio::spawn(hasher::run(
+        hash_rx,
+        tx.clone(),
+        collections.to_vec(),
+        activity.clone(),
+    )));
     for c in collections {
         let (ttx, mut trx) = tokio::sync::mpsc::channel::<ScanTrigger>(8);
         let sink = TriggerSink { tx: ttx, overflow: Default::default() };
         triggers.insert(c.name.clone(), sink.clone());
         let overflow = sink.overflow.clone();
         let (c, tx, waiters) = (c.clone(), tx.clone(), manifest_waiters.clone());
+        let activity = activity.clone();
         let ver_path = state_dir.join("sync").join(format!("{}.ver", c.name));
         guards.push(tokio::spawn(async move {
             // The persisted scan generation: bumped after every
@@ -184,6 +228,7 @@ async fn link_once(
                 }
                 let handshake = if trig.initial { version } else { 0 };
                 let next = version + 1;
+                let _busy = activity.scan();
                 match scan_cycle(&c, &tx, &waiters, trig.force_dirs, handshake, next).await {
                     Ok(true) => {
                         version = next;
@@ -357,13 +402,19 @@ async fn link_once(
                             }
                             continue;
                         }
+                        if let Some(hub_to_host::Msg::Hashlist(h)) = &m.msg {
+                            let _ = hash_tx.try_send(h.clone());
+                            continue;
+                        }
                         if let Some(hub_to_host::Msg::OpenRead(req)) = m.msg {
                             let path = serve::resolve_path(collections, &req);
                             if let Err(e) = &path {
                                 tracing::warn!(error = format!("{e:#}"), "refusing OpenRead");
                             }
                             let ch = byte_channel.clone();
+                            let busy = activity.lease();
                             tokio::spawn(async move {
+                                let _busy = busy;
                                 if let Err(e) =
                                     serve::serve_lease(ch, req.lease_token, path).await
                                 {

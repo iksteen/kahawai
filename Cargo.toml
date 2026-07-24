@@ -29,6 +29,8 @@ clap = { version = "4", features = ["derive"] }
 figment = { version = "0.10", features = ["toml", "env"] }
 rcgen = { version = "0.14", features = ["x509-parser"] }
 x509-parser = "0.18"
+md4 = "0.10"
+crc32fast = "1"
 sha2 = "0.10"
 data-encoding = "2"
 time = "0.3"

@@ -40,7 +40,25 @@ message HostToHub {
     // report unchanged files as seen without re-inspecting them.
     ManifestRequest manifest_request = 7;
     FilesSeen files_seen = 8;
+    // ED2K results (MH-9), trickled in as the idle hasher finishes files.
+    FileHashes file_hashes = 9;
   }
+}
+
+message FileHashes {
+  string collection_id = 1;
+  repeated FileHash hashes = 2;
+}
+
+message FileHash {
+  string path_rel = 1;
+  // eMule/AniDB variant (null chunk appended on exact chunk multiples).
+  string ed2k_hex = 2;
+  // Size at hash time: the hub ignores the result if the row moved on.
+  uint64 size = 3;
+  // Filename-embedded CRC32 verified during the same read (MH-9).
+  bool crc_checked = 4;
+  bool crc_ok = 5;
 }
 
 message ManifestRequest {
@@ -128,7 +146,15 @@ message HubToHost {
     Manifest manifest = 3;
     // Admin-triggered incremental rescan ("" = every collection).
     RescanRequest rescan_request = 4;
+    // Files the hub wants ED2K hashes for (MH-9, anime collections).
+    // Consumed by the host's idle hasher; chunked, no ordering contract.
+    Hashlist hashlist = 5;
   }
+}
+
+message Hashlist {
+  string collection_id = 1;
+  repeated string paths = 2;
 }
 
 message RescanRequest {

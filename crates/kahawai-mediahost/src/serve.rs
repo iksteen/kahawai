@@ -17,10 +17,20 @@ const CHUNK: usize = 256 * 1024;
 /// Resolve an OpenRead against the configured collections, refusing
 /// anything that escapes a collection root (NFR-4).
 pub fn resolve_path(collections: &[CollectionConfig], req: &OpenRead) -> Result<PathBuf> {
+    resolve_rel(collections, &req.collection_id, &req.path_rel)
+}
+
+/// Resolve a collection-relative path against the collection's roots,
+/// canonicalized and confined (shared by lease serving and the hasher).
+pub fn resolve_rel(
+    collections: &[CollectionConfig],
+    collection_id: &str,
+    path_rel: &str,
+) -> Result<PathBuf> {
     let col = collections
         .iter()
-        .find(|c| c.name == req.collection_id)
-        .with_context(|| format!("unknown collection {}", req.collection_id))?;
+        .find(|c| c.name == collection_id)
+        .with_context(|| format!("unknown collection {collection_id}"))?;
     for root in &col.roots {
         let root = match std::fs::canonicalize(root) {
             Ok(r) => r,
@@ -29,14 +39,14 @@ pub fn resolve_path(collections: &[CollectionConfig], req: &OpenRead) -> Result<
         // Canonicalize the candidate too: symlinks and `..` both resolve,
         // so a path that lands outside the root is rejected regardless of
         // how it was spelled.
-        if let Ok(candidate) = std::fs::canonicalize(root.join(&req.path_rel))
+        if let Ok(candidate) = std::fs::canonicalize(root.join(path_rel))
             && candidate.starts_with(&root)
             && candidate.is_file()
         {
             return Ok(candidate);
         }
     }
-    bail!("path not found or outside collection roots: {}", req.path_rel)
+    bail!("path not found or outside collection roots: {path_rel}")
 }
 
 /// Open the byte channel and serve read requests for one lease.

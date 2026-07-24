@@ -199,6 +199,7 @@ fn kind_name(m: &host_to_hub::Msg) -> &'static str {
         host_to_hub::Msg::ScanProgress(_) => "scan_progress",
         host_to_hub::Msg::ManifestRequest(_) => "manifest_request",
         host_to_hub::Msg::FilesSeen(_) => "files_seen",
+        host_to_hub::Msg::FileHashes(_) => "file_hashes",
     }
 }
 
@@ -270,6 +271,7 @@ async fn handle_host_msg(
                 registry.send_to_host(module_id, msg).await?;
                 tracing::info!(%module_id, collection = %r.collection_id,
                     version = r.sync_version, "collection in sync; scan skipped");
+                push_ed2k_worklist(registry, module_id, &r.collection_id).await;
                 return Ok(());
             }
             // Incremental rescan (MH-5): what we already know, so the
@@ -316,8 +318,60 @@ async fn handle_host_msg(
                     .set_collection_sync_version(module_id, &p.collection_id, p.sync_version)
                     .await?;
             }
+            push_ed2k_worklist(registry, module_id, &p.collection_id).await;
+        }
+        host_to_hub::Msg::FileHashes(fh) => {
+            for h in fh.hashes {
+                if h.crc_checked && !h.crc_ok {
+                    tracing::warn!(%module_id, collection = %fh.collection_id,
+                        path = %h.path_rel, "mediahost reports filename CRC32 mismatch");
+                }
+                let stored = registry
+                    .record_ed2k(module_id, &fh.collection_id, &h.path_rel, &h.ed2k_hex, h.size)
+                    .await?;
+                if !stored {
+                    tracing::debug!(%module_id, path = %h.path_rel,
+                        "ed2k result stale (file changed since listing); dropped");
+                }
+            }
         }
         host_to_hub::Msg::ScanProgress(_) | host_to_hub::Msg::Hello(_) => {}
     }
     Ok(())
+}
+
+/// MH-9: send the collection's ED2K worklist (anime only; empty = no-op).
+/// Failures are logged, never fatal — hashing is strictly best-effort.
+async fn push_ed2k_worklist(
+    registry: &crate::registry::Registry,
+    module_id: &str,
+    collection_id: &str,
+) {
+    let paths = match registry.ed2k_worklist(module_id, collection_id).await {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(%module_id, collection = %collection_id,
+                error = format!("{e:#}"), "ed2k worklist failed");
+            return;
+        }
+    };
+    if paths.is_empty() {
+        return;
+    }
+    tracing::info!(%module_id, collection = %collection_id, files = paths.len(),
+        "sending ed2k worklist");
+    for chunk in paths.chunks(5000) {
+        let msg = kahawai_proto::v1::HubToHost {
+            msg: Some(kahawai_proto::v1::hub_to_host::Msg::Hashlist(
+                kahawai_proto::v1::Hashlist {
+                    collection_id: collection_id.to_string(),
+                    paths: chunk.to_vec(),
+                },
+            )),
+        };
+        if let Err(e) = registry.send_to_host(module_id, msg).await {
+            tracing::warn!(%module_id, error = format!("{e:#}"), "ed2k worklist send failed");
+            return;
+        }
+    }
 }

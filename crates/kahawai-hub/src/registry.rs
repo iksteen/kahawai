@@ -168,6 +168,79 @@ impl Registry {
         Ok(())
     }
 
+    /// MH-9: paths in an anime collection still lacking an ED2K hash.
+    /// Copy-forward first: identical content identity elsewhere (renames,
+    /// moves, duplicates) donates its hash — full reads happen at most
+    /// once per content identity, with the files table as the journal.
+    pub async fn ed2k_worklist(
+        &self,
+        module_id: &str,
+        collection_id: &str,
+    ) -> Result<Vec<String>> {
+        let media_type: Option<String> = sqlx::query_scalar(
+            "SELECT media_type FROM collections WHERE module_id = ? AND collection_id = ?",
+        )
+        .bind(module_id)
+        .bind(collection_id)
+        .fetch_optional(&self.db)
+        .await?;
+        if media_type.as_deref() != Some("anime") {
+            return Ok(Vec::new());
+        }
+        sqlx::query(
+            "UPDATE files SET ed2k = (
+                SELECT e.ed2k FROM files e
+                WHERE e.ed2k IS NOT NULL AND e.size = files.size
+                  AND e.head_xxh3 = files.head_xxh3 AND e.tail_xxh3 = files.tail_xxh3
+                  AND e.oshash = files.oshash LIMIT 1)
+             WHERE module_id = ? AND collection_id = ? AND ed2k IS NULL
+               AND EXISTS (
+                SELECT 1 FROM files e
+                WHERE e.ed2k IS NOT NULL AND e.size = files.size
+                  AND e.head_xxh3 = files.head_xxh3 AND e.tail_xxh3 = files.tail_xxh3
+                  AND e.oshash = files.oshash)",
+        )
+        .bind(module_id)
+        .bind(collection_id)
+        .execute(&self.db)
+        .await?;
+        let paths = sqlx::query_scalar(
+            "SELECT path_rel FROM files
+             WHERE module_id = ? AND collection_id = ? AND ed2k IS NULL
+             ORDER BY path_rel",
+        )
+        .bind(module_id)
+        .bind(collection_id)
+        .fetch_all(&self.db)
+        .await?;
+        Ok(paths)
+    }
+
+    /// MH-9: store a reported hash — only if the row still describes the
+    /// file that was hashed (size match; a changed file rehashes later).
+    pub async fn record_ed2k(
+        &self,
+        module_id: &str,
+        collection_id: &str,
+        path_rel: &str,
+        ed2k: &str,
+        size: u64,
+    ) -> Result<bool> {
+        let n = sqlx::query(
+            "UPDATE files SET ed2k = ?
+             WHERE module_id = ? AND collection_id = ? AND path_rel = ? AND size = ?",
+        )
+        .bind(ed2k)
+        .bind(module_id)
+        .bind(collection_id)
+        .bind(path_rel)
+        .bind(size as i64)
+        .execute(&self.db)
+        .await?
+        .rows_affected();
+        Ok(n > 0)
+    }
+
     /// SEC-7 settlement, called on every satellite connection: reconnecting
     /// with the renewed cert retires the old fingerprint; reconnecting on
     /// the old cert after the grace lapsed retires the unused renewal.
@@ -579,6 +652,9 @@ impl Registry {
                     head_xxh3, tail_xxh3, oshash, streams_json)
                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                  ON CONFLICT (module_id, collection_id, path_rel) DO UPDATE SET
+                   ed2k = CASE WHEN excluded.size = files.size
+                                AND excluded.mtime_unix = files.mtime_unix
+                               THEN files.ed2k ELSE NULL END,
                    size = excluded.size, mtime_unix = excluded.mtime_unix,
                    head_xxh3 = excluded.head_xxh3, tail_xxh3 = excluded.tail_xxh3,
                    oshash = excluded.oshash, streams_json = excluded.streams_json",
