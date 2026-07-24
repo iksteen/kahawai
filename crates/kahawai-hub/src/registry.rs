@@ -803,6 +803,44 @@ impl Registry {
                     names::parse_episode(&f.path_rel)
                 };
                 match guess {
+                    None if anime
+                        && let filename = f.path_rel.rsplit('/').next().unwrap_or(&f.path_rel)
+                        && let mg = names::parse_movie(filename)
+                        && mg.year.is_some() =>
+                    {
+                        // Anime movies (HUB-30): no episode shape, but a
+                        // credible "Title (Year)" resolves as a movie —
+                        // Ghibli films et al. Yearless non-parses (NCOP/
+                        // NCED extras) stay bare; ed2k matching will
+                        // identify those precisely later.
+                        source_part = mg.part;
+                        let norm = names::normalize_title(&mg.title);
+                        let existing: Option<String> = sqlx::query_scalar(
+                            "SELECT id FROM items
+                             WHERE kind = 'movie' AND norm_title = ? AND year IS ?",
+                        )
+                        .bind(&norm)
+                        .bind(mg.year)
+                        .fetch_optional(&mut *tx)
+                        .await?;
+                        Some(match existing {
+                            Some(id) => id,
+                            None => {
+                                let id = ulid::Ulid::new().to_string();
+                                sqlx::query(
+                                    "INSERT INTO items (id, kind, title, norm_title, year)
+                                     VALUES (?, 'movie', ?, ?, ?)",
+                                )
+                                .bind(&id)
+                                .bind(&mg.title)
+                                .bind(&norm)
+                                .bind(mg.year)
+                                .execute(&mut *tx)
+                                .await?;
+                                id
+                            }
+                        })
+                    }
                     None => {
                         // Unparseable stays a bare file (review queue,
                         // later) — never guess an identity.

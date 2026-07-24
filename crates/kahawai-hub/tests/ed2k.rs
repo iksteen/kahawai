@@ -73,3 +73,36 @@ async fn copy_forward_and_content_change_semantics() {
         vec!["[G] Show - 01 [ABCD1234].mkv".to_string()]
     );
 }
+
+#[tokio::test]
+async fn anime_collection_resolves_movies_but_not_extras() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    let reg = Registry::new(db.clone(), Default::default());
+    reg.announce_collection("01H", "anime", "anime", &[]).await.unwrap();
+    reg.upsert_files(
+        "01H",
+        "anime",
+        vec![
+            rec("Howls Moving Castle (2004).mkv", 700, 1),
+            rec("[Coalgirls]_Ao_no_Exorcist_NCED2_(1280x720)_[9634C2F9].mkv", 50, 1),
+        ],
+    )
+    .await
+    .unwrap();
+
+    let movie: Option<(String, Option<i64>)> = sqlx::query_as(
+        "SELECT title, year FROM items WHERE kind = 'movie'",
+    )
+    .fetch_optional(&db)
+    .await
+    .unwrap();
+    let (title, year) = movie.expect("anime movie resolved as a movie item");
+    assert_eq!(title, "Howls Moving Castle");
+    assert_eq!(year, Some(2004));
+
+    // The creditless-ending extra must NOT be guessed into anything.
+    let items: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM items").fetch_one(&db).await.unwrap();
+    assert_eq!(items, 1, "NC* extras stay unresolved");
+}
