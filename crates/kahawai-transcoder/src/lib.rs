@@ -18,6 +18,53 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 const RECONNECT_DELAY: Duration = Duration::from_secs(5);
 
 /// Enroll (or load identity) and keep the hub link up forever.
+/// macOS parks session-less idle processes so hard that even kevent
+/// wakeups (timers AND socket readiness) defer for minutes — the link
+/// heartbeat dies no matter how it is launched (caffeinate and nice do
+/// not help; launchd agents cannot load headless). NSProcessInfo's
+/// activity assertion is the documented opt-out.
+#[cfg(target_os = "macos")]
+fn prevent_app_nap() {
+    use std::ffi::c_void;
+    #[link(name = "objc")]
+    unsafe extern "C" {
+        fn objc_getClass(name: *const std::ffi::c_char) -> *mut c_void;
+        fn sel_registerName(name: *const std::ffi::c_char) -> *mut c_void;
+        fn objc_msgSend();
+    }
+    #[link(name = "Foundation", kind = "framework")]
+    unsafe extern "C" {}
+
+    // NSActivityUserInitiated | NSActivityLatencyCritical
+    const OPTIONS: u64 = 0x00FF_FFFF | (1 << 20) | 0xFF_0000_0000;
+    unsafe {
+        type Msg0 = unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void;
+        type Msg1 =
+            unsafe extern "C" fn(*mut c_void, *mut c_void, *const std::ffi::c_char) -> *mut c_void;
+        type Msg2 =
+            unsafe extern "C" fn(*mut c_void, *mut c_void, u64, *mut c_void) -> *mut c_void;
+        let msg0: Msg0 = std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+        let msg1: Msg1 = std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+        let msg2: Msg2 = std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+
+        let pi = msg0(objc_getClass(c"NSProcessInfo".as_ptr()), sel_registerName(c"processInfo".as_ptr()));
+        let reason = msg1(
+            objc_getClass(c"NSString".as_ptr()),
+            sel_registerName(c"stringWithUTF8String:".as_ptr()),
+            c"kahawai transcoder link liveness".as_ptr(),
+        );
+        let token = msg2(
+            pi,
+            sel_registerName(c"beginActivityWithOptions:reason:".as_ptr()),
+            OPTIONS,
+            reason,
+        );
+        // Held for the life of the process: retain and never release.
+        msg0(token, sel_registerName(c"retain".as_ptr()));
+    }
+    tracing::info!("macOS App Nap disabled (NSProcessInfo activity assertion)");
+}
+
 pub async fn run(
     hub_addr: &str,
     state_dir: &Path,
@@ -25,6 +72,8 @@ pub async fn run(
     max_sessions: u32,
     worker_exe: Option<std::path::PathBuf>,
 ) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    prevent_app_nap();
     let id =
         kahawai_transport::enroll::ensure_identity(hub_addr, state_dir, "transcoder", name).await?;
     let tls = kahawai_transport::mtls::mtls_client_config(&id)?;
