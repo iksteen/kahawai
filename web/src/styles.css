@@ -146,6 +146,9 @@ h2 { font-size: 14px; font-weight: 650; color: var(--dim); letter-spacing: 0.08e
   border-radius: 6px; margin-top: 14px;
 }
 .videobox:fullscreen { background: #000; }
+/* controlsList=nofullscreen is Chromium-only; this covers Safari.
+   ponytail: Firefox has no hook to hide it — custom controls if it matters. */
+.videobox video::-webkit-media-controls-fullscreen-button { display: none; }
 .videobox:fullscreen video {
   width: 100%; height: 100%; max-height: none; margin: 0; border-radius: 0;
 }
