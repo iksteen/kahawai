@@ -52,10 +52,14 @@ export default function App() {
   const [route, setRoute] = useState<Route>(() => pathToRoute(window.location.pathname))
 
   // Forward navigation: push a history entry and switch views.
-  const navigate = (r: Route) => {
+  // `replace` swaps the current entry instead — closing the player uses
+  // it so the /play URL doesn't linger in history and re-trigger
+  // autoplay on browser-back.
+  const navigate = (r: Route, opts?: { replace?: boolean }) => {
     const path = routeToPath(r)
     if (path !== window.location.pathname) {
-      window.history.pushState(null, '', path)
+      if (opts?.replace) window.history.replaceState(null, '', path)
+      else window.history.pushState(null, '', path)
     }
     setRoute(r)
   }
@@ -128,7 +132,7 @@ export default function App() {
         <Detail
           id={route.id}
           autoPlay={route.autoPlay}
-          onBack={() => window.history.back()}
+          onBack={() => navigate({ view: 'libraries' })}
           onPlay={(item, session, resumeMs) =>
             navigate({ view: 'player', item, session, resumeMs })
           }
@@ -137,10 +141,11 @@ export default function App() {
       )}
       {route.view === 'player' && (
         <Player
+          key={route.session.session_id}
           item={route.item}
           session={route.session}
           resumeMs={route.resumeMs}
-          onClose={() => window.history.back()}
+          onClose={() => navigate({ view: 'detail', id: route.item.id }, { replace: true })}
         />
       )}
     </div>
