@@ -3,6 +3,7 @@ import {
   adminApprove,
   adminEnrichRun,
   adminEnrichStatus,
+  adminRescan,
   adminProviders,
   adminSetTmdbKey,
   adminSetTvdbKey,
@@ -86,6 +87,14 @@ function TmdbSection({ onNotice }: { onNotice: (s: string) => void }) {
           onClick={() => void adminEnrichRun().then(refresh)}
         >
           {status?.running ? 'Enriching…' : 'Enrich now'}
+        </button>
+        <button
+          className="btn ghost small"
+          onClick={() =>
+            void adminRescan().then((r) => onNotice(`Rescan requested from ${r.asked} mediahost(s)`))
+          }
+        >
+          Rescan collections
         </button>
         {status && (
           <span className="dim mono">

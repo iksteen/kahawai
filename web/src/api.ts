@@ -377,6 +377,9 @@ export const adminApplyMatch = (
     }),
   })
 
+export const adminRescan = () =>
+  json<{ asked: number }>('/admin/v1/rescan', { method: 'POST', body: '{}' })
+
 export const adminEnrichRun = () =>
   json<{ started: boolean }>('/admin/v1/enrich', { method: 'POST' })
 

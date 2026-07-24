@@ -23,13 +23,14 @@ pub async fn run(
     state_dir: &Path,
     name: &str,
     collections: Vec<CollectionConfig>,
+    rescan_minutes: u64,
 ) -> Result<()> {
     let id = kahawai_transport::enroll::ensure_identity(hub_addr, state_dir, "mediahost", name)
         .await?;
     let tls = kahawai_transport::mtls::mtls_client_config(&id)?;
 
     loop {
-        match link_once(hub_addr, tls.clone(), name, &collections).await {
+        match link_once(hub_addr, tls.clone(), name, &collections, rescan_minutes).await {
             Ok(()) => tracing::warn!("hub closed the link; reconnecting"),
             Err(e) => tracing::warn!(error = format!("{e:#}"), "link failed; reconnecting"),
         }
@@ -37,13 +38,35 @@ pub async fn run(
     }
 }
 
-/// One link session: Hello/HelloAck, announce + scan collections, then
-/// heartbeats until the stream dies.
+/// Aborts its tasks when the link session ends.
+struct AbortOnDrop(Vec<tokio::task::JoinHandle<()>>);
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        for h in &self.0 {
+            h.abort();
+        }
+    }
+}
+
+/// A request for one incremental scan cycle. `force_dirs` bypasses the
+/// unchanged-skip for media files in those directories — how sidecar
+/// subtitle/artwork changes get noticed (the media file's own
+/// size/mtime doesn't change when a cover.jpg appears next to it).
+#[derive(Default)]
+struct ScanTrigger {
+    force_dirs: std::collections::HashSet<std::path::PathBuf>,
+}
+
+/// One link session: Hello/HelloAck, then per-collection scan
+/// orchestrators fed by three triggers — the filesystem watcher
+/// (primary; useless over sshfs where inotify never fires), the
+/// periodic backup sweep, and hub-sent RescanRequests (admin button).
 async fn link_once(
     hub_addr: &str,
     tls: std::sync::Arc<rustls::ClientConfig>,
     name: &str,
     collections: &[CollectionConfig],
+    rescan_minutes: u64,
 ) -> Result<()> {
     let channel = kahawai_transport::tls::grpc_channel_with(hub_addr, tls).await?;
     let mut client = MediahostLinkClient::new(channel.clone());
@@ -85,29 +108,116 @@ async fn link_once(
             std::collections::HashMap<String, tokio::sync::mpsc::Sender<kahawai_proto::v1::Manifest>>,
         >,
     > = Default::default();
+    let mut guards: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    let mut triggers: std::collections::HashMap<String, tokio::sync::mpsc::Sender<ScanTrigger>> =
+        Default::default();
     for c in collections {
-        tx.send(HostToHub {
-            msg: Some(host_to_hub::Msg::AnnounceCollection(AnnounceCollection {
-                id: c.name.clone(),
-                media_type: c.media_type.clone(),
-                roots: c.roots.iter().map(|r| r.display().to_string()).collect(),
-            })),
-        })
-        .await
-        .context("link closed before announce")?;
-        // Incremental rescan (MH-5): ask what the hub already knows;
-        // unchanged files (size+mtime) are reported seen, not re-inspected.
-        let (mtx, mrx) = tokio::sync::mpsc::channel(16);
-        manifest_waiters.lock().unwrap().insert(c.name.clone(), mtx);
-        tx.send(HostToHub {
-            msg: Some(host_to_hub::Msg::ManifestRequest(kahawai_proto::v1::ManifestRequest {
-                collection_id: c.name.clone(),
-            })),
-        })
-        .await
-        .context("link closed before manifest request")?;
-        tokio::spawn(scan::scan_collection(c.clone(), tx.clone(), mrx));
+        let (ttx, mut trx) = tokio::sync::mpsc::channel::<ScanTrigger>(8);
+        triggers.insert(c.name.clone(), ttx.clone());
+        let (c, tx, waiters) = (c.clone(), tx.clone(), manifest_waiters.clone());
+        guards.push(tokio::spawn(async move {
+            while let Some(mut trig) = trx.recv().await {
+                // Coalesce queued triggers into one cycle.
+                while let Ok(more) = trx.try_recv() {
+                    trig.force_dirs.extend(more.force_dirs);
+                }
+                if let Err(e) = scan_cycle(&c, &tx, &waiters, trig.force_dirs).await {
+                    tracing::warn!(collection = %c.name, error = format!("{e:#}"), "scan cycle failed");
+                    return; // link is gone; the session restart rescans
+                }
+            }
+        }));
+        ttx.try_send(ScanTrigger::default()).ok(); // startup scan
     }
+
+    // Filesystem watcher → debounced per-collection triggers. Watcher
+    // failures degrade to sweep-only operation, never fatal.
+    {
+        let (etx, mut erx) = tokio::sync::mpsc::unbounded_channel::<std::path::PathBuf>();
+        let watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+            if let Ok(ev) = res {
+                for p in ev.paths {
+                    let _ = etx.send(p);
+                }
+            }
+        });
+        match watcher {
+            Ok(mut watcher) => {
+                use notify::Watcher as _;
+                for c in collections {
+                    for root in &c.roots {
+                        if let Err(e) = watcher.watch(root, notify::RecursiveMode::Recursive) {
+                            tracing::warn!(root = %root.display(), error = %e, "watch failed (sweeps still cover this root)");
+                        }
+                    }
+                }
+                let roots: Vec<(String, std::path::PathBuf)> = collections
+                    .iter()
+                    .flat_map(|c| c.roots.iter().map(|r| (c.name.clone(), r.clone())))
+                    .collect();
+                let triggers2 = triggers.clone();
+                guards.push(tokio::spawn(async move {
+                    let _watcher = watcher; // dies with this task
+                    let mut dirty: std::collections::HashMap<
+                        String,
+                        (std::collections::HashSet<std::path::PathBuf>, tokio::time::Instant),
+                    > = Default::default();
+                    let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+                    loop {
+                        tokio::select! {
+                            ev = erx.recv() => {
+                                let Some(path) = ev else { return };
+                                if let Some((cname, _)) =
+                                    roots.iter().find(|(_, r)| path.starts_with(r))
+                                {
+                                    let dir = path.parent().unwrap_or(&path).to_path_buf();
+                                    let e = dirty
+                                        .entry(cname.clone())
+                                        .or_insert_with(|| (Default::default(), tokio::time::Instant::now()));
+                                    e.0.insert(dir);
+                                    e.1 = tokio::time::Instant::now();
+                                }
+                            }
+                            _ = tick.tick() => {
+                                let quiet = std::time::Duration::from_secs(3);
+                                let ready: Vec<String> = dirty
+                                    .iter()
+                                    .filter(|(_, (_, at))| at.elapsed() >= quiet)
+                                    .map(|(k, _)| k.clone())
+                                    .collect();
+                                for k in ready {
+                                    if let Some((dirs, _)) = dirty.remove(&k)
+                                        && let Some(t) = triggers2.get(&k)
+                                    {
+                                        tracing::info!(collection = %k, dirs = dirs.len(), "watcher triggered rescan");
+                                        t.try_send(ScanTrigger { force_dirs: dirs }).ok();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }));
+            }
+            Err(e) => tracing::warn!(error = %e, "no filesystem watcher; relying on sweeps"),
+        }
+    }
+
+    // Backup sweep (periodic full incremental pass).
+    if rescan_minutes > 0 {
+        let triggers2 = triggers.clone();
+        guards.push(tokio::spawn(async move {
+            let mut t =
+                tokio::time::interval(std::time::Duration::from_secs(rescan_minutes * 60));
+            t.tick().await; // the startup scan already covered "now"
+            loop {
+                t.tick().await;
+                for tt in triggers2.values() {
+                    tt.try_send(ScanTrigger::default()).ok();
+                }
+            }
+        }));
+    }
+    let _guard = AbortOnDrop(guards);
 
     let mut ticker = tokio::time::interval(HEARTBEAT_INTERVAL);
     loop {
@@ -123,6 +233,14 @@ async fn link_once(
             msg = inbound.message() => {
                 match msg {
                     Ok(Some(m)) => {
+                        if let Some(hub_to_host::Msg::RescanRequest(r)) = &m.msg {
+                            for (name, t) in &triggers {
+                                if r.collection_id.is_empty() || *name == r.collection_id {
+                                    t.try_send(ScanTrigger::default()).ok();
+                                }
+                            }
+                            continue;
+                        }
                         if let Some(hub_to_host::Msg::Manifest(m)) = &m.msg {
                             let sender =
                                 manifest_waiters.lock().unwrap().get(&m.collection_id).cloned();
@@ -152,4 +270,35 @@ async fn link_once(
             }
         }
     }
+}
+
+/// One incremental scan cycle: re-announce (resets the hub's seen-set
+/// for reconciliation), fetch a fresh manifest, scan.
+async fn scan_cycle(
+    c: &CollectionConfig,
+    tx: &tokio::sync::mpsc::Sender<HostToHub>,
+    waiters: &std::sync::Mutex<
+        std::collections::HashMap<String, tokio::sync::mpsc::Sender<kahawai_proto::v1::Manifest>>,
+    >,
+    force_dirs: std::collections::HashSet<std::path::PathBuf>,
+) -> Result<()> {
+    tx.send(HostToHub {
+        msg: Some(host_to_hub::Msg::AnnounceCollection(AnnounceCollection {
+            id: c.name.clone(),
+            media_type: c.media_type.clone(),
+            roots: c.roots.iter().map(|r| r.display().to_string()).collect(),
+        })),
+    })
+    .await
+    .context("link closed before announce")?;
+    let (mtx, mrx) = tokio::sync::mpsc::channel(16);
+    waiters.lock().unwrap().insert(c.name.clone(), mtx);
+    tx.send(HostToHub {
+        msg: Some(host_to_hub::Msg::ManifestRequest(kahawai_proto::v1::ManifestRequest {
+            collection_id: c.name.clone(),
+        })),
+    })
+    .await
+    .context("link closed before manifest request")?;
+    scan::scan_collection(c.clone(), tx.clone(), mrx, force_dirs).await
 }

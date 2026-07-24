@@ -102,7 +102,13 @@ message HubToHost {
     // ends when the hub closes the channel's request stream.
     OpenRead open_read = 2;
     Manifest manifest = 3;
+    // Admin-triggered incremental rescan ("" = every collection).
+    RescanRequest rescan_request = 4;
   }
+}
+
+message RescanRequest {
+  string collection_id = 1;
 }
 
 message OpenRead {

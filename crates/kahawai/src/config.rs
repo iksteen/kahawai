@@ -107,6 +107,10 @@ pub struct MediahostConfig {
     pub state_dir: PathBuf,
     pub name: String,
     pub collections: Vec<kahawai_mediahost::scan::CollectionConfig>,
+    /// Backup sweep interval (minutes; 0 disables). The primary change
+    /// detector is the filesystem watcher — which network mounts like
+    /// sshfs can't serve, so the sweep catches what inotify can't see.
+    pub rescan_minutes: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -138,6 +142,7 @@ impl Default for MediahostConfig {
             state_dir: default_mediahost_state_dir(),
             name: "mediahost".into(),
             collections: Vec::new(),
+            rescan_minutes: 60,
         }
     }
 }

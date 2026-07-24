@@ -77,6 +77,7 @@ pub fn router(
         .route("/admin/v1/providers/tmdb", post(admin_set_tmdb))
         .route("/admin/v1/providers/tvdb", post(admin_set_tvdb))
         .route("/admin/v1/enrich", get(admin_enrich_status).post(admin_enrich_run))
+        .route("/admin/v1/rescan", post(admin_rescan))
         .route("/admin/v1/enrich/review", get(admin_review_list))
         .route("/admin/v1/enrich/search", post(admin_review_search))
         .route("/admin/v1/items/{id}/match", post(admin_apply_match))
@@ -280,6 +281,41 @@ async fn admin_enrich_run(State(state): State<AppState>) -> Result<Json<Value>, 
         }
     });
     Ok(Json(json!({ "started": true })))
+}
+
+#[derive(Deserialize, Default)]
+struct RescanRequest {
+    #[serde(default)]
+    collection_id: Option<String>,
+}
+
+/// Ask every connected mediahost for an incremental rescan (the admin
+/// "Rescan now" button; watchers and periodic sweeps are the usual paths).
+async fn admin_rescan(
+    State(state): State<AppState>,
+    body: Option<Json<RescanRequest>>,
+) -> Result<Json<Value>, ApiError> {
+    let collection = body.and_then(|b| b.0.collection_id).unwrap_or_default();
+    let hosts: Vec<String> =
+        sqlx::query_scalar("SELECT module_id FROM satellites WHERE module_type = 'mediahost'")
+            .fetch_all(state.registry.db())
+            .await
+            .map_err(internal)?;
+    let mut asked = 0;
+    for module_id in hosts {
+        if !state.registry.is_connected(&module_id) {
+            continue;
+        }
+        let msg = kahawai_proto::v1::HubToHost {
+            msg: Some(kahawai_proto::v1::hub_to_host::Msg::RescanRequest(
+                kahawai_proto::v1::RescanRequest { collection_id: collection.clone() },
+            )),
+        };
+        if state.registry.send_to_host(&module_id, msg).await.is_ok() {
+            asked += 1;
+        }
+    }
+    Ok(Json(json!({ "asked": asked })))
 }
 
 /// HUB-8 review queue: everything not matched confidently — misses,

@@ -18,6 +18,7 @@ tracing = { workspace = true }
 rustls = { workspace = true }
 walkdir = { workspace = true }
 xxhash-rust = { workspace = true }
+notify = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

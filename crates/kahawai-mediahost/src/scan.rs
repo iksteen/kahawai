@@ -36,6 +36,7 @@ pub async fn scan_collection(
     cfg: CollectionConfig,
     tx: Sender<HostToHub>,
     mut manifest: tokio::sync::mpsc::Receiver<kahawai_proto::v1::Manifest>,
+    force_dirs: std::collections::HashSet<std::path::PathBuf>,
 ) -> Result<()> {
     let (mut scanned, mut failed, mut skipped) = (0u32, 0u32, 0u32);
     let mut batch: Vec<FileRecord> = Vec::with_capacity(BATCH);
@@ -72,7 +73,10 @@ pub async fn scan_collection(
                 .to_string_lossy()
                 .into_owned();
             // Unchanged since the hub last saw it? Seen, not re-inspected.
-            if let Some(&(size, mtime)) = known.get(&rel)
+            // force_dirs overrides: a sidecar/artwork change in the dir
+            // must re-inspect its media files despite matching stats.
+            if !path.parent().is_some_and(|p| force_dirs.contains(p))
+                && let Some(&(size, mtime)) = known.get(&rel)
                 && std::fs::metadata(&path).is_ok_and(|m| {
                     m.len() == size
                         && m.modified()

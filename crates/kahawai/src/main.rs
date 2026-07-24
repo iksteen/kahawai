@@ -373,5 +373,6 @@ async fn run_hub(cfg: config::HubConfig) -> Result<()> {
 }
 
 async fn run_mediahost(cfg: config::MediahostConfig) -> Result<()> {
-    kahawai_mediahost::run(&cfg.hub, &cfg.state_dir, &cfg.name, cfg.collections).await
+    kahawai_mediahost::run(&cfg.hub, &cfg.state_dir, &cfg.name, cfg.collections, cfg.rescan_minutes)
+        .await
 }
