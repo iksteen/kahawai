@@ -366,15 +366,17 @@ h2 { font-size: 14px; font-weight: 650; color: var(--dim); letter-spacing: 0.08e
   position: relative;
 }
 .match-btn {
+  /* Anchored like the kind/seen badges: on the art, upper right
+     (card padding 14/16 + the badges' 6px inset). */
   position: absolute;
-  top: 6px;
-  right: 6px;
+  top: 21px;
+  right: 23px;
   z-index: 2;
-  width: 28px;
-  height: 28px;
-  border-radius: 50%;
-  border: 1px solid var(--line);
-  background: rgba(11, 20, 22, 0.85);
+  width: 22px;
+  height: 22px;
+  border-radius: 4px;
+  border: none;
+  background: rgba(10, 16, 18, 0.78);
   color: var(--dim);
   font-size: 15px;
   line-height: 1;
@@ -388,12 +390,10 @@ h2 { font-size: 14px; font-weight: 650; color: var(--dim); letter-spacing: 0.08e
 .match-btn.miss {
   opacity: 1;
   color: #e2574a;
-  border-color: #e2574a;
 }
 .match-btn.weak {
   opacity: 1;
   color: var(--sand);
-  border-color: var(--sand);
 }
 .dialog-backdrop {
   position: fixed;
