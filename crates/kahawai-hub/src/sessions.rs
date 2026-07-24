@@ -328,6 +328,7 @@ impl Sessions {
         mode: &str,
         start_ms: u64,
         audio_track: u32,
+        video_track: u32,
     ) -> Result<Arc<Session>> {
         let user_active = self
             .active
@@ -359,6 +360,7 @@ impl Sessions {
                     &info,
                     &kahawai_media::remux::WEB_TARGET,
                     audio_track as usize,
+                    video_track as usize,
                 );
                 if !plan.playable() {
                     bail!("no playable streams — this source needs the video transcoder");
@@ -485,6 +487,7 @@ impl Sessions {
                     .args(["--video", kahawai_media::worker::mode_arg(plan.video)])
                     .args(["--audio", kahawai_media::worker::mode_arg(plan.audio)])
                     .args(["--audio-track", &plan.audio_track.to_string()])
+                    .args(["--video-track", &plan.video_track.to_string()])
                     .args(["--start-ms", &start_ms.to_string()])
                     .args(if sink.is_empty() { vec![] } else { vec!["--sink".into(), sink.to_string()] })
                     .stderr(std::process::Stdio::from(log))
@@ -578,6 +581,7 @@ impl Sessions {
                     video: kahawai_media::worker::mode_arg(plan.video).into(),
                     audio: kahawai_media::worker::mode_arg(plan.audio).into(),
                     audio_track: plan.audio_track as u32,
+                    video_track: plan.video_track as u32,
                     start_ms,
                     sink: sink.into(),
                 },
@@ -786,14 +790,15 @@ impl Sessions {
         id: &str,
         position_ms: u64,
         audio_track: Option<u32>,
+        video_track: Option<u32>,
     ) -> Result<()> {
         let session = self.get(id).context("no such session")?;
         let mut plan =
             (*session.plan.lock().unwrap()).context("session has no restartable pipeline")?;
         session.touch();
-        if let Some(track) = audio_track
-            && track as usize != plan.audio_track
-        {
+        let want_audio = audio_track.map(|t| t as usize).unwrap_or(plan.audio_track);
+        let want_video = video_track.map(|t| t as usize).unwrap_or(plan.video_track);
+        if want_audio != plan.audio_track || want_video != plan.video_track {
             // Switching tracks re-plans: the new track's codec decides
             // copy vs encode, not the old one's.
             let (_, _, _, info) =
@@ -801,9 +806,10 @@ impl Sessions {
             plan = kahawai_media::remux::plan_streams(
                 &info,
                 &kahawai_media::remux::WEB_TARGET,
-                track as usize,
+                want_audio,
+                want_video,
             );
-            anyhow::ensure!(plan.playable(), "selected audio track is not playable");
+            anyhow::ensure!(plan.playable(), "selected track is not playable");
             *session.plan.lock().unwrap() = Some(plan);
         }
         match &session.mode {

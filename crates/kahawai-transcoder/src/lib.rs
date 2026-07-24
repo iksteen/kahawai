@@ -184,7 +184,7 @@ async fn link_loop(
                         Some(hub_to_tc::Msg::StartSession(s)) => {
                             let runner = runner.clone();
                             tokio::spawn(async move {
-                                runner.start(s.session_id, s.size, &s.video, &s.audio, s.audio_track, s.start_ms, &s.sink).await;
+                                runner.start(s.session_id, s.size, &s.video, &s.audio, s.audio_track, s.video_track, s.start_ms, &s.sink).await;
                             });
                         }
                         // Inline, not spawned: EndSession→StartSession

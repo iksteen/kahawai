@@ -185,6 +185,7 @@ export function startSession(
   mode: string,
   startMs = 0,
   audioTrack = 0,
+  videoTrack = 0,
 ): Promise<Session> {
   return json('/api/v1/playback/sessions', {
     method: 'POST',
@@ -193,18 +194,25 @@ export function startSession(
       mode,
       start_ms: Math.round(startMs),
       audio_track: audioTrack,
+      video_track: videoTrack,
     }),
   })
 }
 
 /// Seek-restart: the pipeline restarts at the offset; re-attach the
 /// player. An audio_track switches tracks during the restart (HUB-27).
-export function seekSession(sessionId: string, positionMs: number, audioTrack?: number) {
+export function seekSession(
+  sessionId: string,
+  positionMs: number,
+  audioTrack?: number,
+  videoTrack?: number,
+) {
   return api(`/api/v1/playback/sessions/${sessionId}/seek`, {
     method: 'POST',
     body: JSON.stringify({
       position_ms: Math.round(positionMs),
       audio_track: audioTrack ?? null,
+      video_track: videoTrack ?? null,
     }),
   })
 }

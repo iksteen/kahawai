@@ -50,6 +50,10 @@ export default function Player({
     { codec: string; channels: number; language?: string | null }[]
   >([])
   const [audioTrack, setAudioTrack] = useState(0)
+  const [videoTracks, setVideoTracks] = useState<
+    { codec: string; width: number; height: number }[]
+  >([])
+  const [videoTrack, setVideoTrack] = useState(0)
   // The <track> URL must shift cues when the HLS timeline starts mid-file;
   // bump on seek-restarts so the track reloads with the new shift.
   const [trackEpoch, setTrackEpoch] = useState(0)
@@ -59,19 +63,26 @@ export default function Player({
       .then((r) => setSubs(r.subtitles))
       .catch(() => setSubs([]))
     fetchItem(item.id)
-      .then((d) => setAudioTracks(d.sources_detail[0]?.streams?.audio ?? []))
-      .catch(() => setAudioTracks([]))
+      .then((d) => {
+        setAudioTracks(d.sources_detail[0]?.streams?.audio ?? [])
+        setVideoTracks(d.sources_detail[0]?.streams?.video ?? [])
+      })
+      .catch(() => {
+        setAudioTracks([])
+        setVideoTracks([])
+      })
   }, [item.id])
 
   // Track switching is a seek-restart at the current position with the
   // new track (§6 machinery; ~2 s hiccup, same as a deep seek).
-  const switchAudio = async (track: number) => {
+  const switchTracks = async (audio: number, video_: number) => {
     const video = videoRef.current!
-    setAudioTrack(track)
+    setAudioTrack(audio)
+    setVideoTrack(video_)
     setSeeking(true)
     try {
       const absMs = offsetRef.current + video.currentTime * 1000
-      await seekSession(session.session_id, absMs, track)
+      await seekSession(session.session_id, absMs, audio, video_)
       offsetRef.current = Math.round(absMs)
       setPosMs(offsetRef.current)
       setTrackEpoch((e) => e + 1)
@@ -256,11 +267,27 @@ export default function Player({
           <select
             value={audioTrack}
             disabled={seeking}
-            onChange={(e) => void switchAudio(Number(e.target.value))}
+            onChange={(e) => void switchTracks(Number(e.target.value), videoTrack)}
           >
             {audioTracks.map((a, i) => (
               <option key={i} value={i}>
                 {a.language ?? '?'} · {a.codec} {a.channels}ch
+              </option>
+            ))}
+          </select>
+        </label>
+      )}
+      {isHls && videoTracks.length > 1 && (
+        <label className="subpick">
+          Video{' '}
+          <select
+            value={videoTrack}
+            disabled={seeking}
+            onChange={(e) => void switchTracks(audioTrack, Number(e.target.value))}
+          >
+            {videoTracks.map((v, i) => (
+              <option key={i} value={i}>
+                {v.codec} {v.width}×{v.height}
               </option>
             ))}
           </select>

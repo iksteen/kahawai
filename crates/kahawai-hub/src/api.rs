@@ -417,9 +417,11 @@ struct StartSessionRequest {
     /// catch up) — keyframe-snapped by the pipeline.
     #[serde(default)]
     start_ms: u64,
-    /// Audio track index in the source's discovery order (HUB-27).
+    /// Track indexes in the source's discovery order (HUB-27).
     #[serde(default)]
     audio_track: u32,
+    #[serde(default)]
+    video_track: u32,
 }
 
 fn default_mode() -> String {
@@ -433,7 +435,15 @@ async fn start_session(
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     let session = state
         .sessions
-        .start(&state.registry, &claims.sub, &body.item_id, &body.mode, body.start_ms, body.audio_track)
+        .start(
+            &state.registry,
+            &claims.sub,
+            &body.item_id,
+            &body.mode,
+            body.start_ms,
+            body.audio_track,
+            body.video_track,
+        )
         .await
         .map_err(|e| (StatusCode::CONFLICT, format!("{e:#}")))?;
     let (mode, stream_url, ctype) = match &session.mode {
@@ -473,8 +483,9 @@ async fn start_session(
 #[derive(Deserialize)]
 struct SeekRequest {
     position_ms: u64,
-    /// Switch to this audio track during the restart (HUB-27).
+    /// Switch tracks during the restart (HUB-27).
     audio_track: Option<u32>,
+    video_track: Option<u32>,
 }
 
 /// Seek-restart (§6): restart the session's pipeline at the offset.
@@ -486,7 +497,7 @@ async fn seek_session(
 ) -> Result<StatusCode, ApiError> {
     state
         .sessions
-        .seek(&state.registry, &id, body.position_ms, body.audio_track)
+        .seek(&state.registry, &id, body.position_ms, body.audio_track, body.video_track)
         .await
         .map_err(|e| (StatusCode::CONFLICT, format!("{e:#}")))?;
     Ok(StatusCode::NO_CONTENT)
