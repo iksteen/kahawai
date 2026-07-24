@@ -101,7 +101,8 @@ fn fold(s: &str) -> String {
         ("fourteen", "14"), ("fifteen", "15"), ("sixteen", "16"), ("seventeen", "17"),
         ("eighteen", "18"), ("nineteen", "19"), ("twenty", "20"),
     ];
-    let base: String = kahawai_core::names::normalize_title(s)
+    let s = s.replace(['&', '+'], " and ");
+    let base: String = kahawai_core::names::normalize_title(&s)
         .nfd()
         .filter(|c| !unicode_normalization::char::is_combining_mark(*c))
         .collect();
@@ -205,16 +206,43 @@ impl Enricher {
             let sem = sem.clone();
             tasks.spawn(async move {
                 let _permit = sem.acquire().await;
-                let cands = match this.search(&key, &kind, &title, year).await {
-                    Ok(c) => c,
-                    Err(e) => {
-                        tracing::warn!(title, error = format!("{e:#}"), "tmdb search failed");
-                        return;
+                // Query ladder: TMDB's search has holes (a literal "And"
+                // finds nothing where "&" or a shortened query hits), so
+                // retry with variants — the strict verifier still judges
+                // every candidate against the FULL local title.
+                let mut variants = vec![title.clone()];
+                if title.contains(" And ") || title.contains(" and ") {
+                    variants.push(title.replace(" And ", " & ").replace(" and ", " & "));
+                }
+                if title.contains('&') {
+                    variants.push(title.replace('&', "and"));
+                }
+                let words: Vec<&str> = title.split_whitespace().collect();
+                if words.len() > 3 {
+                    variants.push(words[..words.len() - 1].join(" "));
+                    variants.push(words[..words.len() - 2].join(" "));
+                }
+                let mut picked_owned: Option<(Candidate, &'static str)> = None;
+                for (vi, q) in variants.iter().enumerate() {
+                    match this.search(&key, &kind, q, year).await {
+                        Ok(cands) => {
+                            if let Some((c, conf)) = pick_candidate(&cands, &title, year) {
+                                picked_owned = Some((c.clone(), conf));
+                                if vi > 0 {
+                                    tracing::debug!(title, variant = %q, "matched via query variant");
+                                }
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(title, error = format!("{e:#}"), "tmdb search failed");
+                            return;
+                        }
                     }
-                };
-                let picked = pick_candidate(&cands, &title, year);
+                }
+                let picked = picked_owned;
                 let (provider_id, confidence, c) = match &picked {
-                    Some((c, conf)) => (c.id.to_string(), *conf, Some(*c)),
+                    Some((c, conf)) => (c.id.to_string(), *conf, Some(c)),
                     None => (String::new(), "miss", None),
                 };
                 match confidence {
@@ -310,6 +338,10 @@ mod tests {
         let tm = vec![cand(7, "Twelve Monkeys", "1995-12-29"), cand(8, "12 Rounds", "2009-03-19")];
         let (c, conf) = pick_candidate(&tm, "12 Monkeys", None).unwrap();
         assert_eq!((c.id, conf), (7, "auto"));
+        // '&' and 'and' are the same word.
+        let oo = vec![cand(11, "Iliza Shlesinger: Over & Over", "2019-07-02")];
+        let (c, conf) = pick_candidate(&oo, "Iliza Shlesinger Over And Over", None).unwrap();
+        assert_eq!((c.id, conf), (11, "auto"));
         // Franchise prefix: local title ends with the candidate's → weak.
         let rd = vec![
             cand(9, "Raiders of the Lost Ark", "1981-06-12"),
