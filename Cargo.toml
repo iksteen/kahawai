@@ -8,6 +8,7 @@ default-members = ["crates/kahawai"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
 
 [workspace.dependencies]
 kahawai-core = { path = "crates/kahawai-core" }

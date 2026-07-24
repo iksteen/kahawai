@@ -23,6 +23,26 @@ Pre-implementation. See the design documents:
 - [Technical requirements](./docs/kahawai-technical-requirements.md)
 - [Implementation design](./docs/kahawai-implementation.md)
 
+## License
+
+Kahawai is [MIT licensed](./LICENSE).
+
+Media plumbing is provided by [GStreamer](https://gstreamer.freedesktop.org/),
+which kahawai links dynamically as system libraries (LGPL-2.1+) — install it
+through your distribution. Some optional GStreamer plugins kahawai can take
+advantage of (for example `x264enc` from gst-plugins-ugly, or `a52dec`) are
+GPL-licensed; they are loaded at runtime from your system when present, and
+kahawai's preference-ordered element lists fall back gracefully when they are
+not. If you redistribute kahawai *bundled together with* GStreamer and its
+plugins (e.g. a container image), the LGPL/GPL terms of those components apply
+to that bundle — for this open-source project that amounts to shipping the
+license notices and pointing at the (already public) sources, or simply
+excluding the GPL plugin set.
+
+Metadata courtesy of [TMDB](https://www.themoviedb.org/) and
+[TheTVDB](https://thetvdb.com/) when configured; both require the in-app
+attribution kahawai displays alongside their data.
+
 ## Name
 
 *Kahawai* is Hawaiian for **stream**. The same word in te reo Māori names the kahawai fish (*Arripis trutta*), from *kaha* (strong) + *wai* (water). A streaming server could hardly ask for a better pair of meanings, and we use the word with respect for both origins.
