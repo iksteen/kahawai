@@ -222,6 +222,9 @@ export default function Player({
           ) {
             const video = videoRef.current
             offsetRef.current = n
+            // Correct a live ASS renderer immediately — the epoch bump
+            // recreates it, but the skew shouldn't be visible meanwhile.
+            if (jassubRef.current) jassubRef.current.timeOffset = n / 1000
             if (video) setPosMs(n + video.currentTime * 1000)
             setTrackEpoch((e) => e + 1)
           }
