@@ -57,6 +57,29 @@ struct ScanTrigger {
     force_dirs: std::collections::HashSet<std::path::PathBuf>,
 }
 
+/// Trigger sender that never drops: when the queue is full, the trigger
+/// merges into an overflow slot the orchestrator drains before each
+/// cycle, so a busy scan can't lose change notifications.
+#[derive(Clone)]
+struct TriggerSink {
+    tx: tokio::sync::mpsc::Sender<ScanTrigger>,
+    overflow: std::sync::Arc<std::sync::Mutex<Option<ScanTrigger>>>,
+}
+
+impl TriggerSink {
+    fn send(&self, t: ScanTrigger) {
+        if let Err(tokio::sync::mpsc::error::TrySendError::Full(t)) = self.tx.try_send(t) {
+            tracing::debug!("trigger queue full; merging into overflow");
+            let mut slot = self.overflow.lock().unwrap();
+            slot.get_or_insert_with(ScanTrigger::default).force_dirs.extend(t.force_dirs);
+            drop(slot);
+            // Wake the orchestrator if space appeared meanwhile; if the
+            // queue is still full, its items already guarantee a wake.
+            let _ = self.tx.try_send(ScanTrigger::default());
+        }
+    }
+}
+
 /// One link session: Hello/HelloAck, then per-collection scan
 /// orchestrators fed by three triggers — the filesystem watcher
 /// (primary; useless over sshfs where inotify never fires), the
@@ -109,17 +132,21 @@ async fn link_once(
         >,
     > = Default::default();
     let mut guards: Vec<tokio::task::JoinHandle<()>> = Vec::new();
-    let mut triggers: std::collections::HashMap<String, tokio::sync::mpsc::Sender<ScanTrigger>> =
-        Default::default();
+    let mut triggers: std::collections::HashMap<String, TriggerSink> = Default::default();
     for c in collections {
         let (ttx, mut trx) = tokio::sync::mpsc::channel::<ScanTrigger>(8);
-        triggers.insert(c.name.clone(), ttx.clone());
+        let sink = TriggerSink { tx: ttx, overflow: Default::default() };
+        triggers.insert(c.name.clone(), sink.clone());
+        let overflow = sink.overflow.clone();
         let (c, tx, waiters) = (c.clone(), tx.clone(), manifest_waiters.clone());
         guards.push(tokio::spawn(async move {
             while let Some(mut trig) = trx.recv().await {
-                // Coalesce queued triggers into one cycle.
+                // Coalesce queued triggers + the overflow slot into one cycle.
                 while let Ok(more) = trx.try_recv() {
                     trig.force_dirs.extend(more.force_dirs);
+                }
+                if let Some(o) = overflow.lock().unwrap().take() {
+                    trig.force_dirs.extend(o.force_dirs);
                 }
                 if let Err(e) = scan_cycle(&c, &tx, &waiters, trig.force_dirs).await {
                     tracing::warn!(collection = %c.name, error = format!("{e:#}"), "scan cycle failed");
@@ -127,7 +154,7 @@ async fn link_once(
                 }
             }
         }));
-        ttx.try_send(ScanTrigger::default()).ok(); // startup scan
+        sink.send(ScanTrigger::default()); // startup scan
     }
 
     // Filesystem watcher → debounced per-collection triggers. Watcher
@@ -205,7 +232,7 @@ async fn link_once(
                                         && let Some(t) = triggers2.get(&k)
                                     {
                                         tracing::info!(collection = %k, dirs = dirs.len(), "watcher triggered rescan");
-                                        t.try_send(ScanTrigger { force_dirs: dirs }).ok();
+                                        t.send(ScanTrigger { force_dirs: dirs });
                                     }
                                 }
                             }
@@ -227,7 +254,7 @@ async fn link_once(
             loop {
                 t.tick().await;
                 for tt in triggers2.values() {
-                    tt.try_send(ScanTrigger::default()).ok();
+                    tt.send(ScanTrigger::default());
                 }
             }
         }));
@@ -251,7 +278,7 @@ async fn link_once(
                         if let Some(hub_to_host::Msg::RescanRequest(r)) = &m.msg {
                             for (name, t) in &triggers {
                                 if r.collection_id.is_empty() || *name == r.collection_id {
-                                    t.try_send(ScanTrigger::default()).ok();
+                                    t.send(ScanTrigger::default());
                                 }
                             }
                             continue;
