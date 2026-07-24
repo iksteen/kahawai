@@ -113,8 +113,19 @@ fn fold(s: &str) -> String {
         .nfd()
         .filter(|c| !unicode_normalization::char::is_combining_mark(*c))
         .collect();
+    const ROMAN: &[(&str, &str)] = &[
+        ("ii", "2"), ("iii", "3"), ("iv", "4"), ("vi", "6"), ("vii", "7"),
+        ("viii", "8"), ("ix", "9"), ("xi", "11"), ("xii", "12"), ("xiii", "13"),
+    ];
     base.split_whitespace()
-        .map(|w| WORDS.iter().find(|(word, _)| *word == w).map(|(_, d)| *d).unwrap_or(w))
+        .map(|w| {
+            WORDS
+                .iter()
+                .chain(ROMAN.iter())
+                .find(|(word, _)| *word == w)
+                .map(|(_, d)| *d)
+                .unwrap_or(w)
+        })
         .collect::<Vec<_>>()
         .join(" ")
 }
@@ -282,7 +293,10 @@ impl Enricher {
             c.store(0, Ordering::SeqCst);
         }
         let items = sqlx::query(
-            "SELECT i.id, i.kind, i.title, i.year FROM items i
+            "SELECT i.id, i.kind, i.title, i.year,
+                    (SELECT s.path_rel FROM item_sources s
+                     WHERE s.item_id = i.id LIMIT 1) AS src_path
+             FROM items i
              LEFT JOIN item_metadata m ON m.item_id = i.id
              WHERE i.kind IN ('movie', 'show')
                AND (m.item_id IS NULL OR m.confidence = 'miss')
@@ -304,8 +318,22 @@ impl Enricher {
                 row.get::<String, _>("title"),
                 row.get::<Option<i64>, _>("year"),
             );
+            // A movie in its own subdirectory carries a second identity:
+            // the directory name, often cleaner than the release-junk
+            // filename ("Hellraiser - Revelations (2011)/Hellraiser.
+            // VIIII.Revelations…"). Used as an alternative match key.
+            let alt = (kind == "movie")
+                .then(|| row.get::<Option<String>, _>("src_path"))
+                .flatten()
+                .and_then(|p| {
+                    let (dirs, _) = p.rsplit_once('/')?;
+                    let dir = dirs.rsplit('/').next()?;
+                    let g = kahawai_core::names::parse_movie(dir);
+                    (!g.title.is_empty() && fold(&g.title) != fold(&title)).then_some(g)
+                });
             let this = self.clone();
             let key = key.clone();
+            let alt = alt.clone();
             let tvdb_token = tvdb_token.clone();
             let db = registry.db().clone();
             let sem = sem.clone();
@@ -347,6 +375,23 @@ impl Enricher {
                 }
                 let mut picked = picked_owned;
                 let mut provider = "tmdb";
+                if picked.is_none()
+                    && let Some(alt) = &alt
+                {
+                    let alt_year = alt.year.map(|y| y as i64).or(year);
+                    match this.search(&key, &kind, &alt.title, alt_year).await {
+                        Ok(cands) => {
+                            if let Some((c, conf)) = pick_candidate(&cands, &alt.title, alt_year)
+                            {
+                                picked = Some((c.clone(), conf));
+                                tracing::debug!(title, alt = %alt.title, "matched via directory name");
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(title, error = format!("{e:#}"), "tmdb alt search failed")
+                        }
+                    }
+                }
                 if picked.is_none()
                     && let Some(token) = &tvdb_token
                 {
@@ -467,6 +512,13 @@ mod tests {
         let tm = vec![cand(7, "Twelve Monkeys", "1995-12-29"), cand(8, "12 Rounds", "2009-03-19")];
         let (c, conf) = pick_candidate(&tm, "12 Monkeys", None).unwrap();
         assert_eq!((c.id, conf), (7, "auto"));
+        // Roman numerals fold (2+ chars only — "I" and "V" are words).
+        let mib = vec![cand(13, "Men in Black II", "2002-07-03")];
+        let (c, conf) = pick_candidate(&mib, "Men in Black 2", None).unwrap();
+        assert_eq!((c.id, conf), (13, "auto"));
+        let vfv = vec![cand(14, "V for Vendetta", "2006-03-15"), cand(15, "5 for Vendetta", "2000-01-01")];
+        let (c, _) = pick_candidate(&vfv, "V for Vendetta", None).unwrap();
+        assert_eq!(c.id, 14);
         // Acronym spacing: "S H I E L D" == "S.H.I.E.L.D.".
         let sh = vec![cand(12, "Marvel's Agents of S.H.I.E.L.D.", "2013-09-24")];
         let (c, conf) = pick_candidate(&sh, "Marvels Agents of S H I E L D", None).unwrap();
