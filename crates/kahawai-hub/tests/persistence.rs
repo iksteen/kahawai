@@ -258,19 +258,24 @@ async fn manifest_and_files_seen_survive_rescan() {
             })
             .await
             .unwrap();
+            // Round 3 handshakes with the version stored in round 2:
+            // the hub must answer in_sync and send no entries.
             tx.send(pb::HostToHub {
                 msg: Some(pb::host_to_hub::Msg::ManifestRequest(pb::ManifestRequest {
                     collection_id: "movies".into(),
+                    sync_version: if round == 3 { 7 } else { 0 },
                 })),
             })
             .await
             .unwrap();
             // Collect the manifest.
             let mut entries = vec![];
+            let mut in_sync = false;
             loop {
                 match inbound.message().await.unwrap().unwrap().msg {
                     Some(pb::hub_to_host::Msg::Manifest(m)) => {
                         entries.extend(m.entries);
+                        in_sync |= m.in_sync;
                         if m.done {
                             break;
                         }
@@ -278,6 +283,12 @@ async fn manifest_and_files_seen_survive_rescan() {
                     other => panic!("expected manifest, got {other:?}"),
                 }
             }
+            if round == 3 {
+                assert!(in_sync, "matching sync_version must short-circuit");
+                assert!(entries.is_empty());
+                return; // handshake skips the scan entirely
+            }
+            assert!(!in_sync);
             if round == 1 {
                 assert!(entries.is_empty(), "fresh hub knows nothing: {entries:?}");
                 tx.send(pb::HostToHub {
@@ -318,6 +329,7 @@ async fn manifest_and_files_seen_survive_rescan() {
                     failed: 0,
                     complete: true,
                     skipped: (round == 2) as u32,
+                    sync_version: 7, // the generation both rounds report
                 })),
             })
             .await
@@ -345,6 +357,13 @@ async fn manifest_and_files_seen_survive_rescan() {
         .await
         .unwrap();
     assert_eq!(items, 1, "resolved item survives the incremental rescan");
+    // Round 3: reconnect with the stored generation → in_sync short-circuit.
+    scan(3).await;
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM files")
+        .fetch_one(&db)
+        .await
+        .unwrap();
+    assert_eq!(n, 1, "in-sync reconnect must leave state untouched");
 }
 
 #[tokio::test]

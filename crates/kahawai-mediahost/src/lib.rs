@@ -30,7 +30,8 @@ pub async fn run(
     let tls = kahawai_transport::mtls::mtls_client_config(&id)?;
 
     loop {
-        match link_once(hub_addr, tls.clone(), name, &collections, rescan_minutes).await {
+        match link_once(hub_addr, tls.clone(), name, &collections, rescan_minutes, state_dir).await
+        {
             Ok(()) => tracing::warn!("hub closed the link; reconnecting"),
             Err(e) => tracing::warn!(error = format!("{e:#}"), "link failed; reconnecting"),
         }
@@ -55,6 +56,10 @@ impl Drop for AbortOnDrop {
 #[derive(Default)]
 struct ScanTrigger {
     force_dirs: std::collections::HashSet<std::path::PathBuf>,
+    /// Startup trigger: eligible for the sync-version handshake (skip
+    /// the scan when the hub already reflects our last completed one).
+    /// Watcher/sweep/manual triggers always scan — they carry intent.
+    initial: bool,
 }
 
 /// Trigger sender that never drops: when the queue is full, the trigger
@@ -90,6 +95,7 @@ async fn link_once(
     name: &str,
     collections: &[CollectionConfig],
     rescan_minutes: u64,
+    state_dir: &Path,
 ) -> Result<()> {
     let channel = kahawai_transport::tls::grpc_channel_with(hub_addr, tls).await?;
     let mut client = MediahostLinkClient::new(channel.clone());
@@ -139,22 +145,45 @@ async fn link_once(
         triggers.insert(c.name.clone(), sink.clone());
         let overflow = sink.overflow.clone();
         let (c, tx, waiters) = (c.clone(), tx.clone(), manifest_waiters.clone());
+        let ver_path = state_dir.join("sync").join(format!("{}.ver", c.name));
         guards.push(tokio::spawn(async move {
+            // The persisted scan generation: bumped after every
+            // completed cycle, compared by the hub on reconnect.
+            let mut version: u64 = std::fs::read_to_string(&ver_path)
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(0);
             while let Some(mut trig) = trx.recv().await {
                 // Coalesce queued triggers + the overflow slot into one cycle.
                 while let Ok(more) = trx.try_recv() {
                     trig.force_dirs.extend(more.force_dirs);
+                    trig.initial &= more.initial;
                 }
                 if let Some(o) = overflow.lock().unwrap().take() {
                     trig.force_dirs.extend(o.force_dirs);
+                    trig.initial &= o.initial;
                 }
-                if let Err(e) = scan_cycle(&c, &tx, &waiters, trig.force_dirs).await {
-                    tracing::warn!(collection = %c.name, error = format!("{e:#}"), "scan cycle failed");
-                    return; // link is gone; the session restart rescans
+                let handshake = if trig.initial { version } else { 0 };
+                let next = version + 1;
+                match scan_cycle(&c, &tx, &waiters, trig.force_dirs, handshake, next).await {
+                    Ok(true) => {
+                        version = next;
+                        if let Some(dir) = ver_path.parent() {
+                            let _ = std::fs::create_dir_all(dir);
+                        }
+                        if let Err(e) = std::fs::write(&ver_path, version.to_string()) {
+                            tracing::warn!(collection = %c.name, error = %e, "persisting sync version failed");
+                        }
+                    }
+                    Ok(false) => {} // in sync: nothing scanned, version unchanged
+                    Err(e) => {
+                        tracing::warn!(collection = %c.name, error = format!("{e:#}"), "scan cycle failed");
+                        return; // link is gone; the session restart rescans
+                    }
                 }
             }
         }));
-        sink.send(ScanTrigger::default()); // startup scan
+        sink.send(ScanTrigger { initial: true, ..Default::default() }); // startup scan
     }
 
     // Filesystem watcher → debounced per-collection triggers. Watcher
@@ -184,21 +213,32 @@ async fn link_once(
             }
         });
         match watcher {
-            Ok(mut watcher) => {
-                use notify::Watcher as _;
-                for c in collections {
-                    for root in &c.roots {
-                        if let Err(e) = watcher.watch(root, notify::RecursiveMode::Recursive) {
-                            tracing::warn!(root = %root.display(), error = %e, "watch failed (sweeps still cover this root)");
-                        }
-                    }
-                }
+            Ok(watcher) => {
                 let roots: Vec<(String, std::path::PathBuf)> = collections
                     .iter()
                     .flat_map(|c| c.roots.iter().map(|r| (c.name.clone(), r.clone())))
                     .collect();
+                let watch_roots = roots.clone();
                 let triggers2 = triggers.clone();
                 guards.push(tokio::spawn(async move {
+                    // Installing recursive watches walks every directory
+                    // — minutes over sshfs. Done here, off the link's
+                    // critical path: blocking it starved the inbound
+                    // loop and made startup manifests (and in_sync
+                    // replies) time out into full rescans.
+                    let watcher = tokio::task::spawn_blocking(move || {
+                        use notify::Watcher as _;
+                        let mut watcher = watcher;
+                        for (_, root) in &watch_roots {
+                            if let Err(e) = watcher.watch(root, notify::RecursiveMode::Recursive) {
+                                tracing::warn!(root = %root.display(), error = %e, "watch failed (sweeps still cover this root)");
+                            }
+                        }
+                        tracing::info!(roots = watch_roots.len(), "filesystem watches installed");
+                        watcher
+                    })
+                    .await;
+                    let Ok(watcher) = watcher else { return };
                     let _watcher = watcher; // dies with this task
                     let mut dirty: std::collections::HashMap<
                         String,
@@ -232,7 +272,7 @@ async fn link_once(
                                         && let Some(t) = triggers2.get(&k)
                                     {
                                         tracing::info!(collection = %k, dirs = dirs.len(), "watcher triggered rescan");
-                                        t.send(ScanTrigger { force_dirs: dirs });
+                                        t.send(ScanTrigger { force_dirs: dirs, initial: false });
                                     }
                                 }
                             }
@@ -315,7 +355,8 @@ async fn link_once(
 }
 
 /// One incremental scan cycle: re-announce (resets the hub's seen-set
-/// for reconciliation), fetch a fresh manifest, scan.
+/// for reconciliation), fetch a fresh manifest, scan. Returns false
+/// when the hub answered in_sync (handshake matched; nothing scanned).
 async fn scan_cycle(
     c: &CollectionConfig,
     tx: &tokio::sync::mpsc::Sender<HostToHub>,
@@ -323,7 +364,9 @@ async fn scan_cycle(
         std::collections::HashMap<String, tokio::sync::mpsc::Sender<kahawai_proto::v1::Manifest>>,
     >,
     force_dirs: std::collections::HashSet<std::path::PathBuf>,
-) -> Result<()> {
+    handshake_version: u64,
+    report_version: u64,
+) -> Result<bool> {
     tx.send(HostToHub {
         msg: Some(host_to_hub::Msg::AnnounceCollection(AnnounceCollection {
             id: c.name.clone(),
@@ -338,9 +381,10 @@ async fn scan_cycle(
     tx.send(HostToHub {
         msg: Some(host_to_hub::Msg::ManifestRequest(kahawai_proto::v1::ManifestRequest {
             collection_id: c.name.clone(),
+            sync_version: handshake_version,
         })),
     })
     .await
     .context("link closed before manifest request")?;
-    scan::scan_collection(c.clone(), tx.clone(), mrx, force_dirs).await
+    scan::scan_collection(c.clone(), tx.clone(), mrx, force_dirs, report_version).await
 }

@@ -37,17 +37,22 @@ pub async fn scan_collection(
     tx: Sender<HostToHub>,
     mut manifest: tokio::sync::mpsc::Receiver<kahawai_proto::v1::Manifest>,
     force_dirs: std::collections::HashSet<std::path::PathBuf>,
-) -> Result<()> {
+    sync_version: u64,
+) -> Result<bool> {
     let (mut scanned, mut failed, mut skipped) = (0u32, 0u32, 0u32);
     let mut batch: Vec<FileRecord> = Vec::with_capacity(BATCH);
 
     // Collect the hub's manifest (chunked); an old hub never answers, so
     // a timeout degrades to the full rescan.
     let mut known: std::collections::HashMap<String, (u64, i64)> = Default::default();
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
         match tokio::time::timeout_at(deadline, manifest.recv()).await {
             Ok(Some(m)) => {
+                if m.in_sync {
+                    tracing::info!(collection = %cfg.name, "in sync with hub; scan skipped");
+                    return Ok(false);
+                }
                 known.extend(m.entries.into_iter().map(|e| (e.path_rel, (e.size, e.mtime_unix))));
                 if m.done {
                     break;
@@ -141,12 +146,13 @@ pub async fn scan_collection(
             failed,
             complete: true,
             skipped,
+            sync_version,
         })),
     })
     .await
     .context("link closed")?;
     tracing::info!(collection = %cfg.name, scanned, failed, skipped, "scan complete");
-    Ok(())
+    Ok(true)
 }
 
 async fn send_seen(tx: &Sender<HostToHub>, collection: &str, paths: Vec<String>) -> Result<()> {

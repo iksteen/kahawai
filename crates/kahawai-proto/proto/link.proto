@@ -30,6 +30,10 @@ message HostToHub {
 
 message ManifestRequest {
   string collection_id = 1;
+  // The host's persisted scan generation. Non-zero and equal to the
+  // hub's stored value → the hub answers in_sync and the host skips
+  // the scan. 0 = no shortcut (watcher/sweep/manual cycles).
+  uint64 sync_version = 2;
 }
 
 message FileStat {
@@ -44,6 +48,8 @@ message Manifest {
   string collection_id = 1;
   repeated FileStat entries = 2;
   bool done = 3;
+  // Versions matched: no entries follow, skip the scan entirely.
+  bool in_sync = 4;
 }
 
 // Files present and unchanged (size+mtime match the manifest): counted
@@ -93,6 +99,9 @@ message ScanProgress {
   uint32 failed = 3;
   bool complete = 4;
   uint32 skipped = 5; // unchanged, not re-inspected
+  // Scan generation after this cycle; the hub stores it (see
+  // ManifestRequest.sync_version).
+  uint64 sync_version = 6;
 }
 
 message HubToHost {

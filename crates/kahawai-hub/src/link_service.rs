@@ -64,8 +64,6 @@ impl MediahostLink for MediahostLinkService {
         registry.connected(&module_id, &peer.module_type, &hello.name, &peer.fingerprint);
         registry.register_link(&module_id, tx.clone());
 
-        let mut seen: std::collections::HashMap<String, std::collections::HashSet<String>> =
-            std::collections::HashMap::new();
         tokio::spawn(async move {
             let ack = HubToHost {
                 msg: Some(hub_to_host::Msg::HelloAck(HelloAck {
@@ -78,6 +76,30 @@ impl MediahostLink for MediahostLinkService {
                 registry.disconnected(&module_id);
                 return;
             }
+            // Heavy messages (upserts with resolution, reconciliation)
+            // process on an ordered queue so the read loop keeps
+            // reading: while it was blocked on DB work, heartbeats sat
+            // unread in the stream and the 35 s liveness timeout fired
+            // spuriously mid-scan — killing the scan it was serving.
+            let (work_tx, mut work_rx) =
+                tokio::sync::mpsc::channel::<host_to_hub::Msg>(64);
+            let worker = {
+                let registry = registry.clone();
+                let module_id = module_id.clone();
+                tokio::spawn(async move {
+                    let mut seen: std::collections::HashMap<
+                        String,
+                        std::collections::HashSet<String>,
+                    > = std::collections::HashMap::new();
+                    while let Some(msg) = work_rx.recv().await {
+                        if let Err(e) =
+                            handle_host_msg(&registry, &module_id, msg, &mut seen).await
+                        {
+                            tracing::error!(%module_id, error = format!("{e:#}"), "handling link message");
+                        }
+                    }
+                })
+            };
             // Heartbeats arrive every 10 s; three missed = dead link.
             loop {
                 let msg = tokio::time::timeout(
@@ -94,9 +116,14 @@ impl MediahostLink for MediahostLinkService {
                 };
                 match msg {
                     Ok(Some(HostToHub { msg: Some(msg) })) => {
-                        if let Err(e) = handle_host_msg(&registry, &module_id, msg, &mut seen).await
-                        {
-                            tracing::error!(%module_id, error = format!("{e:#}"), "handling link message");
+                        // Liveness inline; everything else in order on
+                        // the worker (a full queue applies backpressure
+                        // but 64 batches of headroom outlasts any DB
+                        // stall shorter than the timeout).
+                        if matches!(msg, host_to_hub::Msg::Heartbeat(_)) {
+                            registry.seen(&module_id);
+                        } else if work_tx.send(msg).await.is_err() {
+                            break;
                         }
                     }
                     Ok(Some(HostToHub { msg: None })) => {} // newer kind: ignore (OPS-7)
@@ -107,6 +134,8 @@ impl MediahostLink for MediahostLinkService {
                     }
                 }
             }
+            drop(work_tx);
+            let _ = worker.await; // drain in order before cleanup
             registry.unregister_link(&module_id);
             registry.disconnected(&module_id);
         });
@@ -195,6 +224,28 @@ async fn handle_host_msg(
                 error = %e.error, "mediahost reported unreadable file");
         }
         host_to_hub::Msg::ManifestRequest(r) => {
+            // Reconnect handshake: matching scan generations mean the
+            // hub already reflects the host's last completed scan — no
+            // manifest, no walk, no reconciliation churn on restart.
+            if r.sync_version != 0
+                && r.sync_version
+                    == registry.collection_sync_version(module_id, &r.collection_id).await?
+            {
+                let msg = kahawai_proto::v1::HubToHost {
+                    msg: Some(kahawai_proto::v1::hub_to_host::Msg::Manifest(
+                        kahawai_proto::v1::Manifest {
+                            collection_id: r.collection_id.clone(),
+                            entries: vec![],
+                            done: true,
+                            in_sync: true,
+                        },
+                    )),
+                };
+                registry.send_to_host(module_id, msg).await?;
+                tracing::info!(%module_id, collection = %r.collection_id,
+                    version = r.sync_version, "collection in sync; scan skipped");
+                return Ok(());
+            }
             // Incremental rescan (MH-5): what we already know, so the
             // host can skip re-inspecting unchanged files.
             let entries = registry.file_stats(module_id, &r.collection_id).await?;
@@ -211,6 +262,7 @@ async fn handle_host_msg(
                             collection_id: r.collection_id.clone(),
                             entries: chunk.to_vec(),
                             done,
+                            in_sync: false,
                         },
                     )),
                 };
@@ -232,6 +284,11 @@ async fn handle_host_msg(
                 scanned = p.scanned, failed = p.failed, skipped = p.skipped, "scan complete");
             if let Some(paths) = seen.remove(&p.collection_id) {
                 registry.reconcile_files(module_id, &p.collection_id, &paths).await?;
+            }
+            if p.sync_version != 0 {
+                registry
+                    .set_collection_sync_version(module_id, &p.collection_id, p.sync_version)
+                    .await?;
             }
         }
         host_to_hub::Msg::ScanProgress(_) | host_to_hub::Msg::Hello(_) => {}

@@ -772,6 +772,38 @@ impl Registry {
         Ok(())
     }
 
+    pub async fn collection_sync_version(
+        &self,
+        module_id: &str,
+        collection_id: &str,
+    ) -> Result<u64> {
+        Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT sync_version FROM collections WHERE module_id = ? AND collection_id = ?",
+        )
+        .bind(module_id)
+        .bind(collection_id)
+        .fetch_optional(&self.db)
+        .await?
+        .unwrap_or(0) as u64)
+    }
+
+    pub async fn set_collection_sync_version(
+        &self,
+        module_id: &str,
+        collection_id: &str,
+        version: u64,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE collections SET sync_version = ? WHERE module_id = ? AND collection_id = ?",
+        )
+        .bind(version as i64)
+        .bind(module_id)
+        .bind(collection_id)
+        .execute(&self.db)
+        .await?;
+        Ok(())
+    }
+
     /// (path, size, mtime) for every known file of a collection — the
     /// incremental-rescan manifest (MH-5).
     pub async fn file_stats(
