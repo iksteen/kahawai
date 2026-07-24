@@ -238,7 +238,7 @@ fn sweep_one(path: &Path, full: bool, has_ffprobe: bool) -> (Verdict, String) {
     let codecs = describe(&info);
 
     // 2. Plan, as the hub would.
-    let plan = kahawai_media::remux::plan_streams(&info, &kahawai_media::remux::WEB_TARGET);
+    let plan = kahawai_media::remux::plan_streams(&info, &kahawai_media::remux::WEB_TARGET, 0);
     if !plan.playable() {
         return (Verdict::Skip, format!("[needs transcoder] {codecs}"));
     }

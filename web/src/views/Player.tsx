@@ -4,6 +4,7 @@ import {
   accessToken,
   api,
   endSession,
+  fetchItem,
   fetchSubtitles,
   postProgress,
   seekSession,
@@ -45,6 +46,10 @@ export default function Player({
   const [seeking, setSeeking] = useState(false)
   const [subs, setSubs] = useState<Subtitle[]>([])
   const [subKey, setSubKey] = useState('')
+  const [audioTracks, setAudioTracks] = useState<
+    { codec: string; channels: number; language?: string | null }[]
+  >([])
+  const [audioTrack, setAudioTrack] = useState(0)
   // The <track> URL must shift cues when the HLS timeline starts mid-file;
   // bump on seek-restarts so the track reloads with the new shift.
   const [trackEpoch, setTrackEpoch] = useState(0)
@@ -53,7 +58,28 @@ export default function Player({
     fetchSubtitles(item.id)
       .then((r) => setSubs(r.subtitles))
       .catch(() => setSubs([]))
+    fetchItem(item.id)
+      .then((d) => setAudioTracks(d.sources_detail[0]?.streams?.audio ?? []))
+      .catch(() => setAudioTracks([]))
   }, [item.id])
+
+  // Track switching is a seek-restart at the current position with the
+  // new track (§6 machinery; ~2 s hiccup, same as a deep seek).
+  const switchAudio = async (track: number) => {
+    const video = videoRef.current!
+    setAudioTrack(track)
+    setSeeking(true)
+    try {
+      const absMs = offsetRef.current + video.currentTime * 1000
+      await seekSession(session.session_id, absMs, track)
+      offsetRef.current = Math.round(absMs)
+      setPosMs(offsetRef.current)
+      setTrackEpoch((e) => e + 1)
+      attach()
+    } finally {
+      setSeeking(false)
+    }
+  }
 
   // <track> is lazy about mode; force the selected one to display.
   useEffect(() => {
@@ -223,6 +249,22 @@ export default function Player({
             {fmt(posMs)} / {fmt(durationMs)}
           </span>
         </div>
+      )}
+      {isHls && audioTracks.length > 1 && (
+        <label className="subpick">
+          Audio{' '}
+          <select
+            value={audioTrack}
+            disabled={seeking}
+            onChange={(e) => void switchAudio(Number(e.target.value))}
+          >
+            {audioTracks.map((a, i) => (
+              <option key={i} value={i}>
+                {a.language ?? '?'} · {a.codec} {a.channels}ch
+              </option>
+            ))}
+          </select>
+        </label>
       )}
       {subs.length > 0 && (
         <label className="subpick">

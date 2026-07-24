@@ -270,6 +270,9 @@ pub const WEB_TARGET: Target = Target { video: &["h264"], audio: &["aac", "mp3"]
 pub struct RemuxPlan {
     pub video: StreamMode,
     pub audio: StreamMode,
+    /// Which audio stream to carry, indexed over the file's audio
+    /// streams in discovery/demux order (HUB-27 track selection).
+    pub audio_track: usize,
 }
 
 impl RemuxPlan {
@@ -285,7 +288,13 @@ impl RemuxPlan {
     }
 }
 
-pub fn plan_streams(info: &kahawai_core::media::MediaInfo, target: &Target) -> RemuxPlan {
+pub fn plan_streams(
+    info: &kahawai_core::media::MediaInfo,
+    target: &Target,
+    audio_track: usize,
+) -> RemuxPlan {
+    // Clamp a stale index (rescan shrank the track list) to the last track.
+    let audio_track = audio_track.min(info.audio.len().saturating_sub(1));
     let names = ts_muxable_names();
     let copyable = |kind: &str, codec: &str, accepted: &[&str]| {
         accepted.contains(&codec)
@@ -303,19 +312,20 @@ pub fn plan_streams(info: &kahawai_core::media::MediaInfo, target: &Target) -> R
     } else {
         StreamMode::Off
     };
-    let audio = if info.audio.iter().any(|a| copyable("audio", &a.codec, target.audio)) {
+    // The plan judges the SELECTED track, not "any track": switching
+    // from an AAC track to a DTS one flips copy → encode.
+    let selected = info.audio.get(audio_track);
+    let audio = if selected.is_some_and(|a| copyable("audio", &a.codec, target.audio)) {
         StreamMode::Copy
     } else if aac_encoder().is_some()
-        && info
-            .audio
-            .iter()
-            .any(|a| codec_to_caps_name("audio", &a.codec).is_some_and(can_decode))
+        && selected
+            .is_some_and(|a| codec_to_caps_name("audio", &a.codec).is_some_and(can_decode))
     {
         StreamMode::Encode
     } else {
         StreamMode::Off
     };
-    RemuxPlan { video, audio }
+    RemuxPlan { video, audio, audio_track }
 }
 
 /// Human-readable per-kind verdict for the playback-info overlay
@@ -355,7 +365,12 @@ pub fn plan_summary(
     };
     (
         kind_summary("video", info.video.iter().map(|v| v.codec.as_str()).collect(), plan.video, "h264"),
-        kind_summary("audio", info.audio.iter().map(|a| a.codec.as_str()).collect(), plan.audio, "aac"),
+        kind_summary(
+            "audio",
+            info.audio.get(plan.audio_track).map(|a| a.codec.as_str()).into_iter().collect(),
+            plan.audio,
+            "aac",
+        ),
     )
 }
 
@@ -521,6 +536,7 @@ fn plumb_parsed_pad(
     pad: &gst::Pad,
     plan: RemuxPlan,
     gate: &Option<Arc<SeekGate>>,
+    audio_seen: &Arc<std::sync::atomic::AtomicUsize>,
 ) {
     // queue: decouples the muxer from parsebin's threads (the aggregator
     // deadlocks without it). Default queue limits (1 MiB / 1 s) are far
@@ -545,6 +561,28 @@ fn plumb_parsed_pad(
         .or_else(|| pad.current_caps())
         .unwrap_or_else(gst::Caps::new_empty);
     let name = advertised.structure(0).map(|s| s.name().to_string()).unwrap_or_default();
+    // Track selection: only the plan's audio track proceeds (demux order
+    // matches discovery order — the assumption subtitle extraction
+    // already relies on). Streams whose advertised caps hide their
+    // audio-ness take the deferred path uncounted; acceptable, they're
+    // also unroutable-looking to the picker UI.
+    if name.starts_with("audio/") {
+        let idx = audio_seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if idx != plan.audio_track {
+            tracing::info!(caps = %name, idx, selected = plan.audio_track, "remux: dropping unselected audio track");
+            let fake = gst::ElementFactory::make("fakesink")
+                .property("sync", false)
+                .property("async", false)
+                .build()
+                .unwrap();
+            pipe.add(&fake).unwrap();
+            fake.sync_state_with_parent().unwrap();
+            if let Err(e) = qsrc.link(&fake.static_pad("sink").unwrap()) {
+                tracing::warn!(caps = %name, error = %e, "remux: fakesink link failed");
+            }
+            return;
+        }
+    }
     if routable(&name, &plan) {
         route_stream(pipe, waiting, &qsrc, &advertised, plan, gate);
         return;
@@ -1174,8 +1212,9 @@ pub fn start_paced(
     let pipe = pipeline.clone();
     let waiting2 = waiting.clone();
     let gate2 = gate.clone();
+    let audio_seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     parsebin.connect_pad_added(move |_, pad| {
-        plumb_parsed_pad(&pipe, &waiting2, pad, plan, &gate2);
+        plumb_parsed_pad(&pipe, &waiting2, pad, plan, &gate2, &audio_seen);
     });
 
     let error = Arc::new(Mutex::new(None::<String>));
@@ -1283,10 +1322,61 @@ impl Drop for RemuxJob {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn selects_requested_audio_track() {
+        crate::init().unwrap();
+        let Some(aac) = aac_encoder() else {
+            eprintln!("skipping: no AAC encoder installed");
+            return;
+        };
+        // Two AAC tracks distinguishable by channel count: 0 = stereo,
+        // 1 = mono. Selecting track 1 must put MONO audio in the output.
+        let dir = tempfile::tempdir().unwrap();
+        let mkv = dir.path().join("two-audio.mkv");
+        let launch = format!(
+            "videotestsrc num-buffers=60 ! video/x-raw,width=64,height=48 ! x264enc ! h264parse ! mux.              audiotestsrc num-buffers=90 ! audio/x-raw,channels=2 ! audioconvert ! {aac} ! aacparse ! mux.              audiotestsrc num-buffers=90 freq=880 ! audio/x-raw,channels=1 ! audioconvert ! {aac} ! aacparse ! mux.              matroskamux name=mux ! filesink location={}",
+            mkv.display()
+        );
+        let pipe = gst::parse::launch(&launch).unwrap();
+        pipe.set_state(gst::State::Playing).unwrap();
+        let msg = pipe.bus().unwrap().timed_pop_filtered(
+            gst::ClockTime::from_seconds(30),
+            &[gst::MessageType::Eos, gst::MessageType::Error],
+        );
+        pipe.set_state(gst::State::Null).unwrap();
+        assert_eq!(msg.map(|m| m.type_()), Some(gst::MessageType::Eos), "fixture build failed");
+
+        for (track, want_channels) in [(0u32, 2u32), (1, 1)] {
+            let info = crate::discover(&mkv, std::time::Duration::from_secs(10)).unwrap();
+            assert_eq!(info.audio.len(), 2, "{info:?}");
+            let plan = plan_streams(&info, &WEB_TARGET, track as usize);
+            let out = tempfile::tempdir().unwrap();
+            let job =
+                start(out.path(), plan, Box::new(FileSource::open(&mkv).unwrap())).unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while !job.finished() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            assert!(job.failed().is_none(), "{:?}", job.failed());
+            let seg = std::fs::read_dir(out.path())
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .find(|p| p.extension().is_some_and(|x| x == "ts"))
+                .expect("no segment produced");
+            let seg_info = crate::discover(&seg, std::time::Duration::from_secs(10)).unwrap();
+            assert_eq!(seg_info.audio.len(), 1, "track {track}: {seg_info:?}");
+            assert_eq!(
+                seg_info.audio[0].channels, want_channels,
+                "track {track} selected the wrong audio: {seg_info:?}"
+            );
+        }
+    }
+
     use super::*;
     use std::time::{Duration, Instant};
 
-    const COPY_AV: RemuxPlan = RemuxPlan { video: StreamMode::Copy, audio: StreamMode::Copy };
+    const COPY_AV: RemuxPlan = RemuxPlan { video: StreamMode::Copy, audio: StreamMode::Copy, audio_track: 0 };
 
     /// Manual repro: REMUX_SRC=/path/to/file cargo test -p kahawai-media \
     ///   remux_file_from_env -- --ignored --nocapture
@@ -1296,7 +1386,7 @@ mod tests {
         let src = std::path::PathBuf::from(std::env::var("REMUX_SRC").expect("set REMUX_SRC"));
         let out = tempfile::tempdir().unwrap();
         let info = crate::discover(&src, Duration::from_secs(30)).unwrap();
-        let plan = plan_streams(&info, &WEB_TARGET);
+        let plan = plan_streams(&info, &WEB_TARGET, 0);
         eprintln!("plan: {plan:?}");
         let job = start(out.path(), plan, Box::new(FileSource::open(&src).unwrap())).unwrap();
         let deadline = Instant::now() + Duration::from_secs(120);
@@ -1329,7 +1419,7 @@ mod tests {
             audio: vec![kahawai_core::media::AudioStream { codec: "eac3".into(), ..Default::default() }],
             ..Default::default()
         };
-        let plan = plan_streams(&info, &WEB_TARGET);
+        let plan = plan_streams(&info, &WEB_TARGET, 0);
         // hevc is muxable but not in the web target: transcode or drop.
         assert_ne!(plan.video, StreamMode::Copy);
         // eac3 is neither web-playable nor muxable: never Copy.
@@ -1408,7 +1498,7 @@ mod tests {
         crate::testutil::render_h264_eac3_mkv(&src_path);
 
         let info = crate::discover(&src_path, Duration::from_secs(30)).unwrap();
-        let plan = plan_streams(&info, &WEB_TARGET);
+        let plan = plan_streams(&info, &WEB_TARGET, 0);
         assert_eq!(plan.audio, StreamMode::Encode, "eac3 should plan as Encode: {info:?}");
         assert_eq!(plan.video, StreamMode::Copy);
 
@@ -1454,7 +1544,7 @@ mod tests {
         ));
 
         let info = crate::discover(&src_path, Duration::from_secs(30)).unwrap();
-        let plan = plan_streams(&info, &WEB_TARGET);
+        let plan = plan_streams(&info, &WEB_TARGET, 0);
         assert_eq!(plan.video, StreamMode::Encode, "mpeg4 should plan as Encode: {info:?}");
         assert_eq!(plan.audio, StreamMode::Copy, "aac should copy: {info:?}");
 
@@ -1524,7 +1614,7 @@ mod tests {
         crate::testutil::render_h264_flac_mkv(&src_path); // ~10 s
 
         let info = crate::discover(&src_path, Duration::from_secs(30)).unwrap();
-        let plan = plan_streams(&info, &WEB_TARGET);
+        let plan = plan_streams(&info, &WEB_TARGET, 0);
         assert_eq!(plan.audio, StreamMode::Encode, "flac should plan Encode: {info:?}");
 
         let out = tempfile::tempdir().unwrap();

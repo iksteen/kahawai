@@ -73,10 +73,12 @@ impl Runner {
         size: u64,
         video: &str,
         audio: &str,
+        audio_track: u32,
         start_ms: u64,
         sink: &str,
     ) {
-        let result = self.start_inner(&session_id, size, video, audio, start_ms, sink).await;
+        let result =
+            self.start_inner(&session_id, size, video, audio, audio_track, start_ms, sink).await;
         let msg = match result {
             Ok(()) => {
                 tracing::info!(session = %session_id, "session ready");
@@ -107,6 +109,7 @@ impl Runner {
         size: u64,
         video: &str,
         audio: &str,
+        audio_track: u32,
         start_ms: u64,
         sink: &str,
     ) -> Result<()> {
@@ -142,6 +145,7 @@ impl Runner {
                     .arg(size.to_string())
                     .args(["--video", video])
                     .args(["--audio", audio])
+                    .args(["--audio-track", &audio_track.to_string()])
                     .args(["--start-ms", &start_ms.to_string()])
                     .args(if sink.is_empty() { vec![] } else { vec!["--sink".into(), sink.to_string()] })
                     .stderr(std::process::Stdio::from(log))
@@ -162,7 +166,8 @@ impl Runner {
                 let err2 = err.clone();
                 let handle = tokio::task::spawn_blocking(move || {
                     if let Err(e) = kahawai_media::worker::run(
-                        &sock, &dir, size, v, a, start_ms, sink_owned.as_deref(),
+                        &sock, &dir, size, v, a, audio_track as usize, start_ms,
+                        sink_owned.as_deref(),
                     ) {
                         tracing::warn!(error = format!("{e:#}"), "in-process worker failed");
                         *err2.lock().unwrap() = Some(format!("{e:#}"));

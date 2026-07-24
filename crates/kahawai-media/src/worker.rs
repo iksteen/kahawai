@@ -70,12 +70,13 @@ pub fn run(
     size: u64,
     video: StreamMode,
     audio: StreamMode,
+    audio_track: usize,
     start_ms: u64,
     sink: Option<&str>,
 ) -> Result<()> {
     let stream = UnixStream::connect(socket)
         .with_context(|| format!("connecting to {}", socket.display()))?;
-    let plan = RemuxPlan { video, audio };
+    let plan = RemuxPlan { video, audio, audio_track };
     // Pacing window (§4.6): transcode ahead of the viewer, but not the
     // whole film. The supervisor keeps `viewer.pos` fresh (absolute ms,
     // from the client's progress pings); muxer-bound buffers beyond

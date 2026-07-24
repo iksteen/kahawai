@@ -140,7 +140,7 @@ fn entries(info: &kahawai_core::media::MediaInfo) -> Vec<SubtitleEntry> {
 
 /// The item's source the way `Sessions::open_source` picks it, without
 /// opening a lease: (module, collection, path, streams info).
-async fn source_row(
+pub(crate) async fn source_row(
     registry: &Registry,
     item_id: &str,
 ) -> Result<(String, String, String, kahawai_core::media::MediaInfo)> {

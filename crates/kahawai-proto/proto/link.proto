@@ -219,6 +219,9 @@ message StartSession {
   // HLS sink override (empty = preference order). Set on retry after a
   // sink crash (TC-6 fallback: hlssink3 bugs, hlssink2 works).
   string sink = 6;
+  // Audio track index in discovery order (HUB-27). Old transcoders
+  // ignore this and play track 0.
+  uint32 audio_track = 7;
 }
 
 message EndSession {
