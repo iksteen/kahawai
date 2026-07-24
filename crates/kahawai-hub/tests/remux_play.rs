@@ -229,7 +229,7 @@ async fn remux_to_hls_end_to_end() {
         )
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert_eq!(resp.status(), StatusCode::OK); // returns {part_base_ms}
     let tail_playlist = tokio::time::timeout(Duration::from_secs(20), async {
         loop {
             let resp = api

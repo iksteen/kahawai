@@ -191,6 +191,10 @@ export type Session = {
   content_type: string
   size: number
   duration_ms: number | null
+  /// Timeline base of the part the pipeline started in (multi-part
+  /// CD1/CD2 sources; 0 for single files).
+  part_base_ms?: number
+  parts?: number
   streams: StreamVerdict | null
 }
 
@@ -220,8 +224,8 @@ export function seekSession(
   positionMs: number,
   audioTrack?: number,
   videoTrack?: number,
-) {
-  return api(`/api/v1/playback/sessions/${sessionId}/seek`, {
+): Promise<{ part_base_ms: number }> {
+  return json(`/api/v1/playback/sessions/${sessionId}/seek`, {
     method: 'POST',
     body: JSON.stringify({
       position_ms: Math.round(positionMs),

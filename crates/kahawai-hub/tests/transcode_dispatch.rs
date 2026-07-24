@@ -291,7 +291,7 @@ async fn dispatches_encode_session_to_transcoder() {
         .await
         .unwrap();
     let status = resp.status();
-    if status != StatusCode::NO_CONTENT {
+    if status != StatusCode::OK {
         let body = String::from_utf8_lossy(&body_bytes(resp).await).to_string();
         panic!("seek-restart failed: {status} — {body}");
     }

@@ -4,6 +4,7 @@
 use std::sync::Arc;
 
 use kahawai_hub::registry::{FileUpsertRecord, Registry};
+use sqlx::Row;
 use tower::ServiceExt;
 
 fn rec(path: &str, size: u64) -> FileUpsertRecord {
@@ -344,4 +345,61 @@ async fn manifest_and_files_seen_survive_rescan() {
         .await
         .unwrap();
     assert_eq!(items, 1, "resolved item survives the incremental rescan");
+}
+
+#[tokio::test]
+async fn multipart_movies_group_into_one_item() {
+    let db = kahawai_hub::db::open_in_memory().await.unwrap();
+    let registry = Registry::new(db.clone(), Default::default());
+    registry.record_satellite("01HOST", "mediahost", "nas", "fp").await.unwrap();
+    registry
+        .announce_collection("01HOST", "movies", "movies", &["/srv/movies".into()])
+        .await
+        .unwrap();
+    registry
+        .upsert_files(
+            "01HOST",
+            "movies",
+            vec![
+                rec("12 Monkeys - CD1.avi", 700),
+                rec("12 Monkeys - CD2.avi", 701),
+                rec("Heat (1995).mkv", 800),
+            ],
+        )
+        .await
+        .unwrap();
+
+    let items: Vec<String> =
+        sqlx::query_scalar("SELECT title FROM items WHERE kind='movie' ORDER BY title")
+            .fetch_all(&db)
+            .await
+            .unwrap();
+    assert_eq!(items, ["12 Monkeys", "Heat"], "{items:?}");
+
+    let parts: Vec<(String, Option<i64>)> = sqlx::query(
+        "SELECT s.path_rel, s.part FROM item_sources s
+         JOIN items i ON i.id = s.item_id WHERE i.title = '12 Monkeys'
+         ORDER BY s.part",
+    )
+    .fetch_all(&db)
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|r| (r.get::<String, _>("path_rel"), r.get("part")))
+    .collect();
+    assert_eq!(
+        parts,
+        vec![
+            ("12 Monkeys - CD1.avi".to_string(), Some(1)),
+            ("12 Monkeys - CD2.avi".to_string(), Some(2)),
+        ]
+    );
+    let heat_part: Option<i64> = sqlx::query_scalar(
+        "SELECT s.part FROM item_sources s JOIN items i ON i.id = s.item_id
+         WHERE i.title = 'Heat'",
+    )
+    .fetch_one(&db)
+    .await
+    .unwrap();
+    assert_eq!(heat_part, None);
 }

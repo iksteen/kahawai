@@ -41,6 +41,9 @@ export default function Player({
   // For HLS sessions the pipeline itself starts at resumeMs, so the
   // playlist's t=0 is that offset; direct sessions play the real file.
   const offsetRef = useRef(isHls ? resumeMs : 0)
+  // Multi-part sources: the pipeline's start.pos is local to its part;
+  // the absolute timeline origin is partBase + start.pos.
+  const partBaseRef = useRef(session.part_base_ms ?? 0)
   const durationMs = session.duration_ms ?? 0
   const [posMs, setPosMs] = useState(offsetRef.current)
   const [seeking, setSeeking] = useState(false)
@@ -82,7 +85,8 @@ export default function Player({
     setSeeking(true)
     try {
       const absMs = offsetRef.current + video.currentTime * 1000
-      await seekSession(session.session_id, absMs, audio, video_)
+      const r = await seekSession(session.session_id, absMs, audio, video_)
+      partBaseRef.current = r.part_base_ms ?? 0
       offsetRef.current = Math.round(absMs)
       setPosMs(offsetRef.current)
       setTrackEpoch((e) => e + 1)
@@ -109,7 +113,8 @@ export default function Player({
       try {
         const r = await api(`${base}start.pos`)
         if (r.ok) {
-          const n = Math.round(Number(await r.text()))
+          const local = Math.round(Number(await r.text()))
+          const n = partBaseRef.current + local
           if (
             Number.isFinite(n) &&
             n !== offsetRef.current &&
@@ -179,7 +184,8 @@ export default function Player({
     }
     setSeeking(true)
     try {
-      await seekSession(session.session_id, targetMs)
+      const r = await seekSession(session.session_id, targetMs)
+      partBaseRef.current = r.part_base_ms ?? 0
       offsetRef.current = Math.round(targetMs)
       setPosMs(targetMs)
       setTrackEpoch((e) => e + 1)
@@ -208,7 +214,15 @@ export default function Player({
       if (!video.paused) report()
     }, 10_000)
     const onPause = () => report()
-    const onEnded = () => report()
+    const onEnded = () => {
+      report()
+      // Multi-part sources (CD1/CD2): this part's playlist ended but
+      // the film hasn't — restart into the next part.
+      if (isHls && (session.parts ?? 1) > 1 && durationMs > 0) {
+        const abs = absMs()
+        if (abs < durationMs - 3000) void seekTo(abs + 250)
+      }
+    }
     video.addEventListener('pause', onPause)
     video.addEventListener('ended', onEnded)
     const onUnload = () => {

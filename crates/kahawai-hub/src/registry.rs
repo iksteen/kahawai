@@ -482,9 +482,11 @@ impl Registry {
 
             // Resolve to a playable item: movies map straight to a
             // movie item; series files map to an episode under a show.
+            let mut source_part: Option<u32> = None;
             let resolved_item: Option<String> = if resolve_movies {
                 let filename = f.path_rel.rsplit('/').next().unwrap_or(&f.path_rel);
                 let guess = names::parse_movie(filename);
+                source_part = guess.part;
                 let norm = names::normalize_title(&guess.title);
                 let existing: Option<String> = sqlx::query_scalar(
                     "SELECT id FROM items WHERE kind = 'movie' AND norm_title = ? AND year IS ?",
@@ -686,15 +688,16 @@ impl Registry {
 
             if let Some(item_id) = resolved_item {
                 sqlx::query(
-                    "INSERT INTO item_sources (module_id, collection_id, path_rel, item_id)
-                     VALUES (?, ?, ?, ?)
+                    "INSERT INTO item_sources (module_id, collection_id, path_rel, item_id, part)
+                     VALUES (?, ?, ?, ?, ?)
                      ON CONFLICT (module_id, collection_id, path_rel) DO UPDATE
-                     SET item_id = excluded.item_id",
+                     SET item_id = excluded.item_id, part = excluded.part",
                 )
                 .bind(module_id)
                 .bind(collection_id)
                 .bind(&f.path_rel)
                 .bind(&item_id)
+                .bind(source_part)
                 .execute(&mut *tx)
                 .await?;
 
@@ -725,6 +728,23 @@ impl Registry {
                 .await?;
             }
         }
+        // Re-resolution can repoint every source away from an item
+        // (multi-part regrouping, better parses) without any file being
+        // deleted — sweep orphans here, not only in reconciliation.
+        sqlx::query(
+            "DELETE FROM items WHERE kind NOT IN ('show', 'album') AND id IN (
+                SELECT i.id FROM items i
+                LEFT JOIN item_sources s ON s.item_id = i.id
+                WHERE s.item_id IS NULL)",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "DELETE FROM items WHERE kind IN ('show', 'album') AND id NOT IN (
+                SELECT DISTINCT p.parent_id FROM items p WHERE p.parent_id IS NOT NULL)",
+        )
+        .execute(&mut *tx)
+        .await?;
         tx.commit().await?;
         Ok(n)
     }

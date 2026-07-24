@@ -52,6 +52,7 @@ pub fn router(
         .route("/api/v1/playback/sessions/{id}", axum::routing::delete(end_session))
         .route("/api/v1/playback/sessions/{id}/stream", get(stream_session))
         .route("/api/v1/playback/sessions/{id}/progress", post(post_progress))
+        .route("/api/v1/playback/sessions/{id}/seek", post(seek_session))
         .route("/api/v1/playback/sessions/{id}/{file}", get(session_file))
         .route_layer(axum::middleware::from_fn_with_state(state.clone(), require_auth));
     let admin = Router::new()
@@ -75,7 +76,6 @@ pub fn router(
         .route("/admin/v1/providers", get(admin_providers))
         .route("/admin/v1/providers/tmdb", post(admin_set_tmdb))
         .route("/admin/v1/enrich", get(admin_enrich_status).post(admin_enrich_run))
-        .route("/api/v1/playback/sessions/{id}/seek", post(seek_session))
         .route("/admin/v1/sessions", get(admin_sessions))
         .route("/admin/v1/sessions/{id}", axum::routing::delete(admin_end_session))
         .route_layer(axum::middleware::from_fn(require_admin))
@@ -533,6 +533,8 @@ async fn start_session(
             "mode": mode,
             "size": session.size,
             "duration_ms": session.duration_ms,
+            "part_base_ms": session.part_base_ms(),
+            "parts": session.parts.len(),
             "content_type": ctype,
             "stream_url": stream_url,
             "streams": session.verdict.as_ref().map(|(video, audio)| json!({
@@ -557,13 +559,13 @@ async fn seek_session(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(body): Json<SeekRequest>,
-) -> Result<StatusCode, ApiError> {
-    state
+) -> Result<Json<Value>, ApiError> {
+    let part_base_ms = state
         .sessions
         .seek(&state.registry, &id, body.position_ms, body.audio_track, body.video_track)
         .await
         .map_err(|e| (StatusCode::CONFLICT, format!("{e:#}")))?;
-    Ok(StatusCode::NO_CONTENT)
+    Ok(Json(json!({ "part_base_ms": part_base_ms })))
 }
 
 async fn end_session(

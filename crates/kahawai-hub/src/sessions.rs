@@ -66,12 +66,28 @@ impl RemuxRunner {
     }
 }
 
+/// One file of a (possibly multi-part) source, with its absolute
+/// timeline offset. CD1/CD2-era rips: parts play as one continuous
+/// timeline; part boundaries are ordinary seek-restarts.
+#[derive(Debug, Clone)]
+pub struct PartSource {
+    pub module_id: String,
+    pub collection_id: String,
+    pub path_rel: String,
+    pub size: u64,
+    pub base_ms: u64,
+    pub duration_ms: u64,
+}
+
 pub struct Session {
     pub id: String,
     pub user_id: String,
     pub item_id: String,
     pub module_id: String,
     pub size: u64,
+    /// All parts in timeline order (len 1 for single-file sources).
+    pub parts: Vec<PartSource>,
+    pub current_part: std::sync::atomic::AtomicUsize,
     pub container: Option<String>,
     pub duration_ms: Option<u64>,
     pub mode: Mode,
@@ -86,7 +102,23 @@ pub struct Session {
     touched: Mutex<std::time::Instant>,
 }
 
+/// Index of the part containing `abs_ms`.
+fn part_index(parts: &[PartSource], abs_ms: u64) -> usize {
+    parts
+        .iter()
+        .rposition(|p| abs_ms >= p.base_ms)
+        .unwrap_or(0)
+}
+
 impl Session {
+    /// Timeline base of the part currently playing (0 for single-file).
+    pub fn part_base_ms(&self) -> u64 {
+        self.parts
+            .get(self.current_part.load(std::sync::atomic::Ordering::SeqCst))
+            .map(|p| p.base_ms)
+            .unwrap_or(0)
+    }
+
     /// Any client activity (stream chunks, playlist/segment fetches,
     /// progress pings) keeps the session alive (HUB-18).
     pub fn touch(&self) {
@@ -188,7 +220,10 @@ pub struct Sessions {
     active: Mutex<HashMap<String, Arc<Session>>>,
     /// Source leases for dispatched sessions (the transcoder pulls bytes
     /// over its link; lives from dispatch to session end).
-    tc_leases: Mutex<HashMap<String, (Lease, u64)>>,
+    /// Hub-held source leases of dispatched sessions: (lease, size,
+    /// part index) — reused across restarts within the same part so
+    /// recovery works even when the mediahost link is flapping.
+    tc_leases: Mutex<HashMap<String, (Lease, u64, usize)>>,
     /// Sessions awaiting the transcoder's ready/error verdict.
     pending_ready: Mutex<HashMap<String, tokio::sync::oneshot::Sender<Result<(), String>>>>,
     /// In-flight artifact fetches, keyed by (session, name).
@@ -262,17 +297,33 @@ impl Sessions {
     /// Pick the best available source for an item and open a read lease
     /// on its mediahost. Used at session start and on seek-restarts of
     /// local remux sessions (whose lease died with the old worker).
+    /// Single-part only (subtitle extraction and friends).
     pub(crate) async fn open_source(
         &self,
         registry: &Registry,
         item_id: &str,
     ) -> Result<(String, String, u64, kahawai_core::media::MediaInfo, Lease)> {
+        let (parts, info) = self.source_parts(registry, item_id).await?;
+        let p = &parts[0];
+        let lease =
+            self.open_lease(registry, &p.module_id, &p.collection_id, &p.path_rel).await?;
+        Ok((p.module_id.clone(), p.path_rel.clone(), p.size, info, lease))
+    }
+
+    /// All parts of the item's best available source in timeline order:
+    /// a complete single-file source wins; otherwise the CD1/CD2-style
+    /// part set (with cumulative timeline bases from per-part durations).
+    pub(crate) async fn source_parts(
+        &self,
+        registry: &Registry,
+        item_id: &str,
+    ) -> Result<(Vec<PartSource>, kahawai_core::media::MediaInfo)> {
         let rows = sqlx::query(
-            "SELECT s.module_id, s.collection_id, s.path_rel, f.size, f.streams_json
+            "SELECT s.module_id, s.collection_id, s.path_rel, s.part, f.size, f.streams_json
              FROM item_sources s
              JOIN files f ON (f.module_id, f.collection_id, f.path_rel)
                            = (s.module_id, s.collection_id, s.path_rel)
-             WHERE s.item_id = ? ORDER BY f.size DESC",
+             WHERE s.item_id = ? ORDER BY s.part IS NOT NULL, f.size DESC",
         )
         .bind(item_id)
         .fetch_all(registry.db())
@@ -280,21 +331,60 @@ impl Sessions {
         if rows.is_empty() {
             bail!("no sources for item");
         }
-        let source = rows
-            .iter()
-            .find(|r| registry.is_connected(&r.get::<String, _>("module_id")))
-            .context("no source is currently available (mediahost offline)")?;
-
-        let module_id: String = source.get("module_id");
-        let collection_id: String = source.get("collection_id");
-        let path_rel: String = source.get("path_rel");
-        let size = source.get::<i64, _>("size") as u64;
-        let info: kahawai_core::media::MediaInfo =
-            serde_json::from_str(source.get::<String, _>("streams_json").as_str())
-                .unwrap_or_default();
-
-        let lease = self.open_lease(registry, &module_id, &collection_id, &path_rel).await?;
-        Ok((module_id, path_rel, size, info, lease))
+        let parse_info = |r: &sqlx::sqlite::SqliteRow| -> kahawai_core::media::MediaInfo {
+            serde_json::from_str(r.get::<String, _>("streams_json").as_str()).unwrap_or_default()
+        };
+        // Complete single file first (query put part-NULL rows up front).
+        if let Some(r) = rows.iter().find(|r| {
+            r.get::<Option<i64>, _>("part").is_none()
+                && registry.is_connected(&r.get::<String, _>("module_id"))
+        }) {
+            let info = parse_info(r);
+            return Ok((
+                vec![PartSource {
+                    module_id: r.get("module_id"),
+                    collection_id: r.get("collection_id"),
+                    path_rel: r.get("path_rel"),
+                    size: r.get::<i64, _>("size") as u64,
+                    base_ms: 0,
+                    duration_ms: info.duration_ms.unwrap_or(0),
+                }],
+                info,
+            ));
+        }
+        // Part set: connected parts, ordered, deduped by part number.
+        let mut by_part: std::collections::BTreeMap<i64, &sqlx::sqlite::SqliteRow> =
+            Default::default();
+        for r in &rows {
+            if let Some(part) = r.get::<Option<i64>, _>("part")
+                && registry.is_connected(&r.get::<String, _>("module_id"))
+            {
+                by_part.entry(part).or_insert(r);
+            }
+        }
+        if by_part.is_empty() {
+            bail!("no source is currently available (mediahost offline)");
+        }
+        let mut parts = Vec::new();
+        let mut base = 0u64;
+        let mut first_info = None;
+        for (_, r) in by_part {
+            let info = parse_info(r);
+            let dur = info
+                .duration_ms
+                .context("multi-part source with unknown part duration")?;
+            parts.push(PartSource {
+                module_id: r.get("module_id"),
+                collection_id: r.get("collection_id"),
+                path_rel: r.get("path_rel"),
+                size: r.get::<i64, _>("size") as u64,
+                base_ms: base,
+                duration_ms: dur,
+            });
+            base += dur;
+            first_info.get_or_insert(info);
+        }
+        Ok((parts, first_info.unwrap()))
     }
 
     /// Open a read lease on an arbitrary path within a collection (also
@@ -340,8 +430,18 @@ impl Sessions {
         if user_active >= self.max_per_user {
             bail!("too many concurrent streams ({user_active}); close one first");
         }
-        let (module_id, path_rel, size, info, lease) =
-            self.open_source(registry, item_id).await?;
+        let (parts, info) = self.source_parts(registry, item_id).await?;
+        if parts.len() > 1 && mode == "direct" {
+            bail!("multi-part sources play via remux/transcode, not direct");
+        }
+        let total_ms: u64 = parts.iter().map(|p| p.duration_ms).sum();
+        let start_idx = part_index(&parts, start_ms);
+        let part = parts[start_idx].clone();
+        let local_ms = start_ms.saturating_sub(part.base_ms);
+        let (module_id, path_rel, size) =
+            (part.module_id.clone(), part.path_rel.clone(), part.size);
+        let lease =
+            self.open_lease(registry, &part.module_id, &part.collection_id, &part.path_rel).await?;
 
         let id = ulid::Ulid::new().to_string();
         let mut verdict = None;
@@ -388,13 +488,17 @@ impl Sessions {
                         // library files crash hlssink3 but mux fine on
                         // hlssink2 (upstream fix pending).
                         if let Err(first) = self
-                            .start_transcode(registry, &tc, &id, plan, lease.clone(), size, start_ms, "")
+                            .start_transcode(
+                                registry, &tc, &id, plan, lease.clone(), size, start_idx,
+                                local_ms, "",
+                            )
                             .await
                         {
                             tracing::warn!(session = %id, error = format!("{first:#}"),
                                 "start failed; retrying with fallback sink");
                             self.start_transcode(
-                                registry, &tc, &id, plan, lease, size, start_ms, "hlssink2",
+                                registry, &tc, &id, plan, lease, size, start_idx, local_ms,
+                                "hlssink2",
                             )
                             .await
                             .with_context(|| format!("first attempt: {first:#}"))?;
@@ -403,16 +507,22 @@ impl Sessions {
                     }
                     None => {
                         let runner = match self
-                            .start_remux(&id, plan, lease, size, start_ms, "")
+                            .start_remux(&id, plan, lease, size, local_ms, "")
                             .await
                         {
                             Ok(r) => r,
                             Err(first) => {
                                 tracing::warn!(session = %id, error = format!("{first:#}"),
                                     "start failed; retrying with fallback sink");
-                                let (_, _, size2, _, lease2) =
-                                    self.open_source(registry, item_id).await?;
-                                self.start_remux(&id, plan, lease2, size2, start_ms, "hlssink2")
+                                let lease2 = self
+                                    .open_lease(
+                                        registry,
+                                        &part.module_id,
+                                        &part.collection_id,
+                                        &part.path_rel,
+                                    )
+                                    .await?;
+                                self.start_remux(&id, plan, lease2, size, local_ms, "hlssink2")
                                     .await
                                     .with_context(|| format!("first attempt: {first:#}"))?
                             }
@@ -434,7 +544,9 @@ impl Sessions {
             module_id,
             size,
             container: info.container.clone(),
-            duration_ms: info.duration_ms,
+            duration_ms: if parts.len() > 1 { Some(total_ms) } else { info.duration_ms },
+            parts,
+            current_part: std::sync::atomic::AtomicUsize::new(start_idx),
             mode: session_mode,
             verdict,
             plan: Mutex::new(session_plan),
@@ -566,11 +678,12 @@ impl Sessions {
         plan: kahawai_media::remux::RemuxPlan,
         lease: Lease,
         size: u64,
+        part_idx: usize,
         start_ms: u64,
         sink: &str,
     ) -> Result<()> {
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-        self.tc_leases.lock().unwrap().insert(session_id.to_string(), (lease, size));
+        self.tc_leases.lock().unwrap().insert(session_id.to_string(), (lease, size, part_idx));
         self.pending_ready.lock().unwrap().insert(session_id.to_string(), ready_tx);
 
         let start = kahawai_proto::v1::HubToTc {
@@ -680,7 +793,7 @@ impl Sessions {
         len: u64,
         req: u64,
     ) {
-        let Some((lease, size)) = self.tc_leases.lock().unwrap().get(session_id).cloned() else {
+        let Some((lease, size, _)) = self.tc_leases.lock().unwrap().get(session_id).cloned() else {
             tracing::debug!(session = session_id, "source read for unknown session");
             return;
         };
@@ -784,6 +897,8 @@ impl Sessions {
     /// again at `position_ms` (keyframe-snapped by the demuxer). Same
     /// session id, same URLs — the client re-attaches to a playlist that
     /// now begins at the offset.
+    /// Returns the timeline base of the part the restart landed in
+    /// (players add it to the pipeline's local start.pos).
     pub async fn seek(
         self: &Arc<Self>,
         registry: &Registry,
@@ -791,7 +906,7 @@ impl Sessions {
         position_ms: u64,
         audio_track: Option<u32>,
         video_track: Option<u32>,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         let session = self.get(id).context("no such session")?;
         let mut plan =
             (*session.plan.lock().unwrap()).context("session has no restartable pipeline")?;
@@ -812,30 +927,31 @@ impl Sessions {
             anyhow::ensure!(plan.playable(), "selected track is not playable");
             *session.plan.lock().unwrap() = Some(plan);
         }
+        // Map the absolute position onto the right part (single-part
+        // sessions: part 0, local == absolute).
+        let idx = part_index(&session.parts, position_ms);
+        let part = session.parts.get(idx).context("session has no parts")?.clone();
+        let local_ms = position_ms.saturating_sub(part.base_ms);
+        session.current_part.store(idx, std::sync::atomic::Ordering::SeqCst);
         match &session.mode {
             Mode::Remux { dir, runner } => {
                 let old =
                     std::mem::replace(&mut *runner.lock().unwrap(), RemuxRunner::Stopped);
                 old.stop_and_wait().await;
                 let _ = std::fs::remove_dir_all(dir);
-                // The old worker's lease died with it; open a fresh one.
-                let (_, _, size, _, lease) =
-                    self.open_source(registry, &session.item_id).await?;
-                let fresh =
-                    self.start_remux(&session.id, plan, lease, size, position_ms, "").await?;
+                // The old worker's lease died with it; open a fresh one
+                // on whichever part the target lands in.
+                let lease = self
+                    .open_lease(registry, &part.module_id, &part.collection_id, &part.path_rel)
+                    .await?;
+                let fresh = self
+                    .start_remux(&session.id, plan, lease, part.size, local_ms, "")
+                    .await?;
                 *runner.lock().unwrap() = fresh;
-                Ok(())
+                Ok(part.base_ms)
             }
             Mode::Transcode { transcoder } => {
                 let tc = transcoder.lock().unwrap().clone();
-                // The hub-held lease survives restarts; reuse it.
-                let (lease, size) = self
-                    .tc_leases
-                    .lock()
-                    .unwrap()
-                    .get(&session.id)
-                    .cloned()
-                    .context("dispatched session lost its source lease")?;
                 let _ = registry
                     .send_to_tc(
                         &tc,
@@ -847,9 +963,28 @@ impl Sessions {
                     )
                     .await;
                 registry.tc_session_ended(&tc);
-                self.tc_leases.lock().unwrap().remove(&session.id);
-                self.start_transcode(registry, &tc, &session.id, plan, lease, size, position_ms, "")
-                    .await
+                // The hub-held lease survives restarts; reuse it while
+                // the target stays inside the same part (works even when
+                // the mediahost link is flapping). Crossing parts needs
+                // a lease on the other file.
+                let held = self.tc_leases.lock().unwrap().remove(&session.id);
+                let lease = match held {
+                    Some((lease, _, held_idx)) if held_idx == idx => lease,
+                    _ => {
+                        self.open_lease(
+                            registry,
+                            &part.module_id,
+                            &part.collection_id,
+                            &part.path_rel,
+                        )
+                        .await?
+                    }
+                };
+                self.start_transcode(
+                    registry, &tc, &session.id, plan, lease, part.size, idx, local_ms, "",
+                )
+                .await?;
+                Ok(part.base_ms)
             }
             Mode::Direct { .. } => bail!("direct sessions seek with range requests"),
         }
@@ -904,14 +1039,6 @@ impl Sessions {
         let new_tc = registry
             .pick_transcoder(&session.needs)
             .context("no capable transcoder left")?;
-        let (lease, size) = self
-            .tc_leases
-            .lock()
-            .unwrap()
-            .get(id)
-            .cloned()
-            .context("session lost its source lease")?;
-        self.tc_leases.lock().unwrap().remove(id);
         // Resume where the viewer was: the player posts progress every
         // 10 s, which is exactly the doc's start_offset for AR-6.
         let position_ms: i64 = sqlx::query_scalar(
@@ -922,7 +1049,21 @@ impl Sessions {
         .fetch_optional(registry.db())
         .await?
         .unwrap_or(0);
-        self.start_transcode(registry, &new_tc, id, plan, lease, size, position_ms.max(0) as u64, "")
+        let idx = part_index(&session.parts, position_ms.max(0) as u64);
+        let part = session.parts.get(idx).context("session has no parts")?.clone();
+        let local_ms = (position_ms.max(0) as u64).saturating_sub(part.base_ms);
+        session.current_part.store(idx, std::sync::atomic::Ordering::SeqCst);
+        // Reuse the hub-held lease when the position is still in its
+        // part — the mediahost may be unreachable during a fleet blip.
+        let held = self.tc_leases.lock().unwrap().remove(id);
+        let lease = match held {
+            Some((lease, _, held_idx)) if held_idx == idx => lease,
+            _ => {
+                self.open_lease(registry, &part.module_id, &part.collection_id, &part.path_rel)
+                    .await?
+            }
+        };
+        self.start_transcode(registry, &new_tc, id, plan, lease, part.size, idx, local_ms, "")
             .await?;
         *transcoder.lock().unwrap() = new_tc.clone();
         Ok(new_tc)

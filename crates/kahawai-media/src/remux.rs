@@ -1295,6 +1295,11 @@ pub fn start_paced(
         anyhow::ensure!(parsebin.send_event(seek), "demuxer refused the start-offset seek");
         gate.open_reporting(out_dir.join("start.pos"));
     }
+    if start_ms == 0 {
+        // Consistent origin reporting: zero-offset runs have a known
+        // origin, write it so players can always sum base + start.pos.
+        let _ = std::fs::write(out_dir.join("start.pos"), "0");
+    }
     pipeline.set_state(gst::State::Playing)?;
     Ok(RemuxJob { pipeline, error, finished, stopping })
 }

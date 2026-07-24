@@ -5,6 +5,8 @@
 pub struct MovieGuess {
     pub title: String,
     pub year: Option<u16>,
+    /// CD1/CD2-era multi-part rips: 1-based part number, None = whole film.
+    pub part: Option<u32>,
 }
 
 /// Parse a movie filename: `The.Matrix.1999.1080p.x264-GRP.mkv` →
@@ -17,7 +19,46 @@ pub fn parse_movie(filename: &str) -> MovieGuess {
         .map(|c| if matches!(c, '.' | '_') { ' ' } else { c })
         .collect();
 
-    let tokens: Vec<&str> = cleaned.split_whitespace().collect();
+    let mut tokens: Vec<&str> = cleaned.split_whitespace().collect();
+    // Part token: "CD1", "cd 2", "Disc1" — as its own token or
+    // marker+digit pair. Deliberately ONLY the cd/disc family:
+    // "Part 2" is a legitimate title suffix (Deathly Hallows), and
+    // merging those would be catastrophic.
+    let mut part = None;
+    let part_of = |tok: &str| -> Option<u32> {
+        let t = tok.to_ascii_lowercase();
+        for marker in ["cd", "disc", "disk"] {
+            if let Some(rest) = t.strip_prefix(marker)
+                && !rest.is_empty()
+                && rest.len() <= 2
+                && rest.chars().all(|c| c.is_ascii_digit())
+            {
+                return rest.parse().ok();
+            }
+        }
+        None
+    };
+    let mut i = 0;
+    while i < tokens.len() {
+        let tok = tokens[i].trim_matches(['(', ')', '[', ']', '-']);
+        if let Some(n) = part_of(tok) {
+            part = Some(n);
+            tokens.remove(i);
+            continue;
+        }
+        // Split form: "cd 2" / "disc 1".
+        if matches!(tok.to_ascii_lowercase().as_str(), "cd" | "disc" | "disk")
+            && i + 1 < tokens.len()
+            && tokens[i + 1].len() <= 2
+            && tokens[i + 1].chars().all(|c| c.is_ascii_digit())
+        {
+            part = tokens[i + 1].parse().ok();
+            tokens.drain(i..=i + 1);
+            continue;
+        }
+        i += 1;
+    }
+
     let mut year = None;
     let mut title_end = tokens.len();
     for (i, tok) in tokens.iter().enumerate().rev() {
@@ -39,7 +80,7 @@ pub fn parse_movie(filename: &str) -> MovieGuess {
     if title.is_empty() {
         title = tokens.join(" ");
     }
-    MovieGuess { title, year }
+    MovieGuess { title, year, part }
 }
 
 fn parse_year_token(tok: &str) -> Option<u16> {
@@ -407,6 +448,23 @@ mod tests {
             normalize_title("Léon: The Professional"),
             normalize_title("léon the professional")
         );
+    }
+
+    #[test]
+    fn parses_multipart_movies() {
+        let g = parse_movie("12 Monkeys - CD1.avi");
+        assert_eq!((g.title.as_str(), g.year, g.part), ("12 Monkeys", None, Some(1)));
+        let g = parse_movie("300 - CD2.avi");
+        assert_eq!((g.title.as_str(), g.part), ("300", Some(2)));
+        let g = parse_movie("Alexander.2004.Disc 2.DVDRip.avi");
+        assert_eq!((g.title.as_str(), g.year, g.part), ("Alexander", Some(2004), Some(2)));
+        // "Part N" is a TITLE, never a part marker.
+        let g = parse_movie("Harry Potter and the Deathly Hallows Part 2 (2011).mkv");
+        assert_eq!(g.part, None);
+        assert!(g.title.contains("Part 2"));
+        // discography noise doesn't trip it: "cd" needs a digit suffix.
+        let g = parse_movie("The Cd Collector (1999).mkv");
+        assert_eq!(g.part, None);
     }
 
     #[test]
