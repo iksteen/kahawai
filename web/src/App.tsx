@@ -1,13 +1,15 @@
 import { useEffect, useState } from 'react'
 import { api, isAdmin, refreshTokens, storeTokens, username, type Item, type Session } from './api'
 import Auth from './views/Auth'
+import Libraries from './views/Libraries'
 import Library from './views/Library'
 import Detail from './views/Detail'
 import Player from './views/Player'
 import Admin from './views/Admin'
 
 type Route =
-  | { view: 'library' }
+  | { view: 'libraries' }
+  | { view: 'library'; id: string }
   | { view: 'admin' }
   | { view: 'detail'; id: string; autoPlay?: boolean }
   | { view: 'player'; item: Item; session: Session; resumeMs: number }
@@ -21,8 +23,10 @@ const BASE = '/app'
 // it re-enters the detail view with autoplay instead.
 function routeToPath(route: Route): string {
   switch (route.view) {
-    case 'library':
+    case 'libraries':
       return `${BASE}/`
+    case 'library':
+      return `${BASE}/lib/${route.id}`
     case 'admin':
       return `${BASE}/admin`
     case 'detail':
@@ -36,10 +40,11 @@ function pathToRoute(pathname: string): Route {
   const rel = pathname.startsWith(BASE) ? pathname.slice(BASE.length) : pathname
   const parts = rel.split('/').filter(Boolean)
   if (parts[0] === 'admin') return { view: 'admin' }
+  if (parts[0] === 'lib' && parts[1]) return { view: 'library', id: parts[1] }
   if (parts[0] === 'item' && parts[1]) {
     return { view: 'detail', id: parts[1], autoPlay: parts[2] === 'play' }
   }
-  return { view: 'library' }
+  return { view: 'libraries' }
 }
 
 export default function App() {
@@ -88,7 +93,7 @@ export default function App() {
   return (
     <div className="shell">
       <header className="topbar">
-        <button className="wordmark" onClick={() => navigate({ view: 'library' })}>
+        <button className="wordmark" onClick={() => navigate({ view: 'libraries' })}>
           kahawai<span className="tilde">~</span>
         </button>
         <div className="topbar-right">
@@ -110,14 +115,20 @@ export default function App() {
         </div>
       </header>
       {route.view === 'admin' && <Admin />}
+      {route.view === 'libraries' && (
+        <Libraries onOpen={(id) => navigate({ view: 'library', id })} />
+      )}
       {route.view === 'library' && (
-        <Library onOpen={(id) => navigate({ view: 'detail', id })} />
+        <Library
+          libraryId={route.id}
+          onOpen={(id) => navigate({ view: 'detail', id })}
+        />
       )}
       {route.view === 'detail' && (
         <Detail
           id={route.id}
           autoPlay={route.autoPlay}
-          onBack={() => navigate({ view: 'library' })}
+          onBack={() => window.history.back()}
           onPlay={(item, session, resumeMs) =>
             navigate({ view: 'player', item, session, resumeMs })
           }

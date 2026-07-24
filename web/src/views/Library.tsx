@@ -1,21 +1,32 @@
 import { useEffect, useState } from 'react'
-import { json, type Item } from '../api'
+import { fetchItems, fetchLibraries, type Item } from '../api'
 
 function fmtResume(ms: number) {
   const s = Math.floor(ms / 1000)
   return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`
 }
 
-export default function Library({ onOpen }: { onOpen: (id: string) => void }) {
+export default function Library({
+  libraryId,
+  onOpen,
+}: {
+  libraryId: string
+  onOpen: (id: string) => void
+}) {
   const [items, setItems] = useState<Item[] | null>(null)
+  const [name, setName] = useState('Library')
   const [filter, setFilter] = useState('')
   const [error, setError] = useState('')
 
   useEffect(() => {
-    json<{ items: Item[] }>('/api/v1/items')
+    setItems(null)
+    fetchItems(libraryId)
       .then((r) => setItems(r.items))
       .catch((e) => setError(String(e)))
-  }, [])
+    fetchLibraries()
+      .then((r) => setName(r.libraries.find((l) => l.id === libraryId)?.name ?? 'Library'))
+      .catch(() => {})
+  }, [libraryId])
 
   if (error) return <div className="error page-pad">{error}</div>
   if (!items) return null
@@ -26,7 +37,7 @@ export default function Library({ onOpen }: { onOpen: (id: string) => void }) {
   return (
     <main>
       <div className="library-head">
-        <h1>Library</h1>
+        <h1>{name}</h1>
         <input
           className="filter"
           placeholder="Filter titles"
@@ -39,8 +50,8 @@ export default function Library({ onOpen }: { onOpen: (id: string) => void }) {
       </div>
       {items.length === 0 && (
         <p className="dim">
-          Nothing here yet. Connect a mediahost with a movies collection and
-          its scan will fill this page.
+          Nothing here yet. Attach a collection to this library and its scan
+          will fill this page.
         </p>
       )}
       <ul className="grid">

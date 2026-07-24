@@ -211,3 +211,109 @@ fn test_router(
     ));
     kahawai_hub::api::router(registry, auth, sessions, enrollments)
 }
+
+#[tokio::test]
+async fn items_filter_by_library() {
+    use kahawai_hub::registry::FileUpsertRecord;
+    let rec = |path: &str, size: u64| FileUpsertRecord {
+        path_rel: path.into(),
+        size,
+        mtime_unix: 1,
+        head_xxh3: size,
+        tail_xxh3: size + 1,
+        oshash: size + 2,
+        streams_json: "{}".into(),
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    let registry = Arc::new(Registry::new(db.clone(), Default::default()));
+    let auth = Arc::new(Auth::new(db.clone(), dir.path()).await.unwrap());
+    let setup_token = auth.setup_token().unwrap();
+    let api = test_router(
+        registry.clone(),
+        auth.clone(),
+        Arc::new(kahawai_hub::sessions::Sessions::new(tempfile::tempdir().unwrap().keep())),
+    );
+    let resp = api
+        .clone()
+        .oneshot(post(
+            "/api/v1/setup",
+            serde_json::json!({"token": setup_token, "username": "ingmar", "password": "hunter22222"}),
+        ))
+        .await
+        .unwrap();
+    let token = body_json(resp).await["access_token"].as_str().unwrap().to_string();
+
+    registry.record_satellite("01HOST", "mediahost", "nas", "fp").await.unwrap();
+    registry
+        .announce_collection("01HOST", "movies", "movies", &["/srv/movies".into()])
+        .await
+        .unwrap();
+    registry
+        .announce_collection("01HOST", "series", "series", &["/srv/series".into()])
+        .await
+        .unwrap();
+    registry
+        .upsert_files("01HOST", "movies", vec![rec("Heat (1995).mkv", 100)])
+        .await
+        .unwrap();
+    registry
+        .upsert_files("01HOST", "series", vec![rec("Andor/Season 1/Andor.S01E01.mkv", 200)])
+        .await
+        .unwrap();
+
+    let libs =
+        body_json(api.clone().oneshot(get_authed("/api/v1/libraries", &token)).await.unwrap())
+            .await;
+    let lib_id = |name: &str| {
+        libs["libraries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|l| l["name"] == name)
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+
+    // Unfiltered: movie + show. Per-library: exactly one each — the show
+    // matches through its episodes' sources, not its own (it has none).
+    let titles = |v: &serde_json::Value| {
+        v["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["title"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>()
+    };
+    let all =
+        body_json(api.clone().oneshot(get_authed("/api/v1/items", &token)).await.unwrap()).await;
+    assert_eq!(titles(&all), ["Andor", "Heat"]);
+    let movies = body_json(
+        api.clone()
+            .oneshot(get_authed(&format!("/api/v1/items?library={}", lib_id("movies")), &token))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(titles(&movies), ["Heat"]);
+    let series = body_json(
+        api.clone()
+            .oneshot(get_authed(&format!("/api/v1/items?library={}", lib_id("series")), &token))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(titles(&series), ["Andor"]);
+    // Unknown library id → empty, not everything.
+    let none = body_json(
+        api.clone()
+            .oneshot(get_authed("/api/v1/items?library=NOPE", &token))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(titles(&none), Vec::<String>::new());
+}

@@ -115,6 +115,16 @@ export type ItemDetail = Item & { sources_detail: Source[]; show_title?: string 
 export const fetchChildren = (id: string) =>
   json<{ children: Item[] }>(`/api/v1/items/${id}/children`)
 
+export type LibrarySummary = { id: string; name: string; media_type: string }
+
+export const fetchLibraries = () =>
+  json<{ libraries: LibrarySummary[] }>('/api/v1/libraries')
+
+export const fetchItems = (libraryId?: string) =>
+  json<{ items: Item[] }>(
+    libraryId ? `/api/v1/items?library=${encodeURIComponent(libraryId)}` : '/api/v1/items'
+  )
+
 export async function fetchItem(id: string): Promise<ItemDetail> {
   const raw = await json<Item & { sources: Source[] | number }>(`/api/v1/items/${id}`)
   const sources = Array.isArray(raw.sources) ? raw.sources : []

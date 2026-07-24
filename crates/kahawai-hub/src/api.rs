@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Path, Request, State};
+use axum::extract::{Path, Query, Request, State};
 use axum::http::StatusCode;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
@@ -34,6 +34,7 @@ pub fn router(
     let state = AppState { registry, auth, sessions, enrollments };
     let protected = Router::new()
         .route("/api/v1/collections", get(list_collections))
+        .route("/api/v1/libraries", get(list_libraries))
         .route("/api/v1/items", get(list_items))
         .route("/api/v1/items/{id}", get(item_detail))
         .route("/api/v1/items/{id}/children", get(item_children))
@@ -583,21 +584,56 @@ async fn list_collections(State(state): State<AppState>) -> Result<Json<Value>, 
     Ok(Json(json!({ "collections": cols })))
 }
 
+async fn list_libraries(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+    let rows = sqlx::query("SELECT id, name, media_type FROM libraries ORDER BY name")
+        .fetch_all(state.registry.db())
+        .await
+        .map_err(internal)?;
+    let libraries: Vec<Value> = rows
+        .iter()
+        .map(|r| {
+            json!({
+                "id": r.get::<String, _>("id"),
+                "name": r.get::<String, _>("name"),
+                "media_type": r.get::<String, _>("media_type"),
+            })
+        })
+        .collect();
+    Ok(Json(json!({ "libraries": libraries })))
+}
+
+#[derive(Deserialize)]
+struct ItemsQuery {
+    library: Option<String>,
+}
+
 async fn list_items(
     State(state): State<AppState>,
+    Query(q): Query<ItemsQuery>,
     axum::Extension(claims): axum::Extension<crate::auth::Claims>,
 ) -> Result<Json<Value>, ApiError> {
+    // Shows carry no item_sources of their own; their library membership
+    // flows up from their episodes' sources.
     let rows = sqlx::query(
         "SELECT i.id, i.kind, i.title, i.year, i.season, i.episode,
                 COUNT(s.item_id) AS sources,
                 w.position_ms, w.played, w.play_count
          FROM items i
          LEFT JOIN item_sources s ON s.item_id = i.id
-         LEFT JOIN watch_state w ON w.item_id = i.id AND w.user_id = ?
+         LEFT JOIN watch_state w ON w.item_id = i.id AND w.user_id = ?1
          WHERE i.kind != 'episode'
+           AND (?2 IS NULL OR i.id IN (
+             SELECT COALESCE(ci.parent_id, ci.id)
+             FROM library_collections lc
+             JOIN item_sources ls
+               ON ls.module_id = lc.module_id AND ls.collection_id = lc.collection_id
+             JOIN items ci ON ci.id = ls.item_id
+             WHERE lc.library_id = ?2
+           ))
          GROUP BY i.id ORDER BY i.title, i.year",
     )
     .bind(&claims.sub)
+    .bind(&q.library)
     .fetch_all(state.registry.db())
     .await
     .map_err(internal)?;
