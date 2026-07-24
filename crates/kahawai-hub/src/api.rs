@@ -1062,7 +1062,7 @@ async fn list_items(
                 md.title AS matched_title,
                 mdc.confidence AS match_confidence,
                 COUNT(s.item_id) AS sources,
-                w.position_ms, w.played, w.play_count
+                w.position_ms, w.duration_ms, w.played, w.play_count
          FROM items i
          LEFT JOIN item_sources s ON s.item_id = i.id
          LEFT JOIN watch_state w ON w.item_id = i.id AND w.user_id = ?1
@@ -1104,6 +1104,7 @@ fn item_row_json(r: &sqlx::sqlite::SqliteRow) -> Value {
         "episode": r.get::<Option<i64>, _>("episode"),
         "sources": r.get::<i64, _>("sources"),
         "resume_position_ms": r.get::<Option<i64>, _>("position_ms"),
+        "resume_duration_ms": r.try_get::<Option<i64>, _>("duration_ms").ok().flatten(),
         "played": r.get::<Option<i64>, _>("played").unwrap_or(0) != 0,
         "play_count": r.get::<Option<i64>, _>("play_count").unwrap_or(0),
     })
@@ -1121,7 +1122,7 @@ async fn item_children(
                 COALESCE(md.title, i.title) AS title,
                 md.premiered AS premiered,
                 COUNT(s.item_id) AS sources,
-                w.position_ms, w.played, w.play_count
+                w.position_ms, w.duration_ms, w.played, w.play_count
          FROM items i
          LEFT JOIN item_sources s ON s.item_id = i.id
          LEFT JOIN watch_state w ON w.item_id = i.id AND w.user_id = ?
@@ -1150,7 +1151,7 @@ async fn item_detail(
                 p.id AS parent_id,
                 COALESCE(pmd.title, p.title) AS show_title,
                 (SELECT COUNT(*) FROM item_sources s WHERE s.item_id = i.id) AS sources,
-                w.position_ms, w.played, w.play_count
+                w.position_ms, w.duration_ms, w.played, w.play_count
          FROM items i
          LEFT JOIN items p ON p.id = i.parent_id
          LEFT JOIN watch_state w ON w.item_id = i.id AND w.user_id = ?

@@ -46,11 +46,6 @@ function KindIcon({ kind }: { kind: string }) {
   )
 }
 
-function fmtResume(ms: number) {
-  const s = Math.floor(ms / 1000)
-  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`
-}
-
 export default function Library({
   libraryId,
   onOpen,
@@ -142,6 +137,34 @@ export default function Library({
                   }}
                 />
                 <KindIcon kind={i.kind} />
+                {i.played && (
+                  <span className="seen-badge" title="seen">
+                    <svg
+                      width="14"
+                      height="14"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="2.5"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                    >
+                      <polyline points="20 6 9 17 4 12" />
+                    </svg>
+                  </span>
+                )}
+                {!i.played &&
+                  !!i.resume_position_ms &&
+                  !!i.resume_duration_ms && (
+                    <span className="card-progress">
+                      <span
+                        className="card-progress-fill"
+                        style={{
+                          width: `${Math.min(100, (i.resume_position_ms / i.resume_duration_ms) * 100)}%`,
+                        }}
+                      />
+                    </span>
+                  )}
               </span>
               <span className="card-title">{i.title}</span>
               <span className="card-meta mono">
@@ -149,13 +172,7 @@ export default function Library({
                 {i.kind === 'album' && i.year ? ` · ${i.year}` : ''}
                 {i.sources > 1 ? ` · ${i.sources} sources` : ''}
               </span>
-              <span className="card-state">
-                {i.played ? (
-                  <span className="seen">seen</span>
-                ) : i.resume_position_ms ? (
-                  <span className="resume">resume {fmtResume(i.resume_position_ms)}</span>
-                ) : null}
-              </span>
+
             </button>
           </li>
         ))}

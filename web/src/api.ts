@@ -117,6 +117,7 @@ export type Item = {
   matched_title?: string | null
   premiered?: string | null
   resume_position_ms: number | null
+  resume_duration_ms?: number | null
   played: boolean
   play_count: number
 }
