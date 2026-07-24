@@ -110,6 +110,11 @@ export type Item = {
   /// Enrichment state (movie/show): null = never enriched,
   /// miss/rejected = unmatched, weak = uncertain, auto/manual = good.
   match_confidence?: string | null
+  /// The filename-derived identity (title/year as parsed from disk) and
+  /// the provider's matched title — for the review dialog.
+  file_title?: string | null
+  file_year?: number | null
+  matched_title?: string | null
   resume_position_ms: number | null
   played: boolean
   play_count: number

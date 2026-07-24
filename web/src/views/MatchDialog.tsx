@@ -17,7 +17,11 @@ export default function MatchDialog({
   onClose: () => void
   onApplied: () => void
 }) {
-  const [query, setQuery] = useState(item.title)
+  // Anchor on the FILE identity: the display title is the (possibly
+  // wrong) match we're here to judge.
+  const fileTitle = item.file_title ?? item.title
+  const fileYear = item.file_year ?? null
+  const [query, setQuery] = useState(fileTitle)
   const [results, setResults] = useState<MatchCandidate[] | null>(null)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
@@ -27,7 +31,7 @@ export default function MatchDialog({
     setBusy(true)
     setError('')
     try {
-      const r = await adminReviewSearch(item.kind, q, item.year)
+      const r = await adminReviewSearch(item.kind, q, fileYear)
       setResults(r.candidates)
     } catch (e) {
       setError(String(e))
@@ -36,9 +40,9 @@ export default function MatchDialog({
     }
   }
 
-  // Search immediately with the item's title.
+  // Search immediately with the file title.
   useEffect(() => {
-    void search(item.title)
+    void search(fileTitle)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [item.id])
 
@@ -65,7 +69,7 @@ export default function MatchDialog({
       <div className="dialog" onClick={(e) => e.stopPropagation()}>
         <div className="dialog-head">
           <h2>
-            Match “{item.title}” {item.year ? `(${item.year})` : ''}
+            Match “{fileTitle}” {fileYear ? `(${fileYear})` : ''}
           </h2>
           <button className="btn ghost small" onClick={onClose}>
             ✕
@@ -74,7 +78,8 @@ export default function MatchDialog({
         {weak && (
           <div className="row-form dialog-weak">
             <span className="dim">
-              Current match is <b>uncertain</b> — confirm it or pick a better one.
+              Uncertain match: <b>{item.matched_title ?? item.title}</b>
+              {item.year ? ` (${item.year})` : ''} — confirm it or pick a better one.
             </span>
             <button className="btn small" disabled={busy} onClick={() => void apply('confirm')}>
               Confirm current

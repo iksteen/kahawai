@@ -967,6 +967,8 @@ async fn list_items(
         "SELECT i.id, i.kind, i.season, i.episode, i.artist,
                 COALESCE(md.title, i.title) AS title,
                 COALESCE(i.year, CAST(substr(md.premiered, 1, 4) AS INTEGER)) AS year,
+                i.title AS file_title, i.year AS file_year,
+                md.title AS matched_title,
                 mdc.confidence AS match_confidence,
                 COUNT(s.item_id) AS sources,
                 w.position_ms, w.played, w.play_count
@@ -1002,6 +1004,9 @@ fn item_row_json(r: &sqlx::sqlite::SqliteRow) -> Value {
         "title": r.get::<String, _>("title"),
         "artist": r.try_get::<Option<String>, _>("artist").ok().flatten(),
         "match_confidence": r.try_get::<Option<String>, _>("match_confidence").ok().flatten(),
+        "file_title": r.try_get::<Option<String>, _>("file_title").ok().flatten(),
+        "file_year": r.try_get::<Option<i64>, _>("file_year").ok().flatten(),
+        "matched_title": r.try_get::<Option<String>, _>("matched_title").ok().flatten(),
         "year": r.get::<Option<i64>, _>("year"),
         "season": r.get::<Option<i64>, _>("season"),
         "episode": r.get::<Option<i64>, _>("episode"),
