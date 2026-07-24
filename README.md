@@ -18,10 +18,104 @@ A Rust backend built on GStreamer, shipped two ways from one codebase:
 
 ## Status
 
-Pre-implementation. See the design documents:
+Running daily. Working today: direct play, in-hub remuxing to HLS,
+hardware-accelerated transcoding dispatched across a fleet (NVENC, VA-API,
+VideoToolbox verified) with self-healing and seek-anywhere; movies, series,
+anime, and music resolution (including multi-CD rips and absolute-numbered
+fansub releases); libraries; embedded and sidecar subtitles served as WebVTT;
+audio/video track switching; TMDB metadata with TheTVDB fallback, posters,
+and an in-place match-review flow; incremental rescans with filesystem
+watching; multi-user watch state — all driven from the embedded web app.
+
+Still ahead: episode-level metadata, subtitle downloads (OpenSubtitles),
+faithful ASS rendering with fonts, AniDB/AniList, MusicBrainz, quality
+ladders, and the hardening pass. Design documents:
 
 - [Technical requirements](./docs/kahawai-technical-requirements.md)
 - [Implementation design](./docs/kahawai-implementation.md)
+
+## Running it
+
+### Prerequisites
+
+- **Rust** (edition 2024 toolchain) and **protoc** (protobuf compiler) to build.
+- **GStreamer 1.24+** with the plugin sets: base, good, bad, ugly, libav, and
+  [gst-plugins-rs](https://gitlab.freedesktop.org/gstreamer/gst-plugins-rs)
+  (for `hlssink3`). Hardware encoders come from your platform: `gst-plugin-va`
+  (VA-API/Quick Sync), the NVIDIA plugin set (NVENC), or macOS VideoToolbox.
+- Node is **not** required to run — the web app ships prebuilt in the binary
+  (`cd web && npm run build` only if you hack on it).
+
+```sh
+cargo build --release
+./target/release/kahawai doctor   # names every capability your GStreamer install provides or lacks
+```
+
+`doctor` is the source of truth: each missing element is listed with exactly
+what it costs you (e.g. "E-AC-3 audio cannot be transcoded — install
+gst-libav"). Essential gaps abort startup; everything else degrades.
+
+### First run (all-in-one)
+
+```sh
+./target/release/kahawai hub &
+./target/release/kahawai mediahost
+```
+
+The hub prints a one-time **setup token** — open http://localhost:8420, paste
+it, and create the admin account. The mediahost (and any transcoder) prints an
+**enrollment code** on first connect; approve it on the admin page. Satellites
+receive certificates from the hub (it is its own CA) and reconnect on their
+own ever after.
+
+Add machines by running `kahawai mediahost` or `kahawai transcoder` anywhere
+that can reach the hub's satellite port, with `[mediahost] hub =` /
+`[transcoder] hub =` pointed at it — same enrollment flow.
+
+### Configuration
+
+One TOML file for every role; each binary reads only its section. Location:
+`$XDG_CONFIG_HOME/kahawai/kahawai.toml` (usually `~/.config/kahawai/`), or
+`./kahawai.toml`, or `--config <path>`. Any key can be overridden with an
+environment variable shaped `KAHAWAI_<SECTION>__<KEY>`, e.g.
+`KAHAWAI_HUB__DATA_DIR=/srv/kahawai`.
+
+```toml
+[hub]
+bind = "127.0.0.1:8420"          # client API + web app; put a reverse proxy in front for TLS
+satellite_bind = "0.0.0.0:8421"  # enrollment + mTLS link for satellites
+data_dir = "~/.local/share/kahawai"  # db, PKI, caches (default shown for user installs)
+hostnames = ["localhost"]        # names/IPs baked into the hub's certificate SANs —
+                                 # add the LAN address remote satellites will dial
+satellite_cert_days = 90
+enrollment_ttl_minutes = 15
+
+[mediahost]
+hub = "localhost:8421"
+name = "nas"                     # shown in the admin UI
+rescan_minutes = 60              # backup sweep; the fs watcher reacts immediately where
+                                 # the filesystem supports it (inotify never fires on
+                                 # network mounts like sshfs — the sweep covers those). 0 = off
+
+[[mediahost.collections]]
+name = "movies"                  # stable id — renaming makes it a new collection
+media_type = "movies"            # movies | series | anime | music
+roots = ["/mnt/media/movies"]
+
+[[mediahost.collections]]
+name = "series"
+media_type = "series"
+roots = ["/mnt/media/series"]
+
+[transcoder]
+hub = "localhost:8421"
+name = "gpu-box"
+max_sessions = 2                 # concurrent encodes this machine offers
+```
+
+Metadata providers (TMDB key, TheTVDB key/PIN) are configured in the admin
+web UI, not the config file. Mediahost roots are treated as strictly
+read-only — kahawai never writes next to your media.
 
 ## License
 
