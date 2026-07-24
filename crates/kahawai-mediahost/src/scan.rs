@@ -67,37 +67,57 @@ pub async fn scan_collection(
     let mut seen_batch: Vec<String> = Vec::new();
 
     let include_audio = cfg.media_type == "music";
+    let force = std::sync::Arc::new(force_dirs);
     for root in &cfg.roots {
         let root = root.clone();
         let paths =
             tokio::task::spawn_blocking(move || walk(&root, include_audio)).await??;
-        for (root_local, path) in paths {
-            let rel = path
-                .strip_prefix(&root_local)
-                .unwrap_or(&path)
-                .to_string_lossy()
-                .into_owned();
-            // Unchanged since the hub last saw it? Seen, not re-inspected.
-            // force_dirs overrides: a sidecar/artwork change in the dir
-            // must re-inspect its media files despite matching stats.
-            if !path.parent().is_some_and(|p| force_dirs.contains(p))
-                && let Some(&(size, mtime)) = known.get(&rel)
-                && std::fs::metadata(&path).is_ok_and(|m| {
-                    m.len() == size
-                        && m.modified()
-                            .ok()
-                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                            .map(|d| d.as_secs() as i64)
-                            == Some(mtime)
+        // Stat in batches ON THE BLOCKING POOL: a network mount makes
+        // each stat a round trip, and doing tens of thousands of them
+        // inline starved async peers of this task for tens of seconds.
+        // Each batch yields (rel, unchanged) verdicts.
+        for stat_batch in paths.chunks(250).map(<[_]>::to_vec) {
+            let known2 = known.clone();
+            let force2 = force.clone();
+            let verdicts: Vec<((std::path::PathBuf, std::path::PathBuf), String, bool)> =
+                tokio::task::spawn_blocking(move || {
+                    stat_batch
+                        .into_iter()
+                        .map(|(root_local, path)| {
+                            let rel = path
+                                .strip_prefix(&root_local)
+                                .unwrap_or(&path)
+                                .to_string_lossy()
+                                .into_owned();
+                            let unchanged = !path
+                                .parent()
+                                .is_some_and(|p| force2.contains(p))
+                                && known2.get(&rel).is_some_and(|&(size, mtime)| {
+                                    std::fs::metadata(&path).is_ok_and(|m| {
+                                        m.len() == size
+                                            && m.modified()
+                                                .ok()
+                                                .and_then(|t| {
+                                                    t.duration_since(std::time::UNIX_EPOCH).ok()
+                                                })
+                                                .map(|d| d.as_secs() as i64)
+                                                == Some(mtime)
+                                    })
+                                });
+                            ((root_local, path), rel, unchanged)
+                        })
+                        .collect()
                 })
-            {
-                skipped += 1;
-                seen_batch.push(rel);
-                if seen_batch.len() >= 1000 {
-                    send_seen(&tx, &cfg.name, std::mem::take(&mut seen_batch)).await?;
+                .await?;
+            for ((root_local, path), rel, unchanged) in verdicts {
+                if unchanged {
+                    skipped += 1;
+                    seen_batch.push(rel);
+                    if seen_batch.len() >= 1000 {
+                        send_seen(&tx, &cfg.name, std::mem::take(&mut seen_batch)).await?;
+                    }
+                    continue;
                 }
-                continue;
-            }
             let (r, p) = (root_local.clone(), path.clone());
             let record =
                 tokio::task::spawn_blocking(move || inspect(&r, &p)).await?;
@@ -130,6 +150,7 @@ pub async fn scan_collection(
                     .await
                     .context("link closed")?;
                 }
+            }
             }
         }
     }
