@@ -115,6 +115,23 @@ export type ItemDetail = Item & { sources_detail: Source[]; show_title?: string 
 export const fetchChildren = (id: string) =>
   json<{ children: Item[] }>(`/api/v1/items/${id}/children`)
 
+export type Subtitle = {
+  key: string
+  kind: 'embedded' | 'sidecar'
+  format: string
+  language: string | null
+  flattened: boolean
+}
+
+export const fetchSubtitles = (itemId: string) =>
+  json<{ subtitles: Subtitle[] }>(`/api/v1/items/${itemId}/subtitles`)
+
+// HUB-32a: flattening ASS must be a labeled, explicit choice.
+export const subtitleLabel = (s: Subtitle) =>
+  `${s.language ?? 'unknown'} · ${s.format}${s.kind === 'sidecar' ? ' · file' : ''}${
+    s.flattened ? ' (flattened)' : ''
+  }`
+
 export type LibrarySummary = { id: string; name: string; media_type: string }
 
 export const fetchLibraries = () =>

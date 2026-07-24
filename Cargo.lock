@@ -1602,8 +1602,10 @@ dependencies = [
  "tonic",
  "tower",
  "tracing",
+ "tracing-subscriber",
  "ulid",
  "x509-parser",
+ "xxhash-rust",
 ]
 
 [[package]]

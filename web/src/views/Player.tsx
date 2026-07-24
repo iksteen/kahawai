@@ -3,10 +3,13 @@ import Hls from 'hls.js'
 import {
   accessToken,
   endSession,
+  fetchSubtitles,
   postProgress,
   seekSession,
+  subtitleLabel,
   type Item,
   type Session,
+  type Subtitle,
 } from '../api'
 
 function fmt(ms: number) {
@@ -39,6 +42,24 @@ export default function Player({
   const durationMs = session.duration_ms ?? 0
   const [posMs, setPosMs] = useState(offsetRef.current)
   const [seeking, setSeeking] = useState(false)
+  const [subs, setSubs] = useState<Subtitle[]>([])
+  const [subKey, setSubKey] = useState('')
+  // The <track> URL must shift cues when the HLS timeline starts mid-file;
+  // bump on seek-restarts so the track reloads with the new shift.
+  const [trackEpoch, setTrackEpoch] = useState(0)
+
+  useEffect(() => {
+    fetchSubtitles(item.id)
+      .then((r) => setSubs(r.subtitles))
+      .catch(() => setSubs([]))
+  }, [item.id])
+
+  // <track> is lazy about mode; force the selected one to display.
+  useEffect(() => {
+    const tracks = videoRef.current?.textTracks
+    if (!tracks) return
+    for (const t of Array.from(tracks)) t.mode = subKey ? 'showing' : 'disabled'
+  }, [subKey, trackEpoch])
 
   const attach = () => {
     const video = videoRef.current!
@@ -92,6 +113,7 @@ export default function Player({
       await seekSession(session.session_id, targetMs)
       offsetRef.current = targetMs
       setPosMs(targetMs)
+      setTrackEpoch((e) => e + 1)
       attach()
     } finally {
       setSeeking(false)
@@ -145,7 +167,16 @@ export default function Player({
       <button className="btn ghost small" onClick={onClose}>
         ← Back
       </button>
-      <video ref={videoRef} controls playsInline />
+      <video ref={videoRef} controls playsInline crossOrigin="use-credentials">
+        {subKey && (
+          <track
+            key={`${subKey}-${trackEpoch}`}
+            default
+            kind="subtitles"
+            src={`/api/v1/items/${item.id}/subtitles/${subKey}.vtt?shift_ms=${-offsetRef.current}`}
+          />
+        )}
+      </video>
       {isHls && durationMs > 0 && (
         <div
           className={`seekbar${seeking ? ' busy' : ''}`}
@@ -160,6 +191,19 @@ export default function Player({
             {fmt(posMs)} / {fmt(durationMs)}
           </span>
         </div>
+      )}
+      {subs.length > 0 && (
+        <label className="subpick">
+          Subtitles{' '}
+          <select value={subKey} onChange={(e) => setSubKey(e.target.value)}>
+            <option value="">Off</option>
+            {subs.map((s) => (
+              <option key={s.key} value={s.key}>
+                {subtitleLabel(s)}
+              </option>
+            ))}
+          </select>
+        </label>
       )}
       <div className="playback-info mono">
         {item.title} · {session.mode}

@@ -211,3 +211,18 @@ h2 { font-size: 14px; font-weight: 650; color: var(--dim); letter-spacing: 0.08e
   cursor: pointer;
   padding: 0 2px;
 }
+
+.subpick {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.85rem;
+  color: var(--dim, #999);
+}
+.subpick select {
+  background: transparent;
+  color: inherit;
+  border: 1px solid #444;
+  border-radius: 4px;
+  padding: 0.15rem 0.4rem;
+}

@@ -23,6 +23,7 @@ pub struct AppState {
     pub auth: Arc<Auth>,
     pub sessions: Arc<crate::sessions::Sessions>,
     pub enrollments: Arc<crate::enrollment_service::EnrollmentService>,
+    pub subtitles: Arc<crate::subtitles::Subtitles>,
 }
 
 pub fn router(
@@ -30,14 +31,17 @@ pub fn router(
     auth: Arc<Auth>,
     sessions: Arc<crate::sessions::Sessions>,
     enrollments: Arc<crate::enrollment_service::EnrollmentService>,
+    subtitles: Arc<crate::subtitles::Subtitles>,
 ) -> Router {
-    let state = AppState { registry, auth, sessions, enrollments };
+    let state = AppState { registry, auth, sessions, enrollments, subtitles };
     let protected = Router::new()
         .route("/api/v1/collections", get(list_collections))
         .route("/api/v1/libraries", get(list_libraries))
         .route("/api/v1/items", get(list_items))
         .route("/api/v1/items/{id}", get(item_detail))
         .route("/api/v1/items/{id}/children", get(item_children))
+        .route("/api/v1/items/{id}/subtitles", get(item_subtitles))
+        .route("/api/v1/items/{id}/subtitles/{file}", get(item_subtitle_vtt))
         .route("/api/v1/playback/sessions", post(start_session))
         .route("/api/v1/playback/sessions/{id}", axum::routing::delete(end_session))
         .route("/api/v1/playback/sessions/{id}/stream", get(stream_session))
@@ -582,6 +586,41 @@ async fn stream_session(
 async fn list_collections(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
     let cols = state.registry.collections().await.map_err(internal)?;
     Ok(Json(json!({ "collections": cols })))
+}
+
+async fn item_subtitles(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let subs = state.subtitles.list(&state.registry, &id).await.map_err(internal)?;
+    Ok(Json(json!({ "subtitles": subs })))
+}
+
+#[derive(Deserialize)]
+struct VttQuery {
+    #[serde(default)]
+    shift_ms: i64,
+}
+
+async fn item_subtitle_vtt(
+    State(state): State<AppState>,
+    Path((id, file)): Path<(String, String)>,
+    Query(q): Query<VttQuery>,
+) -> Result<Response, ApiError> {
+    let key = file.strip_suffix(".vtt").unwrap_or(&file);
+    let vtt = state
+        .subtitles
+        .vtt(&state.registry, &state.sessions, &id, key, q.shift_ms)
+        .await
+        .map_err(internal)?;
+    Ok((
+        [
+            (axum::http::header::CONTENT_TYPE, "text/vtt; charset=utf-8"),
+            (axum::http::header::CACHE_CONTROL, "private, max-age=60"),
+        ],
+        vtt,
+    )
+        .into_response())
 }
 
 async fn list_libraries(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {

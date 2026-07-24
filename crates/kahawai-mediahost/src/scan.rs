@@ -43,9 +43,9 @@ pub async fn scan_collection(cfg: CollectionConfig, tx: Sender<HostToHub>) -> Re
                 .unwrap_or(&path)
                 .to_string_lossy()
                 .into_owned();
-            let p = path.clone();
+            let (r, p) = (root_local.clone(), path.clone());
             let record =
-                tokio::task::spawn_blocking(move || inspect(&p)).await?;
+                tokio::task::spawn_blocking(move || inspect(&r, &p)).await?;
             match record {
                 Ok((size, mtime_unix, head_xxh3, tail_xxh3, oshash, info)) => {
                     scanned += 1;
@@ -129,8 +129,8 @@ fn walk(root: &Path) -> Result<Vec<(PathBuf, PathBuf)>> {
 
 type Inspected = (u64, i64, u64, u64, u64, kahawai_core::media::MediaInfo);
 
-/// One stat + one head/tail read pass + GStreamer discovery.
-fn inspect(path: &Path) -> Result<Inspected> {
+/// One stat + one head/tail read pass + GStreamer discovery + sidecars.
+fn inspect(root: &Path, path: &Path) -> Result<Inspected> {
     let meta = std::fs::metadata(path)?;
     let size = meta.len();
     let mtime_unix = meta
@@ -139,8 +139,58 @@ fn inspect(path: &Path) -> Result<Inspected> {
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
     let (head_xxh3, tail_xxh3, oshash) = identity_hashes(path, size)?;
-    let info = kahawai_media::discover(path, DISCOVER_TIMEOUT)?;
+    let mut info = kahawai_media::discover(path, DISCOVER_TIMEOUT)?;
+    info.external_subtitles = find_sidecars(root, path);
     Ok((size, mtime_unix, head_xxh3, tail_xxh3, oshash, info))
+}
+
+const SUBTITLE_EXTS: &[(&str, &str)] = &[("srt", "srt"), ("ass", "ass"), ("ssa", "ass"), ("vtt", "vtt")];
+
+/// Sidecar subtitles (MH-4): files in the media file's directory named
+/// `<stem>.<ext>` or `<stem>.<tokens>.<ext>`; the first token after the
+/// stem is recorded verbatim as the language ("Movie.en.srt" → "en").
+fn find_sidecars(root: &Path, media: &Path) -> Vec<kahawai_core::media::SidecarSubtitle> {
+    let mut out = Vec::new();
+    let (Some(stem), Some(dir)) =
+        (media.file_stem().and_then(|s| s.to_str()), media.parent())
+    else {
+        return out;
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else { return out };
+    for entry in entries.flatten() {
+        let p = entry.path();
+        let (Some(name), Some(ext)) = (
+            p.file_name().and_then(|n| n.to_str()),
+            p.extension().and_then(|x| x.to_str()),
+        ) else {
+            continue;
+        };
+        let Some((_, format)) =
+            SUBTITLE_EXTS.iter().find(|(e, _)| e.eq_ignore_ascii_case(ext))
+        else {
+            continue;
+        };
+        if !(name.len() > stem.len()
+            && name.starts_with(stem)
+            && name.as_bytes()[stem.len()] == b'.')
+        {
+            continue;
+        }
+        let middle_end = name.len() - ext.len() - 1;
+        let middle = if stem.len() + 1 < middle_end { &name[stem.len() + 1..middle_end] } else { "" };
+        let language = middle
+            .split('.')
+            .next()
+            .filter(|t| !t.is_empty() && t.len() <= 10)
+            .map(|t| t.to_lowercase());
+        out.push(kahawai_core::media::SidecarSubtitle {
+            path_rel: p.strip_prefix(root).unwrap_or(&p).to_string_lossy().into_owned(),
+            format: format.to_string(),
+            language,
+        });
+    }
+    out.sort_by(|a, b| a.path_rel.cmp(&b.path_rel));
+    out
 }
 
 const CHUNK: u64 = 64 * 1024;
@@ -199,6 +249,38 @@ mod tests {
         std::fs::write(&b, b"other content, different name").unwrap();
         let hb2 = identity_hashes(&b, 29).unwrap();
         assert_ne!(ha, hb2);
+    }
+
+    #[test]
+    fn sidecars_matched_by_stem() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir(root.join("m")).unwrap();
+        for f in [
+            "m/Heat (1995).mkv",
+            "m/Heat (1995).srt",
+            "m/Heat (1995).en.srt",
+            "m/Heat (1995).nl.forced.ass",
+            "m/Heat (1995).vtt",
+            "m/Heat (1995) extras.srt", // no dot boundary → not a sidecar
+            "m/Other.srt",
+        ] {
+            std::fs::write(root.join(f), b"x").unwrap();
+        }
+        let subs = find_sidecars(root, &root.join("m/Heat (1995).mkv"));
+        let got: Vec<(&str, &str, Option<&str>)> = subs
+            .iter()
+            .map(|s| (s.path_rel.as_str(), s.format.as_str(), s.language.as_deref()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("m/Heat (1995).en.srt", "srt", Some("en")),
+                ("m/Heat (1995).nl.forced.ass", "ass", Some("nl")),
+                ("m/Heat (1995).srt", "srt", None),
+                ("m/Heat (1995).vtt", "vtt", None),
+            ]
+        );
     }
 
     #[test]

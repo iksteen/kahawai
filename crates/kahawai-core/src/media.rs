@@ -17,6 +17,9 @@ pub struct MediaInfo {
     pub audio: Vec<AudioStream>,
     #[serde(default)]
     pub subtitles: Vec<SubtitleStream>,
+    /// Sidecar subtitle files next to the media file (MH-4).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub external_subtitles: Vec<SidecarSubtitle>,
     /// Container-level tags (title, artist, album, track number, …).
     #[serde(default)]
     pub tags: BTreeMap<String, String>,
@@ -48,5 +51,15 @@ pub struct AudioStream {
 pub struct SubtitleStream {
     /// "srt", "ass", "pgs", "vobsub", "webvtt", …
     pub format: String,
+    pub language: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct SidecarSubtitle {
+    /// Path relative to the collection root (same keying as the media file).
+    pub path_rel: String,
+    /// "srt", "ass", "vtt" — from the file extension.
+    pub format: String,
+    /// Language token from the filename ("Movie.en.srt" → "en"), verbatim.
     pub language: Option<String>,
 }

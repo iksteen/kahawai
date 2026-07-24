@@ -1010,17 +1010,10 @@ pub fn start_full(
     start_paced(out_dir, plan, source, start_ms, sink, None)
 }
 
-pub fn start_paced(
-    out_dir: &Path,
-    plan: RemuxPlan,
-    mut source: Box<dyn RemuxSource>,
-    start_ms: u64,
-    sink: Option<&str>,
-    pace: Option<PaceConfig>,
-) -> Result<RemuxJob> {
-    crate::init()?;
-
-    let pipeline = gst::Pipeline::new();
+/// A seekable appsrc fed from a `RemuxSource` by a dedicated thread.
+/// appsrc callbacks run on GStreamer threads and must not block on I/O;
+/// they forward commands to the feeder thread, which owns the source.
+pub(crate) fn seekable_appsrc(mut source: Box<dyn RemuxSource>) -> AppSrc {
     let appsrc = AppSrc::builder()
         .stream_type(gstreamer_app::AppStreamType::Seekable)
         .block(true)
@@ -1028,8 +1021,6 @@ pub fn start_paced(
         .build();
     appsrc.set_size(source.size() as i64);
 
-    // appsrc callbacks run on GStreamer threads and must not block on I/O;
-    // they forward commands to a feeder thread that owns the source.
     let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<FeedCmd>();
     // Seeks apply synchronously in the callback (generation bump + new
     // position); the feeder picks both up before serving any Need.
@@ -1109,6 +1100,21 @@ pub fn start_paced(
             }
         }
     });
+    appsrc
+}
+
+pub fn start_paced(
+    out_dir: &Path,
+    plan: RemuxPlan,
+    source: Box<dyn RemuxSource>,
+    start_ms: u64,
+    sink: Option<&str>,
+    pace: Option<PaceConfig>,
+) -> Result<RemuxJob> {
+    crate::init()?;
+
+    let pipeline = gst::Pipeline::new();
+    let appsrc = seekable_appsrc(source);
     let parsebin = gst::ElementFactory::make("parsebin").build()?;
     let (hlssink, _sink_name) = make_hls_sink(out_dir, sink)?;
 

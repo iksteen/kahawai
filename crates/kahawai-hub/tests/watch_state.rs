@@ -249,5 +249,5 @@ fn test_router(
         std::time::Duration::from_secs(900),
         90,
     ));
-    kahawai_hub::api::router(registry, auth, sessions, enrollments)
+    kahawai_hub::api::router(registry, auth, sessions, enrollments, Arc::new(kahawai_hub::subtitles::Subtitles::new(tempfile::tempdir().unwrap().keep())))
 }

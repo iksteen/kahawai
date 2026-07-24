@@ -99,10 +99,10 @@ impl Session {
 
 /// Adapts a mediahost read lease to the remuxer's random-access source
 /// trait; runs on the remux feeder thread, bridging into the runtime.
-struct LeaseSource {
-    lease: Lease,
-    size: u64,
-    handle: tokio::runtime::Handle,
+pub(crate) struct LeaseSource {
+    pub(crate) lease: Lease,
+    pub(crate) size: u64,
+    pub(crate) handle: tokio::runtime::Handle,
 }
 
 impl kahawai_media::remux::RemuxSource for LeaseSource {
@@ -261,7 +261,7 @@ impl Sessions {
     /// Pick the best available source for an item and open a read lease
     /// on its mediahost. Used at session start and on seek-restarts of
     /// local remux sessions (whose lease died with the old worker).
-    async fn open_source(
+    pub(crate) async fn open_source(
         &self,
         registry: &Registry,
         item_id: &str,
@@ -292,19 +292,28 @@ impl Sessions {
             serde_json::from_str(source.get::<String, _>("streams_json").as_str())
                 .unwrap_or_default();
 
+        let lease = self.open_lease(registry, &module_id, &collection_id, &path_rel).await?;
+        Ok((module_id, path_rel, size, info, lease))
+    }
+
+    /// Open a read lease on an arbitrary path within a collection (also
+    /// used for sidecar subtitle files, which are not `files` rows).
+    pub(crate) async fn open_lease(
+        &self,
+        registry: &Registry,
+        module_id: &str,
+        collection_id: &str,
+        path_rel: &str,
+    ) -> Result<Lease> {
         let token = new_lease_token();
         let msg = HubToHost {
             msg: Some(hub_to_host::Msg::OpenRead(OpenRead {
                 lease_token: token.clone(),
-                collection_id,
-                path_rel: path_rel.clone(),
+                collection_id: collection_id.to_string(),
+                path_rel: path_rel.to_string(),
             })),
         };
-        let lease = self
-            .leases
-            .establish(&token, registry.send_to_host(&module_id, msg))
-            .await?;
-        Ok((module_id, path_rel, size, info, lease))
+        self.leases.establish(&token, registry.send_to_host(module_id, msg)).await
     }
 
     /// Start a session for an item: pick the best available source, open a
