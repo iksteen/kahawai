@@ -18,48 +18,56 @@ type Phase = 'boot' | 'setup' | 'login' | 'app'
 
 const BASE = '/app'
 
-// URL ↔ route. The player itself is transient (sessions die with it),
-// so it lives at the item's /play URL: deep-loading or forward-ing onto
-// it re-enters the detail view with autoplay instead.
+// URL ↔ route. Items browsed from a library live under it —
+// /app/library/{lib}/item/{id} — so the back-target survives reload
+// and link sharing (collections are many-to-many with libraries; the
+// URL is the navigation context). Bare /app/item/{id} is the
+// context-free deep-link form, falling back to the item's own library.
+// The player is transient (sessions die with it): its /play URL
+// re-enters the detail view with autoplay.
 function routeToPath(route: Route): string {
   switch (route.view) {
     case 'libraries':
       return `${BASE}/`
     case 'library':
-      return `${BASE}/lib/${route.id}`
+      return `${BASE}/library/${route.id}`
     case 'admin':
       return `${BASE}/admin`
-    case 'detail':
-      return `${BASE}/item/${route.id}`
-    case 'player':
-      return `${BASE}/item/${route.item.id}/play`
+    case 'detail': {
+      const prefix = route.fromLib ? `/library/${route.fromLib}` : ''
+      return `${BASE}${prefix}/item/${route.id}`
+    }
+    case 'player': {
+      const prefix = route.fromLib ? `/library/${route.fromLib}` : ''
+      return `${BASE}${prefix}/item/${route.item.id}/play`
+    }
   }
 }
 
-function pathToRoute(pathname: string, state?: unknown): Route {
+function pathToRoute(pathname: string): Route {
   const rel = pathname.startsWith(BASE) ? pathname.slice(BASE.length) : pathname
   const parts = rel.split('/').filter(Boolean)
   if (parts[0] === 'admin') return { view: 'admin' }
-  if (parts[0] === 'lib' && parts[1]) return { view: 'library', id: parts[1] }
+  if ((parts[0] === 'library' || parts[0] === 'lib') && parts[1]) {
+    if (parts[2] === 'item' && parts[3]) {
+      return {
+        view: 'detail',
+        id: parts[3],
+        autoPlay: parts[4] === 'play',
+        fromLib: parts[1],
+      }
+    }
+    return { view: 'library', id: parts[1] }
+  }
   if (parts[0] === 'item' && parts[1]) {
-    // Which library "back" returns to is navigation context, not item
-    // data (collections are many-to-many with libraries): it rides
-    // history.state so back/forward restore it; deep links fall back
-    // to the item's own library server-side.
-    const fromLib =
-      state && typeof state === 'object' && 'fromLib' in state
-        ? ((state as { fromLib?: string }).fromLib ?? undefined)
-        : undefined
-    return { view: 'detail', id: parts[1], autoPlay: parts[2] === 'play', fromLib }
+    return { view: 'detail', id: parts[1], autoPlay: parts[2] === 'play' }
   }
   return { view: 'libraries' }
 }
 
 export default function App() {
   const [phase, setPhase] = useState<Phase>('boot')
-  const [route, setRoute] = useState<Route>(() =>
-    pathToRoute(window.location.pathname, window.history.state)
-  )
+  const [route, setRoute] = useState<Route>(() => pathToRoute(window.location.pathname))
 
   // Forward navigation: push a history entry and switch views.
   // `replace` swaps the current entry instead — closing the player uses
@@ -67,12 +75,9 @@ export default function App() {
   // autoplay on browser-back.
   const navigate = (r: Route, opts?: { replace?: boolean }) => {
     const path = routeToPath(r)
-    const state = 'fromLib' in r && r.fromLib ? { fromLib: r.fromLib } : null
     if (path !== window.location.pathname) {
-      if (opts?.replace) window.history.replaceState(state, '', path)
-      else window.history.pushState(state, '', path)
-    } else {
-      window.history.replaceState(state, '', path)
+      if (opts?.replace) window.history.replaceState(null, '', path)
+      else window.history.pushState(null, '', path)
     }
     setRoute(r)
   }
@@ -81,8 +86,7 @@ export default function App() {
   // ride history (it holds live server objects), so landing back on a
   // /play URL becomes detail-with-autoplay.
   useEffect(() => {
-    const onPop = (e: PopStateEvent) =>
-      setRoute(pathToRoute(window.location.pathname, e.state))
+    const onPop = () => setRoute(pathToRoute(window.location.pathname))
     window.addEventListener('popstate', onPop)
     return () => window.removeEventListener('popstate', onPop)
   }, [])
