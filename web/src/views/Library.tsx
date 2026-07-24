@@ -98,6 +98,7 @@ export default function Library({
                 }}
               />
               {i.kind === 'show' && <span className="chip dim">series</span>}
+              {i.kind === 'movie' && <span className="chip dim">movie</span>}
               <span className="card-title">{i.title}</span>
               <span className="card-meta mono">
                 {i.kind === 'album' ? (i.artist ?? '—') : (i.year ?? '—')}
