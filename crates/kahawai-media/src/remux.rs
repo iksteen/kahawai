@@ -451,8 +451,32 @@ impl SeekGate {
         self.triggered.load(std::sync::atomic::Ordering::SeqCst) >= self.expected
     }
 
-    fn open(&self) {
+    /// Open the gates. The seek's KEY_UNIT flag snapped to a keyframe at
+    /// or before the requested start, so the true playlist origin is only
+    /// knowable now: the first post-flush buffer on each feed reports its
+    /// stream time into `start.pos` (players align subtitles/seekbar to
+    /// it — TS PTS can't carry this, mpegtsmux rebases to a fixed epoch).
+    fn open_reporting(&self, start_pos: std::path::PathBuf) {
+        let min = Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
         for (pad, id) in self.blocked.lock().unwrap().drain(..) {
+            let min = min.clone();
+            let path = start_pos.clone();
+            pad.add_probe(gst::PadProbeType::BUFFER, move |pad, info| {
+                if let Some(gst::PadProbeData::Buffer(b)) = &info.data
+                    && let Some(pts) = b.pts()
+                    && let Some(seg) = pad
+                        .sticky_event::<gst::event::Segment>(0)
+                        .and_then(|e| e.segment().downcast_ref::<gst::ClockTime>().cloned())
+                    && let Some(st) = seg.to_stream_time(pts)
+                {
+                    let ms = st.mseconds();
+                    if ms < min.fetch_min(ms, std::sync::atomic::Ordering::SeqCst) {
+                        let _ = std::fs::write(&path, ms.to_string());
+                    }
+                    return gst::PadProbeReturn::Remove;
+                }
+                gst::PadProbeReturn::Ok // unstamped buffer: keep waiting
+            });
             pad.remove_probe(id);
         }
     }
@@ -1211,7 +1235,7 @@ pub fn start_paced(
             gst::ClockTime::NONE,
         );
         anyhow::ensure!(parsebin.send_event(seek), "demuxer refused the start-offset seek");
-        gate.open();
+        gate.open_reporting(out_dir.join("start.pos"));
     }
     pipeline.set_state(gst::State::Playing)?;
     Ok(RemuxJob { pipeline, error, finished, stopping })

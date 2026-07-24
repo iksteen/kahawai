@@ -872,6 +872,8 @@ async fn transcode_file(
         .map_err(|e| (StatusCode::NOT_FOUND, format!("{e:#}")))?;
     let ctype = if file.ends_with(".m3u8") {
         "application/vnd.apple.mpegurl"
+    } else if file == "start.pos" {
+        "text/plain"
     } else {
         "video/mp2t"
     };
@@ -914,6 +916,10 @@ async fn session_file(
         "application/vnd.apple.mpegurl"
     } else if file.ends_with(".ts") {
         "video/mp2t"
+    } else if file == "start.pos" {
+        // True playlist origin after keyframe snapping (§6): players
+        // align subtitles and the seekbar to it.
+        "text/plain"
     } else {
         return Err((StatusCode::NOT_FOUND, "unknown file type".into()));
     };

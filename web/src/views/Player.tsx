@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import Hls from 'hls.js'
 import {
   accessToken,
+  api,
   endSession,
   fetchSubtitles,
   postProgress,
@@ -61,6 +62,36 @@ export default function Player({
     for (const t of Array.from(tracks)) t.mode = subKey ? 'showing' : 'disabled'
   }, [subKey, trackEpoch])
 
+  // Offset starts snap to the keyframe before the requested position;
+  // the pipeline reports the true playlist origin in start.pos. Adopt
+  // it so subtitle cues and the seekbar line up exactly.
+  const syncOrigin = async () => {
+    if (offsetRef.current === 0) return
+    const base = session.stream_url.replace(/[^/]*$/, '')
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const r = await api(`${base}start.pos`)
+        if (r.ok) {
+          const n = Math.round(Number(await r.text()))
+          if (
+            Number.isFinite(n) &&
+            n !== offsetRef.current &&
+            Math.abs(n - offsetRef.current) < 60000
+          ) {
+            const video = videoRef.current
+            offsetRef.current = n
+            if (video) setPosMs(n + video.currentTime * 1000)
+            setTrackEpoch((e) => e + 1)
+          }
+          return
+        }
+      } catch {
+        /* retry */
+      }
+      await new Promise((res) => setTimeout(res, 700))
+    }
+  }
+
   const attach = () => {
     const video = videoRef.current!
     hlsRef.current?.destroy()
@@ -83,28 +114,6 @@ export default function Player({
         liveMaxLatencyDurationCount: Infinity,
         maxBufferLength: 60,
       })
-      hls.on(Hls.Events.INIT_PTS_FOUND, (_e, data) => {
-        // Audio and video report slightly different PTS; adopting both
-        // would ping-pong the offset (and reload the track) forever.
-        if (data.id !== 'main') return
-        const pts = data.initPTS as unknown
-        const ms =
-          typeof pts === 'number'
-            ? pts / 90
-            : ((pts as { baseTime: number; timescale: number }).baseTime /
-                (pts as { baseTime: number; timescale: number }).timescale) *
-              1000
-        // Seek-restarts snap to the keyframe BEFORE the target, so the
-        // playlist origin is a little earlier than what we asked for;
-        // adopt the real origin so cues and the seekbar line up. The
-        // clamp guards sources whose PTS epoch isn't file time.
-        const rounded = Math.round(ms)
-        if (Math.abs(rounded - offsetRef.current) < 30000 && rounded !== offsetRef.current) {
-          offsetRef.current = rounded
-          setPosMs(rounded + video.currentTime * 1000)
-          setTrackEpoch((e) => e + 1)
-        }
-      })
       hls.loadSource(session.stream_url)
       hls.attachMedia(video)
       hlsRef.current = hls
@@ -112,6 +121,7 @@ export default function Player({
       video.src = session.stream_url // cookie-authenticated
     }
     void video.play().catch(() => undefined)
+    void syncOrigin()
   }
 
   // Seek anywhere on the full timeline: inside the produced range it is
