@@ -62,15 +62,13 @@ export default function Detail({
   id,
   autoPlay,
   fromLib,
-  onBack,
   onPlay,
   onOpenEpisode,
   onOpenLibrary,
 }: {
   id: string
   autoPlay?: boolean
-  fromLib?: string
-  onBack: () => void
+  fromLib: string
   onPlay: (item: Item, session: Session, resumeMs: number) => void
   onOpenEpisode: (id: string) => void
   onOpenLibrary: (id: string) => void
@@ -107,13 +105,11 @@ export default function Detail({
   if (error) return <div className="error page-pad">{error}</div>
   if (!item) return null
 
-  // Hierarchical back: episode → its series page, series/movie → its
-  // library, and the chooser as the fallback when nothing is known.
+  // Hierarchical back: episode → its series page, series/movie → the
+  // library in the URL (the one we navigated from).
   const goUp = () => {
     if (item.kind === 'episode' && item.parent_id) onOpenEpisode(item.parent_id)
-    else if (fromLib) onOpenLibrary(fromLib) // the library we navigated from
-    else if (item.library_id) onOpenLibrary(item.library_id) // deep link: any library it's in
-    else onBack()
+    else onOpenLibrary(fromLib)
   }
   const upLabel =
     item.kind === 'episode' && item.parent_id ? `← ${item.show_title ?? 'Series'}` : '← Library'

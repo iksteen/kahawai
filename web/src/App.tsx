@@ -11,8 +11,8 @@ type Route =
   | { view: 'libraries' }
   | { view: 'library'; id: string }
   | { view: 'admin' }
-  | { view: 'detail'; id: string; autoPlay?: boolean; fromLib?: string }
-  | { view: 'player'; item: Item; session: Session; resumeMs: number; fromLib?: string }
+  | { view: 'detail'; id: string; autoPlay?: boolean; fromLib: string }
+  | { view: 'player'; item: Item; session: Session; resumeMs: number; fromLib: string }
 
 type Phase = 'boot' | 'setup' | 'login' | 'app'
 
@@ -21,8 +21,8 @@ const BASE = '/app'
 // URL ↔ route. Items browsed from a library live under it —
 // /app/library/{lib}/item/{id} — so the back-target survives reload
 // and link sharing (collections are many-to-many with libraries; the
-// URL is the navigation context). Bare /app/item/{id} is the
-// context-free deep-link form, falling back to the item's own library.
+// URL is the navigation context). Nothing mints library-less item
+// links, so there is no bare item form.
 // The player is transient (sessions die with it): its /play URL
 // re-enters the detail view with autoplay.
 function routeToPath(route: Route): string {
@@ -33,14 +33,10 @@ function routeToPath(route: Route): string {
       return `${BASE}/library/${route.id}`
     case 'admin':
       return `${BASE}/admin`
-    case 'detail': {
-      const prefix = route.fromLib ? `/library/${route.fromLib}` : ''
-      return `${BASE}${prefix}/item/${route.id}`
-    }
-    case 'player': {
-      const prefix = route.fromLib ? `/library/${route.fromLib}` : ''
-      return `${BASE}${prefix}/item/${route.item.id}/play`
-    }
+    case 'detail':
+      return `${BASE}/library/${route.fromLib}/item/${route.id}`
+    case 'player':
+      return `${BASE}/library/${route.fromLib}/item/${route.item.id}/play`
   }
 }
 
@@ -48,7 +44,7 @@ function pathToRoute(pathname: string): Route {
   const rel = pathname.startsWith(BASE) ? pathname.slice(BASE.length) : pathname
   const parts = rel.split('/').filter(Boolean)
   if (parts[0] === 'admin') return { view: 'admin' }
-  if ((parts[0] === 'library' || parts[0] === 'lib') && parts[1]) {
+  if (parts[0] === 'library' && parts[1]) {
     if (parts[2] === 'item' && parts[3]) {
       return {
         view: 'detail',
@@ -58,9 +54,6 @@ function pathToRoute(pathname: string): Route {
       }
     }
     return { view: 'library', id: parts[1] }
-  }
-  if (parts[0] === 'item' && parts[1]) {
-    return { view: 'detail', id: parts[1], autoPlay: parts[2] === 'play' }
   }
   return { view: 'libraries' }
 }
@@ -151,7 +144,6 @@ export default function App() {
           id={route.id}
           autoPlay={route.autoPlay}
           fromLib={route.fromLib}
-          onBack={() => navigate({ view: 'libraries' })}
           onPlay={(item, session, resumeMs) =>
             navigate({ view: 'player', item, session, resumeMs, fromLib: route.fromLib })
           }
