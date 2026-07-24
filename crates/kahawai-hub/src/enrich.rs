@@ -59,15 +59,6 @@ pub fn pick_candidate<'c>(
     title: &str,
     year: Option<i64>,
 ) -> Option<(&'c Candidate, &'static str)> {
-    // Fold diacritics on top of kahawai's normalization: rips say
-    // "Leon", TMDB says "Léon" — same film.
-    let fold = |s: &str| -> String {
-        use unicode_normalization::UnicodeNormalization;
-        kahawai_core::names::normalize_title(s)
-            .nfd()
-            .filter(|c| !unicode_normalization::char::is_combining_mark(*c))
-            .collect()
-    };
     let norm = fold(title);
     let title_eq = |c: &Candidate| {
         fold(&c.title) == norm
@@ -80,12 +71,44 @@ pub fn pick_candidate<'c>(
     if let Some(c) = candidates.iter().find(|c| title_eq(c) && year_ok(c)) {
         return Some((c, "auto"));
     }
+    // Franchise-prefixed rips: "Indiana Jones and the Raiders of the
+    // Lost Ark" vs TMDB's "Raiders of the Lost Ark" — the local title
+    // ends with the candidate's (or vice versa). Weak, first hit wins
+    // (TMDB relevance order).
+    if let Some(c) = candidates.iter().find(|c| {
+        let ct = fold(&c.title);
+        ct.len() >= 10 && (norm.ends_with(&ct) || ct.ends_with(&norm)) && year_ok(c)
+    }) {
+        return Some((c, "weak"));
+    }
     // Single plausible hit: accept weakly (release-name noise, subtitles
     // in titles). Multiple hits without a title match = too ambiguous.
     match candidates {
         [only] if year_ok(only) => Some((only, "weak")),
         _ => None,
     }
+}
+
+/// Diacritic + number-word folding on top of kahawai's normalization:
+/// rips say "Leon" and "12 Monkeys", TMDB says "Léon" and "Twelve
+/// Monkeys" — same films.
+fn fold(s: &str) -> String {
+    use unicode_normalization::UnicodeNormalization;
+    const WORDS: &[(&str, &str)] = &[
+        ("zero", "0"), ("one", "1"), ("two", "2"), ("three", "3"), ("four", "4"),
+        ("five", "5"), ("six", "6"), ("seven", "7"), ("eight", "8"), ("nine", "9"),
+        ("ten", "10"), ("eleven", "11"), ("twelve", "12"), ("thirteen", "13"),
+        ("fourteen", "14"), ("fifteen", "15"), ("sixteen", "16"), ("seventeen", "17"),
+        ("eighteen", "18"), ("nineteen", "19"), ("twenty", "20"),
+    ];
+    let base: String = kahawai_core::names::normalize_title(s)
+        .nfd()
+        .filter(|c| !unicode_normalization::char::is_combining_mark(*c))
+        .collect();
+    base.split_whitespace()
+        .map(|w| WORDS.iter().find(|(word, _)| *word == w).map(|(_, d)| *d).unwrap_or(w))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 impl Enricher {
@@ -156,7 +179,8 @@ impl Enricher {
         let items = sqlx::query(
             "SELECT i.id, i.kind, i.title, i.year FROM items i
              LEFT JOIN item_metadata m ON m.item_id = i.id
-             WHERE i.kind IN ('movie', 'show') AND m.item_id IS NULL
+             WHERE i.kind IN ('movie', 'show')
+               AND (m.item_id IS NULL OR m.confidence = 'miss')
              ORDER BY i.title",
         )
         .fetch_all(registry.db())
@@ -282,5 +306,17 @@ mod tests {
         let lp = vec![cand(6, "Léon: The Professional", "1994-09-14")];
         let (_, conf) = pick_candidate(&lp, "Leon The Professional", None).unwrap();
         assert_eq!(conf, "auto");
+        // Number words fold: "12 Monkeys" == "Twelve Monkeys".
+        let tm = vec![cand(7, "Twelve Monkeys", "1995-12-29"), cand(8, "12 Rounds", "2009-03-19")];
+        let (c, conf) = pick_candidate(&tm, "12 Monkeys", None).unwrap();
+        assert_eq!((c.id, conf), (7, "auto"));
+        // Franchise prefix: local title ends with the candidate's → weak.
+        let rd = vec![
+            cand(9, "Raiders of the Lost Ark", "1981-06-12"),
+            cand(10, "The Lost Ark", "2000-01-01"),
+        ];
+        let (c, conf) =
+            pick_candidate(&rd, "Indiana Jones and the Raiders of the Lost Ark", None).unwrap();
+        assert_eq!((c.id, conf), (9, "weak"));
     }
 }
