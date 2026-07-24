@@ -13,7 +13,20 @@ pub struct MovieGuess {
 /// title "The Matrix", year 1999. The *last* plausible year wins, so
 /// `2001 A Space Odyssey (1968)` keeps its numeric title.
 pub fn parse_movie(filename: &str) -> MovieGuess {
-    let stem = filename.rsplit_once('.').map_or(filename, |(s, _)| s);
+    // Strip the suffix only when it plausibly IS a file extension:
+    // 2-4 alphanumerics with at least one letter. Show directories like
+    // "Mr. Robot" reach here too — " Robot" is a title, not an ext, and
+    // "Show.2004"'s year must survive.
+    let stem = match filename.rsplit_once('.') {
+        Some((s, ext))
+            if (2..=4).contains(&ext.len())
+                && ext.chars().all(|c| c.is_ascii_alphanumeric())
+                && ext.chars().any(|c| c.is_ascii_alphabetic()) =>
+        {
+            s
+        }
+        _ => filename,
+    };
     let cleaned: String = stem
         .chars()
         .map(|c| if matches!(c, '.' | '_') { ' ' } else { c })
@@ -448,6 +461,23 @@ mod tests {
             normalize_title("Léon: The Professional"),
             normalize_title("léon the professional")
         );
+    }
+
+    #[test]
+    fn dotted_abbreviations_survive() {
+        // Directories (no extension) with abbreviation dots.
+        assert_eq!(parse_movie("Mr. Robot").title, "Mr Robot");
+        assert_eq!(parse_movie("Mrs. Davis").title, "Mrs Davis");
+        // Numeric suffix is a year, not an extension.
+        let g = parse_movie("Archer.2009");
+        assert_eq!((g.title.as_str(), g.year), ("Archer", Some(2009)));
+        // Real extensions still strip.
+        assert_eq!(parse_movie("Mr. Brooks (2007).mkv").title, "Mr Brooks");
+        // Episode paths pick up the full show name.
+        let g = parse_episode("Mr. Robot/Season 01/Mr. Robot - S01E01 - eps1.0_hellofriend.mov.mp4")
+            .unwrap();
+        assert_eq!(g.show_title, "Mr Robot");
+        assert_eq!((g.season, g.episode), (Some(1), 1));
     }
 
     #[test]
