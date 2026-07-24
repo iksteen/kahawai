@@ -291,16 +291,37 @@ export default function Player({
       <button className="btn ghost small" onClick={onClose}>
         ← Back
       </button>
-      <video ref={videoRef} controls playsInline crossOrigin="use-credentials">
-        {subKey && !useAss && (
-          <track
-            key={`${subKey}-${trackEpoch}`}
-            default
-            kind="subtitles"
-            src={`/api/v1/items/${item.id}/subtitles/${subKey}.vtt?shift_ms=${-Math.round(offsetRef.current)}`}
-          />
-        )}
-      </video>
+      <div className="videobox">
+        <video
+          ref={videoRef}
+          controls
+          controlsList="nofullscreen"
+          playsInline
+          crossOrigin="use-credentials"
+        >
+          {subKey && !useAss && (
+            <track
+              key={`${subKey}-${trackEpoch}`}
+              default
+              kind="subtitles"
+              src={`/api/v1/items/${item.id}/subtitles/${subKey}.vtt?shift_ms=${-Math.round(offsetRef.current)}`}
+            />
+          )}
+        </video>
+        {/* Native fullscreen would take only the <video>, stranding the
+            JASSUB canvas; this fullscreens the box holding both. */}
+        <button
+          className="btn ghost small fs-btn"
+          title="Fullscreen"
+          onClick={(e) => {
+            const box = e.currentTarget.parentElement!
+            if (document.fullscreenElement) void document.exitFullscreen()
+            else void box.requestFullscreen()
+          }}
+        >
+          ⛶
+        </button>
+      </div>
       {isHls && durationMs > 0 && (
         <div
           className={`seekbar${seeking ? ' busy' : ''}`}
