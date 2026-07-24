@@ -21,7 +21,36 @@ message HostToHub {
     FileUpsert file_upsert = 4;
     FileError file_error = 5;
     ScanProgress scan_progress = 6;
+    // Incremental rescan (MH-5): ask what the hub already knows, then
+    // report unchanged files as seen without re-inspecting them.
+    ManifestRequest manifest_request = 7;
+    FilesSeen files_seen = 8;
   }
+}
+
+message ManifestRequest {
+  string collection_id = 1;
+}
+
+message FileStat {
+  string path_rel = 1;
+  uint64 size = 2;
+  int64 mtime_unix = 3;
+}
+
+// The hub's current knowledge of a collection, chunked; `done` on the
+// last chunk.
+message Manifest {
+  string collection_id = 1;
+  repeated FileStat entries = 2;
+  bool done = 3;
+}
+
+// Files present and unchanged (size+mtime match the manifest): counted
+// for reconciliation, no re-inspection, no upsert.
+message FilesSeen {
+  string collection_id = 1;
+  repeated string path_rel = 2;
 }
 
 // A collection this mediahost serves (MH-1). Announced after Hello and
@@ -63,6 +92,7 @@ message ScanProgress {
   uint32 scanned = 2;
   uint32 failed = 3;
   bool complete = 4;
+  uint32 skipped = 5; // unchanged, not re-inspected
 }
 
 message HubToHost {
@@ -71,6 +101,7 @@ message HubToHost {
     // Ask the host to open a ByteChannel for this file (MH-6). The lease
     // ends when the hub closes the channel's request stream.
     OpenRead open_read = 2;
+    Manifest manifest = 3;
   }
 }
 

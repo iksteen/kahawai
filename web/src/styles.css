@@ -226,3 +226,61 @@ h2 { font-size: 14px; font-weight: 650; color: var(--dim); letter-spacing: 0.08e
   border-radius: 4px;
   padding: 0.15rem 0.4rem;
 }
+
+.card-art {
+  width: 100%;
+  aspect-ratio: 1;
+  object-fit: cover;
+  border-radius: 6px;
+  margin-bottom: 0.4rem;
+}
+.queue-bar {
+  position: sticky;
+  bottom: 0;
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.6rem 0.9rem;
+  background: rgba(20, 28, 30, 0.97);
+  border: 1px solid #2a3438;
+  border-radius: 8px;
+  margin-top: 1rem;
+}
+.queue-bar audio {
+  flex: 1;
+  min-width: 0;
+  height: 32px;
+}
+.queue-bar .now {
+  max-width: 18rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.85rem;
+}
+.track-row {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  width: 100%;
+  text-align: left;
+}
+.track-row .tno {
+  width: 2rem;
+  text-align: right;
+  color: var(--dim, #8aa);
+}
+.track-row.playing .tno::before {
+  content: '▶ ';
+}
+
+.album-head {
+  display: flex;
+  gap: 1rem;
+  align-items: flex-start;
+}
+.album-art {
+  width: 160px;
+  aspect-ratio: 1;
+  flex: none;
+}

@@ -178,5 +178,170 @@ fn test_router(
         std::time::Duration::from_secs(900),
         90,
     ));
-    kahawai_hub::api::router(registry, auth, sessions, enrollments, Arc::new(kahawai_hub::subtitles::Subtitles::new(tempfile::tempdir().unwrap().keep())))
+    kahawai_hub::api::router(registry, auth, sessions, enrollments, Arc::new(kahawai_hub::subtitles::Subtitles::new(tempfile::tempdir().unwrap().keep())), Arc::new(kahawai_hub::artwork::Artwork::new(tempfile::tempdir().unwrap().keep())))
+}
+
+/// Incremental rescan (MH-5): a second scan that reports unchanged files
+/// via FilesSeen (no re-upsert) must NOT get them reconciled away, and
+/// the hub must answer ManifestRequest with what it knows.
+#[tokio::test]
+async fn manifest_and_files_seen_survive_rescan() {
+    use kahawai_proto::v1 as pb;
+    let pki = tempfile::tempdir().unwrap();
+    let ca = Arc::new(kahawai_hub::pki::HubCa::load_or_create(pki.path()).unwrap());
+    let allowed = kahawai_transport::mtls::AllowedCerts::default();
+    let (cert_pem, key_pem) = ca.issue_server_cert(&["localhost".into()]).unwrap();
+    let tls = kahawai_transport::mtls::mtls_server_config(
+        &cert_pem,
+        &key_pem,
+        ca.ca_cert_pem(),
+        allowed.clone(),
+    )
+    .unwrap();
+    let db = kahawai_hub::db::open_in_memory().await.unwrap();
+    let registry = Arc::new(Registry::new(db.clone(), allowed.clone()));
+    let sessions =
+        Arc::new(kahawai_hub::sessions::Sessions::new(tempfile::tempdir().unwrap().keep()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let hub_addr = format!("localhost:{}", listener.local_addr().unwrap().port());
+    let link_svc =
+        kahawai_hub::link_service::MediahostLinkService::new(registry.clone(), sessions.clone());
+    tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(link_svc.into_server())
+            .serve_with_incoming(kahawai_transport::tls::tls_incoming(listener, tls))
+            .await
+            .unwrap();
+    });
+
+    let bundle = kahawai_core::pki::new_satellite_csr("mediahost", "01HOST", "nas").unwrap();
+    let signed = ca.sign_satellite_csr(&bundle.csr_der, 90).unwrap();
+    allowed.insert(&signed.fingerprint);
+    let id = kahawai_transport::identity::SatelliteIdentity {
+        module_id: "01HOST".into(),
+        key_pem: bundle.key_pem,
+        cert_pem: signed.cert_pem,
+        ca_pem: ca.ca_cert_pem().to_string(),
+    };
+    let client_tls = kahawai_transport::mtls::mtls_client_config(&id).unwrap();
+
+    let scan = |round: u32| {
+        let hub_addr = hub_addr.clone();
+        let client_tls = client_tls.clone();
+        async move {
+            let channel =
+                kahawai_transport::tls::grpc_channel_with(&hub_addr, client_tls).await.unwrap();
+            let mut client = pb::mediahost_link_client::MediahostLinkClient::new(channel);
+            let (tx, rx) = tokio::sync::mpsc::channel(8);
+            tx.send(pb::HostToHub {
+                msg: Some(pb::host_to_hub::Msg::Hello(pb::Hello {
+                    protocol_major: kahawai_proto::PROTOCOL_MAJOR,
+                    protocol_minor: kahawai_proto::PROTOCOL_MINOR,
+                    name: "nas".into(),
+                })),
+            })
+            .await
+            .unwrap();
+            let mut inbound = client
+                .link(tokio_stream::wrappers::ReceiverStream::new(rx))
+                .await
+                .unwrap()
+                .into_inner();
+            inbound.message().await.unwrap().unwrap(); // HelloAck
+            tx.send(pb::HostToHub {
+                msg: Some(pb::host_to_hub::Msg::AnnounceCollection(pb::AnnounceCollection {
+                    id: "movies".into(),
+                    media_type: "movies".into(),
+                    roots: vec!["/srv/movies".into()],
+                })),
+            })
+            .await
+            .unwrap();
+            tx.send(pb::HostToHub {
+                msg: Some(pb::host_to_hub::Msg::ManifestRequest(pb::ManifestRequest {
+                    collection_id: "movies".into(),
+                })),
+            })
+            .await
+            .unwrap();
+            // Collect the manifest.
+            let mut entries = vec![];
+            loop {
+                match inbound.message().await.unwrap().unwrap().msg {
+                    Some(pb::hub_to_host::Msg::Manifest(m)) => {
+                        entries.extend(m.entries);
+                        if m.done {
+                            break;
+                        }
+                    }
+                    other => panic!("expected manifest, got {other:?}"),
+                }
+            }
+            if round == 1 {
+                assert!(entries.is_empty(), "fresh hub knows nothing: {entries:?}");
+                tx.send(pb::HostToHub {
+                    msg: Some(pb::host_to_hub::Msg::FileUpsert(pb::FileUpsert {
+                        collection_id: "movies".into(),
+                        files: vec![pb::FileRecord {
+                            path_rel: "Heat (1995).mkv".into(),
+                            size: 100,
+                            mtime_unix: 42,
+                            head_xxh3: 1,
+                            tail_xxh3: 2,
+                            oshash: 3,
+                            streams_json: "{}".into(),
+                        }],
+                    })),
+                })
+                .await
+                .unwrap();
+            } else {
+                // Round 2: hub knows the file; report it seen, upsert nothing.
+                assert_eq!(entries.len(), 1, "{entries:?}");
+                assert_eq!(entries[0].path_rel, "Heat (1995).mkv");
+                assert_eq!(entries[0].size, 100);
+                assert_eq!(entries[0].mtime_unix, 42);
+                tx.send(pb::HostToHub {
+                    msg: Some(pb::host_to_hub::Msg::FilesSeen(pb::FilesSeen {
+                        collection_id: "movies".into(),
+                        path_rel: vec!["Heat (1995).mkv".into()],
+                    })),
+                })
+                .await
+                .unwrap();
+            }
+            tx.send(pb::HostToHub {
+                msg: Some(pb::host_to_hub::Msg::ScanProgress(pb::ScanProgress {
+                    collection_id: "movies".into(),
+                    scanned: (round == 1) as u32,
+                    failed: 0,
+                    complete: true,
+                    skipped: (round == 2) as u32,
+                })),
+            })
+            .await
+            .unwrap();
+            // Give the hub a beat to reconcile before the link drops.
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        }
+    };
+
+    scan(1).await;
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM files")
+        .fetch_one(&db)
+        .await
+        .unwrap();
+    assert_eq!(n, 1);
+
+    scan(2).await;
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM files")
+        .fetch_one(&db)
+        .await
+        .unwrap();
+    assert_eq!(n, 1, "FilesSeen must protect unchanged files from reconciliation");
+    let items: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM items")
+        .fetch_one(&db)
+        .await
+        .unwrap();
+    assert_eq!(items, 1, "resolved item survives the incremental rescan");
 }

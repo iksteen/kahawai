@@ -79,6 +79,12 @@ async fn link_once(
         None => bail!("hub closed the link before HelloAck"),
     }
 
+    // Manifest responses are routed to the scan task of their collection.
+    let manifest_waiters: std::sync::Arc<
+        std::sync::Mutex<
+            std::collections::HashMap<String, tokio::sync::mpsc::Sender<kahawai_proto::v1::Manifest>>,
+        >,
+    > = Default::default();
     for c in collections {
         tx.send(HostToHub {
             msg: Some(host_to_hub::Msg::AnnounceCollection(AnnounceCollection {
@@ -89,8 +95,18 @@ async fn link_once(
         })
         .await
         .context("link closed before announce")?;
-        // ponytail: rescan on every (re)connect; incremental journal later.
-        tokio::spawn(scan::scan_collection(c.clone(), tx.clone()));
+        // Incremental rescan (MH-5): ask what the hub already knows;
+        // unchanged files (size+mtime) are reported seen, not re-inspected.
+        let (mtx, mrx) = tokio::sync::mpsc::channel(16);
+        manifest_waiters.lock().unwrap().insert(c.name.clone(), mtx);
+        tx.send(HostToHub {
+            msg: Some(host_to_hub::Msg::ManifestRequest(kahawai_proto::v1::ManifestRequest {
+                collection_id: c.name.clone(),
+            })),
+        })
+        .await
+        .context("link closed before manifest request")?;
+        tokio::spawn(scan::scan_collection(c.clone(), tx.clone(), mrx));
     }
 
     let mut ticker = tokio::time::interval(HEARTBEAT_INTERVAL);
@@ -107,6 +123,14 @@ async fn link_once(
             msg = inbound.message() => {
                 match msg {
                     Ok(Some(m)) => {
+                        if let Some(hub_to_host::Msg::Manifest(m)) = &m.msg {
+                            let sender =
+                                manifest_waiters.lock().unwrap().get(&m.collection_id).cloned();
+                            if let Some(s) = sender {
+                                let _ = s.try_send(m.clone());
+                            }
+                            continue;
+                        }
                         if let Some(hub_to_host::Msg::OpenRead(req)) = m.msg {
                             let path = serve::resolve_path(collections, &req);
                             if let Err(e) = &path {

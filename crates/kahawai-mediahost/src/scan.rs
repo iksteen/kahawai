@@ -21,6 +21,8 @@ pub struct CollectionConfig {
     pub roots: Vec<PathBuf>,
 }
 
+const AUDIO_EXTS: &[&str] = &["flac", "mp3", "m4a", "ogg", "opus", "wav", "aac", "wma"];
+
 const MEDIA_EXTS: &[&str] = &[
     "mkv", "mp4", "m4v", "webm", "avi", "mov", "ts", "m2ts", "ogv", // video
     "flac", "mp3", "ogg", "oga", "opus", "m4a", "aac", "wav", // audio
@@ -30,19 +32,63 @@ const DISCOVER_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Scan one collection, sending batches over the link. Errors only when the
 /// link is gone; per-file failures become FileError messages (MH-8).
-pub async fn scan_collection(cfg: CollectionConfig, tx: Sender<HostToHub>) -> Result<()> {
-    let (mut scanned, mut failed) = (0u32, 0u32);
+pub async fn scan_collection(
+    cfg: CollectionConfig,
+    tx: Sender<HostToHub>,
+    mut manifest: tokio::sync::mpsc::Receiver<kahawai_proto::v1::Manifest>,
+) -> Result<()> {
+    let (mut scanned, mut failed, mut skipped) = (0u32, 0u32, 0u32);
     let mut batch: Vec<FileRecord> = Vec::with_capacity(BATCH);
 
+    // Collect the hub's manifest (chunked); an old hub never answers, so
+    // a timeout degrades to the full rescan.
+    let mut known: std::collections::HashMap<String, (u64, i64)> = Default::default();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        match tokio::time::timeout_at(deadline, manifest.recv()).await {
+            Ok(Some(m)) => {
+                known.extend(m.entries.into_iter().map(|e| (e.path_rel, (e.size, e.mtime_unix))));
+                if m.done {
+                    break;
+                }
+            }
+            _ => {
+                known.clear(); // partial manifest is worse than none
+                break;
+            }
+        }
+    }
+    let mut seen_batch: Vec<String> = Vec::new();
+
+    let include_audio = cfg.media_type == "music";
     for root in &cfg.roots {
         let root = root.clone();
-        let paths = tokio::task::spawn_blocking(move || walk(&root)).await??;
+        let paths =
+            tokio::task::spawn_blocking(move || walk(&root, include_audio)).await??;
         for (root_local, path) in paths {
             let rel = path
                 .strip_prefix(&root_local)
                 .unwrap_or(&path)
                 .to_string_lossy()
                 .into_owned();
+            // Unchanged since the hub last saw it? Seen, not re-inspected.
+            if let Some(&(size, mtime)) = known.get(&rel)
+                && std::fs::metadata(&path).is_ok_and(|m| {
+                    m.len() == size
+                        && m.modified()
+                            .ok()
+                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                            .map(|d| d.as_secs() as i64)
+                            == Some(mtime)
+                })
+            {
+                skipped += 1;
+                seen_batch.push(rel);
+                if seen_batch.len() >= 1000 {
+                    send_seen(&tx, &cfg.name, std::mem::take(&mut seen_batch)).await?;
+                }
+                continue;
+            }
             let (r, p) = (root_local.clone(), path.clone());
             let record =
                 tokio::task::spawn_blocking(move || inspect(&r, &p)).await?;
@@ -81,18 +127,33 @@ pub async fn scan_collection(cfg: CollectionConfig, tx: Sender<HostToHub>) -> Re
     if !batch.is_empty() {
         send_upsert(&tx, &cfg.name, batch).await?;
     }
+    if !seen_batch.is_empty() {
+        send_seen(&tx, &cfg.name, seen_batch).await?;
+    }
     tx.send(HostToHub {
         msg: Some(host_to_hub::Msg::ScanProgress(ScanProgress {
             collection_id: cfg.name.clone(),
             scanned,
             failed,
             complete: true,
+            skipped,
         })),
     })
     .await
     .context("link closed")?;
-    tracing::info!(collection = %cfg.name, scanned, failed, "scan complete");
+    tracing::info!(collection = %cfg.name, scanned, failed, skipped, "scan complete");
     Ok(())
+}
+
+async fn send_seen(tx: &Sender<HostToHub>, collection: &str, paths: Vec<String>) -> Result<()> {
+    tx.send(HostToHub {
+        msg: Some(host_to_hub::Msg::FilesSeen(kahawai_proto::v1::FilesSeen {
+            collection_id: collection.to_string(),
+            path_rel: paths,
+        })),
+    })
+    .await
+    .context("link closed")
 }
 
 async fn send_upsert(tx: &Sender<HostToHub>, collection: &str, files: Vec<FileRecord>) -> Result<()> {
@@ -107,18 +168,18 @@ async fn send_upsert(tx: &Sender<HostToHub>, collection: &str, files: Vec<FileRe
 }
 
 /// Media files under `root`, sorted for deterministic batches.
-fn walk(root: &Path) -> Result<Vec<(PathBuf, PathBuf)>> {
+fn walk(root: &Path, include_audio: bool) -> Result<Vec<(PathBuf, PathBuf)>> {
     let mut out = Vec::new();
     for entry in walkdir::WalkDir::new(root).follow_links(false) {
         let entry = entry?;
         if !entry.file_type().is_file() {
             continue;
         }
-        let is_media = entry
-            .path()
-            .extension()
-            .and_then(|e| e.to_str())
-            .is_some_and(|e| MEDIA_EXTS.contains(&e.to_ascii_lowercase().as_str()));
+        let is_media = entry.path().extension().and_then(|e| e.to_str()).is_some_and(|e| {
+            let e = e.to_ascii_lowercase();
+            MEDIA_EXTS.contains(&e.as_str())
+                || (include_audio && AUDIO_EXTS.contains(&e.as_str()))
+        });
         if is_media {
             out.push((root.to_path_buf(), entry.into_path()));
         }
@@ -141,7 +202,34 @@ fn inspect(root: &Path, path: &Path) -> Result<Inspected> {
     let (head_xxh3, tail_xxh3, oshash) = identity_hashes(path, size)?;
     let mut info = kahawai_media::discover(path, DISCOVER_TIMEOUT)?;
     info.external_subtitles = find_sidecars(root, path);
+    info.artwork = find_artwork(root, path);
     Ok((size, mtime_unix, head_xxh3, tail_xxh3, oshash, info))
+}
+
+/// Local artwork (MH-4): a cover image in the media file's directory.
+/// Names in preference order; first hit wins.
+fn find_artwork(root: &Path, media: &Path) -> Option<String> {
+    const NAMES: &[&str] = &["cover", "folder", "poster", "front"];
+    const EXTS: &[&str] = &["jpg", "jpeg", "png", "webp"];
+    let dir = media.parent()?;
+    let entries: Vec<PathBuf> =
+        std::fs::read_dir(dir).ok()?.flatten().map(|e| e.path()).collect();
+    for name in NAMES {
+        for p in &entries {
+            let stem_ok = p
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .is_some_and(|s| s.eq_ignore_ascii_case(name));
+            let ext_ok = p
+                .extension()
+                .and_then(|x| x.to_str())
+                .is_some_and(|x| EXTS.contains(&x.to_ascii_lowercase().as_str()));
+            if stem_ok && ext_ok {
+                return Some(p.strip_prefix(root).unwrap_or(p).to_string_lossy().into_owned());
+            }
+        }
+    }
+    None
 }
 
 const SUBTITLE_EXTS: &[(&str, &str)] = &[("srt", "srt"), ("ass", "ass"), ("ssa", "ass"), ("vtt", "vtt")];
@@ -291,7 +379,7 @@ mod tests {
         std::fs::write(dir.path().join("sub/a.mp4"), b"x").unwrap();
         std::fs::write(dir.path().join("notes.txt"), b"x").unwrap();
         std::fs::write(dir.path().join("cover.jpg"), b"x").unwrap();
-        let files = walk(dir.path()).unwrap();
+        let files = walk(dir.path(), false).unwrap();
         let names: Vec<_> = files
             .iter()
             .map(|(r, p)| p.strip_prefix(r).unwrap().to_string_lossy().into_owned())

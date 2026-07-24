@@ -323,7 +323,8 @@ async fn run_hub(cfg: config::HubConfig) -> Result<()> {
         .with_context(|| format!("binding client API on {}", cfg.bind))?;
     let subtitles =
         Arc::new(kahawai_hub::subtitles::Subtitles::new(cfg.data_dir.join("subtitles")));
-    let api = kahawai_hub::api::router(registry.clone(), auth, sessions.clone(), Arc::new(svc.clone()), subtitles);
+    let artwork = Arc::new(kahawai_hub::artwork::Artwork::new(cfg.data_dir.join("artwork")));
+    let api = kahawai_hub::api::router(registry.clone(), auth, sessions.clone(), Arc::new(svc.clone()), subtitles, artwork);
     tokio::spawn(async move {
         if let Err(e) = axum::serve(api_listener, api).await {
             tracing::error!(error = %e, "client API server failed");

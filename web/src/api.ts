@@ -100,8 +100,9 @@ export async function json<T>(path: string, init?: RequestInit): Promise<T> {
 
 export type Item = {
   id: string
-  kind: 'movie' | 'show' | 'episode'
+  kind: 'movie' | 'show' | 'episode' | 'album' | 'track'
   title: string
+  artist?: string | null
   year: number | null
   season: number | null
   episode: number | null
@@ -131,6 +132,10 @@ export type ItemDetail = Item & {
   show_title?: string | null
   parent_id?: string | null
 }
+
+/// Local artwork (cover.jpg etc). <img> requests authenticate with the
+/// media cookie; 404 = no artwork (hide the img).
+export const artworkUrl = (id: string) => `/api/v1/items/${id}/artwork`
 
 export const fetchChildren = (id: string) =>
   json<{ children: Item[] }>(`/api/v1/items/${id}/children`)

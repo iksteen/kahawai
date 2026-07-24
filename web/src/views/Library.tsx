@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { fetchItems, fetchLibraries, type Item } from '../api'
+import { artworkUrl, fetchItems, fetchLibraries, type Item } from '../api'
 
 function fmtResume(ms: number) {
   const s = Math.floor(ms / 1000)
@@ -58,10 +58,18 @@ export default function Library({
         {shown.map((i) => (
           <li key={i.id}>
             <button className="card" onClick={() => onOpen(i.id)}>
+              <img
+                className="card-art"
+                src={artworkUrl(i.id)}
+                loading="lazy"
+                alt=""
+                onError={(e) => (e.currentTarget.style.display = 'none')}
+              />
               {i.kind === 'show' && <span className="chip dim">series</span>}
               <span className="card-title">{i.title}</span>
               <span className="card-meta mono">
-                {i.year ?? '—'}
+                {i.kind === 'album' ? (i.artist ?? '—') : (i.year ?? '—')}
+                {i.kind === 'album' && i.year ? ` · ${i.year}` : ''}
                 {i.sources > 1 ? ` · ${i.sources} sources` : ''}
               </span>
               <span className="card-state">

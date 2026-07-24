@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import {
+  artworkUrl,
   fetchChildren,
   fetchItem,
   startSession,
@@ -8,6 +9,7 @@ import {
   type Session,
   type Source,
 } from '../api'
+import AlbumPlayer from './AlbumPlayer'
 
 const GB = 1024 * 1024 * 1024
 
@@ -84,12 +86,13 @@ export default function Detail({
     fetchItem(id).then(setItem).catch((e) => setError(String(e)))
   }, [id])
   useEffect(() => {
-    if (item?.kind === 'show') {
+    if (item?.kind === 'show' || item?.kind === 'album') {
       fetchChildren(item.id)
         .then((c) => setEpisodes(c.children))
         .catch((e) => setError(String(e)))
     }
   }, [item?.id, item?.kind])
+  const [queueAt, setQueueAt] = useState<number | null>(null)
   // Deep-linked or history-forwarded /play URLs: start playback once
   // the item is loaded (shows have nothing to autoplay).
   const [autoPlayed, setAutoPlayed] = useState(false)
@@ -113,6 +116,60 @@ export default function Detail({
   }
   const upLabel =
     item.kind === 'episode' && item.parent_id ? `← ${item.show_title ?? 'Series'}` : '← Library'
+
+  if (item.kind === 'album') {
+    const tracks = episodes // children, ordered disc/track by the API
+    return (
+      <main>
+        <button className="btn ghost small" onClick={goUp}>
+          {upLabel}
+        </button>
+        <div className="detail-head album-head">
+          <img
+            className="card-art album-art"
+            src={artworkUrl(item.id)}
+            alt=""
+            onError={(e) => (e.currentTarget.style.display = 'none')}
+          />
+          <div>
+            <h1>
+              {item.title} {item.year && <span className="year">({item.year})</span>}
+            </h1>
+            <div className="detail-sub mono">
+              {item.artist ?? ''} · {tracks.length} tracks
+            </div>
+            <div className="play-row">
+              <button className="btn" disabled={!tracks.length} onClick={() => setQueueAt(0)}>
+                Play album
+              </button>
+            </div>
+          </div>
+        </div>
+        <ul className="rows">
+          {tracks.map((t, i) => (
+            <li key={t.id}>
+              <button
+                className={`card episode track-row${queueAt === i ? ' playing' : ''}`}
+                onClick={() => setQueueAt(i)}
+              >
+                <span className="tno mono">{t.episode ?? i + 1}</span>
+                <span>{t.title}</span>
+                {t.played && <span className="seen"> ✓</span>}
+              </button>
+            </li>
+          ))}
+        </ul>
+        {queueAt !== null && (
+          <AlbumPlayer
+            tracks={tracks}
+            startAt={queueAt}
+            onTrackChange={(i) => setQueueAt(i)}
+            onStop={() => setQueueAt(null)}
+          />
+        )}
+      </main>
+    )
+  }
 
   if (item.kind === 'show') {
     // null season = absolute numbering (anime); distinct from Specials.

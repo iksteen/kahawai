@@ -52,6 +52,69 @@ fn parse_year_token(tok: &str) -> Option<u16> {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct MusicGuess {
+    pub artist: String,
+    pub album: String,
+    pub album_year: Option<i64>,
+    pub disc: Option<u32>,
+    pub track: u32,
+    pub title: String,
+}
+
+/// Filename fallback for untagged music, matching the Lidarr layout:
+/// `Artist/Album (Year)/[Artist - Album - ][D-]NN [- ]Title.ext`.
+/// Tags always win — this only fires when they're missing.
+pub fn parse_music(path_rel: &str) -> Option<MusicGuess> {
+    let mut parts = path_rel.rsplitn(3, '/');
+    let file = parts.next()?;
+    let album_dir = parts.next()?;
+    let artist_dir = parts.next().unwrap_or("");
+
+    let stem = file.rsplit_once('.').map(|(s, _)| s).unwrap_or(file);
+    // Album dir: "Name (1997)" or bare "Name".
+    let (album, album_year) = match album_dir.rfind('(') {
+        Some(i) if album_dir.ends_with(')') => {
+            let inner = &album_dir[i + 1..album_dir.len() - 1];
+            match inner.parse::<i64>() {
+                Ok(y) if (1900..2100).contains(&y) => (album_dir[..i].trim(), Some(y)),
+                _ => (album_dir.trim(), None),
+            }
+        }
+        _ => (album_dir.trim(), None),
+    };
+    if album.is_empty() {
+        return None;
+    }
+
+    // Track number = first standalone number segment; everything after
+    // it is the title. Segments split on " - ".
+    let segs: Vec<&str> = stem.split(" - ").collect();
+    let num_at = segs.iter().position(|s| {
+        let t = s.trim();
+        !t.is_empty() && t.len() <= 4 && t.chars().all(|c| c.is_ascii_digit())
+    })?;
+    let track: u32 = segs[num_at].trim().parse().ok()?;
+    let title = segs[num_at + 1..].join(" - ");
+    let title = title.trim();
+    if title.is_empty() {
+        return None;
+    }
+    let artist = if artist_dir.is_empty() {
+        segs.first().map(|s| s.trim()).filter(|s| !s.is_empty())?.to_string()
+    } else {
+        artist_dir.trim().to_string()
+    };
+    Some(MusicGuess {
+        artist,
+        album: album.to_string(),
+        album_year,
+        disc: None,
+        track,
+        title: title.to_string(),
+    })
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct EpisodeGuess {
     pub show_title: String,
     pub show_year: Option<u16>,
@@ -344,5 +407,37 @@ mod tests {
             normalize_title("Léon: The Professional"),
             normalize_title("léon the professional")
         );
+    }
+
+    #[test]
+    fn parses_lidarr_music_layout() {
+        let g = parse_music(
+            "Rotting Christ/Khronos (2000)/Rotting Christ - Khronos - 01 - Thou Art Blind.flac",
+        )
+        .unwrap();
+        assert_eq!(
+            g,
+            MusicGuess {
+                artist: "Rotting Christ".into(),
+                album: "Khronos".into(),
+                album_year: Some(2000),
+                disc: None,
+                track: 1,
+                title: "Thou Art Blind".into(),
+            }
+        );
+        // No year, no artist prefix in the filename.
+        let g = parse_music("Garbage/Version 2.0/03 - When I Grow Up.mp3").unwrap();
+        assert_eq!(g.album, "Version 2.0");
+        assert_eq!(g.album_year, None);
+        assert_eq!(g.track, 3);
+        assert_eq!(g.title, "When I Grow Up");
+        assert_eq!(g.artist, "Garbage");
+        // Title containing " - " stays whole after the number.
+        let g = parse_music("X/Y (1999)/X - Y - 07 - Foo - Bar.flac").unwrap();
+        assert_eq!(g.title, "Foo - Bar");
+        // Unparseable: no track number.
+        assert!(parse_music("X/Y/cover.jpg").is_none());
+        assert!(parse_music("X/Y/liner-notes.flac").is_none());
     }
 }

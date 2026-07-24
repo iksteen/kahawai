@@ -1,4 +1,5 @@
 pub mod api;
+pub mod artwork;
 pub mod auth;
 pub mod db;
 pub mod enrollment;

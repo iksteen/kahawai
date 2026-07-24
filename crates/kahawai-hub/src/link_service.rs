@@ -194,9 +194,42 @@ async fn handle_host_msg(
             tracing::warn!(%module_id, collection = %e.collection_id, path = %e.path_rel,
                 error = %e.error, "mediahost reported unreadable file");
         }
+        host_to_hub::Msg::ManifestRequest(r) => {
+            // Incremental rescan (MH-5): what we already know, so the
+            // host can skip re-inspecting unchanged files.
+            let entries = registry.file_stats(module_id, &r.collection_id).await?;
+            const CHUNK: usize = 8000;
+            let total = entries.len();
+            let mut sent = 0;
+            let mut chunks = entries.chunks(CHUNK).peekable();
+            loop {
+                let chunk = chunks.next().unwrap_or(&[]);
+                let done = chunks.peek().is_none();
+                let msg = kahawai_proto::v1::HubToHost {
+                    msg: Some(kahawai_proto::v1::hub_to_host::Msg::Manifest(
+                        kahawai_proto::v1::Manifest {
+                            collection_id: r.collection_id.clone(),
+                            entries: chunk.to_vec(),
+                            done,
+                        },
+                    )),
+                };
+                registry.send_to_host(module_id, msg).await?;
+                sent += chunk.len();
+                if done {
+                    break;
+                }
+            }
+            tracing::debug!(%module_id, collection = %r.collection_id, files = total, sent, "manifest sent");
+        }
+        host_to_hub::Msg::FilesSeen(s) => {
+            if let Some(paths) = seen.get_mut(&s.collection_id) {
+                paths.extend(s.path_rel);
+            }
+        }
         host_to_hub::Msg::ScanProgress(p) if p.complete => {
             tracing::info!(%module_id, collection = %p.collection_id,
-                scanned = p.scanned, failed = p.failed, "scan complete");
+                scanned = p.scanned, failed = p.failed, skipped = p.skipped, "scan complete");
             if let Some(paths) = seen.remove(&p.collection_id) {
                 registry.reconcile_files(module_id, &p.collection_id, &paths).await?;
             }

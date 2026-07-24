@@ -24,6 +24,7 @@ pub struct AppState {
     pub sessions: Arc<crate::sessions::Sessions>,
     pub enrollments: Arc<crate::enrollment_service::EnrollmentService>,
     pub subtitles: Arc<crate::subtitles::Subtitles>,
+    pub artwork: Arc<crate::artwork::Artwork>,
 }
 
 pub fn router(
@@ -32,14 +33,16 @@ pub fn router(
     sessions: Arc<crate::sessions::Sessions>,
     enrollments: Arc<crate::enrollment_service::EnrollmentService>,
     subtitles: Arc<crate::subtitles::Subtitles>,
+    artwork: Arc<crate::artwork::Artwork>,
 ) -> Router {
-    let state = AppState { registry, auth, sessions, enrollments, subtitles };
+    let state = AppState { registry, auth, sessions, enrollments, subtitles, artwork };
     let protected = Router::new()
         .route("/api/v1/collections", get(list_collections))
         .route("/api/v1/libraries", get(list_libraries))
         .route("/api/v1/items", get(list_items))
         .route("/api/v1/items/{id}", get(item_detail))
         .route("/api/v1/items/{id}/children", get(item_children))
+        .route("/api/v1/items/{id}/artwork", get(item_artwork))
         .route("/api/v1/items/{id}/subtitles", get(item_subtitles))
         .route("/api/v1/items/{id}/subtitles/{file}", get(item_subtitle_vtt))
         .route("/api/v1/playback/sessions", post(start_session))
@@ -625,6 +628,29 @@ async fn list_collections(State(state): State<AppState>) -> Result<Json<Value>, 
     Ok(Json(json!({ "collections": cols })))
 }
 
+async fn item_artwork(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Response, ApiError> {
+    match state
+        .artwork
+        .get(&state.registry, &state.sessions, &id)
+        .await
+        .map_err(internal)?
+    {
+        Some((bytes, ctype)) => Ok((
+            [
+                (axum::http::header::CONTENT_TYPE, ctype),
+                // Local artwork changes only on rescan; let clients keep it.
+                (axum::http::header::CACHE_CONTROL, "private, max-age=86400"),
+            ],
+            bytes,
+        )
+            .into_response()),
+        None => Err((StatusCode::NOT_FOUND, "no artwork".into())),
+    }
+}
+
 async fn item_subtitles(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -692,13 +718,13 @@ async fn list_items(
     // Shows carry no item_sources of their own; their library membership
     // flows up from their episodes' sources.
     let rows = sqlx::query(
-        "SELECT i.id, i.kind, i.title, i.year, i.season, i.episode,
+        "SELECT i.id, i.kind, i.title, i.year, i.season, i.episode, i.artist,
                 COUNT(s.item_id) AS sources,
                 w.position_ms, w.played, w.play_count
          FROM items i
          LEFT JOIN item_sources s ON s.item_id = i.id
          LEFT JOIN watch_state w ON w.item_id = i.id AND w.user_id = ?1
-         WHERE i.kind != 'episode'
+         WHERE i.kind NOT IN ('episode', 'track')
            AND (?2 IS NULL OR i.id IN (
              SELECT COALESCE(ci.parent_id, ci.id)
              FROM library_collections lc
@@ -723,6 +749,7 @@ fn item_row_json(r: &sqlx::sqlite::SqliteRow) -> Value {
         "id": r.get::<String, _>("id"),
         "kind": r.get::<String, _>("kind"),
         "title": r.get::<String, _>("title"),
+        "artist": r.try_get::<Option<String>, _>("artist").ok().flatten(),
         "year": r.get::<Option<i64>, _>("year"),
         "season": r.get::<Option<i64>, _>("season"),
         "episode": r.get::<Option<i64>, _>("episode"),
@@ -741,7 +768,7 @@ async fn item_children(
     axum::Extension(claims): axum::Extension<crate::auth::Claims>,
 ) -> Result<Json<Value>, ApiError> {
     let rows = sqlx::query(
-        "SELECT i.id, i.kind, i.title, i.year, i.season, i.episode,
+        "SELECT i.id, i.kind, i.title, i.year, i.season, i.episode, i.artist,
                 COUNT(s.item_id) AS sources,
                 w.position_ms, w.played, w.play_count
          FROM items i
@@ -765,7 +792,7 @@ async fn item_detail(
     axum::Extension(claims): axum::Extension<crate::auth::Claims>,
 ) -> Result<Json<Value>, ApiError> {
     let item = sqlx::query(
-        "SELECT i.id, i.kind, i.title, i.year, i.season, i.episode,
+        "SELECT i.id, i.kind, i.title, i.year, i.season, i.episode, i.artist,
                 p.id AS parent_id, p.title AS show_title,
                 (SELECT COUNT(*) FROM item_sources s WHERE s.item_id = i.id) AS sources,
                 w.position_ms, w.played, w.play_count

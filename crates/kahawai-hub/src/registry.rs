@@ -453,6 +453,7 @@ impl Registry {
         let resolve_series =
             matches!(media_type.as_deref(), Some("series") | Some("anime"));
         let anime = media_type.as_deref() == Some("anime");
+        let resolve_music = media_type.as_deref() == Some("music");
 
         let mut tx = self.db.begin().await?;
         let n = files.len();
@@ -509,6 +510,99 @@ impl Registry {
                         id
                     }
                 })
+            } else if resolve_music {
+                // Tags win (the scanner extracted them); the Lidarr
+                // filename layout is the fallback for untagged rips.
+                let info: kahawai_core::media::MediaInfo =
+                    serde_json::from_str(&f.streams_json).unwrap_or_default();
+                let tags = &info.tags;
+                let tag = |k: &str| tags.get(k).map(|s| s.trim()).filter(|s| !s.is_empty());
+                let parsed = names::parse_music(&f.path_rel);
+                let artist = tag("artist")
+                    .map(str::to_string)
+                    .or_else(|| parsed.as_ref().map(|g| g.artist.clone()));
+                let album = tag("album")
+                    .map(str::to_string)
+                    .or_else(|| parsed.as_ref().map(|g| g.album.clone()));
+                let track_no: Option<u32> = tags
+                    .get("track_number")
+                    .and_then(|v| v.parse().ok())
+                    .or_else(|| parsed.as_ref().map(|g| g.track));
+                let title = tag("title")
+                    .map(str::to_string)
+                    .or_else(|| parsed.as_ref().map(|g| g.title.clone()));
+                let disc: Option<u32> = tags.get("disc_number").and_then(|v| v.parse().ok());
+                let album_year = parsed.as_ref().and_then(|g| g.album_year);
+                match (artist, album, track_no, title) {
+                    (Some(artist), Some(album), Some(track), Some(title)) => {
+                        let album_norm = names::normalize_title(&album);
+                        let existing: Option<String> = sqlx::query_scalar(
+                            "SELECT id FROM items
+                             WHERE kind = 'album' AND norm_title = ?
+                               AND LOWER(artist) = LOWER(?)",
+                        )
+                        .bind(&album_norm)
+                        .bind(&artist)
+                        .fetch_optional(&mut *tx)
+                        .await?;
+                        let album_id = match existing {
+                            Some(id) => id,
+                            None => {
+                                let id = ulid::Ulid::new().to_string();
+                                sqlx::query(
+                                    "INSERT INTO items (id, kind, title, norm_title, year, artist)
+                                     VALUES (?, 'album', ?, ?, ?, ?)",
+                                )
+                                .bind(&id)
+                                .bind(&album)
+                                .bind(&album_norm)
+                                .bind(album_year)
+                                .bind(&artist)
+                                .execute(&mut *tx)
+                                .await?;
+                                id
+                            }
+                        };
+                        // Album artist for dedup is normalized lowercase;
+                        // display keeps the first-seen casing.
+                        let existing_track: Option<String> = sqlx::query_scalar(
+                            "SELECT id FROM items
+                             WHERE kind = 'track' AND parent_id = ?
+                               AND season IS ? AND episode = ?",
+                        )
+                        .bind(&album_id)
+                        .bind(disc)
+                        .bind(track)
+                        .fetch_optional(&mut *tx)
+                        .await?;
+                        Some(match existing_track {
+                            Some(id) => id,
+                            None => {
+                                let id = ulid::Ulid::new().to_string();
+                                sqlx::query(
+                                    "INSERT INTO items
+                                       (id, kind, title, norm_title, year,
+                                        parent_id, season, episode, artist)
+                                     VALUES (?, 'track', ?, ?, NULL, ?, ?, ?, ?)",
+                                )
+                                .bind(&id)
+                                .bind(&title)
+                                .bind(names::normalize_title(&title))
+                                .bind(&album_id)
+                                .bind(disc)
+                                .bind(track)
+                                .bind(&artist)
+                                .execute(&mut *tx)
+                                .await?;
+                                id
+                            }
+                        })
+                    }
+                    _ => {
+                        tracing::debug!(path = %f.path_rel, "no music identity; unresolved");
+                        None
+                    }
+                }
             } else if resolve_series {
                 let guess = if anime {
                     names::parse_anime(&f.path_rel)
@@ -639,6 +733,31 @@ impl Registry {
     /// items left without any source. Watch state is archived keyed to
     /// content identity first (HUB-20), so moves/renames and returning
     /// media keep their history.
+    /// (path, size, mtime) for every known file of a collection — the
+    /// incremental-rescan manifest (MH-5).
+    pub async fn file_stats(
+        &self,
+        module_id: &str,
+        collection_id: &str,
+    ) -> Result<Vec<kahawai_proto::v1::FileStat>> {
+        let rows = sqlx::query(
+            "SELECT path_rel, size, mtime_unix FROM files
+             WHERE module_id = ? AND collection_id = ?",
+        )
+        .bind(module_id)
+        .bind(collection_id)
+        .fetch_all(&self.db)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| kahawai_proto::v1::FileStat {
+                path_rel: r.get("path_rel"),
+                size: r.get::<i64, _>("size") as u64,
+                mtime_unix: r.get("mtime_unix"),
+            })
+            .collect())
+    }
+
     pub async fn reconcile_files(
         &self,
         module_id: &str,
@@ -676,16 +795,17 @@ impl Registry {
             }
         }
         sqlx::query(
-            "DELETE FROM items WHERE kind != 'show' AND id IN (
+            "DELETE FROM items WHERE kind NOT IN ('show', 'album') AND id IN (
                 SELECT i.id FROM items i
                 LEFT JOIN item_sources s ON s.item_id = i.id
                 WHERE s.item_id IS NULL)",
         )
         .execute(&mut *tx)
         .await?;
-        // Shows never have direct sources; they die of childlessness.
+        // Shows and albums never have direct sources; they die of
+        // childlessness.
         sqlx::query(
-            "DELETE FROM items WHERE kind = 'show' AND id NOT IN (
+            "DELETE FROM items WHERE kind IN ('show', 'album') AND id NOT IN (
                 SELECT DISTINCT parent_id FROM items WHERE parent_id IS NOT NULL)",
         )
         .execute(&mut *tx)
@@ -893,16 +1013,17 @@ impl Registry {
             sqlx::query(sql).bind(module_id).execute(&mut *tx).await?;
         }
         sqlx::query(
-            "DELETE FROM items WHERE kind != 'show' AND id IN (
+            "DELETE FROM items WHERE kind NOT IN ('show', 'album') AND id IN (
                 SELECT i.id FROM items i
                 LEFT JOIN item_sources s ON s.item_id = i.id
                 WHERE s.item_id IS NULL)",
         )
         .execute(&mut *tx)
         .await?;
-        // Shows never have direct sources; they die of childlessness.
+        // Shows and albums never have direct sources; they die of
+        // childlessness.
         sqlx::query(
-            "DELETE FROM items WHERE kind = 'show' AND id NOT IN (
+            "DELETE FROM items WHERE kind IN ('show', 'album') AND id NOT IN (
                 SELECT DISTINCT parent_id FROM items WHERE parent_id IS NOT NULL)",
         )
         .execute(&mut *tx)

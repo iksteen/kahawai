@@ -20,6 +20,10 @@ pub struct MediaInfo {
     /// Sidecar subtitle files next to the media file (MH-4).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub external_subtitles: Vec<SidecarSubtitle>,
+    /// Local artwork in the media file's directory (MH-4):
+    /// cover/folder/poster image, path relative to the collection root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artwork: Option<String>,
     /// Container-level tags (title, artist, album, track number, …).
     #[serde(default)]
     pub tags: BTreeMap<String, String>,
