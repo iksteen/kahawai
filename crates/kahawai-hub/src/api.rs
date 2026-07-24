@@ -967,12 +967,14 @@ async fn list_items(
         "SELECT i.id, i.kind, i.season, i.episode, i.artist,
                 COALESCE(md.title, i.title) AS title,
                 COALESCE(i.year, CAST(substr(md.premiered, 1, 4) AS INTEGER)) AS year,
+                mdc.confidence AS match_confidence,
                 COUNT(s.item_id) AS sources,
                 w.position_ms, w.played, w.play_count
          FROM items i
          LEFT JOIN item_sources s ON s.item_id = i.id
          LEFT JOIN watch_state w ON w.item_id = i.id AND w.user_id = ?1
          LEFT JOIN item_metadata md ON md.item_id = i.id AND md.provider_id != ''
+         LEFT JOIN item_metadata mdc ON mdc.item_id = i.id
          WHERE i.kind NOT IN ('episode', 'track')
            AND (?2 IS NULL OR i.id IN (
              SELECT COALESCE(ci.parent_id, ci.id)
@@ -999,6 +1001,7 @@ fn item_row_json(r: &sqlx::sqlite::SqliteRow) -> Value {
         "kind": r.get::<String, _>("kind"),
         "title": r.get::<String, _>("title"),
         "artist": r.try_get::<Option<String>, _>("artist").ok().flatten(),
+        "match_confidence": r.try_get::<Option<String>, _>("match_confidence").ok().flatten(),
         "year": r.get::<Option<i64>, _>("year"),
         "season": r.get::<Option<i64>, _>("season"),
         "episode": r.get::<Option<i64>, _>("episode"),

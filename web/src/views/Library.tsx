@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
-import { artworkUrl, fetchItems, fetchLibraries, type Item } from '../api'
+import { artworkUrl, fetchItems, fetchLibraries, isAdmin, type Item } from '../api'
 import placeholder from '../assets/placeholder.svg'
+import MatchDialog from './MatchDialog'
 
 function fmtResume(ms: number) {
   const s = Math.floor(ms / 1000)
@@ -18,6 +19,12 @@ export default function Library({
   const [name, setName] = useState('Library')
   const [filter, setFilter] = useState('')
   const [error, setError] = useState('')
+  const [matching, setMatching] = useState<Item | null>(null)
+
+  const reload = () =>
+    fetchItems(libraryId)
+      .then((r) => setItems(r.items))
+      .catch((e) => setError(String(e)))
 
   useEffect(() => {
     setItems(null)
@@ -57,7 +64,28 @@ export default function Library({
       )}
       <ul className="grid">
         {shown.map((i) => (
-          <li key={i.id}>
+          <li key={i.id} className="card-cell">
+            {isAdmin() && (i.kind === 'movie' || i.kind === 'show') && (
+              <button
+                className={`match-btn ${
+                  !i.match_confidence || i.match_confidence === 'miss' || i.match_confidence === 'rejected'
+                    ? 'miss'
+                    : i.match_confidence === 'weak'
+                      ? 'weak'
+                      : ''
+                }`}
+                title={
+                  i.match_confidence === 'weak'
+                    ? 'Uncertain match — review'
+                    : i.match_confidence === 'auto' || i.match_confidence === 'manual'
+                      ? 'Re-match metadata'
+                      : 'No metadata match — fix'
+                }
+                onClick={() => setMatching(i)}
+              >
+                ⌕
+              </button>
+            )}
             <button className="card" onClick={() => onOpen(i.id)}>
               <img
                 className="card-art"
@@ -87,6 +115,13 @@ export default function Library({
           </li>
         ))}
       </ul>
+      {matching && (
+        <MatchDialog
+          item={matching}
+          onClose={() => setMatching(null)}
+          onApplied={() => void reload()}
+        />
+      )}
     </main>
   )
 }

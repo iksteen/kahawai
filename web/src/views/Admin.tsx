@@ -1,5 +1,4 @@
 import { useEffect, useState } from 'react'
-import ReviewQueue from './ReviewQueue'
 import {
   adminApprove,
   adminEnrichRun,
@@ -202,7 +201,6 @@ export default function Admin() {
       {error && <div className="error">{error}</div>}
 
       <TmdbSection onNotice={setNotice} />
-      <ReviewQueue />
 
       <h2>Pending enrollments</h2>
       {pending.length === 0 ? (

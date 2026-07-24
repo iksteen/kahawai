@@ -331,3 +331,68 @@ h2 { font-size: 14px; font-weight: 650; color: var(--dim); letter-spacing: 0.08e
   grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
   margin-top: 0.6rem;
 }
+
+.card-cell {
+  position: relative;
+}
+.match-btn {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  z-index: 2;
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  border: 1px solid var(--line);
+  background: rgba(11, 20, 22, 0.85);
+  color: var(--dim);
+  font-size: 15px;
+  line-height: 1;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.12s;
+}
+.card-cell:hover .match-btn {
+  opacity: 1;
+}
+.match-btn.miss {
+  opacity: 1;
+  color: #e2574a;
+  border-color: #e2574a;
+}
+.match-btn.weak {
+  opacity: 1;
+  color: var(--sand);
+  border-color: var(--sand);
+}
+.dialog-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  background: rgba(5, 10, 11, 0.7);
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 6vh 1rem;
+}
+.dialog {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 1rem 1.2rem;
+  width: min(760px, 100%);
+  max-height: 85vh;
+  overflow-y: auto;
+}
+.dialog-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 1rem;
+}
+.dialog-head h2 {
+  margin: 0.2rem 0 0.6rem;
+}
+.dialog-weak {
+  margin-bottom: 0.6rem;
+}

@@ -107,6 +107,9 @@ export type Item = {
   season: number | null
   episode: number | null
   sources: number
+  /// Enrichment state (movie/show): null = never enriched,
+  /// miss/rejected = unmatched, weak = uncertain, auto/manual = good.
+  match_confidence?: string | null
   resume_position_ms: number | null
   played: boolean
   play_count: number
