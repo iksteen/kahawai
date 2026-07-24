@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
-use kahawai_media::subtitles::{decode_text, is_text_format, parse, to_vtt, Cue};
+use kahawai_media::subtitles::{decode_text, is_text_format, parse, to_vtt, Extracted};
 use serde::Serialize;
 use sqlx::Row;
 
@@ -25,6 +25,8 @@ pub struct SubtitleEntry {
     pub language: Option<String>,
     /// True when the source format is ASS/SSA: serving it as VTT loses
     /// styling, and HUB-32a demands that be a labeled, explicit choice.
+    /// Clients with an ASS renderer (the web player, via JASSUB) fetch
+    /// the faithful .ass form instead.
     pub flattened: bool,
 }
 
@@ -56,14 +58,41 @@ impl Subtitles {
         key: &str,
         shift_ms: i64,
     ) -> Result<String> {
+        let ex = self.load(registry, sessions, item_id, key).await?;
+        Ok(to_vtt(&ex.cues, shift_ms))
+    }
+
+    /// The faithful ASS script for an ASS/SSA subtitle (HUB-32) — the
+    /// original sidecar bytes, or the reconstructed embedded track.
+    /// Times are absolute file times; ASS renderers offset via the
+    /// player clock, not the script.
+    pub async fn ass(
+        &self,
+        registry: &Registry,
+        sessions: &Sessions,
+        item_id: &str,
+        key: &str,
+    ) -> Result<String> {
+        let ex = self.load(registry, sessions, item_id, key).await?;
+        ex.ass.context("subtitle has no ASS form")
+    }
+
+    async fn load(
+        &self,
+        registry: &Registry,
+        sessions: &Sessions,
+        item_id: &str,
+        key: &str,
+    ) -> Result<Extracted> {
         let (module_id, collection_id, path_rel, info) = source_row(registry, item_id).await?;
-        let entry = entries(&info)
+        entries(&info)
             .into_iter()
             .find(|e| e.key == key)
             .with_context(|| format!("no subtitle {key} on this item"))?;
 
+        // v2: the cache holds cues + optional faithful ASS.
         let cache_key = format!(
-            "{:016x}-{key}",
+            "v2-{:016x}-{key}",
             xxhash_rust::xxh3::xxh3_64(
                 format!("{module_id}\n{collection_id}\n{path_rel}").as_bytes()
             )
@@ -75,41 +104,88 @@ impl Subtitles {
         let _guard = lock.lock().await;
 
         let cache_path = self.dir.join(format!("{cache_key}.json"));
-        let cues: Vec<Cue> = match std::fs::read(&cache_path) {
-            Ok(bytes) => serde_json::from_slice(&bytes)?,
-            Err(_) => {
-                let cues = if let Some(n) = key.strip_prefix('s') {
-                    let idx: usize = n.parse().context("bad sidecar key")?;
-                    let sidecar =
-                        info.external_subtitles.get(idx).context("sidecar index out of range")?;
-                    let lease = sessions
-                        .open_lease(registry, &module_id, &collection_id, &sidecar.path_rel)
-                        .await?;
-                    let bytes = read_all(lease).await?;
-                    parse(&sidecar.format, &decode_text(&bytes))?
-                } else if let Some(n) = key.strip_prefix('e') {
-                    let idx: usize = n.parse().context("bad embedded key")?;
-                    let (_, _, size, _, lease) =
-                        sessions.open_source(registry, item_id).await?;
-                    let source = crate::sessions::LeaseSource {
-                        lease,
-                        size,
-                        handle: tokio::runtime::Handle::current(),
-                    };
-                    tokio::task::spawn_blocking(move || {
-                        kahawai_media::subtitles::extract_embedded(Box::new(source), idx)
-                    })
-                    .await??
-                } else {
-                    bail!("bad subtitle key: {key}");
-                };
-                std::fs::create_dir_all(&self.dir)?;
-                std::fs::write(&cache_path, serde_json::to_vec(&cues)?)?;
-                cues
-            }
+        if let Ok(bytes) = std::fs::read(&cache_path) {
+            return Ok(serde_json::from_slice(&bytes)?);
+        }
+        let ex: Extracted = if let Some(n) = key.strip_prefix('s') {
+            let idx: usize = n.parse().context("bad sidecar key")?;
+            let sidecar =
+                info.external_subtitles.get(idx).context("sidecar index out of range")?;
+            let lease = sessions
+                .open_lease(registry, &module_id, &collection_id, &sidecar.path_rel)
+                .await?;
+            let bytes = read_all(lease).await?;
+            let text = decode_text(&bytes);
+            let cues = parse(&sidecar.format, &text)?;
+            let ass = matches!(sidecar.format.as_str(), "ass" | "ssa").then_some(text);
+            Extracted { cues, ass }
+        } else if let Some(n) = key.strip_prefix('e') {
+            let idx: usize = n.parse().context("bad embedded key")?;
+            let (_, _, size, _, lease) = sessions.open_source(registry, item_id).await?;
+            let source = crate::sessions::LeaseSource {
+                lease,
+                size,
+                handle: tokio::runtime::Handle::current(),
+            };
+            tokio::task::spawn_blocking(move || {
+                kahawai_media::subtitles::extract_embedded(Box::new(source), idx)
+            })
+            .await??
+        } else {
+            bail!("bad subtitle key: {key}");
         };
-        let _ = entry;
-        Ok(to_vtt(&cues, shift_ms))
+        std::fs::create_dir_all(&self.dir)?;
+        std::fs::write(&cache_path, serde_json::to_vec(&ex)?)?;
+        Ok(ex)
+    }
+
+    /// Font attachments of the item's source (HUB-32), extracted once
+    /// and cached: returns (name, bytes) pairs.
+    pub async fn fonts(
+        &self,
+        registry: &Registry,
+        sessions: &Sessions,
+        item_id: &str,
+    ) -> Result<Vec<(String, Vec<u8>)>> {
+        let (module_id, collection_id, path_rel, _) = source_row(registry, item_id).await?;
+        let cache_key = format!(
+            "fonts-{:016x}",
+            xxhash_rust::xxh3::xxh3_64(
+                format!("{module_id}\n{collection_id}\n{path_rel}").as_bytes()
+            )
+        );
+        let lock = {
+            let mut map = self.inflight.lock().unwrap();
+            map.entry(cache_key.clone()).or_default().clone()
+        };
+        let _guard = lock.lock().await;
+        let dir = self.dir.join(&cache_key);
+        let index = dir.join("index.json");
+        if let Ok(bytes) = std::fs::read(&index) {
+            let names: Vec<String> = serde_json::from_slice(&bytes)?;
+            let mut out = Vec::new();
+            for (i, name) in names.iter().enumerate() {
+                out.push((name.clone(), std::fs::read(dir.join(i.to_string()))?));
+            }
+            return Ok(out);
+        }
+        let (_, _, size, _, lease) = sessions.open_source(registry, item_id).await?;
+        let source = crate::sessions::LeaseSource {
+            lease,
+            size,
+            handle: tokio::runtime::Handle::current(),
+        };
+        let fonts = tokio::task::spawn_blocking(move || {
+            kahawai_media::subtitles::extract_fonts(Box::new(source))
+        })
+        .await??;
+        std::fs::create_dir_all(&dir)?;
+        for (i, (_, bytes)) in fonts.iter().enumerate() {
+            std::fs::write(dir.join(i.to_string()), bytes)?;
+        }
+        let names: Vec<&String> = fonts.iter().map(|(n, _)| n).collect();
+        std::fs::write(&index, serde_json::to_vec(&names)?)?;
+        Ok(fonts)
     }
 }
 

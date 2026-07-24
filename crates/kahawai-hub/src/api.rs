@@ -47,7 +47,9 @@ pub fn router(
         .route("/api/v1/items/{id}/children", get(item_children))
         .route("/api/v1/items/{id}/artwork", get(item_artwork))
         .route("/api/v1/items/{id}/subtitles", get(item_subtitles))
-        .route("/api/v1/items/{id}/subtitles/{file}", get(item_subtitle_vtt))
+        .route("/api/v1/items/{id}/subtitles/{file}", get(item_subtitle_file))
+        .route("/api/v1/items/{id}/fonts", get(item_fonts))
+        .route("/api/v1/items/{id}/fonts/{n}", get(item_font))
         .route("/api/v1/playback/sessions", post(start_session))
         .route("/api/v1/playback/sessions/{id}", axum::routing::delete(end_session))
         .route("/api/v1/playback/sessions/{id}/stream", get(stream_session))
@@ -948,11 +950,28 @@ struct VttQuery {
     shift_ms: f64,
 }
 
-async fn item_subtitle_vtt(
+/// .vtt (flattened, shiftable) or .ass (faithful, absolute times —
+/// ASS renderers offset via the player clock).
+async fn item_subtitle_file(
     State(state): State<AppState>,
     Path((id, file)): Path<(String, String)>,
     Query(q): Query<VttQuery>,
 ) -> Result<Response, ApiError> {
+    if let Some(key) = file.strip_suffix(".ass") {
+        let ass = state
+            .subtitles
+            .ass(&state.registry, &state.sessions, &id, key)
+            .await
+            .map_err(internal)?;
+        return Ok((
+            [
+                (axum::http::header::CONTENT_TYPE, "text/x-ssa; charset=utf-8"),
+                (axum::http::header::CACHE_CONTROL, "private, max-age=3600"),
+            ],
+            ass,
+        )
+            .into_response());
+    }
     let key = file.strip_suffix(".vtt").unwrap_or(&file);
     let vtt = state
         .subtitles
@@ -965,6 +984,42 @@ async fn item_subtitle_vtt(
             (axum::http::header::CACHE_CONTROL, "private, max-age=60"),
         ],
         vtt,
+    )
+        .into_response())
+}
+
+async fn item_fonts(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let fonts = state
+        .subtitles
+        .fonts(&state.registry, &state.sessions, &id)
+        .await
+        .map_err(internal)?;
+    let names: Vec<&String> = fonts.iter().map(|(n, _)| n).collect();
+    Ok(Json(json!({ "fonts": names })))
+}
+
+async fn item_font(
+    State(state): State<AppState>,
+    Path((id, n)): Path<(String, usize)>,
+) -> Result<Response, ApiError> {
+    let fonts = state
+        .subtitles
+        .fonts(&state.registry, &state.sessions, &id)
+        .await
+        .map_err(internal)?;
+    let (_, bytes) = fonts
+        .into_iter()
+        .nth(n)
+        .ok_or((StatusCode::NOT_FOUND, "no such font".into()))?;
+    Ok((
+        [
+            (axum::http::header::CONTENT_TYPE, "font/ttf"),
+            (axum::http::header::CACHE_CONTROL, "private, max-age=86400"),
+        ],
+        bytes,
     )
         .into_response())
 }

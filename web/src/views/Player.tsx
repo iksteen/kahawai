@@ -1,9 +1,11 @@
 import { useEffect, useRef, useState } from 'react'
 import Hls from 'hls.js'
+import JASSUB from 'jassub'
 import {
   accessToken,
   api,
   endSession,
+  fetchFonts,
   fetchItem,
   fetchSubtitles,
   postProgress,
@@ -49,6 +51,7 @@ export default function Player({
   const [seeking, setSeeking] = useState(false)
   const [subs, setSubs] = useState<Subtitle[]>([])
   const [subKey, setSubKey] = useState('')
+  const jassubRef = useRef<JASSUB | null>(null)
   const [audioTracks, setAudioTracks] = useState<
     { codec: string; channels: number; language?: string | null }[]
   >([])
@@ -102,6 +105,44 @@ export default function Player({
     if (!tracks) return
     for (const t of Array.from(tracks)) t.mode = subKey ? 'showing' : 'disabled'
   }, [subKey, trackEpoch])
+
+  const selected = subs.find((s) => s.key === subKey)
+  const useAss = !!selected && (selected.format === 'ass' || selected.format === 'ssa')
+
+  // Faithful ASS rendering (HUB-32): JASSUB draws with libass on a
+  // canvas over the video, fed the original script and the source's
+  // embedded fonts. ASS times are absolute file times; timeOffset
+  // bridges to the (possibly mid-file) HLS timeline. Re-created on
+  // seek-restarts (trackEpoch) to pick up the new offset.
+  useEffect(() => {
+    const video = videoRef.current
+    if (!video || !useAss || !selected) return
+    let dead = false
+    let instance: JASSUB | null = null
+    ;(async () => {
+      let fonts: string[] = []
+      try {
+        const f = await fetchFonts(item.id)
+        fonts = f.fonts.map((_, i) => `/api/v1/items/${item.id}/fonts/${i}`)
+      } catch {
+        /* no fonts — libass falls back */
+      }
+      if (dead) return
+      instance = new JASSUB({
+        video,
+        subUrl: `/api/v1/items/${item.id}/subtitles/${selected.key}.ass`,
+        fonts,
+        timeOffset: offsetRef.current / 1000,
+      })
+      jassubRef.current = instance
+    })()
+    return () => {
+      dead = true
+      instance?.destroy()
+      if (jassubRef.current === instance) jassubRef.current = null
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [useAss, subKey, trackEpoch, item.id])
 
   // Offset starts snap to the keyframe before the requested position;
   // the pipeline reports the true playlist origin in start.pos. Adopt
@@ -251,7 +292,7 @@ export default function Player({
         ← Back
       </button>
       <video ref={videoRef} controls playsInline crossOrigin="use-credentials">
-        {subKey && (
+        {subKey && !useAss && (
           <track
             key={`${subKey}-${trackEpoch}`}
             default

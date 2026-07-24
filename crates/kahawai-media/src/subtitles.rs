@@ -2,8 +2,9 @@
 //! parse SRT/ASS/VTT into cues, serialize cues to WebVTT, and extract
 //! embedded text tracks from a media source without decoding A/V.
 //!
-//! ASS is only ever *flattened* here (dialogue text, styling stripped);
-//! per HUB-32a callers must present that as an explicit, labeled choice.
+//! ASS tracks are extracted faithfully (script header + re-timed
+//! Dialogue lines) for client-side rendering (HUB-32); the flattened
+//! cues remain available for the HUB-32a fallback path.
 
 use anyhow::{bail, Context, Result};
 use gstreamer as gst;
@@ -239,13 +240,34 @@ fn parse_ass(content: &str) -> Vec<Cue> {
     cues
 }
 
+/// Extraction result: flattened cues (VTT serving) plus, for ASS
+/// tracks, the faithful reconstruction — original script header from
+/// the container's codec_data and re-timed Dialogue lines (HUB-32:
+/// styling is never discarded at extraction time).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Extracted {
+    pub cues: Vec<Cue>,
+    pub ass: Option<String>,
+}
+
+/// Rebuild an ASS Dialogue line from a matroska block payload
+/// ("ReadOrder,Layer,Style,Name,ML,MR,MV,Effect,Text") and its timing.
+fn ass_dialogue(raw: &str, start_ms: u64, end_ms: u64) -> Option<String> {
+    let (_read_order, rest) = raw.split_once(',')?;
+    let (layer, rest) = rest.split_once(',')?;
+    let ts = |ms: u64| {
+        format!("{}:{:02}:{:02}.{:02}", ms / 3_600_000, ms / 60_000 % 60, ms / 1000 % 60, ms % 1000 / 10)
+    };
+    Some(format!("Dialogue: {layer},{},{},{rest}", ts(start_ms), ts(end_ms)))
+}
+
 /// Extract the `index`-th text subtitle track (0-based, counting only
 /// subtitle pads in demux order) from a media source. No A/V decoding —
 /// everything except the chosen track goes to fakesinks.
 pub fn extract_embedded(
     source: Box<dyn crate::remux::RemuxSource>,
     index: usize,
-) -> Result<Vec<Cue>> {
+) -> Result<Extracted> {
     crate::init()?;
 
     let pipeline = gst::Pipeline::new();
@@ -261,6 +283,10 @@ pub fn extract_embedded(
     let appsink_pad = appsink.static_pad("sink").unwrap();
     let is_ass = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let is_ass_pa = is_ass.clone();
+    // ASS script header rides the container's codec_data (everything up
+    // to and including the [Events] Format line).
+    let header: std::sync::Arc<std::sync::Mutex<Option<String>>> = Default::default();
+    let header_pa = header.clone();
     parsebin.connect_pad_added(move |_, pad| {
         let caps_name = pad
             .current_caps()
@@ -283,6 +309,15 @@ pub fn extract_embedded(
                 caps_name.contains("ssa") || caps_name.contains("ass"),
                 std::sync::atomic::Ordering::SeqCst,
             );
+            if let Some(cd) = pad
+                .current_caps()
+                .as_ref()
+                .and_then(|c| c.structure(0))
+                .and_then(|s| s.get::<gst::Buffer>("codec_data").ok())
+                && let Ok(map) = cd.map_readable()
+            {
+                *header_pa.lock().unwrap() = Some(decode_text(map.as_slice()));
+            }
             if pad.link(&appsink_pad).is_err() {
                 tracing::warn!("failed to link subtitle pad to appsink");
             }
@@ -303,13 +338,27 @@ pub fn extract_embedded(
     pipeline.set_state(gst::State::Playing).context("starting subtitle extraction")?;
     let bus = pipeline.bus().unwrap();
     let mut cues = Vec::new();
+    let mut raw_events: Vec<(u64, u64, String)> = Vec::new();
     let mut result = Ok(());
+    let mut take = |sample: &gst::Sample, ass: bool| {
+        if let Some((start, end, raw)) = raw_from_sample(sample) {
+            if ass {
+                raw_events.push((start, end, raw.clone()));
+            }
+            let text = if ass {
+                clean_cue_text(raw.splitn(9, ',').last().unwrap_or(""))
+            } else {
+                clean_cue_text(&raw)
+            };
+            if !text.is_empty() {
+                cues.push(Cue { start_ms: start, end_ms: end, text });
+            }
+        }
+    };
     'outer: loop {
         // Drain samples first so the appsink queue never blocks the demuxer.
         while let Some(sample) = appsink.try_pull_sample(gst::ClockTime::ZERO) {
-            if let Some(cue) = cue_from_sample(&sample, is_ass.load(std::sync::atomic::Ordering::SeqCst)) {
-                cues.push(cue);
-            }
+            take(&sample, is_ass.load(std::sync::atomic::Ordering::SeqCst));
         }
         let Some(msg) = bus.timed_pop(gst::ClockTime::from_mseconds(100)) else {
             continue;
@@ -325,17 +374,117 @@ pub fn extract_embedded(
     }
     // Final drain: samples may still sit queued after EOS.
     while let Some(sample) = appsink.try_pull_sample(gst::ClockTime::ZERO) {
-        if let Some(cue) = cue_from_sample(&sample, is_ass.load(std::sync::atomic::Ordering::SeqCst)) {
-            cues.push(cue);
-        }
+        take(&sample, is_ass.load(std::sync::atomic::Ordering::SeqCst));
     }
+    drop(take);
     pipeline.set_state(gst::State::Null).ok();
     result?;
     if cues.is_empty() {
         bail!("no cues extracted (track {index} missing or not a text track)");
     }
     cues.sort_by_key(|c| c.start_ms);
-    Ok(cues)
+
+    // Faithful ASS reconstruction when we have the script header.
+    let ass = header.lock().unwrap().take().and_then(|h| {
+        if raw_events.is_empty() {
+            return None;
+        }
+        let mut out = h.trim_end().to_string();
+        if !out.to_lowercase().contains("[events]") {
+            out.push_str("\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text");
+        }
+        out.push('\n');
+        let mut evs = raw_events;
+        evs.sort_by_key(|(s, _, _)| *s);
+        for (s, e, raw) in &evs {
+            if let Some(line) = ass_dialogue(raw, *s, *e) {
+                out.push_str(&line);
+                out.push('\n');
+            }
+        }
+        Some(out)
+    });
+    Ok(Extracted { cues, ass })
+}
+
+fn raw_from_sample(sample: &gst::Sample) -> Option<(u64, u64, String)> {
+    let buffer = sample.buffer()?;
+    let start_ms = buffer.pts()?.mseconds();
+    let end_ms = start_ms + buffer.duration().map(|d| d.mseconds()).unwrap_or(3000);
+    let map = buffer.map_readable().ok()?;
+    Some((start_ms, end_ms, decode_text(map.as_slice())))
+}
+
+/// Font attachments from a matroska source (HUB-32): matroskademux
+/// exposes attachments as `attachment` tag samples during header parse,
+/// so a short preroll suffices — no full read.
+pub fn extract_fonts(source: Box<dyn crate::remux::RemuxSource>) -> Result<Vec<(String, Vec<u8>)>> {
+    crate::init()?;
+    let pipeline = gst::Pipeline::new();
+    let appsrc = crate::remux::seekable_appsrc(source);
+    let demux = gst::ElementFactory::make("matroskademux").build()?;
+    pipeline.add_many([appsrc.upcast_ref::<gst::Element>(), &demux])?;
+    gst::Element::link_many([appsrc.upcast_ref::<gst::Element>(), &demux])?;
+    let pipe2 = pipeline.clone();
+    demux.connect_pad_added(move |_, pad| {
+        let fake = gst::ElementFactory::make("fakesink")
+            .property("sync", false)
+            .property("async", false)
+            .build()
+            .unwrap();
+        pipe2.add(&fake).ok();
+        fake.sync_state_with_parent().ok();
+        pad.link(&fake.static_pad("sink").unwrap()).ok();
+    });
+    pipeline.set_state(gst::State::Playing).context("starting font extraction")?;
+    let bus = pipeline.bus().unwrap();
+    let mut fonts = Vec::new();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while std::time::Instant::now() < deadline {
+        let Some(msg) = bus.timed_pop(gst::ClockTime::from_mseconds(200)) else {
+            if !fonts.is_empty() {
+                break; // attachments arrive with the headers; done
+            }
+            continue;
+        };
+        match msg.view() {
+            gst::MessageView::Tag(t) => {
+                let tags = t.tags();
+                for i in 0..tags.size_by_name("attachment") {
+                    let Some(v) = tags.index_generic("attachment", i) else { continue };
+                    let Ok(sample) = v.get::<gst::Sample>() else { continue };
+                    let is_font = sample
+                        .caps()
+                        .and_then(|c| c.structure(0))
+                        .map(|s| {
+                            let n = s.name();
+                            n.contains("font") || n.contains("truetype") || n.contains("opentype")
+                        })
+                        .unwrap_or(false);
+                    if !is_font {
+                        continue;
+                    }
+                    let name = sample
+                        .info()
+                        .and_then(|s| s.get::<String>("filename").ok())
+                        .unwrap_or_else(|| format!("font-{}.ttf", fonts.len()));
+                    if let Some(buf) = sample.buffer()
+                        && let Ok(map) = buf.map_readable()
+                    {
+                        // The same attachment tag repeats on every stream's
+                        // TAG message; keep one copy per filename.
+                        if !fonts.iter().any(|(n, _): &(String, Vec<u8>)| *n == name) {
+                            fonts.push((name, map.as_slice().to_vec()));
+                        }
+                    }
+                }
+            }
+            gst::MessageView::Eos(_) | gst::MessageView::Error(_) => break,
+            _ => {}
+        }
+    }
+    pipeline.set_state(gst::State::Null).ok();
+    Ok(fonts)
 }
 
 fn cue_from_sample(sample: &gst::Sample, ass: bool) -> Option<Cue> {
@@ -444,10 +593,17 @@ mod tests {
         }
 
         let source = crate::remux::FileSource::open(&mkv).unwrap();
-        let cues = extract_embedded(Box::new(source), 0).unwrap();
-        assert_eq!(cues.len(), 2, "{cues:?}");
-        assert_eq!(cues[0].text, "First cue");
-        assert_eq!(cues[0].start_ms, 500);
-        assert_eq!(cues[1].text, "Second cue");
+        let ex = extract_embedded(Box::new(source), 0).unwrap();
+        assert_eq!(ex.cues.len(), 2, "{ex:?}");
+        assert_eq!(ex.cues[0].text, "First cue");
+        assert_eq!(ex.cues[0].start_ms, 500);
+        assert_eq!(ex.cues[1].text, "Second cue");
+        assert!(ex.ass.is_none(), "srt track must not fabricate ASS");
+    }
+
+    #[test]
+    fn reconstructs_ass_dialogue_lines() {
+        let line = ass_dialogue("17,0,Default,,0,0,0,,{\\an8}Sign", 61_500, 63_750).unwrap();
+        assert_eq!(line, "Dialogue: 0,0:01:01.50,0:01:03.75,Default,,0,0,0,,{\\an8}Sign");
     }
 }

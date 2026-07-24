@@ -169,11 +169,13 @@ export type Subtitle = {
 export const fetchSubtitles = (itemId: string) =>
   json<{ subtitles: Subtitle[] }>(`/api/v1/items/${itemId}/subtitles`)
 
-// HUB-32a: flattening ASS must be a labeled, explicit choice.
+export const fetchFonts = (itemId: string) =>
+  json<{ fonts: string[] }>(`/api/v1/items/${itemId}/fonts`)
+
+// ASS renders faithfully via JASSUB in this player (HUB-32), so the
+// flattened warning is history here; other clients still get .vtt.
 export const subtitleLabel = (s: Subtitle) =>
-  `${s.language ?? 'unknown'} · ${s.format}${s.kind === 'sidecar' ? ' · file' : ''}${
-    s.flattened ? ' (flattened)' : ''
-  }`
+  `${s.language ?? 'unknown'} · ${s.format}${s.kind === 'sidecar' ? ' · file' : ''}`
 
 export type LibrarySummary = { id: string; name: string; media_type: string }
 

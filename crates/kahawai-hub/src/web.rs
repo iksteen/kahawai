@@ -47,6 +47,9 @@ fn spa_response(path: &str) -> Response {
         Some("png") => "image/png",
         Some("ico") => "image/x-icon",
         Some("map" | "json") => "application/json",
+        // instantiateStreaming refuses anything but application/wasm.
+        Some("wasm") => "application/wasm",
+        Some("woff2") => "font/woff2",
         _ => "application/octet-stream",
     };
     // Vite emits content-hashed asset names; index.html must revalidate.
