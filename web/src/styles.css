@@ -241,12 +241,19 @@ h2 { font-size: 14px; font-weight: 650; color: var(--dim); letter-spacing: 0.08e
   padding: 0.15rem 0.4rem;
 }
 
+.card-artbox { position: relative; display: block; margin-bottom: 0.4rem; }
 .card-art {
   width: 100%;
   aspect-ratio: 1;
   object-fit: cover;
   border-radius: 6px;
-  margin-bottom: 0.4rem;
+  display: block;
+}
+.kind-badge {
+  position: absolute; left: 6px; top: 6px;
+  display: inline-flex; padding: 4px; border-radius: 4px;
+  background: rgba(10, 16, 18, 0.78); color: var(--teal);
+  line-height: 0;
 }
 .queue-bar {
   position: sticky;

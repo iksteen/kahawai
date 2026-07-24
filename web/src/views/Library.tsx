@@ -1,7 +1,50 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useState, type ReactNode } from 'react'
 import { artworkUrl, fetchItems, fetchLibraries, isAdmin, type Item } from '../api'
 import placeholder from '../assets/placeholder.svg'
 import MatchDialog from './MatchDialog'
+
+// Kind glyph for the card art corner (feather icons, MIT).
+function KindIcon({ kind }: { kind: string }) {
+  const paths: Record<string, ReactNode> = {
+    movie: (
+      <>
+        <rect x="2" y="2" width="20" height="20" rx="2.18" />
+        <path d="M7 2v20M17 2v20M2 12h20M2 7h5M2 17h5M17 7h5M17 17h5" />
+      </>
+    ),
+    show: (
+      <>
+        <rect x="2" y="7" width="20" height="15" rx="2" />
+        <polyline points="17 2 12 7 7 2" />
+      </>
+    ),
+    album: (
+      <>
+        <path d="M9 18V5l12-2v13" />
+        <circle cx="6" cy="18" r="3" />
+        <circle cx="18" cy="16" r="3" />
+      </>
+    ),
+  }
+  const glyph = paths[kind]
+  if (!glyph) return null
+  return (
+    <span className="kind-badge" title={kind === 'show' ? 'series' : kind}>
+      <svg
+        width="14"
+        height="14"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="2"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      >
+        {glyph}
+      </svg>
+    </span>
+  )
+}
 
 function fmtResume(ms: number) {
   const s = Math.floor(ms / 1000)
@@ -87,18 +130,19 @@ export default function Library({
               </button>
             )}
             <button className="card" onClick={() => onOpen(i.id)}>
-              <img
-                className="card-art"
-                src={artworkUrl(i.id)}
-                loading="lazy"
-                alt=""
-                onError={(e) => {
-                  e.currentTarget.onerror = null
-                  e.currentTarget.src = placeholder
-                }}
-              />
-              {i.kind === 'show' && <span className="chip dim">series</span>}
-              {i.kind === 'movie' && <span className="chip dim">movie</span>}
+              <span className="card-artbox">
+                <img
+                  className="card-art"
+                  src={artworkUrl(i.id)}
+                  loading="lazy"
+                  alt=""
+                  onError={(e) => {
+                    e.currentTarget.onerror = null
+                    e.currentTarget.src = placeholder
+                  }}
+                />
+                <KindIcon kind={i.kind} />
+              </span>
               <span className="card-title">{i.title}</span>
               <span className="card-meta mono">
                 {i.kind === 'album' ? (i.artist ?? '—') : (i.year ?? '—')}
