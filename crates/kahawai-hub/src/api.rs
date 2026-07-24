@@ -1326,6 +1326,64 @@ async fn session_file(
         .get(&id)
         .ok_or((StatusCode::NOT_FOUND, "no such session".to_string()))?;
     session.touch();
+    // Live subtitle tap (HUB-32): the remux pipeline — local or on a
+    // transcoder — appends ASS events to subs-e{n}.ass from the session
+    // origin. Follow the file's growth until the client leaves, the
+    // session dies, or a seek-restart truncates it (the player then
+    // re-opens against the new origin).
+    if file.starts_with("subs-") && file.ends_with(".ass") {
+        let valid = file[5..].chars().all(|c| c.is_ascii_alphanumeric() || c == '.');
+        if !valid {
+            return Err((StatusCode::BAD_REQUEST, "invalid file name".into()));
+        }
+        let sessions = state.sessions.clone();
+        let registry = state.registry.clone();
+        let sid = id.clone();
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(8);
+        tokio::spawn(async move {
+            let mut pos: usize = 0;
+            let appear_deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            loop {
+                // Re-resolve each cycle: seek-restarts swap the dir.
+                let Some(session) = sessions.get(&sid) else { break };
+                session.touch();
+                let snapshot: Option<Vec<u8>> = match &session.mode {
+                    crate::sessions::Mode::Remux { dir, .. } => {
+                        tokio::fs::read(dir.join(&file)).await.ok()
+                    }
+                    crate::sessions::Mode::Transcode { .. } => {
+                        sessions.fetch_artifact(&registry, &session, &file).await.ok()
+                    }
+                    crate::sessions::Mode::Direct { .. } => break,
+                };
+                match snapshot {
+                    Some(bytes) => {
+                        if bytes.len() < pos {
+                            break; // truncated: new origin, player re-opens
+                        }
+                        if bytes.len() > pos {
+                            let delta = axum::body::Bytes::copy_from_slice(&bytes[pos..]);
+                            pos = bytes.len();
+                            if tx.send(Ok(delta)).await.is_err() {
+                                break; // client gone
+                            }
+                        }
+                    }
+                    None if std::time::Instant::now() < appear_deadline && pos == 0 => {}
+                    None => break, // no ASS track tapped, or session dir gone
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+        });
+        let body =
+            axum::body::Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx));
+        return Ok(axum::response::Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "text/x-ssa; charset=utf-8")
+            .header("cache-control", "no-store")
+            .body(body)
+            .unwrap());
+    }
     let dir = match &session.mode {
         crate::sessions::Mode::Remux { dir, .. } => dir.clone(),
         crate::sessions::Mode::Transcode { .. } => {

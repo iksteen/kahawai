@@ -547,6 +547,8 @@ fn plumb_parsed_pad(
     gate: &Option<Arc<SeekGate>>,
     audio_seen: &Arc<std::sync::atomic::AtomicUsize>,
     video_seen: &Arc<std::sync::atomic::AtomicUsize>,
+    subs_seen: &Arc<std::sync::atomic::AtomicUsize>,
+    subs_dir: &std::path::Path,
 ) {
     // queue: decouples the muxer from parsebin's threads (the aggregator
     // deadlocks without it). Default queue limits (1 MiB / 1 s) are far
@@ -576,6 +578,32 @@ fn plumb_parsed_pad(
     // already relies on). Streams whose advertised caps hide their
     // audio-ness take the deferred path uncounted; acceptable, they're
     // also unroutable-looking to the picker UI.
+    // HUB-32 live tap: ASS events already flow through this pipeline
+    // from the session origin — write them to a session file the hub
+    // streams to ASS-rendering clients. No second read of the source.
+    // Indexing counts every subtitle pad in demux order, matching the
+    // discovery-order e{n} keys.
+    if name.starts_with("application/x-subtitle")
+        || name.starts_with("application/x-ssa")
+        || name.starts_with("application/x-ass")
+        || name.starts_with("text/")
+        || name.starts_with("subpicture/")
+    {
+        let idx = subs_seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if name.contains("ssa") || name.contains("ass") {
+            tap_ass_track(pipe, &qsrc, &advertised, subs_dir, idx);
+        } else {
+            let fake = gst::ElementFactory::make("fakesink")
+                .property("sync", false)
+                .property("async", false)
+                .build()
+                .unwrap();
+            pipe.add(&fake).unwrap();
+            fake.sync_state_with_parent().unwrap();
+            let _ = qsrc.link(&fake.static_pad("sink").unwrap());
+        }
+        return;
+    }
     let unselected = if name.starts_with("audio/") {
         let idx = audio_seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         (idx != plan.audio_track).then_some((idx, plan.audio_track, "audio"))
@@ -618,6 +646,73 @@ fn plumb_parsed_pad(
         }
         gst::PadProbeReturn::Ok
     });
+}
+
+/// Tee an ASS subtitle stream into `subs-e{idx}.ass` in the session
+/// dir: composed script header immediately (codec_data carries it),
+/// then one re-timed Dialogue line per event as it is demuxed. Sparse
+/// and text-sized — a flush per line is nothing.
+fn tap_ass_track(
+    pipe: &gst::Pipeline,
+    from: &gst::Pad,
+    caps: &gst::Caps,
+    dir: &std::path::Path,
+    idx: usize,
+) {
+    let path = dir.join(format!("subs-e{idx}.ass"));
+    let header = caps
+        .structure(0)
+        .and_then(|s| s.get::<gst::Buffer>("codec_data").ok())
+        .and_then(|b| b.map_readable().ok().map(|m| crate::subtitles::decode_text(m.as_slice())))
+        .unwrap_or_default();
+    let mut file = match std::fs::File::create(&path) {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "subtitle tap file failed");
+            let fake = gst::ElementFactory::make("fakesink")
+                .property("sync", false)
+                .property("async", false)
+                .build()
+                .unwrap();
+            pipe.add(&fake).unwrap();
+            fake.sync_state_with_parent().unwrap();
+            let _ = from.link(&fake.static_pad("sink").unwrap());
+            return;
+        }
+    };
+    use std::io::Write;
+    let _ = file.write_all(crate::subtitles::compose_header(&header).as_bytes());
+    let file = std::sync::Mutex::new(file);
+
+    let appsink = gstreamer_app::AppSink::builder().sync(false).build();
+    appsink.set_property("async", false);
+    appsink.set_callbacks(
+        gstreamer_app::AppSinkCallbacks::builder()
+            .new_sample(move |sink| {
+                if let Ok(sample) = sink.pull_sample()
+                    && let Some(buffer) = sample.buffer()
+                    && let Some(pts) = buffer.pts()
+                    && let Ok(map) = buffer.map_readable()
+                {
+                    let start = pts.mseconds();
+                    let end =
+                        start + buffer.duration().map(|d| d.mseconds()).unwrap_or(3000);
+                    let raw = crate::subtitles::decode_text(map.as_slice());
+                    if let Some(line) = crate::subtitles::ass_dialogue(&raw, start, end) {
+                        let mut f = file.lock().unwrap();
+                        let _ = writeln!(f, "{line}");
+                    }
+                }
+                Ok(gst::FlowSuccess::Ok)
+            })
+            .build(),
+    );
+    pipe.add(appsink.upcast_ref::<gst::Element>()).unwrap();
+    appsink.sync_state_with_parent().unwrap();
+    if let Err(e) = from.link(&appsink.static_pad("sink").unwrap()) {
+        tracing::warn!(error = %e, "subtitle tap link failed");
+    }
+    tracing::info!(path = %path.display(), "tapping ASS subtitle track");
 }
 
 /// Route a stream to the muxer (via parser/timestamper) or a fakesink,
@@ -1232,8 +1327,12 @@ pub fn start_paced(
     let gate2 = gate.clone();
     let audio_seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let video_seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let subs_seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let subs_dir = out_dir.to_path_buf();
     parsebin.connect_pad_added(move |_, pad| {
-        plumb_parsed_pad(&pipe, &waiting2, pad, plan, &gate2, &audio_seen, &video_seen);
+        plumb_parsed_pad(
+            &pipe, &waiting2, pad, plan, &gate2, &audio_seen, &video_seen, &subs_seen, &subs_dir,
+        );
     });
 
     let error = Arc::new(Mutex::new(None::<String>));

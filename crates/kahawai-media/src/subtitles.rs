@@ -252,7 +252,7 @@ pub struct Extracted {
 
 /// Rebuild an ASS Dialogue line from a matroska block payload
 /// ("ReadOrder,Layer,Style,Name,ML,MR,MV,Effect,Text") and its timing.
-fn ass_dialogue(raw: &str, start_ms: u64, end_ms: u64) -> Option<String> {
+pub(crate) fn ass_dialogue(raw: &str, start_ms: u64, end_ms: u64) -> Option<String> {
     let (_read_order, rest) = raw.split_once(',')?;
     let (layer, rest) = rest.split_once(',')?;
     let ts = |ms: u64| {
@@ -271,7 +271,7 @@ pub enum SubStreamEvent {
 }
 
 /// The script header normalized for appending Dialogue lines.
-fn compose_header(h: &str) -> String {
+pub(crate) fn compose_header(h: &str) -> String {
     let mut out = h.trim_end().to_string();
     if !out.to_lowercase().contains("[events]") {
         out.push_str("\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text");
