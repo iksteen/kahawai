@@ -97,7 +97,12 @@ async fn link_once(
     rescan_minutes: u64,
     state_dir: &Path,
 ) -> Result<()> {
-    let channel = kahawai_transport::tls::grpc_channel_with(hub_addr, tls).await?;
+    let channel = kahawai_transport::tls::grpc_channel_with(hub_addr, tls.clone()).await?;
+    // The byte plane gets its OWN connection: lease streams pushing (or
+    // stalling on) megabytes must never exhaust the control link's h2
+    // connection window — that froze heartbeats for 40 s at a time and
+    // the hub declared the link dead mid-scan.
+    let byte_channel = kahawai_transport::tls::grpc_channel_with(hub_addr, tls).await?;
     let mut client = MediahostLinkClient::new(channel.clone());
 
     let (tx, rx) = tokio::sync::mpsc::channel::<HostToHub>(16);
@@ -305,11 +310,18 @@ async fn link_once(
     loop {
         tokio::select! {
             _ = ticker.tick() => {
+                let queued = tokio::time::Instant::now();
                 if tx.send(HostToHub { msg: Some(host_to_hub::Msg::Heartbeat(Heartbeat {})) })
                     .await
                     .is_err()
                 {
                     bail!("link sender closed");
+                }
+                let waited = queued.elapsed();
+                if waited > std::time::Duration::from_secs(2) {
+                    tracing::warn!(?waited, "heartbeat send was delayed by a full link channel");
+                } else {
+                    tracing::debug!("heartbeat queued");
                 }
             }
             msg = inbound.message() => {
@@ -336,7 +348,7 @@ async fn link_once(
                             if let Err(e) = &path {
                                 tracing::warn!(error = format!("{e:#}"), "refusing OpenRead");
                             }
-                            let ch = channel.clone();
+                            let ch = byte_channel.clone();
                             tokio::spawn(async move {
                                 if let Err(e) =
                                     serve::serve_lease(ch, req.lease_token, path).await

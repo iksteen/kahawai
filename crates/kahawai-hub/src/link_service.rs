@@ -121,9 +121,19 @@ impl MediahostLink for MediahostLinkService {
                         // but 64 batches of headroom outlasts any DB
                         // stall shorter than the timeout).
                         if matches!(msg, host_to_hub::Msg::Heartbeat(_)) {
+                            tracing::debug!(%module_id, "heartbeat read");
                             registry.seen(&module_id);
-                        } else if work_tx.send(msg).await.is_err() {
-                            break;
+                        } else {
+                            let kind = kind_name(&msg);
+                            tracing::debug!(%module_id, kind, "link msg read");
+                            let queued = tokio::time::Instant::now();
+                            if work_tx.send(msg).await.is_err() {
+                                break;
+                            }
+                            if queued.elapsed() > std::time::Duration::from_secs(2) {
+                                tracing::warn!(%module_id, kind, waited = ?queued.elapsed(),
+                                    "read loop stalled on a full work queue");
+                            }
                         }
                     }
                     Ok(Some(HostToHub { msg: None })) => {} // newer kind: ignore (OPS-7)
@@ -173,6 +183,19 @@ impl MediahostLink for MediahostLinkService {
             }
         });
         Ok(Response::new(req_stream))
+    }
+}
+
+fn kind_name(m: &host_to_hub::Msg) -> &'static str {
+    match m {
+        host_to_hub::Msg::Hello(_) => "hello",
+        host_to_hub::Msg::Heartbeat(_) => "heartbeat",
+        host_to_hub::Msg::AnnounceCollection(_) => "announce",
+        host_to_hub::Msg::FileUpsert(_) => "upsert",
+        host_to_hub::Msg::FileError(_) => "file_error",
+        host_to_hub::Msg::ScanProgress(_) => "scan_progress",
+        host_to_hub::Msg::ManifestRequest(_) => "manifest_request",
+        host_to_hub::Msg::FilesSeen(_) => "files_seen",
     }
 }
 
