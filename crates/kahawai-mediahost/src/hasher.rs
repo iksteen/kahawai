@@ -175,9 +175,23 @@ async fn extract_and_send(
         async {
             let path = crate::serve::resolve_rel(collections, collection_id, path_rel)?;
             let size = std::fs::metadata(&path)?.len();
-            let source = kahawai_media::remux::FileSource::open(&path)?;
             let tracks = tokio::task::spawn_blocking(move || {
-                kahawai_media::subtitles::extract_embedded_all(Box::new(source))
+                // Sparse first (index-driven reads, no demux); trust it
+                // only when it actually produced events — a parser gap
+                // must never look like "no subtitles".
+                match kahawai_media::subindex::extract_sparse(&path) {
+                    Ok(Some(tracks))
+                        if tracks.iter().any(|(_, ex)| !ex.cues.is_empty()) =>
+                    {
+                        tracing::debug!(path = %path.display(), "sparse extraction");
+                        Ok(tracks)
+                    }
+                    _ => {
+                        tracing::debug!(path = %path.display(), "sequential extraction");
+                        let source = kahawai_media::remux::FileSource::open(&path)?;
+                        kahawai_media::subtitles::extract_embedded_all(Box::new(source))
+                    }
+                }
             })
             .await??;
             Ok((size, tracks))

@@ -3,6 +3,7 @@
 
 pub mod doctor;
 pub mod remux;
+pub mod subindex;
 pub mod subtitles;
 pub mod worker;
 #[doc(hidden)]
