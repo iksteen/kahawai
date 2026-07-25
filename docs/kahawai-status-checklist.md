@@ -4,7 +4,7 @@ Status of every numbered requirement from `kahawai-technical-requirements.md`,
 plus the v1 acceptance criteria. Checked = implemented and exercised against
 the live deployment. Unchecked items carry a note when partially done.
 
-Last updated: 2026-07-25 (anime providers, MusicBrainz, image subtitles, HUB-5).
+Last updated: 2026-07-25, against the revised requirements (AR-12, MH-10/11, HUB-30a/32b/32c/34/35).
 
 ## Architecture (AR)
 
@@ -19,6 +19,8 @@ Last updated: 2026-07-25 (anime providers, MusicBrainz, image subtitles, HUB-5).
 - [x] AR-9 Control plane client ↔ hub only
 - [x] AR-10 Direct play mediahost → hub → client with byte ranges; hub-side remux
 - [x] AR-11 Transcoder pulls source bytes via hub-brokered leases
+- [x] AR-12 Control/byte plane isolation: separate connections, no shared
+      flow-control window (the frozen-heartbeat lesson, codified)
 
 ## Security & enrollment (SEC)
 
@@ -33,10 +35,13 @@ Last updated: 2026-07-25 (anime providers, MusicBrainz, image subtitles, HUB-5).
 ## Mediahost (MH)
 
 - [x] MH-1 Collections: media type + roots per collection
-- [x] MH-2 Scan on start/demand + filesystem watching (inotify, debounced,
-      read-event feedback filtered) + periodic sweep backup
+- [ ] MH-2 Scan on start/demand + watching + sweeps live *(amended scoping not
+      met: the admin rescan is still global — collection-scoped-only on-demand
+      scans arrive with HUB-35)*
 - [x] MH-3 GStreamer discovery for technical metadata
-- [x] MH-4 Sidecar detection (subtitles, artwork); local artwork served via hub cache
+- [ ] MH-4 Sidecars + artwork live *(amended: font attachments are not yet
+      DECLARED in the file record at scan — today they're discovered during
+      on-demand extraction instead)*
 - [x] MH-5 Content identity (size/mtime fast path; head/tail xxh3 + oshash) with
       incremental rescan (manifest + FilesSeen reconciliation, sync-version handshake)
 - [x] MH-6 Byte-range lease serving (dedicated byte-plane connection)
@@ -44,7 +49,12 @@ Last updated: 2026-07-25 (anime providers, MusicBrainz, image subtitles, HUB-5).
       *(no explicit rate-limit knob; stat batching + in-sync skip in practice)*
 - [x] MH-8 Unreadable files reported with diagnostics (FileError)
 - [x] MH-9 ED2K hashing: idle-priority background job, eMule/AniDB variant,
-      filename-CRC32 verify in the same pass, at-most-once per content identity
+      filename-CRC32 verify in the same pass, hub-side journal with
+      content-identity copy-forward (at-most-once per content)
+- [x] MH-10 Sync generation per collection: persisted mediahost-side, compared
+      on reconnect, in-sync = no manifest/no walk; FilesSeen reconciliation
+- [x] MH-11 Three-tier job runner: urgent extraction > ED2K > subtitle
+      pre-warm, idle = no scan and no lease being served
 
 ## Hub — registry, resolution, enrichment
 
@@ -53,10 +63,10 @@ Last updated: 2026-07-25 (anime providers, MusicBrainz, image subtitles, HUB-5).
 - [x] HUB-3 Dedup: same logical item from multiple sources → one item, source list
 - [x] HUB-4 Filename/dirname parsing (movies, episodes, anime conventions, music layout)
 - [x] HUB-20 Mediahost deletion cascade + watch-state/match archives restored on re-enroll
-- [x] HUB-5 Providers behind a common `Provider` trait (providers.rs):
-      per-media-type chains declared as data, first claim wins, walker owns
-      miss-recording; TMDB, TVDB, anime composite (AniDB identity + AniList),
-      MusicBrainz + CAA. Local-metadata provider slot open (HUB-9)
+- [ ] HUB-5 Provider trait + declared chains + walker live (TMDB, TVDB, anime
+      composite, MusicBrainz + CAA) *(amended clauses pending: claims are
+      item-level not field-level, and chains are static — not configurable
+      per library)*
 - [ ] HUB-6 Descriptive metadata *(titles, plots, dates, ratings, posters, episode
       stills live; cast/genres not stored)*
 - [ ] HUB-7 Provider rate limits/caching *(API keys via settings + poster caching
@@ -91,8 +101,9 @@ Last updated: 2026-07-25 (anime providers, MusicBrainz, image subtitles, HUB-5).
 - [x] HUB-13 All hub state in embedded storage; survives restart without rescan
 - [ ] HUB-14 Capability-profile negotiation *(mode chosen per source
       container/codecs; no client-supplied capability profile yet)*
-- [ ] HUB-15 Full negotiation matrix *(container/codec compatibility + text subtitle
-      delivery live; subtitle burn-in, HDR/channel-layout decisions pending)*
+- [ ] HUB-15 Full negotiation matrix *(container/codec compatibility + text
+      subtitle delivery + bitmap display-set streaming live; capability
+      profiles, OCR tier, burn-in, HDR/channel-layout decisions pending)*
 - [x] HUB-16 Cheapest-path preference: direct play > remux > transcode
 - [x] HUB-17 HLS delivery for remux/transcode (EVENT playlists, mid-stream seek)
 - [x] HUB-18 Sessions: per-user concurrency caps, progress checkpoints/resume,
@@ -103,8 +114,9 @@ Last updated: 2026-07-25 (anime providers, MusicBrainz, image subtitles, HUB-5).
 ## Hub — web interface
 
 - [x] HUB-25 Embedded web UI compiled into the binary
-- [x] HUB-26 Admin UI: enrollments w/ code entry, satellites, library composition,
-      providers, rescan, users, match review
+- [ ] HUB-26 Admin UI: enrollments, satellites, libraries, providers, users,
+      match review live *(amended: per-library refresh with live per-collection
+      progress pending; the global rescan button must go — HUB-35)*
 - [x] HUB-27 MVP player: login, browse, detail w/ stream info, direct/remux playback,
       audio/video/subtitle track selection, resume, watch state
 - [x] HUB-28 Web UI is a pure client of the public API
@@ -116,15 +128,29 @@ Last updated: 2026-07-25 (anime providers, MusicBrainz, image subtitles, HUB-5).
       (registered client "kahawai", account via admin page, optional
       encrypted session, never-ask-twice cache)
 - [ ] HUB-30 Fansub filename conventions *(group prefixes, absolute numbering,
-      CRC tags, bracket stripping live; hash-exact identification is canonical —
-      late-arriving ED2K hashes re-verify and override name matches;
+      CRC tags, bracket stripping, hash-exact show identification live;
       per-EPISODE hash identification and version tags pending)*
+- [x] HUB-30a Hashes are canonical identity: late ED2K re-verifies name
+      matches, overrides on disagreement (manual included); manual matches
+      otherwise adopt anime ids only via reverse mapping (proven live)
 - [ ] HUB-31 Native anime structure *(absolute numbering via TVDB absolute
       order; relations graph + related-items UI live; season-view projection
       pending — the mapping's per-entry season data is already parsed)*
 - [x] HUB-32 (see subtitles above)
+- [ ] HUB-32b Bitmap tier for image subs *(server-side PGS/VobSub decode,
+      display-set streaming, web overlay rendering live via the session tap;
+      graphics-overlay capability profiles and policy ordering pending)*
+- [ ] HUB-32c OCR text tier (subtile-ocr/Tesseract, default-on cargo feature)
+      *(not built; GPL-3.0 licensing consequence pre-documented in README)*
 - [ ] HUB-33 Dual-audio defaults *(manual audio track switching live; per-user
       original/dub preference not built)*
+- [x] HUB-34 Retrieval efficiency ladder: cache/sidecar → live session tap →
+      mediahost sparse/sequential extraction → hub lease, cached at-most-once
+      *(fonts currently use rungs 1 and 4 only — mediahost font extraction
+      follows once MH-4 declares attachment locations)*
+- [ ] HUB-35 Granular refresh *(per-collection scan requests + coalescing exist
+      at the protocol level; library-refresh endpoints, per-collection progress,
+      and removal of the global rescan pending)*
 
 ## Transcoder (TC)
 
@@ -149,7 +175,9 @@ Last updated: 2026-07-25 (anime providers, MusicBrainz, image subtitles, HUB-5).
 - [x] OPS-7 Cross-version satellite compatibility: protocol gated on major
       version (Hello/HelloAck) — per decision 2026-07-25, major-gating IS the
       compatibility contract; no previous-minor guarantee
-- [ ] OPS-8 Reverse-proxy support *(no forwarded-header/base-URL handling)*
+- [ ] OPS-8 Reverse-proxy support *(no forwarded-header/CORS handling; the
+      application/wasm MIME requirement for the ASS renderer is now documented
+      as a deployment note)*
 
 ## Non-functional (NFR)
 
@@ -162,8 +190,9 @@ Last updated: 2026-07-25 (anime providers, MusicBrainz, image subtitles, HUB-5).
 - [ ] NFR-5 Portability *(Linux x86_64 + macOS transcoder proven; aarch64 untested)*
 - [ ] NFR-6 Operability *(structured logging live; metrics + health endpoints missing)*
 - [x] NFR-7 Versioned client API (`/api/v1`)
-- [x] NFR-8 Codec support delegated to system GStreamer; no bundled patent codecs
-      (README documents the licensing posture)
+- [x] NFR-8 Codec support delegated to system GStreamer; MIT with the OCR
+      feature's GPL-3.0 combined-work consequence pre-documented in README
+      (applies when HUB-32c lands; --no-default-features stays copyleft-free)
 
 ## v1 acceptance criteria
 
