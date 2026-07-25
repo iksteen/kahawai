@@ -77,27 +77,32 @@ impl Subtitles {
     async fn external_provider(
         &self,
         registry: &Registry,
+        user_id: &str,
     ) -> Result<Box<dyn crate::opensubtitles::SubtitleProvider>> {
-        // Always on (HUB-21) unless an admin switched it off.
-        if registry
-            .get_setting(crate::opensubtitles::ENABLED_SETTING)
-            .await?
-            .as_deref()
-            == Some("0")
-        {
-            anyhow::bail!("subtitle downloads are disabled on this server");
-        }
-        let setting = |v: Option<String>| v.filter(|s| !s.is_empty());
-        // Key: config file → admin page → the key we ship.
+        // The application key is ours, overridable only by the config
+        // file. The feature is always available.
         let key = if self.provider_cfg.api_key.is_empty() {
-            setting(registry.get_setting(crate::opensubtitles::KEY_SETTING).await?)
-                .unwrap_or_else(|| crate::opensubtitles::default_api_key().to_string())
+            crate::opensubtitles::default_api_key().to_string()
         } else {
             self.provider_cfg.api_key.clone()
         };
-        // The account is a credential: admin page only.
-        let user = setting(registry.get_setting(crate::opensubtitles::USER_SETTING).await?);
-        let pass = setting(registry.get_setting(crate::opensubtitles::PASS_SETTING).await?);
+        // The account is this USER's, from their own settings: they
+        // spend their own download entitlement. Without one they fall
+        // back to the deployment-wide anonymous budget.
+        let pref = |key: &'static str| async move {
+            sqlx::query_scalar::<_, String>(
+                "SELECT value FROM user_prefs WHERE user_id = ? AND scope = '' AND key = ?",
+            )
+            .bind(user_id)
+            .bind(key)
+            .fetch_optional(registry.db())
+            .await
+            .ok()
+            .flatten()
+            .filter(|v| !v.is_empty())
+        };
+        let user = pref(crate::opensubtitles::USER_PREF_USERNAME).await;
+        let pass = pref(crate::opensubtitles::USER_PREF_PASSWORD).await;
         let http = reqwest::Client::builder().user_agent("kahawai").build()?;
         Ok(Box::new(crate::opensubtitles::OpenSubtitles::new(http, key, user, pass)))
     }
@@ -344,8 +349,9 @@ impl Subtitles {
         registry: &Registry,
         item_id: &str,
         languages: Vec<String>,
+        user_id: &str,
     ) -> Result<(Vec<crate::opensubtitles::Candidate>, crate::opensubtitles::Quota)> {
-        let provider = self.external_provider(registry).await?;
+        let provider = self.external_provider(registry, user_id).await?;
         provider.refresh_quota().await;
         let row = sqlx::query(
             "SELECT i.kind, i.season, i.episode,
@@ -475,7 +481,7 @@ impl Subtitles {
         language: Option<String>,
         user_id: &str,
     ) -> Result<(String, crate::opensubtitles::Quota)> {
-        let provider = self.external_provider(registry).await?;
+        let provider = self.external_provider(registry, user_id).await?;
         let dl = provider.download(file_id).await?;
         let text = decode_text(&dl.bytes);
         let cues = parse(&dl.format, &text)?;

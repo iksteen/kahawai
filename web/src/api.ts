@@ -505,20 +505,7 @@ export const adminProviders = () =>
     tmdb: { configured: boolean }
     tvdb: { configured: boolean }
     anidb: { configured: boolean }
-    opensubtitles?: { configured: boolean; account: boolean }
   }>('/admin/v1/providers')
-
-/// apiKey is optional — a built-in app key ships with the hub; only an
-/// account is needed, and only for downloads.
-export const adminSetOpenSubtitles = (
-  apiKey: string,
-  username?: string,
-  password?: string,
-) =>
-  json<{ saved: boolean }>('/admin/v1/providers/opensubtitles', {
-    method: 'POST',
-    body: JSON.stringify({ api_key: apiKey, username, password }),
-  })
 export const adminSetAnidb = (username: string, password: string, udpApiKey?: string) =>
   json<{ saved: boolean; verified: boolean; error?: string }>('/admin/v1/providers/anidb', {
     method: 'POST',

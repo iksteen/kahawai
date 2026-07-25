@@ -7,7 +7,6 @@ import {
   adminRefreshLibrary,
   openEvents,
   adminSetAnidb,
-  adminSetOpenSubtitles,
   adminSetTmdbKey,
   adminSetTvdbKey,
   adminAttachCollection,
@@ -37,11 +36,6 @@ function TmdbSection({ onNotice, tick }: { onNotice: (s: string) => void; tick: 
   const [configured, setConfigured] = useState(false)
   const [tvdbConfigured, setTvdbConfigured] = useState(false)
   const [anidbConfigured, setAnidbConfigured] = useState(false)
-  const [osConfigured, setOsConfigured] = useState(false)
-  const [osAccount, setOsAccount] = useState(false)
-  const [osKey, setOsKey] = useState('')
-  const [osUser, setOsUser] = useState('')
-  const [osPass, setOsPass] = useState('')
   const [anidbUser, setAnidbUser] = useState('')
   const [anidbPass, setAnidbPass] = useState('')
   const [anidbKey, setAnidbKey] = useState('')
@@ -61,8 +55,6 @@ function TmdbSection({ onNotice, tick }: { onNotice: (s: string) => void; tick: 
         setConfigured(p.tmdb.configured)
         setTvdbConfigured(p.tvdb.configured)
         setAnidbConfigured(p.anidb?.configured ?? false)
-        setOsConfigured(p.opensubtitles?.configured ?? false)
-        setOsAccount(p.opensubtitles?.account ?? false)
       })
       .catch(() => {})
     adminEnrichStatus().then(setStatus).catch(() => {})
@@ -184,50 +176,6 @@ function TmdbSection({ onNotice, tick }: { onNotice: (s: string) => void; tick: 
         >
           Save
         </button>
-      </div>
-      <div className="row-form">
-        <input
-          placeholder={
-            osAccount
-              ? 'OpenSubtitles account set — enter to replace'
-              : 'OpenSubtitles username (for downloads)'
-          }
-          value={osUser}
-          onChange={(e) => setOsUser(e.target.value)}
-        />
-        <input
-          type="password"
-          placeholder="OpenSubtitles password"
-          value={osPass}
-          onChange={(e) => setOsPass(e.target.value)}
-        />
-        <input
-          type="password"
-          placeholder={osConfigured ? 'custom API key set' : 'API key (optional — one is built in)'}
-          value={osKey}
-          onChange={(e) => setOsKey(e.target.value)}
-          style={{ width: '16rem' }}
-        />
-        <button
-          className="btn small"
-          disabled={!osUser.trim() && !osKey.trim()}
-          onClick={() => {
-            void adminSetOpenSubtitles(
-              osKey.trim(),
-              osUser.trim() || undefined,
-              osPass.trim() || undefined,
-            ).then(() => {
-              setOsKey('')
-              setOsUser('')
-              setOsPass('')
-              onNotice('OpenSubtitles account saved')
-              refresh()
-            })
-          }}
-        >
-          Save
-        </button>
-        <span className="dim">search works out of the box; downloads need your account</span>
       </div>
     </>
   )

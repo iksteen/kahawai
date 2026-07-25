@@ -89,15 +89,20 @@ media-token mechanism (AR-8) is the planned fix.
 
 ## Subtitles (OpenSubtitles)
 
-Works with no configuration: the binary ships kahawai's registered
-application key, and anonymous use is entitled to 5 requests/second and
-**5 downloads per 24 hours shared across the whole deployment**. An
-account raises the download entitlement; the admin UI (Metadata
-providers) is the easy way to attach one.
+Always on, with no configuration: the binary ships kahawai's
+registered application key, and anonymous use is entitled to 5
+requests/second and **5 downloads per 24 hours shared across the whole
+deployment**.
+
+Each user may attach their own opensubtitles.com account under
+Settings → OpenSubtitles, which spends that user's own download
+entitlement instead of the shared one. Subtitles they download are
+shared with everyone on the server (HUB-23) — the account governs who
+pays for the download, not who may use the result.
 
 A deployment that wants its own application key — rate-limit
-isolation, or if the embedded one is ever revoked — sets it here, and
-it wins over the same field in the admin page:
+isolation, or if the embedded one is ever revoked — sets it in config;
+this is the only way to override it:
 
 ```toml
 [hub.subtitles.opensubtitles]
@@ -105,9 +110,7 @@ api_key = "${KAHAWAI_OS_KEY}"     # optional: your own registered application ke
 ```
 
 It honours the usual env override
-(`KAHAWAI_HUB__SUBTITLES__OPENSUBTITLES__API_KEY=…`). The OpenSubtitles
-*account* is entered in the admin page instead — it is a credential,
-and the UI is where credentials belong.
+(`KAHAWAI_HUB__SUBTITLES__OPENSUBTITLES__API_KEY=…`).
 
 ## Checklist for exposing a hub
 

@@ -113,6 +113,73 @@ function LangChips({
   )
 }
 
+function OpenSubtitlesAccount({
+  username,
+  hasPassword,
+  onSaved,
+  flash,
+}: {
+  username: string
+  hasPassword: boolean
+  onSaved: (username: string, password: string) => void
+  flash: () => void
+}) {
+  const [user, setUser] = useState(username)
+  const [pass, setPass] = useState('')
+  const [busy, setBusy] = useState(false)
+  useEffect(() => setUser(username), [username])
+
+  const save = (u: string, p: string) => {
+    setBusy(true)
+    Promise.all([
+      putPref('', 'opensubtitles.username', u),
+      putPref('', 'opensubtitles.password', p),
+    ])
+      .then(() => {
+        setPass('')
+        onSaved(u, p)
+        flash()
+      })
+      .finally(() => setBusy(false))
+  }
+
+  return (
+    <div className="row-form pref-row">
+      <span className="pref-label mono">account</span>
+      <input
+        placeholder="opensubtitles.com username"
+        value={user}
+        onChange={(e) => setUser(e.target.value)}
+      />
+      <input
+        type="password"
+        placeholder={hasPassword ? 'password saved — enter to replace' : 'password'}
+        value={pass}
+        onChange={(e) => setPass(e.target.value)}
+      />
+      <button
+        className="btn small"
+        disabled={busy || !user.trim() || !pass.trim()}
+        onClick={() => save(user.trim(), pass)}
+      >
+        Save
+      </button>
+      {(username || hasPassword) && (
+        <button
+          className="btn ghost small"
+          disabled={busy}
+          onClick={() => {
+            setUser('')
+            save('', '')
+          }}
+        >
+          Disconnect
+        </button>
+      )}
+    </div>
+  )
+}
+
 export default function Settings() {
   const [values, setValues] = useState<Record<string, string>>({})
   const [loaded, setLoaded] = useState(false)
@@ -151,6 +218,26 @@ export default function Settings() {
         make it the first choice. Changes save immediately. Anything you set manually
         while watching overrides these for that series or movie.
       </p>
+      <section>
+        <h2>OpenSubtitles</h2>
+        <p className="dim">
+          Subtitle search works without an account, on a small download budget shared by
+          everyone on this server. Attach your own opensubtitles.com account to spend your
+          own budget instead. Subtitles you download are shared with everyone here.
+        </p>
+        <OpenSubtitlesAccount
+          username={values['opensubtitles.username'] ?? ''}
+          hasPassword={!!values['opensubtitles.password']}
+          onSaved={(u, p) =>
+            setValues((cur) => ({
+              ...cur,
+              'opensubtitles.username': u,
+              'opensubtitles.password': p,
+            }))
+          }
+          flash={flash}
+        />
+      </section>
       {MEDIA_TYPES.map((mt) => (
         <section key={mt}>
           <h2>{mt}</h2>

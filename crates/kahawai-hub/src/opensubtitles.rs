@@ -1,8 +1,10 @@
 //! HUB-21/22/24: external subtitle provider. OpenSubtitles.com REST
 //! client behind a small trait so a second provider is one impl. The
-//! app key ships with the binary (see DEFAULT_API_KEY) and grants
-//! anonymous use: 5 requests/s and 5 downloads per 24 h. Configuring an
-//! account (settings) only raises the download quota.
+//! app key ships with the binary (DEFAULT_API_KEY, overridable only by
+//! the config file) and grants anonymous use: 5 requests/s and 5
+//! downloads per 24 h shared by the whole deployment. A user who
+//! attaches their own account in Settings spends their own entitlement
+//! instead; what they download is shared with everyone (HUB-23).
 //!
 //! Matching (HUB-22): the file's OpenSubtitles moviehash — which is
 //! exactly the `oshash` the mediahost already computes (size + u64-LE
@@ -34,11 +36,12 @@ pub fn default_api_key() -> &'static str {
     DEFAULT_API_KEY
 }
 
-pub const KEY_SETTING: &str = "opensubtitles.api_key";
-/// "0" disables the provider entirely (HUB-21: admins may turn it off).
-pub const ENABLED_SETTING: &str = "opensubtitles.enabled";
-pub const USER_SETTING: &str = "opensubtitles.username";
-pub const PASS_SETTING: &str = "opensubtitles.password";
+/// Per-USER preference keys (user_prefs, global scope): each user
+/// attaches their own OpenSubtitles account, spending their own
+/// download entitlement. What they download is shared with everyone —
+/// subtitles belong to the item, not the downloader (HUB-23).
+pub const USER_PREF_USERNAME: &str = "opensubtitles.username";
+pub const USER_PREF_PASSWORD: &str = "opensubtitles.password";
 
 /// Deployment-level provider config (kahawai.toml): just the
 /// application key, and only when a deployment wants its own. Empty =

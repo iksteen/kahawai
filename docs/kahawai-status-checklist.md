@@ -85,14 +85,13 @@ Last updated: 2026-07-25, against the revised requirements (AR-12, MH-10/11, HUB
 ## Hub — subtitles
 
 - [x] HUB-21 External subtitle providers: SubtitleProvider trait with
-      OpenSubtitles.com (REST) as the first impl; kahawai's app key is
-      baked in (the provider asks integrators to ship it — anonymous use
-      is 5 req/s, 5 downloads/24 h), overridable by setting, and an
-      optional account raises the download quota
-      *(deviation pending an architect amendment: the requirement still
-      says the feature is disabled until an admin supplies credentials —
-      shipping the app key is the provider's own guidance. Manual query
-      search is the known follow-up.)*
+      OpenSubtitles.com (REST) as the first impl. Always on: kahawai's
+      application key ships in the binary (5 req/s, 5 downloads/24 h
+      shared per deployment), overridable only by kahawai.toml; each
+      USER may attach their own opensubtitles.com account in Settings to
+      spend their own entitlement, while what they download is shared
+      with everyone (HUB-23) *(manual query search is the known
+      follow-up)*
 - [x] HUB-22 Hash-preferred subtitle matching: two-phase search — the
       file's moviehash (which IS the mediahost's oshash) alone first,
       title/year (+ season/episode, projected for absolute-numbered

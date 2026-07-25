@@ -108,7 +108,6 @@ pub fn router(
         .route("/admin/v1/providers/tmdb", post(admin_set_tmdb))
         .route("/admin/v1/providers/tvdb", post(admin_set_tvdb))
         .route("/admin/v1/providers/anidb", post(admin_set_anidb))
-        .route("/admin/v1/providers/opensubtitles", post(admin_set_opensubtitles))
         .route("/admin/v1/providers/anidb/verify", post(admin_verify_anidb))
         .route("/admin/v1/enrich", get(admin_enrich_status).post(admin_enrich_run))
         .route("/admin/v1/libraries/{id}/refresh", post(admin_refresh_library))
@@ -265,63 +264,11 @@ async fn admin_providers(State(state): State<AppState>) -> Result<Json<Value>, A
         .await
         .map_err(internal)?
         .is_some();
-    // Search always works (built-in app key); "configured" reports a
-    // custom key override.
-    let opensubtitles = state
-        .registry
-        .get_setting(crate::opensubtitles::KEY_SETTING)
-        .await
-        .map_err(internal)?
-        .is_some_and(|k| !k.is_empty());
-    let opensubtitles_account = state
-        .registry
-        .get_setting(crate::opensubtitles::USER_SETTING)
-        .await
-        .map_err(internal)?
-        .is_some_and(|k| !k.is_empty());
     Ok(Json(json!({
         "tmdb": { "configured": tmdb },
         "tvdb": { "configured": tvdb },
         "anidb": { "configured": anidb },
-        "opensubtitles": {
-            "configured": opensubtitles,
-            "account": opensubtitles_account,
-        },
     })))
-}
-
-#[derive(Deserialize)]
-struct SetOpenSubtitles {
-    /// Optional: a custom key overriding the built-in app key.
-    #[serde(default)]
-    api_key: String,
-    #[serde(default)]
-    username: Option<String>,
-    #[serde(default)]
-    password: Option<String>,
-}
-
-/// HUB-21: enable the external subtitle provider. The API key alone
-/// enables search; downloads additionally need an account (the
-/// provider tracks quota against it).
-async fn admin_set_opensubtitles(
-    State(state): State<AppState>,
-    Json(body): Json<SetOpenSubtitles>,
-) -> Result<Json<Value>, ApiError> {
-    // Empty key = use the built-in app key (the normal case).
-    state
-        .registry
-        .set_setting(crate::opensubtitles::KEY_SETTING, body.api_key.trim())
-        .await
-        .map_err(internal)?;
-    // Empty account fields clear the stored credentials.
-    for (setting, value) in [
-        (crate::opensubtitles::USER_SETTING, body.username.as_deref().unwrap_or("").trim()),
-        (crate::opensubtitles::PASS_SETTING, body.password.as_deref().unwrap_or("").trim()),
-    ] {
-        state.registry.set_setting(setting, value).await.map_err(internal)?;
-    }
-    Ok(Json(json!({ "saved": true })))
 }
 
 #[derive(Deserialize)]
@@ -335,11 +282,12 @@ struct SubtitleSearchRequest {
 async fn subtitle_search(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    axum::Extension(claims): axum::Extension<crate::auth::Claims>,
     Json(body): Json<SubtitleSearchRequest>,
 ) -> Result<Json<Value>, ApiError> {
     let (candidates, quota) = state
         .subtitles
-        .search_external(&state.registry, &id, body.languages)
+        .search_external(&state.registry, &id, body.languages, &claims.sub)
         .await
         .map_err(|e| (StatusCode::BAD_GATEWAY, format!("{e:#}")))?;
     Ok(Json(json!({ "candidates": candidates, "quota": quota })))
