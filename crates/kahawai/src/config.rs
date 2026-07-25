@@ -99,14 +99,6 @@ pub struct HubConfig {
 #[serde(deny_unknown_fields, default)]
 pub struct SubtitlesConfig {
     pub opensubtitles: OpenSubtitlesConfig,
-    /// OPS-6: cap on the *re-derivable* subtitle cache (extracted cues
-    /// and font bundles), in MiB. 0 = no cap, the default: the cache
-    /// is small next to the media it describes, and evicting it costs
-    /// a demux pass to rebuild. Set it where the hub's data dir shares
-    /// a small disk. Downloaded subtitles are never evicted — they are
-    /// database-referenced, shared between users, and cost a provider
-    /// entitlement to re-fetch.
-    pub cache_max_mb: u64,
 }
 
 /// HUB-21. The feature is always on and needs no configuration — the

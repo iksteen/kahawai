@@ -214,17 +214,18 @@ limits, OPS-6 scoped to re-derivable caches).
 - [x] OPS-3 `doctor` command with plugin/encoder checks
 - [x] OPS-4 Clock-skew tolerance (backdated certs, enrollment skew warning)
 - [ ] OPS-5 Online backup/restore command
-- [ ] OPS-6 Quota-bounded caches with eviction — scope corrected
-      2026-07-26: the quota may only reclaim what the hub can rebuild
-      for free (extracted cues, font bundles), evicted least-recently-used
-      via `hub.subtitles.cache_max_mb` (0 = off, the default: the cache
-      is small next to the media it describes). Downloaded subtitles are
-      excluded by design — DB-referenced, shared between users (HUB-23),
-      and a re-fetch spends a rate-limited provider entitlement. Artwork
-      is left alone for the same reason. Session scratch is already
-      bounded by session lifecycle. *(unit-tested; not yet exercised on
-      the live deployment, where the cache sits at 2.4 GB against TBs of
-      media and no quota is warranted)*
+- [ ] OPS-6 Quota-bounded caches with eviction — **not built, on purpose**
+      (decided 2026-07-26). Nothing the hub caches is cheap to rebuild:
+      extracted cues and font bundles cost a full-file demux over a
+      byte-plane lease (the cost HUB-34's ladder exists to avoid),
+      downloaded subtitles are DB-referenced, shared between users
+      (HUB-23) and spend a rate-limited provider entitlement, artwork and
+      the AniDB dumps are provider-derived. Transient state (session
+      scratch) is already bounded by lifecycle. Live numbers: 2.4 GB of
+      subtitle cache for 37k files, against TBs of media — disk is not
+      the scarce resource, provider quota and mediahost I/O are. If a
+      cap is ever needed (data_dir on a small disk), it should be an
+      admin-triggered purge that states its cost, not a silent janitor.
 - [x] OPS-7 Cross-version satellite compatibility: protocol gated on major
       version (Hello/HelloAck) — per decision 2026-07-25, major-gating IS the
       compatibility contract; no previous-minor guarantee
