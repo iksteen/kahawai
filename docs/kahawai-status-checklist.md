@@ -204,7 +204,11 @@ Last updated: 2026-07-25, against the revised requirements (AR-12, MH-10/11, HUB
       250k/10/5 untested)*
 - [x] NFR-3 No user-state loss on crash; media never written
 - [x] NFR-4 mTLS everywhere inter-module; token auth on client API
-- [ ] NFR-5 Portability *(Linux x86_64 + macOS transcoder proven; aarch64 untested)*
+- [x] NFR-5 Portability: Linux x86_64, macOS (transcoder), and Linux
+      aarch64 — cross-compiled against a device sysroot
+      (scripts/kahawai-cross-aarch64.sh), proven on a Pi 3 end to end:
+      doctor green (encoders dry-run verified), enrolled as mediahost
+      over mTLS, scanned, served direct play through the hub
 - [ ] NFR-6 Operability *(structured logging live; metrics + health endpoints missing)*
 - [x] NFR-7 Versioned client API (`/api/v1`)
 - [x] NFR-8 Codec support delegated to system GStreamer; MIT with the OCR
