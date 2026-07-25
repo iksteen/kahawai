@@ -44,6 +44,7 @@ impl ProxyTrust {
             return Some(peer);
         }
         let Some(xff) = xff else { return Some(peer) };
+        let mut leftmost = None;
         for hop in xff.rsplit(',') {
             let Ok(ip) = IpAddr::from_str(hop.trim()) else {
                 return Some(peer); // garbled header: fall back to the peer
@@ -51,8 +52,14 @@ impl ProxyTrust {
             if !self.trusts(ip) {
                 return Some(ip);
             }
+            leftmost = Some(ip);
         }
-        Some(peer) // every hop trusted: proxy-to-proxy traffic
+        // Every hop trusted. With a blanket like 0.0.0.0/0 that is the
+        // NORMAL case (nothing can be untrusted), so the leftmost entry
+        // — the origin as the first proxy saw it — is the best answer;
+        // for genuine proxy-to-proxy traffic it is a proxy IP, which is
+        // harmless for throttling.
+        Some(leftmost.unwrap_or(peer))
     }
 }
 
@@ -112,6 +119,19 @@ mod tests {
             t.client_ip(Some(ip("127.0.0.1")), Some("203.0.113.9")),
             Some(ip("127.0.0.1"))
         );
+    }
+
+    #[test]
+    fn blanket_trust_uses_leftmost_origin() {
+        // 0.0.0.0/0: every hop is "trusted", so the walk must not
+        // degenerate to the peer — the origin is the leftmost entry.
+        let t = ProxyTrust::parse(&["0.0.0.0/0".into()]).unwrap();
+        assert_eq!(
+            t.client_ip(Some(ip("172.18.0.2")), Some("203.0.113.9, 172.18.0.3")),
+            Some(ip("203.0.113.9"))
+        );
+        // No header at all still falls back to the peer.
+        assert_eq!(t.client_ip(Some(ip("172.18.0.2")), None), Some(ip("172.18.0.2")));
     }
 
     #[test]

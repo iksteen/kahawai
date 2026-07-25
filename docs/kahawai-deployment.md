@@ -19,6 +19,17 @@ trusted_proxies = ["127.0.0.1"]          # proxy on the same host
 # trusted_proxies = ["172.16.0.0/12"]    # docker/traefik bridge (the
 #                                        # proxy's address changes per
 #                                        # restart; trust the subnet)
+# trusted_proxies = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
+#                                        # all RFC1918 — covers any pool
+#                                        # docker might assign
+# trusted_proxies = ["0.0.0.0/0"]        # trust EVERYTHING: X-Forwarded-For
+#                                        # is taken at face value (leftmost
+#                                        # entry). Only safe when the bind
+#                                        # address is unreachable except
+#                                        # through the proxy — any peer that
+#                                        # CAN connect directly can spoof
+#                                        # its address and dodge or frame
+#                                        # per-IP throttling.
 ```
 
 X-Forwarded-For is resolved right-to-left: the first address that is
