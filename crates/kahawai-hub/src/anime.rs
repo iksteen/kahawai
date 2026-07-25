@@ -1,0 +1,450 @@
+//! Anime metadata plumbing (HUB-29): AniDB as the identity authority,
+//! AniList as the description/relations source, bridged by the
+//! community anime-lists mapping.
+//!
+//! AniDB discipline: the daily anime-titles dump answers ALL title
+//! searches locally — zero API calls. (The UDP file-by-ED2K client
+//! needs a registered AniDB client; it slots in behind settings later.)
+
+use std::collections::HashMap;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use anyhow::{Context, Result};
+use serde::Deserialize;
+
+const TITLES_URL: &str = "https://anidb.net/api/anime-titles.dat.gz";
+/// AniDB says: at most one dump download per day per IP.
+const TITLES_MAX_AGE: Duration = Duration::from_secs(24 * 3600);
+
+const MAPPING_URL: &str =
+    "https://raw.githubusercontent.com/Fribb/anime-lists/master/anime-list-full.json";
+const MAPPING_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 3600);
+
+const ANILIST_URL: &str = "https://graphql.anilist.co";
+/// AniList allows ~90 req/min; stay well under.
+const ANILIST_SPACING: Duration = Duration::from_millis(800);
+
+/// Download `url` to `path` unless a fresh copy exists (best-effort:
+/// a stale cache beats a failed refresh).
+async fn cached_download(
+    http: &reqwest::Client,
+    url: &str,
+    path: &Path,
+    max_age: Duration,
+) -> Result<()> {
+    if let Ok(meta) = std::fs::metadata(path)
+        && meta.modified().ok().and_then(|m| m.elapsed().ok()).map(|a| a < max_age).unwrap_or(false)
+    {
+        return Ok(());
+    }
+    tracing::info!(url, "refreshing anime data file");
+    match http.get(url).send().await.and_then(|r| r.error_for_status()) {
+        Ok(resp) => {
+            let bytes = resp.bytes().await?;
+            if let Some(dir) = path.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            let tmp = path.with_extension("tmp");
+            std::fs::write(&tmp, &bytes)?;
+            std::fs::rename(&tmp, path)?;
+            Ok(())
+        }
+        Err(e) if path.exists() => {
+            tracing::warn!(url, error = %e, "refresh failed; using stale cache");
+            Ok(())
+        }
+        Err(e) => Err(e).context("downloading"),
+    }
+}
+
+// ---------- AniDB titles dump ----------
+
+/// The daily titles dump, indexed for local matching. Lines:
+/// `<aid>|<type>|<language>|<title>` — type 1=primary, 2=synonym,
+/// 3=short, 4=official.
+pub struct AnidbTitles {
+    /// folded title → aids (deduped, primary/official first).
+    index: HashMap<String, Vec<u32>>,
+}
+
+impl AnidbTitles {
+    pub async fn load(http: &reqwest::Client, data_dir: &Path) -> Result<Self> {
+        let path = data_dir.join("anime").join("anime-titles.dat.gz");
+        cached_download(http, TITLES_URL, &path, TITLES_MAX_AGE).await?;
+        let raw = std::fs::read(&path)?;
+        let mut text = String::new();
+        flate2::read::GzDecoder::new(&raw[..]).read_to_string(&mut text)?;
+
+        // (aid, title-type) per folded title; official/primary first.
+        let mut staging: HashMap<String, Vec<(u32, u8)>> = HashMap::new();
+        for line in text.lines() {
+            if line.starts_with('#') {
+                continue;
+            }
+            let mut parts = line.splitn(4, '|');
+            let (Some(aid), Some(ttype), Some(_lang), Some(title)) =
+                (parts.next(), parts.next(), parts.next(), parts.next())
+            else {
+                continue;
+            };
+            let (Ok(aid), Ok(ttype)) = (aid.parse::<u32>(), ttype.parse::<u8>()) else {
+                continue;
+            };
+            if ttype == 3 {
+                continue; // short forms collide wildly
+            }
+            let folded = crate::enrich::fold(title);
+            if folded.is_empty() {
+                continue;
+            }
+            staging.entry(folded).or_default().push((aid, ttype));
+        }
+        let mut index = HashMap::with_capacity(staging.len());
+        for (k, mut v) in staging {
+            // primary(1)/official(4) outrank synonyms(2)
+            v.sort_by_key(|(_, t)| match t {
+                1 => 0u8,
+                4 => 1,
+                _ => 2,
+            });
+            let mut seen = std::collections::HashSet::new();
+            let aids: Vec<u32> = v.into_iter().filter(|(a, _)| seen.insert(*a)).collect::<Vec<_>>()
+                .into_iter()
+                .map(|(a, _)| a)
+                .collect();
+            index.insert(k, aids);
+        }
+        tracing::info!(titles = index.len(), "anidb titles index ready");
+        Ok(Self { index })
+    }
+
+    /// Candidate aids for a local title, best first.
+    pub fn candidates(&self, title: &str) -> Vec<u32> {
+        self.index.get(&crate::enrich::fold(title)).cloned().unwrap_or_default()
+    }
+}
+
+// ---------- anime-lists mapping ----------
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct Mapping {
+    #[serde(default)]
+    pub anidb_id: Option<u32>,
+    #[serde(default)]
+    pub anilist_id: Option<u32>,
+    #[serde(default)]
+    pub tvdb_id: Option<u32>,
+    /// `themoviedb_id` ships as `{"movie": [ids…]}` or `{"tv": id}` (or,
+    /// historically, a bare number).
+    #[serde(default, rename = "themoviedb_id", deserialize_with = "tmdb_ids")]
+    pub tmdb: TmdbIds,
+    #[serde(default, rename = "type")]
+    pub kind: Option<String>, // TV | MOVIE | OVA | ONA | SPECIAL | …
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TmdbIds {
+    pub movie: Option<u32>,
+    pub tv: Option<u32>,
+}
+
+fn tmdb_ids<'de, D: serde::Deserializer<'de>>(d: D) -> Result<TmdbIds, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(u32),
+        Many(Vec<u32>),
+    }
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum V {
+        Obj { movie: Option<OneOrMany>, tv: Option<OneOrMany> },
+        Bare(u32),
+        Other(serde_json::Value),
+    }
+    let first = |v: Option<OneOrMany>| match v {
+        Some(OneOrMany::One(n)) => Some(n),
+        Some(OneOrMany::Many(v)) => v.first().copied(),
+        None => None,
+    };
+    Ok(match V::deserialize(d) {
+        Ok(V::Obj { movie, tv }) => TmdbIds { movie: first(movie), tv: first(tv) },
+        Ok(V::Bare(n)) => TmdbIds { movie: Some(n), tv: Some(n) },
+        _ => TmdbIds::default(),
+    })
+}
+
+impl Mapping {
+    /// The TMDB id matching our item kind (movie vs show).
+    pub fn tmdb_for(&self, kind: &str) -> Option<u32> {
+        if kind == "movie" {
+            self.tmdb.movie
+        } else {
+            self.tmdb.tv
+        }
+    }
+}
+
+pub struct AnimeLists {
+    by_anidb: HashMap<u32, Mapping>,
+    /// Reverse maps: one TVDB series covers many AniDB entries (per
+    /// season); TMDB movie ids are ~1:1.
+    by_tvdb: HashMap<u32, Vec<u32>>,
+    by_tmdb: HashMap<u32, Vec<u32>>,
+}
+
+impl AnimeLists {
+    pub async fn load(http: &reqwest::Client, data_dir: &Path) -> Result<Self> {
+        let path = data_dir.join("anime").join("anime-list-full.json");
+        cached_download(http, MAPPING_URL, &path, MAPPING_MAX_AGE).await?;
+        let raw = std::fs::read(&path)?;
+        let entries: Vec<Mapping> = serde_json::from_slice(&raw)?;
+        let mut by_anidb = HashMap::with_capacity(entries.len());
+        let mut by_tvdb: HashMap<u32, Vec<u32>> = HashMap::new();
+        let mut by_tmdb: HashMap<u32, Vec<u32>> = HashMap::new();
+        for e in entries {
+            if let Some(aid) = e.anidb_id {
+                if let Some(tvdb) = e.tvdb_id {
+                    by_tvdb.entry(tvdb).or_default().push(aid);
+                }
+                for tmdb in [e.tmdb.movie, e.tmdb.tv].into_iter().flatten() {
+                    by_tmdb.entry(tmdb).or_default().push(aid);
+                }
+                by_anidb.insert(aid, e);
+            }
+        }
+        // Lowest AniDB id ≈ first season/original entry.
+        for v in by_tvdb.values_mut().chain(by_tmdb.values_mut()) {
+            v.sort_unstable();
+        }
+        tracing::info!(entries = by_anidb.len(), "anime-lists mapping ready");
+        Ok(Self { by_anidb, by_tvdb, by_tmdb })
+    }
+
+    pub fn by_anidb(&self, aid: u32) -> Option<&Mapping> {
+        self.by_anidb.get(&aid)
+    }
+
+    /// AniDB entries behind an existing generic-provider match — lets a
+    /// manually matched item adopt anime ids WITHOUT re-deciding its
+    /// identity.
+    pub fn reverse(&self, provider: &str, provider_id: &str) -> Vec<u32> {
+        let Ok(id) = provider_id.parse::<u32>() else { return Vec::new() };
+        match provider {
+            "tvdb" => self.by_tvdb.get(&id).cloned().unwrap_or_default(),
+            "tmdb" => self.by_tmdb.get(&id).cloned().unwrap_or_default(),
+            _ => Vec::new(),
+        }
+    }
+}
+
+// ---------- AniList ----------
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnilistMedia {
+    pub id: u32,
+    pub title: AnilistTitle,
+    pub description: Option<String>,
+    pub cover_image: Option<AnilistCover>,
+    pub average_score: Option<f64>,
+    pub start_date: Option<AnilistDate>,
+    pub format: Option<String>, // TV | MOVIE | OVA | ONA | SPECIAL | TV_SHORT | MUSIC
+    pub genres: Option<Vec<String>>,
+    pub relations: Option<AnilistRelations>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AnilistTitle {
+    pub romaji: Option<String>,
+    pub english: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnilistCover {
+    pub extra_large: Option<String>,
+    pub large: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AnilistDate {
+    pub year: Option<i32>,
+    pub month: Option<i32>,
+    pub day: Option<i32>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AnilistRelations {
+    pub edges: Vec<AnilistRelationEdge>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnilistRelationEdge {
+    pub relation_type: Option<String>,
+    pub node: Option<AnilistRelationNode>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AnilistRelationNode {
+    pub id: u32,
+    pub title: AnilistTitle,
+    pub format: Option<String>,
+}
+
+impl AnilistMedia {
+    pub fn display_title(&self) -> Option<String> {
+        self.title.english.clone().or_else(|| self.title.romaji.clone())
+    }
+
+    pub fn premiered(&self) -> Option<String> {
+        let d = self.start_date.as_ref()?;
+        Some(format!("{:04}-{:02}-{:02}", d.year?, d.month.unwrap_or(1), d.day.unwrap_or(1)))
+    }
+
+    /// AniList descriptions carry light HTML; flatten it.
+    pub fn plain_description(&self) -> Option<String> {
+        let d = self.description.as_ref()?;
+        let mut out = d
+            .replace("<br>", "\n")
+            .replace("<br/>", "\n")
+            .replace("<br />", "\n");
+        for tag in ["<i>", "</i>", "<b>", "</b>", "<em>", "</em>"] {
+            out = out.replace(tag, "");
+        }
+        Some(out.trim().to_string())
+    }
+}
+
+const MEDIA_FIELDS: &str = "
+  id
+  title { romaji english }
+  description(asHtml: false)
+  coverImage { extraLarge large }
+  averageScore
+  startDate { year month day }
+  format
+  genres
+  relations {
+    edges { relationType node { id title { romaji english } format } }
+  }";
+
+pub struct Anilist {
+    http: reqwest::Client,
+    /// Global spacing lock (AniList rate limit).
+    last: tokio::sync::Mutex<Option<tokio::time::Instant>>,
+}
+
+impl Anilist {
+    pub fn new(http: reqwest::Client) -> Self {
+        Self { http, last: tokio::sync::Mutex::new(None) }
+    }
+
+    async fn gql(&self, query: &str, variables: serde_json::Value) -> Result<serde_json::Value> {
+        {
+            let mut last = self.last.lock().await;
+            if let Some(t) = *last {
+                let since = t.elapsed();
+                if since < ANILIST_SPACING {
+                    tokio::time::sleep(ANILIST_SPACING - since).await;
+                }
+            }
+            *last = Some(tokio::time::Instant::now());
+        }
+        let resp = self
+            .http
+            .post(ANILIST_URL)
+            .json(&serde_json::json!({"query": query, "variables": variables}))
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<serde_json::Value>()
+            .await?;
+        Ok(resp)
+    }
+
+    pub async fn media_by_id(&self, id: u32) -> Result<Option<AnilistMedia>> {
+        let q = format!("query($id: Int) {{ Media(id: $id, type: ANIME) {{{MEDIA_FIELDS}}} }}");
+        let v = self.gql(&q, serde_json::json!({"id": id})).await?;
+        Ok(serde_json::from_value(v["data"]["Media"].clone()).ok())
+    }
+
+    pub async fn search(&self, title: &str) -> Result<Vec<AnilistMedia>> {
+        let q = format!(
+            "query($s: String) {{ Page(perPage: 8) {{ media(search: $s, type: ANIME) {{{MEDIA_FIELDS}}} }} }}"
+        );
+        let v = self.gql(&q, serde_json::json!({"s": title})).await?;
+        Ok(serde_json::from_value(v["data"]["Page"]["media"].clone()).unwrap_or_default())
+    }
+}
+
+/// Does an AniList/mapping format fit our item kind?
+pub fn format_fits(kind: &str, format: Option<&str>) -> bool {
+    match (kind, format) {
+        (_, None) => true, // unknown format never disqualifies
+        ("movie", Some(f)) => f.eq_ignore_ascii_case("movie"),
+        ("show", Some(f)) => !f.eq_ignore_ascii_case("movie") && !f.eq_ignore_ascii_case("music"),
+        _ => true,
+    }
+}
+
+/// Cache root for the anime data files.
+pub fn anime_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join("anime")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mapping_parses_real_schema() {
+        let json = r#"[
+          {"anidb_id": 1218, "anilist_id": 431, "type": "MOVIE",
+           "themoviedb_id": {"movie": [4935]}},
+          {"anidb_id": 4563, "anilist_id": 1535, "tvdb_id": 79481, "type": "TV",
+           "themoviedb_id": {"tv": 30984}},
+          {"anilist_id": 99999},
+          {"anidb_id": 7729, "type": "MOVIE", "themoviedb_id": null},
+          {"anidb_id": 1, "themoviedb_id": 42}
+        ]"#;
+        let entries: Vec<Mapping> = serde_json::from_str(json).unwrap();
+        assert_eq!(entries[0].tmdb.movie, Some(4935));
+        assert_eq!(entries[0].tmdb_for("movie"), Some(4935));
+        assert_eq!(entries[1].tvdb_id, Some(79481));
+        assert_eq!(entries[1].tmdb_for("show"), Some(30984));
+        assert_eq!(entries[3].tmdb.movie, None);
+        assert_eq!(entries[4].tmdb.movie, Some(42));
+    }
+
+    #[test]
+    fn format_fitting() {
+        assert!(format_fits("movie", Some("MOVIE")));
+        assert!(!format_fits("movie", Some("TV")));
+        assert!(format_fits("show", Some("TV")));
+        assert!(format_fits("show", Some("ONA")));
+        assert!(!format_fits("show", Some("MOVIE")));
+        assert!(format_fits("show", None));
+    }
+
+    #[test]
+    fn description_flattening() {
+        let m = AnilistMedia {
+            id: 1,
+            title: AnilistTitle { romaji: Some("X".into()), english: None },
+            description: Some("Line one.<br><br>\n<i>Note.</i>".into()),
+            cover_image: None,
+            average_score: Some(78.0),
+            start_date: Some(AnilistDate { year: Some(2011), month: Some(4), day: None }),
+            format: Some("TV".into()),
+            genres: None,
+            relations: None,
+        };
+        assert_eq!(m.plain_description().unwrap(), "Line one.\n\n\nNote.");
+        assert_eq!(m.premiered().unwrap(), "2011-04-01");
+        assert_eq!(m.display_title().unwrap(), "X");
+    }
+}

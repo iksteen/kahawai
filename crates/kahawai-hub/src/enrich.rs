@@ -20,6 +20,8 @@ pub const TVDB_PIN_SETTING: &str = "tvdb_pin";
 
 pub struct Enricher {
     http: reqwest::Client,
+    data_dir: std::path::PathBuf,
+    anilist: crate::anime::Anilist,
     running: AtomicBool,
     /// (matched, weak, missed) of the current/last run.
     progress: (AtomicUsize, AtomicUsize, AtomicUsize),
@@ -99,7 +101,7 @@ pub fn pick_candidate<'c>(
 /// Diacritic + number-word folding on top of kahawai's normalization:
 /// rips say "Leon" and "12 Monkeys", TMDB says "Léon" and "Twelve
 /// Monkeys" — same films.
-fn fold(s: &str) -> String {
+pub(crate) fn fold(s: &str) -> String {
     use unicode_normalization::UnicodeNormalization;
     const WORDS: &[(&str, &str)] = &[
         ("zero", "0"), ("one", "1"), ("two", "2"), ("three", "3"), ("four", "4"),
@@ -131,12 +133,15 @@ fn fold(s: &str) -> String {
 }
 
 impl Enricher {
-    pub fn new() -> Self {
+    pub fn new(data_dir: std::path::PathBuf) -> Self {
+        let http = reqwest::Client::builder()
+            .user_agent("kahawai")
+            .build()
+            .expect("http client");
         Self {
-            http: reqwest::Client::builder()
-                .user_agent("kahawai")
-                .build()
-                .expect("http client"),
+            anilist: crate::anime::Anilist::new(http.clone()),
+            data_dir,
+            http,
             running: AtomicBool::new(false),
             progress: Default::default(),
         }
@@ -605,10 +610,208 @@ impl Enricher {
             self.progress.2.load(Ordering::SeqCst),
         );
         tracing::info!(matched = m, weak = w, missed = x, "enrichment run complete");
+        // Anime pass (HUB-29): native identity/metadata for items in
+        // anime collections, run before episodes so the mapped TVDB ids
+        // feed episode enrichment.
+        if let Err(e) = self.enrich_anime(registry).await {
+            tracing::warn!(error = format!("{e:#}"), "anime enrichment failed");
+        }
         if let Err(e) = self.enrich_episodes(registry, &key, tvdb_token.as_ref()).await {
             tracing::warn!(error = format!("{e:#}"), "episode enrichment failed");
         }
         Ok((m, w, x))
+    }
+
+    /// HUB-29: AniDB titles dump → aid (identity), anime-lists mapping
+    /// → AniList/TVDB/TMDB ids, AniList → description/cover/relations.
+    /// Conservative like everything else: only fold-exact identities
+    /// are accepted; anything else keeps its generic-provider metadata.
+    async fn enrich_anime(self: &Arc<Self>, registry: &Registry) -> Result<()> {
+        let items = sqlx::query(
+            "SELECT DISTINCT i.id, i.kind, i.title, i.year,
+                    m.provider, m.provider_id, m.confidence FROM items i
+             JOIN item_sources s ON s.item_id = i.id
+                OR s.item_id IN (SELECT id FROM items WHERE parent_id = i.id)
+             JOIN collections c ON (c.module_id, c.collection_id)
+                                 = (s.module_id, s.collection_id)
+             LEFT JOIN item_metadata m ON m.item_id = i.id
+             WHERE c.media_type = 'anime' AND i.kind IN ('movie', 'show')
+               AND (m.item_id IS NULL OR m.anilist_id IS NULL)
+               AND (m.confidence IS NULL OR m.confidence != 'rejected')
+             ORDER BY i.title",
+        )
+        .fetch_all(registry.db())
+        .await?;
+        if items.is_empty() {
+            return Ok(());
+        }
+        tracing::info!(items = items.len(), "anime enrichment starting");
+        let titles = crate::anime::AnidbTitles::load(&self.http, &self.data_dir).await?;
+        let lists = crate::anime::AnimeLists::load(&self.http, &self.data_dir).await?;
+
+        let mut done = 0usize;
+        for row in items {
+            let (id, kind, title, year) = (
+                row.get::<String, _>("id"),
+                row.get::<String, _>("kind"),
+                row.get::<String, _>("title"),
+                row.get::<Option<i64>, _>("year"),
+            );
+            let existing = row
+                .get::<Option<String>, _>("provider")
+                .zip(row.get::<Option<String>, _>("provider_id"));
+            let manual = row.get::<Option<String>, _>("confidence").as_deref() == Some("manual");
+            match self
+                .anime_one(registry, &titles, &lists, &id, &kind, &title, year, existing, manual)
+                .await
+            {
+                Ok(true) => done += 1,
+                Ok(false) => tracing::debug!(title, "no anime identity; keeping generic metadata"),
+                Err(e) => tracing::warn!(title, error = format!("{e:#}"), "anime enrichment error"),
+            }
+        }
+        tracing::info!(matched = done, "anime enrichment complete");
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn anime_one(
+        self: &Arc<Self>,
+        registry: &Registry,
+        titles: &crate::anime::AnidbTitles,
+        lists: &crate::anime::AnimeLists,
+        item_id: &str,
+        kind: &str,
+        title: &str,
+        year: Option<i64>,
+        existing: Option<(String, String)>,
+        manual: bool,
+    ) -> Result<bool> {
+        // Best identity source: an already-verified generic match,
+        // reverse-mapped — adopts anime ids without re-deciding WHO the
+        // item is. Falls back to the titles dump; manual matches never
+        // fall back (the admin's identity choice is pinned).
+        let reverse: Vec<u32> = existing
+            .as_ref()
+            .map(|(p, pid)| lists.reverse(p, pid))
+            .unwrap_or_default();
+        let mut picks: Vec<(u32, &crate::anime::Mapping)> = reverse
+            .iter()
+            .filter_map(|aid| lists.by_anidb(*aid).map(|m| (*aid, m)))
+            .filter(|(_, m)| crate::anime::format_fits(kind, m.kind.as_deref()))
+            .filter(|(_, m)| m.anilist_id.is_some())
+            .collect();
+        if picks.is_empty() && manual {
+            return Ok(false);
+        }
+        if picks.is_empty() {
+            // Identity: AniDB titles dump, format-checked via the mapping.
+            picks = titles
+                .candidates(title)
+                .into_iter()
+                .filter_map(|aid| lists.by_anidb(aid).map(|m| (aid, m)))
+                .filter(|(_, m)| crate::anime::format_fits(kind, m.kind.as_deref()))
+                .filter(|(_, m)| m.anilist_id.is_some())
+                .collect();
+        }
+
+        let (media, anidb_id) = if picks.is_empty() {
+            // Fallback: AniList search, accepted only on a fold-exact
+            // title (romaji or english) and a fitting format.
+            let found = self.anilist.search(title).await?;
+            let media = found.into_iter().find(|m| {
+                crate::anime::format_fits(kind, m.format.as_deref())
+                    && (m.title.romaji.as_deref().map(fold) == Some(fold(title))
+                        || m.title.english.as_deref().map(fold) == Some(fold(title)))
+            });
+            let Some(media) = media else { return Ok(false) };
+            (media, None)
+        } else {
+            // Ambiguity: same title as TV + movie etc — use the year
+            // when we have one, else take the dump's best-ranked pick.
+            let mut chosen: Option<(u32, crate::anime::AnilistMedia)> = None;
+            for (aid, m) in picks.drain(..).take(3) {
+                let Some(media) = self.anilist.media_by_id(m.anilist_id.unwrap()).await? else {
+                    continue;
+                };
+                let fits_year = match (year, media.start_date.as_ref().and_then(|d| d.year)) {
+                    (Some(y), Some(my)) => (y - i64::from(my)).abs() <= 1,
+                    _ => true,
+                };
+                if fits_year {
+                    chosen = Some((aid, media));
+                    break;
+                }
+                if chosen.is_none() {
+                    chosen = Some((aid, media)); // fallback: best-ranked
+                }
+            }
+            let Some((aid, media)) = chosen else { return Ok(false) };
+            (media, Some(aid))
+        };
+
+        let mapping = anidb_id.and_then(|aid| lists.by_anidb(aid));
+        let poster = media
+            .cover_image
+            .as_ref()
+            .and_then(|c| c.extra_large.clone().or_else(|| c.large.clone()));
+        let genres = media.genres.clone().unwrap_or_default();
+        sqlx::query(
+            "INSERT OR REPLACE INTO item_metadata
+               (item_id, provider, provider_id, title, overview, poster_path, rating,
+                premiered, genres, confidence, updated_at,
+                anidb_id, anilist_id, mapped_tvdb, mapped_tmdb)
+             VALUES (?, 'anilist', ?, ?, ?, ?, ?, ?, ?, 'auto', unixepoch(), ?, ?, ?, ?)",
+        )
+        .bind(item_id)
+        .bind(media.id.to_string())
+        .bind(media.display_title())
+        .bind(media.plain_description())
+        .bind(&poster)
+        .bind(media.average_score.map(|s| s / 10.0))
+        .bind(media.premiered())
+        .bind(serde_json::to_string(&genres)?)
+        .bind(anidb_id)
+        .bind(media.id)
+        .bind(mapping.and_then(|m| m.tvdb_id))
+        .bind(mapping.and_then(|m| m.tmdb_for(kind)))
+        .execute(registry.db())
+        .await?;
+
+        // Relations graph → watch-order building blocks. Watchable
+        // relation kinds only; adaptations point at manga.
+        sqlx::query("DELETE FROM item_relations WHERE from_item = ?")
+            .bind(item_id)
+            .execute(registry.db())
+            .await?;
+        if let Some(rel) = &media.relations {
+            for edge in &rel.edges {
+                let (Some(kind_raw), Some(node)) = (&edge.relation_type, &edge.node) else {
+                    continue;
+                };
+                let keep = matches!(
+                    kind_raw.as_str(),
+                    "SEQUEL" | "PREQUEL" | "SIDE_STORY" | "ALTERNATIVE" | "PARENT"
+                        | "FULL_STORY" | "SUMMARY" | "SPIN_OFF"
+                );
+                if !keep || node.format.as_deref() == Some("MUSIC") {
+                    continue;
+                }
+                sqlx::query(
+                    "INSERT OR IGNORE INTO item_relations
+                       (from_item, kind, target_anilist, target_title)
+                     VALUES (?, ?, ?, ?)",
+                )
+                .bind(item_id)
+                .bind(kind_raw.to_lowercase())
+                .bind(node.id)
+                .bind(node.title.english.clone().or_else(|| node.title.romaji.clone()))
+                .execute(registry.db())
+                .await?;
+            }
+        }
+        tracing::info!(title, anilist = media.id, anidb = anidb_id, "anime matched");
+        Ok(true)
     }
 
     /// Phase two: episode-level metadata for every matched show that
@@ -623,7 +826,8 @@ impl Enricher {
         tvdb_token: Option<&std::sync::Arc<String>>,
     ) -> Result<()> {
         let shows = sqlx::query(
-            "SELECT i.id, m.provider, m.provider_id FROM items i
+            "SELECT i.id, m.provider, m.provider_id, m.mapped_tvdb, m.mapped_tmdb
+             FROM items i
              JOIN item_metadata m ON m.item_id = i.id
              WHERE i.kind = 'show' AND m.provider_id != ''
                AND m.confidence != 'rejected'
@@ -641,11 +845,24 @@ impl Enricher {
         let sem = Arc::new(tokio::sync::Semaphore::new(3));
         let mut tasks = tokio::task::JoinSet::new();
         for row in shows {
-            let (show_id, provider, pid) = (
+            let (show_id, mut provider, mut pid) = (
                 row.get::<String, _>("id"),
                 row.get::<String, _>("provider"),
                 row.get::<String, _>("provider_id"),
             );
+            // Anime shows carry mapped TVDB/TMDB ids (HUB-29): episode
+            // data still comes from those providers.
+            if provider == "anilist" {
+                if let Some(tvdb) = row.get::<Option<i64>, _>("mapped_tvdb") {
+                    provider = "tvdb".into();
+                    pid = tvdb.to_string();
+                } else if let Some(tmdb) = row.get::<Option<i64>, _>("mapped_tmdb") {
+                    provider = "tmdb".into();
+                    pid = tmdb.to_string();
+                } else {
+                    continue; // no episode source for this one
+                }
+            }
             let this = self.clone();
             let key = tmdb_key.to_string();
             let token = tvdb_token.cloned();

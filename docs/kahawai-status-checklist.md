@@ -4,7 +4,7 @@ Status of every numbered requirement from `kahawai-technical-requirements.md`,
 plus the v1 acceptance criteria. Checked = implemented and exercised against
 the live deployment. Unchecked items carry a note when partially done.
 
-Last updated: 2026-07-25.
+Last updated: 2026-07-25 (anime providers).
 
 ## Architecture (AR)
 
@@ -53,8 +53,8 @@ Last updated: 2026-07-25.
 - [x] HUB-3 Dedup: same logical item from multiple sources → one item, source list
 - [x] HUB-4 Filename/dirname parsing (movies, episodes, anime conventions, music layout)
 - [x] HUB-20 Mediahost deletion cascade + watch-state/match archives restored on re-enroll
-- [ ] HUB-5 Providers behind a common trait *(TMDB + TVDB fallback live;
-      MusicBrainz, AniDB/AniList missing; no formal trait yet)*
+- [ ] HUB-5 Providers behind a common trait *(TMDB, TVDB, AniDB titles,
+      AniList live; MusicBrainz missing; no formal trait yet)*
 - [ ] HUB-6 Descriptive metadata *(titles, plots, dates, ratings, posters, episode
       stills live; cast/genres not stored)*
 - [ ] HUB-7 Provider rate limits/caching *(API keys via settings + poster caching
@@ -107,11 +107,14 @@ Last updated: 2026-07-25.
 
 ## Hub — anime (HUB-29..33)
 
-- [ ] HUB-29 AniDB/AniList providers *(not built; ED2K corpus fully hashed and ready)*
+- [ ] HUB-29 AniDB/AniList providers *(AniDB titles-dump identity, anime-lists
+      ID mapping, AniList metadata + relations live — zero AniDB API calls;
+      UDP file-by-ED2K client pending an AniDB account/registered client)*
 - [ ] HUB-30 Fansub filename conventions *(group prefixes, absolute numbering, CRC
       tags, bracket stripping live; AniDB hash-exact identification pending)*
-- [ ] HUB-31 Native anime structure *(absolute numbering authoritative via TVDB
-      absolute order; anime-lists season-view projection and relations pending)*
+- [ ] HUB-31 Native anime structure *(absolute numbering via TVDB absolute
+      order; relations graph + related-items UI live; season-view projection
+      pending — the mapping's per-entry season data is already parsed)*
 - [x] HUB-32 (see subtitles above)
 - [ ] HUB-33 Dual-audio defaults *(manual audio track switching live; per-user
       original/dub preference not built)*

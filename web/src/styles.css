@@ -163,6 +163,13 @@ h2 { font-size: 14px; font-weight: 650; color: var(--dim); letter-spacing: 0.08e
   .filter { width: 100%; margin-left: 0; }
 }
 
+.related { list-style: none; margin: 8px 0 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.linklike {
+  background: none; border: none; padding: 0; cursor: pointer;
+  color: var(--teal); font: inherit;
+}
+.linklike:hover { text-decoration: underline; }
+
 /* -------- admin -------- */
 .rows { list-style: none; margin: 0 0 8px; padding: 0; display: flex; flex-direction: column; gap: 8px; }
 .rows li {

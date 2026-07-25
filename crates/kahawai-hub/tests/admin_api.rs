@@ -64,7 +64,7 @@ async fn admin_flow_enrollments_satellites_archive_restore() {
     let pleb = auth.login("pleb", "pleb-password").await.unwrap();
     let pleb_bearer = format!("Bearer {}", pleb.access_token);
 
-    let api = kahawai_hub::api::router(registry.clone(), auth, sessions, enrollments.clone(), Arc::new(kahawai_hub::subtitles::Subtitles::new(tempfile::tempdir().unwrap().keep())), Arc::new(kahawai_hub::artwork::Artwork::new(tempfile::tempdir().unwrap().keep(), Arc::new(kahawai_hub::enrich::Enricher::new()))), Arc::new(kahawai_hub::enrich::Enricher::new()));
+    let api = kahawai_hub::api::router(registry.clone(), auth, sessions, enrollments.clone(), Arc::new(kahawai_hub::subtitles::Subtitles::new(tempfile::tempdir().unwrap().keep())), Arc::new(kahawai_hub::artwork::Artwork::new(tempfile::tempdir().unwrap().keep(), Arc::new(kahawai_hub::enrich::Enricher::new(tempfile::tempdir().unwrap().keep())))), Arc::new(kahawai_hub::enrich::Enricher::new(tempfile::tempdir().unwrap().keep())));
     let get = |uri: &str, bearer: &str| {
         Request::get(uri).header("authorization", bearer.to_string()).body(Body::empty()).unwrap()
     };
@@ -215,9 +215,9 @@ async fn review_queue_flow() {
         Arc::new(kahawai_hub::subtitles::Subtitles::new(tempfile::tempdir().unwrap().keep())),
         Arc::new(kahawai_hub::artwork::Artwork::new(
             tempfile::tempdir().unwrap().keep(),
-            Arc::new(kahawai_hub::enrich::Enricher::new()),
+            Arc::new(kahawai_hub::enrich::Enricher::new(tempfile::tempdir().unwrap().keep())),
         )),
-        Arc::new(kahawai_hub::enrich::Enricher::new()),
+        Arc::new(kahawai_hub::enrich::Enricher::new(tempfile::tempdir().unwrap().keep())),
     );
     let resp = api
         .clone()

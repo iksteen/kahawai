@@ -176,6 +176,26 @@ export default function Detail({
     )
   }
 
+  const related = item.related && item.related.length > 0 && (
+    <section className="meta-block">
+      <h2>Related</h2>
+      <ul className="related">
+        {item.related.map((r) => (
+          <li key={`${r.kind}-${r.title}`}>
+            <span className="chip dim">{r.kind.replace('_', ' ')}</span>{' '}
+            {r.item_id ? (
+              <button className="linklike" onClick={() => onOpenEpisode(r.item_id!)}>
+                {r.title ?? '?'}
+              </button>
+            ) : (
+              <span className="dim">{r.title ?? '?'} (not in library)</span>
+            )}
+          </li>
+        ))}
+      </ul>
+    </section>
+  )
+
   if (item.kind === 'show') {
     // null season = absolute numbering (anime); distinct from Specials.
     const seasonLabel = (s: number | null) =>
@@ -227,6 +247,7 @@ export default function Detail({
             </ul>
           </section>
         ))}
+        {related}
         {error && <div className="error">{error}</div>}
       </main>
     )
@@ -324,6 +345,8 @@ export default function Detail({
       </div>
       {error && <div className="error">{error}</div>}
 
+      {related}
+
       <h2>Sources</h2>
       <ul className="sources">
         {item.sources_detail.map((s) => (
@@ -340,6 +363,11 @@ export default function Detail({
             This product uses TMDB and the TMDB APIs but is not endorsed, certified, or
             otherwise approved by TMDB.
           </span>
+        </footer>
+      )}
+      {item.metadata?.provider === 'anilist' && (
+        <footer className="tmdb-attrib">
+          <span>Metadata from AniList and AniDB.</span>
         </footer>
       )}
       {item.metadata?.provider === 'tvdb' && (

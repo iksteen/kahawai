@@ -150,6 +150,7 @@ export type ItemDetail = Item & {
   show_title?: string | null
   parent_id?: string | null
   metadata?: ItemMetadata
+  related?: { kind: string; title: string | null; item_id: string | null }[]
 }
 
 /// Local artwork (cover.jpg etc). <img> requests authenticate with the

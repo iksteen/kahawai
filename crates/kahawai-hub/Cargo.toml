@@ -27,6 +27,7 @@ ulid = { workspace = true }
 bytes = "1"
 xxhash-rust = { workspace = true }
 reqwest = { workspace = true }
+flate2 = { workspace = true }
 unicode-normalization = "0.1"
 rust-embed = { workspace = true }
 argon2 = "0.5.3"

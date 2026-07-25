@@ -323,7 +323,7 @@ async fn run_hub(cfg: config::HubConfig) -> Result<()> {
         .with_context(|| format!("binding client API on {}", cfg.bind))?;
     let subtitles =
         Arc::new(kahawai_hub::subtitles::Subtitles::new(cfg.data_dir.join("subtitles")));
-    let enricher = Arc::new(kahawai_hub::enrich::Enricher::new());
+    let enricher = Arc::new(kahawai_hub::enrich::Enricher::new(cfg.data_dir.clone()));
     let artwork = Arc::new(kahawai_hub::artwork::Artwork::new(
         cfg.data_dir.join("artwork"),
         enricher.clone(),

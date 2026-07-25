@@ -1227,6 +1227,37 @@ async fn item_detail(
             "provider": m.get::<String, _>("provider"),
         });
     }
+
+    // Anime relations (HUB-29): watchable related entries, resolved to
+    // in-library items where the target exists here.
+    let related = sqlx::query(
+        "SELECT r.kind, r.target_title, r.target_anilist, m2.item_id AS local_id
+         FROM item_relations r
+         LEFT JOIN item_metadata m2 ON m2.anilist_id = r.target_anilist
+         WHERE r.from_item = ?
+         ORDER BY CASE r.kind
+             WHEN 'prequel' THEN 0 WHEN 'sequel' THEN 1 WHEN 'parent' THEN 2
+             WHEN 'side_story' THEN 3 WHEN 'spin_off' THEN 4 ELSE 5 END,
+             r.target_title",
+    )
+    .bind(&id)
+    .fetch_all(state.registry.db())
+    .await
+    .map_err(internal)?;
+    if !related.is_empty() {
+        out["related"] = Value::Array(
+            related
+                .iter()
+                .map(|r| {
+                    json!({
+                        "kind": r.get::<String, _>("kind"),
+                        "title": r.get::<Option<String>, _>("target_title"),
+                        "item_id": r.get::<Option<String>, _>("local_id"),
+                    })
+                })
+                .collect(),
+        );
+    }
     Ok(Json(out))
 }
 

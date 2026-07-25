@@ -1,3 +1,4 @@
+pub mod anime;
 pub mod api;
 pub mod artwork;
 pub mod enrich;
