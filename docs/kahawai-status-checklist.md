@@ -146,8 +146,9 @@ Last updated: 2026-07-25 (anime providers, MusicBrainz, image subtitles, HUB-5).
 - [ ] OPS-5 Online backup/restore command
 - [ ] OPS-6 Quota-bounded caches with eviction *(subtitle/artwork/session caches
       currently unbounded)*
-- [ ] OPS-7 Cross-version satellite compatibility *(major-version gate only;
-      no previous-minor guarantee mechanism yet)*
+- [x] OPS-7 Cross-version satellite compatibility: protocol gated on major
+      version (Hello/HelloAck) — per decision 2026-07-25, major-gating IS the
+      compatibility contract; no previous-minor guarantee
 - [ ] OPS-8 Reverse-proxy support *(no forwarded-header/base-URL handling)*
 
 ## Non-functional (NFR)
