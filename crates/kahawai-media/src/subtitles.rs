@@ -282,166 +282,31 @@ pub(crate) fn compose_header(h: &str) -> String {
 
 /// Extract the `index`-th text subtitle track (0-based, counting only
 /// subtitle pads in demux order) from a media source. No A/V decoding —
-/// everything except the chosen track goes to fakesinks.
+/// everything except text subtitle tracks goes to fakesinks. One demux
+/// pass extracts ALL tracks; this returns the requested one.
 pub fn extract_embedded(
     source: Box<dyn crate::remux::RemuxSource>,
     index: usize,
 ) -> Result<Extracted> {
-    extract_embedded_stream(source, index, |_| {})
+    let all = extract_embedded_core(source, usize::MAX, |_| {})?;
+    let ex = all
+        .into_iter()
+        .find(|(i, _)| *i == index)
+        .map(|(_, ex)| ex)
+        .filter(|ex| !ex.cues.is_empty());
+    ex.with_context(|| format!("no cues extracted (track {index} missing or not a text track)"))
 }
 
-/// [`extract_embedded`], streaming ASS material through `sink` as it is
-/// demuxed — the caller can serve subtitles long before EOS.
+/// [`extract_embedded_all`], additionally streaming the ASS material
+/// of track `stream_index` through `sink` as it is demuxed — the
+/// caller can serve that track long before EOS while every other text
+/// track is collected in the same pass.
 pub fn extract_embedded_stream(
     source: Box<dyn crate::remux::RemuxSource>,
-    index: usize,
-    mut sink: impl FnMut(SubStreamEvent),
-) -> Result<Extracted> {
-    crate::init()?;
-
-    let pipeline = gst::Pipeline::new();
-    let appsrc = crate::remux::seekable_appsrc(source);
-    let parsebin = gst::ElementFactory::make("parsebin").build()?;
-    let appsink = gstreamer_app::AppSink::builder().sync(false).build();
-    pipeline.add_many([appsrc.upcast_ref::<gst::Element>(), &parsebin])?;
-    pipeline.add(appsink.upcast_ref::<gst::Element>())?;
-    gst::Element::link_many([appsrc.upcast_ref::<gst::Element>(), &parsebin])?;
-
-    let sub_seen = std::sync::atomic::AtomicUsize::new(0);
-    let pipeline_pa = pipeline.clone();
-    let appsink_pad = appsink.static_pad("sink").unwrap();
-    let is_ass = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let is_ass_pa = is_ass.clone();
-    // ASS script header rides the container's codec_data (everything up
-    // to and including the [Events] Format line).
-    let header: std::sync::Arc<std::sync::Mutex<Option<String>>> = Default::default();
-    let header_pa = header.clone();
-    parsebin.connect_pad_added(move |_, pad| {
-        let caps_name = pad
-            .current_caps()
-            .or_else(|| pad.allowed_caps())
-            .and_then(|c| c.structure(0).map(|s| s.name().to_string()))
-            .unwrap_or_default();
-        let is_text = caps_name.starts_with("application/x-subtitle")
-            || caps_name.starts_with("application/x-ssa")
-            || caps_name.starts_with("application/x-ass")
-            || caps_name.starts_with("text/");
-        // Index over ALL subtitle tracks (image ones too) so it aligns
-        // with discovery's subtitle list; only text tracks are linkable.
-        let is_sub = is_text || caps_name.starts_with("subpicture/");
-        let route_to_sink = is_sub
-            && sub_seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == index
-            && is_text
-            && !appsink_pad.is_linked();
-        if route_to_sink {
-            is_ass_pa.store(
-                caps_name.contains("ssa") || caps_name.contains("ass"),
-                std::sync::atomic::Ordering::SeqCst,
-            );
-            if let Some(cd) = pad
-                .current_caps()
-                .as_ref()
-                .and_then(|c| c.structure(0))
-                .and_then(|s| s.get::<gst::Buffer>("codec_data").ok())
-                && let Ok(map) = cd.map_readable()
-            {
-                *header_pa.lock().unwrap() = Some(decode_text(map.as_slice()));
-            }
-            if pad.link(&appsink_pad).is_err() {
-                tracing::warn!("failed to link subtitle pad to appsink");
-            }
-            return;
-        }
-        // Everything else drains into an async-less fakesink so sparse
-        // streams can't hold the pipeline.
-        let fake = gst::ElementFactory::make("fakesink")
-            .property("sync", false)
-            .property("async", false)
-            .build()
-            .unwrap();
-        pipeline_pa.add(&fake).ok();
-        fake.sync_state_with_parent().ok();
-        pad.link(&fake.static_pad("sink").unwrap()).ok();
-    });
-
-    pipeline.set_state(gst::State::Playing).context("starting subtitle extraction")?;
-    let bus = pipeline.bus().unwrap();
-    let mut cues = Vec::new();
-    let mut raw_events: Vec<(u64, u64, String)> = Vec::new();
-    let mut result = Ok(());
-    let mut header_sent = false;
-    let mut take = |sample: &gst::Sample, ass: bool| {
-        if let Some((start, end, raw)) = raw_from_sample(sample) {
-            if ass {
-                if !header_sent
-                    && let Some(h) = header.lock().unwrap().as_deref()
-                {
-                    sink(SubStreamEvent::Header(compose_header(h)));
-                    header_sent = true;
-                }
-                if header_sent
-                    && let Some(line) = ass_dialogue(&raw, start, end)
-                {
-                    sink(SubStreamEvent::Dialogue(line));
-                }
-                raw_events.push((start, end, raw.clone()));
-            }
-            let text = if ass {
-                clean_cue_text(raw.splitn(9, ',').last().unwrap_or(""))
-            } else {
-                clean_cue_text(&raw)
-            };
-            if !text.is_empty() {
-                cues.push(Cue { start_ms: start, end_ms: end, text });
-            }
-        }
-    };
-    'outer: loop {
-        // Drain samples first so the appsink queue never blocks the demuxer.
-        while let Some(sample) = appsink.try_pull_sample(gst::ClockTime::ZERO) {
-            take(&sample, is_ass.load(std::sync::atomic::Ordering::SeqCst));
-        }
-        let Some(msg) = bus.timed_pop(gst::ClockTime::from_mseconds(100)) else {
-            continue;
-        };
-        match msg.view() {
-            gst::MessageView::Eos(_) => break 'outer,
-            gst::MessageView::Error(e) => {
-                result = Err(anyhow::anyhow!("extraction failed: {}", e.error()));
-                break 'outer;
-            }
-            _ => {}
-        }
-    }
-    // Final drain: samples may still sit queued after EOS.
-    while let Some(sample) = appsink.try_pull_sample(gst::ClockTime::ZERO) {
-        take(&sample, is_ass.load(std::sync::atomic::Ordering::SeqCst));
-    }
-    drop(take);
-    pipeline.set_state(gst::State::Null).ok();
-    result?;
-    if cues.is_empty() {
-        bail!("no cues extracted (track {index} missing or not a text track)");
-    }
-    cues.sort_by_key(|c| c.start_ms);
-
-    // Faithful ASS reconstruction when we have the script header.
-    let ass = header.lock().unwrap().take().and_then(|h| {
-        if raw_events.is_empty() {
-            return None;
-        }
-        let mut out = compose_header(&h);
-        let mut evs = raw_events;
-        evs.sort_by_key(|(s, _, _)| *s);
-        for (s, e, raw) in &evs {
-            if let Some(line) = ass_dialogue(raw, *s, *e) {
-                out.push_str(&line);
-                out.push('\n');
-            }
-        }
-        Some(out)
-    });
-    Ok(Extracted { cues, ass })
+    stream_index: usize,
+    sink: impl FnMut(SubStreamEvent),
+) -> Result<Vec<(usize, Extracted)>> {
+    extract_embedded_core(source, stream_index, sink)
 }
 
 fn raw_from_sample(sample: &gst::Sample) -> Option<(u64, u64, String)> {
@@ -459,6 +324,17 @@ fn raw_from_sample(sample: &gst::Sample) -> Option<(u64, u64, String)> {
 pub fn extract_embedded_all(
     source: Box<dyn crate::remux::RemuxSource>,
 ) -> Result<Vec<(usize, Extracted)>> {
+    extract_embedded_core(source, usize::MAX, |_| {})
+}
+
+/// The one demux pass behind every embedded extraction: taps every text
+/// subtitle pad; the tap at `stream_index` (if any, and ASS) also
+/// streams header + Dialogue lines through `out`.
+fn extract_embedded_core(
+    source: Box<dyn crate::remux::RemuxSource>,
+    stream_index: usize,
+    mut out: impl FnMut(SubStreamEvent),
+) -> Result<Vec<(usize, Extracted)>> {
     crate::init()?;
 
     struct Tap {
@@ -466,6 +342,7 @@ pub fn extract_embedded_all(
         sink: gstreamer_app::AppSink,
         is_ass: bool,
         header: Option<String>,
+        streamed_header: bool,
         cues: Vec<Cue>,
         raw_events: Vec<(u64, u64, String)>,
     }
@@ -508,6 +385,7 @@ pub fn extract_embedded_all(
                     sink,
                     is_ass: caps_name.contains("ssa") || caps_name.contains("ass"),
                     header,
+                    streamed_header: false,
                     cues: Vec::new(),
                     raw_events: Vec::new(),
                 });
@@ -529,11 +407,24 @@ pub fn extract_embedded_all(
     pipeline.set_state(gst::State::Playing).context("starting subtitle extraction")?;
     let bus = pipeline.bus().unwrap();
     let mut result = Ok(());
-    let drain = |taps: &mut Vec<Tap>| {
+    let mut drain = |taps: &mut Vec<Tap>| {
         for tap in taps.iter_mut() {
             while let Some(sample) = tap.sink.try_pull_sample(gst::ClockTime::ZERO) {
                 if let Some((start, end, raw)) = raw_from_sample(&sample) {
                     let text = if tap.is_ass {
+                        if tap.idx == stream_index {
+                            if !tap.streamed_header
+                                && let Some(h) = &tap.header
+                            {
+                                out(SubStreamEvent::Header(compose_header(h)));
+                                tap.streamed_header = true;
+                            }
+                            if tap.streamed_header
+                                && let Some(line) = ass_dialogue(&raw, start, end)
+                            {
+                                out(SubStreamEvent::Dialogue(line));
+                            }
+                        }
                         tap.raw_events.push((start, end, raw.clone()));
                         clean_cue_text(raw.splitn(9, ',').last().unwrap_or(""))
                     } else {
@@ -663,21 +554,6 @@ pub fn extract_fonts(source: Box<dyn crate::remux::RemuxSource>) -> Result<Vec<(
     Ok(fonts)
 }
 
-fn cue_from_sample(sample: &gst::Sample, ass: bool) -> Option<Cue> {
-    let buffer = sample.buffer()?;
-    let start_ms = buffer.pts()?.mseconds();
-    let end_ms = start_ms + buffer.duration().map(|d| d.mseconds()).unwrap_or(3000);
-    let map = buffer.map_readable().ok()?;
-    let raw = decode_text(map.as_slice());
-    // Embedded ASS buffers are the Dialogue fields after Format's
-    // ReadOrder: "ReadOrder,Layer,Style,Name,ML,MR,MV,Effect,Text".
-    let text = if ass {
-        clean_cue_text(raw.splitn(9, ',').last().unwrap_or(""))
-    } else {
-        clean_cue_text(&raw)
-    };
-    (!text.is_empty()).then_some(Cue { start_ms, end_ms, text })
-}
 
 #[cfg(test)]
 mod tests {

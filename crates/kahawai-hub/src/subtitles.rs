@@ -140,7 +140,10 @@ impl Subtitles {
         };
         let (tx, rx) = tokio::sync::mpsc::channel::<String>(256);
         let this = self.clone();
+        let (module_id2, collection_id2, path_rel2) =
+            (module_id.clone(), collection_id.clone(), path_rel.clone());
         tokio::spawn(async move {
+            let (module_id, collection_id, path_rel) = (module_id2, collection_id2, path_rel2);
             let _guard = guard; // held until the cache is written
             let extraction = tokio::task::spawn_blocking(move || {
                 kahawai_media::subtitles::extract_embedded_stream(
@@ -158,12 +161,18 @@ impl Subtitles {
             })
             .await;
             match extraction {
-                Ok(Ok(ex)) => {
-                    let write = std::fs::create_dir_all(&this.dir).and_then(|_| {
-                        std::fs::write(&cache_path, serde_json::to_vec(&ex).unwrap_or_default())
-                    });
-                    if let Err(e) = write {
-                        tracing::warn!(error = %e, "subtitle cache write failed");
+                Ok(Ok(tracks)) => {
+                    // One pass extracted EVERY text track: cache them all.
+                    for (i, ex) in &tracks {
+                        if let Err(e) = this.store_extracted(
+                            &module_id,
+                            &collection_id,
+                            &path_rel,
+                            &format!("e{i}"),
+                            ex,
+                        ) {
+                            tracing::warn!(error = format!("{e:#}"), "subtitle cache write failed");
+                        }
                     }
                 }
                 Ok(Err(e)) => {
@@ -226,10 +235,22 @@ impl Subtitles {
                 size,
                 handle: tokio::runtime::Handle::current(),
             };
-            tokio::task::spawn_blocking(move || {
-                kahawai_media::subtitles::extract_embedded(Box::new(source), idx)
+            // Last-resort lease pass: extract every text track in the one
+            // read and cache them all — a second track request must never
+            // pay a second full read.
+            let tracks = tokio::task::spawn_blocking(move || {
+                kahawai_media::subtitles::extract_embedded_all(Box::new(source))
             })
-            .await??
+            .await??;
+            let mut requested = None;
+            for (i, ex) in tracks {
+                if i == idx {
+                    requested = Some(ex.clone());
+                }
+                self.store_extracted(&module_id, &collection_id, &path_rel, &format!("e{i}"), &ex)?;
+            }
+            return requested
+                .with_context(|| format!("no cues extracted (track {idx} missing or not a text track)"));
         } else {
             bail!("bad subtitle key: {key}");
         };
@@ -281,10 +302,17 @@ impl Subtitles {
             "urgent subtitle extraction requested from mediahost");
         let cache_path =
             self.dir.join(format!("{}.json", cache_key(module_id, collection_id, path_rel, key)));
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        // The mediahost is never slower than dragging the file over the
+        // lease ourselves — wait while its link is alive (10 min sanity
+        // cap); the lease fallback is for disconnects, not slowness.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
         while std::time::Instant::now() < deadline {
             if let Ok(bytes) = tokio::fs::read(&cache_path).await {
                 return serde_json::from_slice(&bytes).ok();
+            }
+            if !registry.is_connected(module_id) {
+                tracing::warn!(path = %path_rel, "mediahost gone mid-extraction; falling back to lease");
+                return None;
             }
             tokio::time::sleep(std::time::Duration::from_millis(400)).await;
         }
