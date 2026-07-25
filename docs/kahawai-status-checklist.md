@@ -84,11 +84,20 @@ Last updated: 2026-07-25, against the revised requirements (AR-12, MH-10/11, HUB
 
 ## Hub — subtitles
 
-- [ ] HUB-21 External subtitle providers *(OpenSubtitles designed, not built;
-      blocked on API key)*
-- [ ] HUB-22 Hash-preferred subtitle matching *(oshash already computed per file)*
+- [x] HUB-21 External subtitle providers: SubtitleProvider trait with
+      OpenSubtitles.com (REST) as the first impl; kahawai's app key is
+      baked in (the provider asks integrators to ship it — anonymous use
+      is 5 req/s, 5 downloads/24 h), overridable by setting, and an
+      optional account raises the download quota
+- [x] HUB-22 Hash-preferred subtitle matching: two-phase search — the
+      file's moviehash (which IS the mediahost's oshash) alone first,
+      title/year (+ season/episode, projected for absolute-numbered
+      anime) only when the hash is unknown; hash matches sort first
 - [x] HUB-23 Subtitles stored hub-side only (mediahost link has no write operation)
-- [ ] HUB-24 User-initiated subtitle downloads
+- [x] HUB-24 User-initiated subtitle downloads: search + download from
+      the item detail page; the result is parsed into the normal cue/ASS
+      cache as a "d{id}" track, served by every existing subtitle path,
+      and removable
 - [x] HUB-32 ASS/SSA first-class: faithful extraction (header + re-timed events),
       JASSUB rendering with embedded fonts, live session-pipeline tap (all embedded
       text codecs), mediahost extraction facility with index-driven sparse reads;

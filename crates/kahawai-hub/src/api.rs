@@ -68,6 +68,12 @@ pub fn router(
         .route("/api/v1/items/{id}/children", get(item_children))
         .route("/api/v1/items/{id}/artwork", get(item_artwork))
         .route("/api/v1/items/{id}/subtitles", get(item_subtitles))
+        .route("/api/v1/items/{id}/subtitles/search", post(subtitle_search))
+        .route("/api/v1/items/{id}/subtitles/download", post(subtitle_download))
+        .route(
+            "/api/v1/subtitles/downloaded/{sid}",
+            axum::routing::delete(subtitle_delete),
+        )
         .route("/api/v1/items/{id}/subtitles/{file}", get(item_subtitle_file))
         .route("/api/v1/items/{id}/fonts", get(item_fonts))
         .route("/api/v1/items/{id}/fonts/{n}", get(item_font))
@@ -102,6 +108,7 @@ pub fn router(
         .route("/admin/v1/providers/tmdb", post(admin_set_tmdb))
         .route("/admin/v1/providers/tvdb", post(admin_set_tvdb))
         .route("/admin/v1/providers/anidb", post(admin_set_anidb))
+        .route("/admin/v1/providers/opensubtitles", post(admin_set_opensubtitles))
         .route("/admin/v1/providers/anidb/verify", post(admin_verify_anidb))
         .route("/admin/v1/enrich", get(admin_enrich_status).post(admin_enrich_run))
         .route("/admin/v1/libraries/{id}/refresh", post(admin_refresh_library))
@@ -258,11 +265,118 @@ async fn admin_providers(State(state): State<AppState>) -> Result<Json<Value>, A
         .await
         .map_err(internal)?
         .is_some();
+    // Search always works (built-in app key); "configured" reports a
+    // custom key override.
+    let opensubtitles = state
+        .registry
+        .get_setting(crate::opensubtitles::KEY_SETTING)
+        .await
+        .map_err(internal)?
+        .is_some_and(|k| !k.is_empty());
+    let opensubtitles_account = state
+        .registry
+        .get_setting(crate::opensubtitles::USER_SETTING)
+        .await
+        .map_err(internal)?
+        .is_some_and(|k| !k.is_empty());
     Ok(Json(json!({
         "tmdb": { "configured": tmdb },
         "tvdb": { "configured": tvdb },
         "anidb": { "configured": anidb },
+        "opensubtitles": {
+            "configured": opensubtitles,
+            "account": opensubtitles_account,
+        },
     })))
+}
+
+#[derive(Deserialize)]
+struct SetOpenSubtitles {
+    /// Optional: a custom key overriding the built-in app key.
+    #[serde(default)]
+    api_key: String,
+    #[serde(default)]
+    username: Option<String>,
+    #[serde(default)]
+    password: Option<String>,
+}
+
+/// HUB-21: enable the external subtitle provider. The API key alone
+/// enables search; downloads additionally need an account (the
+/// provider tracks quota against it).
+async fn admin_set_opensubtitles(
+    State(state): State<AppState>,
+    Json(body): Json<SetOpenSubtitles>,
+) -> Result<Json<Value>, ApiError> {
+    // Empty key = use the built-in app key (the normal case).
+    state
+        .registry
+        .set_setting(crate::opensubtitles::KEY_SETTING, body.api_key.trim())
+        .await
+        .map_err(internal)?;
+    // Empty account fields clear the stored credentials.
+    for (setting, value) in [
+        (crate::opensubtitles::USER_SETTING, body.username.as_deref().unwrap_or("").trim()),
+        (crate::opensubtitles::PASS_SETTING, body.password.as_deref().unwrap_or("").trim()),
+    ] {
+        state.registry.set_setting(setting, value).await.map_err(internal)?;
+    }
+    Ok(Json(json!({ "saved": true })))
+}
+
+#[derive(Deserialize)]
+struct SubtitleSearchRequest {
+    /// Preferred languages, ordered. Empty = whatever the provider has.
+    #[serde(default)]
+    languages: Vec<String>,
+}
+
+/// HUB-21/22: search external providers for this item's subtitles.
+async fn subtitle_search(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<SubtitleSearchRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let candidates = state
+        .subtitles
+        .search_external(&state.registry, &id, body.languages)
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("{e:#}")))?;
+    Ok(Json(json!({ "candidates": candidates })))
+}
+
+#[derive(Deserialize)]
+struct SubtitleDownloadRequest {
+    file_id: String,
+    #[serde(default)]
+    language: Option<String>,
+}
+
+/// HUB-24: user-initiated download; the result becomes a normal
+/// subtitle track on the item ("d{id}").
+async fn subtitle_download(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<SubtitleDownloadRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let key = state
+        .subtitles
+        .download_external(&state.registry, &id, &body.file_id, body.language)
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("{e:#}")))?;
+    Ok(Json(json!({ "key": key })))
+}
+
+async fn subtitle_delete(
+    State(state): State<AppState>,
+    Path(sid): Path<i64>,
+) -> Result<Json<Value>, ApiError> {
+    let removed = state
+        .subtitles
+        .delete_downloaded(&state.registry, sid)
+        .await
+        .map_err(internal)?;
+    Ok(Json(json!({ "removed": removed })))
 }
 
 /// Re-validate the STORED AniDB credentials (no resend needed).

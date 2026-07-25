@@ -1,4 +1,5 @@
 pub mod anidb;
+pub mod opensubtitles;
 pub mod proxy;
 pub mod anime;
 pub mod api;

@@ -168,7 +168,7 @@ export const fetchChildren = (id: string) =>
 
 export type Subtitle = {
   key: string
-  kind: 'embedded' | 'sidecar'
+  kind: 'embedded' | 'sidecar' | 'downloaded'
   format: string
   language: string | null
   flattened: boolean
@@ -178,13 +178,39 @@ export type Subtitle = {
 export const fetchSubtitles = (itemId: string) =>
   json<{ subtitles: Subtitle[] }>(`/api/v1/items/${itemId}/subtitles`)
 
+/// HUB-21/22/24: external subtitle search + download.
+export type SubtitleCandidate = {
+  provider: string
+  file_id: string
+  language: string | null
+  release_name: string | null
+  hash_match: boolean
+  downloads: number
+}
+
+export const searchSubtitles = (itemId: string, languages: string[]) =>
+  json<{ candidates: SubtitleCandidate[] }>(`/api/v1/items/${itemId}/subtitles/search`, {
+    method: 'POST',
+    body: JSON.stringify({ languages }),
+  })
+
+export const downloadSubtitle = (itemId: string, fileId: string, language: string | null) =>
+  json<{ key: string }>(`/api/v1/items/${itemId}/subtitles/download`, {
+    method: 'POST',
+    body: JSON.stringify({ file_id: fileId, language }),
+  })
+
+export const deleteDownloadedSubtitle = (id: number) =>
+  json<{ removed: boolean }>(`/api/v1/subtitles/downloaded/${id}`, { method: 'DELETE' })
+
 export const fetchFonts = (itemId: string) =>
   json<{ fonts: string[] }>(`/api/v1/items/${itemId}/fonts`)
 
 // ASS renders faithfully via JASSUB in this player (HUB-32), so the
 // flattened warning is history here; other clients still get .vtt.
 export const subtitleLabel = (s: Subtitle) =>
-  `${s.language ?? 'unknown'} · ${s.format}${s.kind === 'sidecar' ? ' · file' : ''}`
+  `${s.language ?? 'unknown'} · ${s.format}` +
+  (s.kind === 'sidecar' ? ' · file' : s.kind === 'downloaded' ? ' · downloaded' : '')
 
 export type LibrarySummary = { id: string; name: string; media_type: string }
 
@@ -456,7 +482,20 @@ export const adminProviders = () =>
     tmdb: { configured: boolean }
     tvdb: { configured: boolean }
     anidb: { configured: boolean }
+    opensubtitles?: { configured: boolean; account: boolean }
   }>('/admin/v1/providers')
+
+/// apiKey is optional — a built-in app key ships with the hub; only an
+/// account is needed, and only for downloads.
+export const adminSetOpenSubtitles = (
+  apiKey: string,
+  username?: string,
+  password?: string,
+) =>
+  json<{ saved: boolean }>('/admin/v1/providers/opensubtitles', {
+    method: 'POST',
+    body: JSON.stringify({ api_key: apiKey, username, password }),
+  })
 export const adminSetAnidb = (username: string, password: string, udpApiKey?: string) =>
   json<{ saved: boolean; verified: boolean; error?: string }>('/admin/v1/providers/anidb', {
     method: 'POST',

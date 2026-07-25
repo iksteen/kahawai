@@ -66,7 +66,27 @@ impl Subtitles {
     /// `open_source` would pick (largest, preferring connected hosts).
     pub async fn list(&self, registry: &Registry, item_id: &str) -> Result<Vec<SubtitleEntry>> {
         let (_, _, _, info) = source_row(registry, item_id).await?;
-        Ok(entries(&info))
+        let mut out = entries(&info);
+        // HUB-24: subtitles the user downloaded from external providers.
+        let rows = sqlx::query(
+            "SELECT id, language, format, release_name FROM downloaded_subtitles
+             WHERE item_id = ? ORDER BY id",
+        )
+        .bind(item_id)
+        .fetch_all(registry.db())
+        .await?;
+        for r in &rows {
+            let format: String = r.get("format");
+            out.push(SubtitleEntry {
+                key: format!("d{}", r.get::<i64, _>("id")),
+                kind: "downloaded",
+                format: format.clone(),
+                language: r.get::<Option<String>, _>("language"),
+                flattened: matches!(format.as_str(), "ass" | "ssa"),
+                image: false,
+            });
+        }
+        Ok(out)
     }
 
     /// WebVTT for one subtitle key, cue timestamps shifted by `shift_ms`
@@ -194,6 +214,15 @@ impl Subtitles {
         item_id: &str,
         key: &str,
     ) -> Result<Extracted> {
+        // HUB-24: downloaded subtitles live in the cache keyed by their
+        // row id — independent of which source file the item resolves
+        // to, so a re-scan or a second copy never orphans them.
+        if let Some(id) = key.strip_prefix('d') {
+            let id: i64 = id.parse().context("bad downloaded-subtitle key")?;
+            let bytes = std::fs::read(self.downloaded_path(id))
+                .context("downloaded subtitle missing from cache — download it again")?;
+            return Ok(serde_json::from_slice(&bytes)?);
+        }
         let (module_id, collection_id, path_rel, info) = source_row(registry, item_id).await?;
         entries(&info)
             .into_iter()
@@ -260,6 +289,150 @@ impl Subtitles {
         std::fs::create_dir_all(&self.dir)?;
         std::fs::write(&cache_path, serde_json::to_vec(&ex)?)?;
         Ok(ex)
+    }
+
+    fn downloaded_path(&self, id: i64) -> PathBuf {
+        self.dir.join(format!("downloaded-{id}.json"))
+    }
+
+    /// HUB-21/22/24: search external providers for one item. Hash first
+    /// (exact file), title/year as the fallback the provider needs when
+    /// it doesn't know the hash.
+    pub async fn search_external(
+        &self,
+        registry: &Registry,
+        item_id: &str,
+        languages: Vec<String>,
+    ) -> Result<Vec<crate::opensubtitles::Candidate>> {
+        let provider = external_provider(registry).await?;
+        let row = sqlx::query(
+            "SELECT i.kind, i.season, i.episode,
+                    md.proj_season, md.proj_episode,
+                    COALESCE(pm.title, p.title, md.title, i.title) AS search_title,
+                    COALESCE(i.year, p.year,
+                             CAST(substr(COALESCE(md.premiered, pmd.premiered), 1, 4) AS INTEGER))
+                        AS search_year
+             FROM items i
+             LEFT JOIN items p ON p.id = i.parent_id
+             LEFT JOIN item_metadata md ON md.item_id = i.id AND md.provider_id != ''
+             LEFT JOIN item_metadata pmd ON pmd.item_id = i.parent_id AND pmd.provider_id != ''
+             LEFT JOIN item_metadata pm ON pm.item_id = i.parent_id AND pm.provider_id != ''
+             WHERE i.id = ?",
+        )
+        .bind(item_id)
+        .fetch_optional(registry.db())
+        .await?
+        .context("no such item")?;
+
+        // The mediahost's oshash IS the OpenSubtitles moviehash (HUB-22).
+        let hash: Option<i64> = sqlx::query_scalar(
+            "SELECT f.oshash FROM item_sources s
+             JOIN files f ON (f.module_id, f.collection_id, f.path_rel)
+                           = (s.module_id, s.collection_id, s.path_rel)
+             WHERE s.item_id = ? ORDER BY f.size DESC LIMIT 1",
+        )
+        .bind(item_id)
+        .fetch_optional(registry.db())
+        .await?;
+
+        // HUB-22, two phases: the hash is an EXACT file identifier, so
+        // ask for it alone first (the API ANDs parameters — pairing it
+        // with a title query returns nothing when the hash is unknown).
+        // Only if that comes up empty do we fall back to title search.
+        if let Some(h) = hash {
+            let hits = provider
+                .search(&crate::opensubtitles::SearchQuery {
+                    moviehash: Some(h as u64),
+                    title: None,
+                    year: None,
+                    season: None,
+                    episode: None,
+                    languages: languages.clone(),
+                })
+                .await?;
+            if !hits.is_empty() {
+                return Ok(hits);
+            }
+        }
+
+        // Title fallback. For episodes OpenSubtitles wants season +
+        // episode; absolute-numbered anime has no native season, so use
+        // the HUB-31 projection — without it, "episode 11" alone matches
+        // episode 11 of anything.
+        let is_episode = row.get::<String, _>("kind") == "episode";
+        let (mut season, mut episode) = (
+            row.get::<Option<i64>, _>("season"),
+            row.get::<Option<i64>, _>("episode"),
+        );
+        if is_episode && season.is_none() {
+            season = row.get::<Option<i64>, _>("proj_season");
+            episode = row.get::<Option<i64>, _>("proj_episode").or(episode);
+        }
+        if !is_episode {
+            (season, episode) = (None, None);
+        } else if season.is_none() {
+            // Unprojected absolute numbering: an episode filter would be
+            // meaningless, so search the series and let the user choose.
+            episode = None;
+        }
+        let q = crate::opensubtitles::SearchQuery {
+            moviehash: None,
+            title: row.get::<Option<String>, _>("search_title"),
+            // Year is the SHOW's start year for episodes, which the API
+            // ANDs against the episode's air year — precise enough
+            // without it once season+episode are set.
+            year: (!is_episode).then(|| row.get::<Option<i64>, _>("search_year")).flatten(),
+            season,
+            episode,
+            languages,
+        };
+        provider.search(&q).await
+    }
+
+    /// Download a chosen candidate, parse it, and register it for the
+    /// item. Returns the new subtitle key ("d{id}").
+    pub async fn download_external(
+        &self,
+        registry: &Registry,
+        item_id: &str,
+        file_id: &str,
+        language: Option<String>,
+    ) -> Result<String> {
+        let provider = external_provider(registry).await?;
+        let dl = provider.download(file_id).await?;
+        let text = decode_text(&dl.bytes);
+        let cues = parse(&dl.format, &text)?;
+        anyhow::ensure!(!cues.is_empty(), "downloaded subtitle had no cues");
+        let ex = Extracted {
+            cues,
+            ass: matches!(dl.format.as_str(), "ass" | "ssa").then_some(text),
+        };
+        let id: i64 = sqlx::query_scalar(
+            "INSERT INTO downloaded_subtitles (item_id, provider, language, format, release_name)
+             VALUES (?, ?, ?, ?, ?) RETURNING id",
+        )
+        .bind(item_id)
+        .bind(provider.name())
+        .bind(&language)
+        .bind(&dl.format)
+        .bind(&dl.release_name)
+        .fetch_one(registry.db())
+        .await?;
+        std::fs::create_dir_all(&self.dir)?;
+        std::fs::write(self.downloaded_path(id), serde_json::to_vec(&ex)?)?;
+        tracing::info!(item = item_id, id, format = %dl.format, "external subtitle downloaded");
+        Ok(format!("d{id}"))
+    }
+
+    /// Remove a downloaded subtitle (row + cached body).
+    pub async fn delete_downloaded(&self, registry: &Registry, id: i64) -> Result<bool> {
+        let n = sqlx::query("DELETE FROM downloaded_subtitles WHERE id = ?")
+            .bind(id)
+            .execute(registry.db())
+            .await?
+            .rows_affected();
+        let _ = std::fs::remove_file(self.downloaded_path(id));
+        Ok(n > 0)
     }
 
     /// Ingest a mediahost-extracted track into the cache (ladder step 2).
@@ -406,6 +579,26 @@ impl Subtitles {
         std::fs::write(&index, serde_json::to_vec(&names)?)?;
         Ok(fonts)
     }
+}
+
+/// Build the configured external subtitle provider (HUB-21). Disabled
+/// until the admin supplies an API key.
+async fn external_provider(
+    registry: &Registry,
+) -> Result<Box<dyn crate::opensubtitles::SubtitleProvider>> {
+    // The built-in key needs no configuration; the setting overrides it.
+    let key = registry
+        .get_setting(crate::opensubtitles::KEY_SETTING)
+        .await?
+        .filter(|k| !k.is_empty())
+        .unwrap_or_else(|| crate::opensubtitles::default_api_key().to_string());
+    let http = reqwest::Client::builder().user_agent("kahawai").build()?;
+    Ok(Box::new(crate::opensubtitles::OpenSubtitles::new(
+        http,
+        key,
+        registry.get_setting(crate::opensubtitles::USER_SETTING).await?.filter(|s| !s.is_empty()),
+        registry.get_setting(crate::opensubtitles::PASS_SETTING).await?.filter(|s| !s.is_empty()),
+    )))
 }
 
 /// Font-shaped attachment: matroska muxers tag fonts inconsistently

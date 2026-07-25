@@ -5,7 +5,13 @@ import {
   fetchItem,
   fetchLibraries,
   fetchPrefs,
+  fetchSubtitles,
   resolveTracks,
+  searchSubtitles,
+  downloadSubtitle,
+  deleteDownloadedSubtitle,
+  type Subtitle,
+  type SubtitleCandidate,
   startSession,
   type Item,
   type ItemDetail,
@@ -84,14 +90,30 @@ export default function Detail({
   const [episodes, setEpisodes] = useState<Item[]>([])
   const [animeView, setAnimeView] = useState<'seasons' | 'native'>('seasons')
   const [mediaType, setMediaType] = useState('')
+  // HUB-21/24: subtitle tracks + external search results.
+  const [subs, setSubs] = useState<Subtitle[]>([])
+  const [subCands, setSubCands] = useState<SubtitleCandidate[] | null>(null)
+  const [subBusy, setSubBusy] = useState(false)
+  const [subNote, setSubNote] = useState('')
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
 
   useEffect(() => {
     setItem(null)
     setEpisodes([])
+    setSubs([])
+    setSubCands(null)
+    setSubNote('')
     fetchItem(id).then(setItem).catch((e) => setError(String(e)))
   }, [id])
+  const reloadSubs = () =>
+    fetchSubtitles(id)
+      .then((r) => setSubs(r.subtitles))
+      .catch(() => setSubs([]))
+  useEffect(() => {
+    if (item && item.kind !== 'show' && item.kind !== 'album') void reloadSubs()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [item?.id, item?.kind])
   useEffect(() => {
     if (item?.kind === 'show' || item?.kind === 'album') {
       fetchChildren(item.id)
@@ -396,6 +418,93 @@ export default function Detail({
       {error && <div className="error">{error}</div>}
 
       {related}
+
+      <h2>Subtitles</h2>
+      {/* The player is where tracks get picked; this section is about
+          managing downloads, so the file's own tracks are one line. */}
+      <p className="dim">
+        {(() => {
+          const own = subs.filter((s) => s.kind !== 'downloaded')
+          if (own.length === 0) return 'No subtitles in the file.'
+          const langs = [...new Set(own.map((s) => s.language ?? '?'))]
+          return `${own.length} in the file: ${langs.slice(0, 12).join(', ')}${
+            langs.length > 12 ? `, +${langs.length - 12} more` : ''
+          }`
+        })()}
+      </p>
+      <ul className="rows subs-list">
+        {subs
+          .filter((s) => s.kind === 'downloaded')
+          .map((s) => (
+            <li key={s.key}>
+              <span className="chips">
+                <span className="chip">downloaded</span>
+                <span>{s.language ?? '?'} · {s.format}</span>
+              </span>
+              <button
+                className="btn ghost small"
+                onClick={() =>
+                  deleteDownloadedSubtitle(Number(s.key.slice(1)))
+                    .then(reloadSubs)
+                    .catch((e) => setError(String(e)))
+                }
+              >
+                Remove
+              </button>
+            </li>
+          ))}
+      </ul>
+      <div className="row-form">
+        <button
+          className="btn ghost small"
+          disabled={subBusy}
+          onClick={() => {
+            setSubBusy(true)
+            setSubNote('')
+            searchSubtitles(item.id, [])
+              .then((r) => {
+                setSubCands(r.candidates)
+                if (r.candidates.length === 0) setSubNote('No subtitles found for this file.')
+              })
+              .catch((e) => setSubNote(String(e)))
+              .finally(() => setSubBusy(false))
+          }}
+        >
+          {subBusy ? 'Searching…' : 'Find subtitles online'}
+        </button>
+        {subNote && <span className="dim">{subNote}</span>}
+      </div>
+      {subCands && subCands.length > 0 && (
+        <ul className="rows sub-candidates">
+          {subCands.slice(0, 25).map((c) => (
+            <li key={c.file_id}>
+              <span className="chips">
+                {c.hash_match && <span className="chip" title="exact file match">hash</span>}
+                <span className="chip dim">{c.language ?? '?'}</span>
+                <span>{c.release_name ?? '(no name)'}</span>
+                <span className="dim mono">{c.downloads} dl</span>
+              </span>
+              <button
+                className="btn small"
+                disabled={subBusy}
+                onClick={() => {
+                  setSubBusy(true)
+                  downloadSubtitle(item.id, c.file_id, c.language)
+                    .then(() => {
+                      setSubNote('Downloaded — available as a subtitle track.')
+                      setSubCands(null)
+                      return reloadSubs()
+                    })
+                    .catch((e) => setSubNote(String(e)))
+                    .finally(() => setSubBusy(false))
+                }}
+              >
+                Download
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
 
       <h2>Sources</h2>
       <ul className="sources">
