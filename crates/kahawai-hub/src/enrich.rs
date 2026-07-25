@@ -487,8 +487,28 @@ impl Enricher {
         for c in [&self.progress.0, &self.progress.1, &self.progress.2] {
             c.store(0, Ordering::SeqCst);
         }
-        // Anime chain first (HUB-29): see the provider order above.
-        if let Err(e) = self.enrich_anime(registry).await {
+        // HUB-5: instantiate the run's providers; chains are declared in
+        // providers::chain_for. Unconfigured providers stay absent.
+        let mut set = crate::providers::ProviderSet::default();
+        set.add(Box::new(TmdbProvider { enricher: self.clone(), key: key.clone() }));
+        if let Some(token) = tvdb_token.clone() {
+            set.add(Box::new(TvdbProvider { enricher: self.clone(), token }));
+        }
+        let anime_items = self.select_anime_items(registry).await.unwrap_or_default();
+        if !anime_items.is_empty() {
+            match self.build_anime_provider(registry).await {
+                Ok(p) => set.add(Box::new(p)),
+                Err(e) => {
+                    tracing::warn!(error = format!("{e:#}"), "anime provider unavailable this run")
+                }
+            }
+        }
+        set.add(Box::new(MusicbrainzProvider { enricher: self.clone() }));
+        let providers = Arc::new(set);
+
+        // Anime chain first (HUB-29): sequential — its providers pace
+        // themselves against AniDB/AniList.
+        if let Err(e) = self.enrich_anime(registry, &providers, anime_items).await {
             tracing::warn!(error = format!("{e:#}"), "anime enrichment failed");
         }
         let items = sqlx::query(
@@ -499,13 +519,17 @@ impl Enricher {
              LEFT JOIN item_metadata m ON m.item_id = i.id
              WHERE i.kind IN ('movie', 'show')
                AND (m.item_id IS NULL OR m.confidence = 'miss')
+               AND NOT EXISTS (
+                 SELECT 1 FROM item_sources s2
+                 JOIN collections c2 ON (c2.module_id, c2.collection_id)
+                                      = (s2.module_id, s2.collection_id)
+                 WHERE c2.media_type = 'anime'
+                   AND (s2.item_id = i.id
+                        OR s2.item_id IN (SELECT id FROM items WHERE parent_id = i.id)))
              ORDER BY i.title",
         )
         .fetch_all(registry.db())
         .await?;
-        if items.is_empty() {
-            return Ok((0, 0, 0));
-        }
         tracing::info!(items = items.len(), "enrichment run starting");
 
         let sem = Arc::new(tokio::sync::Semaphore::new(4));
@@ -519,8 +543,7 @@ impl Enricher {
             );
             // A movie in its own subdirectory carries a second identity:
             // the directory name, often cleaner than the release-junk
-            // filename ("Hellraiser - Revelations (2011)/Hellraiser.
-            // VIIII.Revelations…"). Used as an alternative match key.
+            // filename. Used as an alternative match key.
             let alt = (kind == "movie")
                 .then(|| row.get::<Option<String>, _>("src_path"))
                 .flatten()
@@ -530,121 +553,38 @@ impl Enricher {
                     let g = kahawai_core::names::parse_movie(dir);
                     (!g.title.is_empty() && fold(&g.title) != fold(&title)).then_some(g)
                 });
+            let item = crate::providers::ItemRef {
+                id,
+                kind,
+                title,
+                year,
+                artist: None,
+                alt,
+                existing: None,
+                manual: false,
+                known_aid: None,
+                identified: false,
+            };
             let this = self.clone();
-            let key = key.clone();
-            let alt = alt.clone();
-            let tvdb_token = tvdb_token.clone();
+            let set = providers.clone();
             let db = registry.db().clone();
             let sem = sem.clone();
             tasks.spawn(async move {
                 let _permit = sem.acquire().await;
-                // Query ladder: TMDB's search has holes (a literal "And"
-                // finds nothing where "&" or a shortened query hits), so
-                // retry with variants — the strict verifier still judges
-                // every candidate against the FULL local title.
-                let mut variants = vec![title.clone()];
-                if title.contains(" And ") || title.contains(" and ") {
-                    variants.push(title.replace(" And ", " & ").replace(" and ", " & "));
-                }
-                if title.contains('&') {
-                    variants.push(title.replace('&', "and"));
-                }
-                let words: Vec<&str> = title.split_whitespace().collect();
-                if words.len() > 3 {
-                    variants.push(words[..words.len() - 1].join(" "));
-                    variants.push(words[..words.len() - 2].join(" "));
-                }
-                let mut picked_owned: Option<(Candidate, &'static str)> = None;
-                for (vi, q) in variants.iter().enumerate() {
-                    match this.search(&key, &kind, q, year).await {
-                        Ok(cands) => {
-                            if let Some((c, conf)) = pick_candidate(&cands, &title, year) {
-                                picked_owned = Some((c.clone(), conf));
-                                if vi > 0 {
-                                    tracing::debug!(title, variant = %q, "matched via query variant");
-                                }
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!(title, error = format!("{e:#}"), "tmdb search failed");
-                            return;
+                match set.run_chain("movies", &db, &item).await {
+                    Some("auto") => {
+                        this.progress.0.fetch_add(1, Ordering::SeqCst);
+                    }
+                    Some("weak") => {
+                        this.progress.1.fetch_add(1, Ordering::SeqCst);
+                    }
+                    Some(_) => {}
+                    None => {
+                        this.progress.2.fetch_add(1, Ordering::SeqCst);
+                        if let Err(e) = this.store_generic(&db, &item.id, "tmdb", None).await {
+                            tracing::warn!(title = %item.title, error = %e, "miss upsert failed");
                         }
                     }
-                }
-                let mut picked = picked_owned;
-                let mut provider = "tmdb";
-                if picked.is_none()
-                    && let Some(alt) = &alt
-                {
-                    let alt_year = alt.year.map(|y| y as i64).or(year);
-                    match this.search(&key, &kind, &alt.title, alt_year).await {
-                        Ok(cands) => {
-                            if let Some((c, conf)) = pick_candidate(&cands, &alt.title, alt_year)
-                            {
-                                picked = Some((c.clone(), conf));
-                                tracing::debug!(title, alt = %alt.title, "matched via directory name");
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!(title, error = format!("{e:#}"), "tmdb alt search failed")
-                        }
-                    }
-                }
-                if picked.is_none()
-                    && let Some(token) = &tvdb_token
-                {
-                    match this.tvdb_search(token, &kind, &title, ).await {
-                        Ok(cands) => {
-                            if let Some((c, conf)) = pick_candidate(&cands, &title, year) {
-                                picked = Some((c.clone(), conf));
-                                provider = "tvdb";
-                                tracing::debug!(title, "matched via TVDB fallback");
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!(title, error = format!("{e:#}"), "tvdb search failed")
-                        }
-                    }
-                }
-                let (provider_id, confidence, c) = match &picked {
-                    Some((c, conf)) => (c.id.to_string(), *conf, Some(c)),
-                    None => (String::new(), "miss", None),
-                };
-                match confidence {
-                    "auto" => this.progress.0.fetch_add(1, Ordering::SeqCst),
-                    "weak" => this.progress.1.fetch_add(1, Ordering::SeqCst),
-                    _ => this.progress.2.fetch_add(1, Ordering::SeqCst),
-                };
-                let r = sqlx::query(
-                    "INSERT INTO item_metadata
-                       (item_id, provider, provider_id, title, overview, poster_path,
-                        rating, premiered, genres, confidence, updated_at)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, unixepoch())
-                     ON CONFLICT (item_id) DO UPDATE SET
-                       provider = excluded.provider,
-                       provider_id = excluded.provider_id,
-                       title = excluded.title,
-                       overview = excluded.overview,
-                       poster_path = excluded.poster_path,
-                       rating = excluded.rating,
-                       premiered = excluded.premiered,
-                       confidence = excluded.confidence,
-                       updated_at = excluded.updated_at",
-                )
-                .bind(&id)
-                .bind(provider)
-                .bind(&provider_id)
-                .bind(c.map(|c| c.title.clone()))
-                .bind(c.and_then(|c| c.overview.clone()))
-                .bind(c.and_then(|c| c.poster_path.clone()))
-                .bind(c.and_then(|c| c.vote_average))
-                .bind(c.and_then(|c| c.release_date.clone()))
-                .bind(confidence)
-                .execute(&db)
-                .await;
-                if let Err(e) = r {
-                    tracing::warn!(title, error = %e, "metadata upsert failed");
                 }
             });
         }
@@ -658,17 +598,19 @@ impl Enricher {
         if let Err(e) = self.enrich_episodes(registry, &key, tvdb_token.as_ref()).await {
             tracing::warn!(error = format!("{e:#}"), "episode enrichment failed");
         }
-        if let Err(e) = self.enrich_music(registry).await {
+        if let Err(e) = self.enrich_music(registry, &providers).await {
             tracing::warn!(error = format!("{e:#}"), "music enrichment failed");
         }
+        providers.finish().await;
         Ok((m, w, x))
     }
 
-    /// MusicBrainz release-group enrichment for albums: strict fold-
-    /// exact title + artist verification, 1 req/s (MB's hard limit),
-    /// Cover Art Archive front cover as the poster fallback (local
-    /// folder art still wins in the artwork chain).
-    async fn enrich_music(self: &Arc<Self>, registry: &Registry) -> Result<()> {
+    /// Album enrichment via the music chain (MusicBrainz today).
+    async fn enrich_music(
+        self: &Arc<Self>,
+        registry: &Registry,
+        providers: &Arc<crate::providers::ProviderSet>,
+    ) -> Result<()> {
         let albums = sqlx::query(
             "SELECT i.id, i.title, i.artist FROM items i
              LEFT JOIN item_metadata m ON m.item_id = i.id
@@ -684,44 +626,30 @@ impl Enricher {
         tracing::info!(albums = albums.len(), "music enrichment starting");
         let (mut matched, mut missed) = (0usize, 0usize);
         for (n, row) in albums.iter().enumerate() {
-            let (id, title, artist) = (
-                row.get::<String, _>("id"),
-                row.get::<String, _>("title"),
-                row.get::<String, _>("artist"),
-            );
-            // MB hard rate limit: one request per second.
-            tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
-            match self.musicbrainz_album(&title, &artist).await {
-                Ok(Some(rg)) => {
-                    matched += 1;
-                    sqlx::query(
-                        "INSERT OR REPLACE INTO item_metadata
-                           (item_id, provider, provider_id, title, overview, poster_path,
-                            rating, premiered, genres, confidence, updated_at)
-                         VALUES (?, 'musicbrainz', ?, ?, NULL, ?, NULL, ?, ?, 'auto', unixepoch())",
-                    )
-                    .bind(&id)
-                    .bind(&rg.id)
-                    .bind(&rg.title)
-                    .bind(format!("https://coverartarchive.org/release-group/{}/front-500", rg.id))
-                    .bind(&rg.first_release_date)
-                    .bind(serde_json::to_string(&rg.genres)?)
-                    .execute(registry.db())
-                    .await?;
-                }
-                Ok(None) => {
+            let item = crate::providers::ItemRef {
+                id: row.get("id"),
+                kind: "album".into(),
+                title: row.get("title"),
+                year: None,
+                artist: row.get("artist"),
+                alt: None,
+                existing: None,
+                manual: false,
+                known_aid: None,
+                identified: false,
+            };
+            match providers.run_chain("music", registry.db(), &item).await {
+                Some(_) => matched += 1,
+                None => {
                     missed += 1;
                     sqlx::query(
                         "INSERT OR REPLACE INTO item_metadata
                            (item_id, provider, provider_id, confidence, updated_at)
                          VALUES (?, 'musicbrainz', '', 'miss', unixepoch())",
                     )
-                    .bind(&id)
+                    .bind(&item.id)
                     .execute(registry.db())
                     .await?;
-                }
-                Err(e) => {
-                    tracing::warn!(title, error = format!("{e:#}"), "musicbrainz lookup failed")
                 }
             }
             if (n + 1) % 100 == 0 {
@@ -801,15 +729,14 @@ impl Enricher {
         Ok(None)
     }
 
-    /// HUB-29: AniDB titles dump → aid (identity), anime-lists mapping
-    /// → AniList/TVDB/TMDB ids, AniList → description/cover/relations.
-    /// Conservative like everything else: only fold-exact identities
-    /// are accepted; anything else keeps its generic-provider metadata.
-    async fn enrich_anime(self: &Arc<Self>, registry: &Registry) -> Result<()> {
-        // Selected: unidentified anime items, PLUS already-matched ones
-        // whose files gained ED2K hashes AniDB hasn't been asked about —
-        // a late hash is canonical and re-verifies the name-based match.
-        let items = sqlx::query(
+    /// Anime items needing the chain: unidentified ones, plus matched
+    /// items whose files gained ED2K hashes AniDB hasn't been asked
+    /// about — a late hash is canonical and re-verifies a name match.
+    async fn select_anime_items(
+        &self,
+        registry: &Registry,
+    ) -> Result<Vec<crate::providers::ItemRef>> {
+        let rows = sqlx::query(
             "SELECT DISTINCT i.id, i.kind, i.title, i.year,
                     m.provider, m.provider_id, m.confidence, m.anidb_id, m.anilist_id
              FROM items i
@@ -834,15 +761,31 @@ impl Enricher {
         )
         .fetch_all(registry.db())
         .await?;
-        if items.is_empty() {
-            return Ok(());
-        }
-        tracing::info!(items = items.len(), "anime enrichment starting");
+        Ok(rows
+            .into_iter()
+            .map(|row| crate::providers::ItemRef {
+                id: row.get("id"),
+                kind: row.get("kind"),
+                title: row.get("title"),
+                year: row.get("year"),
+                artist: None,
+                alt: None,
+                existing: row
+                    .get::<Option<String>, _>("provider")
+                    .zip(row.get::<Option<String>, _>("provider_id")),
+                manual: row.get::<Option<String>, _>("confidence").as_deref() == Some("manual"),
+                known_aid: row.get::<Option<i64>, _>("anidb_id").map(|a| a as u32),
+                identified: row.get::<Option<i64>, _>("anilist_id").is_some(),
+            })
+            .collect())
+    }
+
+    /// The anime chain's composite provider: AniDB identity (ED2K, then
+    /// reverse mapping, then titles dump) + AniList description.
+    async fn build_anime_provider(self: &Arc<Self>, registry: &Registry) -> Result<AnimeProvider> {
         let titles = crate::anime::AnidbTitles::load(&self.http, &self.data_dir).await?;
         let lists = crate::anime::AnimeLists::load(&self.http, &self.data_dir).await?;
-        // Gold path (HUB-30): FILE-by-ED2K when the admin configured an
-        // AniDB account. One session for the whole pass.
-        let mut anidb = match (
+        let anidb = match (
             registry.get_setting(crate::anidb::USER_SETTING).await?,
             registry.get_setting(crate::anidb::PASS_SETTING).await?,
         ) {
@@ -861,59 +804,36 @@ impl Enricher {
             }
             _ => None,
         };
+        Ok(AnimeProvider {
+            enricher: self.clone(),
+            titles,
+            lists,
+            anidb: tokio::sync::Mutex::new(anidb),
+        })
+    }
 
-        let mut done = 0usize;
-        for row in items {
-            let (id, kind, title, year) = (
-                row.get::<String, _>("id"),
-                row.get::<String, _>("kind"),
-                row.get::<String, _>("title"),
-                row.get::<Option<i64>, _>("year"),
-            );
-            let existing = row
-                .get::<Option<String>, _>("provider")
-                .zip(row.get::<Option<String>, _>("provider_id"));
-            let manual = row.get::<Option<String>, _>("confidence").as_deref() == Some("manual");
-            let known_aid = row.get::<Option<i64>, _>("anidb_id").map(|a| a as u32);
-            let identified = row.get::<Option<i64>, _>("anilist_id").is_some();
-            // ED2K-exact identity first: the file IS the identity, no
-            // name heuristics involved. Cached in ed2k_aid so a file is
-            // never asked about twice across runs.
-            let mut exact_aid: Option<u32> = None;
-            if let Some(client) = anidb.as_mut() {
-                match self.anidb_identify(registry, client, &id).await {
-                    Ok(aid) => exact_aid = aid,
-                    Err(e) => {
-                        tracing::warn!(error = format!("{e:#}"), "anidb lookup failed; disabling for this run");
-                        anidb = None;
-                    }
-                }
-            }
-            if identified {
-                // Already matched by name: only a DISAGREEING canonical
-                // hash re-decides; agreement or no-answer changes nothing.
-                match exact_aid {
-                    Some(aid) if known_aid != Some(aid) => {
-                        tracing::warn!(title, old_aid = known_aid, new_aid = aid,
-                            "ed2k identification disagrees with name match; hash wins");
-                    }
-                    _ => continue,
-                }
-            }
-            match self
-                .anime_one(
-                    registry, &titles, &lists, &id, &kind, &title, year, existing, manual,
-                    exact_aid,
-                )
-                .await
-            {
-                Ok(true) => done += 1,
-                Ok(false) => tracing::debug!(title, "no anime identity; keeping generic metadata"),
-                Err(e) => tracing::warn!(title, error = format!("{e:#}"), "anime enrichment error"),
-            }
+    async fn enrich_anime(
+        self: &Arc<Self>,
+        registry: &Registry,
+        providers: &Arc<crate::providers::ProviderSet>,
+        items: Vec<crate::providers::ItemRef>,
+    ) -> Result<()> {
+        if items.is_empty() {
+            return Ok(());
         }
-        if let Some(client) = anidb {
-            client.logout().await;
+        tracing::info!(items = items.len(), "anime enrichment starting");
+        let mut done = 0usize;
+        for item in &items {
+            match providers.run_chain("anime", registry.db(), item).await {
+                Some("settled") => {}
+                Some(_) => done += 1,
+                None => {
+                    tracing::debug!(title = %item.title, "no anime identity; recording miss");
+                    if !item.identified {
+                        self.store_generic(registry.db(), &item.id, "anime", None).await?;
+                    }
+                }
+            }
         }
         tracing::info!(matched = done, "anime enrichment complete");
         Ok(())
@@ -922,9 +842,9 @@ impl Enricher {
     /// Resolve an item's AniDB id from a representative file's ED2K
     /// hash. Results (hits AND misses) are persisted per content in the
     /// ed2k_aid table — AniDB is never asked twice for the same hash.
-    async fn anidb_identify(
+    pub(crate) async fn anidb_identify(
         &self,
-        registry: &Registry,
+        db: &sqlx::SqlitePool,
         client: &mut crate::anidb::Anidb,
         item_id: &str,
     ) -> Result<Option<u32>> {
@@ -938,7 +858,7 @@ impl Enricher {
              ORDER BY s.path_rel LIMIT 1",
         )
         .bind(item_id)
-        .fetch_optional(registry.db())
+        .fetch_optional(db)
         .await?
         else {
             return Ok(None);
@@ -949,7 +869,7 @@ impl Enricher {
             "SELECT aid FROM ed2k_aid WHERE ed2k = ?",
         )
         .bind(&ed2k)
-        .fetch_optional(registry.db())
+        .fetch_optional(db)
         .await?
         {
             return Ok(cached.map(|a| a as u32));
@@ -963,15 +883,15 @@ impl Enricher {
         sqlx::query("INSERT OR REPLACE INTO ed2k_aid (ed2k, aid, updated_at) VALUES (?, ?, unixepoch())")
             .bind(&ed2k)
             .bind(aid)
-            .execute(registry.db())
+            .execute(db)
             .await?;
         Ok(aid)
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn anime_one(
+    pub(crate) async fn anime_one(
         self: &Arc<Self>,
-        registry: &Registry,
+        db: &sqlx::SqlitePool,
         titles: &crate::anime::AnidbTitles,
         lists: &crate::anime::AnimeLists,
         item_id: &str,
@@ -992,7 +912,7 @@ impl Enricher {
             && let Some(anilist_id) = m.anilist_id
             && let Some(media) = self.anilist.media_by_id(anilist_id).await?
         {
-            self.store_anime(registry, item_id, kind, &media, Some(aid), Some(m)).await?;
+            self.store_anime(db, item_id, kind, &media, Some(aid), Some(m)).await?;
             tracing::info!(title, anilist = media.id, anidb = aid, "anime matched (ed2k exact)");
             return Ok(true);
         }
@@ -1056,7 +976,7 @@ impl Enricher {
         };
 
         let mapping = anidb_id.and_then(|aid| lists.by_anidb(aid));
-        self.store_anime(registry, item_id, kind, &media, anidb_id, mapping).await?;
+        self.store_anime(db, item_id, kind, &media, anidb_id, mapping).await?;
         tracing::info!(title, anilist = media.id, anidb = anidb_id, "anime matched");
         Ok(true)
     }
@@ -1064,7 +984,7 @@ impl Enricher {
     /// Persist an AniList match: metadata upsert + relations graph.
     async fn store_anime(
         &self,
-        registry: &Registry,
+        db: &sqlx::SqlitePool,
         item_id: &str,
         kind: &str,
         media: &crate::anime::AnilistMedia,
@@ -1095,14 +1015,14 @@ impl Enricher {
         .bind(media.id)
         .bind(mapping.and_then(|m| m.tvdb_id))
         .bind(mapping.and_then(|m| m.tmdb_for(kind)))
-        .execute(registry.db())
+        .execute(db)
         .await?;
 
         // Relations graph → watch-order building blocks. Watchable
         // relation kinds only; adaptations point at manga.
         sqlx::query("DELETE FROM item_relations WHERE from_item = ?")
             .bind(item_id)
-            .execute(registry.db())
+            .execute(db)
             .await?;
         if let Some(rel) = &media.relations {
             for edge in &rel.edges {
@@ -1126,7 +1046,7 @@ impl Enricher {
                 .bind(kind_raw.to_lowercase())
                 .bind(node.id)
                 .bind(node.title.english.clone().or_else(|| node.title.romaji.clone()))
-                .execute(registry.db())
+                .execute(db)
                 .await?;
             }
         }
@@ -1488,5 +1408,270 @@ mod tests {
         let (c, conf) =
             pick_candidate(&rd, "Indiana Jones and the Raiders of the Lost Ark", None).unwrap();
         assert_eq!((c.id, conf), (9, "weak"));
+    }
+}
+
+// ---------- HUB-5 provider adapters ----------
+
+/// Persist a generic-provider match (or a miss when `pick` is None).
+impl Enricher {
+    pub(crate) async fn store_generic(
+        &self,
+        db: &sqlx::SqlitePool,
+        item_id: &str,
+        provider: &str,
+        pick: Option<&(Candidate, &'static str)>,
+    ) -> Result<()> {
+        let (provider_id, confidence, c) = match pick {
+            Some((c, conf)) => (c.id.to_string(), *conf, Some(c)),
+            None => (String::new(), "miss", None),
+        };
+        sqlx::query(
+            "INSERT INTO item_metadata
+               (item_id, provider, provider_id, title, overview, poster_path,
+                rating, premiered, genres, confidence, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, unixepoch())
+             ON CONFLICT (item_id) DO UPDATE SET
+               provider = excluded.provider,
+               provider_id = excluded.provider_id,
+               title = excluded.title,
+               overview = excluded.overview,
+               poster_path = excluded.poster_path,
+               rating = excluded.rating,
+               premiered = excluded.premiered,
+               confidence = excluded.confidence,
+               updated_at = excluded.updated_at",
+        )
+        .bind(item_id)
+        .bind(provider)
+        .bind(&provider_id)
+        .bind(c.map(|c| c.title.clone()))
+        .bind(c.and_then(|c| c.overview.clone()))
+        .bind(c.and_then(|c| c.poster_path.clone()))
+        .bind(c.and_then(|c| c.vote_average))
+        .bind(c.and_then(|c| c.release_date.clone()))
+        .bind(confidence)
+        .execute(db)
+        .await?;
+        Ok(())
+    }
+}
+
+struct TmdbProvider {
+    enricher: Arc<Enricher>,
+    key: String,
+}
+
+#[async_trait::async_trait]
+impl crate::providers::Provider for TmdbProvider {
+    fn name(&self) -> &'static str {
+        "tmdb"
+    }
+
+    async fn enrich(
+        &self,
+        db: &sqlx::SqlitePool,
+        item: &crate::providers::ItemRef,
+    ) -> Result<crate::providers::Outcome> {
+        if !matches!(item.kind.as_str(), "movie" | "show") {
+            return Ok(crate::providers::Outcome::Declined);
+        }
+        // Query ladder: TMDB's search has holes (a literal "And" finds
+        // nothing where "&" or a shortened query hits); the strict
+        // verifier still judges candidates against the FULL local title.
+        let title = &item.title;
+        let mut variants = vec![title.clone()];
+        if title.contains(" And ") || title.contains(" and ") {
+            variants.push(title.replace(" And ", " & ").replace(" and ", " & "));
+        }
+        if title.contains('&') {
+            variants.push(title.replace('&', "and"));
+        }
+        let words: Vec<&str> = title.split_whitespace().collect();
+        if words.len() > 3 {
+            variants.push(words[..words.len() - 1].join(" "));
+            variants.push(words[..words.len() - 2].join(" "));
+        }
+        let mut picked: Option<(Candidate, &'static str)> = None;
+        for (vi, q) in variants.iter().enumerate() {
+            let cands = self.enricher.search(&self.key, &item.kind, q, item.year).await?;
+            if let Some((c, conf)) = pick_candidate(&cands, title, item.year) {
+                picked = Some((c.clone(), conf));
+                if vi > 0 {
+                    tracing::debug!(title, variant = %q, "matched via query variant");
+                }
+                break;
+            }
+        }
+        if picked.is_none()
+            && let Some(alt) = &item.alt
+        {
+            let alt_year = alt.year.map(|y| y as i64).or(item.year);
+            let cands = self.enricher.search(&self.key, &item.kind, &alt.title, alt_year).await?;
+            if let Some((c, conf)) = pick_candidate(&cands, &alt.title, alt_year) {
+                picked = Some((c.clone(), conf));
+                tracing::debug!(title, alt = %alt.title, "matched via directory name");
+            }
+        }
+        match picked {
+            Some(pick) => {
+                let conf = pick.1;
+                self.enricher.store_generic(db, &item.id, "tmdb", Some(&pick)).await?;
+                Ok(crate::providers::Outcome::Matched(conf))
+            }
+            None => Ok(crate::providers::Outcome::Declined),
+        }
+    }
+}
+
+struct TvdbProvider {
+    enricher: Arc<Enricher>,
+    token: std::sync::Arc<String>,
+}
+
+#[async_trait::async_trait]
+impl crate::providers::Provider for TvdbProvider {
+    fn name(&self) -> &'static str {
+        "tvdb"
+    }
+
+    async fn enrich(
+        &self,
+        db: &sqlx::SqlitePool,
+        item: &crate::providers::ItemRef,
+    ) -> Result<crate::providers::Outcome> {
+        if !matches!(item.kind.as_str(), "movie" | "show") {
+            return Ok(crate::providers::Outcome::Declined);
+        }
+        let cands = self.enricher.tvdb_search(&self.token, &item.kind, &item.title).await?;
+        match pick_candidate(&cands, &item.title, item.year) {
+            Some((c, conf)) => {
+                let pick = (c.clone(), conf);
+                self.enricher.store_generic(db, &item.id, "tvdb", Some(&pick)).await?;
+                tracing::debug!(title = %item.title, "matched via TVDB fallback");
+                Ok(crate::providers::Outcome::Matched(conf))
+            }
+            None => Ok(crate::providers::Outcome::Declined),
+        }
+    }
+}
+
+/// The anime chain's composite: AniDB identity (ED2K exact > reverse
+/// mapping > titles dump), AniList description + relations. "AniDB is
+/// special" (rate limits, bans, never-ask-twice) stays inside.
+pub(crate) struct AnimeProvider {
+    enricher: Arc<Enricher>,
+    titles: crate::anime::AnidbTitles,
+    lists: crate::anime::AnimeLists,
+    anidb: tokio::sync::Mutex<Option<crate::anidb::Anidb>>,
+}
+
+#[async_trait::async_trait]
+impl crate::providers::Provider for AnimeProvider {
+    fn name(&self) -> &'static str {
+        "anime"
+    }
+
+    async fn enrich(
+        &self,
+        db: &sqlx::SqlitePool,
+        item: &crate::providers::ItemRef,
+    ) -> Result<crate::providers::Outcome> {
+        if !matches!(item.kind.as_str(), "movie" | "show") {
+            return Ok(crate::providers::Outcome::Declined);
+        }
+        // ED2K-exact identity first; a failure disables the UDP client
+        // for the rest of the run (ban safety).
+        let mut exact_aid: Option<u32> = None;
+        {
+            let mut guard = self.anidb.lock().await;
+            if let Some(client) = guard.as_mut() {
+                match self.enricher.anidb_identify(db, client, &item.id).await {
+                    Ok(aid) => exact_aid = aid,
+                    Err(e) => {
+                        tracing::warn!(error = format!("{e:#}"), "anidb lookup failed; disabling for this run");
+                        *guard = None;
+                    }
+                }
+            }
+        }
+        if item.identified {
+            // Already matched by name: only a DISAGREEING canonical hash
+            // re-decides; agreement or no-answer settles the chain.
+            match exact_aid {
+                Some(aid) if item.known_aid != Some(aid) => {
+                    tracing::warn!(title = %item.title, old_aid = item.known_aid, new_aid = aid,
+                        "ed2k identification disagrees with name match; hash wins");
+                }
+                _ => return Ok(crate::providers::Outcome::Settled),
+            }
+        }
+        let matched = self
+            .enricher
+            .anime_one(
+                db,
+                &self.titles,
+                &self.lists,
+                &item.id,
+                &item.kind,
+                &item.title,
+                item.year,
+                item.existing.clone(),
+                item.manual,
+                exact_aid,
+            )
+            .await?;
+        Ok(if matched {
+            crate::providers::Outcome::Matched("auto")
+        } else {
+            crate::providers::Outcome::Declined
+        })
+    }
+
+    async fn finish(&self) {
+        if let Some(client) = self.anidb.lock().await.take() {
+            client.logout().await;
+        }
+    }
+}
+
+struct MusicbrainzProvider {
+    enricher: Arc<Enricher>,
+}
+
+#[async_trait::async_trait]
+impl crate::providers::Provider for MusicbrainzProvider {
+    fn name(&self) -> &'static str {
+        "musicbrainz"
+    }
+
+    async fn enrich(
+        &self,
+        db: &sqlx::SqlitePool,
+        item: &crate::providers::ItemRef,
+    ) -> Result<crate::providers::Outcome> {
+        let (Some(artist), "album") = (&item.artist, item.kind.as_str()) else {
+            return Ok(crate::providers::Outcome::Declined);
+        };
+        // MB hard rate limit: one request per second.
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        let Some(rg) = self.enricher.musicbrainz_album(&item.title, artist).await? else {
+            return Ok(crate::providers::Outcome::Declined);
+        };
+        sqlx::query(
+            "INSERT OR REPLACE INTO item_metadata
+               (item_id, provider, provider_id, title, overview, poster_path,
+                rating, premiered, genres, confidence, updated_at)
+             VALUES (?, 'musicbrainz', ?, ?, NULL, ?, NULL, ?, ?, 'auto', unixepoch())",
+        )
+        .bind(&item.id)
+        .bind(&rg.id)
+        .bind(&rg.title)
+        .bind(format!("https://coverartarchive.org/release-group/{}/front-500", rg.id))
+        .bind(&rg.first_release_date)
+        .bind(serde_json::to_string(&rg.genres)?)
+        .execute(db)
+        .await?;
+        Ok(crate::providers::Outcome::Matched("auto"))
     }
 }

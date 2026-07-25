@@ -30,6 +30,7 @@ reqwest = { workspace = true }
 flate2 = { workspace = true }
 md-5 = { workspace = true }
 aes = { workspace = true }
+async-trait = { workspace = true }
 unicode-normalization = "0.1"
 rust-embed = { workspace = true }
 argon2 = "0.5.3"

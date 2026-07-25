@@ -4,7 +4,7 @@ Status of every numbered requirement from `kahawai-technical-requirements.md`,
 plus the v1 acceptance criteria. Checked = implemented and exercised against
 the live deployment. Unchecked items carry a note when partially done.
 
-Last updated: 2026-07-25 (anime providers, MusicBrainz, image subtitles).
+Last updated: 2026-07-25 (anime providers, MusicBrainz, image subtitles, HUB-5).
 
 ## Architecture (AR)
 
@@ -53,9 +53,10 @@ Last updated: 2026-07-25 (anime providers, MusicBrainz, image subtitles).
 - [x] HUB-3 Dedup: same logical item from multiple sources → one item, source list
 - [x] HUB-4 Filename/dirname parsing (movies, episodes, anime conventions, music layout)
 - [x] HUB-20 Mediahost deletion cascade + watch-state/match archives restored on re-enroll
-- [ ] HUB-5 Providers behind a common trait *(TMDB, TVDB, AniDB, AniList,
-      MusicBrainz + CAA live with a declared per-media-type chain and
-      anime-first ordering; no formal trait yet)*
+- [x] HUB-5 Providers behind a common `Provider` trait (providers.rs):
+      per-media-type chains declared as data, first claim wins, walker owns
+      miss-recording; TMDB, TVDB, anime composite (AniDB identity + AniList),
+      MusicBrainz + CAA. Local-metadata provider slot open (HUB-9)
 - [ ] HUB-6 Descriptive metadata *(titles, plots, dates, ratings, posters, episode
       stills live; cast/genres not stored)*
 - [ ] HUB-7 Provider rate limits/caching *(API keys via settings + poster caching

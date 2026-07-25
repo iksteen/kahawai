@@ -1725,6 +1725,7 @@ dependencies = [
  "aes",
  "anyhow",
  "argon2",
+ "async-trait",
  "axum",
  "bytes",
  "flate2",
