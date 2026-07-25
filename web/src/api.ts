@@ -282,7 +282,11 @@ export function resolveTracks(
     if (i >= 0) audioTrack = i
   }
   if (audioTrack === undefined) {
-    for (const want of list(get('', `audio.${mediaType}`))) {
+    // 'original' is the standing backstop: implicit final entry of
+    // every audio wishlist (and the whole list when none is set).
+    const wish = list(get('', `audio.${mediaType}`))
+    if (!wish.includes('original')) wish.push('original')
+    for (const want of wish) {
       const lang = want === 'original' ? originalLanguage : want
       if (!lang) continue
       const i = audio.findIndex((a) => langEq(a.language, lang))

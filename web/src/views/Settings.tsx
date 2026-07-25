@@ -26,7 +26,11 @@ function LangChips({
   onChange: (v: string) => void
   flash: () => void
 }) {
-  const items = value ? value.split(',') : []
+  // 'original' is the permanent audio backstop: always in the list,
+  // not removable (reorderable — others may be preferred above it).
+  const stored = value ? value.split(',') : []
+  const items =
+    kind === 'audio' && !stored.includes('original') ? [...stored, 'original'] : stored
   const [entry, setEntry] = useState('')
   const [bad, setBad] = useState(false)
   const inputRef = useRef<HTMLInputElement>(null)
@@ -58,9 +62,7 @@ function LangChips({
     <div className="row-form pref-row">
       <span className="pref-label mono">{kind}</span>
       <span className="chips">
-        {items.length === 0 && (
-          <span className="dim">{kind === 'audio' ? 'first track' : 'no subtitles'}</span>
-        )}
+        {items.length === 0 && <span className="dim">no subtitles</span>}
         {items.map((l, i) => (
           <button
             key={l}
@@ -68,17 +70,22 @@ function LangChips({
             title={i === 0 ? 'first choice' : 'make first choice'}
             onClick={() => i > 0 && commit([l, ...items.filter((x) => x !== l)])}
           >
-            {l}{' '}
-            <span
-              className="chip-x"
-              title="remove"
-              onClick={(e) => {
-                e.stopPropagation()
-                commit(items.filter((x) => x !== l))
-              }}
-            >
-              ×
-            </span>
+            {l}
+            {!(kind === 'audio' && l === 'original') && (
+              <>
+                {' '}
+                <span
+                  className="chip-x"
+                  title="remove"
+                  onClick={(e) => {
+                    e.stopPropagation()
+                    commit(items.filter((x) => x !== l))
+                  }}
+                >
+                  ×
+                </span>
+              </>
+            )}
           </button>
         ))}
       </span>
