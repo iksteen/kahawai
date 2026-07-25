@@ -29,6 +29,7 @@ pub struct Enricher {
     http: reqwest::Client,
     data_dir: std::path::PathBuf,
     anilist: crate::anime::Anilist,
+    last_nudge: std::sync::atomic::AtomicU64,
     running: AtomicBool,
     /// (matched, weak, missed) of the current/last run.
     progress: (AtomicUsize, AtomicUsize, AtomicUsize),
@@ -150,6 +151,7 @@ impl Enricher {
             data_dir,
             http,
             running: AtomicBool::new(false),
+            last_nudge: std::sync::atomic::AtomicU64::new(0),
             progress: Default::default(),
         }
     }
@@ -422,6 +424,30 @@ impl Enricher {
 
     /// Enrich every movie/show item without metadata. Returns
     /// (matched, weak, missed); a second concurrent call is a no-op.
+    /// Debounced auto-run: at most one spawned enrichment per 10 min,
+    /// used by hooks like "new ED2K hashes landed".
+    pub fn nudge(self: &Arc<Self>, registry: Arc<Registry>) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let last = self.last_nudge.load(Ordering::SeqCst);
+        if now.saturating_sub(last) < 600
+            || self
+                .last_nudge
+                .compare_exchange(last, now, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+        {
+            return;
+        }
+        let this = self.clone();
+        tokio::spawn(async move {
+            if let Err(e) = this.run_once(&registry).await {
+                tracing::debug!(error = format!("{e:#}"), "nudged enrichment skipped");
+            }
+        });
+    }
+
     pub async fn run_once(self: &Arc<Self>, registry: &Registry) -> Result<(usize, usize, usize)> {
         if self.running.swap(true, Ordering::SeqCst) {
             anyhow::bail!("enrichment already running");
@@ -431,6 +457,14 @@ impl Enricher {
         result
     }
 
+    /// Provider chains, per media type (ordered; first identity wins):
+    ///   anime : ED2K→AniDB exact > reverse-mapped verified match >
+    ///           AniDB titles dump > AniList search > (fallback) TMDB > TVDB
+    ///   movies/series : TMDB (ladder + dir alt-key) > TVDB
+    ///   music : embedded tags (identity, at resolution) > MusicBrainz
+    /// The anime pass runs FIRST so anime items never spend a wasted
+    /// TMDB match that would immediately be overwritten; items the anime
+    /// chain declines fall through to the generic pass unmatched.
     async fn run_inner(self: &Arc<Self>, registry: &Registry) -> Result<(usize, usize, usize)> {
         let Some(key) = registry.get_setting(TMDB_KEY_SETTING).await? else {
             anyhow::bail!("no TMDB API key configured");
@@ -452,6 +486,10 @@ impl Enricher {
         };
         for c in [&self.progress.0, &self.progress.1, &self.progress.2] {
             c.store(0, Ordering::SeqCst);
+        }
+        // Anime chain first (HUB-29): see the provider order above.
+        if let Err(e) = self.enrich_anime(registry).await {
+            tracing::warn!(error = format!("{e:#}"), "anime enrichment failed");
         }
         let items = sqlx::query(
             "SELECT i.id, i.kind, i.title, i.year,
@@ -617,12 +655,6 @@ impl Enricher {
             self.progress.2.load(Ordering::SeqCst),
         );
         tracing::info!(matched = m, weak = w, missed = x, "enrichment run complete");
-        // Anime pass (HUB-29): native identity/metadata for items in
-        // anime collections, run before episodes so the mapped TVDB ids
-        // feed episode enrichment.
-        if let Err(e) = self.enrich_anime(registry).await {
-            tracing::warn!(error = format!("{e:#}"), "anime enrichment failed");
-        }
         if let Err(e) = self.enrich_episodes(registry, &key, tvdb_token.as_ref()).await {
             tracing::warn!(error = format!("{e:#}"), "episode enrichment failed");
         }
@@ -774,17 +806,30 @@ impl Enricher {
     /// Conservative like everything else: only fold-exact identities
     /// are accepted; anything else keeps its generic-provider metadata.
     async fn enrich_anime(self: &Arc<Self>, registry: &Registry) -> Result<()> {
+        // Selected: unidentified anime items, PLUS already-matched ones
+        // whose files gained ED2K hashes AniDB hasn't been asked about —
+        // a late hash is canonical and re-verifies the name-based match.
         let items = sqlx::query(
             "SELECT DISTINCT i.id, i.kind, i.title, i.year,
-                    m.provider, m.provider_id, m.confidence FROM items i
+                    m.provider, m.provider_id, m.confidence, m.anidb_id, m.anilist_id
+             FROM items i
              JOIN item_sources s ON s.item_id = i.id
                 OR s.item_id IN (SELECT id FROM items WHERE parent_id = i.id)
              JOIN collections c ON (c.module_id, c.collection_id)
                                  = (s.module_id, s.collection_id)
              LEFT JOIN item_metadata m ON m.item_id = i.id
              WHERE c.media_type = 'anime' AND i.kind IN ('movie', 'show')
-               AND (m.item_id IS NULL OR m.anilist_id IS NULL)
                AND (m.confidence IS NULL OR m.confidence != 'rejected')
+               AND (
+                 m.item_id IS NULL OR m.anilist_id IS NULL
+                 OR EXISTS (
+                   SELECT 1 FROM files f
+                   JOIN item_sources s2 ON (s2.module_id, s2.collection_id, s2.path_rel)
+                                         = (f.module_id, f.collection_id, f.path_rel)
+                   WHERE f.ed2k IS NOT NULL
+                     AND (s2.item_id = i.id
+                          OR s2.item_id IN (SELECT id FROM items WHERE parent_id = i.id))
+                     AND f.ed2k NOT IN (SELECT ed2k FROM ed2k_aid)))
              ORDER BY i.title",
         )
         .fetch_all(registry.db())
@@ -829,6 +874,8 @@ impl Enricher {
                 .get::<Option<String>, _>("provider")
                 .zip(row.get::<Option<String>, _>("provider_id"));
             let manual = row.get::<Option<String>, _>("confidence").as_deref() == Some("manual");
+            let known_aid = row.get::<Option<i64>, _>("anidb_id").map(|a| a as u32);
+            let identified = row.get::<Option<i64>, _>("anilist_id").is_some();
             // ED2K-exact identity first: the file IS the identity, no
             // name heuristics involved. Cached in ed2k_aid so a file is
             // never asked about twice across runs.
@@ -840,6 +887,17 @@ impl Enricher {
                         tracing::warn!(error = format!("{e:#}"), "anidb lookup failed; disabling for this run");
                         anidb = None;
                     }
+                }
+            }
+            if identified {
+                // Already matched by name: only a DISAGREEING canonical
+                // hash re-decides; agreement or no-answer changes nothing.
+                match exact_aid {
+                    Some(aid) if known_aid != Some(aid) => {
+                        tracing::warn!(title, old_aid = known_aid, new_aid = aid,
+                            "ed2k identification disagrees with name match; hash wins");
+                    }
+                    _ => continue,
                 }
             }
             match self

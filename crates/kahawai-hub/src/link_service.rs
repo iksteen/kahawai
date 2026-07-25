@@ -20,6 +20,7 @@ pub struct MediahostLinkService {
     registry: Arc<Registry>,
     sessions: Arc<Sessions>,
     subtitles: Arc<crate::subtitles::Subtitles>,
+    enricher: Arc<crate::enrich::Enricher>,
 }
 
 impl MediahostLinkService {
@@ -27,8 +28,9 @@ impl MediahostLinkService {
         registry: Arc<Registry>,
         sessions: Arc<Sessions>,
         subtitles: Arc<crate::subtitles::Subtitles>,
+        enricher: Arc<crate::enrich::Enricher>,
     ) -> Self {
-        Self { registry, sessions, subtitles }
+        Self { registry, sessions, subtitles, enricher }
     }
 
     pub fn into_server(self) -> MediahostLinkServer<Self> {
@@ -66,6 +68,7 @@ impl MediahostLink for MediahostLinkService {
         let (tx, rx) = tokio::sync::mpsc::channel(16);
         let registry = self.registry.clone();
         let outer_subtitles = self.subtitles.clone();
+        let outer_enricher = self.enricher.clone();
         let module_id = peer.module_id.clone();
         registry.connected(&module_id, &peer.module_type, &hello.name, &peer.fingerprint);
         if let Err(e) = registry.settle_renewal(&module_id, &peer.fingerprint).await {
@@ -96,15 +99,17 @@ impl MediahostLink for MediahostLinkService {
                 let registry = registry.clone();
                 let module_id = module_id.clone();
                 let subtitles = outer_subtitles.clone();
+                let enricher = outer_enricher.clone();
                 tokio::spawn(async move {
                     let mut seen: std::collections::HashMap<
                         String,
                         std::collections::HashSet<String>,
                     > = std::collections::HashMap::new();
                     while let Some(msg) = work_rx.recv().await {
-                        if let Err(e) =
-                            handle_host_msg(&registry, &subtitles, &module_id, msg, &mut seen)
-                                .await
+                        if let Err(e) = handle_host_msg(
+                            &registry, &subtitles, &enricher, &module_id, msg, &mut seen,
+                        )
+                        .await
                         {
                             tracing::error!(%module_id, error = format!("{e:#}"), "handling link message");
                         }
@@ -216,8 +221,9 @@ fn kind_name(m: &host_to_hub::Msg) -> &'static str {
 /// and its scan-complete, at which point files missing from the scan are
 /// reconciled away (deletions on disk propagate on every rescan).
 async fn handle_host_msg(
-    registry: &Registry,
+    registry: &Arc<Registry>,
     subtitles: &crate::subtitles::Subtitles,
+    enricher: &Arc<crate::enrich::Enricher>,
     module_id: &str,
     msg: host_to_hub::Msg,
     seen: &mut std::collections::HashMap<String, std::collections::HashSet<String>>,
@@ -376,6 +382,9 @@ async fn handle_host_msg(
                         "ed2k result stale (file changed since listing); dropped");
                 }
             }
+            // A late hash is canonical identity material (HUB-30):
+            // debounced re-enrichment re-verifies name-based matches.
+            enricher.nudge(registry.clone());
         }
         host_to_hub::Msg::ScanProgress(_) | host_to_hub::Msg::Hello(_) => {}
     }

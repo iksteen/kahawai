@@ -57,6 +57,9 @@ async fn progress_resume_played_caps_and_idle() {
         std::sync::Arc::new(kahawai_hub::subtitles::Subtitles::new(
             tempfile::tempdir().unwrap().keep(),
         )),
+        std::sync::Arc::new(kahawai_hub::enrich::Enricher::new(
+            tempfile::tempdir().unwrap().keep(),
+        )),
     );
     tokio::spawn(async move {
         tonic::transport::Server::builder()

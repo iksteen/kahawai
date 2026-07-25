@@ -53,8 +53,9 @@ Last updated: 2026-07-25 (anime providers, MusicBrainz).
 - [x] HUB-3 Dedup: same logical item from multiple sources → one item, source list
 - [x] HUB-4 Filename/dirname parsing (movies, episodes, anime conventions, music layout)
 - [x] HUB-20 Mediahost deletion cascade + watch-state/match archives restored on re-enroll
-- [ ] HUB-5 Providers behind a common trait *(TMDB, TVDB, AniDB titles,
-      AniList, MusicBrainz + Cover Art Archive live; no formal trait yet)*
+- [ ] HUB-5 Providers behind a common trait *(TMDB, TVDB, AniDB, AniList,
+      MusicBrainz + CAA live with a declared per-media-type chain and
+      anime-first ordering; no formal trait yet)*
 - [ ] HUB-6 Descriptive metadata *(titles, plots, dates, ratings, posters, episode
       stills live; cast/genres not stored)*
 - [ ] HUB-7 Provider rate limits/caching *(API keys via settings + poster caching
@@ -112,7 +113,8 @@ Last updated: 2026-07-25 (anime providers, MusicBrainz).
       (registered client "kahawai", account via admin page, optional
       encrypted session, never-ask-twice cache)
 - [ ] HUB-30 Fansub filename conventions *(group prefixes, absolute numbering,
-      CRC tags, bracket stripping, hash-exact show identification live;
+      CRC tags, bracket stripping live; hash-exact identification is canonical —
+      late-arriving ED2K hashes re-verify and override name matches;
       per-EPISODE hash identification and version tags pending)*
 - [ ] HUB-31 Native anime structure *(absolute numbering via TVDB absolute
       order; relations graph + related-items UI live; season-view projection

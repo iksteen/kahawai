@@ -94,6 +94,9 @@ async fn dispatches_encode_session_to_transcoder() {
         std::sync::Arc::new(kahawai_hub::subtitles::Subtitles::new(
             tempfile::tempdir().unwrap().keep(),
         )),
+        std::sync::Arc::new(kahawai_hub::enrich::Enricher::new(
+            tempfile::tempdir().unwrap().keep(),
+        )),
     );
     let tc_svc = TranscoderLinkService::new(registry.clone(), sessions.clone());
     tokio::spawn(async move {

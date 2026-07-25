@@ -66,6 +66,9 @@ async fn remux_to_hls_end_to_end() {
         std::sync::Arc::new(kahawai_hub::subtitles::Subtitles::new(
             tempfile::tempdir().unwrap().keep(),
         )),
+        std::sync::Arc::new(kahawai_hub::enrich::Enricher::new(
+            tempfile::tempdir().unwrap().keep(),
+        )),
     );
     tokio::spawn(async move {
         tonic::transport::Server::builder()
