@@ -6,11 +6,13 @@ import Library from './views/Library'
 import Detail from './views/Detail'
 import Player from './views/Player'
 import Admin from './views/Admin'
+import Settings from './views/Settings'
 
 type Route =
   | { view: 'libraries' }
   | { view: 'library'; id: string }
   | { view: 'admin' }
+  | { view: 'settings' }
   | { view: 'detail'; id: string; autoPlay?: boolean; fromLib: string }
   | { view: 'player'; item: Item; session: Session; resumeMs: number; fromLib: string }
 
@@ -33,6 +35,8 @@ function routeToPath(route: Route): string {
       return `${BASE}/library/${route.id}`
     case 'admin':
       return `${BASE}/admin`
+    case 'settings':
+      return `${BASE}/settings`
     case 'detail':
       return `${BASE}/library/${route.fromLib}/item/${route.id}`
     case 'player':
@@ -44,6 +48,7 @@ function pathToRoute(pathname: string): Route {
   const rel = pathname.startsWith(BASE) ? pathname.slice(BASE.length) : pathname
   const parts = rel.split('/').filter(Boolean)
   if (parts[0] === 'admin') return { view: 'admin' }
+  if (parts[0] === 'settings') return { view: 'settings' }
   if (parts[0] === 'library' && parts[1]) {
     if (parts[2] === 'item' && parts[3]) {
       return {
@@ -117,6 +122,9 @@ export default function App() {
               Admin
             </button>
           )}
+          <button className="btn ghost small" onClick={() => navigate({ view: 'settings' })}>
+            Settings
+          </button>
           <span className="whoami">{username()}</span>
           <button
             className="btn ghost small"
@@ -130,6 +138,7 @@ export default function App() {
         </div>
       </header>
       {route.view === 'admin' && <Admin />}
+      {route.view === 'settings' && <Settings />}
       {route.view === 'libraries' && (
         <Libraries onOpen={(id) => navigate({ view: 'library', id })} />
       )}

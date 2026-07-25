@@ -7,8 +7,10 @@ import {
   endSession,
   fetchFonts,
   fetchItem,
+  fetchLibraries,
   fetchPrefs,
   fetchSubtitles,
+  pickSubtitle,
   postProgress,
   putPref,
   resolveTracks,
@@ -64,8 +66,8 @@ export default function Player({
     { codec: string; channels: number; language?: string | null }[]
   >([])
   const [audioTrack, setAudioTrack] = useState(0)
-  // 'any' | language → auto-pick a subtitle; null → stay off.
-  const subsPrefRef = useRef<string | null>(null)
+  // Ordered subtitle-language wishlist; [] → subtitles stay off.
+  const subsPrefRef = useRef<string[]>([])
   const [videoTracks, setVideoTracks] = useState<
     { codec: string; width: number; height: number }[]
   >([])
@@ -77,37 +79,33 @@ export default function Player({
   useEffect(() => {
     // One resolution (HUB-33), same helper Detail used to start the
     // session: prefs + streams → selector state and subtitle default.
-    Promise.all([fetchItem(item.id), fetchPrefs().catch(() => ({ prefs: [] }))])
-      .then(([d, p]) => {
+    Promise.all([
+      fetchItem(item.id),
+      fetchPrefs().catch(() => ({ prefs: [] })),
+      fetchLibraries().catch(() => ({ libraries: [] })),
+    ])
+      .then(([d, p, l]) => {
         seriesRef.current = d.parent_id ?? item.id
+        const mediaType = l.libraries.find((x) => x.id === libraryId)?.media_type ?? ''
         const audio = d.sources_detail[0]?.streams?.audio ?? []
         setAudioTracks(audio)
         setVideoTracks(d.sources_detail[0]?.streams?.video ?? [])
-        const r = resolveTracks(p.prefs, seriesRef.current, libraryId, audio)
+        const r = resolveTracks(
+          p.prefs,
+          seriesRef.current,
+          mediaType,
+          d.metadata?.original_language,
+          audio,
+        )
         setAudioTrack(r.audioTrack)
         subsPrefRef.current = r.subs
         return fetchSubtitles(item.id)
       })
       .then((r) => {
         setSubs(r.subtitles)
-        // Auto-pick per the resolved default: remembered language,
-        // else English, else any text sub. Never overrides a choice.
-        const want = subsPrefRef.current
-        if (want && r.subtitles.length > 0) {
-          setSubKey((cur) => {
-            if (cur) return cur
-            const byLang = (lang: string) =>
-              r.subtitles.find(
-                (s) => !s.image && (s.language ?? '').toLowerCase().startsWith(lang.slice(0, 2)),
-              )
-            const pick =
-              (want !== 'any' ? byLang(want) : undefined) ??
-              byLang('en') ??
-              r.subtitles.find((s) => !s.image) ??
-              r.subtitles[0]
-            return pick.key
-          })
-        }
+        // Auto-pick the first wishlist match; never overrides a choice.
+        const pick = pickSubtitle(subsPrefRef.current, r.subtitles)
+        if (pick) setSubKey((cur) => cur || pick.key)
       })
       .catch(() => {
         setSubs([])

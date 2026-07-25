@@ -83,6 +83,7 @@ export default function Detail({
   const [item, setItem] = useState<ItemDetail | null>(null)
   const [episodes, setEpisodes] = useState<Item[]>([])
   const [animeView, setAnimeView] = useState<'seasons' | 'native'>('seasons')
+  const [mediaType, setMediaType] = useState('')
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
 
@@ -97,15 +98,15 @@ export default function Detail({
         .then((c) => setEpisodes(c.children))
         .catch((e) => setError(String(e)))
     }
-    if (item?.kind === 'show') {
-      // HUB-31: the library decides native vs projected seasons.
-      fetchLibraries()
-        .then((l) => {
-          const lib = l.libraries.find((x) => x.id === fromLib)
-          if (lib?.anime_view) setAnimeView(lib.anime_view)
-        })
-        .catch(() => {})
-    }
+    // Library context: media type (per-type track settings, HUB-33)
+    // and the anime season-view choice (HUB-31).
+    fetchLibraries()
+      .then((l) => {
+        const lib = l.libraries.find((x) => x.id === fromLib)
+        setMediaType(lib?.media_type ?? '')
+        if (lib?.anime_view) setAnimeView(lib.anime_view)
+      })
+      .catch(() => {})
   }, [item?.id, item?.kind, fromLib])
   const [queueAt, setQueueAt] = useState<number | null>(null)
   // Deep-linked or history-forwarded /play URLs: start playback once
@@ -297,7 +298,7 @@ export default function Detail({
       // sessions resume client-side.
       const start = fromStart ? 0 : resumeMs
       // HUB-33: pick the default audio track from the user's prefs
-      // (series memory > library original/dub), entirely client-side.
+      // (series memory > per-media-type settings), entirely client-side.
       const audio = item!.sources_detail[0]?.streams?.audio ?? []
       let audioTrack = 0
       try {
@@ -305,7 +306,8 @@ export default function Detail({
         audioTrack = resolveTracks(
           p.prefs,
           item!.parent_id ?? item!.id,
-          fromLib,
+          mediaType,
+          item!.metadata?.original_language,
           audio,
         ).audioTrack
       } catch {

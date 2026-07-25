@@ -1421,8 +1421,11 @@ async fn item_detail(
     // Enrichment (own metadata, or the parent show's for episodes).
     let meta = sqlx::query(
         "SELECT m.overview, m.rating, m.premiered, m.confidence, m.provider,
-                m.original_language FROM items i
+                COALESCE(NULLIF(m.original_language, ''),
+                         NULLIF(pm.original_language, '')) AS original_language
+         FROM items i
          JOIN item_metadata m ON m.item_id IN (i.id, i.parent_id)
+         LEFT JOIN item_metadata pm ON pm.item_id = i.parent_id
          WHERE i.id = ? AND m.provider_id != ''
          ORDER BY m.item_id = i.id DESC LIMIT 1",
     )

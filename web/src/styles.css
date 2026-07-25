@@ -442,3 +442,8 @@ h2 { font-size: 14px; font-weight: 650; color: var(--dim); letter-spacing: 0.08e
   object-fit: cover;
   flex: none;
 }
+
+/* Settings (HUB-33 track defaults) */
+.pref-label { width: 3.5rem; color: var(--dim, #7a8a8f); }
+input.invalid { border-color: #b3564f; }
+.error-inline { color: #b3564f; font-size: 0.85em; }

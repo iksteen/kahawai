@@ -244,26 +244,34 @@ export function startSession(
 
 export type Pref = { scope: string; key: string; value: string }
 
-/// HUB-33, resolved entirely client-side from /api/v1/prefs:
-/// series memory (what the user last set on this series) beats the
-/// library original/dub preference beats source order. The hub stores
-/// the KV and picks nothing.
+/// HUB-33, resolved entirely client-side from /api/v1/prefs.
+/// Precedence: per-series/movie memory (what the user last set) >
+/// per-media-type settings (ordered language lists, 'original' resolves
+/// via the item's original_language) > track 0 / no subs.
+/// Settings live user-global: key `audio.{media_type}` = "nl,original,en",
+/// key `subs.{media_type}` = "nl,en" ('' or absent = no subs).
 export function resolveTracks(
   prefs: Pref[],
   seriesId: string,
-  libraryId: string,
+  mediaType: string,
+  originalLanguage: string | null | undefined,
   audio: { language?: string | null }[],
-): { audioTrack: number; subs: string | null } {
+): { audioTrack: number; subs: string[] } {
   const get = (scope: string, key: string) =>
     prefs.find((p) => p.scope === scope && p.key === key)?.value
+  const list = (v?: string) =>
+    (v ?? '')
+      .split(',')
+      .map((s) => s.trim().toLowerCase())
+      .filter(Boolean)
   const langEq = (l: string | null | undefined, want: string) => {
     if (!l) return false
     const a = l.toLowerCase()
     const b = want.toLowerCase()
     return a === b || a.slice(0, 2) === b.slice(0, 2)
   }
-  const isJa = (l?: string | null) => langEq(l, 'ja')
 
+  // Audio: memory ('en' | '#2'), else the ordered per-type list.
   let audioTrack: number | undefined
   const remembered = get(seriesId, 'audio')
   if (remembered?.startsWith('#')) {
@@ -273,22 +281,48 @@ export function resolveTracks(
     const i = audio.findIndex((a) => langEq(a.language, remembered))
     if (i >= 0) audioTrack = i
   }
-  const lib = get(libraryId, 'audio')
   if (audioTrack === undefined) {
-    if (lib === 'original') {
-      audioTrack = Math.max(0, audio.findIndex((a) => isJa(a.language)))
-    } else if (lib === 'dub') {
-      const en = audio.findIndex((a) => langEq(a.language, 'en'))
-      const nonJa = audio.findIndex((a) => !isJa(a.language))
-      audioTrack = en >= 0 ? en : nonJa >= 0 ? nonJa : 0
-    } else {
-      audioTrack = 0
+    for (const want of list(get('', `audio.${mediaType}`))) {
+      const lang = want === 'original' ? originalLanguage : want
+      if (!lang) continue
+      const i = audio.findIndex((a) => langEq(a.language, lang))
+      if (i >= 0) {
+        audioTrack = i
+        break
+      }
     }
   }
-  // 'off' | 'any' | language | null (null = subtitles stay off)
-  const subs = get(seriesId, 'subs') ?? (lib === 'original' ? 'any' : null)
-  return { audioTrack, subs: subs === 'off' ? null : subs }
+
+  // Subs: memory ('off' | 'any' | lang), else the per-type list.
+  // Returned as the ordered language wishlist ([] = subtitles off).
+  const subsMem = get(seriesId, 'subs')
+  const subs =
+    subsMem === 'off'
+      ? []
+      : subsMem
+        ? [subsMem]
+        : list(get('', `subs.${mediaType}`))
+  return { audioTrack: audioTrack ?? 0, subs }
 }
+
+/// First subtitle matching the wishlist, in wishlist order ('any'
+/// matches the first text sub). null = leave subtitles off.
+export function pickSubtitle(
+  wishlist: string[],
+  subs: Subtitle[],
+): Subtitle | null {
+  for (const want of wishlist) {
+    const hit =
+      want === 'any'
+        ? subs.find((s) => !s.image)
+        : subs.find(
+            (s) => !s.image && (s.language ?? '').toLowerCase().slice(0, 2) === want.slice(0, 2),
+          )
+    if (hit) return hit
+  }
+  return null
+}
+
 
 export const fetchPrefs = () => json<{ prefs: Pref[] }>('/api/v1/prefs')
 
