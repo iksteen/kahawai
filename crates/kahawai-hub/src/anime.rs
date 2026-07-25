@@ -396,6 +396,105 @@ pub fn anime_dir(data_dir: &Path) -> PathBuf {
     data_dir.join("anime")
 }
 
+// ---------- AniDB HTTP API (episode titles) ----------
+
+/// Registered HTTP-type client (separate registration from the UDP
+/// client). Bumping the version requires updating anidb.net FIRST.
+const HTTP_CLIENT: &str = "kahawaihttp";
+const HTTP_CLIENT_VER: u32 = 1;
+/// AniDB allows at most one HTTP API page every two seconds.
+const HTTP_SPACING: Duration = Duration::from_millis(2200);
+
+/// Pacing gate shared by all HTTP API callers in one process.
+pub type HttpGate = tokio::sync::Mutex<Option<tokio::time::Instant>>;
+
+/// Episode titles for one anime: absolute episode number → English
+/// title (transcription fallback). Regular episodes only (epno type 1).
+///
+/// One `anime` XML per aid, cached FOREVER (never-ask-twice): AniDB
+/// bans clients that re-fetch. Delete the cache file to refresh an
+/// ongoing series. Error payloads (<error>banned</error>…) are never
+/// cached.
+pub async fn anidb_episode_titles(
+    http: &reqwest::Client,
+    data_dir: &Path,
+    aid: u32,
+    gate: &HttpGate,
+) -> Result<std::collections::HashMap<i64, String>> {
+    let dir = anime_dir(data_dir).join("httpapi");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("{aid}.xml"));
+    let xml = match std::fs::read_to_string(&path) {
+        Ok(x) => x,
+        Err(_) => {
+            let mut last = gate.lock().await;
+            if let Some(t) = *last {
+                let since = t.elapsed();
+                if since < HTTP_SPACING {
+                    tokio::time::sleep(HTTP_SPACING - since).await;
+                }
+            }
+            *last = Some(tokio::time::Instant::now());
+            let raw = http
+                .get("http://api.anidb.net:9001/httpapi")
+                .query(&[
+                    ("request", "anime"),
+                    ("client", HTTP_CLIENT),
+                    ("clientver", &HTTP_CLIENT_VER.to_string()),
+                    ("protover", "1"),
+                    ("aid", &aid.to_string()),
+                ])
+                .send()
+                .await?
+                .error_for_status()?
+                .bytes()
+                .await?;
+            drop(last);
+            // Responses are usually gzip'd regardless of headers.
+            let text = if raw.starts_with(&[0x1f, 0x8b]) {
+                use std::io::Read;
+                let mut s = String::new();
+                flate2::read::GzDecoder::new(&raw[..]).read_to_string(&mut s)?;
+                s
+            } else {
+                String::from_utf8_lossy(&raw).into_owned()
+            };
+            anyhow::ensure!(
+                !text.trim_start().starts_with("<error"),
+                "anidb http api error for aid {aid}: {}",
+                text.trim().chars().take(120).collect::<String>()
+            );
+            std::fs::write(&path, &text)?;
+            tracing::info!(aid, "anidb anime xml fetched");
+            text
+        }
+    };
+
+    let doc = roxmltree::Document::parse(&xml)?;
+    let mut out = std::collections::HashMap::new();
+    for ep in doc.descendants().filter(|n| n.has_tag_name("episode")) {
+        let Some(epno) = ep.children().find(|n| n.has_tag_name("epno")) else { continue };
+        if epno.attribute("type") != Some("1") {
+            continue; // specials/credits/trailers live in their own space
+        }
+        let Some(n) = epno.text().and_then(|t| t.trim().parse::<i64>().ok()) else { continue };
+        let title_for = |lang: &str| {
+            ep.children()
+                .find(|c| {
+                    c.has_tag_name("title")
+                        && c.attribute(("http://www.w3.org/XML/1998/namespace", "lang"))
+                            == Some(lang)
+                })
+                .and_then(|c| c.text())
+                .map(str::to_string)
+        };
+        if let Some(t) = title_for("en").or_else(|| title_for("x-jat")) {
+            out.insert(n, t);
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

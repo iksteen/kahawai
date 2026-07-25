@@ -58,6 +58,7 @@ serde_json = "1"
 walkdir = "2"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+roxmltree = "0.20"
 notify = "8"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "macros", "migrate"] }
 axum = "0.8"

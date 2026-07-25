@@ -33,6 +33,8 @@ pub struct Enricher {
     running: AtomicBool,
     /// (matched, weak, missed) of the current/last run.
     progress: (AtomicUsize, AtomicUsize, AtomicUsize),
+    /// AniDB HTTP API pacing (one page per 2.2 s, process-wide).
+    anidb_http_gate: crate::anime::HttpGate,
 }
 
 #[derive(Debug, Deserialize)]
@@ -153,6 +155,7 @@ impl Enricher {
             running: AtomicBool::new(false),
             last_nudge: std::sync::atomic::AtomicU64::new(0),
             progress: Default::default(),
+            anidb_http_gate: Default::default(),
         }
     }
 
@@ -1134,7 +1137,7 @@ impl Enricher {
         // absolute numbers for re-fetches each run — a few cached-token
         // pages per anime show; revisit if a library full of them appears.
         let shows = sqlx::query(
-            "SELECT i.id, m.provider, m.provider_id, m.mapped_tvdb, m.mapped_tmdb
+            "SELECT i.id, m.provider, m.provider_id, m.mapped_tvdb, m.mapped_tmdb, m.anidb_id
              FROM items i
              JOIN item_metadata m ON m.item_id = i.id
              WHERE i.kind = 'show' AND m.provider_id != ''
@@ -1181,11 +1184,12 @@ impl Enricher {
             let token = tvdb_token.cloned();
             let db = registry.db().clone();
             let sem = sem.clone();
+            let aid = row.get::<Option<i64>, _>("anidb_id").map(|a| a as u32);
             tasks.spawn(async move {
                 let _permit = sem.acquire().await;
-                if let Err(e) =
-                    this.enrich_show_episodes(&db, &show_id, &provider, &pid, &key, token.as_deref())
-                        .await
+                if let Err(e) = this
+                    .enrich_show_episodes(&db, &show_id, &provider, &pid, &key, token.as_deref(), aid)
+                    .await
                 {
                     tracing::warn!(show = %show_id, error = format!("{e:#}"), "episode fetch failed");
                 }
@@ -1196,6 +1200,7 @@ impl Enricher {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn enrich_show_episodes(
         &self,
         db: &sqlx::SqlitePool,
@@ -1204,6 +1209,7 @@ impl Enricher {
         pid: &str,
         tmdb_key: &str,
         tvdb_token: Option<&String>,
+        anidb_id: Option<u32>,
     ) -> Result<()> {
         // Our episode items: (item_id, season, episode). season NULL =
         // absolute numbering.
@@ -1295,6 +1301,34 @@ impl Enricher {
         }
         if by_key.is_empty() {
             return Ok(());
+        }
+        // HUB-5 field-level claim: AniDB owns episode TITLES for anime;
+        // the TVDB/TMDB bridge keeps stills, overviews, air dates and
+        // the HUB-31 projection.
+        if absolute && let Some(aid) = anidb_id {
+            match crate::anime::anidb_episode_titles(
+                &self.http,
+                &self.data_dir,
+                aid,
+                &self.anidb_http_gate,
+            )
+            .await
+            {
+                Ok(titles) => {
+                    for ((s, n), e) in by_key.iter_mut() {
+                        if s.is_none()
+                            && let Some(t) = titles.get(n)
+                        {
+                            e.title = Some(t.clone());
+                        }
+                    }
+                }
+                Err(e) => tracing::warn!(
+                    aid,
+                    error = format!("{e:#}"),
+                    "anidb episode titles unavailable; keeping bridge titles"
+                ),
+            }
         }
 
         let mut wrote = 0;

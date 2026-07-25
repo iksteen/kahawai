@@ -27,6 +27,7 @@ ulid = { workspace = true }
 bytes = "1"
 xxhash-rust = { workspace = true }
 reqwest = { workspace = true }
+roxmltree = { workspace = true }
 flate2 = { workspace = true }
 md-5 = { workspace = true }
 aes = { workspace = true }
