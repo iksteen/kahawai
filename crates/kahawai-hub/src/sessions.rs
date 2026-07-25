@@ -99,6 +99,7 @@ pub struct Session {
     /// should default subtitles on (original-audio preference).
     pub audio_track: u32,
     pub subs_on: bool,
+    pub subs_lang: Option<String>,
     /// The negotiated plan (remux/transcode) — reused on seek-restarts;
     /// mutable because audio-track switches re-plan (HUB-27).
     plan: Mutex<Option<kahawai_media::remux::RemuxPlan>>,
@@ -107,17 +108,60 @@ pub struct Session {
     touched: Mutex<std::time::Instant>,
 }
 
-/// HUB-33: pick the default audio track from the user's per-library
-/// preference. 'original' → first Japanese track, subtitles on;
-/// 'dub' → first non-Japanese (English preferred), subtitles off.
-/// No preference (or no language tags) → track 0.
+/// The per-user memory scope for track choices: the series for
+/// episodes, the item itself for movies.
+async fn series_scope(registry: &Registry, item_id: &str) -> Result<String> {
+    let parent: Option<Option<String>> =
+        sqlx::query_scalar("SELECT parent_id FROM items WHERE id = ?")
+            .bind(item_id)
+            .fetch_optional(registry.db())
+            .await?;
+    Ok(parent.flatten().unwrap_or_else(|| item_id.to_string()))
+}
+
+/// Loose language-tag match: exact, or same first two letters (covers
+/// en/eng, ja/jpn; 639-2/B oddballs like ger/de fall through to the
+/// library heuristic, which is fine for a memory).
+fn lang_matches(track: &Option<String>, want: &str) -> bool {
+    let Some(t) = track.as_deref() else { return false };
+    let (t, w) = (t.to_ascii_lowercase(), want.to_ascii_lowercase());
+    t == w || (t.len() >= 2 && w.len() >= 2 && t[..2] == w[..2])
+}
+
+/// HUB-33: pick the session's default tracks. Precedence:
+/// 1. what this user last MANUALLY chose on this series (remembered
+///    from explicit track switches / subtitle picks);
+/// 2. the per-library original/dub preference;
+/// 3. source order (track 0, subs off).
+/// Returns (audio track, subs on, preferred subs language).
 async fn default_audio(
     registry: &Registry,
     user_id: &str,
     item_id: &str,
     info: &kahawai_core::media::MediaInfo,
-) -> Result<(u32, bool)> {
-    let pref: Option<String> = sqlx::query_scalar(
+) -> Result<(u32, bool, Option<String>)> {
+    let scope = series_scope(registry, item_id).await?;
+    let series: std::collections::HashMap<String, String> = sqlx::query_as::<_, (String, String)>(
+        "SELECT key, value FROM user_prefs WHERE user_id = ? AND scope = ? AND key IN ('audio','subs')",
+    )
+    .bind(user_id)
+    .bind(&scope)
+    .fetch_all(registry.db())
+    .await?
+    .into_iter()
+    .collect();
+
+    // Audio: series memory first ("ja" | "#2"), else library heuristic.
+    let remembered_audio = series.get("audio").and_then(|v| {
+        if let Some(idx) = v.strip_prefix('#') {
+            let idx: usize = idx.parse().ok()?;
+            (idx < info.audio.len()).then_some(idx)
+        } else {
+            info.audio.iter().position(|a| lang_matches(&a.language, v))
+        }
+    });
+
+    let lib_pref: Option<String> = sqlx::query_scalar(
         "SELECT p.value FROM user_prefs p
          WHERE p.user_id = ? AND p.key = 'audio' AND p.scope IN (
            SELECT lc.library_id FROM item_sources s
@@ -130,32 +174,52 @@ async fn default_audio(
     .bind(item_id)
     .fetch_optional(registry.db())
     .await?;
-    let is_jpn = |l: &Option<String>| {
-        l.as_deref()
-            .map(|l| {
-                let l = l.to_ascii_lowercase();
-                l.starts_with("ja") || l == "jpn"
-            })
-            .unwrap_or(false)
+    let is_jpn = |l: &Option<String>| lang_matches(l, "ja") || lang_matches(l, "jpn");
+    let is_eng = |l: &Option<String>| lang_matches(l, "en");
+
+    let audio = remembered_audio.map(|i| i as u32).unwrap_or_else(|| match lib_pref.as_deref() {
+        Some("original") => info.audio.iter().position(|a| is_jpn(&a.language)).unwrap_or(0) as u32,
+        Some("dub") => info
+            .audio
+            .iter()
+            .position(|a| is_eng(&a.language))
+            .or_else(|| info.audio.iter().position(|a| !is_jpn(&a.language)))
+            .unwrap_or(0) as u32,
+        _ => 0,
+    });
+
+    // Subtitles: series memory ("off" | "any" | lang) outranks the
+    // library heuristic (original → subs on).
+    let (subs_on, subs_lang) = match series.get("subs").map(String::as_str) {
+        Some("off") => (false, None),
+        Some("any") => (true, None),
+        Some(lang) => (true, Some(lang.to_string())),
+        None => (lib_pref.as_deref() == Some("original"), None),
     };
-    let is_eng = |l: &Option<String>| {
-        l.as_deref().map(|l| l.to_ascii_lowercase().starts_with("en")).unwrap_or(false)
-    };
-    Ok(match pref.as_deref() {
-        Some("original") => (
-            info.audio.iter().position(|a| is_jpn(&a.language)).unwrap_or(0) as u32,
-            true,
-        ),
-        Some("dub") => (
-            info.audio
-                .iter()
-                .position(|a| is_eng(&a.language))
-                .or_else(|| info.audio.iter().position(|a| !is_jpn(&a.language)))
-                .unwrap_or(0) as u32,
-            false,
-        ),
-        _ => (0, false),
-    })
+    Ok((audio, subs_on, subs_lang))
+}
+
+/// Remember an explicit track choice on this series (HUB-33).
+async fn remember_choice(
+    registry: &Registry,
+    user_id: &str,
+    item_id: &str,
+    key: &str,
+    value: &str,
+) -> Result<()> {
+    let scope = series_scope(registry, item_id).await?;
+    sqlx::query(
+        "INSERT INTO user_prefs (user_id, scope, key, value) VALUES (?, ?, ?, ?)
+         ON CONFLICT (user_id, scope, key) DO UPDATE SET value = excluded.value",
+    )
+    .bind(user_id)
+    .bind(&scope)
+    .bind(key)
+    .bind(value)
+    .execute(registry.db())
+    .await?;
+    tracing::debug!(user = user_id, scope, key, value, "track choice remembered");
+    Ok(())
 }
 
 /// Index of the part containing `abs_ms`.
@@ -492,13 +556,13 @@ impl Sessions {
         }
         // HUB-33: no explicit track from the client → apply the user's
         // per-library dual-audio preference (original+subs vs dub).
-        let (audio_track, subs_on) = match audio_track {
-            Some(t) => (t, false),
+        let (audio_track, subs_on, subs_lang) = match audio_track {
+            Some(t) => (t, false, None),
             None => default_audio(registry, user_id, item_id, &info)
                 .await
                 .unwrap_or_else(|e| {
                     tracing::debug!(error = format!("{e:#}"), "audio preference lookup failed");
-                    (0, false)
+                    (0, false, None)
                 }),
         };
         let total_ms: u64 = parts.iter().map(|p| p.duration_ms).sum();
@@ -618,6 +682,7 @@ impl Sessions {
             verdict,
             audio_track,
             subs_on,
+            subs_lang,
             plan: Mutex::new(session_plan),
             needs: session_needs,
             touched: Mutex::new(std::time::Instant::now()),
@@ -987,6 +1052,22 @@ impl Sessions {
             // copy vs encode, not the old one's.
             let (_, _, _, info) =
                 crate::subtitles::source_row(registry, &session.item_id).await?;
+            // An explicit audio switch is the user speaking — remember
+            // it for this series (HUB-33), by language when tagged.
+            if want_audio != plan.audio_track {
+                let value = info
+                    .audio
+                    .get(want_audio)
+                    .and_then(|a| a.language.clone())
+                    .map(|l| l.to_ascii_lowercase())
+                    .unwrap_or_else(|| format!("#{want_audio}"));
+                if let Err(e) =
+                    remember_choice(registry, &session.user_id, &session.item_id, "audio", &value)
+                        .await
+                {
+                    tracing::debug!(error = format!("{e:#}"), "audio choice not remembered");
+                }
+            }
             plan = kahawai_media::remux::plan_streams(
                 &info,
                 &kahawai_media::remux::WEB_TARGET,

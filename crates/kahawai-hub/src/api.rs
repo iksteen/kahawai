@@ -967,6 +967,7 @@ async fn start_session(
             "stream_url": stream_url,
             "audio_track": session.audio_track,
             "subs_on": session.subs_on,
+            "subs_lang": session.subs_lang,
             "streams": session.verdict.as_ref().map(|(video, audio)| json!({
                 "video": video,
                 "audio": audio,

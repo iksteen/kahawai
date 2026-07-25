@@ -221,6 +221,7 @@ export type Session = {
   /// when the client sent none) and whether subs should default on.
   audio_track?: number
   subs_on?: boolean
+  subs_lang?: string | null
   streams: StreamVerdict | null
 }
 

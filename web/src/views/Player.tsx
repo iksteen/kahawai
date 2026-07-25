@@ -9,6 +9,7 @@ import {
   fetchItem,
   fetchSubtitles,
   postProgress,
+  putPref,
   seekSession,
   subtitleLabel,
   type Item,
@@ -51,6 +52,9 @@ export default function Player({
   const [seeking, setSeeking] = useState(false)
   const [subs, setSubs] = useState<Subtitle[]>([])
   const [subKey, setSubKey] = useState('')
+  // HUB-33: memory scope for manual track choices (series id, or the
+  // item itself for movies).
+  const seriesRef = useRef<string>(item.id)
   const jassubRef = useRef<JASSUB | null>(null)
   const [audioTracks, setAudioTracks] = useState<
     { codec: string; channels: number; language?: string | null }[]
@@ -68,21 +72,29 @@ export default function Player({
     fetchSubtitles(item.id)
       .then((r) => {
         setSubs(r.subtitles)
-        // HUB-33 original-audio preference: subtitles default ON.
-        // English text sub preferred; never overrides a user choice.
+        // HUB-33: subtitles default ON (original-audio preference or a
+        // remembered per-series choice). Remembered language wins, then
+        // English, then any text sub. Never overrides a user choice.
         if (session.subs_on && r.subtitles.length > 0) {
           setSubKey((cur) => {
             if (cur) return cur
-            const en = r.subtitles.find(
-              (s) => !s.image && (s.language ?? '').toLowerCase().startsWith('en'),
-            )
-            return (en ?? r.subtitles.find((s) => !s.image) ?? r.subtitles[0]).key
+            const byLang = (lang: string) =>
+              r.subtitles.find(
+                (s) => !s.image && (s.language ?? '').toLowerCase().startsWith(lang.slice(0, 2)),
+              )
+            const pick =
+              (session.subs_lang ? byLang(session.subs_lang) : undefined) ??
+              byLang('en') ??
+              r.subtitles.find((s) => !s.image) ??
+              r.subtitles[0]
+            return pick.key
           })
         }
       })
       .catch(() => setSubs([]))
     fetchItem(item.id)
       .then((d) => {
+        seriesRef.current = d.parent_id ?? item.id
         setAudioTracks(d.sources_detail[0]?.streams?.audio ?? [])
         setVideoTracks(d.sources_detail[0]?.streams?.video ?? [])
       })
@@ -640,7 +652,17 @@ export default function Player({
       {subs.length > 0 && (
         <label className="subpick">
           Subtitles{' '}
-          <select value={subKey} onChange={(e) => setSubKey(e.target.value)}>
+          <select
+            value={subKey}
+            onChange={(e) => {
+              const key = e.target.value
+              setSubKey(key)
+              // Remember the explicit choice for this series (HUB-33).
+              const s = subs.find((x) => x.key === key)
+              const value = key === '' ? 'off' : (s?.language ?? 'any').toLowerCase()
+              void putPref(seriesRef.current, 'subs', value).catch(() => {})
+            }}
+          >
             <option value="">Off</option>
             {subs.map((s) => (
               <option key={s.key} value={s.key}>
