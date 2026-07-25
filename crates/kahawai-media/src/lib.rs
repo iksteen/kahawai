@@ -42,6 +42,24 @@ pub fn init() -> Result<()> {
     .map_err(|e| anyhow::anyhow!("gstreamer init failed: {e}"))
 }
 
+/// Demote decoder elements below every software decoder (rank NONE)
+/// so decodebin stops picking them. The per-box calibration knob for
+/// hardware decode paths that are broken or pathologically slow.
+pub fn demote_elements(names: &[String]) -> Result<()> {
+    init()?;
+    for name in names {
+        use gst::prelude::PluginFeatureExt;
+        match gst::ElementFactory::find(name) {
+            Some(f) => {
+                f.set_rank(gst::Rank::NONE);
+                tracing::info!(element = %name, "decoder demoted by config");
+            }
+            None => tracing::warn!(element = %name, "demote_decoders: element not found"),
+        }
+    }
+    Ok(())
+}
+
 /// Discover a media file's technical metadata.
 pub fn discover(path: &Path, timeout: Duration) -> Result<MediaInfo> {
     init()?;

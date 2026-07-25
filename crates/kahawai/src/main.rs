@@ -96,6 +96,7 @@ async fn main() -> Result<()> {
         Cmd::Doctor { json } => doctor(&cfg, json),
         Cmd::RemuxWorker { socket, out_dir, size, video, audio, audio_track, video_track, start_ms, sink } => {
             // Blocking by design: this process exists only for the pipeline.
+            kahawai_media::demote_elements(&cfg.transcoder.demote_decoders)?;
             kahawai_media::worker::run(
                 &socket,
                 &out_dir,

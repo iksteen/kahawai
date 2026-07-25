@@ -122,6 +122,11 @@ pub struct TranscoderConfig {
     pub name: String,
     /// Concurrent encode sessions this box offers (TC-6).
     pub max_sessions: u32,
+    /// Decoder elements to demote below software on this box — the
+    /// per-box calibration knob for hardware whose decode path is
+    /// pathologically slow (e.g. Gemini Lake VA-API: vah265dec 6 fps
+    /// where avdec_h265 does 121). Encode preference is unaffected.
+    pub demote_decoders: Vec<String>,
 }
 
 impl Default for TranscoderConfig {
@@ -131,6 +136,7 @@ impl Default for TranscoderConfig {
             state_dir: default_state_dir("kahawai-transcoder"),
             name: "transcoder".into(),
             max_sessions: 2,
+            demote_decoders: Vec::new(),
         }
     }
 }
