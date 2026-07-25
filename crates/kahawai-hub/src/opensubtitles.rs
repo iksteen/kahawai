@@ -131,6 +131,75 @@ impl OpenSubtitles {
     }
 }
 
+/// Rank results: exact-file (hash) matches first, then the caller's
+/// language order — the request's list is a preference, not merely a
+/// filter — then popularity. Languages not in the list sort last (they
+/// only appear at all in an unfiltered search).
+fn rank_candidates(out: &mut [Candidate], languages: &[String]) {
+    let lang_rank = |l: &Option<String>| -> usize {
+        let Some(l) = l.as_deref() else { return usize::MAX };
+        let l = l.to_ascii_lowercase();
+        languages
+            .iter()
+            .position(|want| {
+                let want = want.to_ascii_lowercase();
+                l == want || l.split(['-', '_']).next() == want.split(['-', '_']).next()
+            })
+            .unwrap_or(usize::MAX)
+    };
+    out.sort_by(|x, y| {
+        y.hash_match
+            .cmp(&x.hash_match)
+            .then(lang_rank(&x.language).cmp(&lang_rank(&y.language)))
+            .then(y.downloads.cmp(&x.downloads))
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cand(lang: &str, hash: bool, downloads: i64) -> Candidate {
+        Candidate {
+            provider: "opensubtitles",
+            file_id: format!("{lang}-{downloads}"),
+            language: Some(lang.into()),
+            release_name: None,
+            hash_match: hash,
+            downloads,
+        }
+    }
+
+    /// The ranking the UI depends on: hash matches first, then the
+    /// caller's language order, then popularity.
+    #[test]
+    fn ranks_hash_then_language_order_then_popularity() {
+        let want = ["en".to_string(), "nl".to_string()];
+        let mut out = vec![
+            cand("nl", true, 500),
+            cand("de", true, 9999), // not requested: after both wanted
+            cand("en", true, 10),
+            cand("en", false, 9999), // no hash: below every hash match
+            cand("pt-BR", true, 1),
+        ];
+        rank_candidates(&mut out, &want);
+        let order: Vec<_> = out
+            .iter()
+            .map(|c| (c.language.clone().unwrap(), c.hash_match))
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                ("en".into(), true),   // hash + first preferred language
+                ("nl".into(), true),   // hash + second
+                ("de".into(), true),   // hash, unrequested language
+                ("pt-BR".into(), true),
+                ("en".into(), false),  // no hash, however popular
+            ]
+        );
+    }
+}
+
 #[async_trait::async_trait]
 impl SubtitleProvider for OpenSubtitles {
     fn name(&self) -> &'static str {
@@ -208,10 +277,7 @@ impl SubtitleProvider for OpenSubtitles {
                 downloads: a.download_count,
             });
         }
-        // Hash matches first, then by popularity.
-        out.sort_by(|x, y| {
-            y.hash_match.cmp(&x.hash_match).then(y.downloads.cmp(&x.downloads))
-        });
+        rank_candidates(&mut out, &q.languages);
         Ok(out)
     }
 
