@@ -43,6 +43,70 @@ pub struct Auth {
     dec: DecodingKey,
     /// `Some(token)` while in setup mode (no users yet, OPS-1).
     setup_token: Mutex<Option<String>>,
+    /// OPS-2 login throttle (in-memory; resets on restart).
+    pub throttle: Throttle,
+}
+
+/// OPS-2: consecutive-failure lockout with exponential backoff, keyed
+/// per account and per source address ("u:{name}" / "ip:{addr}"). After
+/// `threshold` consecutive failures: 30 s, doubling per further failure,
+/// capped at 15 min. Success clears the key. In-memory by design — a
+/// restart forgiving lockouts is acceptable; sustained attacks re-lock
+/// within one threshold's worth of attempts.
+#[derive(Default)]
+pub struct Throttle {
+    entries: Mutex<std::collections::HashMap<String, ThrottleEntry>>,
+}
+
+struct ThrottleEntry {
+    fails: u32,
+    locked_until: Option<std::time::Instant>,
+    last: std::time::Instant,
+}
+
+const LOCK_BASE_SECS: u64 = 30;
+const LOCK_CAP_SECS: u64 = 900;
+
+impl Throttle {
+    /// Remaining lockout for this key, if any.
+    pub fn locked(&self, key: &str) -> Option<std::time::Duration> {
+        let entries = self.entries.lock().unwrap();
+        entries
+            .get(key)?
+            .locked_until?
+            .checked_duration_since(std::time::Instant::now())
+    }
+
+    /// Record a failure; returns the lockout now in force, if any.
+    pub fn fail(&self, key: &str, threshold: u32) -> Option<std::time::Duration> {
+        let mut entries = self.entries.lock().unwrap();
+        // Bounded memory under username/address scanning: when large,
+        // drop entries idle for an hour (their backoff has long lapsed).
+        if entries.len() > 4096 {
+            let cutoff = std::time::Instant::now() - std::time::Duration::from_secs(3600);
+            entries.retain(|_, e| e.last > cutoff);
+        }
+        let e = entries.entry(key.to_string()).or_insert(ThrottleEntry {
+            fails: 0,
+            locked_until: None,
+            last: std::time::Instant::now(),
+        });
+        e.fails += 1;
+        e.last = std::time::Instant::now();
+        if e.fails >= threshold {
+            let lock = std::time::Duration::from_secs(
+                (LOCK_BASE_SECS << (e.fails - threshold).min(16)).min(LOCK_CAP_SECS),
+            );
+            e.locked_until = Some(std::time::Instant::now() + lock);
+            Some(lock)
+        } else {
+            None
+        }
+    }
+
+    pub fn clear(&self, key: &str) {
+        self.entries.lock().unwrap().remove(key);
+    }
 }
 
 fn now_unix() -> i64 {
@@ -111,6 +175,7 @@ impl Auth {
             enc: EncodingKey::from_secret(&secret),
             dec: DecodingKey::from_secret(&secret),
             setup_token: Mutex::new(setup_token),
+            throttle: Throttle::default(),
         })
     }
 

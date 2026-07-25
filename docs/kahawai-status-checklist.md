@@ -179,7 +179,11 @@ Last updated: 2026-07-25, against the revised requirements (AR-12, MH-10/11, HUB
 ## Operations (OPS)
 
 - [x] OPS-1 First-run setup mode (console setup token → admin creation)
-- [ ] OPS-2 Login throttling / lockout
+- [x] OPS-2 Login throttling: consecutive-failure lockout with
+      exponential backoff (30 s → 15 min cap), keyed per account (5) and
+      per source address (20, higher so a shared NAT survives), failures
+      logged with source IP; in-memory, X-Forwarded-For untrusted until
+      OPS-8 adds proxy-trust config
 - [x] OPS-3 `doctor` command with plugin/encoder checks
 - [x] OPS-4 Clock-skew tolerance (backdated certs, enrollment skew warning)
 - [ ] OPS-5 Online backup/restore command

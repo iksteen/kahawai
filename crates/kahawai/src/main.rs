@@ -343,6 +343,7 @@ async fn run_hub(cfg: config::HubConfig) -> Result<()> {
     }
     let api = kahawai_hub::api::router(registry.clone(), auth, sessions.clone(), Arc::new(svc.clone()), subtitles.clone(), artwork, enricher.clone());
     tokio::spawn(async move {
+        let api = api.into_make_service_with_connect_info::<std::net::SocketAddr>();
         if let Err(e) = axum::serve(api_listener, api).await {
             tracing::error!(error = %e, "client API server failed");
         }

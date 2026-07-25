@@ -777,19 +777,68 @@ struct LoginRequest {
     password: String,
 }
 
+/// Source address for OPS-2 throttling: the socket peer (None in
+/// in-process tests). X-Forwarded-For is deliberately NOT trusted
+/// until OPS-8 adds explicit proxy-trust configuration.
+struct ClientIp(Option<std::net::IpAddr>);
+
+impl<S: Send + Sync> axum::extract::FromRequestParts<S> for ClientIp {
+    type Rejection = std::convert::Infallible;
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        Ok(ClientIp(
+            parts
+                .extensions
+                .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+                .map(|c| c.0.ip()),
+        ))
+    }
+}
+
+/// OPS-2 thresholds: consecutive failures before lockout. The per-IP
+/// bar is higher so one shared NAT doesn't lock a household out.
+const THROTTLE_USER_AFTER: u32 = 5;
+const THROTTLE_IP_AFTER: u32 = 20;
+
 async fn login(
     State(state): State<AppState>,
+    ClientIp(ip): ClientIp,
     Json(body): Json<LoginRequest>,
 ) -> Result<Json<Value>, ApiError> {
     if state.auth.setup_required() {
         return Err((StatusCode::SERVICE_UNAVAILABLE, "setup required".into()));
     }
-    let tokens = state
-        .auth
-        .login(&body.username, &body.password)
-        .await
-        .map_err(|_| (StatusCode::UNAUTHORIZED, "invalid credentials".to_string()))?;
-    Ok(Json(json!(tokens)))
+    let user_key = format!("u:{}", body.username.to_lowercase());
+    let ip_key = ip.map(|i| format!("ip:{i}"));
+    let locked = state.auth.throttle.locked(&user_key).or_else(|| {
+        ip_key.as_deref().and_then(|k| state.auth.throttle.locked(k))
+    });
+    if let Some(wait) = locked {
+        tracing::warn!(username = %body.username, ip = ?ip, "login throttled");
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            format!("too many attempts; retry in {}s", wait.as_secs().max(1)),
+        ));
+    }
+    match state.auth.login(&body.username, &body.password).await {
+        Ok(tokens) => {
+            state.auth.throttle.clear(&user_key);
+            if let Some(k) = &ip_key {
+                state.auth.throttle.clear(k);
+            }
+            Ok(Json(json!(tokens)))
+        }
+        Err(_) => {
+            let lock = state.auth.throttle.fail(&user_key, THROTTLE_USER_AFTER);
+            if let Some(k) = &ip_key {
+                state.auth.throttle.fail(k, THROTTLE_IP_AFTER);
+            }
+            tracing::warn!(username = %body.username, ip = ?ip, locked = ?lock, "login failed");
+            Err((StatusCode::UNAUTHORIZED, "invalid credentials".to_string()))
+        }
+    }
 }
 
 #[derive(Deserialize)]

@@ -409,3 +409,74 @@ async fn admin_creates_users() {
         create(admin_token, serde_json::json!({"username": "shorty", "password": "short"})).await;
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
+
+#[tokio::test]
+async fn login_throttles_after_repeated_failures() {
+    // OPS-2: five consecutive bad passwords lock the account — the
+    // sixth attempt gets 429 even with the CORRECT password.
+    let dir = tempfile::tempdir().unwrap();
+    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    let registry = Arc::new(Registry::new(db.clone(), Default::default()));
+    let auth = Arc::new(Auth::new(db.clone(), dir.path()).await.unwrap());
+    let setup_token = auth.setup_token().unwrap();
+    let api = test_router(
+        registry,
+        auth.clone(),
+        Arc::new(kahawai_hub::sessions::Sessions::new(
+            tempfile::tempdir().unwrap().keep(),
+        )),
+    );
+    let resp = api
+        .clone()
+        .oneshot(post(
+            "/api/v1/setup",
+            serde_json::json!({"token": setup_token, "username": "ingmar", "password": "hunter22222"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    for _ in 0..4 {
+        let resp = api
+            .clone()
+            .oneshot(post(
+                "/api/v1/auth/token",
+                serde_json::json!({"username": "ingmar", "password": "wrong"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+    // Fifth failure crosses the threshold and starts the lockout…
+    let resp = api
+        .clone()
+        .oneshot(post(
+            "/api/v1/auth/token",
+            serde_json::json!({"username": "ingmar", "password": "wrong"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    // …so even the correct password is refused while locked.
+    let resp = api
+        .clone()
+        .oneshot(post(
+            "/api/v1/auth/token",
+            serde_json::json!({"username": "ingmar", "password": "hunter22222"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+
+    // A different account is unaffected (throttle is per key, and the
+    // in-process test has no source address to share a bucket on).
+    let resp = api
+        .clone()
+        .oneshot(post(
+            "/api/v1/auth/token",
+            serde_json::json!({"username": "someone-else", "password": "wrong"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
