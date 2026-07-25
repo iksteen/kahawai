@@ -55,10 +55,18 @@ pub fn discover(path: &Path, timeout: Duration) -> Result<MediaInfo> {
     // don't let those masquerade as valid-but-empty media (a slow NAS
     // would scan whole libraries as streamless files).
     let result = info.result();
-    if result != gstreamer_pbutils::DiscovererResult::Ok {
+    let missing_plugins = result == gstreamer_pbutils::DiscovererResult::MissingPlugins;
+    if result != gstreamer_pbutils::DiscovererResult::Ok && !missing_plugins {
         anyhow::bail!("discovering {}: {result:?}", path.display());
     }
-    Ok(map_info(&info))
+    let mapped = map_info(&info);
+    // MissingPlugins with a usable A/V core is one unmappable track
+    // (e.g. S_DVBSUB → application/x-subtitle-unknown), not a broken
+    // file — record what we found instead of failing the whole file.
+    if missing_plugins && (mapped.video.is_empty() || mapped.audio.is_empty()) {
+        anyhow::bail!("discovering {}: {result:?}", path.display());
+    }
+    Ok(mapped)
 }
 
 fn map_info(info: &DiscovererInfo) -> MediaInfo {
@@ -215,6 +223,9 @@ fn normalize_subtitle_format(caps_name: &str) -> String {
         "subpicture/x-pgs" => "pgs",
         "subpicture/x-dvd" => "vobsub",
         "application/x-subtitle-vtt" => "webvtt",
+        // Codec the demuxer couldn't map (e.g. S_DVBSUB): the track is
+        // declared but unserveable; players see it and skip it.
+        "application/x-subtitle-unknown" => "unknown",
         other => other,
     }
     .to_string()
