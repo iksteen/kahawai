@@ -214,18 +214,22 @@ limits, OPS-6 scoped to re-derivable caches).
 - [x] OPS-3 `doctor` command with plugin/encoder checks
 - [x] OPS-4 Clock-skew tolerance (backdated certs, enrollment skew warning)
 - [ ] OPS-5 Online backup/restore command
-- [ ] OPS-6 Quota-bounded caches with eviction — **not built, on purpose**
-      (decided 2026-07-26). Nothing the hub caches is cheap to rebuild:
-      extracted cues and font bundles cost a full-file demux over a
-      byte-plane lease (the cost HUB-34's ladder exists to avoid),
-      downloaded subtitles are DB-referenced, shared between users
-      (HUB-23) and spend a rate-limited provider entitlement, artwork and
-      the AniDB dumps are provider-derived. Transient state (session
-      scratch) is already bounded by lifecycle. Live numbers: 2.4 GB of
-      subtitle cache for 37k files, against TBs of media — disk is not
-      the scarce resource, provider quota and mediahost I/O are. If a
-      cap is ever needed (data_dir on a small disk), it should be an
-      admin-triggered purge that states its cost, not a silent janitor.
+- [x] OPS-6 Quota-bounded caches with eviction — satisfied by there being
+      nothing eligible to evict (audited 2026-07-26). Two costs decide
+      it, and every hub cache is expensive on at least one: **rebuild
+      cost** — extracted cues and font bundles re-demux a whole source
+      file over a byte-plane lease (the cost HUB-34's ladder exists to
+      avoid; 100 % of the live cache is this kind, zero sidecar entries),
+      downloaded subtitles spend a rate-limited provider entitlement and
+      are DB-referenced and shared between users (HUB-23), AniDB dumps
+      are ban-risk traffic; **latency at point of use** — artwork is
+      cheap to refetch but tiny and needed instantly while scrolling a
+      grid, so evicting it trades visible stalls for nothing (a 100 MiB
+      cap reclaimed 89 MB out of a 2.7 GB data dir). Transient state
+      (session scratch) is already bounded by lifecycle: wiped at
+      startup, torn down per session, idle-reaped. A cap for a
+      small-disk deployment belongs in an admin-triggered purge that
+      states its cost, not a silent janitor.
 - [x] OPS-7 Cross-version satellite compatibility: protocol gated on major
       version (Hello/HelloAck) — per decision 2026-07-25, major-gating IS the
       compatibility contract; no previous-minor guarantee
