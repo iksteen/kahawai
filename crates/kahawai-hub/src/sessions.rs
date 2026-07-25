@@ -555,6 +555,7 @@ impl Sessions {
         });
         self.active.lock().unwrap().insert(session.id.clone(), session.clone());
         tracing::info!(session = %session.id, item = item_id, path = %path_rel, mode, "session started");
+        registry.emit(serde_json::json!({ "kind": "sessions" }));
         Ok(session)
     }
 
@@ -1103,6 +1104,9 @@ impl Sessions {
         let Some(session) = self.active.lock().unwrap().remove(id) else {
             return false;
         };
+        if let Some(registry) = self.registry_for_teardown.lock().unwrap().clone() {
+            registry.emit(serde_json::json!({ "kind": "sessions" }));
+        }
         match &session.mode {
             Mode::Remux { dir, runner } => {
                 runner.lock().unwrap().stop();

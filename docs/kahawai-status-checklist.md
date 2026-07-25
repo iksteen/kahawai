@@ -96,7 +96,9 @@ Last updated: 2026-07-25, against the revised requirements (AR-12, MH-10/11, HUB
 
 - [ ] HUB-10 Multi-user *(accounts, admin flag, per-user watch state live;
       per-library access grants and parental controls missing)*
-- [ ] HUB-11 Versioned HTTP/JSON API *(live; no WebSocket/SSE channel yet)*
+- [x] HUB-11 Versioned HTTP/JSON API + /api/v1/events SSE channel
+      (invalidation hints: scan progress, satellite connectivity,
+      sessions, enrichment; cookie-authenticated for EventSource)
 - [ ] HUB-12 Browse/search/filter/sort *(hierarchical browse + client-side title
       filter live; no server-side search/sort/filter endpoints)*
 - [x] HUB-13 All hub state in embedded storage; survives restart without rescan

@@ -86,6 +86,10 @@ pub struct Registry {
     links: Mutex<HashMap<String, tokio::sync::mpsc::Sender<Result<kahawai_proto::v1::HubToHost, tonic::Status>>>>,
     /// Live per-collection scan progress (HUB-35): last report wins.
     scan_progress: Mutex<HashMap<(String, String), ScanState>>,
+    /// HUB-11 event bus: invalidation hints pushed to /api/v1/events
+    /// subscribers ({kind, ...} JSON). Lagging receivers drop events —
+    /// hints, not state; clients refetch what a hint names.
+    events: tokio::sync::broadcast::Sender<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -110,7 +114,17 @@ impl Registry {
             tc_load: Mutex::new(HashMap::new()),
             disabled: Mutex::new(std::collections::HashSet::new()),
             scan_progress: Mutex::new(HashMap::new()),
+            events: tokio::sync::broadcast::channel(256).0,
         }
+    }
+
+    /// Push an event hint to /api/v1/events subscribers (HUB-11).
+    pub fn emit(&self, event: serde_json::Value) {
+        let _ = self.events.send(event); // no subscribers = no-op
+    }
+
+    pub fn subscribe_events(&self) -> tokio::sync::broadcast::Receiver<serde_json::Value> {
+        self.events.subscribe()
     }
 
     pub fn update_scan_progress(
@@ -126,6 +140,15 @@ impl Registry {
             (module_id.to_string(), collection_id.to_string()),
             ScanState { scanned, failed, skipped, complete, updated: SystemTime::now() },
         );
+        self.emit(serde_json::json!({
+            "kind": "scan",
+            "module_id": module_id,
+            "collection_id": collection_id,
+            "scanned": scanned,
+            "failed": failed,
+            "skipped": skipped,
+            "complete": complete,
+        }));
     }
 
     /// Live scan state for the admin overview. Completed states linger a
@@ -457,6 +480,9 @@ impl Registry {
             },
         );
         tracing::info!(%module_id, module_type, name, "satellite connected");
+        self.emit(serde_json::json!({
+            "kind": "satellite", "module_id": module_id, "connected": true,
+        }));
     }
 
     pub fn seen(&self, module_id: &str) {
@@ -472,6 +498,9 @@ impl Registry {
             s.connected = false;
             s.last_seen = SystemTime::now();
             tracing::info!(%module_id, "satellite disconnected");
+            self.emit(serde_json::json!({
+                "kind": "satellite", "module_id": module_id, "connected": false,
+            }));
         }
     }
 

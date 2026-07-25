@@ -325,6 +325,21 @@ export function pickSubtitle(
 
 export const fetchPrefs = () => json<{ prefs: Pref[] }>('/api/v1/prefs')
 
+/// HUB-11 event channel: invalidation hints ({kind, ...}). Authenticates
+/// via the kahawai_token cookie (EventSource cannot set headers). The
+/// browser auto-reconnects; callers just react to hints.
+export function openEvents(onEvent: (e: { kind: string } & Record<string, unknown>) => void) {
+  const es = new EventSource('/api/v1/events')
+  es.onmessage = (m) => {
+    try {
+      onEvent(JSON.parse(m.data))
+    } catch {
+      // malformed hint: ignore
+    }
+  }
+  return es
+}
+
 export const putPref = (scope: string, key: string, value: string) =>
   json<{ ok: boolean }>('/api/v1/prefs', {
     method: 'PUT',

@@ -510,6 +510,7 @@ impl Enricher {
     /// TMDB match that would immediately be overwritten; items the anime
     /// chain declines fall through to the generic pass unmatched.
     async fn run_inner(self: &Arc<Self>, registry: &Registry) -> Result<(usize, usize, usize)> {
+        registry.emit(serde_json::json!({ "kind": "enrich", "running": true }));
         let Some(key) = registry.get_setting(TMDB_KEY_SETTING).await? else {
             anyhow::bail!("no TMDB API key configured");
         };
@@ -639,6 +640,7 @@ impl Enricher {
             self.progress.2.load(Ordering::SeqCst),
         );
         tracing::info!(matched = m, weak = w, missed = x, "enrichment run complete");
+        registry.emit(serde_json::json!({ "kind": "enrich", "running": false }));
         if let Err(e) = self.enrich_episodes(registry, &key, tvdb_token.as_ref()).await {
             tracing::warn!(error = format!("{e:#}"), "episode enrichment failed");
         }

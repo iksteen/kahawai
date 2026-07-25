@@ -5,6 +5,7 @@ import {
   adminEnrichStatus,
   adminProviders,
   adminRefreshLibrary,
+  openEvents,
   adminSetAnidb,
   adminSetTmdbKey,
   adminSetTvdbKey,
@@ -27,10 +28,11 @@ import {
   type Satellite,
 } from '../api'
 
-// ponytail: 3 s polling; the /api/v1/events channel replaces this later.
-const POLL_MS = 3000
+// HUB-11: the events channel pushes invalidation hints; polling remains
+// only as a slow fallback for anything a hint doesn't cover.
+const POLL_MS = 15000
 
-function TmdbSection({ onNotice }: { onNotice: (s: string) => void }) {
+function TmdbSection({ onNotice, tick }: { onNotice: (s: string) => void; tick: number }) {
   const [configured, setConfigured] = useState(false)
   const [tvdbConfigured, setTvdbConfigured] = useState(false)
   const [anidbConfigured, setAnidbConfigured] = useState(false)
@@ -62,7 +64,7 @@ function TmdbSection({ onNotice }: { onNotice: (s: string) => void }) {
     const t = setInterval(refresh, POLL_MS)
     return () => clearInterval(t)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
+  }, [tick])
 
   return (
     <>
@@ -210,10 +212,26 @@ export default function Admin() {
     }
   }
 
+  // Events push; the interval is only a safety net. Hints arrive in
+  // bursts (scan progress), so reloads are debounced.
+  const [tick, setTick] = useState(0)
   useEffect(() => {
     reload()
     const t = setInterval(reload, POLL_MS)
-    return () => clearInterval(t)
+    let debounce: ReturnType<typeof setTimeout> | undefined
+    const es = openEvents(() => {
+      clearTimeout(debounce)
+      debounce = setTimeout(() => {
+        reload()
+        setTick((n) => n + 1)
+      }, 250)
+    })
+    return () => {
+      clearInterval(t)
+      clearTimeout(debounce)
+      es.close()
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   async function approve(e: React.FormEvent) {
@@ -252,7 +270,7 @@ export default function Admin() {
       {notice && <p className="notice">{notice}</p>}
       {error && <div className="error">{error}</div>}
 
-      <TmdbSection onNotice={setNotice} />
+      <TmdbSection onNotice={setNotice} tick={tick} />
 
       <h2>Pending enrollments</h2>
       {pending.length === 0 ? (

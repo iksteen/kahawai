@@ -51,6 +51,7 @@ pub fn router(
         .route("/api/v1/items/{id}/fonts", get(item_fonts))
         .route("/api/v1/items/{id}/fonts/{n}", get(item_font))
         .route("/api/v1/prefs", get(get_prefs).put(put_pref))
+        .route("/api/v1/events", get(events))
         .route("/api/v1/playback/sessions", post(start_session))
         .route("/api/v1/playback/sessions/{id}", axum::routing::delete(end_session))
         .route("/api/v1/playback/sessions/{id}/stream", get(stream_session))
@@ -827,6 +828,23 @@ struct StartSessionRequest {
 
 fn default_mode() -> String {
     "direct".into()
+}
+
+/// HUB-11 event channel: server-sent invalidation hints ({kind, ...}).
+/// EventSource authenticates via the kahawai_token cookie (it cannot
+/// set headers), same as <video>/HLS requests. Hints, not state —
+/// clients refetch whatever a hint names.
+async fn events(
+    State(state): State<AppState>,
+) -> axum::response::sse::Sse<
+    impl tokio_stream::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>,
+> {
+    use axum::response::sse::{Event, KeepAlive, Sse};
+    use tokio_stream::StreamExt;
+    let rx = state.registry.subscribe_events();
+    let stream = tokio_stream::wrappers::BroadcastStream::new(rx)
+        .filter_map(|v| v.ok().map(|v| Ok(Event::default().data(v.to_string()))));
+    Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
 /// Per-user preferences (HUB-33): tiny generic KV, scope = library id
