@@ -44,6 +44,8 @@ message HostToHub {
     FileHashes file_hashes = 9;
     // Extracted subtitle tracks of one file (efficiency ladder step 2).
     FileSubtitles file_subtitles = 10;
+    // Attachment declarations for one file (MH-4 backfill).
+    FileAttachments file_attachments = 11;
   }
 }
 
@@ -174,6 +176,9 @@ message HubToHost {
     ExtractSubs extract_subs = 6;
     // … or background pre-warm, drained below the ED2K queue.
     SubsWorklist subs_worklist = 7;
+    // MH-4 backfill: declare attachments for files scanned before
+    // declaration existed. Cheapest tier (header reads only).
+    AttachmentsWorklist attachments_worklist = 8;
   }
 }
 
@@ -185,6 +190,21 @@ message ExtractSubs {
 message SubsWorklist {
   string collection_id = 1;
   repeated string paths = 2;
+}
+
+message AttachmentsWorklist {
+  string collection_id = 1;
+  repeated string paths = 2;
+}
+
+message FileAttachments {
+  string collection_id = 1;
+  string path_rel = 2;
+  // Size at declaration time: the hub drops the result if the row moved on.
+  uint64 size = 3;
+  // JSON array of {file_name, mime_type, offset, size} — exactly what
+  // MediaInfo.attachments serializes to. "[]" = checked, none found.
+  string attachments_json = 4;
 }
 
 message Hashlist {

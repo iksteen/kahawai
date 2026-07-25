@@ -331,7 +331,7 @@ impl Subtitles {
         sessions: &Sessions,
         item_id: &str,
     ) -> Result<Vec<(String, Vec<u8>)>> {
-        let (module_id, collection_id, path_rel, _) = source_row(registry, item_id).await?;
+        let (module_id, collection_id, path_rel, info) = source_row(registry, item_id).await?;
         let cache_key = format!(
             "fonts-{:016x}",
             xxhash_rust::xxh3::xxh3_64(
@@ -353,16 +353,51 @@ impl Subtitles {
             }
             return Ok(out);
         }
-        let (_, _, size, _, lease) = sessions.open_source(registry, item_id).await?;
-        let source = crate::sessions::LeaseSource {
-            lease,
-            size,
-            handle: tokio::runtime::Handle::current(),
+        // HUB-34 fonts rung. Declarations (MH-4) are authoritative when
+        // present: fonts among them → exact ranged lease reads (no
+        // demux); none among them → empty, instantly. Only records that
+        // were never declared fall back to the gst walk over a lease.
+        let fonts = match &info.attachments {
+            Some(atts) => {
+                let declared: Vec<kahawai_core::media::Attachment> =
+                    atts.iter().filter(|a| is_font(a)).cloned().collect();
+                if declared.is_empty() {
+                    Vec::new()
+                } else {
+                    use tokio_stream::StreamExt;
+                    let (_, _, _, _, lease) = sessions.open_source(registry, item_id).await?;
+                    let mut out = Vec::with_capacity(declared.len());
+                    for a in declared {
+                        let mut stream = lease.read_range(a.offset, a.size);
+                        let mut buf = Vec::with_capacity(a.size as usize);
+                        while let Some(chunk) = stream.next().await {
+                            buf.extend_from_slice(&chunk?);
+                        }
+                        anyhow::ensure!(
+                            buf.len() as u64 == a.size,
+                            "short read for declared attachment {}",
+                            a.file_name
+                        );
+                        out.push((a.file_name, buf));
+                    }
+                    tracing::info!(item = item_id, fonts = out.len(),
+                        "fonts read from declared ranges");
+                    out
+                }
+            }
+            None => {
+                let (_, _, size, _, lease) = sessions.open_source(registry, item_id).await?;
+                let source = crate::sessions::LeaseSource {
+                    lease,
+                    size,
+                    handle: tokio::runtime::Handle::current(),
+                };
+                tokio::task::spawn_blocking(move || {
+                    kahawai_media::subtitles::extract_fonts(Box::new(source))
+                })
+                .await??
+            }
         };
-        let fonts = tokio::task::spawn_blocking(move || {
-            kahawai_media::subtitles::extract_fonts(Box::new(source))
-        })
-        .await??;
         std::fs::create_dir_all(&dir)?;
         for (i, (_, bytes)) in fonts.iter().enumerate() {
             std::fs::write(dir.join(i.to_string()), bytes)?;
@@ -371,6 +406,20 @@ impl Subtitles {
         std::fs::write(&index, serde_json::to_vec(&names)?)?;
         Ok(fonts)
     }
+}
+
+/// Font-shaped attachment: matroska muxers tag fonts inconsistently
+/// (font/ttf, application/x-truetype-font, vnd.ms-opentype, …), so
+/// match mime loosely and fall back to the extension.
+fn is_font(a: &kahawai_core::media::Attachment) -> bool {
+    let m = a.mime_type.to_ascii_lowercase();
+    let n = a.file_name.to_ascii_lowercase();
+    m.contains("font")
+        || m.contains("truetype")
+        || m.contains("opentype")
+        || n.ends_with(".ttf")
+        || n.ends_with(".otf")
+        || n.ends_with(".ttc")
 }
 
 fn entries(info: &kahawai_core::media::MediaInfo) -> Vec<SubtitleEntry> {

@@ -410,6 +410,10 @@ async fn link_once(
                             let _ = hash_tx.try_send(hasher::JobMsg::Hashlist(h.clone()));
                             continue;
                         }
+                        if let Some(hub_to_host::Msg::AttachmentsWorklist(w)) = &m.msg {
+                            let _ = hash_tx.try_send(hasher::JobMsg::AttachmentsWorklist(w.clone()));
+                            continue;
+                        }
                         if let Some(hub_to_host::Msg::SubsWorklist(w)) = &m.msg {
                             let _ = hash_tx.try_send(hasher::JobMsg::SubsWorklist(w.clone()));
                             continue;

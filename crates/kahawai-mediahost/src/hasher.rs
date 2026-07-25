@@ -9,8 +9,8 @@ use std::io::Read;
 use std::time::Duration;
 
 use kahawai_proto::v1::{
-    host_to_hub, ExtractSubs, FileHash, FileHashes, FileSubtitles, Hashlist, HostToHub,
-    SubTrack, SubsWorklist,
+    host_to_hub, AttachmentsWorklist, ExtractSubs, FileAttachments, FileHash, FileHashes,
+    FileSubtitles, Hashlist, HostToHub, SubTrack, SubsWorklist,
 };
 
 use crate::ed2k::{self, Ed2k, CHUNK};
@@ -26,7 +26,54 @@ const BUSY_POLL: Duration = Duration::from_secs(2);
 pub enum JobMsg {
     Hashlist(Hashlist),
     SubsWorklist(SubsWorklist),
+    AttachmentsWorklist(AttachmentsWorklist),
     Urgent(ExtractSubs),
+}
+
+/// One deduped work queue (collection, path_rel) per tier.
+#[derive(Default)]
+struct Tier {
+    q: VecDeque<(String, String)>,
+    seen: HashSet<(String, String)>,
+}
+
+impl Tier {
+    fn push(&mut self, collection_id: &str, paths: Vec<String>) {
+        for path in paths {
+            let key = (collection_id.to_string(), path);
+            if self.seen.insert(key.clone()) {
+                self.q.push_back(key);
+            }
+        }
+    }
+}
+
+/// Route one message into its tier; returns true for urgent work.
+fn intake(
+    msg: JobMsg,
+    urgent: &mut VecDeque<(String, String)>,
+    ed2k: &mut Tier,
+    subs: &mut Tier,
+    atts: &mut Tier,
+) -> bool {
+    match msg {
+        JobMsg::Urgent(e) => {
+            urgent.push_back((e.collection_id, e.path_rel));
+            true
+        }
+        JobMsg::Hashlist(h) => {
+            ed2k.push(&h.collection_id, h.paths);
+            false
+        }
+        JobMsg::SubsWorklist(w) => {
+            subs.push(&w.collection_id, w.paths);
+            false
+        }
+        JobMsg::AttachmentsWorklist(w) => {
+            atts.push(&w.collection_id, w.paths);
+            false
+        }
+    }
 }
 
 pub async fn run(
@@ -36,15 +83,17 @@ pub async fn run(
     activity: Activity,
 ) {
     let mut urgent: VecDeque<(String, String)> = VecDeque::new();
-    let mut ed2k_q: VecDeque<(String, String)> = VecDeque::new();
-    let mut subs_q: VecDeque<(String, String)> = VecDeque::new();
-    let mut ed2k_seen: HashSet<(String, String)> = HashSet::new();
-    let mut subs_seen: HashSet<(String, String)> = HashSet::new();
+    let mut ed2k = Tier::default();
+    let mut subs = Tier::default();
+    let mut atts = Tier::default();
 
     loop {
         // Drain new work; block only when every queue is empty.
         loop {
-            let empty = urgent.is_empty() && ed2k_q.is_empty() && subs_q.is_empty();
+            let empty = urgent.is_empty()
+                && ed2k.q.is_empty()
+                && subs.q.is_empty()
+                && atts.q.is_empty();
             let msg = if empty {
                 match rx.recv().await {
                     Some(m) => m,
@@ -56,25 +105,7 @@ pub async fn run(
                     Err(_) => break,
                 }
             };
-            match msg {
-                JobMsg::Urgent(e) => urgent.push_back((e.collection_id, e.path_rel)),
-                JobMsg::Hashlist(h) => {
-                    for path in h.paths {
-                        let key = (h.collection_id.clone(), path);
-                        if ed2k_seen.insert(key.clone()) {
-                            ed2k_q.push_back(key);
-                        }
-                    }
-                }
-                JobMsg::SubsWorklist(w) => {
-                    for path in w.paths {
-                        let key = (w.collection_id.clone(), path);
-                        if subs_seen.insert(key.clone()) {
-                            subs_q.push_back(key);
-                        }
-                    }
-                }
-            }
+            intake(msg, &mut urgent, &mut ed2k, &mut subs, &mut atts);
         }
 
         // Tier order: urgent (never idle-gated — the active lease IS the
@@ -83,7 +114,7 @@ pub async fn run(
             extract_and_send(&collections, &collection_id, &path_rel, &tx).await;
             continue;
         }
-        if let Some((collection_id, path_rel)) = ed2k_q.pop_front() {
+        if let Some((collection_id, path_rel)) = ed2k.q.pop_front() {
             match hash_one(&collections, &collection_id, &path_rel, &activity).await {
                 Ok(mut fh) => {
                     fh.path_rel = path_rel.clone();
@@ -103,43 +134,26 @@ pub async fn run(
                 Err(e) => tracing::debug!(collection = %collection_id, path = %path_rel,
                     error = format!("{e:#}"), "ed2k skipped"),
             }
-            ed2k_seen.remove(&(collection_id, path_rel));
+            ed2k.seen.remove(&(collection_id, path_rel));
             continue;
         }
-        if let Some((collection_id, path_rel)) = subs_q.pop_front() {
-            // Idle gate before starting; extraction itself is a bounded
+        // Background tiers share the idle gate. Attachment declaration
+        // drains FIRST: it is ~10x cheaper per file (header reads only)
+        // and unblocks font serving, while the subs pre-warm is a
+        // long-tail warmup that can wait behind it.
+        let (from_subs, job) = match atts.q.pop_front() {
+            Some(j) => (false, Some(j)),
+            None => (true, subs.q.pop_front()),
+        };
+        if let Some((collection_id, path_rel)) = job {
+            // Idle gate before starting; the work itself is a bounded
             // local read (ponytail: can't pause a gst pipeline mid-walk).
+            let mut preempted = false;
             while activity.busy() {
                 match tokio::time::timeout(BUSY_POLL, rx.recv()).await {
                     Ok(Some(m)) => {
-                        // Urgent work preempts the wait.
-                        let requeue = matches!(&m, JobMsg::Urgent(_));
-                        match m {
-                            JobMsg::Urgent(e) => urgent.push_back((e.collection_id, e.path_rel)),
-                            other => {
-                                // Defer non-urgent intake to the drain loop.
-                                match other {
-                                    JobMsg::Hashlist(h) => {
-                                        for path in h.paths {
-                                            let key = (h.collection_id.clone(), path);
-                                            if ed2k_seen.insert(key.clone()) {
-                                                ed2k_q.push_back(key);
-                                            }
-                                        }
-                                    }
-                                    JobMsg::SubsWorklist(w) => {
-                                        for path in w.paths {
-                                            let key = (w.collection_id.clone(), path);
-                                            if subs_seen.insert(key.clone()) {
-                                                subs_q.push_back(key);
-                                            }
-                                        }
-                                    }
-                                    JobMsg::Urgent(_) => unreachable!(),
-                                }
-                            }
-                        }
-                        if requeue {
+                        if intake(m, &mut urgent, &mut ed2k, &mut subs, &mut atts) {
+                            preempted = true;
                             break;
                         }
                     }
@@ -147,19 +161,61 @@ pub async fn run(
                     Err(_) => {} // still busy; keep waiting
                 }
             }
-            if !urgent.is_empty() {
+            let tier = if from_subs { &mut subs } else { &mut atts };
+            if preempted || !urgent.is_empty() {
                 // Preempted: put the background job back and loop.
-                subs_seen.remove(&(collection_id.clone(), path_rel.clone()));
-                let key = (collection_id, path_rel);
-                if subs_seen.insert(key.clone()) {
-                    subs_q.push_front(key);
-                }
+                tier.q.push_front((collection_id, path_rel));
                 continue;
             }
-            extract_and_send(&collections, &collection_id, &path_rel, &tx).await;
-            subs_seen.remove(&(collection_id, path_rel));
+            if from_subs {
+                extract_and_send(&collections, &collection_id, &path_rel, &tx).await;
+            } else {
+                declare_and_send(&collections, &collection_id, &path_rel, &tx).await;
+            }
+            tier.seen.remove(&(collection_id, path_rel));
         }
     }
+}
+
+/// MH-4 backfill: declare one file's attachments (sparse header reads,
+/// ~0.3 s even over a network mount) and ship them to the hub. Errors
+/// still report as "[]" so the hub stops re-listing the file.
+async fn declare_and_send(
+    collections: &[CollectionConfig],
+    collection_id: &str,
+    path_rel: &str,
+    tx: &tokio::sync::mpsc::Sender<HostToHub>,
+) {
+    let result: anyhow::Result<(u64, String)> = async {
+        let path = crate::serve::resolve_rel(collections, collection_id, path_rel)?;
+        let size = std::fs::metadata(&path)?.len();
+        let atts = tokio::task::spawn_blocking(move || {
+            kahawai_media::subindex::declare_attachments(&path)
+        })
+        .await??;
+        Ok((size, serde_json::to_string(&atts)?))
+    }
+    .await;
+    let (size, attachments_json) = match result {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::debug!(collection = %collection_id, path = %path_rel,
+                error = format!("{e:#}"), "attachment declaration failed");
+            return; // vanished/unreadable: the next scan reconciles
+        }
+    };
+    if attachments_json != "[]" {
+        tracing::info!(collection = %collection_id, path = %path_rel, "attachments declared");
+    }
+    let msg = HostToHub {
+        msg: Some(host_to_hub::Msg::FileAttachments(FileAttachments {
+            collection_id: collection_id.to_string(),
+            path_rel: path_rel.to_string(),
+            size,
+            attachments_json,
+        })),
+    };
+    let _ = tx.send(msg).await;
 }
 
 /// Extract every text subtitle track of one local file (single demux

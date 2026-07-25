@@ -216,6 +216,7 @@ fn kind_name(m: &host_to_hub::Msg) -> &'static str {
         host_to_hub::Msg::FilesSeen(_) => "files_seen",
         host_to_hub::Msg::FileHashes(_) => "file_hashes",
         host_to_hub::Msg::FileSubtitles(_) => "file_subtitles",
+        host_to_hub::Msg::FileAttachments(_) => "file_attachments",
     }
 }
 
@@ -291,6 +292,7 @@ async fn handle_host_msg(
                     version = r.sync_version, "collection in sync; scan skipped");
                 push_ed2k_worklist(registry, module_id, &r.collection_id).await;
                 push_subs_worklist(registry, module_id, &r.collection_id).await;
+                push_attachments_worklist(registry, module_id, &r.collection_id).await;
                 return Ok(());
             }
             // Incremental rescan (MH-5): what we already know, so the
@@ -357,6 +359,22 @@ async fn handle_host_msg(
             );
             push_ed2k_worklist(registry, module_id, &p.collection_id).await;
             push_subs_worklist(registry, module_id, &p.collection_id).await;
+            push_attachments_worklist(registry, module_id, &p.collection_id).await;
+        }
+        host_to_hub::Msg::FileAttachments(fa) => {
+            let stored = registry
+                .record_file_attachments(
+                    module_id,
+                    &fa.collection_id,
+                    &fa.path_rel,
+                    fa.size,
+                    &fa.attachments_json,
+                )
+                .await?;
+            if fa.attachments_json != "[]" {
+                tracing::info!(%module_id, collection = %fa.collection_id,
+                    path = %fa.path_rel, stored, "attachments declared by mediahost");
+            }
         }
         host_to_hub::Msg::FileSubtitles(fs) => {
             if !fs.error.is_empty() {
@@ -449,6 +467,40 @@ async fn push_ed2k_worklist(
 
 /// Efficiency ladder step 2: send the collection's subtitle pre-warm
 /// worklist (video collections; empty = no-op). Best-effort.
+async fn push_attachments_worklist(
+    registry: &crate::registry::Registry,
+    module_id: &str,
+    collection_id: &str,
+) {
+    let paths = match registry.attachments_worklist(module_id, collection_id).await {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(%module_id, collection = %collection_id,
+                error = format!("{e:#}"), "attachments worklist failed");
+            return;
+        }
+    };
+    if paths.is_empty() {
+        return;
+    }
+    tracing::info!(%module_id, collection = %collection_id, files = paths.len(),
+        "sending attachments worklist");
+    for chunk in paths.chunks(5000) {
+        let msg = kahawai_proto::v1::HubToHost {
+            msg: Some(kahawai_proto::v1::hub_to_host::Msg::AttachmentsWorklist(
+                kahawai_proto::v1::AttachmentsWorklist {
+                    collection_id: collection_id.to_string(),
+                    paths: chunk.to_vec(),
+                },
+            )),
+        };
+        if let Err(e) = registry.send_to_host(module_id, msg).await {
+            tracing::warn!(%module_id, error = format!("{e:#}"), "attachments worklist send failed");
+            return;
+        }
+    }
+}
+
 async fn push_subs_worklist(
     registry: &crate::registry::Registry,
     module_id: &str,

@@ -406,6 +406,7 @@ pub fn declare_attachments(path: &Path) -> Result<Vec<kahawai_core::media::Attac
 
     let mut pos = segment_start;
     let mut pending: Vec<u64> = Vec::new();
+    let mut saw_seekhead = false;
     let mut visited = std::collections::HashSet::new();
     while pos < segment_end.min(r.len) {
         if !visited.insert(pos) {
@@ -418,6 +419,7 @@ pub fn declare_attachments(path: &Path) -> Result<Vec<kahawai_core::media::Attac
         let Some(size) = size else { break };
         match id {
             SEEK_HEAD => {
+                saw_seekhead = true;
                 let data = r.read_at(body, size as usize)?;
                 walk_children(&data, |id, seek| {
                     if id == SEEK {
@@ -440,6 +442,12 @@ pub fn declare_attachments(path: &Path) -> Result<Vec<kahawai_core::media::Attac
                 })?;
             }
             ATTACHMENTS => return read_attached_files(&mut r, body, size),
+            // Trust a present SeekHead: it indexes the top-level
+            // elements, so no Attachments entry by the time clusters
+            // start means there are none — skip the (long) cluster-hop
+            // walk. Partial SeekHeads lose the declaration and fall
+            // back to the gst rung, which is acceptable.
+            CLUSTER if saw_seekhead && pending.is_empty() => break,
             _ => {}
         }
         pos = body + size;

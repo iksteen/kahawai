@@ -273,7 +273,7 @@ fn inspect(root: &Path, path: &Path) -> Result<Inspected> {
     // only, payloads are never read at scan time.
     if matches!(info.container.as_deref(), Some("matroska" | "webm")) {
         match kahawai_media::subindex::declare_attachments(path) {
-            Ok(atts) => info.attachments = atts,
+            Ok(atts) => info.attachments = Some(atts),
             Err(e) => tracing::debug!(
                 path = %path.display(),
                 error = format!("{e:#}"),

@@ -27,11 +27,13 @@ pub struct MediaInfo {
     /// Container-level tags (title, artist, album, track number, …).
     #[serde(default)]
     pub tags: BTreeMap<String, String>,
-    /// Embedded attachments (fonts, cover art) DECLARED at scan (MH-4):
-    /// name, mime, and the payload's byte range — never the payload
-    /// itself. Lets the fonts rung of HUB-34 read exact ranges later.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub attachments: Vec<Attachment>,
+    /// Embedded attachments (fonts, cover art) DECLARED at scan or by
+    /// the MH-4 backfill: name, mime, and the payload's byte range —
+    /// never the payload itself. Tri-state: `None` = never declared
+    /// (fall back to demux), `Some([])` = checked and none exist,
+    /// `Some([...])` = read these exact ranges (HUB-34 fonts rung).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attachments: Option<Vec<Attachment>>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]

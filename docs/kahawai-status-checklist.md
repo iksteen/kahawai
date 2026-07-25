@@ -41,8 +41,8 @@ Last updated: 2026-07-25, against the revised requirements (AR-12, MH-10/11, HUB
 - [x] MH-3 GStreamer discovery for technical metadata
 - [x] MH-4 Sidecars + artwork + attachment declaration: embedded fonts are
       declared (name/mime/byte range, payload never read) in the file record
-      at scan via a sparse EBML walk *(pre-existing records gain declarations
-      only when their content changes and is re-inspected)*
+      at scan via a sparse EBML walk; pre-existing records are backfilled by
+      an idle worklist (cheapest tier, SeekHead-guided early stop)
 - [x] MH-5 Content identity (size/mtime fast path; head/tail xxh3 + oshash) with
       incremental rescan (manifest + FilesSeen reconciliation, sync-version handshake)
 - [x] MH-6 Byte-range lease serving (dedicated byte-plane connection)
@@ -158,9 +158,9 @@ Last updated: 2026-07-25, against the revised requirements (AR-12, MH-10/11, HUB
       client-side: series memory > per-type settings > track 0 / no subs
 - [x] HUB-34 Retrieval efficiency ladder: cache/sidecar → live session tap →
       mediahost sparse/sequential extraction → hub lease, cached at-most-once
-      *(fonts currently use rungs 1 and 4 only — MH-4 now declares
-      attachment byte ranges at scan; serving fonts from those declared
-      ranges is the remaining wiring)*
+      — fonts included: declared attachment ranges serve via exact lease
+      reads (declared-no-fonts answers instantly; only never-declared
+      records still walk gst over a lease)
 - [x] HUB-35 Granular refresh: library-refresh endpoint fanning out
       per-collection scan requests, per-collection live progress in the
       admin overview, global rescan removed (endpoint + button)

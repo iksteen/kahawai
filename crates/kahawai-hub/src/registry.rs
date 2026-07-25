@@ -306,6 +306,69 @@ impl Registry {
         Ok(n > 0)
     }
 
+    /// MH-4 backfill: matroska files whose records predate attachment
+    /// declaration. The mediahost declares them in its cheapest idle
+    /// tier; "attachments":[] marks checked-and-none so the file drops
+    /// out of this list.
+    pub async fn attachments_worklist(
+        &self,
+        module_id: &str,
+        collection_id: &str,
+    ) -> Result<Vec<String>> {
+        let media_type: Option<String> = sqlx::query_scalar(
+            "SELECT media_type FROM collections WHERE module_id = ? AND collection_id = ?",
+        )
+        .bind(module_id)
+        .bind(collection_id)
+        .fetch_optional(&self.db)
+        .await?;
+        if !matches!(media_type.as_deref(), Some("movies") | Some("series") | Some("anime")) {
+            return Ok(Vec::new());
+        }
+        let paths = sqlx::query_scalar(
+            "SELECT path_rel FROM files
+             WHERE module_id = ? AND collection_id = ?
+               AND json_extract(streams_json, '$.container') IN ('matroska', 'webm')
+               AND json_extract(streams_json, '$.attachments') IS NULL
+             ORDER BY path_rel",
+        )
+        .bind(module_id)
+        .bind(collection_id)
+        .fetch_all(&self.db)
+        .await?;
+        Ok(paths)
+    }
+
+    /// Store a mediahost attachment declaration (size-guarded like ED2K:
+    /// dropped when the row moved on). Writes into streams_json so the
+    /// record looks exactly as if the scan had declared it.
+    pub async fn record_file_attachments(
+        &self,
+        module_id: &str,
+        collection_id: &str,
+        path_rel: &str,
+        size: u64,
+        attachments_json: &str,
+    ) -> Result<bool> {
+        // Reject junk before it reaches the row.
+        let parsed: Result<Vec<kahawai_core::media::Attachment>, _> =
+            serde_json::from_str(attachments_json);
+        anyhow::ensure!(parsed.is_ok(), "malformed attachments json");
+        let n = sqlx::query(
+            "UPDATE files SET streams_json = json_set(streams_json, '$.attachments', json(?))
+             WHERE module_id = ? AND collection_id = ? AND path_rel = ? AND size = ?",
+        )
+        .bind(attachments_json)
+        .bind(module_id)
+        .bind(collection_id)
+        .bind(path_rel)
+        .bind(size as i64)
+        .execute(&self.db)
+        .await?
+        .rows_affected();
+        Ok(n > 0)
+    }
+
     /// Efficiency ladder step 2: video-collection files with embedded
     /// text subtitle tracks not yet extracted — the background pre-warm
     /// worklist, drained below ED2K on the mediahost.
