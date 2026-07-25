@@ -57,6 +57,9 @@ pub struct Candidate {
     vote_average: Option<f64>,
     #[serde(default, alias = "first_air_date")]
     release_date: Option<String>,
+    /// ISO 639-1 from TMDB search; TVDB maps primary_language into it.
+    #[serde(default)]
+    original_language: Option<String>,
 }
 
 impl Candidate {
@@ -239,6 +242,8 @@ impl Enricher {
             image_url: Option<String>,
             #[serde(default)]
             overview: Option<String>,
+            #[serde(default)]
+            primary_language: Option<String>,
         }
         #[derive(Deserialize)]
         struct SearchResp {
@@ -266,6 +271,7 @@ impl Enricher {
                     id: r.tvdb_id.as_deref()?.parse().ok()?,
                     title: r.name?,
                     original_title: None,
+                    original_language: r.primary_language,
                     overview: r.overview,
                     // Absolute URL: the artwork store fetches it as-is.
                     poster_path: r.image_url,
@@ -635,6 +641,9 @@ impl Enricher {
         tracing::info!(matched = m, weak = w, missed = x, "enrichment run complete");
         if let Err(e) = self.enrich_episodes(registry, &key, tvdb_token.as_ref()).await {
             tracing::warn!(error = format!("{e:#}"), "episode enrichment failed");
+        }
+        if let Err(e) = self.backfill_original_language(registry, &key).await {
+            tracing::warn!(error = format!("{e:#}"), "original-language backfill failed");
         }
         if let Err(e) = self.enrich_music(registry, &providers).await {
             tracing::warn!(error = format!("{e:#}"), "music enrichment failed");
@@ -1067,8 +1076,8 @@ impl Enricher {
             "INSERT OR REPLACE INTO item_metadata
                (item_id, provider, provider_id, title, overview, poster_path, rating,
                 premiered, genres, confidence, updated_at,
-                anidb_id, anilist_id, mapped_tvdb, mapped_tmdb)
-             VALUES (?, 'anilist', ?, ?, ?, ?, ?, ?, ?, 'auto', unixepoch(), ?, ?, ?, ?)",
+                anidb_id, anilist_id, mapped_tvdb, mapped_tmdb, original_language)
+             VALUES (?, 'anilist', ?, ?, ?, ?, ?, ?, ?, 'auto', unixepoch(), ?, ?, ?, ?, ?)",
         )
         .bind(item_id)
         .bind(media.id.to_string())
@@ -1082,6 +1091,7 @@ impl Enricher {
         .bind(media.id)
         .bind(mapping.and_then(|m| m.tvdb_id))
         .bind(mapping.and_then(|m| m.tmdb_for(kind)))
+        .bind(media.original_language())
         .execute(db)
         .await?;
 
@@ -1117,6 +1127,83 @@ impl Enricher {
                 .await?;
             }
         }
+        Ok(())
+    }
+
+    /// One-time healing for rows matched before original_language was
+    /// captured at search time: fetch TMDB details (movie/tv by matched
+    /// or mapped id). '' marks asked-but-absent so nothing re-asks.
+    /// TVDB-only rows are left NULL (their language arrives if ever
+    /// re-matched); the sweep goes quiet once everything is stamped.
+    async fn backfill_original_language(
+        self: &Arc<Self>,
+        registry: &Registry,
+        tmdb_key: &str,
+    ) -> Result<()> {
+        let rows = sqlx::query(
+            "SELECT m.item_id, i.kind,
+                    CASE WHEN m.provider = 'tmdb' THEN m.provider_id
+                         ELSE CAST(m.mapped_tmdb AS TEXT) END AS tmdb_id
+             FROM item_metadata m JOIN items i ON i.id = m.item_id
+             WHERE m.original_language IS NULL AND m.provider_id != ''
+               AND i.kind IN ('movie', 'show')
+               AND (m.provider = 'tmdb' OR m.mapped_tmdb IS NOT NULL)",
+        )
+        .fetch_all(registry.db())
+        .await?;
+        if rows.is_empty() {
+            return Ok(());
+        }
+        tracing::info!(items = rows.len(), "original-language backfill starting");
+        let sem = Arc::new(tokio::sync::Semaphore::new(4));
+        let mut tasks = tokio::task::JoinSet::new();
+        for row in rows {
+            let (item_id, kind, tmdb_id) = (
+                row.get::<String, _>("item_id"),
+                row.get::<String, _>("kind"),
+                row.get::<Option<String>, _>("tmdb_id"),
+            );
+            let Some(tmdb_id) = tmdb_id else { continue };
+            let this = self.clone();
+            let key = tmdb_key.to_string();
+            let db = registry.db().clone();
+            let sem = sem.clone();
+            tasks.spawn(async move {
+                let _permit = sem.acquire().await;
+                let path = if kind == "movie" { "movie" } else { "tv" };
+                #[derive(Deserialize)]
+                struct Details {
+                    #[serde(default)]
+                    original_language: Option<String>,
+                }
+                let lang = match this
+                    .http
+                    .get(format!("https://api.themoviedb.org/3/{path}/{tmdb_id}"))
+                    .query(&[("api_key", key.as_str())])
+                    .send()
+                    .await
+                    .and_then(|r| r.error_for_status())
+                {
+                    Ok(resp) => match resp.json::<Details>().await {
+                        Ok(det) => det.original_language.unwrap_or_default(),
+                        Err(_) => String::new(),
+                    },
+                    Err(e) => {
+                        tracing::debug!(tmdb_id, error = %e, "details fetch failed");
+                        return; // transient: stays NULL, retried next run
+                    }
+                };
+                let _ = sqlx::query(
+                    "UPDATE item_metadata SET original_language = ? WHERE item_id = ?",
+                )
+                .bind(&lang)
+                .bind(&item_id)
+                .execute(&db)
+                .await;
+            });
+        }
+        while tasks.join_next().await.is_some() {}
+        tracing::info!("original-language backfill complete");
         Ok(())
     }
 
@@ -1479,6 +1566,7 @@ mod tests {
             id,
             title: title.into(),
             original_title: None,
+            original_language: None,
             overview: None,
             poster_path: None,
             vote_average: None,
@@ -1564,8 +1652,8 @@ impl Enricher {
         sqlx::query(
             "INSERT INTO item_metadata
                (item_id, provider, provider_id, title, overview, poster_path,
-                rating, premiered, genres, confidence, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, unixepoch())
+                rating, premiered, genres, confidence, updated_at, original_language)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, unixepoch(), ?)
              ON CONFLICT (item_id) DO UPDATE SET
                provider = excluded.provider,
                provider_id = excluded.provider_id,
@@ -1575,7 +1663,8 @@ impl Enricher {
                rating = excluded.rating,
                premiered = excluded.premiered,
                confidence = excluded.confidence,
-               updated_at = excluded.updated_at",
+               updated_at = excluded.updated_at,
+               original_language = excluded.original_language",
         )
         .bind(item_id)
         .bind(provider)
@@ -1586,6 +1675,7 @@ impl Enricher {
         .bind(c.and_then(|c| c.vote_average))
         .bind(c.and_then(|c| c.release_date.clone()))
         .bind(confidence)
+        .bind(c.and_then(|c| c.original_language.clone()))
         .execute(db)
         .await?;
         Ok(())

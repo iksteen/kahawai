@@ -1420,7 +1420,8 @@ async fn item_detail(
     out["sources"] = json!(sources);
     // Enrichment (own metadata, or the parent show's for episodes).
     let meta = sqlx::query(
-        "SELECT m.overview, m.rating, m.premiered, m.confidence, m.provider FROM items i
+        "SELECT m.overview, m.rating, m.premiered, m.confidence, m.provider,
+                m.original_language FROM items i
          JOIN item_metadata m ON m.item_id IN (i.id, i.parent_id)
          WHERE i.id = ? AND m.provider_id != ''
          ORDER BY m.item_id = i.id DESC LIMIT 1",
@@ -1436,6 +1437,9 @@ async fn item_detail(
             "premiered": m.get::<Option<String>, _>("premiered"),
             "confidence": m.get::<String, _>("confidence"),
             "provider": m.get::<String, _>("provider"),
+            "original_language": m
+                .get::<Option<String>, _>("original_language")
+                .filter(|l| !l.is_empty()),
         });
     }
 

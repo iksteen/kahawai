@@ -146,6 +146,9 @@ export type ItemMetadata = {
   premiered: string | null
   confidence: 'auto' | 'weak'
   provider: string
+  /// ISO 639-1 original language of the matched title (feeds the
+  /// future default-track mechanism).
+  original_language?: string | null
 }
 
 export type ItemDetail = Item & {

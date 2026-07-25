@@ -253,6 +253,7 @@ pub struct AnilistMedia {
     pub start_date: Option<AnilistDate>,
     pub format: Option<String>, // TV | MOVIE | OVA | ONA | SPECIAL | TV_SHORT | MUSIC
     pub genres: Option<Vec<String>>,
+    pub country_of_origin: Option<String>, // "JP" | "CN" | "KR" | …
     pub relations: Option<AnilistRelations>,
 }
 
@@ -300,6 +301,17 @@ impl AnilistMedia {
         self.title.english.clone().or_else(|| self.title.romaji.clone())
     }
 
+    /// Original language from the country of origin (anime is tagged by
+    /// country, not language, on AniList).
+    pub fn original_language(&self) -> Option<&'static str> {
+        match self.country_of_origin.as_deref() {
+            Some("JP") => Some("ja"),
+            Some("CN") | Some("TW") => Some("zh"),
+            Some("KR") => Some("ko"),
+            _ => None,
+        }
+    }
+
     pub fn premiered(&self) -> Option<String> {
         let d = self.start_date.as_ref()?;
         Some(format!("{:04}-{:02}-{:02}", d.year?, d.month.unwrap_or(1), d.day.unwrap_or(1)))
@@ -328,6 +340,7 @@ const MEDIA_FIELDS: &str = "
   startDate { year month day }
   format
   genres
+  countryOfOrigin
   relations {
     edges { relationType node { id title { romaji english } format } }
   }";
@@ -553,6 +566,7 @@ mod tests {
         let m = AnilistMedia {
             id: 1,
             title: AnilistTitle { romaji: Some("X".into()), english: None },
+            country_of_origin: None,
             description: Some("Line one.<br><br>\n<i>Note.</i>".into()),
             cover_image: None,
             average_score: Some(78.0),
