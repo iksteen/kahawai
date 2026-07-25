@@ -269,6 +269,18 @@ fn inspect(root: &Path, path: &Path) -> Result<Inspected> {
     let mut info = kahawai_media::discover(path, DISCOVER_TIMEOUT)?;
     info.external_subtitles = find_sidecars(root, path);
     info.artwork = find_artwork(root, path);
+    // MH-4: declare embedded attachments (fonts) — name/mime/byte range
+    // only, payloads are never read at scan time.
+    if matches!(info.container.as_deref(), Some("matroska" | "webm")) {
+        match kahawai_media::subindex::declare_attachments(path) {
+            Ok(atts) => info.attachments = atts,
+            Err(e) => tracing::debug!(
+                path = %path.display(),
+                error = format!("{e:#}"),
+                "attachment declaration failed"
+            ),
+        }
+    }
     Ok((size, mtime_unix, head_xxh3, tail_xxh3, oshash, info))
 }
 

@@ -27,6 +27,20 @@ pub struct MediaInfo {
     /// Container-level tags (title, artist, album, track number, …).
     #[serde(default)]
     pub tags: BTreeMap<String, String>,
+    /// Embedded attachments (fonts, cover art) DECLARED at scan (MH-4):
+    /// name, mime, and the payload's byte range — never the payload
+    /// itself. Lets the fonts rung of HUB-34 read exact ranges later.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<Attachment>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct Attachment {
+    pub file_name: String,
+    pub mime_type: String,
+    /// Byte offset of the raw payload within the media file.
+    pub offset: u64,
+    pub size: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]

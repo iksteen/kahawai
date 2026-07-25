@@ -109,6 +109,11 @@ const CUE_TRACK_POSITIONS: u32 = 0xB7;
 const CUE_TRACK: u32 = 0xF7;
 const CUE_CLUSTER_POSITION: u32 = 0xF1;
 const CUE_RELATIVE_POSITION: u32 = 0xF0;
+const ATTACHMENTS: u32 = 0x1941_A469;
+const ATTACHED_FILE: u32 = 0x61A7;
+const FILE_NAME: u32 = 0x466E;
+const FILE_MIME: u32 = 0x4660;
+const FILE_DATA: u32 = 0x465C;
 const CLUSTER: u32 = 0x1F43_B675;
 const CLUSTER_TIMESTAMP: u32 = 0xE7;
 const SIMPLE_BLOCK: u32 = 0xA3;
@@ -374,6 +379,132 @@ fn mkv_read_index(r: &mut Reader) -> Result<MkvIndex> {
         }
     }
     Ok(idx)
+}
+
+/// MH-4: declare embedded attachments (name, mime, payload byte range)
+/// without ever reading a payload. Header reads only; jumps straight to
+/// the Attachments element when the SeekHead promises one, otherwise
+/// hops top-level elements by declared size. Non-matroska → empty.
+pub fn declare_attachments(path: &Path) -> Result<Vec<kahawai_core::media::Attachment>> {
+    let file = File::open(path)?;
+    let len = file.metadata()?.len();
+    let mut r = Reader::new(file, len);
+
+    let head = r.read_at(0, 32.min(len as usize))?;
+    let Ok((id, il)) = ebml_id(&head) else { return Ok(Vec::new()) };
+    if id != EBML_HEADER {
+        return Ok(Vec::new());
+    }
+    let (hsize, hsl) = ebml_size(&head[il..])?;
+    let pos = il as u64 + hsl as u64 + hsize.context("unknown EBML header size")?;
+    let seg = r.read_at(pos, 16)?;
+    let (id, il) = ebml_id(&seg)?;
+    anyhow::ensure!(id == SEGMENT, "no segment");
+    let (seg_size, sl) = ebml_size(&seg[il..])?;
+    let segment_start = pos + il as u64 + sl as u64;
+    let segment_end = seg_size.map(|s| segment_start + s).unwrap_or(r.len);
+
+    let mut pos = segment_start;
+    let mut pending: Vec<u64> = Vec::new();
+    let mut visited = std::collections::HashSet::new();
+    while pos < segment_end.min(r.len) {
+        if !visited.insert(pos) {
+            break;
+        }
+        let Ok(head) = r.read_at(pos, 16) else { break };
+        let Ok((id, il)) = ebml_id(&head) else { break };
+        let Ok((size, sl)) = ebml_size(&head[il..]) else { break };
+        let body = pos + il as u64 + sl as u64;
+        let Some(size) = size else { break };
+        match id {
+            SEEK_HEAD => {
+                let data = r.read_at(body, size as usize)?;
+                walk_children(&data, |id, seek| {
+                    if id == SEEK {
+                        let (mut target, mut position) = (0u32, None);
+                        walk_children(seek, |id, v| {
+                            match id {
+                                SEEK_ID => target = uint(v) as u32,
+                                SEEK_POSITION => position = Some(uint(v)),
+                                _ => {}
+                            }
+                            Ok(true)
+                        })?;
+                        if target == ATTACHMENTS
+                            && let Some(p) = position
+                        {
+                            pending.push(segment_start + p);
+                        }
+                    }
+                    Ok(true)
+                })?;
+            }
+            ATTACHMENTS => return read_attached_files(&mut r, body, size),
+            _ => {}
+        }
+        pos = body + size;
+        if let Some(next) = pending.iter().find(|p| !visited.contains(*p)) {
+            pos = *next;
+        }
+    }
+    Ok(Vec::new())
+}
+
+/// Sparse walk of an Attachments element: child headers are read,
+/// FileData payloads are skipped by declared size.
+fn read_attached_files(
+    r: &mut Reader,
+    body: u64,
+    size: u64,
+) -> Result<Vec<kahawai_core::media::Attachment>> {
+    let mut out = Vec::new();
+    let end = body + size;
+    let mut pos = body;
+    while pos < end {
+        let head = r.read_at(pos, 16)?;
+        let (id, il) = ebml_id(&head)?;
+        let (esize, sl) = ebml_size(&head[il..])?;
+        let ebody = pos + il as u64 + sl as u64;
+        let esize = esize.context("unsized element in Attachments")?;
+        if id == ATTACHED_FILE {
+            let (mut name, mut mime) = (String::new(), String::new());
+            let (mut off, mut dlen) = (0u64, 0u64);
+            let cend = ebody + esize;
+            let mut cpos = ebody;
+            while cpos < cend {
+                let h = r.read_at(cpos, 16)?;
+                let (cid, cil) = ebml_id(&h)?;
+                let (csize, csl) = ebml_size(&h[cil..])?;
+                let cbody = cpos + cil as u64 + csl as u64;
+                let csize = csize.context("unsized element in AttachedFile")?;
+                match cid {
+                    FILE_NAME => {
+                        name = String::from_utf8_lossy(&r.read_at(cbody, csize as usize)?)
+                            .into_owned();
+                    }
+                    FILE_MIME => {
+                        mime = String::from_utf8_lossy(&r.read_at(cbody, csize as usize)?)
+                            .into_owned();
+                    }
+                    FILE_DATA => {
+                        (off, dlen) = (cbody, csize); // declared, never read
+                    }
+                    _ => {}
+                }
+                cpos = cbody + csize;
+            }
+            if dlen > 0 {
+                out.push(kahawai_core::media::Attachment {
+                    file_name: name,
+                    mime_type: mime,
+                    offset: off,
+                    size: dlen,
+                });
+            }
+        }
+        pos = ebody + esize;
+    }
+    Ok(out)
 }
 
 /// A parsed subtitle block: (track number, time ticks rel cluster, payload, duration ticks).
@@ -1028,6 +1159,99 @@ mod tests {
         let exact = extract_from_bytes(&tiny_mkv(true));
         assert_eq!(coarse[0].1.cues, exact[0].1.cues);
         assert_eq!(coarse[0].1.ass, exact[0].1.ass);
+    }
+
+    #[test]
+    fn attachments_declared_without_payload_reads() {
+        // Segment: SeekHead → Attachments(2 fonts), then a cluster.
+        let font1: &[u8] = b"\x00\x01\x00\x00fake-truetype-bytes";
+        let font2: &[u8] = b"OTTOfake-opentype";
+        let attached = |name: &str, mime: &str, data: &[u8]| {
+            ebml(
+                ATTACHED_FILE,
+                &[
+                    ebml(FILE_NAME, name.as_bytes()),
+                    ebml(FILE_MIME, mime.as_bytes()),
+                    ebml(FILE_DATA, data),
+                ]
+                .concat(),
+            )
+        };
+        let attachments = ebml(
+            ATTACHMENTS,
+            &[
+                attached("Font1.ttf", "font/ttf", font1),
+                attached("Font2.otf", "font/otf", font2),
+            ]
+            .concat(),
+        );
+        // SeekHead promising the Attachments position (computed below).
+        let seek = |pos: u64| {
+            ebml(
+                SEEK_HEAD,
+                &ebml(
+                    SEEK,
+                    &[
+                        ebml(SEEK_ID, &ATTACHMENTS.to_be_bytes()),
+                        ebml(SEEK_POSITION, &encode_uint(pos)),
+                    ]
+                    .concat(),
+                ),
+            )
+        };
+        let seek_len = seek(0).len() as u64; // position encoding is fixed-size via encode_uint? guard below
+        let segment_body =
+            [seek(seek_len), attachments.clone(), ebml(CLUSTER, &[0u8; 8])].concat();
+        assert_eq!(seek(seek_len).len() as u64, seek_len, "seek element size must be stable");
+
+        let mut file = ebml(EBML_HEADER, &[]);
+        file.extend(ebml(SEGMENT, &segment_body));
+
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(&file).unwrap();
+        f.flush().unwrap();
+        let atts = declare_attachments(f.path()).unwrap();
+        assert_eq!(atts.len(), 2);
+        assert_eq!(atts[0].file_name, "Font1.ttf");
+        assert_eq!(atts[0].mime_type, "font/ttf");
+        assert_eq!(atts[1].file_name, "Font2.otf");
+        // The declared ranges must slice out exactly the payloads.
+        assert_eq!(&file[atts[0].offset as usize..(atts[0].offset + atts[0].size) as usize], font1);
+        assert_eq!(&file[atts[1].offset as usize..(atts[1].offset + atts[1].size) as usize], font2);
+
+        // Non-matroska input declares nothing.
+        let mut junk = tempfile::NamedTempFile::new().unwrap();
+        junk.write_all(b"\x00\x00\x00\x20ftypisommp4-not-mkv-junk-padding").unwrap();
+        junk.flush().unwrap();
+        assert!(declare_attachments(junk.path()).unwrap().is_empty());
+    }
+
+    /// Real-file check: KAHAWAI_ATTACH_CHECK=/path/to/file — declared
+    /// ranges must carry font magic where the mime says font.
+    #[test]
+    #[ignore]
+    fn corpus_attachments() {
+        use std::io::{Read as _, Seek as _};
+        let path = std::path::PathBuf::from(std::env::var("KAHAWAI_ATTACH_CHECK").unwrap());
+        let atts = declare_attachments(&path).unwrap();
+        let mut f = std::fs::File::open(&path).unwrap();
+        for a in &atts {
+            let mut magic = [0u8; 4];
+            f.seek(std::io::SeekFrom::Start(a.offset)).unwrap();
+            f.read_exact(&mut magic).unwrap();
+            println!(
+                "{} ({}) offset={} size={} magic={magic:02x?}",
+                a.file_name, a.mime_type, a.offset, a.size
+            );
+            if a.mime_type.contains("font") || a.mime_type.contains("truetype") {
+                assert!(
+                    matches!(&magic, b"\x00\x01\x00\x00" | b"OTTO" | b"true" | b"ttcf"),
+                    "{}: not font magic: {magic:02x?}",
+                    a.file_name
+                );
+            }
+        }
+        println!("{} attachments declared", atts.len());
     }
 
     /// Corpus equivalence: KAHAWAI_SPARSE_CHECK=/path/to/file — sparse
