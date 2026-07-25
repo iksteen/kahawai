@@ -91,6 +91,41 @@ pub struct HubConfig {
     /// OPS-8: CORS allowlist for third-party web clients — exact
     /// origins, or a single "*". Empty = same-origin only.
     pub cors_origins: Vec<String>,
+    #[serde(default)]
+    pub subtitles: SubtitlesConfig,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct SubtitlesConfig {
+    pub opensubtitles: OpenSubtitlesConfig,
+}
+
+/// HUB-21. The feature works with no configuration at all — the binary
+/// ships kahawai's registered application key. This block exists so a
+/// deployment can use its OWN key (rate-limit isolation, or if the
+/// embedded one is ever revoked), attach an account without touching
+/// the admin UI (containers, env vars), or switch the feature off.
+/// Config wins over anything set in the admin UI.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct OpenSubtitlesConfig {
+    pub enabled: bool,
+    /// Overrides the embedded application key when non-empty.
+    pub api_key: String,
+    pub username: String,
+    pub password: String,
+}
+
+impl Default for OpenSubtitlesConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            api_key: String::new(),
+            username: String::new(),
+            password: String::new(),
+        }
+    }
 }
 
 impl Default for HubConfig {
@@ -104,6 +139,7 @@ impl Default for HubConfig {
             enrollment_ttl_minutes: 15,
             trusted_proxies: Vec::new(),
             cors_origins: Vec::new(),
+            subtitles: SubtitlesConfig::default(),
         }
     }
 }

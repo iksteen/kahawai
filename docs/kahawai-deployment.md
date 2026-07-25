@@ -87,6 +87,30 @@ NOT shared cross-origin, which today means `<video>`/HLS playback —
 which authenticates by cookie — remains same-origin-only. A delegated
 media-token mechanism (AR-8) is the planned fix.
 
+## Subtitles (OpenSubtitles)
+
+Works with no configuration: the binary ships kahawai's registered
+application key, and anonymous use is entitled to 5 requests/second and
+**5 downloads per 24 hours shared across the whole deployment**. An
+account raises the download entitlement; the admin UI (Metadata
+providers) is the easy way to attach one.
+
+Deployments that want their own key — rate-limit isolation, or a
+container with no UI access — configure it here. Any value set in
+config wins over the same value set in the admin UI:
+
+```toml
+[hub.subtitles.opensubtitles]
+enabled  = true                   # false disables search + downloads entirely
+api_key  = "${KAHAWAI_OS_KEY}"    # optional: your own registered application key
+username = "${KAHAWAI_OS_USER}"   # optional account — raises the download entitlement
+password = "${KAHAWAI_OS_PASS}"
+```
+
+Every field is optional and every field honours the usual env override
+(`KAHAWAI_HUB__SUBTITLES__OPENSUBTITLES__API_KEY=…`), so nothing secret
+needs to live in the file.
+
 ## Checklist for exposing a hub
 
 1. `trusted_proxies` set to exactly the proxy hops (OPS-2 needs it).

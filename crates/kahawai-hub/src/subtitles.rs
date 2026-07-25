@@ -53,13 +53,60 @@ fn cache_key(module_id: &str, collection_id: &str, path_rel: &str, key: &str) ->
 
 pub struct Subtitles {
     dir: PathBuf,
+    /// HUB-21 deployment config (kahawai.toml); wins over settings.
+    provider_cfg: crate::opensubtitles::ProviderConfig,
     /// Per-cache-key locks so concurrent requests extract once.
     inflight: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl Subtitles {
     pub fn new(dir: PathBuf) -> Self {
-        Self { dir, inflight: Default::default() }
+        Self { dir, provider_cfg: Default::default(), inflight: Default::default() }
+    }
+
+    /// Attach deployment-level provider config. Without it (tests, and
+    /// any deployment that doesn't care) the built-in app key is used.
+    pub fn with_provider_config(mut self, cfg: crate::opensubtitles::ProviderConfig) -> Self {
+        self.provider_cfg = cfg;
+        self
+    }
+
+    /// Build the external subtitle provider (HUB-21). Precedence per
+    /// field: kahawai.toml → admin setting → built-in. Config wins
+    /// because a container deployment may have no UI access, and its
+    /// operator's explicit intent must not be silently overridden.
+    async fn external_provider(
+        &self,
+        registry: &Registry,
+    ) -> Result<Box<dyn crate::opensubtitles::SubtitleProvider>> {
+        let cfg = &self.provider_cfg;
+        let disabled_by_setting = registry
+            .get_setting(crate::opensubtitles::ENABLED_SETTING)
+            .await?
+            .as_deref()
+            == Some("0");
+        if !cfg.enabled || disabled_by_setting {
+            anyhow::bail!("subtitle downloads are disabled on this server");
+        }
+        let setting = |v: Option<String>| v.filter(|s| !s.is_empty());
+        let key = if cfg.api_key.is_empty() {
+            setting(registry.get_setting(crate::opensubtitles::KEY_SETTING).await?)
+                .unwrap_or_else(|| crate::opensubtitles::default_api_key().to_string())
+        } else {
+            cfg.api_key.clone()
+        };
+        let user = if cfg.username.is_empty() {
+            setting(registry.get_setting(crate::opensubtitles::USER_SETTING).await?)
+        } else {
+            Some(cfg.username.clone())
+        };
+        let pass = if cfg.password.is_empty() {
+            setting(registry.get_setting(crate::opensubtitles::PASS_SETTING).await?)
+        } else {
+            Some(cfg.password.clone())
+        };
+        let http = reqwest::Client::builder().user_agent("kahawai").build()?;
+        Ok(Box::new(crate::opensubtitles::OpenSubtitles::new(http, key, user, pass)))
     }
 
     /// The subtitle tracks we can serve for an item, from the same source
@@ -295,6 +342,7 @@ impl Subtitles {
         self.dir.join(format!("downloaded-{id}.json"))
     }
 
+    /// Search results plus the entitlement state the UI must show.
     /// HUB-21/22/24: search external providers for one item. Hash first
     /// (exact file), title/year as the fallback the provider needs when
     /// it doesn't know the hash.
@@ -303,11 +351,15 @@ impl Subtitles {
         registry: &Registry,
         item_id: &str,
         languages: Vec<String>,
-    ) -> Result<Vec<crate::opensubtitles::Candidate>> {
-        let provider = external_provider(registry).await?;
+    ) -> Result<(Vec<crate::opensubtitles::Candidate>, crate::opensubtitles::Quota)> {
+        let provider = self.external_provider(registry).await?;
+        provider.refresh_quota().await;
         let row = sqlx::query(
             "SELECT i.kind, i.season, i.episode,
                     md.proj_season, md.proj_episode,
+                    CASE WHEN COALESCE(pm.provider, md.provider) = 'tmdb'
+                         THEN COALESCE(pm.provider_id, md.provider_id) END AS tmdb_provider_id,
+                    COALESCE(pm.mapped_tmdb, md.mapped_tmdb) AS mapped_tmdb,
                     COALESCE(pm.title, p.title, md.title, i.title) AS search_title,
                     COALESCE(i.year, p.year,
                              CAST(substr(COALESCE(md.premiered, pmd.premiered), 1, 4) AS INTEGER))
@@ -343,6 +395,8 @@ impl Subtitles {
             let hits = provider
                 .search(&crate::opensubtitles::SearchQuery {
                     moviehash: Some(h as u64),
+                    tmdb_id: None,
+                    imdb_id: None,
                     title: None,
                     year: None,
                     season: None,
@@ -351,13 +405,13 @@ impl Subtitles {
                 })
                 .await?;
             if !hits.is_empty() {
-                return Ok(hits);
+                return Ok((hits, provider.quota()));
             }
         }
 
-        // Title fallback. For episodes OpenSubtitles wants season +
-        // episode; absolute-numbered anime has no native season, so use
-        // the HUB-31 projection — without it, "episode 11" alone matches
+        // For episodes OpenSubtitles wants season + episode;
+        // absolute-numbered anime has no native season, so use the
+        // HUB-31 projection — without it, "episode 11" alone matches
         // episode 11 of anything.
         let is_episode = row.get::<String, _>("kind") == "episode";
         let (mut season, mut episode) = (
@@ -375,8 +429,36 @@ impl Subtitles {
             // meaningless, so search the series and let the user choose.
             episode = None;
         }
+        // HUB-22 middle rung: enrichment's external ids beat a title
+        // string — for episodes the show's TMDB id plus season/episode
+        // is unambiguous where a title match is a guess.
+        let tmdb_id: Option<i64> = row
+            .get::<Option<String>, _>("tmdb_provider_id")
+            .and_then(|s| s.parse().ok())
+            .or_else(|| row.get::<Option<i64>, _>("mapped_tmdb"));
+        if tmdb_id.is_some() {
+            let hits = provider
+                .search(&crate::opensubtitles::SearchQuery {
+                    moviehash: None,
+                    tmdb_id,
+                    imdb_id: None,
+                    title: None,
+                    year: None,
+                    season: if is_episode { season } else { None },
+                    episode: if is_episode { episode } else { None },
+                    languages: languages.clone(),
+                })
+                .await
+                .unwrap_or_default();
+            if !hits.is_empty() {
+                return Ok((hits, provider.quota()));
+            }
+        }
+
         let q = crate::opensubtitles::SearchQuery {
             moviehash: None,
+            tmdb_id: None,
+            imdb_id: None,
             title: row.get::<Option<String>, _>("search_title"),
             // Year is the SHOW's start year for episodes, which the API
             // ANDs against the episode's air year — precise enough
@@ -386,7 +468,8 @@ impl Subtitles {
             episode,
             languages,
         };
-        provider.search(&q).await
+        let hits = provider.search(&q).await?;
+        Ok((hits, provider.quota()))
     }
 
     /// Download a chosen candidate, parse it, and register it for the
@@ -397,8 +480,9 @@ impl Subtitles {
         item_id: &str,
         file_id: &str,
         language: Option<String>,
-    ) -> Result<String> {
-        let provider = external_provider(registry).await?;
+        user_id: &str,
+    ) -> Result<(String, crate::opensubtitles::Quota)> {
+        let provider = self.external_provider(registry).await?;
         let dl = provider.download(file_id).await?;
         let text = decode_text(&dl.bytes);
         let cues = parse(&dl.format, &text)?;
@@ -408,20 +492,22 @@ impl Subtitles {
             ass: matches!(dl.format.as_str(), "ass" | "ssa").then_some(text),
         };
         let id: i64 = sqlx::query_scalar(
-            "INSERT INTO downloaded_subtitles (item_id, provider, language, format, release_name)
-             VALUES (?, ?, ?, ?, ?) RETURNING id",
+            "INSERT INTO downloaded_subtitles
+               (item_id, provider, language, format, release_name, downloaded_by)
+             VALUES (?, ?, ?, ?, ?, ?) RETURNING id",
         )
         .bind(item_id)
         .bind(provider.name())
         .bind(&language)
         .bind(&dl.format)
         .bind(&dl.release_name)
+        .bind(user_id)
         .fetch_one(registry.db())
         .await?;
         std::fs::create_dir_all(&self.dir)?;
         std::fs::write(self.downloaded_path(id), serde_json::to_vec(&ex)?)?;
         tracing::info!(item = item_id, id, format = %dl.format, "external subtitle downloaded");
-        Ok(format!("d{id}"))
+        Ok((format!("d{id}"), provider.quota()))
     }
 
     /// Remove a downloaded subtitle (row + cached body).
@@ -579,26 +665,6 @@ impl Subtitles {
         std::fs::write(&index, serde_json::to_vec(&names)?)?;
         Ok(fonts)
     }
-}
-
-/// Build the configured external subtitle provider (HUB-21). Disabled
-/// until the admin supplies an API key.
-async fn external_provider(
-    registry: &Registry,
-) -> Result<Box<dyn crate::opensubtitles::SubtitleProvider>> {
-    // The built-in key needs no configuration; the setting overrides it.
-    let key = registry
-        .get_setting(crate::opensubtitles::KEY_SETTING)
-        .await?
-        .filter(|k| !k.is_empty())
-        .unwrap_or_else(|| crate::opensubtitles::default_api_key().to_string());
-    let http = reqwest::Client::builder().user_agent("kahawai").build()?;
-    Ok(Box::new(crate::opensubtitles::OpenSubtitles::new(
-        http,
-        key,
-        registry.get_setting(crate::opensubtitles::USER_SETTING).await?.filter(|s| !s.is_empty()),
-        registry.get_setting(crate::opensubtitles::PASS_SETTING).await?.filter(|s| !s.is_empty()),
-    )))
 }
 
 /// Font-shaped attachment: matroska muxers tag fonts inconsistently

@@ -10,6 +10,8 @@ import {
   searchSubtitles,
   downloadSubtitle,
   deleteDownloadedSubtitle,
+  quotaLabel,
+  type SubtitleQuota,
   type Subtitle,
   type SubtitleCandidate,
   startSession,
@@ -98,6 +100,7 @@ export default function Detail({
   const [subLangs, setSubLangs] = useState<string[]>([])
   const [subBusy, setSubBusy] = useState(false)
   const [subNote, setSubNote] = useState('')
+  const [subQuota, setSubQuota] = useState<SubtitleQuota | null>(null)
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
 
@@ -315,6 +318,8 @@ export default function Detail({
   }
 
   const best = item.sources_detail[0]
+  const v = best?.streams?.video?.[0] as { fps?: [number, number] } | undefined
+  const fileFps = v?.fps ? v.fps[0] / v.fps[1] : null
   const duration = best?.streams?.duration_ms
   const resumeMs =
     item.resume_position_ms && duration && item.resume_position_ms < duration * 0.9
@@ -328,6 +333,7 @@ export default function Detail({
     try {
       const r = await searchSubtitles(item!.id, langs)
       setSubCands(r.candidates)
+      setSubQuota(r.quota)
       if (r.candidates.length === 0) {
         setSubNote(
           langs.length > 0
@@ -504,16 +510,29 @@ export default function Detail({
           </button>
         )}
         {subNote && <span className="dim">{subNote}</span>}
+        {quotaLabel(subQuota) && <span className="dim mono">{quotaLabel(subQuota)}</span>}
       </div>
       {subCands && subCands.length > 0 && (
         <ul className="rows sub-candidates">
           {subCands.slice(0, 25).map((c) => (
             <li key={c.file_id}>
               <span className="chips">
-                {c.hash_match && <span className="chip" title="exact file match">hash</span>}
+                {c.hash_match && (
+                  <span className="chip" title="the provider has this exact file's hash on this subtitle">
+                    hash
+                  </span>
+                )}
                 <span className="chip dim">{c.language ?? '?'}</span>
                 <span>{c.release_name ?? '(no name)'}</span>
                 <span className="dim mono">{c.downloads} dl</span>
+                {c.rating ? <span className="dim mono">★ {c.rating.toFixed(1)}</span> : null}
+                {c.uploader && <span className="dim">by {c.uploader}</span>}
+                {/* fps mismatch is the classic cause of progressive drift */}
+                {c.fps && fileFps && Math.abs(c.fps - fileFps) > 0.1 ? (
+                  <span className="chip warn" title={`timed for ${c.fps} fps; this file is ${fileFps.toFixed(3)} fps`}>
+                    {c.fps} fps
+                  </span>
+                ) : null}
               </span>
               <button
                 className="btn small"
@@ -521,7 +540,8 @@ export default function Detail({
                 onClick={() => {
                   setSubBusy(true)
                   downloadSubtitle(item.id, c.file_id, c.language)
-                    .then(() => {
+                    .then((r) => {
+                      setSubQuota(r.quota)
                       setSubNote('Downloaded — available as a subtitle track.')
                       setSubCands(null)
                       return reloadSubs()

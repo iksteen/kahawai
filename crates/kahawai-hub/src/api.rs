@@ -337,12 +337,12 @@ async fn subtitle_search(
     Path(id): Path<String>,
     Json(body): Json<SubtitleSearchRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    let candidates = state
+    let (candidates, quota) = state
         .subtitles
         .search_external(&state.registry, &id, body.languages)
         .await
         .map_err(|e| (StatusCode::BAD_GATEWAY, format!("{e:#}")))?;
-    Ok(Json(json!({ "candidates": candidates })))
+    Ok(Json(json!({ "candidates": candidates, "quota": quota })))
 }
 
 #[derive(Deserialize)]
@@ -357,14 +357,15 @@ struct SubtitleDownloadRequest {
 async fn subtitle_download(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    axum::Extension(claims): axum::Extension<crate::auth::Claims>,
     Json(body): Json<SubtitleDownloadRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    let key = state
+    let (key, quota) = state
         .subtitles
-        .download_external(&state.registry, &id, &body.file_id, body.language)
+        .download_external(&state.registry, &id, &body.file_id, body.language, &claims.sub)
         .await
         .map_err(|e| (StatusCode::BAD_GATEWAY, format!("{e:#}")))?;
-    Ok(Json(json!({ "key": key })))
+    Ok(Json(json!({ "key": key, "quota": quota })))
 }
 
 async fn subtitle_delete(

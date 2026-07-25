@@ -341,8 +341,16 @@ async fn run_hub_inner(
     let api_listener = tokio::net::TcpListener::bind(cfg.bind)
         .await
         .with_context(|| format!("binding client API on {}", cfg.bind))?;
-    let subtitles =
-        Arc::new(kahawai_hub::subtitles::Subtitles::new(cfg.data_dir.join("subtitles")));
+    let os = &cfg.subtitles.opensubtitles;
+    let subtitles = Arc::new(
+        kahawai_hub::subtitles::Subtitles::new(cfg.data_dir.join("subtitles"))
+            .with_provider_config(kahawai_hub::opensubtitles::ProviderConfig {
+                enabled: os.enabled,
+                api_key: os.api_key.clone(),
+                username: os.username.clone(),
+                password: os.password.clone(),
+            }),
+    );
     let enricher = Arc::new(kahawai_hub::enrich::Enricher::new(cfg.data_dir.clone()));
     let artwork = Arc::new(kahawai_hub::artwork::Artwork::new(
         cfg.data_dir.join("artwork"),

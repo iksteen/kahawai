@@ -9,11 +9,17 @@
 //! sums of the first/last 64 KiB) — is the primary search key, with a
 //! title/year fallback for files the provider doesn't recognize by hash.
 
+use std::time::Duration;
+
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
 const API: &str = "https://api.opensubtitles.com/api/v1";
 const USER_AGENT: &str = "kahawai v1";
+/// The app key's entitlement is 5 requests/second. Spacing gate, same
+/// shape as the AniDB/AniList clients (no new dependency for what a
+/// mutex and an Instant already do in this codebase).
+const REQUEST_SPACING: Duration = Duration::from_millis(210);
 
 /// kahawai's registered consumer key. Baked in on purpose: the key
 /// identifies the APPLICATION, not the user — OpenSubtitles explicitly
@@ -29,8 +35,32 @@ pub fn default_api_key() -> &'static str {
 }
 
 pub const KEY_SETTING: &str = "opensubtitles.api_key";
+/// "0" disables the provider entirely (HUB-21: admins may turn it off).
+pub const ENABLED_SETTING: &str = "opensubtitles.enabled";
 pub const USER_SETTING: &str = "opensubtitles.username";
 pub const PASS_SETTING: &str = "opensubtitles.password";
+
+/// Deployment-level provider config (kahawai.toml). Any non-empty
+/// field wins over the corresponding admin-UI setting; empty fields
+/// fall through to the setting, then to the built-in defaults.
+#[derive(Debug, Clone)]
+pub struct ProviderConfig {
+    pub enabled: bool,
+    pub api_key: String,
+    pub username: String,
+    pub password: String,
+}
+
+impl Default for ProviderConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            api_key: String::new(),
+            username: String::new(),
+            password: String::new(),
+        }
+    }
+}
 
 /// One search result the user can choose to download.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -44,6 +74,26 @@ pub struct Candidate {
     /// rather than by title — surfaced so the UI can rank/badge it.
     pub hash_match: bool,
     pub downloads: i64,
+    /// HUB-24 display fields: who uploaded it and how it rates.
+    pub uploader: Option<String>,
+    pub rating: Option<f64>,
+    /// Frames per second the subtitle was timed against, when the
+    /// provider knows it (0/None = unknown). A mismatch with the file
+    /// is the classic cause of progressive drift.
+    pub fps: Option<f64>,
+}
+
+/// HUB-21/24: what is left of the download entitlement. Anonymous
+/// usage shares one budget across the whole deployment, which the UI
+/// must say out loud.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct Quota {
+    pub remaining: Option<i64>,
+    pub total: Option<i64>,
+    /// Seconds until the entitlement resets, when the provider says.
+    pub resets_in_secs: Option<i64>,
+    /// False = anonymous, i.e. shared by everyone using this hub.
+    pub per_account: bool,
 }
 
 /// Downloaded subtitle bytes + normalized format.
@@ -60,10 +110,17 @@ pub trait SubtitleProvider: Send + Sync {
     fn name(&self) -> &'static str;
     async fn search(&self, q: &SearchQuery) -> Result<Vec<Candidate>>;
     async fn download(&self, file_id: &str) -> Result<Downloaded>;
+    /// Last known entitlement state (updated by download responses).
+    fn quota(&self) -> Quota;
+    /// Ask the provider for the current entitlement, if it can say.
+    async fn refresh_quota(&self) {}
 }
 
 pub struct SearchQuery {
     pub moviehash: Option<u64>,
+    /// External ids from enrichment (HUB-22): tried before title search.
+    pub tmdb_id: Option<i64>,
+    pub imdb_id: Option<String>,
     pub title: Option<String>,
     pub year: Option<i64>,
     /// Season/episode for series (OpenSubtitles wants them explicitly).
@@ -80,6 +137,10 @@ pub struct OpenSubtitles {
     /// Cached download token (OpenSubtitles issues it via /login and it
     /// lasts ~24 h; download quota is tracked against it).
     token: tokio::sync::Mutex<Option<String>>,
+    /// Request spacing gate (5 req/s entitlement).
+    last_request: tokio::sync::Mutex<Option<tokio::time::Instant>>,
+    quota: std::sync::Mutex<Quota>,
+    quota_checked: tokio::sync::Mutex<Option<tokio::time::Instant>>,
 }
 
 impl OpenSubtitles {
@@ -89,7 +150,29 @@ impl OpenSubtitles {
         username: Option<String>,
         password: Option<String>,
     ) -> Self {
-        Self { http, api_key, username, password, token: tokio::sync::Mutex::new(None) }
+        let per_account = username.is_some() && password.is_some();
+        Self {
+            http,
+            api_key,
+            username,
+            password,
+            token: tokio::sync::Mutex::new(None),
+            last_request: tokio::sync::Mutex::new(None),
+            quota: std::sync::Mutex::new(Quota { per_account, ..Default::default() }),
+            quota_checked: tokio::sync::Mutex::new(None),
+        }
+    }
+
+    /// Hold the 5 req/s line before every API call.
+    async fn pace(&self) {
+        let mut last = self.last_request.lock().await;
+        if let Some(t) = *last {
+            let since = t.elapsed();
+            if since < REQUEST_SPACING {
+                tokio::time::sleep(REQUEST_SPACING - since).await;
+            }
+        }
+        *last = Some(tokio::time::Instant::now());
     }
 
     fn req(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
@@ -131,6 +214,35 @@ impl OpenSubtitles {
     }
 }
 
+/// OpenSubtitles reports the reset as "23 hours and 12 minutes" (and
+/// occasionally an ISO timestamp). Parse the human form we actually
+/// see; anything else just leaves the countdown unknown.
+fn parse_reset_secs(s: &str) -> Option<i64> {
+    let lower = s.to_ascii_lowercase();
+    let mut secs = 0i64;
+    let mut found = false;
+    let words: Vec<&str> = lower.split_whitespace().collect();
+    for (i, w) in words.iter().enumerate() {
+        let Ok(n) = w.parse::<i64>() else { continue };
+        match words.get(i + 1).copied().unwrap_or("") {
+            u if u.starts_with("hour") => {
+                secs += n * 3600;
+                found = true;
+            }
+            u if u.starts_with("minute") => {
+                secs += n * 60;
+                found = true;
+            }
+            u if u.starts_with("second") => {
+                secs += n;
+                found = true;
+            }
+            _ => {}
+        }
+    }
+    found.then_some(secs)
+}
+
 /// Rank results: exact-file (hash) matches first, then the caller's
 /// language order — the request's list is a preference, not merely a
 /// filter — then popularity. Languages not in the list sort last (they
@@ -167,7 +279,18 @@ mod tests {
             release_name: None,
             hash_match: hash,
             downloads,
+            uploader: None,
+            rating: None,
+            fps: None,
         }
+    }
+
+    #[test]
+    fn parses_the_reset_phrase() {
+        assert_eq!(parse_reset_secs("23 hours and 12 minutes"), Some(23 * 3600 + 12 * 60));
+        assert_eq!(parse_reset_secs("45 minutes"), Some(45 * 60));
+        assert_eq!(parse_reset_secs("30 seconds"), Some(30));
+        assert_eq!(parse_reset_secs("tomorrow"), None);
     }
 
     /// The ranking the UI depends on: hash matches first, then the
@@ -211,6 +334,12 @@ impl SubtitleProvider for OpenSubtitles {
         if let Some(h) = q.moviehash {
             params.push(("moviehash".into(), format!("{h:016x}")));
         }
+        if let Some(id) = q.tmdb_id {
+            params.push(("tmdb_id".into(), id.to_string()));
+        }
+        if let Some(id) = &q.imdb_id {
+            params.push(("imdb_id".into(), id.clone()));
+        }
         if let Some(t) = &q.title {
             params.push(("query".into(), t.clone()));
         }
@@ -227,8 +356,11 @@ impl SubtitleProvider for OpenSubtitles {
             params.push(("languages".into(), q.languages.join(",")));
         }
         anyhow::ensure!(
-            q.moviehash.is_some() || q.title.is_some(),
-            "subtitle search needs a hash or a title"
+            q.moviehash.is_some()
+                || q.tmdb_id.is_some()
+                || q.imdb_id.is_some()
+                || q.title.is_some(),
+            "subtitle search needs a hash, an external id, or a title"
         );
 
         #[derive(Deserialize)]
@@ -249,13 +381,25 @@ impl SubtitleProvider for OpenSubtitles {
             moviehash_match: bool,
             #[serde(default)]
             download_count: i64,
+            #[serde(default)]
+            ratings: Option<f64>,
+            #[serde(default)]
+            fps: Option<f64>,
+            #[serde(default)]
+            uploader: Option<Uploader>,
             files: Vec<FileRef>,
+        }
+        #[derive(Deserialize)]
+        struct Uploader {
+            #[serde(default)]
+            name: Option<String>,
         }
         #[derive(Deserialize)]
         struct FileRef {
             file_id: i64,
         }
 
+        self.pace().await;
         let resp = self
             .req(reqwest::Method::GET, "/subtitles")
             .query(&params)
@@ -275,10 +419,62 @@ impl SubtitleProvider for OpenSubtitles {
                 release_name: a.release,
                 hash_match: a.moviehash_match,
                 downloads: a.download_count,
+                uploader: a.uploader.and_then(|u| u.name),
+                rating: a.ratings.filter(|r| *r > 0.0),
+                fps: a.fps.filter(|f| *f > 0.0),
             });
         }
         rank_candidates(&mut out, &q.languages);
         Ok(out)
+    }
+
+    fn quota(&self) -> Quota {
+        self.quota.lock().unwrap().clone()
+    }
+
+    /// HUB-24 wants the entitlement shown BEFORE a download too. With
+    /// an account the provider will tell us (/infos/user); anonymously
+    /// there is no such endpoint, so it stays unknown until the first
+    /// download reports it. Refreshed at most once a minute.
+    async fn refresh_quota(&self) {
+        {
+            let q = self.quota.lock().unwrap();
+            if !q.per_account {
+                return;
+            }
+        }
+        if let Some(t) = *self.quota_checked.lock().await
+            && t.elapsed() < Duration::from_secs(60)
+        {
+            return;
+        }
+        *self.quota_checked.lock().await = Some(tokio::time::Instant::now());
+        let Ok(Some(token)) = self.token().await else { return };
+        #[derive(Deserialize)]
+        struct Resp {
+            data: UserInfo,
+        }
+        #[derive(Deserialize)]
+        struct UserInfo {
+            #[serde(default)]
+            allowed_downloads: Option<i64>,
+            #[serde(default)]
+            remaining_downloads: Option<i64>,
+        }
+        self.pace().await;
+        let got = self
+            .req(reqwest::Method::GET, "/infos/user")
+            .bearer_auth(&token)
+            .send()
+            .await
+            .ok()
+            .filter(|r| r.status().is_success());
+        let Some(resp) = got else { return };
+        if let Ok(parsed) = resp.json::<Resp>().await {
+            let mut q = self.quota.lock().unwrap();
+            q.remaining = parsed.data.remaining_downloads;
+            q.total = parsed.data.allowed_downloads;
+        }
     }
 
     async fn download(&self, file_id: &str) -> Result<Downloaded> {
@@ -289,7 +485,15 @@ impl SubtitleProvider for OpenSubtitles {
             link: String,
             #[serde(default)]
             file_name: Option<String>,
+            // The entitlement counters ride the download response.
+            #[serde(default)]
+            requests: Option<i64>,
+            #[serde(default)]
+            remaining: Option<i64>,
+            #[serde(default)]
+            reset_time_utc: Option<String>,
         }
+        self.pace().await;
         let mut req = self
             .req(reqwest::Method::POST, "/download")
             .json(&serde_json::json!({ "file_id": file_id }));
@@ -311,6 +515,13 @@ impl SubtitleProvider for OpenSubtitles {
             );
         }
         let dl: DlResp = resp.error_for_status().context("OpenSubtitles download")?.json().await?;
+        {
+            // HUB-24: remember what's left so every response can say so.
+            let mut q = self.quota.lock().unwrap();
+            q.remaining = dl.remaining;
+            q.total = dl.remaining.and_then(|r| dl.requests.map(|used| r + used));
+            q.resets_in_secs = dl.reset_time_utc.as_deref().and_then(parse_reset_secs);
+        }
         let bytes = self
             .http
             .get(&dl.link)

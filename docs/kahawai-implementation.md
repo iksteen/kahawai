@@ -162,11 +162,13 @@ trait SubtitleProvider {
     //  SubCandidate { provider_file_id, lang, format, release, rating,
     //                 download_count, uploader, hash_matched: bool }
     async fn download(&self, id: &ProviderFileId) -> Result<SubtitlePayload>;
-    fn quota(&self) -> QuotaState; // remaining, resets_at
+    fn quota(&self) -> QuotaState; // remaining, resets_at, whether deployment-shared
 }
 ```
 
-`opensubtitles` implements it against the current REST API (`api.opensubtitles.com/api/v1`): API key header, `POST /login` for the user JWT that downloads require, `/subtitles` search by `moviehash`+`moviebytesize` first (exact-release matches, flagged `hash_matched`), falling back to `tmdb_id`/`imdb_id` from enrichment, then title/season/episode. Candidates are ranked for display: hash match ≫ external-ID match + release-string similarity, then download count and rating — but the *user* always picks; there is no automatic selection. The client tracks the account's daily download quota from response headers and returns it with every search and download response so clients can show "N downloads left today"; an exhausted quota fails the download with the reset time, never queues anything in the background. Search responses go through `provider_cache` like everything else.
+`opensubtitles` implements it against the current REST API (`api.opensubtitles.com/api/v1`): the `Api-Key` header carries Kahawai's own registered application key, compiled into the binary — an application identifier, not a secret, and registered to this project rather than borrowed from another (registering one is free and takes minutes). No configuration is required to use the feature. Anonymous operation is entitled to **5 requests/second** (a `governor` limiter enforces it, shared across the process) and **5 downloads per 24 hours**; attaching an account via `POST /login` swaps in the user JWT and raises the download entitlement. Search works either way. Queries go by `moviehash`+`moviebytesize` first (exact-release matches, flagged `hash_matched`), falling back to `tmdb_id`/`imdb_id` from enrichment, then title/season/episode. Candidates are ranked for display: hash match ≫ external-ID match + release-string similarity, then download count and rating — but the *user* always picks; there is no automatic selection.
+
+Entitlement handling: remaining downloads and reset time come from the download response headers, are persisted, and ride along with every search and download response so the UI can show "3 of 5 downloads left today, resets 04:12" — with the anonymous case labelled as a *server-wide* budget, since 5/24h shared across a household is small enough that a user needs to know they're spending a common resource (and that hash-exact matches are worth spending it on). Exhaustion fails the download with the reset time; nothing queues in the background (HUB-24). Because search is cheap and downloads are not, search responses go through `provider_cache` aggressively. Operational note: if the embedded application key is ever rate-limited or revoked upstream, `api_key` in config overrides it without a release.
 
 **Storage — hub only.** Payloads are normalized on ingest (encoding sniff → UTF-8; SRT kept as master, converted on demand) and written under the hub's `data_dir/subtitles/{item_source_id}/{lang}-{n}.srt` with a `subtitles` table row (`item_source_id, lang, origin: local|embedded|opensubtitles|ocr, provider_file_id, uploader, downloaded_by_user, format, created_at`). Nothing is ever written to a mediahost — the mediahost link has no write operation to abuse (MH-6), so this holds by construction. At negotiation time these rows are merged into `SourceStreams` as external text-subtitle streams; delivery is the normal §4.5 path — pass-through/convert served straight from hub disk, or shipped to the transcoder over the byte plane as an extra input when the plan says burn-in.
 
@@ -386,10 +388,14 @@ image_sub_ocr = true                  # runtime switch for the OCR tier (needs t
 # bandwidth — a capability that also feeds the quality ladder, so it
 # lands with that machinery rather than as a one-off here.
 
-[hub.subtitles.opensubtitles]        # feature off unless this block exists
-api_key = "${KAHAWAI_OS_KEY}"
-username = "…"                        # account needed for downloads
+[hub.subtitles.opensubtitles]        # optional block — the feature works with no
+                                     # config at all (embedded application key,
+                                     # anonymous: 5 req/s, 5 downloads/24h shared
+                                     # across this deployment)
+enabled = true
+username = "…"                        # optional account — raises the download entitlement
 password = "${KAHAWAI_OS_PASS}"
+api_key = "${KAHAWAI_OS_KEY}"         # optional override of the embedded application key
 [hub.subtitles]
 default_langs = ["en", "de"]          # default search filter only — downloads are
                                       # always user-initiated, never automatic
@@ -448,7 +454,7 @@ The web UI is built in vertical slices alongside its backend features rather tha
 
 **M3 — Transcoding (5 wks).** Transcoder module, capability probing, negotiation engine, HLS output, seek + quality switch, hw accel (VA-API first). Web: hls.js path, playback-info overlay with negotiation verdict, sessions dashboard. *Exit:* acceptance criterion 2 driven from the web player.
 
-**M4 — Enrichment + series/music/anime (6 wks).** Provider trait + TheTVDB/TMDB/MusicBrainz/local, episode/track resolution, dedup/multi-source, matching review queue, image pipeline, subtitle acquisition (OpenSubtitles: moviehash search, user-initiated download only, hub-side storage, quota surfacing). Anime: fansub tokenizer, AniDB (titles-dump search + ed2k exact match) + AniList + anime-lists mapping, relations/watch order, font-attachment extraction, ASS client-render (JASSUB) and `assrender` burn-in paths, dual-audio preference. Web: enriched browse with artwork, search, match-review queue, library composer, subtitle search/download flow, music player with queue. *Exit:* criterion 1.
+**M4 — Enrichment + series/music/anime (6 wks).** Provider trait + TheTVDB/TMDB/MusicBrainz/local, episode/track resolution, dedup/multi-source, matching review queue, image pipeline, subtitle acquisition (OpenSubtitles: embedded application key, anonymous entitlement handling with account upgrade, moviehash search, user-initiated download only, hub-side storage, entitlement surfacing). Anime: fansub tokenizer, AniDB (titles-dump search + ed2k exact match) + AniList + anime-lists mapping, relations/watch order, font-attachment extraction, ASS client-render (JASSUB) and `assrender` burn-in paths, dual-audio preference. Web: enriched browse with artwork, search, match-review queue, library composer, subtitle search/download flow, music player with queue. *Exit:* criterion 1.
 
 **M5 — Hardening (3.5 wks).** Failover paths, metrics/health, remaining admin surfaces (users/grants, provider settings), backup/restore, cache quotas + janitor, login throttling, clock-skew handling, version-skew CI matrix, reverse-proxy docs (OPS-2, 4..8), docs, packaging (binaries + containers with bundled GStreamer plugin set), performance passes, Playwright suite green in Chromium + WebKit. *Exit:* criteria 3–5, NFR-1 numbers on reference hardware.
 

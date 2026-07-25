@@ -186,19 +186,42 @@ export type SubtitleCandidate = {
   release_name: string | null
   hash_match: boolean
   downloads: number
+  uploader: string | null
+  rating: number | null
+  fps: number | null
+}
+
+/// HUB-21/24: download entitlement. per_account = false means the
+/// budget is shared by everyone on this server, which the UI must say.
+export type SubtitleQuota = {
+  remaining: number | null
+  total: number | null
+  resets_in_secs: number | null
+  per_account: boolean
 }
 
 export const searchSubtitles = (itemId: string, languages: string[]) =>
-  json<{ candidates: SubtitleCandidate[] }>(`/api/v1/items/${itemId}/subtitles/search`, {
-    method: 'POST',
-    body: JSON.stringify({ languages }),
-  })
+  json<{ candidates: SubtitleCandidate[]; quota: SubtitleQuota }>(
+    `/api/v1/items/${itemId}/subtitles/search`,
+    { method: 'POST', body: JSON.stringify({ languages }) },
+  )
 
 export const downloadSubtitle = (itemId: string, fileId: string, language: string | null) =>
-  json<{ key: string }>(`/api/v1/items/${itemId}/subtitles/download`, {
+  json<{ key: string; quota: SubtitleQuota }>(`/api/v1/items/${itemId}/subtitles/download`, {
     method: 'POST',
     body: JSON.stringify({ file_id: fileId, language }),
   })
+
+/// "3 of 5 downloads left today (shared by everyone on this server)"
+export function quotaLabel(q: SubtitleQuota | null): string {
+  if (!q || q.remaining === null) return ''
+  const scope = q.per_account ? '' : ' — shared by everyone on this server'
+  const resets =
+    q.resets_in_secs && q.resets_in_secs > 0
+      ? `, resets in ${Math.max(1, Math.round(q.resets_in_secs / 3600))} h`
+      : ''
+  return `${q.remaining}${q.total ? ` of ${q.total}` : ''} downloads left today${resets}${scope}`
+}
 
 export const deleteDownloadedSubtitle = (id: number) =>
   json<{ removed: boolean }>(`/api/v1/subtitles/downloaded/${id}`, { method: 'DELETE' })
