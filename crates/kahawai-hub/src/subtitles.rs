@@ -71,40 +71,33 @@ impl Subtitles {
         self
     }
 
-    /// Build the external subtitle provider (HUB-21). Precedence per
-    /// field: kahawai.toml → admin setting → built-in. Config wins
-    /// because a container deployment may have no UI access, and its
-    /// operator's explicit intent must not be silently overridden.
+    /// Build the external subtitle provider (HUB-21). The application
+    /// key comes from config, else the admin page, else the key we
+    /// ship; the optional account always comes from the admin page.
     async fn external_provider(
         &self,
         registry: &Registry,
     ) -> Result<Box<dyn crate::opensubtitles::SubtitleProvider>> {
-        let cfg = &self.provider_cfg;
-        let disabled_by_setting = registry
+        // Always on (HUB-21) unless an admin switched it off.
+        if registry
             .get_setting(crate::opensubtitles::ENABLED_SETTING)
             .await?
             .as_deref()
-            == Some("0");
-        if !cfg.enabled || disabled_by_setting {
+            == Some("0")
+        {
             anyhow::bail!("subtitle downloads are disabled on this server");
         }
         let setting = |v: Option<String>| v.filter(|s| !s.is_empty());
-        let key = if cfg.api_key.is_empty() {
+        // Key: config file → admin page → the key we ship.
+        let key = if self.provider_cfg.api_key.is_empty() {
             setting(registry.get_setting(crate::opensubtitles::KEY_SETTING).await?)
                 .unwrap_or_else(|| crate::opensubtitles::default_api_key().to_string())
         } else {
-            cfg.api_key.clone()
+            self.provider_cfg.api_key.clone()
         };
-        let user = if cfg.username.is_empty() {
-            setting(registry.get_setting(crate::opensubtitles::USER_SETTING).await?)
-        } else {
-            Some(cfg.username.clone())
-        };
-        let pass = if cfg.password.is_empty() {
-            setting(registry.get_setting(crate::opensubtitles::PASS_SETTING).await?)
-        } else {
-            Some(cfg.password.clone())
-        };
+        // The account is a credential: admin page only.
+        let user = setting(registry.get_setting(crate::opensubtitles::USER_SETTING).await?);
+        let pass = setting(registry.get_setting(crate::opensubtitles::PASS_SETTING).await?);
         let http = reqwest::Client::builder().user_agent("kahawai").build()?;
         Ok(Box::new(crate::opensubtitles::OpenSubtitles::new(http, key, user, pass)))
     }

@@ -95,21 +95,19 @@ application key, and anonymous use is entitled to 5 requests/second and
 account raises the download entitlement; the admin UI (Metadata
 providers) is the easy way to attach one.
 
-Deployments that want their own key — rate-limit isolation, or a
-container with no UI access — configure it here. Any value set in
-config wins over the same value set in the admin UI:
+A deployment that wants its own application key — rate-limit
+isolation, or if the embedded one is ever revoked — sets it here, and
+it wins over the same field in the admin page:
 
 ```toml
 [hub.subtitles.opensubtitles]
-enabled  = true                   # false disables search + downloads entirely
-api_key  = "${KAHAWAI_OS_KEY}"    # optional: your own registered application key
-username = "${KAHAWAI_OS_USER}"   # optional account — raises the download entitlement
-password = "${KAHAWAI_OS_PASS}"
+api_key = "${KAHAWAI_OS_KEY}"     # optional: your own registered application key
 ```
 
-Every field is optional and every field honours the usual env override
-(`KAHAWAI_HUB__SUBTITLES__OPENSUBTITLES__API_KEY=…`), so nothing secret
-needs to live in the file.
+It honours the usual env override
+(`KAHAWAI_HUB__SUBTITLES__OPENSUBTITLES__API_KEY=…`). The OpenSubtitles
+*account* is entered in the admin page instead — it is a credential,
+and the UI is where credentials belong.
 
 ## Checklist for exposing a hub
 

@@ -341,14 +341,10 @@ async fn run_hub_inner(
     let api_listener = tokio::net::TcpListener::bind(cfg.bind)
         .await
         .with_context(|| format!("binding client API on {}", cfg.bind))?;
-    let os = &cfg.subtitles.opensubtitles;
     let subtitles = Arc::new(
         kahawai_hub::subtitles::Subtitles::new(cfg.data_dir.join("subtitles"))
             .with_provider_config(kahawai_hub::opensubtitles::ProviderConfig {
-                enabled: os.enabled,
-                api_key: os.api_key.clone(),
-                username: os.username.clone(),
-                password: os.password.clone(),
+                api_key: cfg.subtitles.opensubtitles.api_key.clone(),
             }),
     );
     let enricher = Arc::new(kahawai_hub::enrich::Enricher::new(cfg.data_dir.clone()));

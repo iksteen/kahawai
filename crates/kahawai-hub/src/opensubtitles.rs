@@ -40,26 +40,13 @@ pub const ENABLED_SETTING: &str = "opensubtitles.enabled";
 pub const USER_SETTING: &str = "opensubtitles.username";
 pub const PASS_SETTING: &str = "opensubtitles.password";
 
-/// Deployment-level provider config (kahawai.toml). Any non-empty
-/// field wins over the corresponding admin-UI setting; empty fields
-/// fall through to the setting, then to the built-in defaults.
-#[derive(Debug, Clone)]
+/// Deployment-level provider config (kahawai.toml): just the
+/// application key, and only when a deployment wants its own. Empty =
+/// the admin setting, then the built-in key. Account credentials live
+/// in the admin page, not here.
+#[derive(Debug, Clone, Default)]
 pub struct ProviderConfig {
-    pub enabled: bool,
     pub api_key: String,
-    pub username: String,
-    pub password: String,
-}
-
-impl Default for ProviderConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            api_key: String::new(),
-            username: String::new(),
-            password: String::new(),
-        }
-    }
 }
 
 /// One search result the user can choose to download.
