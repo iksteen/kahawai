@@ -98,13 +98,14 @@ export default function Detail({
         .then((c) => setEpisodes(c.children))
         .catch((e) => setError(String(e)))
     }
-    // Library context: media type (per-type track settings, HUB-33)
-    // and the anime season-view choice (HUB-31).
-    fetchLibraries()
-      .then((l) => {
-        const lib = l.libraries.find((x) => x.id === fromLib)
-        setMediaType(lib?.media_type ?? '')
-        if (lib?.anime_view) setAnimeView(lib.anime_view)
+    // Library context: media type (per-type track settings, HUB-33).
+    // Anime presentation (HUB-31) is purely a user preference; default
+    // is the projected seasons view.
+    Promise.all([fetchLibraries(), fetchPrefs().catch(() => ({ prefs: [] }))])
+      .then(([l, p]) => {
+        setMediaType(l.libraries.find((x) => x.id === fromLib)?.media_type ?? '')
+        const mine = p.prefs.find((x) => x.scope === '' && x.key === 'anime_view')?.value
+        setAnimeView(mine === 'native' ? 'native' : 'seasons')
       })
       .catch(() => {})
   }, [item?.id, item?.kind, fromLib])

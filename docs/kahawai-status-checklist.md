@@ -136,8 +136,10 @@ Last updated: 2026-07-25, against the revised requirements (AR-12, MH-10/11, HUB
       otherwise adopt anime ids only via reverse mapping (proven live)
 - [x] HUB-31 Native anime structure: absolute numbering as identity,
       relations graph on the item detail (prequel-first suggested order),
-      and per-library presentation as native or TVDB-style seasons — the
-      projection stored per episode during the TVDB/TMDB bridge
+      and presentation as native or TVDB-style seasons — a per-USER
+      preference (settings page, default seasons; the requirement's
+      per-library knob was dropped 2026-07-25 as needless bookkeeping) —
+      with the projection stored per episode during the TVDB/TMDB bridge
       *(episodes TVDB never curated absolute numbers for stay unprojected
       and fall into an "Other" bucket)*
 - [x] HUB-32 (see subtitles above)

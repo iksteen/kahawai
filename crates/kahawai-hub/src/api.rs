@@ -83,7 +83,6 @@ pub fn router(
         .route("/admin/v1/providers/anidb/verify", post(admin_verify_anidb))
         .route("/admin/v1/enrich", get(admin_enrich_status).post(admin_enrich_run))
         .route("/admin/v1/libraries/{id}/refresh", post(admin_refresh_library))
-        .route("/admin/v1/libraries/{id}/anime-view", post(admin_set_anime_view))
         .route("/admin/v1/collections/refresh", post(admin_refresh_collection))
         .route("/admin/v1/enrich/review", get(admin_review_list))
         .route("/admin/v1/enrich/search", post(admin_review_search))
@@ -378,30 +377,6 @@ async fn admin_enrich_run(State(state): State<AppState>) -> Result<Json<Value>, 
 struct RescanRequest {
     #[serde(default)]
     collection_id: Option<String>,
-}
-
-/// HUB-31: per-library anime presentation — 'seasons' (TVDB-style
-/// projection) or 'native' (flat absolute order).
-async fn admin_set_anime_view(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-    Json(body): Json<Value>,
-) -> Result<Json<Value>, ApiError> {
-    let view = body.get("anime_view").and_then(|v| v.as_str()).unwrap_or_default();
-    if !matches!(view, "seasons" | "native") {
-        return Err((StatusCode::BAD_REQUEST, "anime_view must be seasons|native".into()));
-    }
-    let n = sqlx::query("UPDATE libraries SET anime_view = ? WHERE id = ?")
-        .bind(view)
-        .bind(&id)
-        .execute(state.registry.db())
-        .await
-        .map_err(internal)?
-        .rows_affected();
-    if n == 0 {
-        return Err((StatusCode::NOT_FOUND, "no such library".into()));
-    }
-    Ok(Json(json!({ "anime_view": view })))
 }
 
 /// HUB-35: granular refresh. The admin-facing unit is the LIBRARY —
@@ -1237,11 +1212,10 @@ async fn item_font(
 }
 
 async fn list_libraries(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
-    let rows =
-        sqlx::query("SELECT id, name, media_type, anime_view FROM libraries ORDER BY name")
-            .fetch_all(state.registry.db())
-            .await
-            .map_err(internal)?;
+    let rows = sqlx::query("SELECT id, name, media_type FROM libraries ORDER BY name")
+        .fetch_all(state.registry.db())
+        .await
+        .map_err(internal)?;
     let libraries: Vec<Value> = rows
         .iter()
         .map(|r| {
@@ -1249,7 +1223,6 @@ async fn list_libraries(State(state): State<AppState>) -> Result<Json<Value>, Ap
                 "id": r.get::<String, _>("id"),
                 "name": r.get::<String, _>("name"),
                 "media_type": r.get::<String, _>("media_type"),
-                "anime_view": r.get::<String, _>("anime_view"),
             })
         })
         .collect();

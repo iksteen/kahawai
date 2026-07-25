@@ -678,10 +678,9 @@ impl Registry {
 
     /// Libraries with their member collections, for the admin UI.
     pub async fn libraries_overview(&self) -> Result<Vec<serde_json::Value>> {
-        let libs =
-            sqlx::query("SELECT id, name, media_type, anime_view FROM libraries ORDER BY name")
-                .fetch_all(&self.db)
-                .await?;
+        let libs = sqlx::query("SELECT id, name, media_type FROM libraries ORDER BY name")
+            .fetch_all(&self.db)
+            .await?;
         let members = sqlx::query(
             "SELECT lc.library_id, lc.module_id, lc.collection_id, s.name AS host_name
              FROM library_collections lc
@@ -709,7 +708,6 @@ impl Registry {
                     "id": id,
                     "name": l.get::<String, _>("name"),
                     "media_type": l.get::<String, _>("media_type"),
-                    "anime_view": l.get::<String, _>("anime_view"),
                     "collections": cols,
                 })
             })

@@ -164,6 +164,34 @@ export default function Settings() {
               flash={flash}
             />
           ))}
+          {mt === 'anime' && (
+            <div className="row-form pref-row">
+              <span className="pref-label mono">view</span>
+              <span className="chips">
+                {(['seasons', 'native'] as const).map((v) => (
+                  <button
+                    key={v}
+                    className={(values['anime_view'] ?? 'seasons') === v ? 'chip' : 'chip dim'}
+                    title={
+                      v === 'seasons'
+                        ? 'TVDB-style seasons (projected)'
+                        : 'flat absolute numbering (AniDB-native)'
+                    }
+                    onClick={() =>
+                      putPref('', 'anime_view', v)
+                        .then(() => {
+                          setValues((cur) => ({ ...cur, anime_view: v }))
+                          flash()
+                        })
+                        .catch(() => {})
+                    }
+                  >
+                    {v}
+                  </button>
+                ))}
+              </span>
+            </div>
+          )}
         </section>
       ))}
     </main>

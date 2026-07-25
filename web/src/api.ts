@@ -186,12 +186,7 @@ export const fetchFonts = (itemId: string) =>
 export const subtitleLabel = (s: Subtitle) =>
   `${s.language ?? 'unknown'} · ${s.format}${s.kind === 'sidecar' ? ' · file' : ''}`
 
-export type LibrarySummary = {
-  id: string
-  name: string
-  media_type: string
-  anime_view?: 'seasons' | 'native'
-}
+export type LibrarySummary = { id: string; name: string; media_type: string }
 
 export const fetchLibraries = () =>
   json<{ libraries: LibrarySummary[] }>('/api/v1/libraries')
@@ -419,7 +414,6 @@ export type Library = {
   id: string
   name: string
   media_type: string
-  anime_view?: 'seasons' | 'native'
   collections: LibraryCollection[]
 }
 
@@ -507,12 +501,6 @@ export const adminApplyMatch = (
       provider: candidate?.provider ?? null,
       candidate: candidate ?? null,
     }),
-  })
-
-export const adminSetAnimeView = (id: string, view: 'seasons' | 'native') =>
-  json<{ anime_view: string }>(`/admin/v1/libraries/${id}/anime-view`, {
-    method: 'POST',
-    body: JSON.stringify({ anime_view: view }),
   })
 
 export const adminRefreshLibrary = (id: string) =>
