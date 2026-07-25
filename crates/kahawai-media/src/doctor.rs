@@ -2,6 +2,7 @@
 //! matrix, naming exactly which capability each missing plugin costs.
 
 use gstreamer as gst;
+use gstreamer::prelude::*;
 use serde::Serialize;
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
@@ -144,6 +145,34 @@ pub fn gstreamer_checks() -> Vec<Check> {
             )),
         }
     }
+
+    // hlssink3 has a known panic class (see remux.rs) that the session
+    // starter escapes by retrying on hlssink2 — so the FALLBACK sink is
+    // load-bearing on its own. Verify it instantiates, not merely that
+    // "hls sink" passed: a half-upgraded box (libgsthls.so present but a
+    // shared lib missing — seen live: nettle on silence) drops hlssink2
+    // from the registry while hlssink3 keeps the matrix row green.
+    out.push(match gst::ElementFactory::make("hlssink2").build() {
+        Ok(el) => {
+            let ready = el.set_state(gst::State::Ready).is_ok();
+            let _ = el.set_state(gst::State::Null);
+            if ready {
+                Check::ok("hls fallback sink", "hlssink2 instantiates")
+            } else {
+                Check::warn(
+                    "hls fallback sink",
+                    "hlssink2 present but cannot reach READY — files hitting the \
+                     known hlssink3 panic will fail to start",
+                )
+            }
+        }
+        Err(_) => Check::warn(
+            "hls fallback sink",
+            "hlssink2 unavailable — files hitting the known hlssink3 panic cannot \
+             start; check gst-plugins-bad and its libraries \
+             (ldd /usr/lib/gstreamer-1.0/libgsthls.so)",
+        ),
+    });
 
     // TC-1: encoders that will actually run sessions are dry-run-verified,
     // not just present — a broken element (or a hw element without its
