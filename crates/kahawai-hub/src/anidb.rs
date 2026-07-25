@@ -7,9 +7,12 @@
 //! cache every answer. Two disciplines matter more than the rest, and
 //! both are enforced here rather than left to callers:
 //!
-//! * **Sessions are reused across runs** — the key is persisted and
-//!   revalidated with UPTIME; a fresh AUTH per enrichment run got us
-//!   throttle-banned twice in one evening (37 logins in a day).
+//! * **One session, reused across runs AND restarts** — a fresh AUTH per
+//!   enrichment run got us throttle-banned twice in one evening (37
+//!   logins in a day). AniDB identifies a session by client IP *and
+//!   port*, so the local UDP port is persisted alongside the key and
+//!   rebound on startup; the session then survives a restart (until
+//!   AniDB expires it for inactivity, ~35 min).
 //! * **A 555 stops everything** — AniDB bans have no fixed duration:
 //!   they decay after ~24 h ONLY if the client stops calling, and every
 //!   attempt while banned extends them. So a ban is recorded on disk
@@ -52,12 +55,16 @@ pub struct FileHit {
     pub group_name: String,
 }
 
-/// Persisted between runs: the session key to resume, and when a ban
-/// (if any) may be retried. Lives beside the other anime data files.
+/// What survives a restart: the session key, the local UDP port it is
+/// bound to (AniDB keys sessions by IP+port, so the same port must be
+/// rebound for the key to mean anything), and when a ban lapses.
 #[derive(Default, serde::Serialize, serde::Deserialize)]
 struct State {
     #[serde(default)]
     session: String,
+    /// Local UDP port the session belongs to; 0 = none stored.
+    #[serde(default)]
+    port: u16,
     /// Unix seconds; contact is refused until then.
     #[serde(default)]
     banned_until: i64,
@@ -125,7 +132,22 @@ impl Anidb {
                 (left + 3599) / 3600
             );
         }
-        let socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
+        // Rebind the port the stored session belongs to. If it is taken
+        // (another instance, or the OS still holding it), fall back to
+        // an ephemeral port — the session is then unusable and we
+        // authenticate as normal.
+        let st = load_state(data_dir);
+        let socket = match st.port {
+            0 => tokio::net::UdpSocket::bind("0.0.0.0:0").await?,
+            p => match tokio::net::UdpSocket::bind(("0.0.0.0", p)).await {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::debug!(port = p, error = %e, "stored anidb port unavailable");
+                    tokio::net::UdpSocket::bind("0.0.0.0:0").await?
+                }
+            },
+        };
+        let bound_port = socket.local_addr().map(|a| a.port()).unwrap_or(0);
         socket.connect(SERVER).await.context("resolving api.anidb.net")?;
         let mut client = Self {
             socket,
@@ -157,32 +179,24 @@ impl Anidb {
             client.cipher = Some(aes::Aes128::new_from_slice(&digest).unwrap());
         }
 
-        // Resume the stored session before authenticating: a fresh AUTH
-        // per run is what gets clients throttled. This must come AFTER
-        // ENCRYPT — a session opened on an encrypted channel can only
-        // be probed on one (the first attempt at this resumed nothing
-        // because it asked in plaintext).
-        let stored = load_state(data_dir).session;
-        if !stored.is_empty() {
-            client.session = stored;
+        // Resume before authenticating — but only if we got the same
+        // port back, since the key is meaningless from another one.
+        // Must come AFTER ENCRYPT: an encrypted session can only be
+        // probed over an encrypted channel.
+        if !st.session.is_empty() && st.port != 0 && st.port == bound_port {
+            client.session = st.session;
             match client.command(&format!("UPTIME s={}", client.session)).await {
                 Ok((208, _)) => {
-                    tracing::info!("anidb session resumed (no re-auth)");
+                    tracing::info!(port = bound_port, "anidb session resumed (no re-auth)");
                     return Ok(client);
                 }
                 Ok((555, rest)) => {
                     client.record_ban(&rest);
                     bail!("anidb: BANNED — staying silent for 24 h: {rest}");
                 }
-                // 501/506/other = stale key: authenticate below.
-                Ok((code, rest)) => {
-                    // Not yet confirmed which code AniDB returns here —
-                    // sessions may be bound to the UDP source port, in
-                    // which case a restart can never resume and only the
-                    // in-process reuse matters. Logged at info so the
-                    // next real run answers it.
-                    tracing::info!(code, detail = %rest.trim(),
-                        "stored anidb session not resumable; authenticating");
+                // 501/506 = expired (35 min idle) or otherwise stale.
+                Ok((code, _)) => {
+                    tracing::debug!(code, "stored anidb session stale; authenticating");
                     client.session.clear();
                 }
                 Err(e) => {
@@ -204,7 +218,11 @@ impl Anidb {
                 anyhow::ensure!(!client.session.is_empty(), "no session key in AUTH reply");
                 save_state(
                     data_dir,
-                    &State { session: client.session.clone(), banned_until: 0 },
+                    &State {
+                        session: client.session.clone(),
+                        port: bound_port,
+                        banned_until: 0,
+                    },
                 );
                 if code == 201 {
                     tracing::info!("anidb: a newer client version is available");
@@ -252,9 +270,8 @@ impl Anidb {
             }
             320 => Ok(None),
             501 | 506 => {
-                // The key went stale: forget it so the next run
-                // authenticates instead of resuming a dead session.
-                save_state(&self.data_dir, &State { session: String::new(), banned_until: 0 });
+                let st = load_state(&self.data_dir);
+                save_state(&self.data_dir, &State { session: String::new(), ..st });
                 bail!("anidb session lost: {code}")
             }
             555 => {
@@ -270,10 +287,12 @@ impl Anidb {
     fn record_ban(&mut self, detail: &str) {
         tracing::error!(detail, "anidb BANNED — suppressing all contact for 24 h");
         self.session.clear();
+        let port = load_state(&self.data_dir).port;
         save_state(
             &self.data_dir,
             &State {
                 session: String::new(),
+                port,
                 banned_until: now_unix() + BAN_COOLDOWN.as_secs() as i64,
             },
         );
@@ -380,10 +399,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         assert!(ban_remaining(dir.path()).is_none(), "clean state is not banned");
 
-        save_state(
-            dir.path(),
-            &State { session: "abc".into(), banned_until: now_unix() + 3600 },
-        );
+        save_state(dir.path(), &State { banned_until: now_unix() + 3600, ..Default::default() });
         let left = ban_remaining(dir.path()).expect("ban recorded");
         assert!(left > 3500 && left <= 3600, "{left}");
 
@@ -399,18 +415,21 @@ mod tests {
     #[test]
     fn a_lapsed_ban_is_no_longer_enforced() {
         let dir = tempfile::tempdir().unwrap();
-        save_state(
-            dir.path(),
-            &State { session: String::new(), banned_until: now_unix() - 1 },
-        );
+        save_state(dir.path(), &State { banned_until: now_unix() - 1, ..Default::default() });
         assert!(ban_remaining(dir.path()).is_none());
     }
 
+    /// A session is only resumable from the port it was opened on
+    /// (AniDB keys sessions by IP+port), so both travel together.
     #[test]
-    fn sessions_survive_a_restart() {
+    fn session_and_port_persist_together() {
         let dir = tempfile::tempdir().unwrap();
-        save_state(dir.path(), &State { session: "sess-key".into(), banned_until: 0 });
-        assert_eq!(load_state(dir.path()).session, "sess-key");
+        save_state(
+            dir.path(),
+            &State { session: "key".into(), port: 45678, banned_until: 0 },
+        );
+        let st = load_state(dir.path());
+        assert_eq!((st.session.as_str(), st.port), ("key", 45678));
     }
 
     #[test]
