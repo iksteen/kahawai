@@ -166,6 +166,7 @@ export type Subtitle = {
   format: string
   language: string | null
   flattened: boolean
+  image?: boolean
 }
 
 export const fetchSubtitles = (itemId: string) =>

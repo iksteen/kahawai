@@ -113,8 +113,14 @@ export default function Player({
   // growing document). Falls back to the item-level .vtt <track> when
   // the tap yields nothing (old satellite, no pipeline).
   const [vttFallback, setVttFallback] = useState(false)
+  const useImage = !!selected && !!selected.image
   const liveText =
-    isHls && !!selected && !useAss && selected.kind === 'embedded' && !vttFallback
+    isHls &&
+    !!selected &&
+    !useAss &&
+    !useImage &&
+    selected.kind === 'embedded' &&
+    !vttFallback
   const jsTrackRef = useRef<TextTrack | null>(null)
 
   useEffect(() => setVttFallback(false), [subKey])
@@ -182,6 +188,119 @@ export default function Player({
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [liveText, subKey, trackEpoch, item.id])
+
+  // Image subtitles (PGS/VobSub): the session tap streams decoded
+  // display sets — {"s",cw,ch,"o":[{x,y,png}]} — and we draw the
+  // latest set at/before the playhead on a canvas overlay, scaled from
+  // composition space to the video's displayed content box.
+  const imgCanvasRef = useRef<HTMLCanvasElement | null>(null)
+  useEffect(() => {
+    const video = videoRef.current
+    if (!video || !useImage || !selected || !isHls) return
+    let dead = false
+    const ac = new AbortController()
+    type ImgSet = { s: number; cw: number; ch: number; objects: { x: number; y: number; img: ImageBitmap }[] }
+    const sets: ImgSet[] = []
+    let drawnIdx = -1
+
+    if (!imgCanvasRef.current) {
+      const c = document.createElement('canvas')
+      c.className = 'imgsub-canvas'
+      c.style.position = 'absolute'
+      c.style.pointerEvents = 'none'
+      video.insertAdjacentElement('afterend', c)
+      imgCanvasRef.current = c
+    }
+    const canvas = imgCanvasRef.current
+    canvas.style.display = 'block'
+
+    const place = () => {
+      // The displayed content box: aspect-fit inside the element.
+      const vw = video.videoWidth || 16
+      const vh = video.videoHeight || 9
+      const er = video.clientWidth / video.clientHeight
+      const cr = vw / vh
+      const w = er > cr ? video.clientHeight * cr : video.clientWidth
+      const h = er > cr ? video.clientHeight : video.clientWidth / cr
+      canvas.style.width = `${Math.round(w)}px`
+      canvas.style.height = `${Math.round(h)}px`
+      canvas.style.left = `${Math.round(video.offsetLeft + (video.clientWidth - w) / 2)}px`
+      canvas.style.top = `${Math.round(video.offsetTop + (video.clientHeight - h) / 2)}px`
+    }
+
+    const draw = () => {
+      if (dead) return
+      const t = video.currentTime * 1000 + offsetRef.current
+      let idx = -1
+      for (let i = sets.length - 1; i >= 0; i--) {
+        if (sets[i].s <= t) {
+          idx = i
+          break
+        }
+      }
+      if (idx !== drawnIdx) {
+        drawnIdx = idx
+        const set = idx >= 0 ? sets[idx] : null
+        canvas.width = set?.cw || 1920
+        canvas.height = set?.ch || 1080
+        const ctx = canvas.getContext('2d')!
+        ctx.clearRect(0, 0, canvas.width, canvas.height)
+        if (set) for (const o of set.objects) ctx.drawImage(o.img, o.x, o.y)
+      }
+      place()
+    }
+    // Interval-driven (not rVFC): keeps drawing with the tab occluded,
+    // and 200 ms is well inside PGS timing tolerance.
+    const timer = window.setInterval(draw, 200)
+    video.addEventListener('seeked', draw)
+
+    ;(async () => {
+      const base = session.stream_url.replace(/[^/]*$/, '')
+      const resp = await fetch(`${base}subs-${selected.key}.jsonl`, { signal: ac.signal })
+      if (!resp.ok || !resp.body) return
+      const reader = resp.body.getReader()
+      const dec = new TextDecoder()
+      let buf = ''
+      for (;;) {
+        const { done, value } = await reader.read()
+        if (dead) return
+        if (value) buf += dec.decode(value, { stream: true })
+        const cut = buf.lastIndexOf('\n')
+        if (cut >= 0) {
+          for (const line of buf.slice(0, cut).split('\n')) {
+            if (!line.trim()) continue
+            try {
+              const j = JSON.parse(line)
+              const objects = await Promise.all(
+                (j.o as { x: number; y: number; png: string }[]).map(async (o) => {
+                  const bytes = Uint8Array.from(atob(o.png), (ch) => ch.charCodeAt(0))
+                  const img = await createImageBitmap(new Blob([bytes], { type: 'image/png' }))
+                  return { x: o.x, y: o.y, img }
+                }),
+              )
+              sets.push({ s: j.s, cw: j.cw, ch: j.ch, objects })
+              drawnIdx = -2 // force redraw check
+            } catch {
+              /* partial line */
+            }
+          }
+          buf = buf.slice(cut + 1)
+        }
+        if (done) break
+      }
+    })().catch(() => {})
+
+    return () => {
+      dead = true
+      ac.abort()
+      window.clearInterval(timer)
+      video.removeEventListener('seeked', draw)
+      canvas.style.display = 'none'
+      const ctx = canvas.getContext('2d')
+      ctx?.clearRect(0, 0, canvas.width, canvas.height)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [useImage, subKey, trackEpoch, item.id])
 
   // Faithful ASS rendering (HUB-32): JASSUB draws with libass on a
   // canvas over the video, fed the original script and the source's
@@ -435,7 +554,7 @@ export default function Player({
           playsInline
           crossOrigin="use-credentials"
         >
-          {subKey && !useAss && !liveText && (
+          {subKey && !useAss && !liveText && !useImage && (
             <track
               key={`${subKey}-${trackEpoch}`}
               default

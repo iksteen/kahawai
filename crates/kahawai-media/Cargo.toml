@@ -6,6 +6,8 @@ license.workspace = true
 
 [dependencies]
 serde_json = { workspace = true }
+png = { workspace = true }
+base64 = { workspace = true }
 kahawai-core = { workspace = true }
 anyhow = { workspace = true }
 gstreamer = { workspace = true }

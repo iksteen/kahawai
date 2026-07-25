@@ -591,16 +591,7 @@ fn plumb_parsed_pad(
     {
         let idx = subs_seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if name.starts_with("subpicture/") {
-            // Image subs: counted for stable e{n} keys, rendered in a
-            // later milestone.
-            let fake = gst::ElementFactory::make("fakesink")
-                .property("sync", false)
-                .property("async", false)
-                .build()
-                .unwrap();
-            pipe.add(&fake).unwrap();
-            fake.sync_state_with_parent().unwrap();
-            let _ = qsrc.link(&fake.static_pad("sink").unwrap());
+            tap_image_track(pipe, &qsrc, &advertised, subs_dir, idx, &name);
         } else {
             tap_text_track(pipe, &qsrc, &advertised, subs_dir, idx, &name);
         }
@@ -731,6 +722,111 @@ fn tap_text_track(
         tracing::warn!(error = %e, "subtitle tap link failed");
     }
     tracing::info!(path = %path.display(), "tapping text subtitle track");
+}
+
+/// Tee an image subtitle stream (PGS / VobSub) into
+/// `subs-e{idx}.jsonl`: one display-set line per event —
+/// `{"s":ms,"cw":..,"ch":..,"o":[{"x","y","png":base64}…]}` — decoded
+/// to RGBA server-side so any client can draw them on an overlay
+/// canvas. Empty "o" clears the screen.
+fn tap_image_track(
+    pipe: &gst::Pipeline,
+    from: &gst::Pad,
+    caps: &gst::Caps,
+    dir: &std::path::Path,
+    idx: usize,
+    caps_name: &str,
+) {
+    use base64::Engine;
+    let path = dir.join(format!("subs-e{idx}.jsonl"));
+    let file = match std::fs::File::create(&path) {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "image sub tap file failed");
+            let fake = gst::ElementFactory::make("fakesink")
+                .property("sync", false)
+                .property("async", false)
+                .build()
+                .unwrap();
+            pipe.add(&fake).unwrap();
+            fake.sync_state_with_parent().unwrap();
+            let _ = from.link(&fake.static_pad("sink").unwrap());
+            return;
+        }
+    };
+    let file = std::sync::Mutex::new(file);
+    let is_pgs = caps_name.contains("pgs");
+    let mut pgs = crate::imagesubs::PgsDecoder::default();
+    // VobSub: 16-color palette + display size ride the codec_data (.idx text).
+    let (vob_palette, vob_size) = caps
+        .structure(0)
+        .and_then(|s| s.get::<gst::Buffer>("codec_data").ok())
+        .and_then(|b| b.map_readable().ok().map(|m| {
+            let text = crate::subtitles::decode_text(m.as_slice());
+            let size = text.lines().find_map(|l| {
+                let (w, h) = l.trim().strip_prefix("size:")?.trim().split_once('x')?;
+                Some((w.trim().parse::<u32>().ok()?, h.trim().parse::<u32>().ok()?))
+            });
+            (crate::imagesubs::vobsub_palette(&text), size)
+        }))
+        .unwrap_or_default();
+    let vob_size = vob_size.unwrap_or((720, 576));
+
+    let write_set = move |file: &std::sync::Mutex<std::fs::File>,
+                          ms: u64,
+                          cw: u32,
+                          ch: u32,
+                          objects: &[crate::imagesubs::ImageObject]| {
+        use std::io::Write;
+        let objs: Vec<serde_json::Value> = objects
+            .iter()
+            .filter_map(|o| {
+                let png = crate::imagesubs::to_png(o).ok()?;
+                Some(serde_json::json!({
+                    "x": o.x, "y": o.y,
+                    "png": base64::engine::general_purpose::STANDARD.encode(png),
+                }))
+            })
+            .collect();
+        let line = serde_json::json!({"s": ms, "cw": cw, "ch": ch, "o": objs});
+        let mut f = file.lock().unwrap();
+        let _ = writeln!(f, "{line}");
+    };
+
+    let appsink = gstreamer_app::AppSink::builder().sync(false).build();
+    appsink.set_property("async", false);
+    appsink.set_callbacks(
+        gstreamer_app::AppSinkCallbacks::builder()
+            .new_sample(move |sink| {
+                if let Ok(sample) = sink.pull_sample()
+                    && let Some(buffer) = sample.buffer()
+                    && let Some(pts) = buffer.pts()
+                    && let Ok(map) = buffer.map_readable()
+                {
+                    let ms = pts.mseconds();
+                    if is_pgs {
+                        if let Ok(Some(set)) = pgs.feed(map.as_slice()) {
+                            write_set(&file, ms, set.canvas_w, set.canvas_h, &set.objects);
+                        }
+                    } else if let Ok(Some(obj)) =
+                        crate::imagesubs::vobsub_decode(map.as_slice(), &vob_palette)
+                    {
+                        let end = ms
+                            + buffer.duration().map(|d| d.mseconds()).unwrap_or(5000);
+                        write_set(&file, ms, vob_size.0, vob_size.1, std::slice::from_ref(&obj));
+                        write_set(&file, end, vob_size.0, vob_size.1, &[]);
+                    }
+                }
+                Ok(gst::FlowSuccess::Ok)
+            })
+            .build(),
+    );
+    pipe.add(appsink.upcast_ref::<gst::Element>()).unwrap();
+    appsink.sync_state_with_parent().unwrap();
+    if let Err(e) = from.link(&appsink.static_pad("sink").unwrap()) {
+        tracing::warn!(error = %e, "image sub tap link failed");
+    }
+    tracing::info!(path = %path.display(), pgs = is_pgs, "tapping image subtitle track");
 }
 
 /// Route a stream to the muxer (via parser/timestamper) or a fakesink,

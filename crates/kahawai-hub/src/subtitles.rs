@@ -28,6 +28,9 @@ pub struct SubtitleEntry {
     /// Clients with an ASS renderer (the web player, via JASSUB) fetch
     /// the faithful .ass form instead.
     pub flattened: bool,
+    /// Bitmap subtitles (PGS/VobSub): rendered from the session tap's
+    /// display-set stream on an overlay — no VTT form exists.
+    pub image: bool,
 }
 
 /// A served ASS script: complete (cache/sidecar) or streamed while the
@@ -373,13 +376,15 @@ impl Subtitles {
 fn entries(info: &kahawai_core::media::MediaInfo) -> Vec<SubtitleEntry> {
     let mut out = Vec::new();
     for (i, s) in info.subtitles.iter().enumerate() {
-        if is_text_format(&s.format) {
+        let image = matches!(s.format.as_str(), "pgs" | "vobsub" | "dvdsub");
+        if is_text_format(&s.format) || image {
             out.push(SubtitleEntry {
                 key: format!("e{i}"),
                 kind: "embedded",
                 format: s.format.clone(),
                 language: s.language.clone(),
                 flattened: matches!(s.format.as_str(), "ass" | "ssa"),
+                image,
             });
         }
     }
@@ -390,6 +395,7 @@ fn entries(info: &kahawai_core::media::MediaInfo) -> Vec<SubtitleEntry> {
             format: s.format.clone(),
             language: s.language.clone(),
             flattened: s.format == "ass",
+            image: false,
         });
     }
     out

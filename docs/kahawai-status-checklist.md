@@ -4,7 +4,7 @@ Status of every numbered requirement from `kahawai-technical-requirements.md`,
 plus the v1 acceptance criteria. Checked = implemented and exercised against
 the live deployment. Unchecked items carry a note when partially done.
 
-Last updated: 2026-07-25 (anime providers, MusicBrainz).
+Last updated: 2026-07-25 (anime providers, MusicBrainz, image subtitles).
 
 ## Architecture (AR)
 
@@ -74,7 +74,9 @@ Last updated: 2026-07-25 (anime providers, MusicBrainz).
 - [ ] HUB-24 User-initiated subtitle downloads
 - [x] HUB-32 ASS/SSA first-class: faithful extraction (header + re-timed events),
       JASSUB rendering with embedded fonts, live session-pipeline tap (all embedded
-      text codecs), mediahost extraction facility with index-driven sparse reads
+      text codecs), mediahost extraction facility with index-driven sparse reads;
+      image subtitles (PGS + VobSub) decoded server-side and rendered on a
+      canvas overlay from the same tap — no video transcoding
 - [ ] HUB-32a ASS fallback policy *(flatten live and labeled; burn-in not built;
       no per-library/user policy or playback-info reporting yet)*
 
@@ -163,8 +165,9 @@ Last updated: 2026-07-25 (anime providers, MusicBrainz).
 
 ## v1 acceptance criteria
 
-- [ ] 1. All-in-one mixed-library end-to-end *(video+music+enrichment+web player
-      live; anime AniDB matching and PGS handling missing)*
+- [ ] 1. All-in-one mixed-library end-to-end *(video+music+enrichment+web
+      player+AniDB matching+PGS rendering live; the all-in-one single-machine
+      variant itself unexercised)*
 - [x] 2. Direct play w/ byte-range seek; remux w/ mid-stream subtitle/audio switching
 - [x] 3. Modular three-machine deployment (dev box hub + NAS + macOS transcoder)
 - [x] 4. Mediahost kill mid-playback: unavailability surfaces, reconnect restores

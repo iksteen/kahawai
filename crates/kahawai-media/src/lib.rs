@@ -2,6 +2,7 @@
 //! stream model. Blocking — call from `spawn_blocking` in async contexts.
 
 pub mod doctor;
+pub mod imagesubs;
 pub mod remux;
 pub mod subindex;
 pub mod subtitles;
