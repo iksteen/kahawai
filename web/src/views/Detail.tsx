@@ -93,6 +93,9 @@ export default function Detail({
   // HUB-21/24: subtitle tracks + external search results.
   const [subs, setSubs] = useState<Subtitle[]>([])
   const [subCands, setSubCands] = useState<SubtitleCandidate[] | null>(null)
+  // HUB-33 subtitle-language preference for this library's media type;
+  // empty = no preference, search every language.
+  const [subLangs, setSubLangs] = useState<string[]>([])
   const [subBusy, setSubBusy] = useState(false)
   const [subNote, setSubNote] = useState('')
   const [error, setError] = useState('')
@@ -125,9 +128,16 @@ export default function Detail({
     // is the projected seasons view.
     Promise.all([fetchLibraries(), fetchPrefs().catch(() => ({ prefs: [] }))])
       .then(([l, p]) => {
-        setMediaType(l.libraries.find((x) => x.id === fromLib)?.media_type ?? '')
+        const mt = l.libraries.find((x) => x.id === fromLib)?.media_type ?? ''
+        setMediaType(mt)
         const mine = p.prefs.find((x) => x.scope === '' && x.key === 'anime_view')?.value
         setAnimeView(mine === 'native' ? 'native' : 'seasons')
+        setSubLangs(
+          (p.prefs.find((x) => x.scope === '' && x.key === `subs.${mt}`)?.value ?? '')
+            .split(',')
+            .map((s) => s.trim())
+            .filter(Boolean),
+        )
       })
       .catch(() => {})
   }, [item?.id, item?.kind, fromLib])
@@ -312,6 +322,26 @@ export default function Detail({
       : 0
   const progress = duration && resumeMs ? (resumeMs / duration) * 100 : 0
 
+  async function findSubs(langs: string[]) {
+    setSubBusy(true)
+    setSubNote('')
+    try {
+      const r = await searchSubtitles(item!.id, langs)
+      setSubCands(r.candidates)
+      if (r.candidates.length === 0) {
+        setSubNote(
+          langs.length > 0
+            ? `Nothing in ${langs.join(', ')} for this file.`
+            : 'No subtitles found for this file.',
+        )
+      }
+    } catch (e) {
+      setSubNote(String(e))
+    } finally {
+      setSubBusy(false)
+    }
+  }
+
   async function play(mode: 'direct' | 'remux', fromStart = false) {
     setBusy(true)
     setError('')
@@ -458,20 +488,21 @@ export default function Detail({
         <button
           className="btn ghost small"
           disabled={subBusy}
-          onClick={() => {
-            setSubBusy(true)
-            setSubNote('')
-            searchSubtitles(item.id, [])
-              .then((r) => {
-                setSubCands(r.candidates)
-                if (r.candidates.length === 0) setSubNote('No subtitles found for this file.')
-              })
-              .catch((e) => setSubNote(String(e)))
-              .finally(() => setSubBusy(false))
-          }}
+          onClick={() => void findSubs(subLangs)}
         >
-          {subBusy ? 'Searching…' : 'Find subtitles online'}
+          {subBusy
+            ? 'Searching…'
+            : subLangs.length > 0
+              ? `Find subtitles (${subLangs.join(', ')})`
+              : 'Find subtitles online'}
         </button>
+        {/* The language filter comes from Settings → this media type;
+            offer the unfiltered search when it finds nothing. */}
+        {subLangs.length > 0 && subCands?.length === 0 && !subBusy && (
+          <button className="btn ghost small" onClick={() => void findSubs([])}>
+            Search all languages
+          </button>
+        )}
         {subNote && <span className="dim">{subNote}</span>}
       </div>
       {subCands && subCands.length > 0 && (

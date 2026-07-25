@@ -95,9 +95,10 @@ Last updated: 2026-07-25, against the revised requirements (AR-12, MH-10/11, HUB
       anime) only when the hash is unknown; hash matches sort first
 - [x] HUB-23 Subtitles stored hub-side only (mediahost link has no write operation)
 - [x] HUB-24 User-initiated subtitle downloads: search + download from
-      the item detail page; the result is parsed into the normal cue/ASS
-      cache as a "d{id}" track, served by every existing subtitle path,
-      and removable
+      the item detail page, filtered by the media type's subtitle
+      language preference (HUB-33) with a one-click unfiltered retry;
+      the result is parsed into the normal cue/ASS cache as a "d{id}"
+      track, served by every existing subtitle path, and removable
 - [x] HUB-32 ASS/SSA first-class: faithful extraction (header + re-timed events),
       JASSUB rendering with embedded fonts, live session-pipeline tap (all embedded
       text codecs), mediahost extraction facility with index-driven sparse reads;
