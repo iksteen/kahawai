@@ -795,6 +795,24 @@ impl Enricher {
         tracing::info!(items = items.len(), "anime enrichment starting");
         let titles = crate::anime::AnidbTitles::load(&self.http, &self.data_dir).await?;
         let lists = crate::anime::AnimeLists::load(&self.http, &self.data_dir).await?;
+        // Gold path (HUB-30): FILE-by-ED2K when the admin configured an
+        // AniDB account. One session for the whole pass.
+        let mut anidb = match (
+            registry.get_setting(crate::anidb::USER_SETTING).await?,
+            registry.get_setting(crate::anidb::PASS_SETTING).await?,
+        ) {
+            (Some(user), Some(pass)) if !user.is_empty() && !pass.is_empty() => {
+                let key = registry.get_setting(crate::anidb::APIKEY_SETTING).await?;
+                match crate::anidb::Anidb::login(&user, &pass, key.as_deref()).await {
+                    Ok(c) => Some(c),
+                    Err(e) => {
+                        tracing::warn!(error = format!("{e:#}"), "anidb login failed; title matching only");
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
 
         let mut done = 0usize;
         for row in items {
@@ -808,8 +826,24 @@ impl Enricher {
                 .get::<Option<String>, _>("provider")
                 .zip(row.get::<Option<String>, _>("provider_id"));
             let manual = row.get::<Option<String>, _>("confidence").as_deref() == Some("manual");
+            // ED2K-exact identity first: the file IS the identity, no
+            // name heuristics involved. Cached in ed2k_aid so a file is
+            // never asked about twice across runs.
+            let mut exact_aid: Option<u32> = None;
+            if let Some(client) = anidb.as_mut() {
+                match self.anidb_identify(registry, client, &id).await {
+                    Ok(aid) => exact_aid = aid,
+                    Err(e) => {
+                        tracing::warn!(error = format!("{e:#}"), "anidb lookup failed; disabling for this run");
+                        anidb = None;
+                    }
+                }
+            }
             match self
-                .anime_one(registry, &titles, &lists, &id, &kind, &title, year, existing, manual)
+                .anime_one(
+                    registry, &titles, &lists, &id, &kind, &title, year, existing, manual,
+                    exact_aid,
+                )
                 .await
             {
                 Ok(true) => done += 1,
@@ -817,8 +851,60 @@ impl Enricher {
                 Err(e) => tracing::warn!(title, error = format!("{e:#}"), "anime enrichment error"),
             }
         }
+        if let Some(client) = anidb {
+            client.logout().await;
+        }
         tracing::info!(matched = done, "anime enrichment complete");
         Ok(())
+    }
+
+    /// Resolve an item's AniDB id from a representative file's ED2K
+    /// hash. Results (hits AND misses) are persisted per content in the
+    /// ed2k_aid table — AniDB is never asked twice for the same hash.
+    async fn anidb_identify(
+        &self,
+        registry: &Registry,
+        client: &mut crate::anidb::Anidb,
+        item_id: &str,
+    ) -> Result<Option<u32>> {
+        let Some(row) = sqlx::query(
+            "SELECT f.ed2k, f.size FROM files f
+             JOIN item_sources s ON (s.module_id, s.collection_id, s.path_rel)
+                                  = (f.module_id, f.collection_id, f.path_rel)
+             WHERE f.ed2k IS NOT NULL
+               AND (s.item_id = ?1
+                    OR s.item_id IN (SELECT id FROM items WHERE parent_id = ?1))
+             ORDER BY s.path_rel LIMIT 1",
+        )
+        .bind(item_id)
+        .fetch_optional(registry.db())
+        .await?
+        else {
+            return Ok(None);
+        };
+        let (ed2k, size) = (row.get::<String, _>("ed2k"), row.get::<i64, _>("size") as u64);
+
+        if let Some(cached) = sqlx::query_scalar::<_, Option<i64>>(
+            "SELECT aid FROM ed2k_aid WHERE ed2k = ?",
+        )
+        .bind(&ed2k)
+        .fetch_optional(registry.db())
+        .await?
+        {
+            return Ok(cached.map(|a| a as u32));
+        }
+        let hit = client.file_by_ed2k(size, &ed2k).await?;
+        let aid = hit.as_ref().map(|h| h.aid);
+        if let Some(h) = &hit {
+            tracing::info!(aid = h.aid, epno = %h.epno, group = %h.group_name,
+                "anidb exact file identification");
+        }
+        sqlx::query("INSERT OR REPLACE INTO ed2k_aid (ed2k, aid, updated_at) VALUES (?, ?, unixepoch())")
+            .bind(&ed2k)
+            .bind(aid)
+            .execute(registry.db())
+            .await?;
+        Ok(aid)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -833,11 +919,22 @@ impl Enricher {
         year: Option<i64>,
         existing: Option<(String, String)>,
         manual: bool,
+        exact_aid: Option<u32>,
     ) -> Result<bool> {
-        // Best identity source: an already-verified generic match,
+        // ED2K-exact identification outranks every heuristic — the
+        // hash is the file. Then: an already-verified generic match,
         // reverse-mapped — adopts anime ids without re-deciding WHO the
         // item is. Falls back to the titles dump; manual matches never
         // fall back (the admin's identity choice is pinned).
+        if let Some(aid) = exact_aid
+            && let Some(m) = lists.by_anidb(aid)
+            && let Some(anilist_id) = m.anilist_id
+            && let Some(media) = self.anilist.media_by_id(anilist_id).await?
+        {
+            self.store_anime(registry, item_id, kind, &media, Some(aid), Some(m)).await?;
+            tracing::info!(title, anilist = media.id, anidb = aid, "anime matched (ed2k exact)");
+            return Ok(true);
+        }
         let reverse: Vec<u32> = existing
             .as_ref()
             .map(|(p, pid)| lists.reverse(p, pid))
@@ -898,6 +995,21 @@ impl Enricher {
         };
 
         let mapping = anidb_id.and_then(|aid| lists.by_anidb(aid));
+        self.store_anime(registry, item_id, kind, &media, anidb_id, mapping).await?;
+        tracing::info!(title, anilist = media.id, anidb = anidb_id, "anime matched");
+        Ok(true)
+    }
+
+    /// Persist an AniList match: metadata upsert + relations graph.
+    async fn store_anime(
+        &self,
+        registry: &Registry,
+        item_id: &str,
+        kind: &str,
+        media: &crate::anime::AnilistMedia,
+        anidb_id: Option<u32>,
+        mapping: Option<&crate::anime::Mapping>,
+    ) -> Result<()> {
         let poster = media
             .cover_image
             .as_ref()
@@ -957,8 +1069,7 @@ impl Enricher {
                 .await?;
             }
         }
-        tracing::info!(title, anilist = media.id, anidb = anidb_id, "anime matched");
-        Ok(true)
+        Ok(())
     }
 
     /// Phase two: episode-level metadata for every matched show that

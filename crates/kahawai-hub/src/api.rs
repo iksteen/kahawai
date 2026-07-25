@@ -78,6 +78,7 @@ pub fn router(
         .route("/admin/v1/providers", get(admin_providers))
         .route("/admin/v1/providers/tmdb", post(admin_set_tmdb))
         .route("/admin/v1/providers/tvdb", post(admin_set_tvdb))
+        .route("/admin/v1/providers/anidb", post(admin_set_anidb))
         .route("/admin/v1/enrich", get(admin_enrich_status).post(admin_enrich_run))
         .route("/admin/v1/rescan", post(admin_rescan))
         .route("/admin/v1/enrich/review", get(admin_review_list))
@@ -198,10 +199,60 @@ async fn admin_providers(State(state): State<AppState>) -> Result<Json<Value>, A
         .await
         .map_err(internal)?
         .is_some();
+    let anidb = state
+        .registry
+        .get_setting(crate::anidb::USER_SETTING)
+        .await
+        .map_err(internal)?
+        .is_some();
     Ok(Json(json!({
         "tmdb": { "configured": tmdb },
         "tvdb": { "configured": tvdb },
+        "anidb": { "configured": anidb },
     })))
+}
+
+#[derive(Deserialize)]
+struct SetAnidb {
+    username: String,
+    password: String,
+    #[serde(default)]
+    udp_api_key: Option<String>,
+}
+
+/// AniDB account for the UDP FILE-by-ED2K gold path (HUB-30). The
+/// client identity ("kahawai" v1) is compiled in; only the account is
+/// configuration. Optional UDP API key upgrades to an encrypted session.
+async fn admin_set_anidb(
+    State(state): State<AppState>,
+    Json(body): Json<SetAnidb>,
+) -> Result<Json<Value>, ApiError> {
+    let (user, pass) = (body.username.trim(), body.password.trim());
+    if user.is_empty() || pass.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "username and password required".into()));
+    }
+    state.registry.set_setting(crate::anidb::USER_SETTING, user).await.map_err(internal)?;
+    state.registry.set_setting(crate::anidb::PASS_SETTING, pass).await.map_err(internal)?;
+    if let Some(key) = body.udp_api_key.as_deref().map(str::trim).filter(|k| !k.is_empty()) {
+        state.registry.set_setting(crate::anidb::APIKEY_SETTING, key).await.map_err(internal)?;
+    }
+    // Validate immediately: a bad login should fail HERE, not silently
+    // during the next enrichment run.
+    let key = state.registry.get_setting(crate::anidb::APIKEY_SETTING).await.map_err(internal)?;
+    match crate::anidb::Anidb::login(user, pass, key.as_deref()).await {
+        Ok(client) => {
+            client.logout().await;
+            let enricher = state.enricher.clone();
+            let registry = state.registry.clone();
+            tokio::spawn(async move {
+                if let Err(e) = enricher.run_once(&registry).await {
+                    tracing::warn!(error = format!("{e:#}"), "enrichment run failed");
+                }
+            });
+            Ok(Json(json!({ "saved": true, "verified": true })))
+        }
+        Err(e) => Ok(Json(json!({ "saved": true, "verified": false, "error": format!("{e:#}") }))),
+    }
 }
 
 #[derive(Deserialize)]

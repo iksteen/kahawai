@@ -325,7 +325,16 @@ export const adminCollections = () =>
   json<{ collections: CollectionInfo[] }>('/admin/v1/collections')
 
 export const adminProviders = () =>
-  json<{ tmdb: { configured: boolean }; tvdb: { configured: boolean } }>('/admin/v1/providers')
+  json<{
+    tmdb: { configured: boolean }
+    tvdb: { configured: boolean }
+    anidb: { configured: boolean }
+  }>('/admin/v1/providers')
+export const adminSetAnidb = (username: string, password: string, udpApiKey?: string) =>
+  json<{ saved: boolean; verified: boolean; error?: string }>('/admin/v1/providers/anidb', {
+    method: 'POST',
+    body: JSON.stringify({ username, password, udp_api_key: udpApiKey || null }),
+  })
 export const adminSetTvdbKey = (apiKey: string, pin?: string) =>
   json<{ saved: boolean }>('/admin/v1/providers/tvdb', {
     method: 'POST',

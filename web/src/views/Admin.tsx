@@ -5,6 +5,7 @@ import {
   adminEnrichStatus,
   adminRescan,
   adminProviders,
+  adminSetAnidb,
   adminSetTmdbKey,
   adminSetTvdbKey,
   adminAttachCollection,
@@ -32,6 +33,10 @@ const POLL_MS = 3000
 function TmdbSection({ onNotice }: { onNotice: (s: string) => void }) {
   const [configured, setConfigured] = useState(false)
   const [tvdbConfigured, setTvdbConfigured] = useState(false)
+  const [anidbConfigured, setAnidbConfigured] = useState(false)
+  const [anidbUser, setAnidbUser] = useState('')
+  const [anidbPass, setAnidbPass] = useState('')
+  const [anidbKey, setAnidbKey] = useState('')
   const [key, setKey] = useState('')
   const [tvdbKey, setTvdbKey] = useState('')
   const [tvdbPin, setTvdbPin] = useState('')
@@ -47,6 +52,7 @@ function TmdbSection({ onNotice }: { onNotice: (s: string) => void }) {
       .then((p) => {
         setConfigured(p.tmdb.configured)
         setTvdbConfigured(p.tvdb.configured)
+        setAnidbConfigured(p.anidb?.configured ?? false)
       })
       .catch(() => {})
     adminEnrichStatus().then(setStatus).catch(() => {})
@@ -126,6 +132,51 @@ function TmdbSection({ onNotice }: { onNotice: (s: string) => void }) {
               onNotice('TVDB key saved — enrichment started')
               refresh()
             })
+          }}
+        >
+          Save
+        </button>
+      </div>
+      <div className="row-form">
+        <input
+          placeholder={
+            anidbConfigured
+              ? 'AniDB account configured — enter to replace'
+              : 'AniDB username (exact file matching)'
+          }
+          value={anidbUser}
+          onChange={(e) => setAnidbUser(e.target.value)}
+        />
+        <input
+          type="password"
+          placeholder="AniDB password"
+          value={anidbPass}
+          onChange={(e) => setAnidbPass(e.target.value)}
+        />
+        <input
+          type="password"
+          placeholder="UDP API key (optional, encrypts the session)"
+          value={anidbKey}
+          onChange={(e) => setAnidbKey(e.target.value)}
+          style={{ width: '16rem' }}
+        />
+        <button
+          className="btn small"
+          disabled={!anidbUser.trim() || !anidbPass.trim()}
+          onClick={() => {
+            void adminSetAnidb(anidbUser.trim(), anidbPass.trim(), anidbKey.trim() || undefined).then(
+              (r) => {
+                setAnidbUser('')
+                setAnidbPass('')
+                setAnidbKey('')
+                onNotice(
+                  r.verified
+                    ? 'AniDB account verified — enrichment started'
+                    : `AniDB saved but login failed: ${r.error ?? 'unknown'}`,
+                )
+                refresh()
+              },
+            )
           }}
         >
           Save

@@ -107,11 +107,13 @@ Last updated: 2026-07-25 (anime providers, MusicBrainz).
 
 ## Hub — anime (HUB-29..33)
 
-- [ ] HUB-29 AniDB/AniList providers *(AniDB titles-dump identity, anime-lists
-      ID mapping, AniList metadata + relations live — zero AniDB API calls;
-      UDP file-by-ED2K client pending an AniDB account/registered client)*
-- [ ] HUB-30 Fansub filename conventions *(group prefixes, absolute numbering, CRC
-      tags, bracket stripping live; AniDB hash-exact identification pending)*
+- [x] HUB-29 AniDB/AniList providers: titles-dump identity, anime-lists ID
+      mapping, AniList metadata + relations, UDP FILE-by-ED2K gold path
+      (registered client "kahawai", account via admin page, optional
+      encrypted session, never-ask-twice cache)
+- [ ] HUB-30 Fansub filename conventions *(group prefixes, absolute numbering,
+      CRC tags, bracket stripping, hash-exact show identification live;
+      per-EPISODE hash identification and version tags pending)*
 - [ ] HUB-31 Native anime structure *(absolute numbering via TVDB absolute
       order; relations graph + related-items UI live; season-view projection
       pending — the mapping's per-entry season data is already parsed)*

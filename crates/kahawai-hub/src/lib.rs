@@ -1,3 +1,4 @@
+pub mod anidb;
 pub mod anime;
 pub mod api;
 pub mod artwork;
