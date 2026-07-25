@@ -59,6 +59,8 @@ walkdir = "2"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 roxmltree = "0.20"
+ipnet = "2"
+tower-http = { version = "0.6", default-features = false, features = ["cors"] }
 notify = "8"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "macros", "migrate"] }
 axum = "0.8"

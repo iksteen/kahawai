@@ -341,7 +341,12 @@ async fn run_hub(cfg: config::HubConfig) -> Result<()> {
             }
         });
     }
-    let api = kahawai_hub::api::router(registry.clone(), auth, sessions.clone(), Arc::new(svc.clone()), subtitles.clone(), artwork, enricher.clone());
+    let net = kahawai_hub::api::NetOptions {
+        proxy_trust: kahawai_hub::proxy::ProxyTrust::parse(&cfg.trusted_proxies)
+            .context("hub.trusted_proxies")?,
+        cors_origins: cfg.cors_origins.clone(),
+    };
+    let api = kahawai_hub::api::router(registry.clone(), auth, sessions.clone(), Arc::new(svc.clone()), subtitles.clone(), artwork, enricher.clone(), net);
     tokio::spawn(async move {
         let api = api.into_make_service_with_connect_info::<std::net::SocketAddr>();
         if let Err(e) = axum::serve(api_listener, api).await {

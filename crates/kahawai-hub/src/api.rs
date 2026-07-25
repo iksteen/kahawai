@@ -26,8 +26,19 @@ pub struct AppState {
     pub subtitles: Arc<crate::subtitles::Subtitles>,
     pub artwork: Arc<crate::artwork::Artwork>,
     pub enricher: Arc<crate::enrich::Enricher>,
+    pub proxy_trust: Arc<crate::proxy::ProxyTrust>,
 }
 
+/// OPS-8 knobs, both defaulting to "off" (same-origin, no proxies).
+#[derive(Default, Clone)]
+pub struct NetOptions {
+    pub proxy_trust: crate::proxy::ProxyTrust,
+    /// CORS allowlist: exact origins, or a single "*" for any (no
+    /// credentials either way — third-party clients use bearer tokens).
+    pub cors_origins: Vec<String>,
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn router(
     registry: Arc<Registry>,
     auth: Arc<Auth>,
@@ -36,9 +47,19 @@ pub fn router(
     subtitles: Arc<crate::subtitles::Subtitles>,
     artwork: Arc<crate::artwork::Artwork>,
     enricher: Arc<crate::enrich::Enricher>,
+    net: NetOptions,
 ) -> Router {
-    let state =
-        AppState { registry, auth, sessions, enrollments, subtitles, artwork, enricher };
+    let cors = cors_layer(&net.cors_origins);
+    let state = AppState {
+        registry,
+        auth,
+        sessions,
+        enrollments,
+        subtitles,
+        artwork,
+        enricher,
+        proxy_trust: Arc::new(net.proxy_trust),
+    };
     let protected = Router::new()
         .route("/api/v1/collections", get(list_collections))
         .route("/api/v1/libraries", get(list_libraries))
@@ -92,14 +113,42 @@ pub fn router(
         .route("/admin/v1/sessions/{id}", axum::routing::delete(admin_end_session))
         .route_layer(axum::middleware::from_fn(require_admin))
         .route_layer(axum::middleware::from_fn_with_state(state.clone(), require_auth));
-    Router::new()
+    let mut app = Router::new()
         .merge(admin)
         .route("/api/v1/setup", post(setup))
         .route("/api/v1/auth/token", post(login))
         .route("/api/v1/auth/refresh", post(refresh))
         .merge(protected)
-        .with_state(state)
-        .merge(crate::web::router())
+        .with_state(state);
+    if let Some(cors) = cors {
+        app = app.layer(cors);
+    }
+    app.merge(crate::web::router())
+}
+
+/// OPS-8 CORS: absent config = no CORS headers (same-origin only, the
+/// embedded web UI). "*" = any origin. Credentials stay off — cookies
+/// don't cross origins here; third-party clients hold bearer tokens.
+fn cors_layer(origins: &[String]) -> Option<tower_http::cors::CorsLayer> {
+    use tower_http::cors::{AllowOrigin, Any, CorsLayer};
+    if origins.is_empty() {
+        return None;
+    }
+    let origin = if origins.iter().any(|o| o == "*") {
+        AllowOrigin::from(Any)
+    } else {
+        AllowOrigin::list(
+            origins
+                .iter()
+                .filter_map(|o| o.parse::<axum::http::HeaderValue>().ok()),
+        )
+    };
+    Some(
+        CorsLayer::new()
+            .allow_origin(origin)
+            .allow_methods(Any)
+            .allow_headers(Any),
+    )
 }
 
 type ApiError = (StatusCode, String);
@@ -778,22 +827,25 @@ struct LoginRequest {
 }
 
 /// Source address for OPS-2 throttling: the socket peer (None in
-/// in-process tests). X-Forwarded-For is deliberately NOT trusted
-/// until OPS-8 adds explicit proxy-trust configuration.
+/// in-process tests), or the X-Forwarded-For client when — and only
+/// when — the peer is a configured trusted proxy (OPS-8).
 struct ClientIp(Option<std::net::IpAddr>);
 
-impl<S: Send + Sync> axum::extract::FromRequestParts<S> for ClientIp {
+impl axum::extract::FromRequestParts<AppState> for ClientIp {
     type Rejection = std::convert::Infallible;
     async fn from_request_parts(
         parts: &mut axum::http::request::Parts,
-        _state: &S,
+        state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        Ok(ClientIp(
-            parts
-                .extensions
-                .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
-                .map(|c| c.0.ip()),
-        ))
+        let peer = parts
+            .extensions
+            .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+            .map(|c| c.0.ip());
+        let xff = parts
+            .headers
+            .get("x-forwarded-for")
+            .and_then(|v| v.to_str().ok());
+        Ok(ClientIp(state.proxy_trust.client_ip(peer, xff)))
     }
 }
 
@@ -883,17 +935,21 @@ fn default_mode() -> String {
 /// EventSource authenticates via the kahawai_token cookie (it cannot
 /// set headers), same as <video>/HLS requests. Hints, not state —
 /// clients refetch whatever a hint names.
-async fn events(
-    State(state): State<AppState>,
-) -> axum::response::sse::Sse<
-    impl tokio_stream::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>,
-> {
+async fn events(State(state): State<AppState>) -> impl axum::response::IntoResponse {
     use axum::response::sse::{Event, KeepAlive, Sse};
     use tokio_stream::StreamExt;
     let rx = state.registry.subscribe_events();
     let stream = tokio_stream::wrappers::BroadcastStream::new(rx)
-        .filter_map(|v| v.ok().map(|v| Ok(Event::default().data(v.to_string()))));
-    Sse::new(stream).keep_alive(KeepAlive::default())
+        .filter_map(|v| {
+            v.ok().map(|v| {
+                Ok::<_, std::convert::Infallible>(Event::default().data(v.to_string()))
+            })
+        });
+    // OPS-8: tell buffering proxies (nginx) to pass events through live.
+    (
+        axum::response::AppendHeaders([("x-accel-buffering", "no")]),
+        Sse::new(stream).keep_alive(KeepAlive::default()),
+    )
 }
 
 /// Per-user preferences (HUB-33): tiny generic KV, scope = library id

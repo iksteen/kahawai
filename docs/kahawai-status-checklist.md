@@ -12,7 +12,9 @@ Last updated: 2026-07-25, against the revised requirements (AR-12, MH-10/11, HUB
 - [x] AR-2 Clients talk only to the hub
 - [x] AR-3 Satellites dial out to the hub
 - [x] AR-4 Multiple mediahosts/transcoders per hub; multiple collections per mediahost
-- [x] AR-5 All-in-one binary (`kahawai all-in-one`)
+- [ ] AR-5 All-in-one (`kahawai all-in-one` currently bails "not
+      implemented" — checklist error corrected 2026-07-25; the single
+      binary exists, the combined run mode does not)
 - [x] AR-6 Disconnect tolerance: collections go unavailable, never deleted
 - [x] AR-7 Versioned protocol; Hello/HelloAck major-version gate
 - [ ] AR-8 *(optional v1.x)* Delegated direct-fetch tokens
@@ -192,9 +194,11 @@ Last updated: 2026-07-25, against the revised requirements (AR-12, MH-10/11, HUB
 - [x] OPS-7 Cross-version satellite compatibility: protocol gated on major
       version (Hello/HelloAck) — per decision 2026-07-25, major-gating IS the
       compatibility contract; no previous-minor guarantee
-- [ ] OPS-8 Reverse-proxy support *(no forwarded-header/CORS handling; the
-      application/wasm MIME requirement for the ASS renderer is now documented
-      as a deployment note)*
+- [x] OPS-8 Reverse-proxy support: trusted_proxies (exact IPs and CIDR
+      ranges — docker/traefik bridges) gate X-Forwarded-For for OPS-2
+      throttling (rightmost-untrusted, spoof-safe), configurable CORS
+      allowlist, SSE X-Accel-Buffering: no, docs/kahawai-deployment.md
+      (nginx + traefik examples, wasm MIME note)
 
 ## Non-functional (NFR)
 

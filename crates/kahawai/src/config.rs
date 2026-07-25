@@ -84,6 +84,13 @@ pub struct HubConfig {
     pub hostnames: Vec<String>,
     pub satellite_cert_days: u32,
     pub enrollment_ttl_minutes: u64,
+    /// OPS-8: peers allowed to speak for clients via X-Forwarded-For.
+    /// Exact IPs ("192.168.0.5") or CIDR ranges ("172.16.0.0/12" for a
+    /// docker/traefik bridge). Empty = headers ignored.
+    pub trusted_proxies: Vec<String>,
+    /// OPS-8: CORS allowlist for third-party web clients — exact
+    /// origins, or a single "*". Empty = same-origin only.
+    pub cors_origins: Vec<String>,
 }
 
 impl Default for HubConfig {
@@ -95,6 +102,8 @@ impl Default for HubConfig {
             hostnames: vec!["localhost".into()],
             satellite_cert_days: 90,
             enrollment_ttl_minutes: 15,
+            trusted_proxies: Vec::new(),
+            cors_origins: Vec::new(),
         }
     }
 }
