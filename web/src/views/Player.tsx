@@ -7,9 +7,11 @@ import {
   endSession,
   fetchFonts,
   fetchItem,
+  fetchPrefs,
   fetchSubtitles,
   postProgress,
   putPref,
+  resolveTracks,
   seekSession,
   subtitleLabel,
   type Item,
@@ -31,11 +33,13 @@ export default function Player({
   item,
   session,
   resumeMs,
+  libraryId,
   onClose,
 }: {
   item: Item
   session: Session
   resumeMs: number
+  libraryId: string
   onClose: () => void
 }) {
   const videoRef = useRef<HTMLVideoElement>(null)
@@ -59,7 +63,9 @@ export default function Player({
   const [audioTracks, setAudioTracks] = useState<
     { codec: string; channels: number; language?: string | null }[]
   >([])
-  const [audioTrack, setAudioTrack] = useState(session.audio_track ?? 0)
+  const [audioTrack, setAudioTrack] = useState(0)
+  // 'any' | language → auto-pick a subtitle; null → stay off.
+  const subsPrefRef = useRef<string | null>(null)
   const [videoTracks, setVideoTracks] = useState<
     { codec: string; width: number; height: number }[]
   >([])
@@ -69,13 +75,25 @@ export default function Player({
   const [trackEpoch, setTrackEpoch] = useState(0)
 
   useEffect(() => {
-    fetchSubtitles(item.id)
+    // One resolution (HUB-33), same helper Detail used to start the
+    // session: prefs + streams → selector state and subtitle default.
+    Promise.all([fetchItem(item.id), fetchPrefs().catch(() => ({ prefs: [] }))])
+      .then(([d, p]) => {
+        seriesRef.current = d.parent_id ?? item.id
+        const audio = d.sources_detail[0]?.streams?.audio ?? []
+        setAudioTracks(audio)
+        setVideoTracks(d.sources_detail[0]?.streams?.video ?? [])
+        const r = resolveTracks(p.prefs, seriesRef.current, libraryId, audio)
+        setAudioTrack(r.audioTrack)
+        subsPrefRef.current = r.subs
+        return fetchSubtitles(item.id)
+      })
       .then((r) => {
         setSubs(r.subtitles)
-        // HUB-33: subtitles default ON (original-audio preference or a
-        // remembered per-series choice). Remembered language wins, then
-        // English, then any text sub. Never overrides a user choice.
-        if (session.subs_on && r.subtitles.length > 0) {
+        // Auto-pick per the resolved default: remembered language,
+        // else English, else any text sub. Never overrides a choice.
+        const want = subsPrefRef.current
+        if (want && r.subtitles.length > 0) {
           setSubKey((cur) => {
             if (cur) return cur
             const byLang = (lang: string) =>
@@ -83,7 +101,7 @@ export default function Player({
                 (s) => !s.image && (s.language ?? '').toLowerCase().startsWith(lang.slice(0, 2)),
               )
             const pick =
-              (session.subs_lang ? byLang(session.subs_lang) : undefined) ??
+              (want !== 'any' ? byLang(want) : undefined) ??
               byLang('en') ??
               r.subtitles.find((s) => !s.image) ??
               r.subtitles[0]
@@ -91,23 +109,23 @@ export default function Player({
           })
         }
       })
-      .catch(() => setSubs([]))
-    fetchItem(item.id)
-      .then((d) => {
-        seriesRef.current = d.parent_id ?? item.id
-        setAudioTracks(d.sources_detail[0]?.streams?.audio ?? [])
-        setVideoTracks(d.sources_detail[0]?.streams?.video ?? [])
-      })
       .catch(() => {
+        setSubs([])
         setAudioTracks([])
         setVideoTracks([])
       })
-  }, [item.id])
+  }, [item.id, libraryId])
 
   // Track switching is a seek-restart at the current position with the
   // new track (§6 machinery; ~2 s hiccup, same as a deep seek).
   const switchTracks = async (audio: number, video_: number) => {
     const video = videoRef.current!
+    if (audio !== audioTrack) {
+      // Remember the explicit audio choice for this series (HUB-33):
+      // by language when tagged, by index otherwise.
+      const value = audioTracks[audio]?.language?.toLowerCase() ?? `#${audio}`
+      void putPref(seriesRef.current, 'audio', value).catch(() => {})
+    }
     setAudioTrack(audio)
     setVideoTrack(video_)
     setSeeking(true)

@@ -4,6 +4,8 @@ import {
   fetchChildren,
   fetchItem,
   fetchLibraries,
+  fetchPrefs,
+  resolveTracks,
   startSession,
   type Item,
   type ItemDetail,
@@ -294,7 +296,27 @@ export default function Detail({
       // point (§6) — no waiting for a transcode to catch up. Direct
       // sessions resume client-side.
       const start = fromStart ? 0 : resumeMs
-      const session = await startSession(item!.id, mode, mode === 'direct' ? 0 : start)
+      // HUB-33: pick the default audio track from the user's prefs
+      // (series memory > library original/dub), entirely client-side.
+      const audio = item!.sources_detail[0]?.streams?.audio ?? []
+      let audioTrack = 0
+      try {
+        const p = await fetchPrefs()
+        audioTrack = resolveTracks(
+          p.prefs,
+          item!.parent_id ?? item!.id,
+          fromLib,
+          audio,
+        ).audioTrack
+      } catch {
+        // prefs unavailable → source order
+      }
+      const session = await startSession(
+        item!.id,
+        mode,
+        mode === 'direct' ? 0 : start,
+        audioTrack,
+      )
       onPlay(item!, session, start)
     } catch (e) {
       setError(String(e))

@@ -146,10 +146,11 @@ Last updated: 2026-07-25, against the revised requirements (AR-12, MH-10/11, HUB
       graphics-overlay capability profiles and policy ordering pending)*
 - [ ] HUB-32c OCR text tier (subtile-ocr/Tesseract, default-on cargo feature)
       *(not built; GPL-3.0 licensing consequence pre-documented in README)*
-- [x] HUB-33 Dual-audio defaults: per-user per-library preference
-      (original = first Japanese track + subtitles on, dub = English
-      track, unset = source order), applied by the hub when the client
-      requests no explicit track; library-header toggle in the web UI
+- [x] HUB-33 Dual-audio defaults, one mechanism: the hub stores a plain
+      per-user KV (/api/v1/prefs) and picks nothing; the UI writes prefs
+      on explicit track changes (per series) and via the library-header
+      original/dub toggle, and resolves defaults from them at playback
+      start (series memory > library preference > source order)
 - [x] HUB-34 Retrieval efficiency ladder: cache/sidecar → live session tap →
       mediahost sparse/sequential extraction → hub lease, cached at-most-once
       *(fonts currently use rungs 1 and 4 only — MH-4 now declares

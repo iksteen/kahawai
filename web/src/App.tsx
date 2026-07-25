@@ -157,6 +157,7 @@ export default function App() {
           item={route.item}
           session={route.session}
           resumeMs={route.resumeMs}
+          libraryId={route.fromLib}
           onClose={() =>
             navigate(
               { view: 'detail', id: route.item.id, fromLib: route.fromLib },

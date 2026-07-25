@@ -842,10 +842,10 @@ struct StartSessionRequest {
     /// catch up) — keyframe-snapped by the pipeline.
     #[serde(default)]
     start_ms: u64,
-    /// Track indexes in the source's discovery order (HUB-27). Omitted
-    /// audio → the hub applies the user's dual-audio preference (HUB-33).
+    /// Track indexes in the source's discovery order (HUB-27). The UI
+    /// resolves defaults from /api/v1/prefs client-side (HUB-33).
     #[serde(default)]
-    audio_track: Option<u32>,
+    audio_track: u32,
     #[serde(default)]
     video_track: u32,
 }
@@ -965,9 +965,6 @@ async fn start_session(
             "parts": session.parts.len(),
             "content_type": ctype,
             "stream_url": stream_url,
-            "audio_track": session.audio_track,
-            "subs_on": session.subs_on,
-            "subs_lang": session.subs_lang,
             "streams": session.verdict.as_ref().map(|(video, audio)| json!({
                 "video": video,
                 "audio": audio,

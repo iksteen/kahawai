@@ -217,11 +217,6 @@ export type Session = {
   /// CD1/CD2 sources; 0 for single files).
   part_base_ms?: number
   parts?: number
-  /// HUB-33: the audio track the session opened with (user preference
-  /// when the client sent none) and whether subs should default on.
-  audio_track?: number
-  subs_on?: boolean
-  subs_lang?: string | null
   streams: StreamVerdict | null
 }
 
@@ -229,24 +224,68 @@ export function startSession(
   itemId: string,
   mode: string,
   startMs = 0,
-  audioTrack?: number,
+  audioTrack = 0,
   videoTrack = 0,
 ): Promise<Session> {
-  // audio_track omitted → the hub applies the user's dual-audio
-  // preference (HUB-33) and reports its pick in the response.
   return json('/api/v1/playback/sessions', {
     method: 'POST',
     body: JSON.stringify({
       item_id: itemId,
       mode,
       start_ms: Math.round(startMs),
-      ...(audioTrack !== undefined ? { audio_track: audioTrack } : {}),
+      audio_track: audioTrack,
       video_track: videoTrack,
     }),
   })
 }
 
 export type Pref = { scope: string; key: string; value: string }
+
+/// HUB-33, resolved entirely client-side from /api/v1/prefs:
+/// series memory (what the user last set on this series) beats the
+/// library original/dub preference beats source order. The hub stores
+/// the KV and picks nothing.
+export function resolveTracks(
+  prefs: Pref[],
+  seriesId: string,
+  libraryId: string,
+  audio: { language?: string | null }[],
+): { audioTrack: number; subs: string | null } {
+  const get = (scope: string, key: string) =>
+    prefs.find((p) => p.scope === scope && p.key === key)?.value
+  const langEq = (l: string | null | undefined, want: string) => {
+    if (!l) return false
+    const a = l.toLowerCase()
+    const b = want.toLowerCase()
+    return a === b || a.slice(0, 2) === b.slice(0, 2)
+  }
+  const isJa = (l?: string | null) => langEq(l, 'ja')
+
+  let audioTrack: number | undefined
+  const remembered = get(seriesId, 'audio')
+  if (remembered?.startsWith('#')) {
+    const i = Number(remembered.slice(1))
+    if (i >= 0 && i < audio.length) audioTrack = i
+  } else if (remembered) {
+    const i = audio.findIndex((a) => langEq(a.language, remembered))
+    if (i >= 0) audioTrack = i
+  }
+  const lib = get(libraryId, 'audio')
+  if (audioTrack === undefined) {
+    if (lib === 'original') {
+      audioTrack = Math.max(0, audio.findIndex((a) => isJa(a.language)))
+    } else if (lib === 'dub') {
+      const en = audio.findIndex((a) => langEq(a.language, 'en'))
+      const nonJa = audio.findIndex((a) => !isJa(a.language))
+      audioTrack = en >= 0 ? en : nonJa >= 0 ? nonJa : 0
+    } else {
+      audioTrack = 0
+    }
+  }
+  // 'off' | 'any' | language | null (null = subtitles stay off)
+  const subs = get(seriesId, 'subs') ?? (lib === 'original' ? 'any' : null)
+  return { audioTrack, subs: subs === 'off' ? null : subs }
+}
 
 export const fetchPrefs = () => json<{ prefs: Pref[] }>('/api/v1/prefs')
 
