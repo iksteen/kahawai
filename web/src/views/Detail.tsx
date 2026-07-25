@@ -365,6 +365,11 @@ export default function Detail({
           </span>
         </footer>
       )}
+      {item.metadata?.provider === 'musicbrainz' && (
+        <footer className="tmdb-attrib">
+          <span>Metadata from MusicBrainz; cover art from the Cover Art Archive.</span>
+        </footer>
+      )}
       {item.metadata?.provider === 'anilist' && (
         <footer className="tmdb-attrib">
           <span>Metadata from AniList and AniDB.</span>

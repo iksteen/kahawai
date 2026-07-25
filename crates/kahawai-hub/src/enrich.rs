@@ -18,6 +18,13 @@ pub const TMDB_KEY_SETTING: &str = "tmdb_api_key";
 pub const TVDB_KEY_SETTING: &str = "tvdb_api_key";
 pub const TVDB_PIN_SETTING: &str = "tvdb_pin";
 
+struct MbReleaseGroup {
+    id: String,
+    title: String,
+    first_release_date: Option<String>,
+    genres: Vec<String>,
+}
+
 pub struct Enricher {
     http: reqwest::Client,
     data_dir: std::path::PathBuf,
@@ -619,7 +626,147 @@ impl Enricher {
         if let Err(e) = self.enrich_episodes(registry, &key, tvdb_token.as_ref()).await {
             tracing::warn!(error = format!("{e:#}"), "episode enrichment failed");
         }
+        if let Err(e) = self.enrich_music(registry).await {
+            tracing::warn!(error = format!("{e:#}"), "music enrichment failed");
+        }
         Ok((m, w, x))
+    }
+
+    /// MusicBrainz release-group enrichment for albums: strict fold-
+    /// exact title + artist verification, 1 req/s (MB's hard limit),
+    /// Cover Art Archive front cover as the poster fallback (local
+    /// folder art still wins in the artwork chain).
+    async fn enrich_music(self: &Arc<Self>, registry: &Registry) -> Result<()> {
+        let albums = sqlx::query(
+            "SELECT i.id, i.title, i.artist FROM items i
+             LEFT JOIN item_metadata m ON m.item_id = i.id
+             WHERE i.kind = 'album' AND i.artist IS NOT NULL
+               AND (m.item_id IS NULL OR (m.confidence = 'miss' AND m.updated_at < unixepoch() - 7 * 86400))
+             ORDER BY i.title",
+        )
+        .fetch_all(registry.db())
+        .await?;
+        if albums.is_empty() {
+            return Ok(());
+        }
+        tracing::info!(albums = albums.len(), "music enrichment starting");
+        let (mut matched, mut missed) = (0usize, 0usize);
+        for (n, row) in albums.iter().enumerate() {
+            let (id, title, artist) = (
+                row.get::<String, _>("id"),
+                row.get::<String, _>("title"),
+                row.get::<String, _>("artist"),
+            );
+            // MB hard rate limit: one request per second.
+            tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+            match self.musicbrainz_album(&title, &artist).await {
+                Ok(Some(rg)) => {
+                    matched += 1;
+                    sqlx::query(
+                        "INSERT OR REPLACE INTO item_metadata
+                           (item_id, provider, provider_id, title, overview, poster_path,
+                            rating, premiered, genres, confidence, updated_at)
+                         VALUES (?, 'musicbrainz', ?, ?, NULL, ?, NULL, ?, ?, 'auto', unixepoch())",
+                    )
+                    .bind(&id)
+                    .bind(&rg.id)
+                    .bind(&rg.title)
+                    .bind(format!("https://coverartarchive.org/release-group/{}/front-500", rg.id))
+                    .bind(&rg.first_release_date)
+                    .bind(serde_json::to_string(&rg.genres)?)
+                    .execute(registry.db())
+                    .await?;
+                }
+                Ok(None) => {
+                    missed += 1;
+                    sqlx::query(
+                        "INSERT OR REPLACE INTO item_metadata
+                           (item_id, provider, provider_id, confidence, updated_at)
+                         VALUES (?, 'musicbrainz', '', 'miss', unixepoch())",
+                    )
+                    .bind(&id)
+                    .execute(registry.db())
+                    .await?;
+                }
+                Err(e) => {
+                    tracing::warn!(title, error = format!("{e:#}"), "musicbrainz lookup failed")
+                }
+            }
+            if (n + 1) % 100 == 0 {
+                tracing::info!(done = n + 1, total = albums.len(), matched, "music enrichment progress");
+            }
+        }
+        tracing::info!(matched, missed, "music enrichment complete");
+        Ok(())
+    }
+
+    /// Strictly verified release-group search: the fold of title AND
+    /// artist must match a candidate exactly — never guess.
+    async fn musicbrainz_album(&self, title: &str, artist: &str) -> Result<Option<MbReleaseGroup>> {
+        let query = format!("releasegroup:\"{}\" AND artist:\"{}\"",
+            title.replace('"', ""), artist.replace('"', ""));
+        let encoded: String = query
+            .bytes()
+            .flat_map(|b| match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                    vec![b as char]
+                }
+                _ => format!("%{b:02X}").chars().collect(),
+            })
+            .collect();
+        let url = format!(
+            "https://musicbrainz.org/ws/2/release-group?query={encoded}&fmt=json&limit=8"
+        );
+        let resp: serde_json::Value = self
+            .http
+            .get(&url)
+            // MB requires an identifying UA with contact info.
+            .header("user-agent", "kahawai/0.1 (https://github.com/iksteen/kahawai)")
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let groups = resp["release-groups"].as_array().cloned().unwrap_or_default();
+        let want_title = fold(title);
+        let want_artist = fold(artist);
+        for g in &groups {
+            let gtitle = g["title"].as_str().unwrap_or_default();
+            if fold(gtitle) != want_title {
+                continue;
+            }
+            let artist_ok = g["artist-credit"]
+                .as_array()
+                .map(|credits| {
+                    credits.iter().any(|c| {
+                        c["name"].as_str().map(|n| fold(n) == want_artist).unwrap_or(false)
+                            || c["artist"]["name"]
+                                .as_str()
+                                .map(|n| fold(n) == want_artist)
+                                .unwrap_or(false)
+                    })
+                })
+                .unwrap_or(false);
+            if !artist_ok {
+                continue;
+            }
+            let genres: Vec<String> = g["tags"]
+                .as_array()
+                .map(|t| {
+                    t.iter()
+                        .filter_map(|x| x["name"].as_str().map(str::to_string))
+                        .take(5)
+                        .collect()
+                })
+                .unwrap_or_default();
+            return Ok(Some(MbReleaseGroup {
+                id: g["id"].as_str().unwrap_or_default().to_string(),
+                title: gtitle.to_string(),
+                first_release_date: g["first-release-date"].as_str().map(str::to_string),
+                genres,
+            }));
+        }
+        Ok(None)
     }
 
     /// HUB-29: AniDB titles dump → aid (identity), anime-lists mapping

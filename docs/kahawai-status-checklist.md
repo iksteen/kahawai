@@ -4,7 +4,7 @@ Status of every numbered requirement from `kahawai-technical-requirements.md`,
 plus the v1 acceptance criteria. Checked = implemented and exercised against
 the live deployment. Unchecked items carry a note when partially done.
 
-Last updated: 2026-07-25 (anime providers).
+Last updated: 2026-07-25 (anime providers, MusicBrainz).
 
 ## Architecture (AR)
 
@@ -54,7 +54,7 @@ Last updated: 2026-07-25 (anime providers).
 - [x] HUB-4 Filename/dirname parsing (movies, episodes, anime conventions, music layout)
 - [x] HUB-20 Mediahost deletion cascade + watch-state/match archives restored on re-enroll
 - [ ] HUB-5 Providers behind a common trait *(TMDB, TVDB, AniDB titles,
-      AniList live; MusicBrainz missing; no formal trait yet)*
+      AniList, MusicBrainz + Cover Art Archive live; no formal trait yet)*
 - [ ] HUB-6 Descriptive metadata *(titles, plots, dates, ratings, posters, episode
       stills live; cast/genres not stored)*
 - [ ] HUB-7 Provider rate limits/caching *(API keys via settings + poster caching
