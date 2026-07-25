@@ -380,8 +380,11 @@ ass_fallback = "burn"                 # server default: "burn" | "flatten";
                                       # overridable per library and per user
 image_sub_ocr = true                  # runtime switch for the OCR tier (needs the
                                       # `ocr` cargo feature + tesseract + models)
-ocr_below_kbps = 0                    # >0: prefer OCR text over bitmap tiles for
-                                      # overlay-capable clients under this bandwidth
+# v1: choosing OCR text over bitmap tiles is a client/user PREFERENCE
+# (per-session selectable, remembered per user). An automatic
+# `ocr_below_kbps` threshold is deferred until the hub measures client
+# bandwidth — a capability that also feeds the quality ladder, so it
+# lands with that machinery rather than as a one-off here.
 
 [hub.subtitles.opensubtitles]        # feature off unless this block exists
 api_key = "${KAHAWAI_OS_KEY}"
