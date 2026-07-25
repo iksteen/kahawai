@@ -12,9 +12,12 @@ Last updated: 2026-07-25, against the revised requirements (AR-12, MH-10/11, HUB
 - [x] AR-2 Clients talk only to the hub
 - [x] AR-3 Satellites dial out to the hub
 - [x] AR-4 Multiple mediahosts/transcoders per hub; multiple collections per mediahost
-- [ ] AR-5 All-in-one (`kahawai all-in-one` currently bails "not
-      implemented" — checklist error corrected 2026-07-25; the single
-      binary exists, the combined run mode does not)
+- [x] AR-5 All-in-one: hub + in-process mediahost in one process — the
+      module logic unchanged, the link transport replaced by channels
+      (no gRPC/TLS/enrollment for the local module) and the byte plane
+      replaced by direct file reads (AR-11 short-circuit); the satellite
+      listener stays up so external mediahosts/transcoders dial in;
+      encode work runs in the hub's supervised local workers
 - [x] AR-6 Disconnect tolerance: collections go unavailable, never deleted
 - [x] AR-7 Versioned protocol; Hello/HelloAck major-version gate
 - [ ] AR-8 *(optional v1.x)* Delegated direct-fetch tokens
@@ -221,9 +224,12 @@ Last updated: 2026-07-25, against the revised requirements (AR-12, MH-10/11, HUB
 
 ## v1 acceptance criteria
 
-- [ ] 1. All-in-one mixed-library end-to-end *(video+music+enrichment+web
-      player+AniDB matching+PGS rendering live; the all-in-one single-machine
-      variant itself unexercised)*
+- [x] 1. All-in-one mixed-library end-to-end: the single-machine variant
+      exercised 2026-07-25 (fresh instance, movies + music collections:
+      setup → scan through the in-process link → browse → direct play
+      byte-identical via the function-call byte plane → remux segments →
+      music streaming; enrichment/web player/AniDB/PGS are the same code
+      paths proven live on the modular deployment)
 - [x] 2. Direct play w/ byte-range seek; remux w/ mid-stream subtitle/audio switching
 - [x] 3. Modular three-machine deployment (dev box hub + NAS + macOS transcoder)
 - [x] 4. Mediahost kill mid-playback: unavailability surfaces, reconnect restores

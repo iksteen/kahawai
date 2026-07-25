@@ -40,6 +40,48 @@ impl MediahostLinkService {
     }
 }
 
+/// AR-5: attach an in-process mediahost. Same message handling as a
+/// network link, but the transport is a channel pair — no TLS, no
+/// enrollment, no liveness timeout (the peer shares our fate). Returns
+/// (host→hub sender for the engine, hub→host receiver for it).
+#[allow(clippy::type_complexity)]
+pub fn local_link(
+    registry: Arc<Registry>,
+    subtitles: Arc<crate::subtitles::Subtitles>,
+    enricher: Arc<crate::enrich::Enricher>,
+    module_id: &str,
+    name: &str,
+) -> (
+    tokio::sync::mpsc::Sender<HostToHub>,
+    tokio::sync::mpsc::Receiver<Result<HubToHost, Status>>,
+) {
+    let (host_tx, mut host_rx) = tokio::sync::mpsc::channel::<HostToHub>(64);
+    let (hub_tx, hub_rx) = tokio::sync::mpsc::channel::<Result<HubToHost, Status>>(16);
+    registry.connected(module_id, "mediahost", name, "in-process");
+    registry.register_link(module_id, hub_tx);
+    let module_id = module_id.to_string();
+    tokio::spawn(async move {
+        let mut seen: std::collections::HashMap<String, std::collections::HashSet<String>> =
+            Default::default();
+        while let Some(HostToHub { msg }) = host_rx.recv().await {
+            let Some(msg) = msg else { continue };
+            if matches!(msg, host_to_hub::Msg::Heartbeat(_)) {
+                registry.seen(&module_id);
+                continue;
+            }
+            if let Err(e) =
+                handle_host_msg(&registry, &subtitles, &enricher, &module_id, msg, &mut seen)
+                    .await
+            {
+                tracing::error!(%module_id, error = format!("{e:#}"), "handling local link message");
+            }
+        }
+        registry.unregister_link(&module_id);
+        registry.disconnected(&module_id);
+    });
+    (host_tx, hub_rx)
+}
+
 #[tonic::async_trait]
 impl MediahostLink for MediahostLinkService {
     type LinkStream = ReceiverStream<Result<HubToHost, Status>>;

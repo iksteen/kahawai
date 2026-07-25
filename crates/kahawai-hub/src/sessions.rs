@@ -207,8 +207,13 @@ fn playlist_ready(path: &std::path::Path) -> bool {
     }
 }
 
+type LocalResolver = std::sync::Arc<dyn Fn(&str, &str) -> Result<std::path::PathBuf> + Send + Sync>;
+
 pub struct Sessions {
     pub leases: Leases,
+    /// AR-5: the in-process mediahost, if any — (module_id, path
+    /// resolver). Its leases are direct file reads, no OpenRead.
+    local_source: Mutex<Option<(String, LocalResolver)>>,
     /// Scratch space for remux sessions (`<data_dir>/sessions`).
     scratch_root: PathBuf,
     max_per_user: usize,
@@ -244,6 +249,7 @@ impl Sessions {
         let _ = std::fs::remove_dir_all(&scratch_root);
         Self {
             leases: Leases::default(),
+            local_source: Mutex::new(None),
             scratch_root,
             max_per_user,
             idle_timeout,
@@ -389,6 +395,17 @@ impl Sessions {
 
     /// Open a read lease on an arbitrary path within a collection (also
     /// used for sidecar subtitle files, which are not `files` rows).
+    /// AR-5: register the in-process mediahost — leases for its files
+    /// bypass OpenRead entirely and read the disk directly.
+    pub fn set_local_source(
+        &self,
+        module_id: &str,
+        resolve: impl Fn(&str, &str) -> Result<std::path::PathBuf> + Send + Sync + 'static,
+    ) {
+        *self.local_source.lock().unwrap() =
+            Some((module_id.to_string(), std::sync::Arc::new(resolve)));
+    }
+
     pub(crate) async fn open_lease(
         &self,
         registry: &Registry,
@@ -396,6 +413,17 @@ impl Sessions {
         collection_id: &str,
         path_rel: &str,
     ) -> Result<Lease> {
+        // AR-5/AR-11: the in-process mediahost's byte plane is a
+        // function call — resolve the path and read the disk directly.
+        let local = {
+            let guard = self.local_source.lock().unwrap();
+            guard.as_ref().and_then(|(id, resolve)| {
+                (id == module_id).then(|| resolve(collection_id, path_rel))
+            })
+        };
+        if let Some(path) = local {
+            return Ok(Lease::local(path?));
+        }
         let token = new_lease_token();
         let msg = HubToHost {
             msg: Some(hub_to_host::Msg::OpenRead(OpenRead {
@@ -576,6 +604,10 @@ impl Sessions {
 
         let runner = match &self.worker_exe {
             Some(exe) => {
+                // ponytail: SUN_LEN caps unix socket paths at ~108
+                // bytes — a pathologically deep data_dir breaks remux
+                // here. Bind under a short tmp dir if it ever bites a
+                // real deployment.
                 let sock = dir.join("worker.sock");
                 let listener = tokio::net::UnixListener::bind(&sock)
                     .with_context(|| format!("binding {}", sock.display()))?;

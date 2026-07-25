@@ -165,6 +165,22 @@ impl Registry {
             .cloned()
     }
 
+    /// AR-5: a satellites row for the in-process mediahost so admin
+    /// views and cascades treat it like any satellite. No certificate —
+    /// the marker fingerprint never matches a TLS peer.
+    pub async fn ensure_local_satellite(&self, module_id: &str, name: &str) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO satellites (module_id, module_type, name, cert_fingerprint)
+             VALUES (?, 'mediahost', ?, 'in-process')
+             ON CONFLICT (module_id) DO UPDATE SET name = excluded.name",
+        )
+        .bind(module_id)
+        .bind(name)
+        .execute(&self.db)
+        .await?;
+        Ok(())
+    }
+
     /// Populate the allowlist from the satellites table (hub startup).
     /// Pending renewal fingerprints (SEC-7) are admitted while their grace
     /// holds; lapsed ones are swept here. Grace: [`RENEWAL_GRACE_SECS`].

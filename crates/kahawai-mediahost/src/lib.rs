@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use kahawai_proto::v1::mediahost_link_client::MediahostLinkClient;
-use kahawai_proto::v1::{host_to_hub, hub_to_host, AnnounceCollection, Heartbeat, Hello, HostToHub};
+use kahawai_proto::v1::{host_to_hub, hub_to_host, AnnounceCollection, Heartbeat, Hello, HostToHub, HubToHost};
 use kahawai_proto::{PROTOCOL_MAJOR, PROTOCOL_MINOR};
 use scan::CollectionConfig;
 use tokio_stream::wrappers::ReceiverStream;
@@ -87,6 +87,43 @@ pub async fn run(
     }
 }
 
+/// AR-5 all-in-one: run the mediahost engine against in-process
+/// channels — no gRPC, no TLS, no enrollment. OpenRead never arrives
+/// (the hub short-circuits the byte plane to direct file reads).
+pub async fn run_local(
+    collections: Vec<scan::CollectionConfig>,
+    rescan_minutes: u64,
+    state_dir: &Path,
+    tx: tokio::sync::mpsc::Sender<HostToHub>,
+    mut rx: tokio::sync::mpsc::Receiver<Result<HubToHost, tonic::Status>>,
+) -> Result<()> {
+    let engine = Engine::start(&collections, rescan_minutes, state_dir, tx.clone());
+    let mut ticker = tokio::time::interval(HEARTBEAT_INTERVAL);
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {
+                if tx.send(HostToHub { msg: Some(host_to_hub::Msg::Heartbeat(Heartbeat {})) })
+                    .await
+                    .is_err()
+                {
+                    bail!("local link closed");
+                }
+            }
+            msg = rx.recv() => {
+                match msg {
+                    Some(Ok(m)) => {
+                        if let Some(req) = engine.dispatch(m) {
+                            tracing::warn!(token = %req.lease_token,
+                                "unexpected OpenRead on the in-process link (hub reads directly)");
+                        }
+                    }
+                    Some(Err(_)) | None => bail!("local link closed"),
+                }
+            }
+        }
+    }
+}
+
 /// Aborts its tasks when the link session ends.
 struct AbortOnDrop(Vec<tokio::task::JoinHandle<()>>);
 impl Drop for AbortOnDrop {
@@ -133,61 +170,29 @@ impl TriggerSink {
     }
 }
 
-/// One link session: Hello/HelloAck, then per-collection scan
-/// orchestrators fed by three triggers — the filesystem watcher
-/// (primary; useless over sshfs where inotify never fires), the
-/// periodic backup sweep, and hub-sent RescanRequests (admin button).
-async fn link_once(
-    hub_addr: &str,
-    tls: std::sync::Arc<rustls::ClientConfig>,
-    name: &str,
-    collections: &[CollectionConfig],
-    rescan_minutes: u64,
-    state_dir: &Path,
-) -> Result<()> {
-    let channel = kahawai_transport::tls::grpc_channel_with(hub_addr, tls.clone()).await?;
-    // The byte plane gets its OWN connection: lease streams pushing (or
-    // stalling on) megabytes must never exhaust the control link's h2
-    // connection window — that froze heartbeats for 40 s at a time and
-    // the hub declared the link dead mid-scan.
-    let byte_channel = kahawai_transport::tls::grpc_channel_with(hub_addr, tls).await?;
-    // Mirror the hub's raised limit: worklists and manifests can pass
-    // tonic's 4 MB default on large collections.
-    let mut client = MediahostLinkClient::new(channel.clone())
-        .max_decoding_message_size(64 * 1024 * 1024)
-        .max_encoding_message_size(64 * 1024 * 1024);
+/// Everything a running mediahost is, minus the transport (AR-5): the
+/// scan orchestrators, filesystem watcher, backup sweep and idle job
+/// worker, fed by a HostToHub sender and driven by dispatch(). Both the
+/// gRPC link and the all-in-one in-process link wrap this.
+pub struct Engine {
+    triggers: std::collections::HashMap<String, TriggerSink>,
+    manifest_waiters: std::sync::Arc<
+        std::sync::Mutex<
+            std::collections::HashMap<String, tokio::sync::mpsc::Sender<kahawai_proto::v1::Manifest>>,
+        >,
+    >,
+    hash_tx: tokio::sync::mpsc::Sender<hasher::JobMsg>,
+    pub activity: Activity,
+    _guards: AbortOnDrop,
+}
 
-    let (tx, rx) = tokio::sync::mpsc::channel::<HostToHub>(16);
-    tx.send(HostToHub {
-        msg: Some(host_to_hub::Msg::Hello(Hello {
-            protocol_major: PROTOCOL_MAJOR,
-            protocol_minor: PROTOCOL_MINOR,
-            name: name.to_string(),
-        })),
-    })
-    .await
-    .ok();
-
-    let mut inbound = client
-        .link(ReceiverStream::new(rx))
-        .await
-        .context("opening link")?
-        .into_inner();
-
-    // Hub speaks first: HelloAck with its protocol version (AR-7).
-    match inbound.message().await.context("awaiting HelloAck")? {
-        Some(m) => match m.msg {
-            Some(hub_to_host::Msg::HelloAck(ack)) => {
-                tracing::info!(
-                    hub_protocol = format!("{}.{}", ack.protocol_major, ack.protocol_minor),
-                    "link established"
-                );
-            }
-            _ => bail!("hub did not open with HelloAck"),
-        },
-        None => bail!("hub closed the link before HelloAck"),
-    }
-
+impl Engine {
+    pub fn start(
+        collections: &[scan::CollectionConfig],
+        rescan_minutes: u64,
+        state_dir: &Path,
+        tx: tokio::sync::mpsc::Sender<HostToHub>,
+    ) -> Engine {
     // Manifest responses are routed to the scan task of their collection.
     let manifest_waiters: std::sync::Arc<
         std::sync::Mutex<
@@ -367,7 +372,115 @@ async fn link_once(
             }
         }));
     }
-    let _guard = AbortOnDrop(guards);
+        Engine {
+            triggers,
+            manifest_waiters,
+            hash_tx,
+            activity,
+            _guards: AbortOnDrop(guards),
+        }
+    }
+
+    /// Route one hub→host message. OpenRead is returned to the caller:
+    /// the byte plane is transport-specific (gRPC channel on the wire,
+    /// a direct file read in all-in-one — AR-11 short-circuit).
+    pub fn dispatch(&self, m: HubToHost) -> Option<kahawai_proto::v1::OpenRead> {
+        match m.msg? {
+            hub_to_host::Msg::RescanRequest(r) => {
+                for (name, t) in &self.triggers {
+                    if r.collection_id.is_empty() || *name == r.collection_id {
+                        t.send(ScanTrigger::default());
+                    }
+                }
+                None
+            }
+            hub_to_host::Msg::Manifest(m) => {
+                let sender =
+                    self.manifest_waiters.lock().unwrap().get(&m.collection_id).cloned();
+                if let Some(s) = sender {
+                    let _ = s.try_send(m);
+                }
+                None
+            }
+            hub_to_host::Msg::Hashlist(h) => {
+                let _ = self.hash_tx.try_send(hasher::JobMsg::Hashlist(h));
+                None
+            }
+            hub_to_host::Msg::AttachmentsWorklist(w) => {
+                let _ = self.hash_tx.try_send(hasher::JobMsg::AttachmentsWorklist(w));
+                None
+            }
+            hub_to_host::Msg::SubsWorklist(w) => {
+                let _ = self.hash_tx.try_send(hasher::JobMsg::SubsWorklist(w));
+                None
+            }
+            hub_to_host::Msg::ExtractSubs(e) => {
+                let _ = self.hash_tx.try_send(hasher::JobMsg::Urgent(e));
+                None
+            }
+            hub_to_host::Msg::OpenRead(req) => Some(req),
+            _ => None,
+        }
+    }
+}
+
+/// One link session: Hello/HelloAck, then per-collection scan
+/// orchestrators fed by three triggers — the filesystem watcher
+/// (primary; useless over sshfs where inotify never fires), the
+/// periodic backup sweep, and hub-sent RescanRequests (admin button).
+async fn link_once(
+    hub_addr: &str,
+    tls: std::sync::Arc<rustls::ClientConfig>,
+    name: &str,
+    collections: &[CollectionConfig],
+    rescan_minutes: u64,
+    state_dir: &Path,
+) -> Result<()> {
+    let channel = kahawai_transport::tls::grpc_channel_with(hub_addr, tls.clone()).await?;
+    // The byte plane gets its OWN connection: lease streams pushing (or
+    // stalling on) megabytes must never exhaust the control link's h2
+    // connection window — that froze heartbeats for 40 s at a time and
+    // the hub declared the link dead mid-scan.
+    let byte_channel = kahawai_transport::tls::grpc_channel_with(hub_addr, tls).await?;
+    // Mirror the hub's raised limit: worklists and manifests can pass
+    // tonic's 4 MB default on large collections.
+    let mut client = MediahostLinkClient::new(channel.clone())
+        .max_decoding_message_size(64 * 1024 * 1024)
+        .max_encoding_message_size(64 * 1024 * 1024);
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<HostToHub>(16);
+    tx.send(HostToHub {
+        msg: Some(host_to_hub::Msg::Hello(Hello {
+            protocol_major: PROTOCOL_MAJOR,
+            protocol_minor: PROTOCOL_MINOR,
+            name: name.to_string(),
+        })),
+    })
+    .await
+    .ok();
+
+    let mut inbound = client
+        .link(ReceiverStream::new(rx))
+        .await
+        .context("opening link")?
+        .into_inner();
+
+    // Hub speaks first: HelloAck with its protocol version (AR-7).
+    match inbound.message().await.context("awaiting HelloAck")? {
+        Some(m) => match m.msg {
+            Some(hub_to_host::Msg::HelloAck(ack)) => {
+                tracing::info!(
+                    hub_protocol = format!("{}.{}", ack.protocol_major, ack.protocol_minor),
+                    "link established"
+                );
+            }
+            _ => bail!("hub did not open with HelloAck"),
+        },
+        None => bail!("hub closed the link before HelloAck"),
+    }
+
+    let engine = Engine::start(collections, rescan_minutes, state_dir, tx.clone());
+
 
     let mut ticker = tokio::time::interval(HEARTBEAT_INTERVAL);
     loop {
@@ -390,45 +503,13 @@ async fn link_once(
             msg = inbound.message() => {
                 match msg {
                     Ok(Some(m)) => {
-                        if let Some(hub_to_host::Msg::RescanRequest(r)) = &m.msg {
-                            for (name, t) in &triggers {
-                                if r.collection_id.is_empty() || *name == r.collection_id {
-                                    t.send(ScanTrigger::default());
-                                }
-                            }
-                            continue;
-                        }
-                        if let Some(hub_to_host::Msg::Manifest(m)) = &m.msg {
-                            let sender =
-                                manifest_waiters.lock().unwrap().get(&m.collection_id).cloned();
-                            if let Some(s) = sender {
-                                let _ = s.try_send(m.clone());
-                            }
-                            continue;
-                        }
-                        if let Some(hub_to_host::Msg::Hashlist(h)) = &m.msg {
-                            let _ = hash_tx.try_send(hasher::JobMsg::Hashlist(h.clone()));
-                            continue;
-                        }
-                        if let Some(hub_to_host::Msg::AttachmentsWorklist(w)) = &m.msg {
-                            let _ = hash_tx.try_send(hasher::JobMsg::AttachmentsWorklist(w.clone()));
-                            continue;
-                        }
-                        if let Some(hub_to_host::Msg::SubsWorklist(w)) = &m.msg {
-                            let _ = hash_tx.try_send(hasher::JobMsg::SubsWorklist(w.clone()));
-                            continue;
-                        }
-                        if let Some(hub_to_host::Msg::ExtractSubs(e)) = &m.msg {
-                            let _ = hash_tx.try_send(hasher::JobMsg::Urgent(e.clone()));
-                            continue;
-                        }
-                        if let Some(hub_to_host::Msg::OpenRead(req)) = m.msg {
+                        if let Some(req) = engine.dispatch(m) {
                             let path = serve::resolve_path(collections, &req);
                             if let Err(e) = &path {
                                 tracing::warn!(error = format!("{e:#}"), "refusing OpenRead");
                             }
                             let ch = byte_channel.clone();
-                            let busy = activity.lease();
+                            let busy = engine.activity.lease();
                             tokio::spawn(async move {
                                 let _busy = busy;
                                 if let Err(e) =

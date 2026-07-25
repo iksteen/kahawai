@@ -105,6 +105,92 @@ impl Lease {
     }
 }
 
+impl Lease {
+    /// AR-5/AR-11 short-circuit: a lease served by direct file reads —
+    /// the all-in-one byte plane is a function call, not a channel. The
+    /// serving task speaks the same ReadRequest/ByteChunk protocol so
+    /// every consumer of Lease works unchanged.
+    pub fn local(path: std::path::PathBuf) -> Lease {
+        let (req_tx, mut req_rx) = mpsc::channel::<Result<ReadRequest, tonic::Status>>(4);
+        let (chunk_tx, chunk_rx) = mpsc::channel::<ByteChunk>(8);
+        tokio::spawn(async move {
+            const CHUNK: usize = 256 * 1024;
+            use tokio::io::{AsyncReadExt, AsyncSeekExt};
+            let mut file = match tokio::fs::File::open(&path).await {
+                Ok(f) => f,
+                Err(e) => {
+                    let _ = chunk_tx
+                        .send(ByteChunk {
+                            lease_token: String::new(),
+                            offset: 0,
+                            data: Vec::new(),
+                            eof: false,
+                            error: format!("opening {}: {e}", path.display()),
+                        })
+                        .await;
+                    return;
+                }
+            };
+            let size = file.metadata().await.map(|m| m.len()).unwrap_or(0);
+            while let Some(Ok(req)) = req_rx.recv().await {
+                let end = req.offset.saturating_add(req.len).min(size);
+                let mut cur = req.offset.min(size);
+                if file.seek(std::io::SeekFrom::Start(cur)).await.is_err() {
+                    break;
+                }
+                let mut buf = vec![0u8; CHUNK];
+                while cur < end {
+                    let want = ((end - cur) as usize).min(CHUNK);
+                    let n = match file.read(&mut buf[..want]).await {
+                        Ok(0) => break,
+                        Ok(n) => n,
+                        Err(e) => {
+                            let _ = chunk_tx
+                                .send(ByteChunk {
+                                    lease_token: String::new(),
+                                    offset: cur,
+                                    data: Vec::new(),
+                                    eof: false,
+                                    error: e.to_string(),
+                                })
+                                .await;
+                            return;
+                        }
+                    };
+                    if chunk_tx
+                        .send(ByteChunk {
+                            lease_token: String::new(),
+                            offset: cur,
+                            data: buf[..n].to_vec(),
+                            eof: false,
+                            error: String::new(),
+                        })
+                        .await
+                        .is_err()
+                    {
+                        return; // lease dropped
+                    }
+                    cur += n as u64;
+                }
+                if chunk_tx
+                    .send(ByteChunk {
+                        lease_token: String::new(),
+                        offset: cur,
+                        data: Vec::new(),
+                        eof: true,
+                        error: String::new(),
+                    })
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        });
+        Lease(Arc::new(LeaseInner { req_tx, chunk_rx: tokio::sync::Mutex::new(chunk_rx) }))
+    }
+}
+
 /// Pending leases waiting for their ByteChannel to arrive.
 #[derive(Default)]
 pub struct Leases {

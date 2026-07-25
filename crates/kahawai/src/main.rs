@@ -84,7 +84,9 @@ async fn main() -> Result<()> {
     }
 
     match &cli.command {
-        Cmd::Hub { cmd: None } | Cmd::Mediahost | Cmd::Transcoder => startup_checks(&cfg)?,
+        Cmd::Hub { cmd: None } | Cmd::Mediahost | Cmd::Transcoder | Cmd::AllInOne => {
+            startup_checks(&cfg)?
+        }
         _ => {}
     }
     match cli.command {
@@ -119,9 +121,7 @@ async fn main() -> Result<()> {
             )
             .await
         }
-        Cmd::AllInOne => {
-            anyhow::bail!("not implemented yet — hub, mediahost and transcoder run separately")
-        }
+        Cmd::AllInOne => run_all_in_one(cfg).await,
     }
 }
 
@@ -264,6 +264,25 @@ async fn reset_password(cfg: config::HubConfig, username: &str) -> Result<()> {
 }
 
 async fn run_hub(cfg: config::HubConfig) -> Result<()> {
+    run_hub_inner(cfg, None).await
+}
+
+/// AR-5 all-in-one: the hub plus an IN-PROCESS mediahost — module logic
+/// unchanged, transport replaced by channels, byte plane replaced by
+/// direct file reads. The satellite listener stays up: external
+/// mediahosts/transcoders enroll and dial in exactly as in modular mode.
+async fn run_all_in_one(cfg: config::Config) -> Result<()> {
+    anyhow::ensure!(
+        !cfg.mediahost.collections.is_empty(),
+        "all-in-one needs at least one [[mediahost.collections]] entry"
+    );
+    run_hub_inner(cfg.hub, Some(cfg.mediahost)).await
+}
+
+async fn run_hub_inner(
+    cfg: config::HubConfig,
+    local_mediahost: Option<config::MediahostConfig>,
+) -> Result<()> {
     let ca = Arc::new(kahawai_hub::pki::HubCa::load_or_create(
         &kahawai_hub::pki::pki_dir(&cfg.data_dir),
     )?);
@@ -341,6 +360,37 @@ async fn run_hub(cfg: config::HubConfig) -> Result<()> {
             }
         });
     }
+    if let Some(mh) = local_mediahost {
+        const LOCAL_ID: &str = "local";
+        registry.ensure_local_satellite(LOCAL_ID, &mh.name).await?;
+        let (tx, rx) = kahawai_hub::link_service::local_link(
+            registry.clone(),
+            subtitles.clone(),
+            enricher.clone(),
+            LOCAL_ID,
+            &mh.name,
+        );
+        let cols = mh.collections.clone();
+        sessions.set_local_source(LOCAL_ID, move |collection, path| {
+            kahawai_mediahost::serve::resolve_rel(&cols, collection, path)
+        });
+        let state_dir = mh.state_dir.clone();
+        tokio::spawn(async move {
+            if let Err(e) = kahawai_mediahost::run_local(
+                mh.collections,
+                mh.rescan_minutes,
+                &state_dir,
+                tx,
+                rx,
+            )
+            .await
+            {
+                tracing::error!(error = format!("{e:#}"), "in-process mediahost exited");
+            }
+        });
+        tracing::info!("in-process mediahost started (AR-5)");
+    }
+
     let net = kahawai_hub::api::NetOptions {
         proxy_trust: kahawai_hub::proxy::ProxyTrust::parse(&cfg.trusted_proxies)
             .context("hub.trusted_proxies")?,
