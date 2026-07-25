@@ -3,6 +3,7 @@ import {
   artworkUrl,
   fetchChildren,
   fetchItem,
+  fetchLibraries,
   startSession,
   type Item,
   type ItemDetail,
@@ -79,6 +80,7 @@ export default function Detail({
 }) {
   const [item, setItem] = useState<ItemDetail | null>(null)
   const [episodes, setEpisodes] = useState<Item[]>([])
+  const [animeView, setAnimeView] = useState<'seasons' | 'native'>('seasons')
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
 
@@ -93,7 +95,16 @@ export default function Detail({
         .then((c) => setEpisodes(c.children))
         .catch((e) => setError(String(e)))
     }
-  }, [item?.id, item?.kind])
+    if (item?.kind === 'show') {
+      // HUB-31: the library decides native vs projected seasons.
+      fetchLibraries()
+        .then((l) => {
+          const lib = l.libraries.find((x) => x.id === fromLib)
+          if (lib?.anime_view) setAnimeView(lib.anime_view)
+        })
+        .catch(() => {})
+    }
+  }, [item?.id, item?.kind, fromLib])
   const [queueAt, setQueueAt] = useState<number | null>(null)
   // Deep-linked or history-forwarded /play URLs: start playback once
   // the item is loaded (shows have nothing to autoplay).
@@ -197,10 +208,23 @@ export default function Detail({
   )
 
   if (item.kind === 'show') {
+    // HUB-31: absolute-numbered (anime) episodes carry a TVDB-style
+    // projection; the library's anime_view picks the presentation.
+    const projected =
+      animeView === 'seasons' && episodes.some((e) => e.proj_season != null)
+    const gSeason = (e: Item) => (projected ? e.proj_season ?? null : e.season)
+    const gEpisode = (e: Item) => (projected ? e.proj_episode ?? e.episode : e.episode)
+    const ordered = projected
+      ? [...episodes].sort(
+          (a, b) =>
+            (gSeason(a) ?? 999) - (gSeason(b) ?? 999) ||
+            (gEpisode(a) ?? 0) - (gEpisode(b) ?? 0),
+        )
+      : episodes
     // null season = absolute numbering (anime); distinct from Specials.
     const seasonLabel = (s: number | null) =>
-      s === null ? 'Episodes' : s === 0 ? 'Specials' : `Season ${s}`
-    const seasons = [...new Set(episodes.map((e) => e.season))]
+      s === null ? (projected ? 'Other' : 'Episodes') : s === 0 ? 'Specials' : `Season ${s}`
+    const seasons = [...new Set(ordered.map(gSeason))]
     // First unwatched (or in-progress) episode = the continue point.
     const next = episodes.find((e) => !e.played)
     return (
@@ -228,13 +252,14 @@ export default function Detail({
           <section key={String(s)}>
             <h2>{seasonLabel(s)}</h2>
             <ul className="rows">
-              {episodes
-                .filter((e) => e.season === s)
+              {ordered
+                .filter((e) => gSeason(e) === s)
                 .map((e) => (
                   <li key={e.id}>
                     <button className="card episode" onClick={() => onOpenEpisode(e.id)}>
                       <span className="mono dim">
-                        E{String(e.episode ?? 0).padStart(2, '0')}
+                        E{String(gEpisode(e) ?? 0).padStart(2, '0')}
+                        {projected && <span className="dim"> #{e.episode}</span>}
                       </span>{' '}
                       {e.title}
                       {e.played && <span className="seen"> ✓</span>}

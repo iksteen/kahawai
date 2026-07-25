@@ -134,9 +134,12 @@ Last updated: 2026-07-25, against the revised requirements (AR-12, MH-10/11, HUB
 - [x] HUB-30a Hashes are canonical identity: late ED2K re-verifies name
       matches, overrides on disagreement (manual included); manual matches
       otherwise adopt anime ids only via reverse mapping (proven live)
-- [ ] HUB-31 Native anime structure *(absolute numbering via TVDB absolute
-      order; relations graph + related-items UI live; season-view projection
-      pending — the mapping's per-entry season data is already parsed)*
+- [x] HUB-31 Native anime structure: absolute numbering as identity,
+      relations graph on the item detail (prequel-first suggested order),
+      and per-library presentation as native or TVDB-style seasons — the
+      projection stored per episode during the TVDB/TMDB bridge
+      *(episodes TVDB never curated absolute numbers for stay unprojected
+      and fall into an "Other" bucket)*
 - [x] HUB-32 (see subtitles above)
 - [ ] HUB-32b Bitmap tier for image subs *(server-side PGS/VobSub decode,
       display-set streaming, web overlay rendering live via the session tap;

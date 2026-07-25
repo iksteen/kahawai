@@ -804,6 +804,35 @@ impl Enricher {
             }
             _ => None,
         };
+        // Heal rows identified before mapped-id storage existed (or
+        // before the mapping knew them): Settled items never re-store,
+        // so adopt bridge ids directly from the mapping. Idempotent,
+        // no API calls — and it feeds HUB-31's projection backfill.
+        let stale = sqlx::query(
+            "SELECT item_id, anidb_id, i.kind FROM item_metadata m
+             JOIN items i ON i.id = m.item_id
+             WHERE m.anidb_id IS NOT NULL
+               AND m.mapped_tvdb IS NULL AND m.mapped_tmdb IS NULL",
+        )
+        .fetch_all(registry.db())
+        .await?;
+        for row in stale {
+            let aid = row.get::<i64, _>("anidb_id") as u32;
+            let Some(m) = lists.by_anidb(aid) else { continue };
+            let tmdb = m.tmdb_for(&row.get::<String, _>("kind"));
+            if m.tvdb_id.is_none() && tmdb.is_none() {
+                continue;
+            }
+            sqlx::query(
+                "UPDATE item_metadata SET mapped_tvdb = ?, mapped_tmdb = ? WHERE item_id = ?",
+            )
+            .bind(m.tvdb_id)
+            .bind(tmdb)
+            .bind(row.get::<String, _>("item_id"))
+            .execute(registry.db())
+            .await?;
+            tracing::info!(aid, tvdb = ?m.tvdb_id, tmdb = ?tmdb, "mapped ids backfilled");
+        }
         Ok(AnimeProvider {
             enricher: self.clone(),
             titles,
@@ -1064,16 +1093,26 @@ impl Enricher {
         tmdb_key: &str,
         tvdb_token: Option<&std::sync::Arc<String>>,
     ) -> Result<()> {
+        // Fetch for shows with metadata-less episodes, plus absolute-
+        // numbered shows whose episodes lack the HUB-31 season
+        // projection (backfill). ponytail: a show TVDB never curated
+        // absolute numbers for re-fetches each run — a few cached-token
+        // pages per anime show; revisit if a library full of them appears.
         let shows = sqlx::query(
             "SELECT i.id, m.provider, m.provider_id, m.mapped_tvdb, m.mapped_tmdb
              FROM items i
              JOIN item_metadata m ON m.item_id = i.id
              WHERE i.kind = 'show' AND m.provider_id != ''
                AND m.confidence != 'rejected'
-               AND EXISTS (
+               AND (EXISTS (
                  SELECT 1 FROM items e
                  LEFT JOIN item_metadata em ON em.item_id = e.id
-                 WHERE e.parent_id = i.id AND em.item_id IS NULL)",
+                 WHERE e.parent_id = i.id AND em.item_id IS NULL)
+               OR EXISTS (
+                 SELECT 1 FROM items e
+                 JOIN item_metadata em ON em.item_id = e.id
+                 WHERE e.parent_id = i.id AND e.season IS NULL
+                   AND em.proj_episode IS NULL))",
         )
         .fetch_all(registry.db())
         .await?;
@@ -1144,6 +1183,9 @@ impl Enricher {
         // Provider episodes, keyed however our items are keyed.
         let mut by_key: std::collections::HashMap<(Option<i64>, i64), EpisodeData> =
             Default::default();
+        // HUB-31: absolute number → (season, episode) in the provider's
+        // seasoned order — the season-view projection.
+        let mut proj: std::collections::HashMap<i64, (i64, i64)> = Default::default();
         match (provider, absolute) {
             ("tvdb", false) => {
                 let token = tvdb_token.context("tvdb-matched show but no tvdb token")?;
@@ -1159,6 +1201,14 @@ impl Enricher {
                 for (i, e) in eps_abs.into_iter().enumerate() {
                     let n = e.absolute.unwrap_or(i as i64 + 1);
                     by_key.insert((None, n), e);
+                }
+                // The default order carries absoluteNumber where TVDB
+                // curates it (usual for anime) — that join IS the
+                // season projection.
+                for e in self.tvdb_episodes(token, pid, "default").await.unwrap_or_default() {
+                    if let (Some(abs), Some(s)) = (e.absolute, e.season) {
+                        proj.insert(abs, (s, e.episode));
+                    }
                 }
             }
             (_, false) => {
@@ -1191,6 +1241,7 @@ impl Enricher {
                     Default::default();
                 for abs in 1..=max_abs {
                     if let Some((s, n)) = absolute_to_seasoned(&seasons, abs) {
+                        proj.insert(abs, (s, n));
                         if !fetched.contains_key(&s) {
                             let list =
                                 self.tmdb_season(tmdb_key, pid, s).await.unwrap_or_default();
@@ -1214,11 +1265,14 @@ impl Enricher {
             let key = (r.get::<Option<i64>, _>("season"), r.get::<i64, _>("episode"));
             let Some(e) = by_key.get(&key) else { continue };
             let item_id: String = r.get("id");
+            // Season projection applies to absolute-numbered rows only.
+            let p = if key.0.is_none() { proj.get(&key.1) } else { None };
             sqlx::query(
                 "INSERT INTO item_metadata
                    (item_id, provider, provider_id, title, overview, poster_path,
-                    rating, premiered, genres, confidence, updated_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, 'auto', unixepoch())
+                    rating, premiered, genres, confidence, updated_at,
+                    proj_season, proj_episode)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, 'auto', unixepoch(), ?, ?)
                  ON CONFLICT (item_id) DO UPDATE SET
                    provider = excluded.provider,
                    provider_id = excluded.provider_id,
@@ -1227,7 +1281,9 @@ impl Enricher {
                    poster_path = excluded.poster_path,
                    rating = excluded.rating,
                    premiered = excluded.premiered,
-                   updated_at = excluded.updated_at",
+                   updated_at = excluded.updated_at,
+                   proj_season = excluded.proj_season,
+                   proj_episode = excluded.proj_episode",
             )
             .bind(&item_id)
             .bind(provider)
@@ -1237,6 +1293,8 @@ impl Enricher {
             .bind(e.image.as_deref())
             .bind(e.rating)
             .bind(e.aired.as_deref())
+            .bind(p.map(|v| v.0))
+            .bind(p.map(|v| v.1))
             .execute(db)
             .await?;
             wrote += 1;

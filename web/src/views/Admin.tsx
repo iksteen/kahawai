@@ -5,6 +5,7 @@ import {
   adminEnrichStatus,
   adminProviders,
   adminRefreshLibrary,
+  adminSetAnimeView,
   adminSetAnidb,
   adminSetTmdbKey,
   adminSetTvdbKey,
@@ -365,6 +366,22 @@ export default function Admin() {
               <span className="chips">
                 <span className="chip">{l.media_type}</span>
                 <span>{l.name}</span>
+                {l.media_type === 'anime' && (
+                  <button
+                    className="chip dim"
+                    title="HUB-31: how anime episodes are presented"
+                    onClick={() =>
+                      adminSetAnimeView(
+                        l.id,
+                        l.anime_view === 'seasons' ? 'native' : 'seasons',
+                      )
+                        .then(reload)
+                        .catch((err) => setError(String(err)))
+                    }
+                  >
+                    view: {l.anime_view ?? 'seasons'} ⇄
+                  </button>
+                )}
                 {l.collections.map((m) => {
                   const info = collections.find(
                     (c) => c.module_id === m.module_id && c.collection_id === m.collection_id,
