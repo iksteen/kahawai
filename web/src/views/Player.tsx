@@ -55,7 +55,7 @@ export default function Player({
   const [audioTracks, setAudioTracks] = useState<
     { codec: string; channels: number; language?: string | null }[]
   >([])
-  const [audioTrack, setAudioTrack] = useState(0)
+  const [audioTrack, setAudioTrack] = useState(session.audio_track ?? 0)
   const [videoTracks, setVideoTracks] = useState<
     { codec: string; width: number; height: number }[]
   >([])
@@ -66,7 +66,20 @@ export default function Player({
 
   useEffect(() => {
     fetchSubtitles(item.id)
-      .then((r) => setSubs(r.subtitles))
+      .then((r) => {
+        setSubs(r.subtitles)
+        // HUB-33 original-audio preference: subtitles default ON.
+        // English text sub preferred; never overrides a user choice.
+        if (session.subs_on && r.subtitles.length > 0) {
+          setSubKey((cur) => {
+            if (cur) return cur
+            const en = r.subtitles.find(
+              (s) => !s.image && (s.language ?? '').toLowerCase().startsWith('en'),
+            )
+            return (en ?? r.subtitles.find((s) => !s.image) ?? r.subtitles[0]).key
+          })
+        }
+      })
       .catch(() => setSubs([]))
     fetchItem(item.id)
       .then((d) => {

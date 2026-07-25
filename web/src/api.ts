@@ -217,6 +217,10 @@ export type Session = {
   /// CD1/CD2 sources; 0 for single files).
   part_base_ms?: number
   parts?: number
+  /// HUB-33: the audio track the session opened with (user preference
+  /// when the client sent none) and whether subs should default on.
+  audio_track?: number
+  subs_on?: boolean
   streams: StreamVerdict | null
 }
 
@@ -224,20 +228,32 @@ export function startSession(
   itemId: string,
   mode: string,
   startMs = 0,
-  audioTrack = 0,
+  audioTrack?: number,
   videoTrack = 0,
 ): Promise<Session> {
+  // audio_track omitted → the hub applies the user's dual-audio
+  // preference (HUB-33) and reports its pick in the response.
   return json('/api/v1/playback/sessions', {
     method: 'POST',
     body: JSON.stringify({
       item_id: itemId,
       mode,
       start_ms: Math.round(startMs),
-      audio_track: audioTrack,
+      ...(audioTrack !== undefined ? { audio_track: audioTrack } : {}),
       video_track: videoTrack,
     }),
   })
 }
+
+export type Pref = { scope: string; key: string; value: string }
+
+export const fetchPrefs = () => json<{ prefs: Pref[] }>('/api/v1/prefs')
+
+export const putPref = (scope: string, key: string, value: string) =>
+  json<{ ok: boolean }>('/api/v1/prefs', {
+    method: 'PUT',
+    body: JSON.stringify({ scope, key, value }),
+  })
 
 /// Seek-restart: the pipeline restarts at the offset; re-attach the
 /// player. An audio_track switches tracks during the restart (HUB-27).

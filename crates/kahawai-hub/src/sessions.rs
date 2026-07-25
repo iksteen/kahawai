@@ -94,12 +94,68 @@ pub struct Session {
     /// Per-kind stream verdict (remux sessions): what happened to video
     /// and audio, for the player's playback-info overlay.
     pub verdict: Option<(String, String)>,
+    /// The audio track this session opened with (HUB-33: chosen by
+    /// preference when the client sent none) + whether the player
+    /// should default subtitles on (original-audio preference).
+    pub audio_track: u32,
+    pub subs_on: bool,
     /// The negotiated plan (remux/transcode) — reused on seek-restarts;
     /// mutable because audio-track switches re-plan (HUB-27).
     plan: Mutex<Option<kahawai_media::remux::RemuxPlan>>,
     /// Placement requirements — reused when rescheduling (AR-6).
     needs: crate::registry::PlacementNeed,
     touched: Mutex<std::time::Instant>,
+}
+
+/// HUB-33: pick the default audio track from the user's per-library
+/// preference. 'original' → first Japanese track, subtitles on;
+/// 'dub' → first non-Japanese (English preferred), subtitles off.
+/// No preference (or no language tags) → track 0.
+async fn default_audio(
+    registry: &Registry,
+    user_id: &str,
+    item_id: &str,
+    info: &kahawai_core::media::MediaInfo,
+) -> Result<(u32, bool)> {
+    let pref: Option<String> = sqlx::query_scalar(
+        "SELECT p.value FROM user_prefs p
+         WHERE p.user_id = ? AND p.key = 'audio' AND p.scope IN (
+           SELECT lc.library_id FROM item_sources s
+           JOIN library_collections lc
+             ON (lc.module_id, lc.collection_id) = (s.module_id, s.collection_id)
+           WHERE s.item_id = ?)
+         LIMIT 1",
+    )
+    .bind(user_id)
+    .bind(item_id)
+    .fetch_optional(registry.db())
+    .await?;
+    let is_jpn = |l: &Option<String>| {
+        l.as_deref()
+            .map(|l| {
+                let l = l.to_ascii_lowercase();
+                l.starts_with("ja") || l == "jpn"
+            })
+            .unwrap_or(false)
+    };
+    let is_eng = |l: &Option<String>| {
+        l.as_deref().map(|l| l.to_ascii_lowercase().starts_with("en")).unwrap_or(false)
+    };
+    Ok(match pref.as_deref() {
+        Some("original") => (
+            info.audio.iter().position(|a| is_jpn(&a.language)).unwrap_or(0) as u32,
+            true,
+        ),
+        Some("dub") => (
+            info.audio
+                .iter()
+                .position(|a| is_eng(&a.language))
+                .or_else(|| info.audio.iter().position(|a| !is_jpn(&a.language)))
+                .unwrap_or(0) as u32,
+            false,
+        ),
+        _ => (0, false),
+    })
 }
 
 /// Index of the part containing `abs_ms`.
@@ -417,7 +473,7 @@ impl Sessions {
         item_id: &str,
         mode: &str,
         start_ms: u64,
-        audio_track: u32,
+        audio_track: Option<u32>,
         video_track: u32,
     ) -> Result<Arc<Session>> {
         let user_active = self
@@ -434,6 +490,17 @@ impl Sessions {
         if parts.len() > 1 && mode == "direct" {
             bail!("multi-part sources play via remux/transcode, not direct");
         }
+        // HUB-33: no explicit track from the client → apply the user's
+        // per-library dual-audio preference (original+subs vs dub).
+        let (audio_track, subs_on) = match audio_track {
+            Some(t) => (t, false),
+            None => default_audio(registry, user_id, item_id, &info)
+                .await
+                .unwrap_or_else(|e| {
+                    tracing::debug!(error = format!("{e:#}"), "audio preference lookup failed");
+                    (0, false)
+                }),
+        };
         let total_ms: u64 = parts.iter().map(|p| p.duration_ms).sum();
         let start_idx = part_index(&parts, start_ms);
         let part = parts[start_idx].clone();
@@ -549,6 +616,8 @@ impl Sessions {
             current_part: std::sync::atomic::AtomicUsize::new(start_idx),
             mode: session_mode,
             verdict,
+            audio_track,
+            subs_on,
             plan: Mutex::new(session_plan),
             needs: session_needs,
             touched: Mutex::new(std::time::Instant::now()),

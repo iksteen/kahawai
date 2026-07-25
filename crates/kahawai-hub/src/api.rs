@@ -50,6 +50,7 @@ pub fn router(
         .route("/api/v1/items/{id}/subtitles/{file}", get(item_subtitle_file))
         .route("/api/v1/items/{id}/fonts", get(item_fonts))
         .route("/api/v1/items/{id}/fonts/{n}", get(item_font))
+        .route("/api/v1/prefs", get(get_prefs).put(put_pref))
         .route("/api/v1/playback/sessions", post(start_session))
         .route("/api/v1/playback/sessions/{id}", axum::routing::delete(end_session))
         .route("/api/v1/playback/sessions/{id}/stream", get(stream_session))
@@ -841,15 +842,81 @@ struct StartSessionRequest {
     /// catch up) — keyframe-snapped by the pipeline.
     #[serde(default)]
     start_ms: u64,
-    /// Track indexes in the source's discovery order (HUB-27).
+    /// Track indexes in the source's discovery order (HUB-27). Omitted
+    /// audio → the hub applies the user's dual-audio preference (HUB-33).
     #[serde(default)]
-    audio_track: u32,
+    audio_track: Option<u32>,
     #[serde(default)]
     video_track: u32,
 }
 
 fn default_mode() -> String {
     "direct".into()
+}
+
+/// Per-user preferences (HUB-33): tiny generic KV, scope = library id
+/// or '' for user-global keys.
+async fn get_prefs(
+    State(state): State<AppState>,
+    axum::Extension(claims): axum::Extension<crate::auth::Claims>,
+) -> Result<Json<Value>, ApiError> {
+    let rows = sqlx::query("SELECT scope, key, value FROM user_prefs WHERE user_id = ?")
+        .bind(&claims.sub)
+        .fetch_all(state.registry.db())
+        .await
+        .map_err(internal)?;
+    let prefs: Vec<Value> = rows
+        .iter()
+        .map(|r| {
+            json!({
+                "scope": r.get::<String, _>("scope"),
+                "key": r.get::<String, _>("key"),
+                "value": r.get::<String, _>("value"),
+            })
+        })
+        .collect();
+    Ok(Json(json!({ "prefs": prefs })))
+}
+
+#[derive(Deserialize)]
+struct PutPrefRequest {
+    #[serde(default)]
+    scope: String,
+    key: String,
+    /// Empty value deletes the preference.
+    value: String,
+}
+
+async fn put_pref(
+    State(state): State<AppState>,
+    axum::Extension(claims): axum::Extension<crate::auth::Claims>,
+    Json(body): Json<PutPrefRequest>,
+) -> Result<Json<Value>, ApiError> {
+    if body.key.len() > 64 || body.value.len() > 256 || body.scope.len() > 64 {
+        return Err((StatusCode::BAD_REQUEST, "preference too long".into()));
+    }
+    if body.value.is_empty() {
+        sqlx::query("DELETE FROM user_prefs WHERE user_id = ? AND scope = ? AND key = ?")
+            .bind(&claims.sub)
+            .bind(&body.scope)
+            .bind(&body.key)
+            .execute(state.registry.db())
+            .await
+            .map_err(internal)?;
+    } else {
+        sqlx::query(
+            "INSERT INTO user_prefs (user_id, scope, key, value) VALUES (?, ?, ?, ?)
+             ON CONFLICT (user_id, scope, key) DO UPDATE SET value = excluded.value",
+        )
+        .bind(&claims.sub)
+        .bind(&body.scope)
+        .bind(&body.key)
+        .bind(&body.value)
+        .execute(state.registry.db())
+        .await
+        .map_err(internal)?;
+    }
+    Ok(Json(json!({ "ok": true })))
 }
 
 async fn start_session(
@@ -898,6 +965,8 @@ async fn start_session(
             "parts": session.parts.len(),
             "content_type": ctype,
             "stream_url": stream_url,
+            "audio_track": session.audio_track,
+            "subs_on": session.subs_on,
             "streams": session.verdict.as_ref().map(|(video, audio)| json!({
                 "video": video,
                 "audio": audio,

@@ -1,5 +1,13 @@
 import { useEffect, useState, type ReactNode } from 'react'
-import { artworkUrl, fetchItems, fetchLibraries, isAdmin, type Item } from '../api'
+import {
+  artworkUrl,
+  fetchItems,
+  fetchLibraries,
+  fetchPrefs,
+  isAdmin,
+  putPref,
+  type Item,
+} from '../api'
 import placeholder from '../assets/placeholder.svg'
 import MatchDialog from './MatchDialog'
 
@@ -55,6 +63,8 @@ export default function Library({
 }) {
   const [items, setItems] = useState<Item[] | null>(null)
   const [name, setName] = useState('Library')
+  const [isAnime, setIsAnime] = useState(false)
+  const [audioPref, setAudioPref] = useState('')
   const [filter, setFilter] = useState('')
   const [error, setError] = useState('')
   const [matching, setMatching] = useState<Item | null>(null)
@@ -70,9 +80,29 @@ export default function Library({
       .then((r) => setItems(r.items))
       .catch((e) => setError(String(e)))
     fetchLibraries()
-      .then((r) => setName(r.libraries.find((l) => l.id === libraryId)?.name ?? 'Library'))
+      .then((r) => {
+        const lib = r.libraries.find((l) => l.id === libraryId)
+        setName(lib?.name ?? 'Library')
+        setIsAnime(lib?.media_type === 'anime')
+      })
+      .catch(() => {})
+    // HUB-33: per-user dual-audio preference for this library.
+    fetchPrefs()
+      .then((r) =>
+        setAudioPref(
+          r.prefs.find((p) => p.scope === libraryId && p.key === 'audio')?.value ?? '',
+        ),
+      )
       .catch(() => {})
   }, [libraryId])
+
+  // '' (no preference) → source order; original → jpn + subs; dub → eng.
+  const cycleAudioPref = () => {
+    const next = audioPref === '' ? 'original' : audioPref === 'original' ? 'dub' : ''
+    putPref(libraryId, 'audio', next)
+      .then(() => setAudioPref(next))
+      .catch((e) => setError(String(e)))
+  }
 
   if (error) return <div className="error page-pad">{error}</div>
   if (!items) return null
@@ -84,6 +114,15 @@ export default function Library({
     <main>
       <div className="library-head">
         <h1>{name}</h1>
+        {isAnime && (
+          <button
+            className="btn ghost small"
+            title="Default audio for this library (per user): original = Japanese + subtitles, dub = English"
+            onClick={cycleAudioPref}
+          >
+            audio: {audioPref || 'default'}
+          </button>
+        )}
         <input
           className="filter"
           placeholder="Filter titles"
