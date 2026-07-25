@@ -34,7 +34,9 @@ impl MediahostLinkService {
     }
 
     pub fn into_server(self) -> MediahostLinkServer<Self> {
-        MediahostLinkServer::new(self)
+        // A multi-track FileSubtitles (30+ full subtitle texts) can pass
+        // tonic's 4 MB default, which kills the whole control link.
+        MediahostLinkServer::new(self).max_decoding_message_size(64 * 1024 * 1024)
     }
 }
 
@@ -324,6 +326,16 @@ async fn handle_host_msg(
                 paths.extend(s.path_rel);
             }
         }
+        host_to_hub::Msg::ScanProgress(p) if !p.complete => {
+            registry.update_scan_progress(
+                module_id,
+                &p.collection_id,
+                p.scanned,
+                p.failed,
+                p.skipped,
+                false,
+            );
+        }
         host_to_hub::Msg::ScanProgress(p) if p.complete => {
             tracing::info!(%module_id, collection = %p.collection_id,
                 scanned = p.scanned, failed = p.failed, skipped = p.skipped, "scan complete");
@@ -335,6 +347,14 @@ async fn handle_host_msg(
                     .set_collection_sync_version(module_id, &p.collection_id, p.sync_version)
                     .await?;
             }
+            registry.update_scan_progress(
+                module_id,
+                &p.collection_id,
+                p.scanned,
+                p.failed,
+                p.skipped,
+                true,
+            );
             push_ed2k_worklist(registry, module_id, &p.collection_id).await;
             push_subs_worklist(registry, module_id, &p.collection_id).await;
         }

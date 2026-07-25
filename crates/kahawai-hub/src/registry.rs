@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
 use kahawai_core::names;
@@ -84,6 +84,18 @@ pub struct Registry {
     disabled: Mutex<std::collections::HashSet<String>>,
     /// Command senders for connected hosts' Link streams.
     links: Mutex<HashMap<String, tokio::sync::mpsc::Sender<Result<kahawai_proto::v1::HubToHost, tonic::Status>>>>,
+    /// Live per-collection scan progress (HUB-35): last report wins.
+    scan_progress: Mutex<HashMap<(String, String), ScanState>>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ScanState {
+    pub scanned: u32,
+    pub failed: u32,
+    pub skipped: u32,
+    pub complete: bool,
+    #[serde(skip)]
+    pub updated: SystemTime,
 }
 
 impl Registry {
@@ -97,7 +109,37 @@ impl Registry {
             tc_links: Mutex::new(HashMap::new()),
             tc_load: Mutex::new(HashMap::new()),
             disabled: Mutex::new(std::collections::HashSet::new()),
+            scan_progress: Mutex::new(HashMap::new()),
         }
+    }
+
+    pub fn update_scan_progress(
+        &self,
+        module_id: &str,
+        collection_id: &str,
+        scanned: u32,
+        failed: u32,
+        skipped: u32,
+        complete: bool,
+    ) {
+        self.scan_progress.lock().unwrap().insert(
+            (module_id.to_string(), collection_id.to_string()),
+            ScanState { scanned, failed, skipped, complete, updated: SystemTime::now() },
+        );
+    }
+
+    /// Live scan state for the admin overview. Completed states linger a
+    /// minute (so the finished counts are visible), then disappear.
+    pub fn scan_state(&self, module_id: &str, collection_id: &str) -> Option<ScanState> {
+        self.scan_progress
+            .lock()
+            .unwrap()
+            .get(&(module_id.to_string(), collection_id.to_string()))
+            .filter(|s| {
+                !s.complete
+                    || s.updated.elapsed().unwrap_or_default() < Duration::from_secs(60)
+            })
+            .cloned()
     }
 
     /// Populate the allowlist from the satellites table (hub startup).
@@ -684,11 +726,16 @@ impl Registry {
         Ok(rows
             .iter()
             .map(|r| {
+                let (module_id, collection_id) =
+                    (r.get::<String, _>("module_id"), r.get::<String, _>("collection_id"));
+                let scan = self.scan_state(&module_id, &collection_id);
                 serde_json::json!({
-                    "module_id": r.get::<String, _>("module_id"),
-                    "collection_id": r.get::<String, _>("collection_id"),
+                    "module_id": module_id,
+                    "collection_id": collection_id,
                     "media_type": r.get::<String, _>("media_type"),
                     "host_name": r.get::<Option<String>, _>("host_name"),
+                    "connected": self.is_connected(&module_id),
+                    "scan": scan,
                 })
             })
             .collect())

@@ -81,7 +81,8 @@ pub fn router(
         .route("/admin/v1/providers/anidb", post(admin_set_anidb))
         .route("/admin/v1/providers/anidb/verify", post(admin_verify_anidb))
         .route("/admin/v1/enrich", get(admin_enrich_status).post(admin_enrich_run))
-        .route("/admin/v1/rescan", post(admin_rescan))
+        .route("/admin/v1/libraries/{id}/refresh", post(admin_refresh_library))
+        .route("/admin/v1/collections/refresh", post(admin_refresh_collection))
         .route("/admin/v1/enrich/review", get(admin_review_list))
         .route("/admin/v1/enrich/search", post(admin_review_search))
         .route("/admin/v1/items/{id}/match", post(admin_apply_match))
@@ -377,33 +378,60 @@ struct RescanRequest {
     collection_id: Option<String>,
 }
 
-/// Ask every connected mediahost for an incremental rescan (the admin
-/// "Rescan now" button; watchers and periodic sweeps are the usual paths).
-async fn admin_rescan(
+/// HUB-35: granular refresh. The admin-facing unit is the LIBRARY —
+/// fan out collection-scoped scan requests to each member collection's
+/// mediahost. There is deliberately no global rescan.
+async fn admin_refresh_library(
     State(state): State<AppState>,
-    body: Option<Json<RescanRequest>>,
+    Path(id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    let collection = body.and_then(|b| b.0.collection_id).unwrap_or_default();
-    let hosts: Vec<String> =
-        sqlx::query_scalar("SELECT module_id FROM satellites WHERE module_type = 'mediahost'")
-            .fetch_all(state.registry.db())
-            .await
-            .map_err(internal)?;
-    let mut asked = 0;
-    for module_id in hosts {
-        if !state.registry.is_connected(&module_id) {
-            continue;
-        }
-        let msg = kahawai_proto::v1::HubToHost {
-            msg: Some(kahawai_proto::v1::hub_to_host::Msg::RescanRequest(
-                kahawai_proto::v1::RescanRequest { collection_id: collection.clone() },
-            )),
-        };
-        if state.registry.send_to_host(&module_id, msg).await.is_ok() {
+    let members: Vec<(String, String)> = sqlx::query_as(
+        "SELECT module_id, collection_id FROM library_collections WHERE library_id = ?",
+    )
+    .bind(&id)
+    .fetch_all(state.registry.db())
+    .await
+    .map_err(internal)?;
+    if members.is_empty() {
+        return Err((StatusCode::NOT_FOUND, "library has no collections".into()));
+    }
+    let (mut asked, mut offline) = (0, 0);
+    for (module_id, collection_id) in members {
+        if request_scan(&state, &module_id, &collection_id).await {
             asked += 1;
+        } else {
+            offline += 1;
         }
     }
-    Ok(Json(json!({ "asked": asked })))
+    Ok(Json(json!({ "asked": asked, "offline": offline })))
+}
+
+#[derive(Deserialize)]
+struct RefreshCollectionRequest {
+    module_id: String,
+    collection_id: String,
+}
+
+async fn admin_refresh_collection(
+    State(state): State<AppState>,
+    Json(body): Json<RefreshCollectionRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let asked = request_scan(&state, &body.module_id, &body.collection_id).await;
+    Ok(Json(json!({ "asked": asked as u32, "offline": !asked as u32 })))
+}
+
+/// Send one collection-scoped scan request (MH-2); the mediahost's
+/// trigger sink coalesces with any running scan.
+async fn request_scan(state: &AppState, module_id: &str, collection_id: &str) -> bool {
+    if !state.registry.is_connected(module_id) {
+        return false;
+    }
+    let msg = kahawai_proto::v1::HubToHost {
+        msg: Some(kahawai_proto::v1::hub_to_host::Msg::RescanRequest(
+            kahawai_proto::v1::RescanRequest { collection_id: collection_id.to_string() },
+        )),
+    };
+    state.registry.send_to_host(module_id, msg).await.is_ok()
 }
 
 /// HUB-8 review queue: everything not matched confidently — misses,

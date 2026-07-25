@@ -40,6 +40,10 @@ pub async fn scan_collection(
     sync_version: u64,
 ) -> Result<bool> {
     let (mut scanned, mut failed, mut skipped) = (0u32, 0u32, 0u32);
+    // Live progress (HUB-35/HUB-26): a start beacon (after the in-sync
+    // gate — a skipped scan must not leave a stale "scanning" state),
+    // then interim reports for the admin UI.
+    let mut last_reported = 0u32;
     let mut batch: Vec<FileRecord> = Vec::with_capacity(BATCH);
 
     // Collect the hub's manifest (chunked); an old hub never answers, so
@@ -64,6 +68,18 @@ pub async fn scan_collection(
             }
         }
     }
+    tx.send(HostToHub {
+        msg: Some(host_to_hub::Msg::ScanProgress(ScanProgress {
+            collection_id: cfg.name.clone(),
+            scanned: 0,
+            failed: 0,
+            complete: false,
+            skipped: 0,
+            sync_version: 0,
+        })),
+    })
+    .await
+    .context("link closed")?;
     let mut seen_batch: Vec<String> = Vec::new();
 
     let include_audio = cfg.media_type == "music";
@@ -151,6 +167,25 @@ pub async fn scan_collection(
                     .context("link closed")?;
                 }
             }
+            }
+            // Interim progress once per stat batch, counting skips too —
+            // an incremental rescan of an unchanged collection is mostly
+            // skips, and those must move the admin UI as well.
+            let processed = scanned + failed + skipped;
+            if processed - last_reported >= 500 {
+                last_reported = processed;
+                tx.send(HostToHub {
+                    msg: Some(host_to_hub::Msg::ScanProgress(ScanProgress {
+                        collection_id: cfg.name.clone(),
+                        scanned,
+                        failed,
+                        complete: false,
+                        skipped,
+                        sync_version: 0,
+                    })),
+                })
+                .await
+                .context("link closed")?;
             }
         }
     }

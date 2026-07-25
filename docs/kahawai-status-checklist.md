@@ -35,9 +35,9 @@ Last updated: 2026-07-25, against the revised requirements (AR-12, MH-10/11, HUB
 ## Mediahost (MH)
 
 - [x] MH-1 Collections: media type + roots per collection
-- [ ] MH-2 Scan on start/demand + watching + sweeps live *(amended scoping not
-      met: the admin rescan is still global — collection-scoped-only on-demand
-      scans arrive with HUB-35)*
+- [x] MH-2 Scan on start/demand + watching + sweeps; on-demand scans are
+      collection-scoped only (the global rescan is gone), with interim
+      progress reports every 500 files
 - [x] MH-3 GStreamer discovery for technical metadata
 - [ ] MH-4 Sidecars + artwork live *(amended: font attachments are not yet
       DECLARED in the file record at scan — today they're discovered during
@@ -114,9 +114,9 @@ Last updated: 2026-07-25, against the revised requirements (AR-12, MH-10/11, HUB
 ## Hub — web interface
 
 - [x] HUB-25 Embedded web UI compiled into the binary
-- [ ] HUB-26 Admin UI: enrollments, satellites, libraries, providers, users,
-      match review live *(amended: per-library refresh with live per-collection
-      progress pending; the global rescan button must go — HUB-35)*
+- [x] HUB-26 Admin UI: enrollments, satellites, libraries (with per-library
+      refresh + live per-collection scan progress), providers, users,
+      match review
 - [x] HUB-27 MVP player: login, browse, detail w/ stream info, direct/remux playback,
       audio/video/subtitle track selection, resume, watch state
 - [x] HUB-28 Web UI is a pure client of the public API
@@ -148,9 +148,9 @@ Last updated: 2026-07-25, against the revised requirements (AR-12, MH-10/11, HUB
       mediahost sparse/sequential extraction → hub lease, cached at-most-once
       *(fonts currently use rungs 1 and 4 only — mediahost font extraction
       follows once MH-4 declares attachment locations)*
-- [ ] HUB-35 Granular refresh *(per-collection scan requests + coalescing exist
-      at the protocol level; library-refresh endpoints, per-collection progress,
-      and removal of the global rescan pending)*
+- [x] HUB-35 Granular refresh: library-refresh endpoint fanning out
+      per-collection scan requests, per-collection live progress in the
+      admin overview, global rescan removed (endpoint + button)
 
 ## Transcoder (TC)
 

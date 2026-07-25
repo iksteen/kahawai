@@ -3,8 +3,8 @@ import {
   adminApprove,
   adminEnrichRun,
   adminEnrichStatus,
-  adminRescan,
   adminProviders,
+  adminRefreshLibrary,
   adminSetAnidb,
   adminSetTmdbKey,
   adminSetTvdbKey,
@@ -93,14 +93,6 @@ function TmdbSection({ onNotice }: { onNotice: (s: string) => void }) {
           onClick={() => void adminEnrichRun().then(refresh)}
         >
           {status?.running ? 'Enriching…' : 'Enrich now'}
-        </button>
-        <button
-          className="btn ghost small"
-          onClick={() =>
-            void adminRescan().then((r) => onNotice(`Rescan requested from ${r.asked} mediahost(s)`))
-          }
-        >
-          Rescan collections
         </button>
         {status && (
           <span className="dim mono">
@@ -373,9 +365,26 @@ export default function Admin() {
               <span className="chips">
                 <span className="chip">{l.media_type}</span>
                 <span>{l.name}</span>
-                {l.collections.map((m) => (
-                  <span className="chip dim" key={`${m.module_id}/${m.collection_id}`}>
-                    {m.host_name ?? m.module_id}/{m.collection_id}{' '}
+                {l.collections.map((m) => {
+                  const info = collections.find(
+                    (c) => c.module_id === m.module_id && c.collection_id === m.collection_id,
+                  )
+                  const scan = info?.scan
+                  return (
+                  <span
+                    className={info && !info.connected ? 'chip warn' : 'chip dim'}
+                    key={`${m.module_id}/${m.collection_id}`}
+                  >
+                    {m.host_name ?? m.module_id}/{m.collection_id}
+                    {info && !info.connected && ' (offline)'}
+                    {scan && (
+                      <span className="mono">
+                        {' '}
+                        · {scan.complete ? 'scanned' : 'scanning'} {scan.scanned}
+                        {scan.skipped > 0 && ` (+${scan.skipped} unchanged)`}
+                        {scan.failed > 0 && ` · ${scan.failed} failed`}
+                      </span>
+                    )}{' '}
                     <button
                       className="chip-x"
                       title="detach"
@@ -388,7 +397,8 @@ export default function Admin() {
                       ×
                     </button>
                   </span>
-                ))}
+                  )
+                })}
                 {attachable.length > 0 && (
                   <select
                     value=""
@@ -409,14 +419,33 @@ export default function Admin() {
                   </select>
                 )}
               </span>
-              <button
-                className="btn ghost small"
-                onClick={() =>
-                  adminDeleteLibrary(l.id).then(reload).catch((err) => setError(String(err)))
-                }
-              >
-                Delete
-              </button>
+              <span>
+                <button
+                  className="btn ghost small"
+                  disabled={l.collections.length === 0}
+                  onClick={() =>
+                    adminRefreshLibrary(l.id)
+                      .then((r) => {
+                        setNotice(
+                          `Refresh requested: ${r.asked} collection(s)` +
+                            (r.offline > 0 ? `, ${r.offline} offline` : ''),
+                        )
+                        return reload()
+                      })
+                      .catch((err) => setError(String(err)))
+                  }
+                >
+                  Refresh
+                </button>
+                <button
+                  className="btn ghost small"
+                  onClick={() =>
+                    adminDeleteLibrary(l.id).then(reload).catch((err) => setError(String(err)))
+                  }
+                >
+                  Delete
+                </button>
+              </span>
             </li>
           )
         })}

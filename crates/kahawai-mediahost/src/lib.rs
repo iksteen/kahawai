@@ -151,7 +151,11 @@ async fn link_once(
     // connection window — that froze heartbeats for 40 s at a time and
     // the hub declared the link dead mid-scan.
     let byte_channel = kahawai_transport::tls::grpc_channel_with(hub_addr, tls).await?;
-    let mut client = MediahostLinkClient::new(channel.clone());
+    // Mirror the hub's raised limit: worklists and manifests can pass
+    // tonic's 4 MB default on large collections.
+    let mut client = MediahostLinkClient::new(channel.clone())
+        .max_decoding_message_size(64 * 1024 * 1024)
+        .max_encoding_message_size(64 * 1024 * 1024);
 
     let (tx, rx) = tokio::sync::mpsc::channel::<HostToHub>(16);
     tx.send(HostToHub {

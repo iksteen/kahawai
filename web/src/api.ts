@@ -317,7 +317,18 @@ export type Library = {
   collections: LibraryCollection[]
 }
 
-export type CollectionInfo = LibraryCollection & { media_type: string }
+export type ScanState = {
+  scanned: number
+  failed: number
+  skipped: number
+  complete: boolean
+}
+
+export type CollectionInfo = LibraryCollection & {
+  media_type: string
+  connected: boolean
+  scan: ScanState | null
+}
 
 export const adminLibraries = () =>
   json<{ libraries: Library[] }>('/admin/v1/libraries')
@@ -392,8 +403,17 @@ export const adminApplyMatch = (
     }),
   })
 
-export const adminRescan = () =>
-  json<{ asked: number }>('/admin/v1/rescan', { method: 'POST', body: '{}' })
+export const adminRefreshLibrary = (id: string) =>
+  json<{ asked: number; offline: number }>(`/admin/v1/libraries/${id}/refresh`, {
+    method: 'POST',
+    body: '{}',
+  })
+
+export const adminRefreshCollection = (moduleId: string, collectionId: string) =>
+  json<{ asked: number; offline: number }>('/admin/v1/collections/refresh', {
+    method: 'POST',
+    body: JSON.stringify({ module_id: moduleId, collection_id: collectionId }),
+  })
 
 export const adminEnrichRun = () =>
   json<{ started: boolean }>('/admin/v1/enrich', { method: 'POST' })
