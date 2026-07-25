@@ -35,6 +35,11 @@ pub struct Enricher {
     progress: (AtomicUsize, AtomicUsize, AtomicUsize),
     /// AniDB HTTP API pacing (one page per 2.2 s, process-wide).
     anidb_http_gate: crate::anime::HttpGate,
+    /// The UDP session, kept for the PROCESS lifetime — not per run.
+    /// A login per enrichment run is what got this client banned twice
+    /// in one evening; sessions are cheap to hold and expensive to
+    /// re-establish.
+    anidb: tokio::sync::Mutex<Option<crate::anidb::Anidb>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -159,7 +164,13 @@ impl Enricher {
             last_nudge: std::sync::atomic::AtomicU64::new(0),
             progress: Default::default(),
             anidb_http_gate: Default::default(),
+            anidb: Default::default(),
         }
+    }
+
+    /// Where anime/AniDB state lives (the api's verify path needs it).
+    pub fn data_dir(&self) -> &std::path::Path {
+        &self.data_dir
     }
 
     pub fn status(&self) -> serde_json::Value {
@@ -834,6 +845,11 @@ impl Enricher {
     async fn build_anime_provider(self: &Arc<Self>, registry: &Registry) -> Result<AnimeProvider> {
         let titles = crate::anime::AnidbTitles::load(&self.http, &self.data_dir).await?;
         let lists = crate::anime::AnimeLists::load(&self.http, &self.data_dir).await?;
+        // Reuse the process's session; only authenticate when there
+        // isn't one (first run, or the last one went stale).
+        if self.anidb.lock().await.is_some() {
+            return Ok(AnimeProvider { enricher: self.clone(), titles, lists });
+        }
         let anidb = match (
             registry.get_setting(crate::anidb::USER_SETTING).await?,
             registry.get_setting(crate::anidb::PASS_SETTING).await?,
@@ -843,7 +859,9 @@ impl Enricher {
                     .get_setting(crate::anidb::APIKEY_SETTING)
                     .await?
                     .filter(|k| !k.is_empty());
-                match crate::anidb::Anidb::login(&user, &pass, key.as_deref()).await {
+                match crate::anidb::Anidb::login(&self.data_dir, &user, &pass, key.as_deref())
+                    .await
+                {
                     Ok(c) => Some(c),
                     Err(e) => {
                         tracing::warn!(error = format!("{e:#}"), "anidb login failed; title matching only");
@@ -882,12 +900,8 @@ impl Enricher {
             .await?;
             tracing::info!(aid, tvdb = ?m.tvdb_id, tmdb = ?tmdb, "mapped ids backfilled");
         }
-        Ok(AnimeProvider {
-            enricher: self.clone(),
-            titles,
-            lists,
-            anidb: tokio::sync::Mutex::new(anidb),
-        })
+        *self.anidb.lock().await = anidb;
+        Ok(AnimeProvider { enricher: self.clone(), titles, lists })
     }
 
     async fn enrich_anime(
@@ -1790,7 +1804,6 @@ pub(crate) struct AnimeProvider {
     enricher: Arc<Enricher>,
     titles: crate::anime::AnidbTitles,
     lists: crate::anime::AnimeLists,
-    anidb: tokio::sync::Mutex<Option<crate::anidb::Anidb>>,
 }
 
 #[async_trait::async_trait]
@@ -1811,7 +1824,7 @@ impl crate::providers::Provider for AnimeProvider {
         // for the rest of the run (ban safety).
         let mut exact_aid: Option<u32> = None;
         {
-            let mut guard = self.anidb.lock().await;
+            let mut guard = self.enricher.anidb.lock().await;
             if let Some(client) = guard.as_mut() {
                 match self.enricher.anidb_identify(db, client, &item.id).await {
                     Ok(aid) => exact_aid = aid,
@@ -1856,9 +1869,8 @@ impl crate::providers::Provider for AnimeProvider {
     }
 
     async fn finish(&self) {
-        if let Some(client) = self.anidb.lock().await.take() {
-            client.logout().await;
-        }
+        // Deliberately does NOT log out or drop the client: the session
+        // lives as long as the process so the next run reuses it.
     }
 }
 

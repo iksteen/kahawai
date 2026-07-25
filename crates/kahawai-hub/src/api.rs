@@ -341,9 +341,11 @@ async fn admin_verify_anidb(State(state): State<AppState>) -> Result<Json<Value>
     let (Some(user), Some(pass)) = (user, pass) else {
         return Err((StatusCode::BAD_REQUEST, "no AniDB account configured".into()));
     };
-    match crate::anidb::Anidb::login(&user, &pass, key.as_deref()).await {
+    match crate::anidb::Anidb::login(state.enricher.data_dir(), &user, &pass, key.as_deref())
+        .await
+    {
         Ok(client) => {
-            client.logout().await;
+            client.finish().await;
             Ok(Json(json!({ "verified": true })))
         }
         Err(e) => Ok(Json(json!({ "verified": false, "error": format!("{e:#}") }))),
@@ -389,9 +391,11 @@ async fn admin_set_anidb(
         .await
         .map_err(internal)?
         .filter(|k| !k.is_empty());
-    match crate::anidb::Anidb::login(user, pass, key.as_deref()).await {
+    match crate::anidb::Anidb::login(state.enricher.data_dir(), user, pass, key.as_deref())
+        .await
+    {
         Ok(client) => {
-            client.logout().await;
+            client.finish().await;
             let enricher = state.enricher.clone();
             let registry = state.registry.clone();
             tokio::spawn(async move {

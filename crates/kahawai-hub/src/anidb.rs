@@ -3,9 +3,17 @@
 //! name-based heuristic.
 //!
 //! AniDB is aggressively rate-limited and ban-happy, so this client is
-//! built around never asking twice: one session per enrichment run,
-//! ≥2 s between packets, exponential backoff on trouble, and callers
-//! cache every answer. The client identity is the registered `kahawai`
+//! built around never asking twice: ≥2 s between packets and callers
+//! cache every answer. Two disciplines matter more than the rest, and
+//! both are enforced here rather than left to callers:
+//!
+//! * **Sessions are reused across runs** — the key is persisted and
+//!   revalidated with UPTIME; a fresh AUTH per enrichment run got us
+//!   throttle-banned twice in one evening (37 logins in a day).
+//! * **A 555 stops everything** — AniDB bans have no fixed duration:
+//!   they decay after ~24 h ONLY if the client stops calling, and every
+//!   attempt while banned extends them. So a ban is recorded on disk
+//!   and suppresses all contact until it lapses. The client identity is the registered `kahawai`
 //! app; the account is the admin's (settings). Optionally encrypts the
 //! session with the profile's UDP API key (AES-128-ECB per spec).
 
@@ -23,6 +31,11 @@ const PROTOVER: u32 = 3;
 const PACKET_SPACING: Duration = Duration::from_millis(2200);
 const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How long to stay silent after a 555. AniDB documents no duration
+/// (bans decay only while the client is quiet), so this is the
+/// conservative reading of "come back tomorrow".
+const BAN_COOLDOWN: Duration = Duration::from_secs(24 * 3600);
+
 pub const USER_SETTING: &str = "anidb.username";
 pub const PASS_SETTING: &str = "anidb.password";
 pub const APIKEY_SETTING: &str = "anidb.udp_api_key";
@@ -39,8 +52,55 @@ pub struct FileHit {
     pub group_name: String,
 }
 
+/// Persisted between runs: the session key to resume, and when a ban
+/// (if any) may be retried. Lives beside the other anime data files.
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct State {
+    #[serde(default)]
+    session: String,
+    /// Unix seconds; contact is refused until then.
+    #[serde(default)]
+    banned_until: i64,
+}
+
+fn state_path(data_dir: &std::path::Path) -> std::path::PathBuf {
+    data_dir.join("anime").join("anidb-session.json")
+}
+
+fn load_state(data_dir: &std::path::Path) -> State {
+    std::fs::read(state_path(data_dir))
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default()
+}
+
+fn save_state(data_dir: &std::path::Path, st: &State) {
+    let path = state_path(data_dir);
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(bytes) = serde_json::to_vec(st) {
+        let _ = std::fs::write(path, bytes);
+    }
+}
+
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Seconds left on a recorded ban, if any — checked BEFORE opening a
+/// socket so a banned hub never touches AniDB at all.
+pub fn ban_remaining(data_dir: &std::path::Path) -> Option<i64> {
+    let left = load_state(data_dir).banned_until - now_unix();
+    (left > 0).then_some(left)
+}
+
 pub struct Anidb {
     socket: tokio::net::UdpSocket,
+    data_dir: std::path::PathBuf,
     session: String,
     /// AES-128 key when the session is encrypted (API key configured).
     cipher: Option<aes::Aes128>,
@@ -51,11 +111,31 @@ pub struct Anidb {
 impl Anidb {
     /// Login. `api_key` (profile "UDP API key") upgrades to an
     /// encrypted session first.
-    pub async fn login(user: &str, pass: &str, api_key: Option<&str>) -> Result<Self> {
+    pub async fn login(
+        data_dir: &std::path::Path,
+        user: &str,
+        pass: &str,
+        api_key: Option<&str>,
+    ) -> Result<Self> {
+        // Refuse to speak at all while a ban is on record: contact is
+        // what keeps a ban alive.
+        if let Some(left) = ban_remaining(data_dir) {
+            bail!(
+                "anidb banned us; staying silent for another {} h (contact would extend it)",
+                (left + 3599) / 3600
+            );
+        }
         let socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
         socket.connect(SERVER).await.context("resolving api.anidb.net")?;
-        let mut client =
-            Self { socket, session: String::new(), cipher: None, last_send: None, tag_seq: 0 };
+        let mut client = Self {
+            socket,
+            data_dir: data_dir.to_path_buf(),
+            session: String::new(),
+            cipher: None,
+            last_send: None,
+            tag_seq: 0,
+        };
+
 
         if let Some(key) = api_key.filter(|k| !k.is_empty()) {
             let (code, rest) =
@@ -66,11 +146,50 @@ impl Anidb {
                     "AniDB profile has no UDP API key defined — set one under \
                      Settings → Account on anidb.net, or clear the key here"
                 ),
+                555 => {
+                    client.record_ban(&rest);
+                    bail!("anidb: BANNED — staying silent for 24 h: {rest}")
+                }
                 other => bail!("ENCRYPT refused: {other} {rest}"),
             }
             let salt = rest.split_whitespace().next().unwrap_or_default();
             let digest = Md5::digest(format!("{key}{salt}").as_bytes());
             client.cipher = Some(aes::Aes128::new_from_slice(&digest).unwrap());
+        }
+
+        // Resume the stored session before authenticating: a fresh AUTH
+        // per run is what gets clients throttled. This must come AFTER
+        // ENCRYPT — a session opened on an encrypted channel can only
+        // be probed on one (the first attempt at this resumed nothing
+        // because it asked in plaintext).
+        let stored = load_state(data_dir).session;
+        if !stored.is_empty() {
+            client.session = stored;
+            match client.command(&format!("UPTIME s={}", client.session)).await {
+                Ok((208, _)) => {
+                    tracing::info!("anidb session resumed (no re-auth)");
+                    return Ok(client);
+                }
+                Ok((555, rest)) => {
+                    client.record_ban(&rest);
+                    bail!("anidb: BANNED — staying silent for 24 h: {rest}");
+                }
+                // 501/506/other = stale key: authenticate below.
+                Ok((code, rest)) => {
+                    // Not yet confirmed which code AniDB returns here —
+                    // sessions may be bound to the UDP source port, in
+                    // which case a restart can never resume and only the
+                    // in-process reuse matters. Logged at info so the
+                    // next real run answers it.
+                    tracing::info!(code, detail = %rest.trim(),
+                        "stored anidb session not resumable; authenticating");
+                    client.session.clear();
+                }
+                Err(e) => {
+                    tracing::debug!(error = format!("{e:#}"), "session probe failed; authenticating");
+                    client.session.clear();
+                }
+            }
         }
 
         let (code, rest) = client
@@ -83,6 +202,10 @@ impl Anidb {
                 client.session =
                     rest.split_whitespace().next().unwrap_or_default().to_string();
                 anyhow::ensure!(!client.session.is_empty(), "no session key in AUTH reply");
+                save_state(
+                    data_dir,
+                    &State { session: client.session.clone(), banned_until: 0 },
+                );
                 if code == 201 {
                     tracing::info!("anidb: a newer client version is available");
                 }
@@ -91,7 +214,10 @@ impl Anidb {
             }
             500 => bail!("anidb login failed (check username/password)"),
             503 | 504 => bail!("anidb rejected the client registration: {code} {rest}"),
-            555 => bail!("anidb: BANNED — stop and wait: {rest}"),
+            555 => {
+                client.record_ban(&rest);
+                bail!("anidb: BANNED — staying silent for 24 h: {rest}")
+            }
             other => bail!("anidb AUTH unexpected: {other} {rest}"),
         }
     }
@@ -125,18 +251,38 @@ impl Anidb {
                 }))
             }
             320 => Ok(None),
-            501 | 506 => bail!("anidb session lost: {code}"),
-            555 => bail!("anidb: BANNED — stop and wait: {rest}"),
+            501 | 506 => {
+                // The key went stale: forget it so the next run
+                // authenticates instead of resuming a dead session.
+                save_state(&self.data_dir, &State { session: String::new(), banned_until: 0 });
+                bail!("anidb session lost: {code}")
+            }
+            555 => {
+                self.record_ban(&rest);
+                bail!("anidb: BANNED — staying silent for 24 h: {rest}")
+            }
             other => bail!("anidb FILE unexpected: {other} {rest}"),
         }
     }
 
-    pub async fn logout(mut self) {
-        if !self.session.is_empty() {
-            let cmd = format!("LOGOUT s={}", self.session);
-            let _ = self.command(&cmd).await;
-        }
+    /// Remember a ban and drop the session, so nothing touches AniDB
+    /// until it lapses (every attempt would extend it).
+    fn record_ban(&mut self, detail: &str) {
+        tracing::error!(detail, "anidb BANNED — suppressing all contact for 24 h");
+        self.session.clear();
+        save_state(
+            &self.data_dir,
+            &State {
+                session: String::new(),
+                banned_until: now_unix() + BAN_COOLDOWN.as_secs() as i64,
+            },
+        );
     }
+
+    /// Ends the run WITHOUT logging out: the session key stays valid
+    /// server-side and the next run resumes it. LOGOUT would force the
+    /// next run to AUTH again — the very pattern that got us banned.
+    pub async fn finish(self) {}
 
     /// One request/response with spacing, tagging, optional encryption,
     /// and a single timeout retry.
@@ -226,6 +372,46 @@ fn aes_ecb(cipher: &aes::Aes128, data: &[u8], encrypt: bool) -> Result<Vec<u8>> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The ban gate must refuse BEFORE any socket work — contact is
+    /// what extends a ban, so this is the whole point of the feature.
+    #[tokio::test]
+    async fn a_recorded_ban_blocks_login_without_contact() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(ban_remaining(dir.path()).is_none(), "clean state is not banned");
+
+        save_state(
+            dir.path(),
+            &State { session: "abc".into(), banned_until: now_unix() + 3600 },
+        );
+        let left = ban_remaining(dir.path()).expect("ban recorded");
+        assert!(left > 3500 && left <= 3600, "{left}");
+
+        // Unroutable server would hang/fail if we actually spoke; the
+        // gate returns immediately instead.
+        let err = match Anidb::login(dir.path(), "u", "p", None).await {
+            Ok(_) => panic!("login must be refused while banned"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("staying silent"), "{err}");
+    }
+
+    #[test]
+    fn a_lapsed_ban_is_no_longer_enforced() {
+        let dir = tempfile::tempdir().unwrap();
+        save_state(
+            dir.path(),
+            &State { session: String::new(), banned_until: now_unix() - 1 },
+        );
+        assert!(ban_remaining(dir.path()).is_none());
+    }
+
+    #[test]
+    fn sessions_survive_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        save_state(dir.path(), &State { session: "sess-key".into(), banned_until: 0 });
+        assert_eq!(load_state(dir.path()).session, "sess-key");
+    }
 
     #[test]
     fn aes_ecb_roundtrip() {
