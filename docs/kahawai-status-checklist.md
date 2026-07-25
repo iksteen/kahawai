@@ -89,6 +89,10 @@ Last updated: 2026-07-25, against the revised requirements (AR-12, MH-10/11, HUB
       baked in (the provider asks integrators to ship it — anonymous use
       is 5 req/s, 5 downloads/24 h), overridable by setting, and an
       optional account raises the download quota
+      *(deviation pending an architect amendment: the requirement still
+      says the feature is disabled until an admin supplies credentials —
+      shipping the app key is the provider's own guidance. Manual query
+      search is the known follow-up.)*
 - [x] HUB-22 Hash-preferred subtitle matching: two-phase search — the
       file's moviehash (which IS the mediahost's oshash) alone first,
       title/year (+ season/episode, projected for absolute-numbered
