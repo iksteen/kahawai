@@ -408,69 +408,88 @@ const HTTP_SPACING: Duration = Duration::from_millis(2200);
 /// Pacing gate shared by all HTTP API callers in one process.
 pub type HttpGate = tokio::sync::Mutex<Option<tokio::time::Instant>>;
 
+/// Minimum age before an anime XML may be re-fetched — AniDB's own
+/// cache rule ("cache at least 24h"; re-requesting sooner risks bans).
+const HTTP_MIN_CACHE: Duration = Duration::from_secs(24 * 3600);
+
 /// Episode titles for one anime: absolute episode number → English
 /// title (transcription fallback). Regular episodes only (epno type 1).
 ///
-/// One `anime` XML per aid, cached FOREVER (never-ask-twice): AniDB
-/// bans clients that re-fetch. Delete the cache file to refresh an
-/// ongoing series. Error payloads (<error>banned</error>…) are never
-/// cached.
+/// Caching is demand-driven, not TTL-driven: the XML re-fetches ONLY
+/// when it fails to cover an episode we actually hold (an airing
+/// series gained one) AND the cached copy is older than 24 h. Finished
+/// shows therefore never re-fetch; airing shows re-fetch at most once
+/// a day, and only on real growth. Error payloads are never cached.
 pub async fn anidb_episode_titles(
     http: &reqwest::Client,
     data_dir: &Path,
     aid: u32,
     gate: &HttpGate,
+    wanted: &[i64],
 ) -> Result<std::collections::HashMap<i64, String>> {
     let dir = anime_dir(data_dir).join("httpapi");
     std::fs::create_dir_all(&dir)?;
     let path = dir.join(format!("{aid}.xml"));
-    let xml = match std::fs::read_to_string(&path) {
-        Ok(x) => x,
-        Err(_) => {
-            let mut last = gate.lock().await;
-            if let Some(t) = *last {
-                let since = t.elapsed();
-                if since < HTTP_SPACING {
-                    tokio::time::sleep(HTTP_SPACING - since).await;
-                }
-            }
-            *last = Some(tokio::time::Instant::now());
-            let raw = http
-                .get("http://api.anidb.net:9001/httpapi")
-                .query(&[
-                    ("request", "anime"),
-                    ("client", HTTP_CLIENT),
-                    ("clientver", &HTTP_CLIENT_VER.to_string()),
-                    ("protover", "1"),
-                    ("aid", &aid.to_string()),
-                ])
-                .send()
-                .await?
-                .error_for_status()?
-                .bytes()
-                .await?;
-            drop(last);
-            // Responses are usually gzip'd regardless of headers.
-            let text = if raw.starts_with(&[0x1f, 0x8b]) {
-                use std::io::Read;
-                let mut s = String::new();
-                flate2::read::GzDecoder::new(&raw[..]).read_to_string(&mut s)?;
-                s
-            } else {
-                String::from_utf8_lossy(&raw).into_owned()
-            };
-            anyhow::ensure!(
-                !text.trim_start().starts_with("<error"),
-                "anidb http api error for aid {aid}: {}",
-                text.trim().chars().take(120).collect::<String>()
-            );
-            std::fs::write(&path, &text)?;
-            tracing::info!(aid, "anidb anime xml fetched");
-            text
-        }
-    };
 
-    let doc = roxmltree::Document::parse(&xml)?;
+    let cached = std::fs::read_to_string(&path).ok();
+    let mut titles = match &cached {
+        Some(xml) => parse_episode_titles(xml).unwrap_or_default(),
+        None => Default::default(),
+    };
+    let covered = !titles.is_empty() && wanted.iter().all(|n| titles.contains_key(n));
+    let old_enough = match std::fs::metadata(&path).and_then(|m| m.modified()) {
+        Ok(t) => t.elapsed().unwrap_or_default() >= HTTP_MIN_CACHE,
+        Err(_) => true, // no cache file yet
+    };
+    if covered || !old_enough {
+        return Ok(titles);
+    }
+
+    let mut last = gate.lock().await;
+    if let Some(t) = *last {
+        let since = t.elapsed();
+        if since < HTTP_SPACING {
+            tokio::time::sleep(HTTP_SPACING - since).await;
+        }
+    }
+    *last = Some(tokio::time::Instant::now());
+    let raw = http
+        .get("http://api.anidb.net:9001/httpapi")
+        .query(&[
+            ("request", "anime"),
+            ("client", HTTP_CLIENT),
+            ("clientver", &HTTP_CLIENT_VER.to_string()),
+            ("protover", "1"),
+            ("aid", &aid.to_string()),
+        ])
+        .send()
+        .await?
+        .error_for_status()?
+        .bytes()
+        .await?;
+    drop(last);
+    // Responses are usually gzip'd regardless of headers.
+    let text = if raw.starts_with(&[0x1f, 0x8b]) {
+        use std::io::Read;
+        let mut s = String::new();
+        flate2::read::GzDecoder::new(&raw[..]).read_to_string(&mut s)?;
+        s
+    } else {
+        String::from_utf8_lossy(&raw).into_owned()
+    };
+    anyhow::ensure!(
+        !text.trim_start().starts_with("<error"),
+        "anidb http api error for aid {aid}: {}",
+        text.trim().chars().take(120).collect::<String>()
+    );
+    std::fs::write(&path, &text)?;
+    tracing::info!(aid, "anidb anime xml fetched");
+    titles = parse_episode_titles(&text)?;
+    Ok(titles)
+}
+
+fn parse_episode_titles(xml: &str) -> Result<std::collections::HashMap<i64, String>> {
+    let doc = roxmltree::Document::parse(xml)?;
     let mut out = std::collections::HashMap::new();
     for ep in doc.descendants().filter(|n| n.has_tag_name("episode")) {
         let Some(epno) = ep.children().find(|n| n.has_tag_name("epno")) else { continue };

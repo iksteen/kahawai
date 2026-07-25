@@ -1306,11 +1306,17 @@ impl Enricher {
         // the TVDB/TMDB bridge keeps stills, overviews, air dates and
         // the HUB-31 projection.
         if absolute && let Some(aid) = anidb_id {
+            let wanted: Vec<i64> = eps
+                .iter()
+                .filter(|r| r.get::<Option<i64>, _>("season").is_none())
+                .map(|r| r.get::<i64, _>("episode"))
+                .collect();
             match crate::anime::anidb_episode_titles(
                 &self.http,
                 &self.data_dir,
                 aid,
                 &self.anidb_http_gate,
+                &wanted,
             )
             .await
             {
