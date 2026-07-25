@@ -446,4 +446,8 @@ h2 { font-size: 14px; font-weight: 650; color: var(--dim); letter-spacing: 0.08e
 /* Settings (HUB-33 track defaults) */
 .pref-label { width: 3.5rem; color: var(--dim, #7a8a8f); }
 input.invalid { border-color: #b3564f; }
-.error-inline { color: #b3564f; font-size: 0.85em; }
+.pref-row { align-items: center; }
+.pref-row .chips { min-height: 1.6rem; }
+.pref-row .chip { cursor: pointer; }
+.lang-add { width: 6rem; flex: 0 0 auto; }
+.saved-flash { font-size: 0.55em; vertical-align: middle; opacity: 0.8; }
