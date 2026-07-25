@@ -79,6 +79,7 @@ pub fn router(
         .route("/admin/v1/providers/tmdb", post(admin_set_tmdb))
         .route("/admin/v1/providers/tvdb", post(admin_set_tvdb))
         .route("/admin/v1/providers/anidb", post(admin_set_anidb))
+        .route("/admin/v1/providers/anidb/verify", post(admin_verify_anidb))
         .route("/admin/v1/enrich", get(admin_enrich_status).post(admin_enrich_run))
         .route("/admin/v1/rescan", post(admin_rescan))
         .route("/admin/v1/enrich/review", get(admin_review_list))
@@ -212,6 +213,28 @@ async fn admin_providers(State(state): State<AppState>) -> Result<Json<Value>, A
     })))
 }
 
+/// Re-validate the STORED AniDB credentials (no resend needed).
+async fn admin_verify_anidb(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+    let user = state.registry.get_setting(crate::anidb::USER_SETTING).await.map_err(internal)?;
+    let pass = state.registry.get_setting(crate::anidb::PASS_SETTING).await.map_err(internal)?;
+    let key = state
+        .registry
+        .get_setting(crate::anidb::APIKEY_SETTING)
+        .await
+        .map_err(internal)?
+        .filter(|k| !k.is_empty());
+    let (Some(user), Some(pass)) = (user, pass) else {
+        return Err((StatusCode::BAD_REQUEST, "no AniDB account configured".into()));
+    };
+    match crate::anidb::Anidb::login(&user, &pass, key.as_deref()).await {
+        Ok(client) => {
+            client.logout().await;
+            Ok(Json(json!({ "verified": true })))
+        }
+        Err(e) => Ok(Json(json!({ "verified": false, "error": format!("{e:#}") }))),
+    }
+}
+
 #[derive(Deserialize)]
 struct SetAnidb {
     username: String,
@@ -233,12 +256,24 @@ async fn admin_set_anidb(
     }
     state.registry.set_setting(crate::anidb::USER_SETTING, user).await.map_err(internal)?;
     state.registry.set_setting(crate::anidb::PASS_SETTING, pass).await.map_err(internal)?;
-    if let Some(key) = body.udp_api_key.as_deref().map(str::trim).filter(|k| !k.is_empty()) {
-        state.registry.set_setting(crate::anidb::APIKEY_SETTING, key).await.map_err(internal)?;
-    }
+    // Empty key = clear it (plaintext session); the login path treats
+    // an empty stored key as absent.
+    state
+        .registry
+        .set_setting(
+            crate::anidb::APIKEY_SETTING,
+            body.udp_api_key.as_deref().map(str::trim).unwrap_or(""),
+        )
+        .await
+        .map_err(internal)?;
     // Validate immediately: a bad login should fail HERE, not silently
     // during the next enrichment run.
-    let key = state.registry.get_setting(crate::anidb::APIKEY_SETTING).await.map_err(internal)?;
+    let key = state
+        .registry
+        .get_setting(crate::anidb::APIKEY_SETTING)
+        .await
+        .map_err(internal)?
+        .filter(|k| !k.is_empty());
     match crate::anidb::Anidb::login(user, pass, key.as_deref()).await {
         Ok(client) => {
             client.logout().await;

@@ -60,7 +60,14 @@ impl Anidb {
         if let Some(key) = api_key.filter(|k| !k.is_empty()) {
             let (code, rest) =
                 client.command(&format!("ENCRYPT user={user}&type=1")).await?;
-            anyhow::ensure!(code == 209, "ENCRYPT refused: {code} {rest}");
+            match code {
+                209 => {}
+                309 => bail!(
+                    "AniDB profile has no UDP API key defined — set one under \
+                     Settings → Account on anidb.net, or clear the key here"
+                ),
+                other => bail!("ENCRYPT refused: {other} {rest}"),
+            }
             let salt = rest.split_whitespace().next().unwrap_or_default();
             let digest = Md5::digest(format!("{key}{salt}").as_bytes());
             client.cipher = Some(aes::Aes128::new_from_slice(&digest).unwrap());
@@ -156,19 +163,32 @@ impl Anidb {
             let mut buf = vec![0u8; 4096];
             match tokio::time::timeout(REPLY_TIMEOUT, self.socket.recv(&mut buf)).await {
                 Ok(Ok(n)) => {
+                    // The server answers in PLAINTEXT when it could not
+                    // decrypt us (wrong UDP API key) and for some raw
+                    // errors — fall back so the real message surfaces.
                     let raw = match &self.cipher {
-                        Some(c) => aes_ecb(c, &buf[..n], false)?,
+                        Some(c) => aes_ecb(c, &buf[..n], false)
+                            .unwrap_or_else(|_| buf[..n].to_vec()),
                         None => buf[..n].to_vec(),
                     };
                     let text = String::from_utf8_lossy(&raw).to_string();
-                    // "tag code message…" — drop a mismatched (stale) tag.
+                    // "tag code message…"; untagged replies are server-
+                    // level errors (can't decrypt, banned, …).
                     let rest = match text.strip_prefix(&format!("{tag} ")) {
                         Some(r) => r,
+                        None if text.chars().take(3).all(|c| c.is_ascii_digit()) => &text,
                         None if attempt == 0 => continue,
                         None => bail!("anidb reply tag mismatch: {text}"),
                     };
                     let (code_s, msg) = rest.split_once(' ').unwrap_or((rest, ""));
-                    let code: u16 = code_s.parse().context("unparseable reply code")?;
+                    let code: u16 =
+                        code_s.trim().parse().with_context(|| format!("unparseable reply: {text}"))?;
+                    if code == 598 && self.cipher.is_some() {
+                        bail!(
+                            "AniDB could not decrypt our packets — the UDP API key \
+                             does not match the one in your AniDB profile"
+                        );
+                    }
                     return Ok((code, msg.to_string()));
                 }
                 _ if attempt == 0 => continue, // one retry, doubled spacing

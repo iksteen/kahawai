@@ -802,7 +802,10 @@ impl Enricher {
             registry.get_setting(crate::anidb::PASS_SETTING).await?,
         ) {
             (Some(user), Some(pass)) if !user.is_empty() && !pass.is_empty() => {
-                let key = registry.get_setting(crate::anidb::APIKEY_SETTING).await?;
+                let key = registry
+                    .get_setting(crate::anidb::APIKEY_SETTING)
+                    .await?
+                    .filter(|k| !k.is_empty());
                 match crate::anidb::Anidb::login(&user, &pass, key.as_deref()).await {
                     Ok(c) => Some(c),
                     Err(e) => {
