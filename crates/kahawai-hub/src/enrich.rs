@@ -353,12 +353,42 @@ impl Enricher {
             .collect())
     }
 
-    /// TVDB episodes in a given order ("default" or "absolute"), all pages.
+    /// TVDB episodes in a given order ("default" or "absolute"), all
+    /// pages, with English names/overviews merged over the original-
+    /// language base where TVDB has the translation (the lang-scoped
+    /// endpoint returns null names for untranslated episodes).
+    async fn tvdb_episodes_english(
+        &self,
+        token: &str,
+        series_id: &str,
+        order: &str,
+    ) -> Result<Vec<EpisodeData>> {
+        let mut out = self.tvdb_episodes(token, series_id, order, None).await?;
+        let eng = self
+            .tvdb_episodes(token, series_id, order, Some("eng"))
+            .await
+            .unwrap_or_default();
+        let by_id: std::collections::HashMap<String, EpisodeData> =
+            eng.into_iter().map(|e| (e.provider_id.clone(), e)).collect();
+        for e in &mut out {
+            if let Some(t) = by_id.get(&e.provider_id) {
+                if t.title.is_some() {
+                    e.title = t.title.clone();
+                }
+                if t.overview.is_some() {
+                    e.overview = t.overview.clone();
+                }
+            }
+        }
+        Ok(out)
+    }
+
     async fn tvdb_episodes(
         &self,
         token: &str,
         series_id: &str,
         order: &str,
+        lang: Option<&str>,
     ) -> Result<Vec<EpisodeData>> {
         #[derive(Deserialize)]
         struct Ep {
@@ -393,9 +423,14 @@ impl Enricher {
         for page in 0..20 {
             let resp = self
                 .http
-                .get(format!(
-                    "https://api4.thetvdb.com/v4/series/{series_id}/episodes/{order}"
-                ))
+                .get(match lang {
+                    Some(l) => format!(
+                        "https://api4.thetvdb.com/v4/series/{series_id}/episodes/{order}/{l}"
+                    ),
+                    None => format!(
+                        "https://api4.thetvdb.com/v4/series/{series_id}/episodes/{order}"
+                    ),
+                })
                 .bearer_auth(token)
                 .query(&[("page", page.to_string())])
                 .send()
@@ -1189,7 +1224,7 @@ impl Enricher {
         match (provider, absolute) {
             ("tvdb", false) => {
                 let token = tvdb_token.context("tvdb-matched show but no tvdb token")?;
-                for e in self.tvdb_episodes(token, pid, "default").await? {
+                for e in self.tvdb_episodes_english(token, pid, "default").await? {
                     if let (Some(s), n) = (e.season, e.episode) {
                         by_key.insert((Some(s), n), e);
                     }
@@ -1197,7 +1232,7 @@ impl Enricher {
             }
             ("tvdb", true) => {
                 let token = tvdb_token.context("tvdb-matched show but no tvdb token")?;
-                let eps_abs = self.tvdb_episodes(token, pid, "absolute").await?;
+                let eps_abs = self.tvdb_episodes_english(token, pid, "absolute").await?;
                 for (i, e) in eps_abs.into_iter().enumerate() {
                     let n = e.absolute.unwrap_or(i as i64 + 1);
                     by_key.insert((None, n), e);
@@ -1205,7 +1240,9 @@ impl Enricher {
                 // The default order carries absoluteNumber where TVDB
                 // curates it (usual for anime) — that join IS the
                 // season projection.
-                for e in self.tvdb_episodes(token, pid, "default").await.unwrap_or_default() {
+                for e in
+                    self.tvdb_episodes(token, pid, "default", None).await.unwrap_or_default()
+                {
                     if let (Some(abs), Some(s)) = (e.absolute, e.season) {
                         proj.insert(abs, (s, e.episode));
                     }
