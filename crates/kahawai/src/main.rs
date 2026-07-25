@@ -347,6 +347,22 @@ async fn run_hub_inner(
                 api_key: cfg.subtitles.opensubtitles.api_key.clone(),
             }),
     );
+    // OPS-6: keep the re-derivable subtitle cache under its quota.
+    if cfg.subtitles.cache_max_mb > 0 {
+        let subtitles = subtitles.clone();
+        let max = cfg.subtitles.cache_max_mb * 1_048_576;
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(3600));
+            loop {
+                tick.tick().await;
+                let subtitles = subtitles.clone();
+                let swept = tokio::task::spawn_blocking(move || subtitles.sweep(max)).await;
+                if let Ok(Err(e)) = swept {
+                    tracing::warn!(error = format!("{e:#}"), "subtitle cache sweep failed");
+                }
+            }
+        });
+    }
     let enricher = Arc::new(kahawai_hub::enrich::Enricher::new(cfg.data_dir.clone()));
     let artwork = Arc::new(kahawai_hub::artwork::Artwork::new(
         cfg.data_dir.join("artwork"),

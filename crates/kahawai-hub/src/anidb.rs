@@ -30,8 +30,21 @@ const SERVER: &str = "api.anidb.net:9000";
 const CLIENT: &str = "kahawai";
 const CLIENT_VER: u32 = 1;
 const PROTOVER: u32 = 3;
-/// AniDB demands ≥2 s between packets; be a little politer.
+/// AniDB's flood rule has TWO halves and both are mandatory:
+///
+///   short term — never more than 0.5 packets/s (one per 2 s);
+///   long term  — never more than one packet per 4 s "over an extended
+///                amount of time", with enforcement starting after the
+///                first 5 packets.
+///
+/// A flat 2 s spacing satisfies only the first half, and a bulk
+/// identification run then sits at double the sustained rate for
+/// however long it takes — which is precisely how this deployment
+/// earned its bans. So: a 5-packet burst allowance (the server's own
+/// grace) draining into one packet per 4 s.
 const PACKET_SPACING: Duration = Duration::from_millis(2200);
+const SUSTAINED_SPACING: Duration = Duration::from_millis(4200);
+const BURST_PACKETS: f64 = 5.0;
 const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long to stay silent after a 555. AniDB documents no duration
@@ -112,7 +125,40 @@ pub struct Anidb {
     /// AES-128 key when the session is encrypted (API key configured).
     cipher: Option<aes::Aes128>,
     last_send: Option<tokio::time::Instant>,
+    bucket: Bucket,
     tag_seq: u32,
+}
+
+/// The long-term half of the flood rule: packets refilling at one per
+/// [`SUSTAINED_SPACING`], never banking more than [`BURST_PACKETS`].
+#[derive(Debug)]
+struct Bucket {
+    tokens: f64,
+    at: Option<tokio::time::Instant>,
+}
+
+impl Bucket {
+    fn new() -> Self {
+        Self { tokens: BURST_PACKETS, at: None }
+    }
+
+    /// Spend one packet, returning how long the caller must wait first.
+    fn take(&mut self, now: tokio::time::Instant) -> Duration {
+        let per = SUSTAINED_SPACING.as_secs_f64();
+        if let Some(t) = self.at {
+            self.tokens = (self.tokens + now.saturating_duration_since(t).as_secs_f64() / per)
+                .min(BURST_PACKETS);
+        }
+        let wait = if self.tokens < 1.0 {
+            Duration::from_secs_f64((1.0 - self.tokens) * per)
+        } else {
+            Duration::ZERO
+        };
+        self.tokens = self.tokens.max(1.0) - 1.0;
+        // Bill the wait forward, so it isn't also counted as refill.
+        self.at = Some(now + wait);
+        wait
+    }
 }
 
 impl Anidb {
@@ -155,6 +201,7 @@ impl Anidb {
             session: String::new(),
             cipher: None,
             last_send: None,
+            bucket: Bucket::new(),
             tag_seq: 0,
         };
 
@@ -303,6 +350,23 @@ impl Anidb {
     /// next run to AUTH again — the very pattern that got us banned.
     pub async fn finish(self) {}
 
+    /// Wait until both halves of the flood rule allow another packet.
+    /// `retry` widens the short-term gap for a timeout re-send.
+    async fn pace(&mut self, retry: u32) {
+        let owed = self.bucket.take(tokio::time::Instant::now());
+        if !owed.is_zero() {
+            tokio::time::sleep(owed).await;
+        }
+        if let Some(t) = self.last_send {
+            let wait = PACKET_SPACING * (retry + 1);
+            let since = t.elapsed();
+            if since < wait {
+                tokio::time::sleep(wait - since).await;
+            }
+        }
+        self.last_send = Some(tokio::time::Instant::now());
+    }
+
     /// One request/response with spacing, tagging, optional encryption,
     /// and a single timeout retry.
     async fn command(&mut self, cmd: &str) -> Result<(u16, String)> {
@@ -315,14 +379,7 @@ impl Anidb {
         };
 
         for attempt in 0..2 {
-            if let Some(t) = self.last_send {
-                let since = t.elapsed();
-                let wait = PACKET_SPACING * (attempt + 1);
-                if since < wait {
-                    tokio::time::sleep(wait - since).await;
-                }
-            }
-            self.last_send = Some(tokio::time::Instant::now());
+            self.pace(attempt).await;
             self.socket.send(&payload).await?;
 
             let mut buf = vec![0u8; 4096];
@@ -430,6 +487,37 @@ mod tests {
         );
         let st = load_state(dir.path());
         assert_eq!((st.session.as_str(), st.port), ("key", 45678));
+    }
+
+    /// The long-term rule is the one a bulk run breaks: five packets
+    /// go out on the burst allowance, and after that the bucket holds
+    /// the run to one packet per four seconds.
+    #[test]
+    fn bucket_allows_a_burst_then_the_sustained_rate() {
+        let t0 = tokio::time::Instant::now();
+        let mut b = Bucket::new();
+        for i in 0..BURST_PACKETS as u32 {
+            assert_eq!(b.take(t0), Duration::ZERO, "burst packet {i} was delayed");
+        }
+        // Sixth packet in the same instant has to wait out a refill.
+        let wait = b.take(t0);
+        assert!(
+            wait >= SUSTAINED_SPACING - Duration::from_millis(1) && wait <= SUSTAINED_SPACING,
+            "expected a ~{SUSTAINED_SPACING:?} wait, got {wait:?}"
+        );
+        // Idling banks packets again, but never more than the burst.
+        let mut b = Bucket::new();
+        b.take(t0);
+        assert_eq!(b.take(t0 + SUSTAINED_SPACING), Duration::ZERO);
+        let mut b = Bucket::new();
+        for _ in 0..BURST_PACKETS as u32 {
+            b.take(t0);
+        }
+        let idled = t0 + SUSTAINED_SPACING * 100;
+        for _ in 0..BURST_PACKETS as u32 {
+            assert_eq!(b.take(idled), Duration::ZERO, "idling should refill the burst");
+        }
+        assert!(b.take(idled) > Duration::ZERO, "but never beyond it");
     }
 
     #[test]

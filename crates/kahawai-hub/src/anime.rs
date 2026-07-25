@@ -23,13 +23,11 @@ const MAPPING_URL: &str =
 const MAPPING_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 3600);
 
 const ANILIST_URL: &str = "https://graphql.anilist.co";
-/// AniList allows ~90 req/min; stay well under.
-const ANILIST_SPACING: Duration = Duration::from_millis(800);
 
 /// Download `url` to `path` unless a fresh copy exists (best-effort:
 /// a stale cache beats a failed refresh).
 async fn cached_download(
-    http: &reqwest::Client,
+    http: &crate::gate::Http,
     url: &str,
     path: &Path,
     max_age: Duration,
@@ -40,7 +38,7 @@ async fn cached_download(
         return Ok(());
     }
     tracing::info!(url, "refreshing anime data file");
-    match http.get(url).send().await.and_then(|r| r.error_for_status()) {
+    match http.send(http.get(url)).await.and_then(|r| Ok(r.error_for_status()?)) {
         Ok(resp) => {
             let bytes = resp.bytes().await?;
             if let Some(dir) = path.parent() {
@@ -70,7 +68,7 @@ pub struct AnidbTitles {
 }
 
 impl AnidbTitles {
-    pub async fn load(http: &reqwest::Client, data_dir: &Path) -> Result<Self> {
+    pub async fn load(http: &crate::gate::Http, data_dir: &Path) -> Result<Self> {
         let path = data_dir.join("anime").join("anime-titles.dat.gz");
         cached_download(http, TITLES_URL, &path, TITLES_MAX_AGE).await?;
         let raw = std::fs::read(&path)?;
@@ -196,7 +194,7 @@ pub struct AnimeLists {
 }
 
 impl AnimeLists {
-    pub async fn load(http: &reqwest::Client, data_dir: &Path) -> Result<Self> {
+    pub async fn load(http: &crate::gate::Http, data_dir: &Path) -> Result<Self> {
         let path = data_dir.join("anime").join("anime-list-full.json");
         cached_download(http, MAPPING_URL, &path, MAPPING_MAX_AGE).await?;
         let raw = std::fs::read(&path)?;
@@ -346,36 +344,22 @@ const MEDIA_FIELDS: &str = "
   }";
 
 pub struct Anilist {
-    http: reqwest::Client,
-    /// Global spacing lock (AniList rate limit).
-    last: tokio::sync::Mutex<Option<tokio::time::Instant>>,
+    /// Pacing and 429 backoff live in the gate (gate.rs).
+    http: std::sync::Arc<crate::gate::Http>,
 }
 
 impl Anilist {
-    pub fn new(http: reqwest::Client) -> Self {
-        Self { http, last: tokio::sync::Mutex::new(None) }
+    pub fn new(http: std::sync::Arc<crate::gate::Http>) -> Self {
+        Self { http }
     }
 
     async fn gql(&self, query: &str, variables: serde_json::Value) -> Result<serde_json::Value> {
-        {
-            let mut last = self.last.lock().await;
-            if let Some(t) = *last {
-                let since = t.elapsed();
-                if since < ANILIST_SPACING {
-                    tokio::time::sleep(ANILIST_SPACING - since).await;
-                }
-            }
-            *last = Some(tokio::time::Instant::now());
-        }
-        let resp = self
+        let req = self
             .http
             .post(ANILIST_URL)
-            .json(&serde_json::json!({"query": query, "variables": variables}))
-            .send()
-            .await?
-            .error_for_status()?
-            .json::<serde_json::Value>()
-            .await?;
+            .json(&serde_json::json!({"query": query, "variables": variables}));
+        let resp =
+            self.http.send(req).await?.error_for_status()?.json::<serde_json::Value>().await?;
         Ok(resp)
     }
 
@@ -415,11 +399,6 @@ pub fn anime_dir(data_dir: &Path) -> PathBuf {
 /// client). Bumping the version requires updating anidb.net FIRST.
 const HTTP_CLIENT: &str = "kahawaihttp";
 const HTTP_CLIENT_VER: u32 = 1;
-/// AniDB allows at most one HTTP API page every two seconds.
-const HTTP_SPACING: Duration = Duration::from_millis(2200);
-
-/// Pacing gate shared by all HTTP API callers in one process.
-pub type HttpGate = tokio::sync::Mutex<Option<tokio::time::Instant>>;
 
 /// Minimum age before an anime XML may be re-fetched — AniDB's own
 /// cache rule ("cache at least 24h"; re-requesting sooner risks bans).
@@ -434,10 +413,9 @@ const HTTP_MIN_CACHE: Duration = Duration::from_secs(24 * 3600);
 /// shows therefore never re-fetch; airing shows re-fetch at most once
 /// a day, and only on real growth. Error payloads are never cached.
 pub async fn anidb_episode_titles(
-    http: &reqwest::Client,
+    http: &crate::gate::Http,
     data_dir: &Path,
     aid: u32,
-    gate: &HttpGate,
     wanted: &[i64],
 ) -> Result<std::collections::HashMap<i64, String>> {
     let dir = anime_dir(data_dir).join("httpapi");
@@ -458,29 +436,16 @@ pub async fn anidb_episode_titles(
         return Ok(titles);
     }
 
-    let mut last = gate.lock().await;
-    if let Some(t) = *last {
-        let since = t.elapsed();
-        if since < HTTP_SPACING {
-            tokio::time::sleep(HTTP_SPACING - since).await;
-        }
-    }
-    *last = Some(tokio::time::Instant::now());
-    let raw = http
-        .get("http://api.anidb.net:9001/httpapi")
-        .query(&[
-            ("request", "anime"),
-            ("client", HTTP_CLIENT),
-            ("clientver", &HTTP_CLIENT_VER.to_string()),
-            ("protover", "1"),
-            ("aid", &aid.to_string()),
-        ])
-        .send()
-        .await?
-        .error_for_status()?
-        .bytes()
-        .await?;
-    drop(last);
+    // One page every two seconds, and a 24 h silence if they ban us:
+    // both live in the gate, keyed on api.anidb.net.
+    let req = http.get("http://api.anidb.net:9001/httpapi").query(&[
+        ("request", "anime"),
+        ("client", HTTP_CLIENT),
+        ("clientver", &HTTP_CLIENT_VER.to_string()),
+        ("protover", "1"),
+        ("aid", &aid.to_string()),
+    ]);
+    let raw = http.send(req).await?.error_for_status()?.bytes().await?;
     // Responses are usually gzip'd regardless of headers.
     let text = if raw.starts_with(&[0x1f, 0x8b]) {
         use std::io::Read;

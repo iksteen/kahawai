@@ -10,6 +10,7 @@ pub mod db;
 pub mod enrollment;
 pub mod leases;
 pub mod enrollment_service;
+pub mod gate;
 pub mod link_service;
 pub mod pki;
 pub mod providers;

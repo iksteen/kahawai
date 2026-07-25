@@ -40,6 +40,33 @@ pub enum AssBody {
     Stream(tokio::sync::mpsc::Receiver<String>),
 }
 
+/// Size and last-use time of one cache file. mtime IS last use: the
+/// read path touches an entry when it serves it (see `read_cached`).
+fn file_stats(path: &std::path::Path) -> Result<(u64, std::time::SystemTime)> {
+    let m = std::fs::metadata(path)?;
+    Ok((m.len(), m.modified().unwrap_or(std::time::UNIX_EPOCH)))
+}
+
+/// Same, summed over a font bundle directory.
+fn dir_stats(path: &std::path::Path) -> Result<(u64, std::time::SystemTime)> {
+    let (mut size, mut used) = (0, std::time::UNIX_EPOCH);
+    for e in std::fs::read_dir(path)? {
+        let (s, u) = file_stats(&e?.path())?;
+        size += s;
+        used = used.max(u);
+    }
+    Ok((size, used))
+}
+
+/// Read a cache entry and mark it used, so the OPS-6 sweep evicts by
+/// last use rather than by age — a rewatched show keeps its subtitles.
+fn read_cached(path: &std::path::Path) -> Option<Vec<u8>> {
+    let bytes = std::fs::read(path).ok()?;
+    let now = std::fs::FileTimes::new().set_modified(std::time::SystemTime::now());
+    let _ = std::fs::File::options().write(true).open(path).and_then(|f| f.set_times(now));
+    Some(bytes)
+}
+
 /// Cache key for one subtitle track of one source file — shared by the
 /// lazy extractors and the mediahost ingestion path.
 fn cache_key(module_id: &str, collection_id: &str, path_rel: &str, key: &str) -> String {
@@ -57,11 +84,77 @@ pub struct Subtitles {
     provider_cfg: crate::opensubtitles::ProviderConfig,
     /// Per-cache-key locks so concurrent requests extract once.
     inflight: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Shared with every other provider caller — the rate limits are
+    /// per-IP, so the queues have to be process-wide (gate.rs).
+    http: Arc<crate::gate::Http>,
 }
 
 impl Subtitles {
     pub fn new(dir: PathBuf) -> Self {
-        Self { dir, provider_cfg: Default::default(), inflight: Default::default() }
+        Self {
+            dir,
+            provider_cfg: Default::default(),
+            inflight: Default::default(),
+            http: Arc::new(crate::gate::Http::new().expect("http client")),
+        }
+    }
+
+    /// OPS-6. Trim the cache to `max_bytes`, evicting least-recently-used
+    /// entries first. Returns bytes freed; 0 disables the quota.
+    ///
+    /// Only entries this hub can rebuild for free are eligible: cue/ASS
+    /// extractions and font bundles, both re-derivable from the media
+    /// file itself with no network call. A downloaded subtitle is NOT a
+    /// cache entry — it is referenced from the database, shared between
+    /// every user of that item (HUB-23), and cost someone's provider
+    /// download entitlement to obtain. Deleting one to save disk would
+    /// trade a scarce, rate-limited resource for a cheap one, so the
+    /// quota neither evicts them nor counts them.
+    pub fn sweep(&self, max_bytes: u64) -> Result<u64> {
+        if max_bytes == 0 {
+            return Ok(0);
+        }
+        // (last used, size, path, is_dir)
+        let mut entries: Vec<(std::time::SystemTime, u64, PathBuf, bool)> = Vec::new();
+        let mut total: u64 = 0;
+        for e in std::fs::read_dir(&self.dir)? {
+            let e = e?;
+            let name = e.file_name().to_string_lossy().into_owned();
+            let dir = e.file_type()?.is_dir();
+            let re_derivable = if dir {
+                name.starts_with("fonts-")
+            } else {
+                name.starts_with("v2-") && name.ends_with(".json")
+            };
+            if !re_derivable {
+                continue;
+            }
+            let (size, used) = if dir { dir_stats(&e.path())? } else { file_stats(&e.path())? };
+            total += size;
+            entries.push((used, size, e.path(), dir));
+        }
+        if total <= max_bytes {
+            return Ok(0);
+        }
+        // Evict to 90% so a full cache doesn't re-sweep every hour.
+        let target = max_bytes / 10 * 9;
+        entries.sort_by_key(|(used, ..)| *used);
+        let mut freed = 0;
+        for (_, size, path, dir) in entries {
+            if total <= target {
+                break;
+            }
+            let gone = if dir { std::fs::remove_dir_all(&path) } else { std::fs::remove_file(&path) };
+            match gone {
+                Ok(()) => {
+                    total -= size;
+                    freed += size;
+                }
+                Err(e) => tracing::warn!(path = %path.display(), error = %e, "cache evict failed"),
+            }
+        }
+        tracing::info!(freed_mb = freed / 1_048_576, "subtitle cache swept");
+        Ok(freed)
     }
 
     /// Attach deployment-level provider config. Without it (tests, and
@@ -103,8 +196,12 @@ impl Subtitles {
         };
         let user = pref(crate::opensubtitles::USER_PREF_USERNAME).await;
         let pass = pref(crate::opensubtitles::USER_PREF_PASSWORD).await;
-        let http = reqwest::Client::builder().user_agent("kahawai").build()?;
-        Ok(Box::new(crate::opensubtitles::OpenSubtitles::new(http, key, user, pass)))
+        Ok(Box::new(crate::opensubtitles::OpenSubtitles::new(
+            self.http.clone(),
+            key,
+            user,
+            pass,
+        )))
     }
 
     /// The subtitle tracks we can serve for an item, from the same source
@@ -189,7 +286,7 @@ impl Subtitles {
         };
         let guard = lock.lock_owned().await;
         let cache_path = self.dir.join(format!("{cache_key}.json"));
-        if let Ok(bytes) = std::fs::read(&cache_path) {
+        if let Some(bytes) = read_cached(&cache_path) {
             let ex: Extracted = serde_json::from_slice(&bytes)?;
             return Ok(AssBody::Full(ex.ass.context("subtitle has no ASS form")?));
         }
@@ -283,7 +380,7 @@ impl Subtitles {
         let _guard = lock.lock().await;
 
         let cache_path = self.dir.join(format!("{cache_key}.json"));
-        if let Ok(bytes) = std::fs::read(&cache_path) {
+        if let Some(bytes) = read_cached(&cache_path) {
             return Ok(serde_json::from_slice(&bytes)?);
         }
         let ex: Extracted = if let Some(n) = key.strip_prefix('s') {
@@ -603,7 +700,7 @@ impl Subtitles {
         let _guard = lock.lock().await;
         let dir = self.dir.join(&cache_key);
         let index = dir.join("index.json");
-        if let Ok(bytes) = std::fs::read(&index) {
+        if let Some(bytes) = read_cached(&index) {
             let names: Vec<String> = serde_json::from_slice(&bytes)?;
             let mut out = Vec::new();
             for (i, name) in names.iter().enumerate() {
@@ -753,5 +850,44 @@ async fn read_all(lease: crate::leases::Lease) -> Result<Vec<u8>> {
         if got < CHUNK {
             return Ok(out);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write(dir: &std::path::Path, name: &str, bytes: usize, age_secs: u64) {
+        let path = dir.join(name);
+        std::fs::write(&path, vec![b'x'; bytes]).unwrap();
+        let when = std::time::SystemTime::now() - std::time::Duration::from_secs(age_secs);
+        let times = std::fs::FileTimes::new().set_modified(when);
+        std::fs::File::options().write(true).open(&path).unwrap().set_times(times).unwrap();
+    }
+
+    /// The quota may only reclaim what a demux pass can rebuild. A
+    /// downloaded subtitle cost a provider entitlement and is shared
+    /// between users — it is data, and stays whatever the pressure.
+    #[test]
+    fn sweep_evicts_only_re_derivable_entries_oldest_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let subs = Subtitles::new(dir.path().to_path_buf());
+        write(dir.path(), "v2-0000000000000001-e0.json", 4096, 3600); // oldest
+        write(dir.path(), "v2-0000000000000002-e0.json", 4096, 60); // freshest
+        write(dir.path(), "downloaded-7.json", 4096, 7200); // older than both
+        std::fs::create_dir(dir.path().join("fonts-0000000000000003")).unwrap();
+        write(&dir.path().join("fonts-0000000000000003"), "0", 4096, 1800);
+
+        // Room for one of the three re-derivable entries.
+        let freed = subs.sweep(5000).unwrap();
+        assert_eq!(freed, 8192, "should have evicted the two least-recently-used");
+        assert!(!dir.path().join("v2-0000000000000001-e0.json").exists());
+        assert!(!dir.path().join("fonts-0000000000000003").exists());
+        assert!(dir.path().join("v2-0000000000000002-e0.json").exists(), "kept the freshest");
+        assert!(dir.path().join("downloaded-7.json").exists(), "never evict a download");
+
+        // 0 means no quota at all.
+        assert_eq!(subs.sweep(0).unwrap(), 0);
+        assert!(dir.path().join("v2-0000000000000002-e0.json").exists());
     }
 }

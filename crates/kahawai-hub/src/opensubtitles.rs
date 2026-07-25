@@ -17,11 +17,9 @@ use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
 const API: &str = "https://api.opensubtitles.com/api/v1";
+/// They ask for "AppName vX.Y" specifically, so this stays alongside
+/// the gate's generic UA.
 const USER_AGENT: &str = "kahawai v1";
-/// The app key's entitlement is 5 requests/second. Spacing gate, same
-/// shape as the AniDB/AniList clients (no new dependency for what a
-/// mutex and an Instant already do in this codebase).
-const REQUEST_SPACING: Duration = Duration::from_millis(210);
 
 /// kahawai's registered consumer key. Baked in on purpose: the key
 /// identifies the APPLICATION, not the user — OpenSubtitles explicitly
@@ -120,22 +118,22 @@ pub struct SearchQuery {
 }
 
 pub struct OpenSubtitles {
-    http: reqwest::Client,
+    /// Paced by the shared gate: their standard tier is 1 request per
+    /// second, and /login is capped harder still.
+    http: std::sync::Arc<crate::gate::Http>,
     api_key: String,
     username: Option<String>,
     password: Option<String>,
     /// Cached download token (OpenSubtitles issues it via /login and it
     /// lasts ~24 h; download quota is tracked against it).
     token: tokio::sync::Mutex<Option<String>>,
-    /// Request spacing gate (5 req/s entitlement).
-    last_request: tokio::sync::Mutex<Option<tokio::time::Instant>>,
     quota: std::sync::Mutex<Quota>,
     quota_checked: tokio::sync::Mutex<Option<tokio::time::Instant>>,
 }
 
 impl OpenSubtitles {
     pub fn new(
-        http: reqwest::Client,
+        http: std::sync::Arc<crate::gate::Http>,
         api_key: String,
         username: Option<String>,
         password: Option<String>,
@@ -147,22 +145,9 @@ impl OpenSubtitles {
             username,
             password,
             token: tokio::sync::Mutex::new(None),
-            last_request: tokio::sync::Mutex::new(None),
             quota: std::sync::Mutex::new(Quota { per_account, ..Default::default() }),
             quota_checked: tokio::sync::Mutex::new(None),
         }
-    }
-
-    /// Hold the 5 req/s line before every API call.
-    async fn pace(&self) {
-        let mut last = self.last_request.lock().await;
-        if let Some(t) = *last {
-            let since = t.elapsed();
-            if since < REQUEST_SPACING {
-                tokio::time::sleep(REQUEST_SPACING - since).await;
-            }
-        }
-        *last = Some(tokio::time::Instant::now());
     }
 
     fn req(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
@@ -190,11 +175,10 @@ impl OpenSubtitles {
         struct LoginResp {
             token: String,
         }
-        let resp = self
+        let req = self
             .req(reqwest::Method::POST, "/login")
-            .json(&serde_json::json!({ "username": user, "password": pass }))
-            .send()
-            .await?;
+            .json(&serde_json::json!({ "username": user, "password": pass }));
+        let resp = self.http.send(req).await?;
         if !resp.status().is_success() {
             bail!("OpenSubtitles login failed: {} {}", resp.status(), resp.text().await.unwrap_or_default());
         }
@@ -389,14 +373,9 @@ impl SubtitleProvider for OpenSubtitles {
             file_id: i64,
         }
 
-        self.pace().await;
-        let resp = self
-            .req(reqwest::Method::GET, "/subtitles")
-            .query(&params)
-            .send()
-            .await?
-            .error_for_status()
-            .context("OpenSubtitles search")?;
+        let req = self.req(reqwest::Method::GET, "/subtitles").query(&params);
+        let resp =
+            self.http.send(req).await?.error_for_status().context("OpenSubtitles search")?;
         let parsed: Resp = resp.json().await?;
         let mut out = Vec::new();
         for item in parsed.data {
@@ -451,14 +430,8 @@ impl SubtitleProvider for OpenSubtitles {
             #[serde(default)]
             remaining_downloads: Option<i64>,
         }
-        self.pace().await;
-        let got = self
-            .req(reqwest::Method::GET, "/infos/user")
-            .bearer_auth(&token)
-            .send()
-            .await
-            .ok()
-            .filter(|r| r.status().is_success());
+        let req = self.req(reqwest::Method::GET, "/infos/user").bearer_auth(&token);
+        let got = self.http.send(req).await.ok().filter(|r| r.status().is_success());
         let Some(resp) = got else { return };
         if let Ok(parsed) = resp.json::<Resp>().await {
             let mut q = self.quota.lock().unwrap();
@@ -483,21 +456,20 @@ impl SubtitleProvider for OpenSubtitles {
             #[serde(default)]
             reset_time_utc: Option<String>,
         }
-        self.pace().await;
         let mut req = self
             .req(reqwest::Method::POST, "/download")
             .json(&serde_json::json!({ "file_id": file_id }));
         if let Some(t) = &token {
             req = req.bearer_auth(t);
         }
-        let resp = req.send().await?;
+        // A 429 never reaches here — that's rate limiting, and the gate
+        // owns it. These codes are the entitlement being spent up.
+        let resp = self.http.send(req).await?;
         if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
             *self.token.lock().await = None; // force re-login next time
             bail!("OpenSubtitles rejected the download token — retry");
         }
-        if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS
-            || resp.status() == reqwest::StatusCode::PAYMENT_REQUIRED
-        {
+        if matches!(resp.status().as_u16(), 402 | 406 | 407) {
             bail!(
                 "OpenSubtitles download quota exhausted{} — it resets 24 h after your first \
                  download today",
@@ -512,16 +484,8 @@ impl SubtitleProvider for OpenSubtitles {
             q.total = dl.remaining.and_then(|r| dl.requests.map(|used| r + used));
             q.resets_in_secs = dl.reset_time_utc.as_deref().and_then(parse_reset_secs);
         }
-        let bytes = self
-            .http
-            .get(&dl.link)
-            .header("User-Agent", USER_AGENT)
-            .send()
-            .await?
-            .error_for_status()?
-            .bytes()
-            .await?
-            .to_vec();
+        let req = self.http.get(&dl.link).header("User-Agent", USER_AGENT);
+        let bytes = self.http.send(req).await?.error_for_status()?.bytes().await?.to_vec();
         // OpenSubtitles serves .srt overwhelmingly; sniff ASS.
         let format = if dl
             .file_name

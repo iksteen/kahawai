@@ -26,15 +26,15 @@ struct MbReleaseGroup {
 }
 
 pub struct Enricher {
-    http: reqwest::Client,
+    /// Every provider call goes out through this: pacing and
+    /// rate-limit backoff live in `gate.rs`, not at the call sites.
+    http: std::sync::Arc<crate::gate::Http>,
     data_dir: std::path::PathBuf,
     anilist: crate::anime::Anilist,
     last_nudge: std::sync::atomic::AtomicU64,
     running: AtomicBool,
     /// (matched, weak, missed) of the current/last run.
     progress: (AtomicUsize, AtomicUsize, AtomicUsize),
-    /// AniDB HTTP API pacing (one page per 2.2 s, process-wide).
-    anidb_http_gate: crate::anime::HttpGate,
     /// The UDP session, kept for the PROCESS lifetime — not per run.
     /// A login per enrichment run is what got this client banned twice
     /// in one evening; sessions are cheap to hold and expensive to
@@ -152,10 +152,7 @@ pub(crate) fn fold(s: &str) -> String {
 
 impl Enricher {
     pub fn new(data_dir: std::path::PathBuf) -> Self {
-        let http = reqwest::Client::builder()
-            .user_agent("kahawai")
-            .build()
-            .expect("http client");
+        let http = std::sync::Arc::new(crate::gate::Http::new().expect("http client"));
         Self {
             anilist: crate::anime::Anilist::new(http.clone()),
             data_dir,
@@ -163,7 +160,6 @@ impl Enricher {
             running: AtomicBool::new(false),
             last_nudge: std::sync::atomic::AtomicU64::new(0),
             progress: Default::default(),
-            anidb_http_gate: Default::default(),
             anidb: Default::default(),
         }
     }
@@ -199,7 +195,7 @@ impl Enricher {
         if let (Some(y), "movie") = (year, endpoint) {
             req = req.query(&[("year", y.to_string())]);
         }
-        let resp = req.send().await.context("tmdb request")?;
+        let resp = self.http.send(req).await.context("tmdb request")?;
         anyhow::ensure!(
             resp.status() != reqwest::StatusCode::UNAUTHORIZED,
             "TMDB rejected the API key"
@@ -225,9 +221,7 @@ impl Enricher {
         }
         let resp = self
             .http
-            .post("https://api4.thetvdb.com/v4/login")
-            .json(&body)
-            .send()
+            .send(self.http.post("https://api4.thetvdb.com/v4/login").json(&body))
             .await
             .context("tvdb login request")?
             .error_for_status()
@@ -264,10 +258,12 @@ impl Enricher {
         let media_type = if kind == "movie" { "movie" } else { "series" };
         let resp = self
             .http
-            .get("https://api4.thetvdb.com/v4/search")
-            .bearer_auth(token)
-            .query(&[("query", title), ("type", media_type), ("limit", "10")])
-            .send()
+            .send(
+                self.http
+                    .get("https://api4.thetvdb.com/v4/search")
+                    .bearer_auth(token)
+                    .query(&[("query", title), ("type", media_type), ("limit", "10")]),
+            )
             .await
             .context("tvdb search")?
             .error_for_status()?
@@ -328,7 +324,7 @@ impl Enricher {
         } else {
             req = req.query(&[("api_key", key)]);
         }
-        let s: Season = req.send().await?.error_for_status()?.json().await?;
+        let s: Season = self.http.send(req).await?.error_for_status()?.json().await?;
         Ok(s.episodes
             .into_iter()
             .map(|e| EpisodeData {
@@ -365,7 +361,7 @@ impl Enricher {
         } else {
             req = req.query(&[("api_key", key)]);
         }
-        let s: Show = req.send().await?.error_for_status()?.json().await?;
+        let s: Show = self.http.send(req).await?.error_for_status()?.json().await?;
         Ok(s.seasons
             .into_iter()
             .filter(|s| s.season_number > 0)
@@ -443,17 +439,19 @@ impl Enricher {
         for page in 0..20 {
             let resp = self
                 .http
-                .get(match lang {
-                    Some(l) => format!(
-                        "https://api4.thetvdb.com/v4/series/{series_id}/episodes/{order}/{l}"
-                    ),
-                    None => format!(
-                        "https://api4.thetvdb.com/v4/series/{series_id}/episodes/{order}"
-                    ),
-                })
-                .bearer_auth(token)
-                .query(&[("page", page.to_string())])
-                .send()
+                .send(
+                    self.http
+                        .get(match lang {
+                            Some(l) => format!(
+                                "https://api4.thetvdb.com/v4/series/{series_id}/episodes/{order}/{l}"
+                            ),
+                            None => format!(
+                                "https://api4.thetvdb.com/v4/series/{series_id}/episodes/{order}"
+                            ),
+                        })
+                        .bearer_auth(token)
+                        .query(&[("page", page.to_string())]),
+                )
                 .await?;
             if !resp.status().is_success() {
                 break;
@@ -737,16 +735,11 @@ impl Enricher {
         let url = format!(
             "https://musicbrainz.org/ws/2/release-group?query={encoded}&fmt=json&limit=8"
         );
-        let resp: serde_json::Value = self
-            .http
-            .get(&url)
-            // MB requires an identifying UA with contact info.
-            .header("user-agent", "kahawai/0.1 (https://github.com/iksteen/kahawai)")
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
+        // MB allows one request per second per IP and answers 503 to
+        // everything above it; the gate holds us to that, and carries
+        // the identifying UA it also requires.
+        let resp: serde_json::Value =
+            self.http.send(self.http.get(&url)).await?.error_for_status()?.json().await?;
         let groups = resp["release-groups"].as_array().cloned().unwrap_or_default();
         let want_title = fold(title);
         let want_artist = fold(artist);
@@ -1192,14 +1185,11 @@ impl Enricher {
                     #[serde(default)]
                     original_language: Option<String>,
                 }
-                let lang = match this
+                let req = this
                     .http
                     .get(format!("https://api.themoviedb.org/3/{path}/{tmdb_id}"))
-                    .query(&[("api_key", key.as_str())])
-                    .send()
-                    .await
-                    .and_then(|r| r.error_for_status())
-                {
+                    .query(&[("api_key", key.as_str())]);
+                let lang = match this.http.send(req).await.and_then(|r| Ok(r.error_for_status()?)) {
                     Ok(resp) => match resp.json::<Details>().await {
                         Ok(det) => det.original_language.unwrap_or_default(),
                         Err(_) => String::new(),
@@ -1414,14 +1404,7 @@ impl Enricher {
                 .filter(|r| r.get::<Option<i64>, _>("season").is_none())
                 .map(|r| r.get::<i64, _>("episode"))
                 .collect();
-            match crate::anime::anidb_episode_titles(
-                &self.http,
-                &self.data_dir,
-                aid,
-                &self.anidb_http_gate,
-                &wanted,
-            )
-            .await
+            match crate::anime::anidb_episode_titles(&self.http, &self.data_dir, aid, &wanted).await
             {
                 Ok(titles) => {
                     for ((s, n), e) in by_key.iter_mut() {
@@ -1538,7 +1521,7 @@ impl Enricher {
         } else {
             format!("https://image.tmdb.org/t/p/w500{poster_path}")
         };
-        let resp = self.http.get(&url).send().await?.error_for_status()?;
+        let resp = self.http.send(self.http.get(&url)).await?.error_for_status()?;
         Ok(resp.bytes().await?.to_vec())
     }
 }

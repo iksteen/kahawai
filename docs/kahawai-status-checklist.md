@@ -4,7 +4,8 @@ Status of every numbered requirement from `kahawai-technical-requirements.md`,
 plus the v1 acceptance criteria. Checked = implemented and exercised against
 the live deployment. Unchecked items carry a note when partially done.
 
-Last updated: 2026-07-25, against the revised requirements (AR-12, MH-10/11, HUB-30a/32b/32c/34/35).
+Last updated: 2026-07-26 (provider pacing rewritten against the published
+limits, OPS-6 scoped to re-derivable caches).
 
 ## Architecture (AR)
 
@@ -75,8 +76,16 @@ Last updated: 2026-07-25, against the revised requirements (AR-12, MH-10/11, HUB
       per library)*
 - [ ] HUB-6 Descriptive metadata *(titles, plots, dates, ratings, posters, episode
       stills live; cast/genres not stored)*
-- [ ] HUB-7 Provider rate limits/caching *(API keys via settings + poster caching
-      live; no per-provider TTL cache layer)*
+- [ ] HUB-7 Provider rate limits/caching — rate limits done properly: every
+      provider request goes through one queue per provider host
+      (`hub/gate.rs`), spaced by that provider's *documented* limit and
+      silenced on 429/503 for what `Retry-After` asks. Corrected against
+      the specs 2026-07-26: MusicBrainz was entirely unpaced (1 req/s per
+      IP, 503 on breach), AniList ran at 75/min against a live limit
+      degraded to 30/min, OpenSubtitles at 5/s against a documented 1/s.
+      *(caching: provider-mandated TTLs live — AniDB 24 h per anime,
+      daily titles dump, weekly mapping — but no generic per-provider
+      response cache; enrichment results persist in the DB instead)*
 - [x] HUB-8 Ambiguous matches flagged for manual review (card-based review UI,
       per-item re-match/search dialog)
 - [ ] HUB-9 Local metadata as authoritative provider *(embedded music tags win;
@@ -205,8 +214,17 @@ Last updated: 2026-07-25, against the revised requirements (AR-12, MH-10/11, HUB
 - [x] OPS-3 `doctor` command with plugin/encoder checks
 - [x] OPS-4 Clock-skew tolerance (backdated certs, enrollment skew warning)
 - [ ] OPS-5 Online backup/restore command
-- [ ] OPS-6 Quota-bounded caches with eviction *(subtitle/artwork/session caches
-      currently unbounded)*
+- [ ] OPS-6 Quota-bounded caches with eviction — scope corrected
+      2026-07-26: the quota may only reclaim what the hub can rebuild
+      for free (extracted cues, font bundles), evicted least-recently-used
+      via `hub.subtitles.cache_max_mb` (0 = off, the default: the cache
+      is small next to the media it describes). Downloaded subtitles are
+      excluded by design — DB-referenced, shared between users (HUB-23),
+      and a re-fetch spends a rate-limited provider entitlement. Artwork
+      is left alone for the same reason. Session scratch is already
+      bounded by session lifecycle. *(unit-tested; not yet exercised on
+      the live deployment, where the cache sits at 2.4 GB against TBs of
+      media and no quota is warranted)*
 - [x] OPS-7 Cross-version satellite compatibility: protocol gated on major
       version (Hello/HelloAck) — per decision 2026-07-25, major-gating IS the
       compatibility contract; no previous-minor guarantee
