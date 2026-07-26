@@ -115,19 +115,18 @@ limits, OPS-6 scoped to re-derivable caches).
       copy of what the answer store already is.
 - [x] HUB-8 Ambiguous matches flagged for manual review (card-based review UI,
       per-item re-match/search dialog)
-- [x] HUB-9 Local metadata as authoritative provider: `local` is a ranked
-      provider like any other, at rank 0 by default. It answers with the
-      scanned cover (MH-4) and with a Kodi `.nfo` where one exists;
-      embedded music tags still win identity at resolution. A cover
-      answers with an empty `provider_id` — it fills the poster at
-      whatever rank `local` holds, but never becomes the item's match,
-      since a picture beside a file says nothing about which work it is.
-      An `.nfo` does state that, so it can. Moving `local` down the chain
-      in Admin now actually changes which poster is served — that used to
-      be a hard-coded precedence in `artwork.rs` *(verified on 2,213
-      albums with covers; this library has no `.nfo` files and no cover
-      beside any movie or episode, so those two paths remain untested on
-      real data)*
+- [ ] HUB-9 Local metadata as authoritative provider. Built: `local` is a
+      ranked provider at rank 0, answering with the scanned cover (MH-4),
+      which resolves through the chain like any other field instead of the
+      hard-coded precedence `artwork.rs` used to apply. Verified on 2,213
+      albums. **Not done:** `provider_metadata` holds one row per
+      (item, provider), so an item's `.nfo` and its cover share a row and
+      therefore a fate — when the `.nfo` loses the assignment (a manual
+      pin, a rejection, a reordered chain) the cover is demoted with it,
+      even though a cover claims no identity to lose. The `.nfo` path is
+      also unexercised end to end: mediahost records `nfo` in the scan,
+      but no deployed mediahost has been rebuilt since, so no item carries
+      one yet.
 
 ## Hub — subtitles
 
