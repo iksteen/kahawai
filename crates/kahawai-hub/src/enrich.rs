@@ -1304,15 +1304,24 @@ impl Enricher {
              JOIN merged_metadata m ON m.item_id = i.id
              WHERE i.kind = 'show' AND m.provider_id != ''
                AND m.confidence != 'rejected'
+               -- An episode the provider's list does not cover gets a
+               -- recorded miss, which counts as answered: without that
+               -- the show looks short of episodes forever and every run
+               -- re-queries its whole episode list. Misses go stale after
+               -- a week so an airing show still picks up new episodes.
                AND (EXISTS (
                  SELECT 1 FROM items e
                  LEFT JOIN merged_metadata em ON em.item_id = e.id
-                 WHERE e.parent_id = i.id AND em.item_id IS NULL)
+                 WHERE e.parent_id = i.id
+                   AND (em.item_id IS NULL
+                        OR (em.confidence = 'miss'
+                            AND em.updated_at < unixepoch() - 7 * 86400)))
                OR EXISTS (
                  SELECT 1 FROM items e
                  JOIN merged_metadata em ON em.item_id = e.id
                  WHERE e.parent_id = i.id AND e.season IS NULL
-                   AND em.proj_episode IS NULL))",
+                   AND em.proj_episode IS NULL
+                   AND em.updated_at < unixepoch() - 7 * 86400))",
         )
         .fetch_all(registry.db())
         .await?;
@@ -1389,6 +1398,10 @@ impl Enricher {
         // HUB-31: absolute number → (season, episode) in the provider's
         // seasoned order — the season-view projection.
         let mut proj: std::collections::HashMap<i64, (i64, i64)> = Default::default();
+        // Distinguishes "the provider has nothing for this show" from
+        // "we could not ask it" — the first is an answer to record, the
+        // second must be retried.
+        let (mut fetch_ok, mut fetch_failed) = (0u32, 0u32);
         match (provider, absolute) {
             ("tvdb", false) => {
                 let token = tvdb_token.context("tvdb-matched show but no tvdb token")?;
@@ -1423,14 +1436,35 @@ impl Enricher {
                     .collect::<std::collections::BTreeSet<_>>()
                     .into_iter()
                     .collect();
-                for s in seasons {
-                    match self.tmdb_season(tmdb_key, pid, s).await {
-                        Ok(list) => {
-                            for e in list {
-                                by_key.insert((Some(s), e.episode), e);
+                // Ask which seasons TMDB actually has before requesting
+                // any: local numbering often disagrees, and requesting a
+                // season it does not carry answers 404 — which looks like
+                // a failure and is really "there is nothing there".
+                // "The Continental" reports zero seasons and cost a
+                // wasted request every run until this.
+                match self.tmdb_seasons(tmdb_key, pid).await {
+                    Ok(have) => {
+                        fetch_ok += 1;
+                        let have: std::collections::HashSet<i64> =
+                            have.into_iter().map(|(s, _)| s).collect();
+                        for s in seasons.iter().filter(|s| have.contains(s)) {
+                            match self.tmdb_season(tmdb_key, pid, *s).await {
+                                Ok(list) => {
+                                    for e in list {
+                                        by_key.insert((Some(*s), e.episode), e);
+                                    }
+                                }
+                                Err(e) => {
+                                    fetch_failed += 1;
+                                    tracing::debug!(show = pid, season = s, error = %e,
+                                        "season fetch failed");
+                                }
                             }
                         }
-                        Err(e) => tracing::debug!(show = pid, season = s, error = %e, "season fetch failed"),
+                    }
+                    Err(e) => {
+                        fetch_failed += 1;
+                        tracing::debug!(show = pid, error = %e, "season list fetch failed");
                     }
                 }
             }
@@ -1461,9 +1495,15 @@ impl Enricher {
                 }
             }
         }
-        if by_key.is_empty() {
-            return Ok(());
-        }
+        // An empty episode list is itself an answer — the provider has
+        // nothing under this id — and it must be recorded, or the show
+        // reads as short of episodes forever and every run re-queries it
+        // (this is what kept "The Continental" coming back). But only if
+        // we actually got to ask: all fetches failing is a retry.
+        anyhow::ensure!(
+            !(by_key.is_empty() && fetch_failed > 0 && fetch_ok == 0),
+            "every episode-list fetch failed for {provider} id {pid}"
+        );
         // HUB-5 field-level claim: AniDB owns episode TITLES for anime;
         // the TVDB/TMDB bridge keeps stills, overviews, air dates and
         // the HUB-31 projection.
@@ -1537,7 +1577,30 @@ impl Enricher {
             .await?;
             wrote += 1;
         }
-        tracing::info!(show = show_id, episodes = wrote, "episode metadata stored");
+        // Episodes the provider had nothing for: record the attempt, or
+        // this show is selected again on every single run (it was — nine
+        // times in one day, re-fetching whole episode lists each time).
+        let mut unmatched = 0;
+        for r in &eps {
+            let key = (r.get::<Option<i64>, _>("season"), r.get::<i64, _>("episode"));
+            if by_key.contains_key(&key) {
+                continue;
+            }
+            let item_id: String = r.get("id");
+            crate::providers::store_answer(
+                db,
+                &item_id,
+                provider,
+                "",
+                "miss",
+                crate::providers::Fields::default(),
+                &chain,
+            )
+            .await?;
+            unmatched += 1;
+        }
+        tracing::info!(show = show_id, episodes = wrote, unmatched,
+            "episode metadata stored");
         Ok(())
     }
 
