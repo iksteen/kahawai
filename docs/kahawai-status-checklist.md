@@ -115,7 +115,7 @@ limits, OPS-6 scoped to re-derivable caches).
       copy of what the answer store already is.
 - [x] HUB-8 Ambiguous matches flagged for manual review (card-based review UI,
       per-item re-match/search dialog)
-- [ ] HUB-9 Local metadata as authoritative provider. `local` is **not** a
+- [x] HUB-9 Local metadata as authoritative provider. `local` is **not** a
       chain member and holds no rank: it is asked before the chain and its
       answers sort ahead of every provider's. Ranking it would have implied
       an order in which a search result beats the file on your own disk,
@@ -124,10 +124,18 @@ limits, OPS-6 scoped to re-derivable caches).
       exists. The owner contradicting it — a manual pin elsewhere, or a
       rejection of what the `.nfo` claimed — displaces it wholesale; a
       cover carries no record, so nothing about identity displaces it.
-      Verified live on 2,213 albums. **Remaining:** no deployed mediahost
-      has been rebuilt since `nfo` was added to the scan, so no item
-      carries one and the `.nfo` path is unit-tested only. Flip this box
-      once a redeploy puts a real `.nfo` through it.
+      Verified live: 2,213 albums on their local cover, and 10 movies whose
+      `.nfo` owns identity, title, plot and genres while TMDB side-fills
+      the poster, premiere and rating it did not state.
+
+      Known gap, not part of this requirement: a `.nfo` or cover dropped
+      beside an ALREADY-SCANNED media file is invisible to a rescan — the
+      scan skips any file whose size and mtime match the hub's manifest,
+      so `find_nfo` never runs for it. The filesystem watcher does catch a
+      newly created sidecar (its `Create` event forces the directory, and
+      `force_dirs` bypasses the unchanged check). Fixing the rescan path
+      means putting sidecar state into the manifest comparison, which is a
+      scan-protocol change.
 
 ## Hub — subtitles
 
