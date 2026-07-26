@@ -534,23 +534,18 @@ impl Sessions {
                         Mode::Transcode { transcoder: Mutex::new(tc) }
                     }
                     None => {
+                        let tail = self.open_part_leases(registry, &parts, start_idx).await?;
                         let runner = match self
-                            .start_remux(&id, plan, lease, size, local_ms, "")
+                            .start_remux(&id, plan, tail, local_ms, "")
                             .await
                         {
                             Ok(r) => r,
                             Err(first) => {
                                 tracing::warn!(session = %id, error = format!("{first:#}"),
                                     "start failed; retrying with fallback sink");
-                                let lease2 = self
-                                    .open_lease(
-                                        registry,
-                                        &part.module_id,
-                                        &part.collection_id,
-                                        &part.path_rel,
-                                    )
-                                    .await?;
-                                self.start_remux(&id, plan, lease2, size, local_ms, "hlssink2")
+                                let tail =
+                                    self.open_part_leases(registry, &parts, start_idx).await?;
+                                self.start_remux(&id, plan, tail, local_ms, "hlssink2")
                                     .await
                                     .with_context(|| format!("first attempt: {first:#}"))?
                             }
@@ -587,6 +582,29 @@ impl Sessions {
         Ok(session)
     }
 
+    /// Leases for every part from `from` onward, in timeline order.
+    ///
+    /// A remux pipeline spans the rest of the source, so it needs them
+    /// all up front: concat holds each later part blocked until the one
+    /// before it ends, but the branch has to exist before that happens.
+    /// Costs one lease per remaining part instead of one per session —
+    /// paid once, at the start, rather than as a stall at every boundary.
+    async fn open_part_leases(
+        &self,
+        registry: &Registry,
+        parts: &[PartSource],
+        from: usize,
+    ) -> Result<Vec<(Lease, u64)>> {
+        let mut out = Vec::with_capacity(parts.len().saturating_sub(from));
+        for part in &parts[from..] {
+            let lease = self
+                .open_lease(registry, &part.module_id, &part.collection_id, &part.path_rel)
+                .await?;
+            out.push((lease, part.size));
+        }
+        Ok(out)
+    }
+
     /// Spin up the remux/transcode pipeline — in a supervised worker
     /// process when configured — feed it from the lease, and wait for the
     /// playlist to materialize so the returned URL is immediately playable.
@@ -594,13 +612,13 @@ impl Sessions {
         &self,
         session_id: &str,
         plan: kahawai_media::remux::RemuxPlan,
-        lease: Lease,
-        size: u64,
+        parts: Vec<(Lease, u64)>,
         start_ms: u64,
         sink: &str,
     ) -> Result<RemuxRunner> {
         let dir = self.scratch_root.join(session_id);
         std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+        anyhow::ensure!(!parts.is_empty(), "no source parts for the session");
 
         let runner = match &self.worker_exe {
             Some(exe) => {
@@ -608,27 +626,44 @@ impl Sessions {
                 // bytes — a pathologically deep data_dir breaks remux
                 // here. Bind under a short tmp dir if it ever bites a
                 // real deployment.
-                let sock = dir.join("worker.sock");
-                let listener = tokio::net::UnixListener::bind(&sock)
-                    .with_context(|| format!("binding {}", sock.display()))?;
-                // Serve source reads to the worker for the session's life;
-                // the task ends when the worker closes its socket.
-                tokio::spawn(async move {
-                    match listener.accept().await {
-                        Ok((conn, _)) => {
-                            if let Err(e) = serve_reads(conn, lease, size).await {
-                                tracing::debug!(error = %e, "worker read channel closed");
+                // One socket per part: the worker joins them with concat
+                // into a single pipeline, so a CD1->CD2 boundary is not a
+                // restart. Part one keeps the historical name and the
+                // positional argument; the rest arrive as --part.
+                let mut socks = Vec::with_capacity(parts.len());
+                for (n, (lease, size)) in parts.iter().enumerate() {
+                    let sock = if n == 0 {
+                        dir.join("worker.sock")
+                    } else {
+                        dir.join(format!("worker{n}.sock"))
+                    };
+                    let listener = tokio::net::UnixListener::bind(&sock)
+                        .with_context(|| format!("binding {}", sock.display()))?;
+                    // Serve source reads for the session's life; the task
+                    // ends when the worker closes its socket.
+                    let (lease, size) = (lease.clone(), *size);
+                    tokio::spawn(async move {
+                        match listener.accept().await {
+                            Ok((conn, _)) => {
+                                if let Err(e) = serve_reads(conn, lease, size).await {
+                                    tracing::debug!(error = %e, "worker read channel closed");
+                                }
                             }
+                            Err(e) => tracing::warn!(error = %e, "worker never connected"),
                         }
-                        Err(e) => tracing::warn!(error = %e, "worker never connected"),
-                    }
-                });
+                    });
+                    socks.push((sock, size));
+                }
                 let log = std::fs::File::create(dir.join("worker.log"))?;
-                let child = tokio::process::Command::new(exe)
-                    .arg("remux-worker")
-                    .arg(&sock)
+                let mut cmd = tokio::process::Command::new(exe);
+                cmd.arg("remux-worker")
+                    .arg(&socks[0].0)
                     .arg(&dir)
-                    .arg(size.to_string())
+                    .arg(socks[0].1.to_string());
+                for (sock, size) in &socks[1..] {
+                    cmd.args(["--part", &format!("{}:{size}", sock.display())]);
+                }
+                let child = cmd
                     .args(["--video", kahawai_media::worker::mode_arg(plan.video)])
                     .args(["--audio", kahawai_media::worker::mode_arg(plan.audio)])
                     .args(["--audio-track", &plan.audio_track.to_string()])
@@ -646,7 +681,14 @@ impl Sessions {
                 // In-process (tests): the pipeline pulls (and seeks —
                 // MP4 moov-at-end needs it) from the lease via a blocking
                 // adapter on the remux feeder thread.
-                let source = LeaseSource { lease, size, handle: tokio::runtime::Handle::current() };
+                let handle = tokio::runtime::Handle::current();
+                let sources: Vec<Box<dyn kahawai_media::remux::RemuxSource>> = parts
+                    .into_iter()
+                    .map(|(lease, size)| {
+                        Box::new(LeaseSource { lease, size, handle: handle.clone() })
+                            as Box<dyn kahawai_media::remux::RemuxSource>
+                    })
+                    .collect();
                 // start_at blocks while prerolling for an offset seek —
                 // off the async runtime with it, or the preroll's own
                 // lease reads can never be driven (single-thread runtimes
@@ -654,12 +696,13 @@ impl Sessions {
                 let dir2 = dir.clone();
                 let sink_owned = (!sink.is_empty()).then(|| sink.to_string());
                 let job = tokio::task::spawn_blocking(move || {
-                    kahawai_media::remux::start_full(
+                    kahawai_media::remux::start_parts(
                         &dir2,
                         plan,
-                        Box::new(source),
+                        sources,
                         start_ms,
                         sink_owned.as_deref(),
+                        None,
                     )
                 })
                 .await
@@ -974,12 +1017,13 @@ impl Sessions {
                 let _ = std::fs::remove_dir_all(dir);
                 // The old worker's lease died with it; open a fresh one
                 // on whichever part the target lands in.
-                let lease = self
-                    .open_lease(registry, &part.module_id, &part.collection_id, &part.path_rel)
-                    .await?;
-                let fresh = self
-                    .start_remux(&session.id, plan, lease, part.size, local_ms, "")
-                    .await?;
+                // A seek restarts in the target part and spans the rest
+                // from there: concat cannot serve the seek itself (it
+                // accepts one and then plays from zero — measured), so
+                // the restart stays, but it only ever happens for a seek
+                // now, never for a boundary.
+                let tail = self.open_part_leases(registry, &session.parts, idx).await?;
+                let fresh = self.start_remux(&session.id, plan, tail, local_ms, "").await?;
                 *runner.lock().unwrap() = fresh;
                 Ok(part.base_ms)
             }

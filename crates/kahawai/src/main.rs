@@ -58,6 +58,10 @@ enum Cmd {
         start_ms: u64,
         #[arg(long)]
         sink: Option<String>,
+        /// Additional parts of a split source, in timeline order, as
+        /// `<socket>:<size>`. The positional socket/size is part one.
+        #[arg(long = "part")]
+        parts: Vec<String>,
     },
 }
 
@@ -96,13 +100,17 @@ async fn main() -> Result<()> {
         }
         Cmd::Mediahost => run_mediahost(cfg.mediahost).await,
         Cmd::Doctor { json } => doctor(&cfg, json),
-        Cmd::RemuxWorker { socket, out_dir, size, video, audio, audio_track, video_track, start_ms, sink } => {
+        Cmd::RemuxWorker { socket, out_dir, size, video, audio, audio_track, video_track, start_ms, sink, parts } => {
             // Blocking by design: this process exists only for the pipeline.
             kahawai_media::demote_elements(&cfg.transcoder.demote_decoders)?;
-            kahawai_media::worker::run(
-                &socket,
+            let mut all = vec![(socket, size)];
+            for p in &parts {
+                let (sock, sz) = p.rsplit_once(':').context("--part wants <socket>:<size>")?;
+                all.push((PathBuf::from(sock), sz.parse().context("--part size")?));
+            }
+            kahawai_media::worker::run_parts(
+                &all,
                 &out_dir,
-                size,
                 kahawai_media::worker::parse_mode(&video),
                 kahawai_media::worker::parse_mode(&audio),
                 audio_track,

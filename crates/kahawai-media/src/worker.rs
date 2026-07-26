@@ -75,8 +75,30 @@ pub fn run(
     start_ms: u64,
     sink: Option<&str>,
 ) -> Result<()> {
-    let stream = UnixStream::connect(socket)
-        .with_context(|| format!("connecting to {}", socket.display()))?;
+    run_parts(&[(socket.to_path_buf(), size)], out_dir, video, audio, audio_track, video_track, start_ms, sink)
+}
+
+/// Multi-part entry point: one socket per part, in timeline order, joined
+/// into a single pipeline (see `remux::start_parts`). `start_ms` applies
+/// to the first part; the rest play whole.
+#[allow(clippy::too_many_arguments)] // CLI-shaped plumbing
+pub fn run_parts(
+    parts: &[(std::path::PathBuf, u64)],
+    out_dir: &Path,
+    video: StreamMode,
+    audio: StreamMode,
+    audio_track: usize,
+    video_track: usize,
+    start_ms: u64,
+    sink: Option<&str>,
+) -> Result<()> {
+    anyhow::ensure!(!parts.is_empty(), "no parts given");
+    let mut sources: Vec<Box<dyn RemuxSource>> = Vec::with_capacity(parts.len());
+    for (socket, size) in parts {
+        let stream = UnixStream::connect(socket)
+            .with_context(|| format!("connecting to {}", socket.display()))?;
+        sources.push(Box::new(SocketSource { stream, size: *size }));
+    }
     let plan = RemuxPlan { video, audio, audio_track, video_track };
     // Pacing window (§4.6): transcode ahead of the viewer, but not the
     // whole film. The supervisor keeps `viewer.pos` fresh (absolute ms,
@@ -91,14 +113,7 @@ pub fn run(
         floor_ms: start_ms,
         viewer_file: out_dir.join("viewer.pos"),
     };
-    let job = remux::start_paced(
-        out_dir,
-        plan,
-        Box::new(SocketSource { stream, size }),
-        start_ms,
-        sink,
-        Some(pace),
-    )?;
+    let job = remux::start_parts(out_dir, plan, sources, start_ms, sink, Some(pace))?;
     while !job.finished() {
         std::thread::sleep(std::time::Duration::from_millis(100));
     }

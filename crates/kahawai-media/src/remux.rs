@@ -431,30 +431,15 @@ fn timestamper_for(caps: &gst::CapsRef) -> Option<&'static str> {
 
 /// hlssink2 pads requested up front (splitmuxsink wants them before start);
 /// each is taken by the first matching parsed stream.
-/// Where a stream's branch terminates, once its real caps are known.
+/// Where each stream's branch terminates, once its real caps are known:
+/// the muxer's pad for that stream, claimed once.
 ///
-/// One source feeds the muxer directly and the pad is consumed once. A
-/// MULTI-PART source (CD1/CD2) merges through a `concat` first, so every
-/// part's branch asks for its own sink pad and concat serialises them —
-/// adjusting each segment's base so the running time never jumps. The
-/// muxer, and therefore the playlist, never learns a boundary happened.
-enum Merge {
-    Direct(Option<gst::Pad>),
-    Concat(gst::Element),
-}
-
-impl Merge {
-    /// The pad this branch should feed, or None when the muxer's single
-    /// pad for this stream has already been claimed.
-    fn pad(&mut self) -> Option<gst::Pad> {
-        match self {
-            Merge::Direct(pad) => pad.take(),
-            Merge::Concat(concat) => concat.request_pad_simple("sink_%u"),
-        }
-    }
-}
-
-type WaitingPads = Arc<Mutex<std::collections::HashMap<&'static str, Merge>>>;
+/// A MULTI-PART source has one of these PER PART, holding that part's
+/// pre-claimed `concat` sink pad instead of the muxer's. concat plays its
+/// sink pads in the order they were REQUESTED, so they are requested up
+/// front in timeline order — claiming them lazily from `pad-added` races
+/// across the parts' parsebins and can run CD2 first.
+type WaitingPads = Arc<Mutex<std::collections::HashMap<&'static str, gst::Pad>>>;
 
 /// Offset-start gate: splitmuxsink is not flush-safe once it has seen
 /// data (g_assert !ctx->is_reference aborts on a mid-GOP flush), so for
@@ -901,7 +886,7 @@ fn route_stream(
     // Encode: claim the kind's muxer pad for the decode→re-encode branch.
     if mode == StreamMode::Encode && can_decode(&caps_name) {
         let kind = if caps_name.starts_with("video/") { "video" } else { "audio" };
-        if let Some(sinkpad) = waiting.lock().unwrap().get_mut(kind).and_then(Merge::pad) {
+        if let Some(sinkpad) = waiting.lock().unwrap().remove(kind) {
             tracing::info!(caps = %caps_name, kind, "transcoding stream");
             if kind == "video" {
                 build_video_encode_chain(pipe, from, sinkpad, gate);
@@ -912,10 +897,7 @@ fn route_stream(
         }
     }
     let target = (mode == StreamMode::Copy)
-        .then(|| {
-            ts_compatible(&caps_name)
-                .and_then(|kind| waiting.lock().unwrap().get_mut(kind).and_then(Merge::pad))
-        })
+        .then(|| ts_compatible(&caps_name).and_then(|kind| waiting.lock().unwrap().remove(kind)))
         .flatten();
     match target {
         Some(sinkpad) => {
@@ -1490,7 +1472,9 @@ pub fn start_parts(
     anyhow::ensure!(plan.playable(), "nothing to remux");
     let stopping = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let pace = pace.map(Arc::new);
-    let waiting: WaitingPads = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let per_part: Vec<WaitingPads> = (0..parsebins.len())
+        .map(|_| Arc::new(Mutex::new(std::collections::HashMap::new())))
+        .collect();
     for kind in ["video", "audio"] {
         let wanted = if kind == "video" { plan.has_video() } else { plan.has_audio() };
         if !wanted {
@@ -1502,20 +1486,23 @@ pub fn start_parts(
         if let Some(cfg) = &pace {
             install_pace_probe(&pad, cfg.clone(), stopping.clone());
         }
-        let merge = if multipart {
-            let concat = gst::ElementFactory::make("concat").build()?;
-            pipeline.add(&concat)?;
-            let src = concat.static_pad("src").context("concat has no src pad")?;
-            // Same reason as every other pad feeding this sink: hlssink3
-            // unwraps each fragment's first PTS and a panic in an FFI
-            // callback takes the process with it.
-            guard_pts(&src);
-            src.link(&pad).context("linking concat to the muxer")?;
-            Merge::Concat(concat)
-        } else {
-            Merge::Direct(Some(pad))
-        };
-        waiting.lock().unwrap().insert(kind, merge);
+        if !multipart {
+            per_part[0].lock().unwrap().insert(kind, pad);
+            continue;
+        }
+        let concat = gst::ElementFactory::make("concat").build()?;
+        pipeline.add(&concat)?;
+        let src = concat.static_pad("src").context("concat has no src pad")?;
+        // Same reason as every other pad feeding this sink: hlssink3
+        // unwraps each fragment's first PTS and a panic in an FFI
+        // callback takes the process with it.
+        guard_pts(&src);
+        src.link(&pad).context("linking concat to the muxer")?;
+        // Request order IS play order — one pad per part, in sequence.
+        for slot in per_part.iter() {
+            let sink = concat.request_pad_simple("sink_%u").context("concat sink pad")?;
+            slot.lock().unwrap().insert(kind, sink);
+        }
     }
 
     // Every parsed stream gets a queue immediately (no buffer ever hits an
@@ -1526,8 +1513,15 @@ pub fn start_parts(
     let subs_dir = out_dir.to_path_buf();
     for (n, pb) in parsebins.iter().enumerate() {
         let pipe = pipeline.clone();
-        let waiting2 = waiting.clone();
-        let gate2 = gate.clone();
+        let waiting2 = per_part[n].clone();
+        // Only the first part is seeked, so only its branches are gated.
+        // Gating the others would break the gate twice over: it expects
+        // one branch per stream and would see one per stream PER PART,
+        // and `start.pos` is the minimum stream time across gated pads —
+        // a later part's branch starts at its own zero and would report
+        // the whole session as starting at 0, shifting the client's
+        // timeline by the entire resume offset.
+        let gate2 = if n == 0 { gate.clone() } else { None };
         // Per part, NOT shared: these count tracks in demux order and the
         // count is what `plan.audio_track` / `plan.video_track` select
         // against. Track indices are a property of a file, so sharing
@@ -1665,6 +1659,51 @@ mod multipart {
             path.display()
         ));
         path
+    }
+
+    /// Resuming inside part one still reports where playback actually
+    /// began. `start.pos` is the minimum stream time across the GATED
+    /// pads and the client adds it to the part base, so gating a later
+    /// part — whose branch starts at its own zero — reported the session
+    /// as starting at 0 and shifted the whole timeline by the resume
+    /// offset. Only the part being seeked is gated.
+    #[test]
+    fn resuming_inside_the_first_part_reports_its_own_start() {
+        crate::init().unwrap();
+        if !crate::testutil::has_element("fdkaacenc") {
+            eprintln!("no fdkaacenc; skipped");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let parts = [part(dir.path(), "a1.mkv", "smpte"), part(dir.path(), "a2.mkv", "ball")];
+        let out = dir.path().join("hls");
+        std::fs::create_dir_all(&out).unwrap();
+        let sources: Vec<Box<dyn RemuxSource>> = parts
+            .iter()
+            .map(|p| Box::new(FileSource::open(p).unwrap()) as Box<dyn RemuxSource>)
+            .collect();
+        let plan = RemuxPlan {
+            video: StreamMode::Copy,
+            audio: StreamMode::Copy,
+            audio_track: 0,
+            video_track: 0,
+        };
+        // 2 s into a 5 s first part.
+        let job = start_parts(&out, plan, sources, 2_000, None, None).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+        while !job.finished() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(job.failed().is_none(), "pipeline failed: {:?}", job.failed());
+        let pos: u64 = std::fs::read_to_string(out.join("start.pos"))
+            .expect("no start.pos written")
+            .trim()
+            .parse()
+            .expect("start.pos is not a number");
+        // Keyframe-snapped at or before the request, never zero — zero is
+        // what the second part's branch reports for itself.
+        assert!(pos > 500, "start.pos {pos} — a later part's zero won the minimum");
+        assert!(pos <= 2_000, "start.pos {pos} is past the requested resume point");
     }
 
     /// Two 5 s parts, one playlist, no seam: the muxer never learns the
