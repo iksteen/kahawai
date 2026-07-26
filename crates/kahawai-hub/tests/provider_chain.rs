@@ -710,3 +710,106 @@ async fn an_assignment_whose_answer_decays_is_dropped() {
     kahawai_hub::providers::assign(&db, "i1").await.unwrap();
     assert_eq!(assigned(&db, "i1").await, None);
 }
+
+/// A human's pin outlives both a later answer from a more preferred
+/// provider and a reorder.
+#[tokio::test]
+async fn a_manual_assignment_is_never_recomputed() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    item(&db, "i1").await;
+    let chain = chain_in_force(&db, "movies").await;
+    kahawai_hub::providers::assign_manual(
+        &db, "i1", "tvdb", "414734",
+        Fields { title: Some("hand picked".into()), ..Default::default() }, &chain,
+    )
+    .await
+    .unwrap();
+    assert_eq!(assigned(&db, "i1").await, Some(("tvdb".into(), "414734".into(), true)));
+
+    // TMDB ranks first and answers strongly: the pin still holds.
+    answer_row(&db, "i1", "tmdb", "111", "auto").await;
+    kahawai_hub::providers::assign(&db, "i1").await.unwrap();
+    set_chain(&db, "movies", &["tmdb".into(), "tvdb".into()]).await.unwrap();
+    assert_eq!(assigned(&db, "i1").await, Some(("tvdb".into(), "414734".into(), true)));
+}
+
+/// Rejecting keeps every answer on file — deleting them would make the
+/// next run re-ask every provider, AniDB included, for one UI click — and
+/// schedules the refused providers to be looked at again later.
+#[tokio::test]
+async fn rejecting_keeps_the_answers_and_schedules_another_look() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    item(&db, "i1").await;
+    answer_row(&db, "i1", "tmdb", "19069", "auto").await;
+    answer_row(&db, "i1", "tvdb", "", "miss").await;
+    kahawai_hub::providers::assign(&db, "i1").await.unwrap();
+    assert!(assigned(&db, "i1").await.is_some());
+
+    kahawai_hub::providers::reject_matches(&db, "i1").await.unwrap();
+    assert_eq!(assigned(&db, "i1").await, None, "no assignment after a rejection");
+    let answers: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM provider_metadata WHERE item_id = 'i1'")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    assert_eq!(answers, 2, "the answers, and the recorded miss, survive");
+    let refused: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM rejected_matches WHERE item_id = 'i1'")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    assert_eq!(refused, 1, "only records that exist can be refused");
+    let queued: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM enrichment_queue WHERE item_id = 'i1' AND due_at > unixepoch()",
+    )
+    .fetch_one(&db)
+    .await
+    .unwrap();
+    assert_eq!(queued, 1, "the refused provider gets another look after a cooldown");
+
+    // Re-running the pick does not resurrect the refused record.
+    kahawai_hub::providers::assign(&db, "i1").await.unwrap();
+    assert_eq!(assigned(&db, "i1").await, None);
+}
+
+/// Two answers landing at once must leave exactly one assignment, and the
+/// one the rule dictates — no lost update, no SQLITE_BUSY.
+#[tokio::test]
+async fn concurrent_answers_leave_one_correct_assignment() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    let chain = chain_in_force(&db, "movies").await;
+    for n in 0..12 {
+        let id = format!("i{n}");
+        item(&db, &id).await;
+        let (a, b) = (db.clone(), db.clone());
+        let (c1, c2) = (chain.clone(), chain.clone());
+        let (i1, i2) = (id.clone(), id.clone());
+        let tmdb = async move {
+            store_answer(&a, &i1, "tmdb", "111", "auto", answer("tmdb", None, None), &c1).await
+        };
+        let tvdb = async move {
+            store_answer(&b, &i2, "tvdb", "222", "auto", answer("tvdb", None, None), &c2).await
+        };
+        // Both orders, so neither writer is systematically first.
+        if n % 2 == 0 {
+            let (x, y) = tokio::join!(tmdb, tvdb);
+            x.unwrap();
+            y.unwrap();
+        } else {
+            let (y, x) = tokio::join!(tvdb, tmdb);
+            x.unwrap();
+            y.unwrap();
+        }
+        let rows: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM item_match WHERE item_id = ?")
+                .bind(&id)
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert_eq!(rows, 1, "{id}: exactly one assignment");
+        assert_eq!(assigned(&db, &id).await.unwrap().0, "tmdb", "{id}: the preferred provider");
+    }
+}

@@ -672,14 +672,12 @@ async fn admin_apply_match(
             }
         }
         "reject" => {
-            // Every provider's answer goes, not just the merged row —
-            // otherwise the next merge would promote a runner-up the
-            // user never saw and call the item matched again.
-            sqlx::query("DELETE FROM provider_metadata WHERE item_id = ?")
-                .bind(&id)
-                .execute(db)
-                .await
-                .map_err(internal)?;
+            // The refused records are remembered and the assignment goes;
+            // the ANSWERS stay. Deleting them (what this did) makes the
+            // next run re-ask every provider, AniDB included, for one
+            // click — and it is the refused set, not their absence, that
+            // keeps the item unassigned until something new appears.
+            crate::providers::reject_matches(db, &id).await.map_err(internal)?;
             sqlx::query(
                 "UPDATE merged_metadata SET provider_id = '', title = NULL, overview = NULL,
                         poster_path = NULL, rating = NULL, premiered = NULL,
@@ -705,12 +703,11 @@ async fn admin_apply_match(
             // picked candidate left empty.
             let media_type = crate::providers::media_type_of_item(db, &id).await;
             let chain = crate::providers::chain_in_force(db, &media_type).await;
-            crate::providers::store_answer(
+            crate::providers::assign_manual(
                 db,
                 &id,
                 &provider,
                 &pid.to_string(),
-                crate::providers::MANUAL,
                 crate::providers::Fields {
                     title: c["title"].as_str().map(str::to_string),
                     overview: c["overview"].as_str().map(str::to_string),

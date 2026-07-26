@@ -156,6 +156,8 @@ pub async fn set_chain(db: &SqlitePool, media_type: &str, order: &[String]) -> R
         .await?;
     }
     tx.commit().await?;
+    // Both models while the read path moves over (step 3 of 4).
+    assign_media_type(db, media_type).await?;
     rematerialize_media_type(db, media_type).await
 }
 
@@ -377,13 +379,21 @@ async fn answered(db: &SqlitePool, item_id: &str, chain_entry: &str) -> bool {
 
 /// Which provider currently owns this item's identity, if any has
 /// actually matched it.
+/// Which provider owns this item's identity, as a CHAIN name — the anime
+/// composite's `anilist` answer reads as `anime`, which is what every
+/// consumer actually compares against. Returning the raw column made
+/// TmdbProvider's ("anime", …) arms unreachable, so TMDB has been
+/// title-searching anime items instead of bridging through the mapping.
 pub async fn identity_owner(db: &SqlitePool, item_id: &str) -> Option<String> {
-    sqlx::query_scalar("SELECT provider FROM merged_metadata WHERE item_id = ? AND provider_id != ''")
-        .bind(item_id)
-        .fetch_optional(db)
-        .await
-        .ok()
-        .flatten()
+    sqlx::query_scalar::<_, String>(
+        "SELECT provider FROM item_match WHERE item_id = ? AND provider_id <> ''",
+    )
+    .bind(item_id)
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten()
+    .map(|p| chain_name(&p).to_string())
 }
 
 /// Recompute `merged_metadata` for one item from the stored per-provider
@@ -517,6 +527,11 @@ pub async fn store_answer(
     fields: Fields,
     chain: &[String],
 ) -> Result<()> {
+    // Write FIRST, then read: a deferred transaction that reads before it
+    // writes hits SQLITE_BUSY when it tries to upgrade, and up to seven
+    // writers run concurrently here. The upsert taking the write lock is
+    // what makes the re-pick below see every committed answer.
+    let mut tx = db.begin().await?;
     sqlx::query(
         "INSERT INTO provider_metadata
            (item_id, provider, provider_id, title, overview, poster_path, rating,
@@ -545,10 +560,13 @@ pub async fn store_answer(
     .bind(&fields.original_language)
     .bind(&fields.genres)
     .bind(confidence)
-    .execute(db)
+    .execute(&mut *tx)
     .await?;
-    // merged_metadata is keyed by item and materialized from these rows;
-    // make sure the row exists before merging into it.
+    // Re-pick in the SAME transaction: between dropping a stale assignment
+    // and inserting the new one the item has none, and a reader in that
+    // window would see it unmatched.
+    reassign(&mut tx, Some(item_id), None).await?;
+    // Still maintained until the read path moves off it (step 3 of 4).
     sqlx::query(
         "INSERT INTO merged_metadata (item_id, provider, provider_id, confidence, updated_at)
          VALUES (?, ?, ?, ?, unixepoch())
@@ -558,9 +576,113 @@ pub async fn store_answer(
     .bind(provider)
     .bind(provider_id)
     .bind(confidence)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    materialize(db, item_id, chain).await
+}
+
+/// The user's choice: THIS provider's record is what the item is. Stored
+/// as that provider's answer — a human match is strong by definition —
+/// plus a pinned assignment automatic picking never touches, and the
+/// record stops being refused if it had been.
+pub async fn assign_manual(
+    db: &SqlitePool,
+    item_id: &str,
+    provider: &str,
+    provider_id: &str,
+    fields: Fields,
+    chain: &[String],
+) -> Result<()> {
+    store_answer(db, item_id, provider, provider_id, "auto", fields, chain).await?;
+    let mut tx = db.begin().await?;
+    sqlx::query(
+        "DELETE FROM rejected_matches
+          WHERE item_id = ? AND provider = ? AND provider_id = ?",
+    )
+    .bind(item_id)
+    .bind(provider)
+    .bind(provider_id)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "INSERT INTO item_match (item_id, provider, provider_id, media_type, manual, updated_at)
+         VALUES (?, ?, ?, ?, 1, unixepoch())
+         ON CONFLICT (item_id) DO UPDATE SET
+           provider = excluded.provider,
+           provider_id = excluded.provider_id,
+           manual = 1,
+           updated_at = unixepoch()",
+    )
+    .bind(item_id)
+    .bind(provider)
+    .bind(provider_id)
+    .bind(media_type_of_item(db, item_id).await)
+    .execute(&mut *tx)
+    .await?;
+    // Transitional: the API still reports the merged row's confidence to
+    // the client (step 3 of 4 moves reads onto the assignment). Without
+    // this a manual pick would read back as 'auto' in the meantime.
+    sqlx::query(
+        "UPDATE merged_metadata SET confidence = 'manual', updated_at = unixepoch()
+          WHERE item_id = ? AND provider_id <> ''",
+    )
+    .bind(item_id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Promote the current automatic assignment to a human decision. Touches
+/// nothing else — the answer it points at is already on file.
+pub async fn confirm_assignment(db: &SqlitePool, item_id: &str) -> Result<()> {
+    sqlx::query(
+        "UPDATE item_match SET manual = 1, updated_at = unixepoch()
+          WHERE item_id = ? AND provider_id <> ''",
+    )
+    .bind(item_id)
     .execute(db)
     .await?;
-    materialize(db, item_id, chain).await
+    Ok(())
+}
+
+/// "There is currently no correct record." Every record this item holds is
+/// remembered as refused and the assignment goes, but the ANSWERS stay:
+/// deleting them would make the next run re-ask every provider, AniDB
+/// included, for one click in the UI. The refused set is what lets the
+/// item recover by itself — a record that is not in it may be assigned
+/// automatically, so a provider offering something new is picked up.
+pub async fn reject_matches(db: &SqlitePool, item_id: &str) -> Result<()> {
+    let mut tx = db.begin().await?;
+    sqlx::query(
+        "INSERT INTO rejected_matches (item_id, provider, provider_id, rejected_at)
+         SELECT item_id, provider, provider_id, unixepoch() FROM provider_metadata
+          WHERE item_id = ? AND provider_id <> ''
+         ON CONFLICT (item_id, provider, provider_id) DO NOTHING",
+    )
+    .bind(item_id)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query("DELETE FROM item_match WHERE item_id = ?")
+        .bind(item_id)
+        .execute(&mut *tx)
+        .await?;
+    // Come back to the refused providers after the usual cooldown, so
+    // "something new" is actually checked for without hammering anyone.
+    sqlx::query(
+        "INSERT INTO enrichment_queue (item_id, provider, due_at, reason)
+         SELECT item_id, provider, unixepoch() + ?, 'match rejected' FROM provider_metadata
+          WHERE item_id = ? AND provider_id <> ''
+         ON CONFLICT (item_id, provider) DO UPDATE SET
+           due_at = excluded.due_at, reason = excluded.reason",
+    )
+    .bind(retry_delay(3))
+    .bind(item_id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(())
 }
 
 /// What a provider has to say about an item's description.
