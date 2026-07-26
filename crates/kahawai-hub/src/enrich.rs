@@ -681,14 +681,13 @@ impl Enricher {
                     -- every run for a provider that stores nothing.
                     OR (NOT EXISTS (SELECT 1 FROM provider_metadata pl
                                      WHERE pl.item_id = i.id AND pl.provider = 'local')
-                        AND EXISTS (
-                          SELECT 1 FROM item_sources s4
-                          JOIN files f4 ON (f4.module_id, f4.collection_id, f4.path_rel)
-                                         = (s4.module_id, s4.collection_id, s4.path_rel)
-                          WHERE (s4.item_id = i.id
-                                 OR s4.item_id IN (SELECT id FROM items WHERE parent_id = i.id))
-                            AND (json_extract(f4.streams_json, '$.artwork') IS NOT NULL
-                                 OR json_extract(f4.streams_json, '$.nfo') IS NOT NULL)))
+                        AND i.id IN (SELECT COALESCE(ch.parent_id, ch.id)
+                                       FROM item_sources s4
+                                       JOIN files f4 ON (f4.module_id, f4.collection_id, f4.path_rel)
+                                                      = (s4.module_id, s4.collection_id, s4.path_rel)
+                                       JOIN items ch ON ch.id = s4.item_id
+                                      WHERE json_extract(f4.streams_json, '$.artwork') IS NOT NULL
+                                         OR json_extract(f4.streams_json, '$.nfo') IS NOT NULL))
                     -- or a provider refused and is due again (bans and
                     -- rate limits reschedule, they never drop work).
                     OR EXISTS (
@@ -813,14 +812,13 @@ impl Enricher {
                     -- every run for a provider that stores nothing.
                     OR (NOT EXISTS (SELECT 1 FROM provider_metadata pl
                                      WHERE pl.item_id = i.id AND pl.provider = 'local')
-                        AND EXISTS (
-                          SELECT 1 FROM item_sources s4
-                          JOIN files f4 ON (f4.module_id, f4.collection_id, f4.path_rel)
-                                         = (s4.module_id, s4.collection_id, s4.path_rel)
-                          WHERE (s4.item_id = i.id
-                                 OR s4.item_id IN (SELECT id FROM items WHERE parent_id = i.id))
-                            AND (json_extract(f4.streams_json, '$.artwork') IS NOT NULL
-                                 OR json_extract(f4.streams_json, '$.nfo') IS NOT NULL)))
+                        AND i.id IN (SELECT COALESCE(ch.parent_id, ch.id)
+                                       FROM item_sources s4
+                                       JOIN files f4 ON (f4.module_id, f4.collection_id, f4.path_rel)
+                                                      = (s4.module_id, s4.collection_id, s4.path_rel)
+                                       JOIN items ch ON ch.id = s4.item_id
+                                      WHERE json_extract(f4.streams_json, '$.artwork') IS NOT NULL
+                                         OR json_extract(f4.streams_json, '$.nfo') IS NOT NULL))
                     -- Work the chain still owes: a provider that refused
                     -- and is due again. Without this a rescheduled album
                     -- would sit in the queue forever (HUB-5).
@@ -949,13 +947,21 @@ impl Enricher {
                     m.provider, m.provider_id, COALESCE(m.manual, 0) AS manual,
                     a.anidb_id, a.anilist_id
              FROM items i
-             JOIN item_sources s ON s.item_id = i.id
-                OR s.item_id IN (SELECT id FROM items WHERE parent_id = i.id)
-             JOIN collections c ON (c.module_id, c.collection_id)
-                                 = (s.module_id, s.collection_id)
              LEFT JOIN item_match m ON m.item_id = i.id
              LEFT JOIN anime_ids a ON a.item_id = i.id
-             WHERE c.media_type = 'anime' AND i.kind IN ('movie', 'show')
+             -- Set membership, not a join: `s.item_id = i.id OR s.item_id IN
+             -- (children of i)` as a JOIN condition re-runs a correlated
+             -- subquery per (item x source) pair, which measured 103 s on
+             -- 1.1k anime items. Resolving each source to its top-level
+             -- item with COALESCE(parent_id, id) makes the set computable
+             -- once, off the primary keys.
+             WHERE i.kind IN ('movie', 'show')
+               AND i.id IN (SELECT COALESCE(ch.parent_id, ch.id)
+                              FROM item_sources s
+                              JOIN items ch ON ch.id = s.item_id
+                              JOIN collections c ON (c.module_id, c.collection_id)
+                                                  = (s.module_id, s.collection_id)
+                             WHERE c.media_type = 'anime')
                AND (
                  -- Unmatched, unless a human refused everything it holds.
                  (m.item_id IS NULL
@@ -980,25 +986,25 @@ impl Enricher {
                     -- every run for a provider that stores nothing.
                     OR (NOT EXISTS (SELECT 1 FROM provider_metadata pl
                                      WHERE pl.item_id = i.id AND pl.provider = 'local')
-                        AND EXISTS (
-                          SELECT 1 FROM item_sources s4
-                          JOIN files f4 ON (f4.module_id, f4.collection_id, f4.path_rel)
-                                         = (s4.module_id, s4.collection_id, s4.path_rel)
-                          WHERE (s4.item_id = i.id
-                                 OR s4.item_id IN (SELECT id FROM items WHERE parent_id = i.id))
-                            AND (json_extract(f4.streams_json, '$.artwork') IS NOT NULL
-                                 OR json_extract(f4.streams_json, '$.nfo') IS NOT NULL)))
+                        AND i.id IN (SELECT COALESCE(ch.parent_id, ch.id)
+                                       FROM item_sources s4
+                                       JOIN files f4 ON (f4.module_id, f4.collection_id, f4.path_rel)
+                                                      = (s4.module_id, s4.collection_id, s4.path_rel)
+                                       JOIN items ch ON ch.id = s4.item_id
+                                      WHERE json_extract(f4.streams_json, '$.artwork') IS NOT NULL
+                                         OR json_extract(f4.streams_json, '$.nfo') IS NOT NULL))
                  OR EXISTS (
                    SELECT 1 FROM enrichment_queue q
                    WHERE q.item_id = i.id AND q.due_at <= unixepoch())
-                 OR EXISTS (
-                   SELECT 1 FROM files f
-                   JOIN item_sources s2 ON (s2.module_id, s2.collection_id, s2.path_rel)
-                                         = (f.module_id, f.collection_id, f.path_rel)
-                   WHERE f.ed2k IS NOT NULL
-                     AND (s2.item_id = i.id
-                          OR s2.item_id IN (SELECT id FROM items WHERE parent_id = i.id))
-                     AND f.ed2k NOT IN (SELECT ed2k FROM ed2k_aid)))
+                 -- Same shape, same reason: one pass over the unmapped
+                 -- hashes rather than one per candidate item.
+                 OR i.id IN (SELECT COALESCE(ch.parent_id, ch.id)
+                               FROM files f
+                               JOIN item_sources s2 ON (s2.module_id, s2.collection_id, s2.path_rel)
+                                                     = (f.module_id, f.collection_id, f.path_rel)
+                               JOIN items ch ON ch.id = s2.item_id
+                              WHERE f.ed2k IS NOT NULL
+                                AND f.ed2k NOT IN (SELECT ed2k FROM ed2k_aid)))
              ORDER BY i.title",
         )
         .fetch_all(registry.db())
