@@ -77,9 +77,13 @@ impl Runner {
         video_track: u32,
         start_ms: u64,
         sink: &str,
+        tail_sizes: Vec<u64>,
     ) {
         let result = self
-            .start_inner(&session_id, size, video, audio, audio_track, video_track, start_ms, sink)
+            .start_inner(
+                &session_id, size, video, audio, audio_track, video_track, start_ms, sink,
+                &tail_sizes,
+            )
             .await;
         let msg = match result {
             Ok(()) => {
@@ -115,6 +119,7 @@ impl Runner {
         video_track: u32,
         start_ms: u64,
         sink: &str,
+        tail_sizes: &[u64],
     ) -> Result<()> {
         // Replace any previous run first (seek-restart reuses the id).
         self.end(session_id).await;
@@ -122,30 +127,50 @@ impl Runner {
         let dir = self.scratch_root.join(session_id).join(format!("r{run}"));
         std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
 
-        let sock = dir.join("worker.sock");
-        let listener = tokio::net::UnixListener::bind(&sock)
-            .with_context(|| format!("binding {}", sock.display()))?;
-        // Bridge: worker's socket reads → SourceRead over the link →
-        // SourceData fulfils the pending oneshot → back to the socket.
-        let runner = self.clone();
-        let sid = session_id.to_string();
-        let bridge = tokio::spawn(async move {
-            let Ok((conn, _)) = listener.accept().await else {
-                return;
+        // One socket per part of a split source (CD1/CD2): the worker
+        // joins them with concat into a single pipeline, so the boundary
+        // is not a restart. Each bridge tags its reads with the part it
+        // serves; the hub holds a lease per part.
+        let mut socks: Vec<(std::path::PathBuf, u64)> = Vec::with_capacity(1 + tail_sizes.len());
+        let mut bridges = Vec::with_capacity(1 + tail_sizes.len());
+        for (part, part_size) in std::iter::once(size).chain(tail_sizes.iter().copied()).enumerate()
+        {
+            let sock = if part == 0 {
+                dir.join("worker.sock")
+            } else {
+                dir.join(format!("worker{part}.sock"))
             };
-            if let Err(e) = runner.bridge_reads(conn, &sid).await {
-                tracing::debug!(session = %sid, error = format!("{e:#}"), "read bridge closed");
-            }
-        });
+            let listener = tokio::net::UnixListener::bind(&sock)
+                .with_context(|| format!("binding {}", sock.display()))?;
+            // Bridge: worker's socket reads → SourceRead over the link →
+            // SourceData fulfils the pending oneshot → back to the socket.
+            let runner = self.clone();
+            let sid = session_id.to_string();
+            bridges.push(tokio::spawn(async move {
+                let Ok((conn, _)) = listener.accept().await else {
+                    return;
+                };
+                if let Err(e) = runner.bridge_reads(conn, &sid, part as u32).await {
+                    tracing::debug!(session = %sid, error = format!("{e:#}"), "read bridge closed");
+                }
+            }));
+            socks.push((sock, part_size));
+        }
+        let sock = socks[0].0.clone();
+        let bridge = bridges.remove(0);
 
         let worker = match &self.worker_exe {
             Some(exe) => {
                 let log = std::fs::File::create(dir.join("worker.log"))?;
-                let child = tokio::process::Command::new(exe)
-                    .arg("remux-worker")
+                let mut cmd = tokio::process::Command::new(exe);
+                cmd.arg("remux-worker")
                     .arg(&sock)
                     .arg(&dir)
-                    .arg(size.to_string())
+                    .arg(size.to_string());
+                for (s, n) in &socks[1..] {
+                    cmd.args(["--part", &format!("{}:{n}", s.display())]);
+                }
+                let child = cmd
                     .args(["--video", video])
                     .args(["--audio", audio])
                     .args(["--audio-track", &audio_track.to_string()])
@@ -164,13 +189,13 @@ impl Runner {
                     kahawai_media::worker::parse_mode(video),
                     kahawai_media::worker::parse_mode(audio),
                 );
-                let (sock, dir) = (sock.clone(), dir.clone());
+                let (all, dir) = (socks.clone(), dir.clone());
                 let sink_owned = (!sink.is_empty()).then(|| sink.to_string());
                 let err = Arc::new(Mutex::new(None));
                 let err2 = err.clone();
                 let handle = tokio::task::spawn_blocking(move || {
-                    if let Err(e) = kahawai_media::worker::run(
-                        &sock, &dir, size, v, a, audio_track as usize,
+                    if let Err(e) = kahawai_media::worker::run_parts(
+                        &all, &dir, v, a, audio_track as usize,
                         video_track as usize, start_ms, sink_owned.as_deref(),
                     ) {
                         tracing::warn!(error = format!("{e:#}"), "in-process worker failed");
@@ -278,7 +303,12 @@ impl Runner {
 
     /// Serve the worker's Unix-socket read protocol by round-tripping
     /// each request over the hub link.
-    async fn bridge_reads(&self, mut conn: tokio::net::UnixStream, session_id: &str) -> Result<()> {
+    async fn bridge_reads(
+        &self,
+        mut conn: tokio::net::UnixStream,
+        session_id: &str,
+        part: u32,
+    ) -> Result<()> {
         let mut req = [0u8; 16];
         loop {
             if conn.read_exact(&mut req).await.is_err() {
@@ -297,6 +327,7 @@ impl Runner {
                         offset,
                         len,
                         req: req_id,
+                        part,
                     })),
                 })
                 .await

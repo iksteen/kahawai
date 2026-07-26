@@ -228,7 +228,11 @@ pub struct Sessions {
     /// Hub-held source leases of dispatched sessions: (lease, size,
     /// part index) — reused across restarts within the same part so
     /// recovery works even when the mediahost link is flapping.
-    tc_leases: Mutex<HashMap<String, (Lease, u64, usize)>>,
+    /// Every part from the session's starting part onward, in timeline
+    /// order: the transcoder joins them into one pipeline and asks for
+    /// each by index. Second element is the starting part's index, so a
+    /// seek that stays inside it can reuse these leases.
+    tc_leases: Mutex<HashMap<String, (Vec<(Lease, u64)>, usize)>>,
     /// Sessions awaiting the transcoder's ready/error verdict.
     pending_ready: Mutex<HashMap<String, tokio::sync::oneshot::Sender<Result<(), String>>>>,
     /// In-flight artifact fetches, keyed by (session, name).
@@ -517,16 +521,18 @@ impl Sessions {
                         // hlssink2 (upstream fix pending).
                         if let Err(first) = self
                             .start_transcode(
-                                registry, &tc, &id, plan, lease.clone(), size, start_idx,
-                                local_ms, "",
+                                registry, &tc, &id, plan,
+                                self.open_part_leases(registry, &parts, start_idx).await?,
+                                start_idx, local_ms, "",
                             )
                             .await
                         {
                             tracing::warn!(session = %id, error = format!("{first:#}"),
                                 "start failed; retrying with fallback sink");
                             self.start_transcode(
-                                registry, &tc, &id, plan, lease, size, start_idx, local_ms,
-                                "hlssink2",
+                                registry, &tc, &id, plan,
+                                self.open_part_leases(registry, &parts, start_idx).await?,
+                                start_idx, local_ms, "hlssink2",
                             )
                             .await
                             .with_context(|| format!("first attempt: {first:#}"))?;
@@ -752,14 +758,16 @@ impl Sessions {
         transcoder: &str,
         session_id: &str,
         plan: kahawai_media::remux::RemuxPlan,
-        lease: Lease,
-        size: u64,
+        parts: Vec<(Lease, u64)>,
         part_idx: usize,
         start_ms: u64,
         sink: &str,
     ) -> Result<()> {
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-        self.tc_leases.lock().unwrap().insert(session_id.to_string(), (lease, size, part_idx));
+        anyhow::ensure!(!parts.is_empty(), "no source parts to dispatch");
+        let size = parts[0].1;
+        let tail_sizes: Vec<u64> = parts[1..].iter().map(|(_, n)| *n).collect();
+        self.tc_leases.lock().unwrap().insert(session_id.to_string(), (parts, part_idx));
         self.pending_ready.lock().unwrap().insert(session_id.to_string(), ready_tx);
 
         let start = kahawai_proto::v1::HubToTc {
@@ -773,6 +781,7 @@ impl Sessions {
                     video_track: plan.video_track as u32,
                     start_ms,
                     sink: sink.into(),
+                    tail_sizes,
                 },
             )),
         };
@@ -868,9 +877,12 @@ impl Sessions {
         offset: u64,
         len: u64,
         req: u64,
+        part: u32,
     ) {
-        let Some((lease, size, _)) = self.tc_leases.lock().unwrap().get(session_id).cloned() else {
-            tracing::debug!(session = session_id, "source read for unknown session");
+        let held = self.tc_leases.lock().unwrap().get(session_id).cloned();
+        let Some((lease, size)) = held.and_then(|(parts, _)| parts.get(part as usize).cloned())
+        else {
+            tracing::debug!(session = session_id, part, "source read for unknown session/part");
             return;
         };
         let len = len.min(kahawai_media::worker::MAX_READ);
@@ -897,6 +909,7 @@ impl Sessions {
                     offset,
                     data: buf,
                     req,
+                    part,
                 },
             )),
         };
@@ -1045,20 +1058,12 @@ impl Sessions {
                 // the mediahost link is flapping). Crossing parts needs
                 // a lease on the other file.
                 let held = self.tc_leases.lock().unwrap().remove(&session.id);
-                let lease = match held {
-                    Some((lease, _, held_idx)) if held_idx == idx => lease,
-                    _ => {
-                        self.open_lease(
-                            registry,
-                            &part.module_id,
-                            &part.collection_id,
-                            &part.path_rel,
-                        )
-                        .await?
-                    }
+                let parts = match held {
+                    Some((parts, held_idx)) if held_idx == idx => parts,
+                    _ => self.open_part_leases(registry, &session.parts, idx).await?,
                 };
                 self.start_transcode(
-                    registry, &tc, &session.id, plan, lease, part.size, idx, local_ms, "",
+                    registry, &tc, &session.id, plan, parts, idx, local_ms, "",
                 )
                 .await?;
                 Ok(part.base_ms)
@@ -1133,15 +1138,11 @@ impl Sessions {
         // Reuse the hub-held lease when the position is still in its
         // part — the mediahost may be unreachable during a fleet blip.
         let held = self.tc_leases.lock().unwrap().remove(id);
-        let lease = match held {
-            Some((lease, _, held_idx)) if held_idx == idx => lease,
-            _ => {
-                self.open_lease(registry, &part.module_id, &part.collection_id, &part.path_rel)
-                    .await?
-            }
+        let parts = match held {
+            Some((parts, held_idx)) if held_idx == idx => parts,
+            _ => self.open_part_leases(registry, &session.parts, idx).await?,
         };
-        self.start_transcode(registry, &new_tc, id, plan, lease, part.size, idx, local_ms, "")
-            .await?;
+        self.start_transcode(registry, &new_tc, id, plan, parts, idx, local_ms, "").await?;
         *transcoder.lock().unwrap() = new_tc.clone();
         Ok(new_tc)
     }

@@ -293,6 +293,10 @@ message SourceRead {
   uint64 offset = 2;
   uint64 len = 3;
   uint64 req = 4;
+  // Which part of a split source (CD1/CD2) this read is for, indexed from
+  // the session's starting part. Absent/0 = the first — what every
+  // single-part session and every pre-split transcoder sends.
+  uint32 part = 5;
 }
 
 message SourceData {
@@ -301,6 +305,7 @@ message SourceData {
   // Shorter than requested (including empty) = EOF at that offset.
   bytes data = 3;
   uint64 req = 4;
+  uint32 part = 5;
 }
 
 // One artifact (playlist/segment) streamed in chunks, eof-terminated.
@@ -365,6 +370,12 @@ message StartSession {
   // ignore these and play track 0.
   uint32 audio_track = 7;
   uint32 video_track = 8;
+  // Sizes of the remaining parts of a split source in timeline order,
+  // EXCLUDING the first (that is `size`). A transcoder that understands
+  // this joins them into one pipeline and plays the CD1->CD2 boundary
+  // without restarting; one that does not ignores it and restarts, which
+  // is exactly today's behaviour.
+  repeated uint64 tail_sizes = 9;
 }
 
 message EndSession {
