@@ -40,6 +40,10 @@ pub struct Enricher {
     /// in one evening; sessions are cheap to hold and expensive to
     /// re-establish.
     anidb: tokio::sync::Mutex<Option<crate::anidb::Anidb>>,
+    /// The byte plane, for HUB-9: reading a .nfo means leasing it from the
+    /// mediahost that holds it. Attached at startup; absent in tests, where
+    /// the local provider then simply is not in the chain.
+    sessions: std::sync::OnceLock<Arc<crate::sessions::Sessions>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -213,7 +217,14 @@ impl Enricher {
             last_nudge: std::sync::atomic::AtomicU64::new(0),
             progress: Default::default(),
             anidb: Default::default(),
+            sessions: Default::default(),
         }
+    }
+
+    /// Wire the byte plane in (HUB-9). Without it the local provider is
+    /// left out of the chain rather than failing per item.
+    pub fn attach_sessions(&self, sessions: Arc<crate::sessions::Sessions>) {
+        let _ = self.sessions.set(sessions);
     }
 
     /// Where anime/AniDB state lives (the api's verify path needs it).
@@ -553,7 +564,10 @@ impl Enricher {
         });
     }
 
-    pub async fn run_once(self: &Arc<Self>, registry: &Registry) -> Result<(usize, usize, usize)> {
+    pub async fn run_once(
+        self: &Arc<Self>,
+        registry: &Arc<Registry>,
+    ) -> Result<(usize, usize, usize)> {
         if self.running.swap(true, Ordering::SeqCst) {
             anyhow::bail!("enrichment already running");
         }
@@ -570,7 +584,10 @@ impl Enricher {
     /// The anime pass runs FIRST so anime items never spend a wasted
     /// TMDB match that would immediately be overwritten; items the anime
     /// chain declines fall through to the generic pass unmatched.
-    async fn run_inner(self: &Arc<Self>, registry: &Registry) -> Result<(usize, usize, usize)> {
+    async fn run_inner(
+        self: &Arc<Self>,
+        registry: &Arc<Registry>,
+    ) -> Result<(usize, usize, usize)> {
         registry.emit(serde_json::json!({ "kind": "enrich", "running": true }));
         let Some(key) = registry.get_setting(TMDB_KEY_SETTING).await? else {
             anyhow::bail!("no TMDB API key configured");
@@ -596,6 +613,13 @@ impl Enricher {
         // HUB-5: instantiate the run's providers; chains are declared in
         // providers::chain_for. Unconfigured providers stay absent.
         let mut set = crate::providers::ProviderSet::default();
+        // HUB-9: a human's .nfo leads the chain where one exists.
+        if let Some(sessions) = self.sessions.get() {
+            set.add(Box::new(LocalProvider {
+                sessions: sessions.clone(),
+                registry: Arc::clone(registry),
+            }));
+        }
         set.add(Box::new(TmdbProvider { enricher: self.clone(), key: key.clone() }));
         if let Some(token) = tvdb_token.clone() {
             set.add(Box::new(TvdbProvider { enricher: self.clone(), token }));
@@ -2271,5 +2295,181 @@ impl crate::providers::Provider for MusicbrainzProvider {
         )
         .await?;
         Ok(crate::providers::Outcome::Matched("auto"))
+    }
+}
+
+// ---------- HUB-9: local metadata as a provider ----------
+
+/// What a Kodi-style .nfo says. Everything is optional: these files are
+/// hand-made and half of them are a single `<title>`.
+fn parse_nfo(xml: &str) -> Option<(crate::providers::Fields, Option<String>)> {
+    let doc = roxmltree::Document::parse(xml).ok()?;
+    let root = doc.root_element();
+    // <movie>, <tvshow>, <episodedetails> — the tag names differ, the
+    // children do not.
+    let text = |name: &str| {
+        root.children()
+            .find(|c| c.has_tag_name(name))
+            .and_then(|c| c.text())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    let genres: Vec<String> = root
+        .children()
+        .filter(|c| c.has_tag_name("genre"))
+        .filter_map(|c| c.text())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    // A year on its own is enough to date an item; premiered wins.
+    let premiered = text("premiered").or_else(|| text("year").map(|y| format!("{y}-01-01")));
+    // The id a human curated, if any: <uniqueid> first, then the older
+    // dedicated tags. It becomes this answer's provider_id, so a local
+    // record is as identifiable as any other.
+    let unique = root
+        .children()
+        .find(|c| c.has_tag_name("uniqueid") && c.attribute("default") == Some("true"))
+        .or_else(|| root.children().find(|c| c.has_tag_name("uniqueid")))
+        .and_then(|c| c.text())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| text("tmdbid"))
+        .or_else(|| text("imdbid"));
+    let fields = crate::providers::Fields {
+        title: text("title").or_else(|| text("originaltitle")),
+        overview: text("plot").or_else(|| text("outline")),
+        rating: text("rating").and_then(|r| r.parse::<f64>().ok()).filter(|r| *r > 0.0),
+        premiered,
+        genres: (!genres.is_empty()).then(|| serde_json::to_string(&genres).unwrap_or_default()),
+        ..Default::default()
+    };
+    // A file with nothing usable in it is not an answer.
+    if fields.title.is_none() && fields.overview.is_none() && fields.premiered.is_none() {
+        return None;
+    }
+    Some((fields, unique))
+}
+
+/// HUB-9: the .nfo beside the media is a provider like any other, and by
+/// default the first one — a human wrote it, so it outranks a search
+/// result. It never reaches the network: the file is read through the
+/// same byte-plane lease artwork uses.
+pub(crate) struct LocalProvider {
+    sessions: Arc<crate::sessions::Sessions>,
+    registry: Arc<Registry>,
+}
+
+#[async_trait::async_trait]
+impl crate::providers::Provider for LocalProvider {
+    fn name(&self) -> &'static str {
+        "local"
+    }
+
+    async fn enrich(
+        &self,
+        db: &sqlx::SqlitePool,
+        item: &crate::providers::ItemRef,
+    ) -> Result<crate::providers::Outcome> {
+        // Costs nothing for the files that have no .nfo: the scan already
+        // recorded whether one exists, so this is a DB read, not a lease.
+        let Some((module_id, collection_id, nfo_rel)) = nfo_source(&self.registry, &item.id).await?
+        else {
+            return Ok(crate::providers::Outcome::NotApplicable);
+        };
+        let lease = self
+            .sessions
+            .open_lease(&self.registry, &module_id, &collection_id, &nfo_rel)
+            .await?;
+        let bytes = read_nfo(lease).await?;
+        let Some((fields, unique)) = parse_nfo(&String::from_utf8_lossy(&bytes)) else {
+            return Ok(crate::providers::Outcome::Declined);
+        };
+        // The path identifies the record when the file states no id: two
+        // items never share one .nfo, so it is stable and unique enough.
+        let provider_id = unique.unwrap_or_else(|| nfo_rel.clone());
+        crate::providers::store_answer(db, &item.id, "local", &provider_id, "auto", fields).await?;
+        tracing::debug!(item = %item.id, nfo = %nfo_rel, "local metadata adopted");
+        Ok(crate::providers::Outcome::Matched("auto"))
+    }
+}
+
+/// The .nfo recorded on any of this item's (or its children's) sources.
+async fn nfo_source(
+    registry: &Registry,
+    item_id: &str,
+) -> Result<Option<(String, String, String)>> {
+    let row = sqlx::query(
+        "SELECT s.module_id, s.collection_id,
+                json_extract(f.streams_json, '$.nfo') AS nfo
+         FROM item_sources s
+         JOIN files f ON (f.module_id, f.collection_id, f.path_rel)
+                       = (s.module_id, s.collection_id, s.path_rel)
+         WHERE (s.item_id = ?1
+                OR s.item_id IN (SELECT id FROM items WHERE parent_id = ?1))
+           AND nfo IS NOT NULL
+         LIMIT 1",
+    )
+    .bind(item_id)
+    .fetch_optional(registry.db())
+    .await
+    .context("nfo lookup")?;
+    Ok(row.map(|r| (r.get("module_id"), r.get("collection_id"), r.get("nfo"))))
+}
+
+/// Drain a (small) .nfo through a lease. Capped: a file claiming to be
+/// metadata and weighing megabytes is not one.
+async fn read_nfo(lease: crate::leases::Lease) -> Result<Vec<u8>> {
+    const MAX: u64 = 1 << 20;
+    let mut out = Vec::new();
+    let mut stream = lease.read_range(0, MAX).into_inner();
+    while let Some(chunk) = stream.recv().await {
+        out.extend_from_slice(&chunk.map_err(|e| anyhow::anyhow!("lease read: {e}"))?);
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod nfo_tests {
+    use super::parse_nfo;
+
+    /// A Kodi .nfo, and the half-filled ones people actually have.
+    #[test]
+    fn reads_what_a_human_wrote() {
+        let (f, id) = parse_nfo(
+            r#"<?xml version="1.0"?>
+            <movie>
+              <title>Solaris</title>
+              <plot>A psychologist is sent to a station orbiting Solaris.</plot>
+              <year>1972</year>
+              <rating>8.1</rating>
+              <genre>Science Fiction</genre>
+              <genre>Drama</genre>
+              <uniqueid type="tmdb" default="true">593</uniqueid>
+            </movie>"#,
+        )
+        .expect("a full nfo is an answer");
+        assert_eq!(f.title.as_deref(), Some("Solaris"));
+        assert_eq!(f.rating, Some(8.1));
+        // A bare <year> still dates the item.
+        assert_eq!(f.premiered.as_deref(), Some("1972-01-01"));
+        assert_eq!(f.genres.as_deref(), Some(r#"["Science Fiction","Drama"]"#));
+        assert_eq!(id.as_deref(), Some("593"), "the curated id identifies the record");
+
+        // <premiered> beats a <year>, and a file with only a title counts.
+        let (f, id) = parse_nfo(
+            "<tvshow><title>Andor</title><year>2021</year><premiered>2022-09-21</premiered></tvshow>",
+        )
+        .unwrap();
+        assert_eq!(f.premiered.as_deref(), Some("2022-09-21"));
+        assert_eq!(id, None, "no id in the file: the caller falls back to the path");
+
+        // Nothing usable is not an answer — better no row than an empty one.
+        assert!(parse_nfo("<movie><thumb>poster.jpg</thumb></movie>").is_none());
+        assert!(parse_nfo("not xml at all").is_none());
+        // A zero rating means unrated here too.
+        let (f, _) = parse_nfo("<movie><title>x</title><rating>0.0</rating></movie>").unwrap();
+        assert_eq!(f.rating, None);
     }
 }

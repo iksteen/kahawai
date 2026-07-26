@@ -269,6 +269,7 @@ fn inspect(root: &Path, path: &Path) -> Result<Inspected> {
     let mut info = kahawai_media::discover(path, DISCOVER_TIMEOUT)?;
     info.external_subtitles = find_sidecars(root, path);
     info.artwork = find_artwork(root, path);
+    info.nfo = find_nfo(root, path);
     // MH-4: declare embedded attachments (fonts) — name/mime/byte range
     // only, payloads are never read at scan time.
     if matches!(info.container.as_deref(), Some("matroska" | "webm")) {
@@ -305,6 +306,26 @@ fn find_artwork(root: &Path, media: &Path) -> Option<String> {
             if stem_ok && ext_ok {
                 return Some(p.strip_prefix(root).unwrap_or(p).to_string_lossy().into_owned());
             }
+        }
+    }
+    None
+}
+
+/// A Kodi-style .nfo for this file (HUB-9): `<stem>.nfo` beside it, else
+/// the directory's `movie.nfo`/`tvshow.nfo`. Only the path is recorded —
+/// the hub reads and parses it, because that is where the provider chain
+/// lives and the file is tiny.
+fn find_nfo(root: &Path, media: &Path) -> Option<String> {
+    let dir = media.parent()?;
+    let rel = |p: &Path| p.strip_prefix(root).unwrap_or(p).to_string_lossy().into_owned();
+    let beside = media.with_extension("nfo");
+    if beside.is_file() {
+        return Some(rel(&beside));
+    }
+    for name in ["movie.nfo", "tvshow.nfo"] {
+        let p = dir.join(name);
+        if p.is_file() {
+            return Some(rel(&p));
         }
     }
     None

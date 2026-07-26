@@ -105,11 +105,14 @@ pub fn media_type_key(media_type: &str) -> &'static str {
 /// The normative provider order for a media type — the default, and the
 /// permutation whitelist a stored order must stay within.
 pub fn chain_for(media_type: &str) -> &'static [&'static str] {
+    // HUB-9: local metadata leads every chain by default — a human wrote
+    // the .nfo beside the file, which outranks a search result. Movable
+    // like any other entry if you disagree.
     match media_type_key(media_type) {
-        "anime" => &["anime", "tmdb", "tvdb"],
-        "music" => &["musicbrainz"],
+        "anime" => &["local", "anime", "tmdb", "tvdb"],
+        "music" => &["local", "musicbrainz"],
         // movies and series: same default, separate chains.
-        _ => &["tmdb", "tvdb"],
+        _ => &["local", "tmdb", "tvdb"],
     }
 }
 

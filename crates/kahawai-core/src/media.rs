@@ -24,6 +24,12 @@ pub struct MediaInfo {
     /// cover/folder/poster image, path relative to the collection root.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artwork: Option<String>,
+    /// A Kodi-style .nfo beside the media file or in its directory
+    /// (HUB-9), path relative to the collection root. Recorded at scan so
+    /// the hub can decline instantly for the files that have none — it
+    /// costs a lease read to actually parse one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nfo: Option<String>,
     /// Container-level tags (title, artist, album, track number, …).
     #[serde(default)]
     pub tags: BTreeMap<String, String>,

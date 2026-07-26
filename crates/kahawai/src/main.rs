@@ -348,6 +348,8 @@ async fn run_hub_inner(
             }),
     );
     let enricher = Arc::new(kahawai_hub::enrich::Enricher::new(cfg.data_dir.clone()));
+    // HUB-9: local .nfo files are read over the byte plane, like artwork.
+    enricher.attach_sessions(sessions.clone());
     let artwork = Arc::new(kahawai_hub::artwork::Artwork::new(
         cfg.data_dir.join("artwork"),
         enricher.clone(),
