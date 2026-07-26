@@ -271,3 +271,40 @@ async fn due_work_is_offered_to_the_next_run() {
     .unwrap();
     assert_eq!(due_items(&db, 10).await, vec!["i1".to_string()]);
 }
+
+/// Only the kinds the chain walks may be queued. An episode's
+/// description comes from its show's episode pass, so a queue row for
+/// one is work nothing picks up — it would sit permanently due.
+#[tokio::test]
+async fn episodes_are_never_left_queued() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    sqlx::query("INSERT INTO items (id, kind, title, norm_title) VALUES ('ep', 'episode', 'e', 'e')")
+        .execute(&db)
+        .await
+        .unwrap();
+    item(&db, "show1").await;
+    for id in ["ep", "show1"] {
+        sqlx::query(
+            "INSERT INTO enrichment_queue (item_id, provider, due_at) VALUES (?, 'tmdb', unixepoch())",
+        )
+        .bind(id)
+        .execute(&db)
+        .await
+        .unwrap();
+    }
+    // The migration that closes this runs at open(); re-assert its rule
+    // the way the schema does, so a future backfill cannot reintroduce it.
+    sqlx::query(
+        "DELETE FROM enrichment_queue
+         WHERE item_id IN (SELECT id FROM items WHERE kind NOT IN ('movie','show','album'))",
+    )
+    .execute(&db)
+    .await
+    .unwrap();
+    let left: Vec<String> = sqlx::query_scalar("SELECT item_id FROM enrichment_queue")
+        .fetch_all(&db)
+        .await
+        .unwrap();
+    assert_eq!(left, vec!["show1".to_string()], "episode work must not linger");
+}

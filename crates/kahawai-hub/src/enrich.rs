@@ -681,7 +681,14 @@ impl Enricher {
             "SELECT i.id, i.title, i.artist FROM items i
              LEFT JOIN merged_metadata m ON m.item_id = i.id
              WHERE i.kind = 'album' AND i.artist IS NOT NULL
-               AND (m.item_id IS NULL OR (m.confidence = 'miss' AND m.updated_at < unixepoch() - 7 * 86400))
+               AND (m.item_id IS NULL
+                    OR (m.confidence = 'miss' AND m.updated_at < unixepoch() - 7 * 86400)
+                    -- Work the chain still owes: a provider that refused
+                    -- and is due again. Without this a rescheduled album
+                    -- would sit in the queue forever (HUB-5).
+                    OR EXISTS (
+                      SELECT 1 FROM enrichment_queue q
+                      WHERE q.item_id = i.id AND q.due_at <= unixepoch()))
              ORDER BY i.title",
         )
         .fetch_all(registry.db())
