@@ -1304,18 +1304,22 @@ impl Enricher {
              JOIN merged_metadata m ON m.item_id = i.id
              WHERE i.kind = 'show' AND m.provider_id != ''
                AND m.confidence != 'rejected'
-               -- An episode the provider's list does not cover gets a
-               -- recorded miss, which counts as answered: without that
-               -- the show looks short of episodes forever and every run
-               -- re-queries its whole episode list. Misses go stale after
-               -- a week so an airing show still picks up new episodes.
+               -- Episode data follows the chain like everything else
+               -- (HUB-5): every provider that identified this show is an
+               -- episode source, so a show whose owner carries no episode
+               -- list still gets one from the other. A provider that has
+               -- answered for an episode is not asked again; a recorded
+               -- miss goes stale after a week so airing shows converge.
                AND (EXISTS (
-                 SELECT 1 FROM items e
-                 LEFT JOIN merged_metadata em ON em.item_id = e.id
-                 WHERE e.parent_id = i.id
-                   AND (em.item_id IS NULL
-                        OR (em.confidence = 'miss'
-                            AND em.updated_at < unixepoch() - 7 * 86400)))
+                 SELECT 1 FROM provider_metadata sp
+                 JOIN items e ON e.parent_id = i.id
+                 LEFT JOIN provider_metadata ep
+                        ON ep.item_id = e.id AND ep.provider = sp.provider
+                 WHERE sp.item_id = i.id AND sp.provider_id != ''
+                   AND sp.provider IN ('tmdb', 'tvdb')
+                   AND (ep.item_id IS NULL
+                        OR (ep.confidence = 'miss'
+                            AND ep.updated_at < unixepoch() - 7 * 86400)))
                OR EXISTS (
                  SELECT 1 FROM items e
                  JOIN merged_metadata em ON em.item_id = e.id
@@ -1332,39 +1336,49 @@ impl Enricher {
         let sem = Arc::new(tokio::sync::Semaphore::new(3));
         let mut tasks = tokio::task::JoinSet::new();
         for row in shows {
-            let (show_id, mut provider, mut pid) = (
-                row.get::<String, _>("id"),
-                row.get::<String, _>("provider"),
-                row.get::<String, _>("provider_id"),
-            );
-            // Anime shows carry mapped TVDB/TMDB ids (HUB-29): episode
-            // data still comes from those providers.
-            if provider == "anilist" {
-                if let Some(tvdb) = row.get::<Option<i64>, _>("mapped_tvdb") {
-                    provider = "tvdb".into();
-                    pid = tvdb.to_string();
-                } else if let Some(tmdb) = row.get::<Option<i64>, _>("mapped_tmdb") {
-                    provider = "tmdb".into();
-                    pid = tmdb.to_string();
-                } else {
-                    continue; // no episode source for this one
+            let show_id = row.get::<String, _>("id");
+            let aid = row.get::<Option<i64>, _>("anidb_id").map(|a| a as u32);
+            // Every episode source this show has: the providers that
+            // identified it, plus the anime-lists mapped ids (HUB-29/31)
+            // for anime, whose own services carry no episode lists.
+            let mut sources: Vec<(String, String)> = sqlx::query(
+                "SELECT provider, provider_id FROM provider_metadata
+                 WHERE item_id = ? AND provider_id != '' AND provider IN ('tmdb','tvdb')",
+            )
+            .bind(&show_id)
+            .fetch_all(registry.db())
+            .await?
+            .into_iter()
+            .map(|r| (r.get::<String, _>("provider"), r.get::<String, _>("provider_id")))
+            .collect();
+            for (p, mapped) in [
+                ("tvdb", row.get::<Option<i64>, _>("mapped_tvdb")),
+                ("tmdb", row.get::<Option<i64>, _>("mapped_tmdb")),
+            ] {
+                if let Some(id) = mapped
+                    && !sources.iter().any(|(sp, _)| sp == p)
+                {
+                    sources.push((p.to_string(), id.to_string()));
                 }
             }
-            let this = self.clone();
-            let key = tmdb_key.to_string();
-            let token = tvdb_token.cloned();
-            let db = registry.db().clone();
-            let sem = sem.clone();
-            let aid = row.get::<Option<i64>, _>("anidb_id").map(|a| a as u32);
-            tasks.spawn(async move {
-                let _permit = sem.acquire().await;
-                if let Err(e) = this
-                    .enrich_show_episodes(&db, &show_id, &provider, &pid, &key, token.as_deref(), aid)
-                    .await
-                {
-                    tracing::warn!(show = %show_id, error = format!("{e:#}"), "episode fetch failed");
-                }
-            });
+            for (provider, pid) in sources {
+                let this = self.clone();
+                let key = tmdb_key.to_string();
+                let token = tvdb_token.cloned();
+                let db = registry.db().clone();
+                let sem = sem.clone();
+                let show = show_id.clone();
+                tasks.spawn(async move {
+                    let _permit = sem.acquire().await;
+                    if let Err(e) = this
+                        .enrich_show_episodes(&db, &show, &provider, &pid, &key, token.as_deref(), aid)
+                        .await
+                    {
+                        tracing::warn!(show = %show, provider = %provider,
+                            error = format!("{e:#}"), "episode fetch failed");
+                    }
+                });
+            }
         }
         while tasks.join_next().await.is_some() {}
         tracing::info!("episode enrichment complete");
