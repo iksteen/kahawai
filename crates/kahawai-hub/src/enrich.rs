@@ -675,6 +675,20 @@ impl Enricher {
                           WHERE pm.item_id = i.id
                             AND (pm.provider = r.provider
                                  OR (r.provider = 'anime' AND pm.provider = 'anilist'))))
+                    -- HUB-9: local owes an answer. Gated on there
+                    -- actually being something beside the media, or an
+                    -- item with no cover and no .nfo would be re-selected
+                    -- every run for a provider that stores nothing.
+                    OR (NOT EXISTS (SELECT 1 FROM provider_metadata pl
+                                     WHERE pl.item_id = i.id AND pl.provider = 'local')
+                        AND EXISTS (
+                          SELECT 1 FROM item_sources s4
+                          JOIN files f4 ON (f4.module_id, f4.collection_id, f4.path_rel)
+                                         = (s4.module_id, s4.collection_id, s4.path_rel)
+                          WHERE (s4.item_id = i.id
+                                 OR s4.item_id IN (SELECT id FROM items WHERE parent_id = i.id))
+                            AND (json_extract(f4.streams_json, '$.artwork') IS NOT NULL
+                                 OR json_extract(f4.streams_json, '$.nfo') IS NOT NULL)))
                     -- or a provider refused and is due again (bans and
                     -- rate limits reschedule, they never drop work).
                     OR EXISTS (
@@ -793,6 +807,20 @@ impl Enricher {
                         AND NOT EXISTS (
                           SELECT 1 FROM provider_metadata pm
                           WHERE pm.item_id = i.id AND pm.provider = r.provider))
+                    -- HUB-9: local owes an answer. Gated on there
+                    -- actually being something beside the media, or an
+                    -- item with no cover and no .nfo would be re-selected
+                    -- every run for a provider that stores nothing.
+                    OR (NOT EXISTS (SELECT 1 FROM provider_metadata pl
+                                     WHERE pl.item_id = i.id AND pl.provider = 'local')
+                        AND EXISTS (
+                          SELECT 1 FROM item_sources s4
+                          JOIN files f4 ON (f4.module_id, f4.collection_id, f4.path_rel)
+                                         = (s4.module_id, s4.collection_id, s4.path_rel)
+                          WHERE (s4.item_id = i.id
+                                 OR s4.item_id IN (SELECT id FROM items WHERE parent_id = i.id))
+                            AND (json_extract(f4.streams_json, '$.artwork') IS NOT NULL
+                                 OR json_extract(f4.streams_json, '$.nfo') IS NOT NULL)))
                     -- Work the chain still owes: a provider that refused
                     -- and is due again. Without this a rescheduled album
                     -- would sit in the queue forever (HUB-5).
@@ -946,6 +974,20 @@ impl Enricher {
                        WHERE pm.item_id = i.id
                          AND (pm.provider = r.provider
                               OR (r.provider = 'anime' AND pm.provider = 'anilist'))))
+                    -- HUB-9: local owes an answer. Gated on there
+                    -- actually being something beside the media, or an
+                    -- item with no cover and no .nfo would be re-selected
+                    -- every run for a provider that stores nothing.
+                    OR (NOT EXISTS (SELECT 1 FROM provider_metadata pl
+                                     WHERE pl.item_id = i.id AND pl.provider = 'local')
+                        AND EXISTS (
+                          SELECT 1 FROM item_sources s4
+                          JOIN files f4 ON (f4.module_id, f4.collection_id, f4.path_rel)
+                                         = (s4.module_id, s4.collection_id, s4.path_rel)
+                          WHERE (s4.item_id = i.id
+                                 OR s4.item_id IN (SELECT id FROM items WHERE parent_id = i.id))
+                            AND (json_extract(f4.streams_json, '$.artwork') IS NOT NULL
+                                 OR json_extract(f4.streams_json, '$.nfo') IS NOT NULL)))
                  OR EXISTS (
                    SELECT 1 FROM enrichment_queue q
                    WHERE q.item_id = i.id AND q.due_at <= unixepoch())

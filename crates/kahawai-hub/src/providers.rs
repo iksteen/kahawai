@@ -105,16 +105,27 @@ pub fn media_type_key(media_type: &str) -> &'static str {
 /// The normative provider order for a media type — the default, and the
 /// permutation whitelist a stored order must stay within.
 pub fn chain_for(media_type: &str) -> &'static [&'static str] {
-    // HUB-9: local metadata leads every chain by default — a human wrote
-    // the .nfo beside the file, which outranks a search result. Movable
-    // like any other entry if you disagree.
     match media_type_key(media_type) {
-        "anime" => &["local", "anime", "tmdb", "tvdb"],
-        "music" => &["local", "musicbrainz"],
+        "anime" => &["anime", "tmdb", "tvdb"],
+        "music" => &["musicbrainz"],
         // movies and series: same default, separate chains.
-        _ => &["local", "tmdb", "tvdb"],
+        _ => &["tmdb", "tvdb"],
     }
 }
+
+/// The provider that is not in any chain (HUB-9).
+///
+/// `local` reads what is already beside the media — a cover, a Kodi
+/// `.nfo` — which is the owner's own data rather than a service's guess
+/// at it. Ranking it would imply there is a sensible order in which a
+/// remote search beats the file on your disk, so it is not ranked: it is
+/// asked before the chain and its answers sort ahead of every provider's.
+///
+/// The one thing that displaces it is the owner contradicting it — a
+/// manual pin elsewhere, or a rejection of the record its `.nfo` claimed.
+/// Then local steps aside wholesale, cover included: overriding what the
+/// file says about a work is not a statement about one field of it.
+pub const LOCAL: &str = "local";
 
 /// The order in force for a media type, from `provider_ranks`.
 ///
@@ -201,6 +212,9 @@ SELECT item_id, provider, provider_id, media_type, 0, unixepoch() FROM (
   SELECT t.item_id, t.media_type, pm.provider, pm.provider_id,
          ROW_NUMBER() OVER (PARTITION BY t.item_id ORDER BY
              CASE pm.confidence WHEN 'auto' THEN 0 WHEN 'weak' THEN 1 ELSE 2 END,
+             -- HUB-9: local is unranked and first. A .nfo states what the
+             -- owner says this is; nothing a search turned up outbids it.
+             pm.provider <> 'local',
              COALESCE(r.rank, 99),
              pm.provider) AS n
     FROM (
@@ -609,7 +623,11 @@ impl ProviderSet {
         db: &SqlitePool,
         item: &ItemRef,
     ) -> Option<&'static str> {
-        let chain = chain_in_force(db, media_type).await;
+        // HUB-9: local is asked BEFORE the chain and is not in it, so
+        // there is no ordering in which the owner's own files end up
+        // behind a search result. See LOCAL.
+        let mut chain = vec![LOCAL.to_string()];
+        chain.extend(chain_in_force(db, media_type).await);
         let mut result: Option<&'static str> = None;
         for name in &chain {
             let Some(p) = self.get(name) else { continue };
@@ -742,14 +760,17 @@ SELECT i.id AS item_id, pm.provider, pm.provider_id, pm.confidence,
     // service's idea of this work, and letting it redescribe the assigned
     // one is how a wrong title used to appear under a right match.
     //
-    // An answer with an empty provider_id claims no record — it is a
-    // field somebody found lying next to the file, like the cover the
-    // scan picked up (HUB-9). Nothing about it can contradict the
-    // assignment, so it competes on rank alone, which is what puts
-    // `local` at rank 0 ahead of a provider's own poster and, crucially,
-    // what makes moving `local` down the chain actually do something.
+    // Before all of them sits `local`, which is unranked because there is
+    // no order in which a search result should beat the file on the
+    // owner's disk (HUB-9). It leads on the first key, not by holding
+    // rank 0 — a rank is a knob, and this one had no sensible setting.
+    //
+    // It leads only while its record stands, though: the group key above
+    // is what drops local behind the chain once the owner has pinned
+    // somebody else or rejected what the .nfo claimed. A cover carries no
+    // record, so it is never in that group and never displaced.
     let field_order = "ORDER BY (ap.provider_id <> '' AND ap.not_chosen), \
-                       ap.rank, ap.not_chosen LIMIT 1";
+                       (ap.provider <> 'local'), ap.rank, ap.not_chosen LIMIT 1";
     let fields: String = RESOLVED_FIELDS
         .iter()
         .map(|(name, present, value)| {

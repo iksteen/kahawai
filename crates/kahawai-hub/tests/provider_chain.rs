@@ -45,7 +45,7 @@ async fn earlier_provider_wins_a_field_and_later_ones_fill_the_holes() {
     let db = kahawai_hub::db::open(dir.path()).await.unwrap();
     item(&db, "i1").await;
     let chain = chain_in_force(&db, "movies").await;
-    assert_eq!(chain, vec!["local", "tmdb", "tvdb"]);
+    assert_eq!(chain, vec!["tmdb", "tvdb"]);
 
     // TMDB matched, but has no synopsis and no rating for this one.
     store_answer(&db, "i1", "tmdb", "550", "auto", answer("Fight Club", None, None))
@@ -85,14 +85,14 @@ async fn reordering_re_decides_ownership_without_asking_anyone() {
 
     // Rank TVDB above TMDB. No provider is contacted: the answers are
     // already on disk, which is the whole reason this is affordable.
-    set_chain(&db, "movies", &["local".into(), "tvdb".into(), "tmdb".into()]).await.unwrap();
+    set_chain(&db, "movies", &["tvdb".into(), "tmdb".into()]).await.unwrap();
     let (provider, title, overview, _) = merged(&db, "i1").await;
     assert_eq!(title.as_deref(), Some("TVDB title"), "the reorder took effect");
     assert_eq!(overview.as_deref(), Some("tvdb"));
     assert_eq!(provider, "tvdb", "identity follows the order too");
 
     // And back again — nothing was lost in the first merge.
-    set_chain(&db, "movies", &["local".into(), "tmdb".into(), "tvdb".into()]).await.unwrap();
+    set_chain(&db, "movies", &["tmdb".into(), "tvdb".into()]).await.unwrap();
     assert_eq!(merged(&db, "i1").await.1.as_deref(), Some("TMDB title"));
 }
 
@@ -114,7 +114,7 @@ async fn a_manual_pick_outranks_every_provider_and_survives_reorders() {
     assert_eq!(merged(&db, "i1").await.1.as_deref(), Some("Robot Wars (1993)"));
 
     // TMDB is ranked first and re-runs — the human's answer still wins.
-    set_chain(&db, "movies", &["local".into(), "tmdb".into(), "tvdb".into()]).await.unwrap();
+    set_chain(&db, "movies", &["tmdb".into(), "tvdb".into()]).await.unwrap();
     let (provider, title, ..) = merged(&db, "i1").await;
     assert_eq!(title.as_deref(), Some("Robot Wars (1993)"), "a reorder cannot undo a human");
     assert_eq!(provider, "tvdb", "and it stays attributed to the real service");
@@ -126,9 +126,9 @@ async fn a_stored_order_that_is_not_a_permutation_is_refused() {
     let db = kahawai_hub::db::open(dir.path()).await.unwrap();
     // Dropping a provider would silently disable it; adding an unknown
     // one would silently do nothing.
-    assert!(set_chain(&db, "movies", &["local".into(), "tmdb".into()]).await.is_err());
-    assert!(set_chain(&db, "movies", &["local".into(), "tmdb".into(), "imdb".into()]).await.is_err());
-    assert_eq!(chain_in_force(&db, "movies").await, vec!["local", "tmdb", "tvdb"]);
+    assert!(set_chain(&db, "movies", &["tmdb".into()]).await.is_err());
+    assert!(set_chain(&db, "movies", &["tmdb".into(), "imdb".into()]).await.is_err());
+    assert_eq!(chain_in_force(&db, "movies").await, vec!["tmdb", "tvdb"]);
 }
 
 #[tokio::test]
@@ -161,7 +161,7 @@ async fn an_items_media_type_comes_from_the_collection_it_lives_in() {
     .await
     .unwrap();
     assert_eq!(media_type_of_item(&db, "i1").await, "anime");
-    assert_eq!(chain_in_force(&db, "anime").await, vec!["local", "anime", "tmdb", "tvdb"]);
+    assert_eq!(chain_in_force(&db, "anime").await, vec!["anime", "tmdb", "tvdb"]);
 }
 
 /// The anime composite stores its half under `anilist`; it must still
@@ -328,12 +328,12 @@ async fn series_has_its_own_chain_independent_of_movies() {
     assert_eq!(media_type_key("podcasts"), "movies");
 
     // Seeded separately, and moving one leaves the other alone.
-    assert_eq!(chain_in_force(&db, "series").await, vec!["local", "tmdb", "tvdb"]);
-    set_chain(&db, "series", &["local".into(), "tvdb".into(), "tmdb".into()]).await.unwrap();
-    assert_eq!(chain_in_force(&db, "series").await, vec!["local", "tvdb", "tmdb"]);
+    assert_eq!(chain_in_force(&db, "series").await, vec!["tmdb", "tvdb"]);
+    set_chain(&db, "series", &["tvdb".into(), "tmdb".into()]).await.unwrap();
+    assert_eq!(chain_in_force(&db, "series").await, vec!["tvdb", "tmdb"]);
     assert_eq!(
         chain_in_force(&db, "movies").await,
-        vec!["local", "tmdb", "tvdb"],
+        vec!["tmdb", "tvdb"],
         "reordering series must not touch films"
     );
 }
@@ -371,7 +371,7 @@ async fn a_complete_row_does_not_stop_the_chain() {
         .unwrap();
     assert_eq!(merged(&db, "i1").await.1.as_deref(), Some("Fight Club"));
 
-    set_chain(&db, "movies", &["local".into(), "tvdb".into(), "tmdb".into()]).await.unwrap();
+    set_chain(&db, "movies", &["tvdb".into(), "tmdb".into()]).await.unwrap();
     let (provider, title, overview, rating) = merged(&db, "i1").await;
     assert_eq!(title.as_deref(), Some("TVDB title"), "the reorder now has data to pick");
     assert_eq!(overview.as_deref(), Some("tvdb"));
@@ -411,7 +411,7 @@ async fn a_weak_non_owner_does_not_donate_fields() {
     // Ranking it first does NOT hand it the item: rank breaks ties
     // between comparable matches, it does not promote a guess over a
     // certainty.
-    set_chain(&db, "movies", &["local".into(), "tvdb".into(), "tmdb".into()]).await.unwrap();
+    set_chain(&db, "movies", &["tvdb".into(), "tmdb".into()]).await.unwrap();
     let (provider, _, overview, _) = merged(&db, "i1").await;
     assert_eq!(provider, "tmdb", "the confident match keeps the item");
     assert_eq!(overview, None, "and the weak stranger still donates nothing");
@@ -580,7 +580,7 @@ async fn strong_beats_weak_across_the_preference_order() {
     answer_row(&db, "i1", "tmdb", "111", "auto").await;
     kahawai_hub::providers::assign(&db, "i1").await.unwrap();
     assert_eq!(assigned(&db, "i1").await.unwrap().0, "tmdb");
-    set_chain(&db, "movies", &["local".into(), "tvdb".into(), "tmdb".into()]).await.unwrap();
+    set_chain(&db, "movies", &["tvdb".into(), "tmdb".into()]).await.unwrap();
     kahawai_hub::providers::assign_media_type(&db, "movies").await.unwrap();
     assert_eq!(assigned(&db, "i1").await.unwrap().0, "tvdb");
 }
@@ -629,7 +629,7 @@ async fn a_bridged_answer_never_owns_the_item() {
     answer_row(&db, "i1", "anilist", "9253", "auto").await;
     answer_row(&db, "i1", "tmdb", "42509", "bridged").await;
     // Rank TMDB above the anime composite; the bridge still cannot win.
-    set_chain(&db, "anime", &["local".into(), "tmdb".into(), "anime".into(), "tvdb".into()]).await.unwrap();
+    set_chain(&db, "anime", &["tmdb".into(), "anime".into(), "tvdb".into()]).await.unwrap();
     kahawai_hub::providers::assign(&db, "i1").await.unwrap();
     assert_eq!(assigned(&db, "i1").await.unwrap().0, "anilist");
 
@@ -722,7 +722,7 @@ async fn a_manual_assignment_is_never_recomputed() {
     // TMDB ranks first and answers strongly: the pin still holds.
     answer_row(&db, "i1", "tmdb", "111", "auto").await;
     kahawai_hub::providers::assign(&db, "i1").await.unwrap();
-    set_chain(&db, "movies", &["local".into(), "tmdb".into(), "tvdb".into()]).await.unwrap();
+    set_chain(&db, "movies", &["tmdb".into(), "tvdb".into()]).await.unwrap();
     assert_eq!(assigned(&db, "i1").await, Some(("tvdb".into(), "414734".into(), true)));
 }
 
@@ -898,14 +898,14 @@ async fn the_view_stays_flattenable() {
 }
 
 
-/// HUB-9: local metadata leads every chain by default, so a human's .nfo
-/// wins the fields it states and the search results fill the rest.
+/// HUB-9: local is not in any chain and leads anyway. A .nfo wins the
+/// fields it states; the search results fill in the rest.
 #[tokio::test]
 async fn local_metadata_leads_the_chain() {
     let dir = tempfile::tempdir().unwrap();
     let db = kahawai_hub::db::open(dir.path()).await.unwrap();
-    assert_eq!(chain_in_force(&db, "movies").await, vec!["local", "tmdb", "tvdb"]);
-    assert_eq!(chain_in_force(&db, "anime").await, vec!["local", "anime", "tmdb", "tvdb"]);
+    assert_eq!(chain_in_force(&db, "movies").await, vec!["tmdb", "tvdb"]);
+    assert_eq!(chain_in_force(&db, "anime").await, vec!["anime", "tmdb", "tvdb"]);
 
     item(&db, "i1").await;
     store_answer(&db, "i1", "tmdb", "593", "auto", answer("Solaris (1972)", Some("tmdb plot"), Some(8.0)))
@@ -927,15 +927,67 @@ async fn local_metadata_leads_the_chain() {
     assert_eq!(overview.as_deref(), Some("tmdb plot"), "side-filled");
     assert_eq!(rating, Some(8.0));
 
-    // And it is movable like any other entry.
-    set_chain(&db, "movies", &["tmdb".into(), "local".into(), "tvdb".into()]).await.unwrap();
-    assert_eq!(assigned(&db, "i1").await.unwrap().0, "tmdb");
-    assert_eq!(merged(&db, "i1").await.1.as_deref(), Some("Solaris (1972)"));
+    // It is not orderable: there is no position to move it to, and a
+    // chain naming it is refused rather than quietly accepted.
+    assert!(set_chain(&db, "movies", &["tmdb".into(), "local".into(), "tvdb".into()])
+        .await
+        .is_err());
+    // Reordering what IS in the chain leaves local in front.
+    set_chain(&db, "movies", &["tvdb".into(), "tmdb".into()]).await.unwrap();
+    assert_eq!(assigned(&db, "i1").await.unwrap().0, "local");
+    assert_eq!(merged(&db, "i1").await.1.as_deref(), Some("Solyaris"));
 }
 
-/// HUB-9: the cover next to the file is a field the `local` provider
-/// supplies at rank 0 — it beats TMDB's poster without becoming the
-/// answer to "what work is this?", which a picture cannot say.
+/// The one thing that displaces local: the owner contradicting it. A pin
+/// elsewhere means the .nfo is wrong about which work this is, so local
+/// steps aside wholesale rather than keeping the fields it stated.
+#[tokio::test]
+async fn a_pin_elsewhere_displaces_the_nfo() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    item(&db, "i1").await;
+    store_answer(&db, "i1", "tmdb", "593", "auto", answer("Solaris", Some("tmdb plot"), None))
+        .await
+        .unwrap();
+    store_answer(
+        &db, "i1", "local", "nfo", "auto",
+        Fields { title: Some("Solyaris".into()), ..Default::default() },
+    )
+    .await
+    .unwrap();
+    assert_eq!(merged(&db, "i1").await.1.as_deref(), Some("Solyaris"));
+
+    // The pick carries the record's own fields, as the API does when a
+    // human chooses one out of the search results.
+    kahawai_hub::providers::assign_manual(
+        &db, "i1", "tmdb", "593",
+        answer("Solaris", Some("tmdb plot"), None),
+    )
+    .await
+    .unwrap();
+    let (provider, title, _, _) = merged(&db, "i1").await;
+    assert_eq!(provider, "tmdb");
+    assert_eq!(title.as_deref(), Some("Solaris"), "the pin is not overridden by the .nfo");
+
+    // A cover claims no record, so a pin about identity never displaces
+    // it — that is the whole reason it answers with an empty id.
+    store_answer(
+        &db, "i1", "local", "", "auto",
+        Fields { poster_path: Some("local://cover.jpg".into()), ..Default::default() },
+    )
+    .await
+    .unwrap();
+    let p: Option<String> =
+        sqlx::query_scalar("SELECT poster_path FROM resolved_metadata WHERE item_id = 'i1'")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    assert_eq!(p.as_deref(), Some("local://cover.jpg"));
+}
+
+/// HUB-9: the cover next to the file beats a provider's own poster
+/// without becoming the answer to "what work is this?", which a picture
+/// cannot say — and without holding a rank to beat it with.
 #[tokio::test]
 async fn local_artwork_supplies_the_poster_but_never_the_identity() {
     let dir = tempfile::tempdir().unwrap();
@@ -984,12 +1036,11 @@ async fn local_artwork_supplies_the_poster_but_never_the_identity() {
             .unwrap();
     assert_eq!(m.as_deref(), Some("tmdb"));
 
-    // Rank local below tmdb and the cover loses — the point of the chain.
-    set_chain(&db, "movies", &["tmdb".into(), "local".into(), "tvdb".into()]).await.unwrap();
-    let p: Option<String> =
-        sqlx::query_scalar("SELECT poster_path FROM resolved_metadata WHERE item_id = 'i1'")
-            .fetch_one(&db)
+    // local holds no rank at all — the cover wins on being local.
+    let ranked: Vec<String> =
+        sqlx::query_scalar("SELECT provider FROM provider_ranks WHERE provider = 'local'")
+            .fetch_all(&db)
             .await
             .unwrap();
-    assert_eq!(p.as_deref(), Some("/tmdb.jpg"));
+    assert!(ranked.is_empty(), "local must not be rankable");
 }
