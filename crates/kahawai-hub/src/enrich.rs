@@ -655,9 +655,13 @@ impl Enricher {
                     OR s3.item_id IN (SELECT id FROM items WHERE parent_id = i.id)
                  LIMIT 1)
              WHERE i.kind IN ('movie', 'show')
-               -- A human refused every record this item holds: leave it be
-               -- until a provider offers something that is not refused.
                AND (
+                    -- Never matched, and not because a human refused
+                    -- everything it holds — that one waits for a record
+                    -- that is not refused rather than being re-asked.
+                    (NOT EXISTS (SELECT 1 FROM item_match m WHERE m.item_id = i.id)
+                     AND NOT EXISTS (SELECT 1 FROM rejected_matches rj
+                                      WHERE rj.item_id = i.id))
                     -- HUB-5: every provider in the chain answers once,
                     -- whatever the order — so an item needs work while
                     -- any of them has never been asked.
@@ -779,8 +783,16 @@ impl Enricher {
         let albums = sqlx::query(
             "SELECT i.id, i.title, i.artist FROM items i
              WHERE i.kind = 'album' AND i.artist IS NOT NULL
-               AND (m.item_id IS NULL
-                    OR (m.confidence = 'miss' AND m.updated_at < unixepoch() - 7 * 86400)
+               AND (NOT EXISTS (SELECT 1 FROM item_match m WHERE m.item_id = i.id)
+                    -- Same rule as the video pass: the chain owes an answer
+                    -- while any ranked provider has never been asked, which
+                    -- is what brings `local` to an already-matched album.
+                    OR EXISTS (
+                      SELECT 1 FROM provider_ranks r
+                      WHERE r.media_type = 'music'
+                        AND NOT EXISTS (
+                          SELECT 1 FROM provider_metadata pm
+                          WHERE pm.item_id = i.id AND pm.provider = r.provider))
                     -- Work the chain still owes: a provider that refused
                     -- and is due again. Without this a rescheduled album
                     -- would sit in the queue forever (HUB-5).
@@ -913,10 +925,16 @@ impl Enricher {
                 OR s.item_id IN (SELECT id FROM items WHERE parent_id = i.id)
              JOIN collections c ON (c.module_id, c.collection_id)
                                  = (s.module_id, s.collection_id)
+             LEFT JOIN item_match m ON m.item_id = i.id
+             LEFT JOIN anime_ids a ON a.item_id = i.id
              WHERE c.media_type = 'anime' AND i.kind IN ('movie', 'show')
-               AND (m.confidence IS NULL OR m.confidence != 'rejected')
                AND (
-                 m.item_id IS NULL OR m.anilist_id IS NULL
+                 -- Unmatched, unless a human refused everything it holds.
+                 (m.item_id IS NULL
+                  AND NOT EXISTS (SELECT 1 FROM rejected_matches rj
+                                   WHERE rj.item_id = i.id))
+                 -- Identity not bridged yet: the anime chain's whole job.
+                 OR a.anilist_id IS NULL
                  -- HUB-5: the tail answers too, whatever the order —
                  -- so this item needs work while any chain provider has
                  -- never been asked, or one is due again after refusing.
