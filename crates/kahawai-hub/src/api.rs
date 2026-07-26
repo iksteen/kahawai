@@ -595,7 +595,10 @@ async fn admin_review_list(State(state): State<AppState>) -> Result<Json<Value>,
                 (SELECT s.path_rel FROM item_sources s WHERE s.item_id = i.id LIMIT 1) AS path
          FROM items i
          JOIN resolved_metadata m ON m.item_id = i.id
+         -- Only what a human can act on: episodes and tracks inherit their
+         -- parent's match and have no re-match affordance in the UI.
          WHERE m.confidence IN ('miss', 'weak', 'rejected')
+           AND i.kind IN ('movie', 'show', 'album')
          ORDER BY m.confidence != 'miss', i.title",
     )
     .fetch_all(state.registry.db())
@@ -613,7 +616,7 @@ async fn admin_review_list(State(state): State<AppState>) -> Result<Json<Value>,
                 "confidence": r.get::<String, _>("confidence"),
                 "matched_title": r.get::<Option<String>, _>("matched_title"),
                 "premiered": r.get::<Option<String>, _>("premiered"),
-                "provider": r.get::<String, _>("provider"),
+                "provider": r.try_get::<Option<String>, _>("provider").ok().flatten(),
             })
         })
         .collect();
@@ -1623,7 +1626,7 @@ async fn item_detail(
             "rating": m.get::<Option<f64>, _>("rating"),
             "premiered": m.get::<Option<String>, _>("premiered"),
             "confidence": m.get::<String, _>("confidence"),
-            "provider": m.get::<String, _>("provider"),
+            "provider": m.try_get::<Option<String>, _>("provider").ok().flatten(),
             "original_language": m
                 .get::<Option<String>, _>("original_language")
                 .filter(|l| !l.is_empty()),
