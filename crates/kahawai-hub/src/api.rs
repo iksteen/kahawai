@@ -267,7 +267,7 @@ async fn admin_providers(State(state): State<AppState>) -> Result<Json<Value>, A
         .is_some();
     let db = state.registry.db();
     let mut chains = serde_json::Map::new();
-    for mt in ["movies", "anime", "music"] {
+    for mt in crate::providers::MEDIA_TYPES {
         chains.insert(
             mt.to_string(),
             json!({

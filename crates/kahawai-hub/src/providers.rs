@@ -97,12 +97,25 @@ pub trait Provider: Send + Sync {
     async fn finish(&self) {}
 }
 
-/// The normative provider order per media type — the default, and what
-/// an unset/invalid stored order falls back to.
+/// Every media type that enriches, each with its OWN chain. Movies and
+/// series share a *default* order, which is not the same as sharing a
+/// chain: someone may well want TVDB first for series and TMDB first for
+/// films, and per-type ordering is the only way to say that.
+pub const MEDIA_TYPES: [&str; 4] = ["movies", "series", "anime", "music"];
+
+/// A collection's media type as a chain name. Anything unrecognised
+/// enriches as movies rather than silently having no chain at all.
+pub fn media_type_key(media_type: &str) -> &'static str {
+    MEDIA_TYPES.into_iter().find(|m| *m == media_type).unwrap_or("movies")
+}
+
+/// The normative provider order for a media type — the default, and the
+/// permutation whitelist a stored order must stay within.
 pub fn chain_for(media_type: &str) -> &'static [&'static str] {
-    match media_type {
+    match media_type_key(media_type) {
         "anime" => &["anime", "tmdb", "tvdb"],
         "music" => &["musicbrainz"],
+        // movies and series: same default, separate chains.
         _ => &["tmdb", "tvdb"],
     }
 }
@@ -117,7 +130,7 @@ pub async fn chain_in_force(db: &SqlitePool, media_type: &str) -> Vec<String> {
     let stored: Vec<String> = sqlx::query_scalar(
         "SELECT provider FROM provider_ranks WHERE media_type = ? ORDER BY rank",
     )
-    .bind(media_type)
+    .bind(media_type_key(media_type))
     .fetch_all(db)
     .await
     .unwrap_or_default();
@@ -131,6 +144,7 @@ pub async fn chain_in_force(db: &SqlitePool, media_type: &str) -> Vec<String> {
 /// Only a permutation of the known set is accepted: dropping a provider
 /// would silently disable it, adding an unknown one would do nothing.
 pub async fn set_chain(db: &SqlitePool, media_type: &str, order: &[String]) -> Result<()> {
+    let media_type = media_type_key(media_type);
     let known = chain_for(media_type);
     anyhow::ensure!(
         order.len() == known.len() && known.iter().all(|k| order.iter().any(|s| s == k)),
@@ -251,11 +265,7 @@ pub async fn media_type_of_item(db: &SqlitePool, item_id: &str) -> String {
     .await
     .ok()
     .flatten();
-    match mt.as_deref() {
-        Some("anime") => "anime".into(),
-        Some("music") => "music".into(),
-        _ => "movies".into(),
-    }
+    media_type_key(mt.as_deref().unwrap_or_default()).to_string()
 }
 
 /// Has this chain entry already answered for this item? Compares by
@@ -349,6 +359,7 @@ pub async fn materialize(db: &SqlitePool, item_id: &str, chain: &[String]) -> Re
 /// Re-merge every item of one media type — what a reorder costs. Pure
 /// local work: no provider is contacted.
 pub async fn rematerialize_media_type(db: &SqlitePool, media_type: &str) -> Result<()> {
+    let media_type = media_type_key(media_type);
     let chain = chain_in_force(db, media_type).await;
     // Must classify items exactly as `media_type_of_item` does —
     // including its default — or a reorder would silently skip the
@@ -357,9 +368,8 @@ pub async fn rematerialize_media_type(db: &SqlitePool, media_type: &str) -> Resu
         "SELECT DISTINCT pm.item_id FROM provider_metadata pm
          JOIN items i ON i.id = pm.item_id
          WHERE COALESCE((
-                 SELECT CASE WHEN c.media_type = 'anime' THEN 'anime'
-                             WHEN c.media_type = 'music' THEN 'music'
-                             ELSE 'movies' END
+                 SELECT CASE WHEN c.media_type IN ('movies','series','anime','music')
+                             THEN c.media_type ELSE 'movies' END
                  FROM item_sources s
                  JOIN collections c ON (c.module_id, c.collection_id)
                                      = (s.module_id, s.collection_id)

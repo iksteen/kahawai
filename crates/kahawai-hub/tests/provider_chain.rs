@@ -308,3 +308,28 @@ async fn episodes_are_never_left_queued() {
         .unwrap();
     assert_eq!(left, vec!["show1".to_string()], "episode work must not linger");
 }
+
+/// Movies and series share a DEFAULT order, not a chain. Ranking TVDB
+/// first for series must leave films untouched — the grouping in the
+/// requirement is about the defaults being equal, nothing more.
+#[tokio::test]
+async fn series_has_its_own_chain_independent_of_movies() {
+    use kahawai_hub::providers::{chain_for, media_type_key, MEDIA_TYPES};
+    let dir = tempfile::tempdir().unwrap();
+    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    assert!(MEDIA_TYPES.contains(&"series"));
+    assert_eq!(media_type_key("series"), "series");
+    assert_eq!(chain_for("series"), chain_for("movies"), "same default");
+    // An unknown media type still enriches rather than having no chain.
+    assert_eq!(media_type_key("podcasts"), "movies");
+
+    // Seeded separately, and moving one leaves the other alone.
+    assert_eq!(chain_in_force(&db, "series").await, vec!["tmdb", "tvdb"]);
+    set_chain(&db, "series", &["tvdb".into(), "tmdb".into()]).await.unwrap();
+    assert_eq!(chain_in_force(&db, "series").await, vec!["tvdb", "tmdb"]);
+    assert_eq!(
+        chain_in_force(&db, "movies").await,
+        vec!["tmdb", "tvdb"],
+        "reordering series must not touch films"
+    );
+}

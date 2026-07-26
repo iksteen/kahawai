@@ -568,7 +568,15 @@ impl Enricher {
         let items = sqlx::query(
             "SELECT i.id, i.kind, i.title, i.year,
                     (SELECT s.path_rel FROM item_sources s
-                     WHERE s.item_id = i.id LIMIT 1) AS src_path
+                     WHERE s.item_id = i.id LIMIT 1) AS src_path,
+                    -- Movies and series have separate chains (HUB-5), so
+                    -- the walk needs each item's OWN media type.
+                    (SELECT c.media_type FROM item_sources s2
+                     JOIN collections c ON (c.module_id, c.collection_id)
+                                         = (s2.module_id, s2.collection_id)
+                     WHERE s2.item_id = i.id
+                        OR s2.item_id IN (SELECT id FROM items WHERE parent_id = i.id)
+                     LIMIT 1) AS media_type
              FROM items i
              LEFT JOIN merged_metadata m ON m.item_id = i.id
              WHERE i.kind IN ('movie', 'show')
@@ -600,6 +608,9 @@ impl Enricher {
                 row.get::<String, _>("kind"),
                 row.get::<String, _>("title"),
                 row.get::<Option<i64>, _>("year"),
+            );
+            let media_type = crate::providers::media_type_key(
+                row.get::<Option<String>, _>("media_type").as_deref().unwrap_or_default(),
             );
             // A movie in its own subdirectory carries a second identity:
             // the directory name, often cleaner than the release-junk
@@ -633,7 +644,7 @@ impl Enricher {
             let sem = sem.clone();
             tasks.spawn(async move {
                 let _permit = sem.acquire().await;
-                match set.run_chain("movies", &db, &item).await {
+                match set.run_chain(media_type, &db, &item).await {
                     Some("auto") => {
                         this.progress.0.fetch_add(1, Ordering::SeqCst);
                     }
