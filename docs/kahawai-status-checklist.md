@@ -4,7 +4,8 @@ Status of every numbered requirement from `kahawai-technical-requirements.md`,
 plus the v1 acceptance criteria. Checked = implemented and exercised against
 the live deployment. Unchecked items carry a note when partially done.
 
-Last updated: 2026-07-26 (provider pacing rewritten against the published
+Last updated: 2026-07-26 (HUB-5 rebuilt on per-item assignment + read-time
+resolution; HUB-7 closed; dependencies bumped).
 limits, OPS-6 scoped to re-derivable caches).
 
 ## Architecture (AR)
@@ -71,30 +72,47 @@ limits, OPS-6 scoped to re-derivable caches).
 - [x] HUB-4 Filename/dirname parsing (movies, episodes, anime conventions, music layout)
 - [x] HUB-20 Mediahost deletion cascade + watch-state/match archives restored on re-enroll
 - [x] HUB-5 Provider trait + declared chains + walker (TMDB, TVDB, anime
-      composite, MusicBrainz + CAA), with first-claim-wins at FIELD
-      granularity: every provider's answer is stored in
-      `provider_metadata`, and the served row is the merge of those by
-      rank — so AniDB owns an anime's title while TMDB supplies the
-      synopsis and cover it has nothing for. Order is per media type
+      composite, MusicBrainz + CAA). One row per top-level item says which
+      provider record it IS (`item_match`, plus whether a human chose it);
+      everything descriptive is resolved per read from the providers' own
+      answers, assigned provider first and then the media type's
+      preference order (`resolved_metadata`). So AniDB owns an anime's
+      title while TMDB supplies the synopsis and cover it has nothing for,
+      and nothing is stored that a read can derive. Episodes and tracks
+      carry no assignment: they render through their parent's.
+      Assignment is strongest-match-first, then order — a strong match
+      beats a weak one whatever the ranking says — and re-picked whenever
+      an answer lands, so a more preferred provider that gains info
+      replaces an automatic match by itself. Order is per media type
       (requirement amended 2026-07-26 from "per library"), editable at
-      runtime via `POST /admin/v1/providers/chains/{media_type}`;
-      a reorder re-merges from stored answers and contacts nobody.
-      A provider that can't be reached (ban, 429) is rescheduled with
-      backoff in `enrichment_queue`, never dropped. Manual matches
-      outrank the whole chain (HUB-8/30a). Anime stays bridged through
-      mapped IDs — described by the tail, never re-identified by it.
+      runtime via `POST /admin/v1/providers/chains/{media_type}`, and a
+      reorder re-decides from stored answers and contacts nobody.
+      Refusing a match records the refused records (`rejected_matches`)
+      and keeps every answer, so the item stays unmatched until a provider
+      offers something that was not refused. A provider that can't be
+      reached (ban, 429) is rescheduled with backoff in
+      `enrichment_queue`, never dropped. Manual assignments are never
+      recomputed (HUB-8/30a). Anime stays bridged through mapped IDs —
+      described by the tail, never re-identified by it.
 - [ ] HUB-6 Descriptive metadata *(titles, plots, dates, ratings, posters, episode
       stills live; cast/genres not stored)*
-- [ ] HUB-7 Provider rate limits/caching — rate limits done properly: every
-      provider request goes through one queue per provider host
-      (`hub/gate.rs`), spaced by that provider's *documented* limit and
-      silenced on 429/503 for what `Retry-After` asks. Corrected against
-      the specs 2026-07-26: MusicBrainz was entirely unpaced (1 req/s per
-      IP, 503 on breach), AniList ran at 75/min against a live limit
-      degraded to 30/min, OpenSubtitles at 5/s against a documented 1/s.
-      *(caching: provider-mandated TTLs live — AniDB 24 h per anime,
-      daily titles dump, weekly mapping — but no generic per-provider
-      response cache; enrichment results persist in the DB instead)*
+- [x] HUB-7 Provider rate limits/caching. Rate limits: every provider
+      request goes through one queue per provider host (`hub/gate.rs`),
+      spaced by that provider's *documented* limit and silenced on
+      429/503 for what `Retry-After` asks. Corrected against the specs
+      2026-07-26, when three of four stored numbers turned out wrong in
+      our favour: MusicBrainz was entirely unpaced (1 req/s per IP, 503
+      on breach), AniList ran at 75/min against a live limit degraded to
+      30/min, OpenSubtitles at 5/s against a documented 1/s, and AniDB's
+      flood rule was half-implemented — the short-term 2 s gap without
+      the sustained 4 s one, which is what earned the bans.
+      Caching is satisfied by the answer store rather than by a response
+      cache: every provider answer is kept permanently in
+      `provider_metadata`, including recorded misses, and never
+      re-requested (never-ask-twice); provider-mandated TTLs are honoured
+      where they exist — AniDB 24 h per anime, the daily titles dump, the
+      weekly anime-lists mapping. A separate TTL cache would be a second
+      copy of what the answer store already is.
 - [x] HUB-8 Ambiguous matches flagged for manual review (card-based review UI,
       per-item re-match/search dialog)
 - [ ] HUB-9 Local metadata as authoritative provider *(embedded music tags win;
