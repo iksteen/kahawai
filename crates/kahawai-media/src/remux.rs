@@ -431,7 +431,30 @@ fn timestamper_for(caps: &gst::CapsRef) -> Option<&'static str> {
 
 /// hlssink2 pads requested up front (splitmuxsink wants them before start);
 /// each is taken by the first matching parsed stream.
-type WaitingPads = Arc<Mutex<std::collections::HashMap<&'static str, gst::Pad>>>;
+/// Where a stream's branch terminates, once its real caps are known.
+///
+/// One source feeds the muxer directly and the pad is consumed once. A
+/// MULTI-PART source (CD1/CD2) merges through a `concat` first, so every
+/// part's branch asks for its own sink pad and concat serialises them —
+/// adjusting each segment's base so the running time never jumps. The
+/// muxer, and therefore the playlist, never learns a boundary happened.
+enum Merge {
+    Direct(Option<gst::Pad>),
+    Concat(gst::Element),
+}
+
+impl Merge {
+    /// The pad this branch should feed, or None when the muxer's single
+    /// pad for this stream has already been claimed.
+    fn pad(&mut self) -> Option<gst::Pad> {
+        match self {
+            Merge::Direct(pad) => pad.take(),
+            Merge::Concat(concat) => concat.request_pad_simple("sink_%u"),
+        }
+    }
+}
+
+type WaitingPads = Arc<Mutex<std::collections::HashMap<&'static str, Merge>>>;
 
 /// Offset-start gate: splitmuxsink is not flush-safe once it has seen
 /// data (g_assert !ctx->is_reference aborts on a mid-GOP flush), so for
@@ -549,6 +572,11 @@ fn plumb_parsed_pad(
     video_seen: &Arc<std::sync::atomic::AtomicUsize>,
     subs_seen: &Arc<std::sync::atomic::AtomicUsize>,
     subs_dir: &std::path::Path,
+    // False for the second and later parts of a multi-part source: the
+    // tracks are the same ones continuing, so extracting them again would
+    // overwrite the first part's files with a stream that starts at its
+    // own zero.
+    extract_subs: bool,
 ) {
     // queue: decouples the muxer from parsebin's threads (the aggregator
     // deadlocks without it). Default queue limits (1 MiB / 1 s) are far
@@ -589,6 +617,13 @@ fn plumb_parsed_pad(
         || name.starts_with("text/")
         || name.starts_with("subpicture/")
     {
+        if !extract_subs {
+            let fake = gst::ElementFactory::make("fakesink").build().unwrap();
+            pipe.add(&fake).unwrap();
+            fake.sync_state_with_parent().unwrap();
+            let _ = qsrc.link(&fake.static_pad("sink").unwrap());
+            return;
+        }
         let idx = subs_seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if name.starts_with("subpicture/") {
             tap_image_track(pipe, &qsrc, &advertised, subs_dir, idx, &name);
@@ -866,7 +901,7 @@ fn route_stream(
     // Encode: claim the kind's muxer pad for the decode→re-encode branch.
     if mode == StreamMode::Encode && can_decode(&caps_name) {
         let kind = if caps_name.starts_with("video/") { "video" } else { "audio" };
-        if let Some(sinkpad) = waiting.lock().unwrap().remove(kind) {
+        if let Some(sinkpad) = waiting.lock().unwrap().get_mut(kind).and_then(Merge::pad) {
             tracing::info!(caps = %caps_name, kind, "transcoding stream");
             if kind == "video" {
                 build_video_encode_chain(pipe, from, sinkpad, gate);
@@ -877,7 +912,10 @@ fn route_stream(
         }
     }
     let target = (mode == StreamMode::Copy)
-        .then(|| ts_compatible(&caps_name).and_then(|kind| waiting.lock().unwrap().remove(kind)))
+        .then(|| {
+            ts_compatible(&caps_name)
+                .and_then(|kind| waiting.lock().unwrap().get_mut(kind).and_then(Merge::pad))
+        })
         .flatten();
     match target {
         Some(sinkpad) => {
@@ -1400,15 +1438,52 @@ pub fn start_paced(
     sink: Option<&str>,
     pace: Option<PaceConfig>,
 ) -> Result<RemuxJob> {
+    start_parts(out_dir, plan, vec![source], start_ms, sink, pace)
+}
+
+/// One pipeline spanning a multi-part source, in timeline order.
+///
+/// A CD1/CD2 boundary used to be a pipeline restart: stop the worker,
+/// delete the segments, start again in the next file, and let the client
+/// stitch the two playlists together when the video element fired
+/// `ended`. The most predictable event in the file paid the price of a
+/// random seek. Here the parts are branches of ONE pipeline joined by
+/// `concat`, so the boundary produces no event at all — one playlist,
+/// continuous running time, no discontinuity tag.
+///
+/// `start_ms` applies to the FIRST part only; the rest play whole, which
+/// is what makes them concatenable. Seeking is NOT done this way: concat
+/// accepts a seek after preroll and then plays from zero, and refuses one
+/// during playback outright (both measured — see `concat_spike`). A seek
+/// therefore stays what it is today, a restart in the target part, and
+/// this function is handed the parts from that point on.
+pub fn start_parts(
+    out_dir: &Path,
+    plan: RemuxPlan,
+    sources: Vec<Box<dyn RemuxSource>>,
+    start_ms: u64,
+    sink: Option<&str>,
+    pace: Option<PaceConfig>,
+) -> Result<RemuxJob> {
     crate::init()?;
+    anyhow::ensure!(!sources.is_empty(), "no source parts to remux");
+    let multipart = sources.len() > 1;
 
     let pipeline = gst::Pipeline::new();
-    let appsrc = seekable_appsrc(source);
-    let parsebin = gst::ElementFactory::make("parsebin").build()?;
     let (hlssink, _sink_name) = make_hls_sink(out_dir, sink)?;
+    pipeline.add(&hlssink)?;
 
-    pipeline.add_many([appsrc.upcast_ref::<gst::Element>(), &parsebin, &hlssink])?;
-    gst::Element::link_many([appsrc.upcast_ref::<gst::Element>(), &parsebin])?;
+    // The first part owns the start offset and the seek gate; later parts
+    // are held by concat until it EOSes, then play from their own zero.
+    let mut parsebins = Vec::with_capacity(sources.len());
+    for source in sources {
+        let appsrc = seekable_appsrc(source);
+        let parsebin = gst::ElementFactory::make("parsebin").build()?;
+        pipeline.add_many([appsrc.upcast_ref::<gst::Element>(), &parsebin])?;
+        gst::Element::link_many([appsrc.upcast_ref::<gst::Element>(), &parsebin])?;
+        parsebins.push(parsebin);
+    }
+    let parsebin = parsebins[0].clone();
 
     // Request the muxer pads *now* — splitmuxsink inside hlssink2 must see
     // them before starting or it never leaves Ready.
@@ -1416,19 +1491,31 @@ pub fn start_paced(
     let stopping = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let pace = pace.map(Arc::new);
     let waiting: WaitingPads = Arc::new(Mutex::new(std::collections::HashMap::new()));
-    if plan.has_video() {
-        let pad = hlssink.request_pad_simple("video").context("requesting video pad")?;
+    for kind in ["video", "audio"] {
+        let wanted = if kind == "video" { plan.has_video() } else { plan.has_audio() };
+        if !wanted {
+            continue;
+        }
+        let pad = hlssink
+            .request_pad_simple(kind)
+            .with_context(|| format!("requesting {kind} pad"))?;
         if let Some(cfg) = &pace {
             install_pace_probe(&pad, cfg.clone(), stopping.clone());
         }
-        waiting.lock().unwrap().insert("video", pad);
-    }
-    if plan.has_audio() {
-        let pad = hlssink.request_pad_simple("audio").context("requesting audio pad")?;
-        if let Some(cfg) = &pace {
-            install_pace_probe(&pad, cfg.clone(), stopping.clone());
-        }
-        waiting.lock().unwrap().insert("audio", pad);
+        let merge = if multipart {
+            let concat = gst::ElementFactory::make("concat").build()?;
+            pipeline.add(&concat)?;
+            let src = concat.static_pad("src").context("concat has no src pad")?;
+            // Same reason as every other pad feeding this sink: hlssink3
+            // unwraps each fragment's first PTS and a panic in an FFI
+            // callback takes the process with it.
+            guard_pts(&src);
+            src.link(&pad).context("linking concat to the muxer")?;
+            Merge::Concat(concat)
+        } else {
+            Merge::Direct(Some(pad))
+        };
+        waiting.lock().unwrap().insert(kind, merge);
     }
 
     // Every parsed stream gets a queue immediately (no buffer ever hits an
@@ -1436,18 +1523,27 @@ pub fn start_paced(
     // stream once its real caps flow (see plumb_parsed_pad).
     let gate = (start_ms > 0)
         .then(|| SeekGate::new(plan.has_video() as usize + plan.has_audio() as usize));
-    let pipe = pipeline.clone();
-    let waiting2 = waiting.clone();
-    let gate2 = gate.clone();
-    let audio_seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let video_seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let subs_seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let subs_dir = out_dir.to_path_buf();
-    parsebin.connect_pad_added(move |_, pad| {
-        plumb_parsed_pad(
-            &pipe, &waiting2, pad, plan, &gate2, &audio_seen, &video_seen, &subs_seen, &subs_dir,
-        );
-    });
+    for (n, pb) in parsebins.iter().enumerate() {
+        let pipe = pipeline.clone();
+        let waiting2 = waiting.clone();
+        let gate2 = gate.clone();
+        // Per part, NOT shared: these count tracks in demux order and the
+        // count is what `plan.audio_track` / `plan.video_track` select
+        // against. Track indices are a property of a file, so sharing
+        // them across parts would offset part two's tracks past the
+        // selection and play it silent.
+        let audio_seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let video_seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let subs_seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let subs_dir = subs_dir.clone();
+        pb.connect_pad_added(move |_, pad| {
+            plumb_parsed_pad(
+                &pipe, &waiting2, pad, plan, &gate2, &audio_seen, &video_seen, &subs_seen,
+                &subs_dir, n == 0,
+            );
+        });
+    }
 
     let error = Arc::new(Mutex::new(None::<String>));
     let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1554,6 +1650,65 @@ impl RemuxJob {
 impl Drop for RemuxJob {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+#[cfg(test)]
+mod multipart {
+    //! A multi-part source plays as one stream (HUB-17 / §4.6).
+    use super::*;
+
+    fn part(dir: &std::path::Path, name: &str, pattern: &str) -> std::path::PathBuf {
+        let path = dir.join(name);
+        crate::testutil::render(&format!(
+            "videotestsrc num-buffers=125 pattern={pattern} ! video/x-raw,format=I420,width=320,height=240,framerate=25/1 ! x264enc key-int-max=25 bframes=0 ! h264parse ! matroskamux name=m audiotestsrc num-buffers=215 ! audioconvert ! fdkaacenc ! m. m. ! filesink location=\"{}\"",
+            path.display()
+        ));
+        path
+    }
+
+    /// Two 5 s parts, one playlist, no seam: the muxer never learns the
+    /// source changed file, so there is nothing for a client to stitch.
+    #[test]
+    fn two_parts_render_as_one_continuous_playlist() {
+        crate::init().unwrap();
+        if !crate::testutil::has_element("fdkaacenc") {
+            eprintln!("no fdkaacenc; skipped");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let parts = [part(dir.path(), "cd1.mkv", "smpte"), part(dir.path(), "cd2.mkv", "ball")];
+        let out = dir.path().join("hls");
+        std::fs::create_dir_all(&out).unwrap();
+
+        let sources: Vec<Box<dyn RemuxSource>> = parts
+            .iter()
+            .map(|p| Box::new(FileSource::open(p).unwrap()) as Box<dyn RemuxSource>)
+            .collect();
+        let plan = RemuxPlan {
+            video: StreamMode::Copy,
+            audio: StreamMode::Copy,
+            audio_track: 0,
+            video_track: 0,
+        };
+        let job = start_parts(&out, plan, sources, 0, None, None).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+        while !job.finished() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(job.failed().is_none(), "pipeline failed: {:?}", job.failed());
+        assert!(job.finished(), "pipeline never finished");
+
+        let playlist =
+            std::fs::read_to_string(out.join("master.m3u8")).expect("no playlist written");
+        let total: f64 = playlist
+            .lines()
+            .filter_map(|l| l.strip_prefix("#EXTINF:"))
+            .filter_map(|l| l.trim_end_matches(',').parse::<f64>().ok())
+            .sum();
+        assert!(total > 9.0, "playlist covers {total}s — the second part never played");
+        assert!(!playlist.contains("EXT-X-DISCONTINUITY"), "the timeline broke at the seam");
+        assert!(playlist.contains("EXT-X-ENDLIST"), "playlist never finalised");
     }
 }
 
