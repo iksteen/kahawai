@@ -29,7 +29,7 @@ pub async fn ensure_identity(
         return Ok(id);
     }
 
-    let module_id = ulid::Ulid::new().to_string();
+    let module_id = ulid::Ulid::generate().to_string();
     let bundle = new_satellite_csr(module_type, &module_id, name)?;
     let code = enrollment_code(&bundle.csr_der);
     // The one thing the human at this console must see (SEC-2):

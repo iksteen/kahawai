@@ -56,7 +56,9 @@ pub async fn open_in_memory() -> Result<SqlitePool> {
 /// than store, so their definition is free to change, and a migration is
 /// an immutable log of changes to what IS stored.
 async fn install_views(pool: &SqlitePool) -> Result<()> {
-    sqlx::raw_sql(&crate::providers::resolved_metadata_sql())
+    // Safe by construction: the statement is generated from a fixed field
+    // table in providers.rs, with no caller input anywhere in it.
+    sqlx::raw_sql(sqlx::AssertSqlSafe(crate::providers::resolved_metadata_sql()))
         .execute(pool)
         .await
         .context("installing resolved_metadata")?;

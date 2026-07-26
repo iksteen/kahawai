@@ -22,7 +22,7 @@
 
 use std::time::Duration;
 
-use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyInit};
+use aes::cipher::{BlockCipherDecrypt, BlockCipherEncrypt, KeyInit};
 use anyhow::{bail, Context, Result};
 use md5::{Digest, Md5};
 
@@ -423,20 +423,19 @@ impl Anidb {
 
 /// AES-128-ECB with PKCS#7, as the UDP API's ENCRYPT specifies.
 fn aes_ecb(cipher: &aes::Aes128, data: &[u8], encrypt: bool) -> Result<Vec<u8>> {
-    use aes::cipher::generic_array::GenericArray;
     if encrypt {
         let pad = 16 - (data.len() % 16);
         let mut buf = data.to_vec();
         buf.extend(std::iter::repeat_n(pad as u8, pad));
-        for chunk in buf.chunks_mut(16) {
-            cipher.encrypt_block(GenericArray::from_mut_slice(chunk));
+        for chunk in buf.chunks_exact_mut(16) {
+            cipher.encrypt_block(chunk.try_into().expect("16-byte block"));
         }
         Ok(buf)
     } else {
         anyhow::ensure!(data.len() % 16 == 0 && !data.is_empty(), "bad ciphertext length");
         let mut buf = data.to_vec();
-        for chunk in buf.chunks_mut(16) {
-            cipher.decrypt_block(GenericArray::from_mut_slice(chunk));
+        for chunk in buf.chunks_exact_mut(16) {
+            cipher.decrypt_block(chunk.try_into().expect("16-byte block"));
         }
         let pad = *buf.last().unwrap() as usize;
         anyhow::ensure!(pad >= 1 && pad <= 16 && pad <= buf.len(), "bad padding");

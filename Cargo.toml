@@ -29,15 +29,15 @@ clap = { version = "4", features = ["derive"] }
 figment = { version = "0.10", features = ["toml", "env"] }
 rcgen = { version = "0.14", features = ["x509-parser"] }
 x509-parser = "0.18"
-md4 = "0.10"
+md4 = "0.11"
 crc32fast = "1"
 flate2 = "1"
-md-5 = "0.10"
-png = "0.17"
-base64 = "0.22"
+md-5 = "0.11"
+png = "0.18"
+base64 = "0.23"
 async-trait = "0.1"
-aes = "0.8"
-sha2 = "0.10"
+aes = "0.9"
+sha2 = "0.11"
 data-encoding = "2"
 time = "0.3"
 tempfile = "3"
@@ -51,18 +51,18 @@ rustls-pki-types = "1.12"
 tokio-stream = { version = "0.1", features = ["sync"] }
 tower = "0.5"
 hyper-util = "0.1"
-ulid = "1"
+ulid = "3"
 gstreamer = "0.25"
 gstreamer-pbutils = "0.25"
 serde_json = "1"
 walkdir = "2"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-roxmltree = "0.20"
+reqwest = { version = "0.13", default-features = false, features = ["json", "query", "rustls", "webpki-roots", "http2"] }
+roxmltree = "0.21"
 ipnet = "2"
-tower-http = { version = "0.6", default-features = false, features = ["cors"] }
+tower-http = { version = "0.7", default-features = false, features = ["cors"] }
 notify = "8"
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "macros", "migrate"] }
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite", "macros", "migrate"] }
 axum = "0.8"
 rust-embed = "8"
 libc = "0.2"

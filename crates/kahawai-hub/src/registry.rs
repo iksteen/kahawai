@@ -706,7 +706,7 @@ impl Registry {
             matches!(media_type, "movies" | "series" | "anime" | "music"),
             "unknown media type {media_type:?}"
         );
-        let id = ulid::Ulid::new().to_string();
+        let id = ulid::Ulid::generate().to_string();
         sqlx::query("INSERT INTO libraries (id, name, media_type) VALUES (?, ?, ?)")
             .bind(&id)
             .bind(name)
@@ -918,7 +918,7 @@ impl Registry {
                 Some(match existing {
                     Some(id) => id,
                     None => {
-                        let id = ulid::Ulid::new().to_string();
+                        let id = ulid::Ulid::generate().to_string();
                         sqlx::query(
                             "INSERT INTO items (id, kind, title, norm_title, year)
                              VALUES (?, 'movie', ?, ?, ?)",
@@ -970,7 +970,7 @@ impl Registry {
                         let album_id = match existing {
                             Some(id) => id,
                             None => {
-                                let id = ulid::Ulid::new().to_string();
+                                let id = ulid::Ulid::generate().to_string();
                                 sqlx::query(
                                     "INSERT INTO items (id, kind, title, norm_title, year, artist)
                                      VALUES (?, 'album', ?, ?, ?, ?)",
@@ -1000,7 +1000,7 @@ impl Registry {
                         Some(match existing_track {
                             Some(id) => id,
                             None => {
-                                let id = ulid::Ulid::new().to_string();
+                                let id = ulid::Ulid::generate().to_string();
                                 sqlx::query(
                                     "INSERT INTO items
                                        (id, kind, title, norm_title, year,
@@ -1055,7 +1055,7 @@ impl Registry {
                         Some(match existing {
                             Some(id) => id,
                             None => {
-                                let id = ulid::Ulid::new().to_string();
+                                let id = ulid::Ulid::generate().to_string();
                                 sqlx::query(
                                     "INSERT INTO items (id, kind, title, norm_title, year)
                                      VALUES (?, 'movie', ?, ?, ?)",
@@ -1089,7 +1089,7 @@ impl Registry {
                         let show_id = match show {
                             Some(id) => id,
                             None => {
-                                let id = ulid::Ulid::new().to_string();
+                                let id = ulid::Ulid::generate().to_string();
                                 sqlx::query(
                                     "INSERT INTO items (id, kind, title, norm_title, year)
                                      VALUES (?, 'show', ?, ?, ?)",
@@ -1116,7 +1116,7 @@ impl Registry {
                         Some(match ep {
                             Some(id) => id,
                             None => {
-                                let id = ulid::Ulid::new().to_string();
+                                let id = ulid::Ulid::generate().to_string();
                                 let title = g
                                     .episode_title
                                     .clone()
@@ -1313,9 +1313,11 @@ impl Registry {
                 .execute(&mut *tx)
                 .await?;
             for table in ["item_sources", "files"] {
-                sqlx::query(&format!(
+                // Safe by construction: `table` comes from the literal array
+                // above, never from a caller.
+                sqlx::query(sqlx::AssertSqlSafe(format!(
                     "DELETE FROM {table} WHERE module_id = ? AND collection_id = ? AND path_rel = ?"
-                ))
+                )))
                 .bind(module_id)
                 .bind(collection_id)
                 .bind(path)

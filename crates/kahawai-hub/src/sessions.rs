@@ -471,7 +471,7 @@ impl Sessions {
         let lease =
             self.open_lease(registry, &part.module_id, &part.collection_id, &part.path_rel).await?;
 
-        let id = ulid::Ulid::new().to_string();
+        let id = ulid::Ulid::generate().to_string();
         let mut verdict = None;
         let mut session_plan = None;
         let mut session_needs = crate::registry::PlacementNeed::default();

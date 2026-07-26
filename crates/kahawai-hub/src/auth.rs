@@ -207,7 +207,7 @@ impl Auth {
         if username.trim().is_empty() || password.len() < 8 {
             bail!("username required and password must be at least 8 characters");
         }
-        let id = ulid::Ulid::new().to_string();
+        let id = ulid::Ulid::generate().to_string();
         let hash = hash_password(password)?;
         sqlx::query("INSERT INTO users (id, username, password_hash, is_admin) VALUES (?, ?, ?, 1)")
             .bind(&id)
@@ -225,7 +225,7 @@ impl Auth {
         if username.trim().is_empty() || password.len() < 8 {
             bail!("username required and password must be at least 8 characters");
         }
-        let id = ulid::Ulid::new().to_string();
+        let id = ulid::Ulid::generate().to_string();
         let hash = hash_password(password)?;
         sqlx::query("INSERT INTO users (id, username, password_hash, is_admin) VALUES (?, ?, ?, ?)")
             .bind(&id)
