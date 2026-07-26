@@ -1558,6 +1558,218 @@ impl Drop for RemuxJob {
 }
 
 #[cfg(test)]
+mod concat_spike {
+    //! SPIKE (not a requirement): can one pipeline span a multi-part
+    //! source, so a CD1->CD2 boundary produces no event at all? Today the
+    //! boundary is implemented as a seek — tear the pipeline down, delete
+    //! the segments, restart in the next file — and the client stitches
+    //! it back together on `ended`.
+    //!
+    //! Uses the real seekable appsrc, not filesrc: production feeds bytes
+    //! from a lease, and whether a seek reaches back through concat to the
+    //! right appsrc is the whole question.
+    use super::*;
+
+    fn fixture(dir: &std::path::Path, name: &str, pattern: &str) -> std::path::PathBuf {
+        let path = dir.join(name);
+        crate::testutil::render(&format!(
+            "videotestsrc num-buffers=125 pattern={pattern} ! video/x-raw,format=I420,width=320,height=240,framerate=25/1 ! x264enc key-int-max=25 bframes=0 ! h264parse ! matroskamux ! filesink location=\"{}\"",
+            path.display()
+        ));
+        path
+    }
+
+    /// Two parts, one concat, one sink. `link` receives concat's src pad.
+    fn concat_pipeline(
+        parts: &[std::path::PathBuf],
+        tail: &[&str],
+    ) -> (gst::Pipeline, gst::Element) {
+        crate::init().unwrap();
+        let pipeline = gst::Pipeline::new();
+        let concat = gst::ElementFactory::make("concat").build().unwrap();
+        pipeline.add(&concat).unwrap();
+        let mut prev = concat.clone();
+        for name in tail {
+            let el = gst::ElementFactory::make(name).build().unwrap();
+            pipeline.add(&el).unwrap();
+            prev.link(&el).unwrap();
+            prev = el;
+        }
+        for part in parts {
+            let src = seekable_appsrc(Box::new(FileSource::open(part).unwrap()));
+            let parsebin = gst::ElementFactory::make("parsebin").build().unwrap();
+            pipeline.add_many([src.upcast_ref::<gst::Element>(), &parsebin]).unwrap();
+            src.link(&parsebin).unwrap();
+            let concat = concat.clone();
+            let pipe = pipeline.downgrade();
+            parsebin.connect_pad_added(move |_, pad| {
+                let Some(pipe) = pipe.upgrade() else { return };
+                // The queue is not optional. Without it the A/V variant
+                // deadlocks outright: a demuxer pushes every stream from
+                // one thread, so a branch blocked on a concat that is
+                // still draining the other part stalls its siblings too.
+                let queue = gst::ElementFactory::make("queue")
+                    .property("max-size-buffers", 0u32)
+                    .property("max-size-bytes", 0u32)
+                    .property("max-size-time", 0u64)
+                    .build()
+                    .unwrap();
+                pipe.add(&queue).unwrap();
+                queue.sync_state_with_parent().unwrap();
+                pad.link(&queue.static_pad("sink").unwrap()).unwrap();
+                let sink = concat.request_pad_simple("sink_%u").unwrap();
+                queue.static_pad("src").unwrap().link(&sink).unwrap();
+            });
+        }
+        (pipeline, prev)
+    }
+
+    fn run_to_eos(pipeline: &gst::Pipeline, secs: u64) -> Option<gst::Message> {
+        pipeline.set_state(gst::State::Playing).unwrap();
+        let msg = pipeline.bus().unwrap().timed_pop_filtered(
+            gst::ClockTime::from_seconds(secs),
+            &[gst::MessageType::Eos, gst::MessageType::Error],
+        );
+        pipeline.set_state(gst::State::Null).unwrap();
+        msg
+    }
+
+    /// HALF ONE: does concat, fed by the production appsrc, produce a
+    /// single continuous HLS playlist across a part boundary?
+    #[test]
+    fn concat_over_appsrc_yields_one_continuous_playlist() {
+        crate::init().unwrap();
+        if gst::ElementFactory::find("hlssink3").is_none() {
+            eprintln!("no hlssink3; skipped");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let parts =
+            [fixture(dir.path(), "p1.mkv", "smpte"), fixture(dir.path(), "p2.mkv", "ball")];
+        let out = dir.path().join("hls");
+        std::fs::create_dir_all(&out).unwrap();
+
+        let (pipeline, tail) = concat_pipeline(&parts, &["h264parse"]);
+        let sink = gst::ElementFactory::make("hlssink3")
+            .property("target-duration", 2u32)
+            .property("playlist-length", 0u32)
+            .property("max-files", 0u32)
+            .property("location", out.join("seg%05d.ts").to_str().unwrap())
+            .property("playlist-location", out.join("play.m3u8").to_str().unwrap())
+            .build()
+            .unwrap();
+        pipeline.add(&sink).unwrap();
+        // hlssink3 muxes internally: elementary streams on request pads.
+        let pad = sink.request_pad_simple("video").unwrap();
+        // imp.rs:304 unwraps each fragment's first PTS and a panic in an
+        // FFI callback kills the process, so guard here as production does.
+        guard_pts(&tail.static_pad("src").unwrap());
+        tail.static_pad("src").unwrap().link(&pad).unwrap();
+
+        let msg = run_to_eos(&pipeline, 60);
+        assert!(
+            matches!(msg.as_ref().map(|m| m.view()), Some(gst::MessageView::Eos(_))),
+            "pipeline did not reach EOS: {msg:?}"
+        );
+
+        let playlist = std::fs::read_to_string(out.join("play.m3u8")).unwrap();
+        let total: f64 = playlist
+            .lines()
+            .filter_map(|l| l.strip_prefix("#EXTINF:"))
+            .filter_map(|l| l.trim_end_matches(',').parse::<f64>().ok())
+            .sum();
+        // Two 5 s parts arriving as one stream, and NO discontinuity tag:
+        // the muxer never learns there was a boundary.
+        assert!(total > 9.0, "playlist covers only {total}s — the second part is missing");
+        assert!(!playlist.contains("EXT-X-DISCONTINUITY"), "timeline broke at the seam");
+        assert!(playlist.contains("EXT-X-ENDLIST"), "playlist never finalised");
+    }
+
+    /// HALF TWO: can the concatenated timeline be SEEKED, or must a seek
+    /// keep restarting the pipeline in the target part as it does today?
+    /// `concat`'s documentation says nothing about seeking, so this is
+    /// the deciding measurement for whether one pipeline can serve a
+    /// whole multi-part film.
+    #[test]
+    fn seeking_across_the_concat_boundary() {
+        crate::init().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let parts =
+            [fixture(dir.path(), "s1.mkv", "smpte"), fixture(dir.path(), "s2.mkv", "ball")];
+        let (pipeline, tail) = concat_pipeline(&parts, &["h264parse", "fakesink"]);
+        tail.set_property("sync", false);
+
+        // First buffer PTS after the seek: where playback actually resumed.
+        let seen: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
+        let seen2 = seen.clone();
+        tail.static_pad("sink").unwrap().add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+            if let Some(gst::PadProbeData::Buffer(b)) = &info.data {
+                let mut s = seen2.lock().unwrap();
+                if s.is_none() {
+                    *s = b.pts().map(|p| p.mseconds());
+                }
+            }
+            gst::PadProbeReturn::Ok
+        });
+
+        // (a) seek from PAUSED, after preroll.
+        pipeline.set_state(gst::State::Paused).unwrap();
+        let _ = pipeline.state(gst::ClockTime::from_seconds(30));
+        // 7 s lands inside part two (two 5 s parts).
+        let paused_ok = pipeline.seek_simple(
+            gst::SeekFlags::FLUSH | gst::SeekFlags::KEY_UNIT,
+            gst::ClockTime::from_mseconds(7_000),
+        );
+        let msg = run_to_eos(&pipeline, 60);
+        let from_paused = *seen.lock().unwrap();
+        eprintln!("SPIKE paused-seek accepted={paused_ok:?} first_pts={from_paused:?}ms eos={}",
+            matches!(msg.as_ref().map(|m| m.view()), Some(gst::MessageView::Eos(_))));
+        // Characterisation, deliberately pinned to today's behaviour: the
+        // seek is ACCEPTED and then ignored — playback resumes at zero,
+        // not at 7 s. Anything built on concat seeks would look correct in
+        // a paused test and silently restart the film in a real player.
+        assert!(paused_ok.is_ok(), "a paused seek used to be accepted");
+        assert_eq!(from_paused, Some(0), "concat now honours seeks — revisit the design");
+
+        // (b) the realistic case: scrub while playing.
+        let (pipeline, tail) = concat_pipeline(&parts, &["h264parse", "fakesink"]);
+        tail.set_property("sync", false);
+        let live: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
+        let live2 = live.clone();
+        let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let armed2 = armed.clone();
+        tail.static_pad("sink").unwrap().add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+            if let Some(gst::PadProbeData::Buffer(b)) = &info.data {
+                if armed2.load(std::sync::atomic::Ordering::SeqCst) {
+                    let mut s = live2.lock().unwrap();
+                    if s.is_none() {
+                        *s = b.pts().map(|p| p.mseconds());
+                    }
+                }
+            }
+            gst::PadProbeReturn::Ok
+        });
+        pipeline.set_state(gst::State::Playing).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        armed.store(true, std::sync::atomic::Ordering::SeqCst);
+        let live_ok = pipeline.seek_simple(
+            gst::SeekFlags::FLUSH | gst::SeekFlags::KEY_UNIT,
+            gst::ClockTime::from_mseconds(7_000),
+        );
+        let msg2 = run_to_eos(&pipeline, 60);
+        eprintln!("SPIKE live-seek accepted={live_ok:?} first_pts={:?}ms eos={}",
+            *live.lock().unwrap(),
+            matches!(msg2.as_ref().map(|m| m.view()), Some(gst::MessageView::Eos(_))));
+        // Seeking while PLAYING is refused outright. If this ever starts
+        // succeeding, one pipeline could serve seeks too and the
+        // restart-per-part path could go.
+        assert!(live_ok.is_err(), "concat now accepts a live seek — revisit the design");
+        // Recorded, not asserted: this test exists to MEASURE, and the
+        // answer decides the design. Whatever it prints is the finding.
+    }
+}
+
+#[cfg(test)]
 mod tests {
     #[test]
     fn selects_requested_video_track() {
