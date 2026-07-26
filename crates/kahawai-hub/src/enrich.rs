@@ -570,9 +570,15 @@ impl Enricher {
                     (SELECT s.path_rel FROM item_sources s
                      WHERE s.item_id = i.id LIMIT 1) AS src_path
              FROM items i
-             LEFT JOIN item_metadata m ON m.item_id = i.id
+             LEFT JOIN merged_metadata m ON m.item_id = i.id
              WHERE i.kind IN ('movie', 'show')
-               AND (m.item_id IS NULL OR m.confidence = 'miss')
+               AND (m.item_id IS NULL OR m.confidence = 'miss'
+                    -- HUB-5: work the chain still owes — a provider
+                    -- never asked, or one that refused and is now due
+                    -- again (bans and rate limits reschedule, never drop).
+                    OR EXISTS (
+                      SELECT 1 FROM enrichment_queue q
+                      WHERE q.item_id = i.id AND q.due_at <= unixepoch()))
                AND NOT EXISTS (
                  SELECT 1 FROM item_sources s2
                  JOIN collections c2 ON (c2.module_id, c2.collection_id)
@@ -618,6 +624,8 @@ impl Enricher {
                 manual: false,
                 known_aid: None,
                 identified: false,
+                owner: None,
+                gaps: Vec::new(),
             };
             let this = self.clone();
             let set = providers.clone();
@@ -671,7 +679,7 @@ impl Enricher {
     ) -> Result<()> {
         let albums = sqlx::query(
             "SELECT i.id, i.title, i.artist FROM items i
-             LEFT JOIN item_metadata m ON m.item_id = i.id
+             LEFT JOIN merged_metadata m ON m.item_id = i.id
              WHERE i.kind = 'album' AND i.artist IS NOT NULL
                AND (m.item_id IS NULL OR (m.confidence = 'miss' AND m.updated_at < unixepoch() - 7 * 86400))
              ORDER BY i.title",
@@ -695,18 +703,22 @@ impl Enricher {
                 manual: false,
                 known_aid: None,
                 identified: false,
+                owner: None,
+                gaps: Vec::new(),
             };
             match providers.run_chain("music", registry.db(), &item).await {
                 Some(_) => matched += 1,
                 None => {
                     missed += 1;
-                    sqlx::query(
-                        "INSERT OR REPLACE INTO item_metadata
-                           (item_id, provider, provider_id, confidence, updated_at)
-                         VALUES (?, 'musicbrainz', '', 'miss', unixepoch())",
+                    crate::providers::store_answer(
+                        registry.db(),
+                        &item.id,
+                        "musicbrainz",
+                        "",
+                        "miss",
+                        Default::default(),
+                        &crate::providers::chain_in_force(registry.db(), "music").await,
                     )
-                    .bind(&item.id)
-                    .execute(registry.db())
                     .await?;
                 }
             }
@@ -797,11 +809,18 @@ impl Enricher {
                 OR s.item_id IN (SELECT id FROM items WHERE parent_id = i.id)
              JOIN collections c ON (c.module_id, c.collection_id)
                                  = (s.module_id, s.collection_id)
-             LEFT JOIN item_metadata m ON m.item_id = i.id
+             LEFT JOIN merged_metadata m ON m.item_id = i.id
              WHERE c.media_type = 'anime' AND i.kind IN ('movie', 'show')
                AND (m.confidence IS NULL OR m.confidence != 'rejected')
                AND (
                  m.item_id IS NULL OR m.anilist_id IS NULL
+                 -- HUB-5: work the chain still owes for this item —
+                 -- the TMDB/TVDB tail that has never been asked to fill
+                 -- what the anime services left empty, or a provider
+                 -- that refused and is due again.
+                 OR EXISTS (
+                   SELECT 1 FROM enrichment_queue q
+                   WHERE q.item_id = i.id AND q.due_at <= unixepoch())
                  OR EXISTS (
                    SELECT 1 FROM files f
                    JOIN item_sources s2 ON (s2.module_id, s2.collection_id, s2.path_rel)
@@ -829,6 +848,8 @@ impl Enricher {
                 manual: row.get::<Option<String>, _>("confidence").as_deref() == Some("manual"),
                 known_aid: row.get::<Option<i64>, _>("anidb_id").map(|a| a as u32),
                 identified: row.get::<Option<i64>, _>("anilist_id").is_some(),
+                owner: None,
+                gaps: Vec::new(),
             })
             .collect())
     }
@@ -869,7 +890,7 @@ impl Enricher {
         // so adopt bridge ids directly from the mapping. Idempotent,
         // no API calls — and it feeds HUB-31's projection backfill.
         let stale = sqlx::query(
-            "SELECT item_id, anidb_id, i.kind FROM item_metadata m
+            "SELECT item_id, anidb_id, i.kind FROM merged_metadata m
              JOIN items i ON i.id = m.item_id
              WHERE m.anidb_id IS NOT NULL
                AND m.mapped_tvdb IS NULL AND m.mapped_tmdb IS NULL",
@@ -884,7 +905,7 @@ impl Enricher {
                 continue;
             }
             sqlx::query(
-                "UPDATE item_metadata SET mapped_tvdb = ?, mapped_tmdb = ? WHERE item_id = ?",
+                "UPDATE merged_metadata SET mapped_tvdb = ?, mapped_tmdb = ? WHERE item_id = ?",
             )
             .bind(m.tvdb_id)
             .bind(tmdb)
@@ -1081,26 +1102,40 @@ impl Enricher {
             .as_ref()
             .and_then(|c| c.extra_large.clone().or_else(|| c.large.clone()));
         let genres = media.genres.clone().unwrap_or_default();
-        sqlx::query(
-            "INSERT OR REPLACE INTO item_metadata
-               (item_id, provider, provider_id, title, overview, poster_path, rating,
-                premiered, genres, confidence, updated_at,
-                anidb_id, anilist_id, mapped_tvdb, mapped_tmdb, original_language)
-             VALUES (?, 'anilist', ?, ?, ?, ?, ?, ?, ?, 'auto', unixepoch(), ?, ?, ?, ?, ?)",
+        // The anime composite's answer (HUB-5). Recorded under
+        // 'anilist', which ranks wherever 'anime' sits in the chain, so
+        // the TMDB/TVDB tail can fill what AniList leaves empty —
+        // cover art and synopsis, most often — without ever being able
+        // to overwrite what AniDB/AniList did supply.
+        crate::providers::store_answer(
+            db,
+            item_id,
+            "anilist",
+            &media.id.to_string(),
+            "auto",
+            crate::providers::Fields {
+                title: media.display_title(),
+                overview: media.plain_description(),
+                poster_path: poster.clone(),
+                rating: media.average_score.map(|s| s / 10.0),
+                premiered: media.premiered(),
+                original_language: media.original_language().map(str::to_string),
+                genres: Some(serde_json::to_string(&genres)?),
+            },
+            &crate::providers::chain_in_force(db, "anime").await,
         )
-        .bind(item_id)
-        .bind(media.id.to_string())
-        .bind(media.display_title())
-        .bind(media.plain_description())
-        .bind(&poster)
-        .bind(media.average_score.map(|s| s / 10.0))
-        .bind(media.premiered())
-        .bind(serde_json::to_string(&genres)?)
+        .await?;
+        // Identity columns the merge never touches: they say what this
+        // anime IS and how it bridges to the other services.
+        sqlx::query(
+            "UPDATE merged_metadata SET anidb_id = ?, anilist_id = ?,
+                mapped_tvdb = ?, mapped_tmdb = ? WHERE item_id = ?",
+        )
         .bind(anidb_id)
         .bind(media.id)
         .bind(mapping.and_then(|m| m.tvdb_id))
         .bind(mapping.and_then(|m| m.tmdb_for(kind)))
-        .bind(media.original_language())
+        .bind(item_id)
         .execute(db)
         .await?;
 
@@ -1153,7 +1188,7 @@ impl Enricher {
             "SELECT m.item_id, i.kind,
                     CASE WHEN m.provider = 'tmdb' THEN m.provider_id
                          ELSE CAST(m.mapped_tmdb AS TEXT) END AS tmdb_id
-             FROM item_metadata m JOIN items i ON i.id = m.item_id
+             FROM merged_metadata m JOIN items i ON i.id = m.item_id
              WHERE m.original_language IS NULL AND m.provider_id != ''
                AND i.kind IN ('movie', 'show')
                AND (m.provider = 'tmdb' OR m.mapped_tmdb IS NOT NULL)",
@@ -1200,7 +1235,7 @@ impl Enricher {
                     }
                 };
                 let _ = sqlx::query(
-                    "UPDATE item_metadata SET original_language = ? WHERE item_id = ?",
+                    "UPDATE merged_metadata SET original_language = ? WHERE item_id = ?",
                 )
                 .bind(&lang)
                 .bind(&item_id)
@@ -1232,16 +1267,16 @@ impl Enricher {
         let shows = sqlx::query(
             "SELECT i.id, m.provider, m.provider_id, m.mapped_tvdb, m.mapped_tmdb, m.anidb_id
              FROM items i
-             JOIN item_metadata m ON m.item_id = i.id
+             JOIN merged_metadata m ON m.item_id = i.id
              WHERE i.kind = 'show' AND m.provider_id != ''
                AND m.confidence != 'rejected'
                AND (EXISTS (
                  SELECT 1 FROM items e
-                 LEFT JOIN item_metadata em ON em.item_id = e.id
+                 LEFT JOIN merged_metadata em ON em.item_id = e.id
                  WHERE e.parent_id = i.id AND em.item_id IS NULL)
                OR EXISTS (
                  SELECT 1 FROM items e
-                 JOIN item_metadata em ON em.item_id = e.id
+                 JOIN merged_metadata em ON em.item_id = e.id
                  WHERE e.parent_id = i.id AND e.season IS NULL
                    AND em.proj_episode IS NULL))",
         )
@@ -1424,40 +1459,46 @@ impl Enricher {
         }
 
         let mut wrote = 0;
+        // Episodes inherit their show's chain: same media type, same
+        // precedence, so a reorder covers them too.
+        let media_type = crate::providers::media_type_of_item(db, show_id).await;
+        let chain = crate::providers::chain_in_force(db, &media_type).await;
         for r in &eps {
             let key = (r.get::<Option<i64>, _>("season"), r.get::<i64, _>("episode"));
             let Some(e) = by_key.get(&key) else { continue };
             let item_id: String = r.get("id");
             // Season projection applies to absolute-numbered rows only.
             let p = if key.0.is_none() { proj.get(&key.1) } else { None };
-            sqlx::query(
-                "INSERT INTO item_metadata
-                   (item_id, provider, provider_id, title, overview, poster_path,
-                    rating, premiered, genres, confidence, updated_at,
-                    proj_season, proj_episode)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, 'auto', unixepoch(), ?, ?)
-                 ON CONFLICT (item_id) DO UPDATE SET
-                   provider = excluded.provider,
-                   provider_id = excluded.provider_id,
-                   title = excluded.title,
-                   overview = excluded.overview,
-                   poster_path = excluded.poster_path,
-                   rating = excluded.rating,
-                   premiered = excluded.premiered,
-                   updated_at = excluded.updated_at,
-                   proj_season = excluded.proj_season,
-                   proj_episode = excluded.proj_episode",
+            // An episode's description is a provider answer like any
+            // other (HUB-5) — one provider supplies it today, but it
+            // goes through the same store, so a merge can never revert
+            // what the episode pass wrote.
+            crate::providers::store_answer(
+                db,
+                &item_id,
+                provider,
+                &e.provider_id,
+                "auto",
+                crate::providers::Fields {
+                    title: e.title.clone(),
+                    overview: e.overview.clone(),
+                    poster_path: e.image.clone(),
+                    rating: e.rating,
+                    premiered: e.aired.clone(),
+                    ..Default::default()
+                },
+                &chain,
             )
-            .bind(&item_id)
-            .bind(provider)
-            .bind(&e.provider_id)
-            .bind(e.title.as_deref())
-            .bind(e.overview.as_deref())
-            .bind(e.image.as_deref())
-            .bind(e.rating)
-            .bind(e.aired.as_deref())
+            .await?;
+            // The season/absolute projection is identity, not
+            // description: the merge never touches it (HUB-31).
+            sqlx::query(
+                "UPDATE merged_metadata SET proj_season = ?, proj_episode = ?
+                 WHERE item_id = ?",
+            )
             .bind(p.map(|v| v.0))
             .bind(p.map(|v| v.1))
+            .bind(&item_id)
             .execute(db)
             .await?;
             wrote += 1;
@@ -1644,40 +1685,121 @@ impl Enricher {
         provider: &str,
         pick: Option<&(Candidate, &'static str)>,
     ) -> Result<()> {
+        self.store_answer_for(db, item_id, provider, pick, "movies").await
+    }
+
+    /// Record one provider's answer and re-merge the item (HUB-5).
+    pub(crate) async fn store_answer_for(
+        &self,
+        db: &sqlx::SqlitePool,
+        item_id: &str,
+        provider: &str,
+        pick: Option<&(Candidate, &'static str)>,
+        media_type: &str,
+    ) -> Result<()> {
         let (provider_id, confidence, c) = match pick {
             Some((c, conf)) => (c.id.to_string(), *conf, Some(c)),
             None => (String::new(), "miss", None),
         };
-        sqlx::query(
-            "INSERT INTO item_metadata
-               (item_id, provider, provider_id, title, overview, poster_path,
-                rating, premiered, genres, confidence, updated_at, original_language)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, unixepoch(), ?)
-             ON CONFLICT (item_id) DO UPDATE SET
-               provider = excluded.provider,
-               provider_id = excluded.provider_id,
-               title = excluded.title,
-               overview = excluded.overview,
-               poster_path = excluded.poster_path,
-               rating = excluded.rating,
-               premiered = excluded.premiered,
-               confidence = excluded.confidence,
-               updated_at = excluded.updated_at,
-               original_language = excluded.original_language",
+        let fields = crate::providers::Fields {
+            title: c.map(|c| c.title.clone()),
+            overview: c.and_then(|c| c.overview.clone()),
+            poster_path: c.and_then(|c| c.poster_path.clone()),
+            rating: c.and_then(|c| c.vote_average),
+            premiered: c.and_then(|c| c.release_date.clone()),
+            original_language: c.and_then(|c| c.original_language.clone()),
+            genres: None, // TMDB/TVDB search results carry no genre names
+        };
+        let chain = crate::providers::chain_in_force(db, media_type).await;
+        crate::providers::store_answer(
+            db,
+            item_id,
+            provider,
+            &provider_id,
+            confidence,
+            fields,
+            &chain,
         )
-        .bind(item_id)
-        .bind(provider)
-        .bind(&provider_id)
-        .bind(c.map(|c| c.title.clone()))
-        .bind(c.and_then(|c| c.overview.clone()))
-        .bind(c.and_then(|c| c.poster_path.clone()))
-        .bind(c.and_then(|c| c.vote_average))
-        .bind(c.and_then(|c| c.release_date.clone()))
-        .bind(confidence)
-        .bind(c.and_then(|c| c.original_language.clone()))
-        .execute(db)
-        .await?;
-        Ok(())
+        .await
+    }
+
+    /// TheTVDB record by id — the bridged path, same rule as TMDB's:
+    /// used only where a mapping already says which record this is.
+    pub(crate) async fn tvdb_details(
+        &self,
+        token: &str,
+        kind: &str,
+        tvdb_id: i64,
+    ) -> Result<Candidate> {
+        #[derive(Deserialize)]
+        struct Extended {
+            #[serde(default)]
+            name: Option<String>,
+            #[serde(default)]
+            overview: Option<String>,
+            #[serde(default)]
+            image: Option<String>,
+            #[serde(default)]
+            score: Option<f64>,
+            #[serde(default, alias = "firstAired")]
+            first_aired: Option<String>,
+        }
+        #[derive(Deserialize)]
+        struct Resp {
+            data: Extended,
+        }
+        let path = if kind == "movie" { "movies" } else { "series" };
+        let req = self
+            .http
+            .get(format!("https://api4.thetvdb.com/v4/{path}/{tvdb_id}/extended"))
+            .bearer_auth(token);
+        let r: Resp = self
+            .http
+            .send(req)
+            .await
+            .context("tvdb details")?
+            .error_for_status()?
+            .json()
+            .await
+            .context("tvdb details json")?;
+        Ok(Candidate {
+            id: tvdb_id as u64,
+            title: r.data.name.unwrap_or_default(),
+            original_title: None,
+            overview: r.data.overview,
+            poster_path: r.data.image,
+            vote_average: r.data.score,
+            release_date: r.data.first_aired,
+            original_language: None,
+        })
+    }
+
+    /// TMDB details by id — the bridged path (HUB-31): an anime item
+    /// identified by AniDB carries a mapped TMDB id, and this fills the
+    /// description fields AniList left empty WITHOUT re-matching it.
+    pub(crate) async fn tmdb_details(
+        &self,
+        key: &str,
+        kind: &str,
+        tmdb_id: i64,
+    ) -> Result<Candidate> {
+        let path = if kind == "movie" { "movie" } else { "tv" };
+        let mut req = self.http.get(format!("https://api.themoviedb.org/3/{path}/{tmdb_id}"));
+        if key.starts_with("eyJ") {
+            req = req.bearer_auth(key);
+        } else {
+            req = req.query(&[("api_key", key)]);
+        }
+        let c: Candidate = self
+            .http
+            .send(req)
+            .await
+            .context("tmdb details")?
+            .error_for_status()?
+            .json()
+            .await
+            .context("tmdb details json")?;
+        Ok(c)
     }
 }
 
@@ -1685,6 +1807,61 @@ struct TmdbProvider {
     enricher: Arc<Enricher>,
     key: String,
 }
+
+impl TmdbProvider {
+    /// Supply missing fields for an item another provider identified.
+    ///
+    /// Anime is bridged, never re-matched (HUB-5/HUB-31): the mapped
+    /// TMDB id from anime-lists is the only way in, and if there is no
+    /// mapping we decline rather than guess. When TMDB merely ranks
+    /// below another general provider, an ordinary search is fair game
+    /// — that ban applies to anime identity, not to description.
+    async fn fill_gaps(
+        &self,
+        db: &sqlx::SqlitePool,
+        item: &crate::providers::ItemRef,
+        owner: &str,
+    ) -> Result<crate::providers::Outcome> {
+        if item.gaps.is_empty() {
+            return Ok(crate::providers::Outcome::Declined);
+        }
+        let mapped: Option<i64> =
+            sqlx::query_scalar("SELECT mapped_tmdb FROM merged_metadata WHERE item_id = ?")
+                .bind(&item.id)
+                .fetch_optional(db)
+                .await?
+                .flatten();
+        let candidate = match (owner, mapped) {
+            // Bridged: AniDB decided what this is, TMDB describes it.
+            ("anime", Some(id)) => self.enricher.tmdb_details(&self.key, &item.kind, id).await?,
+            ("anime", None) => return Ok(crate::providers::Outcome::Declined),
+            _ => {
+                let cands =
+                    self.enricher.search(&self.key, &item.kind, &item.title, item.year).await?;
+                match pick_candidate(&cands, &item.title, item.year) {
+                    Some((c, _)) => c.clone(),
+                    None => return Ok(crate::providers::Outcome::Declined),
+                }
+            }
+        };
+        // provider_id is recorded so the row is a real answer, but the
+        // merge only hands identity to the top-ranked matcher.
+        let pick = (candidate, "auto");
+        self.enricher
+            .store_answer_for(
+                db,
+                &item.id,
+                "tmdb",
+                Some(&pick),
+                &crate::providers::media_type_of_item(db, &item.id).await,
+            )
+            .await?;
+        tracing::debug!(title = %item.title, owner, gaps = ?item.gaps,
+            "tmdb supplied fields for an item it did not identify");
+        Ok(crate::providers::Outcome::Contributed)
+    }
+}
+
 
 #[async_trait::async_trait]
 impl crate::providers::Provider for TmdbProvider {
@@ -1699,6 +1876,13 @@ impl crate::providers::Provider for TmdbProvider {
     ) -> Result<crate::providers::Outcome> {
         if !matches!(item.kind.as_str(), "movie" | "show") {
             return Ok(crate::providers::Outcome::Declined);
+        }
+        // Someone above us owns this item's identity. Fill what they
+        // left empty; never re-decide what the item IS.
+        if let Some(owner) = &item.owner
+            && owner != self.name()
+        {
+            return self.fill_gaps(db, item, owner).await;
         }
         // Query ladder: TMDB's search has holes (a literal "And" finds
         // nothing where "&" or a shortened query hits); the strict
@@ -1766,6 +1950,26 @@ impl crate::providers::Provider for TvdbProvider {
     ) -> Result<crate::providers::Outcome> {
         if !matches!(item.kind.as_str(), "movie" | "show") {
             return Ok(crate::providers::Outcome::Declined);
+        }
+        // Anime identity is AniDB's; TVDB may describe, never re-match
+        // (HUB-5/HUB-31). Without a mapped id there is no honest way in,
+        // so it declines rather than searching by title.
+        if item.owner.as_deref() == Some("anilist") {
+            let mapped: Option<i64> =
+                sqlx::query_scalar("SELECT mapped_tvdb FROM merged_metadata WHERE item_id = ?")
+                    .bind(&item.id)
+                    .fetch_optional(db)
+                    .await?
+                    .flatten();
+            let Some(tvdb_id) = mapped.filter(|_| !item.gaps.is_empty()) else {
+                return Ok(crate::providers::Outcome::Declined);
+            };
+            let c = self.enricher.tvdb_details(&self.token, &item.kind, tvdb_id).await?;
+            let pick = (c, "auto");
+            self.enricher
+                .store_answer_for(db, &item.id, "tvdb", Some(&pick), "anime")
+                .await?;
+            return Ok(crate::providers::Outcome::Contributed);
         }
         let cands = self.enricher.tvdb_search(&self.token, &item.kind, &item.title).await?;
         match pick_candidate(&cands, &item.title, item.year) {
@@ -1875,24 +2079,29 @@ impl crate::providers::Provider for MusicbrainzProvider {
         let (Some(artist), "album") = (&item.artist, item.kind.as_str()) else {
             return Ok(crate::providers::Outcome::Declined);
         };
-        // MB hard rate limit: one request per second.
-        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        // Pacing lives in the gate now (one request per second, keyed on
+        // musicbrainz.org) — a sleep here would only double it.
         let Some(rg) = self.enricher.musicbrainz_album(&item.title, artist).await? else {
             return Ok(crate::providers::Outcome::Declined);
         };
-        sqlx::query(
-            "INSERT OR REPLACE INTO item_metadata
-               (item_id, provider, provider_id, title, overview, poster_path,
-                rating, premiered, genres, confidence, updated_at)
-             VALUES (?, 'musicbrainz', ?, ?, NULL, ?, NULL, ?, ?, 'auto', unixepoch())",
+        crate::providers::store_answer(
+            db,
+            &item.id,
+            "musicbrainz",
+            &rg.id,
+            "auto",
+            crate::providers::Fields {
+                title: Some(rg.title.clone()),
+                poster_path: Some(format!(
+                    "https://coverartarchive.org/release-group/{}/front-500",
+                    rg.id
+                )),
+                premiered: rg.first_release_date.clone(),
+                genres: Some(serde_json::to_string(&rg.genres)?),
+                ..Default::default()
+            },
+            &crate::providers::chain_in_force(db, "music").await,
         )
-        .bind(&item.id)
-        .bind(&rg.id)
-        .bind(&rg.title)
-        .bind(format!("https://coverartarchive.org/release-group/{}/front-500", rg.id))
-        .bind(&rg.first_release_date)
-        .bind(serde_json::to_string(&rg.genres)?)
-        .execute(db)
         .await?;
         Ok(crate::providers::Outcome::Matched("auto"))
     }

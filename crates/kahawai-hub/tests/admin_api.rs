@@ -257,7 +257,7 @@ async fn review_queue_flow() {
         .unwrap();
     for (id, pid, conf) in [(&miss_id, "", "miss"), (&weak_id, "42", "weak")] {
         sqlx::query(
-            "INSERT INTO item_metadata (item_id, provider, provider_id, title, confidence, updated_at)
+            "INSERT INTO merged_metadata (item_id, provider, provider_id, title, confidence, updated_at)
              VALUES (?, 'tmdb', ?, 'Guess', ?, 0)",
         )
         .bind(id)
@@ -318,7 +318,7 @@ async fn review_queue_flow() {
     }
 
     let states: Vec<(String, String)> =
-        sqlx::query("SELECT item_id, confidence FROM item_metadata ORDER BY item_id")
+        sqlx::query("SELECT item_id, confidence FROM merged_metadata ORDER BY item_id")
             .fetch_all(&db)
             .await
             .unwrap()

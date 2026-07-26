@@ -70,10 +70,19 @@ limits, OPS-6 scoped to re-derivable caches).
 - [x] HUB-3 Dedup: same logical item from multiple sources → one item, source list
 - [x] HUB-4 Filename/dirname parsing (movies, episodes, anime conventions, music layout)
 - [x] HUB-20 Mediahost deletion cascade + watch-state/match archives restored on re-enroll
-- [ ] HUB-5 Provider trait + declared chains + walker live (TMDB, TVDB, anime
-      composite, MusicBrainz + CAA) *(amended clauses pending: claims are
-      item-level not field-level, and chains are static — not configurable
-      per library)*
+- [x] HUB-5 Provider trait + declared chains + walker (TMDB, TVDB, anime
+      composite, MusicBrainz + CAA), with first-claim-wins at FIELD
+      granularity: every provider's answer is stored in
+      `provider_metadata`, and the served row is the merge of those by
+      rank — so AniDB owns an anime's title while TMDB supplies the
+      synopsis and cover it has nothing for. Order is per media type
+      (requirement amended 2026-07-26 from "per library"), editable at
+      runtime via `POST /admin/v1/providers/chains/{media_type}`;
+      a reorder re-merges from stored answers and contacts nobody.
+      A provider that can't be reached (ban, 429) is rescheduled with
+      backoff in `enrichment_queue`, never dropped. Manual matches
+      outrank the whole chain (HUB-8/30a). Anime stays bridged through
+      mapped IDs — described by the tail, never re-identified by it.
 - [ ] HUB-6 Descriptive metadata *(titles, plots, dates, ratings, posters, episode
       stills live; cast/genres not stored)*
 - [ ] HUB-7 Provider rate limits/caching — rate limits done properly: every

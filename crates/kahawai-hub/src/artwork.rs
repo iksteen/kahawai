@@ -81,7 +81,7 @@ impl Artwork {
     ) -> Result<Option<(Vec<u8>, &'static str)>> {
         let poster: Option<String> = sqlx::query_scalar(
             "SELECT m.poster_path FROM items i
-             JOIN item_metadata m ON m.item_id IN (i.id, i.parent_id)
+             JOIN merged_metadata m ON m.item_id IN (i.id, i.parent_id)
              WHERE i.id = ? AND m.poster_path IS NOT NULL
              ORDER BY m.item_id = i.id DESC LIMIT 1",
         )

@@ -377,9 +377,9 @@ impl Subtitles {
                         AS search_year
              FROM items i
              LEFT JOIN items p ON p.id = i.parent_id
-             LEFT JOIN item_metadata md ON md.item_id = i.id AND md.provider_id != ''
-             LEFT JOIN item_metadata pmd ON pmd.item_id = i.parent_id AND pmd.provider_id != ''
-             LEFT JOIN item_metadata pm ON pm.item_id = i.parent_id AND pm.provider_id != ''
+             LEFT JOIN merged_metadata md ON md.item_id = i.id AND md.provider_id != ''
+             LEFT JOIN merged_metadata pmd ON pmd.item_id = i.parent_id AND pmd.provider_id != ''
+             LEFT JOIN merged_metadata pm ON pm.item_id = i.parent_id AND pm.provider_id != ''
              WHERE i.id = ?",
         )
         .bind(item_id)

@@ -105,6 +105,7 @@ pub fn router(
         .route("/admin/v1/collections", get(admin_collections))
         .route("/admin/v1/users", post(admin_create_user))
         .route("/admin/v1/providers", get(admin_providers))
+        .route("/admin/v1/providers/chains/{media_type}", post(admin_set_chain))
         .route("/admin/v1/providers/tmdb", post(admin_set_tmdb))
         .route("/admin/v1/providers/tvdb", post(admin_set_tvdb))
         .route("/admin/v1/providers/anidb", post(admin_set_anidb))
@@ -264,11 +265,43 @@ async fn admin_providers(State(state): State<AppState>) -> Result<Json<Value>, A
         .await
         .map_err(internal)?
         .is_some();
+    let db = state.registry.db();
+    let mut chains = serde_json::Map::new();
+    for mt in ["movies", "anime", "music"] {
+        chains.insert(
+            mt.to_string(),
+            json!({
+                "order": crate::providers::chain_in_force(db, mt).await,
+                "default": crate::providers::chain_for(mt),
+            }),
+        );
+    }
     Ok(Json(json!({
         "tmdb": { "configured": tmdb },
         "tvdb": { "configured": tvdb },
         "anidb": { "configured": anidb },
+        "chains": chains,
     })))
+}
+
+#[derive(Deserialize)]
+struct SetChain {
+    order: Vec<String>,
+}
+
+/// HUB-5: reorder a media type's providers. Precedence is per field, so
+/// this decides who wins where two providers both have an answer — and
+/// it re-merges from stored answers, sending no provider a request.
+async fn admin_set_chain(
+    State(state): State<AppState>,
+    Path(media_type): Path<String>,
+    Json(body): Json<SetChain>,
+) -> Result<Json<Value>, ApiError> {
+    crate::providers::set_chain(state.registry.db(), &media_type, &body.order)
+        .await
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    state.registry.emit(json!({ "kind": "enrich", "chain": media_type }));
+    Ok(Json(json!({ "ok": true })))
 }
 
 #[derive(Deserialize)]
@@ -561,7 +594,7 @@ async fn admin_review_list(State(state): State<AppState>) -> Result<Json<Value>,
                 m.title AS matched_title, m.premiered, m.provider, m.provider_id,
                 (SELECT s.path_rel FROM item_sources s WHERE s.item_id = i.id LIMIT 1) AS path
          FROM items i
-         JOIN item_metadata m ON m.item_id = i.id
+         JOIN merged_metadata m ON m.item_id = i.id
          WHERE m.confidence IN ('miss', 'weak', 'rejected')
          ORDER BY m.confidence != 'miss', i.title",
     )
@@ -624,18 +657,31 @@ async fn admin_apply_match(
     let db = state.registry.db();
     match body.action.as_str() {
         "confirm" => {
-            sqlx::query(
-                "UPDATE item_metadata SET confidence = 'manual', updated_at = unixepoch()
-                 WHERE item_id = ? AND provider_id != ''",
-            )
-            .bind(&id)
-            .execute(db)
-            .await
-            .map_err(internal)?;
+            // Confirming pins the answer: HUB-5's merge ranks manual
+            // above every chain position, so a later reorder or run
+            // cannot quietly replace what a human approved.
+            for table in ["merged_metadata", "provider_metadata"] {
+                sqlx::query(&format!(
+                    "UPDATE {table} SET confidence = 'manual', updated_at = unixepoch()
+                     WHERE item_id = ? AND provider_id != ''"
+                ))
+                .bind(&id)
+                .execute(db)
+                .await
+                .map_err(internal)?;
+            }
         }
         "reject" => {
+            // Every provider's answer goes, not just the merged row —
+            // otherwise the next merge would promote a runner-up the
+            // user never saw and call the item matched again.
+            sqlx::query("DELETE FROM provider_metadata WHERE item_id = ?")
+                .bind(&id)
+                .execute(db)
+                .await
+                .map_err(internal)?;
             sqlx::query(
-                "UPDATE item_metadata SET provider_id = '', title = NULL, overview = NULL,
+                "UPDATE merged_metadata SET provider_id = '', title = NULL, overview = NULL,
                         poster_path = NULL, rating = NULL, premiered = NULL,
                         confidence = 'rejected', updated_at = unixepoch()
                  WHERE item_id = ?",
@@ -653,31 +699,28 @@ async fn admin_apply_match(
             let pid = c["id"]
                 .as_u64()
                 .ok_or((StatusCode::BAD_REQUEST, "candidate.id required".into()))?;
-            sqlx::query(
-                "INSERT INTO item_metadata
-                   (item_id, provider, provider_id, title, overview, poster_path,
-                    rating, premiered, genres, confidence, updated_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, 'manual', unixepoch())
-                 ON CONFLICT (item_id) DO UPDATE SET
-                   provider = excluded.provider,
-                   provider_id = excluded.provider_id,
-                   title = excluded.title,
-                   overview = excluded.overview,
-                   poster_path = excluded.poster_path,
-                   rating = excluded.rating,
-                   premiered = excluded.premiered,
-                   confidence = 'manual',
-                   updated_at = excluded.updated_at",
+            // A human's pick is stored as that provider's answer with
+            // manual confidence, which outranks the whole chain in the
+            // merge — the rest of the chain may still fill fields the
+            // picked candidate left empty.
+            let media_type = crate::providers::media_type_of_item(db, &id).await;
+            let chain = crate::providers::chain_in_force(db, &media_type).await;
+            crate::providers::store_answer(
+                db,
+                &id,
+                &provider,
+                &pid.to_string(),
+                crate::providers::MANUAL,
+                crate::providers::Fields {
+                    title: c["title"].as_str().map(str::to_string),
+                    overview: c["overview"].as_str().map(str::to_string),
+                    poster_path: c["poster_path"].as_str().map(str::to_string),
+                    rating: c["vote_average"].as_f64(),
+                    premiered: c["release_date"].as_str().map(str::to_string),
+                    ..Default::default()
+                },
+                &chain,
             )
-            .bind(&id)
-            .bind(&provider)
-            .bind(pid.to_string())
-            .bind(c["title"].as_str())
-            .bind(c["overview"].as_str())
-            .bind(c["poster_path"].as_str())
-            .bind(c["vote_average"].as_f64())
-            .bind(c["release_date"].as_str())
-            .execute(db)
             .await
             .map_err(internal)?;
         }
@@ -1443,8 +1486,8 @@ async fn list_items(
          FROM items i
          LEFT JOIN item_sources s ON s.item_id = i.id
          LEFT JOIN watch_state w ON w.item_id = i.id AND w.user_id = ?1
-         LEFT JOIN item_metadata md ON md.item_id = i.id AND md.provider_id != ''
-         LEFT JOIN item_metadata mdc ON mdc.item_id = i.id
+         LEFT JOIN merged_metadata md ON md.item_id = i.id AND md.provider_id != ''
+         LEFT JOIN merged_metadata mdc ON mdc.item_id = i.id
          WHERE i.kind NOT IN ('episode', 'track')
            AND (?2 IS NULL OR i.id IN (
              SELECT COALESCE(ci.parent_id, ci.id)
@@ -1506,7 +1549,7 @@ async fn item_children(
          FROM items i
          LEFT JOIN item_sources s ON s.item_id = i.id
          LEFT JOIN watch_state w ON w.item_id = i.id AND w.user_id = ?
-         LEFT JOIN item_metadata md ON md.item_id = i.id AND md.provider_id != ''
+         LEFT JOIN merged_metadata md ON md.item_id = i.id AND md.provider_id != ''
          WHERE i.parent_id = ?
          GROUP BY i.id ORDER BY i.season, i.episode",
     )
@@ -1535,8 +1578,8 @@ async fn item_detail(
          FROM items i
          LEFT JOIN items p ON p.id = i.parent_id
          LEFT JOIN watch_state w ON w.item_id = i.id AND w.user_id = ?
-         LEFT JOIN item_metadata md ON md.item_id = i.id AND md.provider_id != ''
-         LEFT JOIN item_metadata pmd ON pmd.item_id = p.id AND pmd.provider_id != ''
+         LEFT JOIN merged_metadata md ON md.item_id = i.id AND md.provider_id != ''
+         LEFT JOIN merged_metadata pmd ON pmd.item_id = p.id AND pmd.provider_id != ''
          WHERE i.id = ?",
     )
         .bind(&claims.sub)
@@ -1587,8 +1630,8 @@ async fn item_detail(
                 COALESCE(NULLIF(m.original_language, ''),
                          NULLIF(pm.original_language, '')) AS original_language
          FROM items i
-         JOIN item_metadata m ON m.item_id IN (i.id, i.parent_id)
-         LEFT JOIN item_metadata pm ON pm.item_id = i.parent_id
+         JOIN merged_metadata m ON m.item_id IN (i.id, i.parent_id)
+         LEFT JOIN merged_metadata pm ON pm.item_id = i.parent_id
          WHERE i.id = ? AND m.provider_id != ''
          ORDER BY m.item_id = i.id DESC LIMIT 1",
     )
@@ -1614,7 +1657,7 @@ async fn item_detail(
     let related = sqlx::query(
         "SELECT r.kind, r.target_title, r.target_anilist, m2.item_id AS local_id
          FROM item_relations r
-         LEFT JOIN item_metadata m2 ON m2.anilist_id = r.target_anilist
+         LEFT JOIN merged_metadata m2 ON m2.anilist_id = r.target_anilist
          WHERE r.from_item = ?
          ORDER BY CASE r.kind
              WHEN 'prequel' THEN 0 WHEN 'sequel' THEN 1 WHEN 'parent' THEN 2
