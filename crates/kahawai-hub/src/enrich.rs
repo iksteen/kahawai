@@ -1830,7 +1830,7 @@ impl TmdbProvider {
         owner: &str,
     ) -> Result<crate::providers::Outcome> {
         if item.gaps.is_empty() {
-            return Ok(crate::providers::Outcome::Declined);
+            return Ok(crate::providers::Outcome::NotApplicable);
         }
         let mapped: Option<i64> =
             sqlx::query_scalar("SELECT mapped_tmdb FROM merged_metadata WHERE item_id = ?")
@@ -1841,7 +1841,9 @@ impl TmdbProvider {
         let candidate = match (owner, mapped) {
             // Bridged: AniDB decided what this is, TMDB describes it.
             ("anime", Some(id)) => self.enricher.tmdb_details(&self.key, &item.kind, id).await?,
-            ("anime", None) => return Ok(crate::providers::Outcome::Declined),
+            // No mapped id yet — anime-lists refreshes weekly, so this
+            // is "cannot ask", not "asked and missed".
+            ("anime", None) => return Ok(crate::providers::Outcome::NotApplicable),
             _ => {
                 let cands =
                     self.enricher.search(&self.key, &item.kind, &item.title, item.year).await?;
@@ -1882,7 +1884,7 @@ impl crate::providers::Provider for TmdbProvider {
         item: &crate::providers::ItemRef,
     ) -> Result<crate::providers::Outcome> {
         if !matches!(item.kind.as_str(), "movie" | "show") {
-            return Ok(crate::providers::Outcome::Declined);
+            return Ok(crate::providers::Outcome::NotApplicable);
         }
         // Someone above us owns this item's identity. Fill what they
         // left empty; never re-decide what the item IS.
@@ -1956,7 +1958,7 @@ impl crate::providers::Provider for TvdbProvider {
         item: &crate::providers::ItemRef,
     ) -> Result<crate::providers::Outcome> {
         if !matches!(item.kind.as_str(), "movie" | "show") {
-            return Ok(crate::providers::Outcome::Declined);
+            return Ok(crate::providers::Outcome::NotApplicable);
         }
         // Anime identity is AniDB's; TVDB may describe, never re-match
         // (HUB-5/HUB-31). Without a mapped id there is no honest way in,
@@ -1969,7 +1971,7 @@ impl crate::providers::Provider for TvdbProvider {
                     .await?
                     .flatten();
             let Some(tvdb_id) = mapped.filter(|_| !item.gaps.is_empty()) else {
-                return Ok(crate::providers::Outcome::Declined);
+                return Ok(crate::providers::Outcome::NotApplicable);
             };
             let c = self.enricher.tvdb_details(&self.token, &item.kind, tvdb_id).await?;
             let pick = (c, "auto");
@@ -2012,7 +2014,7 @@ impl crate::providers::Provider for AnimeProvider {
         item: &crate::providers::ItemRef,
     ) -> Result<crate::providers::Outcome> {
         if !matches!(item.kind.as_str(), "movie" | "show") {
-            return Ok(crate::providers::Outcome::Declined);
+            return Ok(crate::providers::Outcome::NotApplicable);
         }
         // ED2K-exact identity first; a failure disables the UDP client
         // for the rest of the run (ban safety).
@@ -2084,7 +2086,7 @@ impl crate::providers::Provider for MusicbrainzProvider {
         item: &crate::providers::ItemRef,
     ) -> Result<crate::providers::Outcome> {
         let (Some(artist), "album") = (&item.artist, item.kind.as_str()) else {
-            return Ok(crate::providers::Outcome::Declined);
+            return Ok(crate::providers::Outcome::NotApplicable);
         };
         // Pacing lives in the gate now (one request per second, keyed on
         // musicbrainz.org) — a sleep here would only double it.

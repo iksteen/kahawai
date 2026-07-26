@@ -500,12 +500,24 @@ export const adminLibraries = () =>
 export const adminCollections = () =>
   json<{ collections: CollectionInfo[] }>('/admin/v1/collections')
 
+export type ProviderChain = { order: string[]; default: string[] }
+
 export const adminProviders = () =>
   json<{
     tmdb: { configured: boolean }
     tvdb: { configured: boolean }
     anidb: { configured: boolean }
+    chains: Record<string, ProviderChain>
   }>('/admin/v1/providers')
+
+/// HUB-5: precedence per media type. Earlier wins a field; later ones
+/// fill what it left empty. Applying re-merges from stored answers, so
+/// it is instant and sends no provider a request.
+export const adminSetChain = (mediaType: string, order: string[]) =>
+  json<{ ok: boolean }>(`/admin/v1/providers/chains/${mediaType}`, {
+    method: 'POST',
+    body: JSON.stringify({ order }),
+  })
 export const adminSetAnidb = (username: string, password: string, udpApiKey?: string) =>
   json<{ saved: boolean; verified: boolean; error?: string }>('/admin/v1/providers/anidb', {
     method: 'POST',

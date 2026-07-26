@@ -4,6 +4,8 @@ import {
   adminEnrichRun,
   adminEnrichStatus,
   adminProviders,
+  adminSetChain,
+  type ProviderChain,
   adminRefreshLibrary,
   openEvents,
   adminSetAnidb,
@@ -48,6 +50,7 @@ function TmdbSection({ onNotice, tick }: { onNotice: (s: string) => void; tick: 
     weak: number
     missed: number
   } | null>(null)
+  const [chains, setChains] = useState<Record<string, ProviderChain>>({})
 
   const refresh = () => {
     adminProviders()
@@ -55,6 +58,7 @@ function TmdbSection({ onNotice, tick }: { onNotice: (s: string) => void; tick: 
         setConfigured(p.tmdb.configured)
         setTvdbConfigured(p.tvdb.configured)
         setAnidbConfigured(p.anidb?.configured ?? false)
+        setChains(p.chains ?? {})
       })
       .catch(() => {})
     adminEnrichStatus().then(setStatus).catch(() => {})
@@ -69,6 +73,7 @@ function TmdbSection({ onNotice, tick }: { onNotice: (s: string) => void; tick: 
   return (
     <>
       <h2>Metadata providers</h2>
+      <ProviderOrder chains={chains} onNotice={onNotice} onDone={refresh} />
       <div className="row-form">
         <input
           type="password"
@@ -496,5 +501,108 @@ export default function Admin() {
         ))}
       </ul>
     </main>
+  )
+}
+
+/// HUB-5: which provider wins a field, per media type. Earlier providers
+/// own a field; later ones only fill what the earlier left empty. Applying
+/// re-merges from answers already on disk — no provider is contacted, so
+/// this is safe to try and trivially reversible.
+function ProviderOrder({
+  chains,
+  onNotice,
+  onDone,
+}: {
+  chains: Record<string, ProviderChain>
+  onNotice: (m: string) => void
+  onDone: () => void
+}) {
+  const [draft, setDraft] = useState<Record<string, string[]>>({})
+  const [busy, setBusy] = useState<string | null>(null)
+  const order = (mt: string) => draft[mt] ?? chains[mt]?.order ?? []
+  const dirty = (mt: string) =>
+    JSON.stringify(order(mt)) !== JSON.stringify(chains[mt]?.order ?? [])
+
+  const move = (mt: string, i: number, by: number) => {
+    const next = [...order(mt)]
+    const j = i + by
+    if (j < 0 || j >= next.length) return
+    ;[next[i], next[j]] = [next[j], next[i]]
+    setDraft({ ...draft, [mt]: next })
+  }
+
+  const apply = (mt: string) => {
+    setBusy(mt)
+    void adminSetChain(mt, order(mt))
+      .then(() => {
+        onNotice(`${mt}: provider order applied — metadata re-merged`)
+        setDraft((d) => {
+          const { [mt]: _dropped, ...rest } = d
+          return rest
+        })
+        onDone()
+      })
+      .finally(() => setBusy(null))
+  }
+
+  const names = Object.keys(chains)
+  if (names.length === 0) return null
+  return (
+    <div className="provider-order">
+      {names.map((mt) => (
+        <div className="row-form" key={mt}>
+          <span className="mono" style={{ minWidth: '5rem' }}>
+            {mt}
+          </span>
+          {order(mt).map((p, i) => (
+            <span key={p} className="chip">
+              <span className="dim mono">{i + 1}.</span> {p}
+              <button
+                className="btn ghost small"
+                title="higher precedence"
+                disabled={i === 0}
+                onClick={() => move(mt, i, -1)}
+              >
+                ↑
+              </button>
+              <button
+                className="btn ghost small"
+                title="lower precedence"
+                disabled={i === order(mt).length - 1}
+                onClick={() => move(mt, i, 1)}
+              >
+                ↓
+              </button>
+            </span>
+          ))}
+          {order(mt).length < 2 && <span className="dim">only one provider</span>}
+          <button
+            className="btn small"
+            disabled={!dirty(mt) || busy === mt}
+            onClick={() => apply(mt)}
+          >
+            {busy === mt ? 'Applying…' : 'Apply'}
+          </button>
+          {dirty(mt) && (
+            <button
+              className="btn ghost small"
+              onClick={() =>
+                setDraft((d) => {
+                  const { [mt]: _dropped, ...rest } = d
+                  return rest
+                })
+              }
+            >
+              Reset
+            </button>
+          )}
+        </div>
+      ))}
+      <p className="dim">
+        The first provider to supply a field owns it; the rest fill what it left
+        empty. Applying re-merges stored answers — instant, and no provider is
+        contacted.
+      </p>
+    </div>
   )
 }

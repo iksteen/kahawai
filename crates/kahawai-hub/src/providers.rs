@@ -78,8 +78,14 @@ pub enum Outcome {
     Settled,
     /// Supplied missing fields without touching identity.
     Contributed,
-    /// Not this provider's item (or nothing verifiable found): next.
+    /// Looked, and had nothing to offer. This IS an answer: it is
+    /// recorded as a miss so the data says the provider was consulted.
     Declined,
+    /// Could not be consulted at all — wrong kind of item for this
+    /// provider, or an anime item with no mapped id to bridge through.
+    /// Recorded as nothing, because nothing was asked: should a mapping
+    /// appear later, the provider is still eligible.
+    NotApplicable,
 }
 
 #[async_trait::async_trait]
@@ -556,8 +562,21 @@ impl ProviderSet {
                     result = result.or(Some("settled"));
                 }
                 // Declined on the merits — it looked and had nothing.
-                // That is an answer, not a deferral.
-                Ok(Outcome::Declined) => settled(db, &item.id, name).await,
+                // That is an answer, so record it as a miss: otherwise
+                // "already asked" rests on the ABSENCE of a row, the
+                // data cannot tell you this provider was consulted, and
+                // whether it gets asked again depends on which selection
+                // query happens to pick the item up.
+                Ok(Outcome::Declined) => {
+                    let _ =
+                        store_answer(db, &item.id, name, "", "miss", Fields::default(), &chain)
+                            .await;
+                    settled(db, &item.id, name).await;
+                }
+                // Nothing was asked, so nothing is recorded — but the
+                // queue row goes, or an item that cannot be bridged
+                // would be retried on every single run.
+                Ok(Outcome::NotApplicable) => settled(db, &item.id, name).await,
                 // Could not look: rate-limited, banned, network. The
                 // item keeps its place in the queue and comes back when
                 // the provider will listen again.
