@@ -657,37 +657,17 @@ async fn admin_apply_match(
     let db = state.registry.db();
     match body.action.as_str() {
         "confirm" => {
-            // Confirming pins the answer: HUB-5's merge ranks manual
-            // above every chain position, so a later reorder or run
-            // cannot quietly replace what a human approved.
-            for table in ["merged_metadata", "provider_metadata"] {
-                sqlx::query(&format!(
-                    "UPDATE {table} SET confidence = 'manual', updated_at = unixepoch()
-                     WHERE item_id = ? AND provider_id != ''"
-                ))
-                .bind(&id)
-                .execute(db)
-                .await
-                .map_err(internal)?;
-            }
+            // Pin what is already assigned: automatic re-picking then leaves
+            // it alone, whatever a later answer or a reorder says.
+            crate::providers::confirm_assignment(db, &id).await.map_err(internal)?;
         }
         "reject" => {
             // The refused records are remembered and the assignment goes;
-            // the ANSWERS stay. Deleting them (what this did) makes the
-            // next run re-ask every provider, AniDB included, for one
-            // click — and it is the refused set, not their absence, that
-            // keeps the item unassigned until something new appears.
+            // the ANSWERS stay. Deleting them made the next run re-ask every
+            // provider, AniDB included, for one click — and it is the
+            // refused set, not their absence, that keeps the item
+            // unassigned until a provider offers something new.
             crate::providers::reject_matches(db, &id).await.map_err(internal)?;
-            sqlx::query(
-                "UPDATE merged_metadata SET provider_id = '', title = NULL, overview = NULL,
-                        poster_path = NULL, rating = NULL, premiered = NULL,
-                        confidence = 'rejected', updated_at = unixepoch()
-                 WHERE item_id = ?",
-            )
-            .bind(&id)
-            .execute(db)
-            .await
-            .map_err(internal)?;
         }
         "pick" => {
             let c = body.candidate.ok_or((StatusCode::BAD_REQUEST, "candidate required".into()))?;
@@ -697,12 +677,8 @@ async fn admin_apply_match(
             let pid = c["id"]
                 .as_u64()
                 .ok_or((StatusCode::BAD_REQUEST, "candidate.id required".into()))?;
-            // A human's pick is stored as that provider's answer with
-            // manual confidence, which outranks the whole chain in the
-            // merge — the rest of the chain may still fill fields the
-            // picked candidate left empty.
-            let media_type = crate::providers::media_type_of_item(db, &id).await;
-            let chain = crate::providers::chain_in_force(db, &media_type).await;
+            // A human's choice: stored as that provider's answer and pinned,
+            // so automatic re-picking leaves it alone whatever lands later.
             crate::providers::assign_manual(
                 db,
                 &id,
@@ -716,7 +692,6 @@ async fn admin_apply_match(
                     premiered: c["release_date"].as_str().map(str::to_string),
                     ..Default::default()
                 },
-                &chain,
             )
             .await
             .map_err(internal)?;

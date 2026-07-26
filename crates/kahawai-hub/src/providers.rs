@@ -21,20 +21,23 @@
 //!   EMPTY `provider_id` means one thing only: it looked and found
 //!   nothing, always paired with `confidence = "miss"` — and that pair
 //!   is how never-ask-twice is remembered.
-//! * `merged_metadata` — derived, one row per item. Rebuilt from the
-//!   answers by rank: first non-empty value per field. Identity
-//!   (`provider`/`provider_id`/`confidence`) goes to the highest-ranked
-//!   answer with a non-empty id, so a reorder can move identity to a
-//!   provider that had merely been describing — intended. Its anime ids
-//!   and season projection are written directly and never merged.
-//!   Nothing else in the hub may write this table.
+//! * `item_match` — what a TOP-LEVEL item IS: one provider's record, and
+//!   whether a human chose it. Episodes and tracks never carry one; they
+//!   render through their parent's. Nothing is stored here that a read
+//!   could derive, which is the point — see `resolved_metadata_sql`.
+//! * `rejected_matches` — records a human refused. An item where every
+//!   candidate is refused stays unassigned; a record that is NOT here may
+//!   be assigned automatically, so the item recovers by itself when a
+//!   provider offers something new.
+//! * `anime_ids` — bridge identity (AniDB/AniList ids and the TVDB/TMDB
+//!   mapping). Never side-filled: these say what the work IS, not what it
+//!   looks like.
 //! * `provider_ranks` — precedence, one row per chain position, per
 //!   media type. Editable at runtime; changing it re-merges.
 //! * `enrichment_queue` — work owed: a provider that refused (ban, rate
 //!   limit, transport) with `due_at` and a growing backoff.
 
 use anyhow::Result;
-use sqlx::Row;
 use sqlx::SqlitePool;
 
 /// One item as the chain walker sees it. The `anime_*` fields carry the
@@ -156,9 +159,9 @@ pub async fn set_chain(db: &SqlitePool, media_type: &str, order: &[String]) -> R
         .await?;
     }
     tx.commit().await?;
-    // Both models while the read path moves over (step 3 of 4).
-    assign_media_type(db, media_type).await?;
-    rematerialize_media_type(db, media_type).await
+    // Reordering re-decides ownership from answers already on disk: no
+    // provider is contacted, which is what makes the knob affordable.
+    assign_media_type(db, media_type).await
 }
 
 /// Drop an automatic assignment whose backing answer no longer qualifies
@@ -396,115 +399,6 @@ pub async fn identity_owner(db: &SqlitePool, item_id: &str) -> Option<String> {
     .map(|p| chain_name(&p).to_string())
 }
 
-/// Recompute `merged_metadata` for one item from the stored per-provider
-/// answers: chain order decides, first non-NULL wins per field. Identity
-/// (provider/provider_id/confidence) goes to the highest-ranked provider
-/// that actually matched something.
-pub async fn materialize(db: &SqlitePool, item_id: &str, chain: &[String]) -> Result<()> {
-    let rows = sqlx::query(
-        "SELECT provider, provider_id, title, overview, poster_path, rating,
-                premiered, original_language, genres, confidence
-         FROM provider_metadata WHERE item_id = ?",
-    )
-    .bind(item_id)
-    .fetch_all(db)
-    .await?;
-    if rows.is_empty() {
-        return Ok(());
-    }
-    // Two orthogonal keys, and they must stay orthogonal: how much the
-    // match is TRUSTED, then where the provider sits in the chain.
-    // Collapsing both into one number made every manual match rank 0,
-    // so with two manual matches the winner fell out of insertion order
-    // — the chain said TMDB first and the row kept TVDB.
-    let chain_pos =
-        |p: &str| chain.iter().position(|c| c == chain_name(p)).unwrap_or(usize::MAX);
-    let tier = |r: &&sqlx::sqlite::SqliteRow| {
-        if r.get::<String, _>("provider_id").is_empty() {
-            return 3; // looked, found nothing
-        }
-        match r.get::<String, _>("confidence").as_str() {
-            MANUAL => 0,
-            "weak" => 2,
-            _ => 1,
-        }
-    };
-    let mut ordered: Vec<_> = rows.iter().collect();
-    ordered.sort_by_key(|r| (tier(r), chain_pos(&r.get::<String, _>("provider"))));
-    // Best-trusted, then best-ranked: that is the identity, and the same
-    // order decides every field below.
-    let owner = *ordered.first().expect("non-empty");
-    let owner_provider = owner.get::<String, _>("provider");
-    // A weak match may describe the item it identified, but must not
-    // donate fields to somebody else's item: an uncertain match filling
-    // a synopsis for the wrong film is worse than an empty synopsis.
-    let mergeable = |r: &&&sqlx::sqlite::SqliteRow| -> bool {
-        r.get::<String, _>("confidence") != "weak"
-            || r.get::<String, _>("provider") == owner_provider
-    };
-    let text = |field: &str| -> Option<String> {
-        ordered
-            .iter()
-            .filter(mergeable)
-            .find_map(|r| r.get::<Option<String>, _>(field).filter(|s| !s.is_empty()))
-    };
-    let rating: Option<f64> =
-        ordered.iter().filter(mergeable).find_map(|r| r.get::<Option<f64>, _>("rating"));
-
-    sqlx::query(
-        "UPDATE merged_metadata SET
-           provider = ?, provider_id = ?, confidence = ?,
-           title = ?, overview = ?, poster_path = ?, rating = ?,
-           premiered = ?, original_language = ?, genres = ?, updated_at = unixepoch()
-         WHERE item_id = ?",
-    )
-    .bind(owner.get::<String, _>("provider"))
-    .bind(owner.get::<String, _>("provider_id"))
-    .bind(owner.get::<String, _>("confidence"))
-    .bind(text("title"))
-    .bind(text("overview"))
-    .bind(text("poster_path"))
-    .bind(rating)
-    .bind(text("premiered"))
-    .bind(text("original_language"))
-    .bind(text("genres"))
-    .bind(item_id)
-    .execute(db)
-    .await?;
-    Ok(())
-}
-
-/// Re-merge every item of one media type — what a reorder costs. Pure
-/// local work: no provider is contacted.
-pub async fn rematerialize_media_type(db: &SqlitePool, media_type: &str) -> Result<()> {
-    let media_type = media_type_key(media_type);
-    let chain = chain_in_force(db, media_type).await;
-    // Must classify items exactly as `media_type_of_item` does —
-    // including its default — or a reorder would silently skip the
-    // items the two disagree about.
-    let ids: Vec<String> = sqlx::query_scalar(
-        "SELECT DISTINCT pm.item_id FROM provider_metadata pm
-         JOIN items i ON i.id = pm.item_id
-         WHERE COALESCE((
-                 SELECT CASE WHEN c.media_type IN ('movies','series','anime','music')
-                             THEN c.media_type ELSE 'movies' END
-                 FROM item_sources s
-                 JOIN collections c ON (c.module_id, c.collection_id)
-                                     = (s.module_id, s.collection_id)
-                 WHERE s.item_id = i.id
-                    OR s.item_id IN (SELECT id FROM items WHERE parent_id = i.id)
-                 LIMIT 1), 'movies') = ?",
-    )
-    .bind(media_type)
-    .fetch_all(db)
-    .await?;
-    for id in &ids {
-        materialize(db, id, &chain).await?;
-    }
-    tracing::info!(media_type, items = ids.len(), ?chain, "provider order applied");
-    Ok(())
-}
-
 /// Record one provider's answer for an item, then re-merge.
 ///
 /// `provider_id` is that provider's own record id, and a gap-filler
@@ -525,7 +419,6 @@ pub async fn store_answer(
     provider_id: &str,
     confidence: &str,
     fields: Fields,
-    chain: &[String],
 ) -> Result<()> {
     // Write FIRST, then read: a deferred transaction that reads before it
     // writes hits SQLITE_BUSY when it tries to upgrade, and up to seven
@@ -566,20 +459,8 @@ pub async fn store_answer(
     // and inserting the new one the item has none, and a reader in that
     // window would see it unmatched.
     reassign(&mut tx, Some(item_id), None).await?;
-    // Still maintained until the read path moves off it (step 3 of 4).
-    sqlx::query(
-        "INSERT INTO merged_metadata (item_id, provider, provider_id, confidence, updated_at)
-         VALUES (?, ?, ?, ?, unixepoch())
-         ON CONFLICT (item_id) DO NOTHING",
-    )
-    .bind(item_id)
-    .bind(provider)
-    .bind(provider_id)
-    .bind(confidence)
-    .execute(&mut *tx)
-    .await?;
     tx.commit().await?;
-    materialize(db, item_id, chain).await
+    Ok(())
 }
 
 /// The user's choice: THIS provider's record is what the item is. Stored
@@ -592,9 +473,8 @@ pub async fn assign_manual(
     provider: &str,
     provider_id: &str,
     fields: Fields,
-    chain: &[String],
 ) -> Result<()> {
-    store_answer(db, item_id, provider, provider_id, "auto", fields, chain).await?;
+    store_answer(db, item_id, provider, provider_id, "auto", fields).await?;
     let mut tx = db.begin().await?;
     sqlx::query(
         "DELETE FROM rejected_matches
@@ -618,16 +498,6 @@ pub async fn assign_manual(
     .bind(provider)
     .bind(provider_id)
     .bind(media_type_of_item(db, item_id).await)
-    .execute(&mut *tx)
-    .await?;
-    // Transitional: the API still reports the merged row's confidence to
-    // the client (step 3 of 4 moves reads onto the assignment). Without
-    // this a manual pick would read back as 'auto' in the meantime.
-    sqlx::query(
-        "UPDATE merged_metadata SET confidence = 'manual', updated_at = unixepoch()
-          WHERE item_id = ? AND provider_id <> ''",
-    )
-    .bind(item_id)
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
@@ -696,42 +566,6 @@ pub struct Fields {
     pub original_language: Option<String>,
     /// JSON array, as stored.
     pub genres: Option<String>,
-}
-
-impl Fields {
-    /// Which of these are still missing from the merged row — what is
-    /// left for the rest of the chain to supply.
-    pub async fn gaps(db: &SqlitePool, item_id: &str) -> Result<Vec<&'static str>> {
-        let row = sqlx::query(
-            "SELECT title, overview, poster_path, rating, premiered,
-                    original_language, genres
-             FROM merged_metadata WHERE item_id = ?",
-        )
-        .bind(item_id)
-        .fetch_optional(db)
-        .await?;
-        let Some(row) = row else {
-            return Ok(vec![
-                "title",
-                "overview",
-                "poster_path",
-                "rating",
-                "premiered",
-                "original_language",
-                "genres",
-            ]);
-        };
-        let mut out = Vec::new();
-        for f in ["title", "overview", "poster_path", "premiered", "original_language", "genres"] {
-            if row.get::<Option<String>, _>(f).filter(|s| !s.is_empty()).is_none() {
-                out.push(f);
-            }
-        }
-        if row.get::<Option<f64>, _>("rating").is_none() {
-            out.push("rating");
-        }
-        Ok(out)
-    }
 }
 
 /// Providers instantiated for one enrichment run (credentials resolved,
@@ -812,7 +646,7 @@ impl ProviderSet {
                     // established earlier. It erased a manual match once.
                     if !answered(db, &item.id, name).await {
                         let _ =
-                            store_answer(db, &item.id, name, "", "miss", Fields::default(), &chain)
+                            store_answer(db, &item.id, name, "", "miss", Fields::default())
                                 .await;
                     }
                     settled(db, &item.id, name).await;

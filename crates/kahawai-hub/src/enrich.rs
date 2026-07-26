@@ -797,7 +797,6 @@ impl Enricher {
                         "",
                         "miss",
                         Default::default(),
-                        &crate::providers::chain_in_force(registry.db(), "music").await,
                     )
                     .await?;
                 }
@@ -1208,7 +1207,6 @@ impl Enricher {
                 original_language: media.original_language().map(str::to_string),
                 genres: Some(serde_json::to_string(&genres)?),
             },
-            &crate::providers::chain_in_force(db, "anime").await,
         )
         .await?;
         // Identity columns the merge never touches: they say what this
@@ -1631,7 +1629,6 @@ impl Enricher {
                     premiered: e.aired.clone(),
                     ..Default::default()
                 },
-                &chain,
             )
             .await?;
             // The season/absolute projection is identity, not
@@ -1665,7 +1662,6 @@ impl Enricher {
                 "",
                 "miss",
                 crate::providers::Fields::default(),
-                &chain,
             )
             .await?;
             unmatched += 1;
@@ -1892,7 +1888,6 @@ impl Enricher {
             &provider_id,
             confidence,
             fields,
-            &chain,
         )
         .await
     }
@@ -2273,7 +2268,6 @@ impl crate::providers::Provider for MusicbrainzProvider {
                 genres: Some(serde_json::to_string(&rg.genres)?),
                 ..Default::default()
             },
-            &crate::providers::chain_in_force(db, "music").await,
         )
         .await?;
         Ok(crate::providers::Outcome::Matched("auto"))
