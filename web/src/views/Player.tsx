@@ -579,6 +579,14 @@ export default function Player({
       endSession(session.session_id, true)
       hlsRef.current?.destroy()
     }
+    // Everything this effect reads is fixed for the session: durationMs
+    // and isHls are derived from the `session` prop, parts/resumeMs are
+    // props, and attach/seekTo close over only those plus refs. A new
+    // session REMOUNTS this component (App renders it keyed on
+    // session_id), so none of it can go stale here. Listing them would
+    // re-run the cleanup — which reports progress, ends the session and
+    // destroys the hls instance — on every unrelated render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [session.session_id])
 
   const pct = durationMs > 0 ? Math.min(100, (posMs / durationMs) * 100) : 0

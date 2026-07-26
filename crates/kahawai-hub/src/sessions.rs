@@ -1171,3 +1171,45 @@ impl Sessions {
         true
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{part_index, PartSource};
+
+    fn part(base_ms: u64, duration_ms: u64) -> PartSource {
+        PartSource {
+            module_id: "m".into(),
+            collection_id: "c".into(),
+            path_rel: format!("CD{}.avi", base_ms),
+            size: 1,
+            base_ms,
+            duration_ms,
+        }
+    }
+
+    /// The CD1→CD2 hand-off is this function and nothing else: when a
+    /// part's playlist ends the client seeks to `end + 250 ms`, and which
+    /// file that lands in is decided here. Boundaries measured against
+    /// the real two-part rip in the library (part 2 based at 3_752_711).
+    #[test]
+    fn a_timestamp_lands_in_the_part_that_contains_it() {
+        let parts = [part(0, 3_752_711), part(3_752_711, 3_758_967)];
+
+        assert_eq!(part_index(&parts, 0), 0, "start of part one");
+        assert_eq!(part_index(&parts, 3_752_710), 0, "last ms of part one");
+        // base_ms is inclusive: the boundary itself is already part two,
+        // which is why the client's `+250` cannot land back in part one.
+        assert_eq!(part_index(&parts, 3_752_711), 1, "the boundary");
+        assert_eq!(part_index(&parts, 3_752_961), 1, "end-of-part-one + 250");
+        assert_eq!(part_index(&parts, 7_511_677), 1, "last ms of the film");
+        // Past the end clamps to the final part rather than panicking:
+        // a seek beyond the timeline is a UI rounding error, not a crash.
+        assert_eq!(part_index(&parts, u64::MAX), 1, "past the end");
+
+        // Single-file sources take the same path with one part.
+        assert_eq!(part_index(&[part(0, 1_000)], 999), 0);
+        assert_eq!(part_index(&[part(0, 1_000)], 10_000), 0);
+        // No parts at all is not reachable today, but must not panic.
+        assert_eq!(part_index(&[], 42), 0);
+    }
+}
