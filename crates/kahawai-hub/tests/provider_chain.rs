@@ -456,6 +456,26 @@ async fn a_confident_match_outranks_a_weak_one_whatever_the_order() {
         .unwrap();
     assert_eq!(merged(&db, "i1").await.0, "tmdb");
     assert_eq!(merged(&db, "i1").await.1.as_deref(), Some("Being Human (US)"));
+
+    // A confident non-owner still fills what the manual pick lacks —
+    // a hand-matched item should not lose the poster TVDB has.
+    store_answer(
+        &db,
+        "i1",
+        "tvdb",
+        "222",
+        "auto",
+        Fields { poster_path: Some("/art.jpg".into()), ..Default::default() },
+        &chain,
+    )
+    .await
+    .unwrap();
+    let poster: Option<String> =
+        sqlx::query_scalar("SELECT poster_path FROM merged_metadata WHERE item_id = 'i1'")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    assert_eq!(poster.as_deref(), Some("/art.jpg"));
 }
 
 /// A confirmed year beats a silent one. TMDB carries a 1952 series
@@ -483,4 +503,40 @@ fn a_stated_year_beats_an_exact_title_with_no_year() {
     let officer = Candidate::for_test(1, "The Officer", Some("2023-01-01"));
     let unrelated = Candidate::for_test(2, "Something Else", Some("2023-01-01"));
     assert!(pick_candidate(&[officer, unrelated], "The Office", Some(2023)).is_none());
+}
+
+/// Trust and chain position are separate keys. With TWO manual matches
+/// the chain has to break the tie — collapsing both into one rank left
+/// the winner falling out of insertion order, so a hand-pick on the
+/// top-ranked provider changed nothing on screen.
+#[tokio::test]
+async fn among_two_manual_matches_the_chain_order_decides() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    item(&db, "i1").await;
+    let chain = chain_in_force(&db, "movies").await; // tmdb, tvdb
+    // TVDB hand-matched first, so it is the older row.
+    store_answer(&db, "i1", "tvdb", "414734", MANUAL, answer("The Continental (2023)", None, None), &chain)
+        .await
+        .unwrap();
+    assert_eq!(merged(&db, "i1").await.0, "tvdb");
+    // Then TMDB hand-matched: it ranks first, so it takes the item.
+    store_answer(
+        &db,
+        "i1",
+        "tmdb",
+        "72710",
+        MANUAL,
+        answer("The Continental: From the World of John Wick", None, None),
+        &chain,
+    )
+    .await
+    .unwrap();
+    let (provider, title, ..) = merged(&db, "i1").await;
+    assert_eq!(provider, "tmdb", "the chain breaks the tie between equals");
+    assert_eq!(title.as_deref(), Some("The Continental: From the World of John Wick"));
+
+    // Reordering flips it back, with no refetching.
+    set_chain(&db, "movies", &["tvdb".into(), "tmdb".into()]).await.unwrap();
+    assert_eq!(merged(&db, "i1").await.0, "tvdb");
 }

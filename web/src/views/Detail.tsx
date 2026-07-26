@@ -179,7 +179,7 @@ export default function Detail({
         <div className="detail-head album-head">
           <img
             className="card-art album-art"
-            src={artworkUrl(item.id)}
+            src={artworkUrl(item.id, item.art_version)}
             alt=""
             onError={(e) => {
               e.currentTarget.onerror = null
@@ -395,7 +395,7 @@ export default function Detail({
         {item.kind === 'episode' && item.metadata && (
           <img
             className="card-art episode-still"
-            src={artworkUrl(item.id)}
+            src={artworkUrl(item.id, item.art_version)}
             alt=""
             onError={(e) => {
               e.currentTarget.onerror = null

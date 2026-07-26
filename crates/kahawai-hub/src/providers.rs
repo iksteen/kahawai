@@ -297,51 +297,35 @@ pub async fn materialize(db: &SqlitePool, item_id: &str, chain: &[String]) -> Re
     if rows.is_empty() {
         return Ok(());
     }
-    let rank = |p: &str, confidence: &str| {
-        if confidence == MANUAL {
-            return 0;
+    // Two orthogonal keys, and they must stay orthogonal: how much the
+    // match is TRUSTED, then where the provider sits in the chain.
+    // Collapsing both into one number made every manual match rank 0,
+    // so with two manual matches the winner fell out of insertion order
+    // — the chain said TMDB first and the row kept TVDB.
+    let chain_pos =
+        |p: &str| chain.iter().position(|c| c == chain_name(p)).unwrap_or(usize::MAX);
+    let tier = |r: &&sqlx::sqlite::SqliteRow| {
+        if r.get::<String, _>("provider_id").is_empty() {
+            return 3; // looked, found nothing
         }
-        let name = chain_name(p);
-        chain.iter().position(|c| c == name).map(|i| i + 1).unwrap_or(usize::MAX)
+        match r.get::<String, _>("confidence").as_str() {
+            MANUAL => 0,
+            "weak" => 2,
+            _ => 1,
+        }
     };
     let mut ordered: Vec<_> = rows.iter().collect();
-    ordered.sort_by_key(|r| {
-        rank(&r.get::<String, _>("provider"), &r.get::<String, _>("confidence"))
-    });
-
-    // Identity goes to the most CONFIDENT match, and only then to the
-    // best-ranked one. Rank alone would let a weak match outrank a
-    // certain one now that every provider is asked: TMDB guessing at
-    // "Being Human" must not displace TVDB knowing it.
-    let tier = |r: &&sqlx::sqlite::SqliteRow| match r.get::<String, _>("confidence").as_str() {
-        _ if r.get::<String, _>("provider_id").is_empty() => 3, // never matched
-        MANUAL => 0,
-        "weak" => 2,
-        _ => 1,
-    };
-    let owner = ordered
-        .iter()
-        .enumerate()
-        .min_by_key(|(rank_pos, r)| (tier(r), *rank_pos))
-        .map(|(_, r)| r)
-        .expect("non-empty");
-    // A provider that matched only WEAKLY may describe the item it
-    // identified, but must not donate fields to an item somebody else
-    // identified: an uncertain match filling a synopsis for the wrong
-    // film is worse than an empty synopsis. Every provider is asked now,
-    // so this is what keeps that from degrading the row.
+    ordered.sort_by_key(|r| (tier(r), chain_pos(&r.get::<String, _>("provider"))));
+    // Best-trusted, then best-ranked: that is the identity, and the same
+    // order decides every field below.
+    let owner = *ordered.first().expect("non-empty");
     let owner_provider = owner.get::<String, _>("provider");
-    // A human's match settles what the item IS; nobody else's guess is
-    // corroborated, so when the owner is manual only the owner donates.
-    // TMDB had auto-matched a 1952 series of the same name and its
-    // rating leaked into a 2023 show the user had corrected by hand.
-    let owner_is_manual = owner.get::<String, _>("confidence") == MANUAL;
+    // A weak match may describe the item it identified, but must not
+    // donate fields to somebody else's item: an uncertain match filling
+    // a synopsis for the wrong film is worse than an empty synopsis.
     let mergeable = |r: &&&sqlx::sqlite::SqliteRow| -> bool {
-        let same = r.get::<String, _>("provider") == owner_provider;
-        if owner_is_manual {
-            return same;
-        }
-        r.get::<String, _>("confidence") != "weak" || same
+        r.get::<String, _>("confidence") != "weak"
+            || r.get::<String, _>("provider") == owner_provider
     };
     let text = |field: &str| -> Option<String> {
         ordered

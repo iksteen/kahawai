@@ -140,7 +140,7 @@ export default function Library({
               <span className="card-artbox">
                 <img
                   className="card-art"
-                  src={artworkUrl(i.id)}
+                  src={artworkUrl(i.id, i.art_version)}
                   loading="lazy"
                   alt=""
                   onError={(e) => {

@@ -113,6 +113,8 @@ export type Item = {
   /// Enrichment state (movie/show): null = never enriched,
   /// miss/rejected = unmatched, weak = uncertain, auto/manual = good.
   match_confidence?: string | null
+  /// Metadata timestamp, used to bust the artwork cache on a re-match.
+  art_version?: number | null
   /// The filename-derived identity (title/year as parsed from disk) and
   /// the provider's matched title — for the review dialog.
   file_title?: string | null
@@ -161,7 +163,12 @@ export type ItemDetail = Item & {
 
 /// Local artwork (cover.jpg etc). <img> requests authenticate with the
 /// media cookie; 404 = no artwork (hide the img).
-export const artworkUrl = (id: string) => `/api/v1/items/${id}/artwork`
+///
+/// The response is cached hard (a day), so pass the item's `art_version`
+/// — its metadata timestamp — or a re-match leaves the old poster on
+/// screen until the cache expires.
+export const artworkUrl = (id: string, version?: number | null) =>
+  `/api/v1/items/${id}/artwork${version ? `?v=${version}` : ''}`
 
 export const fetchChildren = (id: string) =>
   json<{ children: Item[] }>(`/api/v1/items/${id}/children`)

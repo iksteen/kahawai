@@ -1481,6 +1481,7 @@ async fn list_items(
                 i.title AS file_title, i.year AS file_year,
                 md.title AS matched_title,
                 mdc.confidence AS match_confidence,
+                mdc.updated_at AS art_version,
                 COUNT(s.item_id) AS sources,
                 w.position_ms, w.duration_ms, w.played, w.play_count
          FROM items i
@@ -1515,6 +1516,10 @@ fn item_row_json(r: &sqlx::sqlite::SqliteRow) -> Value {
         "title": r.get::<String, _>("title"),
         "artist": r.try_get::<Option<String>, _>("artist").ok().flatten(),
         "match_confidence": r.try_get::<Option<String>, _>("match_confidence").ok().flatten(),
+        // Artwork is cached hard by the browser (a day), so the URL has
+        // to change when the metadata does — otherwise re-matching an
+        // item leaves yesterday's poster on the card.
+        "art_version": r.try_get::<Option<i64>, _>("art_version").ok().flatten(),
         "premiered": r.try_get::<Option<String>, _>("premiered").ok().flatten(),
         "file_title": r.try_get::<Option<String>, _>("file_title").ok().flatten(),
         "file_year": r.try_get::<Option<i64>, _>("file_year").ok().flatten(),
@@ -1543,6 +1548,7 @@ async fn item_children(
         "SELECT i.id, i.kind, i.year, i.season, i.episode, i.artist,
                 COALESCE(md.title, i.title) AS title,
                 md.premiered AS premiered,
+                md.updated_at AS art_version,
                 md.proj_season, md.proj_episode,
                 COUNT(s.item_id) AS sources,
                 w.position_ms, w.duration_ms, w.played, w.play_count
@@ -1572,6 +1578,7 @@ async fn item_detail(
                 COALESCE(md.title, i.title) AS title,
                 COALESCE(i.year, CAST(substr(md.premiered, 1, 4) AS INTEGER)) AS year,
                 p.id AS parent_id,
+                md.updated_at AS art_version,
                 COALESCE(pmd.title, p.title) AS show_title,
                 (SELECT COUNT(*) FROM item_sources s WHERE s.item_id = i.id) AS sources,
                 w.position_ms, w.duration_ms, w.played, w.play_count
