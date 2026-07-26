@@ -112,7 +112,6 @@ pub fn router(
         .route("/admin/v1/providers/anidb/verify", post(admin_verify_anidb))
         .route("/admin/v1/enrich", get(admin_enrich_status).post(admin_enrich_run))
         .route("/admin/v1/libraries/{id}/refresh", post(admin_refresh_library))
-        .route("/admin/v1/collections/refresh", post(admin_refresh_collection))
         .route("/admin/v1/enrich/review", get(admin_review_list))
         .route("/admin/v1/enrich/search", post(admin_review_search))
         .route("/admin/v1/items/{id}/match", post(admin_apply_match))
@@ -576,20 +575,6 @@ async fn admin_refresh_library(
         }
     }
     Ok(Json(json!({ "asked": asked, "offline": offline })))
-}
-
-#[derive(Deserialize)]
-struct RefreshCollectionRequest {
-    module_id: String,
-    collection_id: String,
-}
-
-async fn admin_refresh_collection(
-    State(state): State<AppState>,
-    Json(body): Json<RefreshCollectionRequest>,
-) -> Result<Json<Value>, ApiError> {
-    let asked = request_scan(&state, &body.module_id, &body.collection_id).await;
-    Ok(Json(json!({ "asked": asked as u32, "offline": !asked as u32 })))
 }
 
 /// Send one collection-scoped scan request (MH-2); the mediahost's
