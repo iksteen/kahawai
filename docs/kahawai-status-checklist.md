@@ -4,10 +4,6 @@ Status of every numbered requirement from `kahawai-technical-requirements.md`,
 plus the v1 acceptance criteria. Checked = implemented and exercised against
 the live deployment. Unchecked items carry a note when partially done.
 
-Last updated: 2026-07-26 (HUB-5 rebuilt on per-item assignment + read-time
-resolution; HUB-7 closed; dependencies bumped).
-limits, OPS-6 scoped to re-derivable caches).
-
 ## Architecture (AR)
 
 - [x] AR-1 Three modules (hub, mediahost, transcoder) + shared core crates
