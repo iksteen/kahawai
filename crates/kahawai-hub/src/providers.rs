@@ -331,9 +331,17 @@ pub async fn materialize(db: &SqlitePool, item_id: &str, chain: &[String]) -> Re
     // film is worse than an empty synopsis. Every provider is asked now,
     // so this is what keeps that from degrading the row.
     let owner_provider = owner.get::<String, _>("provider");
+    // A human's match settles what the item IS; nobody else's guess is
+    // corroborated, so when the owner is manual only the owner donates.
+    // TMDB had auto-matched a 1952 series of the same name and its
+    // rating leaked into a 2023 show the user had corrected by hand.
+    let owner_is_manual = owner.get::<String, _>("confidence") == MANUAL;
     let mergeable = |r: &&&sqlx::sqlite::SqliteRow| -> bool {
-        r.get::<String, _>("confidence") != "weak"
-            || r.get::<String, _>("provider") == owner_provider
+        let same = r.get::<String, _>("provider") == owner_provider;
+        if owner_is_manual {
+            return same;
+        }
+        r.get::<String, _>("confidence") != "weak" || same
     };
     let text = |field: &str| -> Option<String> {
         ordered
@@ -585,9 +593,17 @@ impl ProviderSet {
                     result = result.or(Some("settled"));
                 }
                 Ok(Outcome::Declined) => {
-                    let _ =
-                        store_answer(db, &item.id, name, "", "miss", Fields::default(), &chain)
-                            .await;
+                    // Record the miss only if this provider has nothing
+                    // on file. A decline must never overwrite an existing
+                    // answer: the identity owner is re-asked every run to
+                    // re-verify, and a search that comes back empty this
+                    // time would otherwise erase what it — or a HUMAN —
+                    // established earlier. It erased a manual match once.
+                    if !answered(db, &item.id, name).await {
+                        let _ =
+                            store_answer(db, &item.id, name, "", "miss", Fields::default(), &chain)
+                                .await;
+                    }
                     settled(db, &item.id, name).await;
                 }
                 Ok(Outcome::NotApplicable) => settled(db, &item.id, name).await,

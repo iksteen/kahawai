@@ -76,6 +76,27 @@ impl Candidate {
 /// Conservative pick: normalized-title equality (title or original),
 /// year within ±1 when both sides know it → auto. A single result that
 /// at least contains the words → weak. Otherwise none.
+impl Candidate {
+    /// The provider's record id for this candidate.
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// Fixture for the matcher tests: id, title, air date.
+    pub fn for_test(id: u64, title: &str, aired: Option<&str>) -> Self {
+        Self {
+            id,
+            title: title.into(),
+            original_title: None,
+            overview: None,
+            poster_path: None,
+            vote_average: None,
+            release_date: aired.map(str::to_string),
+            original_language: None,
+        }
+    }
+}
+
 pub fn pick_candidate<'c>(
     candidates: &'c [Candidate],
     title: &str,
@@ -95,8 +116,39 @@ pub fn pick_candidate<'c>(
         (Some(w), Some(h)) => (w - h).abs() <= 1,
         _ => true,
     };
+    // A year both sides actually state and agree on. Distinct from
+    // year_ok, which passes when either side is silent — that leniency
+    // let TMDB's 1952 "The Continental" win an exact-title match over
+    // the 2023 "The Continental: From the World of John Wick" the local
+    // file plainly meant.
+    let year_agrees =
+        |c: &Candidate| matches!((year, c.year()), (Some(w), Some(h)) if (w - h).abs() <= 1);
+    // The local title with the candidate's subtitle after it: a folder
+    // named "The Continental" against "The Continental: From the World
+    // of John Wick". Only counts at a separator, so "The Office" does
+    // not swallow "The Officer".
+    // Tested on the RAW title, because fold() strips the punctuation
+    // that makes it a subtitle: without the colon, "Heat Wave" would
+    // read as "Heat" plus a subtitle.
+    let subtitled = |c: &Candidate| {
+        c.title
+            .split_once(|ch| matches!(ch, ':' | '-' | '\u{2013}' | '\u{2014}'))
+            .is_some_and(|(head, _)| fold(head) == norm)
+    };
+
+    // Confirmed year beats a silent one, whichever title form matched.
+    if let Some(c) = candidates.iter().find(|c| title_eq(c) && year_agrees(c)) {
+        return Some((c, "auto"));
+    }
+    if let Some(c) = candidates.iter().find(|c| subtitled(c) && year_agrees(c)) {
+        return Some((c, "auto"));
+    }
+    // No year on either side: an exact title is still the best signal.
     if let Some(c) = candidates.iter().find(|c| title_eq(c) && year_ok(c)) {
         return Some((c, "auto"));
+    }
+    if let Some(c) = candidates.iter().find(|c| subtitled(c) && year_ok(c)) {
+        return Some((c, "weak"));
     }
     // Franchise-prefixed rips: "Indiana Jones and the Raiders of the
     // Lost Ark" vs TMDB's "Raiders of the Lost Ark" — the local title
@@ -1744,10 +1796,15 @@ mod tests {
         assert_eq!((c.id, conf), (2, "auto"));
         // Year mismatch beyond ±1 disqualifies the title match.
         assert!(pick_candidate(&cands[1..], "Heat", Some(2006)).is_none());
-        // Single plausible result without title equality → weak.
+        // Local title + the candidate's subtitle, and the year agrees:
+        // "Leon (1994)" IS "Léon: The Professional (1994)".
         let one = vec![cand(3, "Léon: The Professional", "1994-09-14")];
         let (c, conf) = pick_candidate(&one, "Leon", Some(1994)).unwrap();
-        assert_eq!((c.id, conf), (3, "weak"));
+        assert_eq!((c.id, conf), (3, "auto"));
+        // Single plausible result that is not a subtitle form → weak.
+        let vague = vec![cand(9, "The Professional", "1994-09-14")];
+        let (c, conf) = pick_candidate(&vague, "Leon", Some(1994)).unwrap();
+        assert_eq!((c.id, conf), (9, "weak"));
         // Multiple results, none matching → miss.
         let many = vec![cand(4, "A", "2000-01-01"), cand(5, "B", "2000-01-01")];
         assert!(pick_candidate(&many, "C", None).is_none());
@@ -1816,7 +1873,8 @@ impl Enricher {
             title: c.map(|c| c.title.clone()),
             overview: c.and_then(|c| c.overview.clone()),
             poster_path: c.and_then(|c| c.poster_path.clone()),
-            rating: c.and_then(|c| c.vote_average),
+            // TMDB says 0 for unrated; that is absent, not a score of zero.
+            rating: c.and_then(|c| c.vote_average).filter(|r| *r > 0.0),
             premiered: c.and_then(|c| c.release_date.clone()),
             original_language: c.and_then(|c| c.original_language.clone()),
             genres: None, // TMDB/TVDB search results carry no genre names

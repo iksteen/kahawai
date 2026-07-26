@@ -457,3 +457,30 @@ async fn a_confident_match_outranks_a_weak_one_whatever_the_order() {
     assert_eq!(merged(&db, "i1").await.0, "tmdb");
     assert_eq!(merged(&db, "i1").await.1.as_deref(), Some("Being Human (US)"));
 }
+
+/// A confirmed year beats a silent one. TMDB carries a 1952 series
+/// called "The Continental" with no air date at all, and it won an
+/// exact-title match over "The Continental: From the World of John Wick"
+/// (2023) — which is what the file plainly meant.
+#[test]
+fn a_stated_year_beats_an_exact_title_with_no_year() {
+    use kahawai_hub::enrich::{pick_candidate, Candidate};
+    let old_show = Candidate::for_test(19069, "The Continental", None);
+    let right = Candidate::for_test(72710, "The Continental: From the World of John Wick",
+        Some("2023-09-22"));
+    // TMDB returns the relevant one first, the exact-title one second.
+    let cands = vec![right, old_show];
+    let (picked, conf) = pick_candidate(&cands, "The Continental", Some(2023)).unwrap();
+    assert_eq!(picked.id(), 72710, "the year the file states must decide");
+    assert_eq!(conf, "auto");
+
+    // With no year to go on, the exact title is still the best signal.
+    let (picked, _) = pick_candidate(&cands, "The Continental", None).unwrap();
+    assert_eq!(picked.id(), 19069);
+
+    // A subtitle only counts at a separator: no swallowing neighbours.
+    // Two candidates, so the lone-plausible-hit tier stays out of it.
+    let officer = Candidate::for_test(1, "The Officer", Some("2023-01-01"));
+    let unrelated = Candidate::for_test(2, "Something Else", Some("2023-01-01"));
+    assert!(pick_candidate(&[officer, unrelated], "The Office", Some(2023)).is_none());
+}
