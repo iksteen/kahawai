@@ -58,16 +58,6 @@ pub struct ItemRef {
     /// the item — it may only add what is missing, bridging through
     /// mapped IDs where the chain declares that (anime, HUB-31).
     pub owner: Option<String>,
-    /// Set by the walker: fields still missing from the merged row.
-    /// Empty means the chain is done, whoever is left in it.
-    pub gaps: Vec<&'static str>,
-}
-
-impl ItemRef {
-    /// Is this field still missing?
-    pub fn wants(&self, field: &str) -> bool {
-        self.gaps.iter().any(|g| *g == field)
-    }
 }
 
 pub enum Outcome {
@@ -319,19 +309,40 @@ pub async fn materialize(db: &SqlitePool, item_id: &str, chain: &[String]) -> Re
         rank(&r.get::<String, _>("provider"), &r.get::<String, _>("confidence"))
     });
 
-    let text = |field: &str| -> Option<String> {
-        ordered.iter().find_map(|r| {
-            r.get::<Option<String>, _>(field).filter(|s| !s.is_empty())
-        })
+    // Identity goes to the most CONFIDENT match, and only then to the
+    // best-ranked one. Rank alone would let a weak match outrank a
+    // certain one now that every provider is asked: TMDB guessing at
+    // "Being Human" must not displace TVDB knowing it.
+    let tier = |r: &&sqlx::sqlite::SqliteRow| match r.get::<String, _>("confidence").as_str() {
+        _ if r.get::<String, _>("provider_id").is_empty() => 3, // never matched
+        MANUAL => 0,
+        "weak" => 2,
+        _ => 1,
     };
-    let rating: Option<f64> = ordered.iter().find_map(|r| r.get::<Option<f64>, _>("rating"));
-    // Identity: the best-ranked provider that actually identified the
-    // item; if none did, the best-ranked row (a recorded miss).
     let owner = ordered
         .iter()
-        .find(|r| !r.get::<String, _>("provider_id").is_empty())
-        .or(ordered.first())
+        .enumerate()
+        .min_by_key(|(rank_pos, r)| (tier(r), *rank_pos))
+        .map(|(_, r)| r)
         .expect("non-empty");
+    // A provider that matched only WEAKLY may describe the item it
+    // identified, but must not donate fields to an item somebody else
+    // identified: an uncertain match filling a synopsis for the wrong
+    // film is worse than an empty synopsis. Every provider is asked now,
+    // so this is what keeps that from degrading the row.
+    let owner_provider = owner.get::<String, _>("provider");
+    let mergeable = |r: &&&sqlx::sqlite::SqliteRow| -> bool {
+        r.get::<String, _>("confidence") != "weak"
+            || r.get::<String, _>("provider") == owner_provider
+    };
+    let text = |field: &str| -> Option<String> {
+        ordered
+            .iter()
+            .filter(mergeable)
+            .find_map(|r| r.get::<Option<String>, _>(field).filter(|s| !s.is_empty()))
+    };
+    let rating: Option<f64> =
+        ordered.iter().filter(mergeable).find_map(|r| r.get::<Option<f64>, _>("rating"));
 
     sqlx::query(
         "UPDATE merged_metadata SET
@@ -546,22 +557,24 @@ impl ProviderSet {
         let mut result: Option<&'static str> = None;
         for name in &chain {
             let Some(p) = self.get(name) else { continue };
-            let gaps = Fields::gaps(db, &item.id).await.unwrap_or_default();
-            if result.is_some() && gaps.is_empty() {
-                break; // nothing left for anyone below
-            }
-            let mut ctx = item.clone();
-            ctx.gaps = gaps;
-            ctx.owner = identity_owner(db, &item.id).await;
-            // Never ask twice: a provider that has already answered for
-            // this item is in the merge, gaps and all — asking again
-            // every run would spend requests to be told the same "I
-            // don't have a poster either". The identity owner is exempt:
-            // it re-runs to re-verify (an ED2K result may disagree).
-            let owns = ctx.owner.as_deref().map(chain_name) == Some(name.as_str());
+            // Every provider gets asked, whatever the order says and
+            // whether or not the row already looks complete: their
+            // answers are stored separately, so precedence stays a local
+            // decision that can be re-taken for free. Asking only until
+            // the row filled up made the ranking a lottery over who
+            // happened to be consulted first.
+            //
+            // Bounded by never-ask-twice: one request per (item,
+            // provider), ever — a recorded miss counts as an answer. The
+            // identity owner is exempt so it can re-verify (a late ED2K
+            // result may disagree, HUB-30a).
+            let owner = identity_owner(db, &item.id).await;
+            let owns = owner.as_deref().map(chain_name) == Some(name.as_str());
             if !owns && answered(db, &item.id, name).await {
                 continue;
             }
+            let mut ctx = item.clone();
+            ctx.owner = owner;
             match p.enrich(db, &ctx).await {
                 Ok(Outcome::Matched(conf)) => {
                     settled(db, &item.id, name).await;
@@ -571,25 +584,13 @@ impl ProviderSet {
                     settled(db, &item.id, name).await;
                     result = result.or(Some("settled"));
                 }
-                // Declined on the merits — it looked and had nothing.
-                // That is an answer, so record it as a miss: otherwise
-                // "already asked" rests on the ABSENCE of a row, the
-                // data cannot tell you this provider was consulted, and
-                // whether it gets asked again depends on which selection
-                // query happens to pick the item up.
                 Ok(Outcome::Declined) => {
                     let _ =
                         store_answer(db, &item.id, name, "", "miss", Fields::default(), &chain)
                             .await;
                     settled(db, &item.id, name).await;
                 }
-                // Nothing was asked, so nothing is recorded — but the
-                // queue row goes, or an item that cannot be bridged
-                // would be retried on every single run.
                 Ok(Outcome::NotApplicable) => settled(db, &item.id, name).await,
-                // Could not look: rate-limited, banned, network. The
-                // item keeps its place in the queue and comes back when
-                // the provider will listen again.
                 Err(e) => {
                     let reason = format!("{e:#}");
                     tracing::warn!(provider = %name, title = %item.title, error = %reason,

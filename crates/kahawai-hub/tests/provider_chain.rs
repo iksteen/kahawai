@@ -333,3 +333,127 @@ async fn series_has_its_own_chain_independent_of_movies() {
         "reordering series must not touch films"
     );
 }
+
+/// Every provider answers, whatever the order — that is what makes
+/// ranking a preference rather than a lottery over who was asked. A
+/// complete row is no longer a reason to stop.
+#[tokio::test]
+async fn a_complete_row_does_not_stop_the_chain() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    item(&db, "i1").await;
+    let chain = chain_in_force(&db, "movies").await;
+    // TMDB answered completely.
+    store_answer(
+        &db,
+        "i1",
+        "tmdb",
+        "550",
+        "auto",
+        Fields {
+            title: Some("Fight Club".into()),
+            overview: Some("tmdb synopsis".into()),
+            poster_path: Some("/p.jpg".into()),
+            rating: Some(8.4),
+            premiered: Some("1999-10-15".into()),
+            ..Default::default()
+        },
+        &chain,
+    )
+    .await
+    .unwrap();
+    // TVDB is asked anyway and its answer is kept, ready to win if the
+    // order changes later.
+    store_answer(&db, "i1", "tvdb", "77", "auto", answer("TVDB title", Some("tvdb"), None), &chain)
+        .await
+        .unwrap();
+    assert_eq!(merged(&db, "i1").await.1.as_deref(), Some("Fight Club"));
+
+    set_chain(&db, "movies", &["tvdb".into(), "tmdb".into()]).await.unwrap();
+    let (provider, title, overview, rating) = merged(&db, "i1").await;
+    assert_eq!(title.as_deref(), Some("TVDB title"), "the reorder now has data to pick");
+    assert_eq!(overview.as_deref(), Some("tvdb"));
+    assert_eq!(provider, "tvdb");
+    assert_eq!(rating, Some(8.4), "and TMDB still supplies what TVDB lacks");
+}
+
+/// A provider that matched only weakly may describe the item it
+/// identified, but must not donate fields to somebody else's item: an
+/// uncertain match filling a synopsis for the wrong film is worse than
+/// no synopsis. Now that every provider is asked, this is the guard.
+#[tokio::test]
+async fn a_weak_non_owner_does_not_donate_fields() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    item(&db, "i1").await;
+    let chain = chain_in_force(&db, "movies").await;
+    store_answer(&db, "i1", "tmdb", "550", "auto", answer("Solaris", None, None), &chain)
+        .await
+        .unwrap();
+    // TVDB matched something it is not sure about.
+    store_answer(
+        &db,
+        "i1",
+        "tvdb",
+        "999",
+        "weak",
+        answer("Solaris (remake)", Some("wrong film's synopsis"), Some(3.0)),
+        &chain,
+    )
+    .await
+    .unwrap();
+    let (provider, title, overview, rating) = merged(&db, "i1").await;
+    assert_eq!(provider, "tmdb");
+    assert_eq!(title.as_deref(), Some("Solaris"));
+    assert_eq!(overview, None, "a weak stranger's synopsis stays out");
+    assert_eq!(rating, None, "and its rating too");
+
+    // Ranking it first does NOT hand it the item: rank breaks ties
+    // between comparable matches, it does not promote a guess over a
+    // certainty.
+    set_chain(&db, "movies", &["tvdb".into(), "tmdb".into()]).await.unwrap();
+    let (provider, _, overview, _) = merged(&db, "i1").await;
+    assert_eq!(provider, "tmdb", "the confident match keeps the item");
+    assert_eq!(overview, None, "and the weak stranger still donates nothing");
+
+    // It does own an item nobody else could identify, and then its own
+    // data is all there is.
+    item(&db, "i2").await;
+    store_answer(&db, "i2", "tmdb", "", "miss", Fields::default(), &chain).await.unwrap();
+    store_answer(&db, "i2", "tvdb", "999", "weak", answer("Obscure", Some("only guess"), None), &chain)
+        .await
+        .unwrap();
+    let (provider, _, overview, _) = merged(&db, "i2").await;
+    assert_eq!(provider, "tvdb");
+    assert_eq!(overview.as_deref(), Some("only guess"));
+}
+
+/// Rank decides between equals; it does not let a guess outrank a
+/// certainty. Once every provider is asked, the top-ranked one will
+/// sometimes have only a weak match for an item another identified
+/// confidently — the confident one must keep the item.
+#[tokio::test]
+async fn a_confident_match_outranks_a_weak_one_whatever_the_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    item(&db, "i1").await;
+    let chain = chain_in_force(&db, "movies").await; // tmdb, tvdb
+    store_answer(&db, "i1", "tmdb", "111", "weak", answer("Being Human?", None, None), &chain)
+        .await
+        .unwrap();
+    store_answer(&db, "i1", "tvdb", "222", "auto", answer("Being Human", Some("bbc"), None), &chain)
+        .await
+        .unwrap();
+
+    let (provider, title, overview, _) = merged(&db, "i1").await;
+    assert_eq!(provider, "tvdb", "the certain match keeps the item");
+    assert_eq!(title.as_deref(), Some("Being Human"));
+    assert_eq!(overview.as_deref(), Some("bbc"));
+
+    // A manual correction still beats both, from either provider.
+    store_answer(&db, "i1", "tmdb", "333", MANUAL, answer("Being Human (US)", None, None), &chain)
+        .await
+        .unwrap();
+    assert_eq!(merged(&db, "i1").await.0, "tmdb");
+    assert_eq!(merged(&db, "i1").await.1.as_deref(), Some("Being Human (US)"));
+}

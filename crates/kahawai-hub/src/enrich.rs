@@ -571,19 +571,31 @@ impl Enricher {
                      WHERE s.item_id = i.id LIMIT 1) AS src_path,
                     -- Movies and series have separate chains (HUB-5), so
                     -- the walk needs each item's OWN media type.
-                    (SELECT c.media_type FROM item_sources s2
-                     JOIN collections c ON (c.module_id, c.collection_id)
-                                         = (s2.module_id, s2.collection_id)
-                     WHERE s2.item_id = i.id
-                        OR s2.item_id IN (SELECT id FROM items WHERE parent_id = i.id)
-                     LIMIT 1) AS media_type
+                    c0.media_type AS media_type
              FROM items i
              LEFT JOIN merged_metadata m ON m.item_id = i.id
+             LEFT JOIN collections c0 ON (c0.module_id, c0.collection_id) = (
+                 SELECT s3.module_id, s3.collection_id FROM item_sources s3
+                 WHERE s3.item_id = i.id
+                    OR s3.item_id IN (SELECT id FROM items WHERE parent_id = i.id)
+                 LIMIT 1)
              WHERE i.kind IN ('movie', 'show')
                AND (m.item_id IS NULL OR m.confidence = 'miss'
-                    -- HUB-5: work the chain still owes — a provider
-                    -- never asked, or one that refused and is now due
-                    -- again (bans and rate limits reschedule, never drop).
+                    -- HUB-5: every provider in the chain answers once,
+                    -- whatever the order — so an item needs work while
+                    -- any of them has never been asked.
+                    OR EXISTS (
+                      SELECT 1 FROM provider_ranks r
+                      WHERE r.media_type = CASE
+                              WHEN c0.media_type IN ('movies','series','anime','music')
+                              THEN c0.media_type ELSE 'movies' END
+                        AND NOT EXISTS (
+                          SELECT 1 FROM provider_metadata pm
+                          WHERE pm.item_id = i.id
+                            AND (pm.provider = r.provider
+                                 OR (r.provider = 'anime' AND pm.provider = 'anilist'))))
+                    -- or a provider refused and is due again (bans and
+                    -- rate limits reschedule, they never drop work).
                     OR EXISTS (
                       SELECT 1 FROM enrichment_queue q
                       WHERE q.item_id = i.id AND q.due_at <= unixepoch()))
@@ -636,7 +648,6 @@ impl Enricher {
                 known_aid: None,
                 identified: false,
                 owner: None,
-                gaps: Vec::new(),
             };
             let this = self.clone();
             let set = providers.clone();
@@ -722,7 +733,6 @@ impl Enricher {
                 known_aid: None,
                 identified: false,
                 owner: None,
-                gaps: Vec::new(),
             };
             match providers.run_chain("music", registry.db(), &item).await {
                 Some(_) => matched += 1,
@@ -832,10 +842,17 @@ impl Enricher {
                AND (m.confidence IS NULL OR m.confidence != 'rejected')
                AND (
                  m.item_id IS NULL OR m.anilist_id IS NULL
-                 -- HUB-5: work the chain still owes for this item —
-                 -- the TMDB/TVDB tail that has never been asked to fill
-                 -- what the anime services left empty, or a provider
-                 -- that refused and is due again.
+                 -- HUB-5: the tail answers too, whatever the order —
+                 -- so this item needs work while any chain provider has
+                 -- never been asked, or one is due again after refusing.
+                 OR EXISTS (
+                   SELECT 1 FROM provider_ranks r
+                   WHERE r.media_type = 'anime'
+                     AND NOT EXISTS (
+                       SELECT 1 FROM provider_metadata pm
+                       WHERE pm.item_id = i.id
+                         AND (pm.provider = r.provider
+                              OR (r.provider = 'anime' AND pm.provider = 'anilist'))))
                  OR EXISTS (
                    SELECT 1 FROM enrichment_queue q
                    WHERE q.item_id = i.id AND q.due_at <= unixepoch())
@@ -867,7 +884,6 @@ impl Enricher {
                 known_aid: row.get::<Option<i64>, _>("anidb_id").map(|a| a as u32),
                 identified: row.get::<Option<i64>, _>("anilist_id").is_some(),
                 owner: None,
-                gaps: Vec::new(),
             })
             .collect())
     }
@@ -1840,9 +1856,6 @@ impl TmdbProvider {
         item: &crate::providers::ItemRef,
         owner: &str,
     ) -> Result<crate::providers::Outcome> {
-        if item.gaps.is_empty() {
-            return Ok(crate::providers::Outcome::NotApplicable);
-        }
         let mapped: Option<i64> =
             sqlx::query_scalar("SELECT mapped_tmdb FROM merged_metadata WHERE item_id = ?")
                 .bind(&item.id)
@@ -1876,8 +1889,8 @@ impl TmdbProvider {
                 &crate::providers::media_type_of_item(db, &item.id).await,
             )
             .await?;
-        tracing::debug!(title = %item.title, owner, gaps = ?item.gaps,
-            "tmdb supplied fields for an item it did not identify");
+        tracing::debug!(title = %item.title, owner,
+            "tmdb recorded its answer for an item it did not identify");
         Ok(crate::providers::Outcome::Contributed)
     }
 }
@@ -1981,7 +1994,7 @@ impl crate::providers::Provider for TvdbProvider {
                     .fetch_optional(db)
                     .await?
                     .flatten();
-            let Some(tvdb_id) = mapped.filter(|_| !item.gaps.is_empty()) else {
+            let Some(tvdb_id) = mapped else {
                 return Ok(crate::providers::Outcome::NotApplicable);
             };
             let c = self.enricher.tvdb_details(&self.token, &item.kind, tvdb_id).await?;
