@@ -255,9 +255,11 @@ async fn review_queue_flow() {
         .fetch_one(&db)
         .await
         .unwrap();
+    // The new model: the provider's own answer, plus an assignment when it
+    // actually matched something. A miss is an answer with no record.
     for (id, pid, conf) in [(&miss_id, "", "miss"), (&weak_id, "42", "weak")] {
         sqlx::query(
-            "INSERT INTO merged_metadata (item_id, provider, provider_id, title, confidence, updated_at)
+            "INSERT INTO provider_metadata (item_id, provider, provider_id, title, confidence, updated_at)
              VALUES (?, 'tmdb', ?, 'Guess', ?, 0)",
         )
         .bind(id)
@@ -266,6 +268,7 @@ async fn review_queue_flow() {
         .execute(&db)
         .await
         .unwrap();
+        kahawai_hub::providers::assign(&db, id).await.unwrap();
     }
 
     let authed = |method: &str, uri: String, body: Option<serde_json::Value>| {
@@ -318,7 +321,8 @@ async fn review_queue_flow() {
     }
 
     let states: Vec<(String, String)> =
-        sqlx::query("SELECT item_id, confidence FROM merged_metadata ORDER BY item_id")
+        sqlx::query("SELECT item_id, confidence FROM resolved_metadata
+                      WHERE confidence IS NOT NULL ORDER BY item_id")
             .fetch_all(&db)
             .await
             .unwrap()

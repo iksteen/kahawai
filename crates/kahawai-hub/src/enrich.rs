@@ -625,14 +625,15 @@ impl Enricher {
                     -- the walk needs each item's OWN media type.
                     c0.media_type AS media_type
              FROM items i
-             LEFT JOIN merged_metadata m ON m.item_id = i.id
              LEFT JOIN collections c0 ON (c0.module_id, c0.collection_id) = (
                  SELECT s3.module_id, s3.collection_id FROM item_sources s3
                  WHERE s3.item_id = i.id
                     OR s3.item_id IN (SELECT id FROM items WHERE parent_id = i.id)
                  LIMIT 1)
              WHERE i.kind IN ('movie', 'show')
-               AND (m.item_id IS NULL OR m.confidence = 'miss'
+               -- A human refused every record this item holds: leave it be
+               -- until a provider offers something that is not refused.
+               AND (
                     -- HUB-5: every provider in the chain answers once,
                     -- whatever the order — so an item needs work while
                     -- any of them has never been asked.
@@ -753,7 +754,6 @@ impl Enricher {
     ) -> Result<()> {
         let albums = sqlx::query(
             "SELECT i.id, i.title, i.artist FROM items i
-             LEFT JOIN merged_metadata m ON m.item_id = i.id
              WHERE i.kind = 'album' AND i.artist IS NOT NULL
                AND (m.item_id IS NULL
                     OR (m.confidence = 'miss' AND m.updated_at < unixepoch() - 7 * 86400)
@@ -883,13 +883,13 @@ impl Enricher {
     ) -> Result<Vec<crate::providers::ItemRef>> {
         let rows = sqlx::query(
             "SELECT DISTINCT i.id, i.kind, i.title, i.year,
-                    m.provider, m.provider_id, m.confidence, m.anidb_id, m.anilist_id
+                    m.provider, m.provider_id, COALESCE(m.manual, 0) AS manual,
+                    a.anidb_id, a.anilist_id
              FROM items i
              JOIN item_sources s ON s.item_id = i.id
                 OR s.item_id IN (SELECT id FROM items WHERE parent_id = i.id)
              JOIN collections c ON (c.module_id, c.collection_id)
                                  = (s.module_id, s.collection_id)
-             LEFT JOIN merged_metadata m ON m.item_id = i.id
              WHERE c.media_type = 'anime' AND i.kind IN ('movie', 'show')
                AND (m.confidence IS NULL OR m.confidence != 'rejected')
                AND (
@@ -932,7 +932,7 @@ impl Enricher {
                 existing: row
                     .get::<Option<String>, _>("provider")
                     .zip(row.get::<Option<String>, _>("provider_id")),
-                manual: row.get::<Option<String>, _>("confidence").as_deref() == Some("manual"),
+                manual: row.get::<i64, _>("manual") != 0,
                 known_aid: row.get::<Option<i64>, _>("anidb_id").map(|a| a as u32),
                 identified: row.get::<Option<i64>, _>("anilist_id").is_some(),
                 owner: None,
@@ -976,10 +976,10 @@ impl Enricher {
         // so adopt bridge ids directly from the mapping. Idempotent,
         // no API calls — and it feeds HUB-31's projection backfill.
         let stale = sqlx::query(
-            "SELECT item_id, anidb_id, i.kind FROM merged_metadata m
-             JOIN items i ON i.id = m.item_id
-             WHERE m.anidb_id IS NOT NULL
-               AND m.mapped_tvdb IS NULL AND m.mapped_tmdb IS NULL",
+            "SELECT a.item_id, a.anidb_id, i.kind FROM anime_ids a
+             JOIN items i ON i.id = a.item_id
+             WHERE a.anidb_id IS NOT NULL
+               AND a.mapped_tvdb IS NULL AND a.mapped_tmdb IS NULL",
         )
         .fetch_all(registry.db())
         .await?;
@@ -991,7 +991,7 @@ impl Enricher {
                 continue;
             }
             sqlx::query(
-                "UPDATE merged_metadata SET mapped_tvdb = ?, mapped_tmdb = ? WHERE item_id = ?",
+                "UPDATE anime_ids SET mapped_tvdb = ?, mapped_tmdb = ? WHERE item_id = ?",
             )
             .bind(m.tvdb_id)
             .bind(tmdb)
@@ -1214,14 +1214,19 @@ impl Enricher {
         // Identity columns the merge never touches: they say what this
         // anime IS and how it bridges to the other services.
         sqlx::query(
-            "UPDATE merged_metadata SET anidb_id = ?, anilist_id = ?,
-                mapped_tvdb = ?, mapped_tmdb = ? WHERE item_id = ?",
+            "INSERT INTO anime_ids (item_id, anidb_id, anilist_id, mapped_tvdb, mapped_tmdb)
+             VALUES (?, ?, ?, ?, ?)
+             ON CONFLICT (item_id) DO UPDATE SET
+               anidb_id = excluded.anidb_id,
+               anilist_id = excluded.anilist_id,
+               mapped_tvdb = COALESCE(excluded.mapped_tvdb, anime_ids.mapped_tvdb),
+               mapped_tmdb = COALESCE(excluded.mapped_tmdb, anime_ids.mapped_tmdb)",
         )
+        .bind(item_id)
         .bind(anidb_id)
         .bind(media.id)
         .bind(mapping.and_then(|m| m.tvdb_id))
         .bind(mapping.and_then(|m| m.tmdb_for(kind)))
-        .bind(item_id)
         .execute(db)
         .await?;
 
@@ -1271,13 +1276,10 @@ impl Enricher {
         tmdb_key: &str,
     ) -> Result<()> {
         let rows = sqlx::query(
-            "SELECT m.item_id, i.kind,
-                    CASE WHEN m.provider = 'tmdb' THEN m.provider_id
-                         ELSE CAST(m.mapped_tmdb AS TEXT) END AS tmdb_id
-             FROM merged_metadata m JOIN items i ON i.id = m.item_id
-             WHERE m.original_language IS NULL AND m.provider_id != ''
-               AND i.kind IN ('movie', 'show')
-               AND (m.provider = 'tmdb' OR m.mapped_tmdb IS NOT NULL)",
+            "SELECT pm.item_id, i.kind, pm.provider_id AS tmdb_id
+             FROM provider_metadata pm JOIN items i ON i.id = pm.item_id
+             WHERE pm.provider = 'tmdb' AND pm.original_language IS NULL
+               AND pm.provider_id != '' AND i.kind IN ('movie', 'show')",
         )
         .fetch_all(registry.db())
         .await?;
@@ -1321,7 +1323,8 @@ impl Enricher {
                     }
                 };
                 let _ = sqlx::query(
-                    "UPDATE merged_metadata SET original_language = ? WHERE item_id = ?",
+                    "UPDATE provider_metadata SET original_language = ?, updated_at = unixepoch()
+                      WHERE item_id = ? AND provider = 'tmdb'",
                 )
                 .bind(&lang)
                 .bind(&item_id)
@@ -1351,11 +1354,11 @@ impl Enricher {
         // absolute numbers for re-fetches each run — a few cached-token
         // pages per anime show; revisit if a library full of them appears.
         let shows = sqlx::query(
-            "SELECT i.id, m.provider, m.provider_id, m.mapped_tvdb, m.mapped_tmdb, m.anidb_id
+            "SELECT i.id, a.mapped_tvdb, a.mapped_tmdb, a.anidb_id
              FROM items i
-             JOIN merged_metadata m ON m.item_id = i.id
-             WHERE i.kind = 'show' AND m.provider_id != ''
-               AND m.confidence != 'rejected'
+             JOIN item_match m ON m.item_id = i.id AND m.provider_id != ''
+             LEFT JOIN anime_ids a ON a.item_id = i.id
+             WHERE i.kind = 'show'
                -- Episode data follows the chain like everything else
                -- (HUB-5): every provider that identified this show is an
                -- episode source, so a show whose owner carries no episode
@@ -1374,8 +1377,9 @@ impl Enricher {
                             AND ep.updated_at < unixepoch() - 7 * 86400)))
                OR EXISTS (
                  SELECT 1 FROM items e
-                 JOIN merged_metadata em ON em.item_id = e.id
+                 JOIN provider_metadata em ON em.item_id = e.id
                  WHERE e.parent_id = i.id AND e.season IS NULL
+                   AND em.provider IN ('tmdb', 'tvdb')
                    AND em.proj_episode IS NULL
                    AND em.updated_at < unixepoch() - 7 * 86400))",
         )
@@ -1633,12 +1637,13 @@ impl Enricher {
             // The season/absolute projection is identity, not
             // description: the merge never touches it (HUB-31).
             sqlx::query(
-                "UPDATE merged_metadata SET proj_season = ?, proj_episode = ?
-                 WHERE item_id = ?",
+                "UPDATE provider_metadata SET proj_season = ?, proj_episode = ?
+                 WHERE item_id = ? AND provider = ?",
             )
             .bind(p.map(|v| v.0))
             .bind(p.map(|v| v.1))
             .bind(&item_id)
+            .bind(provider)
             .execute(db)
             .await?;
             wrote += 1;
@@ -1992,7 +1997,7 @@ impl TmdbProvider {
         owner: &str,
     ) -> Result<crate::providers::Outcome> {
         let mapped: Option<i64> =
-            sqlx::query_scalar("SELECT mapped_tmdb FROM merged_metadata WHERE item_id = ?")
+            sqlx::query_scalar("SELECT mapped_tmdb FROM anime_ids WHERE item_id = ?")
                 .bind(&item.id)
                 .fetch_optional(db)
                 .await?
@@ -2124,7 +2129,7 @@ impl crate::providers::Provider for TvdbProvider {
         // so it declines rather than searching by title.
         if item.owner.as_deref() == Some("anilist") {
             let mapped: Option<i64> =
-                sqlx::query_scalar("SELECT mapped_tvdb FROM merged_metadata WHERE item_id = ?")
+                sqlx::query_scalar("SELECT mapped_tvdb FROM anime_ids WHERE item_id = ?")
                     .bind(&item.id)
                     .fetch_optional(db)
                     .await?

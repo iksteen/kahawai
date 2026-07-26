@@ -594,7 +594,7 @@ async fn admin_review_list(State(state): State<AppState>) -> Result<Json<Value>,
                 m.title AS matched_title, m.premiered, m.provider, m.provider_id,
                 (SELECT s.path_rel FROM item_sources s WHERE s.item_id = i.id LIMIT 1) AS path
          FROM items i
-         JOIN merged_metadata m ON m.item_id = i.id
+         JOIN resolved_metadata m ON m.item_id = i.id
          WHERE m.confidence IN ('miss', 'weak', 'rejected')
          ORDER BY m.confidence != 'miss', i.title",
     )
@@ -1477,15 +1477,14 @@ async fn list_items(
                 COALESCE(i.year, CAST(substr(md.premiered, 1, 4) AS INTEGER)) AS year,
                 i.title AS file_title, i.year AS file_year,
                 md.title AS matched_title,
-                mdc.confidence AS match_confidence,
-                mdc.updated_at AS art_version,
+                md.confidence AS match_confidence,
+                md.updated_at AS art_version,
                 COUNT(s.item_id) AS sources,
                 w.position_ms, w.duration_ms, w.played, w.play_count
          FROM items i
          LEFT JOIN item_sources s ON s.item_id = i.id
          LEFT JOIN watch_state w ON w.item_id = i.id AND w.user_id = ?1
-         LEFT JOIN merged_metadata md ON md.item_id = i.id AND md.provider_id != ''
-         LEFT JOIN merged_metadata mdc ON mdc.item_id = i.id
+         LEFT JOIN resolved_metadata md ON md.item_id = i.id
          WHERE i.kind NOT IN ('episode', 'track')
            AND (?2 IS NULL OR i.id IN (
              SELECT COALESCE(ci.parent_id, ci.id)
@@ -1552,7 +1551,7 @@ async fn item_children(
          FROM items i
          LEFT JOIN item_sources s ON s.item_id = i.id
          LEFT JOIN watch_state w ON w.item_id = i.id AND w.user_id = ?
-         LEFT JOIN merged_metadata md ON md.item_id = i.id AND md.provider_id != ''
+         LEFT JOIN resolved_metadata md ON md.item_id = i.id
          WHERE i.parent_id = ?
          GROUP BY i.id ORDER BY i.season, i.episode",
     )
@@ -1582,8 +1581,8 @@ async fn item_detail(
          FROM items i
          LEFT JOIN items p ON p.id = i.parent_id
          LEFT JOIN watch_state w ON w.item_id = i.id AND w.user_id = ?
-         LEFT JOIN merged_metadata md ON md.item_id = i.id AND md.provider_id != ''
-         LEFT JOIN merged_metadata pmd ON pmd.item_id = p.id AND pmd.provider_id != ''
+         LEFT JOIN resolved_metadata md ON md.item_id = i.id
+         LEFT JOIN resolved_metadata pmd ON pmd.item_id = p.id
          WHERE i.id = ?",
     )
         .bind(&claims.sub)
@@ -1634,8 +1633,8 @@ async fn item_detail(
                 COALESCE(NULLIF(m.original_language, ''),
                          NULLIF(pm.original_language, '')) AS original_language
          FROM items i
-         JOIN merged_metadata m ON m.item_id IN (i.id, i.parent_id)
-         LEFT JOIN merged_metadata pm ON pm.item_id = i.parent_id
+         JOIN resolved_metadata m ON m.item_id IN (i.id, i.parent_id)
+         LEFT JOIN resolved_metadata pm ON pm.item_id = i.parent_id
          WHERE i.id = ? AND m.provider_id != ''
          ORDER BY m.item_id = i.id DESC LIMIT 1",
     )
@@ -1661,7 +1660,7 @@ async fn item_detail(
     let related = sqlx::query(
         "SELECT r.kind, r.target_title, r.target_anilist, m2.item_id AS local_id
          FROM item_relations r
-         LEFT JOIN merged_metadata m2 ON m2.anilist_id = r.target_anilist
+         LEFT JOIN anime_ids m2 ON m2.anilist_id = r.target_anilist
          WHERE r.from_item = ?
          ORDER BY CASE r.kind
              WHEN 'prequel' THEN 0 WHEN 'sequel' THEN 1 WHEN 'parent' THEN 2

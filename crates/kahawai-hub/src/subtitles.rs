@@ -370,16 +370,18 @@ impl Subtitles {
                     md.proj_season, md.proj_episode,
                     CASE WHEN COALESCE(pm.provider, md.provider) = 'tmdb'
                          THEN COALESCE(pm.provider_id, md.provider_id) END AS tmdb_provider_id,
-                    COALESCE(pm.mapped_tmdb, md.mapped_tmdb) AS mapped_tmdb,
+                    COALESCE(pai.mapped_tmdb, ai.mapped_tmdb) AS mapped_tmdb,
                     COALESCE(pm.title, p.title, md.title, i.title) AS search_title,
                     COALESCE(i.year, p.year,
                              CAST(substr(COALESCE(md.premiered, pmd.premiered), 1, 4) AS INTEGER))
                         AS search_year
              FROM items i
              LEFT JOIN items p ON p.id = i.parent_id
-             LEFT JOIN merged_metadata md ON md.item_id = i.id AND md.provider_id != ''
-             LEFT JOIN merged_metadata pmd ON pmd.item_id = i.parent_id AND pmd.provider_id != ''
-             LEFT JOIN merged_metadata pm ON pm.item_id = i.parent_id AND pm.provider_id != ''
+             LEFT JOIN resolved_metadata md ON md.item_id = i.id
+             LEFT JOIN resolved_metadata pmd ON pmd.item_id = i.parent_id
+             LEFT JOIN resolved_metadata pm ON pm.item_id = i.parent_id
+             LEFT JOIN anime_ids ai ON ai.item_id = i.id
+             LEFT JOIN anime_ids pai ON pai.item_id = i.parent_id
              WHERE i.id = ?",
         )
         .bind(item_id)
