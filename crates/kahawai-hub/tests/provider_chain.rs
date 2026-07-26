@@ -540,3 +540,173 @@ async fn among_two_manual_matches_the_chain_order_decides() {
     set_chain(&db, "movies", &["tvdb".into(), "tmdb".into()]).await.unwrap();
     assert_eq!(merged(&db, "i1").await.0, "tvdb");
 }
+
+// ---------- HUB-5 take three: assignment, not merge ----------
+
+/// (provider, provider_id, manual) of an item's assignment, if it has one.
+async fn assigned(db: &SqlitePool, id: &str) -> Option<(String, String, bool)> {
+    sqlx::query("SELECT provider, provider_id, manual FROM item_match WHERE item_id = ?")
+        .bind(id)
+        .fetch_optional(db)
+        .await
+        .unwrap()
+        .map(|r| (r.get("provider"), r.get("provider_id"), r.get::<i64, _>("manual") != 0))
+}
+
+async fn answer_row(db: &SqlitePool, id: &str, provider: &str, pid: &str, strength: &str) {
+    sqlx::query(
+        "INSERT INTO provider_metadata (item_id, provider, provider_id, title, confidence, updated_at)
+         VALUES (?, ?, ?, ?, ?, unixepoch())
+         ON CONFLICT (item_id, provider) DO UPDATE SET
+           provider_id = excluded.provider_id, confidence = excluded.confidence",
+    )
+    .bind(id)
+    .bind(provider)
+    .bind(pid)
+    .bind(format!("{provider} says"))
+    .bind(strength)
+    .execute(db)
+    .await
+    .unwrap();
+}
+
+/// A strong match beats a weak one whatever the preference order says —
+/// the order breaks ties between comparable matches, it does not promote a
+/// guess over a certainty.
+#[tokio::test]
+async fn strong_beats_weak_across_the_preference_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    item(&db, "i1").await;
+    answer_row(&db, "i1", "tmdb", "111", "weak").await; // ranks FIRST for movies
+    answer_row(&db, "i1", "tvdb", "222", "auto").await;
+    kahawai_hub::providers::assign(&db, "i1").await.unwrap();
+    assert_eq!(assigned(&db, "i1").await, Some(("tvdb".into(), "222".into(), false)));
+
+    // Equal strength: now the order decides, and a reorder moves it.
+    answer_row(&db, "i1", "tmdb", "111", "auto").await;
+    kahawai_hub::providers::assign(&db, "i1").await.unwrap();
+    assert_eq!(assigned(&db, "i1").await.unwrap().0, "tmdb");
+    set_chain(&db, "movies", &["tvdb".into(), "tmdb".into()]).await.unwrap();
+    kahawai_hub::providers::assign_media_type(&db, "movies").await.unwrap();
+    assert_eq!(assigned(&db, "i1").await.unwrap().0, "tvdb");
+}
+
+/// The owner's rule, directly: a more preferred provider that gains info
+/// later replaces the earlier automatic match.
+#[tokio::test]
+async fn a_later_preferred_answer_replaces_an_automatic_match() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    item(&db, "i1").await;
+    answer_row(&db, "i1", "tvdb", "222", "auto").await;
+    kahawai_hub::providers::assign(&db, "i1").await.unwrap();
+    assert_eq!(assigned(&db, "i1").await.unwrap().0, "tvdb");
+
+    answer_row(&db, "i1", "tmdb", "111", "auto").await;
+    kahawai_hub::providers::assign(&db, "i1").await.unwrap();
+    assert_eq!(assigned(&db, "i1").await.unwrap().0, "tmdb", "the preferred provider takes over");
+}
+
+/// Only misses, or nothing at all, means NO assignment row — absence is
+/// the unmatched state, not a sentinel.
+#[tokio::test]
+async fn misses_leave_the_item_unassigned() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    item(&db, "i1").await;
+    kahawai_hub::providers::assign(&db, "i1").await.unwrap();
+    assert_eq!(assigned(&db, "i1").await, None, "never asked");
+
+    answer_row(&db, "i1", "tmdb", "", "miss").await;
+    answer_row(&db, "i1", "tvdb", "", "miss").await;
+    kahawai_hub::providers::assign(&db, "i1").await.unwrap();
+    assert_eq!(assigned(&db, "i1").await, None, "asked, nothing found");
+}
+
+/// An answer that was only reachable through somebody else's mapped id
+/// describes the item but may never own it — otherwise ranking TMDB first
+/// would hand an anime item to a record reached *because* AniDB identified
+/// it.
+#[tokio::test]
+async fn a_bridged_answer_never_owns_the_item() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    item(&db, "i1").await;
+    answer_row(&db, "i1", "anilist", "9253", "auto").await;
+    answer_row(&db, "i1", "tmdb", "42509", "bridged").await;
+    // Rank TMDB above the anime composite; the bridge still cannot win.
+    set_chain(&db, "anime", &["tmdb".into(), "anime".into(), "tvdb".into()]).await.unwrap();
+    kahawai_hub::providers::assign(&db, "i1").await.unwrap();
+    assert_eq!(assigned(&db, "i1").await.unwrap().0, "anilist");
+
+    // And a bridged answer alone leaves the item unassigned.
+    item(&db, "i2").await;
+    answer_row(&db, "i2", "tmdb", "42509", "bridged").await;
+    kahawai_hub::providers::assign(&db, "i2").await.unwrap();
+    assert_eq!(assigned(&db, "i2").await, None);
+}
+
+/// A refused record is not a candidate; an item where everything has been
+/// refused stays unassigned, and a NEW record is picked up automatically —
+/// which is what "try again when something new pops up" means.
+#[tokio::test]
+async fn refused_records_are_skipped_until_something_new_appears() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    item(&db, "i1").await;
+    answer_row(&db, "i1", "tmdb", "19069", "auto").await;
+    kahawai_hub::providers::assign(&db, "i1").await.unwrap();
+    assert_eq!(assigned(&db, "i1").await.unwrap().1, "19069");
+
+    sqlx::query(
+        "INSERT INTO rejected_matches (item_id, provider, provider_id, rejected_at)
+         VALUES ('i1', 'tmdb', '19069', unixepoch())",
+    )
+    .execute(&db)
+    .await
+    .unwrap();
+    kahawai_hub::providers::assign(&db, "i1").await.unwrap();
+    assert_eq!(assigned(&db, "i1").await, None, "the refused record is dropped");
+    // The answers themselves survive a rejection.
+    let kept: i64 = sqlx::query_scalar("SELECT count(*) FROM provider_metadata WHERE item_id='i1'")
+        .fetch_one(&db)
+        .await
+        .unwrap();
+    assert_eq!(kept, 1);
+
+    // A different record from the same provider is fair game.
+    answer_row(&db, "i1", "tmdb", "72710", "auto").await;
+    kahawai_hub::providers::assign(&db, "i1").await.unwrap();
+    assert_eq!(assigned(&db, "i1").await.unwrap().1, "72710");
+}
+
+/// Episodes and tracks never get an assignment: they follow their parent.
+#[tokio::test]
+async fn episodes_are_never_assigned() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    sqlx::query("INSERT INTO items (id, kind, title, norm_title) VALUES ('ep','episode','e','e')")
+        .execute(&db)
+        .await
+        .unwrap();
+    answer_row(&db, "ep", "tvdb", "999", "auto").await;
+    kahawai_hub::providers::assign(&db, "ep").await.unwrap();
+    assert_eq!(assigned(&db, "ep").await, None);
+}
+
+/// An assignment whose backing answer is downgraded to a miss is dropped,
+/// not left pointing at nothing.
+#[tokio::test]
+async fn an_assignment_whose_answer_decays_is_dropped() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    item(&db, "i1").await;
+    answer_row(&db, "i1", "tmdb", "111", "auto").await;
+    kahawai_hub::providers::assign(&db, "i1").await.unwrap();
+    assert!(assigned(&db, "i1").await.is_some());
+
+    answer_row(&db, "i1", "tmdb", "", "miss").await;
+    kahawai_hub::providers::assign(&db, "i1").await.unwrap();
+    assert_eq!(assigned(&db, "i1").await, None);
+}

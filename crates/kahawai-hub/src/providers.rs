@@ -159,6 +159,111 @@ pub async fn set_chain(db: &SqlitePool, media_type: &str, order: &[String]) -> R
     rematerialize_media_type(db, media_type).await
 }
 
+/// Drop an automatic assignment whose backing answer no longer qualifies
+/// — downgraded to a miss, or since refused. Manual pins are left alone.
+const DROP_STALE_ASSIGNMENT: &str = "\
+DELETE FROM item_match
+ WHERE manual = 0
+   AND (?1 IS NULL OR item_id = ?1)
+   AND (?2 IS NULL OR media_type = ?2)
+   AND (NOT EXISTS (
+          SELECT 1 FROM provider_metadata pm
+           WHERE pm.item_id = item_match.item_id
+             AND pm.provider = item_match.provider
+             AND pm.provider_id <> ''
+             AND pm.confidence IN ('auto', 'weak'))
+        OR EXISTS (
+          SELECT 1 FROM rejected_matches rj
+           WHERE rj.item_id = item_match.item_id
+             AND rj.provider = item_match.provider
+             AND rj.provider_id = item_match.provider_id))";
+
+/// Pick each item's assignment from the answers already on disk: a strong
+/// match before a weak one, then the media type's preference order, then
+/// the provider name so the outcome is deterministic. Refused records are
+/// not candidates, and no candidate means NO ROW — absence is how "never
+/// asked", "only misses" and "everything refused" are all expressed.
+///
+/// The pick is from scratch every time, which is what makes "a more
+/// preferred provider that gains info replaces the automatic match" free.
+/// Manual pins are declined in the ON CONFLICT, the single guard.
+const PICK_ASSIGNMENT: &str = "\
+INSERT INTO item_match (item_id, provider, provider_id, media_type, manual, updated_at)
+SELECT item_id, provider, provider_id, media_type, 0, unixepoch() FROM (
+  SELECT t.item_id, t.media_type, pm.provider, pm.provider_id,
+         ROW_NUMBER() OVER (PARTITION BY t.item_id ORDER BY
+             CASE pm.confidence WHEN 'auto' THEN 0 WHEN 'weak' THEN 1 ELSE 2 END,
+             COALESCE(r.rank, 99),
+             pm.provider) AS n
+    FROM (
+      SELECT i.id AS item_id,
+             COALESCE((SELECT CASE WHEN c.media_type IN ('movies','series','anime','music')
+                                   THEN c.media_type ELSE 'movies' END
+                         FROM item_sources s
+                         JOIN collections c ON (c.module_id, c.collection_id)
+                                             = (s.module_id, s.collection_id)
+                        WHERE s.item_id = i.id
+                           OR s.item_id IN (SELECT id FROM items WHERE parent_id = i.id)
+                        LIMIT 1), 'movies') AS media_type
+        FROM items i
+       -- Top level only. Episodes and tracks follow their parent, and this
+       -- filter is the only thing enforcing that.
+       WHERE i.kind IN ('movie', 'show', 'album')
+         AND (?1 IS NULL OR i.id = ?1)
+    ) t
+    JOIN provider_metadata pm ON pm.item_id = t.item_id
+    LEFT JOIN provider_ranks r
+           ON r.media_type = t.media_type
+          AND r.provider = CASE pm.provider WHEN 'anilist' THEN 'anime' ELSE pm.provider END
+   WHERE pm.confidence IN ('auto', 'weak') AND pm.provider_id <> ''
+     AND (?2 IS NULL OR t.media_type = ?2)
+     AND NOT EXISTS (SELECT 1 FROM rejected_matches rj
+                      WHERE rj.item_id = pm.item_id
+                        AND rj.provider = pm.provider
+                        AND rj.provider_id = pm.provider_id)
+) WHERE n = 1
+ON CONFLICT (item_id) DO UPDATE SET
+  provider = excluded.provider,
+  provider_id = excluded.provider_id,
+  media_type = excluded.media_type,
+  updated_at = unixepoch()
+WHERE item_match.manual = 0";
+
+/// Re-pick one item's assignment. Local work only; no provider is asked.
+pub async fn assign(db: &SqlitePool, item_id: &str) -> Result<()> {
+    let mut tx = db.begin().await?;
+    reassign(&mut tx, Some(item_id), None).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Re-pick every item of one media type — what a reorder costs. Still no
+/// provider is asked: the answers are already stored.
+pub async fn assign_media_type(db: &SqlitePool, media_type: &str) -> Result<()> {
+    let mut tx = db.begin().await?;
+    reassign(&mut tx, None, Some(media_type_key(media_type))).await?;
+    tx.commit().await?;
+    tracing::info!(media_type, "assignments re-picked");
+    Ok(())
+}
+
+/// Both statements must run in ONE transaction: between the delete and the
+/// insert an item has no assignment, and a reader in that window would see
+/// it as unmatched.
+pub(crate) async fn reassign(
+    tx: &mut sqlx::SqliteConnection,
+    item_id: Option<&str>,
+    media_type: Option<&str>,
+) -> Result<()> {
+    sqlx::query(DROP_STALE_ASSIGNMENT)
+        .bind(item_id)
+        .bind(media_type)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(PICK_ASSIGNMENT).bind(item_id).bind(media_type).execute(&mut *tx).await?;
+    Ok(())
+}
+
 /// Backoff before retrying a provider that refused: 15 min, then an
 /// hour, then 4, then a day — the same shape as the login throttle, and
 /// well inside AniDB's "a ban decays after ~24 h of silence".
