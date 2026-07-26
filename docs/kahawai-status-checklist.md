@@ -90,8 +90,21 @@ the live deployment. Unchecked items carry a note when partially done.
       `enrichment_queue`, never dropped. Manual assignments are never
       recomputed (HUB-8/30a). Anime stays bridged through mapped IDs —
       described by the tail, never re-identified by it.
-- [ ] HUB-6 Descriptive metadata *(titles, plots, dates, ratings, posters, episode
-      stills live; cast/genres not stored)*
+- [x] HUB-6 Descriptive metadata: titles, plots, dates, ratings, posters,
+      episode stills, season/episode and album/release structure, plus
+      genres and cast. Genres and cast ride the SAME TMDB details request
+      that already fetched `original_language` —
+      `append_to_response=credits` folds the credits sub-request into one
+      call (verified against the live API), so the pair costs no extra
+      provider traffic, which is the only thing that made cast affordable
+      under HUB-7 pacing. Cast is stored as JSON in billing order, capped
+      at 15: TMDB returns 68 for a 1995 film and nothing renders that.
+      Live: 1,109 of 1,137 top-level items resolve to genres and 1,097 to
+      a cast; the shortfall is the 21 items TMDB never matched. Everything
+      is stored, so it all reads back with the providers unreachable.
+      *(Cast comes from TMDB only, and TVDB's own genre list is not read —
+      both reach TVDB-owned items by side-fill whenever TMDB also
+      answered.)*
 - [x] HUB-7 Provider rate limits/caching. Rate limits: every provider
       request goes through one queue per provider host (`hub/gate.rs`),
       spaced by that provider's *documented* limit and silenced on

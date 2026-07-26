@@ -151,6 +151,9 @@ export type ItemMetadata = {
   /// ISO 639-1 original language of the matched title (feeds the
   /// future default-track mechanism).
   original_language?: string | null
+  /// HUB-6. Both describe the work, so an episode shows its show's.
+  genres?: string[] | null
+  cast?: { name: string; character: string | null }[] | null
 }
 
 export type ItemDetail = Item & {

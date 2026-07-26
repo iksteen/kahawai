@@ -777,8 +777,8 @@ impl Enricher {
         if let Err(e) = self.enrich_episodes(registry, &key, tvdb_token.as_ref()).await {
             tracing::warn!(error = format!("{e:#}"), "episode enrichment failed");
         }
-        if let Err(e) = self.backfill_original_language(registry, &key).await {
-            tracing::warn!(error = format!("{e:#}"), "original-language backfill failed");
+        if let Err(e) = self.backfill_details(registry, &key).await {
+            tracing::warn!(error = format!("{e:#}"), "tmdb details backfill failed");
         }
         if let Err(e) = self.enrich_music(registry, &providers).await {
             tracing::warn!(error = format!("{e:#}"), "music enrichment failed");
@@ -1296,6 +1296,7 @@ impl Enricher {
                 premiered: media.premiered(),
                 original_language: media.original_language().map(str::to_string),
                 genres: Some(serde_json::to_string(&genres)?),
+                cast_json: None,
             },
         )
         .await?;
@@ -1358,7 +1359,17 @@ impl Enricher {
     /// or mapped id). '' marks asked-but-absent so nothing re-asks.
     /// TVDB-only rows are left NULL (their language arrives if ever
     /// re-matched); the sweep goes quiet once everything is stamped.
-    async fn backfill_original_language(
+    /// How much of the billing to keep. Enough for "who's in this?" on a
+    /// detail page; the tail of a big film is crowd and stand-ins.
+    const CAST_LIMIT: usize = 15;
+
+    /// HUB-6: one TMDB details request per item fills original_language,
+    /// genres and cast together. `append_to_response=credits` folds the
+    /// credits sub-request into the SAME call (verified against the live
+    /// API: /movie/63 returns genres and 68 cast entries in one response),
+    /// so adding cast costs no extra provider traffic — which is the only
+    /// reason it is affordable at all under HUB-7 pacing.
+    async fn backfill_details(
         self: &Arc<Self>,
         registry: &Registry,
         tmdb_key: &str,
@@ -1366,15 +1377,19 @@ impl Enricher {
         let rows = sqlx::query(
             "SELECT pm.item_id, i.kind, pm.provider_id AS tmdb_id
              FROM provider_metadata pm JOIN items i ON i.id = pm.item_id
-             WHERE pm.provider = 'tmdb' AND pm.original_language IS NULL
-               AND pm.provider_id != '' AND i.kind IN ('movie', 'show')",
+             WHERE pm.provider = 'tmdb' AND pm.provider_id != ''
+               AND i.kind IN ('movie', 'show')
+               -- Any of the three missing is worth the one request that
+               -- fills all three.
+               AND (pm.original_language IS NULL OR pm.genres IS NULL
+                    OR pm.cast_json IS NULL)",
         )
         .fetch_all(registry.db())
         .await?;
         if rows.is_empty() {
             return Ok(());
         }
-        tracing::info!(items = rows.len(), "original-language backfill starting");
+        tracing::info!(items = rows.len(), "tmdb details backfill starting");
         let sem = Arc::new(tokio::sync::Semaphore::new(4));
         let mut tasks = tokio::task::JoinSet::new();
         for row in rows {
@@ -1392,29 +1407,73 @@ impl Enricher {
                 let _permit = sem.acquire().await;
                 let path = if kind == "movie" { "movie" } else { "tv" };
                 #[derive(Deserialize)]
+                struct Named {
+                    name: String,
+                }
+                #[derive(Deserialize)]
+                struct CastMember {
+                    name: String,
+                    #[serde(default)]
+                    character: Option<String>,
+                }
+                #[derive(Deserialize)]
+                struct Credits {
+                    #[serde(default)]
+                    cast: Vec<CastMember>,
+                }
+                #[derive(Deserialize)]
                 struct Details {
                     #[serde(default)]
                     original_language: Option<String>,
+                    #[serde(default)]
+                    genres: Vec<Named>,
+                    #[serde(default)]
+                    credits: Option<Credits>,
                 }
                 let req = this
                     .http
                     .get(format!("https://api.themoviedb.org/3/{path}/{tmdb_id}"))
-                    .query(&[("api_key", key.as_str())]);
-                let lang = match this.http.send(req).await.and_then(|r| Ok(r.error_for_status()?)) {
+                    .query(&[("api_key", key.as_str()), ("append_to_response", "credits")]);
+                let det = match this.http.send(req).await.and_then(|r| Ok(r.error_for_status()?)) {
                     Ok(resp) => match resp.json::<Details>().await {
-                        Ok(det) => det.original_language.unwrap_or_default(),
-                        Err(_) => String::new(),
+                        Ok(det) => det,
+                        Err(e) => {
+                            tracing::debug!(tmdb_id, error = %e, "details decode failed");
+                            return;
+                        }
                     },
                     Err(e) => {
                         tracing::debug!(tmdb_id, error = %e, "details fetch failed");
                         return; // transient: stays NULL, retried next run
                     }
                 };
+                let lang = det.original_language.unwrap_or_default();
+                let genres: Vec<String> = det.genres.into_iter().map(|g| g.name).collect();
+                // Billing order, top of the bill only: TMDB returns 68 for
+                // a 1995 film and no UI shows a cast of 68. Empty stays
+                // empty rather than becoming "[]", so the row still reads
+                // as unanswered and is retried.
+                let cast: Vec<serde_json::Value> = det
+                    .credits
+                    .map(|c| c.cast)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .take(Self::CAST_LIMIT)
+                    .map(|p| {
+                        serde_json::json!({ "name": p.name, "character": p.character })
+                    })
+                    .collect();
                 let _ = sqlx::query(
-                    "UPDATE provider_metadata SET original_language = ?, updated_at = unixepoch()
+                    "UPDATE provider_metadata
+                        SET original_language = ?,
+                            genres = COALESCE(?, genres),
+                            cast_json = COALESCE(?, cast_json),
+                            updated_at = unixepoch()
                       WHERE item_id = ? AND provider = 'tmdb'",
                 )
                 .bind(&lang)
+                .bind((!genres.is_empty()).then(|| serde_json::to_string(&genres).unwrap()))
+                .bind((!cast.is_empty()).then(|| serde_json::to_string(&cast).unwrap()))
                 .bind(&item_id)
                 .execute(&db)
                 .await;
@@ -1968,7 +2027,10 @@ impl Enricher {
             rating: c.and_then(|c| c.vote_average).filter(|r| *r > 0.0),
             premiered: c.and_then(|c| c.release_date.clone()),
             original_language: c.and_then(|c| c.original_language.clone()),
-            genres: None, // TMDB/TVDB search results carry no genre names
+            // Search results carry neither: both arrive with the details
+            // request that also fills original_language (HUB-6).
+            genres: None,
+            cast_json: None,
         };
         let chain = crate::providers::chain_in_force(db, media_type).await;
         crate::providers::store_answer(

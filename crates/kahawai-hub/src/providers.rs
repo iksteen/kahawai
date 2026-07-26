@@ -445,8 +445,8 @@ pub async fn store_answer(
     sqlx::query(
         "INSERT INTO provider_metadata
            (item_id, provider, provider_id, title, overview, poster_path, rating,
-            premiered, original_language, genres, confidence, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch())
+            premiered, original_language, genres, cast_json, confidence, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch())
          ON CONFLICT (item_id, provider) DO UPDATE SET
            provider_id = excluded.provider_id,
            title = excluded.title,
@@ -456,6 +456,15 @@ pub async fn store_answer(
            premiered = excluded.premiered,
            original_language = excluded.original_language,
            genres = excluded.genres,
+           -- Cast arrives later than the match (one details request fills
+           -- language, genres and cast at once), so a plain overwrite would
+           -- erase it every time this row is re-answered. Keep it only
+           -- while the answer still describes the SAME record.
+           cast_json = CASE
+               WHEN excluded.provider_id <> provider_metadata.provider_id
+                   THEN excluded.cast_json
+               ELSE COALESCE(excluded.cast_json, provider_metadata.cast_json)
+           END,
            confidence = excluded.confidence,
            updated_at = excluded.updated_at",
     )
@@ -469,6 +478,7 @@ pub async fn store_answer(
     .bind(&fields.premiered)
     .bind(&fields.original_language)
     .bind(&fields.genres)
+    .bind(&fields.cast_json)
     .bind(confidence)
     .execute(&mut *tx)
     .await?;
@@ -583,6 +593,8 @@ pub struct Fields {
     pub original_language: Option<String>,
     /// JSON array, as stored.
     pub genres: Option<String>,
+    /// JSON array of {name, character}, billing order, as stored.
+    pub cast_json: Option<String>,
 }
 
 /// Providers instantiated for one enrichment run (credentials resolved,
@@ -690,7 +702,7 @@ impl ProviderSet {
 /// Fields resolved per read: `(column, "is present" test, value)`. The
 /// projection pair is deliberately decided by ONE test — a season from
 /// TVDB with an episode number from TMDB would be nonsense.
-const RESOLVED_FIELDS: [(&str, &str, &str); 9] = [
+const RESOLVED_FIELDS: [(&str, &str, &str); 10] = [
     ("title", "NULLIF(pm.title, '') IS NOT NULL", "NULLIF(pm.title, '')"),
     ("overview", "NULLIF(pm.overview, '') IS NOT NULL", "NULLIF(pm.overview, '')"),
     ("poster_path", "NULLIF(pm.poster_path, '') IS NOT NULL", "NULLIF(pm.poster_path, '')"),
@@ -701,6 +713,7 @@ const RESOLVED_FIELDS: [(&str, &str, &str); 9] = [
         "NULLIF(pm.original_language, '')",
     ),
     ("genres", "NULLIF(pm.genres, '') IS NOT NULL", "NULLIF(pm.genres, '')"),
+    ("cast_json", "NULLIF(pm.cast_json, '') IS NOT NULL", "NULLIF(pm.cast_json, '')"),
     ("rating", "pm.rating IS NOT NULL", "pm.rating"),
     ("proj_season", "pm.proj_season IS NOT NULL", "pm.proj_season"),
     ("proj_episode", "pm.proj_season IS NOT NULL", "pm.proj_episode"),
@@ -733,7 +746,7 @@ DROP VIEW IF EXISTS answer_priority;
 CREATE VIEW answer_priority AS
 SELECT i.id AS item_id, pm.provider, pm.provider_id, pm.confidence,
        pm.title, pm.overview, pm.poster_path, pm.rating, pm.premiered,
-       pm.original_language, pm.genres, pm.proj_season, pm.proj_episode,
+       pm.original_language, pm.genres, pm.cast_json, pm.proj_season, pm.proj_episode,
        pm.updated_at,
        -- The effective assignment: this item's own, else its parent's.
        -- Episodes and tracks never carry one, so they render as their show

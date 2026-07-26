@@ -1614,6 +1614,10 @@ async fn item_detail(
     // Enrichment (own metadata, or the parent show's for episodes).
     let meta = sqlx::query(
         "SELECT m.overview, m.rating, m.premiered, m.confidence, m.provider,
+                -- An episode carries neither; both describe the work, so
+                -- they come from the show when the episode has none.
+                COALESCE(NULLIF(m.genres, ''), NULLIF(pm.genres, '')) AS genres,
+                COALESCE(NULLIF(m.cast_json, ''), NULLIF(pm.cast_json, '')) AS cast_json,
                 COALESCE(NULLIF(m.original_language, ''),
                          NULLIF(pm.original_language, '')) AS original_language
          FROM items i
@@ -1636,6 +1640,14 @@ async fn item_detail(
             "original_language": m
                 .get::<Option<String>, _>("original_language")
                 .filter(|l| !l.is_empty()),
+            // Stored as JSON; hand them out as arrays rather than making
+            // every client parse a string out of a field (HUB-6).
+            "genres": m
+                .get::<Option<String>, _>("genres")
+                .and_then(|g| serde_json::from_str::<Value>(&g).ok()),
+            "cast": m
+                .get::<Option<String>, _>("cast_json")
+                .and_then(|c| serde_json::from_str::<Value>(&c).ok()),
         });
     }
 

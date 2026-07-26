@@ -423,18 +423,34 @@ export default function Detail({
         </div>
       </div>
 
-      {item.metadata?.overview && (
+      {(item.metadata?.overview || item.metadata?.genres?.length) && (
         <section className="meta-block">
-          <p className="overview">{item.metadata.overview}</p>
+          {item.metadata.overview && <p className="overview">{item.metadata.overview}</p>}
           <div className="detail-sub mono">
             {item.metadata.premiered && <span>{item.metadata.premiered}</span>}
             {item.metadata.rating ? <span> · ★ {item.metadata.rating.toFixed(1)}</span> : null}
+            {item.metadata.genres?.length ? (
+              <span> · {item.metadata.genres.join(' · ')}</span>
+            ) : null}
             {item.metadata.confidence === 'weak' && (
               <span className="dim"> · uncertain match</span>
             )}
           </div>
         </section>
       )}
+      {item.metadata?.cast?.length ? (
+        <section className="meta-block">
+          <h2>Cast</h2>
+          <ul className="cast">
+            {item.metadata.cast.map((p) => (
+              <li key={p.name}>
+                <span>{p.name}</span>
+                {p.character && <span className="dim"> as {p.character}</span>}
+              </li>
+            ))}
+          </ul>
+        </section>
+      ) : null}
 
       <div className="play-row">
         <button className="btn" disabled={busy || !best?.available} onClick={() => play(autoMode(best))}>
