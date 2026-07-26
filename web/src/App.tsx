@@ -1,5 +1,13 @@
 import { useEffect, useState } from 'react'
-import { api, isAdmin, refreshTokens, storeTokens, username, type Item, type Session } from './api'
+import {
+  fetchBootstrap,
+  isAdmin,
+  refreshTokens,
+  storeTokens,
+  username,
+  type Item,
+  type Session,
+} from './api'
 import Auth from './views/Auth'
 import Libraries from './views/Libraries'
 import Library from './views/Library'
@@ -89,12 +97,16 @@ export default function App() {
     return () => window.removeEventListener('popstate', onPop)
   }, [])
 
+  // One public endpoint states which screen to open on. This used to be
+  // read off the STATUS of /api/v1/items — 503 meant setup, 401 meant
+  // login — which inferred the client's own state from an error path and
+  // pulled the whole catalogue (1.4 MB) for a body it discarded.
   useEffect(() => {
     ;(async () => {
-      const r = await api('/api/v1/items')
-      if (r.status === 503) setPhase('setup')
-      else if (r.status === 401) setPhase('login')
-      else setPhase('app')
+      const s = await fetchBootstrap().catch(() => null)
+      if (!s) setPhase('login')
+      else if (s.setup_required) setPhase('setup')
+      else setPhase(s.authenticated ? 'app' : 'login')
     })()
   }, [])
 

@@ -480,3 +480,65 @@ async fn login_throttles_after_repeated_failures() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
+
+/// The client's first request answers which screen to open on, instead of
+/// inferring it from an error status on an unrelated endpoint — which is
+/// what made the web UI fetch the whole catalogue on every load.
+#[tokio::test]
+async fn bootstrap_states_setup_and_auth_without_a_token() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    let registry = Arc::new(Registry::new(db.clone(), Default::default()));
+    let auth = Arc::new(Auth::new(db.clone(), dir.path()).await.unwrap());
+    let setup_token = auth.setup_token().expect("fresh hub is in setup mode");
+    let api = test_router(
+        registry,
+        auth.clone(),
+        Arc::new(kahawai_hub::sessions::Sessions::new(tempfile::tempdir().unwrap().keep())),
+    );
+    let probe = || Request::get("/api/v1/bootstrap").body(Body::empty()).unwrap();
+
+    // Reachable in setup mode, unlike everything behind require_auth.
+    let resp = api.clone().oneshot(probe()).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = body_json(resp).await;
+    assert_eq!(v["setup_required"], true);
+    assert_eq!(v["authenticated"], false);
+
+    api.clone()
+        .oneshot(post(
+            "/api/v1/setup",
+            serde_json::json!({"token": setup_token, "username": "ingmar", "password": "hunter22222"}),
+        ))
+        .await
+        .unwrap();
+
+    // Setup done, no token presented: the login screen, said plainly.
+    let v = body_json(api.clone().oneshot(probe()).await.unwrap()).await;
+    assert_eq!(v["setup_required"], false);
+    assert_eq!(v["authenticated"], false);
+
+    // A garbage token is not authentication.
+    let resp = api
+        .clone()
+        .oneshot(get_authed("/api/v1/bootstrap", "not-a-jwt"))
+        .await
+        .unwrap();
+    assert_eq!(body_json(resp).await["authenticated"], false);
+
+    let token = body_json(
+        api.clone()
+            .oneshot(post(
+                "/api/v1/auth/token",
+                serde_json::json!({"username": "ingmar", "password": "hunter22222"}),
+            ))
+            .await
+            .unwrap(),
+    )
+    .await["access_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let resp = api.oneshot(get_authed("/api/v1/bootstrap", &token)).await.unwrap();
+    assert_eq!(body_json(resp).await["authenticated"], true);
+}

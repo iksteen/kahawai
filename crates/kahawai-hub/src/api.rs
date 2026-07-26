@@ -122,6 +122,7 @@ pub fn router(
         .route_layer(axum::middleware::from_fn_with_state(state.clone(), require_auth));
     let mut app = Router::new()
         .merge(admin)
+        .route("/api/v1/bootstrap", get(bootstrap))
         .route("/api/v1/setup", post(setup))
         .route("/api/v1/auth/token", post(login))
         .route("/api/v1/auth/refresh", post(refresh))
@@ -164,6 +165,51 @@ fn internal(e: impl std::fmt::Display) -> ApiError {
     (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
 }
 
+/// The token as a client presents it: Authorization header first, the
+/// kahawai_token cookie as the fallback for <video>/HLS requests, which
+/// cannot set headers (HUB-27). Shared with `bootstrap`, so what counts
+/// as "signed in" cannot drift between the gate and what the gate says.
+fn presented_token(req: &Request) -> Option<String> {
+    let header = req
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(str::to_string);
+    header.or_else(|| {
+        req.headers()
+            .get(axum::http::header::COOKIE)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|c| {
+                c.split(';')
+                    .filter_map(|kv| kv.trim().split_once('='))
+                    .find(|(k, _)| *k == "kahawai_token")
+                    .map(|(_, v)| v.to_string())
+            })
+    })
+}
+
+/// Which screen the client should open on, stated rather than inferred.
+///
+/// Public by necessity, and deliberately so: every route behind
+/// `require_auth` answers 503 before setup and 401 without a token, so a
+/// client reading those is guessing its own state off an error path — and
+/// pays whatever the endpoint it picked costs. The web UI probed
+/// `/api/v1/items` and pulled the entire catalogue (1.4 MB, 578 ms here)
+/// to read a status line it then threw away.
+///
+/// Says nothing a caller could not learn by trying to log in, so it needs
+/// no token: `setup_required` is already printed on the console at
+/// startup, and `authenticated` describes the request's OWN token.
+async fn bootstrap(State(state): State<AppState>, req: Request) -> Json<Value> {
+    let setup_required = state.auth.setup_required();
+    Json(json!({
+        "setup_required": setup_required,
+        "authenticated": !setup_required
+            && presented_token(&req).and_then(|t| state.auth.verify(&t).ok()).is_some(),
+    }))
+}
+
 async fn require_auth(
     State(state): State<AppState>,
     mut req: Request,
@@ -174,26 +220,7 @@ async fn require_auth(
         tracing::warn!(path = %req.uri(), "503: setup_required returned true");
         return Err((StatusCode::SERVICE_UNAVAILABLE, "setup required".into()));
     }
-    // Bearer header first; the kahawai_token cookie is the fallback for
-    // <video>/HLS requests, which cannot set headers (HUB-27).
-    let header_token = req
-        .headers()
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .map(str::to_string);
-    let cookie_token = req
-        .headers()
-        .get(axum::http::header::COOKIE)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|c| {
-            c.split(';')
-                .filter_map(|kv| kv.trim().split_once('='))
-                .find(|(k, _)| *k == "kahawai_token")
-                .map(|(_, v)| v.to_string())
-        });
-    let claims = header_token
-        .or(cookie_token)
+    let claims = presented_token(&req)
         .and_then(|t| state.auth.verify(&t).ok())
         .ok_or((StatusCode::UNAUTHORIZED, "invalid or missing token".to_string()))?;
     req.extensions_mut().insert(claims);
@@ -521,12 +548,6 @@ async fn admin_enrich_run(State(state): State<AppState>) -> Result<Json<Value>, 
         }
     });
     Ok(Json(json!({ "started": true })))
-}
-
-#[derive(Deserialize, Default)]
-struct RescanRequest {
-    #[serde(default)]
-    collection_id: Option<String>,
 }
 
 /// HUB-35: granular refresh. The admin-facing unit is the LIBRARY —

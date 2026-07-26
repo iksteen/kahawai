@@ -247,10 +247,14 @@ export type LibrarySummary = { id: string; name: string; media_type: string }
 export const fetchLibraries = () =>
   json<{ libraries: LibrarySummary[] }>('/api/v1/libraries')
 
-export const fetchItems = (libraryId?: string) =>
-  json<{ items: Item[] }>(
-    libraryId ? `/api/v1/items?library=${encodeURIComponent(libraryId)}` : '/api/v1/items'
-  )
+export const fetchItems = (libraryId: string) =>
+  json<{ items: Item[] }>(`/api/v1/items?library=${encodeURIComponent(libraryId)}`)
+
+/// Which screen to open on. Public: needs no token, and answers before
+/// setup has happened.
+export type Bootstrap = { setup_required: boolean; authenticated: boolean }
+
+export const fetchBootstrap = () => json<Bootstrap>('/api/v1/bootstrap')
 
 export async function fetchItem(id: string): Promise<ItemDetail> {
   const raw = await json<Item & { sources: Source[] | number }>(`/api/v1/items/${id}`)
@@ -542,18 +546,6 @@ export const adminSetTmdbKey = (apiKey: string) =>
   })
 export const adminEnrichStatus = () =>
   json<{ running: boolean; matched: number; weak: number; missed: number }>('/admin/v1/enrich')
-export type ReviewEntry = {
-  item_id: string
-  kind: 'movie' | 'show'
-  title: string
-  year: number | null
-  path: string | null
-  confidence: 'miss' | 'weak' | 'rejected'
-  matched_title: string | null
-  premiered: string | null
-  provider: string
-}
-
 export type MatchCandidate = {
   id: number
   title: string
@@ -565,8 +557,6 @@ export type MatchCandidate = {
   provider: 'tmdb' | 'tvdb'
 }
 
-export const adminReviewList = () =>
-  json<{ entries: ReviewEntry[] }>('/admin/v1/enrich/review')
 export const adminReviewSearch = (kind: string, query: string, year?: number | null) =>
   json<{ candidates: MatchCandidate[] }>('/admin/v1/enrich/search', {
     method: 'POST',
@@ -590,12 +580,6 @@ export const adminRefreshLibrary = (id: string) =>
   json<{ asked: number; offline: number }>(`/admin/v1/libraries/${id}/refresh`, {
     method: 'POST',
     body: '{}',
-  })
-
-export const adminRefreshCollection = (moduleId: string, collectionId: string) =>
-  json<{ asked: number; offline: number }>('/admin/v1/collections/refresh', {
-    method: 'POST',
-    body: JSON.stringify({ module_id: moduleId, collection_id: collectionId }),
   })
 
 export const adminEnrichRun = () =>
