@@ -735,7 +735,21 @@ SELECT i.id AS item_id, pm.provider, pm.provider_id, pm.confidence,
         AND r.provider = CASE WHEN pm.provider = 'anilist' THEN 'anime'
                               ELSE pm.provider END;
 ";
+    // Identity is the assignment's to state, so the chosen answer first.
     let order = "ORDER BY ap.not_chosen, ap.rank LIMIT 1";
+    // Fields come from the assigned record first and every OTHER record
+    // after it, in chain order: a rival record describes some other
+    // service's idea of this work, and letting it redescribe the assigned
+    // one is how a wrong title used to appear under a right match.
+    //
+    // An answer with an empty provider_id claims no record — it is a
+    // field somebody found lying next to the file, like the cover the
+    // scan picked up (HUB-9). Nothing about it can contradict the
+    // assignment, so it competes on rank alone, which is what puts
+    // `local` at rank 0 ahead of a provider's own poster and, crucially,
+    // what makes moving `local` down the chain actually do something.
+    let field_order = "ORDER BY (ap.provider_id <> '' AND ap.not_chosen), \
+                       ap.rank, ap.not_chosen LIMIT 1";
     let fields: String = RESOLVED_FIELDS
         .iter()
         .map(|(name, present, value)| {
@@ -746,7 +760,7 @@ SELECT i.id AS item_id, pm.provider, pm.provider_id, pm.confidence,
      WHERE ap.item_id = i.id AND {present}
        -- a weak answer describes only the item it was chosen for
        AND (ap.confidence <> 'weak' OR ap.not_chosen = 0)
-     {order}) AS {name},\n"
+     {field_order}) AS {name},\n"
             )
         })
         .collect();

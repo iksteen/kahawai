@@ -932,3 +932,64 @@ async fn local_metadata_leads_the_chain() {
     assert_eq!(assigned(&db, "i1").await.unwrap().0, "tmdb");
     assert_eq!(merged(&db, "i1").await.1.as_deref(), Some("Solaris (1972)"));
 }
+
+/// HUB-9: the cover next to the file is a field the `local` provider
+/// supplies at rank 0 — it beats TMDB's poster without becoming the
+/// answer to "what work is this?", which a picture cannot say.
+#[tokio::test]
+async fn local_artwork_supplies_the_poster_but_never_the_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    item(&db, "i1").await;
+
+    store_answer(
+        &db,
+        "i1",
+        "tmdb",
+        "550",
+        "auto",
+        Fields {
+            title: Some("Fight Club".into()),
+            poster_path: Some("/tmdb.jpg".into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    // Empty provider_id: a scanned cover, no claim of identity.
+    store_answer(
+        &db,
+        "i1",
+        "local",
+        "",
+        "auto",
+        Fields { poster_path: Some("local://cover.jpg".into()), ..Default::default() },
+    )
+    .await
+    .unwrap();
+
+    let r = sqlx::query("SELECT provider, title, poster_path FROM resolved_metadata WHERE item_id = 'i1'")
+        .fetch_one(&db)
+        .await
+        .unwrap();
+    assert_eq!(r.get::<Option<String>, _>("poster_path").as_deref(), Some("local://cover.jpg"));
+    assert_eq!(r.get::<String, _>("provider"), "tmdb");
+    assert_eq!(r.get::<Option<String>, _>("title").as_deref(), Some("Fight Club"));
+
+    // And the assignment itself is TMDB's, not local's.
+    let m: Option<String> =
+        sqlx::query_scalar("SELECT provider FROM item_match WHERE item_id = 'i1'")
+            .fetch_optional(&db)
+            .await
+            .unwrap();
+    assert_eq!(m.as_deref(), Some("tmdb"));
+
+    // Rank local below tmdb and the cover loses — the point of the chain.
+    set_chain(&db, "movies", &["tmdb".into(), "local".into(), "tvdb".into()]).await.unwrap();
+    let p: Option<String> =
+        sqlx::query_scalar("SELECT poster_path FROM resolved_metadata WHERE item_id = 'i1'")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    assert_eq!(p.as_deref(), Some("/tmdb.jpg"));
+}

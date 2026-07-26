@@ -2390,26 +2390,48 @@ impl crate::providers::Provider for LocalProvider {
         db: &sqlx::SqlitePool,
         item: &crate::providers::ItemRef,
     ) -> Result<crate::providers::Outcome> {
-        // Costs nothing for the files that have no .nfo: the scan already
-        // recorded whether one exists, so this is a DB read, not a lease.
-        let Some((module_id, collection_id, nfo_rel)) = nfo_source(&self.registry, &item.id).await?
-        else {
+        // Both local sources come out of the scan record, so an item with
+        // neither costs one DB read and no lease.
+        let art = crate::artwork::find_artwork_source(&self.registry, &item.id).await?;
+        let nfo = nfo_source(&self.registry, &item.id).await?;
+        if art.is_none() && nfo.is_none() {
             return Ok(crate::providers::Outcome::NotApplicable);
+        }
+        // The cover next to the media is local metadata too (HUB-9), and
+        // routing it through the chain is what makes "local first" a rank
+        // the user can change rather than an if-statement in artwork.rs.
+        let mut fields = crate::providers::Fields {
+            poster_path: art
+                .as_ref()
+                .map(|(_, _, p)| format!("{}{p}", crate::artwork::LOCAL)),
+            ..Default::default()
         };
-        let lease = self
-            .sessions
-            .open_lease(&self.registry, &module_id, &collection_id, &nfo_rel)
-            .await?;
-        let bytes = read_nfo(lease).await?;
-        let Some((fields, unique)) = parse_nfo(&String::from_utf8_lossy(&bytes)) else {
-            return Ok(crate::providers::Outcome::Declined);
-        };
-        // The path identifies the record when the file states no id: two
-        // items never share one .nfo, so it is stable and unique enough.
-        let provider_id = unique.unwrap_or_else(|| nfo_rel.clone());
+        // Empty id on purpose: a cover is a field, not an identity. It
+        // side-fills at whatever rank `local` holds, but a picture next to
+        // the file says nothing about WHICH work this is, so it must never
+        // become the item's match. A .nfo does state that, and sets one.
+        let mut provider_id = String::new();
+        // A .nfo is a lease read, so only when the scan saw one.
+        if let Some((module_id, collection_id, nfo_rel)) = nfo {
+            let lease = self
+                .sessions
+                .open_lease(&self.registry, &module_id, &collection_id, &nfo_rel)
+                .await?;
+            let bytes = read_nfo(lease).await?;
+            if let Some((parsed, unique)) = parse_nfo(&String::from_utf8_lossy(&bytes)) {
+                // The path identifies the record when the file states no
+                // id: two items never share one .nfo.
+                provider_id = unique.unwrap_or(nfo_rel.clone());
+                fields = crate::providers::Fields { poster_path: fields.poster_path, ..parsed };
+                tracing::debug!(item = %item.id, nfo = %nfo_rel, "local metadata adopted");
+            }
+        }
         crate::providers::store_answer(db, &item.id, "local", &provider_id, "auto", fields).await?;
-        tracing::debug!(item = %item.id, nfo = %nfo_rel, "local metadata adopted");
-        Ok(crate::providers::Outcome::Matched("auto"))
+        Ok(if provider_id.is_empty() {
+            crate::providers::Outcome::Contributed
+        } else {
+            crate::providers::Outcome::Matched("auto")
+        })
     }
 }
 
