@@ -813,3 +813,97 @@ async fn concurrent_answers_leave_one_correct_assignment() {
         assert_eq!(assigned(&db, &id).await.unwrap().0, "tmdb", "{id}: the preferred provider");
     }
 }
+
+/// The view resolves an item's fields: the assigned provider first, then
+/// the preference order fills what it left empty.
+#[tokio::test]
+async fn the_view_side_fills_from_the_preference_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    item(&db, "i1").await;
+    let chain = chain_in_force(&db, "movies").await;
+    // TMDB is assigned but has no synopsis; TVDB has one.
+    store_answer(&db, "i1", "tmdb", "550", "auto", answer("Fight Club", None, Some(8.4)), &chain)
+        .await
+        .unwrap();
+    store_answer(&db, "i1", "tvdb", "77", "auto", answer("FC", Some("a synopsis"), None), &chain)
+        .await
+        .unwrap();
+    let r = sqlx::query(
+        "SELECT provider, title, overview, rating, confidence FROM resolved_metadata
+          WHERE item_id = 'i1'",
+    )
+    .fetch_one(&db)
+    .await
+    .unwrap();
+    assert_eq!(r.get::<String, _>("provider"), "tmdb");
+    assert_eq!(r.get::<String, _>("title"), "Fight Club", "the assigned provider's title");
+    assert_eq!(r.get::<String, _>("overview"), "a synopsis", "side-filled from TVDB");
+    assert_eq!(r.get::<f64, _>("rating"), 8.4);
+    assert_eq!(r.get::<String, _>("confidence"), "auto");
+}
+
+/// An episode has no assignment: it renders through its show's.
+#[tokio::test]
+async fn the_view_resolves_an_episode_through_its_show() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    item(&db, "show1").await;
+    sqlx::query(
+        "INSERT INTO items (id, kind, title, norm_title, parent_id, season, episode)
+         VALUES ('ep1', 'episode', 'e', 'e', 'show1', 1, 1)",
+    )
+    .execute(&db)
+    .await
+    .unwrap();
+    let chain = chain_in_force(&db, "movies").await;
+    // The show is assigned to TVDB (TMDB missed it).
+    store_answer(&db, "show1", "tmdb", "", "miss", Fields::default(), &chain).await.unwrap();
+    store_answer(&db, "show1", "tvdb", "9", "auto", answer("The Show", None, None), &chain)
+        .await
+        .unwrap();
+    // Both providers answered for the episode itself.
+    store_answer(&db, "ep1", "tmdb", "1", "auto", answer("tmdb episode", None, None), &chain)
+        .await
+        .unwrap();
+    store_answer(&db, "ep1", "tvdb", "2", "auto", answer("tvdb episode", Some("t"), None), &chain)
+        .await
+        .unwrap();
+
+    let title: String =
+        sqlx::query_scalar("SELECT title FROM resolved_metadata WHERE item_id = 'ep1'")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    assert_eq!(title, "tvdb episode", "the episode follows the show's provider, not the rank");
+    assert_eq!(assigned(&db, "ep1").await, None, "and still has no assignment of its own");
+}
+
+/// The flattening rule from the module doc, as a runnable check: a
+/// per-item read of the view must not materialise it. If someone tidies
+/// the scalar subqueries into joins this fails, which is the only warning
+/// there is — the results stay correct and get 70x slower.
+#[tokio::test]
+async fn the_view_stays_flattenable() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    item(&db, "i1").await;
+    let plan: Vec<String> = sqlx::query(
+        "EXPLAIN QUERY PLAN
+         SELECT i.id, v.title FROM items i
+         LEFT JOIN resolved_metadata v ON v.item_id = i.id
+          WHERE i.parent_id = 'i1'",
+    )
+    .fetch_all(&db)
+    .await
+    .unwrap()
+    .iter()
+    .map(|r| r.get::<String, _>("detail"))
+    .collect();
+    let plan = plan.join("\n");
+    assert!(
+        !plan.to_uppercase().contains("MATERIALIZE"),
+        "the view materialised instead of flattening:\n{plan}"
+    );
+}
+

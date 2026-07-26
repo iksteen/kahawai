@@ -829,3 +829,119 @@ impl ProviderSet {
         result
     }
 }
+
+// ---------- the resolved view (HUB-5 read model) ----------
+
+/// Fields resolved per read: `(column, "is present" test, value)`. The
+/// projection pair is deliberately decided by ONE test — a season from
+/// TVDB with an episode number from TMDB would be nonsense.
+const RESOLVED_FIELDS: [(&str, &str, &str); 9] = [
+    ("title", "NULLIF(pm.title, '') IS NOT NULL", "NULLIF(pm.title, '')"),
+    ("overview", "NULLIF(pm.overview, '') IS NOT NULL", "NULLIF(pm.overview, '')"),
+    ("poster_path", "NULLIF(pm.poster_path, '') IS NOT NULL", "NULLIF(pm.poster_path, '')"),
+    ("premiered", "NULLIF(pm.premiered, '') IS NOT NULL", "NULLIF(pm.premiered, '')"),
+    (
+        "original_language",
+        "NULLIF(pm.original_language, '') IS NOT NULL",
+        "NULLIF(pm.original_language, '')",
+    ),
+    ("genres", "NULLIF(pm.genres, '') IS NOT NULL", "NULLIF(pm.genres, '')"),
+    ("rating", "pm.rating IS NOT NULL", "pm.rating"),
+    ("proj_season", "pm.proj_season IS NOT NULL", "pm.proj_season"),
+    ("proj_episode", "pm.proj_season IS NOT NULL", "pm.proj_episode"),
+];
+
+/// The read model: an item's fields resolved from the providers' answers,
+/// the assigned provider first and then the media type's preference order.
+///
+/// Installed at startup rather than by a migration: the resolution rule is
+/// the thing being experimented with, and a migration is an immutable log.
+///
+/// TWO RULES, both measured, both silent when broken:
+///
+///  * **No JOIN in the view's FROM.** SQLite will not flatten a subquery
+///    containing a join into the right operand of a LEFT JOIN, and every
+///    read site joins this view that way. With a join here the whole view
+///    materialises: `item_children` went 0.6 ms → 45 ms, still returning
+///    correct rows. Scalar subqueries stay flattenable — the check is that
+///    EXPLAIN QUERY PLAN for a per-item read shows no MATERIALIZE.
+///  * **Never join it on a non-key column.** A full scan is ~400 ms; that
+///    is why the anime ids live in their own table.
+pub fn resolved_metadata_sql() -> String {
+    // Every answer with the priority already attached, so the resolver
+    // below never has to reach out of its own subquery: the bundled SQLite
+    // (libsqlite3-sys, older than the CLI's) will not resolve a reference
+    // two levels out, and doing it here keeps one join in one place.
+    let priority = "\
+DROP VIEW IF EXISTS resolved_metadata;
+DROP VIEW IF EXISTS answer_priority;
+CREATE VIEW answer_priority AS
+SELECT i.id AS item_id, pm.provider, pm.provider_id, pm.confidence,
+       pm.title, pm.overview, pm.poster_path, pm.rating, pm.premiered,
+       pm.original_language, pm.genres, pm.proj_season, pm.proj_episode,
+       pm.updated_at,
+       -- The effective assignment: this item's own, else its parent's.
+       -- Episodes and tracks never carry one, so they render as their show
+       -- or album does.
+       COALESCE(own.provider, par.provider) AS chosen,
+       COALESCE(own.manual, par.manual, 0) AS manual,
+       MAX(COALESCE(own.updated_at, 0), COALESCE(par.updated_at, 0)) AS assigned_at,
+       -- 0 sorts first: the assigned provider, then the preference order.
+       (pm.provider IS NOT COALESCE(own.provider, par.provider)) AS not_chosen,
+       COALESCE(r.rank, 99) AS rank
+  FROM items i
+  JOIN provider_metadata pm ON pm.item_id = i.id
+  LEFT JOIN item_match own ON own.item_id = i.id
+  LEFT JOIN item_match par ON par.item_id = i.parent_id
+  LEFT JOIN provider_ranks r
+         ON r.media_type = COALESCE(own.media_type, par.media_type)
+        AND r.provider = CASE WHEN pm.provider = 'anilist' THEN 'anime'
+                              ELSE pm.provider END;
+";
+    let order = "ORDER BY ap.not_chosen, ap.rank LIMIT 1";
+    let fields: String = RESOLVED_FIELDS
+        .iter()
+        .map(|(name, present, value)| {
+            let present = present.replace("pm.", "ap.");
+            let value = value.replace("pm.", "ap.");
+            format!(
+                "  (SELECT {value} FROM answer_priority ap
+     WHERE ap.item_id = i.id AND {present}
+       -- a weak answer describes only the item it was chosen for
+       AND (ap.confidence <> 'weak' OR ap.not_chosen = 0)
+     {order}) AS {name},\n"
+            )
+        })
+        .collect();
+    format!(
+        "{priority}
+CREATE VIEW resolved_metadata AS
+SELECT i.id AS item_id,
+  COALESCE((SELECT ap.manual FROM answer_priority ap
+             WHERE ap.item_id = i.id LIMIT 1), 0) AS manual,
+  (SELECT ap.provider FROM answer_priority ap
+    WHERE ap.item_id = i.id AND ap.provider_id <> '' {order}) AS provider,
+  (SELECT ap.provider_id FROM answer_priority ap
+    WHERE ap.item_id = i.id AND ap.provider_id <> '' {order}) AS provider_id,
+  -- The strength the API reports. A human decision comes only from the
+  -- assignment. 'rejected' means every record this item holds was refused,
+  -- 'miss' that somebody looked and nobody had anything.
+  CASE WHEN (SELECT ap.manual FROM answer_priority ap
+              WHERE ap.item_id = i.id AND ap.not_chosen = 0 LIMIT 1) = 1 THEN 'manual'
+       WHEN EXISTS (SELECT 1 FROM answer_priority ap
+                     WHERE ap.item_id = i.id AND ap.not_chosen = 0
+                       AND ap.provider_id <> '')
+         THEN (SELECT ap.confidence FROM answer_priority ap
+                WHERE ap.item_id = i.id AND ap.not_chosen = 0 LIMIT 1)
+       WHEN EXISTS (SELECT 1 FROM rejected_matches rj WHERE rj.item_id = i.id)
+         THEN 'rejected'
+       ELSE (SELECT 'miss' FROM answer_priority ap
+              WHERE ap.item_id = i.id LIMIT 1) END AS confidence,
+{fields}  -- Posters are cached for a day, so this must move when an answer
+  -- lands AND when the assignment changes: picking a different provider
+  -- changes no answer's updated_at.
+  (SELECT NULLIF(MAX(MAX(ap.updated_at), MAX(ap.assigned_at)), 0)
+     FROM answer_priority ap WHERE ap.item_id = i.id) AS updated_at
+FROM items i"
+    )
+}

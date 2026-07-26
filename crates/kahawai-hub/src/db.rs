@@ -37,6 +37,7 @@ pub async fn open(data_dir: &Path) -> Result<SqlitePool> {
         .run(&pool)
         .await
         .context("running migrations")?;
+    install_views(&pool).await?;
     Ok(pool)
 }
 
@@ -47,5 +48,17 @@ pub async fn open_in_memory() -> Result<SqlitePool> {
         .connect("sqlite::memory:")
         .await?;
     sqlx::migrate!("./migrations").run(&pool).await?;
+    install_views(&pool).await?;
     Ok(pool)
+}
+
+/// Views are installed on open, not by a migration: they derive rather
+/// than store, so their definition is free to change, and a migration is
+/// an immutable log of changes to what IS stored.
+async fn install_views(pool: &SqlitePool) -> Result<()> {
+    sqlx::raw_sql(&crate::providers::resolved_metadata_sql())
+        .execute(pool)
+        .await
+        .context("installing resolved_metadata")?;
+    Ok(())
 }
