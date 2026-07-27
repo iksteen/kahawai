@@ -187,7 +187,7 @@ the live deployment. Unchecked items carry a note when partially done.
 - [x] HUB-11 Versioned HTTP/JSON API + /api/v1/events SSE channel
       (invalidation hints: scan progress, satellite connectivity,
       sessions, enrichment; cookie-authenticated for EventSource)
-- [ ] HUB-12 Browse/search/filter/sort. Hierarchical browse, plus server-side
+- [x] HUB-12 Browse/search/filter/sort. Hierarchical browse, plus server-side
       search, sort and paging on `GET /api/v1/items` (`q`, `sort`, `limit`,
       `offset`, returning `total`), which the web library uses: it reserves
       the full height of the result set from the first response and fetches
@@ -197,10 +197,12 @@ the live deployment. Unchecked items carry a note when partially done.
       the home screen it searches every library at once, showing at most 5
       hits each and only libraries that have any; clicking a library's name
       goes there with the query still standing, where the same box filters
-      that library. *(Remaining: image serving with server-side RESIZING —
-      artwork is cached but always served at its stored size, so a 34px
-      result thumbnail downloads a 600px cover. The requirement names
-      resizing explicitly.)*
+      that library. Artwork is served at named sizes
+      (`?size=thumb|card`, the list lives in `artwork::SIZES`), resized on
+      first request and then kept: a search-result thumbnail is 3.5 kB
+      against the 136 kB original, 97% less. An unknown name serves the
+      original rather than failing, so retiring a size cannot break a page
+      that is already open.
 - [x] HUB-13 All hub state in embedded storage; survives restart without rescan
 - [ ] HUB-14 Capability-profile negotiation *(mode chosen per source
       container/codecs; no client-supplied capability profile yet)*
@@ -313,6 +315,12 @@ the live deployment. Unchecked items carry a note when partially done.
       startup, torn down per session, idle-reaped. A cap for a
       small-disk deployment belongs in an admin-triggered purge that
       states its cost, not a silent janitor.
+      One thing IS deleted, and it does not contradict the above: at
+      startup the artwork cache drops resized derivatives that can never
+      be served again — a size no longer in `artwork::SIZES`, or a copy
+      whose original is gone. That is unreachability, not a quota; nothing
+      is removed for being large, and the sizes still in use are kept
+      forever like every other entry here (`tests/artwork_sizes.rs`).
 - [x] OPS-7 Cross-version satellite compatibility: protocol gated on major
       version (Hello/HelloAck) — per decision 2026-07-25, major-gating IS the
       compatibility contract; no previous-minor guarantee

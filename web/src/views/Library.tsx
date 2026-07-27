@@ -104,7 +104,7 @@ function Card({
         <span className="card-artbox">
           <img
             className="card-art"
-            src={artworkUrl(i.id, i.art_version)}
+            src={artworkUrl(i.id, i.art_version, 'card')}
             loading="lazy"
             alt=""
             onError={(e) => {

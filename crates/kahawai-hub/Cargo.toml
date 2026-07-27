@@ -31,6 +31,7 @@ roxmltree = { workspace = true }
 ipnet = { workspace = true }
 tower-http = { workspace = true }
 flate2 = { workspace = true }
+image = { workspace = true }
 md-5 = { workspace = true }
 aes = { workspace = true }
 async-trait = { workspace = true }

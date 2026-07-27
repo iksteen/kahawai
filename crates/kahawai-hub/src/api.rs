@@ -1385,13 +1385,25 @@ async fn list_collections(State(state): State<AppState>) -> Result<Json<Value>, 
     Ok(Json(json!({ "collections": cols })))
 }
 
+/// `?size=` names one of `artwork::SIZES`; anything else, including
+/// nothing, serves the original.
+#[derive(serde::Deserialize, Default)]
+struct ArtworkQuery {
+    size: Option<String>,
+    /// Cache-buster the client appends; read only so it does not land in
+    /// `size` by accident.
+    #[allow(dead_code)]
+    v: Option<String>,
+}
+
 async fn item_artwork(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    Query(q): Query<ArtworkQuery>,
 ) -> Result<Response, ApiError> {
     match state
         .artwork
-        .get(&state.registry, &state.sessions, &id)
+        .get_at(&state.registry, &state.sessions, &id, q.size.as_deref())
         .await
         .map_err(internal)?
     {

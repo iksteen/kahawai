@@ -170,8 +170,17 @@ export type ItemDetail = Item & {
 /// The response is cached hard (a day), so pass the item's `art_version`
 /// — its metadata timestamp — or a re-match leaves the old poster on
 /// screen until the cache expires.
-export const artworkUrl = (id: string, version?: number | null) =>
-  `/api/v1/items/${id}/artwork${version ? `?v=${version}` : ''}`
+/// `size` names one of the hub's sizes (`thumb`, `card`); omitting it
+/// serves the original, which is what the detail view wants. Ask for the
+/// size the element actually displays — a grid of 34px rows pulling
+/// 600px covers is the reason this parameter exists.
+export const artworkUrl = (id: string, version?: number | null, size?: 'thumb' | 'card') => {
+  const p = new URLSearchParams()
+  if (size) p.set('size', size)
+  if (version) p.set('v', String(version))
+  const q = p.toString()
+  return `/api/v1/items/${id}/artwork${q ? `?${q}` : ''}`
+}
 
 export const fetchChildren = (id: string) =>
   json<{ children: Item[] }>(`/api/v1/items/${id}/children`)

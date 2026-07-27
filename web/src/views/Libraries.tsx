@@ -92,7 +92,7 @@ export default function Libraries({
                   >
                     <img
                       className="result-art"
-                      src={artworkUrl(i.id, i.art_version)}
+                      src={artworkUrl(i.id, i.art_version, 'thumb')}
                       loading="lazy"
                       alt=""
                       onError={(e) => {

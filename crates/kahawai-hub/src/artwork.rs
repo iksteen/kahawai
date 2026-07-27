@@ -2,6 +2,27 @@
 //! the scan, fetched through the source's read lease once and cached on
 //! the hub. Albums and shows inherit artwork from their children's
 //! directories (they have no sources of their own).
+//!
+//! # Sizes (HUB-12)
+//!
+//! A grid of 34-pixel thumbnails should not each pull a 600-pixel cover,
+//! so the endpoint serves named sizes from [`SIZES`]. Names rather than
+//! free-form pixel values: a client that can ask for any width can mint
+//! unbounded cache entries, and the set of sizes the UI actually uses is
+//! small and known here.
+//!
+//! Derivatives are made on FIRST REQUEST and then kept. That follows
+//! OPS-6's reasoning rather than departing from it: artwork is fetched
+//! during a grid scroll, so a miss is a blank card the user watches
+//! appear, and the resize itself is one decode plus one encode of a file
+//! already on local disk.
+//!
+//! The one thing that IS evicted, at startup, is a derivative whose size
+//! no longer exists — see [`Artwork::sweep_stale_sizes`]. That is not a
+//! janitor and not a quota: nothing is removed because the cache grew,
+//! only because the size it was made for is gone from the list above.
+//! Each variant's directory is named for its size in pixels, so editing
+//! a number in [`SIZES`] is itself what makes the old ones stale.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -20,9 +41,118 @@ pub struct Artwork {
     inflight: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
+/// The sizes a client may ask for, as `name → longest edge in pixels`.
+///
+/// Add, rename or re-number freely: the next startup drops whatever no
+/// longer appears here, and the first request for a new entry builds it.
+/// Values are generous enough for a 2× display of the element that uses
+/// them — `thumb` for the 34px search-result rows, `card` for the 220px
+/// library grid. Asking for no size still serves the original.
+pub const SIZES: &[(&str, u32)] = &[("thumb", 96), ("card", 480)];
+
+/// Directory holding one size's derivatives. The pixel count is IN the
+/// name, so changing a size in [`SIZES`] renames the directory and the
+/// old one becomes stale by construction rather than by remembering to
+/// invalidate anything.
+fn variant_dir(name: &str, px: u32) -> String {
+    format!("size-{name}-{px}")
+}
+
 impl Artwork {
     pub fn new(dir: PathBuf, enricher: Arc<crate::enrich::Enricher>) -> Self {
-        Self { dir, enricher, inflight: Default::default() }
+        let art = Self { dir, enricher, inflight: Default::default() };
+        art.sweep_stale_sizes();
+        art
+    }
+
+    /// Drop derivatives that can no longer be reached: a whole size that
+    /// has left [`SIZES`], and within the sizes that remain, any copy
+    /// whose ORIGINAL is gone.
+    ///
+    /// Runs at startup because that is the only moment either can have
+    /// changed — [`SIZES`] is a compile-time constant, and an original
+    /// only disappears when something outside this process removes it.
+    /// Neither is a quota: nothing here is dropped for being large, only
+    /// for being unreachable. A derivative is named after the original's
+    /// cache key, so "is the original still there" is one `exists()`.
+    ///
+    /// Best effort throughout. An unreadable cache directory costs disk,
+    /// never correctness, and originals are never touched.
+    fn sweep_stale_sizes(&self) {
+        let keep: Vec<String> =
+            SIZES.iter().map(|(name, px)| variant_dir(name, *px)).collect();
+        let Ok(entries) = std::fs::read_dir(&self.dir) else { return };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !name.starts_with("size-") {
+                continue;
+            }
+            if !keep.contains(&name) {
+                match std::fs::remove_dir_all(entry.path()) {
+                    Ok(()) => {
+                        tracing::info!(size = %name, "artwork size retired; cache dropped")
+                    }
+                    Err(e) => {
+                        tracing::warn!(size = %name, error = %e, "could not drop retired size")
+                    }
+                }
+                continue;
+            }
+            let Ok(copies) = std::fs::read_dir(entry.path()) else { continue };
+            let mut orphans = 0u32;
+            for copy in copies.flatten() {
+                // Same file name as the original it was made from, one
+                // directory up. Gone means this can never be served.
+                if self.dir.join(copy.file_name()).exists() {
+                    continue;
+                }
+                if std::fs::remove_file(copy.path()).is_ok() {
+                    orphans += 1;
+                }
+            }
+            if orphans > 0 {
+                tracing::info!(size = %name, orphans, "dropped resized copies with no original");
+            }
+        }
+    }
+
+    /// Artwork at a named size, built on first request and kept.
+    ///
+    /// An unknown name serves the ORIGINAL rather than failing. Sizes
+    /// come and go from [`SIZES`], and a page loaded before one was
+    /// retired would otherwise show broken images until reloaded; the
+    /// wrong number of bytes beats a hole in the grid.
+    pub async fn get_at(
+        &self,
+        registry: &Registry,
+        sessions: &Sessions,
+        item_id: &str,
+        size: Option<&str>,
+    ) -> Result<Option<(Vec<u8>, &'static str)>> {
+        let Some((bytes, ctype, key)) = self.original(registry, sessions, item_id).await? else {
+            return Ok(None);
+        };
+        let Some(name) = size else { return Ok(Some((bytes, ctype))) };
+        let Some((_, px)) = SIZES.iter().find(|(n, _)| *n == name) else {
+            tracing::debug!(size = %name, "unknown artwork size; serving the original");
+            return Ok(Some((bytes, ctype)));
+        };
+
+        let dir = self.dir.join(variant_dir(name, *px));
+        let path = dir.join(&key);
+        if let Ok(small) = std::fs::read(&path) {
+            return Ok(Some((small, "image/jpeg")));
+        }
+        // Decoding and re-encoding is CPU work on a runtime thread that
+        // is otherwise serving requests, so it goes to the blocking pool.
+        let px = *px;
+        let small = tokio::task::spawn_blocking(move || resize_to(&bytes, px)).await??;
+        std::fs::create_dir_all(&dir)?;
+        // Written next to the read above, not atomically: two requests
+        // racing write identical bytes, and a torn file is re-made on the
+        // next miss.
+        let _ = std::fs::write(&path, &small);
+        Ok(Some((small, "image/jpeg")))
     }
 
     /// Image bytes + content type for the poster the provider chain
@@ -35,6 +165,18 @@ impl Artwork {
         sessions: &Sessions,
         item_id: &str,
     ) -> Result<Option<(Vec<u8>, &'static str)>> {
+        Ok(self.original(registry, sessions, item_id).await?.map(|(b, c, _)| (b, c)))
+    }
+
+    /// As [`Artwork::get`], plus the cache key the bytes are stored
+    /// under — which is what a derivative is named after, so a resized
+    /// copy is tied to the exact original it came from.
+    async fn original(
+        &self,
+        registry: &Registry,
+        sessions: &Sessions,
+        item_id: &str,
+    ) -> Result<Option<(Vec<u8>, &'static str, String)>> {
         let Some(poster) = resolved_poster(registry, item_id).await? else {
             return Ok(None);
         };
@@ -69,14 +211,14 @@ impl Artwork {
 
         let cache_path = self.dir.join(&cache_key);
         if let Ok(bytes) = std::fs::read(&cache_path) {
-            return Ok(Some((bytes, ctype)));
+            return Ok(Some((bytes, ctype, cache_key)));
         }
         let lease =
             sessions.open_lease(registry, &module_id, &collection_id, &art_rel).await?;
         let bytes = read_all(lease).await?;
         std::fs::create_dir_all(&self.dir)?;
         std::fs::write(&cache_path, &bytes)?;
-        Ok(Some((bytes, ctype)))
+        Ok(Some((bytes, ctype, cache_key)))
     }
 }
 
@@ -85,7 +227,7 @@ impl Artwork {
     async fn remote_poster(
         &self,
         poster: &str,
-    ) -> Result<Option<(Vec<u8>, &'static str)>> {
+    ) -> Result<Option<(Vec<u8>, &'static str, String)>> {
         let cache_key =
             format!("tmdb-{:016x}", xxhash_rust::xxh3::xxh3_64(poster.as_bytes()));
         let lock = {
@@ -95,13 +237,31 @@ impl Artwork {
         let _guard = lock.lock().await;
         let cache_path = self.dir.join(&cache_key);
         if let Ok(bytes) = std::fs::read(&cache_path) {
-            return Ok(Some((bytes, "image/jpeg")));
+            return Ok(Some((bytes, "image/jpeg", cache_key)));
         }
         let bytes = self.enricher.fetch_poster(poster).await?;
         std::fs::create_dir_all(&self.dir)?;
         std::fs::write(&cache_path, &bytes)?;
-        Ok(Some((bytes, "image/jpeg")))
+        Ok(Some((bytes, "image/jpeg", cache_key)))
     }
+}
+
+/// Fit an image inside `px` on its longest edge, as JPEG.
+///
+/// Always JPEG, whatever went in: these are small, lossy is invisible at
+/// this scale, and one output type means one content type to serve. An
+/// image already within the box is re-encoded rather than passed through,
+/// so a "size" is always the size it says — a 40px cover asked for at
+/// `card` does not come back claiming to be 480.
+fn resize_to(bytes: &[u8], px: u32) -> Result<Vec<u8>> {
+    let img = image::load_from_memory(bytes).context("decoding artwork")?;
+    let small = img.resize(px, px, image::imageops::FilterType::Lanczos3);
+    let mut out = std::io::Cursor::new(Vec::new());
+    small
+        .to_rgb8()
+        .write_to(&mut out, image::ImageFormat::Jpeg)
+        .context("encoding resized artwork")?;
+    Ok(out.into_inner())
 }
 
 /// Scheme marking a `poster_path` that names a file in a collection

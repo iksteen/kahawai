@@ -34,6 +34,9 @@ crc32fast = "1"
 flate2 = "1"
 md-5 = "0.11"
 png = "0.18"
+# Only the three formats artwork is ever served in. The default feature
+# set pulls in a dozen decoders we would never reach.
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 base64 = "0.23"
 async-trait = "0.1"
 aes = "0.9"
