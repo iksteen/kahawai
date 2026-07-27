@@ -100,7 +100,10 @@ function Card({
           </svg>
         </button>
       )}
-      <button className="card" onClick={() => onOpen(i.id)}>
+      <button
+        className="card"
+        onClick={() => onOpen(i.kind === 'track' && i.parent_id ? i.parent_id : i.id)}
+      >
         <span className="card-artbox">
           <img
             className="card-art"
@@ -144,7 +147,9 @@ function Card({
         <span className="card-meta mono">
           {i.kind === 'episode'
             ? `${i.parent_title ?? ''} · S${i.season ?? '?'}E${i.episode ?? '?'}`
-            : (i.kind === 'album' ? (i.artist ?? '—') : (i.year ?? '—'))}
+            : i.kind === 'track'
+              ? [i.artist, i.parent_title].filter(Boolean).join(' · ')
+              : (i.kind === 'album' ? (i.artist ?? '—') : (i.year ?? '—'))}
           {i.kind === 'album' && i.year ? ` · ${i.year}` : ''}
           {i.sources > 1 ? ` · ${i.sources} sources` : ''}
         </span>

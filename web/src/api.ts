@@ -110,7 +110,10 @@ export type Item = {
   proj_season?: number | null
   proj_episode?: number | null
   /// The show an episode belongs to — search can return episodes, and a
-  /// hit called "Pilot" needs to say which of its namesakes it is.
+  /// hit called "Pilot" needs to say which of its namesakes it is. For a
+  /// track hit, `parent_id` is the album to open: tracks have no detail
+  /// view of their own.
+  parent_id?: string | null
   parent_title?: string | null
   sources: number
   /// Enrichment state (movie/show): null = never enriched,

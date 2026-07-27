@@ -1648,6 +1648,7 @@ md.title AS matched_title,
 md.confidence AS match_confidence,
 md.updated_at AS art_version,
 (SELECT COUNT(*) FROM item_sources s WHERE s.item_id = i.id) AS sources,
+i.parent_id,
 (SELECT p.sort_title FROM items p WHERE p.id = i.parent_id) AS parent_title,
 w.position_ms, w.duration_ms, w.played, w.play_count";
 
@@ -1748,10 +1749,13 @@ async fn list_items(
             let sql = item_page_sql(
                 &format!(
                     "SELECT c.id AS item_id FROM items c
-                      WHERE c.kind IN ('movie', 'show', 'album', 'episode') {member}
+                      WHERE c.kind IN ('movie', 'show', 'album', 'episode', 'track') {member}
                         AND (c.norm_title LIKE '%' || ?3 || '%'
                              OR c.sort_title LIKE '%' || ?3 || '%'
-                             OR c.norm_artist LIKE '%' || ?3 || '%')
+                             -- Artist matches ALBUMS only. A track row for
+                             -- every song by the artist would bury the
+                             -- albums; titles are how songs are found.
+                             OR (c.kind = 'album' AND c.norm_artist LIKE '%' || ?3 || '%'))
                       ORDER BY {order_c} LIMIT ?4 OFFSET ?5"
                 ),
                 items_order(q.sort.as_deref()),
@@ -1773,10 +1777,10 @@ async fn list_items(
             } else {
                 let count = format!(
                     "SELECT COUNT(*) FROM items c
-                      WHERE c.kind IN ('movie', 'show', 'album', 'episode') {member}
+                      WHERE c.kind IN ('movie', 'show', 'album', 'episode', 'track') {member}
                         AND (c.norm_title LIKE '%' || ?3 || '%'
                              OR c.sort_title LIKE '%' || ?3 || '%'
-                             OR c.norm_artist LIKE '%' || ?3 || '%')"
+                             OR (c.kind = 'album' AND c.norm_artist LIKE '%' || ?3 || '%'))"
                 );
                 sqlx::query_scalar(sqlx::AssertSqlSafe(count))
                     .bind("") // ?1 unused here; keeps the numbering shared
@@ -1842,7 +1846,9 @@ fn item_row_json(r: &sqlx::sqlite::SqliteRow) -> Value {
         "season": r.get::<Option<i64>, _>("season"),
         "episode": r.get::<Option<i64>, _>("episode"),
         // The show an episode belongs to, so a search hit called "Pilot"
-        // says which of its eight namesakes it is.
+        // says which of its eight namesakes it is. The id lets a track
+        // hit open its ALBUM — tracks have no detail view of their own.
+        "parent_id": r.try_get::<Option<String>, _>("parent_id").ok().flatten(),
         "parent_title": r.try_get::<Option<String>, _>("parent_title").ok().flatten(),
         "proj_season": r.try_get::<Option<i64>, _>("proj_season").ok().flatten(),
         "proj_episode": r.try_get::<Option<i64>, _>("proj_episode").ok().flatten(),

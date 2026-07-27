@@ -224,9 +224,17 @@ async fn search_finds_artists_and_episode_titles() {
     assert_eq!(hits[0]["title"], "Ozymandias", "resolved title, not the filename");
     assert_eq!(hits[0]["parent_title"], "A Show", "a hit named like 8 others needs its show");
 
-    // Tracks stay out: "motorhead" must not bury the album under tracks.
+    // Tracks match by TITLE, never by artist: "motorhead" must not bury
+    // the album under a row per song, but the song itself is findable.
     q("INSERT INTO items (id, kind, title, norm_title, parent_id, artist, norm_artist)
        VALUES ('trk','track','Overkill','overkill','alb','Motörhead','motorhead')").await;
     let v = page(&api, &token, "/api/v1/items?q=motorhead").await;
     assert_eq!(v["items"].as_array().unwrap().len(), 1, "still just the album");
+
+    let v = page(&api, &token, "/api/v1/items?q=overkill").await;
+    let hits = v["items"].as_array().unwrap();
+    assert_eq!(hits.len(), 1, "the track is findable by its title");
+    assert_eq!(hits[0]["id"], "trk");
+    assert_eq!(hits[0]["parent_id"], "alb", "a track hit carries the album to open");
+    assert_eq!(hits[0]["parent_title"], "Ace of Spades");
 }

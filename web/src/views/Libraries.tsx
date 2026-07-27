@@ -88,7 +88,12 @@ export default function Libraries({
                 <li key={i.id}>
                   <button
                     className="result-row"
-                    onClick={() => onOpenItem(i.id, h.library.id)}
+                    onClick={() =>
+                      onOpenItem(
+                        i.kind === 'track' && i.parent_id ? i.parent_id : i.id,
+                        h.library.id,
+                      )
+                    }
                   >
                     <img
                       className="result-art"
@@ -104,9 +109,11 @@ export default function Libraries({
                     <span className="result-meta mono">
                       {i.kind === 'episode'
                         ? `${i.parent_title ?? ''} S${i.season ?? '?'}E${i.episode ?? '?'}`
-                        : i.kind === 'album'
-                          ? (i.artist ?? '')
-                          : (i.year ?? '')}
+                        : i.kind === 'track'
+                          ? [i.artist, i.parent_title].filter(Boolean).join(' · ')
+                          : i.kind === 'album'
+                            ? (i.artist ?? '')
+                            : (i.year ?? '')}
                     </span>
                   </button>
                 </li>
