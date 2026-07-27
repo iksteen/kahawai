@@ -187,8 +187,20 @@ the live deployment. Unchecked items carry a note when partially done.
 - [x] HUB-11 Versioned HTTP/JSON API + /api/v1/events SSE channel
       (invalidation hints: scan progress, satellite connectivity,
       sessions, enrichment; cookie-authenticated for EventSource)
-- [ ] HUB-12 Browse/search/filter/sort *(hierarchical browse + client-side title
-      filter live; no server-side search/sort/filter endpoints)*
+- [ ] HUB-12 Browse/search/filter/sort. Hierarchical browse, plus server-side
+      search, sort and paging on `GET /api/v1/items` (`q`, `sort`, `limit`,
+      `offset`, returning `total`), which the web library uses: it reserves
+      the full height of the result set from the first response and fetches
+      100-item chunks as rows come into view, so only the visible rows are
+      ever in the DOM and the scrollbar never moves under the thumb.
+      Search is one box in the header whose meaning follows the screen: on
+      the home screen it searches every library at once, showing at most 5
+      hits each and only libraries that have any; clicking a library's name
+      goes there with the query still standing, where the same box filters
+      that library. *(Remaining: image serving with server-side RESIZING —
+      artwork is cached but always served at its stored size, so a 34px
+      result thumbnail downloads a 600px cover. The requirement names
+      resizing explicitly.)*
 - [x] HUB-13 All hub state in embedded storage; survives restart without rescan
 - [ ] HUB-14 Capability-profile negotiation *(mode chosen per source
       container/codecs; no client-supplied capability profile yet)*

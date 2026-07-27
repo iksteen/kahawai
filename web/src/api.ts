@@ -250,8 +250,32 @@ export type LibrarySummary = { id: string; name: string; media_type: string }
 export const fetchLibraries = () =>
   json<{ libraries: LibrarySummary[] }>('/api/v1/libraries')
 
-export const fetchItems = (libraryId: string) =>
-  json<{ items: Item[] }>(`/api/v1/items?library=${encodeURIComponent(libraryId)}`)
+/// How a library is browsed. `sort` is one of the names the hub knows
+/// (`title`, `-title`, `year`, `-year`, `added`, `-added`); anything else
+/// falls back to title there rather than erroring.
+export type ItemsPage = {
+  library?: string
+  q?: string
+  sort?: string
+  limit?: number
+  offset?: number
+}
+
+/// The hub pages this endpoint — 200 items unless asked otherwise, capped
+/// at 1000. Sending no window is not "give me everything", it is "give me
+/// the first 200 and do not mention the rest", which is how the browser
+/// spent three commits showing 200 of 881 films. Always read `total`.
+export const fetchItems = (page: ItemsPage) => {
+  const p = new URLSearchParams()
+  if (page.library) p.set('library', page.library)
+  if (page.q) p.set('q', page.q)
+  if (page.sort) p.set('sort', page.sort)
+  if (page.limit !== undefined) p.set('limit', String(page.limit))
+  if (page.offset) p.set('offset', String(page.offset))
+  return json<{ items: Item[]; total: number; limit: number; offset: number }>(
+    `/api/v1/items?${p.toString()}`,
+  )
+}
 
 /// Which screen to open on. Public: needs no token, and answers before
 /// setup has happened.

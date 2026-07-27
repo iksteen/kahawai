@@ -46,6 +46,10 @@ main { animation: rise 240ms ease-out; }
 .tilde { color: var(--teal); }
 .topbar-right { display: flex; gap: 12px; align-items: center; }
 .whoami { color: var(--dim); font-size: 13px; }
+/* One search box for the whole app, so it is in the same place whichever
+   screen you are on. `justify-content: space-between` puts it in the
+   middle by itself; the margins keep it off both neighbours. */
+.topbar-search { width: 320px; margin: 0 24px; }
 
 /* -------- buttons, inputs -------- */
 .btn {
@@ -91,7 +95,49 @@ h1 { font-size: 22px; font-weight: 650; letter-spacing: 0.01em; margin: 0; }
 h2 { font-size: 14px; font-weight: 650; color: var(--dim); letter-spacing: 0.08em;
      text-transform: uppercase; margin: 36px 0 12px; }
 .filter { width: 220px; margin-left: auto; }
+/* Sized to its longest option, not to the search box beside it. */
+.sort { width: auto; }
 .count { color: var(--dim); }
+
+/* The library's full height is reserved from the first response, and the
+   grid inside it is translated to the rows currently on screen. Only the
+   visible rows exist in the DOM; the scrollbar still describes all of
+   them, so it never jumps the way an infinite-scroll one does. */
+.grid-scroll { position: relative; }
+.grid-scroll > .grid {
+  position: absolute; top: 0; left: 0; right: 0;
+  will-change: transform;
+}
+/* A cell whose row has not arrived yet: same box, no content. */
+.card-pending { pointer-events: none; }
+.card-pending .card-art { background: var(--line); opacity: 0.35; }
+
+/* -------- cross-library results -------- */
+.result-lib { margin-bottom: 26px; }
+/* The heading IS the way into the library, so it has to look pressable
+   across its whole width rather than like a label with a link in it. */
+.result-lib-head {
+  display: flex; align-items: baseline; gap: 10px; width: 100%;
+  background: none; border: 0; border-bottom: 1px solid var(--line);
+  padding: 0 2px 6px; margin-bottom: 10px; cursor: pointer; text-align: left;
+}
+.result-lib-head:hover { border-bottom-color: var(--teal-dim); }
+.result-lib-head:hover .result-lib-name { color: var(--teal); }
+.result-lib-name { font-weight: 650; font-size: 15px; }
+.result-lib-head .count { margin-left: auto; font-size: 12px; }
+.result-list { list-style: none; margin: 0; padding: 0; }
+.result-row {
+  display: flex; align-items: center; gap: 12px; width: 100%;
+  background: none; border: 0; border-radius: 5px;
+  padding: 6px 8px; cursor: pointer; text-align: left;
+}
+.result-row:hover { background: var(--surface); }
+.result-art {
+  width: 34px; height: 34px; object-fit: cover; border-radius: 3px;
+  flex: none; display: block;
+}
+.result-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.result-meta { color: var(--dim); margin-left: auto; font-size: 12px; flex: none; }
 
 .grid {
   list-style: none; margin: 0; padding: 0;
@@ -104,7 +150,17 @@ h2 { font-size: 14px; font-weight: 650; color: var(--dim); letter-spacing: 0.08e
   padding: 14px 16px; min-height: 92px;
 }
 .card:hover { border-color: var(--teal-dim); }
-.card-title { font-weight: 600; font-size: 15.5px; }
+/* Always exactly two lines tall — clipped when longer, padded out when
+   shorter. Every cell being the same height is what lets the library
+   reserve its full scroll height up front and be RIGHT about it; when
+   titles were free to wrap to one, two or three lines, cards measured
+   307/331/355px and the reserved height drifted as you scrolled. */
+.card-title {
+  font-weight: 600; font-size: 15.5px; line-height: 1.3;
+  height: 2.6em;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+  overflow: hidden;
+}
 .card-meta { color: var(--dim); }
 
 /* -------- detail -------- */

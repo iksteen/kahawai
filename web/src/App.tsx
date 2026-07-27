@@ -74,6 +74,21 @@ function pathToRoute(pathname: string): Route {
 export default function App() {
   const [phase, setPhase] = useState<Phase>('boot')
   const [route, setRoute] = useState<Route>(() => pathToRoute(window.location.pathname))
+  // One search box, two meanings, decided by where you are: on the home
+  // screen it searches every library; on a library it filters that one.
+  // The text itself is shared, which is what lets a result lead into its
+  // library with the query still standing.
+  const [search, setSearch] = useState('')
+  const [query, setQuery] = useState('')
+
+  // Typing hits the database — on the home screen once per library — so
+  // wait for a pause. Debounced HERE rather than in each view: two views
+  // debouncing the same text would each have their own idea of when it
+  // settled, and the query would change twice on every keystroke.
+  useEffect(() => {
+    const t = setTimeout(() => setQuery(search), 250)
+    return () => clearTimeout(t)
+  }, [search])
 
   // Forward navigation: push a history entry and switch views.
   // `replace` swaps the current entry instead — closing the player uses
@@ -128,6 +143,19 @@ export default function App() {
         <button className="wordmark" onClick={() => navigate({ view: 'libraries' })}>
           kahawai<span className="tilde">~</span>
         </button>
+        {/* Only where it means something. On the player, admin and
+            settings there is nothing for it to search, and a box that
+            silently does nothing is worse than no box. */}
+        {(route.view === 'libraries' || route.view === 'library') && (
+          <input
+            className="topbar-search"
+            placeholder={
+              route.view === 'library' ? 'Filter this library' : 'Search all libraries'
+            }
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+          />
+        )}
         <div className="topbar-right">
           {isAdmin() && (
             <button className="btn ghost small" onClick={() => navigate({ view: 'admin' })}>
@@ -152,11 +180,16 @@ export default function App() {
       {route.view === 'admin' && <Admin />}
       {route.view === 'settings' && <Settings />}
       {route.view === 'libraries' && (
-        <Libraries onOpen={(id) => navigate({ view: 'library', id })} />
+        <Libraries
+          query={query}
+          onOpen={(id) => navigate({ view: 'library', id })}
+          onOpenItem={(id, fromLib) => navigate({ view: 'detail', id, fromLib })}
+        />
       )}
       {route.view === 'library' && (
         <Library
           libraryId={route.id}
+          query={query}
           onOpen={(id) => navigate({ view: 'detail', id, fromLib: route.id })}
         />
       )}
