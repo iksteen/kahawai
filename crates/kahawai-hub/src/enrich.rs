@@ -624,6 +624,13 @@ impl Enricher {
         if let Some(token) = tvdb_token.clone() {
             set.add(Box::new(TvdbProvider { enricher: self.clone(), token }));
         }
+        // Recover any bridge ids that went missing before deciding what
+        // needs work — a rebuilt id is one less item to re-identify.
+        match Self::rebuild_anime_ids(registry.db()).await {
+            Ok(n) if n > 0 => tracing::info!(rows = n, "anime bridge ids rebuilt from stored answers"),
+            Ok(_) => {}
+            Err(e) => tracing::warn!(error = format!("{e:#}"), "anime id rebuild failed"),
+        }
         let anime_items = self.select_anime_items(registry).await.unwrap_or_default();
         if !anime_items.is_empty() {
             match self.build_anime_provider(registry).await {
@@ -1359,6 +1366,52 @@ impl Enricher {
     /// or mapped id). '' marks asked-but-absent so nothing re-asks.
     /// TVDB-only rows are left NULL (their language arrives if ever
     /// re-matched); the sweep goes quiet once everything is stamped.
+    /// Rebuild the anime bridge ids from answers already on disk.
+    ///
+    /// `anime_ids` is derived state, but it used to be written only at
+    /// match time — so losing it lost it for good: never-ask-twice sees
+    /// the provider answers still there, skips the provider, and the id
+    /// never comes back. Both columns are recoverable without contacting
+    /// anyone: the AniList id IS that provider's `provider_id`, and the
+    /// AniDB id is in `ed2k_aid`, keyed by the same first-file hash the
+    /// lookup used. `mapped_tvdb`/`mapped_tmdb` then heal themselves
+    /// through the existing backfill, which keys on the AniDB id.
+    ///
+    /// Fills holes only — COALESCE keeps whatever is already there, so a
+    /// human's correction or a fresher answer always wins over a
+    /// reconstruction.
+    pub async fn rebuild_anime_ids(db: &sqlx::SqlitePool) -> Result<u64> {
+        let done = sqlx::query(
+            "INSERT INTO anime_ids (item_id, anidb_id, anilist_id)
+             SELECT item_id, aid, anilist FROM (
+               SELECT i.id AS item_id,
+                 (SELECT ea.aid FROM ed2k_aid ea
+                    JOIN files f ON f.ed2k = ea.ed2k
+                    JOIN item_sources s
+                      ON (s.module_id, s.collection_id, s.path_rel)
+                       = (f.module_id, f.collection_id, f.path_rel)
+                   WHERE (s.item_id = i.id
+                          OR s.item_id IN (SELECT id FROM items WHERE parent_id = i.id))
+                     AND ea.aid IS NOT NULL
+                   -- Same file the identification used, so the same answer.
+                   ORDER BY s.path_rel LIMIT 1) AS aid,
+                 (SELECT CAST(pm.provider_id AS INTEGER) FROM provider_metadata pm
+                   WHERE pm.item_id = i.id AND pm.provider = 'anilist'
+                     AND pm.provider_id <> '') AS anilist
+               FROM items i
+               WHERE i.kind IN ('movie', 'show')
+             )
+             WHERE aid IS NOT NULL OR anilist IS NOT NULL
+             ON CONFLICT (item_id) DO UPDATE SET
+               anidb_id = COALESCE(anime_ids.anidb_id, excluded.anidb_id),
+               anilist_id = COALESCE(anime_ids.anilist_id, excluded.anilist_id)",
+        )
+        .execute(db)
+        .await?
+        .rows_affected();
+        Ok(done)
+    }
+
     /// How much of the billing to keep. Enough for "who's in this?" on a
     /// detail page; the tail of a big film is crowd and stand-ins.
     const CAST_LIMIT: usize = 15;
