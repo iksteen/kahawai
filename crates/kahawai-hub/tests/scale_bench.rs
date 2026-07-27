@@ -242,6 +242,7 @@ async fn browse_latency_and_scale() {
             .await;
         let (search, _) =
             b.time(&format!("/api/v1/items?library={}&q=film+1234", b.library), 3).await;
+
         let (detail, _) =
             b.time(&format!("/api/v1/items/01BENCHITEM{:015}", items / 2), 5).await;
 
@@ -251,6 +252,7 @@ async fn browse_latency_and_scale() {
         eprintln!("  GET /items?library{:>8.1} ms  (first page)", scoped.as_secs_f64() * 1e3);
         eprintln!("  ...last page      {:>8.1} ms", deep.as_secs_f64() * 1e3);
         eprintln!("  ...search         {:>8.1} ms", search.as_secs_f64() * 1e3);
+
         eprintln!("  GET /items/{{id}}   {:>8.1} ms", detail.as_secs_f64() * 1e3);
         let t = Instant::now();
         let n: i64 = sqlx::query_scalar(
