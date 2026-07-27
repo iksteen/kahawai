@@ -14,6 +14,7 @@ pub mod enrollment_service;
 pub mod gate;
 pub mod link_service;
 pub mod pki;
+pub mod metrics;
 pub mod providers;
 pub mod registry;
 pub mod renewal_service;

@@ -316,7 +316,23 @@ the live deployment. Unchecked items carry a note when partially done.
       (scripts/kahawai-cross-aarch64.sh), proven on a Pi 3 end to end:
       doctor green (encoders dry-run verified), enrolled as mediahost
       over mTLS, scanned, served direct play through the hub
-- [ ] NFR-6 Operability *(structured logging live; metrics + health endpoints missing)*
+- [x] NFR-6 Operability: structured logging (tracing), single-file TOML
+      with `KAHAWAI_<SECTION>__<KEY>` env overrides, `GET /health` and
+      `GET /metrics` (Prometheus text 0.0.4), and SIGHUP config reload.
+      Health is public — an uptime check holds no credential, and it says
+      nothing a failed login does not; metrics sit behind admin auth
+      because they report library scale and module names, and Prometheus
+      scrapes with a bearer token. A satellite being away is `degraded`,
+      not down: its collections go unavailable and nothing is lost (AR-6),
+      and a check that fails the server because one Pi is unplugged gets
+      muted. Health per module is served BY THE HUB rather than by each
+      module: satellites dial out and never listen (AR-3), so an endpoint
+      on each would invert the architecture and be unreachable through NAT
+      anyway. Reload applies what can change under a running process
+      (`trusted_proxies`) and reports the rest — listeners, `data_dir`,
+      cert SANs — as needing a restart, rather than half-applying; a
+      config that fails to parse is rejected and the running settings
+      stand. Live: scrape 8.3 ms / 2.2 KB across 5 modules and 37k files.
 - [x] NFR-7 Versioned client API (`/api/v1`)
 - [x] NFR-8 Codec support delegated to system GStreamer; MIT with the OCR
       feature's GPL-3.0 combined-work consequence pre-documented in README

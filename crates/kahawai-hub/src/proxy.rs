@@ -10,9 +10,12 @@ use anyhow::{Context, Result};
 /// Which peers are proxies. Entries are exact IPs ("192.168.0.5") or
 /// CIDR ranges ("172.16.0.0/12" — docker/traefik bridges whose proxy
 /// address changes per restart). Empty = trust nobody (default).
-#[derive(Default, Clone)]
+/// The list is behind a lock so a running hub can be handed a new one
+/// (NFR-6 online reload) without rebuilding the router: every reader
+/// holds the same `Arc<ProxyTrust>` and sees the swap on its next call.
+#[derive(Default)]
 pub struct ProxyTrust {
-    nets: Vec<ipnet::IpNet>,
+    nets: std::sync::RwLock<Vec<ipnet::IpNet>>,
 }
 
 impl ProxyTrust {
@@ -27,11 +30,22 @@ impl ProxyTrust {
             };
             nets.push(net);
         }
-        Ok(Self { nets })
+        Ok(Self { nets: std::sync::RwLock::new(nets) })
+    }
+
+    /// Adopt a new list in place. Rejects the whole set on a bad entry —
+    /// a reload that half-applies is worse than one that refuses, because
+    /// the operator would have to guess which half took.
+    pub fn reload(&self, entries: &[String]) -> Result<usize> {
+        let parsed = Self::parse(entries)?;
+        let new = parsed.nets.into_inner().unwrap_or_default();
+        let n = new.len();
+        *self.nets.write().unwrap() = new;
+        Ok(n)
     }
 
     pub fn trusts(&self, ip: IpAddr) -> bool {
-        self.nets.iter().any(|n| n.contains(&ip))
+        self.nets.read().unwrap().iter().any(|n| n.contains(&ip))
     }
 
     /// The real client address: the TCP peer, unless the peer is a

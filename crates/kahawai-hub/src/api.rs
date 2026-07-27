@@ -32,7 +32,9 @@ pub struct AppState {
 /// OPS-8 knobs, both defaulting to "off" (same-origin, no proxies).
 #[derive(Default, Clone)]
 pub struct NetOptions {
-    pub proxy_trust: crate::proxy::ProxyTrust,
+    /// Shared so a reload can swap its contents under a running
+    /// router (NFR-6) instead of rebuilding one.
+    pub proxy_trust: Arc<crate::proxy::ProxyTrust>,
     /// CORS allowlist: exact origins, or a single "*" for any (no
     /// credentials either way — third-party clients use bearer tokens).
     pub cors_origins: Vec<String>,
@@ -58,7 +60,7 @@ pub fn router(
         subtitles,
         artwork,
         enricher,
-        proxy_trust: Arc::new(net.proxy_trust),
+        proxy_trust: net.proxy_trust,
     };
     let protected = Router::new()
         .route("/api/v1/collections", get(list_collections))
@@ -117,10 +119,18 @@ pub fn router(
         .route("/admin/v1/items/{id}/match", post(admin_apply_match))
         .route("/admin/v1/sessions", get(admin_sessions))
         .route("/admin/v1/sessions/{id}", axum::routing::delete(admin_end_session))
+        // NFR-6. Behind admin auth because it reports library scale and
+        // module names; Prometheus scrapes it with a bearer token.
+        .route("/metrics", get(metrics))
         .route_layer(axum::middleware::from_fn(require_admin))
         .route_layer(axum::middleware::from_fn_with_state(state.clone(), require_auth));
     let mut app = Router::new()
         .merge(admin)
+        // NFR-6: public on purpose. It names modules and their state and
+        // nothing else — a load balancer or uptime check must be able to
+        // ask without holding a credential, and there is nothing here
+        // that a failed login does not already reveal.
+        .route("/health", get(health))
         .route("/api/v1/bootstrap", get(bootstrap))
         .route("/api/v1/setup", post(setup))
         .route("/api/v1/auth/token", post(login))
@@ -200,6 +210,39 @@ fn presented_token(req: &Request) -> Option<String> {
 /// Says nothing a caller could not learn by trying to log in, so it needs
 /// no token: `setup_required` is already printed on the console at
 /// startup, and `authenticated` describes the request's OWN token.
+/// NFR-6: Prometheus text exposition.
+async fn metrics(State(state): State<AppState>) -> Result<Response, ApiError> {
+    let snap = crate::metrics::gather(
+        &state.registry,
+        &state.sessions,
+        state.enricher.data_dir(),
+    )
+    .await
+    .map_err(internal)?;
+    Ok((
+        [(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
+        crate::metrics::render(&snap),
+    )
+        .into_response())
+}
+
+/// NFR-6: health for the hub and every module it knows.
+///
+/// 200 while the hub itself is serving, even when a satellite is away —
+/// its collections go unavailable, nothing is lost (AR-6), and a check
+/// that fails the whole server because one Pi is unplugged gets muted.
+/// The body carries the detail, and `status` distinguishes the two.
+async fn health(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+    let snap = crate::metrics::gather(
+        &state.registry,
+        &state.sessions,
+        state.enricher.data_dir(),
+    )
+    .await
+    .map_err(internal)?;
+    Ok(Json(crate::metrics::health(&snap)))
+}
+
 async fn bootstrap(State(state): State<AppState>, req: Request) -> Json<Value> {
     let setup_required = state.auth.setup_required();
     Json(json!({

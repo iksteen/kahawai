@@ -105,7 +105,7 @@ async fn main() -> Result<()> {
         _ => {}
     }
     match cli.command {
-        Cmd::Hub { cmd: None } => run_hub(cfg.hub).await,
+        Cmd::Hub { cmd: None } => run_hub(cfg.hub, config_used).await,
         Cmd::Hub { cmd: Some(HubCmd::ResetPassword { username }) } => {
             reset_password(cfg.hub, &username).await
         }
@@ -164,7 +164,7 @@ async fn main() -> Result<()> {
             )
             .await
         }
-        Cmd::AllInOne => run_all_in_one(cfg).await,
+        Cmd::AllInOne => run_all_in_one(cfg, config_used).await,
     }
 }
 
@@ -306,25 +306,27 @@ async fn reset_password(cfg: config::HubConfig, username: &str) -> Result<()> {
     Ok(())
 }
 
-async fn run_hub(cfg: config::HubConfig) -> Result<()> {
-    run_hub_inner(cfg, None).await
+async fn run_hub(cfg: config::HubConfig, config_path: Option<PathBuf>) -> Result<()> {
+    run_hub_inner(cfg, None, config_path).await
 }
 
 /// AR-5 all-in-one: the hub plus an IN-PROCESS mediahost — module logic
 /// unchanged, transport replaced by channels, byte plane replaced by
 /// direct file reads. The satellite listener stays up: external
 /// mediahosts/transcoders enroll and dial in exactly as in modular mode.
-async fn run_all_in_one(cfg: config::Config) -> Result<()> {
+async fn run_all_in_one(cfg: config::Config, config_path: Option<PathBuf>) -> Result<()> {
     anyhow::ensure!(
         !cfg.mediahost.collections.is_empty(),
         "all-in-one needs at least one [[mediahost.collections]] entry"
     );
-    run_hub_inner(cfg.hub, Some(cfg.mediahost)).await
+    run_hub_inner(cfg.hub, Some(cfg.mediahost), config_path).await
 }
 
 async fn run_hub_inner(
     cfg: config::HubConfig,
     local_mediahost: Option<config::MediahostConfig>,
+    // The file SIGHUP re-reads (NFR-6). None when defaults were used.
+    config_path: Option<PathBuf>,
 ) -> Result<()> {
     let ca = Arc::new(kahawai_hub::pki::HubCa::load_or_create(
         &kahawai_hub::pki::pki_dir(&cfg.data_dir),
@@ -440,11 +442,48 @@ async fn run_hub_inner(
         tracing::info!("in-process mediahost started (AR-5)");
     }
 
-    let net = kahawai_hub::api::NetOptions {
-        proxy_trust: kahawai_hub::proxy::ProxyTrust::parse(&cfg.trusted_proxies)
+    let proxy_trust = Arc::new(
+        kahawai_hub::proxy::ProxyTrust::parse(&cfg.trusted_proxies)
             .context("hub.trusted_proxies")?,
+    );
+    let net = kahawai_hub::api::NetOptions {
+        proxy_trust: proxy_trust.clone(),
         cors_origins: cfg.cors_origins.clone(),
     };
+    // NFR-6 online reload: SIGHUP re-reads the config file and adopts the
+    // settings that can change under a running process. Everything else —
+    // listeners, data_dir, cert SANs — is structural: it decides how the
+    // sockets were bound or what is already on disk, so it is reported as
+    // ignored rather than half-applied.
+    {
+        let proxy_trust = proxy_trust.clone();
+        let config_path = config_path.clone();
+        tokio::spawn(async move {
+            let Ok(mut hup) = tokio::signal::unix::signal(
+                tokio::signal::unix::SignalKind::hangup(),
+            ) else {
+                return;
+            };
+            while hup.recv().await.is_some() {
+                match config::load(config_path.as_deref()) {
+                    Ok((fresh, _)) => match proxy_trust.reload(&fresh.hub.trusted_proxies) {
+                        Ok(n) => tracing::info!(
+                            trusted_proxies = n,
+                            "config reloaded (listeners, data_dir and cert SANs need a restart)"
+                        ),
+                        Err(e) => tracing::warn!(
+                            error = format!("{e:#}"),
+                            "config reload rejected; keeping the running settings"
+                        ),
+                    },
+                    Err(e) => tracing::warn!(
+                        error = format!("{e:#}"),
+                        "config reload failed to parse; keeping the running settings"
+                    ),
+                }
+            }
+        });
+    }
     let api = kahawai_hub::api::router(registry.clone(), auth, sessions.clone(), Arc::new(svc.clone()), subtitles.clone(), artwork, enricher.clone(), net);
     tokio::spawn(async move {
         let api = api.into_make_service_with_connect_info::<std::net::SocketAddr>();
