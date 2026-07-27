@@ -161,6 +161,29 @@ impl Bucket {
     }
 }
 
+/// How long to hold before the next packet: BOTH halves of AniDB's flood
+/// rule, whichever binds. `bucket` is the sustained rate, `last_send` the
+/// short-term gap (widened on a retry re-send).
+///
+/// Separated from the sleeping on purpose — the spacing is the thing that
+/// earned us a ban, and it cannot be measured from live traffic: reply
+/// timestamps float with round-trip time, so a correct 2.2 s send gap can
+/// read as 2.16 s between answers.
+fn pace_delay(
+    bucket: &mut Bucket,
+    last_send: Option<tokio::time::Instant>,
+    retry: u32,
+    now: tokio::time::Instant,
+) -> Duration {
+    // Sleeping for the bucket first and re-measuring afterwards, as this
+    // used to, is the same as taking the larger of the two.
+    let sustained = bucket.take(now);
+    let short = last_send.map_or(Duration::ZERO, |t| {
+        (PACKET_SPACING * (retry + 1)).saturating_sub(now.saturating_duration_since(t))
+    });
+    sustained.max(short)
+}
+
 impl Anidb {
     /// Login. `api_key` (profile "UDP API key") upgrades to an
     /// encrypted session first.
@@ -353,16 +376,9 @@ impl Anidb {
     /// Wait until both halves of the flood rule allow another packet.
     /// `retry` widens the short-term gap for a timeout re-send.
     async fn pace(&mut self, retry: u32) {
-        let owed = self.bucket.take(tokio::time::Instant::now());
+        let owed = pace_delay(&mut self.bucket, self.last_send, retry, tokio::time::Instant::now());
         if !owed.is_zero() {
             tokio::time::sleep(owed).await;
-        }
-        if let Some(t) = self.last_send {
-            let wait = PACKET_SPACING * (retry + 1);
-            let since = t.elapsed();
-            if since < wait {
-                tokio::time::sleep(wait - since).await;
-            }
         }
         self.last_send = Some(tokio::time::Instant::now());
     }
@@ -447,6 +463,59 @@ fn aes_ecb(cipher: &aes::Aes128, data: &[u8], encrypt: bool) -> Result<Vec<u8>> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every gap between SENDS, over a run long enough to drain the
+    /// burst. This is what live traffic cannot tell us: replies float
+    /// with round-trip time, so the 2.16 s observed between two answers
+    /// says nothing about whether the packets left 2.2 s apart.
+    #[test]
+    fn every_send_gap_honours_both_halves_of_the_flood_rule() {
+        let mut bucket = Bucket::new();
+        let mut last: Option<tokio::time::Instant> = None;
+        let mut now = tokio::time::Instant::now();
+        let start = now;
+        let mut gaps = Vec::new();
+        for _ in 0..50 {
+            now += pace_delay(&mut bucket, last, 0, now); // the caller sleeps
+            if let Some(prev) = last {
+                gaps.push((now - prev).as_secs_f64());
+            }
+            last = Some(now); // and sends
+        }
+        let worst = gaps.iter().cloned().fold(f64::INFINITY, f64::min);
+        assert!(
+            worst >= PACKET_SPACING.as_secs_f64() - 1e-9,
+            "two packets left {worst:.3}s apart, inside the {:?} floor",
+            PACKET_SPACING
+        );
+        // ...and the run as a whole stays under the sustained rate.
+        let elapsed = (now - start).as_secs_f64();
+        let floor = (50.0 - BURST_PACKETS) * SUSTAINED_SPACING.as_secs_f64();
+        assert!(elapsed >= floor - 0.01, "50 packets in {elapsed:.1}s, floor {floor:.1}s");
+    }
+
+    /// A timed-out packet is re-sent no sooner than a widened gap — the
+    /// re-send is the case where a naive client hammers hardest.
+    #[test]
+    fn a_retry_widens_the_short_term_gap() {
+        let mut bucket = Bucket::new();
+        let now = tokio::time::Instant::now();
+        // Burst spent, so only the short-term half can bind.
+        for _ in 0..BURST_PACKETS as usize {
+            bucket.take(now);
+        }
+        let just_sent = Some(now);
+        for retry in 0..3u32 {
+            let mut b = Bucket::new();
+            let owed = pace_delay(&mut b, just_sent, retry, now);
+            assert_eq!(
+                owed,
+                PACKET_SPACING * (retry + 1),
+                "retry {retry} should wait {} x the base gap",
+                retry + 1
+            );
+        }
+    }
 
     /// What a BULK run leans on, which is where this went wrong: the
     /// burst and the refill cap are covered by
