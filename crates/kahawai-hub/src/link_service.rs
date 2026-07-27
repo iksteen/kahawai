@@ -322,6 +322,7 @@ async fn handle_host_msg(
                 let msg = kahawai_proto::v1::HubToHost {
                     msg: Some(kahawai_proto::v1::hub_to_host::Msg::Manifest(
                         kahawai_proto::v1::Manifest {
+                            sidecars_compared: true,
                             collection_id: r.collection_id.clone(),
                             entries: vec![],
                             done: true,
@@ -350,6 +351,7 @@ async fn handle_host_msg(
                 let msg = kahawai_proto::v1::HubToHost {
                     msg: Some(kahawai_proto::v1::hub_to_host::Msg::Manifest(
                         kahawai_proto::v1::Manifest {
+                            sidecars_compared: true,
                             collection_id: r.collection_id.clone(),
                             entries: chunk.to_vec(),
                             done,

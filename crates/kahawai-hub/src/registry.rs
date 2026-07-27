@@ -1270,8 +1270,10 @@ impl Registry {
         collection_id: &str,
     ) -> Result<Vec<kahawai_proto::v1::FileStat>> {
         let rows = sqlx::query(
-            "SELECT path_rel, size, mtime_unix FROM files
-             WHERE module_id = ? AND collection_id = ?",
+            "SELECT path_rel, size, mtime_unix,
+                    COALESCE(json_extract(streams_json, '$.nfo'), '') AS nfo,
+                    COALESCE(json_extract(streams_json, '$.artwork'), '') AS art
+             FROM files WHERE module_id = ? AND collection_id = ?",
         )
         .bind(module_id)
         .bind(collection_id)
@@ -1283,8 +1285,18 @@ impl Registry {
                 path_rel: r.get("path_rel"),
                 size: r.get::<i64, _>("size") as u64,
                 mtime_unix: r.get("mtime_unix"),
+                sidecars: Self::sidecar_sig(&r.get::<String, _>("nfo"), &r.get::<String, _>("art")),
             })
             .collect())
+    }
+
+    /// One line describing a file's sidecars, compared verbatim on both
+    /// sides. Order is fixed so the same pair always spells the same way.
+    pub fn sidecar_sig(nfo: &str, artwork: &str) -> String {
+        if nfo.is_empty() && artwork.is_empty() {
+            return String::new();
+        }
+        format!("n:{nfo}|a:{artwork}")
     }
 
     pub async fn reconcile_files(

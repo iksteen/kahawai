@@ -687,6 +687,19 @@ impl Enricher {
                     -- actually being something beside the media, or an
                     -- item with no cover and no .nfo would be re-selected
                     -- every run for a provider that stores nothing.
+                    -- local's answer and what the scan can see disagree,
+                    -- in either direction: a sidecar appeared and nobody
+                    -- has read it, or the one it was built from is gone
+                    -- and the answer now describes a deleted file.
+                    OR (EXISTS (SELECT 1 FROM provider_metadata pl
+                                 WHERE pl.item_id = i.id AND pl.provider = 'local'
+                                   AND pl.provider_id <> '')
+                        != (i.id IN (SELECT COALESCE(ch.parent_id, ch.id)
+                                       FROM item_sources s5
+                                       JOIN files f5 ON (f5.module_id, f5.collection_id, f5.path_rel)
+                                                      = (s5.module_id, s5.collection_id, s5.path_rel)
+                                       JOIN items ch ON ch.id = s5.item_id
+                                      WHERE json_extract(f5.streams_json, '$.nfo') IS NOT NULL)))
                     OR (NOT EXISTS (SELECT 1 FROM provider_metadata pl
                                      WHERE pl.item_id = i.id AND pl.provider = 'local')
                         AND i.id IN (SELECT COALESCE(ch.parent_id, ch.id)
@@ -818,6 +831,19 @@ impl Enricher {
                     -- actually being something beside the media, or an
                     -- item with no cover and no .nfo would be re-selected
                     -- every run for a provider that stores nothing.
+                    -- local's answer and what the scan can see disagree,
+                    -- in either direction: a sidecar appeared and nobody
+                    -- has read it, or the one it was built from is gone
+                    -- and the answer now describes a deleted file.
+                    OR (EXISTS (SELECT 1 FROM provider_metadata pl
+                                 WHERE pl.item_id = i.id AND pl.provider = 'local'
+                                   AND pl.provider_id <> '')
+                        != (i.id IN (SELECT COALESCE(ch.parent_id, ch.id)
+                                       FROM item_sources s5
+                                       JOIN files f5 ON (f5.module_id, f5.collection_id, f5.path_rel)
+                                                      = (s5.module_id, s5.collection_id, s5.path_rel)
+                                       JOIN items ch ON ch.id = s5.item_id
+                                      WHERE json_extract(f5.streams_json, '$.nfo') IS NOT NULL)))
                     OR (NOT EXISTS (SELECT 1 FROM provider_metadata pl
                                      WHERE pl.item_id = i.id AND pl.provider = 'local')
                         AND i.id IN (SELECT COALESCE(ch.parent_id, ch.id)
@@ -992,6 +1018,19 @@ impl Enricher {
                     -- actually being something beside the media, or an
                     -- item with no cover and no .nfo would be re-selected
                     -- every run for a provider that stores nothing.
+                    -- local's answer and what the scan can see disagree,
+                    -- in either direction: a sidecar appeared and nobody
+                    -- has read it, or the one it was built from is gone
+                    -- and the answer now describes a deleted file.
+                    OR (EXISTS (SELECT 1 FROM provider_metadata pl
+                                 WHERE pl.item_id = i.id AND pl.provider = 'local'
+                                   AND pl.provider_id <> '')
+                        != (i.id IN (SELECT COALESCE(ch.parent_id, ch.id)
+                                       FROM item_sources s5
+                                       JOIN files f5 ON (f5.module_id, f5.collection_id, f5.path_rel)
+                                                      = (s5.module_id, s5.collection_id, s5.path_rel)
+                                       JOIN items ch ON ch.id = s5.item_id
+                                      WHERE json_extract(f5.streams_json, '$.nfo') IS NOT NULL)))
                     OR (NOT EXISTS (SELECT 1 FROM provider_metadata pl
                                      WHERE pl.item_id = i.id AND pl.provider = 'local')
                         AND i.id IN (SELECT COALESCE(ch.parent_id, ch.id)
@@ -2592,6 +2631,20 @@ impl crate::providers::Provider for LocalProvider {
         let art = crate::artwork::find_artwork_source(&self.registry, &item.id).await?;
         let nfo = nfo_source(&self.registry, &item.id).await?;
         if art.is_none() && nfo.is_none() {
+            // Nothing beside the media any more. If local previously
+            // answered, that answer describes a file that has been
+            // deleted — retract it rather than leave the item claiming an
+            // identity from a .nfo nobody can read. Re-picking then hands
+            // the item back to whichever provider actually has it.
+            let stale = sqlx::query("DELETE FROM provider_metadata WHERE item_id = ? AND provider = 'local'")
+                .bind(&item.id)
+                .execute(db)
+                .await?
+                .rows_affected();
+            if stale > 0 {
+                tracing::info!(item = %item.id, "local metadata withdrawn; its sidecars are gone");
+                crate::providers::assign(db, &item.id).await?;
+            }
             return Ok(crate::providers::Outcome::NotApplicable);
         }
         // The cover next to the media is local metadata too (HUB-9), and

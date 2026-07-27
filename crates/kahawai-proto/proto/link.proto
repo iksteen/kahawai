@@ -96,6 +96,11 @@ message FileStat {
   string path_rel = 1;
   uint64 size = 2;
   int64 mtime_unix = 3;
+  // The sidecars the hub has recorded for this file (.nfo, artwork), so
+  // the host can notice one that appeared or vanished. Size and mtime
+  // describe the MEDIA file and never move when a sidecar changes beside
+  // it, which is why a dropped-in .nfo used to stay invisible forever.
+  string sidecars = 4;
 }
 
 // The hub's current knowledge of a collection, chunked; `done` on the
@@ -106,6 +111,10 @@ message Manifest {
   bool done = 3;
   // Versions matched: no entries follow, skip the scan entirely.
   bool in_sync = 4;
+  // The hub filled FileStat.sidecars. Absent from an older hub, where an
+  // empty signature means "not sent" rather than "none recorded", so the
+  // host must not read anything into it.
+  bool sidecars_compared = 5;
 }
 
 // Files present and unchanged (size+mtime match the manifest): counted

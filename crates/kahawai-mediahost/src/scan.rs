@@ -48,7 +48,11 @@ pub async fn scan_collection(
 
     // Collect the hub's manifest (chunked); an old hub never answers, so
     // a timeout degrades to the full rescan.
-    let mut known: std::collections::HashMap<String, (u64, i64)> = Default::default();
+    let mut known: std::collections::HashMap<String, (u64, i64, String)> = Default::default();
+    // Whether the hub sent sidecar signatures at all. An older hub sends
+    // none, and an empty signature then means "not sent" rather than
+    // "none recorded" — comparing against it would rescan everything.
+    let mut compare_sidecars = false;
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
         match tokio::time::timeout_at(deadline, manifest.recv()).await {
@@ -57,7 +61,12 @@ pub async fn scan_collection(
                     tracing::info!(collection = %cfg.name, "in sync with hub; scan skipped");
                     return Ok(false);
                 }
-                known.extend(m.entries.into_iter().map(|e| (e.path_rel, (e.size, e.mtime_unix))));
+                compare_sidecars |= m.sidecars_compared;
+                known.extend(
+                    m.entries
+                        .into_iter()
+                        .map(|e| (e.path_rel, (e.size, e.mtime_unix, e.sidecars))),
+                );
                 if m.done {
                     break;
                 }
@@ -95,6 +104,7 @@ pub async fn scan_collection(
         for stat_batch in paths.chunks(250).map(<[_]>::to_vec) {
             let known2 = known.clone();
             let force2 = force.clone();
+            let compare2 = compare_sidecars;
             let verdicts: Vec<((std::path::PathBuf, std::path::PathBuf), String, bool)> =
                 tokio::task::spawn_blocking(move || {
                     stat_batch
@@ -108,17 +118,28 @@ pub async fn scan_collection(
                             let unchanged = !path
                                 .parent()
                                 .is_some_and(|p| force2.contains(p))
-                                && known2.get(&rel).is_some_and(|&(size, mtime)| {
-                                    std::fs::metadata(&path).is_ok_and(|m| {
-                                        m.len() == size
-                                            && m.modified()
-                                                .ok()
-                                                .and_then(|t| {
-                                                    t.duration_since(std::time::UNIX_EPOCH).ok()
-                                                })
-                                                .map(|d| d.as_secs() as i64)
-                                                == Some(mtime)
-                                    })
+                                && known2.get(&rel).is_some_and(|(size, mtime, sidecars)| {
+                                    let stat_matches =
+                                        std::fs::metadata(&path).is_ok_and(|m| {
+                                            m.len() == *size
+                                                && m.modified()
+                                                    .ok()
+                                                    .and_then(|t| {
+                                                        t.duration_since(std::time::UNIX_EPOCH)
+                                                            .ok()
+                                                    })
+                                                    .map(|d| d.as_secs() as i64)
+                                                    == Some(*mtime)
+                                        });
+                                    // Size and mtime describe the MEDIA file and do
+                                    // not move when a .nfo or a cover appears beside
+                                    // it, so a sidecar dropped in next to an
+                                    // already-scanned file used to stay invisible
+                                    // until the file itself changed. Costs a few
+                                    // stats per file, and only where the hub asked.
+                                    stat_matches
+                                        && (!compare2
+                                            || &sidecar_sig(&root_local, &path) == sidecars)
                                 });
                             ((root_local, path), rel, unchanged)
                         })
@@ -287,6 +308,18 @@ fn inspect(root: &Path, path: &Path) -> Result<Inspected> {
 
 /// Local artwork (MH-4): a cover image in the media file's directory.
 /// Names in preference order; first hit wins.
+/// The sidecars visible beside `media` right now, in the hub's spelling
+/// (`kahawai_hub::registry::sidecar_sig`). The two must agree verbatim:
+/// this is compared as a string, not parsed.
+fn sidecar_sig(root: &Path, media: &Path) -> String {
+    let nfo = find_nfo(root, media).unwrap_or_default();
+    let art = find_artwork(root, media).unwrap_or_default();
+    if nfo.is_empty() && art.is_empty() {
+        return String::new();
+    }
+    format!("n:{nfo}|a:{art}")
+}
+
 fn find_artwork(root: &Path, media: &Path) -> Option<String> {
     const NAMES: &[&str] = &["cover", "folder", "poster", "front"];
     const EXTS: &[&str] = &["jpg", "jpeg", "png", "webp"];
@@ -411,6 +444,51 @@ fn sum_u64_le(bytes: &[u8]) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// The two sides compare this as a STRING, so they must spell it the
+    /// same way. A silent divergence here would rescan the whole library
+    /// on every pass, or nothing ever again.
+    #[test]
+    fn the_sidecar_signature_matches_the_hub_spelling() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let media = root.join("Solaris (1972).mkv");
+        std::fs::write(&media, b"x").unwrap();
+
+        // Nothing beside it: empty on both sides, so an item with no
+        // sidecars never looks changed.
+        assert_eq!(sidecar_sig(root, &media), "");
+        assert_eq!(kahawai_hub_sig("", ""), "");
+
+        std::fs::write(root.join("Solaris (1972).nfo"), b"<movie/>").unwrap();
+        let with_nfo = sidecar_sig(root, &media);
+        assert_eq!(with_nfo, kahawai_hub_sig("Solaris (1972).nfo", ""));
+        assert_ne!(with_nfo, "", "a dropped-in .nfo must change the signature");
+
+        // Artwork is matched by name (cover/folder/poster/front), not
+        // by the media's stem.
+        std::fs::write(root.join("cover.jpg"), b"JPEG").unwrap();
+        let both = sidecar_sig(root, &media);
+        assert_eq!(both, kahawai_hub_sig("Solaris (1972).nfo", "cover.jpg"));
+        assert_ne!(both, with_nfo, "artwork appearing must change it too");
+
+        // And removal is symmetric — the case that left a stale answer
+        // pointing at a .nfo nobody could read.
+        std::fs::remove_file(root.join("Solaris (1972).nfo")).unwrap();
+        assert_ne!(sidecar_sig(root, &media), both, "a vanished .nfo must change it");
+    }
+
+    /// The hub's spelling, copied here on purpose: if `sidecar_sig` on
+    /// either side is edited alone, this test fails rather than the
+    /// library silently rescanning forever.
+    fn kahawai_hub_sig(nfo: &str, artwork: &str) -> String {
+        if nfo.is_empty() && artwork.is_empty() {
+            return String::new();
+        }
+        format!("n:{nfo}|a:{artwork}")
+    }
+
     use super::*;
 
     #[test]

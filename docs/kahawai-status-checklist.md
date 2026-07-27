@@ -133,21 +133,20 @@ the live deployment. Unchecked items carry a note when partially done.
       exists. The owner contradicting it — a manual pin elsewhere, or a
       rejection of what the `.nfo` claimed — displaces it wholesale; a
       cover carries no record, so nothing about identity displaces it.
-      Verified live: 2,213 albums on their local cover, and 10 movies whose
-      `.nfo` owns identity, title, plot and genres while TMDB side-fills
-      the poster, premiere and rating it did not state.
-
-      Known gap, not part of this requirement: a `.nfo` or cover dropped
-      beside an ALREADY-SCANNED media file is invisible to a rescan — the
-      scan skips any file whose size and mtime match the hub's manifest,
-      so `find_nfo` never runs for it. The filesystem watcher does catch a
-      newly created sidecar (its `Create` event forces the directory, and
-      `force_dirs` bypasses the unchanged check). Fixing the rescan path
-      means putting sidecar state into the manifest comparison, which is a
-      scan-protocol change.
-
-## Hub — subtitles
-
+      Sidecars are tracked in both directions: the manifest carries the
+      signature of what the hub recorded (`FileStat.sidecars`), so a
+      `.nfo` or cover dropped beside an ALREADY-SCANNED file is noticed by
+      an ordinary rescan — size and mtime describe the media file and
+      never move when something appears beside it — and one that vanishes
+      makes `local` withdraw its answer rather than leave an item claiming
+      an identity read out of a deleted file.
+      Verified live: 2,213 albums on their local cover; a `.nfo` owning
+      identity, title, plot and genres while TMDB side-fills the poster,
+      premiere and rating it did not state; and a `.nfo` added to and then
+      removed from an untouched media file, picked up and withdrawn by
+      ordinary refreshes. A no-change rescan still reports
+      `scanned=0 skipped=905`, so the comparison costs nothing when
+      nothing moved.
 - [x] HUB-21 External subtitle providers: SubtitleProvider trait with
       OpenSubtitles.com (REST) as the first impl. Always on: kahawai's
       application key ships in the binary (5 req/s, 5 downloads/24 h
