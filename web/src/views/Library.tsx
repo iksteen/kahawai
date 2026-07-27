@@ -142,7 +142,9 @@ function Card({
         </span>
         <span className="card-title">{i.title}</span>
         <span className="card-meta mono">
-          {i.kind === 'album' ? (i.artist ?? '—') : (i.year ?? '—')}
+          {i.kind === 'episode'
+            ? `${i.parent_title ?? ''} · S${i.season ?? '?'}E${i.episode ?? '?'}`
+            : (i.kind === 'album' ? (i.artist ?? '—') : (i.year ?? '—'))}
           {i.kind === 'album' && i.year ? ` · ${i.year}` : ''}
           {i.sources > 1 ? ` · ${i.sources} sources` : ''}
         </span>

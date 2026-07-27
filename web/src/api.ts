@@ -109,6 +109,9 @@ export type Item = {
   /// HUB-31: TVDB-style projection of absolute numbering (anime).
   proj_season?: number | null
   proj_episode?: number | null
+  /// The show an episode belongs to — search can return episodes, and a
+  /// hit called "Pilot" needs to say which of its namesakes it is.
+  parent_title?: string | null
   sources: number
   /// Enrichment state (movie/show): null = never enriched,
   /// miss/rejected = unmatched, weak = uncertain, auto/manual = good.

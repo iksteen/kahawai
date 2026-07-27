@@ -15,8 +15,9 @@ use sqlx::SqlitePool;
 const TRUTH: &str = "SELECT COUNT(*) FROM items i WHERE i.sort_title IS NOT COALESCE(
         (SELECT pm.title FROM item_match im
            JOIN provider_metadata pm
-             ON pm.item_id = im.item_id AND pm.provider = im.provider
-          WHERE im.item_id = i.id AND NULLIF(pm.title, '') IS NOT NULL),
+             ON pm.item_id = i.id AND pm.provider = im.provider
+          WHERE im.item_id = COALESCE(i.parent_id, i.id)
+            AND NULLIF(pm.title, '') IS NOT NULL),
         i.title)";
 
 async fn drifted(db: &SqlitePool) -> i64 {
@@ -139,6 +140,85 @@ async fn sort_title_never_drifts() {
     .await
     .unwrap();
     assert_eq!(sort_title(&db, "i1").await.as_deref(), Some("12 Monkeys (1995)"));
+    assert_eq!(drifted(&db).await, 0);
+}
+
+/// An episode's sort_title is the title its SHOW's assigned provider
+/// gave it (0041) — that is what makes episode titles searchable, so it
+/// has to follow the show's assignment around, not the episode's own
+/// filename.
+#[tokio::test]
+async fn an_episodes_sort_title_follows_the_shows_assignment() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    sqlx::query(
+        "INSERT INTO items (id, kind, title, norm_title) VALUES ('show1','show','A Show','a show')",
+    )
+    .execute(&db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO items (id, kind, title, norm_title, parent_id, season, episode)
+         VALUES ('ep1','episode','S01E01','s01e01','show1',1,1)",
+    )
+    .execute(&db)
+    .await
+    .unwrap();
+    // No assignment anywhere: filename title stands.
+    assert_eq!(sort_title(&db, "ep1").await.as_deref(), Some("S01E01"));
+    assert_eq!(drifted(&db).await, 0);
+
+    // The show matches tvdb, and the projection writes the episode's own
+    // per-provider rows — the tvdb one should now name the episode.
+    for (provider, pid, ep_title) in
+        [("tvdb", "414734", "The Real Title"), ("tmdb", "63", "Другое название")]
+    {
+        kahawai_hub::providers::store_answer(
+            &db,
+            "show1",
+            provider,
+            pid,
+            "auto",
+            kahawai_hub::providers::Fields { title: Some("A Show".into()), ..Default::default() },
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO provider_metadata (item_id, provider, provider_id, title, confidence, updated_at)
+             VALUES ('ep1', ?, ?, ?, 'auto', unixepoch())",
+        )
+        .bind(provider)
+        .bind(format!("{pid}-e1"))
+        .bind(ep_title)
+        .execute(&db)
+        .await
+        .unwrap();
+    }
+    // Movies chain ranks tmdb first, so tmdb owns the show...
+    assert_eq!(sort_title(&db, "ep1").await.as_deref(), Some("Другое название"));
+    assert_eq!(drifted(&db).await, 0);
+
+    // ...and pinning the show to tvdb flips every episode title with it.
+    sqlx::query(
+        "INSERT INTO manual_match (item_id, provider, provider_id, pinned_at)
+         VALUES ('show1','tvdb','414734', unixepoch())",
+    )
+    .execute(&db)
+    .await
+    .unwrap();
+    assert_eq!(
+        sort_title(&db, "ep1").await.as_deref(),
+        Some("The Real Title"),
+        "re-assigning the show must re-derive its children"
+    );
+    assert_eq!(drifted(&db).await, 0);
+
+    // The projected title being corrected follows too, raw SQL included.
+    sqlx::query("UPDATE provider_metadata SET title='Corrected' WHERE item_id='ep1' AND provider='tvdb'")
+        .execute(&db)
+        .await
+        .unwrap();
+    assert_eq!(sort_title(&db, "ep1").await.as_deref(), Some("Corrected"));
     assert_eq!(drifted(&db).await, 0);
 }
 
@@ -334,6 +414,15 @@ async fn library_membership_never_drifts() {
     item(&db, "show2", "Another Show").await;
     q("UPDATE items SET parent_id='show2' WHERE id='ep1'").await;
     assert_eq!(lib_drift(&db).await, 0, "after re-parenting");
+
+    // A source MOVED between collections — an UPDATE, not delete+insert.
+    // 0037's update trigger re-creates membership rows, and 0040 forgot
+    // to teach it the sort keys: the rows came back keyless and the item
+    // vanished to the top of every sorted browse (fixed in 0041).
+    q("UPDATE item_sources SET collection_id='c1' WHERE item_id='ep1'").await;
+    assert_eq!(lib_drift(&db).await, 0, "after a source moved collections");
+    q("UPDATE item_sources SET collection_id='c2' WHERE item_id='ep1'").await;
+    assert_eq!(lib_drift(&db).await, 0, "and moved back");
 
     // And removing the item — sources first, as the app does, since
     // item_sources has no cascade — takes its membership with it.

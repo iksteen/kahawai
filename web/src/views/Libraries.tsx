@@ -102,7 +102,11 @@ export default function Libraries({
                     />
                     <span className="result-title">{i.title}</span>
                     <span className="result-meta mono">
-                      {i.kind === 'album' ? (i.artist ?? '') : (i.year ?? '')}
+                      {i.kind === 'episode'
+                        ? `${i.parent_title ?? ''} S${i.season ?? '?'}E${i.episode ?? '?'}`
+                        : i.kind === 'album'
+                          ? (i.artist ?? '')
+                          : (i.year ?? '')}
                     </span>
                   </button>
                 </li>

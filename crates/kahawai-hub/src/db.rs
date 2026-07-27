@@ -52,7 +52,35 @@ pub async fn open(data_dir: &Path) -> Result<SqlitePool> {
         .await
         .context("running migrations")?;
     install_derived(&pool).await?;
+    backfill_norm_artist(&pool).await?;
     Ok(pool)
+}
+
+/// Fill `items.norm_artist` where it is missing (0041). Folding is a
+/// Rust function, so the migration could not do this; the write sites
+/// keep it filled from here on, which makes this a no-op after its first
+/// run — the guard query is one indexless scan of a column that is
+/// almost always fully populated.
+async fn backfill_norm_artist(pool: &SqlitePool) -> Result<()> {
+    let missing: Vec<(String, String)> = sqlx::query_as(
+        "SELECT id, artist FROM items WHERE artist IS NOT NULL AND norm_artist IS NULL",
+    )
+    .fetch_all(pool)
+    .await?;
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let mut tx = pool.begin().await?;
+    for (id, artist) in &missing {
+        sqlx::query("UPDATE items SET norm_artist = ? WHERE id = ?")
+            .bind(crate::enrich::fold(artist))
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    tracing::info!(rows = missing.len(), "norm_artist backfilled");
+    Ok(())
 }
 
 /// In-memory DB for tests.

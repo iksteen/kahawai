@@ -972,14 +972,18 @@ impl Registry {
                             None => {
                                 let id = ulid::Ulid::generate().to_string();
                                 sqlx::query(
-                                    "INSERT INTO items (id, kind, title, norm_title, year, artist)
-                                     VALUES (?, 'album', ?, ?, ?, ?)",
+                                    "INSERT INTO items (id, kind, title, norm_title, year, artist,
+                                                        norm_artist)
+                                     VALUES (?, 'album', ?, ?, ?, ?, ?)",
                                 )
                                 .bind(&id)
                                 .bind(&album)
                                 .bind(&album_norm)
                                 .bind(album_year)
                                 .bind(&artist)
+                                // Folded like the search needle is, or an
+                                // accented artist can never be found.
+                                .bind(crate::enrich::fold(&artist))
                                 .execute(&mut *tx)
                                 .await?;
                                 id
@@ -1004,8 +1008,8 @@ impl Registry {
                                 sqlx::query(
                                     "INSERT INTO items
                                        (id, kind, title, norm_title, year,
-                                        parent_id, season, episode, artist)
-                                     VALUES (?, 'track', ?, ?, NULL, ?, ?, ?, ?)",
+                                        parent_id, season, episode, artist, norm_artist)
+                                     VALUES (?, 'track', ?, ?, NULL, ?, ?, ?, ?, ?)",
                                 )
                                 .bind(&id)
                                 .bind(&title)
@@ -1014,6 +1018,7 @@ impl Registry {
                                 .bind(disc)
                                 .bind(track)
                                 .bind(&artist)
+                                .bind(crate::enrich::fold(&artist))
                                 .execute(&mut *tx)
                                 .await?;
                                 id
