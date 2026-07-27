@@ -69,6 +69,17 @@ enum Cmd {
 enum HubCmd {
     /// Overwrite a user's password (reads the new password from stdin).
     ResetPassword { username: String },
+    /// Snapshot the hub (OPS-5) — database, PKI, subtitles, config —
+    /// without stopping it. Image and provider caches are left out: a
+    /// running hub fetches those again.
+    Backup { dest: PathBuf },
+    /// Restore a snapshot into this hub's data dir. Stop the hub first.
+    Restore {
+        src: PathBuf,
+        /// Replace an existing database.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[tokio::main]
@@ -97,6 +108,30 @@ async fn main() -> Result<()> {
         Cmd::Hub { cmd: None } => run_hub(cfg.hub).await,
         Cmd::Hub { cmd: Some(HubCmd::ResetPassword { username }) } => {
             reset_password(cfg.hub, &username).await
+        }
+        Cmd::Hub { cmd: Some(HubCmd::Backup { dest }) } => {
+            let m = kahawai_hub::backup::backup(&cfg.hub.data_dir, config_used.as_deref(), &dest)
+                .await?;
+            println!(
+                "snapshot written to {}\n  database   {:.1} MB\n  subtitles  {} files, {:.1} MB\n  pki        {}\n  config     {}",
+                dest.display(),
+                m.db_bytes as f64 / 1e6,
+                m.subtitle_files,
+                m.subtitle_bytes as f64 / 1e6,
+                if m.has_pki { "included" } else { "absent" },
+                if m.has_config { "included" } else { "absent" },
+            );
+            Ok(())
+        }
+        Cmd::Hub { cmd: Some(HubCmd::Restore { src, force }) } => {
+            let m = kahawai_hub::backup::restore(&src, &cfg.hub.data_dir, force)?;
+            println!(
+                "restored a snapshot taken at {} (kahawai {}) into {}",
+                m.taken_at,
+                m.kahawai_version,
+                cfg.hub.data_dir.display()
+            );
+            Ok(())
         }
         Cmd::Mediahost => run_mediahost(cfg.mediahost).await,
         Cmd::Doctor { json } => doctor(&cfg, json),

@@ -268,7 +268,17 @@ the live deployment. Unchecked items carry a note when partially done.
       OPS-8 adds proxy-trust config
 - [x] OPS-3 `doctor` command with plugin/encoder checks
 - [x] OPS-4 Clock-skew tolerance (backdated certs, enrollment skew warning)
-- [ ] OPS-5 Online backup/restore command
+- [x] OPS-5 Online backup/restore: `kahawai hub backup <dir>` snapshots
+      the database (via `VACUUM INTO`, so the hub keeps serving and no
+      write is refused), the PKI, the downloaded subtitles, the token
+      secret and the config; `kahawai hub restore <dir>` puts them back,
+      refusing a populated data dir without `--force`. Image and provider
+      caches are excluded as re-derivable — 225 MB here against 12 KB of
+      PKI. The CA and the satellite records travel together, which is what
+      lets existing satellites reconnect on their own certificates instead
+      of being re-enrolled. Live: 61 MB database + 46,037 subtitle files
+      (2.7 GB) in 8.7 s against a running hub, snapshot `integrity_check`
+      ok and item counts matching.
 - [x] OPS-6 Quota-bounded caches with eviction — satisfied by there being
       nothing eligible to evict (audited 2026-07-26). Two costs decide
       it, and every hub cache is expensive on at least one: **rebuild

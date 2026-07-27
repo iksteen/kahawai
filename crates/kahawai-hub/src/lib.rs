@@ -5,6 +5,7 @@ pub mod anime;
 pub mod api;
 pub mod artwork;
 pub mod enrich;
+pub mod backup;
 pub mod auth;
 pub mod db;
 pub mod enrollment;
