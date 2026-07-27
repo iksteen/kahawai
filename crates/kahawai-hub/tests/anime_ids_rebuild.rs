@@ -41,7 +41,7 @@ async fn bridge_ids_are_rebuilt_from_stored_answers() {
     seed(&db).await;
 
     // Nothing recorded yet: both ids come purely from what is on disk.
-    let n = Enricher::rebuild_anime_ids(&db).await.unwrap();
+    let n = Enricher::rebuild_anime_ids(&db, None).await.unwrap();
     assert_eq!(n, 1, "one item should have been rebuilt");
     let row = sqlx::query("SELECT anidb_id, anilist_id FROM anime_ids WHERE item_id = 'show1'")
         .fetch_one(&db)
@@ -53,7 +53,7 @@ async fn bridge_ids_are_rebuilt_from_stored_answers() {
     // The case that started this: the id is wiped while every provider
     // answer survives, so no provider would ever be asked again.
     sqlx::query("UPDATE anime_ids SET anidb_id = NULL").execute(&db).await.unwrap();
-    Enricher::rebuild_anime_ids(&db).await.unwrap();
+    Enricher::rebuild_anime_ids(&db, None).await.unwrap();
     let back: Option<i64> =
         sqlx::query_scalar("SELECT anidb_id FROM anime_ids WHERE item_id = 'show1'")
             .fetch_one(&db)
@@ -65,7 +65,7 @@ async fn bridge_ids_are_rebuilt_from_stored_answers() {
     // reconstruction, which is the whole reason this is safe to run on
     // every pass.
     sqlx::query("UPDATE anime_ids SET anidb_id = 9999").execute(&db).await.unwrap();
-    Enricher::rebuild_anime_ids(&db).await.unwrap();
+    Enricher::rebuild_anime_ids(&db, None).await.unwrap();
     let kept: Option<i64> =
         sqlx::query_scalar("SELECT anidb_id FROM anime_ids WHERE item_id = 'show1'")
             .fetch_one(&db)

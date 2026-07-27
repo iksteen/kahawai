@@ -626,7 +626,8 @@ impl Enricher {
         }
         // Recover any bridge ids that went missing before deciding what
         // needs work — a rebuilt id is one less item to re-identify.
-        match Self::rebuild_anime_ids(registry.db()).await {
+        let lists_for_rebuild = crate::anime::AnimeLists::load(&self.http, &self.data_dir).await.ok();
+        match Self::rebuild_anime_ids(registry.db(), lists_for_rebuild.as_ref()).await {
             Ok(n) if n > 0 => tracing::info!(rows = n, "anime bridge ids rebuilt from stored answers"),
             Ok(_) => {}
             Err(e) => tracing::warn!(error = format!("{e:#}"), "anime id rebuild failed"),
@@ -1380,7 +1381,10 @@ impl Enricher {
     /// Fills holes only — COALESCE keeps whatever is already there, so a
     /// human's correction or a fresher answer always wins over a
     /// reconstruction.
-    pub async fn rebuild_anime_ids(db: &sqlx::SqlitePool) -> Result<u64> {
+    pub async fn rebuild_anime_ids(
+        db: &sqlx::SqlitePool,
+        lists: Option<&crate::anime::AnimeLists>,
+    ) -> Result<u64> {
         let done = sqlx::query(
             "INSERT INTO anime_ids (item_id, anidb_id, anilist_id)
              SELECT item_id, aid, anilist FROM (
@@ -1409,7 +1413,37 @@ impl Enricher {
         .execute(db)
         .await?
         .rows_affected();
-        Ok(done)
+
+        // Whatever the hash could not answer for, the mapping can: an
+        // anime identified by TITLE never had its aid recorded anywhere
+        // except the column being rebuilt, but the AniList id survives as
+        // that provider's answer, and anime-lists maps one to the other.
+        // That is a recorded fact rather than a re-run of the heuristic —
+        // re-matching a title against a dump that has moved on can land
+        // somewhere the original never did.
+        let Some(lists) = lists else { return Ok(done) };
+        let orphans = sqlx::query(
+            "SELECT item_id, anilist_id FROM anime_ids
+              WHERE anidb_id IS NULL AND anilist_id IS NOT NULL",
+        )
+        .fetch_all(db)
+        .await?;
+        let mut healed = 0u64;
+        for row in orphans {
+            let anilist: i64 = row.get("anilist_id");
+            let aids = lists.reverse("anilist", &anilist.to_string());
+            // Only an unambiguous mapping. Two aids behind one AniList
+            // entry is a split-season case, and guessing which half an
+            // item is would be worse than leaving the column empty.
+            let [aid] = aids[..] else { continue };
+            sqlx::query("UPDATE anime_ids SET anidb_id = ? WHERE item_id = ? AND anidb_id IS NULL")
+                .bind(aid)
+                .bind(row.get::<String, _>("item_id"))
+                .execute(db)
+                .await?;
+            healed += 1;
+        }
+        Ok(done + healed)
     }
 
     /// How much of the billing to keep. Enough for "who's in this?" on a

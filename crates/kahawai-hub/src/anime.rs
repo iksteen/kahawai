@@ -191,6 +191,7 @@ pub struct AnimeLists {
     /// season); TMDB movie ids are ~1:1.
     by_tvdb: HashMap<u32, Vec<u32>>,
     by_tmdb: HashMap<u32, Vec<u32>>,
+    by_anilist: HashMap<u32, Vec<u32>>,
 }
 
 impl AnimeLists {
@@ -202,6 +203,7 @@ impl AnimeLists {
         let mut by_anidb = HashMap::with_capacity(entries.len());
         let mut by_tvdb: HashMap<u32, Vec<u32>> = HashMap::new();
         let mut by_tmdb: HashMap<u32, Vec<u32>> = HashMap::new();
+        let mut by_anilist: HashMap<u32, Vec<u32>> = HashMap::new();
         for e in entries {
             if let Some(aid) = e.anidb_id {
                 if let Some(tvdb) = e.tvdb_id {
@@ -210,15 +212,18 @@ impl AnimeLists {
                 for tmdb in [e.tmdb.movie, e.tmdb.tv].into_iter().flatten() {
                     by_tmdb.entry(tmdb).or_default().push(aid);
                 }
+                if let Some(al) = e.anilist_id {
+                    by_anilist.entry(al).or_default().push(aid);
+                }
                 by_anidb.insert(aid, e);
             }
         }
         // Lowest AniDB id ≈ first season/original entry.
-        for v in by_tvdb.values_mut().chain(by_tmdb.values_mut()) {
+        for v in by_tvdb.values_mut().chain(by_tmdb.values_mut()).chain(by_anilist.values_mut()) {
             v.sort_unstable();
         }
         tracing::info!(entries = by_anidb.len(), "anime-lists mapping ready");
-        Ok(Self { by_anidb, by_tvdb, by_tmdb })
+        Ok(Self { by_anidb, by_tvdb, by_tmdb, by_anilist })
     }
 
     pub fn by_anidb(&self, aid: u32) -> Option<&Mapping> {
@@ -233,6 +238,10 @@ impl AnimeLists {
         match provider {
             "tvdb" => self.by_tvdb.get(&id).cloned().unwrap_or_default(),
             "tmdb" => self.by_tmdb.get(&id).cloned().unwrap_or_default(),
+            // Recovering an AniDB id from the AniList id we already hold,
+            // which is how a title-matched anime is rebuilt: the mapping
+            // is a recorded fact, unlike re-running the match.
+            "anilist" => self.by_anilist.get(&id).cloned().unwrap_or_default(),
             _ => Vec::new(),
         }
     }
