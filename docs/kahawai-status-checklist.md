@@ -305,10 +305,21 @@ the live deployment. Unchecked items carry a note when partially done.
 
 ## Non-functional (NFR)
 
-- [ ] NFR-1 Start-latency targets *(direct/remux starts are fast in practice;
-      not formally measured against targets)*
-- [ ] NFR-2 Scale targets *(37k files / 1 mediahost / 3 transcoders live;
-      250k/10/5 untested)*
+- [ ] NFR-1 Performance. Measured (`tests/scale_bench.rs`, release, real
+      router): item detail 0.2 ms and flat at any catalogue size; the
+      resolved-metadata view costs 12.4 ms over 50k items and 55.7 ms over
+      250k, so the read model scales. **Browse fails the 200 ms target**:
+      2.6 s at 50k and 13.0 s at 250k — because `GET /items` returns the
+      whole catalogue, 20 MB and 100 MB respectively. The SQL is 0.5% of
+      that; the rest is serialising and shipping it. No query tuning
+      closes a 20 MB response, so this needs pagination, which changes the
+      client API. Start-latency (direct ≤ 2 s, transcode ≤ 6 s) and 100
+      concurrent sessions are still unmeasured.
+- [ ] NFR-2 Scale targets. The storage and read model hold at the stated
+      size: 250k files across 10 collections seed in 16.7 s, the view over
+      them costs 55.7 ms, item detail stays 0.2 ms. What does not hold is
+      browse at that size (see NFR-1) — so 250k files are *stored* fine
+      and not yet *browsable* fine. 5 transcoders untested; 3 live.
 - [x] NFR-3 No user-state loss on crash; media never written
 - [x] NFR-4 mTLS everywhere inter-module; token auth on client API
 - [x] NFR-5 Portability: Linux x86_64, macOS (transcoder), and Linux
