@@ -249,19 +249,13 @@ How something works and why it was built that way belong in
 ## Non-functional (NFR)
 
 - [ ] NFR-1 Performance. Browse meets the 200 ms target at 50k items on
-      every path — first page, last page, search and item detail
-      (`tests/scale_bench.rs`).
-      Remaining: at 250k the last page takes 1222 ms, because an OFFSET
-      walks the rows it skips; fixing it needs keyset pagination, which
-      cannot seek to an arbitrary offset and needs an index per sort
-      order, so it is deferred as a client-API decision. Search at that
-      size sits on the target at ~215 ms. Start-latency (direct <= 2 s,
-      transcode <= 6 s) and 100 concurrent sessions are unmeasured.
-- [ ] NFR-2 Scale targets. 250k files across 10 collections hold: the
-      read model, item detail and the first page are all well inside the
-      browse target.
-      Remaining: the last page and search at that size (see NFR-1), and
-      5 concurrent transcoders untested — 3 are live.
+      every path — first page, last page, search and item detail — and
+      holds it at 250k (`tests/scale_bench.rs`, worst run asserted).
+      Remaining: start-latency (direct <= 2 s, transcode <= 6 s) and 100
+      concurrent direct-play sessions are unmeasured.
+- [ ] NFR-2 Scale targets. 250k files across 10 collections hold on
+      every browse path, deep pages and adversarial search included.
+      Remaining: 5 concurrent transcoders untested — 3 are live.
 - [x] NFR-3 No user-state loss on crash; media never written
 - [x] NFR-4 mTLS everywhere inter-module; token auth on client API
 - [x] NFR-5 Portability: Linux x86_64, macOS (transcoder), and Linux

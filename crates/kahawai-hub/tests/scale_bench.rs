@@ -251,6 +251,11 @@ async fn browse_latency_and_scale() {
             .await;
         let (search, _) =
             b.time(&format!("/api/v1/items?library={}&q=film+1234", b.library), 3).await;
+        // The adversarial search: every seeded title contains "film", so
+        // this needle matches the entire catalogue — the page streams but
+        // the count must still visit everything.
+        let (search_dense, _) =
+            b.time(&format!("/api/v1/items?library={}&q=film", b.library), 3).await;
 
         let (detail, _) =
             b.time(&format!("/api/v1/items/01BENCHITEM{:015}", items / 2), 5).await;
@@ -261,6 +266,7 @@ async fn browse_latency_and_scale() {
         eprintln!("  GET /items?library{:>8.1} ms  (first page)", scoped.as_secs_f64() * 1e3);
         eprintln!("  ...last page      {:>8.1} ms", deep.as_secs_f64() * 1e3);
         eprintln!("  ...search         {:>8.1} ms", search.as_secs_f64() * 1e3);
+        eprintln!("  ...search (dense) {:>8.1} ms", search_dense.as_secs_f64() * 1e3);
 
         eprintln!("  GET /items/{{id}}   {:>8.1} ms", detail.as_secs_f64() * 1e3);
 
@@ -318,6 +324,7 @@ async fn browse_latency_and_scale() {
             ("first page", scoped),
             ("last page", deep),
             ("search", search),
+            ("dense search", search_dense),
             ("item detail", detail),
         ] {
             if took.as_millis() > 200 {

@@ -215,7 +215,13 @@ const LIB_TRUTH: &str = "SELECT (
         JOIN library_collections lc
           ON lc.module_id = ls.module_id AND lc.collection_id = ls.collection_id)
      WHERE NOT EXISTS (SELECT 1 FROM item_libraries il
-                        WHERE il.library_id = lid AND il.item_id = iid))";
+                        WHERE il.library_id = lid AND il.item_id = iid))
+  + (
+    -- 0040: membership carries copies of the item's sort keys, so a deep
+    -- page is one covering scan. A copy that disagrees with items is the
+    -- browse showing rows in an order the user cannot see.
+    SELECT COUNT(*) FROM item_libraries il JOIN items i ON i.id = il.item_id
+     WHERE il.sort_title IS NOT i.sort_title OR il.year IS NOT i.year)";
 
 async fn lib_drift(db: &SqlitePool) -> i64 {
     sqlx::query_scalar(LIB_TRUTH).fetch_one(db).await.unwrap()
@@ -271,6 +277,32 @@ async fn library_membership_never_drifts() {
     q("INSERT INTO library_collections (library_id, module_id, collection_id)
        VALUES ('lib2','m1','c1')").await;
     assert_eq!(lib_drift(&db).await, 0, "two libraries over one collection");
+
+    // The sort-key copies (0040) must follow a retitle through the whole
+    // chain: answer → items.sort_title (0035) → item_libraries (0040).
+    kahawai_hub::providers::store_answer(
+        &db,
+        "show1",
+        "tmdb",
+        "77",
+        "auto",
+        kahawai_hub::providers::Fields { title: Some("Renamed Show".into()), ..Default::default() },
+    )
+    .await
+    .unwrap();
+    assert_eq!(lib_drift(&db).await, 0, "after a provider retitle");
+    let key: Option<String> = sqlx::query_scalar(
+        "SELECT sort_title FROM item_libraries WHERE library_id='lib1' AND item_id='show1'",
+    )
+    .fetch_one(&db)
+    .await
+    .unwrap();
+    assert_eq!(key.as_deref(), Some("Renamed Show"), "the membership copy follows the retitle");
+    // Including by RAW SQL, which is how the old merge drifted.
+    q("UPDATE provider_metadata SET title='Renamed Again' WHERE item_id='show1'").await;
+    assert_eq!(lib_drift(&db).await, 0, "after a raw retitle");
+    q("UPDATE items SET year=1999 WHERE id='show1'").await;
+    assert_eq!(lib_drift(&db).await, 0, "after a raw year change");
 
     // A second source in another collection of lib1 — removing one must
     // not evict the item while the other still holds it.

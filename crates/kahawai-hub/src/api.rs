@@ -1562,24 +1562,15 @@ const ITEMS_PAGE_MAX: u32 = 1000;
 /// candidate row BEFORE the LIMIT applies — naming two instead of one
 /// took the browse query from 19 ms to 80 ms at 39k items. A tiebreaker
 /// only decides identical titles, where the stored year is as good.
+///
+/// Used for the search/unscoped candidate scan (via [`items_order_c`])
+/// and for re-ordering the joined page. Deliberately NOT ending in a
+/// unique column: rows that tie come out in the index's own rowid order,
+/// stable between consecutive pages while the plan stays an index scan.
+/// Appending `i.id` forced a temp b-tree and 96 ms → 912 ms deep pages.
+/// The membership orders below DO end in a unique column, because there
+/// `item_id` is inside the covering index and costs nothing.
 fn items_order(sort: Option<&str>) -> &'static str {
-    // Every name here is `items.sort_title` or `items.year`, both carried
-    // by one index (0035) — so a page is a range scan and costs the same
-    // at offset 0 as at offset 49,800. Naming a view field instead would
-    // resolve it for every candidate row before LIMIT applies.
-    // Deliberately NOT ending in a unique column. Rows that tie on the
-    // named terms — 69 albums and 6 films on the live library — come out
-    // in the index's own order, which is `rowid` and therefore stable
-    // between the two queries that fetch consecutive pages, as long as
-    // the plan stays this index scan. Appending `i.id` would make the
-    // order total by construction instead of by plan, and it costs far
-    // too much to be worth it: SQLite can no longer satisfy the ORDER BY
-    // from `items_sort_title` alone, falls back to a temp b-tree, and
-    // therefore resolves the metadata view for EVERY candidate row
-    // before LIMIT applies — 96 ms to 912 ms on a deep page. Widening
-    // the index to `(sort_title, year, id)` avoids the temp b-tree but
-    // still costs 134 ms, because the ULID makes every index page carry
-    // fewer rows.
     match sort.unwrap_or("title") {
         "year" => "i.year IS NULL, i.year, i.sort_title",
         "-year" => "i.year IS NULL, i.year DESC, i.sort_title",
@@ -1590,6 +1581,42 @@ fn items_order(sort: Option<&str>) -> &'static str {
         "-added" => "i.id DESC, i.sort_title",
         "-title" => "i.sort_title DESC, i.year",
         _ => "i.sort_title, i.year",
+    }
+}
+
+/// [`items_order`] for the inner candidate scan, whose alias is `c` so it
+/// cannot collide with the outer join's `i`.
+fn items_order_c(sort: Option<&str>) -> String {
+    items_order(sort).replace("i.", "c.")
+}
+
+/// ORDER BY pairs for a library page driven from the membership table:
+/// the inner scan of `item_libraries_browse` (0040) and the outer
+/// re-order of the joined page.
+///
+/// Every inner order ends in `item_id`, which is IN the covering index,
+/// so the order is total for free — a tie cannot straddle a page
+/// boundary differently on two requests. `-title` runs the whole index
+/// backwards (year descends within a tied title, where it used to
+/// ascend): a uniform direction is what keeps a deep reverse page a
+/// plain backward scan instead of a temp sort.
+fn membership_order(sort: Option<&str>) -> (&'static str, &'static str) {
+    match sort.unwrap_or("title") {
+        "year" => (
+            "year IS NULL, year, sort_title, item_id",
+            "i.year IS NULL, i.year, i.sort_title, i.id",
+        ),
+        "-year" => (
+            "year IS NULL, year DESC, sort_title, item_id",
+            "i.year IS NULL, i.year DESC, i.sort_title, i.id",
+        ),
+        "added" => ("item_id", "i.id"),
+        "-added" => ("item_id DESC", "i.id DESC"),
+        "-title" => (
+            "sort_title DESC, year DESC, item_id DESC",
+            "i.sort_title DESC, i.year DESC, i.id DESC",
+        ),
+        _ => ("sort_title, year, item_id", "i.sort_title, i.year, i.id"),
     }
 }
 
@@ -1610,6 +1637,43 @@ fn items_order(sort: Option<&str>) -> &'static str {
 /// `library_membership_holds_only_top_level_items` in tests/sort_title.rs.
 const COUNT_IN_LIBRARY: &str = "SELECT COUNT(*) FROM item_libraries WHERE library_id = ?1";
 
+/// The columns a browse row carries, resolved for the ≤200 rows of ONE
+/// page — never for a candidate. See [`item_page_sql`].
+const ITEM_PAGE_COLS: &str = "\
+i.id, i.kind, i.season, i.episode, i.artist,
+COALESCE(md.title, i.title) AS title,
+COALESCE(i.year, CAST(substr(md.premiered, 1, 4) AS INTEGER)) AS year,
+i.title AS file_title, i.year AS file_year,
+md.title AS matched_title,
+md.confidence AS match_confidence,
+md.updated_at AS art_version,
+(SELECT COUNT(*) FROM item_sources s WHERE s.item_id = i.id) AS sources,
+w.position_ms, w.duration_ms, w.played, w.play_count";
+
+/// Wrap an id-producing inner query in the joins that dress a page.
+///
+/// Every branch of the browse pages this way — a deferred join. The
+/// inner query decides WHICH ≤200 items make the page using only indexed
+/// scalar columns; the resolved-metadata view, the watch state and the
+/// source count are joined onto those ids afterwards. Joining first and
+/// paging second resolves the view for every candidate the sort visits,
+/// which is the 912 ms failure mode that keeps re-appearing whenever an
+/// ORDER BY stops matching an index.
+///
+/// The outer ORDER BY re-sorts only the returned page: the inner query
+/// already chose and ordered the ids, the join just does not promise to
+/// preserve that order.
+fn item_page_sql(inner: &str, order_out: &str) -> String {
+    format!(
+        "SELECT {ITEM_PAGE_COLS}
+           FROM ({inner}) page
+           JOIN items i ON i.id = page.item_id
+           LEFT JOIN watch_state w ON w.item_id = i.id AND w.user_id = ?1
+           LEFT JOIN resolved_metadata md ON md.item_id = i.id
+          ORDER BY {order_out}"
+    )
+}
+
 async fn list_items(
     State(state): State<AppState>,
     Query(q): Query<ItemsQuery>,
@@ -1621,83 +1685,122 @@ async fn list_items(
     // the resolved title, so a search finds an item by what it is called
     // now as well as by its filename.
     let needle = q.q.as_deref().map(crate::enrich::fold).filter(|s| !s.is_empty());
-    let order = items_order(q.sort.as_deref());
+    let db = state.registry.db();
 
-    // Shows carry no item_sources of their own; their library membership
-    // flows up from their episodes' sources.
-    let sql = format!(
-        "SELECT i.id, i.kind, i.season, i.episode, i.artist,
-                COALESCE(md.title, i.title) AS title,
-                COALESCE(i.year, CAST(substr(md.premiered, 1, 4) AS INTEGER)) AS year,
-                i.title AS file_title, i.year AS file_year,
-                md.title AS matched_title,
-                md.confidence AS match_confidence,
-                md.updated_at AS art_version,
-                -- Counted per returned row, NOT with a GROUP BY over the
-                -- catalogue: grouping has to finish before ORDER BY and
-                -- LIMIT can apply, so it did the work for all 50k items to
-                -- return 200 — 257 ms against 57 ms.
-                (SELECT COUNT(*) FROM item_sources s WHERE s.item_id = i.id) AS sources,
-                w.position_ms, w.duration_ms, w.played, w.play_count
-         FROM items i
-         LEFT JOIN watch_state w ON w.item_id = i.id AND w.user_id = ?1
-         LEFT JOIN resolved_metadata md ON md.item_id = i.id
-
-         WHERE i.kind NOT IN ('episode', 'track')
-           -- Membership is a stored fact (0036), not a join resolved per
-           -- query: deriving it cost 111 ms a page and 105 ms a count over
-           -- 50k items, against 0.2 ms and 1.9 ms now.
-           AND (?2 IS NULL OR EXISTS (
-             SELECT 1 FROM item_libraries il
-              WHERE il.library_id = ?2 AND il.item_id = i.id
-           ))
-           AND (?3 IS NULL
-                OR i.norm_title LIKE '%' || ?3 || '%'
-                OR i.sort_title LIKE '%' || ?3 || '%')
-         ORDER BY {order} LIMIT ?4 OFFSET ?5"
-    );
-    let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
-        .bind(&claims.sub)
-        .bind(&q.library)
-        .bind(&needle)
-        .bind(limit)
-        .bind(offset)
-        .fetch_all(state.registry.db())
-        .await
-        .map_err(internal)?;
-    // The count the client needs to size the result set. A second query
-    // rather than a window function: `COUNT(*) OVER ()` would compute it
-    // per returned row.
-    //
-    // Two forms, chosen rather than merged. A single query with
-    // `(?N IS NULL OR ...)` guards reads as one thing but plans as the
-    // worst of both: the guard is opaque at plan time, which is the
-    // pattern that has cost us an index twice now.
-    let total: i64 = match (&q.library, &needle) {
-        (Some(library), None) => sqlx::query_scalar(COUNT_IN_LIBRARY)
-            .bind(library)
-            .fetch_one(state.registry.db())
-            .await,
-        // Searching, or unscoped: the title predicate has to touch every
-        // candidate anyway, so drive from `items` and keep the filters
-        // as written.
-        _ => sqlx::query_scalar(
-            "SELECT COUNT(*) FROM items i
-              WHERE i.kind NOT IN ('episode', 'track')
-                AND (?1 IS NULL OR EXISTS (
-                  SELECT 1 FROM item_libraries il
-                   WHERE il.library_id = ?1 AND il.item_id = i.id
-                ))
-                AND (?2 IS NULL
-                     OR i.norm_title LIKE '%' || ?2 || '%'
-                     OR i.sort_title LIKE '%' || ?2 || '%')",
-        )
-        .bind(&q.library)
-        .bind(&needle)
-        .fetch_one(state.registry.db())
-        .await,
-    }
-    .map_err(internal)?;
+    // Three explicit shapes rather than one query with
+    // `(?N IS NULL OR ...)` guards: a guard is opaque at plan time, which
+    // is the pattern that has cost us an index twice now.
+    let (rows, total) = match (&q.library, &needle) {
+        // A library, no search — the overwhelmingly common browse. The
+        // page comes off `item_libraries_browse` (0040) alone: membership
+        // and sort keys live in one covering index, so a deep page skips
+        // rows at one index step each instead of probing `items` per
+        // skipped row. That probe chain is what made the last page of a
+        // 250k library cost 1.2 s; this shape measures 21 ms there.
+        (Some(library), None) => {
+            let (order_in, order_out) = membership_order(q.sort.as_deref());
+            let sql = item_page_sql(
+                &format!(
+                    "SELECT item_id FROM item_libraries WHERE library_id = ?2
+                      ORDER BY {order_in} LIMIT ?3 OFFSET ?4"
+                ),
+                order_out,
+            );
+            let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
+                .bind(&claims.sub)
+                .bind(library)
+                .bind(limit)
+                .bind(offset)
+                .fetch_all(db)
+                .await
+                .map_err(internal)?;
+            let total: i64 = sqlx::query_scalar(COUNT_IN_LIBRARY)
+                .bind(library)
+                .fetch_one(db)
+                .await
+                .map_err(internal)?;
+            (rows, total)
+        }
+        // Searching. The title predicate has to look at candidates, so
+        // the scan follows the sort index and streams: an underfull page
+        // means the scan ran out, and the total is known without a
+        // second pass. Only a FULL page pays the counting scan.
+        (library, Some(needle)) => {
+            let member = match library {
+                Some(_) => {
+                    "AND EXISTS (SELECT 1 FROM item_libraries il
+                                  WHERE il.library_id = ?2 AND il.item_id = c.id)"
+                }
+                None => "",
+            };
+            let order_c = items_order_c(q.sort.as_deref());
+            let sql = item_page_sql(
+                &format!(
+                    "SELECT c.id AS item_id FROM items c
+                      WHERE c.kind NOT IN ('episode', 'track') {member}
+                        AND (c.norm_title LIKE '%' || ?3 || '%'
+                             OR c.sort_title LIKE '%' || ?3 || '%')
+                      ORDER BY {order_c} LIMIT ?4 OFFSET ?5"
+                ),
+                items_order(q.sort.as_deref()),
+            );
+            // ?2 must exist even without a library, so numbering is
+            // uniform; it is simply never referenced then.
+            let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
+                .bind(&claims.sub)
+                .bind(library.as_deref().unwrap_or(""))
+                .bind(needle)
+                .bind(limit)
+                .bind(offset)
+                .fetch_all(db)
+                .await
+                .map_err(internal)?;
+            let total: i64 = if rows.len() < limit as usize && !(rows.is_empty() && offset > 0) {
+                // The page underfilled: the scan saw everything.
+                offset as i64 + rows.len() as i64
+            } else {
+                let count = format!(
+                    "SELECT COUNT(*) FROM items c
+                      WHERE c.kind NOT IN ('episode', 'track') {member}
+                        AND (c.norm_title LIKE '%' || ?3 || '%'
+                             OR c.sort_title LIKE '%' || ?3 || '%')"
+                );
+                sqlx::query_scalar(sqlx::AssertSqlSafe(count))
+                    .bind("") // ?1 unused here; keeps the numbering shared
+                    .bind(library.as_deref().unwrap_or(""))
+                    .bind(needle)
+                    .fetch_one(db)
+                    .await
+                    .map_err(internal)?
+            };
+            (rows, total)
+        }
+        // Unscoped, no search: everything, in sort order.
+        (None, None) => {
+            let order_c = items_order_c(q.sort.as_deref());
+            let sql = item_page_sql(
+                &format!(
+                    "SELECT c.id AS item_id FROM items c
+                      WHERE c.kind NOT IN ('episode', 'track')
+                      ORDER BY {order_c} LIMIT ?2 OFFSET ?3"
+                ),
+                items_order(q.sort.as_deref()),
+            );
+            let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
+                .bind(&claims.sub)
+                .bind(limit)
+                .bind(offset)
+                .fetch_all(db)
+                .await
+                .map_err(internal)?;
+            let total: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM items WHERE kind NOT IN ('episode', 'track')")
+                    .fetch_one(db)
+                    .await
+                    .map_err(internal)?;
+            (rows, total)
+        }
+    };
     let items: Vec<Value> = rows.iter().map(item_row_json).collect();
     Ok(Json(json!({
         "items": items,
