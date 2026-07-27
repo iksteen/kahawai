@@ -62,8 +62,20 @@ fn is_sql(s: &str) -> bool {
     if s.contains('{') {
         return false;
     }
-    let head = s.trim_start().split_whitespace().next().unwrap_or("").to_ascii_uppercase();
-    matches!(head.as_str(), "SELECT" | "INSERT" | "UPDATE" | "DELETE" | "WITH" | "REPLACE")
+    let upper = s.to_ascii_uppercase();
+    let mut words = upper.split_whitespace();
+    let (head, next) = (words.next().unwrap_or(""), words.next().unwrap_or(""));
+    // The keyword alone does not make it a statement: `AFTER {event} ON`
+    // clauses in the trigger builder are "INSERT", "DELETE" and
+    // "UPDATE OF <cols>", which start with one and parse as none. Demand
+    // the shape that always follows the verb.
+    match head {
+        "INSERT" => next == "INTO" || next == "OR",
+        "DELETE" => next == "FROM",
+        "UPDATE" => upper.contains(" SET "),
+        "SELECT" | "WITH" | "REPLACE" => true,
+        _ => false,
+    }
 }
 
 #[tokio::test]

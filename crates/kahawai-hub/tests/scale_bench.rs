@@ -139,15 +139,9 @@ async fn seed(dir: &std::path::Path, items: usize) -> Bench {
             .await
             .unwrap();
         }
-        sqlx::query(
-            "INSERT INTO item_match (item_id, provider, provider_id, media_type, manual, updated_at)
-             VALUES (?, 'tmdb', ?, 'movies', 0, unixepoch())",
-        )
-        .bind(&id)
-        .bind(n.to_string())
-        .execute(&mut *tx)
-        .await
-        .unwrap();
+        // No item_match insert: the answers above are the input, and the
+        // assignment derives itself. Seeding it by hand now collides
+        // with what the triggers already wrote.
     }
     tx.commit().await.unwrap();
     eprintln!("  seeded {items} items over {MEDIAHOSTS} collections in {:?}", t0.elapsed());
@@ -216,6 +210,7 @@ impl Bench {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "seeds a quarter-million rows; run by hand"]
 async fn browse_latency_and_scale() {
+    let mut missed = Vec::new();
     for items in [50_000usize, 250_000] {
         // KEEP_BENCH_DB=/path leaves the seeded database behind so a plan
         // can be read against the real thing rather than a smaller stand-in.
@@ -254,6 +249,39 @@ async fn browse_latency_and_scale() {
         eprintln!("  ...search         {:>8.1} ms", search.as_secs_f64() * 1e3);
 
         eprintln!("  GET /items/{{id}}   {:>8.1} ms", detail.as_secs_f64() * 1e3);
+
+        // The write side of the trigger-driven pick. A reorder recomputes
+        // every item of the media type — accepted deliberately, so the
+        // number belongs on the record rather than in an argument.
+        let t = Instant::now();
+        kahawai_hub::providers::set_chain(&b.db, "movies", &["tvdb".into(), "tmdb".into()])
+            .await
+            .unwrap();
+        eprintln!("  chain reorder     {:>8.1} ms  (re-picks every item)",
+                  t.elapsed().as_secs_f64() * 1e3);
+
+        // And the hottest write path in the system: a rescan announcing
+        // sources in bulk. The trigger's WHEN guard is what keeps this
+        // from paying for a pick per row.
+        let t = Instant::now();
+        let mut tx = b.db.begin().await.unwrap();
+        for n in 0..1000 {
+            sqlx::query(
+                "INSERT INTO item_sources (item_id, module_id, collection_id, path_rel)
+                 VALUES (?, ?, ?, ?)",
+            )
+            .bind(format!("01BENCHITEM{n:015}"))
+            .bind(format!("01BENCHMODULE{:011}", n % MEDIAHOSTS))
+            .bind(format!("c{}", n % MEDIAHOSTS))
+            .bind(format!("extra {n}.mkv"))
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        }
+        tx.commit().await.unwrap();
+        eprintln!("  1000 item_sources {:>8.1} ms  (scan path)",
+                  t.elapsed().as_secs_f64() * 1e3);
+
         let t = Instant::now();
         let n: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM items i JOIN resolved_metadata m ON m.item_id = i.id",
@@ -264,19 +292,27 @@ async fn browse_latency_and_scale() {
         eprintln!("  view over {n:>6}    {:>8.1} ms  (SQL only, no serialisation)",
                   t.elapsed().as_secs_f64() * 1e3);
 
-        // NFR-1 states the browse target at 50k. Recorded at 250k too,
-        // because NFR-2 asks the shape to hold there, and a number that
-        // is merely printed is a number nobody notices moving.
-        // NFR-1 states the target at 50k; asserted at BOTH sizes, since
+        // NFR-1 states the target at 50k; recorded at BOTH sizes, since
         // NFR-2 asks the shape to hold at 250k and a page should not care
         // how much is behind it.
-        for (what, took) in [("first page", scoped), ("last page", deep), ("search", search)] {
-            assert!(
-                took.as_millis() <= 200,
-                "NFR-1: {what} at {items} items took {:.1} ms, target 200 ms",
-                took.as_secs_f64() * 1e3
-            );
+        //
+        // Collected, not asserted here. Failing inside the loop meant one
+        // miss at 50k stopped the 250k run from happening at all — so a
+        // benchmark whose whole job is producing numbers produced none
+        // for the size that was hardest to reach.
+        for (what, took) in [
+            ("first page", scoped),
+            ("last page", deep),
+            ("search", search),
+            ("item detail", detail),
+        ] {
+            if took.as_millis() > 200 {
+                missed.push(format!(
+                    "NFR-1: {what} at {items} items took {:.1} ms, target 200 ms",
+                    took.as_secs_f64() * 1e3
+                ));
+            }
         }
-        assert!(detail.as_millis() <= 200, "item detail should not scale with catalogue size");
     }
+    assert!(missed.is_empty(), "{}", missed.join("\n"));
 }

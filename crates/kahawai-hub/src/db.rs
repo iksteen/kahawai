@@ -37,7 +37,7 @@ pub async fn open(data_dir: &Path) -> Result<SqlitePool> {
         .run(&pool)
         .await
         .context("running migrations")?;
-    install_views(&pool).await?;
+    install_derived(&pool).await?;
     Ok(pool)
 }
 
@@ -48,19 +48,60 @@ pub async fn open_in_memory() -> Result<SqlitePool> {
         .connect("sqlite::memory:")
         .await?;
     sqlx::migrate!("./migrations").run(&pool).await?;
-    install_views(&pool).await?;
+    install_derived(&pool).await?;
     Ok(pool)
 }
 
-/// Views are installed on open, not by a migration: they derive rather
-/// than store, so their definition is free to change, and a migration is
-/// an immutable log of changes to what IS stored.
-async fn install_views(pool: &SqlitePool) -> Result<()> {
+/// Derivations are installed on open, not by a migration: they derive
+/// rather than store, so their definition is free to change, and a
+/// migration is an immutable log of changes to what IS stored.
+///
+/// Triggers that MAINTAIN a stored table are the same category with one
+/// extra hazard. A stale view fails loudly — a column it names is gone.
+/// A stale trigger keeps working and quietly maintains the wrong answer.
+/// So a definition that differs from what this binary wants is not just
+/// replaced: everything it was maintaining is rebuilt from scratch, which
+/// makes a downgrade-then-upgrade self-healing rather than silently
+/// wrong.
+async fn install_derived(pool: &SqlitePool) -> Result<()> {
     // Safe by construction: the statement is generated from a fixed field
     // table in providers.rs, with no caller input anywhere in it.
     sqlx::raw_sql(sqlx::AssertSqlSafe(crate::providers::resolved_metadata_sql()))
         .execute(pool)
         .await
         .context("installing resolved_metadata")?;
+
+    let want = crate::providers::repick_triggers();
+    let have: Vec<(String, String)> = sqlx::query_as(
+        "SELECT name, sql FROM sqlite_schema
+          WHERE type = 'trigger' AND name LIKE 'repick\\_%' ESCAPE '\\'
+          ORDER BY name",
+    )
+    .fetch_all(pool)
+    .await
+    .context("reading installed triggers")?;
+    let mut sorted = want.clone();
+    sorted.sort();
+    if sorted == have {
+        return Ok(());
+    }
+
+    let mut tx = pool.begin().await?;
+    for (name, _) in have.iter().chain(want.iter()) {
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!("DROP TRIGGER IF EXISTS {name}")))
+            .execute(&mut *tx)
+            .await
+            .with_context(|| format!("dropping trigger {name}"))?;
+    }
+    for (name, sql) in &want {
+        sqlx::raw_sql(sqlx::AssertSqlSafe(sql.clone()))
+            .execute(&mut *tx)
+            .await
+            .with_context(|| format!("installing trigger {name}"))?;
+    }
+    // What the old definitions maintained is now of unknown provenance.
+    crate::providers::reassign(&mut tx, None, None).await.context("rebuilding item_match")?;
+    tx.commit().await?;
+    tracing::info!(triggers = want.len(), "assignment triggers installed; item_match rebuilt");
     Ok(())
 }

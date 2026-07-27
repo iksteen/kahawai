@@ -9,37 +9,62 @@
 //! Local metadata (embedded tags) acts earlier, at resolution time —
 //! it decides identity before enrichment ever runs (HUB-9, partial).
 //!
-//! # Derived state is maintained by the DATABASE, not by callers
+//! # Inputs and derivations
 //!
-//! `items.sort_title` (0035) and `item_libraries` (0036) are denormalised
-//! — browse cannot sort or filter on a value resolved per read and still
-//! answer in 200 ms. Storing what a read can derive is what `merged_
-//! metadata` did, and it was wrong for one reason: it went stale.
+//! Every table here is one of two things, and which one it is decides who
+//! writes it.
 //!
-//! So these are maintained by TRIGGERS on the tables they derive from,
-//! and the contract is about TABLES, not functions:
+//! **Inputs** are facts nothing can recompute: what a provider answered,
+//! the order the owner wants providers tried in, which records they
+//! refused, which record they pinned, where an item's files live. Code
+//! writes these.
 //!
-//! > Write `item_match`, `provider_metadata`, `items`, `item_sources` or
+//! **Derivations** are functions of the inputs, stored only because a
+//! read cannot afford to compute them — browse cannot sort or filter on a
+//! value resolved per read and still answer in 200 ms. `item_match`
+//! (which record an item IS), `items.sort_title` (0035) and
+//! `item_libraries` (0036) are all of this kind. **Nothing in this crate
+//! writes them.** Triggers do, on every write to the inputs they depend
+//! on:
+//!
+//! > Write `provider_metadata`, `provider_ranks`, `rejected_matches`,
+//! > `manual_match`, `item_sources`, `collections`, `items` or
 //! > `library_collections`, and everything derived from them is already
 //! > correct. There is nothing to remember and nothing to call.
 //!
-//! That is why reordering providers keeps sorting right without
-//! `set_chain` knowing that sort keys exist: it writes `item_match`, and
-//! that is the whole of its obligation. Do NOT add call-site updates for
-//! derived state — a second mechanism is how the two disagree.
+//! Storing what a read can derive is what `merged_metadata` did, and it
+//! was wrong for exactly one reason: it went stale, because staying
+//! correct depended on someone remembering to call something. Triggers
+//! remove the someone. That is why `set_chain` is one INSERT and
+//! `store_answer` is one upsert — reordering the chain re-decides
+//! ownership of a whole media type, and neither function knows it.
 //!
-//! Two things would break it, so avoid both:
+//! It also means a derivation must not carry an input as a column. The
+//! human pin used to be `item_match.manual`, which forced the pick to
+//! recompute *around* rows it must not touch — three separate
+//! `manual = 0` predicates, each a chance to get it wrong. It lives in
+//! `manual_match` now, and the pick recomputes every row from scratch
+//! with the pin as its first sort key.
 //!
-//! * `INSERT OR REPLACE` into a triggered table. SQLite does not fire
-//!   DELETE triggers for REPLACE unless `recursive_triggers` is on, and
-//!   it is off. Use `ON CONFLICT ... DO UPDATE`, as `store_answer` and
-//!   the assignment pick do.
-//! * Bulk-loading a table with triggers disabled or via a path that
+//! Three things would break this, so avoid all three:
+//!
+//! * `INSERT OR REPLACE` into an input table. SQLite does not fire DELETE
+//!   triggers for REPLACE unless `recursive_triggers` is on, and it is
+//!   off. Use `ON CONFLICT ... DO UPDATE`, as `store_answer` does.
+//! * Bulk-loading an input with triggers disabled or via a path that
 //!   bypasses them, then assuming a later pass will fix it up.
+//! * Writing a derivation directly, "just this once", to correct
+//!   something. The next input write recomputes it and your correction is
+//!   gone — if it disagreed with the pick, fix the pick.
 //!
-//! `tests/sort_title.rs` is the guard: it re-derives the truth from
-//! scratch after every kind of write, including raw SQL, and fails if the
-//! stored answer disagrees.
+//! Within one transaction the last input write must cover every item
+//! whose inputs changed; intermediate states are invisible (WAL readers
+//! see the pre-transaction snapshot) and each recompute is total, so the
+//! last one wins.
+//!
+//! `tests/item_match_derived.rs` and `tests/sort_title.rs` are the
+//! guards: each re-derives the truth from scratch after every kind of
+//! write, including raw SQL, and fails if the stored answer disagrees.
 //!
 //! # The tables, and what they mean
 //!
@@ -47,27 +72,38 @@
 //! changes, this describes what the tables mean, next to the code that
 //! enforces it.
 //!
+//! Inputs:
+//!
 //! * `provider_metadata` — one row per (item, provider): what that
 //!   provider said. `provider_id` is that provider's own record id,
 //!   recorded whether it identified the item or merely described it. An
 //!   EMPTY `provider_id` means one thing only: it looked and found
 //!   nothing, always paired with `confidence = "miss"` — and that pair
 //!   is how never-ask-twice is remembered.
-//! * `item_match` — what a TOP-LEVEL item IS: one provider's record, and
-//!   whether a human chose it. Episodes and tracks never carry one; they
-//!   render through their parent's. Nothing is stored here that a read
-//!   could derive, which is the point — see `resolved_metadata_sql`.
+//! * `provider_ranks` — precedence, one row per chain position, per
+//!   media type. Editable at runtime; changing it re-picks.
 //! * `rejected_matches` — records a human refused. An item where every
 //!   candidate is refused stays unassigned; a record that is NOT here may
 //!   be assigned automatically, so the item recovers by itself when a
 //!   provider offers something new.
+//! * `manual_match` — the record a human pinned, at most one per item.
+//!   Stateless intent: it names a record, and every pick re-applies it.
+//!   A pin whose record no longer exists simply does not win, and starts
+//!   winning again if the record comes back.
 //! * `anime_ids` — bridge identity (AniDB/AniList ids and the TVDB/TMDB
 //!   mapping). Never side-filled: these say what the work IS, not what it
 //!   looks like.
-//! * `provider_ranks` — precedence, one row per chain position, per
-//!   media type. Editable at runtime; changing it re-merges.
 //! * `enrichment_queue` — work owed: a provider that refused (ban, rate
 //!   limit, transport) with `due_at` and a growing backoff.
+//!
+//! Derived — read these, never write them:
+//!
+//! * `item_match` — what a TOP-LEVEL item IS: one provider's record, plus
+//!   `manual`, which reads 1 when the winner is the pin. Episodes and
+//!   tracks never carry one; they render through their parent's. Absence
+//!   is meaningful and is the only representation of "unmatched": "never
+//!   asked", "only misses" and "everything refused" are all no row.
+//!   Maintained by [`repick_triggers`].
 
 use anyhow::Result;
 use sqlx::SqlitePool;
@@ -189,38 +225,42 @@ pub async fn set_chain(db: &SqlitePool, media_type: &str, order: &[String]) -> R
         order.len() == known.len() && known.iter().all(|k| order.iter().any(|s| s == k)),
         "provider order must be a permutation of {known:?}"
     );
-    let mut tx = db.begin().await?;
-    sqlx::query("DELETE FROM provider_ranks WHERE media_type = ?")
-        .bind(media_type)
-        .execute(&mut *tx)
-        .await?;
-    for (rank, provider) in order.iter().enumerate() {
-        sqlx::query(
-            "INSERT INTO provider_ranks (media_type, provider, rank) VALUES (?, ?, ?)",
-        )
-        .bind(media_type)
-        .bind(provider)
-        .bind(rank as i64)
-        .execute(&mut *tx)
-        .await?;
-    }
-    tx.commit().await?;
-    // Reordering re-decides ownership from answers already on disk: no
-    // provider is contacted, which is what makes the knob affordable.
-    //
-    // Writing item_match is the whole obligation — sort keys and library
-    // membership follow from the triggers on that table, and this
-    // function neither knows nor needs to know they exist. See the module
-    // doc, "Derived state is maintained by the DATABASE".
-    assign_all_in(db, media_type).await
+    // ONE statement, and only for the positions that actually moved.
+    // Delete-then-reinsert would have written every row twice and left a
+    // window in between where the media type had no ranks at all — and
+    // once the pick is trigger-driven, each of those writes is a
+    // catalogue-wide recompute against ranks that were never real.
+    sqlx::query(
+        "INSERT INTO provider_ranks (media_type, provider, rank)
+         -- `WHERE true` is not decoration: after a SELECT with a FROM,
+         -- SQLite cannot tell ON CONFLICT from a join's ON without it.
+         SELECT ?1, j.value, j.key FROM json_each(?2) j WHERE true
+         ON CONFLICT (media_type, provider) DO UPDATE SET rank = excluded.rank
+          WHERE provider_ranks.rank IS NOT excluded.rank",
+    )
+    .bind(media_type)
+    .bind(serde_json::to_string(order)?)
+    .execute(db)
+    .await?;
+    // And that is the whole function. Reordering re-decides ownership of
+    // every item of this media type from answers already on disk — no
+    // provider is contacted, which is what makes the knob affordable —
+    // but re-deciding it is the database's job, not this one's. See the
+    // module doc, "Derived state is maintained by the DATABASE".
+    Ok(())
 }
 
-/// Drop an automatic assignment whose backing answer no longer qualifies
-/// — downgraded to a miss, or since refused. Manual pins are left alone.
+/// Drop an assignment whose backing answer no longer qualifies —
+/// downgraded to a miss, or since refused.
+///
+/// This applies to pinned assignments too. A pin lives in `manual_match`
+/// and says which RECORD the owner chose; it cannot keep an `item_match`
+/// row alive after the answer behind it is gone, or the table would hold
+/// a match no provider still offers. If the answer comes back, so does
+/// the pin — it is stateless intent, re-applied by every pick.
 const DROP_STALE_ASSIGNMENT: &str = "\
 DELETE FROM item_match
- WHERE manual = 0
-   AND (?1 IS NULL OR item_id = ?1)
+ WHERE (?1 IS NULL OR item_id = ?1)
    AND (?2 IS NULL OR media_type = ?2)
    AND (NOT EXISTS (
           SELECT 1 FROM provider_metadata pm
@@ -240,14 +280,24 @@ DELETE FROM item_match
 /// not candidates, and no candidate means NO ROW — absence is how "never
 /// asked", "only misses" and "everything refused" are all expressed.
 ///
-/// The pick is from scratch every time, which is what makes "a more
-/// preferred provider that gains info replaces the automatic match" free.
-/// Manual pins are declined in the ON CONFLICT, the single guard.
+/// The pick is from scratch every time — EVERY row, pins included — which
+/// is what makes "a more preferred provider that gains info replaces the
+/// automatic match" free.
+///
+/// A human pin is not an exception to the pick, it is its first sort key.
+/// That is the whole reason `manual_match` exists: when the pin was a
+/// column on the result, three separate `manual = 0` predicates had to
+/// remember not to touch it, and each was a chance to get it wrong.
 const PICK_ASSIGNMENT: &str = "\
 INSERT INTO item_match (item_id, provider, provider_id, media_type, manual, updated_at)
-SELECT item_id, provider, provider_id, media_type, 0, unixepoch() FROM (
+SELECT item_id, provider, provider_id, media_type, pinned, unixepoch() FROM (
   SELECT t.item_id, t.media_type, pm.provider, pm.provider_id,
+         mm.item_id IS NOT NULL AS pinned,
          ROW_NUMBER() OVER (PARTITION BY t.item_id ORDER BY
+             -- The owner naming a record outranks everything, local
+             -- included: a .nfo says what the file is, a pin says the
+             -- .nfo is wrong about it.
+             mm.item_id IS NULL,
              CASE pm.confidence WHEN 'auto' THEN 0 WHEN 'weak' THEN 1 ELSE 2 END,
              -- HUB-9: local is unranked and first. A .nfo states what the
              -- owner says this is; nothing a search turned up outbids it.
@@ -271,6 +321,11 @@ SELECT item_id, provider, provider_id, media_type, 0, unixepoch() FROM (
          AND (?1 IS NULL OR i.id = ?1)
     ) t
     JOIN provider_metadata pm ON pm.item_id = t.item_id
+    -- One row per item at most (item_id is its primary key), so this
+    -- cannot multiply candidates.
+    LEFT JOIN manual_match mm ON mm.item_id = pm.item_id
+                             AND mm.provider = pm.provider
+                             AND mm.provider_id = pm.provider_id
     LEFT JOIN provider_ranks r
            ON r.media_type = t.media_type
           AND r.provider = CASE pm.provider WHEN 'anilist' THEN 'anime' ELSE pm.provider END
@@ -285,35 +340,207 @@ ON CONFLICT (item_id) DO UPDATE SET
   provider = excluded.provider,
   provider_id = excluded.provider_id,
   media_type = excluded.media_type,
+  manual = excluded.manual,
   updated_at = unixepoch()
-WHERE item_match.manual = 0";
+-- Only when the answer actually moved. `updated_at` is what the browser
+-- caches artwork against for a day, and an UPDATE fires the sort_title
+-- trigger whether or not it changed a byte — so a pick that re-decides
+-- the same thing must be a no-op, not a write.
+WHERE item_match.provider    IS NOT excluded.provider
+   OR item_match.provider_id IS NOT excluded.provider_id
+   OR item_match.media_type  IS NOT excluded.media_type
+   OR item_match.manual      IS NOT excluded.manual";
 
-/// Re-pick one item's assignment. Local work only; no provider is asked.
-pub async fn assign(db: &SqlitePool, item_id: &str) -> Result<()> {
-    let mut tx = db.begin().await?;
-    reassign(&mut tx, Some(item_id), None).await?;
-    tx.commit().await?;
-    Ok(())
+/// The recompute, as a trigger body: the same two statements
+/// [`reassign`] runs, with each `(?N IS NULL OR col = ?N)` filter
+/// replaced by a plain equality against an expression the trigger has in
+/// scope, or by `1` when this trigger recomputes everything.
+///
+/// The whole clause is replaced, not just the placeholder, and that is
+/// the entire performance story. A bound parameter has no value when the
+/// plan is chosen, so `(?1 IS NULL OR item_id = ?1)` is the only way to
+/// write an optional filter — but SQLite then cannot use an index for
+/// either branch, and measured `SCAN item_match` plus a kind-scan of
+/// `items` per invocation. In a trigger the filter IS known when the
+/// statement is compiled, so it can be an equality, and the same work
+/// becomes two index lookups. At 50k items that is the difference
+/// between a rescan finishing and a rescan being quadratic.
+///
+/// `None` means no filter at all. An expression that could evaluate to
+/// NULL would silently match nothing instead — every caller below passes
+/// a `NOT NULL` column or a `COALESCE` ending in one.
+fn repick_body(item: Option<&str>, media_type: Option<&str>) -> String {
+    let eq = |col: &str, value: Option<&str>| match value {
+        Some(v) => format!("{col} = {v}"),
+        None => "1".to_string(),
+    };
+    let body = format!(
+        "{}; {};",
+        DROP_STALE_ASSIGNMENT
+            .replace("(?1 IS NULL OR item_id = ?1)", &eq("item_id", item))
+            .replace("(?2 IS NULL OR media_type = ?2)", &eq("media_type", media_type)),
+        PICK_ASSIGNMENT
+            .replace("(?1 IS NULL OR i.id = ?1)", &eq("i.id", item))
+            .replace("(?2 IS NULL OR t.media_type = ?2)", &eq("t.media_type", media_type))
+    );
+    // Those replacements match on the filters' exact text. If one is
+    // reworded and a `.replace` silently stops matching, the placeholder
+    // survives — and a placeholder that reaches SQLite as part of a
+    // trigger is a scan that nobody notices until the catalogue is big.
+    assert!(!body.contains('?'), "a repick filter was not substituted:\n{body}");
+    body
 }
 
-/// Re-pick every item of one media type — what a reorder costs. Still no
-/// provider is asked: the answers are already stored.
-pub async fn assign_all_in(db: &SqlitePool, media_type: &str) -> Result<()> {
-    let mut tx = db.begin().await?;
-    reassign(&mut tx, None, Some(media_type_key(media_type))).await?;
-    tx.commit().await?;
-    tracing::info!(media_type, "assignments re-picked");
-    Ok(())
+/// Every write that can change which record an item is, and the trigger
+/// that re-derives `item_match` from it.
+///
+/// Returned rather than written into a migration for the same reason the
+/// views are: these DERIVE, and a derivation's definition is free to
+/// change, where a migration is an immutable log of changes to what is
+/// stored. [`crate::db::install_derived`] handles the one hazard that
+/// creates — a definition left behind by an older binary.
+///
+/// Two rules run through the list. **Column-scoping**: an UPDATE trigger
+/// names only the columns the pick actually reads, because the enrichment
+/// run's own `UPDATE provider_metadata` statements (details backfill,
+/// episode projection) touch none of them and would otherwise cost a
+/// recompute each, thousands per run. **WHEN guards**: the cascade from
+/// `DELETE FROM items` and the bulk `item_sources` insert on every scan
+/// are the two hottest paths in the system, and both can skip the body
+/// entirely.
+pub fn repick_triggers() -> Vec<(String, String)> {
+    // The item an `item_sources` row decides for: episodes and tracks
+    // give their PARENT its media type, never themselves one.
+    let src_item = |side: &str| {
+        format!(
+            "COALESCE((SELECT parent_id FROM items WHERE id = {side}.item_id), {side}.item_id)"
+        )
+    };
+    // A scan inserts item_sources in bulk for items nothing has enriched
+    // yet, where the pick has nothing to find. Skip those outright.
+    let has_answers = |side: &str| {
+        format!(
+            "EXISTS (SELECT 1 FROM provider_metadata pm WHERE pm.item_id = {})",
+            src_item(side)
+        )
+    };
+    // An FK cascade from `DELETE FROM items` fires these with the parent
+    // already gone. The pick would find nothing; don't ask it to look.
+    let survives = "EXISTS (SELECT 1 FROM items WHERE id = OLD.item_id)";
+
+    let mut out = Vec::new();
+    let mut add = |name: &str, event: &str, table: &str, when: Option<String>, body: String| {
+        let when = when.map(|w| format!("\nWHEN {w}")).unwrap_or_default();
+        out.push((
+            name.to_string(),
+            format!("CREATE TRIGGER {name} AFTER {event} ON {table}{when}\nBEGIN\n{body}\nEND"),
+        ));
+    };
+
+    // Answers. `title` is NOT in the update list on purpose: it decides
+    // the sort key (0035's own triggers), never which record an item is.
+    let by_new_item = repick_body(Some("NEW.item_id"), None);
+    let by_old_item = repick_body(Some("OLD.item_id"), None);
+    add("repick_answer_ins", "INSERT", "provider_metadata", None, by_new_item.clone());
+    add(
+        "repick_answer_upd",
+        "UPDATE OF provider_id, confidence",
+        "provider_metadata",
+        None,
+        by_new_item.clone(),
+    );
+    add(
+        "repick_answer_del",
+        "DELETE",
+        "provider_metadata",
+        Some(survives.into()),
+        by_old_item.clone(),
+    );
+
+    // Chain order: one media type's worth of items, all of them.
+    add("repick_rank_ins", "INSERT", "provider_ranks", None, repick_body(None, Some("NEW.media_type")));
+    add(
+        "repick_rank_upd",
+        "UPDATE OF rank",
+        "provider_ranks",
+        None,
+        repick_body(None, Some("NEW.media_type")),
+    );
+    add("repick_rank_del", "DELETE", "provider_ranks", None, repick_body(None, Some("OLD.media_type")));
+
+    // Refusals.
+    add("repick_reject_ins", "INSERT", "rejected_matches", None, by_new_item.clone());
+    add(
+        "repick_reject_del",
+        "DELETE",
+        "rejected_matches",
+        Some(survives.into()),
+        by_old_item.clone(),
+    );
+
+    // Human pins.
+    add("repick_pin_ins", "INSERT", "manual_match", None, by_new_item.clone());
+    add(
+        "repick_pin_upd",
+        "UPDATE OF provider, provider_id",
+        "manual_match",
+        None,
+        by_new_item,
+    );
+    add("repick_pin_del", "DELETE", "manual_match", Some(survives.into()), by_old_item);
+
+    // Which collection an item's files live in decides its media type,
+    // and the media type decides the chain — so moving a source can move
+    // the answer. Nothing maintained this before; it simply drifted.
+    add(
+        "repick_source_ins",
+        "INSERT",
+        "item_sources",
+        Some(has_answers("NEW")),
+        repick_body(Some(&src_item("NEW")), None),
+    );
+    add(
+        "repick_source_upd",
+        "UPDATE OF module_id, collection_id",
+        "item_sources",
+        Some(has_answers("NEW")),
+        repick_body(Some(&src_item("NEW")), None),
+    );
+    add(
+        "repick_source_del",
+        "DELETE",
+        "item_sources",
+        Some(format!("{survives} AND {}", has_answers("OLD"))),
+        repick_body(Some(&src_item("OLD")), None),
+    );
+
+    // A satellite re-announcing a collection can change its media type.
+    // Rare, and it moves every item in it, so recompute the lot.
+    add(
+        "repick_collection_upd",
+        "UPDATE OF media_type",
+        "collections",
+        None,
+        repick_body(None, None),
+    );
+    out
 }
 
-/// Both statements must run in ONE transaction: between the delete and the
-/// insert an item has no assignment, and a reader in that window would see
-/// it as unmatched.
+/// Recompute assignments from scratch, filtered or not.
+///
+/// The triggers do this on every input write, so nothing in normal
+/// operation calls it. It exists for the one moment there are no triggers
+/// to rely on: [`crate::db::install_derived`] replacing a definition an
+/// older binary left behind, where what that definition maintained is of
+/// unknown provenance and has to be rebuilt.
 pub(crate) async fn reassign(
     tx: &mut sqlx::SqliteConnection,
     item_id: Option<&str>,
     media_type: Option<&str>,
 ) -> Result<()> {
+    // One transaction, always: between the delete and the insert an item
+    // has no assignment, and a reader in that window would see it as
+    // unmatched.
     sqlx::query(DROP_STALE_ASSIGNMENT)
         .bind(item_id)
         .bind(media_type)
@@ -474,13 +701,24 @@ pub async fn store_answer(
     confidence: &str,
     fields: Fields,
 ) -> Result<()> {
-    // Write FIRST, then read: a deferred transaction that reads before it
-    // writes hits SQLITE_BUSY when it tries to upgrade, and up to seven
-    // writers run concurrently here. The upsert taking the write lock is
-    // what makes the re-pick below see every committed answer.
-    let mut tx = db.begin().await?;
-    sqlx::query(
-        "INSERT INTO provider_metadata
+    // One statement, no transaction. The assignment follows from the
+    // trigger on this write, inside the same implicit transaction, so
+    // the window where an item briefly has no assignment cannot be
+    // observed — a guarantee the previous two-statement transaction
+    // provided by convention and this provides by construction. It also
+    // takes one multi-statement transaction off the path seven writers
+    // share.
+    bind_answer(sqlx::query(STORE_ANSWER), item_id, provider, provider_id, confidence, &fields)
+        .execute(db)
+        .await?;
+    Ok(())
+}
+
+/// One provider's answer, upserted. Standalone so a caller that already
+/// holds a transaction (`assign_manual`) can run it there rather than
+/// opening a second one.
+const STORE_ANSWER: &str = "\
+INSERT INTO provider_metadata
            (item_id, provider, provider_id, title, overview, poster_path, rating,
             premiered, original_language, genres, cast_json, confidence, updated_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch())
@@ -503,34 +741,37 @@ pub async fn store_answer(
                ELSE COALESCE(excluded.cast_json, provider_metadata.cast_json)
            END,
            confidence = excluded.confidence,
-           updated_at = excluded.updated_at",
-    )
-    .bind(item_id)
-    .bind(provider)
-    .bind(provider_id)
-    .bind(&fields.title)
-    .bind(&fields.overview)
-    .bind(&fields.poster_path)
-    .bind(fields.rating)
-    .bind(&fields.premiered)
-    .bind(&fields.original_language)
-    .bind(&fields.genres)
-    .bind(&fields.cast_json)
-    .bind(confidence)
-    .execute(&mut *tx)
-    .await?;
-    // Re-pick in the SAME transaction: between dropping a stale assignment
-    // and inserting the new one the item has none, and a reader in that
-    // window would see it unmatched.
-    reassign(&mut tx, Some(item_id), None).await?;
-    tx.commit().await?;
-    Ok(())
+           updated_at = excluded.updated_at";
+
+/// The twelve binds [`STORE_ANSWER`] wants, in its order.
+fn bind_answer<'a>(
+    q: sqlx::query::Query<'a, sqlx::Sqlite, sqlx::sqlite::SqliteArguments>,
+    item_id: &'a str,
+    provider: &'a str,
+    provider_id: &'a str,
+    confidence: &'a str,
+    fields: &'a Fields,
+) -> sqlx::query::Query<'a, sqlx::Sqlite, sqlx::sqlite::SqliteArguments> {
+    q.bind(item_id)
+        .bind(provider)
+        .bind(provider_id)
+        .bind(&fields.title)
+        .bind(&fields.overview)
+        .bind(&fields.poster_path)
+        .bind(fields.rating)
+        .bind(&fields.premiered)
+        .bind(&fields.original_language)
+        .bind(&fields.genres)
+        .bind(&fields.cast_json)
+        .bind(confidence)
 }
 
-/// The user's choice: THIS provider's record is what the item is. Stored
-/// as that provider's answer — a human match is strong by definition —
-/// plus a pinned assignment automatic picking never touches, and the
-/// record stops being refused if it had been.
+/// The user's choice: THIS provider's record is what the item is.
+///
+/// Three inputs, one transaction: the answer itself (a human match is
+/// strong by definition), the record stops being refused if it had been,
+/// and the pin. The assignment is not written here — it is derived from
+/// those three, and the pick is what derives it.
 pub async fn assign_manual(
     db: &SqlitePool,
     item_id: &str,
@@ -538,8 +779,14 @@ pub async fn assign_manual(
     provider_id: &str,
     fields: Fields,
 ) -> Result<()> {
-    store_answer(db, item_id, provider, provider_id, "auto", fields).await?;
     let mut tx = db.begin().await?;
+    bind_answer(sqlx::query(STORE_ANSWER), item_id, provider, provider_id, "auto", &fields)
+        .execute(&mut *tx)
+        .await?;
+    // A pin and a refusal of the same record contradict each other. The
+    // pin is the newer statement, so it is the one that stands — and it
+    // has to land BEFORE the pick, which treats a refused record as no
+    // candidate at all.
     sqlx::query(
         "DELETE FROM rejected_matches
           WHERE item_id = ? AND provider = ? AND provider_id = ?",
@@ -549,31 +796,39 @@ pub async fn assign_manual(
     .bind(provider_id)
     .execute(&mut *tx)
     .await?;
-    sqlx::query(
-        "INSERT INTO item_match (item_id, provider, provider_id, media_type, manual, updated_at)
-         VALUES (?, ?, ?, ?, 1, unixepoch())
-         ON CONFLICT (item_id) DO UPDATE SET
-           provider = excluded.provider,
-           provider_id = excluded.provider_id,
-           manual = 1,
-           updated_at = unixepoch()",
-    )
-    .bind(item_id)
-    .bind(provider)
-    .bind(provider_id)
-    .bind(media_type_of_item(db, item_id).await)
-    .execute(&mut *tx)
-    .await?;
+    sqlx::query(PIN_MATCH)
+        .bind(item_id)
+        .bind(provider)
+        .bind(provider_id)
+        .execute(&mut *tx)
+        .await?;
     tx.commit().await?;
     Ok(())
 }
 
+/// The human pin itself: one record per item, replaced rather than added
+/// to, because an item is one thing.
+const PIN_MATCH: &str = "\
+INSERT INTO manual_match (item_id, provider, provider_id, pinned_at)
+VALUES (?1, ?2, ?3, unixepoch())
+ON CONFLICT (item_id) DO UPDATE SET
+  provider = excluded.provider,
+  provider_id = excluded.provider_id,
+  pinned_at = excluded.pinned_at";
+
 /// Promote the current automatic assignment to a human decision. Touches
-/// nothing else — the answer it points at is already on file.
+/// no answer — the record it points at is already on file. The only
+/// difference from [`assign_manual`] is where the record comes from: what
+/// is already assigned, rather than a click on a search result.
 pub async fn confirm_assignment(db: &SqlitePool, item_id: &str) -> Result<()> {
     sqlx::query(
-        "UPDATE item_match SET manual = 1, updated_at = unixepoch()
-          WHERE item_id = ? AND provider_id <> ''",
+        "INSERT INTO manual_match (item_id, provider, provider_id, pinned_at)
+         SELECT item_id, provider, provider_id, unixepoch() FROM item_match
+          WHERE item_id = ?1 AND provider_id <> ''
+         ON CONFLICT (item_id) DO UPDATE SET
+           provider = excluded.provider,
+           provider_id = excluded.provider_id,
+           pinned_at = excluded.pinned_at",
     )
     .bind(item_id)
     .execute(db)
@@ -598,7 +853,13 @@ pub async fn reject_matches(db: &SqlitePool, item_id: &str) -> Result<()> {
     .bind(item_id)
     .execute(&mut *tx)
     .await?;
-    sqlx::query("DELETE FROM item_match WHERE item_id = ?")
+    // The pin goes too, or it would reassert the very record just
+    // refused. "No correct record" outranks an earlier "this one".
+    //
+    // Between them these two are the whole of it: every candidate is now
+    // refused and nothing is pinned, so the pick has no winner to find
+    // and the assignment goes on its own.
+    sqlx::query("DELETE FROM manual_match WHERE item_id = ?")
         .bind(item_id)
         .execute(&mut *tx)
         .await?;

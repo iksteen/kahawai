@@ -2634,8 +2634,9 @@ impl crate::providers::Provider for LocalProvider {
             // Nothing beside the media any more. If local previously
             // answered, that answer describes a file that has been
             // deleted — retract it rather than leave the item claiming an
-            // identity from a .nfo nobody can read. Re-picking then hands
-            // the item back to whichever provider actually has it.
+            // identity from a .nfo nobody can read. Deleting the answer is
+            // the whole obligation: the item is handed back to whichever
+            // provider actually has it by the trigger on this statement.
             let stale = sqlx::query("DELETE FROM provider_metadata WHERE item_id = ? AND provider = 'local'")
                 .bind(&item.id)
                 .execute(db)
@@ -2643,7 +2644,6 @@ impl crate::providers::Provider for LocalProvider {
                 .rows_affected();
             if stale > 0 {
                 tracing::info!(item = %item.id, "local metadata withdrawn; its sidecars are gone");
-                crate::providers::assign(db, &item.id).await?;
             }
             return Ok(crate::providers::Outcome::NotApplicable);
         }

@@ -77,9 +77,12 @@ the live deployment. Unchecked items carry a note when partially done.
       and nothing is stored that a read can derive. Episodes and tracks
       carry no assignment: they render through their parent's.
       Assignment is strongest-match-first, then order — a strong match
-      beats a weak one whatever the ranking says — and re-picked whenever
-      an answer lands, so a more preferred provider that gains info
-      replaces an automatic match by itself. Order is per media type
+      beats a weak one whatever the ranking says — and it is DERIVED, not
+      maintained: `item_match` is recomputed from scratch by triggers on
+      every write to an input (answers, chain order, refusals, pins,
+      which collection an item's files sit in), so a more preferred
+      provider that gains info replaces an automatic match by itself and
+      no code path can forget to re-pick. Order is per media type
       (requirement amended 2026-07-26 from "per library"), editable at
       runtime via `POST /admin/v1/providers/chains/{media_type}`, and a
       reorder re-decides from stored answers and contacts nobody.
@@ -87,9 +90,13 @@ the live deployment. Unchecked items carry a note when partially done.
       and keeps every answer, so the item stays unmatched until a provider
       offers something that was not refused. A provider that can't be
       reached (ban, 429) is rescheduled with backoff in
-      `enrichment_queue`, never dropped. Manual assignments are never
-      recomputed (HUB-8/30a). Anime stays bridged through mapped IDs —
-      described by the tail, never re-identified by it.
+      `enrichment_queue`, never dropped. A human pin (`manual_match`,
+      HUB-8/30a) is an input like any other and wins as the pick's first
+      sort key rather than by being exempt from it — so it outranks even
+      local metadata, and a pin whose record is withdrawn stops winning
+      instead of stranding an assignment nothing backs. Anime stays
+      bridged through mapped IDs — described by the tail, never
+      re-identified by it.
 - [x] HUB-6 Descriptive metadata: titles, plots, dates, ratings, posters,
       episode stills, season/episode and album/release structure, plus
       genres and cast. Genres and cast ride the SAME TMDB details request
@@ -306,20 +313,25 @@ the live deployment. Unchecked items carry a note when partially done.
 ## Non-functional (NFR)
 
 - [ ] NFR-1 Performance. Measured (`tests/scale_bench.rs`, release, real
-      router): item detail 0.2 ms and flat at any catalogue size; the
-      resolved-metadata view costs 12.4 ms over 50k items and 55.7 ms over
-      250k, so the read model scales. **Browse fails the 200 ms target**:
-      2.6 s at 50k and 13.0 s at 250k — because `GET /items` returns the
-      whole catalogue, 20 MB and 100 MB respectively. The SQL is 0.5% of
-      that; the rest is serialising and shipping it. No query tuning
-      closes a 20 MB response, so this needs pagination, which changes the
-      client API. Start-latency (direct ≤ 2 s, transcode ≤ 6 s) and 100
-      concurrent sessions are still unmeasured.
+      router, 50k / 250k items): first page 33 / 148 ms, search 21 / 104
+      ms, unscoped `GET /items` 11 / 31 ms, item detail 0.3 ms and flat at
+      any catalogue size, resolved-metadata view 11 / 53 ms. Browse used
+      to return the whole catalogue — 2.6 s and 20 MB at 50k — and now
+      pages server-side (HUB-12) against an indexed sort key and a stored
+      library membership, which is what took it under the target.
+      **One case still misses**: the LAST page costs 267 / 1479 ms,
+      because an OFFSET walks the rows it skips. Keyset pagination fixes
+      it and changes the client API, so it is deliberately deferred.
+      Write side, same benchmark: a chain reorder re-picks every item of
+      a media type in 1.3 s at 50k and 6.8 s at 250k (admin action,
+      no provider contacted), and the scan path costs 0.06 ms per
+      `item_sources` row at both sizes. Start-latency (direct ≤ 2 s,
+      transcode ≤ 6 s) and 100 concurrent sessions are still unmeasured.
 - [ ] NFR-2 Scale targets. The storage and read model hold at the stated
-      size: 250k files across 10 collections seed in 16.7 s, the view over
-      them costs 55.7 ms, item detail stays 0.2 ms. What does not hold is
-      browse at that size (see NFR-1) — so 250k files are *stored* fine
-      and not yet *browsable* fine. 5 transcoders untested; 3 live.
+      size: 250k files across 10 collections seed in 48 s, the view over
+      them costs 53 ms, item detail stays 0.3 ms and a first page 148 ms.
+      Browse now holds at that size too, with the last-page exception
+      under NFR-1. 5 transcoders untested; 3 live.
 - [x] NFR-3 No user-state loss on crash; media never written
 - [x] NFR-4 mTLS everywhere inter-module; token auth on client API
 - [x] NFR-5 Portability: Linux x86_64, macOS (transcoder), and Linux

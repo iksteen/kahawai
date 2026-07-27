@@ -268,7 +268,6 @@ async fn review_queue_flow() {
         .execute(&db)
         .await
         .unwrap();
-        kahawai_hub::providers::assign(&db, id).await.unwrap();
     }
 
     let authed = |method: &str, uri: String, body: Option<serde_json::Value>| {

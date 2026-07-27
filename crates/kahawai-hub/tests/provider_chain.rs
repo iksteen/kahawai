@@ -573,15 +573,12 @@ async fn strong_beats_weak_across_the_preference_order() {
     item(&db, "i1").await;
     answer_row(&db, "i1", "tmdb", "111", "weak").await; // ranks FIRST for movies
     answer_row(&db, "i1", "tvdb", "222", "auto").await;
-    kahawai_hub::providers::assign(&db, "i1").await.unwrap();
     assert_eq!(assigned(&db, "i1").await, Some(("tvdb".into(), "222".into(), false)));
 
     // Equal strength: now the order decides, and a reorder moves it.
     answer_row(&db, "i1", "tmdb", "111", "auto").await;
-    kahawai_hub::providers::assign(&db, "i1").await.unwrap();
     assert_eq!(assigned(&db, "i1").await.unwrap().0, "tmdb");
     set_chain(&db, "movies", &["tvdb".into(), "tmdb".into()]).await.unwrap();
-    kahawai_hub::providers::assign_all_in(&db, "movies").await.unwrap();
     assert_eq!(assigned(&db, "i1").await.unwrap().0, "tvdb");
 }
 
@@ -593,11 +590,9 @@ async fn a_later_preferred_answer_replaces_an_automatic_match() {
     let db = kahawai_hub::db::open(dir.path()).await.unwrap();
     item(&db, "i1").await;
     answer_row(&db, "i1", "tvdb", "222", "auto").await;
-    kahawai_hub::providers::assign(&db, "i1").await.unwrap();
     assert_eq!(assigned(&db, "i1").await.unwrap().0, "tvdb");
 
     answer_row(&db, "i1", "tmdb", "111", "auto").await;
-    kahawai_hub::providers::assign(&db, "i1").await.unwrap();
     assert_eq!(assigned(&db, "i1").await.unwrap().0, "tmdb", "the preferred provider takes over");
 }
 
@@ -608,12 +603,10 @@ async fn misses_leave_the_item_unassigned() {
     let dir = tempfile::tempdir().unwrap();
     let db = kahawai_hub::db::open(dir.path()).await.unwrap();
     item(&db, "i1").await;
-    kahawai_hub::providers::assign(&db, "i1").await.unwrap();
     assert_eq!(assigned(&db, "i1").await, None, "never asked");
 
     answer_row(&db, "i1", "tmdb", "", "miss").await;
     answer_row(&db, "i1", "tvdb", "", "miss").await;
-    kahawai_hub::providers::assign(&db, "i1").await.unwrap();
     assert_eq!(assigned(&db, "i1").await, None, "asked, nothing found");
 }
 
@@ -630,13 +623,11 @@ async fn a_bridged_answer_never_owns_the_item() {
     answer_row(&db, "i1", "tmdb", "42509", "bridged").await;
     // Rank TMDB above the anime composite; the bridge still cannot win.
     set_chain(&db, "anime", &["tmdb".into(), "anime".into(), "tvdb".into()]).await.unwrap();
-    kahawai_hub::providers::assign(&db, "i1").await.unwrap();
     assert_eq!(assigned(&db, "i1").await.unwrap().0, "anilist");
 
     // And a bridged answer alone leaves the item unassigned.
     item(&db, "i2").await;
     answer_row(&db, "i2", "tmdb", "42509", "bridged").await;
-    kahawai_hub::providers::assign(&db, "i2").await.unwrap();
     assert_eq!(assigned(&db, "i2").await, None);
 }
 
@@ -649,7 +640,6 @@ async fn refused_records_are_skipped_until_something_new_appears() {
     let db = kahawai_hub::db::open(dir.path()).await.unwrap();
     item(&db, "i1").await;
     answer_row(&db, "i1", "tmdb", "19069", "auto").await;
-    kahawai_hub::providers::assign(&db, "i1").await.unwrap();
     assert_eq!(assigned(&db, "i1").await.unwrap().1, "19069");
 
     sqlx::query(
@@ -659,7 +649,6 @@ async fn refused_records_are_skipped_until_something_new_appears() {
     .execute(&db)
     .await
     .unwrap();
-    kahawai_hub::providers::assign(&db, "i1").await.unwrap();
     assert_eq!(assigned(&db, "i1").await, None, "the refused record is dropped");
     // The answers themselves survive a rejection.
     let kept: i64 = sqlx::query_scalar("SELECT count(*) FROM provider_metadata WHERE item_id='i1'")
@@ -670,7 +659,6 @@ async fn refused_records_are_skipped_until_something_new_appears() {
 
     // A different record from the same provider is fair game.
     answer_row(&db, "i1", "tmdb", "72710", "auto").await;
-    kahawai_hub::providers::assign(&db, "i1").await.unwrap();
     assert_eq!(assigned(&db, "i1").await.unwrap().1, "72710");
 }
 
@@ -684,7 +672,6 @@ async fn episodes_are_never_assigned() {
         .await
         .unwrap();
     answer_row(&db, "ep", "tvdb", "999", "auto").await;
-    kahawai_hub::providers::assign(&db, "ep").await.unwrap();
     assert_eq!(assigned(&db, "ep").await, None);
 }
 
@@ -696,11 +683,9 @@ async fn an_assignment_whose_answer_decays_is_dropped() {
     let db = kahawai_hub::db::open(dir.path()).await.unwrap();
     item(&db, "i1").await;
     answer_row(&db, "i1", "tmdb", "111", "auto").await;
-    kahawai_hub::providers::assign(&db, "i1").await.unwrap();
     assert!(assigned(&db, "i1").await.is_some());
 
     answer_row(&db, "i1", "tmdb", "", "miss").await;
-    kahawai_hub::providers::assign(&db, "i1").await.unwrap();
     assert_eq!(assigned(&db, "i1").await, None);
 }
 
@@ -721,9 +706,45 @@ async fn a_manual_assignment_is_never_recomputed() {
 
     // TMDB ranks first and answers strongly: the pin still holds.
     answer_row(&db, "i1", "tmdb", "111", "auto").await;
-    kahawai_hub::providers::assign(&db, "i1").await.unwrap();
     set_chain(&db, "movies", &["tmdb".into(), "tvdb".into()]).await.unwrap();
     assert_eq!(assigned(&db, "i1").await, Some(("tvdb".into(), "414734".into(), true)));
+}
+
+/// "Yes, that one" on an automatic match. It must survive exactly what a
+/// pin survives — the point of confirming is that the guessing stops —
+/// and it had no test at all, which is how the promotion could have been
+/// left half-applied without anything noticing.
+#[tokio::test]
+async fn confirming_an_automatic_match_makes_it_as_durable_as_a_pin() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    item(&db, "i1").await;
+    answer_row(&db, "i1", "tvdb", "414734", "auto").await;
+    assert_eq!(assigned(&db, "i1").await, Some(("tvdb".into(), "414734".into(), false)));
+
+    kahawai_hub::providers::confirm_assignment(&db, "i1").await.unwrap();
+    assert_eq!(assigned(&db, "i1").await, Some(("tvdb".into(), "414734".into(), true)));
+    // Confirming records the same pin a hand-picked match does — it is
+    // the input the assignment is then derived from.
+    assert_eq!(
+        sqlx::query_as::<_, (String, String)>(
+            "SELECT provider, provider_id FROM manual_match WHERE item_id = 'i1'"
+        )
+        .fetch_optional(&db)
+        .await
+        .unwrap(),
+        Some(("tvdb".into(), "414734".into()))
+    );
+
+    // A better-ranked strong answer arrives afterwards. Before confirming
+    // it would have taken the item; now it may only describe it.
+    answer_row(&db, "i1", "tmdb", "111", "auto").await;
+    set_chain(&db, "movies", &["tmdb".into(), "tvdb".into()]).await.unwrap();
+    assert_eq!(
+        assigned(&db, "i1").await,
+        Some(("tvdb".into(), "414734".into(), true)),
+        "a confirmed match is a human decision, not a strong guess"
+    );
 }
 
 /// Rejecting keeps every answer on file — deleting them would make the
@@ -736,7 +757,6 @@ async fn rejecting_keeps_the_answers_and_schedules_another_look() {
     item(&db, "i1").await;
     answer_row(&db, "i1", "tmdb", "19069", "auto").await;
     answer_row(&db, "i1", "tvdb", "", "miss").await;
-    kahawai_hub::providers::assign(&db, "i1").await.unwrap();
     assert!(assigned(&db, "i1").await.is_some());
 
     kahawai_hub::providers::reject_matches(&db, "i1").await.unwrap();
@@ -762,7 +782,6 @@ async fn rejecting_keeps_the_answers_and_schedules_another_look() {
     assert_eq!(queued, 1, "the refused provider gets another look after a cooldown");
 
     // Re-running the pick does not resurrect the refused record.
-    kahawai_hub::providers::assign(&db, "i1").await.unwrap();
     assert_eq!(assigned(&db, "i1").await, None);
 }
 
