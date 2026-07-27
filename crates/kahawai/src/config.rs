@@ -91,6 +91,13 @@ pub struct HubConfig {
     /// OPS-8: CORS allowlist for third-party web clients — exact
     /// origins, or a single "*". Empty = same-origin only.
     pub cors_origins: Vec<String>,
+    /// NFR-6: the bearer token Prometheus scrapes `/metrics` with. Unset
+    /// (the default) means the endpoint is not served at all — access
+    /// tokens live 15 minutes and no scraper refreshes them, so the
+    /// choice is a static credential or nothing, and nothing is the safer
+    /// default for something that reports library scale.
+    #[serde(default)]
+    pub metrics_token: Option<String>,
     #[serde(default)]
     pub subtitles: SubtitlesConfig,
 }
@@ -126,6 +133,8 @@ impl Default for HubConfig {
             enrollment_ttl_minutes: 15,
             trusted_proxies: Vec::new(),
             cors_origins: Vec::new(),
+            // Off by default: scraping is opt-in.
+            metrics_token: None,
             subtitles: SubtitlesConfig::default(),
         }
     }

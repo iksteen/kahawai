@@ -121,3 +121,30 @@ It honours the usual env override
    the reverse proxy; expose it directly or via TCP passthrough.
 4. Login throttling is on by default; watch `login failed` /
    `login throttled` log lines.
+
+
+## Scraping metrics (NFR-6)
+
+`/metrics` is off until `hub.metrics_token` is set, and it takes that
+token — not a login token. Access tokens expire after 15 minutes and
+Prometheus has no refresh flow, so a static credential scoped to this one
+read-only route is the only thing that actually scrapes.
+
+```toml
+[hub]
+metrics_token = "a-long-random-string"
+```
+
+```yaml
+scrape_configs:
+  - job_name: kahawai
+    authorization:
+      credentials_file: /etc/prometheus/kahawai.token
+    static_configs:
+      - targets: ["hub.example:8420"]
+```
+
+Unset means the endpoint 404s for everyone, including admins; a wrong
+token is 401. `/health` needs no credential and is what an uptime check
+should poll — it reports every module, and a satellite being away is
+`degraded` rather than a failure (AR-6).

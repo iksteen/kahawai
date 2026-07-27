@@ -27,6 +27,7 @@ pub struct AppState {
     pub artwork: Arc<crate::artwork::Artwork>,
     pub enricher: Arc<crate::enrich::Enricher>,
     pub proxy_trust: Arc<crate::proxy::ProxyTrust>,
+    pub metrics_token: Arc<Option<String>>,
 }
 
 /// OPS-8 knobs, both defaulting to "off" (same-origin, no proxies).
@@ -38,6 +39,8 @@ pub struct NetOptions {
     /// CORS allowlist: exact origins, or a single "*" for any (no
     /// credentials either way — third-party clients use bearer tokens).
     pub cors_origins: Vec<String>,
+    /// NFR-6 scrape credential. None = `/metrics` is not served.
+    pub metrics_token: Option<String>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -61,6 +64,7 @@ pub fn router(
         artwork,
         enricher,
         proxy_trust: net.proxy_trust,
+        metrics_token: Arc::new(net.metrics_token),
     };
     let protected = Router::new()
         .route("/api/v1/collections", get(list_collections))
@@ -119,9 +123,6 @@ pub fn router(
         .route("/admin/v1/items/{id}/match", post(admin_apply_match))
         .route("/admin/v1/sessions", get(admin_sessions))
         .route("/admin/v1/sessions/{id}", axum::routing::delete(admin_end_session))
-        // NFR-6. Behind admin auth because it reports library scale and
-        // module names; Prometheus scrapes it with a bearer token.
-        .route("/metrics", get(metrics))
         .route_layer(axum::middleware::from_fn(require_admin))
         .route_layer(axum::middleware::from_fn_with_state(state.clone(), require_auth));
     let mut app = Router::new()
@@ -131,6 +132,9 @@ pub fn router(
         // ask without holding a credential, and there is nothing here
         // that a failed login does not already reveal.
         .route("/health", get(health))
+        // NFR-6: its own static credential, not a login token — see
+        // `metrics`. Outside the admin group on purpose.
+        .route("/metrics", get(metrics))
         .route("/api/v1/bootstrap", get(bootstrap))
         .route("/api/v1/setup", post(setup))
         .route("/api/v1/auth/token", post(login))
@@ -210,8 +214,32 @@ fn presented_token(req: &Request) -> Option<String> {
 /// Says nothing a caller could not learn by trying to log in, so it needs
 /// no token: `setup_required` is already printed on the console at
 /// startup, and `authenticated` describes the request's OWN token.
-/// NFR-6: Prometheus text exposition.
-async fn metrics(State(state): State<AppState>) -> Result<Response, ApiError> {
+/// NFR-6: Prometheus text exposition, behind its own static token.
+///
+/// NOT a login token. Access tokens live 15 minutes and no scraper
+/// refreshes them, so an admin-token endpoint would serve one scrape and
+/// then 401 forever. `hub.metrics_token` is a static credential scoped to
+/// this one read-only route — no user, no session, no refresh.
+///
+/// Unset means NOT SERVED: 404, so a hub that was never configured for
+/// scraping does not advertise an endpoint reporting its library size.
+/// A configured-but-wrong token is 401, so an operator can tell "off
+/// here" from "wrong secret".
+async fn metrics(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> Result<Response, ApiError> {
+    let Some(expected) = state.metrics_token.as_deref() else {
+        return Err((StatusCode::NOT_FOUND, "metrics are not enabled".into()));
+    };
+    let presented = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .unwrap_or_default();
+    if !ct_eq(presented.as_bytes(), expected.as_bytes()) {
+        return Err((StatusCode::UNAUTHORIZED, "bad metrics token".into()));
+    }
     let snap = crate::metrics::gather(
         &state.registry,
         &state.sessions,
@@ -267,6 +295,13 @@ async fn require_auth(
         .ok_or((StatusCode::UNAUTHORIZED, "invalid or missing token".to_string()))?;
     req.extensions_mut().insert(claims);
     Ok(next.run(req).await)
+}
+
+/// Layered after require_auth: the Claims extension is already present.
+/// Constant-time compare, so a wrong token cannot be discovered a byte at
+/// a time. Length is not hidden and does not need to be.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 /// Layered after require_auth: the Claims extension is already present.

@@ -12,6 +12,8 @@ use tower::ServiceExt;
 
 use std::sync::Arc;
 
+const SCRAPE_TOKEN: &str = "scrape-me-8f2c";
+
 /// Same shape the other API tests build; kept local rather than shared
 /// so this file has no reason to be edited when they change.
 async fn harness() -> (axum::Router, String) {
@@ -43,7 +45,10 @@ async fn harness() -> (axum::Router, String) {
             enricher.clone(),
         )),
         enricher,
-        kahawai_hub::api::NetOptions::default(),
+        kahawai_hub::api::NetOptions {
+            metrics_token: Some(SCRAPE_TOKEN.into()),
+            ..Default::default()
+        },
     );
     let token = auth
         .complete_setup(
@@ -78,8 +83,9 @@ async fn health_answers_without_a_credential_and_metrics_does_not() {
     assert_eq!(v["status"], "ok", "a hub with no satellites is not unhealthy");
     assert!(v["version"].is_string());
 
-    // Metrics report library scale and module names, so they are not
-    // public. Prometheus scrapes with a bearer token.
+    // Metrics need their OWN static token: an access token lives 15
+    // minutes and no scraper refreshes one, so a login credential would
+    // serve a single scrape and 401 ever after.
     let resp = api
         .clone()
         .oneshot(Request::get("/metrics").body(Body::empty()).unwrap())
@@ -87,11 +93,24 @@ async fn health_answers_without_a_credential_and_metrics_does_not() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 
+    // An admin login token is NOT a scrape credential.
     let resp = api
         .clone()
         .oneshot(
             Request::get("/metrics")
-                .header("authorization", format!("Bearer {}", token))
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "a login token must not scrape");
+
+    let resp = api
+        .clone()
+        .oneshot(
+            Request::get("/metrics")
+                .header("authorization", format!("Bearer {SCRAPE_TOKEN}"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -117,4 +136,61 @@ async fn health_answers_without_a_credential_and_metrics_does_not() {
             "not a number: {line}"
         );
     }
+}
+
+/// With no `hub.metrics_token` configured the endpoint is not served at
+/// all — not 401, not an empty body. A hub nobody set up for scraping
+/// should not advertise an endpoint that reports its library size, and
+/// the 404/401 split lets an operator tell "off here" from "wrong
+/// secret" without guessing.
+#[tokio::test]
+async fn metrics_are_not_served_when_no_token_is_configured() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    let registry = Arc::new(kahawai_hub::registry::Registry::new(db.clone(), Default::default()));
+    let auth = Arc::new(kahawai_hub::auth::Auth::new(db, dir.path()).await.unwrap());
+    let sessions =
+        Arc::new(kahawai_hub::sessions::Sessions::new(tempfile::tempdir().unwrap().keep()));
+    let ca = Arc::new(
+        kahawai_hub::pki::HubCa::load_or_create(tempfile::tempdir().unwrap().keep().as_path())
+            .unwrap(),
+    );
+    let enrollments = Arc::new(kahawai_hub::enrollment_service::EnrollmentService::new(
+        ca,
+        registry.clone(),
+        std::time::Duration::from_secs(900),
+        90,
+    ));
+    let enricher = Arc::new(kahawai_hub::enrich::Enricher::new(dir.path().to_path_buf()));
+    let api = kahawai_hub::api::router(
+        registry,
+        auth,
+        sessions,
+        enrollments,
+        Arc::new(kahawai_hub::subtitles::Subtitles::new(tempfile::tempdir().unwrap().keep())),
+        Arc::new(kahawai_hub::artwork::Artwork::new(
+            tempfile::tempdir().unwrap().keep(),
+            enricher.clone(),
+        )),
+        enricher,
+        // The default: no scrape token.
+        kahawai_hub::api::NetOptions::default(),
+    );
+    std::mem::forget(dir);
+
+    for header in [None, Some("Bearer anything")] {
+        let mut req = Request::get("/metrics");
+        if let Some(h) = header {
+            req = req.header("authorization", h);
+        }
+        let resp = api.clone().oneshot(req.body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "header {header:?}");
+    }
+
+    // Health is unaffected — it is the endpoint that must always answer.
+    let resp = api
+        .oneshot(Request::get("/health").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
 }

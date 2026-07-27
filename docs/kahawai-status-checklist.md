@@ -321,8 +321,13 @@ the live deployment. Unchecked items carry a note when partially done.
       `GET /metrics` (Prometheus text 0.0.4), and SIGHUP config reload.
       Health is public — an uptime check holds no credential, and it says
       nothing a failed login does not; metrics sit behind admin auth
-      because they report library scale and module names, and Prometheus
-      scrapes with a bearer token. A satellite being away is `degraded`,
+      behind their OWN static credential (`hub.metrics_token`) rather than
+      a login token: access tokens live 15 minutes and no scraper
+      refreshes one, so an admin-token endpoint would serve a single
+      scrape and 401 ever after. Unset — the default — means `/metrics`
+      is not served at all (404), so a hub nobody configured for scraping
+      does not advertise what its library holds; a wrong token is 401, so
+      "off here" is distinguishable from "wrong secret". A satellite being away is `degraded`,
       not down: its collections go unavailable and nothing is lost (AR-6),
       and a check that fails the server because one Pi is unplugged gets
       muted. Health per module is served BY THE HUB rather than by each

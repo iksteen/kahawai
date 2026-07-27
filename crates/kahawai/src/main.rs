@@ -449,7 +449,12 @@ async fn run_hub_inner(
     let net = kahawai_hub::api::NetOptions {
         proxy_trust: proxy_trust.clone(),
         cors_origins: cfg.cors_origins.clone(),
+        metrics_token: cfg.metrics_token.clone().filter(|t| !t.is_empty()),
     };
+    match cfg.metrics_token.as_deref() {
+        Some(t) if !t.is_empty() => tracing::info!("/metrics enabled (hub.metrics_token)"),
+        _ => tracing::info!("/metrics disabled — set hub.metrics_token to enable scraping"),
+    }
     // NFR-6 online reload: SIGHUP re-reads the config file and adopts the
     // settings that can change under a running process. Everything else —
     // listeners, data_dir, cert SANs — is structural: it decides how the
