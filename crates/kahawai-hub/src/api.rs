@@ -1524,6 +1524,46 @@ async fn list_libraries(State(state): State<AppState>) -> Result<Json<Value>, Ap
 #[derive(Deserialize)]
 struct ItemsQuery {
     library: Option<String>,
+    /// HUB-12 server-side search: a substring of the title, folded the
+    /// same way titles are stored so accents and case do not matter.
+    q: Option<String>,
+    /// `title` (default), `year`, `added`. Prefixed with `-` for
+    /// descending: `-year`.
+    sort: Option<String>,
+    /// NFR-1: a page, not the catalogue. Absent = the default page size,
+    /// never "everything" — that is the shape that took 13 s over 250k
+    /// items and shipped 100 MB.
+    limit: Option<u32>,
+    offset: Option<u32>,
+}
+
+/// Page sizes. The cap exists so a client cannot ask for the old
+/// behaviour by accident; the default is a screenful of cards with room
+/// to scroll past the fold.
+const ITEMS_PAGE_DEFAULT: u32 = 200;
+const ITEMS_PAGE_MAX: u32 = 1000;
+
+/// `sort` → an ORDER BY the query can interpolate. Never the raw
+/// parameter: this is the one place a browse request touches SQL text.
+/// The tiebreakers use i.year, not the resolved one, on purpose. Every
+/// view field named in an ORDER BY is a correlated subquery run for every
+/// candidate row BEFORE the LIMIT applies — naming two instead of one
+/// took the browse query from 19 ms to 80 ms at 39k items. A tiebreaker
+/// only decides identical titles, where the stored year is as good.
+fn items_order(sort: Option<&str>) -> &'static str {
+    // `sort_title` is the assigned answer's title, resolved by a plain
+    // join (see the query) rather than the view.
+    match sort.unwrap_or("title") {
+        "year" => "i.year IS NULL, i.year, sort_title",
+        "-year" => "i.year IS NULL, i.year DESC, sort_title",
+        // Item ids are ULIDs, which sort lexicographically by the time
+        // they were minted — so "recently added" needs no column and
+        // cannot disagree with one.
+        "added" => "i.id, sort_title",
+        "-added" => "i.id DESC, sort_title",
+        "-title" => "sort_title DESC, i.year",
+        _ => "sort_title, i.year",
+    }
 }
 
 async fn list_items(
@@ -1531,22 +1571,44 @@ async fn list_items(
     Query(q): Query<ItemsQuery>,
     axum::Extension(claims): axum::Extension<crate::auth::Claims>,
 ) -> Result<Json<Value>, ApiError> {
+    let limit = q.limit.unwrap_or(ITEMS_PAGE_DEFAULT).min(ITEMS_PAGE_MAX);
+    let offset = q.offset.unwrap_or(0);
+    // Folded once here, matched against norm_title (already folded) and
+    // the resolved title, so a search finds an item by what it is called
+    // now as well as by its filename.
+    let needle = q.q.as_deref().map(crate::enrich::fold).filter(|s| !s.is_empty());
+    let order = items_order(q.sort.as_deref());
+
     // Shows carry no item_sources of their own; their library membership
     // flows up from their episodes' sources.
-    let rows = sqlx::query(
+    let sql = format!(
         "SELECT i.id, i.kind, i.season, i.episode, i.artist,
                 COALESCE(md.title, i.title) AS title,
+                COALESCE(spm.title, i.title) AS sort_title,
                 COALESCE(i.year, CAST(substr(md.premiered, 1, 4) AS INTEGER)) AS year,
                 i.title AS file_title, i.year AS file_year,
                 md.title AS matched_title,
                 md.confidence AS match_confidence,
                 md.updated_at AS art_version,
-                COUNT(s.item_id) AS sources,
+                -- Counted per returned row, NOT with a GROUP BY over the
+                -- catalogue: grouping has to finish before ORDER BY and
+                -- LIMIT can apply, so it did the work for all 50k items to
+                -- return 200 — 257 ms against 57 ms.
+                (SELECT COUNT(*) FROM item_sources s WHERE s.item_id = i.id) AS sources,
                 w.position_ms, w.duration_ms, w.played, w.play_count
          FROM items i
-         LEFT JOIN item_sources s ON s.item_id = i.id
          LEFT JOIN watch_state w ON w.item_id = i.id AND w.user_id = ?1
          LEFT JOIN resolved_metadata md ON md.item_id = i.id
+         -- Sorting and searching go through the ASSIGNED answer directly,
+         -- not the view. Every view field named in an ORDER BY is resolved
+         -- for every candidate row before LIMIT applies: 410 ms against
+         -- 49 ms over 50k fully-enriched items. The two agree except when
+         -- the assigned record carries no title and the view side-fills
+         -- one — rare, and it costs a row its place in the sort, not its
+         -- title on screen.
+         LEFT JOIN item_match sim ON sim.item_id = i.id
+         LEFT JOIN provider_metadata spm
+                ON spm.item_id = sim.item_id AND spm.provider = sim.provider
          WHERE i.kind NOT IN ('episode', 'track')
            AND (?2 IS NULL OR i.id IN (
              SELECT COALESCE(ci.parent_id, ci.id)
@@ -1556,15 +1618,63 @@ async fn list_items(
              JOIN items ci ON ci.id = ls.item_id
              WHERE lc.library_id = ?2
            ))
-         GROUP BY i.id ORDER BY title, year",
-    )
-    .bind(&claims.sub)
+           AND (?3 IS NULL
+                OR i.norm_title LIKE '%' || ?3 || '%'
+                OR spm.title LIKE '%' || ?3 || '%')
+         ORDER BY {order} LIMIT ?4 OFFSET ?5"
+    );
+    let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
+        .bind(&claims.sub)
+        .bind(&q.library)
+        .bind(&needle)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(state.registry.db())
+        .await
+        .map_err(internal)?;
+    // The count the page bar needs. A second query rather than a window
+    // function: it reads one index and stays under a millisecond, where
+    // COUNT(*) OVER () would compute it per returned row.
+    // Joining the view here would pay its cost for every row in the
+    // catalogue just to count them; it is only needed when the search
+    // has to look at resolved titles.
+    let count_sql = if needle.is_some() {
+        "SELECT COUNT(*) FROM items i
+          LEFT JOIN item_match sim ON sim.item_id = i.id
+          LEFT JOIN provider_metadata spm
+                 ON spm.item_id = sim.item_id AND spm.provider = sim.provider
+          WHERE i.kind NOT IN ('episode', 'track')"
+    } else {
+        "SELECT COUNT(*) FROM items i
+          WHERE i.kind NOT IN ('episode', 'track')"
+    };
+    let total: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "{count_sql}
+            AND (?1 IS NULL OR i.id IN (
+              SELECT COALESCE(ci.parent_id, ci.id)
+              FROM library_collections lc
+              JOIN item_sources ls
+                ON ls.module_id = lc.module_id AND ls.collection_id = lc.collection_id
+              JOIN items ci ON ci.id = ls.item_id
+              WHERE lc.library_id = ?1
+            ))
+            AND (?2 IS NULL
+                 OR i.norm_title LIKE '%' || ?2 || '%'
+                 OR {title_col} LIKE '%' || ?2 || '%')",
+            title_col = if needle.is_some() { "spm.title" } else { "''" }
+    )))
     .bind(&q.library)
-    .fetch_all(state.registry.db())
+    .bind(&needle)
+    .fetch_one(state.registry.db())
     .await
     .map_err(internal)?;
     let items: Vec<Value> = rows.iter().map(item_row_json).collect();
-    Ok(Json(json!({ "items": items })))
+    Ok(Json(json!({
+        "items": items,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    })))
 }
 
 fn item_row_json(r: &sqlx::sqlite::SqliteRow) -> Value {

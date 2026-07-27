@@ -217,22 +217,40 @@ impl Bench {
 #[ignore = "seeds a quarter-million rows; run by hand"]
 async fn browse_latency_and_scale() {
     for items in [50_000usize, 250_000] {
+        // KEEP_BENCH_DB=/path leaves the seeded database behind so a plan
+        // can be read against the real thing rather than a smaller stand-in.
+        let keep = std::env::var("KEEP_BENCH_DB").ok().map(|p| format!("{p}-{items}"));
         let dir = tempfile::tempdir().unwrap();
+        if let Some(k) = &keep {
+            std::fs::create_dir_all(k).unwrap();
+        }
         eprintln!("\n=== {items} items");
-        let b = seed(dir.path(), items).await;
+        let path: &std::path::Path =
+            keep.as_ref().map(std::path::Path::new).unwrap_or(dir.path());
+        let b = seed(path, items).await;
 
         let files: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM files").fetch_one(&b.db).await.unwrap();
         let (whole, bytes) = b.time("/api/v1/items", 3).await;
         let (scoped, _) =
             b.time(&format!("/api/v1/items?library={}", b.library), 3).await;
+        // The page a user actually lands on, and one deep in the middle:
+        // an OFFSET still walks the rows it skips, so the last page is
+        // the honest worst case, not the first.
+        let (deep, _) = b
+            .time(&format!("/api/v1/items?library={}&offset={}", b.library, items - 200), 3)
+            .await;
+        let (search, _) =
+            b.time(&format!("/api/v1/items?library={}&q=film+1234", b.library), 3).await;
         let (detail, _) =
             b.time(&format!("/api/v1/items/01BENCHITEM{:015}", items / 2), 5).await;
 
         eprintln!("  files             {files}");
         eprintln!("  GET /items        {:>8.1} ms  ({:.1} MB)", whole.as_secs_f64() * 1e3,
                   bytes as f64 / 1e6);
-        eprintln!("  GET /items?library{:>8.1} ms", scoped.as_secs_f64() * 1e3);
+        eprintln!("  GET /items?library{:>8.1} ms  (first page)", scoped.as_secs_f64() * 1e3);
+        eprintln!("  ...last page      {:>8.1} ms", deep.as_secs_f64() * 1e3);
+        eprintln!("  ...search         {:>8.1} ms", search.as_secs_f64() * 1e3);
         eprintln!("  GET /items/{{id}}   {:>8.1} ms", detail.as_secs_f64() * 1e3);
         let t = Instant::now();
         let n: i64 = sqlx::query_scalar(
@@ -247,11 +265,14 @@ async fn browse_latency_and_scale() {
         // NFR-1 states the browse target at 50k. Recorded at 250k too,
         // because NFR-2 asks the shape to hold there, and a number that
         // is merely printed is a number nobody notices moving.
-        if items == 50_000 && std::env::var("BENCH_REPORT_ONLY").is_err() {
+        // NFR-1 states the target at 50k; asserted at BOTH sizes, since
+        // NFR-2 asks the shape to hold at 250k and a page should not care
+        // how much is behind it.
+        for (what, took) in [("first page", scoped), ("last page", deep), ("search", search)] {
             assert!(
-                scoped.as_millis() <= 200,
-                "NFR-1: browse at 50k took {:.1} ms, target 200 ms",
-                scoped.as_secs_f64() * 1e3
+                took.as_millis() <= 200,
+                "NFR-1: {what} at {items} items took {:.1} ms, target 200 ms",
+                took.as_secs_f64() * 1e3
             );
         }
         assert!(detail.as_millis() <= 200, "item detail should not scale with catalogue size");
