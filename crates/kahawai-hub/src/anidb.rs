@@ -448,6 +448,39 @@ fn aes_ecb(cipher: &aes::Aes128, data: &[u8], encrypt: bool) -> Result<Vec<u8>> 
 mod tests {
     use super::*;
 
+    /// What a BULK run leans on, which is where this went wrong: the
+    /// burst and the refill cap are covered by
+    /// [`bucket_allows_a_burst_then_the_sustained_rate`], but neither
+    /// says anything about a long pass. The ban came from exactly that —
+    /// a run that honoured the short gap between packets and still sat
+    /// above the sustained rate for its whole duration.
+    ///
+    /// Arithmetic, so it is proved here rather than by sending traffic:
+    /// a live run long enough to exhaust the burst allowance would be
+    /// the very pattern being guarded against.
+    #[test]
+    fn a_long_run_can_never_outpace_the_sustained_rate() {
+        let base = tokio::time::Instant::now();
+        let mut b = Bucket::new();
+        let mut now = base;
+        const N: usize = 200;
+        for _ in 0..N {
+            now += b.take(now); // the caller sleeps for what it is told
+        }
+        let elapsed = (now - base).as_secs_f64();
+        let floor = (N as f64 - BURST_PACKETS) * SUSTAINED_SPACING.as_secs_f64();
+        assert!(
+            elapsed >= floor - 0.01,
+            "{N} packets in {elapsed:.1}s, under the {floor:.1}s the rule requires"
+        );
+        // And no slower than it requires — over-throttling a 900-file
+        // pass by one interval each is an hour nobody asked for.
+        assert!(
+            elapsed <= floor + SUSTAINED_SPACING.as_secs_f64(),
+            "over-throttled: {elapsed:.1}s against a {floor:.1}s floor"
+        );
+    }
+
     /// The ban gate must refuse BEFORE any socket work — contact is
     /// what extends a ban, so this is the whole point of the feature.
     #[tokio::test]
