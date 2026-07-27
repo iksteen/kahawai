@@ -1567,18 +1567,48 @@ fn items_order(sort: Option<&str>) -> &'static str {
     // by one index (0035) — so a page is a range scan and costs the same
     // at offset 0 as at offset 49,800. Naming a view field instead would
     // resolve it for every candidate row before LIMIT applies.
+    // Deliberately NOT ending in a unique column. Rows that tie on the
+    // named terms — 69 albums and 6 films on the live library — come out
+    // in the index's own order, which is `rowid` and therefore stable
+    // between the two queries that fetch consecutive pages, as long as
+    // the plan stays this index scan. Appending `i.id` would make the
+    // order total by construction instead of by plan, and it costs far
+    // too much to be worth it: SQLite can no longer satisfy the ORDER BY
+    // from `items_sort_title` alone, falls back to a temp b-tree, and
+    // therefore resolves the metadata view for EVERY candidate row
+    // before LIMIT applies — 96 ms to 912 ms on a deep page. Widening
+    // the index to `(sort_title, year, id)` avoids the temp b-tree but
+    // still costs 134 ms, because the ULID makes every index page carry
+    // fewer rows.
     match sort.unwrap_or("title") {
         "year" => "i.year IS NULL, i.year, i.sort_title",
         "-year" => "i.year IS NULL, i.year DESC, i.sort_title",
         // Item ids are ULIDs, which sort lexicographically by the time
-        // they were minted — so "recently added" needs no column and
-        // cannot disagree with one.
+        // they were minted — so "recently added" needs no column, cannot
+        // disagree with one, and is already total on its own.
         "added" => "i.id, i.sort_title",
         "-added" => "i.id DESC, i.sort_title",
         "-title" => "i.sort_title DESC, i.year",
         _ => "i.sort_title, i.year",
     }
 }
+
+/// The total for a library with no search term — the overwhelmingly
+/// common browse.
+///
+/// `item_libraries` IS the answer: it is keyed `(library_id, item_id)`,
+/// so counting a library is one key-range scan. Counting `items` and
+/// probing membership per row instead cost 47 ms at 50k and 523 ms at
+/// 250k, against 3.4 ms and 15.5 ms here — on every request, including
+/// the first page.
+///
+/// No `kind` filter, because membership only ever holds TOP-LEVEL items:
+/// the 0036/0039 triggers project `COALESCE(parent_id, id)`, so an
+/// episode's source lands its show. Re-checking the invariant with a
+/// join costs more than the query it protects (73 ms / 594 ms — worse
+/// than what it replaced), so it is pinned by a test instead:
+/// `library_membership_holds_only_top_level_items` in tests/sort_title.rs.
+const COUNT_IN_LIBRARY: &str = "SELECT COUNT(*) FROM item_libraries WHERE library_id = ?1";
 
 async fn list_items(
     State(state): State<AppState>,
@@ -1635,24 +1665,38 @@ async fn list_items(
         .fetch_all(state.registry.db())
         .await
         .map_err(internal)?;
-    // The count the page bar needs. A second query rather than a window
-    // function: it reads one index and stays under a millisecond, where
-    // COUNT(*) OVER () would compute it per returned row.
-    let count_sql = "SELECT COUNT(*) FROM items i
-          WHERE i.kind NOT IN ('episode', 'track')";
-    let total: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
-            "{count_sql}
-            AND (?1 IS NULL OR EXISTS (
-              SELECT 1 FROM item_libraries il
-               WHERE il.library_id = ?1 AND il.item_id = i.id
-            ))
-            AND (?2 IS NULL
-                 OR i.norm_title LIKE '%' || ?2 || '%'
-                 OR i.sort_title LIKE '%' || ?2 || '%')")))
-    .bind(&q.library)
-    .bind(&needle)
-    .fetch_one(state.registry.db())
-    .await
+    // The count the client needs to size the result set. A second query
+    // rather than a window function: `COUNT(*) OVER ()` would compute it
+    // per returned row.
+    //
+    // Two forms, chosen rather than merged. A single query with
+    // `(?N IS NULL OR ...)` guards reads as one thing but plans as the
+    // worst of both: the guard is opaque at plan time, which is the
+    // pattern that has cost us an index twice now.
+    let total: i64 = match (&q.library, &needle) {
+        (Some(library), None) => sqlx::query_scalar(COUNT_IN_LIBRARY)
+            .bind(library)
+            .fetch_one(state.registry.db())
+            .await,
+        // Searching, or unscoped: the title predicate has to touch every
+        // candidate anyway, so drive from `items` and keep the filters
+        // as written.
+        _ => sqlx::query_scalar(
+            "SELECT COUNT(*) FROM items i
+              WHERE i.kind NOT IN ('episode', 'track')
+                AND (?1 IS NULL OR EXISTS (
+                  SELECT 1 FROM item_libraries il
+                   WHERE il.library_id = ?1 AND il.item_id = i.id
+                ))
+                AND (?2 IS NULL
+                     OR i.norm_title LIKE '%' || ?2 || '%'
+                     OR i.sort_title LIKE '%' || ?2 || '%')",
+        )
+        .bind(&q.library)
+        .bind(&needle)
+        .fetch_one(state.registry.db())
+        .await,
+    }
     .map_err(internal)?;
     let items: Vec<Value> = rows.iter().map(item_row_json).collect();
     Ok(Json(json!({

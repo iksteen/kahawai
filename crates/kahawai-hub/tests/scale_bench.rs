@@ -181,9 +181,18 @@ async fn seed(dir: &std::path::Path, items: usize) -> Bench {
 }
 
 impl Bench {
-    /// Best of `runs`, so one scheduler hiccup does not decide a verdict.
+    /// WORST of `runs`, and every run is printed.
+    ///
+    /// This used to report the best "so one scheduler hiccup does not
+    /// decide a verdict", and that is exactly how a real defect stayed
+    /// hidden: the browse query was bimodal — 253 ms or 50 ms for the
+    /// same statement, depending on which pooled connection served it —
+    /// and best-of-N reported the good mode every time. A latency target
+    /// is a promise about the slow case, so the slow case is what gets
+    /// asserted.
     async fn time(&self, uri: &str, runs: usize) -> (std::time::Duration, usize) {
-        let mut best = std::time::Duration::MAX;
+        let mut worst = std::time::Duration::ZERO;
+        let mut all = Vec::new();
         let mut bytes = 0;
         for _ in 0..runs {
             let t = Instant::now();
@@ -200,10 +209,15 @@ impl Bench {
                 .unwrap();
             assert!(resp.status().is_success(), "{uri} -> {}", resp.status());
             let b = axum::body::to_bytes(resp.into_body(), 1 << 30).await.unwrap();
-            best = best.min(t.elapsed());
+            let took = t.elapsed();
+            all.push(format!("{:.1}", took.as_secs_f64() * 1e3));
+            worst = worst.max(took);
             bytes = b.len();
         }
-        (best, bytes)
+        // Printed, not summarised: a spread between runs is itself a
+        // finding, and averaging it away is what cost a day.
+        eprintln!("      {uri}  runs: {} ms", all.join(", "));
+        (worst, bytes)
     }
 }
 

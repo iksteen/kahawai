@@ -320,6 +320,101 @@ async fn library_membership_never_drifts() {
 /// primary key of `item_match` and part of `provider_metadata`'s — but
 /// "nothing does it today" is the reasoning that let `merged_metadata`
 /// drift, so it is checked rather than assumed.
+/// `item_libraries` holds TOP-LEVEL items only — an episode's source
+/// lands its show, never the episode.
+///
+/// This is load-bearing, not incidental: the browse count is a bare
+/// `COUNT(*) FROM item_libraries WHERE library_id = ?`, with no `kind`
+/// filter, because re-checking one costs more than the query it would
+/// protect (73 ms against 47 ms at 50k items, and worse at 250k). So the
+/// invariant is pinned here instead. If it ever breaks, every library's
+/// item total silently gains its episodes.
+#[tokio::test]
+async fn library_membership_holds_only_top_level_items() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    let q = |sql: &'static str| {
+        let db = db.clone();
+        async move {
+            sqlx::query(sql).execute(&db).await.unwrap_or_else(|e| panic!("{sql}\n  -> {e}"))
+        }
+    };
+    q("INSERT INTO libraries (id, name, media_type) VALUES ('lib1','A','series')").await;
+    q("INSERT INTO satellites (module_id, module_type, name, cert_fingerprint, enrolled_at, disabled)
+       VALUES ('m1','mediahost','h','',unixepoch(),0)").await;
+    q("INSERT INTO collections (module_id, collection_id, media_type, roots_json, sync_version)
+       VALUES ('m1','c1','series','[\"/m\"]',1)").await;
+    q("INSERT INTO library_collections (library_id, module_id, collection_id)
+       VALUES ('lib1','m1','c1')").await;
+
+    // A show with episodes, and a film — the sources hang off the
+    // EPISODES, which is the shape that would put them in membership if
+    // the projection were ever dropped.
+    item(&db, "show1", "A Show").await;
+    item(&db, "movie1", "A Film").await;
+    for (ep, path) in [("ep1", "s01e01.mkv"), ("ep2", "s01e02.mkv")] {
+        sqlx::query(
+            "INSERT INTO items (id, kind, title, norm_title, parent_id)
+             VALUES (?, 'episode', ?, ?, 'show1')",
+        )
+        .bind(ep)
+        .bind(ep)
+        .bind(ep)
+        .execute(&db)
+        .await
+        .unwrap();
+        for (item_id, p) in [(ep, path)] {
+            sqlx::query(
+                "INSERT INTO files (module_id, collection_id, path_rel, size, mtime_unix,
+                                    head_xxh3, tail_xxh3, oshash, streams_json, subs_extracted)
+                 VALUES ('m1','c1',?,1,1,0,0,0,'{}',0)",
+            )
+            .bind(p)
+            .execute(&db)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO item_sources (item_id, module_id, collection_id, path_rel)
+                 VALUES (?, 'm1','c1', ?)",
+            )
+            .bind(item_id)
+            .bind(p)
+            .execute(&db)
+            .await
+            .unwrap();
+        }
+    }
+    q("INSERT INTO files (module_id, collection_id, path_rel, size, mtime_unix,
+                          head_xxh3, tail_xxh3, oshash, streams_json, subs_extracted)
+       VALUES ('m1','c1','film.mkv',1,1,0,0,0,'{}',0)").await;
+    q("INSERT INTO item_sources (item_id, module_id, collection_id, path_rel)
+       VALUES ('movie1','m1','c1','film.mkv')").await;
+
+    let offenders: Vec<String> = sqlx::query_scalar(
+        "SELECT il.item_id FROM item_libraries il JOIN items i ON i.id = il.item_id
+          WHERE i.kind IN ('episode','track') OR i.parent_id IS NOT NULL",
+    )
+    .fetch_all(&db)
+    .await
+    .unwrap();
+    assert!(offenders.is_empty(), "membership must be top-level only, got {offenders:?}");
+
+    // And the bare count the endpoint runs agrees with the careful one.
+    let bare: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM item_libraries WHERE library_id='lib1'")
+        .fetch_one(&db)
+        .await
+        .unwrap();
+    let careful: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM items i WHERE i.kind NOT IN ('episode','track')
+          AND EXISTS (SELECT 1 FROM item_libraries il
+                       WHERE il.library_id = 'lib1' AND il.item_id = i.id)",
+    )
+    .fetch_one(&db)
+    .await
+    .unwrap();
+    assert_eq!((bare, careful), (2, 2), "the show and the film, not the episodes");
+}
+
 #[tokio::test]
 async fn moving_a_row_between_items_leaves_nothing_stale() {
     let dir = tempfile::tempdir().unwrap();

@@ -15,7 +15,21 @@ pub async fn open(data_dir: &Path) -> Result<SqlitePool> {
         .filename(&path)
         .create_if_missing(true)
         .journal_mode(SqliteJournalMode::Wal)
-        .foreign_keys(true);
+        .foreign_keys(true)
+        // 8 MiB of page cache PER CONNECTION (negative = KiB, not pages).
+        //
+        // SQLite's default is 2 MB, which is smaller than the index a
+        // browse page walks: a deep page over 50k items thrashed it and
+        // the SAME query took 253 ms or 50 ms depending on which pooled
+        // connection served it. Measured at 2/8/16/64 MiB, the two-mode
+        // behaviour disappears at 8 and nothing improves above it.
+        //
+        // Cost, both axes: memory is a CEILING of 8 connections × 8 MiB =
+        // 64 MiB, allocated lazily as pages are touched, against a hub
+        // that already holds a 61 MB database and serves video. Latency
+        // at point of use is the thing bought: browse is the one path a
+        // user waits on synchronously.
+        .pragma("cache_size", "-8192");
     let pool = SqlitePoolOptions::new()
         .max_connections(8)
         .connect_with(opts)
