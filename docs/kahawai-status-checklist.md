@@ -4,6 +4,20 @@ Status of every numbered requirement from `kahawai-technical-requirements.md`,
 plus the v1 acceptance criteria. Checked = implemented and exercised against
 the live deployment. Unchecked items carry a note when partially done.
 
+**This file records status, not design.** An entry says what works and
+what is left, in a few lines.
+
+Do not cite evidence that something WORKS — no "verified live", no counts
+or timings proving a box deserves its tick. That is a snapshot of one
+afternoon, it goes stale where a fact does not, and the tests and
+benchmarks hold it better. Do cite a number that shows something is
+BROKEN or missing: it says how far off we are, which is the one thing the
+reader cannot get from the tick.
+
+How something works and why it was built that way belong in
+`kahawai-implementation.md`; a decision that changes what a requirement
+*means* is an amendment recorded in the requirement itself, dated.
+
 ## Architecture (AR)
 
 - [x] AR-1 Three modules (hub, mediahost, transcoder) + shared core crates
@@ -68,92 +82,29 @@ the live deployment. Unchecked items carry a note when partially done.
 - [x] HUB-4 Filename/dirname parsing (movies, episodes, anime conventions, music layout)
 - [x] HUB-20 Mediahost deletion cascade + watch-state/match archives restored on re-enroll
 - [x] HUB-5 Provider trait + declared chains + walker (TMDB, TVDB, anime
-      composite, MusicBrainz + CAA). One row per top-level item says which
-      provider record it IS (`item_match`, plus whether a human chose it);
-      everything descriptive is resolved per read from the providers' own
-      answers, assigned provider first and then the media type's
-      preference order (`resolved_metadata`). So AniDB owns an anime's
-      title while TMDB supplies the synopsis and cover it has nothing for,
-      and nothing is stored that a read can derive. Episodes and tracks
-      carry no assignment: they render through their parent's.
-      Assignment is strongest-match-first, then order — a strong match
-      beats a weak one whatever the ranking says — and it is DERIVED, not
-      maintained: `item_match` is recomputed from scratch by triggers on
-      every write to an input (answers, chain order, refusals, pins,
-      which collection an item's files sit in), so a more preferred
-      provider that gains info replaces an automatic match by itself and
-      no code path can forget to re-pick. Order is per media type
-      (requirement amended 2026-07-26 from "per library"), editable at
-      runtime via `POST /admin/v1/providers/chains/{media_type}`, and a
-      reorder re-decides from stored answers and contacts nobody.
-      Refusing a match records the refused records (`rejected_matches`)
-      and keeps every answer, so the item stays unmatched until a provider
-      offers something that was not refused. A provider that can't be
-      reached (ban, 429) is rescheduled with backoff in
-      `enrichment_queue`, never dropped. A human pin (`manual_match`,
-      HUB-8/30a) is an input like any other and wins as the pick's first
-      sort key rather than by being exempt from it — so it outranks even
-      local metadata, and a pin whose record is withdrawn stops winning
-      instead of stranding an assignment nothing backs. Anime stays
-      bridged through mapped IDs — described by the tail, never
-      re-identified by it.
+      composite, MusicBrainz + CAA). Which record an item IS is derived
+      by triggers from stored answers, chain order, refusals and pins —
+      design in implementation §4.1/§4.2; per-media-type ordering is the
+      2026-07-26 amendment recorded in the requirement.
 - [x] HUB-6 Descriptive metadata: titles, plots, dates, ratings, posters,
-      episode stills, season/episode and album/release structure, plus
-      genres and cast. Genres and cast ride the SAME TMDB details request
-      that already fetched `original_language` —
-      `append_to_response=credits` folds the credits sub-request into one
-      call (verified against the live API), so the pair costs no extra
-      provider traffic, which is the only thing that made cast affordable
-      under HUB-7 pacing. Cast is stored as JSON in billing order, capped
-      at 15: TMDB returns 68 for a 1995 film and nothing renders that.
-      Live: 1,109 of 1,137 top-level items resolve to genres and 1,097 to
-      a cast; the shortfall is the 21 items TMDB never matched. Everything
-      is stored, so it all reads back with the providers unreachable.
-      *(Cast comes from TMDB only, and TVDB's own genre list is not read —
-      both reach TVDB-owned items by side-fill whenever TMDB also
-      answered.)*
-- [x] HUB-7 Provider rate limits/caching. Rate limits: every provider
-      request goes through one queue per provider host (`hub/gate.rs`),
-      spaced by that provider's *documented* limit and silenced on
-      429/503 for what `Retry-After` asks. Corrected against the specs
-      2026-07-26, when three of four stored numbers turned out wrong in
-      our favour: MusicBrainz was entirely unpaced (1 req/s per IP, 503
-      on breach), AniList ran at 75/min against a live limit degraded to
-      30/min, OpenSubtitles at 5/s against a documented 1/s, and AniDB's
-      flood rule was half-implemented — the short-term 2 s gap without
-      the sustained 4 s one, which is what earned the bans.
-      Caching is satisfied by the answer store rather than by a response
-      cache: every provider answer is kept permanently in
-      `provider_metadata`, including recorded misses, and never
-      re-requested (never-ask-twice); provider-mandated TTLs are honoured
-      where they exist — AniDB 24 h per anime, the daily titles dump, the
-      weekly anime-lists mapping. A separate TTL cache would be a second
-      copy of what the answer store already is.
+      episode stills, season/episode and album/release structure, genres
+      and cast; all stored, so everything reads back with providers
+      unreachable.
+      *(Cast is TMDB-only and TVDB's own genre list is unread; both reach
+      TVDB-owned items by side-fill when TMDB also answered.)*
+- [x] HUB-7 Provider rate limits/caching. One queue per provider host
+      (`hub/gate.rs`) spaced at each provider's documented limit, 429/503
+      parks that provider alone; caching is the permanent answer store
+      rather than a TTL response cache (implementation §4.3). Stored
+      limits were corrected against the specs 2026-07-26 — three of four
+      were wrong in our favour.
 - [x] HUB-8 Ambiguous matches flagged for manual review (card-based review UI,
       per-item re-match/search dialog)
-- [x] HUB-9 Local metadata as authoritative provider. `local` is **not** a
-      chain member and holds no rank: it is asked before the chain and its
-      answers sort ahead of every provider's. Ranking it would have implied
-      an order in which a search result beats the file on your own disk,
-      and made you maintain a knob with one sensible setting. It answers
-      with the scanned cover (MH-4) and with a Kodi `.nfo` where one
-      exists. The owner contradicting it — a manual pin elsewhere, or a
-      rejection of what the `.nfo` claimed — displaces it wholesale; a
-      cover carries no record, so nothing about identity displaces it.
-      Sidecars are tracked in both directions: the manifest carries the
-      signature of what the hub recorded (`FileStat.sidecars`), so a
-      `.nfo` or cover dropped beside an ALREADY-SCANNED file is noticed by
-      an ordinary rescan — size and mtime describe the media file and
-      never move when something appears beside it — and one that vanishes
-      makes `local` withdraw its answer rather than leave an item claiming
-      an identity read out of a deleted file.
-      Verified live: 2,213 albums on their local cover; a `.nfo` owning
-      identity, title, plot and genres while TMDB side-fills the poster,
-      premiere and rating it did not state; and a `.nfo` added to and then
-      removed from an untouched media file, picked up and withdrawn by
-      ordinary refreshes. A no-change rescan still reports
-      `scanned=0 skipped=905`, so the comparison costs nothing when
-      nothing moved.
+- [x] HUB-9 Local metadata as authoritative provider — unranked and
+      asked before the chain (requirement amended 2026-07-26). Sidecars
+      are tracked in both directions, so a `.nfo` or cover appearing
+      beside an already-scanned file is picked up by an ordinary rescan
+      and a vanished one makes `local` withdraw its answer.
 - [x] HUB-21 External subtitle providers: SubtitleProvider trait with
       OpenSubtitles.com (REST) as the first impl. Always on: kahawai's
       application key ships in the binary (5 req/s, 5 downloads/24 h
@@ -187,22 +138,11 @@ the live deployment. Unchecked items carry a note when partially done.
 - [x] HUB-11 Versioned HTTP/JSON API + /api/v1/events SSE channel
       (invalidation hints: scan progress, satellite connectivity,
       sessions, enrichment; cookie-authenticated for EventSource)
-- [x] HUB-12 Browse/search/filter/sort. Hierarchical browse, plus server-side
-      search, sort and paging on `GET /api/v1/items` (`q`, `sort`, `limit`,
-      `offset`, returning `total`), which the web library uses: it reserves
-      the full height of the result set from the first response and fetches
-      100-item chunks as rows come into view, so only the visible rows are
-      ever in the DOM and the scrollbar never moves under the thumb.
-      Search is one box in the header whose meaning follows the screen: on
-      the home screen it searches every library at once, showing at most 5
-      hits each and only libraries that have any; clicking a library's name
-      goes there with the query still standing, where the same box filters
-      that library. Artwork is served at named sizes
-      (`?size=thumb|card`, the list lives in `artwork::SIZES`), resized on
-      first request and then kept: a search-result thumbnail is 3.5 kB
-      against the 136 kB original, 97% less. An unknown name serves the
-      original rather than failing, so retiring a size cannot break a page
-      that is already open.
+- [x] HUB-12 Browse/search/filter/sort. Hierarchical browse, one
+      endpoint for browse and cross-library search with server-side sort
+      and paging, item detail with stream info, artwork at named sizes,
+      playback and admin endpoints. Client behaviour and the API shape
+      are in implementation §4.4/§4.7.
 - [x] HUB-13 All hub state in embedded storage; survives restart without rescan
 - [ ] HUB-14 Capability-profile negotiation *(mode chosen per source
       container/codecs; no client-supplied capability profile yet)*
@@ -288,39 +228,15 @@ the live deployment. Unchecked items carry a note when partially done.
       OPS-8 adds proxy-trust config
 - [x] OPS-3 `doctor` command with plugin/encoder checks
 - [x] OPS-4 Clock-skew tolerance (backdated certs, enrollment skew warning)
-- [x] OPS-5 Online backup/restore: `kahawai hub backup <dir>` snapshots
-      the database (via `VACUUM INTO`, so the hub keeps serving and no
-      write is refused), the PKI, the downloaded subtitles, the token
-      secret and the config; `kahawai hub restore <dir>` puts them back,
-      refusing a populated data dir without `--force`. Image and provider
-      caches are excluded as re-derivable — 225 MB here against 12 KB of
-      PKI. The CA and the satellite records travel together, which is what
-      lets existing satellites reconnect on their own certificates instead
-      of being re-enrolled. Live: 61 MB database + 46,037 subtitle files
-      (2.7 GB) in 8.7 s against a running hub, snapshot `integrity_check`
-      ok and item counts matching.
+- [x] OPS-5 Online backup/restore (`kahawai hub backup|restore`),
+      taken while the hub keeps serving, and including the PKI so
+      restored hubs accept existing satellite certs without re-enrolment;
+      caches excluded as re-derivable.
 - [x] OPS-6 Quota-bounded caches with eviction — satisfied by there being
-      nothing eligible to evict (audited 2026-07-26). Two costs decide
-      it, and every hub cache is expensive on at least one: **rebuild
-      cost** — extracted cues and font bundles re-demux a whole source
-      file over a byte-plane lease (the cost HUB-34's ladder exists to
-      avoid; 100 % of the live cache is this kind, zero sidecar entries),
-      downloaded subtitles spend a rate-limited provider entitlement and
-      are DB-referenced and shared between users (HUB-23), AniDB dumps
-      are ban-risk traffic; **latency at point of use** — artwork is
-      cheap to refetch but tiny and needed instantly while scrolling a
-      grid, so evicting it trades visible stalls for nothing (a 100 MiB
-      cap reclaimed 89 MB out of a 2.7 GB data dir). Transient state
-      (session scratch) is already bounded by lifecycle: wiped at
-      startup, torn down per session, idle-reaped. A cap for a
-      small-disk deployment belongs in an admin-triggered purge that
-      states its cost, not a silent janitor.
-      One thing IS deleted, and it does not contradict the above: at
-      startup the artwork cache drops resized derivatives that can never
-      be served again — a size no longer in `artwork::SIZES`, or a copy
-      whose original is gone. That is unreachability, not a quota; nothing
-      is removed for being large, and the sizes still in use are kept
-      forever like every other entry here (`tests/artwork_sizes.rs`).
+      nothing eligible to evict; requirement amended 2026-07-26 with the
+      audit, reasoning in implementation §10. The one deletion is
+      unreachability, not quota: resized artwork whose size left the code
+      list, or whose original is gone, dropped at startup.
 - [x] OPS-7 Cross-version satellite compatibility: protocol gated on major
       version (Hello/HelloAck) — per decision 2026-07-25, major-gating IS the
       compatibility contract; no previous-minor guarantee
@@ -332,26 +248,20 @@ the live deployment. Unchecked items carry a note when partially done.
 
 ## Non-functional (NFR)
 
-- [ ] NFR-1 Performance. Measured (`tests/scale_bench.rs`, release, real
-      router, 50k / 250k items): first page 33 / 148 ms, search 21 / 104
-      ms, unscoped `GET /items` 11 / 31 ms, item detail 0.3 ms and flat at
-      any catalogue size, resolved-metadata view 11 / 53 ms. Browse used
-      to return the whole catalogue — 2.6 s and 20 MB at 50k — and now
-      pages server-side (HUB-12) against an indexed sort key and a stored
-      library membership, which is what took it under the target.
-      **One case still misses**: the LAST page costs 267 / 1479 ms,
-      because an OFFSET walks the rows it skips. Keyset pagination fixes
-      it and changes the client API, so it is deliberately deferred.
-      Write side, same benchmark: a chain reorder re-picks every item of
-      a media type in 1.3 s at 50k and 6.8 s at 250k (admin action,
-      no provider contacted), and the scan path costs 0.06 ms per
-      `item_sources` row at both sizes. Start-latency (direct ≤ 2 s,
-      transcode ≤ 6 s) and 100 concurrent sessions are still unmeasured.
-- [ ] NFR-2 Scale targets. The storage and read model hold at the stated
-      size: 250k files across 10 collections seed in 48 s, the view over
-      them costs 53 ms, item detail stays 0.3 ms and a first page 148 ms.
-      Browse now holds at that size too, with the last-page exception
-      under NFR-1. 5 transcoders untested; 3 live.
+- [ ] NFR-1 Performance. Browse meets the 200 ms target at 50k items on
+      every path — first page, last page, search and item detail
+      (`tests/scale_bench.rs`).
+      Remaining: at 250k the last page takes 1222 ms, because an OFFSET
+      walks the rows it skips; fixing it needs keyset pagination, which
+      cannot seek to an arbitrary offset and needs an index per sort
+      order, so it is deferred as a client-API decision. Search at that
+      size sits on the target at ~215 ms. Start-latency (direct <= 2 s,
+      transcode <= 6 s) and 100 concurrent sessions are unmeasured.
+- [ ] NFR-2 Scale targets. 250k files across 10 collections hold: the
+      read model, item detail and the first page are all well inside the
+      browse target.
+      Remaining: the last page and search at that size (see NFR-1), and
+      5 concurrent transcoders untested — 3 are live.
 - [x] NFR-3 No user-state loss on crash; media never written
 - [x] NFR-4 mTLS everywhere inter-module; token auth on client API
 - [x] NFR-5 Portability: Linux x86_64, macOS (transcoder), and Linux
@@ -359,28 +269,11 @@ the live deployment. Unchecked items carry a note when partially done.
       (scripts/kahawai-cross-aarch64.sh), proven on a Pi 3 end to end:
       doctor green (encoders dry-run verified), enrolled as mediahost
       over mTLS, scanned, served direct play through the hub
-- [x] NFR-6 Operability: structured logging (tracing), single-file TOML
-      with `KAHAWAI_<SECTION>__<KEY>` env overrides, `GET /health` and
-      `GET /metrics` (Prometheus text 0.0.4), and SIGHUP config reload.
-      Health is public — an uptime check holds no credential, and it says
-      nothing a failed login does not; metrics sit behind admin auth
-      behind their OWN static credential (`hub.metrics_token`) rather than
-      a login token: access tokens live 15 minutes and no scraper
-      refreshes one, so an admin-token endpoint would serve a single
-      scrape and 401 ever after. Unset — the default — means `/metrics`
-      is not served at all (404), so a hub nobody configured for scraping
-      does not advertise what its library holds; a wrong token is 401, so
-      "off here" is distinguishable from "wrong secret". A satellite being away is `degraded`,
-      not down: its collections go unavailable and nothing is lost (AR-6),
-      and a check that fails the server because one Pi is unplugged gets
-      muted. Health per module is served BY THE HUB rather than by each
-      module: satellites dial out and never listen (AR-3), so an endpoint
-      on each would invert the architecture and be unreachable through NAT
-      anyway. Reload applies what can change under a running process
-      (`trusted_proxies`) and reports the rest — listeners, `data_dir`,
-      cert SANs — as needing a restart, rather than half-applying; a
-      config that fails to parse is rejected and the running settings
-      stand. Live: scrape 8.3 ms / 2.2 KB across 5 modules and 37k files.
+- [x] NFR-6 Operability: structured logging, single-file TOML with env
+      overrides, `GET /health` (public) and `GET /metrics` (Prometheus
+      0.0.4, behind its own static `hub.metrics_token`; unset = not
+      served at all), SIGHUP reload for what can change under a running
+      process.
 - [x] NFR-7 Versioned client API (`/api/v1`)
 - [x] NFR-8 Codec support delegated to system GStreamer; MIT with the OCR
       feature's GPL-3.0 combined-work consequence pre-documented in README
