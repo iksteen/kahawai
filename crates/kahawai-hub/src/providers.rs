@@ -9,6 +9,38 @@
 //! Local metadata (embedded tags) acts earlier, at resolution time —
 //! it decides identity before enrichment ever runs (HUB-9, partial).
 //!
+//! # Derived state is maintained by the DATABASE, not by callers
+//!
+//! `items.sort_title` (0035) and `item_libraries` (0036) are denormalised
+//! — browse cannot sort or filter on a value resolved per read and still
+//! answer in 200 ms. Storing what a read can derive is what `merged_
+//! metadata` did, and it was wrong for one reason: it went stale.
+//!
+//! So these are maintained by TRIGGERS on the tables they derive from,
+//! and the contract is about TABLES, not functions:
+//!
+//! > Write `item_match`, `provider_metadata`, `items`, `item_sources` or
+//! > `library_collections`, and everything derived from them is already
+//! > correct. There is nothing to remember and nothing to call.
+//!
+//! That is why reordering providers keeps sorting right without
+//! `set_chain` knowing that sort keys exist: it writes `item_match`, and
+//! that is the whole of its obligation. Do NOT add call-site updates for
+//! derived state — a second mechanism is how the two disagree.
+//!
+//! Two things would break it, so avoid both:
+//!
+//! * `INSERT OR REPLACE` into a triggered table. SQLite does not fire
+//!   DELETE triggers for REPLACE unless `recursive_triggers` is on, and
+//!   it is off. Use `ON CONFLICT ... DO UPDATE`, as `store_answer` and
+//!   the assignment pick do.
+//! * Bulk-loading a table with triggers disabled or via a path that
+//!   bypasses them, then assuming a later pass will fix it up.
+//!
+//! `tests/sort_title.rs` is the guard: it re-derives the truth from
+//! scratch after every kind of write, including raw SQL, and fails if the
+//! stored answer disagrees.
+//!
 //! # The tables, and what they mean
 //!
 //! This is the reference for the enrichment schema: migrations record
@@ -175,7 +207,12 @@ pub async fn set_chain(db: &SqlitePool, media_type: &str, order: &[String]) -> R
     tx.commit().await?;
     // Reordering re-decides ownership from answers already on disk: no
     // provider is contacted, which is what makes the knob affordable.
-    assign_media_type(db, media_type).await
+    //
+    // Writing item_match is the whole obligation — sort keys and library
+    // membership follow from the triggers on that table, and this
+    // function neither knows nor needs to know they exist. See the module
+    // doc, "Derived state is maintained by the DATABASE".
+    assign_all_in(db, media_type).await
 }
 
 /// Drop an automatic assignment whose backing answer no longer qualifies
@@ -261,7 +298,7 @@ pub async fn assign(db: &SqlitePool, item_id: &str) -> Result<()> {
 
 /// Re-pick every item of one media type — what a reorder costs. Still no
 /// provider is asked: the answers are already stored.
-pub async fn assign_media_type(db: &SqlitePool, media_type: &str) -> Result<()> {
+pub async fn assign_all_in(db: &SqlitePool, media_type: &str) -> Result<()> {
     let mut tx = db.begin().await?;
     reassign(&mut tx, None, Some(media_type_key(media_type))).await?;
     tx.commit().await?;

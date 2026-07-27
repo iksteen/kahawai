@@ -581,7 +581,7 @@ async fn strong_beats_weak_across_the_preference_order() {
     kahawai_hub::providers::assign(&db, "i1").await.unwrap();
     assert_eq!(assigned(&db, "i1").await.unwrap().0, "tmdb");
     set_chain(&db, "movies", &["tvdb".into(), "tmdb".into()]).await.unwrap();
-    kahawai_hub::providers::assign_media_type(&db, "movies").await.unwrap();
+    kahawai_hub::providers::assign_all_in(&db, "movies").await.unwrap();
     assert_eq!(assigned(&db, "i1").await.unwrap().0, "tvdb");
 }
 
