@@ -314,3 +314,210 @@ async fn library_membership_never_drifts() {
         .unwrap();
     assert_eq!(left, 0, "nothing should still claim membership");
 }
+
+/// The gap an AFTER UPDATE trigger keyed on NEW leaves: a row that MOVES
+/// to a different item. Nothing in the hub does this — `item_id` is the
+/// primary key of `item_match` and part of `provider_metadata`'s — but
+/// "nothing does it today" is the reasoning that let `merged_metadata`
+/// drift, so it is checked rather than assumed.
+#[tokio::test]
+async fn moving_a_row_between_items_leaves_nothing_stale() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    item(&db, "a", "Item A").await;
+    item(&db, "b", "Item B").await;
+
+    kahawai_hub::providers::store_answer(
+        &db,
+        "a",
+        "tmdb",
+        "1",
+        "auto",
+        kahawai_hub::providers::Fields { title: Some("From TMDB".into()), ..Default::default() },
+    )
+    .await
+    .unwrap();
+    assert_eq!(sort_title(&db, "a").await.as_deref(), Some("From TMDB"));
+
+    // Re-point the ANSWER at the other item.
+    sqlx::query("UPDATE provider_metadata SET item_id = 'b' WHERE item_id = 'a'")
+        .execute(&db)
+        .await
+        .unwrap();
+    assert_eq!(drifted(&db).await, 0, "answer moved between items");
+
+    // And the ASSIGNMENT.
+    sqlx::query("UPDATE item_match SET item_id = 'b' WHERE item_id = 'a'")
+        .execute(&db)
+        .await
+        .unwrap();
+    assert_eq!(drifted(&db).await, 0, "assignment moved between items");
+
+    // The same shape on the membership side: a source moving collection,
+    // and a collection moving library.
+    sqlx::query(
+        "INSERT INTO satellites (module_id, module_type, name, cert_fingerprint, enrolled_at, disabled)
+         VALUES ('m1','mediahost','h','',unixepoch(),0)",
+    )
+    .execute(&db)
+    .await
+    .unwrap();
+    for c in ["c1", "c2"] {
+        sqlx::query(
+            "INSERT INTO collections (module_id, collection_id, media_type, roots_json, sync_version)
+             VALUES ('m1', ?, 'movies', '[\"/m\"]', 1)",
+        )
+        .bind(c)
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO files (module_id, collection_id, path_rel, size, mtime_unix,
+                                head_xxh3, tail_xxh3, oshash, streams_json, subs_extracted)
+             VALUES ('m1', ?, 'f.mkv', 1, 1, 0, 0, 0, '{}', 0)",
+        )
+        .bind(c)
+        .execute(&db)
+        .await
+        .unwrap();
+    }
+    sqlx::query("INSERT INTO libraries (id, name, media_type) VALUES ('L1','L','movies')")
+        .execute(&db)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO libraries (id, name, media_type) VALUES ('L2','M','movies')")
+        .execute(&db)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO library_collections (library_id, module_id, collection_id)
+                 VALUES ('L1','m1','c1')")
+        .execute(&db)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO item_sources (item_id, module_id, collection_id, path_rel)
+                 VALUES ('a','m1','c1','f.mkv')")
+        .execute(&db)
+        .await
+        .unwrap();
+    assert_eq!(lib_drift(&db).await, 0, "seeded");
+
+    sqlx::query("UPDATE item_sources SET collection_id='c2' WHERE item_id='a'")
+        .execute(&db)
+        .await
+        .unwrap();
+    assert_eq!(lib_drift(&db).await, 0, "source moved collection");
+
+    sqlx::query("UPDATE library_collections SET library_id='L2' WHERE library_id='L1'")
+        .execute(&db)
+        .await
+        .unwrap();
+    assert_eq!(lib_drift(&db).await, 0, "collection moved library");
+}
+
+/// Reordering providers re-decides which record an item IS, and the new
+/// winner usually carries a different title. That path writes item_match
+/// rather than any title column, so it is worth proving the sort key
+/// follows a decision made somewhere else entirely.
+#[tokio::test]
+async fn reordering_providers_moves_the_sort_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    item(&db, "i1", "some.file.2019").await;
+
+    // Two equally strong answers with different titles. Default order
+    // for movies is tmdb before tvdb, so tmdb wins first.
+    for (provider, pid, title) in
+        [("tmdb", "1", "The TMDB Title"), ("tvdb", "2", "A TVDB Title")]
+    {
+        kahawai_hub::providers::store_answer(
+            &db,
+            "i1",
+            provider,
+            pid,
+            "auto",
+            kahawai_hub::providers::Fields {
+                title: Some(title.into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    }
+    assert_eq!(sort_title(&db, "i1").await.as_deref(), Some("The TMDB Title"));
+    assert_eq!(drifted(&db).await, 0);
+
+    // Put tvdb first. Nothing writes a title here — only provider_ranks
+    // and, through the re-pick, item_match.
+    kahawai_hub::providers::set_chain(&db, "movies", &["tvdb".into(), "tmdb".into()])
+        .await
+        .unwrap();
+    assert_eq!(
+        sort_title(&db, "i1").await.as_deref(),
+        Some("A TVDB Title"),
+        "the sort key must follow the reorder, not the write that caused it"
+    );
+    assert_eq!(drifted(&db).await, 0);
+
+    // And back.
+    kahawai_hub::providers::set_chain(&db, "movies", &["tmdb".into(), "tvdb".into()])
+        .await
+        .unwrap();
+    assert_eq!(sort_title(&db, "i1").await.as_deref(), Some("The TMDB Title"));
+    assert_eq!(drifted(&db).await, 0);
+}
+
+/// The one divergence, pinned so it stays known: `sort_title` follows the
+/// ASSIGNED record, while the resolved view side-fills a title from
+/// another provider when the assigned record has none. Such an item is
+/// displayed under the side-filled title and sorted under its filename.
+///
+/// It needs a match that carries no title at all, which providers do not
+/// normally return — but if this ever stops being rare, the fix is to
+/// resolve sort_title the way the view does, and this test is where that
+/// would be noticed.
+#[tokio::test]
+async fn a_titleless_match_sorts_by_filename_while_showing_a_borrowed_title() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    item(&db, "i1", "zzz.filename").await;
+
+    // The assigned record identifies the item but names nothing.
+    kahawai_hub::providers::store_answer(
+        &db,
+        "i1",
+        "tmdb",
+        "1",
+        "auto",
+        kahawai_hub::providers::Fields::default(),
+    )
+    .await
+    .unwrap();
+    // A lower-ranked provider does have a title, which the view borrows.
+    kahawai_hub::providers::store_answer(
+        &db,
+        "i1",
+        "tvdb",
+        "2",
+        "auto",
+        kahawai_hub::providers::Fields {
+            title: Some("Borrowed Title".into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let shown: Option<String> =
+        sqlx::query_scalar("SELECT title FROM resolved_metadata WHERE item_id = 'i1'")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    assert_eq!(shown.as_deref(), Some("Borrowed Title"), "the view side-fills");
+    assert_eq!(
+        sort_title(&db, "i1").await.as_deref(),
+        Some("zzz.filename"),
+        "the sort key falls back to the filename, and this is the known divergence"
+    );
+    // Still not DRIFT: the stored value is what its definition says.
+    assert_eq!(drifted(&db).await, 0);
+}
