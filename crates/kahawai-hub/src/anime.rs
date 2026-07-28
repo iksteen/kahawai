@@ -369,6 +369,14 @@ impl Anilist {
             .json(&serde_json::json!({"query": query, "variables": variables}));
         let resp =
             self.http.send(req).await?.error_for_status()?.json::<serde_json::Value>().await?;
+        // GraphQL reports failure in-band: a 200 whose body carries
+        // `errors` must surface as an error, not deserialize into
+        // "no such anime" — that once became a permanent recorded miss.
+        if let Some(errs) = resp.get("errors").and_then(|e| e.as_array())
+            && !errs.is_empty()
+        {
+            anyhow::bail!("anilist graphql error: {}", errs[0]["message"].as_str().unwrap_or("?"));
+        }
         Ok(resp)
     }
 

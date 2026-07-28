@@ -344,3 +344,81 @@ async fn specials_land_in_season_zero_and_the_rest_is_left_alone() {
             .unwrap();
     assert_eq!(title, "title sp");
 }
+
+/// A name-based 'anime' miss is provisional while any of the item's
+/// hashed files was never put to AniDB: the void re-opens the question,
+/// exhausted hashes close it for good, and a human refusal is never
+/// re-litigated. (The Doomed Megalopolis failure, 2026-07-28.)
+#[tokio::test]
+async fn unverified_anime_misses_are_voided_until_hashes_are_spent() {
+    let (_enricher, db, _dir) = harness().await;
+    // 'show' harness item + one hashed episode file, NOT yet in ed2k_aid.
+    episode(&db, "e1", None, 1, AID, "1").await;
+    sqlx::query("DELETE FROM ed2k_aid").execute(&db).await.unwrap();
+    let miss = |db: &SqlitePool| {
+        let db = db.clone();
+        async move {
+            sqlx::query(
+                "INSERT INTO provider_metadata (item_id, provider, provider_id, confidence, updated_at)
+                 VALUES ('show','anime','','miss',unixepoch())
+                 ON CONFLICT (item_id, provider) DO UPDATE SET confidence='miss'",
+            )
+            .execute(&db)
+            .await
+            .unwrap()
+        }
+    };
+    miss(&db).await;
+
+    // Unasked hash on file → the miss is void.
+    assert_eq!(kahawai_hub::enrich::Enricher::void_unverified_anime_misses(&db).await.unwrap(), 1);
+
+    // Every hash spent (a recorded miss counts) → the miss is final.
+    miss(&db).await;
+    sqlx::query("INSERT INTO ed2k_aid (ed2k, aid, updated_at) VALUES ('hash-e1', NULL, unixepoch())")
+        .execute(&db)
+        .await
+        .unwrap();
+    assert_eq!(kahawai_hub::enrich::Enricher::void_unverified_anime_misses(&db).await.unwrap(), 0);
+
+    // A human refusal blocks the void even with a fresh unasked hash.
+    sqlx::query("DELETE FROM ed2k_aid").execute(&db).await.unwrap();
+    sqlx::query(
+        "INSERT INTO rejected_matches (item_id, provider, provider_id, rejected_at)
+         VALUES ('show','anilist','1','1')",
+    )
+    .execute(&db)
+    .await
+    .unwrap();
+    assert_eq!(kahawai_hub::enrich::Enricher::void_unverified_anime_misses(&db).await.unwrap(), 0);
+}
+
+/// Writing an anime identity clears TMDB/TVDB title-search MISSES (the
+/// bridge asks by mapped id — a different question) but never a real
+/// answer.
+#[tokio::test]
+async fn anime_identity_voids_stale_title_search_misses() {
+    let (enricher, db, _dir) = harness().await;
+    sqlx::query(
+        "INSERT INTO provider_metadata (item_id, provider, provider_id, confidence, updated_at)
+         VALUES ('show','tmdb','','miss',unixepoch()),
+                ('show','tvdb','42','auto',unixepoch())",
+    )
+    .execute(&db)
+    .await
+    .unwrap();
+    let media: kahawai_hub::anime::AnilistMedia = serde_json::from_value(serde_json::json!({
+        "id": 1148, "title": {"romaji": "Teito Monogatari", "english": "Doomed Megalopolis"}
+    }))
+    .unwrap();
+    enricher.store_anime(&db, "show", "show", &media, Some(1505), None).await.unwrap();
+
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT provider, confidence FROM provider_metadata
+          WHERE item_id='show' AND provider IN ('tmdb','tvdb') ORDER BY provider",
+    )
+    .fetch_all(&db)
+    .await
+    .unwrap();
+    assert_eq!(rows, [("tvdb".into(), "auto".into())], "miss gone, real answer kept");
+}

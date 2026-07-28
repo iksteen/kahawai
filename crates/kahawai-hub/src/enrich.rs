@@ -1259,6 +1259,10 @@ impl Enricher {
         if items.is_empty() {
             return Ok(());
         }
+        let voided = Self::void_unverified_anime_misses(registry.db()).await?;
+        if voided > 0 {
+            tracing::info!(voided, "anime misses voided pending hash verification");
+        }
         tracing::info!(items = items.len(), "anime enrichment starting");
         // HUB-30: per-run budget for episode-hash lookups, shared across
         // shows. The client already paces every packet to AniDB's flood
@@ -1315,6 +1319,33 @@ impl Enricher {
         Ok(())
     }
 
+    /// A recorded 'anime' miss taken while the item still holds hashed
+    /// files AniDB was never asked about is not a final answer: it was
+    /// decided on name evidence alone while stronger evidence (the
+    /// hash, HUB-30a) sat unconsulted — hashes often land minutes after
+    /// the item was first walked. Void it so the walker re-asks.
+    /// Bounded: every re-ask records one more hash in ed2k_aid, so the
+    /// predicate extinguishes itself; human refusals stay refused.
+    /// (Doomed Megalopolis, 2026-07-28: four hashed files, a permanent
+    /// name-based miss, and no path back.)
+    pub async fn void_unverified_anime_misses(db: &sqlx::SqlitePool) -> Result<u64> {
+        Ok(sqlx::query(
+            "DELETE FROM provider_metadata
+              WHERE provider = 'anime' AND confidence = 'miss'
+                AND item_id NOT IN (SELECT item_id FROM rejected_matches)
+                AND item_id IN (SELECT COALESCE(ch.parent_id, ch.id)
+                                  FROM files f
+                                  JOIN item_sources s ON (s.module_id, s.collection_id, s.path_rel)
+                                                       = (f.module_id, f.collection_id, f.path_rel)
+                                  JOIN items ch ON ch.id = s.item_id
+                                 WHERE f.ed2k IS NOT NULL
+                                   AND f.ed2k NOT IN (SELECT ed2k FROM ed2k_aid))",
+        )
+        .execute(db)
+        .await?
+        .rows_affected())
+    }
+
     /// Resolve an item's AniDB id from a representative file's ED2K
     /// hash. Results (hits AND misses) are persisted per content in the
     /// ed2k_aid table — AniDB is never asked twice for the same hash.
@@ -1331,7 +1362,11 @@ impl Enricher {
              WHERE f.ed2k IS NOT NULL
                AND (s.item_id = ?1
                     OR s.item_id IN (SELECT id FROM items WHERE parent_id = ?1))
-             ORDER BY s.path_rel LIMIT 1",
+             -- Prefer a file AniDB has never been asked about: a cached
+             -- miss on the alphabetically-first file must not block the
+             -- siblings from ever being consulted.
+             ORDER BY EXISTS (SELECT 1 FROM ed2k_aid c WHERE c.ed2k = f.ed2k),
+                      s.path_rel LIMIT 1",
         )
         .bind(item_id)
         .fetch_optional(db)
@@ -1886,7 +1921,7 @@ impl Enricher {
     }
 
     /// Persist an AniList match: metadata upsert + relations graph.
-    async fn store_anime(
+    pub async fn store_anime(
         &self,
         db: &sqlx::SqlitePool,
         item_id: &str,
@@ -1900,6 +1935,19 @@ impl Enricher {
             .as_ref()
             .and_then(|c| c.extra_large.clone().or_else(|| c.large.clone()));
         let genres = media.genres.clone().unwrap_or_default();
+        // An anime identity invalidates recorded TMDB/TVDB misses: they
+        // answered "who are you by TITLE search" (asked before identity
+        // existed, possibly against a junk-suffixed title), while the
+        // tail now asks by mapped ID — a different question the walker
+        // must be allowed to put. Real answers are left alone.
+        sqlx::query(
+            "DELETE FROM provider_metadata
+              WHERE item_id = ?1 AND provider IN ('tmdb', 'tvdb')
+                AND confidence = 'miss'",
+        )
+        .bind(item_id)
+        .execute(db)
+        .await?;
         // The anime composite's answer (HUB-5). Recorded under
         // 'anilist', which ranks wherever 'anime' sits in the chain, so
         // the TMDB/TVDB tail can fill what AniList leaves empty —
