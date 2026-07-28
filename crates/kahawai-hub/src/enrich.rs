@@ -1493,16 +1493,31 @@ impl Enricher {
         for r in rows {
             let (aid, epno) = (r.get::<i64, _>("aid"), r.get::<String, _>("epno"));
             let path: String = r.get("path_rel");
-            let Some((owner, kind)) = sqlx::query_as::<_, (String, String)>(
+            let owner_row = sqlx::query_as::<_, (String, String)>(
                 "SELECT i.id, i.kind FROM anime_ids a JOIN items i ON i.id = a.item_id
                   WHERE a.anidb_id = ? LIMIT 1",
             )
             .bind(aid)
             .fetch_optional(db)
-            .await?
-            else {
-                tracing::debug!(path = %path, aid, "bare file's anime is not in the catalogue");
-                continue;
+            .await?;
+            let (owner, kind) = match owner_row {
+                Some(pair) => pair,
+                // Nothing owns this aid. If AniDB says it is a MOVIE,
+                // the item is minted (or an aid-less twin adopted) from
+                // the provider's answer — the only place an item
+                // originates from an answer rather than a filename,
+                // agreed 2026-07-28, because a yearless "Akira.mkv" can
+                // never earn an item any other way. A series stays bare:
+                // one stray file must not scaffold a show.
+                None => match self.mint_movie_for_aid(db, aid as u32).await {
+                    Ok(Some(id)) => (id, "movie".to_string()),
+                    Ok(None) => continue,
+                    Err(e) => {
+                        tracing::debug!(path = %path, aid, error = format!("{e:#}"),
+                            "could not establish what this aid is; leaving bare");
+                        continue;
+                    }
+                },
             };
             let target = match kind.as_str() {
                 // The file IS (part of) the movie itself.
@@ -1567,6 +1582,65 @@ impl Enricher {
             bound += 1;
         }
         Ok(bound)
+    }
+
+    /// A movie item for an aid nothing owns — adopted if an aid-less
+    /// twin exists under the same normalized title and year (a TMDB
+    /// title-match of the same film), minted from AniDB's answer
+    /// otherwise. Returns None for non-movie types.
+    async fn mint_movie_for_aid(
+        &self,
+        db: &sqlx::SqlitePool,
+        aid: u32,
+    ) -> Result<Option<String>> {
+        let info = crate::anime::anidb_anime_info(&self.http, &self.data_dir, aid).await?;
+        if info.kind != "Movie" {
+            tracing::debug!(aid, kind = %info.kind, "not a movie; leaving bare");
+            return Ok(None);
+        }
+        let norm = kahawai_core::names::normalize_title(&info.title);
+        let twin: Option<String> = sqlx::query_scalar(
+            "SELECT i.id FROM items i
+              WHERE i.kind = 'movie' AND i.norm_title = ?1 AND i.year IS ?2
+                AND NOT EXISTS (SELECT 1 FROM anime_ids a
+                                 WHERE a.item_id = i.id AND a.anidb_id IS NOT NULL)",
+        )
+        .bind(&norm)
+        .bind(info.year)
+        .fetch_optional(db)
+        .await?;
+        let id = match twin {
+            Some(id) => {
+                tracing::info!(aid, title = %info.title, item = %id,
+                    "hash identity adopted an existing movie");
+                id
+            }
+            None => {
+                let id = ulid::Ulid::generate().to_string();
+                sqlx::query(
+                    "INSERT INTO items (id, kind, title, norm_title, year)
+                     VALUES (?, 'movie', ?, ?, ?)",
+                )
+                .bind(&id)
+                .bind(&info.title)
+                .bind(&norm)
+                .bind(info.year)
+                .execute(db)
+                .await?;
+                tracing::info!(aid, title = %info.title, year = ?info.year,
+                    "movie minted from hash identity");
+                id
+            }
+        };
+        sqlx::query(
+            "INSERT INTO anime_ids (item_id, anidb_id) VALUES (?, ?)
+             ON CONFLICT (item_id) DO UPDATE SET anidb_id = excluded.anidb_id",
+        )
+        .bind(&id)
+        .bind(aid)
+        .execute(db)
+        .await?;
+        Ok(Some(id))
     }
 
     /// Bind each hashed file to the episode AniDB says it IS (HUB-30a:

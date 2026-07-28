@@ -182,10 +182,14 @@ How something works and why it was built that way belong in
       Release revisions are generic: anime `NNv2` and scene
       REPACK/PROPER/RERIP parse to one number on the file record, and
       source ranking prefers the corrected release within a resolution
-      tier (`names::release_revision`, ranking in sessions/api).
-      Remaining: batch markers and OVA/ONA designations are not in the
-      tokenizer; files whose hash names a DIFFERENT AniDB entry than
-      their show's (per-season splits) are logged, not re-bound.
+      tier. Designations (OVA/ONA/SP/NCOP/NCED/MOVIE, arabic and roman
+      indexes) slot into season-0 bands by name, refined by hash; bare
+      files answer to their hash, including minting a movie item from
+      AniDB's answer when nothing owns the aid.
+      Remaining: batch markers (multi-episode files, "OVA 1-2") are not
+      handled; files whose hash names a DIFFERENT AniDB entry than their
+      show's (per-season splits) are logged, not re-bound; a series-type
+      aid with no catalogue item deliberately stays bare.
 - [x] HUB-30a Hashes are canonical identity: late ED2K re-verifies name
       matches, overrides on disagreement (manual included); manual matches
       otherwise adopt anime ids only via reverse mapping (proven live)

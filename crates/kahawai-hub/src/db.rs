@@ -29,7 +29,13 @@ pub async fn open(data_dir: &Path) -> Result<SqlitePool> {
         // that already holds a 61 MB database and serves video. Latency
         // at point of use is the thing bought: browse is the one path a
         // user waits on synchronously.
-        .pragma("cache_size", "-8192");
+        .pragma("cache_size", "-8192")
+        // The enrichment pass, the repick triggers and a browse request
+        // are three legitimate concurrent writers; sqlx's default 5 s
+        // busy handout has been seen expiring under a long pass
+        // ("database is locked" in the binder). Waiting longer IS the
+        // correct behaviour — no writer here holds the lock unbounded.
+        .busy_timeout(std::time::Duration::from_secs(30));
     let pool = SqlitePoolOptions::new()
         .max_connections(8)
         .connect_with(opts)
@@ -54,6 +60,7 @@ pub async fn open(data_dir: &Path) -> Result<SqlitePool> {
     install_derived(&pool).await?;
     backfill_norm_artist(&pool).await?;
     backfill_revision(&pool).await?;
+    repair_release_tag_titles(&pool).await?;
     Ok(pool)
 }
 
@@ -110,6 +117,56 @@ async fn backfill_revision(pool: &SqlitePool) -> Result<()> {
     }
     tx.commit().await?;
     tracing::info!(rows = missing.len(), "release revisions backfilled");
+    Ok(())
+}
+
+/// Retitle items whose names carry a trailing release tag —
+/// "(Dual-Audio)", "(Eng.-Dub)" — that the parser now strips (see
+/// names::strip_release_tags). Same one-shot shape as the other
+/// backfills: the parser stops producing such titles, so after this
+/// heals the existing rows it never matches again. A rename that would
+/// collide with an existing item is left for a human or for hash
+/// reconciliation — renaming into a collision would create twins the
+/// dedup key can no longer tell apart.
+async fn repair_release_tag_titles(pool: &SqlitePool) -> Result<()> {
+    let rows: Vec<(String, String, Option<i64>, String)> = sqlx::query_as(
+        "SELECT id, title, year, kind FROM items
+          WHERE kind IN ('show', 'movie') AND title LIKE '%)'",
+    )
+    .fetch_all(pool)
+    .await?;
+    let mut fixed = 0;
+    for (id, title, year, kind) in rows {
+        let stripped = kahawai_core::names::strip_release_tags(&title);
+        if stripped == title || stripped.is_empty() {
+            continue;
+        }
+        let norm = kahawai_core::names::normalize_title(&stripped);
+        let taken: Option<String> = sqlx::query_scalar(
+            "SELECT id FROM items WHERE kind = ?1 AND norm_title = ?2 AND year IS ?3 AND id <> ?4",
+        )
+        .bind(&kind)
+        .bind(&norm)
+        .bind(year)
+        .bind(&id)
+        .fetch_optional(pool)
+        .await?;
+        if let Some(other) = taken {
+            tracing::warn!(item = %id, title = %title, duplicate_of = %other,
+                "release-tag title left in place: cleaned name already exists");
+            continue;
+        }
+        sqlx::query("UPDATE items SET title = ?, norm_title = ? WHERE id = ?")
+            .bind(&stripped)
+            .bind(&norm)
+            .bind(&id)
+            .execute(pool)
+            .await?;
+        fixed += 1;
+    }
+    if fixed > 0 {
+        tracing::info!(rows = fixed, "release-tag titles repaired");
+    }
     Ok(())
 }
 

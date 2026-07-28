@@ -445,8 +445,18 @@ pub async fn anidb_episode_titles(
         return Ok(titles);
     }
 
-    // One page every two seconds, and a 24 h silence if they ban us:
-    // both live in the gate, keyed on api.anidb.net.
+    let text = fetch_anime_xml(http, &path, aid).await?;
+    titles = parse_episode_titles(&text)?;
+    Ok(titles)
+}
+
+/// One page every two seconds, and a 24 h silence if they ban us: both
+/// live in the gate, keyed on api.anidb.net.
+async fn fetch_anime_xml(
+    http: &crate::gate::Http,
+    path: &Path,
+    aid: u32,
+) -> Result<String> {
     let req = http.get("http://api.anidb.net:9001/httpapi").query(&[
         ("request", "anime"),
         ("client", HTTP_CLIENT),
@@ -469,10 +479,59 @@ pub async fn anidb_episode_titles(
         "anidb http api error for aid {aid}: {}",
         text.trim().chars().take(120).collect::<String>()
     );
-    std::fs::write(&path, &text)?;
+    std::fs::write(path, &text)?;
     tracing::info!(aid, "anidb anime xml fetched");
-    titles = parse_episode_titles(&text)?;
-    Ok(titles)
+    Ok(text)
+}
+
+/// What an aid IS, from the per-anime XML: enough to mint a movie item
+/// from a hash identity (HUB-30). Cache-first, ask-once — the same file
+/// the episode-titles path keeps.
+pub struct AnidbAnimeInfo {
+    /// AniDB's own type string: "Movie", "TV Series", "OVA", "Web", …
+    pub kind: String,
+    pub title: String,
+    pub year: Option<i64>,
+}
+
+pub async fn anidb_anime_info(
+    http: &crate::gate::Http,
+    data_dir: &Path,
+    aid: u32,
+) -> Result<AnidbAnimeInfo> {
+    let dir = anime_dir(data_dir).join("httpapi");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("{aid}.xml"));
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(_) => fetch_anime_xml(http, &path, aid).await?,
+    };
+    let doc = roxmltree::Document::parse(&text)?;
+    let kind = doc
+        .descendants()
+        .find(|n| n.has_tag_name("type"))
+        .and_then(|n| n.text())
+        .unwrap_or("")
+        .to_string();
+    // The official English title where one exists, else the main
+    // (romaji) title — the preference the rest of the pipeline shows.
+    let titles: Vec<_> = doc.descendants().filter(|n| n.has_tag_name("title")).collect();
+    let title = titles
+        .iter()
+        .find(|n| n.attribute("type") == Some("official")
+            && n.attribute(("http://www.w3.org/XML/1998/namespace", "lang")) == Some("en"))
+        .or_else(|| titles.iter().find(|n| n.attribute("type") == Some("main")))
+        .and_then(|n| n.text())
+        .unwrap_or("")
+        .to_string();
+    let year = doc
+        .descendants()
+        .find(|n| n.has_tag_name("startdate"))
+        .and_then(|n| n.text())
+        .and_then(|d| d.get(..4))
+        .and_then(|y| y.parse().ok());
+    anyhow::ensure!(!title.is_empty(), "anidb xml for {aid} carries no title");
+    Ok(AnidbAnimeInfo { kind, title, year })
 }
 
 fn parse_episode_titles(xml: &str) -> Result<std::collections::HashMap<i64, String>> {

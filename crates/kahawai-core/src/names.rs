@@ -12,7 +12,40 @@ pub struct MovieGuess {
 /// Parse a movie filename: `The.Matrix.1999.1080p.x264-GRP.mkv` →
 /// title "The Matrix", year 1999. The *last* plausible year wins, so
 /// `2001 A Space Odyssey (1968)` keeps its numeric title.
+/// Strip trailing parenthetical RELEASE tags from a name: "(Dual-Audio)",
+/// "(Eng.-Dub)", "(Uncut)", "(OVA)". A borrowed collection titled every
+/// directory this way, and the tag rode into show titles, poisoning
+/// provider matching and deduplication — "Hellsing Ultimate (Dual-Audio)"
+/// is not a different show from "Hellsing Ultimate". A parenthetical is
+/// stripped only when one of its words is unambiguously release-speak,
+/// so "(Director's Cut)" and a bare year survive.
+pub fn strip_release_tags(name: &str) -> String {
+    const TAGS: &[&str] = &[
+        "dual", "audio", "dub", "dubbed", "sub", "subbed", "subs", "eng", "uncut",
+        "ova", "ona", "remaster", "remastered", "batch", "uncensored",
+    ];
+    let mut out = name.trim_end().to_string();
+    loop {
+        let Some(open) = out.rfind('(') else { break };
+        if !out.ends_with(')') {
+            break;
+        }
+        let inner = &out[open + 1..out.len() - 1];
+        let releaseish = inner
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .filter(|w| !w.is_empty())
+            .any(|w| TAGS.contains(&w.to_ascii_lowercase().as_str()));
+        if !releaseish {
+            break;
+        }
+        out.truncate(open);
+        out = out.trim_end().to_string();
+    }
+    out
+}
+
 pub fn parse_movie(filename: &str) -> MovieGuess {
+    let filename = &strip_release_tags(filename);
     // Strip the suffix only when it plausibly IS a file extension:
     // 2-4 alphanumerics with at least one letter. Show directories like
     // "Mr. Robot" reach here too — " Robot" is a title, not an ext, and
@@ -770,5 +803,21 @@ mod tests {
         // and the hash refines the slot when AniDB knows the file. The
         // year in parens is stripped and can never become an index.
         assert_eq!(slot("[Grp] Show OVA (1997) - 04.mkv"), Some((Some(0), 4)));
+    }
+
+    #[test]
+    fn release_tag_parentheticals_leave_titles_alone() {
+        use super::strip_release_tags as strip;
+        assert_eq!(strip("Hellsing Ultimate (Dual-Audio)"), "Hellsing Ultimate");
+        assert_eq!(strip("8 Man After (Eng.-Dub)"), "8 Man After");
+        assert_eq!(strip("Mezzo Forte (Uncut) (Dual Audio)"), "Mezzo Forte");
+        assert_eq!(strip("BALDR FORCE EXE Resolution (OVA)"), "BALDR FORCE EXE Resolution");
+        // Not release-speak: kept.
+        assert_eq!(strip("Blade Runner (Director's Cut)"), "Blade Runner (Director's Cut)");
+        assert_eq!(strip("Fate/stay night (2014)"), "Fate/stay night (2014)");
+        assert_eq!(strip("Akira"), "Akira");
+        // And the parse itself now sheds the tag from a directory name.
+        assert_eq!(super::parse_movie("1001 Nights (Dual-Audio)").title, "1001 Nights");
+        assert_eq!(super::parse_movie("Armitage Dual Matrix [2002] (Dual-Audio)").year, Some(2002));
     }
 }

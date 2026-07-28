@@ -158,6 +158,102 @@ async fn bare_files_bind_to_what_their_hash_names() {
     assert_eq!(enricher.bind_bare_files(&db).await.unwrap(), 0);
 }
 
+/// A bare file whose aid nothing owns MINTS a movie item from AniDB's
+/// answer — or adopts an aid-less twin — while a series-type aid stays
+/// bare. The XML is a fixture in the cache location, so no network.
+#[tokio::test]
+async fn ownerless_movies_are_minted_or_adopted_from_the_hash() {
+    let (enricher, db, dir) = harness().await;
+    let xmldir = dir.path().join("anime/httpapi");
+    std::fs::create_dir_all(&xmldir).unwrap();
+    let xml = |aid: u32, kind: &str, title: &str, date: &str| {
+        std::fs::write(
+            xmldir.join(format!("{aid}.xml")),
+            format!(
+                "<anime id=\"{aid}\"><type>{kind}</type><startdate>{date}</startdate>\
+                 <titles><title xml:lang=\"x-jat\" type=\"main\">{title} Romaji</title>\
+                 <title xml:lang=\"en\" type=\"official\">{title}</title></titles></anime>"
+            ),
+        )
+        .unwrap();
+    };
+    xml(979, "Movie", "Akira", "1988-07-16");
+    xml(500, "TV Series", "Some Show", "1999-01-01");
+    xml(600, "Movie", "Adopted Film", "2001-06-01");
+    // The adoptable twin: same normalized title and year, no anime_ids.
+    sqlx::query(
+        "INSERT INTO items (id, kind, title, norm_title, year)
+         VALUES ('twin','movie','Adopted Film','adopted film',2001)",
+    )
+    .execute(&db)
+    .await
+    .unwrap();
+
+    for (path, hash, aid) in
+        [("akira.mkv", "h-akira", 979), ("stray-ep.mkv", "h-se", 500), ("adopt.mkv", "h-ad", 600)]
+    {
+        sqlx::query(
+            "INSERT INTO files (module_id, collection_id, path_rel, size, mtime_unix,
+                                head_xxh3, tail_xxh3, oshash, streams_json, subs_extracted, ed2k)
+             VALUES ('m','c', ?, 700, 1, 0, 0, 0, '{}', 0, ?)",
+        )
+        .bind(path)
+        .bind(hash)
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO ed2k_aid (ed2k, aid, eid, epno, gid, group_name, updated_at)
+             VALUES (?, ?, 1, '1', 7, 'Grp', unixepoch())",
+        )
+        .bind(hash)
+        .bind(aid)
+        .execute(&db)
+        .await
+        .unwrap();
+    }
+
+    let bound = enricher.bind_bare_files(&db).await.unwrap();
+    assert_eq!(bound, 2, "the movie and the adoption bind; the stray episode does not");
+
+    let akira: (String, Option<i64>, String) = sqlx::query_as(
+        "SELECT i.title, i.year, i.id FROM item_sources s JOIN items i ON i.id=s.item_id
+          WHERE s.path_rel='akira.mkv'",
+    )
+    .fetch_one(&db)
+    .await
+    .unwrap();
+    assert_eq!((akira.0.as_str(), akira.1), ("Akira", Some(1988)), "minted from the XML");
+    let aid_of: i64 =
+        sqlx::query_scalar("SELECT anidb_id FROM anime_ids WHERE item_id = ?")
+            .bind(&akira.2)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    assert_eq!(aid_of, 979);
+
+    let adopted: String =
+        sqlx::query_scalar("SELECT item_id FROM item_sources WHERE path_rel='adopt.mkv'")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    assert_eq!(adopted, "twin", "an aid-less twin is adopted, not duplicated");
+
+    let stray: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM item_sources WHERE path_rel='stray-ep.mkv'")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    assert_eq!(stray, 0, "a series-type aid must not scaffold a show");
+    // And no phantom show was created for it.
+    let shows: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM items WHERE kind IN ('show','movie')")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    assert_eq!(shows, 3, "show harness + akira + twin, nothing else");
+}
+
 /// A file WE parked in season 0 on a name guess is reclaimed by a
 /// regular hash number — season 0 is speculation, not identity. A real
 /// SxxEyy key still is.
