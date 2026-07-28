@@ -578,6 +578,11 @@ export default function Detail({
         {item.sources_detail.map((s) => (
           <li key={s.path_rel}>
             <span className="path mono">{s.path_rel}</span>
+            {s.revision > 1 && (
+              <span className="chip" title="corrected release (v2 / REPACK / PROPER)">
+                v{s.revision}
+              </span>
+            )}
             <Chips s={s} />
           </li>
         ))}

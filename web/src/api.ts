@@ -145,6 +145,9 @@ export type Source = {
   path_rel: string
   size: number
   available: boolean
+  /// Release revision: 1 plain, 2+ for v2 / REPACK / PROPER. Higher
+  /// outranks lower within the same resolution when playback picks.
+  revision: number
   streams: StreamInfo | null
 }
 

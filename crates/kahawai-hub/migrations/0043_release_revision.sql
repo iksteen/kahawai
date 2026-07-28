@@ -1,0 +1,11 @@
+-- HUB-30 generalized: which revision of a release a file is.
+--
+-- 1 = plain; anime `NNv2` makes it 2, and each scene REPACK/PROPER/RERIP
+-- tag adds one. Parsed from the basename by names::release_revision —
+-- parsing is Rust, so existing rows are backfilled by db::open and the
+-- ingest keeps it filled from here on (NULL = not yet parsed).
+--
+-- The number exists for source ranking: within the same resolution tier
+-- the corrected release must beat the defective one, and byte size
+-- cannot express that — a v2 is often SMALLER than the encode it fixes.
+ALTER TABLE files ADD COLUMN revision INTEGER;

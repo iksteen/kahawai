@@ -179,11 +179,13 @@ How something works and why it was built that way belong in
       and on disagreement the hash re-binds the file to the episode it
       IS — specials into season 0, misnumbered rips to their real number
       (`tests/hash_binding.rs`).
-      Remaining: version tags (`v2`) are parsed past but not stored, so
-      source ranking cannot prefer a v2 over a v1; batch markers and
-      OVA/ONA designations are not in the tokenizer; files whose hash
-      names a DIFFERENT AniDB entry than their show's (per-season
-      splits) are logged, not re-bound.
+      Release revisions are generic: anime `NNv2` and scene
+      REPACK/PROPER/RERIP parse to one number on the file record, and
+      source ranking prefers the corrected release within a resolution
+      tier (`names::release_revision`, ranking in sessions/api).
+      Remaining: batch markers and OVA/ONA designations are not in the
+      tokenizer; files whose hash names a DIFFERENT AniDB entry than
+      their show's (per-season splits) are logged, not re-bound.
 - [x] HUB-30a Hashes are canonical identity: late ED2K re-verifies name
       matches, overrides on disagreement (manual included); manual matches
       otherwise adopt anime ids only via reverse mapping (proven live)

@@ -368,6 +368,50 @@ pub fn normalize_title(title: &str) -> String {
     out.trim_end().to_string()
 }
 
+/// Release revision from a FILENAME: 1 for a plain release, higher for
+/// a corrected one (HUB-30 generalized).
+///
+/// Two conventions, one number. Anime fansub `NNv2` means "second
+/// version of this episode's release"; scene `REPACK`/`PROPER`/`RERIP`
+/// mean "this release corrects a defective one" and each adds one. The
+/// number exists for source ranking: within the same quality tier the
+/// corrected release must win, and byte size cannot say so — a v2 is
+/// often SMALLER than the broken encode it replaces.
+///
+/// Precision over recall, because titles lie. This collection's own
+/// files include "Proper Preparation and Planning", "Intellectual
+/// Property" and "(Proper Night Out mix)" — so tags must be standalone
+/// delimiter-separated tokens, and PROPER (an English word) only counts
+/// in ALL CAPS, while REPACK/RERIP (not words) match case-insensitively,
+/// which is what still catches a P2P-styled "Repack". Only the basename
+/// is read: directory names hold titles like "Version 2.0".
+pub fn release_revision(path_rel: &str) -> u32 {
+    let name = path_rel.rsplit('/').next().unwrap_or(path_rel);
+    let mut version: u32 = 1;
+    let (mut repack, mut proper, mut rerip) = (false, false, false);
+    for token in name.split(['.', '_', '-', '[', ']', '(', ')', ' ']) {
+        if token.eq_ignore_ascii_case("repack") {
+            repack = true;
+        } else if token.eq_ignore_ascii_case("rerip") {
+            rerip = true;
+        } else if token == "PROPER" {
+            proper = true;
+        } else if let Some((ep, v)) = token.split_once(['v', 'V']) {
+            // `05v2`: both halves numeric, so "x264" and plain words
+            // cannot match.
+            if !ep.is_empty()
+                && ep.chars().all(|c| c.is_ascii_digit())
+                && !v.is_empty()
+                && v.chars().all(|c| c.is_ascii_digit())
+                && let Ok(n) = v.parse::<u32>()
+            {
+                version = version.max(n);
+            }
+        }
+    }
+    version + repack as u32 + proper as u32 + rerip as u32
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -527,5 +571,34 @@ mod tests {
         // Unparseable: no track number.
         assert!(parse_music("X/Y/cover.jpg").is_none());
         assert!(parse_music("X/Y/liner-notes.flac").is_none());
+    }
+
+    #[test]
+    fn release_revision_reads_tags_not_titles() {
+        use super::release_revision as rev;
+        // The real corrected releases in the live collection.
+        assert_eq!(rev("Avengers.Infinity.War.2018.BDRip.1080p.PROPER.X265.Ac3-GANJAMAN.mkv"), 2);
+        assert_eq!(rev("Captain.America.Civil.War.2016.PROPER.REMASTERED.1080p.BluRay.x265.mp4"), 2);
+        assert_eq!(rev("Kingsman.The.Golden.Circle.2017.REPACK.1080p.BluRay.DD.7.1.X265-Ralphy.mkv"), 2);
+        assert_eq!(rev("Obsession.[2026].[1080p.BluRay.x265].[REPACK].mkv"), 2);
+        assert_eq!(rev("The.Chronicles.of.Riddick.Dark.Fury.2004.Repack.1080p.BRRip.mkv"), 2);
+        assert_eq!(rev("Mr.Robot.S02E06.PROPER.HDTV.x264-KILLERS[ettv].mkv"), 2);
+        // Titles that merely contain the words — every one from the same
+        // collection, every one a plain release.
+        assert_eq!(rev("The Boys (2019) - S02E02 - Proper Preparation and Planning (1080p).mkv"), 1);
+        assert_eq!(rev("Atypical - S01E08 - The Silencing Properties of Snow.mkv"), 1);
+        assert_eq!(rev("Silicon Valley - S04E03 - Intellectual Property.mkv"), 1);
+        assert_eq!(rev("Republica - Republica - 12 - Out of This World (Proper Night Out mix).flac"), 1);
+        assert_eq!(rev("Judas Priest - Turbo - 03 - Private Property.flac"), 1);
+        // Anime versions, attached to the episode number.
+        assert_eq!(rev("[Grp] Show - 05v2 [720p][A1B2C3D4].mkv"), 2);
+        assert_eq!(rev("[Grp]_Show_-_12V3_(1080p).mkv"), 3);
+        assert_eq!(rev("[Grp] Show - 05 [720p].mkv"), 1);
+        // A version AND a repack compound.
+        assert_eq!(rev("[Grp] Show - 05v2 REPACK.mkv"), 3);
+        // Directory names hold titles; only the basename is read.
+        assert_eq!(rev("Garbage/Version 2.0/03 - When I Grow Up.mp3"), 1);
+        // Codec/channel tokens cannot match.
+        assert_eq!(rev("Film.2020.1080p.x264.DD5.1.mkv"), 1);
     }
 }

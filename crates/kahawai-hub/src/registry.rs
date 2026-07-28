@@ -875,9 +875,10 @@ impl Registry {
             sqlx::query(
                 "INSERT INTO files
                    (module_id, collection_id, path_rel, size, mtime_unix,
-                    head_xxh3, tail_xxh3, oshash, streams_json)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    head_xxh3, tail_xxh3, oshash, streams_json, revision)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                  ON CONFLICT (module_id, collection_id, path_rel) DO UPDATE SET
+                   revision = excluded.revision,
                    ed2k = CASE WHEN excluded.size = files.size
                                 AND excluded.mtime_unix = files.mtime_unix
                                THEN files.ed2k ELSE NULL END,
@@ -897,6 +898,7 @@ impl Registry {
             .bind(f.tail_xxh3 as i64)
             .bind(f.oshash as i64)
             .bind(&f.streams_json)
+            .bind(names::release_revision(&f.path_rel) as i64)
             .execute(&mut *tx)
             .await?;
 

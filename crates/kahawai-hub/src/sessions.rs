@@ -333,7 +333,15 @@ impl Sessions {
              FROM item_sources s
              JOIN files f ON (f.module_id, f.collection_id, f.path_rel)
                            = (s.module_id, s.collection_id, s.path_rel)
-             WHERE s.item_id = ? ORDER BY s.part IS NOT NULL, f.size DESC",
+             WHERE s.item_id = ?
+             -- HUB-3 ranking. Resolution tier first: that is a deliberate
+             -- quality choice. Within a tier the CORRECTED release wins
+             -- (revision — a v2/REPACK is often smaller than the broken
+             -- encode it replaces, so size cannot decide this), then size.
+             ORDER BY s.part IS NOT NULL,
+                      COALESCE(json_extract(f.streams_json, '$.video[0].height'), 0) DESC,
+                      COALESCE(f.revision, 1) DESC,
+                      f.size DESC",
         )
         .bind(item_id)
         .fetch_all(registry.db())

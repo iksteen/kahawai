@@ -53,6 +53,7 @@ pub async fn open(data_dir: &Path) -> Result<SqlitePool> {
         .context("running migrations")?;
     install_derived(&pool).await?;
     backfill_norm_artist(&pool).await?;
+    backfill_revision(&pool).await?;
     Ok(pool)
 }
 
@@ -80,6 +81,35 @@ async fn backfill_norm_artist(pool: &SqlitePool) -> Result<()> {
     }
     tx.commit().await?;
     tracing::info!(rows = missing.len(), "norm_artist backfilled");
+    Ok(())
+}
+
+/// Fill `files.revision` where it is missing (0043) — same story as
+/// `norm_artist`: the parse is Rust, so the migration could not do it,
+/// and this is a no-op after its first run.
+async fn backfill_revision(pool: &SqlitePool) -> Result<()> {
+    let missing: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT module_id, collection_id, path_rel FROM files WHERE revision IS NULL",
+    )
+    .fetch_all(pool)
+    .await?;
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let mut tx = pool.begin().await?;
+    for (m, c, path) in &missing {
+        sqlx::query(
+            "UPDATE files SET revision = ? WHERE module_id = ? AND collection_id = ? AND path_rel = ?",
+        )
+        .bind(kahawai_core::names::release_revision(path) as i64)
+        .bind(m)
+        .bind(c)
+        .bind(path)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    tracing::info!(rows = missing.len(), "release revisions backfilled");
     Ok(())
 }
 

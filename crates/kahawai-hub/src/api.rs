@@ -1920,11 +1920,17 @@ async fn item_detail(
         .ok_or((StatusCode::NOT_FOUND, "no such item".to_string()))?;
 
     let sources = sqlx::query(
-        "SELECT s.module_id, s.collection_id, s.path_rel, f.size, f.streams_json
+        "SELECT s.module_id, s.collection_id, s.path_rel, f.size, f.streams_json,
+                COALESCE(f.revision, 1) AS revision
          FROM item_sources s
          JOIN files f ON (f.module_id, f.collection_id, f.path_rel)
                        = (s.module_id, s.collection_id, s.path_rel)
-         WHERE s.item_id = ? ORDER BY f.size DESC",
+         WHERE s.item_id = ?
+         -- Same order playback picks in (sessions::source_parts), so the
+         -- list a user reads is the preference the player acts on.
+         ORDER BY COALESCE(json_extract(f.streams_json, '$.video[0].height'), 0) DESC,
+                  COALESCE(f.revision, 1) DESC,
+                  f.size DESC",
     )
     .bind(&id)
     .fetch_all(state.registry.db())
@@ -1944,6 +1950,7 @@ async fn item_detail(
                 "path_rel": r.get::<String, _>("path_rel"),
                 "size": r.get::<i64, _>("size"),
                 "available": state.registry.is_connected(&module_id),
+                "revision": r.get::<i64, _>("revision"),
                 "streams": streams,
             })
         })
