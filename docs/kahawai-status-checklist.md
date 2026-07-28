@@ -144,12 +144,17 @@ How something works and why it was built that way belong in
       playback and admin endpoints. Client behaviour and the API shape
       are in implementation §4.4/§4.7.
 - [x] HUB-13 All hub state in embedded storage; survives restart without rescan
-- [ ] HUB-14 Capability-profile negotiation *(mode chosen per source
-      container/codecs; no client-supplied capability profile yet)*
-- [ ] HUB-15 Full negotiation matrix *(container/codec compatibility + text
-      subtitle delivery + bitmap display-set streaming live; capability
-      profiles, OCR tier, burn-in, HDR/channel-layout decisions pending)*
-- [x] HUB-16 Cheapest-path preference: direct play > remux > transcode
+- [x] HUB-14 Capability-profile negotiation: browser-probed profile with
+      every play request, hub decides per stream (`negotiate.rs`,
+      `tests/negotiate_play.rs`); explicit mode = operator force
+- [ ] HUB-15 Negotiation matrix: codec/profile/level, resolution/fps
+      ceilings, bandwidth cap (pref + profile), channel downmix,
+      subtitle tiers with graphics_overlay/ass_render gating. Missing:
+      HDR tone-map (15a), OCR (32c), burn-in
+- [ ] HUB-15a HDR→SDR tone-mapping tier (element chain, TC-1 filter
+      report, doctor verdict, quality bar vs real HDR test matrix)
+- [x] HUB-16 Cheapest-path preference incl. SOURCE choice: every
+      candidate judged, direct > copy > audio-enc > video-enc, rank ties
 - [x] HUB-17 HLS delivery for remux/transcode (EVENT playlists, mid-stream seek)
 - [x] HUB-18 Sessions: per-user concurrency caps, progress checkpoints/resume,
       idle reaping, seek-anywhere with pipeline restart
