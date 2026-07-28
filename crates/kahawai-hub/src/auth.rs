@@ -159,6 +159,18 @@ impl Auth {
             s
         };
 
+        // Dead tokens have no audit value beyond their revoked flag's
+        // lifetime: an expired row can never authenticate again, so it
+        // is pure growth (1,569 rows for 2 users when this landed,
+        // mostly scripted test-account logins). Pruned at open.
+        let pruned = sqlx::query("DELETE FROM refresh_tokens WHERE expires_at < unixepoch()")
+            .execute(&db)
+            .await?
+            .rows_affected();
+        if pruned > 0 {
+            tracing::info!(pruned, "expired refresh tokens removed");
+        }
+
         let users: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users").fetch_one(&db).await?;
         let setup_token = if users == 0 {
             let raw = random_token(4).to_uppercase();

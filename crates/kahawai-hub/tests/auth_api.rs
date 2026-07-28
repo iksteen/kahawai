@@ -542,3 +542,34 @@ async fn bootstrap_states_setup_and_auth_without_a_token() {
     let resp = api.oneshot(get_authed("/api/v1/bootstrap", &token)).await.unwrap();
     assert_eq!(body_json(resp).await["authenticated"], true);
 }
+
+/// Expired refresh tokens are pruned when Auth opens; live ones stay.
+#[tokio::test]
+async fn expired_refresh_tokens_prune_at_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    let auth = Auth::new(db.clone(), dir.path()).await.unwrap();
+    auth.complete_setup(&auth.setup_token().unwrap(), "u", "hunter22222hunter").await.unwrap();
+    sqlx::query(
+        "INSERT INTO refresh_tokens (token_hash, user_id, expires_at)
+         SELECT 'dead', id, unixepoch() - 1 FROM users LIMIT 1",
+    )
+    .execute(&db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO refresh_tokens (token_hash, user_id, expires_at)
+         SELECT 'live', id, unixepoch() + 3600 FROM users LIMIT 1",
+    )
+    .execute(&db)
+    .await
+    .unwrap();
+
+    let _ = Auth::new(db.clone(), dir.path()).await.unwrap();
+    let left: Vec<String> =
+        sqlx::query_scalar("SELECT token_hash FROM refresh_tokens WHERE token_hash IN ('dead','live')")
+            .fetch_all(&db)
+            .await
+            .unwrap();
+    assert_eq!(left, ["live"], "expired pruned, live kept");
+}
