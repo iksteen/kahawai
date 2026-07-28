@@ -603,10 +603,15 @@ export type MatchCandidate = {
   provider: 'tmdb' | 'tvdb'
 }
 
-export const adminReviewSearch = (kind: string, query: string, year?: number | null) =>
+export const adminReviewSearch = (
+  kind: string,
+  query: string,
+  year?: number | null,
+  item?: string,
+) =>
   json<{ candidates: MatchCandidate[] }>('/admin/v1/enrich/search', {
     method: 'POST',
-    body: JSON.stringify({ kind, query, year: year ?? null }),
+    body: JSON.stringify({ kind, query, year: year ?? null, item: item ?? null }),
   })
 export const adminApplyMatch = (
   itemId: string,

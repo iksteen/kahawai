@@ -712,6 +712,9 @@ struct ReviewSearch {
     kind: String,
     query: String,
     year: Option<i64>,
+    /// The item being matched — lets ranking favour the provider that
+    /// owns its collection's identity space (anilist for anime).
+    item: Option<String>,
 }
 
 async fn admin_review_search(
@@ -720,7 +723,7 @@ async fn admin_review_search(
 ) -> Result<Json<Value>, ApiError> {
     let candidates = state
         .enricher
-        .search_candidates(&state.registry, &body.kind, &body.query, body.year)
+        .search_candidates(&state.registry, &body.kind, &body.query, body.year, body.item.as_deref())
         .await
         .map_err(internal)?;
     Ok(Json(json!({ "candidates": candidates })))

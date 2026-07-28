@@ -31,7 +31,7 @@ export default function MatchDialog({
     setBusy(true)
     setError('')
     try {
-      const r = await adminReviewSearch(item.kind, q, fileYear)
+      const r = await adminReviewSearch(item.kind, q, fileYear, item.id)
       setResults(r.candidates)
     } catch (e) {
       setError(String(e))

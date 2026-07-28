@@ -2596,7 +2596,28 @@ impl Enricher {
         kind: &str,
         query: &str,
         year: Option<i64>,
+        item: Option<&str>,
     ) -> Result<serde_json::Value> {
+        // Which identity space does this item live in? An anime-
+        // collection item wants AniList candidates ahead of the
+        // generic providers at equal relevance — and vice versa.
+        let anime_first = match item {
+            Some(id) => sqlx::query_scalar::<_, i64>(
+                "SELECT EXISTS (
+                   SELECT 1 FROM item_sources s
+                   JOIN collections c ON (c.module_id, c.collection_id)
+                                       = (s.module_id, s.collection_id)
+                   WHERE c.media_type = 'anime'
+                     AND (s.item_id = ?1 OR s.item_id IN
+                          (SELECT id FROM items WHERE parent_id = ?1)))",
+            )
+            .bind(id)
+            .fetch_one(registry.db())
+            .await
+            .map(|v| v != 0)
+            .unwrap_or(false),
+            None => false,
+        };
         let mut out: Vec<serde_json::Value> = Vec::new();
         if let Some(key) = registry.get_setting(TMDB_KEY_SETTING).await? {
             match self.search(&key, kind, query, year).await {
@@ -2652,6 +2673,7 @@ impl Enricher {
             })),
             Err(e) => tracing::warn!(error = format!("{e:#}"), "review anilist search failed"),
         }
+        rank_candidates(&mut out, query, year, anime_first);
         Ok(serde_json::json!(out))
     }
 
@@ -3516,5 +3538,88 @@ mod nfo_tests {
         // A zero rating means unrated here too.
         let (f, _) = parse_nfo("<movie><title>x</title><rating>0.0</rating></movie>").unwrap();
         assert_eq!(f.rating, None);
+    }
+}
+
+/// Rank hand-matching candidates by relevance to what the admin TYPED,
+/// not by which provider answered first: an exact folded-title match
+/// outranks a prefix match outranks a substring, a matching year (when
+/// one was given) breaks ties, then rating. Searching "Kite" must put
+/// the things actually CALLED Kite above "One Day A Letter Arrives
+/// from the Dog Kingdom".
+pub fn rank_candidates(
+    out: &mut [serde_json::Value],
+    query: &str,
+    year: Option<i64>,
+    anime_first: bool,
+) {
+    let q = fold(query);
+    let key = |v: &serde_json::Value| {
+        let t = v["title"].as_str().map(fold).unwrap_or_default();
+        let title_score = if t == q {
+            0u8
+        } else if t.starts_with(&q) {
+            1
+        } else if t.contains(&q) {
+            2
+        } else {
+            3
+        };
+        let year_miss = match (year, v["release_date"].as_str().and_then(|d| d.get(..4))) {
+            (Some(want), Some(got)) => (got.parse::<i64>().ok() != Some(want)) as u8,
+            _ => 0,
+        };
+        // At equal relevance, the provider that owns the item's
+        // identity space leads: anilist for anime items, the generic
+        // pair otherwise.
+        let is_anilist = v["provider"].as_str() == Some("anilist");
+        let provider_rank = (is_anilist != anime_first) as u8;
+        // Rating descending, NaN-safe, as an integer key.
+        let rating = -(v["vote_average"].as_f64().unwrap_or(0.0) * 10.0) as i64;
+        (title_score, year_miss, provider_rank, rating)
+    };
+    out.sort_by_key(key);
+}
+
+#[cfg(test)]
+mod candidate_rank_tests {
+    use super::rank_candidates;
+    use serde_json::json;
+
+    #[test]
+    fn typed_title_beats_provider_order() {
+        let mut cands = vec![
+            json!({"title": "One Day A Letter Arrives", "release_date": "2015-01-01", "vote_average": 9.0}),
+            json!({"title": "Kite Liberator", "release_date": "2008-03-21", "vote_average": 6.0}),
+            json!({"title": "Kite", "release_date": "2014-10-09", "vote_average": 5.0}),
+            json!({"title": "Kite", "release_date": "1998-02-25", "vote_average": 7.0}),
+        ];
+        rank_candidates(&mut cands, "Kite", Some(1998), false);
+        let titles: Vec<(&str, &str)> = cands
+            .iter()
+            .map(|c| (c["title"].as_str().unwrap(), &c["release_date"].as_str().unwrap()[..4]))
+            .collect();
+        assert_eq!(
+            titles,
+            [("Kite", "1998"), ("Kite", "2014"), ("Kite Liberator", "2008"),
+             ("One Day A Letter Arrives", "2015")],
+            "exact + year first, prefix next, unrelated last whatever its rating"
+        );
+    }
+
+    #[test]
+    fn collection_identity_space_leads_at_equal_relevance() {
+        let mk = || {
+            vec![
+                json!({"title": "Kite", "provider": "tmdb", "release_date": "2014-10-09", "vote_average": 9.0}),
+                json!({"title": "Kite", "provider": "anilist", "release_date": "1998-02-25", "vote_average": 7.0}),
+            ]
+        };
+        let mut anime = mk();
+        rank_candidates(&mut anime, "Kite", None, true);
+        assert_eq!(anime[0]["provider"], "anilist", "anime item: anilist leads its rating notwithstanding");
+        let mut generic = mk();
+        rank_candidates(&mut generic, "Kite", None, false);
+        assert_eq!(generic[0]["provider"], "tmdb", "generic item: tmdb leads");
     }
 }
