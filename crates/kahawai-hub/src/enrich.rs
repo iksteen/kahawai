@@ -2624,6 +2624,10 @@ impl Enricher {
                 Ok(cands) => out.extend(cands.iter().map(|c| {
                     let mut v = serde_json::to_value(c).unwrap();
                     v["provider"] = serde_json::json!("tmdb");
+                    // The search hit one typed endpoint, so the format
+                    // is the endpoint's, not per-candidate data.
+                    v["format"] =
+                        serde_json::json!(if kind == "movie" { "Movie" } else { "Series" });
                     // Absolute preview URL for the admin UI.
                     if let Some(p) = c.poster_path.as_deref() {
                         v["poster_url"] =
@@ -2641,6 +2645,8 @@ impl Enricher {
                     Ok(cands) => out.extend(cands.iter().map(|c| {
                         let mut v = serde_json::to_value(c).unwrap();
                         v["provider"] = serde_json::json!("tvdb");
+                        v["format"] =
+                            serde_json::json!(if kind == "movie" { "Movie" } else { "Series" });
                         if let Some(p) = c.poster_path.as_deref() {
                             v["poster_url"] = serde_json::json!(p);
                         }
@@ -2669,6 +2675,16 @@ impl Enricher {
                         .and_then(|c| c.large.clone().or_else(|| c.extra_large.clone())),
                     "release_date": m.premiered(),
                     "vote_average": m.average_score.map(|s| s / 10.0),
+                    "format": m.format.as_deref().map(|f| match f {
+                        "TV" => "TV",
+                        "TV_SHORT" => "TV Short",
+                        "MOVIE" => "Movie",
+                        "OVA" => "OVA",
+                        "ONA" => "ONA",
+                        "SPECIAL" => "Special",
+                        "MUSIC" => "Music",
+                        other => other,
+                    }),
                 })
             })),
             Err(e) => tracing::warn!(error = format!("{e:#}"), "review anilist search failed"),

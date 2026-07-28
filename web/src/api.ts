@@ -593,6 +593,7 @@ export const adminSetTmdbKey = (apiKey: string) =>
 export const adminEnrichStatus = () =>
   json<{ running: boolean; matched: number; weak: number; missed: number }>('/admin/v1/enrich')
 export type MatchCandidate = {
+  format?: string | null
   id: number
   title: string
   overview?: string | null

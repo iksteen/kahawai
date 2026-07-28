@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import placeholder from '../assets/placeholder.svg'
 import {
   adminApplyMatch,
   adminReviewSearch,
@@ -107,12 +108,20 @@ export default function MatchDialog({
             {results.map((c) => (
               <li key={`${c.provider}-${c.id}`}>
                 <button className="card" disabled={busy} onClick={() => void apply('pick', c)}>
-                  {c.poster_url && (
-                    <img className="card-art" src={c.poster_url} alt="" loading="lazy" />
-                  )}
+                  <img
+                    className="card-art"
+                    src={c.poster_url ?? placeholder}
+                    alt=""
+                    loading="lazy"
+                    onError={(e) => {
+                      e.currentTarget.onerror = null
+                      e.currentTarget.src = placeholder
+                    }}
+                  />
                   <span className="card-title">{c.title}</span>
                   <span className="card-meta mono">
                     {c.release_date?.slice(0, 4) ?? '—'} · {c.provider}
+                    {c.format ? ` · ${c.format}` : ''}
                   </span>
                 </button>
               </li>
