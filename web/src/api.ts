@@ -308,7 +308,14 @@ export async function fetchItem(id: string): Promise<ItemDetail> {
   return { ...(raw as Item), sources: sources.length, sources_detail: sources }
 }
 
-export type StreamVerdict = { video: string; audio: string }
+export type SubtitleVerdict = {
+  index: number
+  format: string
+  language?: string | null
+  tier: 'text' | 'convert' | 'graphics' | 'unavailable'
+  note: string
+}
+export type StreamVerdict = { video: string; audio: string; subtitles?: SubtitleVerdict[] }
 
 export type Session = {
   session_id: string
@@ -324,9 +331,11 @@ export type Session = {
   streams: StreamVerdict | null
 }
 
+/// HUB-14: no `mode` — the hub negotiates from the capability profile.
+/// (An explicit mode remains available on the wire for scripts/debug.)
 export function startSession(
   itemId: string,
-  mode: string,
+  profile: import('./capabilities').CapabilityProfile,
   startMs = 0,
   audioTrack = 0,
   videoTrack = 0,
@@ -335,7 +344,7 @@ export function startSession(
     method: 'POST',
     body: JSON.stringify({
       item_id: itemId,
-      mode,
+      profile,
       start_ms: Math.round(startMs),
       audio_track: audioTrack,
       video_track: videoTrack,

@@ -1,3 +1,4 @@
+import { buildProfile } from '../capabilities'
 import { useEffect, useState } from 'react'
 import {
   artworkUrl,
@@ -40,12 +41,6 @@ function fmtDuration(ms?: number) {
   return m >= 60 ? `${Math.floor(m / 60)} h ${m % 60} min` : `${m} min`
 }
 
-// Browsers demux mp4/webm natively; everything else goes through the
-// in-hub remuxer (no transcoder involved).
-function autoMode(s?: Source): 'direct' | 'remux' {
-  const c = s?.streams?.container
-  return c === 'mp4' || c === 'webm' ? 'direct' : 'remux'
-}
 
 function Chips({ s }: { s: Source }) {
   const st = s.streams
@@ -154,7 +149,7 @@ export default function Detail({
     if (autoPlay && !autoPlayed && item && item.kind !== 'show') {
       setAutoPlayed(true)
       const best = item.sources_detail[0]
-      if (best?.available) void play(autoMode(best))
+      if (best?.available) void play()
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [autoPlay, autoPlayed, item?.id])
@@ -352,7 +347,7 @@ export default function Detail({
     }
   }
 
-  async function play(mode: 'direct' | 'remux', fromStart = false) {
+  async function play(fromStart = false) {
     setBusy(true)
     setError('')
     try {
@@ -376,12 +371,18 @@ export default function Detail({
       } catch {
         // prefs unavailable → source order
       }
-      const session = await startSession(
-        item!.id,
-        mode,
-        mode === 'direct' ? 0 : start,
-        audioTrack,
-      )
+      // HUB-14: send the probed capability profile; the hub decides
+      // the mode. start_ms is ignored by the direct path server-side,
+      // so resuming needs no mode prediction here.
+      let cap: number | undefined
+      try {
+        const p = await fetchPrefs()
+        const v = p.prefs.find((x) => x.scope === '' && x.key === 'bandwidth_kbps')?.value
+        cap = v ? Number(v) : undefined
+      } catch {
+        // prefs unavailable → no cap
+      }
+      const session = await startSession(item!.id, buildProfile(cap), start, audioTrack)
       onPlay(item!, session, start)
     } catch (e) {
       setError(String(e))
@@ -457,18 +458,16 @@ export default function Detail({
       ) : null}
 
       <div className="play-row">
-        <button className="btn" disabled={busy || !best?.available} onClick={() => play(autoMode(best))}>
+        <button className="btn" disabled={busy || !best?.available} onClick={() => play()}>
           {resumeMs ? `Resume` : 'Play'}
         </button>
         {resumeMs > 0 && (
-          <button className="btn ghost" disabled={busy} onClick={() => play(autoMode(best), true)}>
+          <button className="btn ghost" disabled={busy} onClick={() => play(true)}>
             Play from start
           </button>
         )}
         <span className="dim small-note">
-          {autoMode(best) === 'remux'
-            ? 'remuxed to HLS in the hub — streams converted only when needed'
-            : 'direct play'}
+          negotiated per stream — the player overlay shows the taken path
         </span>
       </div>
       {error && <div className="error">{error}</div>}

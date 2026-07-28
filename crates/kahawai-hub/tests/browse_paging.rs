@@ -238,3 +238,45 @@ async fn search_finds_artists_and_episode_titles() {
     assert_eq!(hits[0]["parent_id"], "alb", "a track hit carries the album to open");
     assert_eq!(hits[0]["parent_title"], "Ace of Spades");
 }
+
+/// HUB-32b: a client that cannot composite display sets is not offered
+/// image subtitles; capability-less requests keep seeing everything.
+#[tokio::test]
+async fn image_subtitles_are_gated_on_graphics_overlay() {
+    let (api, token, db) = harness().await;
+    let q = |sql: &'static str| {
+        let db = db.clone();
+        async move {
+            sqlx::query(sql).execute(&db).await.unwrap_or_else(|e| panic!("{sql}\n  -> {e}"))
+        }
+    };
+    q("INSERT INTO satellites (module_id, module_type, name, cert_fingerprint, enrolled_at, disabled)
+       VALUES ('m2','mediahost','m2','',unixepoch(),0)").await;
+    q("INSERT INTO collections (module_id, collection_id, media_type, roots_json, sync_version)
+       VALUES ('m2','c2','movies','[\"/m\"]',1)").await;
+    q("INSERT INTO items (id, kind, title, norm_title) VALUES ('subs-item','movie','Subbed','subbed')").await;
+    q(r#"INSERT INTO files (module_id, collection_id, path_rel, size, mtime_unix,
+                            head_xxh3, tail_xxh3, oshash, subs_extracted, streams_json)
+       VALUES ('m2','c2','subbed.mkv', 700, 1, 0, 0, 0, 0,
+               '{"container":"matroska",
+                 "subtitles":[{"format":"srt","language":"en"},
+                              {"format":"ass","language":"en"},
+                              {"format":"pgs","language":"en"}]}')"#).await;
+    q("INSERT INTO item_sources (item_id, module_id, collection_id, path_rel)
+       VALUES ('subs-item','m2','c2','subbed.mkv')").await;
+
+    let formats = |v: &serde_json::Value| -> Vec<String> {
+        v["subtitles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["format"].as_str().unwrap().to_string())
+            .collect()
+    };
+    let all = page(&api, &token, "/api/v1/items/subs-item/subtitles").await;
+    assert!(formats(&all).contains(&"pgs".to_string()), "default keeps image subs: {all}");
+    let gated =
+        page(&api, &token, "/api/v1/items/subs-item/subtitles?graphics_overlay=false").await;
+    assert!(!formats(&gated).contains(&"pgs".to_string()), "gated must omit pgs: {gated}");
+    assert_eq!(formats(&gated).len(), formats(&all).len() - 1, "only the image entry drops");
+}

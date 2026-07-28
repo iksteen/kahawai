@@ -94,6 +94,12 @@ pub struct Session {
     /// Per-kind stream verdict (remux sessions): what happened to video
     /// and audio, for the player's playback-info overlay.
     pub verdict: Option<(String, String)>,
+    /// Per-subtitle-stream tier verdicts (HUB-32a/b) — additive in the
+    /// API response.
+    pub sub_verdicts: Vec<kahawai_media::negotiate::SubtitleVerdict>,
+    /// The effective capability profile (client's or fallback, cap
+    /// merged) — re-plans on track switches negotiate against IT.
+    profile: kahawai_core::media::CapabilityProfile,
     /// The negotiated plan (remux/transcode) — reused on seek-restarts;
     /// mutable because audio-track switches re-plan (HUB-27).
     plan: Mutex<Option<kahawai_media::remux::RemuxPlan>>,
@@ -405,6 +411,62 @@ impl Sessions {
         Ok((parts, first_info.unwrap()))
     }
 
+    /// HUB-16: EVERY playable candidate, in the established rank order —
+    /// each connected complete file is one candidate, plus at most one
+    /// part-set candidate at the end. `source_parts` remains "the best
+    /// by rank"; negotiation instead judges each candidate by COST and
+    /// only falls back to rank as the tiebreak.
+    pub(crate) async fn candidate_sources(
+        &self,
+        registry: &Registry,
+        item_id: &str,
+    ) -> Result<Vec<(Vec<PartSource>, kahawai_core::media::MediaInfo)>> {
+        let rows = sqlx::query(
+            "SELECT s.module_id, s.collection_id, s.path_rel, s.part, f.size, f.streams_json
+             FROM item_sources s
+             JOIN files f ON (f.module_id, f.collection_id, f.path_rel)
+                           = (s.module_id, s.collection_id, s.path_rel)
+             WHERE s.item_id = ?
+             ORDER BY s.part IS NOT NULL,
+                      COALESCE(json_extract(f.streams_json, '$.video[0].height'), 0) DESC,
+                      COALESCE(f.revision, 1) DESC,
+                      f.size DESC",
+        )
+        .bind(item_id)
+        .fetch_all(registry.db())
+        .await?;
+        let parse_info = |r: &sqlx::sqlite::SqliteRow| -> kahawai_core::media::MediaInfo {
+            serde_json::from_str(r.get::<String, _>("streams_json").as_str()).unwrap_or_default()
+        };
+        let mut out = Vec::new();
+        for r in rows.iter().filter(|r| {
+            r.get::<Option<i64>, _>("part").is_none()
+                && registry.is_connected(&r.get::<String, _>("module_id"))
+        }) {
+            let info = parse_info(r);
+            out.push((
+                vec![PartSource {
+                    module_id: r.get("module_id"),
+                    collection_id: r.get("collection_id"),
+                    path_rel: r.get("path_rel"),
+                    size: r.get::<i64, _>("size") as u64,
+                    base_ms: 0,
+                    duration_ms: info.duration_ms.unwrap_or(0),
+                }],
+                info,
+            ));
+        }
+        // The part set (if any) as one trailing candidate, via the
+        // existing assembly which already handles ordering and dedup.
+        if rows.iter().any(|r| r.get::<Option<i64>, _>("part").is_some())
+            && let Ok(ps) = self.source_parts(registry, item_id).await
+            && ps.0.len() > 1
+        {
+            out.push(ps);
+        }
+        Ok(out)
+    }
+
     /// Open a read lease on an arbitrary path within a collection (also
     /// used for sidecar subtitle files, which are not `files` rows).
     /// AR-5: register the in-process mediahost — leases for its files
@@ -447,15 +509,22 @@ impl Sessions {
         self.leases.establish(&token, registry.send_to_host(module_id, msg)).await
     }
 
-    /// Start a session for an item: pick the best available source, open a
-    /// read lease on its mediahost, and for remux start the in-hub pipeline
-    /// (from `start_ms` when resuming into the middle of the file).
+    /// Start a session for an item. With an explicit `mode` (scripts,
+    /// debugging, old clients) the pre-negotiation behavior applies
+    /// verbatim: best-ranked source, mode taken at its word. Without
+    /// one, the hub NEGOTIATES (HUB-14): the client's capability
+    /// profile — or the conservative fallback — is judged against
+    /// every candidate source and the cheapest sufficient path wins
+    /// (HUB-16: direct > copy > audio-encode > video-encode), rank
+    /// breaking ties.
+    #[allow(clippy::too_many_arguments)] // request-shaped plumbing
     pub async fn start(
         self: &Arc<Self>,
         registry: &Registry,
         user_id: &str,
         item_id: &str,
-        mode: &str,
+        mode: Option<&str>,
+        profile: Option<kahawai_core::media::CapabilityProfile>,
         start_ms: u64,
         audio_track: u32,
         video_track: u32,
@@ -470,7 +539,70 @@ impl Sessions {
         if user_active >= self.max_per_user {
             bail!("too many concurrent streams ({user_active}); close one first");
         }
-        let (parts, info) = self.source_parts(registry, item_id).await?;
+        // ONE path: every session negotiates. The user's standing
+        // bandwidth cap tightens whatever the client asked for (HUB-15).
+        let mut profile = profile.unwrap_or_default();
+        let pref_cap: Option<u32> = sqlx::query_scalar::<_, String>(
+            "SELECT value FROM user_prefs
+              WHERE user_id = ? AND scope = '' AND key = 'bandwidth_kbps'",
+        )
+        .bind(user_id)
+        .fetch_optional(registry.db())
+        .await?
+        .and_then(|v| v.parse().ok())
+        .filter(|v| *v > 0);
+        profile.max_bandwidth_kbps = match (profile.max_bandwidth_kbps, pref_cap) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        let negotiate_one = |parts: &[PartSource], info: &kahawai_core::media::MediaInfo| {
+            let est_kbps = info
+                .duration_ms
+                .filter(|d| *d > 0)
+                .map(|d| ((parts.iter().map(|p| p.size).sum::<u64>() * 8) / d) as u32);
+            kahawai_media::negotiate::negotiate(
+                &profile,
+                info,
+                audio_track as usize,
+                video_track as usize,
+                parts.len() == 1,
+                est_kbps,
+            )
+        };
+        let (parts, info, sp, mode) = match mode {
+            // Operator override (scripts, pipeline debugging): the mode
+            // is forced on the rank-best source; the PLAN still comes
+            // from negotiation.
+            Some(m) => {
+                let (parts, info) = self.source_parts(registry, item_id).await?;
+                let sp = negotiate_one(&parts, &info);
+                (parts, info, sp, m.to_string())
+            }
+            // HUB-14/16: judge every candidate, cheapest sufficient
+            // path wins, rank breaks ties.
+            None => {
+                let candidates = self.candidate_sources(registry, item_id).await?;
+                if candidates.is_empty() {
+                    bail!("no source is currently available (mediahost offline)");
+                }
+                let mut best: Option<(kahawai_media::negotiate::SourcePlan, usize)> = None;
+                for (idx, (parts, info)) in candidates.iter().enumerate() {
+                    let sp = negotiate_one(parts, info);
+                    if best.as_ref().is_none_or(|(cur, _)| sp.cost < cur.cost) {
+                        best = Some((sp, idx));
+                    }
+                }
+                let (sp, idx) = best.unwrap();
+                let mode = if sp.direct { "direct" } else { "remux" };
+                let (parts, info) = candidates.into_iter().nth(idx).unwrap();
+                (parts, info, sp, mode.to_string())
+            }
+        };
+        if sp.cost == kahawai_media::negotiate::Cost::Unplayable && mode != "direct" {
+            bail!("no playable streams — this source needs the video transcoder");
+        }
+        let negotiated = sp;
+        let mode = mode.as_str();
         if parts.len() > 1 && mode == "direct" {
             bail!("multi-part sources play via remux/transcode, not direct");
         }
@@ -491,21 +623,14 @@ impl Sessions {
             "direct" => Mode::Direct { lease },
             "remux" => {
                 // The muxer stalls on unfed pads, so only claim what the
-                // plan will actually feed — decided by the muxer's own
-                // templates and the installed decoders/encoders (single
-                // source of truth with the pipeline's link logic).
-                // ponytail: every remux client gets the web target profile; real
-                // per-client capability probes (HUB-14) select profiles later.
-                let plan = kahawai_media::remux::plan_streams(
-                    &info,
-                    &kahawai_media::remux::WEB_TARGET,
-                    audio_track as usize,
-                    video_track as usize,
-                );
+                // plan will actually feed — the negotiated plan is the
+                // single source of truth with the pipeline's link logic.
+                let plan = negotiated.plan;
                 if !plan.playable() {
                     bail!("no playable streams — this source needs the video transcoder");
                 }
-                verdict = Some(kahawai_media::remux::plan_summary(&info, &plan));
+                verdict =
+                    Some((negotiated.video_verdict.clone(), negotiated.audio_verdict.clone()));
                 session_plan = Some(plan);
                 use kahawai_media::remux::StreamMode;
                 session_needs = crate::registry::PlacementNeed {
@@ -586,6 +711,8 @@ impl Sessions {
             current_part: std::sync::atomic::AtomicUsize::new(start_idx),
             mode: session_mode,
             verdict,
+            sub_verdicts: negotiated.subtitles,
+            profile,
             plan: Mutex::new(session_plan),
             needs: session_needs,
             touched: Mutex::new(std::time::Instant::now()),
@@ -676,6 +803,15 @@ impl Sessions {
                     .arg(socks[0].1.to_string());
                 for (sock, size) in &socks[1..] {
                     cmd.args(["--part", &format!("{}:{size}", sock.display())]);
+                }
+                for (flag, v) in [
+                    ("--video-kbps", plan.video_kbps),
+                    ("--max-height", plan.max_height),
+                    ("--max-channels", plan.max_channels),
+                ] {
+                    if let Some(v) = v {
+                        cmd.args([flag, &v.to_string()]);
+                    }
                 }
                 let child = cmd
                     .args(["--video", kahawai_media::worker::mode_arg(plan.video)])
@@ -790,6 +926,9 @@ impl Sessions {
                     start_ms,
                     sink: sink.into(),
                     tail_sizes,
+                    video_kbps: plan.video_kbps.unwrap_or(0),
+                    max_height: plan.max_height.unwrap_or(0),
+                    max_channels: plan.max_channels.unwrap_or(0),
                 },
             )),
         };
@@ -1015,12 +1154,15 @@ impl Sessions {
             // copy vs encode, not the old one's.
             let (_, _, _, info) =
                 crate::subtitles::source_row(registry, &session.item_id).await?;
-            plan = kahawai_media::remux::plan_streams(
+            plan = kahawai_media::negotiate::negotiate(
+                &session.profile,
                 &info,
-                &kahawai_media::remux::WEB_TARGET,
                 want_audio,
                 want_video,
-            );
+                session.parts.len() == 1,
+                None,
+            )
+            .plan;
             anyhow::ensure!(plan.playable(), "selected track is not playable");
             *session.plan.lock().unwrap() = Some(plan);
         }

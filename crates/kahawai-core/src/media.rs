@@ -60,9 +60,20 @@ pub struct VideoStream {
     pub fps: Option<(u32, u32)>,
     pub bit_depth: Option<u32>,
     pub interlaced: bool,
-    // ponytail: HDR metadata (HDR10/HLG/DoVi, MH-3) not extracted yet — add
-    // when negotiation grows tone-mapping decisions.
+    /// "hdr10" | "hlg", from caps colorimetry (MH-3). None = SDR or a
+    /// row probed before extraction existed — negotiation treats both
+    /// as SDR (HUB-15a).
     pub hdr: Option<String>,
+    /// Caps profile string ("high", "main-10", …). None = unknown
+    /// (pre-extension row) — negotiation is unknown-permissive.
+    #[serde(default)]
+    pub profile: Option<String>,
+    /// Caps level string ("4.1"). Same unknown semantics as `profile`.
+    #[serde(default)]
+    pub level: Option<String>,
+    /// Stream bitrate where the container states one; 0 is never stored.
+    #[serde(default)]
+    pub bitrate_kbps: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -71,6 +82,72 @@ pub struct AudioStream {
     pub channels: u32,
     pub sample_rate: u32,
     pub language: Option<String>,
+    #[serde(default)]
+    pub bitrate_kbps: Option<u32>,
+    /// Channel mask as a hex string ("0x3f") when the caps carry one —
+    /// enough to distinguish 5.1 from 6.0 later without committing to a
+    /// pretty-printer now.
+    #[serde(default)]
+    pub layout: Option<String>,
+}
+
+/// HUB-14: what the requesting client can play. Sent with each play
+/// request; per-request state, never persisted. `Default` is the
+/// conservative fallback for requests without one — it reproduces the
+/// pre-negotiation behavior exactly (mp4/webm direct, WEB_TARGET
+/// codecs, no ceilings), so old clients and scripts lose nothing.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct CapabilityProfile {
+    /// Containers the client demuxes natively (normalized like
+    /// `MediaInfo.container`: "mp4", "webm", "matroska", …).
+    pub containers: Vec<String>,
+    pub video: Vec<VideoCap>,
+    /// Audio codec names the client decodes ("aac", "mp3", "opus", …).
+    pub audio: Vec<String>,
+    /// 0 = unlimited. The web client sends 0: browsers downmix 5.1 AAC
+    /// natively, and forcing stereo would re-encode every 5.1 track.
+    pub max_audio_channels: u32,
+    pub max_height: Option<u32>,
+    pub max_fps: Option<u32>,
+    /// Client can display HDR. Until HUB-15a lands this only shapes
+    /// the verdict text, never the decision.
+    pub hdr: bool,
+    /// min()-ed with the user's stored bandwidth pref by the hub.
+    pub max_bandwidth_kbps: Option<u32>,
+    /// HUB-32a: client renders ASS/SSA faithfully (JASSUB).
+    pub ass_render: bool,
+    /// HUB-32b: client composites bitmap display sets (canvas overlay).
+    pub graphics_overlay: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct VideoCap {
+    /// Normalized codec name ("h264", "hevc", "vp9", "av1").
+    pub codec: String,
+    /// Highest caps profile the client decodes; None = no ceiling.
+    #[serde(default)]
+    pub max_profile: Option<String>,
+    /// Highest caps level ("4.1"); None = no ceiling.
+    #[serde(default)]
+    pub max_level: Option<String>,
+}
+
+impl Default for CapabilityProfile {
+    fn default() -> Self {
+        Self {
+            containers: vec!["mp4".into(), "webm".into()],
+            video: vec![VideoCap { codec: "h264".into(), ..Default::default() }],
+            audio: vec!["aac".into(), "mp3".into()],
+            max_audio_channels: 0,
+            max_height: None,
+            max_fps: None,
+            hdr: false,
+            max_bandwidth_kbps: None,
+            ass_render: false,
+            graphics_overlay: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]

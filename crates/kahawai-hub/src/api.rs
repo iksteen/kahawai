@@ -1085,8 +1085,13 @@ async fn refresh(
 #[derive(Deserialize)]
 struct StartSessionRequest {
     item_id: String,
-    #[serde(default = "default_mode")]
-    mode: String,
+    /// Explicit mode = the pre-negotiation contract, verbatim (scripts,
+    /// debugging). Absent = the hub negotiates from `profile` (HUB-14).
+    #[serde(default)]
+    mode: Option<String>,
+    /// The client's capability profile; absent = conservative fallback.
+    #[serde(default)]
+    profile: Option<kahawai_core::media::CapabilityProfile>,
     /// Begin playback here (resume without waiting for a transcode to
     /// catch up) — keyframe-snapped by the pipeline.
     #[serde(default)]
@@ -1097,10 +1102,6 @@ struct StartSessionRequest {
     audio_track: u32,
     #[serde(default)]
     video_track: u32,
-}
-
-fn default_mode() -> String {
-    "direct".into()
 }
 
 /// HUB-11 event channel: server-sent invalidation hints ({kind, ...}).
@@ -1200,7 +1201,8 @@ async fn start_session(
             &state.registry,
             &claims.sub,
             &body.item_id,
-            &body.mode,
+            body.mode.as_deref(),
+            body.profile.clone(),
             body.start_ms,
             body.audio_track,
             body.video_track,
@@ -1238,6 +1240,9 @@ async fn start_session(
             "streams": session.verdict.as_ref().map(|(video, audio)| json!({
                 "video": video,
                 "audio": audio,
+                // Additive (HUB-32a/b): per-subtitle tier verdicts on
+                // negotiated sessions; [] on explicit-mode sessions.
+                "subtitles": session.sub_verdicts,
             })),
         })),
     ))
@@ -1423,11 +1428,25 @@ async fn item_artwork(
     }
 }
 
+#[derive(Deserialize)]
+struct SubtitleCaps {
+    /// HUB-32b: absent = true, so clients predating capability
+    /// declaration keep seeing everything.
+    graphics_overlay: Option<bool>,
+}
+
 async fn item_subtitles(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    Query(caps): Query<SubtitleCaps>,
 ) -> Result<Json<Value>, ApiError> {
-    let subs = state.subtitles.list(&state.registry, &id).await.map_err(internal)?;
+    let mut subs = state.subtitles.list(&state.registry, &id).await.map_err(internal)?;
+    // A client that cannot composite display sets has no use for image
+    // subtitles — offering one it cannot render is worse than absence
+    // (the session verdict already names the missing tiers, HUB-32b).
+    if caps.graphics_overlay == Some(false) {
+        subs.retain(|s| !s.image);
+    }
     Ok(Json(json!({ "subtitles": subs })))
 }
 

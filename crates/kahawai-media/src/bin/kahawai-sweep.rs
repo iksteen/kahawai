@@ -59,21 +59,30 @@ fn main() {
     let mut limit = usize::MAX;
     let mut jobs = 4usize;
     let mut one = None;
+    let mut profile_path: Option<PathBuf> = None;
     while let Some(a) = args.next() {
         match a.as_str() {
             "--full" => full = true,
             "--one" => one = args.next().map(PathBuf::from),
             "--limit" => limit = args.next().and_then(|v| v.parse().ok()).expect("--limit N"),
             "--jobs" => jobs = args.next().and_then(|v| v.parse().ok()).expect("--jobs N"),
+            // A CapabilityProfile as JSON (dump the browser's
+            // buildProfile() from the console to sweep a real client).
+            "--profile" => profile_path = args.next().map(PathBuf::from),
             other => dir = Some(PathBuf::from(other)),
         }
     }
+    let profile: kahawai_core::media::CapabilityProfile = match &profile_path {
+        Some(p) => serde_json::from_str(&std::fs::read_to_string(p).expect("--profile file"))
+            .expect("--profile JSON"),
+        None => Default::default(),
+    };
 
     // Child mode: sweep exactly one file, print "<tag>\t<detail>", exit 0.
     if let Some(path) = one {
         kahawai_media::init().expect("gstreamer init");
         let has_ffprobe = std::process::Command::new("ffprobe").arg("-version").output().is_ok();
-        let (verdict, detail) = sweep_one(&path, full, has_ffprobe);
+        let (verdict, detail) = sweep_one(&path, full, has_ffprobe, &profile);
         println!("{}\t{}", verdict.tag().trim_end(), detail);
         return;
     }
@@ -229,7 +238,12 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-fn sweep_one(path: &Path, full: bool, has_ffprobe: bool) -> (Verdict, String) {
+fn sweep_one(
+    path: &Path,
+    full: bool,
+    has_ffprobe: bool,
+    profile: &kahawai_core::media::CapabilityProfile,
+) -> (Verdict, String) {
     // 1. Discovery, as the mediahost scanner would do it.
     let info = match kahawai_media::discover(path, Duration::from_secs(30)) {
         Ok(i) => i,
@@ -237,11 +251,20 @@ fn sweep_one(path: &Path, full: bool, has_ffprobe: bool) -> (Verdict, String) {
     };
     let codecs = describe(&info);
 
-    // 2. Plan, as the hub would.
-    let plan = kahawai_media::remux::plan_streams(&info, &kahawai_media::remux::WEB_TARGET, 0, 0);
-    if !plan.playable() {
+    // 2. Negotiate, as the hub would (HUB-14).
+    let sp = kahawai_media::negotiate::negotiate(profile, &info, 0, 0, true, None);
+    let plan = sp.plan;
+    if sp.cost == kahawai_media::negotiate::Cost::Unplayable {
         return (Verdict::Skip, format!("[needs transcoder] {codecs}"));
     }
+    let cost_tag = match sp.cost {
+        kahawai_media::negotiate::Cost::Direct => "direct",
+        kahawai_media::negotiate::Cost::Copy => "copy",
+        kahawai_media::negotiate::Cost::AudioEncode => "a-enc",
+        kahawai_media::negotiate::Cost::VideoEncode => "v-enc",
+        kahawai_media::negotiate::Cost::Unplayable => unreachable!(),
+    };
+    let codecs = format!("[{cost_tag}] {codecs}");
     let video_dropped = !plan.has_video() && !info.video.is_empty();
     let audio_dropped = !plan.has_audio() && !info.audio.is_empty();
     let mut codecs = codecs;

@@ -1,0 +1,397 @@
+//! HUB-14/HUB-15: the negotiation engine. A pure function from (client
+//! capability profile, source stream facts, track selection) to a
+//! per-elementary-stream plan — no I/O, no GStreamer state beyond the
+//! encoder/muxer availability probes remux.rs already caches. The hub
+//! runs it against EVERY candidate source and picks the cheapest
+//! (HUB-16: direct > copy-remux > audio-encode > video-encode).
+//!
+//! Unknown-permissive: a source probed before the MH-3 extension has no
+//! profile/level/bitrate/HDR facts. Missing facts never veto a copy —
+//! the codec-name gate always applies, and re-encoding entire
+//! un-rescanned libraries to defend against a hypothetical
+//! profile-mismatch would be a worse failure than the occasional
+//! visible playback error. HDR `None` reads as SDR.
+
+use kahawai_core::media::{CapabilityProfile, MediaInfo};
+
+use crate::remux::{
+    aac_encoder, can_decode, codec_to_caps_name, h264_encoder, plan_summary, ts_muxable_names,
+    RemuxPlan, StreamMode,
+};
+
+/// HUB-16 cost order; `Ord` IS the preference (smaller = cheaper).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Cost {
+    Direct,
+    Copy,
+    AudioEncode,
+    VideoEncode,
+    Unplayable,
+}
+
+#[derive(Debug, Clone)]
+pub struct SourcePlan {
+    /// Serve bytes as-is; `plan` is still filled for verdict text.
+    pub direct: bool,
+    pub plan: RemuxPlan,
+    pub cost: Cost,
+    pub video_verdict: String,
+    pub audio_verdict: String,
+    pub subtitles: Vec<SubtitleVerdict>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SubtitleVerdict {
+    pub index: usize,
+    pub format: String,
+    pub language: Option<String>,
+    pub tier: SubtitleTier,
+    pub note: &'static str,
+}
+
+/// HUB-32a/b policy order as data. `Unavailable` is honest: the tiers
+/// below Graphics (OCR per HUB-32c, burn-in) are not built.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubtitleTier {
+    Text,
+    Convert,
+    Graphics,
+    Unavailable,
+}
+
+/// H.264 caps profile strings in capability order: a client that
+/// decodes an entry decodes everything before it.
+const H264_PROFILES: &[&str] = &[
+    "constrained-baseline",
+    "baseline",
+    "main",
+    "high",
+    "high-10",
+    "high-4:2:2",
+    "high-4:4:4",
+];
+
+/// HEVC order (the short list that occurs in the wild).
+const HEVC_PROFILES: &[&str] = &["main", "main-still-picture", "main-10"];
+
+fn profile_rank(codec: &str, profile: &str) -> Option<usize> {
+    let table = match codec {
+        "h264" => H264_PROFILES,
+        "hevc" => HEVC_PROFILES,
+        _ => return None,
+    };
+    table.iter().position(|p| *p == profile)
+}
+
+/// "4.1" → 41; unparseable → None (permissive).
+fn level_num(level: &str) -> Option<u32> {
+    let mut parts = level.split('.');
+    let major: u32 = parts.next()?.parse().ok()?;
+    let minor: u32 = parts.next().map_or(Some(0), |m| m.parse().ok())?;
+    Some(major * 10 + minor)
+}
+
+/// Does the client's video capability admit this source stream for
+/// COPY? Codec name is a hard gate; profile/level compare only when
+/// BOTH sides state one (unknown-permissive on either side).
+fn video_fits(profile: &CapabilityProfile, v: &kahawai_core::media::VideoStream) -> bool {
+    let Some(cap) = profile.video.iter().find(|c| c.codec == v.codec) else {
+        return false;
+    };
+    if let (Some(have), Some(max)) = (v.profile.as_deref(), cap.max_profile.as_deref())
+        && let (Some(h), Some(m)) = (profile_rank(&v.codec, have), profile_rank(&v.codec, max))
+        && h > m
+    {
+        return false;
+    }
+    if let (Some(have), Some(max)) = (v.level.as_deref(), cap.max_level.as_deref())
+        && let (Some(h), Some(m)) = (level_num(have), level_num(max))
+        && h > m
+    {
+        return false;
+    }
+    if let Some(max_h) = profile.max_height
+        && v.height > max_h
+    {
+        return false;
+    }
+    if let (Some(max_fps), Some((n, d))) = (profile.max_fps, v.fps)
+        && d > 0
+        && n / d > max_fps
+    {
+        return false;
+    }
+    true
+}
+
+/// The whole decision, one source. `est_kbps` is the hub's aggregate
+/// size×8/duration estimate — the only bitrate available for
+/// pre-extension rows; used solely when a cap is set.
+pub fn negotiate(
+    profile: &CapabilityProfile,
+    info: &MediaInfo,
+    audio_track: usize,
+    video_track: usize,
+    single_part: bool,
+    est_kbps: Option<u32>,
+) -> SourcePlan {
+    let audio_track = audio_track.min(info.audio.len().saturating_sub(1));
+    let video_track = video_track.min(info.video.len().saturating_sub(1));
+    let names = ts_muxable_names();
+    let muxable = |kind: &str, codec: &str| {
+        codec_to_caps_name(kind, codec).is_some_and(|n| names.contains(n))
+    };
+    let cap = profile.max_bandwidth_kbps;
+    let over_cap = cap.is_some_and(|c| est_kbps.is_some_and(|e| e > c));
+
+    let v = info.video.get(video_track);
+    let a = info.audio.get(audio_track);
+
+    // Copy admissibility per stream, before muxability (direct play
+    // has no muxer; TS-muxability gates only the remux path).
+    let v_client_ok = v.is_some_and(|v| video_fits(profile, v)) && !over_cap;
+    let a_client_ok = a.is_some_and(|a| {
+        profile.audio.contains(&a.codec)
+            && (profile.max_audio_channels == 0 || a.channels <= profile.max_audio_channels)
+    });
+
+    // Direct: the container itself plus every selected stream fits.
+    let container_ok = info
+        .container
+        .as_deref()
+        .is_some_and(|c| profile.containers.iter().any(|p| p == c));
+    let direct = single_part
+        && container_ok
+        && (v.is_none() || v_client_ok)
+        && (a.is_none() || a_client_ok)
+        && (v.is_some() || a.is_some());
+
+    // Remux/transcode verdict per stream.
+    let video = if v.is_some_and(|s| v_client_ok && muxable("video", &s.codec)) {
+        StreamMode::Copy
+    } else if h264_encoder().is_some()
+        && v.is_some_and(|s| codec_to_caps_name("video", &s.codec).is_some_and(can_decode))
+    {
+        StreamMode::Encode
+    } else {
+        StreamMode::Off
+    };
+    let audio = if a.is_some_and(|s| a_client_ok && muxable("audio", &s.codec)) {
+        StreamMode::Copy
+    } else if aac_encoder().is_some()
+        && a.is_some_and(|s| codec_to_caps_name("audio", &s.codec).is_some_and(can_decode))
+    {
+        StreamMode::Encode
+    } else {
+        StreamMode::Off
+    };
+
+    let plan = RemuxPlan {
+        video,
+        audio,
+        audio_track,
+        video_track,
+        video_kbps: (video == StreamMode::Encode).then(|| cap.map_or(6000, |c| 6000.min(c))),
+        max_height: (video == StreamMode::Encode).then_some(profile.max_height).flatten(),
+        max_channels: (audio == StreamMode::Encode && profile.max_audio_channels > 0)
+            .then_some(profile.max_audio_channels),
+    };
+
+    let cost = if direct {
+        Cost::Direct
+    } else if !plan.playable() {
+        Cost::Unplayable
+    } else if video == StreamMode::Encode {
+        Cost::VideoEncode
+    } else if audio == StreamMode::Encode {
+        Cost::AudioEncode
+    } else {
+        Cost::Copy
+    };
+
+    // Verdicts: the established plan_summary strings, plus negotiation
+    // notes nothing else can know.
+    let (mut video_verdict, audio_verdict) = plan_summary(info, &plan);
+    if direct {
+        video_verdict = match v {
+            Some(s) => format!("{} direct", s.codec),
+            None => "none".into(),
+        };
+    }
+    if let Some(s) = v
+        && s.hdr.is_some()
+        && !profile.hdr
+    {
+        // HUB-15a lands the tone-map tier; until then the honest truth.
+        video_verdict.push_str(" · HDR delivered as-is (tone-map not built, HUB-15a)");
+    }
+    if over_cap && !direct && video == StreamMode::Encode {
+        video_verdict.push_str(" · bandwidth cap");
+    }
+
+    let subtitles = info
+        .subtitles
+        .iter()
+        .enumerate()
+        .map(|(index, s)| {
+            let (tier, note) = match s.format.as_str() {
+                "ass" | "ssa" if profile.ass_render => (SubtitleTier::Text, ""),
+                "ass" | "ssa" => (SubtitleTier::Convert, "flattened to VTT"),
+                "pgs" | "vobsub" | "dvdsub" if profile.graphics_overlay => {
+                    (SubtitleTier::Graphics, "")
+                }
+                "pgs" | "vobsub" | "dvdsub" => (
+                    SubtitleTier::Unavailable,
+                    "needs OCR (HUB-32c) or burn-in — neither built",
+                ),
+                _ => (SubtitleTier::Text, ""),
+            };
+            SubtitleVerdict {
+                index,
+                format: s.format.clone(),
+                language: s.language.clone(),
+                tier,
+                note,
+            }
+        })
+        .collect();
+
+    SourcePlan { direct, plan, cost, video_verdict, audio_verdict, subtitles }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kahawai_core::media::{AudioStream, SubtitleStream, VideoCap, VideoStream};
+
+    fn media(container: &str, v: Option<VideoStream>, a: Option<AudioStream>) -> MediaInfo {
+        MediaInfo {
+            container: Some(container.into()),
+            duration_ms: Some(60_000),
+            video: v.into_iter().collect(),
+            audio: a.into_iter().collect(),
+            ..Default::default()
+        }
+    }
+    fn vs(codec: &str) -> VideoStream {
+        VideoStream { codec: codec.into(), width: 1920, height: 1080, ..Default::default() }
+    }
+    fn au(codec: &str, channels: u32) -> AudioStream {
+        AudioStream { codec: codec.into(), channels, sample_rate: 48000, ..Default::default() }
+    }
+    fn chrome() -> CapabilityProfile {
+        CapabilityProfile {
+            containers: vec!["mp4".into(), "webm".into()],
+            video: vec![
+                VideoCap { codec: "h264".into(), ..Default::default() },
+                VideoCap { codec: "hevc".into(), ..Default::default() },
+            ],
+            audio: vec!["aac".into(), "mp3".into(), "opus".into()],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn decision_table() {
+        let p = chrome();
+        // mp4/h264/aac: direct.
+        let sp = negotiate(&p, &media("mp4", Some(vs("h264")), Some(au("aac", 2))), 0, 0, true, None);
+        assert_eq!(sp.cost, Cost::Direct);
+        assert!(sp.direct);
+        // Same streams in MKV: copy-remux (container unsupported).
+        let sp = negotiate(&p, &media("matroska", Some(vs("h264")), Some(au("aac", 6))), 0, 0, true, None);
+        assert_eq!(sp.cost, Cost::Copy);
+        assert_eq!(sp.plan.video, StreamMode::Copy);
+        // DTS audio: audio encode, channels unlimited so no downmix.
+        let sp = negotiate(&p, &media("matroska", Some(vs("h264")), Some(au("dts", 6))), 0, 0, true, None);
+        assert_eq!(sp.cost, Cost::AudioEncode);
+        assert_eq!(sp.plan.max_channels, None);
+        // HEVC with hevc in profile: copy; without: video encode.
+        let sp = negotiate(&p, &media("matroska", Some(vs("hevc")), Some(au("aac", 2))), 0, 0, true, None);
+        assert_eq!(sp.plan.video, StreamMode::Copy);
+        let mut no_hevc = chrome();
+        no_hevc.video.retain(|c| c.codec != "hevc");
+        let sp = negotiate(&no_hevc, &media("matroska", Some(vs("hevc")), Some(au("aac", 2))), 0, 0, true, None);
+        assert_eq!(sp.cost, Cost::VideoEncode);
+        assert_eq!(sp.plan.video_kbps, Some(6000));
+        // Multi-part never direct, even when everything fits.
+        let sp = negotiate(&p, &media("mp4", Some(vs("h264")), Some(au("aac", 2))), 0, 0, false, None);
+        assert_ne!(sp.cost, Cost::Direct);
+    }
+
+    #[test]
+    fn ceilings_and_caps() {
+        // 2160p against a 1080 ceiling: encode with scale.
+        let mut p = chrome();
+        p.max_height = Some(1080);
+        let big = VideoStream { height: 2160, width: 3840, ..vs("h264") };
+        let sp = negotiate(&p, &media("matroska", Some(big), Some(au("aac", 2))), 0, 0, true, None);
+        assert_eq!(sp.cost, Cost::VideoEncode);
+        assert_eq!(sp.plan.max_height, Some(1080));
+        // Profile ceiling: high-10 source vs high client → encode; unknown source profile → copy.
+        let mut p = chrome();
+        p.video = vec![VideoCap { codec: "h264".into(), max_profile: Some("high".into()), max_level: None }];
+        let ten_bit = VideoStream { profile: Some("high-10".into()), ..vs("h264") };
+        let sp = negotiate(&p, &media("matroska", Some(ten_bit), Some(au("aac", 2))), 0, 0, true, None);
+        assert_eq!(sp.cost, Cost::VideoEncode);
+        let unknown = vs("h264"); // no profile field → permissive
+        let sp = negotiate(&p, &media("matroska", Some(unknown), Some(au("aac", 2))), 0, 0, true, None);
+        assert_eq!(sp.cost, Cost::Copy, "unknown profile must not veto a copy");
+        // Bandwidth cap: 14 Mbit estimate vs 8 Mbit cap → no direct, encode clamped.
+        let mut p = chrome();
+        p.max_bandwidth_kbps = Some(800);
+        let sp = negotiate(&p, &media("mp4", Some(vs("h264")), Some(au("aac", 2))), 0, 0, true, Some(14000));
+        assert_ne!(sp.cost, Cost::Direct);
+        assert_eq!(sp.plan.video_kbps, Some(800));
+        // Channel limit: 5.1 aac vs max 2 → encode with downmix.
+        let mut p = chrome();
+        p.max_audio_channels = 2;
+        let sp = negotiate(&p, &media("matroska", Some(vs("h264")), Some(au("aac", 6))), 0, 0, true, None);
+        assert_eq!(sp.cost, Cost::AudioEncode);
+        assert_eq!(sp.plan.max_channels, Some(2));
+    }
+
+    #[test]
+    fn hdr_and_subtitles_speak_in_verdicts() {
+        let p = chrome(); // hdr: false
+        let hdr = VideoStream { hdr: Some("hdr10".into()), ..vs("h264") };
+        let mut info = media("matroska", Some(hdr), Some(au("aac", 2)));
+        info.subtitles = vec![
+            SubtitleStream { format: "srt".into(), language: None },
+            SubtitleStream { format: "ass".into(), language: None },
+            SubtitleStream { format: "pgs".into(), language: None },
+        ];
+        let sp = negotiate(&p, &info, 0, 0, true, None);
+        assert_eq!(sp.cost, Cost::Copy, "HDR must not flip the decision until HUB-15a");
+        assert!(sp.video_verdict.contains("HUB-15a"), "verdict: {}", sp.video_verdict);
+        assert_eq!(sp.subtitles[0].tier, SubtitleTier::Text);
+        assert_eq!(sp.subtitles[1].tier, SubtitleTier::Convert, "no ass_render → flatten");
+        assert_eq!(sp.subtitles[2].tier, SubtitleTier::Unavailable);
+        let mut able = chrome();
+        able.ass_render = true;
+        able.graphics_overlay = true;
+        let sp = negotiate(&able, &info, 0, 0, true, None);
+        assert_eq!(sp.subtitles[1].tier, SubtitleTier::Text);
+        assert_eq!(sp.subtitles[2].tier, SubtitleTier::Graphics);
+    }
+
+    /// The fallback profile reproduces plan_streams(WEB_TARGET) on the
+    /// remux path — profileless requests lose nothing.
+    #[test]
+    fn default_profile_matches_web_target() {
+        let p = CapabilityProfile::default();
+        for (v, a) in [
+            (Some(vs("h264")), Some(au("aac", 6))),
+            (Some(vs("hevc")), Some(au("aac", 2))),
+            (Some(vs("h264")), Some(au("dts", 6))),
+            (Some(vs("h264")), Some(au("flac", 2))),
+        ] {
+            let info = media("matroska", v, a);
+            let old = crate::remux::plan_streams(&info, &crate::remux::WEB_TARGET, 0, 0);
+            let new = negotiate(&p, &info, 0, 0, true, None);
+            assert_eq!(new.plan.video, old.video, "video parity for {info:?}");
+            assert_eq!(new.plan.audio, old.audio, "audio parity for {info:?}");
+        }
+    }
+}

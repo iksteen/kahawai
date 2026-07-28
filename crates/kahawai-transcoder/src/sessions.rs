@@ -67,6 +67,7 @@ impl Runner {
     }
 
     #[allow(clippy::too_many_arguments)] // wire-shaped plumbing
+    #[allow(clippy::too_many_arguments)] // wire-shaped plumbing
     pub async fn start(
         self: &Arc<Self>,
         session_id: String,
@@ -78,11 +79,12 @@ impl Runner {
         start_ms: u64,
         sink: &str,
         tail_sizes: Vec<u64>,
+        encode_params: (u32, u32, u32),
     ) {
         let result = self
             .start_inner(
                 &session_id, size, video, audio, audio_track, video_track, start_ms, sink,
-                &tail_sizes,
+                &tail_sizes, encode_params,
             )
             .await;
         let msg = match result {
@@ -109,6 +111,7 @@ impl Runner {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)] // wire-shaped plumbing
     async fn start_inner(
         self: &Arc<Self>,
         session_id: &str,
@@ -120,6 +123,7 @@ impl Runner {
         start_ms: u64,
         sink: &str,
         tail_sizes: &[u64],
+        (video_kbps, max_height, max_channels): (u32, u32, u32),
     ) -> Result<()> {
         // Replace any previous run first (seek-restart reuses the id).
         self.end(session_id).await;
@@ -170,6 +174,15 @@ impl Runner {
                 for (s, n) in &socks[1..] {
                     cmd.args(["--part", &format!("{}:{n}", s.display())]);
                 }
+                for (flag, v) in [
+                    ("--video-kbps", video_kbps),
+                    ("--max-height", max_height),
+                    ("--max-channels", max_channels),
+                ] {
+                    if v > 0 {
+                        cmd.args([flag, &v.to_string()]);
+                    }
+                }
                 let child = cmd
                     .args(["--video", video])
                     .args(["--audio", audio])
@@ -185,18 +198,22 @@ impl Runner {
                 Worker::Child(child)
             }
             None => {
-                let (v, a) = (
-                    kahawai_media::worker::parse_mode(video),
-                    kahawai_media::worker::parse_mode(audio),
-                );
+                let plan = kahawai_media::remux::RemuxPlan {
+                    video: kahawai_media::worker::parse_mode(video),
+                    audio: kahawai_media::worker::parse_mode(audio),
+                    audio_track: audio_track as usize,
+                    video_track: video_track as usize,
+                    video_kbps: (video_kbps > 0).then_some(video_kbps),
+                    max_height: (max_height > 0).then_some(max_height),
+                    max_channels: (max_channels > 0).then_some(max_channels),
+                };
                 let (all, dir) = (socks.clone(), dir.clone());
                 let sink_owned = (!sink.is_empty()).then(|| sink.to_string());
                 let err = Arc::new(Mutex::new(None));
                 let err2 = err.clone();
                 let handle = tokio::task::spawn_blocking(move || {
                     if let Err(e) = kahawai_media::worker::run_parts(
-                        &all, &dir, v, a, audio_track as usize,
-                        video_track as usize, start_ms, sink_owned.as_deref(),
+                        &all, &dir, plan, start_ms, sink_owned.as_deref(),
                     ) {
                         tracing::warn!(error = format!("{e:#}"), "in-process worker failed");
                         *err2.lock().unwrap() = Some(format!("{e:#}"));

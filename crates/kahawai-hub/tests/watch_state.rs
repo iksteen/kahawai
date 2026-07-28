@@ -173,7 +173,7 @@ async fn progress_resume_played_caps_and_idle() {
     let start_session = || {
         api.clone().oneshot(post(
             "/api/v1/playback/sessions".into(),
-            serde_json::json!({"item_id": item_id}),
+            serde_json::json!({"item_id": item_id, "mode": "direct"}),
         ))
     };
     let resp = start_session().await.unwrap();

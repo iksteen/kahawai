@@ -702,6 +702,17 @@ export default function Player({
           ? ` · video: ${session.streams.video} · audio: ${session.streams.audio}`
           : ''}{' '}
         · {session.content_type}
+        {session.streams?.subtitles?.length ? (
+          <div className="dim">
+            {session.streams.subtitles
+              .map(
+                (s) =>
+                  `subs ${s.format}${s.language ? `/${s.language}` : ''}: ${s.tier}` +
+                  (s.note ? ` (${s.note})` : ''),
+              )
+              .join(' · ')}
+          </div>
+        ) : null}
       </div>
     </main>
   )

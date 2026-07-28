@@ -177,7 +177,7 @@ async fn direct_play_ranges_end_to_end() {
             Request::post("/api/v1/playback/sessions")
                 .header("authorization", bearer.clone())
                 .header("content-type", "application/json")
-                .body(Body::from(format!("{{\"item_id\":\"{item_id}\"}}")))
+                .body(Body::from(format!("{{\"item_id\":\"{item_id}\",\"mode\":\"direct\"}}")))
                 .unwrap(),
         )
         .await
@@ -255,7 +255,7 @@ async fn direct_play_ranges_end_to_end() {
             Request::post("/api/v1/playback/sessions")
                 .header("authorization", bearer)
                 .header("content-type", "application/json")
-                .body(Body::from(format!("{{\"item_id\":\"{item_id}\"}}")))
+                .body(Body::from(format!("{{\"item_id\":\"{item_id}\",\"mode\":\"direct\"}}")))
                 .unwrap(),
         )
         .await

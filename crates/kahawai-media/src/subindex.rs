@@ -205,7 +205,7 @@ fn mkv_read_index(r: &mut Reader) -> Result<MkvIndex> {
     let (id, il) = ebml_id(&head)?;
     anyhow::ensure!(id == EBML_HEADER, "not matroska");
     let (hsize, hsl) = ebml_size(&head[il..])?;
-    let mut pos = il as u64 + hsl as u64 + hsize.context("unknown EBML header size")?;
+    let pos = il as u64 + hsl as u64 + hsize.context("unknown EBML header size")?;
 
     // Segment.
     let seg = r.read_at(pos, 16)?;
@@ -348,13 +348,12 @@ fn mkv_read_index(r: &mut Reader) -> Result<MkvIndex> {
                     Ok(true)
                 })?;
             }
-            CLUSTER => {
-                if idx.first_cluster.is_none() {
+            CLUSTER
+                if idx.first_cluster.is_none() => {
                     idx.first_cluster = Some(pos);
                 }
                 // Tracks/Cues may still be ahead (SeekHead pending covers
                 // the usual layouts); keep hopping — header reads only.
-            }
             _ => {}
         }
         // Jump to any SeekHead-promised sections we haven't visited,
@@ -930,7 +929,7 @@ fn mp4_extract(file: File) -> Result<Vec<(usize, Extracted)>> {
         let Some(samples) = mp4_sample_table(stbl, timescale) else { return Ok(()) };
         let mut cues = Vec::new();
         for (off, size, start_ms, dur_ms) in samples {
-            if size < 2 || size > 1 << 20 {
+            if !(2..=1 << 20).contains(&size) {
                 continue;
             }
             let data = match r.read_at(off, size as usize) {

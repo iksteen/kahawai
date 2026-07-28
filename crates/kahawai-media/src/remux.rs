@@ -18,7 +18,7 @@ use gstreamer_app::AppSrc;
 /// sink pad templates. Never hand-list what the element can tell us: a
 /// hardcoded list shipped eac3 (which mpegtsmux rejects at runtime →
 /// opaque not-negotiated) and omitted dts/opus (which it happily muxes).
-fn ts_muxable_names() -> &'static std::collections::HashSet<String> {
+pub(crate) fn ts_muxable_names() -> &'static std::collections::HashSet<String> {
     static NAMES: std::sync::OnceLock<std::collections::HashSet<String>> =
         std::sync::OnceLock::new();
     NAMES.get_or_init(|| {
@@ -61,7 +61,7 @@ fn ts_compatible(caps_name: &str) -> Option<&'static str> {
 /// Codecs discovery couldn't normalize pass through as raw caps names
 /// (`video/x-divx`, `video/x-msmpeg`, …) — usable directly for decoder
 /// lookups, so old exotics still plan as Encode instead of dropping.
-fn codec_to_caps_name<'a>(kind: &str, codec: &'a str) -> Option<&'a str> {
+pub(crate) fn codec_to_caps_name<'a>(kind: &str, codec: &'a str) -> Option<&'a str> {
     if codec.contains('/') {
         return Some(codec);
     }
@@ -231,7 +231,7 @@ pub fn decoder_caps_names() -> Vec<String> {
 
 /// Can any installed decoder take this stream? Derived from the element
 /// registry (never hand-list what it can tell us).
-fn can_decode(caps_name: &str) -> bool {
+pub(crate) fn can_decode(caps_name: &str) -> bool {
     let caps = gst::Caps::new_empty_simple(caps_name);
     gst::ElementFactory::factories_with_type(
         gst::ElementFactoryType::DECODER,
@@ -244,11 +244,12 @@ fn can_decode(caps_name: &str) -> bool {
 /// What happens to one stream kind in a session (HUB-16 decision order:
 /// copy what the client and muxer both take, encode what they don't but
 /// a decoder can read, drop the rest).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum StreamMode {
     Copy,
     /// Decode → re-encode to the target codec (h264 video / AAC audio).
     Encode,
+    #[default]
     Off,
 }
 
@@ -266,7 +267,7 @@ pub const WEB_TARGET: Target = Target { video: &["h264"], audio: &["aac", "mp3"]
 /// Per-kind session plan — the single source of truth shared between
 /// session planning and pipeline routing, so the muxer pads requested up
 /// front always match the streams that will actually be linked.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct RemuxPlan {
     pub video: StreamMode,
     pub audio: StreamMode,
@@ -276,6 +277,11 @@ pub struct RemuxPlan {
     /// Same for video (dual-video muxes: clean + hardsubbed fansub
     /// releases, sample tracks next to the feature).
     pub video_track: usize,
+    /// Encode-branch parameters (HUB-14/15). None = the historical
+    /// fixed values: 6000 kbit video, no scaling, no downmix.
+    pub video_kbps: Option<u32>,
+    pub max_height: Option<u32>,
+    pub max_channels: Option<u32>,
 }
 
 impl RemuxPlan {
@@ -329,7 +335,7 @@ pub fn plan_streams(
     } else {
         StreamMode::Off
     };
-    RemuxPlan { video, audio, audio_track, video_track }
+    RemuxPlan { video, audio, audio_track, video_track, ..Default::default() }
 }
 
 /// Human-readable per-kind verdict for the playback-info overlay
@@ -889,9 +895,9 @@ fn route_stream(
         if let Some(sinkpad) = waiting.lock().unwrap().remove(kind) {
             tracing::info!(caps = %caps_name, kind, "transcoding stream");
             if kind == "video" {
-                build_video_encode_chain(pipe, from, sinkpad, gate);
+                build_video_encode_chain(pipe, from, sinkpad, gate, plan.video_kbps, plan.max_height);
             } else {
-                build_audio_encode_chain(pipe, from, sinkpad, &caps_name, gate);
+                build_audio_encode_chain(pipe, from, sinkpad, &caps_name, gate, plan.max_channels);
             }
             return;
         }
@@ -955,6 +961,8 @@ fn build_video_encode_chain(
     from: &gst::Pad,
     sinkpad: gst::Pad,
     gate: &Option<Arc<SeekGate>>,
+    video_kbps: Option<u32>,
+    max_height: Option<u32>,
 ) {
     let Some(enc_name) = h264_encoder() else {
         tracing::error!("video encode routed with no verified H.264 encoder");
@@ -986,13 +994,42 @@ fn build_video_encode_chain(
         .collect();
     let enc = gst::ElementFactory::make(enc_name).build().unwrap();
     // Sane defaults, guarded per element (props differ across encoders).
-    // nvh264enc/x264enc take kbit/s.
-    set_prop_str_if_present(&enc, "bitrate", "6000");
+    // nvh264enc/x264enc take kbit/s. The plan may clamp (bandwidth cap).
+    set_prop_str_if_present(&enc, "bitrate", &video_kbps.unwrap_or(6000).to_string());
     let parse = gst::ElementFactory::make("h264parse").build().unwrap();
     // Parameter sets on every keyframe (independently decodable segments).
     set_prop_if_present(&parse, "config-interval", -1i32);
 
-    let mut chain: Vec<&gst::Element> = converters.iter().collect();
+    // HUB-15 resolution ceiling: a RANGE capsfilter after videoscale, so
+    // sources already within the ceiling pass through untouched and only
+    // larger ones downscale (aspect preserved by videoscale's fixation).
+    let scaler: Vec<gst::Element> = match max_height {
+        Some(h) if gst::ElementFactory::find("videoscale").is_some() => {
+            let scale = gst::ElementFactory::make("videoscale").build().unwrap();
+            let caps = gst::Caps::builder("video/x-raw")
+                .field("height", gst::IntRange::new(16i32, h as i32))
+                .build();
+            let filter = gst::ElementFactory::make("capsfilter")
+                .property("caps", caps)
+                .build()
+                .unwrap();
+            vec![scale, filter]
+        }
+        _ => vec![],
+    };
+
+    // The scaler works on system memory: it must sit right after
+    // videoconvert, BEFORE any CUDA upload — a capsfilter on raw caps
+    // cannot link against CUDAMemory.
+    let scale_at = converter_names
+        .iter()
+        .position(|n| *n == "videoconvert")
+        .map(|i| i + 1)
+        .unwrap_or(converters.len());
+    let mut chain: Vec<&gst::Element> = Vec::new();
+    chain.extend(converters[..scale_at].iter());
+    chain.extend(scaler.iter());
+    chain.extend(converters[scale_at..].iter());
     chain.push(&enc);
     chain.push(&parse);
     pipe.add(&decode).unwrap();
@@ -1028,12 +1065,35 @@ fn build_video_encode_chain(
 /// the fallback strategy) → audioconvert → audioresample → AAC encoder →
 /// aacparse (raw→ADTS for the TS muxer) → muxer pad. The only decode/
 /// encode work in the hub, and audio-only by design: a few % CPU.
+/// The HUB-15 channel-ceiling element pair, or nothing when unlimited.
+fn channel_limiter(max_channels: Option<u32>) -> Vec<gst::Element> {
+    match max_channels {
+        Some(n) if n > 0 => {
+            // A degenerate range ([1,1]) is invalid caps — mono is a
+            // fixed value, everything else a range.
+            let caps = if n == 1 {
+                gst::Caps::builder("audio/x-raw").field("channels", 1i32).build()
+            } else {
+                gst::Caps::builder("audio/x-raw")
+                    .field("channels", gst::IntRange::new(1i32, n as i32))
+                    .build()
+            };
+            vec![gst::ElementFactory::make("capsfilter")
+                .property("caps", caps)
+                .build()
+                .unwrap()]
+        }
+        _ => vec![],
+    }
+}
+
 fn build_audio_encode_chain(
     pipe: &gst::Pipeline,
     from: &gst::Pad,
     sinkpad: gst::Pad,
     caps_name: &str,
     gate: &Option<Arc<SeekGate>>,
+    max_channels: Option<u32>,
 ) {
     let Some(enc_name) = aac_encoder() else {
         // Planner guarantees this; guard anyway (fakesink beats a stall).
@@ -1055,19 +1115,28 @@ fn build_audio_encode_chain(
             .build()
             .unwrap();
         let dec = gst::ElementFactory::make("avdec_eac3").build().unwrap();
-        build_audio_tail(pipe, from, sinkpad, enc_name, &[setter, dec], gate);
+        build_audio_tail(pipe, from, sinkpad, enc_name, &[setter, dec], gate, max_channels);
         return;
     }
     let decode = gst::ElementFactory::make("decodebin").build().unwrap();
     let convert = gst::ElementFactory::make("audioconvert").build().unwrap();
+    // HUB-15 channel ceiling: audioconvert performs the downmix; the
+    // RANGE capsfilter states the ceiling so within-limit sources pass
+    // untouched.
+    let limiter = channel_limiter(max_channels);
     let resample = gst::ElementFactory::make("audioresample").build().unwrap();
     let enc = gst::ElementFactory::make(enc_name).build().unwrap();
     set_prop_str_if_present(&enc, "bitrate", "192000");
     let parse = gst::ElementFactory::make("aacparse").build().unwrap();
 
-    pipe.add_many([&decode, &convert, &resample, &enc, &parse]).unwrap();
-    gst::Element::link_many([&convert, &resample, &enc, &parse]).unwrap();
-    for el in [&decode, &convert, &resample, &enc, &parse] {
+    let mut chain: Vec<&gst::Element> = vec![&convert];
+    chain.extend(limiter.iter());
+    chain.extend([&resample, &enc, &parse]);
+    pipe.add(&decode).unwrap();
+    pipe.add_many(chain.iter().copied()).unwrap();
+    gst::Element::link_many(chain.iter().copied()).unwrap();
+    decode.sync_state_with_parent().unwrap();
+    for el in &chain {
         el.sync_state_with_parent().unwrap();
     }
     let out = parse.static_pad("src").unwrap();
@@ -1103,15 +1172,19 @@ fn build_audio_tail(
     enc_name: &str,
     front: &[gst::Element],
     gate: &Option<Arc<SeekGate>>,
+    max_channels: Option<u32>,
 ) {
     let convert = gst::ElementFactory::make("audioconvert").build().unwrap();
+    let limiter = channel_limiter(max_channels);
     let resample = gst::ElementFactory::make("audioresample").build().unwrap();
     let enc = gst::ElementFactory::make(enc_name).build().unwrap();
     set_prop_str_if_present(&enc, "bitrate", "192000");
     let parse = gst::ElementFactory::make("aacparse").build().unwrap();
 
     let mut chain: Vec<&gst::Element> = front.iter().collect();
-    chain.extend([&convert, &resample, &enc, &parse]);
+    chain.push(&convert);
+    chain.extend(limiter.iter());
+    chain.extend([&resample, &enc, &parse]);
     pipe.add_many(chain.iter().copied()).unwrap();
     gst::Element::link_many(chain.iter().copied()).unwrap();
     for el in &chain {
@@ -1687,6 +1760,7 @@ mod multipart {
             audio: StreamMode::Copy,
             audio_track: 0,
             video_track: 0,
+            ..Default::default()
         };
         // 2 s into a 5 s first part.
         let job = start_parts(&out, plan, sources, 2_000, None, None).unwrap();
@@ -1729,6 +1803,7 @@ mod multipart {
             audio: StreamMode::Copy,
             audio_track: 0,
             video_track: 0,
+            ..Default::default()
         };
         let job = start_parts(&out, plan, sources, 0, None, None).unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
@@ -2065,7 +2140,7 @@ mod tests {
     use super::*;
     use std::time::{Duration, Instant};
 
-    const COPY_AV: RemuxPlan = RemuxPlan { video: StreamMode::Copy, audio: StreamMode::Copy, audio_track: 0, video_track: 0 };
+    const COPY_AV: RemuxPlan = RemuxPlan { video: StreamMode::Copy, audio: StreamMode::Copy, audio_track: 0, video_track: 0, video_kbps: None, max_height: None, max_channels: None };
 
     /// Manual repro: REMUX_SRC=/path/to/file cargo test -p kahawai-media \
     ///   remux_file_from_env -- --ignored --nocapture
@@ -2326,6 +2401,56 @@ mod tests {
             total > 1.5 && total < 4.0,
             "expected only the tail, playlist covers {total}s:\n{playlist}"
         );
+    }
+
+    /// HUB-15 encode parameters reach the pipeline: the produced
+    /// segments obey the resolution ceiling and the channel downmix.
+    #[test]
+    fn encode_honors_scale_and_downmix() {
+        crate::init().unwrap();
+        if h264_encoder().is_none() || aac_encoder().is_none() {
+            eprintln!("skipping: encoders unavailable");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let src_path = dir.path().join("in.mkv");
+        crate::testutil::render_h264_flac_mkv(&src_path); // 320x240, flac
+
+        let info = crate::discover(&src_path, Duration::from_secs(30)).unwrap();
+        let plan = RemuxPlan {
+            video: StreamMode::Encode,
+            audio: StreamMode::Encode,
+            audio_track: 0,
+            video_track: 0,
+            video_kbps: Some(500),
+            max_height: Some(120),
+            max_channels: Some(1),
+        };
+        let _ = info;
+        let out = tempfile::tempdir().unwrap();
+        let job =
+            start_at(out.path(), plan, Box::new(FileSource::open(&src_path).unwrap()), 0).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !job.finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(job.finished(), "param encode did not finish");
+        assert!(job.failed().is_none(), "param encode failed: {:?}", job.failed());
+
+        // Probe the first produced segment: the ceiling and downmix are
+        // facts about the OUTPUT, not the plan.
+        let seg = std::fs::read_dir(out.path())
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .find(|p| p.extension().is_some_and(|x| x == "ts"))
+            .expect("no segment produced");
+        let seg_info = crate::discover(&seg, Duration::from_secs(30)).unwrap();
+        assert!(
+            seg_info.video[0].height <= 120,
+            "height {} exceeds the ceiling",
+            seg_info.video[0].height
+        );
+        assert_eq!(seg_info.audio[0].channels, 1, "downmix to mono did not happen");
     }
 
     #[test]

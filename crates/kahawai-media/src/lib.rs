@@ -3,6 +3,7 @@
 
 pub mod doctor;
 pub mod imagesubs;
+pub mod negotiate;
 pub mod remux;
 pub mod subindex;
 pub mod subtitles;
@@ -48,7 +49,7 @@ pub fn init() -> Result<()> {
 pub fn demote_elements(names: &[String]) -> Result<()> {
     init()?;
     for name in names {
-        use gst::prelude::PluginFeatureExt;
+        
         match gst::ElementFactory::find(name) {
             Some(f) => {
                 f.set_rank(gst::Rank::NONE);
@@ -103,10 +104,31 @@ fn map_info(info: &DiscovererInfo) -> MediaInfo {
     // pipeline will actually see.
     for s in info.video_streams().into_iter().filter(is_terminal) {
         let caps = s.caps();
+        let st_get = |field: &str| {
+            caps.as_ref()
+                .and_then(|c| c.structure(0).and_then(|st| st.get::<&str>(field).ok()))
+                .map(str::to_string)
+        };
         let name = caps
             .as_ref()
             .and_then(|c| c.structure(0).map(|st| st.name().to_string()))
             .unwrap_or_default();
+        // HDR from colorimetry (MH-3): the transfer function names the
+        // standard — PQ = HDR10-family, HLG = HLG. Colorimetry strings
+        // are either the canonical shorthands or colon-separated fields
+        // where the 3rd is the transfer characteristic (16 = PQ, 14/18
+        // = HLG per GstVideoTransferFunction).
+        let hdr = st_get("colorimetry").and_then(|c| {
+            if c.contains("bt2100-pq") || c.split(':').nth(2) == Some("16") {
+                Some("hdr10".to_string())
+            } else if c.contains("bt2100-hlg")
+                || matches!(c.split(':').nth(2), Some("14") | Some("18"))
+            {
+                Some("hlg".to_string())
+            } else {
+                None
+            }
+        });
         out.video.push(VideoStream {
             codec: normalize_video_codec(&name),
             width: s.width(),
@@ -117,7 +139,10 @@ fn map_info(info: &DiscovererInfo) -> MediaInfo {
             },
             bit_depth: (s.depth() > 0).then_some(s.depth()),
             interlaced: s.is_interlaced(),
-            hdr: None,
+            hdr,
+            profile: st_get("profile"),
+            level: st_get("level"),
+            bitrate_kbps: (s.bitrate() > 0).then(|| s.bitrate() / 1000),
         });
     }
 
@@ -133,11 +158,18 @@ fn map_info(info: &DiscovererInfo) -> MediaInfo {
         let layer = caps
             .as_ref()
             .and_then(|c| c.structure(0).and_then(|st| st.get::<i32>("layer").ok()));
+        let layout = caps.as_ref().and_then(|c| {
+            c.structure(0)
+                .and_then(|st| st.get::<gst::Bitmask>("channel-mask").ok())
+                .map(|m| format!("{:#x}", m.0))
+        });
         out.audio.push(AudioStream {
             codec: normalize_audio_codec(&name, version, layer),
             channels: s.channels(),
             sample_rate: s.sample_rate(),
             language: s.language().map(|l| l.to_string()),
+            bitrate_kbps: (s.bitrate() > 0).then(|| s.bitrate() / 1000),
+            layout,
         });
     }
 
@@ -288,9 +320,33 @@ mod tests {
         assert_eq!(info.video[0].codec, "h264");
         assert_eq!((info.video[0].width, info.video[0].height), (320, 240));
         assert_eq!(info.video[0].fps, Some((25, 1)));
+        // MH-3 extension: x264enc+h264parse emit profile/level in caps.
+        assert!(info.video[0].profile.is_some(), "caps profile must be extracted");
+        assert!(info.video[0].level.is_some(), "caps level must be extracted");
+        assert_eq!(info.video[0].hdr, None, "SDR testsrc must not read as HDR");
         assert_eq!(info.audio.len(), 1);
         assert_eq!(info.audio[0].codec, "vorbis");
         assert!(info.duration_ms.unwrap_or(0) > 500);
+    }
+
+    /// The graceful-degradation contract (HUB-14): a streams_json row
+    /// probed BEFORE the MH-3 extension deserializes with every new
+    /// field None — negotiation treats those as unknown-permissive.
+    #[test]
+    fn pre_extension_rows_deserialize_with_unknowns() {
+        let old = r#"{
+            "container": "matroska", "duration_ms": 1000,
+            "video": [{"codec":"h264","width":1920,"height":1080,
+                       "fps":[24,1],"bit_depth":null,"interlaced":false,"hdr":null}],
+            "audio": [{"codec":"aac","channels":6,"sample_rate":48000,"language":"en"}],
+            "subtitles": [{"format":"ass","language":"en"}]
+        }"#;
+        let info: kahawai_core::media::MediaInfo = serde_json::from_str(old).unwrap();
+        let v = &info.video[0];
+        assert_eq!((v.profile.as_deref(), v.level.as_deref(), v.bitrate_kbps, v.hdr.as_deref()),
+                   (None, None, None, None));
+        let a = &info.audio[0];
+        assert_eq!((a.bitrate_kbps, a.layout.as_deref(), a.channels), (None, None, 6));
     }
 
     #[test]

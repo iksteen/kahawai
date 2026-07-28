@@ -62,6 +62,13 @@ enum Cmd {
         /// `<socket>:<size>`. The positional socket/size is part one.
         #[arg(long = "part")]
         parts: Vec<String>,
+        /// HUB-15 encode parameters; absent = historical fixed values.
+        #[arg(long)]
+        video_kbps: Option<u32>,
+        #[arg(long)]
+        max_height: Option<u32>,
+        #[arg(long)]
+        max_channels: Option<u32>,
     },
 }
 
@@ -135,7 +142,7 @@ async fn main() -> Result<()> {
         }
         Cmd::Mediahost => run_mediahost(cfg.mediahost).await,
         Cmd::Doctor { json } => doctor(&cfg, json),
-        Cmd::RemuxWorker { socket, out_dir, size, video, audio, audio_track, video_track, start_ms, sink, parts } => {
+        Cmd::RemuxWorker { socket, out_dir, size, video, audio, audio_track, video_track, start_ms, sink, parts, video_kbps, max_height, max_channels } => {
             // Blocking by design: this process exists only for the pipeline.
             kahawai_media::demote_elements(&cfg.transcoder.demote_decoders)?;
             let mut all = vec![(socket, size)];
@@ -143,16 +150,16 @@ async fn main() -> Result<()> {
                 let (sock, sz) = p.rsplit_once(':').context("--part wants <socket>:<size>")?;
                 all.push((PathBuf::from(sock), sz.parse().context("--part size")?));
             }
-            kahawai_media::worker::run_parts(
-                &all,
-                &out_dir,
-                kahawai_media::worker::parse_mode(&video),
-                kahawai_media::worker::parse_mode(&audio),
+            let plan = kahawai_media::remux::RemuxPlan {
+                video: kahawai_media::worker::parse_mode(&video),
+                audio: kahawai_media::worker::parse_mode(&audio),
                 audio_track,
                 video_track,
-                start_ms,
-                sink.as_deref(),
-            )
+                video_kbps,
+                max_height,
+                max_channels,
+            };
+            kahawai_media::worker::run_parts(&all, &out_dir, plan, start_ms, sink.as_deref())
         }
         Cmd::Transcoder => {
             kahawai_transcoder::run(

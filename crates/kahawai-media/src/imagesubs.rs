@@ -173,7 +173,7 @@ fn pgs_rle_decode(rle: &[u8], w: u32, h: u32, palette: &[[u8; 4]]) -> Result<Vec
     let mut out = vec![0u8; w * h * 4];
     let (mut x, mut yline) = (0usize, 0usize);
     let mut i = 0usize;
-    let mut put = |x: &mut usize, y: usize, color: u8, run: usize, out: &mut Vec<u8>| {
+    let put = |x: &mut usize, y: usize, color: u8, run: usize, out: &mut Vec<u8>| {
         let px = palette.get(color as usize).copied().unwrap_or([0; 4]);
         for _ in 0..run {
             if *x < w && y < h {
@@ -295,7 +295,7 @@ pub fn vobsub_decode(spu: &[u8], palette16: &[[u8; 3]]) -> Result<Option<ImageOb
         let mut nib = start * 2; // nibble index into spu
         let read = |n: usize| -> u8 {
             let byte = spu.get(n / 2).copied().unwrap_or(0);
-            if n % 2 == 0 { byte >> 4 } else { byte & 0xF }
+            if n.is_multiple_of(2) { byte >> 4 } else { byte & 0xF }
         };
         let mut y = field;
         let mut x = 0usize;
@@ -313,13 +313,13 @@ pub fn vobsub_decode(spu: &[u8], palette16: &[[u8; 3]]) -> Result<Option<ImageOb
                         nib += 1;
                         if v < 4 {
                             // 0x000c: fill to end of line.
-                            v = v | ((w - x) << 2);
+                            v |= ((w - x) << 2);
                         }
                     }
                 }
             }
             let run = (v >> 2).min(w - x);
-            let color = (v & 3) as usize;
+            let color = (v & 3);
             let pi = pal_idx[3 - color] as usize; // control order is reversed
             let a = alpha[3 - color];
             let rgb = palette16.get(pi).copied().unwrap_or([0, 0, 0]);

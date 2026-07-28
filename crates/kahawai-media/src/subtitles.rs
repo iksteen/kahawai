@@ -173,7 +173,7 @@ fn parse_vtt(content: &str) -> Vec<Cue> {
         let Some(timing) = lines.next() else { continue };
         let Some((start, rest)) = timing.split_once("-->") else { continue };
         // Cue settings may follow the end timestamp.
-        let end = rest.trim().split_whitespace().next().unwrap_or("");
+        let end = rest.split_whitespace().next().unwrap_or("");
         let (Some(start), Some(end)) = (parse_timestamp(start), parse_timestamp(end)) else {
             continue;
         };

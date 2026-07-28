@@ -68,14 +68,11 @@ pub fn run(
     socket: &Path,
     out_dir: &Path,
     size: u64,
-    video: StreamMode,
-    audio: StreamMode,
-    audio_track: usize,
-    video_track: usize,
+    plan: RemuxPlan,
     start_ms: u64,
     sink: Option<&str>,
 ) -> Result<()> {
-    run_parts(&[(socket.to_path_buf(), size)], out_dir, video, audio, audio_track, video_track, start_ms, sink)
+    run_parts(&[(socket.to_path_buf(), size)], out_dir, plan, start_ms, sink)
 }
 
 /// Multi-part entry point: one socket per part, in timeline order, joined
@@ -85,10 +82,7 @@ pub fn run(
 pub fn run_parts(
     parts: &[(std::path::PathBuf, u64)],
     out_dir: &Path,
-    video: StreamMode,
-    audio: StreamMode,
-    audio_track: usize,
-    video_track: usize,
+    plan: RemuxPlan,
     start_ms: u64,
     sink: Option<&str>,
 ) -> Result<()> {
@@ -99,7 +93,6 @@ pub fn run_parts(
             .with_context(|| format!("connecting to {}", socket.display()))?;
         sources.push(Box::new(SocketSource { stream, size: *size }));
     }
-    let plan = RemuxPlan { video, audio, audio_track, video_track };
     // Pacing window (§4.6): transcode ahead of the viewer, but not the
     // whole film. The supervisor keeps `viewer.pos` fresh (absolute ms,
     // from the client's progress pings); muxer-bound buffers beyond

@@ -385,6 +385,11 @@ message StartSession {
   // without restarting; one that does not ignores it and restarts, which
   // is exactly today's behaviour.
   repeated uint64 tail_sizes = 9;
+  // HUB-15 encode parameters; 0 = unset (historical fixed values). Old
+  // transcoders ignore them entirely.
+  uint32 video_kbps = 10;
+  uint32 max_height = 11;
+  uint32 max_channels = 12;
 }
 
 message EndSession {
