@@ -225,20 +225,32 @@ async fn remux_to_hls_end_to_end() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
-    // Seek-restart (§6): the same session restarts its pipeline at an
-    // offset; the playlist regenerates covering only the tail.
-    let resp = api
-        .clone()
-        .oneshot(
-            Request::post(format!("/api/v1/playback/sessions/{session_id}/seek"))
-                .header("authorization", bearer.clone())
-                .header("content-type", "application/json")
-                .body(Body::from(r#"{"position_ms":6000}"#))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK); // returns {part_base_ms}
+    // A SCRUB: four concurrent seeks on one session. They serialize on
+    // the session's seek lock — interleaved restarts used to wipe each
+    // other's scratch dir mid-bind (intermittent 409s in the wild).
+    let seek_to = |ms: u64| {
+        let api = api.clone();
+        let bearer = bearer.clone();
+        let session_id = session_id.clone();
+        async move {
+            api.oneshot(
+                Request::post(format!("/api/v1/playback/sessions/{session_id}/seek"))
+                    .header("authorization", bearer)
+                    .header("content-type", "application/json")
+                    .body(Body::from(format!("{{\"position_ms\":{ms}}}")))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+        }
+    };
+    let statuses = tokio::join!(seek_to(1000), seek_to(2500), seek_to(4000), seek_to(6000));
+    let statuses = [statuses.0, statuses.1, statuses.2, statuses.3];
+    assert!(
+        statuses.iter().all(|s| *s == StatusCode::OK),
+        "every concurrent seek must succeed: {statuses:?}"
+    );
     let tail_playlist = tokio::time::timeout(Duration::from_secs(20), async {
         loop {
             let resp = api

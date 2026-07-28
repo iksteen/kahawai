@@ -107,6 +107,11 @@ pub struct Session {
     plan: Mutex<Option<kahawai_media::remux::RemuxPlan>>,
     /// Placement requirements — reused when rescheduling (AR-6).
     needs: crate::registry::PlacementNeed,
+    /// Serializes seek-restarts. A scrub fires seeks faster than a
+    /// restart completes, and two interleaved restarts wipe each
+    /// other's scratch dir mid-bind (observed as intermittent 409s).
+    /// async Mutex: held across the stop→wipe→lease→spawn awaits.
+    seek_lock: tokio::sync::Mutex<()>,
     touched: Mutex<std::time::Instant>,
 }
 
@@ -715,6 +720,7 @@ impl Sessions {
             verdict: Mutex::new(verdict),
             sub_verdicts: negotiated.subtitles,
             profile,
+            seek_lock: tokio::sync::Mutex::new(()),
             plan: Mutex::new(session_plan),
             needs: session_needs,
             touched: Mutex::new(std::time::Instant::now()),
@@ -1150,6 +1156,9 @@ impl Sessions {
         video_track: Option<u32>,
     ) -> Result<u64> {
         let session = self.get(id).context("no such session")?;
+        // One restart at a time: later seeks queue behind the running
+        // one instead of corrupting it.
+        let _restarting = session.seek_lock.lock().await;
         let mut plan =
             (*session.plan.lock().unwrap()).context("session has no restartable pipeline")?;
         session.touch();
