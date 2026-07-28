@@ -46,6 +46,51 @@ pub struct Enricher {
     sessions: std::sync::OnceLock<Arc<crate::sessions::Sessions>>,
 }
 
+/// One file moved to the episode its hash says it is (HUB-30).
+#[derive(Debug)]
+pub struct EpisodeRebind {
+    pub path: String,
+    pub from: (Option<i64>, i64),
+    pub to: (Option<i64>, i64),
+}
+
+/// AniDB's episode string, classified. Regular episodes are bare digits
+/// ("1", "01"); one letter prefixes the rest: S special, C credit,
+/// T trailer, P parody, O other.
+///
+/// Every typed kind slots into SEASON 0, in disjoint hundred-bands —
+/// S=n, C=100+n, T=200+n, P=300+n, O=400+n — so a credits reel can
+/// never collide with a special. The bands are this hub's own layout,
+/// not a provider convention; a show would need a hundred specials to
+/// breach one, and AniDB numbers none anywhere near that.
+enum Epno {
+    Regular(i64),
+    Zero(i64),
+}
+
+fn parse_epno(epno: &str) -> Option<Epno> {
+    if let Ok(n) = epno.parse::<i64>() {
+        return Some(Epno::Regular(n));
+    }
+    let mut chars = epno.chars();
+    let band = match chars.next()?.to_ascii_uppercase() {
+        'S' => 0,
+        'C' => 100,
+        'T' => 200,
+        'P' => 300,
+        'O' => 400,
+        _ => return None,
+    };
+    chars.as_str().parse::<i64>().ok().map(|n| Epno::Zero(band + n))
+}
+
+fn fmt_slot(season: Option<i64>, episode: i64) -> String {
+    match season {
+        Some(s) => format!("S{s:02}E{episode:02}"),
+        None => format!("abs {episode}"),
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct SearchResponse {
     results: Vec<Candidate>,
@@ -1146,12 +1191,74 @@ impl Enricher {
         providers: &Arc<crate::providers::ProviderSet>,
         items: Vec<crate::providers::ItemRef>,
     ) -> Result<()> {
+        // Bind FIRST, for every identified show — not just the selected
+        // ones. Selection gates network traffic; binding is idempotent
+        // database work costing milliseconds, and gating it too meant a
+        // binder rule change could never reach a show whose hashes were
+        // already fully cached. The cached answers are the input, the
+        // binding is derived from them: a disagreement is work owed
+        // whether or not any provider needs asking.
+        let identified: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT a.item_id, a.anidb_id FROM anime_ids a WHERE a.anidb_id IS NOT NULL",
+        )
+        .fetch_all(registry.db())
+        .await?;
+        for (show_id, aid) in &identified {
+            match self.bind_hashed_episodes(registry.db(), show_id, *aid as u32).await {
+                Ok(moves) if !moves.is_empty() => {
+                    tracing::info!(show = %show_id, moved = moves.len(),
+                        "episodes re-bound to hash identity");
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!(error = format!("{e:#}"), "episode binding failed"),
+            }
+        }
         if items.is_empty() {
             return Ok(());
         }
         tracing::info!(items = items.len(), "anime enrichment starting");
+        // HUB-30: per-run budget for episode-hash lookups, shared across
+        // shows. The client already paces every packet to AniDB's flood
+        // rule; this only bounds how long one run can spend, and the
+        // remainder carries over — each answer is cached forever.
+        const HASH_LOOKUP_BUDGET: usize = 500;
+        let mut lookups = 0usize;
         let mut done = 0usize;
         for item in &items {
+            // Exact-file episode identity, BEFORE the chain runs: the
+            // bridge projection then writes titles onto the corrected
+            // slots in this same pass. Shows identified for the first
+            // time this run (no known aid yet) get theirs next pass.
+            if let Some(aid) = item.known_aid {
+                let asked = {
+                    let mut guard = self.anidb.lock().await;
+                    match guard.as_mut() {
+                        Some(client) if lookups < HASH_LOOKUP_BUDGET => self
+                            .resolve_episode_hashes(
+                                registry.db(),
+                                client,
+                                &item.id,
+                                HASH_LOOKUP_BUDGET - lookups,
+                            )
+                            .await
+                            .unwrap_or_else(|e| {
+                                tracing::warn!(error = format!("{e:#}"),
+                                    "episode hash lookups failed; binding what is cached");
+                                0
+                            }),
+                        _ => 0,
+                    }
+                };
+                lookups += asked;
+                match self.bind_hashed_episodes(registry.db(), &item.id, aid).await {
+                    Ok(moves) if !moves.is_empty() => {
+                        tracing::info!(title = %item.title, moved = moves.len(),
+                            "episodes re-bound to hash identity");
+                    }
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(error = format!("{e:#}"), "episode binding failed"),
+                }
+            }
             match providers.run_chain("anime", registry.db(), item).await {
                 Some("settled") => {}
                 Some(_) => done += 1,
@@ -1214,6 +1321,209 @@ impl Enricher {
             .execute(db)
             .await?;
         Ok(aid)
+    }
+
+    /// Ask AniDB which episode each of a show's hashed files IS, up to
+    /// `budget` lookups. Answers land in `ed2k_aid`, misses included, so
+    /// every file is asked at most once ever; the client paces itself to
+    /// AniDB's flood rule, and the budget only bounds how long one
+    /// enrichment run can spend here — the remainder is picked up next
+    /// run.
+    async fn resolve_episode_hashes(
+        &self,
+        db: &sqlx::SqlitePool,
+        client: &mut crate::anidb::Anidb,
+        show_id: &str,
+        budget: usize,
+    ) -> Result<usize> {
+        // A row with an aid but no epno predates 0042 and is re-asked
+        // once; a NULL aid is a recorded miss and stays terminal.
+        let files: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT f.ed2k, f.size FROM files f
+             JOIN item_sources s ON (s.module_id, s.collection_id, s.path_rel)
+                                  = (f.module_id, f.collection_id, f.path_rel)
+             JOIN items ep ON ep.id = s.item_id
+             WHERE ep.parent_id = ?1 AND f.ed2k IS NOT NULL
+               AND NOT EXISTS (SELECT 1 FROM ed2k_aid c
+                                WHERE c.ed2k = f.ed2k
+                                  AND (c.aid IS NULL OR c.epno IS NOT NULL))
+             ORDER BY s.path_rel",
+        )
+        .bind(show_id)
+        .fetch_all(db)
+        .await?;
+        let mut asked = 0;
+        for (ed2k, size) in files.iter().take(budget) {
+            let hit = client.file_by_ed2k(*size as u64, ed2k).await?;
+            sqlx::query(
+                "INSERT OR REPLACE INTO ed2k_aid
+                   (ed2k, aid, eid, epno, gid, group_name, updated_at)
+                 VALUES (?, ?, ?, ?, ?, ?, unixepoch())",
+            )
+            .bind(ed2k)
+            .bind(hit.as_ref().map(|h| h.aid))
+            .bind(hit.as_ref().map(|h| h.eid))
+            .bind(hit.as_ref().map(|h| h.epno.clone()))
+            .bind(hit.as_ref().map(|h| h.gid))
+            .bind(hit.as_ref().map(|h| h.group_name.clone()))
+            .execute(db)
+            .await?;
+            asked += 1;
+        }
+        if files.len() > budget {
+            tracing::info!(
+                show = show_id,
+                remaining = files.len() - budget,
+                "episode hash lookups continue next run"
+            );
+        }
+        Ok(asked)
+    }
+
+    /// Bind each hashed file to the episode AniDB says it IS (HUB-30a:
+    /// the hash states what the file is, so on disagreement the hash
+    /// wins). Pure database work — the lookups above already happened.
+    ///
+    /// Deliberately narrow where the numbering spaces are not the same:
+    /// `epno` is scoped to ONE AniDB entry, so only files whose aid
+    /// matches their show's are touched (a mismatch usually means AniDB
+    /// splits the series into per-season entries; logged, left alone).
+    /// Regular numbers are enforced only for absolute-keyed episodes —
+    /// the anime norm, and the space AniDB numbers in. Every TYPED
+    /// number — specials, credits, trailers, parodies, other — is
+    /// enforced unconditionally into season 0's banded layout (see
+    /// [`Epno`]): these are precisely the files name-parsing cannot
+    /// place, and a credits reel filename-squatting on an episode slot
+    /// is an artifact of the numbering the hash exists to correct.
+    pub async fn bind_hashed_episodes(
+        &self,
+        db: &sqlx::SqlitePool,
+        show_id: &str,
+        show_aid: u32,
+    ) -> Result<Vec<EpisodeRebind>> {
+        let rows = sqlx::query(
+            "SELECT s.module_id, s.collection_id, s.path_rel,
+                    ep.id AS item_id, ep.title, ep.norm_title, ep.season, ep.episode,
+                    c.aid, c.epno
+             FROM item_sources s
+             JOIN items ep ON ep.id = s.item_id
+             JOIN files f ON (f.module_id, f.collection_id, f.path_rel)
+                           = (s.module_id, s.collection_id, s.path_rel)
+             JOIN ed2k_aid c ON c.ed2k = f.ed2k
+             WHERE ep.parent_id = ?1 AND c.aid IS NOT NULL AND c.epno IS NOT NULL
+             ORDER BY s.path_rel",
+        )
+        .bind(show_id)
+        .fetch_all(db)
+        .await?;
+
+        let mut moves = Vec::new();
+        for r in rows {
+            let (aid, epno) = (r.get::<i64, _>("aid") as u32, r.get::<String, _>("epno"));
+            let path: String = r.get("path_rel");
+            if aid != show_aid {
+                tracing::debug!(path = %path, file_aid = aid, show_aid,
+                    "file belongs to a different anidb entry; not rebinding");
+                continue;
+            }
+            let (cur_season, cur_ep) =
+                (r.get::<Option<i64>, _>("season"), r.get::<i64, _>("episode"));
+            let target = match parse_epno(&epno) {
+                Some(Epno::Regular(n)) => {
+                    // Only meaningful where the show's own numbering IS
+                    // AniDB's: absolute-keyed episodes.
+                    if cur_season.is_some() {
+                        continue;
+                    }
+                    (None, n)
+                }
+                Some(Epno::Zero(n)) => (Some(0), n),
+                None => {
+                    tracing::warn!(path = %path, epno = %epno,
+                        "unrecognised anidb epno; leaving name-derived binding");
+                    continue;
+                }
+            };
+            if (cur_season, cur_ep) == (target.0, target.1) {
+                continue;
+            }
+
+            let item_id: String = r.get("item_id");
+            let mut tx = db.begin().await?;
+            let existing: Option<String> = sqlx::query_scalar(
+                "SELECT id FROM items WHERE parent_id = ?1 AND season IS ?2 AND episode = ?3",
+            )
+            .bind(show_id)
+            .bind(target.0)
+            .bind(target.1)
+            .fetch_optional(&mut *tx)
+            .await?;
+            let target_id = match existing {
+                Some(id) => id,
+                None => {
+                    let id = ulid::Ulid::generate().to_string();
+                    // The file's own title travels with it: it described
+                    // this content, whatever number it wore.
+                    sqlx::query(
+                        "INSERT INTO items (id, kind, title, norm_title, parent_id, season, episode)
+                         VALUES (?, 'episode', ?, ?, ?, ?, ?)",
+                    )
+                    .bind(&id)
+                    .bind(r.get::<String, _>("title"))
+                    .bind(r.get::<String, _>("norm_title"))
+                    .bind(show_id)
+                    .bind(target.0)
+                    .bind(target.1)
+                    .execute(&mut *tx)
+                    .await?;
+                    id
+                }
+            };
+            sqlx::query(
+                "UPDATE item_sources SET item_id = ?1
+                 WHERE module_id = ?2 AND collection_id = ?3 AND path_rel = ?4",
+            )
+            .bind(&target_id)
+            .bind(r.get::<String, _>("module_id"))
+            .bind(r.get::<String, _>("collection_id"))
+            .bind(&path)
+            .execute(&mut *tx)
+            .await?;
+            // Watch state follows the FILE — the user watched this
+            // content under whatever number it was misfiled as.
+            sqlx::query(
+                "UPDATE watch_state SET item_id = ?1
+                 WHERE item_id = ?2
+                   AND NOT EXISTS (SELECT 1 FROM watch_state w2
+                                    WHERE w2.item_id = ?1 AND w2.user_id = watch_state.user_id)",
+            )
+            .bind(&target_id)
+            .bind(&item_id)
+            .execute(&mut *tx)
+            .await?;
+            // A misnumbered episode item left with no sources is a ghost
+            // row in the season view; its provider answers describe the
+            // NUMBER and go with it (the projection refills the target).
+            sqlx::query(
+                "DELETE FROM items
+                 WHERE id = ?1 AND kind = 'episode'
+                   AND NOT EXISTS (SELECT 1 FROM item_sources s WHERE s.item_id = ?1)",
+            )
+            .bind(&item_id)
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+
+            tracing::info!(path = %path,
+                from = %fmt_slot(cur_season, cur_ep), to = %fmt_slot(target.0, target.1),
+                "hash-corrected episode binding");
+            moves.push(EpisodeRebind {
+                path,
+                from: (cur_season, cur_ep),
+                to: (target.0, target.1),
+            });
+        }
+        Ok(moves)
     }
 
     #[allow(clippy::too_many_arguments)]
