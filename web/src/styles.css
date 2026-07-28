@@ -518,3 +518,5 @@ input.invalid { border-color: #b3564f; }
 .pref-row .chip { cursor: pointer; }
 .lang-add { width: 6rem; flex: 0 0 auto; }
 .saved-flash { font-size: 0.55em; vertical-align: middle; opacity: 0.8; }
+
+.library-head h1.clickable { cursor: pointer; }

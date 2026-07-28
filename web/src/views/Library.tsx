@@ -162,12 +162,16 @@ export default function Library({
   libraryId,
   query,
   onOpen,
+  onResetSearch,
 }: {
   libraryId: string
   /// Already debounced, and owned by the header's search box — on this
   /// screen that box filters this library.
   query: string
   onOpen: (id: string) => void
+  /// The library title doubles as "show me everything again": the
+  /// filter lives in the app header, so the view can only ask.
+  onResetSearch: () => void
 }) {
   const [name, setName] = useState('Library')
   const [sort, setSort] = useState('title')
@@ -336,7 +340,9 @@ export default function Library({
   return (
     <main>
       <div className="library-head">
-        <h1>{name}</h1>
+        <h1 className="clickable" onClick={onResetSearch}>
+          {name}
+        </h1>
         <select
           className="sort filter"
           value={sort}

@@ -140,7 +140,15 @@ export default function App() {
   return (
     <div className="shell">
       <header className="topbar">
-        <button className="wordmark" onClick={() => navigate({ view: 'libraries' })}>
+        <button
+          className="wordmark"
+          onClick={() => {
+            // Going home is a fresh start: a standing filter that
+            // silently follows you there reads as missing items.
+            setSearch('')
+            navigate({ view: 'libraries' })
+          }}
+        >
           kahawai<span className="tilde">~</span>
         </button>
         {/* Only where it means something. On the player, admin and
@@ -191,6 +199,7 @@ export default function App() {
           libraryId={route.id}
           query={query}
           onOpen={(id) => navigate({ view: 'detail', id, fromLib: route.id })}
+          onResetSearch={() => setSearch('')}
         />
       )}
       {route.view === 'detail' && (
