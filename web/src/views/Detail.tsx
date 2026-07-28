@@ -26,9 +26,11 @@ import placeholder from '../assets/placeholder.svg'
 
 const GB = 1024 * 1024 * 1024
 
-// S01E02 for seasoned episodes; E11 for absolute numbering (anime).
-function seLabel(season: number | null, episode: number | null) {
-  const e = `E${String(episode ?? 0).padStart(2, '0')}`
+// S01E02 for seasoned episodes; E11 for absolute numbering (anime);
+// E01-02 for a batch file spanning a range.
+function seLabel(season: number | null, episode: number | null, end?: number | null) {
+  let e = `E${String(episode ?? 0).padStart(2, '0')}`
+  if (end != null) e += `-${String(end).padStart(2, '0')}`
   return season === null ? e : `S${String(season).padStart(2, '0')}${e}`
 }
 
@@ -281,7 +283,7 @@ export default function Detail({
               <>
                 {' · next: '}
                 <button className="btn ghost small" onClick={() => onOpenEpisode(next.id)}>
-                  {seLabel(next.season, next.episode)} {next.title}
+                  {seLabel(next.season, next.episode, next.episode_end)} {next.title}
                 </button>
               </>
             )}
@@ -298,6 +300,8 @@ export default function Detail({
                     <button className="card episode" onClick={() => onOpenEpisode(e.id)}>
                       <span className="mono dim">
                         E{String(gEpisode(e) ?? 0).padStart(2, '0')}
+                        {e.episode_end != null &&
+                          `-${String(e.episode_end).padStart(2, '0')}`}
                         {projected && <span className="dim"> #{e.episode}</span>}
                       </span>{' '}
                       {e.title}
@@ -407,7 +411,7 @@ export default function Detail({
         <h1>
           {item.kind === 'episode' && item.show_title ? `${item.show_title} · ` : ''}
           {item.kind === 'episode'
-            ? `${seLabel(item.season, item.episode)} · `
+            ? `${seLabel(item.season, item.episode, item.episode_end)} · `
             : ''}
           {item.title} {item.year && <span className="year">({item.year})</span>}
         </h1>

@@ -1121,18 +1121,47 @@ impl Registry {
                         .fetch_optional(&mut *tx)
                         .await?;
                         Some(match ep {
-                            Some(id) => id,
+                            Some(id) => {
+                                // A batch marker learned on a later scan
+                                // widens the existing slot in place — and
+                                // an auto-generated "Episode N" title
+                                // widens with it (a provider/human title
+                                // is never touched).
+                                sqlx::query(
+                                    "UPDATE items SET episode_end = ?1,
+                                            title = CASE
+                                              WHEN ?1 IS NOT NULL
+                                               AND title = 'Episode ' || episode
+                                              THEN 'Episodes ' || episode || '-' || ?1
+                                              ELSE title END,
+                                            norm_title = CASE
+                                              WHEN ?1 IS NOT NULL
+                                               AND norm_title = 'episode ' || episode
+                                              THEN 'episodes ' || episode || '-' || ?1
+                                              ELSE norm_title END
+                                      WHERE id = ?2 AND episode_end IS NOT ?1",
+                                )
+                                .bind(g.episode_end)
+                                .bind(&id)
+                                .execute(&mut *tx)
+                                .await?;
+                                id
+                            }
                             None => {
                                 let id = ulid::Ulid::generate().to_string();
-                                let title = g
-                                    .episode_title
-                                    .clone()
-                                    .unwrap_or_else(|| format!("Episode {}", g.episode));
+                                let title = g.episode_title.clone().unwrap_or_else(|| {
+                                    match g.episode_end {
+                                        Some(end) => {
+                                            format!("Episodes {}-{}", g.episode, end)
+                                        }
+                                        None => format!("Episode {}", g.episode),
+                                    }
+                                });
                                 sqlx::query(
                                     "INSERT INTO items
                                        (id, kind, title, norm_title, year,
-                                        parent_id, season, episode)
-                                     VALUES (?, 'episode', ?, ?, NULL, ?, ?, ?)",
+                                        parent_id, season, episode, episode_end)
+                                     VALUES (?, 'episode', ?, ?, NULL, ?, ?, ?, ?)",
                                 )
                                 .bind(&id)
                                 .bind(&title)
@@ -1140,6 +1169,7 @@ impl Registry {
                                 .bind(&show_id)
                                 .bind(g.season)
                                 .bind(g.episode)
+                                .bind(g.episode_end)
                                 .execute(&mut *tx)
                                 .await?;
                                 id

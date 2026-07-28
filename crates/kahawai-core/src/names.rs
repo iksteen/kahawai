@@ -209,6 +209,10 @@ pub struct EpisodeGuess {
     /// whole identity, season views are a later projection (HUB-31).
     pub season: Option<u32>,
     pub episode: u32,
+    /// Batch marker (HUB-30): the file SPANS `episode..=episode_end`
+    /// ("OVA 1-2", "S01E01-E02"). None = a single episode. The scan
+    /// creates one item per number, all sharing the file.
+    pub episode_end: Option<u32>,
     pub episode_title: Option<String>,
 }
 
@@ -227,10 +231,11 @@ pub fn parse_episode(path_rel: &str) -> Option<EpisodeGuess> {
         .map(|c| if matches!(c, '.' | '_') { ' ' } else { c })
         .collect();
     let tokens: Vec<&str> = cleaned.split_whitespace().collect();
-    let (idx, season, episode) = tokens
-        .iter()
-        .enumerate()
-        .find_map(|(i, t)| parse_sxxeyy(t).or_else(|| parse_nnxnn(t)).map(|(s, e)| (i, s, e)))?;
+    let (idx, season, episode, episode_end) = tokens.iter().enumerate().find_map(|(i, t)| {
+        parse_sxxeyy(t)
+            .or_else(|| parse_nnxnn(t).map(|(s, e)| (s, e, None)))
+            .map(|(s, e, end)| (i, s, e, end))
+    })?;
 
     // Show identity: the top-level directory when there is one (skipping
     // season dirs), else the filename tokens before SxxEyy.
@@ -264,6 +269,7 @@ pub fn parse_episode(path_rel: &str) -> Option<EpisodeGuess> {
         show_year: show_guess.year,
         season: Some(season),
         episode,
+        episode_end,
         episode_title: (!ep_title.is_empty()).then_some(ep_title),
     })
 }
@@ -323,36 +329,55 @@ pub fn parse_anime(path_rel: &str) -> Option<EpisodeGuess> {
     // number ("OVA 2" — consumed, so it cannot double as an episode
     // number), defaulting to 1. A remaining standalone episode number
     // still wins: "[Grp] Show - 05 Special Training" is episode 5.
-    let designator = tokens.iter().enumerate().find_map(|(i, t)| {
-        let split = t.len() - t.chars().rev().take_while(|c| c.is_ascii_digit()).count();
-        let (base, digits) = t.split_at(split);
-        let band = match base.to_ascii_uppercase().as_str() {
-            "NCOP" => Some(Some(100u32)),
-            "NCED" => Some(Some(120)),
-            "OVA" | "OAV" | "ONA" | "SP" | "SPECIAL" | "SPECIALS" => Some(Some(0)),
-            "MOVIE" | "GEKIJOUBAN" => Some(None),
-            _ => None,
-        }?;
-        let (index, consumed) = if !digits.is_empty() {
-            (digits.parse().ok(), None)
-        } else {
-            match tokens.get(i + 1) {
-                Some(n)
-                    if n.len() <= 4
-                        && n.chars().all(|c| c.is_ascii_digit())
-                        && !(1900..=2099).contains(&n.parse::<u32>().unwrap_or(0)) =>
-                {
-                    (n.parse().ok(), Some(i + 1))
+    // Among several designator tokens, one carrying an EXPLICIT index
+    // (attached digits, a following number/range/roman) outranks an
+    // earlier indexless one: in "Kite Special Edition Uncut OVA 1-2"
+    // the adjective "Special" must not shadow the real "OVA 1-2".
+    let designator = {
+        let mut cands = tokens.iter().enumerate().filter_map(|(i, t)| {
+            let split = t.len() - t.chars().rev().take_while(|c| c.is_ascii_digit()).count();
+            let (base, digits) = t.split_at(split);
+            let band = match base.to_ascii_uppercase().as_str() {
+                "NCOP" => Some(Some(100u32)),
+                "NCED" => Some(Some(120)),
+                "OVA" | "OAV" | "ONA" | "SP" | "SPECIAL" | "SPECIALS" => Some(Some(0)),
+                "MOVIE" | "GEKIJOUBAN" => Some(None),
+                _ => None,
+            }?;
+            let (index, consumed, span_end) = if !digits.is_empty() {
+                (digits.parse().ok(), None, None)
+            } else {
+                match tokens.get(i + 1) {
+                    Some(n)
+                        if n.len() <= 4
+                            && n.chars().all(|c| c.is_ascii_digit())
+                            && !(1900..=2099).contains(&n.parse::<u32>().unwrap_or(0)) =>
+                    {
+                        (n.parse().ok(), Some(i + 1), None)
+                    }
+                    // "OVA 1-2": one file spanning a range of the band —
+                    // the position right after a designator is context
+                    // enough to trust the dash (HUB-30 batch markers).
+                    Some(r) if num_range(r).is_some() => {
+                        let (a, b) = num_range(r).unwrap();
+                        (Some(a), Some(i + 1), Some(b))
+                    }
+                    // "OVA II": fansub packs number in roman as often as
+                    // arabic — uppercase only, or the English word "I" in
+                    // an episode title would become an index.
+                    Some(r) if roman(r).is_some() => (roman(r), Some(i + 1), None),
+                    _ => (Some(1), None, None),
                 }
-                // "OVA II": fansub packs number in roman as often as
-                // arabic — uppercase only, or the English word "I" in an
-                // episode title would become an index.
-                Some(r) if roman(r).is_some() => (roman(r), Some(i + 1)),
-                _ => (Some(1), None),
-            }
-        };
-        Some((i, band, index.unwrap_or(1), consumed))
-    });
+            };
+            let explicit = !digits.is_empty() || consumed.is_some();
+            Some((i, band, index.unwrap_or(1), consumed, span_end, explicit))
+        });
+        let all: Vec<_> = cands.by_ref().collect();
+        all.iter()
+            .find(|c| c.5)
+            .or(all.first())
+            .map(|&(i, band, index, consumed, span, _)| (i, band, index, consumed, span))
+    };
 
     // Absolute episode: an explicit E01/EP01 token wins; otherwise the
     // LAST standalone number (optional vN) that isn't a plausible year.
@@ -365,14 +390,22 @@ pub fn parse_anime(path_rel: &str) -> Option<EpisodeGuess> {
         }
         Some((i, rest.parse().ok()?))
     });
-    let episode_number = e_token.or_else(|| {
+    let episode_number = e_token.map(|(i, n)| (i, n, None)).or_else(|| {
         tokens.iter().enumerate().rev().find_map(|(i, t)| {
             // A number consumed as a designator's index is not an
             // episode candidate.
-            if let Some((_, _, _, Some(consumed))) = designator
+            if let Some((_, _, _, Some(consumed), _)) = designator
                 && i == consumed
             {
                 return None;
+            }
+            // A trailing batch marker ("Show - 01-02") spans a range.
+            // FINAL token only: mid-name dashed numbers are usually
+            // title ("Ranma 1-2 Special" must not become a span).
+            if i == tokens.len() - 1
+                && let Some((a, b)) = num_range(t)
+            {
+                return Some((i, a, Some(b)));
             }
             let num = t.split(['v', 'V']).next()?;
             if num.is_empty() || num.len() > 4 || !num.chars().all(|c| c.is_ascii_digit()) {
@@ -382,16 +415,16 @@ pub fn parse_anime(path_rel: &str) -> Option<EpisodeGuess> {
             if (1900..=2099).contains(&n) {
                 return None; // year, not an episode
             }
-            Some((i, n))
+            Some((i, n, None))
         })
     });
-    let (idx, episode) = match (episode_number, designator) {
+    let (idx, episode, episode_end) = match (episode_number, designator) {
         // A designator with an EXPLICIT index — attached digits or the
         // number right after it — outranks any other number in the name:
         // "Cyber City Oedo 808 Ova 02" is the second OVA, and the 808 is
         // title. An INDEXLESS designator loses to a real episode number:
         // "[Grp] Show - 05 Special Training" is episode 5.
-        (_, Some((i, band, index, consumed)))
+        (_, Some((i, band, index, consumed, span)))
             if consumed.is_some()
                 || tokens[i].chars().next_back().is_some_and(|c| c.is_ascii_digit()) =>
         {
@@ -416,17 +449,18 @@ pub fn parse_anime(path_rel: &str) -> Option<EpisodeGuess> {
                         show_year: show_guess.year,
                         season: Some(0),
                         episode: b + index,
+                        episode_end: span.map(|s| b + s),
                         episode_title: None,
                     });
                 }
             }
         }
-        (Some(pair), _) => pair,
+        (Some(triple), _) => triple,
         // MOVIE: not an episode of anything. Bail out entirely so the
         // caller's movie path (a credible "Title (Year)") or, failing
         // that, exact hash identification takes it.
-        (None, Some((_, None, _, _))) => return None,
-        (None, Some((i, Some(band), index, _))) => {
+        (None, Some((_, None, _, _, _))) => return None,
+        (None, Some((i, Some(band), index, _, span))) => {
             let title = if i == 0 {
                 top_dir(path_rel).unwrap_or("Unknown Show").to_string()
             } else {
@@ -443,6 +477,7 @@ pub fn parse_anime(path_rel: &str) -> Option<EpisodeGuess> {
                 // knows the file, the hash refines the slot later.
                 season: Some(0),
                 episode: band + index,
+                episode_end: span.map(|s| band + s),
                 episode_title: None,
             });
         }
@@ -463,8 +498,24 @@ pub fn parse_anime(path_rel: &str) -> Option<EpisodeGuess> {
         show_year: show_guess.year,
         season: None, // absolute numbering is authoritative
         episode,
+        episode_end,
         episode_title: (!ep_title.is_empty()).then_some(ep_title),
     })
+}
+
+/// A batch-marker token: `1-2`, `01-02`, `1-26` — two 1-3 digit numbers,
+/// strictly increasing. Four digits would be years ("1997-2001"), and
+/// equality ("5-5") is junk, not a span.
+fn num_range(t: &str) -> Option<(u32, u32)> {
+    let (a, b) = t.split_once('-')?;
+    if a.is_empty() || b.is_empty() || a.len() > 3 || b.len() > 3 {
+        return None;
+    }
+    if !a.chars().all(|c| c.is_ascii_digit()) || !b.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let (a, b) = (a.parse::<u32>().ok()?, b.parse::<u32>().ok()?);
+    (b > a).then_some((a, b))
 }
 
 /// Uppercase roman numerals I..XIII — the range fansub packs use.
@@ -482,18 +533,25 @@ fn top_dir(path_rel: &str) -> Option<&str> {
     parts.next().map(|_| first) // only when there IS a directory
 }
 
-fn parse_sxxeyy(tok: &str) -> Option<(u32, u32)> {
+fn parse_sxxeyy(tok: &str) -> Option<(u32, u32, Option<u32>)> {
     let t = tok.trim_matches(|c: char| !c.is_ascii_alphanumeric());
     let rest = t.strip_prefix(['s', 'S'])?;
     let e_pos = rest.find(['e', 'E'])?;
     let (s, e_part) = rest.split_at(e_pos);
     let e = &e_part[1..];
-    // Multi-episode: S01E01E02 / S01E01-E02 — first episode wins.
     let e_first: String = e.chars().take_while(|c| c.is_ascii_digit()).collect();
     if s.is_empty() || e_first.is_empty() || !s.chars().all(|c| c.is_ascii_digit()) {
         return None;
     }
-    Some((s.parse().ok()?, e_first.parse().ok()?))
+    let first: u32 = e_first.parse().ok()?;
+    // Multi-episode: S01E01E02 / S01E01-E02 / S01E01-02 — the file
+    // spans a range; a non-increasing tail is junk, not a range.
+    let tail = &e[e_first.len()..];
+    let tail = tail.strip_prefix('-').unwrap_or(tail);
+    let tail = tail.strip_prefix(['e', 'E']).unwrap_or(tail);
+    let end_digits: String = tail.chars().take_while(|c| c.is_ascii_digit()).collect();
+    let end = end_digits.parse::<u32>().ok().filter(|n| *n > first);
+    Some((s.parse().ok()?, first, end))
 }
 
 fn is_season_dir(dir: &str) -> bool {
@@ -591,6 +649,40 @@ mod tests {
             assert_eq!(g.episode_title.as_deref(), ep_title, "{path}");
         }
         assert!(parse_episode("Movies/Heat (1995).mkv").is_none());
+    }
+
+    /// HUB-30 batch markers: one file spanning a range of episodes.
+    #[test]
+    fn batch_markers_span_a_range_and_titles_with_dashes_do_not() {
+        // The live Kite file: designator + range in tag-stripped tail.
+        let g = parse_anime(
+            "Kite OVAs & Liberator (Dual-Audio)/Kite Special Edition Uncut OVA 1-2 (Eng.-Dub).mkv",
+        )
+        .unwrap();
+        assert_eq!((g.season, g.episode, g.episode_end), (Some(0), 1, Some(2)));
+
+        // Trailing bare range.
+        let g = parse_anime("Show/[Grp] Show - 01-02.mkv").unwrap();
+        assert_eq!((g.episode, g.episode_end), (1, Some(2)));
+
+        // SxxEyy ranges, both spellings.
+        let g = parse_episode("Show/Show - S01E01-E03 - Double.mkv").unwrap();
+        assert_eq!((g.season, g.episode, g.episode_end), (Some(1), 1, Some(3)));
+        let g = parse_episode("Show/Show - S02E05-06.mkv").unwrap();
+        assert_eq!((g.season, g.episode, g.episode_end), (Some(2), 5, Some(6)));
+
+        // A dashed number INSIDE a title is not a span ("Ranma 1-2"),
+        // and a real episode number still wins over it.
+        let g = parse_anime("Ranma/[Grp] Ranma 1-2 - 05.mkv").unwrap();
+        assert_eq!((g.episode, g.episode_end), (5, None));
+        let g = parse_anime("Ranma/[Grp] Ranma 1-2 Special.mkv").unwrap();
+        assert_eq!((g.season, g.episode, g.episode_end), (Some(0), 1, None));
+
+        // Year ranges are never spans.
+        assert!(num_range("1997-2001").is_none());
+        // Non-increasing is junk, not a span.
+        assert!(num_range("5-5").is_none());
+        assert!(num_range("10-2").is_none());
     }
 
     #[test]

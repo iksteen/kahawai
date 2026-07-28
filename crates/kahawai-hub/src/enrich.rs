@@ -1439,6 +1439,9 @@ impl Enricher {
                                   = (f.module_id, f.collection_id, f.path_rel)
              JOIN items ep ON ep.id = s.item_id
              WHERE ep.parent_id = ?1 AND f.ed2k IS NOT NULL
+               -- Span episodes (batch files, 0045) answer to their
+               -- range, not to a single-epno FILE reply: skip the ask.
+               AND ep.episode_end IS NULL
                AND NOT EXISTS (SELECT 1 FROM ed2k_aid c
                                 WHERE c.ed2k = f.ed2k
                                   AND (c.aid IS NULL OR c.epno IS NOT NULL))
@@ -1648,8 +1651,14 @@ impl Enricher {
         aid: u32,
     ) -> Result<Option<String>> {
         let info = crate::anime::anidb_anime_info(&self.http, &self.data_dir, aid).await?;
-        if info.kind != "Movie" {
-            tracing::debug!(aid, kind = %info.kind, "not a movie; leaving bare");
+        // Movie-shaped: AniDB's Movie type, or a single-episode OVA/Web
+        // entry — one sitting, no series structure to invent. Multi-
+        // episode series types deliberately stay bare (never conjure a
+        // show around one stray file).
+        let movie_shaped = info.kind == "Movie"
+            || (matches!(info.kind.as_str(), "OVA" | "Web") && info.episode_count == Some(1));
+        if !movie_shaped {
+            tracing::debug!(aid, kind = %info.kind, "not movie-shaped; leaving bare");
             return Ok(None);
         }
         let norm = kahawai_core::names::normalize_title(&info.title);
@@ -1728,6 +1737,9 @@ impl Enricher {
                            = (s.module_id, s.collection_id, s.path_rel)
              JOIN ed2k_aid c ON c.ed2k = f.ed2k
              WHERE ep.parent_id = ?1 AND c.aid IS NOT NULL AND c.epno IS NOT NULL
+               -- Span episodes (batch files, 0045) are their own truth;
+               -- a single-epno answer must not collapse the range.
+               AND ep.episode_end IS NULL
              ORDER BY s.path_rel",
         )
         .bind(show_id)

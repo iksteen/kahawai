@@ -169,30 +169,14 @@ How something works and why it was built that way belong in
 ## Hub — anime (HUB-29..33)
 
 - [x] HUB-29 AniDB/AniList providers: titles-dump identity, anime-lists ID
-      mapping, AniList metadata + relations, UDP FILE-by-ED2K gold path
-      (registered client "kahawai", account via admin page, optional
-      encrypted session, never-ask-twice cache)
-      *(2026-07-28: never-ask-twice re-keyed from recorded misses to the
-      question itself — `provider_queries`, migration 0044 — so renames,
-      late hashes and derivation fixes re-ask automatically)*
-- [ ] HUB-30 Fansub filename conventions. Group prefixes, absolute
-      numbering, CRC tags, bracket stripping, hash-exact show
-      identification, and per-EPISODE hash identification: every hashed
-      file is asked of AniDB once (episode, group cached in `ed2k_aid`),
-      and on disagreement the hash re-binds the file to the episode it
-      IS — specials into season 0, misnumbered rips to their real number
-      (`tests/hash_binding.rs`).
-      Release revisions are generic: anime `NNv2` and scene
-      REPACK/PROPER/RERIP parse to one number on the file record, and
-      source ranking prefers the corrected release within a resolution
-      tier. Designations (OVA/ONA/SP/NCOP/NCED/MOVIE, arabic and roman
-      indexes) slot into season-0 bands by name, refined by hash; bare
-      files answer to their hash, including minting a movie item from
-      AniDB's answer when nothing owns the aid.
-      Remaining: batch markers (multi-episode files, "OVA 1-2") are not
-      handled; files whose hash names a DIFFERENT AniDB entry than their
-      show's (per-season splits) are logged, not re-bound; a series-type
-      aid with no catalogue item deliberately stays bare.
+      mapping, AniList metadata + relations, UDP FILE-by-ED2K gold path,
+      question-keyed never-ask-twice (`provider_queries`, 0044)
+- [ ] HUB-30 Fansub filename conventions: group prefixes, absolute
+      numbering, CRC tags, bracket stripping, designators with season-0
+      bands, per-episode hash identity + re-binding (`ed2k_aid`,
+      `tests/hash_binding.rs`), generic release revisions (0043),
+      bare-file identification + movie minting, batch-marker spans
+      (0045). Missing: cross-aid re-binding (per-season splits)
 - [x] HUB-30a Hashes are canonical identity: late ED2K re-verifies name
       matches, overrides on disagreement (manual included); manual matches
       otherwise adopt anime ids only via reverse mapping (proven live)

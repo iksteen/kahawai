@@ -166,20 +166,25 @@ async fn ownerless_movies_are_minted_or_adopted_from_the_hash() {
     let (enricher, db, dir) = harness().await;
     let xmldir = dir.path().join("anime/httpapi");
     std::fs::create_dir_all(&xmldir).unwrap();
-    let xml = |aid: u32, kind: &str, title: &str, date: &str| {
+    let xml = |aid: u32, kind: &str, eps: u32, title: &str, date: &str| {
         std::fs::write(
             xmldir.join(format!("{aid}.xml")),
             format!(
-                "<anime id=\"{aid}\"><type>{kind}</type><startdate>{date}</startdate>\
+                "<anime id=\"{aid}\"><type>{kind}</type><episodecount>{eps}</episodecount>\
+                 <startdate>{date}</startdate>\
                  <titles><title xml:lang=\"x-jat\" type=\"main\">{title} Romaji</title>\
                  <title xml:lang=\"en\" type=\"official\">{title}</title></titles></anime>"
             ),
         )
         .unwrap();
     };
-    xml(979, "Movie", "Akira", "1988-07-16");
-    xml(500, "TV Series", "Some Show", "1999-01-01");
-    xml(600, "Movie", "Adopted Film", "2001-06-01");
+    xml(979, "Movie", 1, "Akira", "1988-07-16");
+    xml(500, "TV Series", 26, "Some Show", "1999-01-01");
+    xml(600, "Movie", 1, "Adopted Film", "2001-06-01");
+    // Movie-shaped despite the type string: a single-episode OVA
+    // (Kite Liberator's shape) mints; a multi-episode OVA stays bare.
+    xml(700, "OVA", 1, "Lone OVA", "2008-03-01");
+    xml(800, "OVA", 4, "Serial OVA", "2005-01-01");
     // The adoptable twin: same normalized title and year, no anime_ids.
     sqlx::query(
         "INSERT INTO items (id, kind, title, norm_title, year)
@@ -189,8 +194,13 @@ async fn ownerless_movies_are_minted_or_adopted_from_the_hash() {
     .await
     .unwrap();
 
-    for (path, hash, aid) in
-        [("akira.mkv", "h-akira", 979), ("stray-ep.mkv", "h-se", 500), ("adopt.mkv", "h-ad", 600)]
+    for (path, hash, aid) in [
+        ("akira.mkv", "h-akira", 979),
+        ("stray-ep.mkv", "h-se", 500),
+        ("adopt.mkv", "h-ad", 600),
+        ("lone-ova.mkv", "h-lo", 700),
+        ("serial-ova.mkv", "h-so", 800),
+    ]
     {
         sqlx::query(
             "INSERT INTO files (module_id, collection_id, path_rel, size, mtime_unix,
@@ -214,7 +224,24 @@ async fn ownerless_movies_are_minted_or_adopted_from_the_hash() {
     }
 
     let bound = enricher.bind_bare_files(&db).await.unwrap();
-    assert_eq!(bound, 2, "the movie and the adoption bind; the stray episode does not");
+    assert_eq!(
+        bound, 3,
+        "movie, adoption and single-episode OVA bind; stray episode and serial OVA do not"
+    );
+    let lone: Option<String> = sqlx::query_scalar(
+        "SELECT i.title FROM item_sources s JOIN items i ON i.id=s.item_id WHERE s.path_rel='lone-ova.mkv'",
+    )
+    .fetch_optional(&db)
+    .await
+    .unwrap();
+    assert_eq!(lone.as_deref(), Some("Lone OVA"), "single-episode OVA minted as a movie");
+    let serial: Option<String> = sqlx::query_scalar(
+        "SELECT s.item_id FROM item_sources s WHERE s.path_rel='serial-ova.mkv'",
+    )
+    .fetch_optional(&db)
+    .await
+    .unwrap();
+    assert!(serial.is_none(), "multi-episode OVA stays bare");
 
     let akira: (String, Option<i64>, String) = sqlx::query_as(
         "SELECT i.title, i.year, i.id FROM item_sources s JOIN items i ON i.id=s.item_id
@@ -251,7 +278,7 @@ async fn ownerless_movies_are_minted_or_adopted_from_the_hash() {
             .fetch_one(&db)
             .await
             .unwrap();
-    assert_eq!(shows, 3, "show harness + akira + twin, nothing else");
+    assert_eq!(shows, 4, "show harness + akira + twin + lone OVA, nothing else");
 }
 
 /// A file WE parked in season 0 on a name guess is reclaimed by a

@@ -500,6 +500,11 @@ pub struct AnidbAnimeInfo {
     pub kind: String,
     pub title: String,
     pub year: Option<i64>,
+    /// `<episodecount>`, when the XML states one. A single-episode
+    /// OVA/Web entry is movie-shaped for minting purposes (Kite
+    /// Liberator, 2026-07-28: type OVA, one episode, invisible until
+    /// this let it mint).
+    pub episode_count: Option<i64>,
 }
 
 pub async fn anidb_anime_info(
@@ -538,8 +543,13 @@ pub async fn anidb_anime_info(
         .and_then(|n| n.text())
         .and_then(|d| d.get(..4))
         .and_then(|y| y.parse().ok());
+    let episode_count = doc
+        .descendants()
+        .find(|n| n.has_tag_name("episodecount"))
+        .and_then(|n| n.text())
+        .and_then(|c| c.parse().ok());
     anyhow::ensure!(!title.is_empty(), "anidb xml for {aid} carries no title");
-    Ok(AnidbAnimeInfo { kind, title, year })
+    Ok(AnidbAnimeInfo { kind, title, year, episode_count })
 }
 
 fn parse_episode_titles(xml: &str) -> Result<std::collections::HashMap<i64, String>> {

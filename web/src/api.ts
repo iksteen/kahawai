@@ -106,6 +106,7 @@ export type Item = {
   year: number | null
   season: number | null
   episode: number | null
+  episode_end?: number | null
   /// HUB-31: TVDB-style projection of absolute numbering (anime).
   proj_season?: number | null
   proj_episode?: number | null

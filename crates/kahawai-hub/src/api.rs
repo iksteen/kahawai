@@ -1851,6 +1851,8 @@ fn item_row_json(r: &sqlx::sqlite::SqliteRow) -> Value {
         "year": r.get::<Option<i64>, _>("year"),
         "season": r.get::<Option<i64>, _>("season"),
         "episode": r.get::<Option<i64>, _>("episode"),
+        // Batch span (0045): the file covers episode..episode_end.
+        "episode_end": r.try_get::<Option<i64>, _>("episode_end").ok().flatten(),
         // The show an episode belongs to, so a search hit called "Pilot"
         // says which of its eight namesakes it is. The id lets a track
         // hit open its ALBUM — tracks have no detail view of their own.
@@ -1874,7 +1876,7 @@ async fn item_children(
     axum::Extension(claims): axum::Extension<crate::auth::Claims>,
 ) -> Result<Json<Value>, ApiError> {
     let rows = sqlx::query(
-        "SELECT i.id, i.kind, i.year, i.season, i.episode, i.artist,
+        "SELECT i.id, i.kind, i.year, i.season, i.episode, i.episode_end, i.artist,
                 COALESCE(md.title, i.title) AS title,
                 md.premiered AS premiered,
                 md.updated_at AS art_version,
