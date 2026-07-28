@@ -128,7 +128,14 @@ impl Http {
         *next = Instant::now() + spacing(&host);
         let resp = resp.with_context(|| format!("{host} request failed"))?;
         if matches!(resp.status().as_u16(), 429 | 503) {
-            let penalty = retry_after(&resp).unwrap_or(DEFAULT_PENALTY).min(MAX_PENALTY);
+            // MusicBrainz answers 503 with `Retry-After: 0` — "just slow
+            // down" — which read literally parks for nothing and the next
+            // paced request eats another 503 (39 in a row, 2026-07-28).
+            // A zero header is no usable header.
+            let penalty = retry_after(&resp)
+                .filter(|d| !d.is_zero())
+                .unwrap_or(DEFAULT_PENALTY)
+                .min(MAX_PENALTY);
             *next = Instant::now() + penalty;
             tracing::warn!(host, status = %resp.status(), secs = penalty.as_secs(),
                 "provider rate-limited us; going quiet");
@@ -196,5 +203,18 @@ mod tests {
         assert!(parked_for(&busy).await > Duration::from_secs(80), "Retry-After ignored");
         // ...and only that provider: the healthy one is free again.
         assert!(parked_for(&ok).await < Duration::from_secs(1));
+
+        // MusicBrainz's `Retry-After: 0` must fall back to the default
+        // penalty, not park for nothing and eat the next 503 too.
+        let shrug = server(
+            "127.0.0.3",
+            "HTTP/1.1 503 Service Unavailable\r\nRetry-After: 0\r\nContent-Length: 0\r\n\r\n",
+        )
+        .await;
+        assert!(http.send(http.get(&shrug)).await.is_err());
+        assert!(
+            parked_for(&shrug).await > Duration::from_secs(30),
+            "zero Retry-After must still park"
+        );
     }
 }

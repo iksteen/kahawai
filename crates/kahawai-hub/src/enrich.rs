@@ -3059,8 +3059,12 @@ impl crate::providers::Provider for TvdbProvider {
         }
         // Anime identity is AniDB's; TVDB may describe, never re-match
         // (HUB-5/HUB-31). Without a mapped id there is no honest way in,
-        // so it declines rather than searching by title.
-        if item.owner.as_deref() == Some("anilist") {
+        // so it declines rather than searching by title. The owner
+        // arrives as a CHAIN name ("anime", identity_owner maps it) —
+        // comparing against the raw column name left this guard dead
+        // and TVDB title-searching anime; 11 movie-namespace answers
+        // diverged from the mapping before 2026-07-28 caught it.
+        if item.owner.as_deref() == Some("anime") {
             let mapped: Option<i64> =
                 sqlx::query_scalar("SELECT mapped_tvdb FROM anime_ids WHERE item_id = ?")
                     .bind(&item.id)
