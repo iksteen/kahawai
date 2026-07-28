@@ -2631,6 +2631,27 @@ impl Enricher {
                 }
             }
         }
+        // Anime identity had no voice here: TMDB's "Kite" is the 2014
+        // live-action film, and the 1998 OVA is AniList's to name. The
+        // pin machinery is provider-generic, so offering 'anilist'
+        // candidates is all HUB-8 needs to hand-match anime.
+        match self.anilist.search(query).await {
+            Ok(media) => out.extend(media.iter().map(|m| {
+                serde_json::json!({
+                    "id": m.id,
+                    "provider": "anilist",
+                    "title": m.display_title(),
+                    "overview": m.plain_description(),
+                    "poster_path": m.cover_image.as_ref()
+                        .and_then(|c| c.extra_large.clone().or_else(|| c.large.clone())),
+                    "poster_url": m.cover_image.as_ref()
+                        .and_then(|c| c.large.clone().or_else(|| c.extra_large.clone())),
+                    "release_date": m.premiered(),
+                    "vote_average": m.average_score.map(|s| s / 10.0),
+                })
+            })),
+            Err(e) => tracing::warn!(error = format!("{e:#}"), "review anilist search failed"),
+        }
         Ok(serde_json::json!(out))
     }
 
