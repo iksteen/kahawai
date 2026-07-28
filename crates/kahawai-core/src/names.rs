@@ -281,6 +281,46 @@ pub fn parse_anime(path_rel: &str) -> Option<EpisodeGuess> {
     }
     let tokens: Vec<&str> = cleaned.split_whitespace().filter(|t| *t != "-").collect();
 
+    // HUB-30 release designations: NCOP/NCED (creditless op/ed), OVA/
+    // OAV/ONA/SP/SPECIAL, and MOVIE. Consulted only in THIS branch — a
+    // SxxEyy name never reaches it, which is what keeps "Houndoom's
+    // Special Delivery" and "Zorua The Movie!" (real episode titles in
+    // the live collection) out of the specials bin. The designator's
+    // index is its attached digits (NCOP2) or the immediately following
+    // number ("OVA 2" — consumed, so it cannot double as an episode
+    // number), defaulting to 1. A remaining standalone episode number
+    // still wins: "[Grp] Show - 05 Special Training" is episode 5.
+    let designator = tokens.iter().enumerate().find_map(|(i, t)| {
+        let split = t.len() - t.chars().rev().take_while(|c| c.is_ascii_digit()).count();
+        let (base, digits) = t.split_at(split);
+        let band = match base.to_ascii_uppercase().as_str() {
+            "NCOP" => Some(Some(100u32)),
+            "NCED" => Some(Some(120)),
+            "OVA" | "OAV" | "ONA" | "SP" | "SPECIAL" | "SPECIALS" => Some(Some(0)),
+            "MOVIE" | "GEKIJOUBAN" => Some(None),
+            _ => None,
+        }?;
+        let (index, consumed) = if !digits.is_empty() {
+            (digits.parse().ok(), None)
+        } else {
+            match tokens.get(i + 1) {
+                Some(n)
+                    if n.len() <= 4
+                        && n.chars().all(|c| c.is_ascii_digit())
+                        && !(1900..=2099).contains(&n.parse::<u32>().unwrap_or(0)) =>
+                {
+                    (n.parse().ok(), Some(i + 1))
+                }
+                // "OVA II": fansub packs number in roman as often as
+                // arabic — uppercase only, or the English word "I" in an
+                // episode title would become an index.
+                Some(r) if roman(r).is_some() => (roman(r), Some(i + 1)),
+                _ => (Some(1), None),
+            }
+        };
+        Some((i, band, index.unwrap_or(1), consumed))
+    });
+
     // Absolute episode: an explicit E01/EP01 token wins; otherwise the
     // LAST standalone number (optional vN) that isn't a plausible year.
     let e_token = tokens.iter().enumerate().find_map(|(i, t)| {
@@ -292,8 +332,15 @@ pub fn parse_anime(path_rel: &str) -> Option<EpisodeGuess> {
         }
         Some((i, rest.parse().ok()?))
     });
-    let (idx, episode) = e_token.or_else(|| {
+    let episode_number = e_token.or_else(|| {
         tokens.iter().enumerate().rev().find_map(|(i, t)| {
+            // A number consumed as a designator's index is not an
+            // episode candidate.
+            if let Some((_, _, _, Some(consumed))) = designator
+                && i == consumed
+            {
+                return None;
+            }
             let num = t.split(['v', 'V']).next()?;
             if num.is_empty() || num.len() > 4 || !num.chars().all(|c| c.is_ascii_digit()) {
                 return None;
@@ -304,7 +351,70 @@ pub fn parse_anime(path_rel: &str) -> Option<EpisodeGuess> {
             }
             Some((i, n))
         })
-    })?;
+    });
+    let (idx, episode) = match (episode_number, designator) {
+        // A designator with an EXPLICIT index — attached digits or the
+        // number right after it — outranks any other number in the name:
+        // "Cyber City Oedo 808 Ova 02" is the second OVA, and the 808 is
+        // title. An INDEXLESS designator loses to a real episode number:
+        // "[Grp] Show - 05 Special Training" is episode 5.
+        (_, Some((i, band, index, consumed)))
+            if consumed.is_some()
+                || tokens[i].chars().next_back().is_some_and(|c| c.is_ascii_digit()) =>
+        {
+            match band {
+                None => return None,
+                Some(b) => {
+                    let title = if i == 0 {
+                        top_dir(path_rel).unwrap_or("Unknown Show").to_string()
+                    } else {
+                        tokens[..i].join(" ")
+                    };
+                    let show_guess = match top_dir(path_rel) {
+                        Some(top) => parse_movie(top),
+                        None => parse_movie(&title),
+                    };
+                    return Some(EpisodeGuess {
+                        show_title: if show_guess.title.is_empty() {
+                            title
+                        } else {
+                            show_guess.title
+                        },
+                        show_year: show_guess.year,
+                        season: Some(0),
+                        episode: b + index,
+                        episode_title: None,
+                    });
+                }
+            }
+        }
+        (Some(pair), _) => pair,
+        // MOVIE: not an episode of anything. Bail out entirely so the
+        // caller's movie path (a credible "Title (Year)") or, failing
+        // that, exact hash identification takes it.
+        (None, Some((_, None, _, _))) => return None,
+        (None, Some((i, Some(band), index, _))) => {
+            let title = if i == 0 {
+                top_dir(path_rel).unwrap_or("Unknown Show").to_string()
+            } else {
+                tokens[..i].join(" ")
+            };
+            let show_guess = match top_dir(path_rel) {
+                Some(top) => parse_movie(top),
+                None => parse_movie(&title),
+            };
+            return Some(EpisodeGuess {
+                show_title: if show_guess.title.is_empty() { title } else { show_guess.title },
+                show_year: show_guess.year,
+                // The same season-0 bands the hash binder uses; if AniDB
+                // knows the file, the hash refines the slot later.
+                season: Some(0),
+                episode: band + index,
+                episode_title: None,
+            });
+        }
+        (None, None) => return None,
+    };
 
     let mut title = tokens[..idx].join(" ");
     if title.is_empty() {
@@ -321,6 +431,15 @@ pub fn parse_anime(path_rel: &str) -> Option<EpisodeGuess> {
         season: None, // absolute numbering is authoritative
         episode,
         episode_title: (!ep_title.is_empty()).then_some(ep_title),
+    })
+}
+
+/// Uppercase roman numerals I..XIII — the range fansub packs use.
+fn roman(t: &str) -> Option<u32> {
+    Some(match t {
+        "I" => 1, "II" => 2, "III" => 3, "IV" => 4, "V" => 5, "VI" => 6, "VII" => 7,
+        "VIII" => 8, "IX" => 9, "X" => 10, "XI" => 11, "XII" => 12, "XIII" => 13,
+        _ => return None,
     })
 }
 
@@ -600,5 +719,56 @@ mod tests {
         assert_eq!(rev("Garbage/Version 2.0/03 - When I Grow Up.mp3"), 1);
         // Codec/channel tokens cannot match.
         assert_eq!(rev("Film.2020.1080p.x264.DD5.1.mkv"), 1);
+    }
+
+    #[test]
+    fn designations_slot_into_season_zero_and_titles_stay_episodes() {
+        use super::parse_anime;
+        let slot = |p: &str| parse_anime(p).map(|g| (g.season, g.episode));
+        // The Coalgirls NC files that sat bare and invisible for want of
+        // exactly this.
+        assert_eq!(
+            slot("Ao No Exorcist/x/[Coalgirls]_Ao_no_Exorcist_NCOP_(1280x720)_[B97DE8EE].mkv"),
+            Some((Some(0), 101))
+        );
+        assert_eq!(
+            slot("Ao No Exorcist/x/[Coalgirls]_Ao_no_Exorcist_NCOP2_(1280x720)_[EA9A5C59].mkv"),
+            Some((Some(0), 102))
+        );
+        assert_eq!(
+            slot("Ao No Exorcist/x/[Coalgirls]_Ao_no_Exorcist_NCED_(1280x720)_[8A18F47C].mkv"),
+            Some((Some(0), 121))
+        );
+        // A designator with an explicit index beats a title number; the
+        // real thing, from a borrowed collection.
+        assert_eq!(slot("X/Cyber City Oedo 808 Ova 02 The Decoy Program.mkv"), Some((Some(0), 2)));
+        // An indexless designator AFTER a real episode number loses.
+        assert_eq!(slot("Macross Plus (Dual-Audio)/Mcross + - 02 - OVA.mkv"), Some((None, 2)));
+        // Roman-numbered OVA packs, from a borrowed collection where all
+        // four Hellsings piled onto slot 1.
+        assert_eq!(slot("X/Hellsing Ultimate OVA I.mkv"), Some((Some(0), 1)));
+        assert_eq!(slot("X/Hellsing Ultimate OVA IV.mkv"), Some((Some(0), 4)));
+        // Specials, attached and adjacent index forms.
+        assert_eq!(slot("[Grp] Show - OVA [720p].mkv"), Some((Some(0), 1)));
+        assert_eq!(slot("[Grp] Show - OVA 2 [720p].mkv"), Some((Some(0), 2)));
+        assert_eq!(slot("[Grp] Show - SP03.mkv"), Some((Some(0), 3)));
+        assert_eq!(slot("Show/Specials/Show - Special 2.mkv"), Some((Some(0), 2)));
+        // A real episode number outranks a designator in the title.
+        assert_eq!(slot("[Grp] Show - 05 Special Training.mkv"), Some((None, 5)));
+        // SxxEyy names never reach the fansub branch at all — the shield
+        // for the live collection's episode titles.
+        assert_eq!(slot("Pokemon/Season 04/Pokemon 04x23 Houndoom's Special Delivery.mkv"),
+                   Some((Some(4), 23)));
+        assert_eq!(slot("Pokemon/Season 14/Pokemon 14x40 Zorua The Movie! Legend.mkv"),
+                   Some((Some(14), 40)));
+        // MOVIE bails out to the movie/hash path rather than inventing
+        // an episode from a stray number.
+        assert_eq!(slot("[Grp] Show - Movie 2 [1080p].mkv"), None);
+        // "Show OVA - 04" is undecidable by tokens alone: episode 4 of an
+        // OVA series, or the fourth OVA? The adjacency rule reads it as
+        // OVA #4 — season 0 either way presents it as extra material,
+        // and the hash refines the slot when AniDB knows the file. The
+        // year in parens is stripped and can never become an index.
+        assert_eq!(slot("[Grp] Show OVA (1997) - 04.mkv"), Some((Some(0), 4)));
     }
 }

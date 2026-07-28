@@ -678,7 +678,28 @@ impl Enricher {
             Err(e) => tracing::warn!(error = format!("{e:#}"), "anime id rebuild failed"),
         }
         let anime_items = self.select_anime_items(registry).await.unwrap_or_default();
-        if !anime_items.is_empty() {
+        // The provider (and with it the AniDB session) must also build
+        // when the only work is BARE files awaiting hash lookups — they
+        // belong to no item, so no selection can ever represent them.
+        // Same predicate resolve_bare_hashes scans with.
+        let bare_pending: bool = sqlx::query_scalar::<_, i64>(
+            "SELECT EXISTS (
+               SELECT 1 FROM files f
+               JOIN collections col ON (col.module_id, col.collection_id)
+                                     = (f.module_id, f.collection_id)
+               WHERE col.media_type = 'anime' AND f.ed2k IS NOT NULL
+                 AND NOT EXISTS (SELECT 1 FROM item_sources s
+                                  WHERE (s.module_id, s.collection_id, s.path_rel)
+                                      = (f.module_id, f.collection_id, f.path_rel))
+                 AND NOT EXISTS (SELECT 1 FROM ed2k_aid c
+                                  WHERE c.ed2k = f.ed2k
+                                    AND (c.aid IS NULL OR c.epno IS NOT NULL)))",
+        )
+        .fetch_one(registry.db())
+        .await
+        .map(|v| v != 0)
+        .unwrap_or(false);
+        if !anime_items.is_empty() || bare_pending {
             match self.build_anime_provider(registry).await {
                 Ok(p) => set.add(Box::new(p)),
                 Err(e) => {
@@ -1213,6 +1234,28 @@ impl Enricher {
                 Err(e) => tracing::warn!(error = format!("{e:#}"), "episode binding failed"),
             }
         }
+        // Bare files likewise, UNCONDITIONALLY: they belong to no item,
+        // so no selection can ever surface them — and this section runs
+        // before the empty-selection return below, which is the second
+        // time that return has quietly gated derivation work it must not.
+        const HASH_LOOKUP_BUDGET: usize = 500;
+        let mut lookups = 0usize;
+        {
+            let mut guard = self.anidb.lock().await;
+            if let Some(client) = guard.as_mut() {
+                match self.resolve_bare_hashes(registry.db(), client, HASH_LOOKUP_BUDGET).await {
+                    Ok(n) => lookups += n,
+                    Err(e) => {
+                        tracing::warn!(error = format!("{e:#}"), "bare-file hash lookups failed")
+                    }
+                }
+            }
+        }
+        match self.bind_bare_files(registry.db()).await {
+            Ok(n) if n > 0 => tracing::info!(bound = n, "bare files identified by hash"),
+            Ok(_) => {}
+            Err(e) => tracing::warn!(error = format!("{e:#}"), "bare-file binding failed"),
+        }
         if items.is_empty() {
             return Ok(());
         }
@@ -1221,8 +1264,6 @@ impl Enricher {
         // shows. The client already paces every packet to AniDB's flood
         // rule; this only bounds how long one run can spend, and the
         // remainder carries over — each answer is cached forever.
-        const HASH_LOOKUP_BUDGET: usize = 500;
-        let mut lookups = 0usize;
         let mut done = 0usize;
         for item in &items {
             // Exact-file episode identity, BEFORE the chain runs: the
@@ -1380,6 +1421,154 @@ impl Enricher {
         Ok(asked)
     }
 
+    /// Ask AniDB about hashed files in anime collections that are bound
+    /// to NOTHING — the NCOP/NCED extras and movie files whose names
+    /// carry no episode shape. The old code's comment promised "ed2k
+    /// matching will identify those precisely later" and later never
+    /// came: the per-show resolver only walks bound files, so bare files
+    /// were invisible to it, to browse, and to AniDB alike.
+    async fn resolve_bare_hashes(
+        &self,
+        db: &sqlx::SqlitePool,
+        client: &mut crate::anidb::Anidb,
+        budget: usize,
+    ) -> Result<usize> {
+        let files: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT f.ed2k, f.size FROM files f
+             JOIN collections col ON (col.module_id, col.collection_id)
+                                   = (f.module_id, f.collection_id)
+             WHERE col.media_type = 'anime' AND f.ed2k IS NOT NULL
+               AND NOT EXISTS (SELECT 1 FROM item_sources s
+                                WHERE (s.module_id, s.collection_id, s.path_rel)
+                                    = (f.module_id, f.collection_id, f.path_rel))
+               AND NOT EXISTS (SELECT 1 FROM ed2k_aid c
+                                WHERE c.ed2k = f.ed2k
+                                  AND (c.aid IS NULL OR c.epno IS NOT NULL))
+             ORDER BY f.path_rel",
+        )
+        .fetch_all(db)
+        .await?;
+        let mut asked = 0;
+        for (ed2k, size) in files.iter().take(budget) {
+            let hit = client.file_by_ed2k(*size as u64, ed2k).await?;
+            sqlx::query(
+                "INSERT OR REPLACE INTO ed2k_aid
+                   (ed2k, aid, eid, epno, gid, group_name, updated_at)
+                 VALUES (?, ?, ?, ?, ?, ?, unixepoch())",
+            )
+            .bind(ed2k)
+            .bind(hit.as_ref().map(|h| h.aid))
+            .bind(hit.as_ref().map(|h| h.eid))
+            .bind(hit.as_ref().map(|h| h.epno.clone()))
+            .bind(hit.as_ref().map(|h| h.gid))
+            .bind(hit.as_ref().map(|h| h.group_name.clone()))
+            .execute(db)
+            .await?;
+            asked += 1;
+        }
+        Ok(asked)
+    }
+
+    /// Bind bare anime-collection files whose cached hash answer names
+    /// an identity the catalogue holds: an episode slot under the show
+    /// matched to that aid, or the movie item itself. Pure database
+    /// work; a file whose aid matches nothing stays bare and is logged.
+    pub async fn bind_bare_files(&self, db: &sqlx::SqlitePool) -> Result<usize> {
+        let rows = sqlx::query(
+            "SELECT f.module_id, f.collection_id, f.path_rel, c.aid, c.epno
+             FROM files f
+             JOIN collections col ON (col.module_id, col.collection_id)
+                                   = (f.module_id, f.collection_id)
+             JOIN ed2k_aid c ON c.ed2k = f.ed2k
+             WHERE col.media_type = 'anime'
+               AND c.aid IS NOT NULL AND c.epno IS NOT NULL
+               AND NOT EXISTS (SELECT 1 FROM item_sources s
+                                WHERE (s.module_id, s.collection_id, s.path_rel)
+                                    = (f.module_id, f.collection_id, f.path_rel))
+             ORDER BY f.path_rel",
+        )
+        .fetch_all(db)
+        .await?;
+        let mut bound = 0;
+        for r in rows {
+            let (aid, epno) = (r.get::<i64, _>("aid"), r.get::<String, _>("epno"));
+            let path: String = r.get("path_rel");
+            let Some((owner, kind)) = sqlx::query_as::<_, (String, String)>(
+                "SELECT i.id, i.kind FROM anime_ids a JOIN items i ON i.id = a.item_id
+                  WHERE a.anidb_id = ? LIMIT 1",
+            )
+            .bind(aid)
+            .fetch_optional(db)
+            .await?
+            else {
+                tracing::debug!(path = %path, aid, "bare file's anime is not in the catalogue");
+                continue;
+            };
+            let target = match kind.as_str() {
+                // The file IS (part of) the movie itself.
+                "movie" => owner.clone(),
+                _ => {
+                    let slot = match parse_epno(&epno) {
+                        Some(Epno::Regular(n)) => (None::<i64>, n),
+                        Some(Epno::Zero(n)) => (Some(0), n),
+                        None => {
+                            tracing::debug!(path = %path, epno = %epno, "unrecognised epno");
+                            continue;
+                        }
+                    };
+                    let existing: Option<String> = sqlx::query_scalar(
+                        "SELECT id FROM items WHERE parent_id = ?1 AND season IS ?2 AND episode = ?3",
+                    )
+                    .bind(&owner)
+                    .bind(slot.0)
+                    .bind(slot.1)
+                    .fetch_optional(db)
+                    .await?;
+                    match existing {
+                        Some(id) => id,
+                        None => {
+                            let id = ulid::Ulid::generate().to_string();
+                            let stem = path
+                                .rsplit('/')
+                                .next()
+                                .unwrap_or(&path)
+                                .rsplit_once('.')
+                                .map(|(s, _)| s)
+                                .unwrap_or(&path)
+                                .to_string();
+                            sqlx::query(
+                                "INSERT INTO items (id, kind, title, norm_title, parent_id, season, episode)
+                                 VALUES (?, 'episode', ?, ?, ?, ?, ?)",
+                            )
+                            .bind(&id)
+                            .bind(&stem)
+                            .bind(kahawai_core::names::normalize_title(&stem))
+                            .bind(&owner)
+                            .bind(slot.0)
+                            .bind(slot.1)
+                            .execute(db)
+                            .await?;
+                            id
+                        }
+                    }
+                }
+            };
+            sqlx::query(
+                "INSERT INTO item_sources (item_id, module_id, collection_id, path_rel)
+                 VALUES (?, ?, ?, ?)",
+            )
+            .bind(&target)
+            .bind(r.get::<String, _>("module_id"))
+            .bind(r.get::<String, _>("collection_id"))
+            .bind(&path)
+            .execute(db)
+            .await?;
+            tracing::info!(path = %path, epno = %epno, "bare file identified by hash and bound");
+            bound += 1;
+        }
+        Ok(bound)
+    }
+
     /// Bind each hashed file to the episode AniDB says it IS (HUB-30a:
     /// the hash states what the file is, so on disagreement the hash
     /// wins). Pure database work — the lookups above already happened.
@@ -1430,9 +1619,12 @@ impl Enricher {
                 (r.get::<Option<i64>, _>("season"), r.get::<i64, _>("episode"));
             let target = match parse_epno(&epno) {
                 Some(Epno::Regular(n)) => {
-                    // Only meaningful where the show's own numbering IS
-                    // AniDB's: absolute-keyed episodes.
-                    if cur_season.is_some() {
+                    // Meaningful where the show's own numbering IS
+                    // AniDB's: absolute-keyed episodes — and season 0,
+                    // which is OUR OWN speculative parking (a name-
+                    // guessed OVA slot); a regular hash number reclaims
+                    // a file parked there. Real SxxEyy keys stay.
+                    if cur_season.is_some() && cur_season != Some(0) {
                         continue;
                     }
                     (None, n)

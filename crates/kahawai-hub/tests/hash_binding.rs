@@ -100,6 +100,77 @@ async fn slot_of(db: &SqlitePool, path: &str) -> (Option<i64>, i64, String) {
     .unwrap()
 }
 
+/// A file bound to NOTHING — the NCOP/NCED shape — is identified by its
+/// cached hash answer and bound under whatever its aid names: a season-0
+/// slot for a show, the movie item itself for a movie.
+#[tokio::test]
+async fn bare_files_bind_to_what_their_hash_names() {
+    let (enricher, db, _dir) = harness().await;
+    let q = |sql: &'static str| {
+        let db = db.clone();
+        async move {
+            sqlx::query(sql).execute(&db).await.unwrap_or_else(|e| panic!("{sql}\n  -> {e}"))
+        }
+    };
+    q("INSERT INTO anime_ids (item_id, anidb_id) VALUES ('show', 1234)").await;
+    q("INSERT INTO items (id, kind, title, norm_title) VALUES ('film','movie','A Film','a film')").await;
+    q("INSERT INTO anime_ids (item_id, anidb_id) VALUES ('film', 9999)").await;
+
+    // Three bare files: a creditless opening (C2) of the show, the
+    // movie's own bytes ("1"), and one whose anime is not on the shelf.
+    for (path, hash) in [("ncop.mkv", "h-nc"), ("film.mkv", "h-film"), ("stray.mkv", "h-stray")] {
+        sqlx::query(
+            "INSERT INTO files (module_id, collection_id, path_rel, size, mtime_unix,
+                                head_xxh3, tail_xxh3, oshash, streams_json, subs_extracted, ed2k)
+             VALUES ('m','c', ?, 700, 1, 0, 0, 0, '{}', 0, ?)",
+        )
+        .bind(path)
+        .bind(hash)
+        .execute(&db)
+        .await
+        .unwrap();
+    }
+    q("INSERT INTO ed2k_aid (ed2k, aid, eid, epno, gid, group_name, updated_at)
+       VALUES ('h-nc', 1234, 1, 'C2', 7, 'Grp', unixepoch())").await;
+    q("INSERT INTO ed2k_aid (ed2k, aid, eid, epno, gid, group_name, updated_at)
+       VALUES ('h-film', 9999, 2, '1', 7, 'Grp', unixepoch())").await;
+    q("INSERT INTO ed2k_aid (ed2k, aid, eid, epno, gid, group_name, updated_at)
+       VALUES ('h-stray', 5555, 3, '1', 7, 'Grp', unixepoch())").await;
+
+    let bound = enricher.bind_bare_files(&db).await.unwrap();
+    assert_eq!(bound, 2);
+    assert_eq!(slot_of(&db, "ncop.mkv").await.0, Some(0));
+    assert_eq!(slot_of(&db, "ncop.mkv").await.1, 102, "C2 lands in the credits band");
+    let film: String =
+        sqlx::query_scalar("SELECT item_id FROM item_sources WHERE path_rel='film.mkv'")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    assert_eq!(film, "film", "a movie file becomes the movie's own source");
+    let stray: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM item_sources WHERE path_rel='stray.mkv'")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    assert_eq!(stray, 0, "an anime not in the catalogue binds nothing");
+
+    // Idempotent.
+    assert_eq!(enricher.bind_bare_files(&db).await.unwrap(), 0);
+}
+
+/// A file WE parked in season 0 on a name guess is reclaimed by a
+/// regular hash number — season 0 is speculation, not identity. A real
+/// SxxEyy key still is.
+#[tokio::test]
+async fn a_regular_hash_number_reclaims_a_season_zero_parking() {
+    let (enricher, db, _dir) = harness().await;
+    episode(&db, "parked", Some(0), 1, AID, "3").await;
+    let moves = enricher.bind_hashed_episodes(&db, "show", AID).await.unwrap();
+    assert_eq!(moves.len(), 1);
+    assert_eq!((moves[0].from, moves[0].to), ((Some(0), 1), (None, 3)));
+    assert_eq!(slot_of(&db, "parked.mkv").await.0, None);
+}
+
 #[tokio::test]
 async fn the_hash_wins_over_the_filename() {
     let (enricher, db, _dir) = harness().await;

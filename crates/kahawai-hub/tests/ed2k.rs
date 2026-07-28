@@ -101,8 +101,20 @@ async fn anime_collection_resolves_movies_but_not_extras() {
     assert_eq!(title, "Howls Moving Castle");
     assert_eq!(year, Some(2004));
 
-    // The creditless-ending extra must NOT be guessed into anything.
-    let items: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM items").fetch_one(&db).await.unwrap();
-    assert_eq!(items, 1, "NC* extras stay unresolved");
+    // The creditless-ending extra binds by NAME into season 0's ED band
+    // (HUB-30 designations) — it used to stay bare on the promise that
+    // "ed2k will identify it later", which never came for a file no item
+    // held. The hash still refines the slot when AniDB knows the file.
+    let nc: Option<(Option<i64>, i64, String)> = sqlx::query_as(
+        "SELECT i.season, i.episode, p.title
+           FROM item_sources s JOIN items i ON i.id = s.item_id
+           JOIN items p ON p.id = i.parent_id
+          WHERE s.path_rel LIKE '%NCED2%'",
+    )
+    .fetch_optional(&db)
+    .await
+    .unwrap();
+    let (season, episode, show) = nc.expect("NC extra bound under its show");
+    assert_eq!((season, episode), (Some(0), 122), "NCED2 lands in the ED credits band");
+    assert_eq!(show, "Ao no Exorcist");
 }
