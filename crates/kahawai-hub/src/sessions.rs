@@ -110,9 +110,43 @@ pub struct Session {
     /// Serializes seek-restarts. A scrub fires seeks faster than a
     /// restart completes, and two interleaved restarts wipe each
     /// other's scratch dir mid-bind (observed as intermittent 409s).
-    /// async Mutex: held across the stop→wipe→lease→spawn awaits.
+    /// Held only by the detached executor task, never by a request.
     seek_lock: tokio::sync::Mutex<()>,
+    /// The newest seek intent, COALESCED: a scrub burst collapses to
+    /// one restart at the final position. Explicit track choices merge
+    /// forward so a scrub cannot silently discard a track switch.
+    pending_seek: Mutex<Option<PendingSeek>>,
+    seek_gen: std::sync::atomic::AtomicU64,
+    /// (generation, outcome) of the last completed restart. Requests
+    /// await this instead of executing: superseded seeks return the
+    /// winner's result, and an HTTP-cancelled request can no longer
+    /// abort a restart midway (the executor task is detached).
+    seek_done: tokio::sync::watch::Sender<(u64, Result<u64, String>)>,
     touched: Mutex<std::time::Instant>,
+}
+
+/// A coalesced seek intent.
+#[derive(Debug, Clone, Copy)]
+struct PendingSeek {
+    generation: u64,
+    position_ms: u64,
+    audio_track: Option<u32>,
+    video_track: Option<u32>,
+}
+
+impl PendingSeek {
+    /// The newer intent wins the position; explicit track choices
+    /// survive supersession (None = "keep current").
+    fn merge(prev: Option<PendingSeek>, next: PendingSeek) -> PendingSeek {
+        match prev {
+            Some(p) => PendingSeek {
+                audio_track: next.audio_track.or(p.audio_track),
+                video_track: next.video_track.or(p.video_track),
+                ..next
+            },
+            None => next,
+        }
+    }
 }
 
 /// Index of the part containing `abs_ms`.
@@ -721,6 +755,9 @@ impl Sessions {
             sub_verdicts: negotiated.subtitles,
             profile,
             seek_lock: tokio::sync::Mutex::new(()),
+            pending_seek: Mutex::new(None),
+            seek_gen: std::sync::atomic::AtomicU64::new(0),
+            seek_done: tokio::sync::watch::channel((0, Ok(0))).0,
             plan: Mutex::new(session_plan),
             needs: session_needs,
             touched: Mutex::new(std::time::Instant::now()),
@@ -1149,16 +1186,76 @@ impl Sessions {
     /// (players add it to the pipeline's local start.pos).
     pub async fn seek(
         self: &Arc<Self>,
-        registry: &Registry,
+        registry: &Arc<Registry>,
         id: &str,
         position_ms: u64,
         audio_track: Option<u32>,
         video_track: Option<u32>,
     ) -> Result<u64> {
         let session = self.get(id).context("no such session")?;
-        // One restart at a time: later seeks queue behind the running
-        // one instead of corrupting it.
-        let _restarting = session.seek_lock.lock().await;
+        // Register the intent; a burst coalesces to the newest one.
+        let my_gen = {
+            let generation = session.seek_gen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            let mut pending = session.pending_seek.lock().unwrap();
+            let next = PendingSeek { generation, position_ms, audio_track, video_track };
+            *pending = Some(PendingSeek::merge(pending.take(), next));
+            generation
+        };
+        let mut done = session.seek_done.subscribe();
+        // Detached executor: an HTTP disconnect cancels the REQUEST
+        // future, never the restart itself.
+        {
+            let (this, registry, session) = (self.clone(), registry.clone(), session.clone());
+            tokio::spawn(async move {
+                let _serialized = session.seek_lock.lock().await;
+                // Take whatever intent is newest; None = a prior
+                // executor already covered it (we were a burst).
+                let Some(todo) = session.pending_seek.lock().unwrap().take() else {
+                    return;
+                };
+                // Inner spawn: a PANIC in the restart still publishes —
+                // an unpublished generation would hang every waiter.
+                let (this2, registry2, session2) = (this.clone(), registry.clone(), session.clone());
+                let outcome = match tokio::spawn(async move {
+                    this2.execute_seek(&registry2, &session2, todo).await
+                })
+                .await
+                {
+                    Ok(r) => r.map_err(|e| format!("{e:#}")),
+                    Err(join) => Err(format!("seek restart panicked: {join}")),
+                };
+                let _ = session.seek_done.send((todo.generation, outcome));
+            });
+        }
+        // Await the restart that covers this request: ours, or the
+        // newer one that superseded it — either way the returned state
+        // is what actually plays now. Bounded: a wedged restart turns
+        // into an error, never a hung client request.
+        let waited = tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                {
+                    let latest = done.borrow();
+                    if latest.0 >= my_gen {
+                        return latest.1.clone().map_err(|e| anyhow::anyhow!(e));
+                    }
+                }
+                done.changed().await.context("session torn down mid-seek")?;
+            }
+        })
+        .await;
+        match waited {
+            Ok(r) => r,
+            Err(_) => bail!("seek restart did not settle within 60s"),
+        }
+    }
+
+    async fn execute_seek(
+        self: &Arc<Self>,
+        registry: &Registry,
+        session: &Arc<Session>,
+        todo: PendingSeek,
+    ) -> Result<u64> {
+        let PendingSeek { position_ms, audio_track, video_track, .. } = todo;
         let mut plan =
             (*session.plan.lock().unwrap()).context("session has no restartable pipeline")?;
         session.touch();
@@ -1423,5 +1520,40 @@ mod tests {
         assert_eq!(part_index(&[part(0, 1_000)], 10_000), 0);
         // No parts at all is not reachable today, but must not panic.
         assert_eq!(part_index(&[], 42), 0);
+    }
+}
+
+#[cfg(test)]
+mod seek_merge_tests {
+    use super::PendingSeek;
+
+    /// A scrub must not silently discard a queued track switch: the
+    /// newest position wins, explicit track choices carry forward.
+    #[test]
+    fn scrub_keeps_the_queued_track_switch() {
+        let switch = PendingSeek {
+            generation: 1,
+            position_ms: 1000,
+            audio_track: Some(1),
+            video_track: None,
+        };
+        let scrub = PendingSeek {
+            generation: 2,
+            position_ms: 9000,
+            audio_track: None,
+            video_track: None,
+        };
+        let merged = PendingSeek::merge(Some(switch), scrub);
+        assert_eq!(merged.generation, 2);
+        assert_eq!(merged.position_ms, 9000, "newest position wins");
+        assert_eq!(merged.audio_track, Some(1), "track choice survives");
+        // And an explicit newer choice overrides an older one.
+        let re_switch = PendingSeek {
+            generation: 3,
+            position_ms: 9000,
+            audio_track: Some(0),
+            video_track: None,
+        };
+        assert_eq!(PendingSeek::merge(Some(merged), re_switch).audio_track, Some(0));
     }
 }
