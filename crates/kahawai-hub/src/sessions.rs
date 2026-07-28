@@ -758,6 +758,10 @@ impl Sessions {
         sink: &str,
     ) -> Result<RemuxRunner> {
         let dir = self.scratch_root.join(session_id);
+        // ALWAYS from a clean dir: a crashed first attempt leaves its
+        // socket (EADDRINUSE killed the TC-6 fallback) and a stale
+        // playlist the readiness check would mistake for output.
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
         anyhow::ensure!(!parts.is_empty(), "no source parts for the session");
 

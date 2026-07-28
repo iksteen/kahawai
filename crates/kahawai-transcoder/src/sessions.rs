@@ -129,6 +129,7 @@ impl Runner {
         self.end(session_id).await;
         let run = self.run_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let dir = self.scratch_root.join(session_id).join(format!("r{run}"));
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
 
         // One socket per part of a split source (CD1/CD2): the worker

@@ -143,6 +143,18 @@ async fn main() -> Result<()> {
         Cmd::Mediahost => run_mediahost(cfg.mediahost).await,
         Cmd::Doctor { json } => doctor(&cfg, json),
         Cmd::RemuxWorker { socket, out_dir, size, video, audio, audio_track, video_track, start_ms, sink, parts, video_kbps, max_height, max_channels } => {
+            // Die WITH the supervisor: kill_on_drop only fires inside a
+            // living parent, so a hub/transcoder restart used to orphan
+            // pipeline workers indefinitely (one survived three days).
+            // PDEATHSIG is the kernel's guarantee; the getppid check
+            // closes the race where the parent died before prctl ran.
+            #[cfg(target_os = "linux")]
+            unsafe {
+                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+                if libc::getppid() == 1 {
+                    anyhow::bail!("supervisor already gone; not starting");
+                }
+            }
             // Blocking by design: this process exists only for the pipeline.
             kahawai_media::demote_elements(&cfg.transcoder.demote_decoders)?;
             let mut all = vec![(socket, size)];
