@@ -1748,8 +1748,13 @@ async fn list_items(
             let order_c = items_order_c(q.sort.as_deref());
             let sql = item_page_sql(
                 &format!(
+                    // +c.kind: degraded on purpose. As a plain term the
+                    // 5-value IN steers the planner onto items_kind_title
+                    // and every candidate pays a random table probe for
+                    // its LIKE columns — a search predicate this dense
+                    // (LIKE over most rows) wants the sequential scan.
                     "SELECT c.id AS item_id FROM items c
-                      WHERE c.kind IN ('movie', 'show', 'album', 'episode', 'track') {member}
+                      WHERE +c.kind IN ('movie', 'show', 'album', 'episode', 'track') {member}
                         AND (c.norm_title LIKE '%' || ?3 || '%'
                              OR c.sort_title LIKE '%' || ?3 || '%'
                              -- Artist matches ALBUMS only. A track row for
@@ -1776,8 +1781,9 @@ async fn list_items(
                 offset as i64 + rows.len() as i64
             } else {
                 let count = format!(
+                    // Same +c.kind degrade as the page query above.
                     "SELECT COUNT(*) FROM items c
-                      WHERE c.kind IN ('movie', 'show', 'album', 'episode', 'track') {member}
+                      WHERE +c.kind IN ('movie', 'show', 'album', 'episode', 'track') {member}
                         AND (c.norm_title LIKE '%' || ?3 || '%'
                              OR c.sort_title LIKE '%' || ?3 || '%'
                              OR (c.kind = 'album' AND c.norm_artist LIKE '%' || ?3 || '%'))"
