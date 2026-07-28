@@ -299,6 +299,19 @@ pub const GENERIC_SELECTION_SQL: &str =
              ORDER BY i.title";
 
 
+/// Is this error, anywhere in its chain, an HTTP 404? A mapped id that
+/// the provider answers 404 for is an ANSWER — "no such record" (legacy
+/// series ids TVDB v4 dropped, movies that changed namespace) — and
+/// must record its question and decline terminally, not reschedule
+/// forever as if the network had hiccuped.
+fn is_http_404(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| {
+        c.downcast_ref::<reqwest::Error>()
+            .and_then(reqwest::Error::status)
+            .is_some_and(|s| s == reqwest::StatusCode::NOT_FOUND)
+    })
+}
+
 pub(crate) fn fold(s: &str) -> String {
     use unicode_normalization::UnicodeNormalization;
     const WORDS: &[(&str, &str)] = &[
@@ -2900,7 +2913,15 @@ impl TmdbProvider {
                 {
                     return Ok(crate::providers::Outcome::NotApplicable);
                 }
-                let c = self.enricher.tmdb_details(&self.key, &item.kind, id).await?;
+                let c = match self.enricher.tmdb_details(&self.key, &item.kind, id).await {
+                    Ok(c) => c,
+                    Err(e) if is_http_404(&e) => {
+                        crate::providers::record_question(db, &item.id, "tmdb", "mapped_id", &q)
+                            .await;
+                        return Ok(crate::providers::Outcome::Declined);
+                    }
+                    Err(e) => return Err(e),
+                };
                 crate::providers::record_question(db, &item.id, "tmdb", "mapped_id", &q).await;
                 c
             }
@@ -3078,7 +3099,15 @@ impl crate::providers::Provider for TvdbProvider {
             if !crate::providers::question_pending(db, &item.id, "tvdb", "mapped_id", &q).await {
                 return Ok(crate::providers::Outcome::NotApplicable);
             }
-            let c = self.enricher.tvdb_details(&self.token, &item.kind, tvdb_id).await?;
+            let c = match self.enricher.tvdb_details(&self.token, &item.kind, tvdb_id).await {
+                Ok(c) => c,
+                Err(e) if is_http_404(&e) => {
+                    crate::providers::record_question(db, &item.id, "tvdb", "mapped_id", &q)
+                        .await;
+                    return Ok(crate::providers::Outcome::Declined);
+                }
+                Err(e) => return Err(e),
+            };
             crate::providers::record_question(db, &item.id, "tvdb", "mapped_id", &q).await;
             let pick = (c, "auto");
             self.enricher
