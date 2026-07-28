@@ -382,7 +382,15 @@ export default function Detail({
       } catch {
         // prefs unavailable → no cap
       }
-      const session = await startSession(item!.id, buildProfile(cap), start, audioTrack)
+      // Source-aware precision: probe the exact strings the announced
+      // streams call for (profile/level from the hub's own probing).
+      const announced = item!.sources_detail.flatMap((s) => s.streams?.video ?? [])
+      const session = await startSession(
+        item!.id,
+        buildProfile(cap, announced),
+        start,
+        audioTrack,
+      )
       onPlay(item!, session, start)
     } catch (e) {
       setError(String(e))

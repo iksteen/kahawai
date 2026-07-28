@@ -137,7 +137,7 @@ export type Item = {
 export type StreamInfo = {
   container?: string
   duration_ms?: number
-  video?: { codec: string; width: number; height: number }[]
+  video?: { codec: string; width: number; height: number; profile?: string | null; level?: string | null }[]
   audio?: { codec: string; channels: number; language?: string | null }[]
   subtitles?: { format: string; language?: string | null }[]
 }

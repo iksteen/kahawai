@@ -46,10 +46,74 @@ function supported(mime: string): boolean {
   return v.canPlayType(mime) !== ''
 }
 
+// ---- Source-aware refinement (HUB-14 precision) ----
+//
+// The generic matrix answers "does this browser know the codec FAMILY";
+// the announced source metadata lets us ask the exact question: build
+// the RFC-6381 string for the stream's own profile/level and probe
+// THAT. A passing probe becomes a precise VideoCap (the hub admits any
+// matching cap, so precise entries compose with the family floor).
+
+/// GStreamer caps profile → avc1 profile_idc+constraint bytes.
+const H264_PROFILE_HEX: Record<string, string> = {
+  'constrained-baseline': '42E0',
+  baseline: '4200',
+  main: '4D40',
+  high: '6400',
+  'high-10': '6E00',
+}
+
+/// "4.1" → "29" (hex of 41); undefined on junk.
+function h264LevelHex(level: string): string | undefined {
+  const [maj, min = '0'] = level.split('.')
+  const n = Number(maj) * 10 + Number(min)
+  return Number.isFinite(n) && n > 0 ? n.toString(16).toUpperCase().padStart(2, '0') : undefined
+}
+
+type AnnouncedVideo = { codec: string; profile?: string | null; level?: string | null }
+
+/// The exact codec string for an announced stream, or undefined when
+/// the metadata predates the probe extension (generic floor applies).
+function rfc6381(v: AnnouncedVideo): string | undefined {
+  if (!v.profile || !v.level) return undefined
+  if (v.codec === 'h264') {
+    const p = H264_PROFILE_HEX[v.profile]
+    const l = h264LevelHex(v.level)
+    return p && l ? `video/mp4; codecs="avc1.${p}${l}"` : undefined
+  }
+  if (v.codec === 'hevc') {
+    const [maj, min = '0'] = v.level.split('.')
+    const n = (Number(maj) * 10 + Number(min)) * 3
+    if (!Number.isFinite(n) || n <= 0) return undefined
+    if (v.profile === 'main') return `video/mp4; codecs="hvc1.1.6.L${n}.B0"`
+    if (v.profile === 'main-10') return `video/mp4; codecs="hvc1.2.4.L${n}.B0"`
+  }
+  return undefined
+}
+
+/// Precise caps for every announced video stream this browser verified.
+function refineForSources(streams: AnnouncedVideo[]): VideoCap[] {
+  const out: VideoCap[] = []
+  const seen = new Set<string>()
+  for (const v of streams) {
+    const key = `${v.codec}/${v.profile}/${v.level}`
+    if (seen.has(key)) continue
+    seen.add(key)
+    const mime = rfc6381(v)
+    if (mime && supported(mime)) {
+      out.push({ codec: v.codec, max_profile: v.profile!, max_level: v.level! })
+    }
+  }
+  return out
+}
+
 /** Probe once per page load; the result only changes with the browser. */
 let cached: CapabilityProfile | null = null
 
-export function buildProfile(bandwidthKbps?: number | null): CapabilityProfile {
+export function buildProfile(
+  bandwidthKbps?: number | null,
+  announced?: AnnouncedVideo[],
+): CapabilityProfile {
   if (!cached) {
     cached = {
       containers: CONTAINER_PROBES.filter(([, m]) => supported(m)).map(([n]) => n),
@@ -67,7 +131,10 @@ export function buildProfile(bandwidthKbps?: number | null): CapabilityProfile {
     if (cached.audio.length === 0) cached.audio = ['aac', 'mp3']
     if (cached.containers.length === 0) cached.containers = ['mp4']
   }
-  const p = { ...cached }
+  const p = { ...cached, video: [...cached.video] }
   if (bandwidthKbps && bandwidthKbps > 0) p.max_bandwidth_kbps = bandwidthKbps
+  // Exact per-stream verifications ride ALONGSIDE the family floor —
+  // the hub admits a stream when any cap for its codec does.
+  if (announced?.length) p.video.push(...refineForSources(announced))
   return p
 }

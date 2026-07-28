@@ -92,15 +92,12 @@ fn level_num(level: &str) -> Option<u32> {
     Some(major * 10 + minor)
 }
 
-/// Does the client's video capability admit this source stream for
-/// COPY? Codec name is a hard gate; profile/level compare only when
-/// BOTH sides state one (unknown-permissive on either side).
-fn video_fits(profile: &CapabilityProfile, v: &kahawai_core::media::VideoStream) -> bool {
-    let Some(cap) = profile.video.iter().find(|c| c.codec == v.codec) else {
-        return false;
-    };
+/// Does one declared capability admit this stream? Codec name is a
+/// hard gate; profile/level compare only when BOTH sides state one
+/// (unknown-permissive on either side).
+fn cap_admits(codec: &str, cap: &kahawai_core::media::VideoCap, v: &kahawai_core::media::VideoStream) -> bool {
     if let (Some(have), Some(max)) = (v.profile.as_deref(), cap.max_profile.as_deref())
-        && let (Some(h), Some(m)) = (profile_rank(&v.codec, have), profile_rank(&v.codec, max))
+        && let (Some(h), Some(m)) = (profile_rank(codec, have), profile_rank(codec, max))
         && h > m
     {
         return false;
@@ -108,6 +105,23 @@ fn video_fits(profile: &CapabilityProfile, v: &kahawai_core::media::VideoStream)
     if let (Some(have), Some(max)) = (v.level.as_deref(), cap.max_level.as_deref())
         && let (Some(h), Some(m)) = (level_num(have), level_num(max))
         && h > m
+    {
+        return false;
+    }
+    true
+}
+
+/// Does the client's video capability admit this source stream for
+/// COPY? A profile may carry SEVERAL caps per codec (a generic family
+/// entry plus source-aware exact probes) — ANY admitting cap suffices,
+/// which is what lets a precise "High 4.1 verified" coexist with the
+/// family floor without weakening either.
+fn video_fits(profile: &CapabilityProfile, v: &kahawai_core::media::VideoStream) -> bool {
+    if !profile
+        .video
+        .iter()
+        .filter(|c| c.codec == v.codec)
+        .any(|c| cap_admits(&v.codec, c, v))
     {
         return false;
     }
@@ -374,6 +388,46 @@ mod tests {
         let sp = negotiate(&able, &info, 0, 0, true, None);
         assert_eq!(sp.subtitles[1].tier, SubtitleTier::Text);
         assert_eq!(sp.subtitles[2].tier, SubtitleTier::Graphics);
+    }
+
+    /// Multiple caps per codec compose: an exact source-aware probe and
+    /// the generic family floor each admit what THEY verified.
+    #[test]
+    fn any_cap_per_codec_admits() {
+        let mut p = chrome();
+        // Precise-only declaration: High 4.1 verified, nothing else.
+        p.video = vec![VideoCap {
+            codec: "h264".into(),
+            max_profile: Some("high".into()),
+            max_level: Some("4.1".into()),
+        }];
+        let ok = VideoStream {
+            profile: Some("high".into()),
+            level: Some("4.1".into()),
+            ..vs("h264")
+        };
+        let sp = negotiate(&p, &media("matroska", Some(ok), Some(au("aac", 2))), 0, 0, true, None);
+        assert_eq!(sp.plan.video, StreamMode::Copy);
+        let over = VideoStream {
+            profile: Some("high-10".into()),
+            level: Some("4.1".into()),
+            ..vs("h264")
+        };
+        let sp = negotiate(&p, &media("matroska", Some(over), Some(au("aac", 2))), 0, 0, true, None);
+        assert_eq!(sp.cost, Cost::VideoEncode, "the precise cap must reject high-10");
+        // Adding a second, higher cap for the same codec admits it.
+        p.video.push(VideoCap {
+            codec: "h264".into(),
+            max_profile: Some("high-10".into()),
+            max_level: Some("4.1".into()),
+        });
+        let over = VideoStream {
+            profile: Some("high-10".into()),
+            level: Some("4.1".into()),
+            ..vs("h264")
+        };
+        let sp = negotiate(&p, &media("matroska", Some(over), Some(au("aac", 2))), 0, 0, true, None);
+        assert_eq!(sp.plan.video, StreamMode::Copy, "any admitting cap suffices");
     }
 
     /// The fallback profile reproduces plan_streams(WEB_TARGET) on the
