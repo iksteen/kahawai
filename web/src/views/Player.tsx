@@ -75,6 +75,9 @@ export default function Player({
   // The <track> URL must shift cues when the HLS timeline starts mid-file;
   // bump on seek-restarts so the track reloads with the new shift.
   const [trackEpoch, setTrackEpoch] = useState(0)
+  // Live stream verdicts: a track switch re-plans server-side and the
+  // overlay must describe what plays NOW.
+  const [streams, setStreams] = useState(session.streams)
 
   useEffect(() => {
     // One resolution (HUB-33), same helper Detail used to start the
@@ -130,6 +133,7 @@ export default function Player({
     try {
       const absMs = offsetRef.current + video.currentTime * 1000
       const r = await seekSession(session.session_id, absMs, audio, video_)
+      if (r.streams) setStreams(r.streams)
       partBaseRef.current = r.part_base_ms ?? 0
       offsetRef.current = Math.round(absMs)
       setPosMs(offsetRef.current)
@@ -698,13 +702,11 @@ export default function Player({
       )}
       <div className="playback-info mono">
         {item.title} · {session.mode}
-        {session.streams
-          ? ` · video: ${session.streams.video} · audio: ${session.streams.audio}`
-          : ''}{' '}
+        {streams ? ` · video: ${streams.video} · audio: ${streams.audio}` : ''}{' '}
         · {session.content_type}
-        {session.streams?.subtitles?.length ? (
+        {streams?.subtitles?.length ? (
           <div className="dim">
-            {session.streams.subtitles
+            {streams.subtitles
               .map(
                 (s) =>
                   `subs ${s.format}${s.language ? `/${s.language}` : ''}: ${s.tier}` +

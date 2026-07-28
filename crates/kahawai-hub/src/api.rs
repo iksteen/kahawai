@@ -950,7 +950,7 @@ async fn admin_sessions(State(state): State<AppState>) -> Result<Json<Value>, Ap
             },
             "module_id": s.module_id,
             "idle_secs": s.idle_for().as_secs(),
-            "streams": s.verdict.as_ref().map(|(video, audio)| json!({
+            "streams": s.verdict.lock().unwrap().as_ref().map(|(video, audio)| json!({
                 "video": video,
                 "audio": audio,
             })),
@@ -1237,7 +1237,7 @@ async fn start_session(
             "parts": session.parts.len(),
             "content_type": ctype,
             "stream_url": stream_url,
-            "streams": session.verdict.as_ref().map(|(video, audio)| json!({
+            "streams": session.verdict.lock().unwrap().as_ref().map(|(video, audio)| json!({
                 "video": video,
                 "audio": audio,
                 // Additive (HUB-32a/b): per-subtitle tier verdicts on
@@ -1268,7 +1268,15 @@ async fn seek_session(
         .seek(&state.registry, &id, body.position_ms, body.audio_track, body.video_track)
         .await
         .map_err(|e| (StatusCode::CONFLICT, format!("{e:#}")))?;
-    Ok(Json(json!({ "part_base_ms": part_base_ms })))
+    // A track switch re-planned: hand back the verdicts of what plays
+    // NOW so the overlay never lies about the current streams.
+    let session = state.sessions.get(&id);
+    let streams = session.as_ref().and_then(|s| {
+        s.verdict.lock().unwrap().as_ref().map(|(video, audio)| {
+            json!({ "video": video, "audio": audio, "subtitles": s.sub_verdicts })
+        })
+    });
+    Ok(Json(json!({ "part_base_ms": part_base_ms, "streams": streams })))
 }
 
 async fn end_session(

@@ -468,7 +468,7 @@ export function seekSession(
   positionMs: number,
   audioTrack?: number,
   videoTrack?: number,
-): Promise<{ part_base_ms: number }> {
+): Promise<{ part_base_ms: number; streams?: StreamVerdict | null }> {
   return json(`/api/v1/playback/sessions/${sessionId}/seek`, {
     method: 'POST',
     body: JSON.stringify({

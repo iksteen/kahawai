@@ -92,8 +92,10 @@ pub struct Session {
     pub duration_ms: Option<u64>,
     pub mode: Mode,
     /// Per-kind stream verdict (remux sessions): what happened to video
-    /// and audio, for the player's playback-info overlay.
-    pub verdict: Option<(String, String)>,
+    /// and audio, for the player's playback-info overlay. LIVE state: a
+    /// track switch re-plans and the verdict must say what is playing
+    /// NOW, not what played at session start.
+    pub verdict: Mutex<Option<(String, String)>>,
     /// Per-subtitle-stream tier verdicts (HUB-32a/b) — additive in the
     /// API response.
     pub sub_verdicts: Vec<kahawai_media::negotiate::SubtitleVerdict>,
@@ -710,7 +712,7 @@ impl Sessions {
             parts,
             current_part: std::sync::atomic::AtomicUsize::new(start_idx),
             mode: session_mode,
-            verdict,
+            verdict: Mutex::new(verdict),
             sub_verdicts: negotiated.subtitles,
             profile,
             plan: Mutex::new(session_plan),
@@ -1158,16 +1160,18 @@ impl Sessions {
             // copy vs encode, not the old one's.
             let (_, _, _, info) =
                 crate::subtitles::source_row(registry, &session.item_id).await?;
-            plan = kahawai_media::negotiate::negotiate(
+            let sp = kahawai_media::negotiate::negotiate(
                 &session.profile,
                 &info,
                 want_audio,
                 want_video,
                 session.parts.len() == 1,
                 None,
-            )
-            .plan;
+            );
+            plan = sp.plan;
             anyhow::ensure!(plan.playable(), "selected track is not playable");
+            *session.verdict.lock().unwrap() =
+                Some((sp.video_verdict.clone(), sp.audio_verdict.clone()));
             *session.plan.lock().unwrap() = Some(plan);
         }
         // Map the absolute position onto the right part (single-part
