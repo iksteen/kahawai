@@ -220,6 +220,85 @@ pub fn pick_candidate<'c>(
 /// Diacritic + number-word folding on top of kahawai's normalization:
 /// rips say "Leon" and "12 Monkeys", TMDB says "Léon" and "Twelve
 /// Monkeys" — same films.
+/// The generic pass's selection (movies/series; anime items are carved
+/// out to their own pass). Extracted so `scale_bench` can time the real
+/// statement: this runs at the top of every enrichment pass, so its
+/// quiescent cost at catalogue scale is a standing tax. Binds ?1 =
+/// [`crate::providers::QUERY_REV`].
+pub const GENERIC_SELECTION_SQL: &str =
+            "SELECT i.id, i.kind, i.title, i.norm_title, i.year,
+                    (SELECT s.path_rel FROM item_sources s
+                     WHERE s.item_id = i.id LIMIT 1) AS src_path,
+                    -- Movies and series have separate chains (HUB-5), so
+                    -- the walk needs each item's OWN media type.
+                    c0.media_type AS media_type
+             FROM items i
+             LEFT JOIN collections c0 ON (c0.module_id, c0.collection_id) = (
+                 SELECT s3.module_id, s3.collection_id FROM item_sources s3
+                 WHERE s3.item_id = i.id
+                    OR s3.item_id IN (SELECT id FROM items WHERE parent_id = i.id)
+                 LIMIT 1)
+             WHERE i.kind IN ('movie', 'show')
+               AND (
+                    -- HUB-5: a searcher is owed work while its CURRENT
+                    -- title question has no provider_queries row and no
+                    -- real answer stands. Never-matched, renamed and
+                    -- QUERY_REV-bumped items all land here; misses never
+                    -- gate. tmdb/tvdb are the generic pass's network
+                    -- searchers (mirrors the ProviderSet the pass builds).
+                    EXISTS (
+                      SELECT 1 FROM (SELECT 'tmdb' AS p UNION ALL SELECT 'tvdb') sp
+                      WHERE NOT EXISTS (
+                          SELECT 1 FROM provider_metadata pm
+                          WHERE pm.item_id = i.id AND pm.provider = sp.p
+                            AND pm.provider_id <> '')
+                        AND NOT EXISTS (
+                          SELECT 1 FROM provider_queries q
+                          WHERE q.item_id = i.id AND q.provider = sp.p
+                            AND q.query_type = 'title'
+                            AND q.query = i.norm_title || '|' || COALESCE(i.year, '')
+                            AND q.rev >= ?1))
+                    -- HUB-9: local owes an answer. Gated on there
+                    -- actually being something beside the media, or an
+                    -- item with no cover and no .nfo would be re-selected
+                    -- every run for a provider that stores nothing.
+                    -- local's answer and what the scan can see disagree,
+                    -- in either direction: a sidecar appeared and nobody
+                    -- has read it, or the one it was built from is gone
+                    -- and the answer now describes a deleted file.
+                    OR (EXISTS (SELECT 1 FROM provider_metadata pl
+                                 WHERE pl.item_id = i.id AND pl.provider = 'local'
+                                   AND pl.provider_id <> '')
+                        != (i.id IN (SELECT COALESCE(ch.parent_id, ch.id)
+                                       FROM item_sources s5
+                                       JOIN files f5 ON (f5.module_id, f5.collection_id, f5.path_rel)
+                                                      = (s5.module_id, s5.collection_id, s5.path_rel)
+                                       JOIN items ch ON ch.id = s5.item_id
+                                      WHERE json_extract(f5.streams_json, '$.nfo') IS NOT NULL)))
+                    OR (NOT EXISTS (SELECT 1 FROM provider_metadata pl
+                                     WHERE pl.item_id = i.id AND pl.provider = 'local')
+                        AND i.id IN (SELECT COALESCE(ch.parent_id, ch.id)
+                                       FROM item_sources s4
+                                       JOIN files f4 ON (f4.module_id, f4.collection_id, f4.path_rel)
+                                                      = (s4.module_id, s4.collection_id, s4.path_rel)
+                                       JOIN items ch ON ch.id = s4.item_id
+                                      WHERE json_extract(f4.streams_json, '$.artwork') IS NOT NULL
+                                         OR json_extract(f4.streams_json, '$.nfo') IS NOT NULL))
+                    -- or a provider refused and is due again (bans and
+                    -- rate limits reschedule, they never drop work).
+                    OR EXISTS (
+                      SELECT 1 FROM enrichment_queue q
+                      WHERE q.item_id = i.id AND q.due_at <= unixepoch()))
+               AND NOT EXISTS (
+                 SELECT 1 FROM item_sources s2
+                 JOIN collections c2 ON (c2.module_id, c2.collection_id)
+                                      = (s2.module_id, s2.collection_id)
+                 WHERE c2.media_type = 'anime'
+                   AND (s2.item_id = i.id
+                        OR s2.item_id IN (SELECT id FROM items WHERE parent_id = i.id)))
+             ORDER BY i.title";
+
+
 pub(crate) fn fold(s: &str) -> String {
     use unicode_normalization::UnicodeNormalization;
     const WORDS: &[(&str, &str)] = &[
@@ -715,82 +794,10 @@ impl Enricher {
         if let Err(e) = self.enrich_anime(registry, &providers, anime_items).await {
             tracing::warn!(error = format!("{e:#}"), "anime enrichment failed");
         }
-        let items = sqlx::query(
-            "SELECT i.id, i.kind, i.title, i.year,
-                    (SELECT s.path_rel FROM item_sources s
-                     WHERE s.item_id = i.id LIMIT 1) AS src_path,
-                    -- Movies and series have separate chains (HUB-5), so
-                    -- the walk needs each item's OWN media type.
-                    c0.media_type AS media_type
-             FROM items i
-             LEFT JOIN collections c0 ON (c0.module_id, c0.collection_id) = (
-                 SELECT s3.module_id, s3.collection_id FROM item_sources s3
-                 WHERE s3.item_id = i.id
-                    OR s3.item_id IN (SELECT id FROM items WHERE parent_id = i.id)
-                 LIMIT 1)
-             WHERE i.kind IN ('movie', 'show')
-               AND (
-                    -- Never matched, and not because a human refused
-                    -- everything it holds — that one waits for a record
-                    -- that is not refused rather than being re-asked.
-                    (NOT EXISTS (SELECT 1 FROM item_match m WHERE m.item_id = i.id)
-                     AND NOT EXISTS (SELECT 1 FROM rejected_matches rj
-                                      WHERE rj.item_id = i.id))
-                    -- HUB-5: every provider in the chain answers once,
-                    -- whatever the order — so an item needs work while
-                    -- any of them has never been asked.
-                    OR EXISTS (
-                      SELECT 1 FROM provider_ranks r
-                      WHERE r.media_type = CASE
-                              WHEN c0.media_type IN ('movies','series','anime','music')
-                              THEN c0.media_type ELSE 'movies' END
-                        AND NOT EXISTS (
-                          SELECT 1 FROM provider_metadata pm
-                          WHERE pm.item_id = i.id
-                            AND (pm.provider = r.provider
-                                 OR (r.provider = 'anime' AND pm.provider = 'anilist'))))
-                    -- HUB-9: local owes an answer. Gated on there
-                    -- actually being something beside the media, or an
-                    -- item with no cover and no .nfo would be re-selected
-                    -- every run for a provider that stores nothing.
-                    -- local's answer and what the scan can see disagree,
-                    -- in either direction: a sidecar appeared and nobody
-                    -- has read it, or the one it was built from is gone
-                    -- and the answer now describes a deleted file.
-                    OR (EXISTS (SELECT 1 FROM provider_metadata pl
-                                 WHERE pl.item_id = i.id AND pl.provider = 'local'
-                                   AND pl.provider_id <> '')
-                        != (i.id IN (SELECT COALESCE(ch.parent_id, ch.id)
-                                       FROM item_sources s5
-                                       JOIN files f5 ON (f5.module_id, f5.collection_id, f5.path_rel)
-                                                      = (s5.module_id, s5.collection_id, s5.path_rel)
-                                       JOIN items ch ON ch.id = s5.item_id
-                                      WHERE json_extract(f5.streams_json, '$.nfo') IS NOT NULL)))
-                    OR (NOT EXISTS (SELECT 1 FROM provider_metadata pl
-                                     WHERE pl.item_id = i.id AND pl.provider = 'local')
-                        AND i.id IN (SELECT COALESCE(ch.parent_id, ch.id)
-                                       FROM item_sources s4
-                                       JOIN files f4 ON (f4.module_id, f4.collection_id, f4.path_rel)
-                                                      = (s4.module_id, s4.collection_id, s4.path_rel)
-                                       JOIN items ch ON ch.id = s4.item_id
-                                      WHERE json_extract(f4.streams_json, '$.artwork') IS NOT NULL
-                                         OR json_extract(f4.streams_json, '$.nfo') IS NOT NULL))
-                    -- or a provider refused and is due again (bans and
-                    -- rate limits reschedule, they never drop work).
-                    OR EXISTS (
-                      SELECT 1 FROM enrichment_queue q
-                      WHERE q.item_id = i.id AND q.due_at <= unixepoch()))
-               AND NOT EXISTS (
-                 SELECT 1 FROM item_sources s2
-                 JOIN collections c2 ON (c2.module_id, c2.collection_id)
-                                      = (s2.module_id, s2.collection_id)
-                 WHERE c2.media_type = 'anime'
-                   AND (s2.item_id = i.id
-                        OR s2.item_id IN (SELECT id FROM items WHERE parent_id = i.id)))
-             ORDER BY i.title",
-        )
-        .fetch_all(registry.db())
-        .await?;
+        let items = sqlx::query(GENERIC_SELECTION_SQL)
+            .bind(crate::providers::QUERY_REV)
+            .fetch_all(registry.db())
+            .await?;
         tracing::info!(items = items.len(), "enrichment run starting");
 
         let sem = Arc::new(tokio::sync::Semaphore::new(4));
@@ -821,8 +828,10 @@ impl Enricher {
                 id,
                 kind,
                 title,
+                norm_title: row.get("norm_title"),
                 year,
                 artist: None,
+                norm_artist: None,
                 alt,
                 existing: None,
                 manual: false,
@@ -881,18 +890,22 @@ impl Enricher {
         providers: &Arc<crate::providers::ProviderSet>,
     ) -> Result<()> {
         let albums = sqlx::query(
-            "SELECT i.id, i.title, i.artist FROM items i
+            "SELECT i.id, i.title, i.norm_title, i.artist, i.norm_artist FROM items i
              WHERE i.kind = 'album' AND i.artist IS NOT NULL
-               AND (NOT EXISTS (SELECT 1 FROM item_match m WHERE m.item_id = i.id)
-                    -- Same rule as the video pass: the chain owes an answer
-                    -- while any ranked provider has never been asked, which
-                    -- is what brings `local` to an already-matched album.
-                    OR EXISTS (
-                      SELECT 1 FROM provider_ranks r
-                      WHERE r.media_type = 'music'
-                        AND NOT EXISTS (
-                          SELECT 1 FROM provider_metadata pm
-                          WHERE pm.item_id = i.id AND pm.provider = r.provider))
+               AND (
+                    -- Same rule as the video pass: MusicBrainz is owed
+                    -- work while its CURRENT question has no
+                    -- provider_queries row and no real answer stands.
+                    (NOT EXISTS (
+                       SELECT 1 FROM provider_metadata pm
+                       WHERE pm.item_id = i.id AND pm.provider = 'musicbrainz'
+                         AND pm.provider_id <> '')
+                     AND NOT EXISTS (
+                       SELECT 1 FROM provider_queries q
+                       WHERE q.item_id = i.id AND q.provider = 'musicbrainz'
+                         AND q.query_type = 'title'
+                         AND q.query = COALESCE(i.norm_artist, '') || '|' || i.norm_title
+                         AND q.rev >= ?1))
                     -- HUB-9: local owes an answer. Gated on there
                     -- actually being something beside the media, or an
                     -- item with no cover and no .nfo would be re-selected
@@ -927,6 +940,7 @@ impl Enricher {
                       WHERE q.item_id = i.id AND q.due_at <= unixepoch()))
              ORDER BY i.title",
         )
+        .bind(crate::providers::QUERY_REV)
         .fetch_all(registry.db())
         .await?;
         if albums.is_empty() {
@@ -939,8 +953,10 @@ impl Enricher {
                 id: row.get("id"),
                 kind: "album".into(),
                 title: row.get("title"),
+                norm_title: row.get("norm_title"),
                 year: None,
                 artist: row.get("artist"),
+                norm_artist: row.get("norm_artist"),
                 alt: None,
                 existing: None,
                 manual: false,
@@ -1038,12 +1054,13 @@ impl Enricher {
     /// Anime items needing the chain: unidentified ones, plus matched
     /// items whose files gained ED2K hashes AniDB hasn't been asked
     /// about — a late hash is canonical and re-verifies a name match.
-    async fn select_anime_items(
+    pub async fn select_anime_items(
         &self,
         registry: &Registry,
     ) -> Result<Vec<crate::providers::ItemRef>> {
         let rows = sqlx::query(
-            "SELECT DISTINCT i.id, i.kind, i.title, i.year,
+            "SELECT DISTINCT i.id, i.kind, i.title, i.norm_title, i.year,
+                    i.artist, i.norm_artist,
                     m.provider, m.provider_id, COALESCE(m.manual, 0) AS manual,
                     a.anidb_id, a.anilist_id
              FROM items i
@@ -1063,23 +1080,40 @@ impl Enricher {
                                                   = (s.module_id, s.collection_id)
                              WHERE c.media_type = 'anime')
                AND (
-                 -- Unmatched, unless a human refused everything it holds.
-                 (m.item_id IS NULL
-                  AND NOT EXISTS (SELECT 1 FROM rejected_matches rj
-                                   WHERE rj.item_id = i.id))
-                 -- Identity not bridged yet: the anime chain's whole job.
-                 OR a.anilist_id IS NULL
-                 -- HUB-5: the tail answers too, whatever the order —
-                 -- so this item needs work while any chain provider has
-                 -- never been asked, or one is due again after refusing.
-                 OR EXISTS (
-                   SELECT 1 FROM provider_ranks r
-                   WHERE r.media_type = 'anime'
-                     AND NOT EXISTS (
-                       SELECT 1 FROM provider_metadata pm
-                       WHERE pm.item_id = i.id
-                         AND (pm.provider = r.provider
-                              OR (r.provider = 'anime' AND pm.provider = 'anilist'))))
+                 -- The NAME question is owed: no anime identity stands
+                 -- and the current title anchor was never asked. A
+                 -- repaired title or a QUERY_REV bump re-opens this
+                 -- automatically; misses never gate (HUB-5).
+                 (NOT EXISTS (SELECT 1 FROM provider_metadata pm
+                               WHERE pm.item_id = i.id AND pm.provider = 'anilist'
+                                 AND pm.provider_id <> '')
+                  AND NOT EXISTS (SELECT 1 FROM provider_queries q
+                                   WHERE q.item_id = i.id AND q.provider = 'anime'
+                                     AND q.query_type = 'title'
+                                     AND q.query = i.norm_title || '|' || COALESCE(i.year, '')
+                                     AND q.rev >= ?1))
+                 -- A BRIDGE fetch is owed: identity mapped, no real
+                 -- tail answer, that mapped id never fetched. (TMDB's
+                 -- title-search-while-unowned rides the name branch
+                 -- above — both anchors record in the same walk.)
+                 OR (a.mapped_tmdb IS NOT NULL
+                     AND NOT EXISTS (SELECT 1 FROM provider_metadata pm
+                                      WHERE pm.item_id = i.id AND pm.provider = 'tmdb'
+                                        AND pm.provider_id <> '')
+                     AND NOT EXISTS (SELECT 1 FROM provider_queries q
+                                      WHERE q.item_id = i.id AND q.provider = 'tmdb'
+                                        AND q.query_type = 'mapped_id'
+                                        AND q.query = CAST(a.mapped_tmdb AS TEXT)
+                                        AND q.rev >= ?1))
+                 OR (a.mapped_tvdb IS NOT NULL
+                     AND NOT EXISTS (SELECT 1 FROM provider_metadata pm
+                                      WHERE pm.item_id = i.id AND pm.provider = 'tvdb'
+                                        AND pm.provider_id <> '')
+                     AND NOT EXISTS (SELECT 1 FROM provider_queries q
+                                      WHERE q.item_id = i.id AND q.provider = 'tvdb'
+                                        AND q.query_type = 'mapped_id'
+                                        AND q.query = CAST(a.mapped_tvdb AS TEXT)
+                                        AND q.rev >= ?1))
                     -- HUB-9: local owes an answer. Gated on there
                     -- actually being something beside the media, or an
                     -- item with no cover and no .nfo would be re-selected
@@ -1120,6 +1154,7 @@ impl Enricher {
                                 AND f.ed2k NOT IN (SELECT ed2k FROM ed2k_aid)))
              ORDER BY i.title",
         )
+        .bind(crate::providers::QUERY_REV)
         .fetch_all(registry.db())
         .await?;
         Ok(rows
@@ -1128,8 +1163,10 @@ impl Enricher {
                 id: row.get("id"),
                 kind: row.get("kind"),
                 title: row.get("title"),
+                norm_title: row.get("norm_title"),
                 year: row.get("year"),
-                artist: None,
+                artist: row.get("artist"),
+                norm_artist: row.get("norm_artist"),
                 alt: None,
                 existing: row
                     .get::<Option<String>, _>("provider")
@@ -1259,10 +1296,6 @@ impl Enricher {
         if items.is_empty() {
             return Ok(());
         }
-        let voided = Self::void_unverified_anime_misses(registry.db()).await?;
-        if voided > 0 {
-            tracing::info!(voided, "anime misses voided pending hash verification");
-        }
         tracing::info!(items = items.len(), "anime enrichment starting");
         // HUB-30: per-run budget for episode-hash lookups, shared across
         // shows. The client already paces every packet to AniDB's flood
@@ -1317,33 +1350,6 @@ impl Enricher {
         }
         tracing::info!(matched = done, "anime enrichment complete");
         Ok(())
-    }
-
-    /// A recorded 'anime' miss taken while the item still holds hashed
-    /// files AniDB was never asked about is not a final answer: it was
-    /// decided on name evidence alone while stronger evidence (the
-    /// hash, HUB-30a) sat unconsulted — hashes often land minutes after
-    /// the item was first walked. Void it so the walker re-asks.
-    /// Bounded: every re-ask records one more hash in ed2k_aid, so the
-    /// predicate extinguishes itself; human refusals stay refused.
-    /// (Doomed Megalopolis, 2026-07-28: four hashed files, a permanent
-    /// name-based miss, and no path back.)
-    pub async fn void_unverified_anime_misses(db: &sqlx::SqlitePool) -> Result<u64> {
-        Ok(sqlx::query(
-            "DELETE FROM provider_metadata
-              WHERE provider = 'anime' AND confidence = 'miss'
-                AND item_id NOT IN (SELECT item_id FROM rejected_matches)
-                AND item_id IN (SELECT COALESCE(ch.parent_id, ch.id)
-                                  FROM files f
-                                  JOIN item_sources s ON (s.module_id, s.collection_id, s.path_rel)
-                                                       = (f.module_id, f.collection_id, f.path_rel)
-                                  JOIN items ch ON ch.id = s.item_id
-                                 WHERE f.ed2k IS NOT NULL
-                                   AND f.ed2k NOT IN (SELECT ed2k FROM ed2k_aid))",
-        )
-        .execute(db)
-        .await?
-        .rows_affected())
     }
 
     /// Resolve an item's AniDB id from a representative file's ED2K
@@ -1935,19 +1941,6 @@ impl Enricher {
             .as_ref()
             .and_then(|c| c.extra_large.clone().or_else(|| c.large.clone()));
         let genres = media.genres.clone().unwrap_or_default();
-        // An anime identity invalidates recorded TMDB/TVDB misses: they
-        // answered "who are you by TITLE search" (asked before identity
-        // existed, possibly against a junk-suffixed title), while the
-        // tail now asks by mapped ID — a different question the walker
-        // must be allowed to put. Real answers are left alone.
-        sqlx::query(
-            "DELETE FROM provider_metadata
-              WHERE item_id = ?1 AND provider IN ('tmdb', 'tvdb')
-                AND confidence = 'miss'",
-        )
-        .bind(item_id)
-        .execute(db)
-        .await?;
         // The anime composite's answer (HUB-5). Recorded under
         // 'anilist', which ranks wherever 'anime' sits in the chain, so
         // the TMDB/TVDB tail can fill what AniList leaves empty —
@@ -2901,13 +2894,29 @@ impl TmdbProvider {
                 .flatten();
         let candidate = match (owner, mapped) {
             // Bridged: AniDB decided what this is, TMDB describes it.
-            ("anime", Some(id)) => self.enricher.tmdb_details(&self.key, &item.kind, id).await?,
+            ("anime", Some(id)) => {
+                let q = id.to_string();
+                if !crate::providers::question_pending(db, &item.id, "tmdb", "mapped_id", &q).await
+                {
+                    return Ok(crate::providers::Outcome::NotApplicable);
+                }
+                let c = self.enricher.tmdb_details(&self.key, &item.kind, id).await?;
+                crate::providers::record_question(db, &item.id, "tmdb", "mapped_id", &q).await;
+                c
+            }
             // No mapped id yet — anime-lists refreshes weekly, so this
             // is "cannot ask", not "asked and missed".
             ("anime", None) => return Ok(crate::providers::Outcome::NotApplicable),
             _ => {
+                let anchor = crate::providers::title_anchor(&item.norm_title, item.year);
+                if !crate::providers::question_pending(db, &item.id, "tmdb", "title", &anchor)
+                    .await
+                {
+                    return Ok(crate::providers::Outcome::NotApplicable);
+                }
                 let cands =
                     self.enricher.search(&self.key, &item.kind, &item.title, item.year).await?;
+                crate::providers::record_question(db, &item.id, "tmdb", "title", &anchor).await;
                 match pick_candidate(&cands, &item.title, item.year) {
                     Some((c, _)) => c.clone(),
                     None => return Ok(crate::providers::Outcome::Declined),
@@ -2954,38 +2963,65 @@ impl crate::providers::Provider for TmdbProvider {
         {
             return self.fill_gaps(db, item, owner).await;
         }
+        // The question log gates the network, not the walker: the
+        // ladder's variants are subsumed by the primary anchor (a
+        // ladder change is a derivation change — bump QUERY_REV), the
+        // directory alt-key is its own question.
+        let anchor = crate::providers::title_anchor(&item.norm_title, item.year);
+        let alt_anchor = item.alt.as_ref().map(|a| {
+            crate::providers::title_anchor(
+                &kahawai_core::names::normalize_title(&a.title),
+                a.year.map(|y| y as i64).or(item.year),
+            )
+        });
+        let ask_primary =
+            crate::providers::question_pending(db, &item.id, "tmdb", "title", &anchor).await;
+        let ask_alt = match &alt_anchor {
+            Some(a) => crate::providers::question_pending(db, &item.id, "tmdb", "title", a).await,
+            None => false,
+        };
+        if !ask_primary && !ask_alt {
+            return Ok(crate::providers::Outcome::Declined);
+        }
         // Query ladder: TMDB's search has holes (a literal "And" finds
         // nothing where "&" or a shortened query hits); the strict
         // verifier still judges candidates against the FULL local title.
         let title = &item.title;
-        let mut variants = vec![title.clone()];
-        if title.contains(" And ") || title.contains(" and ") {
-            variants.push(title.replace(" And ", " & ").replace(" and ", " & "));
-        }
-        if title.contains('&') {
-            variants.push(title.replace('&', "and"));
-        }
-        let words: Vec<&str> = title.split_whitespace().collect();
-        if words.len() > 3 {
-            variants.push(words[..words.len() - 1].join(" "));
-            variants.push(words[..words.len() - 2].join(" "));
-        }
         let mut picked: Option<(Candidate, &'static str)> = None;
-        for (vi, q) in variants.iter().enumerate() {
-            let cands = self.enricher.search(&self.key, &item.kind, q, item.year).await?;
-            if let Some((c, conf)) = pick_candidate(&cands, title, item.year) {
-                picked = Some((c.clone(), conf));
-                if vi > 0 {
-                    tracing::debug!(title, variant = %q, "matched via query variant");
-                }
-                break;
+        if ask_primary {
+            let mut variants = vec![title.clone()];
+            if title.contains(" And ") || title.contains(" and ") {
+                variants.push(title.replace(" And ", " & ").replace(" and ", " & "));
             }
+            if title.contains('&') {
+                variants.push(title.replace('&', "and"));
+            }
+            let words: Vec<&str> = title.split_whitespace().collect();
+            if words.len() > 3 {
+                variants.push(words[..words.len() - 1].join(" "));
+                variants.push(words[..words.len() - 2].join(" "));
+            }
+            for (vi, q) in variants.iter().enumerate() {
+                let cands = self.enricher.search(&self.key, &item.kind, q, item.year).await?;
+                if let Some((c, conf)) = pick_candidate(&cands, title, item.year) {
+                    picked = Some((c.clone(), conf));
+                    if vi > 0 {
+                        tracing::debug!(title, variant = %q, "matched via query variant");
+                    }
+                    break;
+                }
+            }
+            crate::providers::record_question(db, &item.id, "tmdb", "title", &anchor).await;
         }
         if picked.is_none()
+            && ask_alt
             && let Some(alt) = &item.alt
         {
             let alt_year = alt.year.map(|y| y as i64).or(item.year);
             let cands = self.enricher.search(&self.key, &item.kind, &alt.title, alt_year).await?;
+            if let Some(a) = &alt_anchor {
+                crate::providers::record_question(db, &item.id, "tmdb", "title", a).await;
+            }
             if let Some((c, conf)) = pick_candidate(&cands, &alt.title, alt_year) {
                 picked = Some((c.clone(), conf));
                 tracing::debug!(title, alt = %alt.title, "matched via directory name");
@@ -3034,14 +3070,24 @@ impl crate::providers::Provider for TvdbProvider {
             let Some(tvdb_id) = mapped else {
                 return Ok(crate::providers::Outcome::NotApplicable);
             };
+            let q = tvdb_id.to_string();
+            if !crate::providers::question_pending(db, &item.id, "tvdb", "mapped_id", &q).await {
+                return Ok(crate::providers::Outcome::NotApplicable);
+            }
             let c = self.enricher.tvdb_details(&self.token, &item.kind, tvdb_id).await?;
+            crate::providers::record_question(db, &item.id, "tvdb", "mapped_id", &q).await;
             let pick = (c, "auto");
             self.enricher
                 .store_answer_for(db, &item.id, "tvdb", Some(&pick), "anime")
                 .await?;
             return Ok(crate::providers::Outcome::Contributed);
         }
+        let anchor = crate::providers::title_anchor(&item.norm_title, item.year);
+        if !crate::providers::question_pending(db, &item.id, "tvdb", "title", &anchor).await {
+            return Ok(crate::providers::Outcome::Declined);
+        }
         let cands = self.enricher.tvdb_search(&self.token, &item.kind, &item.title).await?;
+        crate::providers::record_question(db, &item.id, "tvdb", "title", &anchor).await;
         match pick_candidate(&cands, &item.title, item.year) {
             Some((c, conf)) => {
                 let pick = (c.clone(), conf);
@@ -3103,6 +3149,15 @@ impl crate::providers::Provider for AnimeProvider {
                 _ => return Ok(crate::providers::Outcome::Settled),
             }
         }
+        // The name question is gated by its anchor; the hash side keeps
+        // its own ledger (ed2k_aid). An exact hash hit always proceeds —
+        // it is the identity, whatever was asked before.
+        let anchor = crate::providers::title_anchor(&item.norm_title, item.year);
+        if exact_aid.is_none()
+            && !crate::providers::question_pending(db, &item.id, "anime", "title", &anchor).await
+        {
+            return Ok(crate::providers::Outcome::Declined);
+        }
         let matched = self
             .enricher
             .anime_one(
@@ -3118,6 +3173,7 @@ impl crate::providers::Provider for AnimeProvider {
                 exact_aid,
             )
             .await?;
+        crate::providers::record_question(db, &item.id, "anime", "title", &anchor).await;
         Ok(if matched {
             crate::providers::Outcome::Matched("auto")
         } else {
@@ -3149,9 +3205,18 @@ impl crate::providers::Provider for MusicbrainzProvider {
         let (Some(artist), "album") = (&item.artist, item.kind.as_str()) else {
             return Ok(crate::providers::Outcome::NotApplicable);
         };
+        let anchor =
+            crate::providers::music_anchor(item.norm_artist.as_deref(), &item.norm_title);
+        if !crate::providers::question_pending(db, &item.id, "musicbrainz", "title", &anchor)
+            .await
+        {
+            return Ok(crate::providers::Outcome::Declined);
+        }
         // Pacing lives in the gate now (one request per second, keyed on
         // musicbrainz.org) — a sleep here would only double it.
-        let Some(rg) = self.enricher.musicbrainz_album(&item.title, artist).await? else {
+        let rg = self.enricher.musicbrainz_album(&item.title, artist).await?;
+        crate::providers::record_question(db, &item.id, "musicbrainz", "title", &anchor).await;
+        let Some(rg) = rg else {
             return Ok(crate::providers::Outcome::Declined);
         };
         crate::providers::store_answer(

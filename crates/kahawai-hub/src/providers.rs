@@ -78,8 +78,23 @@
 //!   provider said. `provider_id` is that provider's own record id,
 //!   recorded whether it identified the item or merely described it. An
 //!   EMPTY `provider_id` means one thing only: it looked and found
-//!   nothing, always paired with `confidence = "miss"` — and that pair
-//!   is how never-ask-twice is remembered.
+//!   nothing, always paired with `confidence = "miss"`. A miss is
+//!   PRESENTATION ("consulted, nothing found"), never a gate: the walk
+//!   skips a provider only on a real answer.
+//! * `provider_queries` — never-ask-twice, keyed on the QUESTION: one
+//!   row per (item, provider, query_type, query) a provider actually
+//!   sent over the network. A provider is due while its CURRENT
+//!   question has no row; the row is written when the (possibly empty)
+//!   response arrives, so transport errors retry via the queue.
+//!   `query_type` is 'title' (canonical anchor: `norm_title|year`, or
+//!   `norm_artist|norm_title` for music — the ladder's internal
+//!   variants are subsumed by the anchor) or 'mapped_id' (bridge
+//!   fetch). `rev` is compared against [`QUERY_REV`]; bumping the const
+//!   re-opens every recorded question once. Hash questions live in
+//!   `ed2k_aid` instead: content-keyed, shared across items, the
+//!   stronger dedup. Consequence: a repaired title, a late-arriving
+//!   hash or a derivation fix re-asks automatically — one paced request
+//!   per changed question, ever.
 //! * `provider_ranks` — precedence, one row per chain position, per
 //!   media type. Editable at runtime; changing it re-picks.
 //! * `rejected_matches` — records a human refused. An item where every
@@ -116,8 +131,14 @@ pub struct ItemRef {
     pub id: String,
     pub kind: String,
     pub title: String,
+    /// `items.norm_title`, verbatim — the Rust half of the title
+    /// anchor. Never recompute it here: the SQL half of the anchor
+    /// reads the column, and the two must be one function.
+    pub norm_title: String,
     pub year: Option<i64>,
     pub artist: Option<String>,
+    /// `items.norm_artist`, for the music anchor.
+    pub norm_artist: Option<String>,
     /// Alternative identity from the parent directory name (movies).
     pub alt: Option<kahawai_core::names::MovieGuess>,
     pub existing: Option<(String, String)>,
@@ -661,6 +682,89 @@ async fn answered(db: &SqlitePool, item_id: &str, chain_entry: &str) -> bool {
     providers.iter().any(|p| chain_name(p) == chain_entry)
 }
 
+/// The walk skips a provider only when it holds a REAL answer — a miss
+/// never gates (the question log does). Compare [`answered`], which the
+/// Declined arm still uses so a re-walk does not refresh a miss row.
+async fn has_real_answer(db: &SqlitePool, item_id: &str, chain_entry: &str) -> bool {
+    let providers: Vec<String> = sqlx::query_scalar(
+        "SELECT provider FROM provider_metadata WHERE item_id = ? AND provider_id <> ''",
+    )
+    .bind(item_id)
+    .fetch_all(db)
+    .await
+    .unwrap_or_default();
+    providers.iter().any(|p| chain_name(p) == chain_entry)
+}
+
+/// Bump when query DERIVATION changes — a fold/parser/ladder fix that
+/// alters what would be sent for the same inputs. Every recorded
+/// question becomes stale at once and re-asks exactly once, paced.
+/// (A changed INPUT — title repair, new mapped id — needs no bump: the
+/// anchor text itself changes.)
+pub const QUERY_REV: i64 = 1;
+
+/// The canonical title question: what a title search asks, reduced to
+/// its deciding inputs. SQL twin in the selection queries:
+/// `i.norm_title || '|' || COALESCE(i.year, '')`.
+pub fn title_anchor(norm_title: &str, year: Option<i64>) -> String {
+    format!("{norm_title}|{}", year.map(|y| y.to_string()).unwrap_or_default())
+}
+
+/// The music question. SQL twin:
+/// `COALESCE(i.norm_artist, '') || '|' || i.norm_title`.
+pub fn music_anchor(norm_artist: Option<&str>, norm_title: &str) -> String {
+    format!("{}|{norm_title}", norm_artist.unwrap_or_default())
+}
+
+/// Is this question still owed? `rev >=` (not `=`) so a binary
+/// downgrade does not re-open everything a newer rev already asked.
+pub async fn question_pending(
+    db: &SqlitePool,
+    item_id: &str,
+    provider: &str,
+    query_type: &str,
+    query: &str,
+) -> bool {
+    !sqlx::query_scalar::<_, i64>(
+        "SELECT EXISTS (SELECT 1 FROM provider_queries
+          WHERE item_id = ? AND provider = ? AND query_type = ? AND query = ? AND rev >= ?)",
+    )
+    .bind(item_id)
+    .bind(provider)
+    .bind(query_type)
+    .bind(query)
+    .bind(QUERY_REV)
+    .fetch_one(db)
+    .await
+    .map(|v| v != 0)
+    .unwrap_or(true)
+}
+
+/// Record that the question was asked and a response (even an empty
+/// one) arrived. Call AFTER the network call returns — a transport
+/// error must leave the question owed so the queue retries it.
+pub async fn record_question(
+    db: &SqlitePool,
+    item_id: &str,
+    provider: &str,
+    query_type: &str,
+    query: &str,
+) {
+    let _ = sqlx::query(
+        "INSERT INTO provider_queries (item_id, provider, query_type, query, rev, asked_at)
+         VALUES (?, ?, ?, ?, ?, unixepoch())
+         ON CONFLICT (item_id, provider, query_type, query)
+         DO UPDATE SET rev = excluded.rev, asked_at = excluded.asked_at",
+    )
+    .bind(item_id)
+    .bind(provider)
+    .bind(query_type)
+    .bind(query)
+    .bind(QUERY_REV)
+    .execute(db)
+    .await;
+}
+
 /// Which provider currently owns this item's identity, if any has
 /// actually matched it.
 /// Which provider owns this item's identity, as a CHAIN name — the anime
@@ -948,13 +1052,15 @@ impl ProviderSet {
             // the row filled up made the ranking a lottery over who
             // happened to be consulted first.
             //
-            // Bounded by never-ask-twice: one request per (item,
-            // provider), ever — a recorded miss counts as an answer. The
-            // identity owner is exempt so it can re-verify (a late ED2K
-            // result may disagree, HUB-30a).
+            // A REAL answer is terminal; a miss is not — the provider
+            // re-runs and its own question log (`provider_queries`)
+            // decides whether any network request is actually due, so
+            // never-ask-twice means "never ask the same QUESTION
+            // twice". The identity owner is exempt even from that so it
+            // can re-verify (a late ED2K result may disagree, HUB-30a).
             let owner = identity_owner(db, &item.id).await;
             let owns = owner.as_deref().map(chain_name) == Some(name.as_str());
-            if !owns && answered(db, &item.id, name).await {
+            if !owns && has_real_answer(db, &item.id, name).await {
                 continue;
             }
             let mut ctx = item.clone();

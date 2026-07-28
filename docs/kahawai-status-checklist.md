@@ -172,6 +172,9 @@ How something works and why it was built that way belong in
       mapping, AniList metadata + relations, UDP FILE-by-ED2K gold path
       (registered client "kahawai", account via admin page, optional
       encrypted session, never-ask-twice cache)
+      *(2026-07-28: never-ask-twice re-keyed from recorded misses to the
+      question itself — `provider_queries`, migration 0044 — so renames,
+      late hashes and derivation fixes re-ask automatically)*
 - [ ] HUB-30 Fansub filename conventions. Group prefixes, absolute
       numbering, CRC tags, bracket stripping, hash-exact show
       identification, and per-EPISODE hash identification: every hashed

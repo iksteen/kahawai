@@ -312,6 +312,53 @@ async fn browse_latency_and_scale() {
         eprintln!("  view over {n:>6}    {:>8.1} ms  (SQL only, no serialisation)",
                   t.elapsed().as_secs_f64() * 1e3);
 
+        // The enrichment pass's standing tax: the question-gated
+        // selection at the top of every run (provider_queries, 0044).
+        // Quiescent — every item holds real answers — it must decide
+        // "nothing to do" near-free at catalogue scale.
+        let mut sel_idle = std::time::Duration::ZERO;
+        let mut runs_q = Vec::new();
+        for _ in 0..5 {
+            let t = Instant::now();
+            let rows = sqlx::query(kahawai_hub::enrich::GENERIC_SELECTION_SQL)
+                .bind(kahawai_hub::providers::QUERY_REV)
+                .fetch_all(&b.db)
+                .await
+                .unwrap();
+            let took = t.elapsed();
+            assert!(rows.is_empty(), "quiescent selection must be empty, got {}", rows.len());
+            runs_q.push(format!("{:.1}", took.as_secs_f64() * 1e3));
+            sel_idle = sel_idle.max(took);
+        }
+        eprintln!("  selection (idle)  {:>8.1} ms  runs: {}", sel_idle.as_secs_f64() * 1e3,
+                  runs_q.join(", "));
+
+        // With work owed: strip 1000 items' answers — no question rows
+        // exist for them, so exactly those must surface as due.
+        sqlx::query(
+            "DELETE FROM provider_metadata
+              WHERE item_id < '01BENCHITEM000000000001000'",
+        )
+        .execute(&b.db)
+        .await
+        .unwrap();
+        let mut sel_due = std::time::Duration::ZERO;
+        let mut runs_d = Vec::new();
+        for _ in 0..5 {
+            let t = Instant::now();
+            let rows = sqlx::query(kahawai_hub::enrich::GENERIC_SELECTION_SQL)
+                .bind(kahawai_hub::providers::QUERY_REV)
+                .fetch_all(&b.db)
+                .await
+                .unwrap();
+            let took = t.elapsed();
+            assert_eq!(rows.len(), 1000, "exactly the stripped items are due");
+            runs_d.push(format!("{:.1}", took.as_secs_f64() * 1e3));
+            sel_due = sel_due.max(took);
+        }
+        eprintln!("  selection (1000 due){:>6.1} ms  runs: {}", sel_due.as_secs_f64() * 1e3,
+                  runs_d.join(", "));
+
         // NFR-1 states the target at 50k; recorded at BOTH sizes, since
         // NFR-2 asks the shape to hold at 250k and a page should not care
         // how much is behind it.
@@ -330,6 +377,28 @@ async fn browse_latency_and_scale() {
             if took.as_millis() > 200 {
                 missed.push(format!(
                     "NFR-1: {what} at {items} items took {:.1} ms, target 200 ms",
+                    took.as_secs_f64() * 1e3
+                ));
+            }
+        }
+        // Selection is background work, so its target is a pathology
+        // tripwire, not a latency promise. Measured 2026-07-28 (release,
+        // worst of 5): 50k idle 496 ms, 250k idle 2377 ms — LINEAR in
+        // catalogue size (point probes per item on the pm/q PKs, plan
+        // verified), bimodal on pooled-connection page cache (~590 ms
+        // warm at 250k). The tripwire sits ~2x above the measured worst:
+        // a quadratic step at these sizes lands in the tens of seconds
+        // and cannot hide under it. If the standing tax itself ever
+        // matters, the lever is a partial index
+        // (provider_metadata(provider, item_id) WHERE provider_id <> '')
+        // to drive from the answered side — unbuilt, no need yet.
+        let (idle_limit, due_limit) = if items > 100_000 { (5_000u128, 5_500) } else { (1_200, 1_300) };
+        for (what, took, limit) in
+            [("selection idle", sel_idle, idle_limit), ("selection 1000 due", sel_due, due_limit)]
+        {
+            if took.as_millis() > limit {
+                missed.push(format!(
+                    "{what} at {items} items took {:.1} ms, tripwire {limit} ms",
                     took.as_secs_f64() * 1e3
                 ));
             }

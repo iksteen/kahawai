@@ -345,80 +345,105 @@ async fn specials_land_in_season_zero_and_the_rest_is_left_alone() {
     assert_eq!(title, "title sp");
 }
 
-/// A name-based 'anime' miss is provisional while any of the item's
-/// hashed files was never put to AniDB: the void re-opens the question,
-/// exhausted hashes close it for good, and a human refusal is never
-/// re-litigated. (The Doomed Megalopolis failure, 2026-07-28.)
+/// HUB-5 question-gated selection: an item is due while its CURRENT
+/// question has no provider_queries row — a miss never gates, a rename
+/// re-opens automatically, a real answer is terminal. (The Doomed
+/// Megalopolis failure, 2026-07-28: a name-based miss permanently
+/// blocked files whose hashes arrived minutes later.)
 #[tokio::test]
-async fn unverified_anime_misses_are_voided_until_hashes_are_spent() {
-    let (_enricher, db, _dir) = harness().await;
-    // 'show' harness item + one hashed episode file, NOT yet in ed2k_aid.
-    episode(&db, "e1", None, 1, AID, "1").await;
-    sqlx::query("DELETE FROM ed2k_aid").execute(&db).await.unwrap();
-    let miss = |db: &SqlitePool| {
-        let db = db.clone();
-        async move {
-            sqlx::query(
-                "INSERT INTO provider_metadata (item_id, provider, provider_id, confidence, updated_at)
-                 VALUES ('show','anime','','miss',unixepoch())
-                 ON CONFLICT (item_id, provider) DO UPDATE SET confidence='miss'",
-            )
-            .execute(&db)
-            .await
-            .unwrap()
-        }
-    };
-    miss(&db).await;
+async fn selection_follows_the_question_not_the_miss() {
+    let (enricher, db, _dir) = harness().await;
+    let registry =
+        kahawai_hub::registry::Registry::new(db.clone(), Default::default());
+    async fn selected(
+        registry: &kahawai_hub::registry::Registry,
+        enricher: &Enricher,
+    ) -> bool {
+        enricher.select_anime_items(registry).await.unwrap().iter().any(|i| i.id == "show")
+    }
+    // Membership in an anime collection (the harness show has no source
+    // yet — give it one, unhashed so the hash branch stays quiet).
+    sqlx::query(
+        "INSERT INTO items (id, kind, title, norm_title, parent_id) VALUES ('ep','episode','e','e','show')",
+    )
+    .execute(&db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO item_sources (item_id, module_id, collection_id, path_rel) VALUES ('ep','m','c','e.mkv')",
+    )
+    .execute(&db)
+    .await
+    .unwrap();
 
-    // Unasked hash on file → the miss is void.
-    assert_eq!(kahawai_hub::enrich::Enricher::void_unverified_anime_misses(&db).await.unwrap(), 1);
+    // Never asked: the name question is owed.
+    assert!(selected(&registry, &enricher).await, "fresh item must be due");
 
-    // Every hash spent (a recorded miss counts) → the miss is final.
-    miss(&db).await;
-    sqlx::query("INSERT INTO ed2k_aid (ed2k, aid, updated_at) VALUES ('hash-e1', NULL, unixepoch())")
+    // A recorded miss alone does NOT settle it — only the question does.
+    sqlx::query(
+        "INSERT INTO provider_metadata (item_id, provider, provider_id, confidence, updated_at)
+         VALUES ('show','anime','','miss',unixepoch())",
+    )
+    .execute(&db)
+    .await
+    .unwrap();
+    assert!(selected(&registry, &enricher).await, "a miss must not gate");
+    kahawai_hub::providers::record_question(
+        &db,
+        "show",
+        "anime",
+        "title",
+        &kahawai_hub::providers::title_anchor("x", None),
+    )
+    .await;
+    assert!(!selected(&registry, &enricher).await, "asked question settles it");
+
+    // A rename changes the question: due again, exactly once.
+    sqlx::query("UPDATE items SET title='Y', norm_title='y' WHERE id='show'")
         .execute(&db)
         .await
         .unwrap();
-    assert_eq!(kahawai_hub::enrich::Enricher::void_unverified_anime_misses(&db).await.unwrap(), 0);
-
-    // A human refusal blocks the void even with a fresh unasked hash.
-    sqlx::query("DELETE FROM ed2k_aid").execute(&db).await.unwrap();
-    sqlx::query(
-        "INSERT INTO rejected_matches (item_id, provider, provider_id, rejected_at)
-         VALUES ('show','anilist','1','1')",
+    assert!(selected(&registry, &enricher).await, "rename re-opens the question");
+    kahawai_hub::providers::record_question(
+        &db,
+        "show",
+        "anime",
+        "title",
+        &kahawai_hub::providers::title_anchor("y", None),
     )
-    .execute(&db)
-    .await
-    .unwrap();
-    assert_eq!(kahawai_hub::enrich::Enricher::void_unverified_anime_misses(&db).await.unwrap(), 0);
-}
+    .await;
+    assert!(!selected(&registry, &enricher).await);
 
-/// Writing an anime identity clears TMDB/TVDB title-search MISSES (the
-/// bridge asks by mapped id — a different question) but never a real
-/// answer.
-#[tokio::test]
-async fn anime_identity_voids_stale_title_search_misses() {
-    let (enricher, db, _dir) = harness().await;
+    // A real answer is terminal for the name branch, whatever the log.
+    sqlx::query("UPDATE items SET title='Z', norm_title='z' WHERE id='show'")
+        .execute(&db)
+        .await
+        .unwrap();
     sqlx::query(
         "INSERT INTO provider_metadata (item_id, provider, provider_id, confidence, updated_at)
-         VALUES ('show','tmdb','','miss',unixepoch()),
-                ('show','tvdb','42','auto',unixepoch())",
+         VALUES ('show','anilist','1148','auto',unixepoch())",
     )
     .execute(&db)
     .await
     .unwrap();
-    let media: kahawai_hub::anime::AnilistMedia = serde_json::from_value(serde_json::json!({
-        "id": 1148, "title": {"romaji": "Teito Monogatari", "english": "Doomed Megalopolis"}
-    }))
-    .unwrap();
-    enricher.store_anime(&db, "show", "show", &media, Some(1505), None).await.unwrap();
+    assert!(!selected(&registry, &enricher).await, "identity beats any rename");
 
-    let rows: Vec<(String, String)> = sqlx::query_as(
-        "SELECT provider, confidence FROM provider_metadata
-          WHERE item_id='show' AND provider IN ('tmdb','tvdb') ORDER BY provider",
+    // …until the identity brings a NEW question: the bridge fetch by
+    // mapped id is owed despite an old tvdb title-search miss.
+    sqlx::query(
+        "INSERT INTO anime_ids (item_id, anidb_id, anilist_id, mapped_tvdb) VALUES ('show',1505,1148,98611)",
     )
-    .fetch_all(&db)
+    .execute(&db)
     .await
     .unwrap();
-    assert_eq!(rows, [("tvdb".into(), "auto".into())], "miss gone, real answer kept");
+    sqlx::query(
+        "INSERT INTO provider_metadata (item_id, provider, provider_id, confidence, updated_at)
+         VALUES ('show','tvdb','','miss',unixepoch())",
+    )
+    .execute(&db)
+    .await
+    .unwrap();
+    assert!(selected(&registry, &enricher).await, "mapped id is a new question");
+    kahawai_hub::providers::record_question(&db, "show", "tvdb", "mapped_id", "98611").await;
+    assert!(!selected(&registry, &enricher).await, "bridge question spent");
 }
