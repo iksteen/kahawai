@@ -238,6 +238,31 @@ export default function Settings() {
           flash={flash}
         />
       </section>
+      <section>
+        <h2>playback</h2>
+        <div className="row-form pref-row">
+          <span className="pref-label mono">bandwidth</span>
+          <input
+            className="pref-input mono"
+            type="number"
+            min={0}
+            placeholder="kbit/s cap (0 = none)"
+            defaultValue={values['bandwidth_kbps'] ?? ''}
+            onBlur={(e) => {
+              const v = e.currentTarget.value.trim()
+              putPref('', 'bandwidth_kbps', v === '0' ? '' : v)
+                .then(() => {
+                  setValues((cur) => ({ ...cur, bandwidth_kbps: v }))
+                  flash()
+                })
+                .catch(() => {})
+            }}
+          />
+          <span className="dim small-note">
+            caps playback bitrate (HUB-15) — copies refuse, encodes clamp
+          </span>
+        </div>
+      </section>
       {MEDIA_TYPES.map((mt) => (
         <section key={mt}>
           <h2>{mt}</h2>
@@ -252,28 +277,6 @@ export default function Settings() {
             />
           ))}
           {mt === 'anime' && (
-            <div className="row-form pref-row">
-              <span className="pref-label mono">bandwidth</span>
-              <input
-                className="pref-input mono"
-                type="number"
-                min={0}
-                placeholder="kbit/s cap (0 = none)"
-                defaultValue={values['bandwidth_kbps'] ?? ''}
-                onBlur={(e) => {
-                  const v = e.currentTarget.value.trim()
-                  putPref('', 'bandwidth_kbps', v === '0' ? '' : v)
-                    .then(() => {
-                      setValues((cur) => ({ ...cur, bandwidth_kbps: v }))
-                      flash()
-                    })
-                    .catch(() => {})
-                }}
-              />
-              <span className="dim small-note">
-                caps playback bitrate (HUB-15) — copies refuse, encodes clamp
-              </span>
-            </div>
             <div className="row-form pref-row">
               <span className="pref-label mono">view</span>
               <span className="chips">

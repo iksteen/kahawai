@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { endSession, postProgress, startSession, type Item, type Session } from '../api'
+import { endSession, postProgress, startSessionDirect, type Item, type Session } from '../api'
 
 /// Queue playback for an album (HUB-27): one direct-play session per
 /// track, auto-advance on ended, prev/next. The <audio> element streams
@@ -33,7 +33,7 @@ export default function AlbumPlayer({
     const track = tracks[index]
     if (!track) return
     onTrackChange(index)
-    startSession(track.id, 'direct')
+    startSessionDirect(track.id)
       .then((s) => {
         if (cancelled) {
           void endSession(s.session_id)

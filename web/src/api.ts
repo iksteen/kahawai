@@ -352,6 +352,15 @@ export function startSession(
   })
 }
 
+/// Music plays direct by operator contract (browsers decode flac/mp3
+/// natively; HUB-19 owns future music delivery shapes).
+export function startSessionDirect(itemId: string): Promise<Session> {
+  return json('/api/v1/playback/sessions', {
+    method: 'POST',
+    body: JSON.stringify({ item_id: itemId, mode: 'direct' }),
+  })
+}
+
 export type Pref = { scope: string; key: string; value: string }
 
 /// HUB-33, resolved entirely client-side from /api/v1/prefs.
