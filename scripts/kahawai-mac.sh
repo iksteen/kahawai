@@ -29,10 +29,17 @@ AGENT=org.thegraveyard.kahawai.transcoder
 setup() {
     [ "$(uname)" = Darwin ] || { echo "run setup ON the mac" >&2; exit 2; }
     mkdir -p "$(dirname "$PASSFILE")" && chmod 700 "$(dirname "$PASSFILE")"
-    [ -f "$PASSFILE" ] || { openssl rand -hex 24 > "$PASSFILE"; chmod 600 "$PASSFILE"; }
+    [ -f "$PASSFILE" ] || { /usr/bin/openssl rand -hex 24 > "$PASSFILE"; chmod 600 "$PASSFILE"; }
     local pass; pass=$(cat "$PASSFILE")
     local tmp; tmp=$(mktemp -d)
     trap 'rm -rf "$tmp"' EXIT
+    # The SYSTEM openssl, never whatever is on PATH: OpenSSL 3 writes
+    # PKCS#12 with AES-256 and a SHA-256 MAC, which Security.framework
+    # rejects outright ("MAC verification failed during PKCS12 import"),
+    # while macOS's own LibreSSL writes what it accepts. Homebrew's
+    # openssl shadows the system one in any normal login shell, so this
+    # fails for a human and works over ssh — measured, both ways.
+    local openssl=/usr/bin/openssl
 
     # A code-signing cert of our own. Self-signed is enough: nothing
     # verifies it against a chain, it only has to be STABLE.
@@ -48,11 +55,11 @@ basicConstraints=critical,CA:false
 keyUsage=critical,digitalSignature
 extendedKeyUsage=critical,codeSigning
 EOF
-    openssl req -x509 -newkey rsa:2048 -sha256 -days 7300 -nodes \
+    "$openssl" req -x509 -newkey rsa:2048 -sha256 -days 7300 -nodes \
         -keyout "$tmp/key.pem" -out "$tmp/cert.pem" -config "$tmp/ext.cnf" 2>/dev/null
     # A passphrase is required: Security.framework rejects a PKCS#12
     # with an empty one ("MAC verification failed").
-    openssl pkcs12 -export -out "$tmp/id.p12" -inkey "$tmp/key.pem" -in "$tmp/cert.pem" \
+    "$openssl" pkcs12 -export -out "$tmp/id.p12" -inkey "$tmp/key.pem" -in "$tmp/cert.pem" \
         -name "$IDENTITY" -passout pass:import
 
     # Its own keychain, not the login one: this must be unlockable by a
