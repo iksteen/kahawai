@@ -61,16 +61,25 @@ impl Timeline {
 /// when the container's index doesn't permit the sparse read or the
 /// track isn't an image track — the caller then burns nothing and
 /// says so, rather than encoding video for no reason.
-pub fn timeline(src: &mut dyn RemuxSource, sub_index: usize) -> Result<Option<Timeline>> {
-    let Some(track) = crate::subindex::extract_image_track(src, sub_index)? else {
+pub fn timeline(
+    src: &mut dyn RemuxSource,
+    sub_index: usize,
+    budget: std::time::Duration,
+) -> Result<Option<Timeline>> {
+    let Some(track) = crate::subindex::extract_image_track(src, sub_index, budget)? else {
         return Ok(None);
     };
     let is_pgs = track.codec.contains("PGS");
-    let palette = track
-        .codec_private
+    // VobSub's .idx rides in CodecPrivate: it carries both the palette
+    // and the canvas its coordinates are relative to. That canvas is
+    // NOT always the video's resolution (a re-encode keeps the
+    // original .idx), so scaling must know it — PGS states its own.
+    let idx_text = track.codec_private.as_deref().map(crate::subtitles::decode_text);
+    let palette = idx_text
         .as_deref()
-        .map(|p| crate::imagesubs::vobsub_palette(&crate::subtitles::decode_text(p)))
+        .map(crate::imagesubs::vobsub_palette)
         .unwrap_or_default();
+    let vob_canvas = idx_text.as_deref().and_then(crate::imagesubs::vobsub_size);
 
     let mut pgs = crate::imagesubs::PgsDecoder::default();
     let mut entries: Vec<Entry> = Vec::new();
@@ -84,7 +93,10 @@ pub fn timeline(src: &mut dyn RemuxSource, sub_index: usize) -> Result<Option<Ti
             }
         } else {
             match crate::imagesubs::vobsub_decode(payload, &palette) {
-                Ok(Some(obj)) => ((0, 0), vec![obj]),
+                // No declared size: the coordinates are the frame's own
+                // (scale 1.0 downstream), which is the historical
+                // assumption and right for same-resolution rips.
+                Ok(Some(obj)) => (vob_canvas.unwrap_or((0, 0)), vec![obj]),
                 _ => continue,
             }
         };

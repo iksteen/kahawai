@@ -195,9 +195,14 @@ How something works and why it was built that way belong in
       *(episodes TVDB never curated absolute numbers for stay unprojected
       and fall into an "Other" bucket)*
 - [x] HUB-32 (see subtitles above)
-- [ ] HUB-32b Bitmap tier for image subs *(server-side PGS/VobSub decode,
-      display-set streaming, web overlay rendering live via the session tap;
-      graphics-overlay capability profiles and policy ordering pending)*
+- [ ] HUB-32b Bitmap tier for image subs: server-side PGS/VobSub decode,
+      display-set streaming, web overlay rendering via the session tap,
+      graphics-overlay capability gating both the offer and the client's
+      own rendering. Burn-in fallback built (timeline + overlay
+      compositor, seek-exact) but offered only for locally-read sources:
+      the index walk runs at ~4 KB/s over the byte plane, so remote
+      sources report the track unavailable instead. Needs mediahost-side
+      extraction of image sets to lift
 - [ ] HUB-32c OCR text tier (subtile-ocr/Tesseract, default-on cargo feature)
       *(not built; GPL-3.0 licensing consequence pre-documented in README)*
 - [x] HUB-33 Dual-audio defaults, one mechanism: the hub stores a plain

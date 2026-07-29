@@ -237,6 +237,16 @@ pub fn vobsub_palette(codec_private: &str) -> Vec<[u8; 3]> {
     Vec::new()
 }
 
+/// The display size an S_VOBSUB CodecPrivate declares (`size: 720x576`).
+/// VobSub coordinates are relative to THIS canvas, which need not be
+/// the video's own resolution — a re-encode keeps the original .idx.
+pub fn vobsub_size(codec_private: &str) -> Option<(u32, u32)> {
+    codec_private.lines().find_map(|l| {
+        let (w, h) = l.trim().strip_prefix("size:")?.trim().split_once('x')?;
+        Some((w.trim().parse().ok()?, h.trim().parse().ok()?))
+    })
+}
+
 /// Decode one VobSub SPU (post-demux Matroska block payload) into a
 /// positioned bitmap. Returns None for empty/unshowable units.
 pub fn vobsub_decode(spu: &[u8], palette16: &[[u8; 3]]) -> Result<Option<ImageObject>> {
@@ -423,6 +433,13 @@ mod tests {
         let block2 = [seg(0x16, &clear_pcs), seg(0x80, &[])].concat();
         let set2 = dec.feed(&block2).unwrap().expect("clear set");
         assert!(set2.objects.is_empty());
+    }
+
+    #[test]
+    fn vobsub_size_parses() {
+        let idx = "# comment\nsize: 720x576\npalette: 000000\n";
+        assert_eq!(vobsub_size(idx), Some((720, 576)));
+        assert_eq!(vobsub_size("palette: 000000\n"), None);
     }
 
     #[test]

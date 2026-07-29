@@ -517,6 +517,16 @@ impl Sessions {
     /// used for sidecar subtitle files, which are not `files` rows).
     /// AR-5: register the in-process mediahost — leases for its files
     /// bypass OpenRead entirely and read the disk directly.
+    /// Is this module's byte plane short-circuited to local reads
+    /// (AR-11, all-in-one)? Burn-in's index walk needs it.
+    pub fn reads_locally(&self, module_id: &str) -> bool {
+        self.local_source
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|(m, _)| m == module_id)
+    }
+
     pub fn set_local_source(
         &self,
         module_id: &str,
@@ -622,6 +632,15 @@ impl Sessions {
                 Some(tc) => registry.transcoder_reports_tonemap(&tc),
                 None => kahawai_media::remux::tonemap_available(),
             };
+            // HUB-32b: burn-in reads the subtitle timeline from the
+            // container index, which is disk-speed on a local source
+            // and round-trip-bound over the byte plane (~4 KB/s
+            // measured — no session can wait for it). Until the
+            // mediahost extracts image sets on its own disk, offer the
+            // tier only where the source is read locally.
+            let burn_capable = parts
+                .first()
+                .is_some_and(|p| self.reads_locally(&p.module_id));
             kahawai_media::negotiate::negotiate(
                 &profile,
                 info,
@@ -630,6 +649,7 @@ impl Sessions {
                 parts.len() == 1,
                 est_kbps,
                 tonemap,
+                burn_capable,
             )
         };
         let (parts, info, sp, mode) = match mode {
@@ -1323,6 +1343,10 @@ impl Sessions {
                 }
                 _ => kahawai_media::remux::tonemap_available(),
             };
+            let burn_capable = session
+                .parts
+                .first()
+                .is_some_and(|p| self.reads_locally(&p.module_id));
             let sp = kahawai_media::negotiate::negotiate(
                 &session.profile,
                 &info,
@@ -1331,6 +1355,7 @@ impl Sessions {
                 session.parts.len() == 1,
                 None,
                 tonemap,
+                burn_capable,
             );
             plan = sp.plan;
             anyhow::ensure!(plan.playable(), "selected track is not playable");

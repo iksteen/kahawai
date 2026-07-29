@@ -799,10 +799,7 @@ fn tap_image_track(
         .and_then(|s| s.get::<gst::Buffer>("codec_data").ok())
         .and_then(|b| b.map_readable().ok().map(|m| {
             let text = crate::subtitles::decode_text(m.as_slice());
-            let size = text.lines().find_map(|l| {
-                let (w, h) = l.trim().strip_prefix("size:")?.trim().split_once('x')?;
-                Some((w.trim().parse::<u32>().ok()?, h.trim().parse::<u32>().ok()?))
-            });
+            let size = crate::imagesubs::vobsub_size(&text);
             (crate::imagesubs::vobsub_palette(&text), size)
         }))
         .unwrap_or_default();
@@ -1023,6 +1020,11 @@ pub fn tonemap_available() -> bool {
         ok
     })
 }
+
+/// How long the burn-in index walk may take before the session gives
+/// up on it and plays without subtitles (HUB-32b). Generous for local
+/// disk, far short of the playlist deadline.
+const BURN_INDEX_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// PQ encode (SMPTE ST 2084 inverse EOTF): linear (1.0 = 10000 nits)
 /// → PQ code. Rust twin of the shader's pq_encode.
@@ -1778,7 +1780,11 @@ pub fn start_parts(
     let burn_timeline = match plan.burn_subtitle {
         Some(idx) => {
             let t0 = std::time::Instant::now();
-            match crate::burnin::timeline(&mut *sources[0], idx) {
+            // Bounded: a session must start even when the timeline
+            // cannot be had. Local sources finish in milliseconds; a
+            // lease-backed one may not finish at all, and then the
+            // encode runs without the burn and the verdict says so.
+            match crate::burnin::timeline(&mut *sources[0], idx, BURN_INDEX_BUDGET) {
                 Ok(Some(t)) if !t.is_empty() => {
                     tracing::info!(
                         track = idx,

@@ -61,6 +61,12 @@ pub fn extract_sparse(path: &Path) -> Result<Option<Vec<(usize, Extracted)>>> {
 struct Reader<'a> {
     src: &'a mut dyn RemuxSource,
     len: u64,
+    /// Walks are index-driven and finish in milliseconds on local
+    /// disk, but every read is a round trip when the source is a
+    /// session lease (measured: ~4 KB/s hub->mediahost->NAS, which is
+    /// minutes for one film). Callers that sit in front of a live
+    /// session give the walk a budget and degrade when it runs out.
+    deadline: Option<std::time::Instant>,
     /// Readahead window: header walks issue thousands of tiny reads;
     /// over network filesystems each would be a round trip.
     win_start: u64,
@@ -72,10 +78,21 @@ const READAHEAD: usize = 256 * 1024;
 impl<'a> Reader<'a> {
     fn new(src: &'a mut dyn RemuxSource) -> Self {
         let len = src.size();
-        Self { src, len, win_start: 0, win: Vec::new() }
+        Self { src, len, win_start: 0, win: Vec::new(), deadline: None }
+    }
+
+    fn with_budget(src: &'a mut dyn RemuxSource, budget: std::time::Duration) -> Self {
+        let mut r = Self::new(src);
+        r.deadline = Some(std::time::Instant::now() + budget);
+        r
     }
 
     fn read_at(&mut self, off: u64, n: usize) -> Result<Vec<u8>> {
+        if let Some(d) = self.deadline
+            && std::time::Instant::now() > d
+        {
+            bail!("index walk exceeded its read budget");
+        }
         let end = off + n as u64;
         let in_window = off >= self.win_start
             && end <= self.win_start + self.win.len() as u64;
@@ -746,8 +763,9 @@ pub struct ImageTrack {
 pub fn extract_image_track(
     src: &mut dyn RemuxSource,
     sub_index: usize,
+    budget: std::time::Duration,
 ) -> Result<Option<ImageTrack>> {
-    let mut r = Reader::new(src);
+    let mut r = Reader::with_budget(src, budget);
     let magic = r.read_at(0, 4)?;
     if magic != [0x1A, 0x45, 0xDF, 0xA3] {
         return Ok(None); // mp4 image subtitles do not occur in practice
@@ -1196,7 +1214,9 @@ mod tests {
         let idx: usize = std::env::var("IMGSUB_IDX").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
         let mut src = crate::remux::FileSource::open(std::path::Path::new(&path)).unwrap();
         let t0 = std::time::Instant::now();
-        let track = super::extract_image_track(&mut src, idx).unwrap().expect("no image track");
+        let track = super::extract_image_track(&mut src, idx, std::time::Duration::from_secs(60))
+            .unwrap()
+            .expect("no image track");
         let bytes: usize = track.blocks.iter().map(|(_, _, b)| b.len()).sum();
         println!(
             "codec {} · {} blocks · {} KiB · {:.2}s",
@@ -1213,7 +1233,13 @@ mod tests {
             if let Ok(Some(set)) = dec.feed(payload) {
                 sets += 1;
                 if first.is_none() && !set.objects.is_empty() {
-                    first = Some((*ms, set.canvas_w, set.canvas_h, set.objects.len()));
+                    let o = &set.objects[0];
+                    first = Some((
+                        *ms,
+                        set.canvas_w,
+                        set.canvas_h,
+                        format!("rect {}x{}+{}+{}", o.w, o.h, o.x, o.y),
+                    ));
                 }
             }
         }

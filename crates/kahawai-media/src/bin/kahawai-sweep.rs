@@ -260,6 +260,8 @@ fn sweep_one(
         true,
         None,
         kahawai_media::remux::tonemap_available(),
+        // The sweep reads local files: the burn-in index walk is free.
+        true,
     );
     let plan = sp.plan;
     if sp.cost == kahawai_media::negotiate::Cost::Unplayable {
