@@ -48,9 +48,16 @@ const float maxE = 0.751827096;
 const float maxTgt = 0.772370248;
 const float KS = 0.658555373;
 
-float eetf(float e, float ks, float mt) { // e = pixel PQ code / maxE, in [0,1]
+float eetf(float e, float ks, float mt) { // e = pixel PQ code / maxE
+  // Peak at or below the target: nothing to compress — and KS→1
+  // makes the Hermite divisor vanish (NaN → clamp → BLACK blobs on
+  // speculars, owner-observed on near-SDR scenes).
+  if (mt >= 0.999) return min(e, 1.0);
   if (e <= ks) return e;
-  float t = (e - ks) / (1.0 - ks);
+  // t clamped: pixels above the tracked p99.9 peak (the top 0.1% of
+  // every frame) land at the rolloff END — white, like libplacebo —
+  // instead of extrapolating the cubic off a cliff.
+  float t = clamp((e - ks) / (1.0 - ks), 0.0, 1.0);
   float t2 = t * t;
   float t3 = t2 * t;
   return (2.0 * t3 - 3.0 * t2 + 1.0) * ks + (t3 - 2.0 * t2 + t) * (1.0 - ks)
