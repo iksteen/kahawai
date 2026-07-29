@@ -113,22 +113,7 @@ fn map_info(info: &DiscovererInfo) -> MediaInfo {
             .as_ref()
             .and_then(|c| c.structure(0).map(|st| st.name().to_string()))
             .unwrap_or_default();
-        // HDR from colorimetry (MH-3): the transfer function names the
-        // standard — PQ = HDR10-family, HLG = HLG. Colorimetry strings
-        // are either the canonical shorthands or colon-separated fields
-        // where the 3rd is the transfer characteristic (16 = PQ, 14/18
-        // = HLG per GstVideoTransferFunction).
-        let hdr = st_get("colorimetry").and_then(|c| {
-            if c.contains("bt2100-pq") || c.split(':').nth(2) == Some("16") {
-                Some("hdr10".to_string())
-            } else if c.contains("bt2100-hlg")
-                || matches!(c.split(':').nth(2), Some("14") | Some("18"))
-            {
-                Some("hlg".to_string())
-            } else {
-                None
-            }
-        });
+        let hdr = classify_hdr(st_get("colorimetry").as_deref());
         out.video.push(VideoStream {
             codec: normalize_video_codec(&name),
             width: s.width(),
@@ -209,6 +194,26 @@ fn map_info(info: &DiscovererInfo) -> MediaInfo {
 
 /// A stream info is terminal when nothing further re-types it (its
 /// `next()` is the end of the parse chain).
+/// HDR from colorimetry (MH-3): the transfer function names the
+/// standard — PQ = HDR10-family, HLG = HLG. Caps carry either a
+/// canonical shorthand ("bt2100-pq") or the colon-separated numeric
+/// form whose 3rd field serializes GstVideoTransferFunction
+/// (video-color.h: 14 = SMPTE2084/PQ, 15 = ARIB STD-B67/HLG — and 16
+/// is BT601, NOT PQ). These are gst enum values, not ISO H.273 codes;
+/// an earlier map used 16/14/18 from H.273 and read every
+/// numerically-tagged PQ file as hlg.
+fn classify_hdr(colorimetry: Option<&str>) -> Option<String> {
+    let c = colorimetry?;
+    let transfer = c.split(':').nth(2);
+    if c.contains("bt2100-pq") || transfer == Some("14") {
+        Some("hdr10".to_string())
+    } else if c.contains("bt2100-hlg") || transfer == Some("15") {
+        Some("hlg".to_string())
+    } else {
+        None
+    }
+}
+
 fn is_terminal<T: gst::glib::prelude::IsA<DiscovererStreamInfo>>(s: &T) -> bool {
     s.as_ref().next().is_none()
 }
@@ -284,6 +289,19 @@ fn normalize_subtitle_format(caps_name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Both caps colorimetry forms classify, and the gst-enum/H.273
+    /// confusion stays dead: 14 is PQ, 15 is HLG, 16 is BT601 (SD!).
+    #[test]
+    fn hdr_classification_reads_gst_enum_not_h273() {
+        assert_eq!(classify_hdr(Some("bt2100-pq")).as_deref(), Some("hdr10"));
+        assert_eq!(classify_hdr(Some("bt2100-hlg")).as_deref(), Some("hlg"));
+        assert_eq!(classify_hdr(Some("0:6:14:7")).as_deref(), Some("hdr10"), "14 = SMPTE2084");
+        assert_eq!(classify_hdr(Some("0:6:15:7")).as_deref(), Some("hlg"), "15 = ARIB STD-B67");
+        assert_eq!(classify_hdr(Some("0:6:16:7")), None, "16 = BT601, not PQ");
+        assert_eq!(classify_hdr(Some("bt709")), None);
+        assert_eq!(classify_hdr(None), None);
+    }
 
     /// Build a tiny fixture by running a gst-launch-style pipeline to EOS.
     fn render(pipeline: &str) {
