@@ -1288,18 +1288,16 @@ fn build_video_encode_chain(
 /// aacparse (raw→ADTS for the TS muxer) → muxer pad. The only decode/
 /// encode work in the hub, and audio-only by design: a few % CPU.
 /// The HUB-15 channel-ceiling element pair, or nothing when unlimited.
-fn channel_limiter(max_channels: Option<u32>) -> Vec<gst::Element> {
-    match max_channels {
+fn channel_limiter(channels: Option<u32>) -> Vec<gst::Element> {
+    match channels {
         Some(n) if n > 0 => {
-            // A degenerate range ([1,1]) is invalid caps — mono is a
-            // fixed value, everything else a range.
-            let caps = if n == 1 {
-                gst::Caps::builder("audio/x-raw").field("channels", 1i32).build()
-            } else {
-                gst::Caps::builder("audio/x-raw")
-                    .field("channels", gst::IntRange::new(1i32, n as i32))
-                    .build()
-            };
+            // An EXACT count, never a range: range caps fixate to their
+            // minimum, so `channels=[1,2]` handed a stereo-capable
+            // client mono off a 5.1 source (measured; the ceiling had
+            // shipped that way since HUB-15). The hub resolves the
+            // client's ceiling against the source's own channel count
+            // before this, so a fixed value never upmixes either.
+            let caps = gst::Caps::builder("audio/x-raw").field("channels", n as i32).build();
             vec![gst::ElementFactory::make("capsfilter")
                 .property("caps", caps)
                 .build()
@@ -2674,6 +2672,57 @@ mod tests {
             seg_info.video[0].height
         );
         assert_eq!(seg_info.audio[0].channels, 1, "downmix to mono did not happen");
+    }
+
+    /// HUB-15 channel ceiling: a client that accepts stereo gets
+    /// STEREO off a 5.1 source. Range caps fixated to their minimum
+    /// and delivered mono — invisible until a browser could declare
+    /// the ceiling (the capability debug mask).
+    #[test]
+    fn channel_ceiling_downmixes_to_the_ceiling_not_mono() {
+        crate::init().unwrap();
+        if h264_encoder().is_none()
+            || aac_encoder().is_none()
+            || !crate::testutil::has_element("fdkaacenc")
+        {
+            eprintln!("skipping: encoders unavailable");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let src_path = dir.path().join("in51.mkv");
+        crate::testutil::render_h264_aac51_mkv(&src_path);
+        let info = crate::discover(&src_path, Duration::from_secs(30)).unwrap();
+        assert_eq!(info.audio[0].channels, 6, "fixture must be 5.1: {info:?}");
+
+        let plan = RemuxPlan {
+            video: StreamMode::Copy,
+            audio: StreamMode::Encode,
+            audio_track: 0,
+            video_track: 0,
+            video_kbps: None,
+            max_height: None,
+            max_channels: Some(2),
+            tone_map: false,
+        };
+        let out = tempfile::tempdir().unwrap();
+        let job =
+            start_at(out.path(), plan, Box::new(FileSource::open(&src_path).unwrap()), 0).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !job.finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(job.finished(), "downmix encode did not finish");
+        assert!(job.failed().is_none(), "downmix encode failed: {:?}", job.failed());
+        let seg = std::fs::read_dir(out.path())
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .find(|p| p.extension().is_some_and(|x| x == "ts"))
+            .expect("no segment produced");
+        let seg_info = crate::discover(&seg, Duration::from_secs(30)).unwrap();
+        assert_eq!(
+            seg_info.audio[0].channels, 2,
+            "stereo ceiling must produce stereo, not mono"
+        );
     }
 
     /// HUB-15a end to end at pipeline level: a PQ HEVC source encoded

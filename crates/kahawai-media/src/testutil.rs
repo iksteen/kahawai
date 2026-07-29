@@ -42,6 +42,15 @@ pub fn has_element(name: &str) -> bool {
     gst::ElementFactory::find(name).is_some()
 }
 
+/// 5.1 fixture: h264 + 6-channel AAC, for the HUB-15 channel ceiling
+/// (a stereo client must get stereo, not the range's mono).
+pub fn render_h264_aac51_mkv(path: &Path) {
+    render(&format!(
+        "videotestsrc num-buffers=50 ! video/x-raw,format=I420,width=320,height=240,framerate=25/1 ! x264enc ! h264parse ! matroskamux name=m audiotestsrc num-buffers=90 ! audio/x-raw,channels=6,channel-mask=(bitmask)0x3f,rate=48000 ! audioconvert ! fdkaacenc ! aacparse ! m. m. ! filesink location=\"{}\"",
+        path.display()
+    ));
+}
+
 /// HDR10 fixture (HUB-15a): HEVC Main-10, PQ colorimetry — probes as
 /// hdr10. Caller gates on `has_element("x265enc")`.
 pub fn render_pq_hevc_mkv(path: &Path) {

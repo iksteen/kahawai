@@ -230,8 +230,16 @@ pub fn negotiate(
         video_track,
         video_kbps: (video == StreamMode::Encode).then(|| cap.map_or(6000, |c| 6000.min(c))),
         max_height: (video == StreamMode::Encode).then_some(profile.max_height).flatten(),
-        max_channels: (audio == StreamMode::Encode && profile.max_audio_channels > 0)
-            .then_some(profile.max_audio_channels),
+        // The client's ceiling resolved to the count the encoder should
+        // actually produce: a stereo-capable client gets stereo, and a
+        // source with fewer channels than the ceiling keeps its own
+        // (never upmix). Unknown source count (pre-extension row) falls
+        // back to the ceiling itself.
+        max_channels: (audio == StreamMode::Encode && profile.max_audio_channels > 0).then(|| {
+            a.map(|s| s.channels)
+                .filter(|c| *c > 0)
+                .map_or(profile.max_audio_channels, |c| c.min(profile.max_audio_channels))
+        }),
         tone_map,
     };
 
@@ -416,6 +424,26 @@ mod tests {
         let sp = negotiate(&able, &info, 0, 0, true, None, false);
         assert_eq!(sp.subtitles[1].tier, SubtitleTier::Text);
         assert_eq!(sp.subtitles[2].tier, SubtitleTier::Graphics);
+    }
+
+    /// The channel ceiling resolves against the SOURCE: a stereo
+    /// client gets 2 off a 5.1 track, and a mono track stays mono
+    /// rather than being upmixed to fill the ceiling.
+    #[test]
+    fn channel_ceiling_resolves_against_the_source() {
+        let mut p = chrome();
+        p.max_audio_channels = 2;
+        let sp = negotiate(&p, &media("matroska", Some(vs("h264")), Some(au("dts", 6))), 0, 0, true, None, false);
+        assert_eq!(sp.plan.audio, StreamMode::Encode);
+        assert_eq!(sp.plan.max_channels, Some(2), "5.1 → the client's ceiling");
+
+        let sp = negotiate(&p, &media("matroska", Some(vs("h264")), Some(au("dts", 1))), 0, 0, true, None, false);
+        assert_eq!(sp.plan.max_channels, Some(1), "mono source is not upmixed to the ceiling");
+
+        // Unlimited (the web client's own declaration) imposes nothing.
+        p.max_audio_channels = 0;
+        let sp = negotiate(&p, &media("matroska", Some(vs("h264")), Some(au("dts", 6))), 0, 0, true, None, false);
+        assert_eq!(sp.plan.max_channels, None);
     }
 
     /// HUB-15a decision arm: PQ + encode + capable box → tone-map;
