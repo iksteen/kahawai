@@ -297,6 +297,12 @@ impl Runner {
                 match &mut s.worker {
                     Worker::Child(child) => {
                         if let Some(status) = child.try_wait()? {
+                            // A clean exit with a finished playlist is a
+                            // pipeline that COMPLETED (short content
+                            // remuxes faster than this poll).
+                            if status.success() && ready(&playlist) {
+                                return Ok(());
+                            }
                             let log =
                                 std::fs::read_to_string(dir.join("worker.log")).unwrap_or_default();
                             let tail: String =
@@ -306,7 +312,11 @@ impl Runner {
                     }
                     Worker::InProcess(handle, err) => {
                         if handle.is_finished() {
-                            let detail = err.lock().unwrap().clone().unwrap_or_default();
+                            let detail = err.lock().unwrap().clone();
+                            if detail.is_none() && ready(&playlist) {
+                                return Ok(());
+                            }
+                            let detail = detail.unwrap_or_default();
                             anyhow::bail!("in-process worker exited before the playlist: {detail}");
                         }
                     }

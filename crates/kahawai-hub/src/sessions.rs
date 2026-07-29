@@ -102,6 +102,11 @@ pub struct Session {
     /// The effective capability profile (client's or fallback, cap
     /// merged) — re-plans on track switches negotiate against IT.
     profile: kahawai_core::media::CapabilityProfile,
+    /// The HLS sink this session's content actually works on. Some
+    /// files crash hlssink3 (TC-6); once the fallback saved a start or
+    /// a seek, every later restart uses it directly instead of paying
+    /// a crash per restart.
+    sink: Mutex<String>,
     /// The negotiated plan (remux/transcode) — reused on seek-restarts;
     /// mutable because audio-track switches re-plan (HUB-27).
     plan: Mutex<Option<kahawai_media::remux::RemuxPlan>>,
@@ -657,6 +662,7 @@ impl Sessions {
             self.open_lease(registry, &part.module_id, &part.collection_id, &part.path_rel).await?;
 
         let id = ulid::Ulid::generate().to_string();
+        let mut chosen_sink = String::new();
         let mut verdict = None;
         let mut session_plan = None;
         let mut session_needs = crate::registry::PlacementNeed::default();
@@ -710,6 +716,7 @@ impl Sessions {
                             )
                             .await
                             .with_context(|| format!("first attempt: {first:#}"))?;
+                            chosen_sink = "hlssink2".into();
                         }
                         Mode::Transcode { transcoder: Mutex::new(tc) }
                     }
@@ -725,9 +732,12 @@ impl Sessions {
                                     "start failed; retrying with fallback sink");
                                 let tail =
                                     self.open_part_leases(registry, &parts, start_idx).await?;
-                                self.start_remux(&id, plan, tail, local_ms, "hlssink2")
+                                let r = self
+                                    .start_remux(&id, plan, tail, local_ms, "hlssink2")
                                     .await
-                                    .with_context(|| format!("first attempt: {first:#}"))?
+                                    .with_context(|| format!("first attempt: {first:#}"))?;
+                                chosen_sink = "hlssink2".into();
+                                r
                             }
                         };
                         Mode::Remux {
@@ -754,6 +764,7 @@ impl Sessions {
             verdict: Mutex::new(verdict),
             sub_verdicts: negotiated.subtitles,
             profile,
+            sink: Mutex::new(chosen_sink),
             seek_lock: tokio::sync::Mutex::new(()),
             pending_seek: Mutex::new(None),
             seek_gen: std::sync::atomic::AtomicU64::new(0),
@@ -925,9 +936,20 @@ impl Sessions {
                 }
                 RemuxRunner::Worker(child) => {
                     if let Some(status) = child.lock().unwrap().try_wait()? {
-                        let log = std::fs::read_to_string(dir.join("worker.log")).unwrap_or_default();
-                        let tail: String = log.lines().rev().take(4).collect::<Vec<_>>().join(" | ");
-                        bail!("pipeline worker exited at start ({status}): {tail}");
+                        // A CLEAN exit is a pipeline that FINISHED: an
+                        // all-copy remux of short content completes in
+                        // under a second — faster than this poll. The
+                        // playlist (with ENDLIST) is the product; fall
+                        // through to the ready-check below instead of
+                        // declaring death. Only a non-zero exit, or a
+                        // clean exit with nothing produced, is failure.
+                        if !(status.success() && playlist_ready(&playlist)) {
+                            let log =
+                                std::fs::read_to_string(dir.join("worker.log")).unwrap_or_default();
+                            let tail: String =
+                                log.lines().rev().take(4).collect::<Vec<_>>().join(" | ");
+                            bail!("pipeline worker exited at start ({status}): {tail}");
+                        }
                     }
                 }
                 RemuxRunner::Stopped => unreachable!("start_remux never yields Stopped"),
@@ -1299,8 +1321,27 @@ impl Sessions {
                 // accepts one and then plays from zero — measured), so
                 // the restart stays, but it only ever happens for a seek
                 // now, never for a boundary.
+                let sink = session.sink.lock().unwrap().clone();
                 let tail = self.open_part_leases(registry, &session.parts, idx).await?;
-                let fresh = self.start_remux(&session.id, plan, tail, local_ms, "").await?;
+                let fresh = match self.start_remux(&session.id, plan, tail, local_ms, &sink).await
+                {
+                    Ok(r) => r,
+                    Err(first) if sink != "hlssink2" => {
+                        // The same TC-6 fallback the start path has: some
+                        // content crashes hlssink3 on EVERY restart.
+                        tracing::warn!(session = %session.id, error = format!("{first:#}"),
+                            "seek restart failed; retrying with fallback sink");
+                        let tail =
+                            self.open_part_leases(registry, &session.parts, idx).await?;
+                        let r = self
+                            .start_remux(&session.id, plan, tail, local_ms, "hlssink2")
+                            .await
+                            .with_context(|| format!("first attempt: {first:#}"))?;
+                        *session.sink.lock().unwrap() = "hlssink2".into();
+                        r
+                    }
+                    Err(e) => return Err(e),
+                };
                 *runner.lock().unwrap() = fresh;
                 Ok(part.base_ms)
             }
@@ -1326,10 +1367,27 @@ impl Sessions {
                     Some((parts, held_idx)) if held_idx == idx => parts,
                     _ => self.open_part_leases(registry, &session.parts, idx).await?,
                 };
-                self.start_transcode(
-                    registry, &tc, &session.id, plan, parts, idx, local_ms, "",
-                )
-                .await?;
+                let sink = session.sink.lock().unwrap().clone();
+                if let Err(first) = self
+                    .start_transcode(
+                        registry, &tc, &session.id, plan, parts, idx, local_ms, &sink,
+                    )
+                    .await
+                {
+                    if sink == "hlssink2" {
+                        return Err(first);
+                    }
+                    tracing::warn!(session = %session.id, error = format!("{first:#}"),
+                        "seek restart failed; retrying with fallback sink");
+                    let parts =
+                        self.open_part_leases(registry, &session.parts, idx).await?;
+                    self.start_transcode(
+                        registry, &tc, &session.id, plan, parts, idx, local_ms, "hlssink2",
+                    )
+                    .await
+                    .with_context(|| format!("first attempt: {first:#}"))?;
+                    *session.sink.lock().unwrap() = "hlssink2".into();
+                }
                 Ok(part.base_ms)
             }
             Mode::Direct { .. } => bail!("direct sessions seek with range requests"),
