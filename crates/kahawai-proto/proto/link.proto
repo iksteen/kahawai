@@ -395,6 +395,10 @@ message StartSession {
   // HUB-15a: tone-map HDR video to SDR in the encode chain (GL shader).
   // Only set when this box reported the capability.
   bool tone_map = 13;
+  // HUB-32b: burn this image subtitle track into the picture, as
+  // 1 + the e{n} index (0 = burn nothing, so old transcoders that
+  // ignore the field simply do not burn).
+  uint32 burn_subtitle = 14;
 }
 
 message EndSession {

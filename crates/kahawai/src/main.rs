@@ -72,6 +72,9 @@ enum Cmd {
         /// HUB-15a: tone-map HDR to SDR in the video encode chain.
         #[arg(long)]
         tone_map: bool,
+        /// HUB-32b: burn this image subtitle track (e{n}) into the picture.
+        #[arg(long)]
+        burn_sub: Option<usize>,
     },
 }
 
@@ -145,7 +148,7 @@ async fn main() -> Result<()> {
         }
         Cmd::Mediahost => run_mediahost(cfg.mediahost).await,
         Cmd::Doctor { json } => doctor(&cfg, json),
-        Cmd::RemuxWorker { socket, out_dir, size, video, audio, audio_track, video_track, start_ms, sink, parts, video_kbps, max_height, max_channels, tone_map } => {
+        Cmd::RemuxWorker { socket, out_dir, size, video, audio, audio_track, video_track, start_ms, sink, parts, video_kbps, max_height, max_channels, tone_map, burn_sub } => {
             // Die WITH the supervisor: kill_on_drop only fires inside a
             // living parent, so a hub/transcoder restart used to orphan
             // pipeline workers indefinitely (one survived three days).
@@ -174,6 +177,7 @@ async fn main() -> Result<()> {
                 max_height,
                 max_channels,
                 tone_map,
+                burn_subtitle: burn_sub,
             };
             kahawai_media::worker::run_parts(&all, &out_dir, plan, start_ms, sink.as_deref())
         }

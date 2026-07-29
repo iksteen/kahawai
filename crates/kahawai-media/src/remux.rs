@@ -285,6 +285,10 @@ pub struct RemuxPlan {
     /// HUB-15a: run the GL PQ→SDR tone-map segment in the video encode
     /// chain. Only set when the executing box reported the capability.
     pub tone_map: bool,
+    /// HUB-32b last resort: burn this image subtitle track (the `e{n}`
+    /// index) into the picture, for clients that cannot composite one
+    /// themselves. Forces the video encode that carries it.
+    pub burn_subtitle: Option<usize>,
     pub max_channels: Option<u32>,
 }
 
@@ -567,6 +571,7 @@ fn plumb_parsed_pad(
     video_seen: &Arc<std::sync::atomic::AtomicUsize>,
     subs_seen: &Arc<std::sync::atomic::AtomicUsize>,
     subs_dir: &std::path::Path,
+    burn: &Option<std::sync::Arc<crate::burnin::Timeline>>,
     // False for the second and later parts of a multi-part source: the
     // tracks are the same ones continuing, so extracting them again would
     // overwrite the first part's files with a stream that starts at its
@@ -653,19 +658,20 @@ fn plumb_parsed_pad(
         }
     }
     if routable(&name, &plan) {
-        route_stream(pipe, waiting, &qsrc, &advertised, plan, gate);
+        route_stream(pipe, waiting, &qsrc, &advertised, plan, gate, burn);
         return;
     }
 
     let pipe = pipe.clone();
     let waiting = waiting.clone();
     let gate = gate.clone();
+    let burn = burn.clone();
     qsrc.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |qpad, info| {
         if let Some(gst::PadProbeData::Event(ev)) = &info.data
             && let gst::EventView::Caps(c) = ev.view()
             && qpad.peer().is_none()
         {
-            route_stream(&pipe, &waiting, qpad, &c.caps_owned(), plan, &gate);
+            route_stream(&pipe, &waiting, qpad, &c.caps_owned(), plan, &gate, &burn);
         }
         gst::PadProbeReturn::Ok
     });
@@ -890,6 +896,7 @@ fn route_stream(
     caps: &gst::Caps,
     plan: RemuxPlan,
     gate: &Option<Arc<SeekGate>>,
+    burn: &Option<std::sync::Arc<crate::burnin::Timeline>>,
 ) {
     let caps_name = caps.structure(0).map(|s| s.name().to_string()).unwrap_or_default();
     let mode = mode_for(&caps_name, &plan);
@@ -901,6 +908,7 @@ fn route_stream(
             if kind == "video" {
                 build_video_encode_chain(
                     pipe, from, sinkpad, gate, plan.video_kbps, plan.max_height, plan.tone_map,
+                    burn.clone(),
                 );
             } else {
                 build_audio_encode_chain(pipe, from, sinkpad, &caps_name, gate, plan.max_channels);
@@ -1162,6 +1170,7 @@ fn tonemap_segment() -> Vec<gst::Element> {
     vec![upload, to_rgba, rgba, shader, from_rgba, download, nv12, relabel]
 }
 
+#[allow(clippy::too_many_arguments)] // one plan, spelled out
 fn build_video_encode_chain(
     pipe: &gst::Pipeline,
     from: &gst::Pad,
@@ -1170,6 +1179,7 @@ fn build_video_encode_chain(
     video_kbps: Option<u32>,
     max_height: Option<u32>,
     tone_map: bool,
+    burn: Option<std::sync::Arc<crate::burnin::Timeline>>,
 ) {
     let Some(enc_name) = h264_encoder() else {
         tracing::error!("video encode routed with no verified H.264 encoder");
@@ -1247,10 +1257,24 @@ fn build_video_encode_chain(
         .position(|n| *n == "videoconvert")
         .map(|i| i + 1)
         .unwrap_or(converters.len());
+    // HUB-32b burn-in goes LAST in system memory: after the tone map
+    // (subtitle white is already SDR — mapping it through the PQ curve
+    // would crush it) and after the scaler (blit at output size, and
+    // the rectangles scale to the frame the encoder actually sees).
+    let burn_el: Vec<gst::Element> = burn
+        .filter(|t| !t.is_empty())
+        .and_then(crate::burnin::overlay_element)
+        .into_iter()
+        .collect();
+    if burn_el.is_empty() {
+        tracing::warn!("burn-in requested but no overlay/timeline — encoding without subtitles");
+    }
+
     let mut chain: Vec<&gst::Element> = Vec::new();
     chain.extend(converters[..scale_at].iter());
     chain.extend(tonemap.iter());
     chain.extend(scaler.iter());
+    chain.extend(burn_el.iter());
     chain.extend(converters[scale_at..].iter());
     chain.push(&enc);
     chain.push(&parse);
@@ -1743,6 +1767,39 @@ pub fn start_parts(
     crate::init()?;
     anyhow::ensure!(!sources.is_empty(), "no source parts to remux");
     let multipart = sources.len() > 1;
+    let mut sources = sources;
+
+    // HUB-32b burn-in: read the display-set timeline from the FIRST
+    // part's own container index before its bytes are handed to the
+    // pipeline (the source is random-access and stateless, so the walk
+    // costs a few scattered kilobytes and leaves nothing behind). Doing
+    // it up front — rather than following the demuxer's subtitle pad —
+    // is what makes a session that STARTS mid-set show that set.
+    let burn_timeline = match plan.burn_subtitle {
+        Some(idx) => {
+            let t0 = std::time::Instant::now();
+            match crate::burnin::timeline(&mut *sources[0], idx) {
+                Ok(Some(t)) if !t.is_empty() => {
+                    tracing::info!(
+                        track = idx,
+                        sets = t.len(),
+                        ms = t0.elapsed().as_millis(),
+                        "burn-in: display-set timeline read"
+                    );
+                    Some(std::sync::Arc::new(t))
+                }
+                Ok(_) => {
+                    tracing::warn!(track = idx, "burn-in: no display sets — burning nothing");
+                    None
+                }
+                Err(e) => {
+                    tracing::warn!(track = idx, error = format!("{e:#}"), "burn-in: timeline failed");
+                    None
+                }
+            }
+        }
+        None => None,
+    };
 
     let pipeline = gst::Pipeline::new();
     let (hlssink, _sink_name) = make_hls_sink(out_dir, sink)?;
@@ -1824,10 +1881,11 @@ pub fn start_parts(
         let video_seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let subs_seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let subs_dir = subs_dir.clone();
+        let burn_tl = burn_timeline.clone();
         pb.connect_pad_added(move |_, pad| {
             plumb_parsed_pad(
                 &pipe, &waiting2, pad, plan, &gate2, &audio_seen, &video_seen, &subs_seen,
-                &subs_dir, n == 0,
+                &subs_dir, &burn_tl, n == 0,
             );
         });
     }
@@ -2360,7 +2418,7 @@ mod tests {
     use super::*;
     use std::time::{Duration, Instant};
 
-    const COPY_AV: RemuxPlan = RemuxPlan { video: StreamMode::Copy, audio: StreamMode::Copy, audio_track: 0, video_track: 0, video_kbps: None, max_height: None, max_channels: None, tone_map: false };
+    const COPY_AV: RemuxPlan = RemuxPlan { video: StreamMode::Copy, audio: StreamMode::Copy, audio_track: 0, video_track: 0, video_kbps: None, max_height: None, max_channels: None, tone_map: false, burn_subtitle: None };
 
     /// Manual repro: REMUX_SRC=/path/to/file cargo test -p kahawai-media \
     ///   remux_file_from_env -- --ignored --nocapture
@@ -2646,6 +2704,7 @@ mod tests {
             max_height: Some(120),
             max_channels: Some(1),
             tone_map: false,
+            burn_subtitle: None,
         };
         let _ = info;
         let out = tempfile::tempdir().unwrap();
@@ -2672,6 +2731,58 @@ mod tests {
             seg_info.video[0].height
         );
         assert_eq!(seg_info.audio[0].channels, 1, "downmix to mono did not happen");
+    }
+
+    /// HUB-32b burn-in end to end: a PGS source encoded with
+    /// `burn_subtitle` must carry the subtitle in the PICTURE, and it
+    /// must be there when the session STARTS MID-SET — the case a
+    /// live subtitle pad cannot serve.
+    ///
+    /// Manual (needs a real image-sub file, none is synthesizable here):
+    ///   BURN_SRC=/path/clip.mkv BURN_AT_MS=25500 cargo test -p kahawai-media \
+    ///     burn_in_from_env -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn burn_in_from_env() {
+        crate::init().unwrap();
+        let Ok(src) = std::env::var("BURN_SRC") else { return };
+        let at: u64 = std::env::var("BURN_AT_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        let plan = RemuxPlan {
+            video: StreamMode::Encode,
+            audio: StreamMode::Off,
+            audio_track: 0,
+            video_track: 0,
+            video_kbps: Some(8000),
+            max_height: None,
+            max_channels: None,
+            tone_map: false,
+            burn_subtitle: Some(0),
+        };
+        let out = tempfile::tempdir().unwrap();
+        let job = start_at(
+            out.path(),
+            plan,
+            Box::new(FileSource::open(std::path::Path::new(&src)).unwrap()),
+            at,
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(300);
+        while !job.finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(job.failed().is_none(), "burn-in run failed: {:?}", job.failed());
+        let seg = std::fs::read_dir(out.path())
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|x| x == "ts"))
+            .min()
+            .expect("no segment produced");
+        let keep = std::path::Path::new(
+            &std::env::var("BURN_OUT").unwrap_or_else(|_| "/tmp/burn-seg.ts".into()),
+        )
+        .to_path_buf();
+        std::fs::copy(&seg, &keep).unwrap();
+        println!("first segment -> {}", keep.display());
     }
 
     /// HUB-15 channel ceiling: a client that accepts stereo gets
@@ -2703,6 +2814,7 @@ mod tests {
             max_height: None,
             max_channels: Some(2),
             tone_map: false,
+            burn_subtitle: None,
         };
         let out = tempfile::tempdir().unwrap();
         let job =
@@ -2754,6 +2866,7 @@ mod tests {
             max_height: None,
             max_channels: None,
             tone_map: true,
+            burn_subtitle: None,
         };
         let out = tempfile::tempdir().unwrap();
         let job =

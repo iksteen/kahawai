@@ -35,15 +35,15 @@ pub fn extract_sparse(path: &Path) -> Result<Option<Vec<(usize, Extracted)>>> {
     }
     file.seek(SeekFrom::Start(0))?;
     drop(file);
-    let src = Box::new(crate::remux::FileSource::open(path)?);
+    let mut src = crate::remux::FileSource::open(path)?;
     if magic[..4] == [0x1A, 0x45, 0xDF, 0xA3] {
-        return mkv_extract(src).map(Some).or_else(|e| {
+        return mkv_extract(&mut src).map(Some).or_else(|e| {
             tracing::debug!(error = format!("{e:#}"), "mkv sparse parse failed; falling back");
             Ok(None)
         });
     }
     if &magic[4..8] == b"ftyp" {
-        return mp4_extract(src).map(Some).or_else(|e| {
+        return mp4_extract(&mut src).map(Some).or_else(|e| {
             tracing::debug!(error = format!("{e:#}"), "mp4 sparse parse failed; falling back");
             Ok(None)
         });
@@ -58,8 +58,8 @@ pub fn extract_sparse(path: &Path) -> Result<Option<Vec<(usize, Extracted)>>> {
 /// mediahost's extraction pass, and the session's own lease-backed
 /// reader when a pipeline worker needs the same index (burn-in builds
 /// its display-set timeline that way — see `extract_image_track`).
-struct Reader {
-    src: Box<dyn RemuxSource>,
+struct Reader<'a> {
+    src: &'a mut dyn RemuxSource,
     len: u64,
     /// Readahead window: header walks issue thousands of tiny reads;
     /// over network filesystems each would be a round trip.
@@ -69,8 +69,8 @@ struct Reader {
 
 const READAHEAD: usize = 256 * 1024;
 
-impl Reader {
-    fn new(src: Box<dyn RemuxSource>) -> Self {
+impl<'a> Reader<'a> {
+    fn new(src: &'a mut dyn RemuxSource) -> Self {
         let len = src.size();
         Self { src, len, win_start: 0, win: Vec::new() }
     }
@@ -413,9 +413,9 @@ fn mkv_read_index(r: &mut Reader) -> Result<MkvIndex> {
 /// the Attachments element when the SeekHead promises one, otherwise
 /// hops top-level elements by declared size. Non-matroska → empty.
 pub fn declare_attachments(path: &Path) -> Result<Vec<kahawai_core::media::Attachment>> {
-    let src = Box::new(crate::remux::FileSource::open(path)?);
+    let mut src = crate::remux::FileSource::open(path)?;
     let len = src.size();
-    let mut r = Reader::new(src);
+    let mut r = Reader::new(&mut src);
 
     let head = r.read_at(0, 32.min(len as usize))?;
     let Ok((id, il)) = ebml_id(&head) else { return Ok(Vec::new()) };
@@ -734,8 +734,9 @@ pub struct ImageTrack {
     pub codec: String,
     /// CodecPrivate: the VobSub `.idx` text (palette, display size).
     pub codec_private: Option<Vec<u8>>,
-    /// (presentation ms, payload) per block.
-    pub blocks: Vec<(u64, Vec<u8>)>,
+    /// (presentation ms, declared duration ms, payload) per block.
+    /// VobSub carries its own lifetime; PGS ends at the next set.
+    pub blocks: Vec<(u64, Option<u64>, Vec<u8>)>,
 }
 
 /// Index-driven read of ONE image subtitle track (`e{sub_index}`).
@@ -743,7 +744,7 @@ pub struct ImageTrack {
 /// path, or that track is not an image track — callers then have no
 /// timeline and skip burn-in rather than guessing.
 pub fn extract_image_track(
-    src: Box<dyn RemuxSource>,
+    src: &mut dyn RemuxSource,
     sub_index: usize,
 ) -> Result<Option<ImageTrack>> {
     let mut r = Reader::new(src);
@@ -765,13 +766,13 @@ struct MkvOut {
     image: Option<ImageTrack>,
 }
 
-fn mkv_extract(src: Box<dyn RemuxSource>) -> Result<Vec<(usize, Extracted)>> {
+fn mkv_extract(src: &mut dyn RemuxSource) -> Result<Vec<(usize, Extracted)>> {
     Ok(mkv_walk(Reader::new(src), None)?.text)
 }
 
 /// The shared walk. `image = Some(sub_index)` collects that one image
 /// track's blocks; `None` collects every text track's.
-fn mkv_walk(mut r: Reader, image: Option<usize>) -> Result<MkvOut> {
+fn mkv_walk(mut r: Reader<'_>, image: Option<usize>) -> Result<MkvOut> {
     let idx = mkv_read_index(&mut r)?;
     if idx.tracks.is_empty() {
         return Ok(MkvOut { text: Vec::new(), image: None });
@@ -892,15 +893,15 @@ fn mkv_walk(mut r: Reader, image: Option<usize>) -> Result<MkvOut> {
         let Some(t) = idx.tracks.iter().find(|t| t.sub_index == want && !t.is_text()) else {
             return Ok(MkvOut { text: Vec::new(), image: None });
         };
-        let mut out: Vec<(u64, Vec<u8>)> = blocks
+        let mut out: Vec<(u64, Option<u64>, Vec<u8>)> = blocks
             .iter()
             .filter(|(_, b)| b.track == t.number)
             .map(|(cluster_ts, b)| {
                 let ticks = cluster_ts.saturating_add_signed(i64::from(b.rel_time));
-                (to_ms(ticks), b.payload.clone())
+                (to_ms(ticks), b.duration.map(|d| to_ms(d)), b.payload.clone())
             })
             .collect();
-        out.sort_by_key(|(ms, _)| *ms);
+        out.sort_by_key(|(ms, _, _)| *ms);
         return Ok(MkvOut {
             text: Vec::new(),
             image: Some(ImageTrack {
@@ -972,7 +973,7 @@ fn encode_element(id: u32, body: &[u8]) -> Vec<u8> {
 
 // ---------- MP4 ----------
 
-fn mp4_extract(src: Box<dyn RemuxSource>) -> Result<Vec<(usize, Extracted)>> {
+fn mp4_extract(src: &mut dyn RemuxSource) -> Result<Vec<(usize, Extracted)>> {
     let mut r = Reader::new(src);
     // Find moov at top level.
     let mut pos = 0u64;
@@ -1193,10 +1194,10 @@ mod tests {
     fn image_track_from_env() {
         let Ok(path) = std::env::var("IMGSUB_SRC") else { return };
         let idx: usize = std::env::var("IMGSUB_IDX").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
-        let src = Box::new(crate::remux::FileSource::open(std::path::Path::new(&path)).unwrap());
+        let mut src = crate::remux::FileSource::open(std::path::Path::new(&path)).unwrap();
         let t0 = std::time::Instant::now();
-        let track = super::extract_image_track(src, idx).unwrap().expect("no image track");
-        let bytes: usize = track.blocks.iter().map(|(_, b)| b.len()).sum();
+        let track = super::extract_image_track(&mut src, idx).unwrap().expect("no image track");
+        let bytes: usize = track.blocks.iter().map(|(_, _, b)| b.len()).sum();
         println!(
             "codec {} · {} blocks · {} KiB · {:.2}s",
             track.codec,
@@ -1208,7 +1209,7 @@ mod tests {
         let mut dec = crate::imagesubs::PgsDecoder::default();
         let mut sets = 0usize;
         let mut first = None;
-        for (ms, payload) in &track.blocks {
+        for (ms, _dur, payload) in &track.blocks {
             if let Ok(Some(set)) = dec.feed(payload) {
                 sets += 1;
                 if first.is_none() && !set.objects.is_empty() {

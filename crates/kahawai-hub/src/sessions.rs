@@ -894,6 +894,9 @@ impl Sessions {
                 if plan.tone_map {
                     cmd.arg("--tone-map");
                 }
+                if let Some(n) = plan.burn_subtitle {
+                    cmd.args(["--burn-sub", &n.to_string()]);
+                }
                 let child = cmd
                     .args(["--video", kahawai_media::worker::mode_arg(plan.video)])
                     .args(["--audio", kahawai_media::worker::mode_arg(plan.audio)])
@@ -1022,6 +1025,8 @@ impl Sessions {
                     max_height: plan.max_height.unwrap_or(0),
                     max_channels: plan.max_channels.unwrap_or(0),
                     tone_map: plan.tone_map,
+                    // 1-based on the wire: 0 means "burn nothing".
+                    burn_subtitle: plan.burn_subtitle.map_or(0, |n| n as u32 + 1),
                 },
             )),
         };

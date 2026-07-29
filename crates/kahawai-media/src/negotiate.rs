@@ -57,6 +57,8 @@ pub enum SubtitleTier {
     Text,
     Convert,
     Graphics,
+    /// HUB-32b last resort: composited into the picture by the encoder.
+    Burn,
     Unavailable,
 }
 
@@ -139,6 +141,17 @@ fn video_fits(profile: &CapabilityProfile, v: &kahawai_core::media::VideoStream)
     true
 }
 
+/// Does this client need an image subtitle burned in? (HUB-32b: it
+/// cannot composite one, and the source carries one.) Decided before
+/// the plan, because it vetoes direct play and copy alike.
+fn burn_wanted(profile: &CapabilityProfile, info: &MediaInfo) -> bool {
+    !profile.graphics_overlay
+        && info
+            .subtitles
+            .iter()
+            .any(|s| matches!(s.format.as_str(), "pgs" | "vobsub" | "dvdsub"))
+}
+
 /// The whole decision, one source. `est_kbps` is the hub's aggregate
 /// size×8/duration estimate — the only bitrate available for
 /// pre-extension rows; used solely when a cap is set. `tonemap` is the
@@ -193,10 +206,26 @@ pub fn negotiate(
         && container_ok
         && (v.is_none() || v_client_ok)
         && (a.is_none() || a_client_ok)
-        && (v.is_some() || a.is_some());
+        && (v.is_some() || a.is_some())
+        // Serving the file as-is cannot burn anything into it.
+        && !burn_wanted(profile, info);
+
+    // HUB-32b last resort: an image subtitle a client cannot composite
+    // is burned into the picture. The policy is fidelity-first — the
+    // client gets its subtitles — so this FORCES the video encode that
+    // carries them, turning a direct play or a copy into a transcode.
+    // Only the first such track: burning two on top of each other is
+    // never what anyone means.
+    let burn_subtitle = (!profile.graphics_overlay)
+        .then(|| {
+            info.subtitles
+                .iter()
+                .position(|s| matches!(s.format.as_str(), "pgs" | "vobsub" | "dvdsub"))
+        })
+        .flatten();
 
     // Remux/transcode verdict per stream.
-    let video = if v.is_some_and(|s| v_client_ok && muxable("video", &s.codec)) {
+    let video = if v.is_some_and(|s| v_client_ok && muxable("video", &s.codec) && burn_subtitle.is_none()) {
         StreamMode::Copy
     } else if h264_encoder().is_some()
         && v.is_some_and(|s| codec_to_caps_name("video", &s.codec).is_some_and(can_decode))
@@ -235,6 +264,8 @@ pub fn negotiate(
         // source with fewer channels than the ceiling keeps its own
         // (never upmix). Unknown source count (pre-extension row) falls
         // back to the ceiling itself.
+        // Only claim the burn when the encode that carries it exists.
+        burn_subtitle: burn_subtitle.filter(|_| video == StreamMode::Encode),
         max_channels: (audio == StreamMode::Encode && profile.max_audio_channels > 0).then(|| {
             a.map(|s| s.channels)
                 .filter(|c| *c > 0)
@@ -289,9 +320,16 @@ pub fn negotiate(
                 "pgs" | "vobsub" | "dvdsub" if profile.graphics_overlay => {
                     (SubtitleTier::Graphics, "")
                 }
+                "pgs" | "vobsub" | "dvdsub" if plan.burn_subtitle == Some(index) => {
+                    (SubtitleTier::Burn, "burned in (forces the video encode)")
+                }
+                "pgs" | "vobsub" | "dvdsub" if burn_subtitle.is_some() => (
+                    SubtitleTier::Unavailable,
+                    "only one track can be burned in",
+                ),
                 "pgs" | "vobsub" | "dvdsub" => (
                     SubtitleTier::Unavailable,
-                    "needs OCR (HUB-32c) or burn-in — neither built",
+                    "cannot be burned in (source is not decodable here)",
                 ),
                 _ => (SubtitleTier::Text, ""),
             };
@@ -410,6 +448,10 @@ mod tests {
             SubtitleStream { format: "ass".into(), language: None },
             SubtitleStream { format: "pgs".into(), language: None },
         ];
+        // This fixture's client can composite, so the PGS track does
+        // NOT drag the plan into an encode (burn-in has its own test).
+        let mut p = p;
+        p.graphics_overlay = true;
         // No capable box: the copy stands, the verdict says as-is.
         let sp = negotiate(&p, &info, 0, 0, true, None, false);
         assert_eq!(sp.cost, Cost::Copy, "without tone-map capability the copy stands");
@@ -417,7 +459,7 @@ mod tests {
         assert!(!sp.plan.tone_map, "copies never tone-map");
         assert_eq!(sp.subtitles[0].tier, SubtitleTier::Text);
         assert_eq!(sp.subtitles[1].tier, SubtitleTier::Convert, "no ass_render → flatten");
-        assert_eq!(sp.subtitles[2].tier, SubtitleTier::Unavailable);
+        assert_eq!(sp.subtitles[2].tier, SubtitleTier::Graphics);
         let mut able = chrome();
         able.ass_render = true;
         able.graphics_overlay = true;
@@ -444,6 +486,49 @@ mod tests {
         p.max_audio_channels = 0;
         let sp = negotiate(&p, &media("matroska", Some(vs("h264")), Some(au("dts", 6))), 0, 0, true, None, false);
         assert_eq!(sp.plan.max_channels, None);
+    }
+
+    /// HUB-32b: a client that cannot composite gets image subtitles
+    /// burned in, and that forces the encode which carries them — a
+    /// copy or a direct play cannot have anything burned into it.
+    #[test]
+    fn image_subs_burn_in_and_force_the_encode() {
+        let mut p = chrome();
+        p.graphics_overlay = false;
+        // A source that would otherwise be a clean copy.
+        let mut info = media("matroska", Some(vs("h264")), Some(au("aac", 2)));
+        info.subtitles = vec![SubtitleStream { format: "pgs".into(), language: None }];
+
+        let sp = negotiate(&p, &info, 0, 0, true, None, false);
+        assert_eq!(sp.cost, Cost::VideoEncode, "burn-in forces the encode: {}", sp.video_verdict);
+        assert_eq!(sp.plan.burn_subtitle, Some(0));
+        assert_eq!(sp.subtitles[0].tier, SubtitleTier::Burn);
+
+        // Direct play is off the table for the same reason.
+        let mut mp4 = info.clone();
+        mp4.container = Some("mp4".into());
+        let sp = negotiate(&p, &mp4, 0, 0, true, None, false);
+        assert!(!sp.direct, "cannot burn into a file served as-is");
+
+        // A compositing client keeps its cheap path and its overlay.
+        p.graphics_overlay = true;
+        let sp = negotiate(&p, &info, 0, 0, true, None, false);
+        assert_eq!(sp.cost, Cost::Copy);
+        assert_eq!(sp.plan.burn_subtitle, None);
+        assert_eq!(sp.subtitles[0].tier, SubtitleTier::Graphics);
+    }
+
+    /// Text subtitles never trigger burn-in — they have their own
+    /// tiers, and a video encode for them would be gratuitous.
+    #[test]
+    fn text_subs_do_not_force_burn_in() {
+        let mut p = chrome();
+        p.graphics_overlay = false;
+        let mut info = media("matroska", Some(vs("h264")), Some(au("aac", 2)));
+        info.subtitles = vec![SubtitleStream { format: "srt".into(), language: None }];
+        let sp = negotiate(&p, &info, 0, 0, true, None, false);
+        assert_eq!(sp.cost, Cost::Copy);
+        assert_eq!(sp.plan.burn_subtitle, None);
     }
 
     /// HUB-15a decision arm: PQ + encode + capable box → tone-map;
