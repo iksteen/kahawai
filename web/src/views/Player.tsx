@@ -15,11 +15,14 @@ import {
   putPref,
   resolveTracks,
   seekSession,
+  startPlaybackSession,
   subtitleLabel,
-  type Item,
+  type ItemDetail,
   type Session,
   type Subtitle,
 } from '../api'
+import { buildProfile, loadMask, maskSummary } from '../capabilities'
+import CapabilityDebug from './CapabilityDebug'
 
 function fmt(ms: number) {
   const s = Math.max(0, Math.floor(ms / 1000))
@@ -37,14 +40,25 @@ export default function Player({
   resumeMs,
   libraryId,
   onClose,
+  onRestart,
 }: {
-  item: Item
+  item: ItemDetail
   session: Session
   resumeMs: number
   libraryId: string
   onClose: () => void
+  /** Play again from `at` on a freshly negotiated session (capability
+   *  debug: a mask only takes effect on a new session). */
+  onRestart: (session: Session, at: number) => void
 }) {
   const videoRef = useRef<HTMLVideoElement>(null)
+  // The capabilities THIS session was negotiated with: frozen at mount
+  // so the player's own rendering can never disagree with what the hub
+  // was told (a mask edited mid-session applies on the next restart).
+  const capsRef = useRef(buildProfile())
+  const [showCaps, setShowCaps] = useState(false)
+  const [restarting, setRestarting] = useState(false)
+  const maskedRef = useRef(maskSummary(loadMask()))
   const hlsRef = useRef<Hls | null>(null)
   const isHls = session.stream_url.endsWith('.m3u8')
   // For HLS sessions the pipeline itself starts at resumeMs, so the
@@ -103,7 +117,9 @@ export default function Player({
         )
         setAudioTrack(r.audioTrack)
         subsPrefRef.current = r.subs
-        return fetchSubtitles(item.id)
+        // HUB-32b: a client that declares no display-set compositing
+        // is not offered image subtitles at all.
+        return fetchSubtitles(item.id, capsRef.current.graphics_overlay)
       })
       .then((r) => {
         setSubs(r.subtitles)
@@ -117,6 +133,23 @@ export default function Player({
         setVideoTracks([])
       })
   }, [item.id, libraryId])
+
+  // A capability mask reaches the hub only on a NEW session — the hub
+  // stores the effective profile per session and re-plans track
+  // switches against it — so applying one restarts playback here.
+  const [capsError, setCapsError] = useState('')
+  const restartWithCaps = async () => {
+    setRestarting(true)
+    setCapsError('')
+    try {
+      const at = Math.round(posMs)
+      const fresh = await startPlaybackSession(item, at, audioTrack, videoTrack)
+      onRestart(fresh, at) // remounts this component; the old session ends in cleanup
+    } catch (e) {
+      setCapsError(String(e))
+      setRestarting(false)
+    }
+  }
 
   // Track switching is a seek-restart at the current position with the
   // new track (§6 machinery; ~2 s hiccup, same as a deep seek).
@@ -161,17 +194,26 @@ export default function Player({
   }, [subKey, trackEpoch])
 
   const selected = subs.find((s) => s.key === subKey)
-  const useAss = !!selected && (selected.format === 'ass' || selected.format === 'ssa')
+  const isAss = !!selected && (selected.format === 'ass' || selected.format === 'ssa')
+  // HUB-32a: faithful ASS rendering only when this client DECLARES it.
+  // Without the declaration the hub plans the flattened-to-VTT tier and
+  // the player must actually take it — otherwise a masked run would
+  // change the verdict text and nothing else.
+  const useAss = isAss && capsRef.current.ass_render
   // Embedded non-ASS on an HLS session rides the live session tap and
   // feeds cues via the TextTrack API (a <track> can't consume a
   // growing document). Falls back to the item-level .vtt <track> when
   // the tap yields nothing (old satellite, no pipeline).
   const [vttFallback, setVttFallback] = useState(false)
   const useImage = !!selected && !!selected.image
+  // Keyed on the FORMAT, not on useAss: the pipeline taps an ASS track
+  // as .ass and never writes the .jsonl this path reads, so a client
+  // that declined ASS rendering must go straight to the flattened
+  // .vtt track rather than chase a tap that cannot exist.
   const liveText =
     isHls &&
     !!selected &&
-    !useAss &&
+    !isAss &&
     !useImage &&
     selected.kind === 'embedded' &&
     !vttFallback
@@ -712,7 +754,15 @@ export default function Player({
       <div className="playback-info mono">
         {item.title} · {session.mode}
         {streams ? ` · video: ${streams.video} · audio: ${streams.audio}` : ''}{' '}
-        · {session.content_type}
+        · {session.content_type}{' '}
+        <button className="btn ghost small" onClick={() => setShowCaps((v) => !v)}>
+          {showCaps ? 'hide caps' : 'caps'}
+        </button>
+        {/* The mask this session was negotiated with, always visible:
+            a forgotten mask must never read as a bug in the hub. */}
+        {maskedRef.current.length > 0 && (
+          <span className="caps-badge">masked: {maskedRef.current.join(' ')}</span>
+        )}
         {streams?.subtitles?.length ? (
           <div className="dim">
             {streams.subtitles
@@ -724,6 +774,8 @@ export default function Player({
               .join(' · ')}
           </div>
         ) : null}
+        {showCaps && <CapabilityDebug onApply={restartWithCaps} applying={restarting} />}
+        {capsError && <div className="dim">restart failed: {capsError}</div>}
       </div>
     </main>
   )

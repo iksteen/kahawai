@@ -107,13 +107,99 @@ function refineForSources(streams: AnnouncedVideo[]): VideoCap[] {
   return out
 }
 
+// ---- Debug capability mask ----
+//
+// The negotiation matrix (HUB-14/15) and the subtitle tiers (HUB-32a/b)
+// have branches that most browsers never take: a client that cannot
+// decode HEVC, cannot display HDR, cannot render ASS, cannot composite
+// bitmap display sets. Hunting for a browser that genuinely lacks each
+// one is slow and unrepeatable, so the player can SUBTRACT from the
+// probe. What the mask changes is not cosmetic: the profile sent to the
+// hub and the rendering the player itself performs both follow the
+// masked answer, so a masked client behaves like the real thing.
+//
+// Codec/container entries can only be dropped — claiming a decoder the
+// browser lacks would produce a stream it cannot play, which tests
+// nothing. The three booleans are declarations rather than probes
+// (JASSUB and the display-set canvas are always bundled; `hdr` is a
+// behavioural claim no feature test exposes), so those may go either
+// way.
+
+const MASK_KEY = 'kahawai.capmask'
+
+export type CapabilityMask = {
+  /** Codec families / containers to drop from the probed lists. */
+  video?: string[]
+  audio?: string[]
+  containers?: string[]
+  /** Ceilings to impose; absent = whatever the probe allowed. */
+  max_height?: number
+  max_audio_channels?: number
+  /** Declaration overrides; absent = the probe's own answer. */
+  hdr?: boolean
+  ass_render?: boolean
+  graphics_overlay?: boolean
+}
+
+export function loadMask(): CapabilityMask {
+  try {
+    const raw = localStorage.getItem(MASK_KEY)
+    return raw ? (JSON.parse(raw) as CapabilityMask) : {}
+  } catch {
+    return {} // unparseable or storage denied: no mask
+  }
+}
+
+export function saveMask(m: CapabilityMask) {
+  try {
+    if (maskSummary(m).length === 0) localStorage.removeItem(MASK_KEY)
+    else localStorage.setItem(MASK_KEY, JSON.stringify(m))
+  } catch {
+    // private mode: the mask applies for this page's lifetime only
+  }
+}
+
+/**
+ * What this mask actually changes, one token each; `[]` means inert.
+ * The player shows these so a mask left on can never be mistaken for a
+ * bug — the whole trap this affordance would otherwise set.
+ */
+export function maskSummary(m: CapabilityMask): string[] {
+  const out: string[] = []
+  for (const kind of ['video', 'audio', 'containers'] as const) {
+    const dropped = m[kind]
+    if (dropped?.length) out.push(`−${dropped.join(',')}`)
+  }
+  if (m.max_height) out.push(`≤${m.max_height}p`)
+  if (m.max_audio_channels) out.push(`${m.max_audio_channels}ch`)
+  for (const flag of ['hdr', 'ass_render', 'graphics_overlay'] as const) {
+    if (m[flag] !== undefined) out.push(`${flag}=${m[flag]}`)
+  }
+  return out
+}
+
+function applyMask(p: CapabilityProfile, m: CapabilityMask): CapabilityProfile {
+  const out: CapabilityProfile = { ...p, video: [...p.video] }
+  if (m.video?.length) out.video = out.video.filter((c) => !m.video!.includes(c.codec))
+  if (m.audio?.length) out.audio = out.audio.filter((c) => !m.audio!.includes(c))
+  if (m.containers?.length) out.containers = out.containers.filter((c) => !m.containers!.includes(c))
+  // Ceilings tighten, never loosen.
+  if (m.max_height) out.max_height = Math.min(m.max_height, out.max_height ?? m.max_height)
+  if (m.max_audio_channels) out.max_audio_channels = m.max_audio_channels
+  if (m.hdr !== undefined) out.hdr = m.hdr
+  if (m.ass_render !== undefined) out.ass_render = m.ass_render
+  if (m.graphics_overlay !== undefined) out.graphics_overlay = m.graphics_overlay
+  return out
+}
+
 /** Probe once per page load; the result only changes with the browser. */
 let cached: CapabilityProfile | null = null
 
-export function buildProfile(
-  bandwidthKbps?: number | null,
-  announced?: AnnouncedVideo[],
-): CapabilityProfile {
+/**
+ * The browser's own answer, mask NOT applied — what the debug panel
+ * offers to subtract from, and the baseline it compares against.
+ */
+export function probedProfile(): CapabilityProfile {
   if (!cached) {
     cached = {
       containers: CONTAINER_PROBES.filter(([, m]) => supported(m)).map(([n]) => n),
@@ -132,14 +218,25 @@ export function buildProfile(
     }
     // A browser with no probeable video at all (should not happen)
     // must not send an empty list — that would transcode everything.
+    // (A mask emptying the list IS meaningful and is applied later.)
     if (cached.video.length === 0) cached.video = [{ codec: 'h264' }]
     if (cached.audio.length === 0) cached.audio = ['aac', 'mp3']
     if (cached.containers.length === 0) cached.containers = ['mp4']
   }
-  const p = { ...cached, video: [...cached.video] }
+  return cached
+}
+
+export function buildProfile(
+  bandwidthKbps?: number | null,
+  announced?: AnnouncedVideo[],
+): CapabilityProfile {
+  const base = probedProfile()
+  const p: CapabilityProfile = { ...base, video: [...base.video] }
   if (bandwidthKbps && bandwidthKbps > 0) p.max_bandwidth_kbps = bandwidthKbps
   // Exact per-stream verifications ride ALONGSIDE the family floor —
   // the hub admits a stream when any cap for its codec does.
   if (announced?.length) p.video.push(...refineForSources(announced))
-  return p
+  // The mask goes LAST: a source-aware precise cap must not smuggle
+  // back a family the mask just dropped.
+  return applyMask(p, loadMask())
 }

@@ -213,6 +213,25 @@ h2 { font-size: 14px; font-weight: 650; color: var(--dim); letter-spacing: 0.08e
 .videobox:fullscreen .fs-btn { top: 8px; }
 .playback-info { color: var(--dim); margin-top: 10px; }
 
+/* Capability debug mask (HUB-14/32 branch testing). */
+.caps-badge {
+  margin-left: 8px; padding: 1px 8px; border-radius: 999px;
+  border: 1px solid var(--warn, #b8860b); color: var(--warn, #b8860b);
+}
+.caps-panel {
+  margin-top: 10px; padding: 10px 12px;
+  border: 1px solid var(--line); border-radius: 8px;
+  display: flex; flex-direction: column; gap: 8px;
+}
+.caps-intro { line-height: 1.5; max-width: 70ch; }
+.caps-row { display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; }
+.caps-label { min-width: 5.5em; }
+.caps-opts { display: flex; gap: 12px; flex-wrap: wrap; align-items: baseline; }
+.caps-opts label { display: inline-flex; gap: 4px; align-items: baseline; cursor: pointer; }
+.caps-opts select { margin-left: 4px; }
+.caps-off { color: var(--dim); text-decoration: line-through; }
+.caps-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+
 @media (max-width: 560px) {
   .shell { padding: 0 14px 40px; }
   .library-head { flex-wrap: wrap; }

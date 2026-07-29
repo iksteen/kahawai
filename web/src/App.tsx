@@ -5,7 +5,7 @@ import {
   refreshTokens,
   storeTokens,
   username,
-  type Item,
+  type ItemDetail,
   type Session,
 } from './api'
 import Auth from './views/Auth'
@@ -22,7 +22,7 @@ type Route =
   | { view: 'admin' }
   | { view: 'settings' }
   | { view: 'detail'; id: string; autoPlay?: boolean; fromLib: string }
-  | { view: 'player'; item: Item; session: Session; resumeMs: number; fromLib: string }
+  | { view: 'player'; item: ItemDetail; session: Session; resumeMs: number; fromLib: string }
 
 type Phase = 'boot' | 'setup' | 'login' | 'app'
 
@@ -224,6 +224,14 @@ export default function App() {
           onClose={() =>
             navigate(
               { view: 'detail', id: route.item.id, fromLib: route.fromLib },
+              { replace: true }
+            )
+          }
+          // Capability-debug restart: a new session id remounts the
+          // player (keyed above), which ends the old one in cleanup.
+          onRestart={(session, at) =>
+            navigate(
+              { view: 'player', item: route.item, session, resumeMs: at, fromLib: route.fromLib },
               { replace: true }
             )
           }

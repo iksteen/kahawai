@@ -1,4 +1,3 @@
-import { buildProfile } from '../capabilities'
 import { useEffect, useState } from 'react'
 import {
   artworkUrl,
@@ -15,7 +14,7 @@ import {
   type SubtitleQuota,
   type Subtitle,
   type SubtitleCandidate,
-  startSession,
+  startPlaybackSession,
   type Item,
   type ItemDetail,
   type Session,
@@ -81,7 +80,7 @@ export default function Detail({
   id: string
   autoPlay?: boolean
   fromLib: string
-  onPlay: (item: Item, session: Session, resumeMs: number) => void
+  onPlay: (item: ItemDetail, session: Session, resumeMs: number) => void
   onOpenEpisode: (id: string) => void
   onOpenLibrary: (id: string) => void
 }) {
@@ -372,26 +371,11 @@ export default function Detail({
       } catch {
         // prefs unavailable → source order
       }
-      // HUB-14: send the probed capability profile; the hub decides
-      // the mode. start_ms is ignored by the direct path server-side,
-      // so resuming needs no mode prediction here.
-      let cap: number | undefined
-      try {
-        const p = await fetchPrefs()
-        const v = p.prefs.find((x) => x.scope === '' && x.key === 'bandwidth_kbps')?.value
-        cap = v ? Number(v) : undefined
-      } catch {
-        // prefs unavailable → no cap
-      }
-      // Source-aware precision: probe the exact strings the announced
-      // streams call for (profile/level from the hub's own probing).
-      const announced = item!.sources_detail.flatMap((s) => s.streams?.video ?? [])
-      const session = await startSession(
-        item!.id,
-        buildProfile(cap, announced),
-        start,
-        audioTrack,
-      )
+      // HUB-14: the hub decides the mode from the capability profile
+      // (built in one shared place, mask included). start_ms is ignored
+      // by the direct path server-side, so resuming needs no mode
+      // prediction here.
+      const session = await startPlaybackSession(item!, start, audioTrack)
       onPlay(item!, session, start)
     } catch (e) {
       setError(String(e))

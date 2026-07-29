@@ -2,6 +2,8 @@
 // Authorization header for fetches and a cookie for <video>/HLS requests
 // (media elements cannot set headers). 401s trigger one refresh + retry.
 
+import { buildProfile } from './capabilities'
+
 const LS_ACCESS = 'kahawai.access'
 const LS_REFRESH = 'kahawai.refresh'
 
@@ -204,8 +206,14 @@ export type Subtitle = {
   image?: boolean
 }
 
-export const fetchSubtitles = (itemId: string) =>
-  json<{ subtitles: Subtitle[] }>(`/api/v1/items/${itemId}/subtitles`)
+/// HUB-32b: a client that cannot composite bitmap display sets asks the
+/// hub not to offer image subtitles at all — an entry it could never
+/// render is worse than its absence. The declaration comes from the
+/// capability profile (so a debug mask flips it like a real client).
+export const fetchSubtitles = (itemId: string, graphicsOverlay = true) =>
+  json<{ subtitles: Subtitle[] }>(
+    `/api/v1/items/${itemId}/subtitles${graphicsOverlay ? '' : '?graphics_overlay=false'}`,
+  )
 
 /// HUB-21/22/24: external subtitle search + download.
 export type SubtitleCandidate = {
@@ -350,6 +358,30 @@ export function startSession(
       video_track: videoTrack,
     }),
   })
+}
+
+/// One place builds a play request: bandwidth pref → probed profile →
+/// source-aware refinements → debug mask → session. Shared by the
+/// detail page's play button and the player's capability restart, so
+/// both negotiate from an identical profile.
+export async function startPlaybackSession(
+  item: ItemDetail,
+  startMs = 0,
+  audioTrack = 0,
+  videoTrack = 0,
+): Promise<Session> {
+  let cap: number | undefined
+  try {
+    const p = await fetchPrefs()
+    const v = p.prefs.find((x) => x.scope === '' && x.key === 'bandwidth_kbps')?.value
+    cap = v ? Number(v) : undefined
+  } catch {
+    // prefs unavailable → no cap
+  }
+  // Source-aware precision: probe the exact strings the announced
+  // streams call for (profile/level from the hub's own probing).
+  const announced = item.sources_detail.flatMap((s) => s.streams?.video ?? [])
+  return startSession(item.id, buildProfile(cap, announced), startMs, audioTrack, videoTrack)
 }
 
 /// Music plays direct by operator contract (browsers decode flac/mp3
