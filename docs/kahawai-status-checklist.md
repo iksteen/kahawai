@@ -154,8 +154,8 @@ How something works and why it was built that way belong in
 - [x] HUB-15a HDR→SDR tone-mapping tier: GL shader (BT.2390 EETF,
       scene-adaptive peak probe, libplacebo-fitted display mapping),
       TC-1 `tonemap` report, doctor row, placement preference, verdict.
-      Quality gate: 10-title matrix vs mpv/libplacebo, percentile-curve
-      RMS 0.050, bias −0.005
+      Quality gate: 10-title matrix vs libplacebo GPU renders,
+      per-title percentile RMS ≤ 0.006; live scene check within 0.01
 - [x] HUB-16 Cheapest-path preference incl. SOURCE choice: every
       candidate judged, direct > copy > audio-enc > video-enc, rank ties
 - [x] HUB-17 HLS delivery for remux/transcode (EVENT playlists, mid-stream seek)

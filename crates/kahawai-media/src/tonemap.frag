@@ -64,20 +64,22 @@ float eetf(float e, float ks, float mt) { // e = pixel PQ code / maxE
        + (-2.0 * t3 + 3.0 * t2) * mt;
 }
 
-// Display mapping fitted against mpv/libplacebo percentile curves on
-// real HDR movie frames (2026-07-29): tone-mapped ABSOLUTE nits are
-// shown on a ~112-nit-white SDR display with a Hermite shoulder from
-// 0.84 up to 203/112.4 nits relative — libplacebo renders brighter
-// than a literal 203-nit-white mapping and slams scene highlights to
-// signal white; a plain 203-normalize measured as the owner's "grey
-// smear". Gamma 2.227 from the same fit (consumer ~2.2 displays).
-// 112.4 was the least-squares fit across three titles; the owner's
-// eye against mpv asked for one more notch — 100 nits, the classic
-// SDR reference white.
-const float W_REL = 10000.0 / 100.0;
-const float Z_MAX = 203.0 / 100.0;
-const float KNEE = 0.84;
-const float GAMMA = 2.227;
+// Display mapping refit 2026-07-29 (late) against what mpv actually
+// DISPLAYS: vo=gpu/libplacebo window captures via IPC
+// screenshot-to-file. Every earlier fit (W=100-112) chased mpv's
+// vo=image screenshots, which run zimg's SOFTWARE tone mapper — a
+// different, brighter renderer (owner caught it live: "way brighter
+// than mpv" while the stream matched the zimg refs). Against the
+// real libplacebo: W=200 (the textbook BT.2408-ish 203-nit white),
+// knee 0.80, gamma 2.19 — joint-fit loss 0.0025, per-title
+// percentile RMS <= 0.006 on 9/10 matrix titles. The scene-adaptive
+// peak (uniforms above) is what makes the textbook mapping land:
+// without it, bright-scene highlights stall and the whole image
+// needs fake exposure to compensate.
+const float W_REL = 10000.0 / 200.0;
+const float Z_MAX = 203.0 / 200.0;
+const float KNEE = 0.80;
+const float GAMMA = 2.19;
 
 float shoulder(float z) {
   if (z <= KNEE) return z;
