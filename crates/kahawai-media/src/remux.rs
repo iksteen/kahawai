@@ -13,6 +13,7 @@ use anyhow::{Context, Result};
 use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app::AppSrc;
+use gstreamer_video as gst_video;
 
 /// Caps structure names mpegtsmux can actually carry, read from its own
 /// sink pad templates. Never hand-list what the element can tell us: a
@@ -1015,6 +1016,113 @@ pub fn tonemap_available() -> bool {
     })
 }
 
+/// PQ encode (SMPTE ST 2084 inverse EOTF): linear (1.0 = 10000 nits)
+/// → PQ code. Rust twin of the shader's pq_encode.
+fn pq_encode(y: f64) -> f64 {
+    const M1: f64 = 2610.0 / 16384.0;
+    const M2: f64 = 2523.0 / 4096.0 * 128.0;
+    const C1: f64 = 3424.0 / 4096.0;
+    const C2: f64 = 2413.0 / 4096.0 * 32.0;
+    const C3: f64 = 2392.0 / 4096.0 * 32.0;
+    let p = y.max(0.0).powf(M1);
+    ((C1 + C2 * p) / (1.0 + C3 * p)).powf(M2)
+}
+
+fn pq_eotf(e: f64) -> f64 {
+    const M1: f64 = 2610.0 / 16384.0;
+    const M2: f64 = 2523.0 / 4096.0 * 128.0;
+    const C1: f64 = 3424.0 / 4096.0;
+    const C2: f64 = 2413.0 / 4096.0 * 32.0;
+    const C3: f64 = 2392.0 / 4096.0 * 32.0;
+    let p = e.max(0.0).powf(1.0 / M2);
+    ((p - C1).max(0.0) / (C2 - C3 * p)).powf(1.0 / M1)
+}
+
+/// PQ(203 nits) — the EETF's SDR target, fixed.
+const TGT_E: f64 = 0.580688881;
+
+/// Scene-peak probe (HUB-15a dynamic adaptation): sample the luma
+/// plane of every buffer entering the GL segment, track a smoothed
+/// p99.9 peak (instant attack, slow decay — libplacebo's shape), and
+/// feed the shader's EETF uniforms. A static 1000-nit assumption
+/// measured ~0.7 signal on real scene highlights where libplacebo
+/// reaches ~0.98 (the owner's "grey smear"): typical frames peak at
+/// 200–800 nits, far below mastering ceilings.
+fn attach_peak_probe(upload: &gst::Element, shader: &gst::Element) {
+    let pad = upload.static_pad("sink").unwrap();
+    let shader = shader.clone();
+    // (smoothed peak, last-set peak, reusable sample buffer)
+    let state = std::sync::Mutex::new((1000.0f64, 1000.0f64, Vec::<u16>::new()));
+    pad.add_probe(gst::PadProbeType::BUFFER, move |pad, info| {
+        let Some(gst::PadProbeData::Buffer(buffer)) = &info.data else {
+            return gst::PadProbeReturn::Ok;
+        };
+        let Some(caps) = pad.current_caps() else {
+            return gst::PadProbeReturn::Ok;
+        };
+        let Ok(vinfo) = gst_video::VideoInfo::from_caps(&caps) else {
+            return gst::PadProbeReturn::Ok;
+        };
+        use gst_video::VideoFormat;
+        let ten_bit = match vinfo.format() {
+            VideoFormat::P01010le | VideoFormat::I42010le => true,
+            VideoFormat::Nv12 | VideoFormat::I420 => false,
+            _ => return gst::PadProbeReturn::Ok,
+        };
+        let Ok(frame) = gst_video::VideoFrameRef::from_buffer_ref_readable(buffer, &vinfo) else {
+            return gst::PadProbeReturn::Ok;
+        };
+        let Ok(data) = frame.plane_data(0) else {
+            return gst::PadProbeReturn::Ok;
+        };
+        let stride = vinfo.stride()[0] as usize;
+        let (w, h) = (vinfo.width() as usize, vinfo.height() as usize);
+        let mut st = state.lock().unwrap();
+        let (_, _, ref mut samples) = *st;
+        samples.clear();
+        // Every 16th row/col: ~32k samples at 4K — enough for p99.9,
+        // cheap enough for every frame.
+        let mut y = 0;
+        while y < h {
+            let row = &data[y * stride..];
+            let mut x = 0;
+            while x < w {
+                let code = if ten_bit {
+                    let lo = row[x * 2] as u16;
+                    let hi = row[x * 2 + 1] as u16;
+                    ((hi << 8) | lo) >> 6 // P010: 10 bits in the high bits
+                } else {
+                    (row[x] as u16) << 2
+                };
+                samples.push(code);
+                x += 16;
+            }
+            y += 16;
+        }
+        if samples.is_empty() {
+            return gst::PadProbeReturn::Ok;
+        }
+        samples.sort_unstable();
+        let p999 = samples[samples.len() - 1 - samples.len() / 1000];
+        let nits = (pq_eotf(p999 as f64 / 1023.0) * 10000.0).clamp(203.0, 4000.0);
+        // Instant attack (a clipped flash is worse than a dim one),
+        // ~2 s decay at 24 fps.
+        st.0 = if nits > st.0 { nits } else { st.0 * 0.98 + nits * 0.02 };
+        if (st.0 - st.1).abs() / st.1 > 0.01 {
+            st.1 = st.0;
+            let max_e = pq_encode(st.0 / 10000.0);
+            let max_tgt = TGT_E / max_e;
+            let uniforms = gst::Structure::builder("uniforms")
+                .field("uMaxE", max_e as f32)
+                .field("uMaxTgt", max_tgt as f32)
+                .field("uKS", (1.5 * max_tgt - 0.5) as f32)
+                .build();
+            shader.set_property("uniforms", &uniforms);
+        }
+        gst::PadProbeReturn::Ok
+    });
+}
+
 /// The GL tone-map segment: upload → RGBA → PQ→SDR shader → back to
 /// system memory, then capssetter rewrites the colorimetry tag to
 /// bt709 so the encoder's VUI tells the player the truth (the shader
@@ -1050,6 +1158,7 @@ fn tonemap_segment() -> Vec<gst::Element> {
         .property("caps", gst::Caps::builder("video/x-raw").field("colorimetry", "bt709").build())
         .build()
         .unwrap();
+    attach_peak_probe(&upload, &shader);
     vec![upload, to_rgba, rgba, shader, from_rgba, download, nv12, relabel]
 }
 
