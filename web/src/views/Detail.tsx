@@ -364,6 +364,7 @@ export default function Detail({
         audioTrack = resolveTracks(
           p.prefs,
           item!.parent_id ?? item!.id,
+          item!.id,
           mediaType,
           item!.metadata?.original_language,
           audio,

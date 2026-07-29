@@ -96,6 +96,7 @@ export default function Player({
         const r = resolveTracks(
           p.prefs,
           seriesRef.current,
+          item.id,
           mediaType,
           d.metadata?.original_language,
           audio,
@@ -122,10 +123,18 @@ export default function Player({
   const switchTracks = async (audio: number, video_: number) => {
     const video = videoRef.current!
     if (audio !== audioTrack) {
-      // Remember the explicit audio choice for this series (HUB-33):
-      // by language when tagged, by index otherwise.
+      // Two additive layers (HUB-33). The SERIES remembers the
+      // language (portable across episodes with differing track
+      // orders) — a language-motivated switch keeps steering the whole
+      // series. MOVIES additionally pin the exact track index: "the
+      // commentary track of THIS film" has no language representation,
+      // and there is no series intent to follow. Episodes deliberately
+      // do NOT pin, so one episode never freezes on an old choice.
       const value = audioTracks[audio]?.language?.toLowerCase() ?? `#${audio}`
       void putPref(seriesRef.current, 'audio', value).catch(() => {})
+      if (item.kind === 'movie') {
+        void putPref(item.id, 'audio.track', `#${audio}`).catch(() => {})
+      }
     }
     setAudioTrack(audio)
     setVideoTrack(video_)

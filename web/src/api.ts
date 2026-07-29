@@ -372,6 +372,7 @@ export type Pref = { scope: string; key: string; value: string }
 export function resolveTracks(
   prefs: Pref[],
   seriesId: string,
+  itemId: string,
   mediaType: string,
   originalLanguage: string | null | undefined,
   audio: { language?: string | null }[],
@@ -390,10 +391,20 @@ export function resolveTracks(
     return a === b || a.slice(0, 2) === b.slice(0, 2)
   }
 
-  // Audio: memory ('en' | '#2'), else the ordered per-type list.
+  // Audio, most specific first: THIS item's exact track (two English
+  // tracks — feature + commentary — are common, so language cannot
+  // express the choice), then the series language memory, then the
+  // ordered per-type list.
   let audioTrack: number | undefined
+  const exact = get(itemId, 'audio.track')
+  if (exact?.startsWith('#')) {
+    const i = Number(exact.slice(1))
+    if (i >= 0 && i < audio.length) audioTrack = i
+  }
   const remembered = get(seriesId, 'audio')
-  if (remembered?.startsWith('#')) {
+  if (audioTrack !== undefined) {
+    // exact item pref already decided
+  } else if (remembered?.startsWith('#')) {
     const i = Number(remembered.slice(1))
     if (i >= 0 && i < audio.length) audioTrack = i
   } else if (remembered) {
