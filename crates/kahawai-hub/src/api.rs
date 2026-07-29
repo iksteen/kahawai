@@ -1267,7 +1267,14 @@ async fn seek_session(
         .sessions
         .seek(&state.registry, &id, body.position_ms, body.audio_track, body.video_track)
         .await
-        .map_err(|e| (StatusCode::CONFLICT, format!("{e:#}")))?;
+        .map_err(|e| {
+            // Every failed seek tells its story here, not just the ones
+            // the fallback retried — a 409 must never be untraceable.
+            tracing::warn!(session = %id, position_ms = body.position_ms,
+                audio_track = ?body.audio_track, video_track = ?body.video_track,
+                error = format!("{e:#}"), "seek failed");
+            (StatusCode::CONFLICT, format!("{e:#}"))
+        })?;
     // A track switch re-planned: hand back the verdicts of what plays
     // NOW so the overlay never lies about the current streams.
     let session = state.sessions.get(&id);
