@@ -1319,24 +1319,106 @@ fn build_video_encode_chain(
 /// the fallback strategy) → audioconvert → audioresample → AAC encoder →
 /// aacparse (raw→ADTS for the TS muxer) → muxer pad. The only decode/
 /// encode work in the hub, and audio-only by design: a few % CPU.
-/// The HUB-15 channel-ceiling element pair, or nothing when unlimited.
-fn channel_limiter(channels: Option<u32>) -> Vec<gst::Element> {
-    match channels {
-        Some(n) if n > 0 => {
-            // An EXACT count, never a range: range caps fixate to their
-            // minimum, so `channels=[1,2]` handed a stereo-capable
-            // client mono off a 5.1 source (measured; the ceiling had
-            // shipped that way since HUB-15). The hub resolves the
-            // client's ceiling against the source's own channel count
-            // before this, so a fixed value never upmixes either.
-            let caps = gst::Caps::builder("audio/x-raw").field("channels", n as i32).build();
-            vec![gst::ElementFactory::make("capsfilter")
-                .property("caps", caps)
-                .build()
-                .unwrap()]
-        }
-        _ => vec![],
+/// Canonical AAC input layouts, most channels first. `channel-mask` bits
+/// are GStreamer positions: 0x3f = 5.1 (FL FR FC LFE RL RR), 0x63f adds
+/// SL SR (standard 7.1), 0xff instead adds FLC FRC (7.1 "front wide").
+const AAC_LAYOUTS: &[(u32, u64)] = &[(8, 0xff), (8, 0x63f), (6, 0x3f), (2, 0x3), (1, 0x4)];
+
+/// Does the AAC encoder accept this exact layout? Measured, once per
+/// layout, because the pad template lies: fdkaacenc advertises
+/// `channels={1,2,3,4,5,6,8}` unconditionally but at 8 accepts only the
+/// front-wide layout and refuses standard 7.1 outright.
+///
+/// Caps it will not take do not fail the link. Negotiation quietly
+/// fixates on the template's FIRST value instead, and the encode becomes
+/// mono (fdk-aac on Linux) or a 4.0-labelled stream whose payload is 5.1
+/// and decodes nowhere (fdk-aac on macOS — every frame "channel element
+/// 1.1 is not allocated"). That is what a DTS 7.1 track shipped to the
+/// browser as "the file is corrupt", with nothing in any log.
+fn aac_accepts(enc: &str, channels: u32, mask: u64) -> bool {
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<(u32, u64), bool>>> =
+        std::sync::OnceLock::new();
+    let seen = SEEN.get_or_init(Default::default);
+    if let Some(hit) = seen.lock().unwrap().get(&(channels, mask)) {
+        return *hit;
     }
+    let ok = dry_run(&format!(
+        "audiotestsrc num-buffers=5 ! audioconvert ! audioresample \
+         ! audio/x-raw,channels={channels},channel-mask=(bitmask)0x{mask:x} ! {enc} ! fakesink"
+    ));
+    seen.lock().unwrap().insert((channels, mask), ok);
+    ok
+}
+
+/// The layout to pin on the encoder's input for a decoded stream of
+/// `channels`/`mask`, never above `ceiling` (the client's, HUB-15).
+///
+/// The source's own layout when the encoder takes it — a 7.1 file the
+/// encoder can carry stays 7.1. Otherwise the largest layout it does
+/// take whose positions the source actually HAS, so what happens is a
+/// real fold (7.1 side surround → 5.1) and never a relabel of surround
+/// content into front-wide channels the source never had. None = even
+/// mono was refused; leave negotiation alone and let the encoder's own
+/// error surface.
+fn aac_input_layout(enc: &str, channels: u32, mask: u64, ceiling: Option<u32>) -> Option<(u32, u64)> {
+    let bound = ceiling.filter(|c| *c > 0).map_or(channels, |c| c.min(channels));
+    // An unpositioned stream (mask 0, common for mono/stereo) claims no
+    // positions, so nothing is a relabel and every small enough layout
+    // is fair game.
+    let has_positions = |m: u64| mask == 0 || m & mask == m;
+    std::iter::once((channels, mask))
+        .filter(|_| mask != 0 && channels <= bound)
+        .chain(AAC_LAYOUTS.iter().copied().filter(|(n, m)| *n <= bound && has_positions(*m)))
+        .find(|(n, m)| aac_accepts(enc, *n, *m))
+}
+
+/// Pin the encoder's input layout from the decoded caps, on the caps
+/// event that precedes the first buffer — i.e. before the encoder
+/// negotiates, which is the whole point (see [`aac_accepts`]).
+fn install_layout_pin(pad: &gst::Pad, filter: &gst::Element, ceiling: Option<u32>, enc: &str) {
+    let filter = filter.clone();
+    let enc = enc.to_string();
+    pad.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |_, info| {
+        let Some(gst::PadProbeData::Event(ev)) = &info.data else {
+            return gst::PadProbeReturn::Ok;
+        };
+        let gst::EventView::Caps(c) = ev.view() else {
+            return gst::PadProbeReturn::Ok;
+        };
+        let Some(s) = c.caps().structure(0) else {
+            return gst::PadProbeReturn::Remove;
+        };
+        let channels: u32 = s.get::<i32>("channels").unwrap_or(0).max(0) as u32;
+        let mask = s.get::<gst::Bitmask>("channel-mask").map(|b| *b).unwrap_or(0);
+        if channels == 0 {
+            return gst::PadProbeReturn::Remove;
+        }
+        match aac_input_layout(&enc, channels, mask, ceiling) {
+            Some((n, m)) => {
+                let caps = gst::Caps::builder("audio/x-raw")
+                    .field("channels", n as i32)
+                    .field("channel-mask", gst::Bitmask::new(m))
+                    .build();
+                filter.set_property("caps", &caps);
+                if n != channels {
+                    tracing::info!(
+                        source_channels = channels,
+                        source_mask = format!("0x{mask:x}"),
+                        encoded_channels = n,
+                        encoder = %enc,
+                        "audio downmixed: the encoder does not accept the source layout"
+                    );
+                }
+            }
+            None => tracing::warn!(
+                channels,
+                mask = format!("0x{mask:x}"),
+                encoder = %enc,
+                "no AAC input layout accepted; leaving negotiation to the encoder"
+            ),
+        }
+        gst::PadProbeReturn::Remove
+    });
 }
 
 fn build_audio_encode_chain(
@@ -1372,18 +1454,17 @@ fn build_audio_encode_chain(
     }
     let decode = gst::ElementFactory::make("decodebin").build().unwrap();
     let convert = gst::ElementFactory::make("audioconvert").build().unwrap();
-    // HUB-15 channel ceiling: audioconvert performs the downmix; the
-    // RANGE capsfilter states the ceiling so within-limit sources pass
-    // untouched.
-    let limiter = channel_limiter(max_channels);
+    // audioconvert does the remap; this capsfilter says what to remap TO,
+    // filled in from the decoded caps once they are known (the HUB-15
+    // client ceiling is one bound on that choice, the encoder's own
+    // accepted layouts the other).
+    let limiter = gst::ElementFactory::make("capsfilter").build().unwrap();
     let resample = gst::ElementFactory::make("audioresample").build().unwrap();
     let enc = gst::ElementFactory::make(enc_name).build().unwrap();
     set_prop_str_if_present(&enc, "bitrate", "192000");
     let parse = gst::ElementFactory::make("aacparse").build().unwrap();
 
-    let mut chain: Vec<&gst::Element> = vec![&convert];
-    chain.extend(limiter.iter());
-    chain.extend([&resample, &enc, &parse]);
+    let chain: Vec<&gst::Element> = vec![&convert, &limiter, &resample, &enc, &parse];
     pipe.add(&decode).unwrap();
     pipe.add_many(chain.iter().copied()).unwrap();
     gst::Element::link_many(chain.iter().copied()).unwrap();
@@ -1400,10 +1481,13 @@ fn build_audio_encode_chain(
         tracing::warn!(error = %e, "remux: encode chain → muxer link failed");
     }
     let convert_sink = convert.static_pad("sink").unwrap();
+    let pin_target = limiter.clone();
+    let pin_enc = enc_name.to_string();
     decode.connect_pad_added(move |_, pad| {
         if convert_sink.is_linked() {
             return; // first decoded stream wins
         }
+        install_layout_pin(pad, &pin_target, max_channels, &pin_enc);
         if let Err(e) = pad.link(&convert_sink) {
             tracing::warn!(error = %e, "remux: decodebin → encode chain link failed");
         }
@@ -1427,16 +1511,20 @@ fn build_audio_tail(
     max_channels: Option<u32>,
 ) {
     let convert = gst::ElementFactory::make("audioconvert").build().unwrap();
-    let limiter = channel_limiter(max_channels);
+    let limiter = gst::ElementFactory::make("capsfilter").build().unwrap();
     let resample = gst::ElementFactory::make("audioresample").build().unwrap();
     let enc = gst::ElementFactory::make(enc_name).build().unwrap();
     set_prop_str_if_present(&enc, "bitrate", "192000");
     let parse = gst::ElementFactory::make("aacparse").build().unwrap();
 
+    // The explicit decoder's own src pad carries the decoded caps, so the
+    // layout is pinned from there instead of a decodebin pad-added.
+    if let Some(src) = front.last().and_then(|el| el.static_pad("src")) {
+        install_layout_pin(&src, &limiter, max_channels, enc_name);
+    }
+
     let mut chain: Vec<&gst::Element> = front.iter().collect();
-    chain.push(&convert);
-    chain.extend(limiter.iter());
-    chain.extend([&resample, &enc, &parse]);
+    chain.extend([&convert, &limiter, &resample, &enc, &parse]);
     pipe.add_many(chain.iter().copied()).unwrap();
     gst::Element::link_many(chain.iter().copied()).unwrap();
     for el in &chain {
@@ -2868,6 +2956,91 @@ mod tests {
         assert_eq!(
             seg_info.audio[0].channels, 2,
             "stereo ceiling must produce stereo, not mono"
+        );
+    }
+
+    /// The layout search never answers with a layout the encoder refuses,
+    /// never invents channel positions the source does not have, and
+    /// never collapses 7.1 to something tiny — the fixation failure that
+    /// shipped a DTS 7.1 track to the browser as mono (Linux fdk-aac) and
+    /// as an undecodable 4.0-labelled stream (macOS fdk-aac).
+    #[test]
+    fn aac_layout_search_answers_with_something_the_encoder_takes() {
+        crate::init().unwrap();
+        let Some(enc) = aac_encoder() else {
+            eprintln!("skipping: no AAC encoder");
+            return;
+        };
+        let (n, m) = aac_input_layout(enc, 8, 0x63f, None).expect("no layout accepted for 7.1");
+        assert!(aac_accepts(enc, n, m), "chose a layout {n}ch/0x{m:x} the encoder refuses");
+        assert_eq!(m & 0x63f, m, "invented positions the source lacks: 0x{m:x}");
+        assert!(n >= 6, "7.1 collapsed to {n} channels");
+        // The client's ceiling still bounds the choice (HUB-15).
+        let (capped, _) = aac_input_layout(enc, 8, 0x63f, Some(2)).expect("no layout under ceiling");
+        assert_eq!(capped, 2, "stereo ceiling ignored");
+    }
+
+    /// The pipeline half, on the source material this box can actually
+    /// produce: with NO ceiling — what the web client sends — a 5.1
+    /// source must come out 5.1 and decode. The pin sits where the
+    /// fixation happened, so a pin that chooses badly shows up here as a
+    /// shrunken or undecodable stream. (Genuine 7.1 side-surround has no
+    /// fixture: every encoder here refuses those caps, and Opus decodes
+    /// unpositioned, which audioconvert cannot remap at all. 7.1 is
+    /// verified against real content on the fleet.)
+    #[test]
+    fn unbounded_encode_keeps_the_source_layout_and_decodes() {
+        crate::init().unwrap();
+        if aac_encoder().is_none() || !crate::testutil::has_element("fdkaacenc") {
+            eprintln!("skipping: encoders unavailable");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let src_path = dir.path().join("in51.mkv");
+        crate::testutil::render_h264_aac51_mkv(&src_path);
+        let info = crate::discover(&src_path, Duration::from_secs(30)).unwrap();
+        assert_eq!(info.audio[0].channels, 6, "fixture must be 5.1: {info:?}");
+
+        let plan = RemuxPlan {
+            video: StreamMode::Copy,
+            audio: StreamMode::Encode,
+            audio_track: 0,
+            video_track: 0,
+            video_kbps: None,
+            max_height: None,
+            max_channels: None, // what the web client sends: no ceiling
+            tone_map: false,
+            burn_subtitle: None,
+        };
+        let out = tempfile::tempdir().unwrap();
+        let job =
+            start_at(out.path(), plan, Box::new(FileSource::open(&src_path).unwrap()), 0).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !job.finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(job.finished(), "unbounded encode did not finish");
+        assert!(job.failed().is_none(), "unbounded encode failed: {:?}", job.failed());
+        let seg = std::fs::read_dir(out.path())
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .find(|p| p.extension().is_some_and(|x| x == "ts"))
+            .expect("no segment produced");
+        let seg_info = crate::discover(&seg, Duration::from_secs(30)).unwrap();
+        assert_eq!(
+            seg_info.audio[0].channels, 6,
+            "5.1 source must stay 5.1 with no ceiling: {seg_info:?}"
+        );
+        // Labels can agree with the payload and still be a lie; decoding
+        // the whole segment to EOS is what catches a mismatched channel
+        // configuration ("channel element 1.1 is not allocated").
+        assert!(
+            dry_run(&format!(
+                "filesrc location={} ! tsdemux ! aacparse ! avdec_aac ! audioconvert ! fakesink",
+                seg.display()
+            )),
+            "segment audio does not decode: {}",
+            seg.display()
         );
     }
 
