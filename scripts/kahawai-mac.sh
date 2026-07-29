@@ -74,15 +74,34 @@ EOF
     # shellcheck disable=SC2046
     security list-keychains -d user -s $(security list-keychains -d user | tr -d '"') "$KEYCHAIN"
 
-    # The one interactive step: codesign refuses an identity whose
-    # certificate carries no trust setting, and setting trust needs an
-    # authorization no script may fake. Expect a password prompt.
-    echo "granting code-signing trust — macOS will ask for your password:" >&2
-    security add-trusted-cert -d -r trustRoot -p codeSign -k /Library/Keychains/System.keychain \
-        "$tmp/cert.pem"
+    # The one step no script may do for you: codesign refuses an
+    # identity whose certificate carries no trust setting, and setting
+    # trust needs an authorization. The USER domain needs no root and
+    # is enough for signing as this user, so try it first; the admin
+    # domain writes to the System keychain and does need root.
+    echo "granting code-signing trust (a prompt may appear):" >&2
+    if ! security add-trusted-cert -r trustRoot -p codeSign "$tmp/cert.pem" 2>&1; then
+        echo "user-domain trust failed; using the admin domain (sudo):" >&2
+        sudo security add-trusted-cert -d -r trustRoot -p codeSign \
+            -k /Library/Keychains/System.keychain "$tmp/cert.pem"
+    fi
 
-    security find-identity -v -p codesigning "$KEYCHAIN"
-    echo "setup done. Deploy from the dev box: scripts/kahawai-mac.sh deploy" >&2
+    # Prove it: an identity that lists but cannot sign is the failure
+    # mode this whole subcommand exists to avoid.
+    security find-identity -v -p codesigning "$KEYCHAIN" || true
+    local probe; probe=$(mktemp)
+    cp /usr/bin/true "$probe"
+    if codesign --force --sign "$IDENTITY" --keychain "$KEYCHAIN" \
+        --identifier "$BUNDLE_ID" "$probe" 2>&1; then
+        echo "setup done — signing works. Deploy: scripts/kahawai-mac.sh deploy" >&2
+    else
+        echo "setup INCOMPLETE: the identity exists but codesign refuses it." >&2
+        echo "Open Keychain Access, find \"$IDENTITY\" in the" >&2
+        echo "kahawai-signing keychain, Get Info → Trust → Code Signing: Always Trust." >&2
+        rm -f "$probe"
+        exit 1
+    fi
+    rm -f "$probe"
 }
 
 deploy() {
