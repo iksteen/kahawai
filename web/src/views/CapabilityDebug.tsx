@@ -1,7 +1,9 @@
 // The capability mask editor (see capabilities.ts for what a mask is
-// and why it only ever subtracts). Lives in the player, next to the
-// negotiation verdict it changes: toggle a codec off, restart, read
-// what the hub decided instead.
+// and why it only ever subtracts). Rendered twice, because a mask only
+// takes effect on the next session: on the item page, where it is set
+// before playback starts, and in the player, next to the verdict it
+// changes — toggle a codec off, restart, read what the hub decided
+// instead.
 
 import { useState } from 'react'
 import {
@@ -18,10 +20,14 @@ type DropKind = 'video' | 'audio' | 'containers'
 export default function CapabilityDebug({
   onApply,
   applying,
+  onChange,
 }: {
   /** Restart playback with the new mask; absent = show the hint only. */
   onApply?: () => void
   applying?: boolean
+  /** Told after every edit, so a mask badge outside this panel can
+   *  stop showing what the mask USED to be. */
+  onChange?: () => void
 }) {
   const probed = probedProfile()
   const [mask, setMask] = useState<CapabilityMask>(loadMask)
@@ -30,6 +36,7 @@ export default function CapabilityDebug({
   const update = (next: CapabilityMask) => {
     setMask(next)
     saveMask(next)
+    onChange?.()
   }
 
   const dropped = (kind: DropKind, name: string) => !!mask[kind]?.includes(name)

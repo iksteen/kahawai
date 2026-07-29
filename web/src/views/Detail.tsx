@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import {
   artworkUrl,
   fetchChildren,
@@ -21,6 +21,8 @@ import {
   type Source,
 } from '../api'
 import AlbumPlayer from './AlbumPlayer'
+import CapabilityDebug from './CapabilityDebug'
+import { loadMask, maskSummary } from '../capabilities'
 import tmdbLogo from '../assets/tmdb.svg'
 import placeholder from '../assets/placeholder.svg'
 
@@ -99,6 +101,12 @@ export default function Detail({
   const [subQuota, setSubQuota] = useState<SubtitleQuota | null>(null)
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
+  const [showCaps, setShowCaps] = useState(false)
+  // The badge reads the stored mask, which the panel edits underneath
+  // it; the counter repaints it on an edit instead of leaving the
+  // previous mask on screen.
+  const [capsRev, setCapsRev] = useState(0)
+  const masked = useMemo(() => maskSummary(loadMask()), [capsRev])
 
   useEffect(() => {
     setItem(null)
@@ -462,7 +470,15 @@ export default function Detail({
         <span className="dim small-note">
           negotiated per stream — the player overlay shows the taken path
         </span>
+        {/* Here, not in Settings and not only in the player: a mask
+            takes effect on the NEXT session, so it has to be settable
+            before this button is pressed. */}
+        <button className="btn ghost small" onClick={() => setShowCaps((v) => !v)}>
+          {showCaps ? 'hide caps' : 'caps'}
+        </button>
+        {masked.length > 0 && <span className="caps-badge mono">masked: {masked.join(' ')}</span>}
       </div>
+      {showCaps && <CapabilityDebug onChange={() => setCapsRev((n) => n + 1)} />}
       {error && <div className="error">{error}</div>}
 
       {related}
