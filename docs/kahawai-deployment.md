@@ -148,3 +148,41 @@ Unset means the endpoint 404s for everyone, including admins; a wrong
 token is 401. `/health` needs no credential and is what an uptime check
 should poll — it reports every module, and a satellite being away is
 `degraded` rather than a failure (AR-6).
+
+## macOS satellites
+
+A macOS transcoder needs one thing no other platform does: a stable
+code signature. The transcoder dials the hub over the LAN, so macOS 15+
+gates it behind **Local Network** privacy, and that grant is keyed to
+the binary's code signature. An ad-hoc signature is keyed by cdhash,
+which changes with every rebuild — so every rebuild silently loses
+network access (`No route to host` in a reconnect loop) until someone
+re-approves it in System Settings. Signed with a stable identity, the
+grant keys on the identity and survives rebuilds.
+
+`scripts/kahawai-mac.sh` owns both halves:
+
+```sh
+# ON the mac, once. Creates a self-signed code-signing identity in its
+# own keychain (never the login one, so a build script can unlock it
+# without touching your login password) and grants it code-signing
+# trust. That last step prompts for your password — trust settings are
+# deliberately not scriptable, which is why setup is separate.
+scripts/kahawai-mac.sh setup
+
+# from the dev box, per deploy: sync tracked files + web/dist, build,
+# sign, restart the launchd agent, wait for the link.
+scripts/kahawai-mac.sh deploy [user@host]
+```
+
+Deploy without an identity still works; it says plainly that the
+binary stays ad-hoc signed and the Local Network grant will need
+re-approving, rather than leaving a silent reconnect loop to diagnose.
+
+Two macOS-only behaviours are already handled in code and worth knowing
+about: `vtdec`/`vtdec_hw` are demoted at startup (they build a GL
+texture cache and SIGSEGV without an AppKit main loop, which a headless
+worker never has — `vtenc` is safe and stays preferred), and App Nap is
+switched off with an NSProcessInfo activity assertion, because macOS
+otherwise defers a session-less process's timers *and* socket wakeups
+until the link heartbeat dies.
