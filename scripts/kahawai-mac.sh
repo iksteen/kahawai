@@ -74,14 +74,16 @@ EOF
     # shellcheck disable=SC2046
     security list-keychains -d user -s $(security list-keychains -d user | tr -d '"') "$KEYCHAIN"
 
-    # The one step no script may do for you: codesign refuses an
-    # identity whose certificate carries no trust setting, and setting
-    # trust needs an authorization. The USER domain needs no root and
-    # is enough for signing as this user, so try it first; the admin
-    # domain writes to the System keychain and does need root.
-    echo "granting code-signing trust (a prompt may appear):" >&2
-    if ! security add-trusted-cert -r trustRoot -p codeSign "$tmp/cert.pem" 2>&1; then
-        echo "user-domain trust failed; using the admin domain (sudo):" >&2
+    # The one step no script may do for you. Per `security
+    # add-trusted-cert -h`: the default domain is USER (no -d) and
+    # needs no root, while -d is the admin store, which writes
+    # /Library/Keychains/System.keychain and therefore does. Either way
+    # changing trust settings needs an authorization, so this shows a
+    # dialog in a login session and simply refuses over ssh ("the
+    # authorization was denied since no user interaction was possible").
+    echo "granting code-signing trust — approve the dialog:" >&2
+    if ! security add-trusted-cert -r trustRoot -p codeSign -k "$KEYCHAIN" "$tmp/cert.pem"; then
+        echo "user-domain trust refused; trying the admin store (needs root):" >&2
         sudo security add-trusted-cert -d -r trustRoot -p codeSign \
             -k /Library/Keychains/System.keychain "$tmp/cert.pem"
     fi
