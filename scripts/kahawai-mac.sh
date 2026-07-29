@@ -31,8 +31,11 @@ setup() {
     mkdir -p "$(dirname "$PASSFILE")" && chmod 700 "$(dirname "$PASSFILE")"
     [ -f "$PASSFILE" ] || { /usr/bin/openssl rand -hex 24 > "$PASSFILE"; chmod 600 "$PASSFILE"; }
     local pass; pass=$(cat "$PASSFILE")
-    local tmp; tmp=$(mktemp -d)
-    trap 'rm -rf "$tmp"' EXIT
+    # NOT `local`: the EXIT trap runs after this function has returned,
+    # where a function-local is out of scope and `set -u` turns the
+    # cleanup into the script's last words.
+    tmp=$(mktemp -d)
+    trap 'rm -rf "${tmp:-}"' EXIT
     # The SYSTEM openssl, never whatever is on PATH: OpenSSL 3 writes
     # PKCS#12 with AES-256 and a SHA-256 MAC, which Security.framework
     # rejects outright ("MAC verification failed during PKCS12 import"),
