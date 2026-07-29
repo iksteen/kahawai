@@ -117,19 +117,46 @@ deploy() {
     # web/dist is gitignored but rust-embed needs it at compile time.
     [ -d "$repo/web/dist" ] && rsync -a "$repo/web/dist/" "$host:kahawai-src/web/dist/"
 
+    # Where the log ends BEFORE the restart: "link established" is a
+    # line the previous run also wrote, and grepping the tail would
+    # report a successful link that never happened.
+    local mark; mark=$(ssh "$host" 'wc -l < ~/kahawai-transcoder.log 2>/dev/null || echo 0')
+
     echo "==> building + signing + restarting on $host" >&2
-    ssh "$host" "IDENTITY='$IDENTITY' KEYCHAIN='$KEYCHAIN' PASSFILE='$PASSFILE' \
-        BUNDLE_ID='$BUNDLE_ID' AGENT='$AGENT' bash -s" <<'REMOTE'
+    # Only host-independent values cross the wire: KEYCHAIN and PASSFILE
+    # live under $HOME, and interpolating them here would ship the DEV
+    # BOX's home directory to the mac — where the keychain then never
+    # exists and every deploy silently falls back to ad-hoc signing.
+    ssh "$host" "IDENTITY='$IDENTITY' BUNDLE_ID='$BUNDLE_ID' AGENT='$AGENT' bash -s" <<'REMOTE'
 set -euo pipefail
 export PATH="$PATH:/opt/homebrew/bin:/usr/local/bin:$HOME/.cargo/bin"
+KEYCHAIN="$HOME/Library/Keychains/kahawai-signing.keychain-db"
+PASSFILE="$HOME/.config/kahawai/signing-keychain.pass"
 cd ~/kahawai-src
 cargo build --release 2>&1 | tail -1
 BIN=target/release/kahawai
 if security find-identity -v -p codesigning "$KEYCHAIN" 2>/dev/null | grep -q "$IDENTITY"; then
     security unlock-keychain -p "$(cat "$PASSFILE")" "$KEYCHAIN"
+    # NOT --options runtime: Hardened Runtime turns on library
+    # validation, which then refuses every Homebrew dylib this binary
+    # links ("mapping process and mapped file (non-platform) have
+    # different Team IDs") and the transcoder dies in dyld before main.
+    # Hardened Runtime buys notarization, which a LAN satellite does not
+    # need; the stable signing identity is the whole point here.
     codesign --force --sign "$IDENTITY" --keychain "$KEYCHAIN" \
-        --identifier "$BUNDLE_ID" --options runtime "$BIN"
-    echo "signed: $(codesign -dv "$BIN" 2>&1 | grep -m1 Authority || echo unknown)"
+        --identifier "$BUNDLE_ID" "$BIN"
+    # Authority only appears at -dvv. Report the designated requirement
+    # too, because THAT is what decides whether the Local Network grant
+    # survives: an identity-and-identifier requirement does, a cdhash
+    # one (ad-hoc) does not.
+    #
+    # Substitutions, not pipelines: `grep -m1` closes the pipe early,
+    # codesign dies of SIGPIPE, and `pipefail` then aborts this script
+    # between printing the line and restarting the agent.
+    auth=$(codesign -dvv "$BIN" 2>&1 | grep Authority || true)
+    req=$(codesign -d --requirements - "$BIN" 2>&1 | grep designated || true)
+    echo "signed: ${auth:-authority unknown}"
+    echo "requirement: ${req:-unknown}"
 else
     # Honest about the consequence rather than silently ad-hoc: the
     # Local Network grant will need re-approving after this build.
@@ -143,13 +170,15 @@ REMOTE
     echo "==> waiting for the link" >&2
     for _ in $(seq 1 12); do
         sleep 2
-        if ssh "$host" 'tail -5 ~/kahawai-transcoder.log' 2>/dev/null | grep -q "link established"; then
-            ssh "$host" 'grep -E "link established|tone-map" ~/kahawai-transcoder.log | tail -2'
+        local fresh
+        fresh=$(ssh "$host" "tail -n +$((mark + 1)) ~/kahawai-transcoder.log" 2>/dev/null || true)
+        if grep -q "link established" <<<"$fresh"; then
+            grep -E "link established|tone-map" <<<"$fresh" | tail -2
             return 0
         fi
     done
-    echo "link not established; last lines:" >&2
-    ssh "$host" 'tail -3 ~/kahawai-transcoder.log' >&2
+    echo "link not established since the restart; new lines:" >&2
+    ssh "$host" "tail -n +$((mark + 1)) ~/kahawai-transcoder.log | tail -3" >&2
     return 1
 }
 
