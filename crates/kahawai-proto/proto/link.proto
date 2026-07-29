@@ -333,6 +333,8 @@ message CapabilityReport {
   // match the SOURCE codec too: a box can own a great encoder and still
   // decode AV1 at 0.3x realtime in software (observed on a J5005).
   repeated string decode_caps = 3;
+  // HUB-15a: the GL tone-map segment (glshader + friends) is available.
+  bool tonemap = 4;
 }
 
 message EncoderCap {
@@ -390,6 +392,9 @@ message StartSession {
   uint32 video_kbps = 10;
   uint32 max_height = 11;
   uint32 max_channels = 12;
+  // HUB-15a: tone-map HDR video to SDR in the encode chain (GL shader).
+  // Only set when this box reported the capability.
+  bool tone_map = 13;
 }
 
 message EndSession {

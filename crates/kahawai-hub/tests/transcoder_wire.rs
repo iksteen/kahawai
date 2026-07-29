@@ -133,6 +133,7 @@ async fn transcoder_registers_capabilities_and_clears_on_disconnect() {
             ],
             max_sessions: 2,
             decode_caps: vec!["video/x-av1".into(), "audio/x-flac".into()],
+            tonemap: false,
         })),
     })
     .await
@@ -158,6 +159,7 @@ async fn transcoder_registers_capabilities_and_clears_on_disconnect() {
         encode_audio: true,
         video_caps: video_caps.iter().map(|s| s.to_string()).collect(),
         audio_caps: vec!["audio/x-flac".into()],
+        needs_tonemap: false,
     };
     let av1 = need(&["video/x-av1"]);
     assert_eq!(hub.registry.pick_transcoder(&av1).as_deref(), Some("01TC"));

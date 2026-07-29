@@ -606,6 +606,22 @@ impl Sessions {
                 .duration_ms
                 .filter(|d| *d > 0)
                 .map(|d| ((parts.iter().map(|p| p.size).sum::<u64>() * 8) / d) as u32);
+            // HUB-15a: would the box that runs a video encode of THIS
+            // source tone-map? Same placement question the real dispatch
+            // asks (ponytail: probed with encode_audio=false — a fleet
+            // where that changes the pick diverges cosmetically; the
+            // worker-side guard keeps the failure soft).
+            let need = crate::registry::PlacementNeed {
+                encode_video: true,
+                encode_audio: false,
+                video_caps: kahawai_media::remux::source_caps_names("video", info),
+                audio_caps: vec![],
+                needs_tonemap: true,
+            };
+            let tonemap = match registry.pick_transcoder(&need) {
+                Some(tc) => registry.transcoder_reports_tonemap(&tc),
+                None => kahawai_media::remux::tonemap_available(),
+            };
             kahawai_media::negotiate::negotiate(
                 &profile,
                 info,
@@ -613,6 +629,7 @@ impl Sessions {
                 video_track as usize,
                 parts.len() == 1,
                 est_kbps,
+                tonemap,
             )
         };
         let (parts, info, sp, mode) = match mode {
@@ -685,6 +702,7 @@ impl Sessions {
                     encode_audio: plan.audio == StreamMode::Encode,
                     video_caps: kahawai_media::remux::source_caps_names("video", &info),
                     audio_caps: kahawai_media::remux::source_caps_names("audio", &info),
+                    needs_tonemap: plan.tone_map,
                 };
                 // Encode work goes to the fleet when one is available
                 // (§4.5); pure remux — and encode with no fleet — stays
@@ -873,6 +891,9 @@ impl Sessions {
                         cmd.args([flag, &v.to_string()]);
                     }
                 }
+                if plan.tone_map {
+                    cmd.arg("--tone-map");
+                }
                 let child = cmd
                     .args(["--video", kahawai_media::worker::mode_arg(plan.video)])
                     .args(["--audio", kahawai_media::worker::mode_arg(plan.audio)])
@@ -1000,6 +1021,7 @@ impl Sessions {
                     video_kbps: plan.video_kbps.unwrap_or(0),
                     max_height: plan.max_height.unwrap_or(0),
                     max_channels: plan.max_channels.unwrap_or(0),
+                    tone_map: plan.tone_map,
                 },
             )),
         };
@@ -1288,6 +1310,14 @@ impl Sessions {
             // copy vs encode, not the old one's.
             let (_, _, _, info) =
                 crate::subtitles::source_row(registry, &session.item_id).await?;
+            // HUB-15a: the executor is already chosen here — ask IT.
+            let tonemap = match &session.mode {
+                Mode::Transcode { transcoder } => {
+                    let tc = transcoder.lock().unwrap().clone();
+                    registry.transcoder_reports_tonemap(&tc)
+                }
+                _ => kahawai_media::remux::tonemap_available(),
+            };
             let sp = kahawai_media::negotiate::negotiate(
                 &session.profile,
                 &info,
@@ -1295,6 +1325,7 @@ impl Sessions {
                 want_video,
                 session.parts.len() == 1,
                 None,
+                tonemap,
             );
             plan = sp.plan;
             anyhow::ensure!(plan.playable(), "selected track is not playable");

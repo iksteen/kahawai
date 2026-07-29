@@ -281,6 +281,9 @@ pub struct RemuxPlan {
     /// fixed values: 6000 kbit video, no scaling, no downmix.
     pub video_kbps: Option<u32>,
     pub max_height: Option<u32>,
+    /// HUB-15a: run the GL PQ→SDR tone-map segment in the video encode
+    /// chain. Only set when the executing box reported the capability.
+    pub tone_map: bool,
     pub max_channels: Option<u32>,
 }
 
@@ -895,7 +898,9 @@ fn route_stream(
         if let Some(sinkpad) = waiting.lock().unwrap().remove(kind) {
             tracing::info!(caps = %caps_name, kind, "transcoding stream");
             if kind == "video" {
-                build_video_encode_chain(pipe, from, sinkpad, gate, plan.video_kbps, plan.max_height);
+                build_video_encode_chain(
+                    pipe, from, sinkpad, gate, plan.video_kbps, plan.max_height, plan.tone_map,
+                );
             } else {
                 build_audio_encode_chain(pipe, from, sinkpad, &caps_name, gate, plan.max_channels);
             }
@@ -956,6 +961,98 @@ fn route_stream(
 /// for the TS muxer). Rescues codecs no browser decodes (MPEG-4 Part 2,
 /// AV1/VP9-in-TS). videoconvert costs one GPU→CPU hop with hw decoders;
 /// ponytail: cudaconvert zero-copy path when both ends are NVENC/NVDEC.
+/// HUB-15a: the PQ→SDR fragment shader (see tonemap.frag for the why).
+const TONEMAP_FRAG: &str = include_str!("tonemap.frag");
+
+/// HUB-15a: the GL tone-map segment, dry-run-verified once (TC-1
+/// standard, same as the encoders): element presence is not enough — a
+/// headless box can carry every GL plugin and still fail to open a GL
+/// display, and that must surface here, not mid-session.
+pub fn tonemap_available() -> bool {
+    static VERIFIED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *VERIFIED.get_or_init(|| {
+        if crate::init().is_err()
+            || ["glupload", "glcolorconvert", "glshader", "gldownload", "capssetter"]
+                .iter()
+                .any(|n| gst::ElementFactory::find(n).is_none())
+        {
+            return false;
+        }
+        // Dry-run the REAL segment: GL context creation, RGBA
+        // negotiation and shader compilation all happen or fail here.
+        let pipe = gst::Pipeline::new();
+        let src = gst::ElementFactory::make("videotestsrc")
+            .property("num-buffers", 5i32)
+            .build()
+            .unwrap();
+        let sink = gst::ElementFactory::make("fakesink").build().unwrap();
+        let seg = tonemap_segment();
+        pipe.add(&src).unwrap();
+        pipe.add_many(&seg).unwrap();
+        pipe.add(&sink).unwrap();
+        let mut all: Vec<&gst::Element> = vec![&src];
+        all.extend(seg.iter());
+        all.push(&sink);
+        if gst::Element::link_many(all).is_err() || pipe.set_state(gst::State::Playing).is_err() {
+            let _ = pipe.set_state(gst::State::Null);
+            tracing::warn!("GL tone-map segment failed dry-run — tier unavailable on this box");
+            return false;
+        }
+        let ok = pipe
+            .bus()
+            .and_then(|bus| {
+                bus.timed_pop_filtered(
+                    gst::ClockTime::from_seconds(5),
+                    &[gst::MessageType::Eos, gst::MessageType::Error],
+                )
+            })
+            .is_some_and(|msg| msg.type_() == gst::MessageType::Eos);
+        let _ = pipe.set_state(gst::State::Null);
+        if !ok {
+            tracing::warn!("GL tone-map segment failed dry-run — tier unavailable on this box");
+        }
+        ok
+    })
+}
+
+/// The GL tone-map segment: upload → RGBA → PQ→SDR shader → back to
+/// system memory, then capssetter rewrites the colorimetry tag to
+/// bt709 so the encoder's VUI tells the player the truth (the shader
+/// changed the pixels; nothing else knows to change the label).
+fn tonemap_segment() -> Vec<gst::Element> {
+    let upload = gst::ElementFactory::make("glupload").build().unwrap();
+    let to_rgba = gst::ElementFactory::make("glcolorconvert").build().unwrap();
+    let rgba = gst::ElementFactory::make("capsfilter")
+        .property(
+            "caps",
+            gst::Caps::builder("video/x-raw")
+                .features(["memory:GLMemory"])
+                .field("format", "RGBA")
+                .build(),
+        )
+        .build()
+        .unwrap();
+    let shader = gst::ElementFactory::make("glshader")
+        .property("fragment", TONEMAP_FRAG)
+        .build()
+        .unwrap();
+    let from_rgba = gst::ElementFactory::make("glcolorconvert").build().unwrap();
+    let download = gst::ElementFactory::make("gldownload").build().unwrap();
+    // NV12 pinned HERE, GPU-side: without it glcolorconvert stays RGBA
+    // and a VA encoder with no converter between (the non-CUDA path has
+    // none after this segment) refuses system-memory RGBA — observed as
+    // not-negotiated on the J5005. Every encoder we place takes NV12.
+    let nv12 = gst::ElementFactory::make("capsfilter")
+        .property("caps", gst::Caps::builder("video/x-raw").field("format", "NV12").build())
+        .build()
+        .unwrap();
+    let relabel = gst::ElementFactory::make("capssetter")
+        .property("caps", gst::Caps::builder("video/x-raw").field("colorimetry", "bt709").build())
+        .build()
+        .unwrap();
+    vec![upload, to_rgba, rgba, shader, from_rgba, download, nv12, relabel]
+}
+
 fn build_video_encode_chain(
     pipe: &gst::Pipeline,
     from: &gst::Pad,
@@ -963,6 +1060,7 @@ fn build_video_encode_chain(
     gate: &Option<Arc<SeekGate>>,
     video_kbps: Option<u32>,
     max_height: Option<u32>,
+    tone_map: bool,
 ) {
     let Some(enc_name) = h264_encoder() else {
         tracing::error!("video encode routed with no verified H.264 encoder");
@@ -1018,6 +1116,20 @@ fn build_video_encode_chain(
         _ => vec![],
     };
 
+    // HUB-15a: the GL segment sits in the same system-memory zone as
+    // the scaler, before it — tone-map at source resolution, then
+    // scale (scaling PQ-coded pixels before linearizing would blur
+    // across the transfer curve; and the shader is per-pixel GPU work,
+    // its cost does not care).
+    let tonemap: Vec<gst::Element> = if tone_map && tonemap_available() {
+        tonemap_segment()
+    } else {
+        if tone_map {
+            tracing::warn!("tone-map requested but GL segment unavailable — encoding as-is");
+        }
+        vec![]
+    };
+
     // The scaler works on system memory: it must sit right after
     // videoconvert, BEFORE any CUDA upload — a capsfilter on raw caps
     // cannot link against CUDAMemory.
@@ -1028,6 +1140,7 @@ fn build_video_encode_chain(
         .unwrap_or(converters.len());
     let mut chain: Vec<&gst::Element> = Vec::new();
     chain.extend(converters[..scale_at].iter());
+    chain.extend(tonemap.iter());
     chain.extend(scaler.iter());
     chain.extend(converters[scale_at..].iter());
     chain.push(&enc);
@@ -2140,7 +2253,7 @@ mod tests {
     use super::*;
     use std::time::{Duration, Instant};
 
-    const COPY_AV: RemuxPlan = RemuxPlan { video: StreamMode::Copy, audio: StreamMode::Copy, audio_track: 0, video_track: 0, video_kbps: None, max_height: None, max_channels: None };
+    const COPY_AV: RemuxPlan = RemuxPlan { video: StreamMode::Copy, audio: StreamMode::Copy, audio_track: 0, video_track: 0, video_kbps: None, max_height: None, max_channels: None, tone_map: false };
 
     /// Manual repro: REMUX_SRC=/path/to/file cargo test -p kahawai-media \
     ///   remux_file_from_env -- --ignored --nocapture
@@ -2425,6 +2538,7 @@ mod tests {
             video_kbps: Some(500),
             max_height: Some(120),
             max_channels: Some(1),
+            tone_map: false,
         };
         let _ = info;
         let out = tempfile::tempdir().unwrap();
@@ -2451,6 +2565,57 @@ mod tests {
             seg_info.video[0].height
         );
         assert_eq!(seg_info.audio[0].channels, 1, "downmix to mono did not happen");
+    }
+
+    /// HUB-15a end to end at pipeline level: a PQ HEVC source encoded
+    /// with tone_map produces segments OUR OWN probe reads as SDR —
+    /// the capssetter relabel reached the encoder's VUI. (Tone QUALITY
+    /// was judged on real HDR movie frames; this guards the plumbing.)
+    #[test]
+    fn tonemap_encode_outputs_sdr_tagged_video() {
+        crate::init().unwrap();
+        if h264_encoder().is_none()
+            || !tonemap_available()
+            || !crate::testutil::has_element("x265enc")
+        {
+            eprintln!("skipping: encoder, GL tone-map segment, or x265enc unavailable");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let src_path = dir.path().join("in.mkv");
+        crate::testutil::render_pq_hevc_mkv(&src_path);
+        let info = crate::discover(&src_path, Duration::from_secs(30)).unwrap();
+        assert_eq!(info.video[0].hdr.as_deref(), Some("hdr10"), "fixture must probe hdr10");
+
+        let plan = RemuxPlan {
+            video: StreamMode::Encode,
+            audio: StreamMode::Copy,
+            audio_track: 0,
+            video_track: 0,
+            video_kbps: Some(500),
+            max_height: None,
+            max_channels: None,
+            tone_map: true,
+        };
+        let out = tempfile::tempdir().unwrap();
+        let job =
+            start_at(out.path(), plan, Box::new(FileSource::open(&src_path).unwrap()), 0).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !job.finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(job.finished(), "tone-map encode did not finish");
+        assert!(job.failed().is_none(), "tone-map encode failed: {:?}", job.failed());
+        let seg = std::fs::read_dir(out.path())
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .find(|p| p.extension().is_some_and(|x| x == "ts"))
+            .expect("no segment produced");
+        let seg_info = crate::discover(&seg, Duration::from_secs(30)).unwrap();
+        assert_eq!(
+            seg_info.video[0].hdr, None,
+            "output still tagged HDR — the colorimetry relabel failed"
+        );
     }
 
     #[test]

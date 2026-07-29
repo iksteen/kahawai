@@ -312,6 +312,26 @@ async fn handle_host_msg(
                 error = %e.error, "mediahost reported unreadable file");
         }
         host_to_hub::Msg::ManifestRequest(r) => {
+            // Deep refresh: answer EMPTY, so every file re-probes
+            // (first-scan semantics). Must beat the in-sync gate — a
+            // deep refresh of an in-sync collection is the whole point.
+            if registry.take_deep_rescan(module_id, &r.collection_id) {
+                let msg = kahawai_proto::v1::HubToHost {
+                    msg: Some(kahawai_proto::v1::hub_to_host::Msg::Manifest(
+                        kahawai_proto::v1::Manifest {
+                            sidecars_compared: false,
+                            collection_id: r.collection_id.clone(),
+                            entries: vec![],
+                            done: true,
+                            in_sync: false,
+                        },
+                    )),
+                };
+                registry.send_to_host(module_id, msg).await?;
+                tracing::info!(%module_id, collection = %r.collection_id,
+                    "deep refresh: empty manifest sent, full re-probe");
+                return Ok(());
+            }
             // Reconnect handshake: matching scan generations mean the
             // hub already reflects the host's last completed scan — no
             // manifest, no walk, no reconciliation churn on restart.

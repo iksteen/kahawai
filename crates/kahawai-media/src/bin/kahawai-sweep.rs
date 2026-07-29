@@ -252,7 +252,15 @@ fn sweep_one(
     let codecs = describe(&info);
 
     // 2. Negotiate, as the hub would (HUB-14).
-    let sp = kahawai_media::negotiate::negotiate(profile, &info, 0, 0, true, None);
+    let sp = kahawai_media::negotiate::negotiate(
+        profile,
+        &info,
+        0,
+        0,
+        true,
+        None,
+        kahawai_media::remux::tonemap_available(),
+    );
     let plan = sp.plan;
     if sp.cost == kahawai_media::negotiate::Cost::Unplayable {
         return (Verdict::Skip, format!("[needs transcoder] {codecs}"));

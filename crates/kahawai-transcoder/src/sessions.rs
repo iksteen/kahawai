@@ -79,7 +79,7 @@ impl Runner {
         start_ms: u64,
         sink: &str,
         tail_sizes: Vec<u64>,
-        encode_params: (u32, u32, u32),
+        encode_params: (u32, u32, u32, bool),
     ) {
         let result = self
             .start_inner(
@@ -123,7 +123,7 @@ impl Runner {
         start_ms: u64,
         sink: &str,
         tail_sizes: &[u64],
-        (video_kbps, max_height, max_channels): (u32, u32, u32),
+        (video_kbps, max_height, max_channels, tone_map): (u32, u32, u32, bool),
     ) -> Result<()> {
         // Replace any previous run first (seek-restart reuses the id).
         self.end(session_id).await;
@@ -184,6 +184,9 @@ impl Runner {
                         cmd.args([flag, &v.to_string()]);
                     }
                 }
+                if tone_map {
+                    cmd.arg("--tone-map");
+                }
                 let child = cmd
                     .args(["--video", video])
                     .args(["--audio", audio])
@@ -207,6 +210,7 @@ impl Runner {
                     video_kbps: (video_kbps > 0).then_some(video_kbps),
                     max_height: (max_height > 0).then_some(max_height),
                     max_channels: (max_channels > 0).then_some(max_channels),
+                    tone_map,
                 };
                 let (all, dir) = (socks.clone(), dir.clone());
                 let sink_owned = (!sink.is_empty()).then(|| sink.to_string());

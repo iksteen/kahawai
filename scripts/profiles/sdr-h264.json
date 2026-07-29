@@ -1,0 +1,9 @@
+{
+  "containers": ["mp4", "webm"],
+  "video": [{"codec": "h264", "max_profile": "high", "max_level": "5.1"}],
+  "audio": ["aac", "mp3"],
+  "max_audio_channels": 0,
+  "hdr": false,
+  "ass_render": true,
+  "graphics_overlay": true
+}

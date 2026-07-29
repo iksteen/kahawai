@@ -119,7 +119,9 @@ fn probe_capabilities(max_sessions: u32) -> Result<CapabilityReport> {
     }
     let decode_caps = kahawai_media::remux::decoder_caps_names();
     tracing::info!(decoders = decode_caps.len(), "decoder inventory");
-    Ok(CapabilityReport { encoders, max_sessions, decode_caps })
+    let tonemap = kahawai_media::remux::tonemap_available();
+    tracing::info!(tonemap, "HDR tone-map segment (HUB-15a)");
+    Ok(CapabilityReport { encoders, max_sessions, decode_caps, tonemap })
 }
 
 /// One link session: Hello/HelloAck, capability registration, then
@@ -197,7 +199,7 @@ async fn link_loop(
                         Some(hub_to_tc::Msg::StartSession(s)) => {
                             let runner = runner.clone();
                             tokio::spawn(async move {
-                                runner.start(s.session_id, s.size, &s.video, &s.audio, s.audio_track, s.video_track, s.start_ms, &s.sink, s.tail_sizes, (s.video_kbps, s.max_height, s.max_channels)).await;
+                                runner.start(s.session_id, s.size, &s.video, &s.audio, s.audio_track, s.video_track, s.start_ms, &s.sink, s.tail_sizes, (s.video_kbps, s.max_height, s.max_channels, s.tone_map)).await;
                             });
                         }
                         // Inline, not spawned: EndSession→StartSession

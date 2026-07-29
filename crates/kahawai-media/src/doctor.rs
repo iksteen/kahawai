@@ -177,6 +177,19 @@ pub fn gstreamer_checks() -> Vec<Check> {
     // TC-1: encoders that will actually run sessions are dry-run-verified,
     // not just present — a broken element (or a hw element without its
     // driver) surfaces here, not mid-session.
+    // HUB-15a: HDR→SDR is a GL shader segment, not a matrix row — all
+    // five elements must be present together or the tier is absent.
+    out.push(if crate::remux::tonemap_available() {
+        Check::ok("hdr tone-map", "GL shader segment (glshader + capssetter)")
+    } else {
+        Check::warn(
+            "hdr tone-map",
+            "GL segment incomplete — HDR sources transcode without tone-mapping \
+             (washed-out colors); check gst-plugins-base GL and capssetter \
+             (gst-plugins-bad)",
+        )
+    });
+
     for (row, verified, disabled) in [
         ("encode aac", crate::remux::aac_encoder(), "audio transcode disabled"),
         ("encode h264", crate::remux::h264_encoder(), "video transcode disabled"),

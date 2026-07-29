@@ -627,12 +627,18 @@ async fn admin_enrich_run(State(state): State<AppState>) -> Result<Json<Value>, 
     Ok(Json(json!({ "started": true })))
 }
 
+#[derive(serde::Deserialize, Default)]
+struct RefreshQuery {
+    deep: Option<bool>,
+}
+
 /// HUB-35: granular refresh. The admin-facing unit is the LIBRARY —
 /// fan out collection-scoped scan requests to each member collection's
 /// mediahost. There is deliberately no global rescan.
 async fn admin_refresh_library(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    Query(q): Query<RefreshQuery>,
 ) -> Result<Json<Value>, ApiError> {
     let members: Vec<(String, String)> = sqlx::query_as(
         "SELECT module_id, collection_id FROM library_collections WHERE library_id = ?",
@@ -646,6 +652,11 @@ async fn admin_refresh_library(
     }
     let (mut asked, mut offline) = (0, 0);
     for (module_id, collection_id) in members {
+        // ?deep=true: re-probe every file, stat-unchanged or not — how
+        // rows probed by an older binary pick up new stream facts.
+        if q.deep.unwrap_or(false) {
+            state.registry.mark_deep_rescan(&module_id, &collection_id);
+        }
         if request_scan(&state, &module_id, &collection_id).await {
             asked += 1;
         } else {

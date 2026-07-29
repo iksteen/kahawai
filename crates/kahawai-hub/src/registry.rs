@@ -58,6 +58,9 @@ pub struct PlacementNeed {
     /// Source caps names per kind (any one must be decodable).
     pub video_caps: Vec<String>,
     pub audio_caps: Vec<String>,
+    /// HUB-15a: the plan tone-maps — prefer a box reporting the GL
+    /// segment (preference, not filter).
+    pub needs_tonemap: bool,
 }
 
 /// SEC-7: how long a renewed-but-unused fingerprint stays admitted.
@@ -86,6 +89,13 @@ pub struct Registry {
     links: Mutex<HashMap<String, tokio::sync::mpsc::Sender<Result<kahawai_proto::v1::HubToHost, tonic::Status>>>>,
     /// Live per-collection scan progress (HUB-35): last report wins.
     scan_progress: Mutex<HashMap<(String, String), ScanState>>,
+    /// Deep-refresh marks: the next manifest request for (module,
+    /// collection) is answered EMPTY, so the host re-probes every file
+    /// (first-scan semantics — works with any satellite version). This
+    /// is how pre-extension streams_json rows pick up newly probed
+    /// facts (HDR, profile/level): the incremental scan skips
+    /// stat-unchanged files by design and would never heal them.
+    deep_rescan: Mutex<std::collections::HashSet<(String, String)>>,
     /// HUB-11 event bus: invalidation hints pushed to /api/v1/events
     /// subscribers ({kind, ...} JSON). Lagging receivers drop events —
     /// hints, not state; clients refetch what a hint names.
@@ -114,6 +124,7 @@ impl Registry {
             tc_load: Mutex::new(HashMap::new()),
             disabled: Mutex::new(std::collections::HashSet::new()),
             scan_progress: Mutex::new(HashMap::new()),
+            deep_rescan: Mutex::new(std::collections::HashSet::new()),
             events: tokio::sync::broadcast::channel(256).0,
         }
     }
@@ -1405,8 +1416,36 @@ impl Registry {
                 .collect::<Vec<_>>(),
             "max_sessions": caps.max_sessions,
             "decode_caps": caps.decode_caps,
+            "tonemap": caps.tonemap,
         });
         self.transcoder_caps.lock().unwrap().insert(module_id.to_string(), json);
+    }
+
+    pub fn mark_deep_rescan(&self, module_id: &str, collection_id: &str) {
+        self.deep_rescan
+            .lock()
+            .unwrap()
+            .insert((module_id.to_string(), collection_id.to_string()));
+    }
+
+    /// One-shot: consumed by the manifest answer, so a later ordinary
+    /// refresh is incremental again.
+    pub fn take_deep_rescan(&self, module_id: &str, collection_id: &str) -> bool {
+        self.deep_rescan
+            .lock()
+            .unwrap()
+            .remove(&(module_id.to_string(), collection_id.to_string()))
+    }
+
+    /// HUB-15a: does this transcoder report the GL tone-map segment?
+    pub fn transcoder_reports_tonemap(&self, module_id: &str) -> bool {
+        self.transcoder_caps
+            .lock()
+            .unwrap()
+            .get(module_id)
+            .and_then(|c| c.get("tonemap"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
     }
 
     pub fn clear_transcoder_caps(&self, module_id: &str) {
@@ -1475,7 +1514,7 @@ impl Registry {
         let links = self.tc_links.lock().unwrap();
         let load = self.tc_load.lock().unwrap();
         let disabled = self.disabled.lock().unwrap();
-        let mut candidates: Vec<(bool, usize, String)> = caps
+        let mut candidates: Vec<(bool, bool, usize, String)> = caps
             .iter()
             .filter(|(id, _)| links.contains_key(*id) && !disabled.contains(*id))
             .filter_map(|(id, c)| {
@@ -1509,12 +1548,17 @@ impl Registry {
                 let hw = encoders
                     .iter()
                     .any(|e| e["codec"] == "h264" && e["hardware"] == true);
-                Some((hw, current, id.clone()))
+                // HUB-15a: an HDR encode prefers a box that can tone-map
+                // — a preference, not a filter: with no capable box the
+                // job still runs (worker encodes as-is, verdict said so).
+                let tm = !need.needs_tonemap
+                    || c.get("tonemap").and_then(|v| v.as_bool()).unwrap_or(false);
+                Some((tm, hw, current, id.clone()))
             })
             .collect();
-        // Most hardware, least loaded.
-        candidates.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
-        candidates.first().map(|(_, _, id)| id.clone())
+        // Tone-map fit, most hardware, least loaded.
+        candidates.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)).then(a.2.cmp(&b.2)));
+        candidates.first().map(|(_, _, _, id)| id.clone())
     }
 
     /// Enrolled satellites (DB) merged with live connection state.

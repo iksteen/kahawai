@@ -42,6 +42,15 @@ pub fn has_element(name: &str) -> bool {
     gst::ElementFactory::find(name).is_some()
 }
 
+/// HDR10 fixture (HUB-15a): HEVC Main-10, PQ colorimetry — probes as
+/// hdr10. Caller gates on `has_element("x265enc")`.
+pub fn render_pq_hevc_mkv(path: &Path) {
+    render(&format!(
+        "videotestsrc num-buffers=75 ! video/x-raw,format=I420_10LE,width=320,height=240,framerate=25/1,colorimetry=bt2100-pq ! x265enc bitrate=500 speed-preset=ultrafast key-int-max=25 ! h265parse ! matroskamux name=m audiotestsrc num-buffers=130 ! audioconvert ! fdkaacenc ! m. m. ! filesink location=\"{}\"",
+        path.display()
+    ));
+}
+
 fn render_av(path: &Path, muxer: &str) {
     render(&format!(
         "videotestsrc num-buffers=250 ! video/x-raw,format=I420,width=320,height=240,framerate=25/1 ! x264enc bframes=3 b-adapt=false key-int-max=25 ! h264parse ! {muxer} name=m audiotestsrc num-buffers=430 ! audioconvert ! fdkaacenc ! m. m. ! filesink location=\"{}\"",

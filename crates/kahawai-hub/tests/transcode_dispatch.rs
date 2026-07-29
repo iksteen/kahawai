@@ -176,6 +176,7 @@ async fn dispatches_encode_session_to_transcoder() {
             }],
             max_sessions: 2,
             decode_caps: vec![], // empty = assume capable (OPS-7)
+            tonemap: false,
         };
         let _ = kahawai_transcoder::link_once(
             &hub_addr2,
@@ -346,6 +347,7 @@ async fn dispatches_encode_session_to_transcoder() {
             }],
             max_sessions: 2,
             decode_caps: vec![],
+            tonemap: false,
         };
         let _ = kahawai_transcoder::link_once(
             &hub_addr3, tc2_tls, "backup-box", caps, &tc2_path, &None,

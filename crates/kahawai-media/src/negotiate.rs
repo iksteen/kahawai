@@ -141,7 +141,9 @@ fn video_fits(profile: &CapabilityProfile, v: &kahawai_core::media::VideoStream)
 
 /// The whole decision, one source. `est_kbps` is the hub's aggregate
 /// size×8/duration estimate — the only bitrate available for
-/// pre-extension rows; used solely when a cap is set.
+/// pre-extension rows; used solely when a cap is set. `tonemap` is the
+/// hub's answer to "can the box that would run an encode tone-map HDR"
+/// (HUB-15a) — a server fact, not a client capability.
 pub fn negotiate(
     profile: &CapabilityProfile,
     info: &MediaInfo,
@@ -149,6 +151,7 @@ pub fn negotiate(
     video_track: usize,
     single_part: bool,
     est_kbps: Option<u32>,
+    tonemap: bool,
 ) -> SourcePlan {
     let audio_track = audio_track.min(info.audio.len().saturating_sub(1));
     let video_track = video_track.min(info.video.len().saturating_sub(1));
@@ -201,6 +204,14 @@ pub fn negotiate(
         StreamMode::Off
     };
 
+    // HUB-15a: tone-map only when the pixels get rewritten anyway (an
+    // encode) and only PQ — HLG is SDR-compatible by design, and a
+    // COPY of HDR to an SDR client stays a copy: browsers that decode
+    // HEVC tone-map in their own compositor, better than we can.
+    let tone_map = tonemap
+        && video == StreamMode::Encode
+        && v.is_some_and(|s| s.hdr.as_deref() == Some("hdr10"));
+
     let plan = RemuxPlan {
         video,
         audio,
@@ -210,6 +221,7 @@ pub fn negotiate(
         max_height: (video == StreamMode::Encode).then_some(profile.max_height).flatten(),
         max_channels: (audio == StreamMode::Encode && profile.max_audio_channels > 0)
             .then_some(profile.max_audio_channels),
+        tone_map,
     };
 
     let cost = if direct {
@@ -233,12 +245,15 @@ pub fn negotiate(
             None => "none".into(),
         };
     }
-    if let Some(s) = v
+    if plan.tone_map {
+        video_verdict.push_str(" · hdr10 → sdr (tone-mapped)");
+    } else if let Some(s) = v
         && s.hdr.is_some()
         && !profile.hdr
     {
-        // HUB-15a lands the tone-map tier; until then the honest truth.
-        video_verdict.push_str(" · HDR delivered as-is (tone-map not built, HUB-15a)");
+        // Copies: the client's decoder tone-maps better than we can.
+        // Encodes without a capable box: the honest truth (HUB-15a).
+        video_verdict.push_str(" · HDR delivered as-is");
     }
     if over_cap && !direct && video == StreamMode::Encode {
         video_verdict.push_str(" · bandwidth cap");
@@ -310,27 +325,27 @@ mod tests {
     fn decision_table() {
         let p = chrome();
         // mp4/h264/aac: direct.
-        let sp = negotiate(&p, &media("mp4", Some(vs("h264")), Some(au("aac", 2))), 0, 0, true, None);
+        let sp = negotiate(&p, &media("mp4", Some(vs("h264")), Some(au("aac", 2))), 0, 0, true, None, false);
         assert_eq!(sp.cost, Cost::Direct);
         assert!(sp.direct);
         // Same streams in MKV: copy-remux (container unsupported).
-        let sp = negotiate(&p, &media("matroska", Some(vs("h264")), Some(au("aac", 6))), 0, 0, true, None);
+        let sp = negotiate(&p, &media("matroska", Some(vs("h264")), Some(au("aac", 6))), 0, 0, true, None, false);
         assert_eq!(sp.cost, Cost::Copy);
         assert_eq!(sp.plan.video, StreamMode::Copy);
         // DTS audio: audio encode, channels unlimited so no downmix.
-        let sp = negotiate(&p, &media("matroska", Some(vs("h264")), Some(au("dts", 6))), 0, 0, true, None);
+        let sp = negotiate(&p, &media("matroska", Some(vs("h264")), Some(au("dts", 6))), 0, 0, true, None, false);
         assert_eq!(sp.cost, Cost::AudioEncode);
         assert_eq!(sp.plan.max_channels, None);
         // HEVC with hevc in profile: copy; without: video encode.
-        let sp = negotiate(&p, &media("matroska", Some(vs("hevc")), Some(au("aac", 2))), 0, 0, true, None);
+        let sp = negotiate(&p, &media("matroska", Some(vs("hevc")), Some(au("aac", 2))), 0, 0, true, None, false);
         assert_eq!(sp.plan.video, StreamMode::Copy);
         let mut no_hevc = chrome();
         no_hevc.video.retain(|c| c.codec != "hevc");
-        let sp = negotiate(&no_hevc, &media("matroska", Some(vs("hevc")), Some(au("aac", 2))), 0, 0, true, None);
+        let sp = negotiate(&no_hevc, &media("matroska", Some(vs("hevc")), Some(au("aac", 2))), 0, 0, true, None, false);
         assert_eq!(sp.cost, Cost::VideoEncode);
         assert_eq!(sp.plan.video_kbps, Some(6000));
         // Multi-part never direct, even when everything fits.
-        let sp = negotiate(&p, &media("mp4", Some(vs("h264")), Some(au("aac", 2))), 0, 0, false, None);
+        let sp = negotiate(&p, &media("mp4", Some(vs("h264")), Some(au("aac", 2))), 0, 0, false, None, false);
         assert_ne!(sp.cost, Cost::Direct);
     }
 
@@ -340,28 +355,28 @@ mod tests {
         let mut p = chrome();
         p.max_height = Some(1080);
         let big = VideoStream { height: 2160, width: 3840, ..vs("h264") };
-        let sp = negotiate(&p, &media("matroska", Some(big), Some(au("aac", 2))), 0, 0, true, None);
+        let sp = negotiate(&p, &media("matroska", Some(big), Some(au("aac", 2))), 0, 0, true, None, false);
         assert_eq!(sp.cost, Cost::VideoEncode);
         assert_eq!(sp.plan.max_height, Some(1080));
         // Profile ceiling: high-10 source vs high client → encode; unknown source profile → copy.
         let mut p = chrome();
         p.video = vec![VideoCap { codec: "h264".into(), max_profile: Some("high".into()), max_level: None }];
         let ten_bit = VideoStream { profile: Some("high-10".into()), ..vs("h264") };
-        let sp = negotiate(&p, &media("matroska", Some(ten_bit), Some(au("aac", 2))), 0, 0, true, None);
+        let sp = negotiate(&p, &media("matroska", Some(ten_bit), Some(au("aac", 2))), 0, 0, true, None, false);
         assert_eq!(sp.cost, Cost::VideoEncode);
         let unknown = vs("h264"); // no profile field → permissive
-        let sp = negotiate(&p, &media("matroska", Some(unknown), Some(au("aac", 2))), 0, 0, true, None);
+        let sp = negotiate(&p, &media("matroska", Some(unknown), Some(au("aac", 2))), 0, 0, true, None, false);
         assert_eq!(sp.cost, Cost::Copy, "unknown profile must not veto a copy");
         // Bandwidth cap: 14 Mbit estimate vs 8 Mbit cap → no direct, encode clamped.
         let mut p = chrome();
         p.max_bandwidth_kbps = Some(800);
-        let sp = negotiate(&p, &media("mp4", Some(vs("h264")), Some(au("aac", 2))), 0, 0, true, Some(14000));
+        let sp = negotiate(&p, &media("mp4", Some(vs("h264")), Some(au("aac", 2))), 0, 0, true, Some(14000), false);
         assert_ne!(sp.cost, Cost::Direct);
         assert_eq!(sp.plan.video_kbps, Some(800));
         // Channel limit: 5.1 aac vs max 2 → encode with downmix.
         let mut p = chrome();
         p.max_audio_channels = 2;
-        let sp = negotiate(&p, &media("matroska", Some(vs("h264")), Some(au("aac", 6))), 0, 0, true, None);
+        let sp = negotiate(&p, &media("matroska", Some(vs("h264")), Some(au("aac", 6))), 0, 0, true, None, false);
         assert_eq!(sp.cost, Cost::AudioEncode);
         assert_eq!(sp.plan.max_channels, Some(2));
     }
@@ -376,18 +391,43 @@ mod tests {
             SubtitleStream { format: "ass".into(), language: None },
             SubtitleStream { format: "pgs".into(), language: None },
         ];
-        let sp = negotiate(&p, &info, 0, 0, true, None);
-        assert_eq!(sp.cost, Cost::Copy, "HDR must not flip the decision until HUB-15a");
-        assert!(sp.video_verdict.contains("HUB-15a"), "verdict: {}", sp.video_verdict);
+        let sp = negotiate(&p, &info, 0, 0, true, None, true);
+        assert_eq!(sp.cost, Cost::Copy, "HDR never flips a copy — the client's decoder maps");
+        assert!(sp.video_verdict.contains("as-is"), "verdict: {}", sp.video_verdict);
+        assert!(!sp.plan.tone_map, "copies never tone-map");
         assert_eq!(sp.subtitles[0].tier, SubtitleTier::Text);
         assert_eq!(sp.subtitles[1].tier, SubtitleTier::Convert, "no ass_render → flatten");
         assert_eq!(sp.subtitles[2].tier, SubtitleTier::Unavailable);
         let mut able = chrome();
         able.ass_render = true;
         able.graphics_overlay = true;
-        let sp = negotiate(&able, &info, 0, 0, true, None);
+        let sp = negotiate(&able, &info, 0, 0, true, None, false);
         assert_eq!(sp.subtitles[1].tier, SubtitleTier::Text);
         assert_eq!(sp.subtitles[2].tier, SubtitleTier::Graphics);
+    }
+
+    /// HUB-15a decision arm: PQ + encode + capable box → tone-map;
+    /// no capable box, or HLG, or a copy → not.
+    #[test]
+    fn tonemap_arm_gates_on_encode_pq_and_capability() {
+        let mut no_hevc = chrome();
+        no_hevc.video.retain(|c| c.codec != "hevc");
+        let pq = VideoStream { hdr: Some("hdr10".into()), ..vs("hevc") };
+        let info = media("matroska", Some(pq), Some(au("aac", 2)));
+
+        let sp = negotiate(&no_hevc, &info, 0, 0, true, None, true);
+        assert_eq!(sp.cost, Cost::VideoEncode);
+        assert!(sp.plan.tone_map);
+        assert!(sp.video_verdict.contains("tone-mapped"), "verdict: {}", sp.video_verdict);
+
+        let sp = negotiate(&no_hevc, &info, 0, 0, true, None, false);
+        assert!(!sp.plan.tone_map, "no capable box → encode as-is");
+        assert!(sp.video_verdict.contains("as-is"), "verdict: {}", sp.video_verdict);
+
+        let hlg = VideoStream { hdr: Some("hlg".into()), ..vs("hevc") };
+        let info = media("matroska", Some(hlg), Some(au("aac", 2)));
+        let sp = negotiate(&no_hevc, &info, 0, 0, true, None, true);
+        assert!(!sp.plan.tone_map, "HLG is SDR-compatible by design — no map");
     }
 
     /// Multiple caps per codec compose: an exact source-aware probe and
@@ -406,14 +446,14 @@ mod tests {
             level: Some("4.1".into()),
             ..vs("h264")
         };
-        let sp = negotiate(&p, &media("matroska", Some(ok), Some(au("aac", 2))), 0, 0, true, None);
+        let sp = negotiate(&p, &media("matroska", Some(ok), Some(au("aac", 2))), 0, 0, true, None, false);
         assert_eq!(sp.plan.video, StreamMode::Copy);
         let over = VideoStream {
             profile: Some("high-10".into()),
             level: Some("4.1".into()),
             ..vs("h264")
         };
-        let sp = negotiate(&p, &media("matroska", Some(over), Some(au("aac", 2))), 0, 0, true, None);
+        let sp = negotiate(&p, &media("matroska", Some(over), Some(au("aac", 2))), 0, 0, true, None, false);
         assert_eq!(sp.cost, Cost::VideoEncode, "the precise cap must reject high-10");
         // Adding a second, higher cap for the same codec admits it.
         p.video.push(VideoCap {
@@ -426,7 +466,7 @@ mod tests {
             level: Some("4.1".into()),
             ..vs("h264")
         };
-        let sp = negotiate(&p, &media("matroska", Some(over), Some(au("aac", 2))), 0, 0, true, None);
+        let sp = negotiate(&p, &media("matroska", Some(over), Some(au("aac", 2))), 0, 0, true, None, false);
         assert_eq!(sp.plan.video, StreamMode::Copy, "any admitting cap suffices");
     }
 
@@ -443,7 +483,7 @@ mod tests {
         ] {
             let info = media("matroska", v, a);
             let old = crate::remux::plan_streams(&info, &crate::remux::WEB_TARGET, 0, 0);
-            let new = negotiate(&p, &info, 0, 0, true, None);
+            let new = negotiate(&p, &info, 0, 0, true, None, false);
             assert_eq!(new.plan.video, old.video, "video parity for {info:?}");
             assert_eq!(new.plan.audio, old.audio, "audio parity for {info:?}");
         }
