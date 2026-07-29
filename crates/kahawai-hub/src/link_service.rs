@@ -259,6 +259,7 @@ fn kind_name(m: &host_to_hub::Msg) -> &'static str {
         host_to_hub::Msg::FileHashes(_) => "file_hashes",
         host_to_hub::Msg::FileSubtitles(_) => "file_subtitles",
         host_to_hub::Msg::FileAttachments(_) => "file_attachments",
+        host_to_hub::Msg::ImageSubtitles(_) => "image_subtitles",
     }
 }
 
@@ -386,6 +387,19 @@ async fn handle_host_msg(
                 }
             }
             tracing::debug!(%module_id, collection = %r.collection_id, files = total, sent, "manifest sent");
+        }
+        // HUB-32b: display sets the host walked for us; cached for the
+        // burn-in session that asked (and for any later one).
+        host_to_hub::Msg::ImageSubtitles(m) => {
+            if !m.error.is_empty() {
+                tracing::warn!(%module_id, collection = %m.collection_id, path = %m.path_rel,
+                    track = m.sub_index, error = %m.error, "image display-set extraction failed");
+            } else if let Err(e) = subtitles.store_image_sets(module_id, &m).await {
+                tracing::warn!(%module_id, error = format!("{e:#}"), "storing image display sets");
+            } else {
+                tracing::info!(%module_id, collection = %m.collection_id, path = %m.path_rel,
+                    track = m.sub_index, blocks = m.blocks.len(), "image display sets cached");
+            }
         }
         host_to_hub::Msg::FilesSeen(s) => {
             if let Some(paths) = seen.get_mut(&s.collection_id) {

@@ -72,7 +72,7 @@ pub fn run(
     start_ms: u64,
     sink: Option<&str>,
 ) -> Result<()> {
-    run_parts(&[(socket.to_path_buf(), size)], out_dir, plan, start_ms, sink)
+    run_parts(&[(socket.to_path_buf(), size)], out_dir, plan, start_ms, sink, None)
 }
 
 /// Multi-part entry point: one socket per part, in timeline order, joined
@@ -85,6 +85,7 @@ pub fn run_parts(
     plan: RemuxPlan,
     start_ms: u64,
     sink: Option<&str>,
+    burn_sets: Option<&Path>,
 ) -> Result<()> {
     anyhow::ensure!(!parts.is_empty(), "no parts given");
     let mut sources: Vec<Box<dyn RemuxSource>> = Vec::with_capacity(parts.len());
@@ -106,7 +107,7 @@ pub fn run_parts(
         floor_ms: start_ms,
         viewer_file: out_dir.join("viewer.pos"),
     };
-    let job = remux::start_parts(out_dir, plan, sources, start_ms, sink, Some(pace))?;
+    let job = remux::start_parts(out_dir, plan, sources, start_ms, sink, Some(pace), burn_sets)?;
     while !job.finished() {
         std::thread::sleep(std::time::Duration::from_millis(100));
     }

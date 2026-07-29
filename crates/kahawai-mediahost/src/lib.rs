@@ -418,6 +418,14 @@ impl Engine {
                 let _ = self.hash_tx.try_send(hasher::JobMsg::Urgent(e));
                 None
             }
+            // HUB-32b: an image subtitle track's display sets, walked
+            // from the container index here — on local disk it costs
+            // milliseconds, and over the hub's byte plane it would not
+            // finish inside a session start at all.
+            hub_to_host::Msg::ExtractImageSubs(e) => {
+                let _ = self.hash_tx.try_send(hasher::JobMsg::UrgentImage(e));
+                None
+            }
             hub_to_host::Msg::OpenRead(req) => Some(req),
             _ => None,
         }

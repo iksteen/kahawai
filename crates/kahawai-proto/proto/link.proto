@@ -46,6 +46,9 @@ message HostToHub {
     FileSubtitles file_subtitles = 10;
     // Attachment declarations for one file (MH-4 backfill).
     FileAttachments file_attachments = 11;
+    // HUB-32b: one image subtitle track's raw display-set blocks,
+    // walked from the container index on the host's own disk.
+    ImageSubtitles image_subtitles = 12;
   }
 }
 
@@ -188,12 +191,45 @@ message HubToHost {
     // MH-4 backfill: declare attachments for files scanned before
     // declaration existed. Cheapest tier (header reads only).
     AttachmentsWorklist attachments_worklist = 8;
+    // HUB-32b: read one image subtitle track's display-set blocks.
+    // Index-driven and free on local disk; the hub cannot do this
+    // itself because every read would cross the byte plane.
+    ExtractImageSubs extract_image_subs = 9;
   }
 }
 
 message ExtractSubs {
   string collection_id = 1;
   string path_rel = 2;
+}
+
+message ExtractImageSubs {
+  string collection_id = 1;
+  string path_rel = 2;
+  // Which subtitle track, in the e{n} numbering discovery uses.
+  uint32 sub_index = 3;
+}
+
+/// One image subtitle track, undecoded: the payloads are still PGS
+/// segments / VobSub SPUs, which is both the compact form and the one
+/// the pipeline worker's own decoders take.
+message ImageSubtitles {
+  string collection_id = 1;
+  string path_rel = 2;
+  uint32 sub_index = 3;
+  // Matroska CodecID (S_HDMV/PGS, S_VOBSUB); empty = no such track.
+  string codec = 4;
+  // CodecPrivate: VobSub's .idx text (palette + canvas size).
+  bytes codec_private = 5;
+  repeated ImageSubBlock blocks = 6;
+  string error = 7;
+}
+
+message ImageSubBlock {
+  uint64 start_ms = 1;
+  // 0 = undeclared; the set then ends where the next one begins.
+  uint64 duration_ms = 2;
+  bytes payload = 3;
 }
 
 message SubsWorklist {
@@ -399,6 +435,11 @@ message StartSession {
   // 1 + the e{n} index (0 = burn nothing, so old transcoders that
   // ignore the field simply do not burn).
   uint32 burn_subtitle = 14;
+  // The display sets to burn, in the worker's own on-disk format. Sent
+  // with the session because a dispatched worker can no more walk the
+  // source index than the hub can — every read would cross the byte
+  // plane. Empty = nothing to burn.
+  bytes burn_sets = 15;
 }
 
 message EndSession {

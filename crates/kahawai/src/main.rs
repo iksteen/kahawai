@@ -75,6 +75,11 @@ enum Cmd {
         /// HUB-32b: burn this image subtitle track (e{n}) into the picture.
         #[arg(long)]
         burn_sub: Option<usize>,
+        /// Display sets to burn, extracted by the mediahost. Present for
+        /// every dispatched session — a worker cannot walk the source
+        /// index itself (every read crosses the byte plane).
+        #[arg(long)]
+        burn_sets: Option<PathBuf>,
     },
 }
 
@@ -148,7 +153,7 @@ async fn main() -> Result<()> {
         }
         Cmd::Mediahost => run_mediahost(cfg.mediahost).await,
         Cmd::Doctor { json } => doctor(&cfg, json),
-        Cmd::RemuxWorker { socket, out_dir, size, video, audio, audio_track, video_track, start_ms, sink, parts, video_kbps, max_height, max_channels, tone_map, burn_sub } => {
+        Cmd::RemuxWorker { socket, out_dir, size, video, audio, audio_track, video_track, start_ms, sink, parts, video_kbps, max_height, max_channels, tone_map, burn_sub, burn_sets } => {
             // Die WITH the supervisor: kill_on_drop only fires inside a
             // living parent, so a hub/transcoder restart used to orphan
             // pipeline workers indefinitely (one survived three days).
@@ -179,7 +184,7 @@ async fn main() -> Result<()> {
                 tone_map,
                 burn_subtitle: burn_sub,
             };
-            kahawai_media::worker::run_parts(&all, &out_dir, plan, start_ms, sink.as_deref())
+            kahawai_media::worker::run_parts(&all, &out_dir, plan, start_ms, sink.as_deref(), burn_sets.as_deref())
         }
         Cmd::Transcoder => {
             kahawai_transcoder::run(

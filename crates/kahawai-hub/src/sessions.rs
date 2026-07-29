@@ -102,6 +102,9 @@ pub struct Session {
     /// The effective capability profile (client's or fallback, cap
     /// merged) — re-plans on track switches negotiate against IT.
     profile: kahawai_core::media::CapabilityProfile,
+    /// HUB-32b: the display sets this session burns, if any. A seek
+    /// restarts the pipeline, which must burn the same subtitles.
+    burn_sets: Option<std::path::PathBuf>,
     /// The HLS sink this session's content actually works on. Some
     /// files crash hlssink3 (TC-6); once the fallback saved a start or
     /// a seek, every later restart uses it directly instead of paying
@@ -260,6 +263,11 @@ fn playlist_ready(path: &std::path::Path) -> bool {
 }
 
 type LocalResolver = std::sync::Arc<dyn Fn(&str, &str) -> Result<std::path::PathBuf> + Send + Sync>;
+
+/// How long a burn-in session waits for the mediahost to walk its
+/// index. Milliseconds on local disk; this is the sanity bound, well
+/// inside the client's own patience.
+const BURN_SETS_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
 
 pub struct Sessions {
     pub leases: Leases,
@@ -577,6 +585,7 @@ impl Sessions {
     pub async fn start(
         self: &Arc<Self>,
         registry: &Registry,
+        subtitles: &crate::subtitles::Subtitles,
         user_id: &str,
         item_id: &str,
         mode: Option<&str>,
@@ -611,7 +620,9 @@ impl Sessions {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
         };
-        let negotiate_one = |parts: &[PartSource], info: &kahawai_core::media::MediaInfo| {
+        let negotiate_with = |parts: &[PartSource],
+                              info: &kahawai_core::media::MediaInfo,
+                              burn_capable: bool| {
             let est_kbps = info
                 .duration_ms
                 .filter(|d| *d > 0)
@@ -632,15 +643,11 @@ impl Sessions {
                 Some(tc) => registry.transcoder_reports_tonemap(&tc),
                 None => kahawai_media::remux::tonemap_available(),
             };
-            // HUB-32b: burn-in reads the subtitle timeline from the
-            // container index, which is disk-speed on a local source
-            // and round-trip-bound over the byte plane (~4 KB/s
-            // measured — no session can wait for it). Until the
-            // mediahost extracts image sets on its own disk, offer the
-            // tier only where the source is read locally.
-            let burn_capable = parts
-                .first()
-                .is_some_and(|p| self.reads_locally(&p.module_id));
+            // HUB-32b: the timeline comes from the mediahost, which
+            // walks its own disk in milliseconds (the hub cannot: every
+            // read would cross the byte plane at ~4 KB/s). Offer the
+            // tier while that host is reachable; `burn_sets` below is
+            // what actually decides, and a failure there re-plans.
             kahawai_media::negotiate::negotiate(
                 &profile,
                 info,
@@ -651,6 +658,16 @@ impl Sessions {
                 tonemap,
                 burn_capable,
             )
+        };
+        // HUB-32b: the timeline comes from the mediahost, which walks
+        // its own disk in milliseconds — the hub cannot, every read
+        // would cross the byte plane at ~4 KB/s. Offer the tier while
+        // that host is reachable; the sets themselves decide below.
+        let negotiate_one = |parts: &[PartSource], info: &kahawai_core::media::MediaInfo| {
+            let capable = parts
+                .first()
+                .is_some_and(|p| registry.is_connected(&p.module_id) || self.reads_locally(&p.module_id));
+            negotiate_with(parts, info, capable)
         };
         let (parts, info, sp, mode) = match mode {
             // Operator override (scripts, pipeline debugging): the mode
@@ -681,6 +698,31 @@ impl Sessions {
                 (parts, info, sp, mode.to_string())
             }
         };
+        // HUB-32b: a burn is only real once the display sets exist. Ask
+        // the mediahost, and if they do not arrive, negotiate again
+        // with the tier withdrawn — better an honest "unavailable"
+        // than an encode that burns nothing.
+        let mut burn_sets: Option<std::path::PathBuf> = None;
+        let mut sp = sp;
+        if let Some(idx) = sp.plan.burn_subtitle
+            && let Some(part) = parts.first()
+        {
+            burn_sets = subtitles
+                .image_sets(
+                    registry,
+                    &part.module_id,
+                    &part.collection_id,
+                    &part.path_rel,
+                    idx,
+                    BURN_SETS_WAIT,
+                )
+                .await;
+            if burn_sets.is_none() {
+                tracing::warn!(item = item_id, track = idx,
+                    "burn-in: no display sets; re-planning without it");
+                sp = negotiate_with(&parts, &info, false);
+            }
+        }
         if sp.cost == kahawai_media::negotiate::Cost::Unplayable && mode != "direct" {
             bail!("no playable streams — this source needs the video transcoder");
         }
@@ -732,6 +774,11 @@ impl Sessions {
                 } else {
                     None
                 };
+                // Read once: the same bytes serve both dispatch attempts.
+                let sets_bytes = match &burn_sets {
+                    Some(p) => std::fs::read(p).unwrap_or_default(),
+                    None => Vec::new(),
+                };
                 match placed {
                     Some(tc) => {
                         // TC-6: one retry on the fallback HLS sink — two
@@ -741,7 +788,7 @@ impl Sessions {
                             .start_transcode(
                                 registry, &tc, &id, plan,
                                 self.open_part_leases(registry, &parts, start_idx).await?,
-                                start_idx, local_ms, "",
+                                start_idx, local_ms, "", sets_bytes.clone(),
                             )
                             .await
                         {
@@ -750,7 +797,7 @@ impl Sessions {
                             self.start_transcode(
                                 registry, &tc, &id, plan,
                                 self.open_part_leases(registry, &parts, start_idx).await?,
-                                start_idx, local_ms, "hlssink2",
+                                start_idx, local_ms, "hlssink2", sets_bytes.clone(),
                             )
                             .await
                             .with_context(|| format!("first attempt: {first:#}"))?;
@@ -761,7 +808,7 @@ impl Sessions {
                     None => {
                         let tail = self.open_part_leases(registry, &parts, start_idx).await?;
                         let runner = match self
-                            .start_remux(&id, plan, tail, local_ms, "")
+                            .start_remux(&id, plan, tail, local_ms, "", burn_sets.as_deref())
                             .await
                         {
                             Ok(r) => r,
@@ -771,7 +818,7 @@ impl Sessions {
                                 let tail =
                                     self.open_part_leases(registry, &parts, start_idx).await?;
                                 let r = self
-                                    .start_remux(&id, plan, tail, local_ms, "hlssink2")
+                                    .start_remux(&id, plan, tail, local_ms, "hlssink2", burn_sets.as_deref())
                                     .await
                                     .with_context(|| format!("first attempt: {first:#}"))?;
                                 chosen_sink = "hlssink2".into();
@@ -801,6 +848,7 @@ impl Sessions {
             mode: session_mode,
             verdict: Mutex::new(verdict),
             sub_verdicts: negotiated.subtitles,
+            burn_sets: burn_sets.clone(),
             profile,
             sink: Mutex::new(chosen_sink),
             seek_lock: tokio::sync::Mutex::new(()),
@@ -850,6 +898,8 @@ impl Sessions {
         parts: Vec<(Lease, u64)>,
         start_ms: u64,
         sink: &str,
+        // HUB-32b: display sets the mediahost walked for us.
+        sets: Option<&std::path::Path>,
     ) -> Result<RemuxRunner> {
         let dir = self.scratch_root.join(session_id);
         // ALWAYS from a clean dir: a crashed first attempt leaves its
@@ -917,6 +967,9 @@ impl Sessions {
                 if let Some(n) = plan.burn_subtitle {
                     cmd.args(["--burn-sub", &n.to_string()]);
                 }
+                if let Some(p) = &sets {
+                    cmd.args(["--burn-sets", &p.to_string_lossy()]);
+                }
                 let child = cmd
                     .args(["--video", kahawai_media::worker::mode_arg(plan.video)])
                     .args(["--audio", kahawai_media::worker::mode_arg(plan.audio)])
@@ -949,6 +1002,7 @@ impl Sessions {
                 // deadlock outright).
                 let dir2 = dir.clone();
                 let sink_owned = (!sink.is_empty()).then(|| sink.to_string());
+                let sets_owned = sets.map(|p| p.to_path_buf());
                 let job = tokio::task::spawn_blocking(move || {
                     kahawai_media::remux::start_parts(
                         &dir2,
@@ -957,6 +1011,7 @@ impl Sessions {
                         start_ms,
                         sink_owned.as_deref(),
                         None,
+                        sets_owned.as_deref(),
                     )
                 })
                 .await
@@ -1011,6 +1066,7 @@ impl Sessions {
 
     /// Dispatch a session to a transcoder and wait for its playlist.
     #[allow(clippy::too_many_arguments)] // private plumbing, one call site per mode
+    #[allow(clippy::too_many_arguments)] // wire-shaped plumbing
     async fn start_transcode(
         &self,
         registry: &Registry,
@@ -1021,6 +1077,9 @@ impl Sessions {
         part_idx: usize,
         start_ms: u64,
         sink: &str,
+        // HUB-32b: a dispatched worker can no more walk the source
+        // index than the hub can, so the display sets ride along.
+        burn_sets: Vec<u8>,
     ) -> Result<()> {
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         anyhow::ensure!(!parts.is_empty(), "no source parts to dispatch");
@@ -1047,6 +1106,7 @@ impl Sessions {
                     tone_map: plan.tone_map,
                     // 1-based on the wire: 0 means "burn nothing".
                     burn_subtitle: plan.burn_subtitle.map_or(0, |n| n as u32 + 1),
+                    burn_sets: burn_sets.clone(),
                 },
             )),
         };
@@ -1384,7 +1444,7 @@ impl Sessions {
                 // now, never for a boundary.
                 let sink = session.sink.lock().unwrap().clone();
                 let tail = self.open_part_leases(registry, &session.parts, idx).await?;
-                let fresh = match self.start_remux(&session.id, plan, tail, local_ms, &sink).await
+                let fresh = match self.start_remux(&session.id, plan, tail, local_ms, &sink, session.burn_sets.as_deref()).await
                 {
                     Ok(r) => r,
                     Err(first) if sink != "hlssink2" => {
@@ -1395,7 +1455,7 @@ impl Sessions {
                         let tail =
                             self.open_part_leases(registry, &session.parts, idx).await?;
                         let r = self
-                            .start_remux(&session.id, plan, tail, local_ms, "hlssink2")
+                            .start_remux(&session.id, plan, tail, local_ms, "hlssink2", session.burn_sets.as_deref())
                             .await
                             .with_context(|| format!("first attempt: {first:#}"))?;
                         *session.sink.lock().unwrap() = "hlssink2".into();
@@ -1432,6 +1492,8 @@ impl Sessions {
                 if let Err(first) = self
                     .start_transcode(
                         registry, &tc, &session.id, plan, parts, idx, local_ms, &sink,
+                        session.burn_sets.as_ref().map(|p| std::fs::read(p).unwrap_or_default())
+                            .unwrap_or_default(),
                     )
                     .await
                 {
@@ -1444,6 +1506,8 @@ impl Sessions {
                         self.open_part_leases(registry, &session.parts, idx).await?;
                     self.start_transcode(
                         registry, &tc, &session.id, plan, parts, idx, local_ms, "hlssink2",
+                        session.burn_sets.as_ref().map(|p| std::fs::read(p).unwrap_or_default())
+                            .unwrap_or_default(),
                     )
                     .await
                     .with_context(|| format!("first attempt: {first:#}"))?;
@@ -1525,7 +1589,12 @@ impl Sessions {
             Some((parts, held_idx)) if held_idx == idx => parts,
             _ => self.open_part_leases(registry, &session.parts, idx).await?,
         };
-        self.start_transcode(registry, &new_tc, id, plan, parts, idx, local_ms, "").await?;
+        let sets = session
+            .burn_sets
+            .as_ref()
+            .map(|p| std::fs::read(p).unwrap_or_default())
+            .unwrap_or_default();
+        self.start_transcode(registry, &new_tc, id, plan, parts, idx, local_ms, "", sets).await?;
         *transcoder.lock().unwrap() = new_tc.clone();
         Ok(new_tc)
     }

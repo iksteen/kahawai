@@ -33,7 +33,11 @@ impl TranscoderLinkService {
     }
 
     pub fn into_server(self) -> TranscoderLinkServer<Self> {
+        // HUB-32b: display sets ride with StartSession and reach
+        // megabytes; tonic's 4 MB default would drop the link.
         TranscoderLinkServer::new(self)
+            .max_decoding_message_size(64 * 1024 * 1024)
+            .max_encoding_message_size(64 * 1024 * 1024)
     }
 }
 

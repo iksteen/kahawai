@@ -80,11 +80,12 @@ impl Runner {
         sink: &str,
         tail_sizes: Vec<u64>,
         encode_params: (u32, u32, u32, bool, u32),
+        burn_sets: Vec<u8>,
     ) {
         let result = self
             .start_inner(
                 &session_id, size, video, audio, audio_track, video_track, start_ms, sink,
-                &tail_sizes, encode_params,
+                &tail_sizes, encode_params, burn_sets,
             )
             .await;
         let msg = match result {
@@ -124,6 +125,7 @@ impl Runner {
         sink: &str,
         tail_sizes: &[u64],
         (video_kbps, max_height, max_channels, tone_map, burn_subtitle): (u32, u32, u32, bool, u32),
+        burn_sets: Vec<u8>,
     ) -> Result<()> {
         // Replace any previous run first (seek-restart reuses the id).
         self.end(session_id).await;
@@ -190,6 +192,12 @@ impl Runner {
                 if burn_subtitle > 0 {
                     cmd.args(["--burn-sub", &(burn_subtitle - 1).to_string()]);
                 }
+                if !burn_sets.is_empty() {
+                    let p = dir.join("burn-sets.bin");
+                    std::fs::write(&p, &burn_sets)
+                        .with_context(|| format!("writing {}", p.display()))?;
+                    cmd.args(["--burn-sets", &p.to_string_lossy()]);
+                }
                 let child = cmd
                     .args(["--video", video])
                     .args(["--audio", audio])
@@ -218,11 +226,18 @@ impl Runner {
                 };
                 let (all, dir) = (socks.clone(), dir.clone());
                 let sink_owned = (!sink.is_empty()).then(|| sink.to_string());
+                let sets_path = if burn_sets.is_empty() {
+                    None
+                } else {
+                    let p = dir.join("burn-sets.bin");
+                    std::fs::write(&p, &burn_sets)?;
+                    Some(p)
+                };
                 let err = Arc::new(Mutex::new(None));
                 let err2 = err.clone();
                 let handle = tokio::task::spawn_blocking(move || {
                     if let Err(e) = kahawai_media::worker::run_parts(
-                        &all, &dir, plan, start_ms, sink_owned.as_deref(),
+                        &all, &dir, plan, start_ms, sink_owned.as_deref(), sets_path.as_deref(),
                     ) {
                         tracing::warn!(error = format!("{e:#}"), "in-process worker failed");
                         *err2.lock().unwrap() = Some(format!("{e:#}"));

@@ -1210,6 +1210,7 @@ async fn start_session(
         .sessions
         .start(
             &state.registry,
+            &state.subtitles,
             &claims.sub,
             &body.item_id,
             body.mode.as_deref(),

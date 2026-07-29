@@ -135,7 +135,12 @@ pub async fn link_once(
     worker_exe: &Option<std::path::PathBuf>,
 ) -> Result<()> {
     let channel = kahawai_transport::tls::grpc_channel_with(hub_addr, tls).await?;
-    let mut client = TranscoderLinkClient::new(channel);
+    // HUB-32b: a StartSession carries the display sets to burn, which
+    // run to megabytes on a feature film — well past tonic's 4 MB
+    // default, which would drop the link instead of the session.
+    let mut client = TranscoderLinkClient::new(channel)
+        .max_decoding_message_size(64 * 1024 * 1024)
+        .max_encoding_message_size(64 * 1024 * 1024);
 
     let (tx, rx) = tokio::sync::mpsc::channel::<TcToHub>(16);
     tx.send(TcToHub {
@@ -199,7 +204,7 @@ async fn link_loop(
                         Some(hub_to_tc::Msg::StartSession(s)) => {
                             let runner = runner.clone();
                             tokio::spawn(async move {
-                                runner.start(s.session_id, s.size, &s.video, &s.audio, s.audio_track, s.video_track, s.start_ms, &s.sink, s.tail_sizes, (s.video_kbps, s.max_height, s.max_channels, s.tone_map, s.burn_subtitle)).await;
+                                runner.start(s.session_id, s.size, &s.video, &s.audio, s.audio_track, s.video_track, s.start_ms, &s.sink, s.tail_sizes, (s.video_kbps, s.max_height, s.max_channels, s.tone_map, s.burn_subtitle), s.burn_sets).await;
                             });
                         }
                         // Inline, not spawned: EndSession→StartSession

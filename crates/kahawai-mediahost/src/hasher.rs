@@ -28,6 +28,7 @@ pub enum JobMsg {
     SubsWorklist(SubsWorklist),
     AttachmentsWorklist(AttachmentsWorklist),
     Urgent(ExtractSubs),
+    UrgentImage(kahawai_proto::v1::ExtractImageSubs),
 }
 
 /// One deduped work queue (collection, path_rel) per tier.
@@ -52,11 +53,18 @@ impl Tier {
 fn intake(
     msg: JobMsg,
     urgent: &mut VecDeque<(String, String)>,
+    urgent_image: &mut VecDeque<kahawai_proto::v1::ExtractImageSubs>,
     ed2k: &mut Tier,
     subs: &mut Tier,
     atts: &mut Tier,
 ) -> bool {
     match msg {
+        // Same urgency as a text extraction: a viewer is waiting on it
+        // to start a burn-in session.
+        JobMsg::UrgentImage(e) => {
+            urgent_image.push_back(e);
+            true
+        }
         JobMsg::Urgent(e) => {
             urgent.push_back((e.collection_id, e.path_rel));
             true
@@ -83,6 +91,7 @@ pub async fn run(
     activity: Activity,
 ) {
     let mut urgent: VecDeque<(String, String)> = VecDeque::new();
+    let mut urgent_image: VecDeque<kahawai_proto::v1::ExtractImageSubs> = VecDeque::new();
     let mut ed2k = Tier::default();
     let mut subs = Tier::default();
     let mut atts = Tier::default();
@@ -91,6 +100,7 @@ pub async fn run(
         // Drain new work; block only when every queue is empty.
         loop {
             let empty = urgent.is_empty()
+                && urgent_image.is_empty()
                 && ed2k.q.is_empty()
                 && subs.q.is_empty()
                 && atts.q.is_empty();
@@ -105,13 +115,18 @@ pub async fn run(
                     Err(_) => break,
                 }
             };
-            intake(msg, &mut urgent, &mut ed2k, &mut subs, &mut atts);
+            intake(msg, &mut urgent, &mut urgent_image, &mut ed2k, &mut subs, &mut atts);
         }
 
         // Tier order: urgent (never idle-gated — the active lease IS the
         // requesting viewer) → ED2K → background subs.
         if let Some((collection_id, path_rel)) = urgent.pop_front() {
             extract_and_send(&collections, &collection_id, &path_rel, &tx).await;
+            continue;
+        }
+        if let Some(e) = urgent_image.pop_front() {
+            extract_image_and_send(&collections, &e.collection_id, &e.path_rel, e.sub_index, &tx)
+                .await;
             continue;
         }
         if let Some((collection_id, path_rel)) = ed2k.q.pop_front() {
@@ -152,7 +167,7 @@ pub async fn run(
             while activity.busy() {
                 match tokio::time::timeout(BUSY_POLL, rx.recv()).await {
                     Ok(Some(m)) => {
-                        if intake(m, &mut urgent, &mut ed2k, &mut subs, &mut atts) {
+                        if intake(m, &mut urgent, &mut urgent_image, &mut ed2k, &mut subs, &mut atts) {
                             preempted = true;
                             break;
                         }
@@ -216,6 +231,81 @@ async fn declare_and_send(
         })),
     };
     let _ = tx.send(msg).await;
+}
+
+/// HUB-32b: one image subtitle track's raw display-set blocks, read
+/// through the container's own index. Undecoded on purpose — the
+/// payloads are compact this way and the pipeline worker owns the
+/// decoders.
+async fn extract_image_and_send(
+    collections: &[CollectionConfig],
+    collection_id: &str,
+    path_rel: &str,
+    sub_index: u32,
+    tx: &tokio::sync::mpsc::Sender<HostToHub>,
+) {
+    let started = std::time::Instant::now();
+    let (collections2, cid, prel) =
+        (collections.to_vec(), collection_id.to_string(), path_rel.to_string());
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let path = crate::serve::resolve_rel(&collections2, &cid, &prel)?;
+        let mut src = kahawai_media::remux::FileSource::open(&path)?;
+        // Local disk: no budget needed, and a header walk is still
+        // only a few percent of the file.
+        kahawai_media::subindex::extract_image_track(
+            &mut src,
+            sub_index as usize,
+            std::time::Duration::from_secs(120),
+        )
+    })
+    .await;
+
+    let msg = match result {
+        Ok(Ok(Some(track))) => {
+            tracing::info!(
+                collection = collection_id, path = path_rel, track = sub_index,
+                blocks = track.blocks.len(), ms = started.elapsed().as_millis(),
+                "image display sets extracted"
+            );
+            kahawai_proto::v1::ImageSubtitles {
+                collection_id: collection_id.into(),
+                path_rel: path_rel.into(),
+                sub_index,
+                codec: track.codec,
+                codec_private: track.codec_private.unwrap_or_default(),
+                blocks: track
+                    .blocks
+                    .into_iter()
+                    .map(|(start_ms, dur, payload)| kahawai_proto::v1::ImageSubBlock {
+                        start_ms,
+                        duration_ms: dur.unwrap_or(0),
+                        payload,
+                    })
+                    .collect(),
+                error: String::new(),
+            }
+        }
+        other => {
+            let error = match other {
+                Ok(Ok(None)) => "no such image track, or the container has no usable index".into(),
+                Ok(Err(e)) => format!("{e:#}"),
+                Err(e) => format!("{e}"),
+                Ok(Ok(Some(_))) => unreachable!("handled above"),
+            };
+            tracing::warn!(collection = collection_id, path = path_rel, track = sub_index,
+                %error, "image display-set extraction failed");
+            kahawai_proto::v1::ImageSubtitles {
+                collection_id: collection_id.into(),
+                path_rel: path_rel.into(),
+                sub_index,
+                error,
+                ..Default::default()
+            }
+        }
+    };
+    let _ = tx
+        .send(HostToHub { msg: Some(host_to_hub::Msg::ImageSubtitles(msg)) })
+        .await;
 }
 
 /// Extract every text subtitle track of one local file (single demux

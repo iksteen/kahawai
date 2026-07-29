@@ -146,6 +146,11 @@ const ATTACHED_FILE: u32 = 0x61A7;
 const FILE_NAME: u32 = 0x466E;
 const FILE_MIME: u32 = 0x4660;
 const FILE_DATA: u32 = 0x465C;
+const CONTENT_ENCODINGS: u32 = 0x6D80;
+const CONTENT_ENCODING: u32 = 0x6240;
+const CONTENT_COMPRESSION: u32 = 0x5034;
+const CONTENT_COMP_ALGO: u32 = 0x4254;
+const CONTENT_COMP_SETTINGS: u32 = 0x4255;
 const CLUSTER: u32 = 0x1F43_B675;
 const CLUSTER_TIMESTAMP: u32 = 0xE7;
 const SIMPLE_BLOCK: u32 = 0xA3;
@@ -212,6 +217,16 @@ fn walk_children(data: &[u8], mut f: impl FnMut(u32, &[u8]) -> Result<bool>) -> 
     Ok(())
 }
 
+/// Matroska per-track content compression (ContentEncodings). Common
+/// on subtitle tracks — this library's PGS is zlib — and applied to
+/// every block payload before anything can parse it.
+#[derive(Clone, PartialEq)]
+enum Compression {
+    Zlib,
+    /// Header stripping: these bytes were removed from every payload.
+    HeaderStrip(Vec<u8>),
+}
+
 struct MkvTrack {
     /// Container track number (block headers reference this).
     number: u64,
@@ -223,6 +238,7 @@ struct MkvTrack {
     header: Option<String>,
     /// CodecPrivate — the VobSub .idx text (palette + display size).
     private: Option<Vec<u8>>,
+    compression: Option<Compression>,
 }
 
 impl MkvTrack {
@@ -239,6 +255,65 @@ struct MkvIndex {
     sub_cues: Vec<(u64, u64, Option<u64>, u64)>,
     /// First cluster position (absolute), for the header walk.
     first_cluster: Option<u64>,
+}
+
+/// ContentEncodings → the one compression we must undo. Anything
+/// exotic (encryption, unknown algo) yields None and the track's
+/// payloads are left alone — garbled is better than wrong-and-silent,
+/// and the caller's decoder will simply find nothing.
+fn read_compression(data: &[u8]) -> Option<Compression> {
+    let mut out = None;
+    walk_children(data, |id, v| {
+        if id == CONTENT_ENCODING {
+            walk_children(v, |id, v| {
+                if id == CONTENT_COMPRESSION {
+                    let (mut algo, mut settings) = (0u64, Vec::new());
+                    walk_children(v, |id, v| {
+                        match id {
+                            CONTENT_COMP_ALGO => algo = uint(v),
+                            CONTENT_COMP_SETTINGS => settings = v.to_vec(),
+                            _ => {}
+                        }
+                        Ok(true)
+                    })
+                    .ok();
+                    out = match algo {
+                        0 => Some(Compression::Zlib),
+                        3 => Some(Compression::HeaderStrip(settings)),
+                        _ => None,
+                    };
+                }
+                Ok(true)
+            })
+            .ok();
+        }
+        Ok(true)
+    })
+    .ok();
+    out
+}
+
+fn decompress(payload: &[u8], how: Option<&Compression>) -> Vec<u8> {
+    match how {
+        Some(Compression::Zlib) => {
+            use std::io::Read;
+            let mut out = Vec::new();
+            match flate2::read::ZlibDecoder::new(payload).read_to_end(&mut out) {
+                Ok(_) => out,
+                Err(e) => {
+                    tracing::debug!(error = %e, "zlib block did not inflate");
+                    payload.to_vec()
+                }
+            }
+        }
+        Some(Compression::HeaderStrip(prefix)) => {
+            let mut out = Vec::with_capacity(prefix.len() + payload.len());
+            out.extend_from_slice(prefix);
+            out.extend_from_slice(payload);
+            out
+        }
+        None => payload.to_vec(),
+    }
 }
 
 fn mkv_read_index(r: &mut Reader) -> Result<MkvIndex> {
@@ -326,12 +401,14 @@ fn mkv_read_index(r: &mut Reader) -> Result<MkvIndex> {
                     if id == TRACK_ENTRY {
                         let (mut number, mut ttype, mut codec, mut private) =
                             (0u64, 0u64, String::new(), None::<Vec<u8>>);
+                        let mut compression = None;
                         walk_children(entry, |id, v| {
                             match id {
                                 TRACK_NUMBER => number = uint(v),
                                 TRACK_TYPE => ttype = uint(v),
                                 CODEC_ID => codec = String::from_utf8_lossy(v).to_string(),
                                 CODEC_PRIVATE => private = Some(v.to_vec()),
+                                CONTENT_ENCODINGS => compression = read_compression(v),
                                 _ => {}
                             }
                             Ok(true)
@@ -353,6 +430,7 @@ fn mkv_read_index(r: &mut Reader) -> Result<MkvIndex> {
                                     .filter(|_| is_ass)
                                     .map(decode_text),
                                 private: private.clone(),
+                                compression: compression.clone(),
                             });
                             sub_seen += 1;
                         }
@@ -916,7 +994,7 @@ fn mkv_walk(mut r: Reader<'_>, image: Option<usize>) -> Result<MkvOut> {
             .filter(|(_, b)| b.track == t.number)
             .map(|(cluster_ts, b)| {
                 let ticks = cluster_ts.saturating_add_signed(i64::from(b.rel_time));
-                (to_ms(ticks), b.duration.map(|d| to_ms(d)), b.payload.clone())
+                (to_ms(ticks), b.duration.map(|d| to_ms(d)), decompress(&b.payload, t.compression.as_ref()))
             })
             .collect();
         out.sort_by_key(|(ms, _, _)| *ms);
@@ -938,7 +1016,7 @@ fn mkv_walk(mut r: Reader<'_>, image: Option<usize>) -> Result<MkvOut> {
             let start_ticks = cluster_ts.saturating_add_signed(i64::from(b.rel_time));
             let start = to_ms(start_ticks);
             let end = b.duration.map(|d| to_ms(start_ticks + d)).unwrap_or(start + 3000);
-            let raw = decode_text(&b.payload);
+            let raw = decode_text(&decompress(&b.payload, t.compression.as_ref()));
             let text = if t.is_ass {
                 raw_events.push((start, end, raw.clone()));
                 clean_cue_text(raw.splitn(9, ',').last().unwrap_or(""))

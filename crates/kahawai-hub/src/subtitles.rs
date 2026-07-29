@@ -553,6 +553,86 @@ impl Subtitles {
     /// reads, no lease traffic) and wait for the cache to land. Returns
     /// the cached result, or None on timeout/disconnect — the caller
     /// falls back to hub-side lease extraction.
+    /// HUB-32b: the display-set file for one image subtitle track,
+    /// asked of the mediahost (whose disk makes the index walk free)
+    /// and cached like any other extraction. `None` when the host is
+    /// gone or the track has no usable index — the caller then plans
+    /// without a burn instead of promising one.
+    pub async fn image_sets(
+        &self,
+        registry: &Registry,
+        module_id: &str,
+        collection_id: &str,
+        path_rel: &str,
+        sub_index: usize,
+        wait: std::time::Duration,
+    ) -> Option<std::path::PathBuf> {
+        let key = format!("i{sub_index}");
+        let cache_path = self
+            .dir
+            .join(format!("{}.sets", cache_key(module_id, collection_id, path_rel, &key)));
+        if tokio::fs::metadata(&cache_path).await.is_ok() {
+            return Some(cache_path);
+        }
+        if !registry.is_connected(module_id) {
+            return None;
+        }
+        let msg = kahawai_proto::v1::HubToHost {
+            msg: Some(kahawai_proto::v1::hub_to_host::Msg::ExtractImageSubs(
+                kahawai_proto::v1::ExtractImageSubs {
+                    collection_id: collection_id.to_string(),
+                    path_rel: path_rel.to_string(),
+                    sub_index: sub_index as u32,
+                },
+            )),
+        };
+        registry.send_to_host(module_id, msg).await.ok()?;
+        tracing::info!(collection = %collection_id, path = %path_rel, track = sub_index,
+            "image display sets requested from mediahost");
+        // A viewer is waiting on this one: bounded, unlike the text
+        // extraction's patient 10 minutes.
+        let deadline = std::time::Instant::now() + wait;
+        while std::time::Instant::now() < deadline {
+            if tokio::fs::metadata(&cache_path).await.is_ok() {
+                return Some(cache_path);
+            }
+            if !registry.is_connected(module_id) {
+                return None;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        tracing::warn!(collection = %collection_id, path = %path_rel, track = sub_index,
+            "image display sets did not arrive in time");
+        None
+    }
+
+    /// Store what the mediahost walked, in the worker's own format.
+    pub async fn store_image_sets(
+        &self,
+        module_id: &str,
+        msg: &kahawai_proto::v1::ImageSubtitles,
+    ) -> Result<()> {
+        let key = format!("i{}", msg.sub_index);
+        let path = self
+            .dir
+            .join(format!("{}.sets", cache_key(module_id, &msg.collection_id, &msg.path_rel, &key)));
+        let blocks: Vec<(u64, Option<u64>, Vec<u8>)> = msg
+            .blocks
+            .iter()
+            .map(|b| (b.start_ms, (b.duration_ms > 0).then_some(b.duration_ms), b.payload.clone()))
+            .collect();
+        let bytes = kahawai_media::burnin::encode_sets(
+            &msg.codec,
+            (!msg.codec_private.is_empty()).then_some(&msg.codec_private[..]),
+            &blocks,
+        );
+        tokio::fs::create_dir_all(&self.dir).await.ok();
+        let tmp = path.with_extension("sets.tmp");
+        tokio::fs::write(&tmp, &bytes).await?;
+        tokio::fs::rename(&tmp, &path).await?;
+        Ok(())
+    }
+
     async fn request_extraction(
         &self,
         registry: &Registry,

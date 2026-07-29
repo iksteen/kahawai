@@ -69,12 +69,22 @@ pub fn timeline(
     let Some(track) = crate::subindex::extract_image_track(src, sub_index, budget)? else {
         return Ok(None);
     };
-    let is_pgs = track.codec.contains("PGS");
+    Ok(Some(build(&track.codec, track.codec_private.as_deref(), &track.blocks)))
+}
+
+/// Decode raw display-set blocks into a timeline. Shared by both
+/// sources of blocks: our own index walk and the mediahost's.
+fn build(
+    codec: &str,
+    codec_private: Option<&[u8]>,
+    blocks: &[(u64, Option<u64>, Vec<u8>)],
+) -> Timeline {
+    let is_pgs = codec.contains("PGS");
     // VobSub's .idx rides in CodecPrivate: it carries both the palette
     // and the canvas its coordinates are relative to. That canvas is
     // NOT always the video's resolution (a re-encode keeps the
     // original .idx), so scaling must know it — PGS states its own.
-    let idx_text = track.codec_private.as_deref().map(crate::subtitles::decode_text);
+    let idx_text = codec_private.map(crate::subtitles::decode_text);
     let palette = idx_text
         .as_deref()
         .map(crate::imagesubs::vobsub_palette)
@@ -83,7 +93,7 @@ pub fn timeline(
 
     let mut pgs = crate::imagesubs::PgsDecoder::default();
     let mut entries: Vec<Entry> = Vec::new();
-    for (ms, dur, payload) in &track.blocks {
+    for (ms, dur, payload) in blocks {
         // A PGS block may define objects without composing a screen —
         // the decoder answers None until a set is complete.
         let (canvas, objects) = if is_pgs {
@@ -122,103 +132,262 @@ pub fn timeline(
     {
         last.end_ms = last.start_ms + 5_000;
     }
-    Ok(Some(Timeline { entries }))
+    Timeline { entries }
 }
 
-/// Build the overlay element and wire its per-frame draw to `timeline`.
-/// Returns `None` when the element is unavailable (the caller then
-/// keeps the plan but reports that nothing was burned).
-pub fn overlay_element(timeline: std::sync::Arc<Timeline>) -> Option<gst::Element> {
-    let overlay = gst::ElementFactory::make("overlaycomposition").build().ok()?;
-    // Cache the built composition: a display set spans dozens to
-    // hundreds of frames and the rectangles are immutable once scaled.
+/// The blocks as a single file, for handing a worker a timeline it
+/// cannot read itself. Deliberately trivial and self-describing: the
+/// hub writes it, the worker reads it, nothing else parses it.
+///
+/// `KBS1` | codec (u16 len + utf8) | codec_private (u32 len + bytes)
+/// then per block: start_ms u64 | duration_ms u64 | len u32 | payload.
+/// All little-endian; duration 0 = undeclared.
+pub fn encode_sets(
+    codec: &str,
+    codec_private: Option<&[u8]>,
+    blocks: &[(u64, Option<u64>, Vec<u8>)],
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4096);
+    out.extend_from_slice(b"KBS1");
+    out.extend_from_slice(&(codec.len() as u16).to_le_bytes());
+    out.extend_from_slice(codec.as_bytes());
+    let priv_bytes = codec_private.unwrap_or(&[]);
+    out.extend_from_slice(&(priv_bytes.len() as u32).to_le_bytes());
+    out.extend_from_slice(priv_bytes);
+    for (start, dur, payload) in blocks {
+        out.extend_from_slice(&start.to_le_bytes());
+        out.extend_from_slice(&dur.unwrap_or(0).to_le_bytes());
+        out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        out.extend_from_slice(payload);
+    }
+    out
+}
+
+fn decode_sets(data: &[u8]) -> Result<(String, Option<Vec<u8>>, Vec<(u64, Option<u64>, Vec<u8>)>)> {
+    let mut p = 0usize;
+    fn take<'a>(data: &'a [u8], p: &mut usize, n: usize) -> Result<&'a [u8]> {
+        let end = p.checked_add(n).filter(|e| *e <= data.len());
+        let Some(end) = end else { anyhow::bail!("display-set file truncated") };
+        let out = &data[*p..end];
+        *p = end;
+        Ok(out)
+    }
+    anyhow::ensure!(take(data, &mut p, 4)? == b"KBS1", "not a display-set file");
+    let n = u16::from_le_bytes(take(data, &mut p, 2)?.try_into().unwrap()) as usize;
+    let codec = String::from_utf8_lossy(take(data, &mut p, n)?).to_string();
+    let n = u32::from_le_bytes(take(data, &mut p, 4)?.try_into().unwrap()) as usize;
+    let codec_private =
+        (n > 0).then(|| take(data, &mut p, n).map(<[u8]>::to_vec)).transpose()?;
+    let mut blocks = Vec::new();
+    while p < data.len() {
+        let start = u64::from_le_bytes(take(data, &mut p, 8)?.try_into().unwrap());
+        let dur = u64::from_le_bytes(take(data, &mut p, 8)?.try_into().unwrap());
+        let n = u32::from_le_bytes(take(data, &mut p, 4)?.try_into().unwrap()) as usize;
+        blocks.push((start, (dur > 0).then_some(dur), take(data, &mut p, n)?.to_vec()));
+    }
+    Ok((codec, codec_private, blocks))
+}
+
+/// Timeline from sets someone else read for us (the mediahost walks
+/// the index on its own disk — see `subindex::extract_image_track`).
+pub fn timeline_from_file(path: &std::path::Path) -> Result<Option<Timeline>> {
+    let data = std::fs::read(path)?;
+    let (codec, codec_private, blocks) = decode_sets(&data)?;
+    Ok(Some(build(&codec, codec_private.as_deref(), &blocks)))
+}
+
+/// An element that blends `timeline` into every frame passing through
+/// it, at the frame's own presentation time.
+///
+/// This blends EXPLICITLY rather than handing the composition to
+/// `overlaycomposition`, whose contract is negotiated: it attaches the
+/// composition as buffer metadata whenever downstream claims to
+/// support it and only blends otherwise. The VA encoder claims it and
+/// then ignores it, so subtitles vanished on one box while burning
+/// correctly on another (NVENC, which makes no such claim) — a
+/// difference no amount of reading the pipeline reveals. Blending here
+/// is unconditional and needs nothing of the encoder.
+pub fn blend_element(
+    timeline: std::sync::Arc<Timeline>,
+    start_ms: u64,
+) -> Option<gst::Element> {
+    let el = gst::ElementFactory::make("identity").build().ok()?;
+    let pad = el.static_pad("src")?;
+    // A display set spans dozens of frames and its rectangles are
+    // immutable once scaled: build once per (set, frame size).
     let cache: std::sync::Mutex<Option<(usize, i32, i32, gst_video::VideoOverlayComposition)>> =
         std::sync::Mutex::new(None);
-    overlay.connect("draw", false, move |args| {
-        // The signal is typed: it must ALWAYS hand back a composition
-        // value, and a frame with no subtitle returns a null one. A
-        // Rust `None` here is "no return value at all" and aborts the
-        // process from an FFI frame that cannot unwind.
-        let comp: Option<gst_video::VideoOverlayComposition> = (|| {
-        let sample = args[1].get::<gst::Sample>().ok()?;
-        let buffer = sample.buffer()?;
-        let pts = buffer.pts()?;
-        let caps = sample.caps()?;
-        let info = gst_video::VideoInfo::from_caps(caps).ok()?;
-        let (fw, fh) = (info.width() as i32, info.height() as i32);
-        let idx = timeline.at(pts.mseconds())?;
-
-        let mut cached = cache.lock().unwrap();
-        if let Some((i, cw, ch, comp)) = cached.as_ref()
-            && *i == idx
-            && *cw == fw
-            && *ch == fh
-        {
-            return Some(comp.clone());
+    // Say once what actually happened: a burn that silently does
+    // nothing is the failure mode this tier keeps finding (a negotiated
+    // overlay dropped by one encoder, a timeline that never matches a
+    // frame time), and a debug-level line hides exactly that.
+    // Whether frame timestamps are the file's own or rebased to the
+    // seek point is not ours to decide: a session started at 15.5s
+    // arrives as 15500ms on one box and as 0ms on another (measured,
+    // same code, different plugin sets). So measure it on the first
+    // frame instead of assuming — a wrong assumption puts every
+    // subtitle at the wrong time, which is worse than none.
+    let base = std::sync::atomic::AtomicU64::new(u64::MAX);
+    let seen = std::sync::atomic::AtomicUsize::new(0);
+    let first_span = (
+        timeline.entries.first().map(|e| e.start_ms).unwrap_or(0),
+        timeline.entries.last().map(|e| e.end_ms).unwrap_or(0),
+    );
+    let say = move |what: &str| {
+        let n = seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n < 3 {
+            tracing::info!(frame = n, outcome = what, timeline_ms = ?first_span,
+                "burn-in: frame outcome");
         }
-        let entry = &timeline.entries[idx];
-        // Canvas → frame, UNIFORMLY by width. The canvas shares the
-        // picture's width but not always its height: this film is
-        // 3840x1600 scope with subtitles authored against a 1920x1080
-        // master, and scaling x and y independently squashed the text
-        // by a quarter (measured against mpv, which renders it 2:1).
-        // A zero canvas (VobSub without a declared size) means the
-        // objects already speak frame coordinates.
-        let scale = if entry.canvas_w > 0 {
-            f64::from(fw) / f64::from(entry.canvas_w)
-        } else {
-            1.0
+    };
+    pad.add_probe(gst::PadProbeType::BUFFER, move |pad, info| {
+        let Some(gst::PadProbeData::Buffer(buffer)) = &mut info.data else {
+            return gst::PadProbeReturn::Ok;
         };
-        let mut rects = Vec::with_capacity(entry.objects.len());
-        for o in &entry.objects {
-            if o.w == 0 || o.h == 0 {
-                continue;
-            }
-            // Overlay rectangles take BGRA (unpremultiplied); our
-            // decoders produce RGBA, so swap R and B in place.
-            let mut bgra = o.rgba.clone();
-            for px in bgra.chunks_exact_mut(4) {
-                px.swap(0, 2);
-            }
-            let mut buf = gst::Buffer::from_mut_slice(bgra);
-            {
-                let bref = buf.get_mut()?;
-                gst_video::VideoMeta::add(
-                    bref,
-                    gst_video::VideoFrameFlags::empty(),
-                    gst_video::VideoFormat::Bgra,
-                    o.w,
-                    o.h,
-                )
-                .ok()?;
-            }
-            let rw = (f64::from(o.w) * scale).round().max(1.0) as u32;
-            let rh = (f64::from(o.h) * scale).round().max(1.0) as u32;
-            // A canvas taller than the picture (the cropped-scope case)
-            // puts bottom-anchored subtitles past the last row; keep
-            // them on screen instead of off it.
-            let rx = (f64::from(o.x) * scale).round() as i32;
-            let ry = (f64::from(o.y) * scale).round() as i32;
-            let rx = rx.min(fw - rw as i32).max(0);
-            let ry = ry.min(fh - rh as i32).max(0);
-            let rect = gst_video::VideoOverlayRectangle::new_raw(
-                &buf,
-                rx,
-                ry,
-                rw,
-                rh,
-                gst_video::VideoOverlayFormatFlags::empty(),
-            );
-            rects.push(rect);
+        let Some(pts) = buffer.pts() else {
+            say("no pts");
+            return gst::PadProbeReturn::Ok;
+        };
+        let Some(caps) = pad.current_caps() else {
+            say("no caps");
+            return gst::PadProbeReturn::Ok;
+        };
+        let Ok(vinfo) = gst_video::VideoInfo::from_caps(&caps) else {
+            say("caps not video");
+            return gst::PadProbeReturn::Ok;
+        };
+        let (fw, fh) = (vinfo.width() as i32, vinfo.height() as i32);
+        let ms = pts.mseconds();
+        let mut b = base.load(std::sync::atomic::Ordering::Relaxed);
+        if b == u64::MAX {
+            // Rebased streams start near zero; absolute ones start at
+            // (or after) the offset the session asked for.
+            b = if start_ms > 1_000 && ms + 1_000 < start_ms { start_ms } else { 0 };
+            base.store(b, std::sync::atomic::Ordering::Relaxed);
+            tracing::info!(first_pts_ms = ms, start_ms, offset_ms = b,
+                "burn-in: frame time base measured");
         }
-        if rects.is_empty() {
-            return None;
+        let Some(idx) = timeline.at(ms + b) else {
+            say(&format!("no set at {}ms", ms + b));
+            return gst::PadProbeReturn::Ok;
+        };
+
+        let comp = {
+            let mut cached = cache.lock().unwrap();
+            match cached.as_ref() {
+                Some((i, cw, ch, c)) if *i == idx && *cw == fw && *ch == fh => c.clone(),
+                _ => match compose(&timeline.entries[idx], fw, fh) {
+                    Some(c) => {
+                        *cached = Some((idx, fw, fh, c.clone()));
+                        c
+                    }
+                    None => {
+                        say("composition empty");
+                        return gst::PadProbeReturn::Ok;
+                    }
+                },
+            }
+        };
+        let bufref = buffer.make_mut();
+        match gst_video::VideoFrameRef::from_buffer_ref_writable(bufref, &vinfo) {
+            Ok(mut frame) => match comp.blend(&mut frame) {
+                Ok(()) => say("blended"),
+                Err(e) => say(&format!("blend failed: {e}")),
+            },
+            Err(e) => say(&format!("frame not writable: {e}")),
         }
-        let comp = gst_video::VideoOverlayComposition::new(rects.iter()).ok()?;
-        *cached = Some((idx, fw, fh, comp.clone()));
-        Some(comp)
-        })();
-        Some(comp.to_value())
+        gst::PadProbeReturn::Ok
     });
-    Some(overlay)
+    Some(el)
+}
+
+/// One display set as a composition in FRAME coordinates.
+fn compose(entry: &Entry, fw: i32, fh: i32) -> Option<gst_video::VideoOverlayComposition> {
+    // Canvas → frame, UNIFORMLY by width. The canvas shares the
+    // picture's width but not always its height: a 3840x1600 scope
+    // film carries subtitles authored against 1920x1080, and scaling
+    // the axes independently squashed the text by a quarter (measured
+    // against mpv, which renders it 2:1). A zero canvas (VobSub with
+    // no declared size) means the objects already speak frame
+    // coordinates.
+    let scale =
+        if entry.canvas_w > 0 { f64::from(fw) / f64::from(entry.canvas_w) } else { 1.0 };
+    let mut rects = Vec::with_capacity(entry.objects.len());
+    for o in &entry.objects {
+        if o.w == 0 || o.h == 0 {
+            continue;
+        }
+        // Overlay rectangles take BGRA (unpremultiplied); our decoders
+        // produce RGBA, so swap R and B.
+        let mut bgra = o.rgba.clone();
+        for px in bgra.chunks_exact_mut(4) {
+            px.swap(0, 2);
+        }
+        let mut buf = gst::Buffer::from_mut_slice(bgra);
+        {
+            let bref = buf.get_mut()?;
+            gst_video::VideoMeta::add(
+                bref,
+                gst_video::VideoFrameFlags::empty(),
+                gst_video::VideoFormat::Bgra,
+                o.w,
+                o.h,
+            )
+            .ok()?;
+        }
+        let rw = (f64::from(o.w) * scale).round().max(1.0) as u32;
+        let rh = (f64::from(o.h) * scale).round().max(1.0) as u32;
+        // A canvas taller than the picture (cropped scope) puts
+        // bottom-anchored subtitles past the last row; keep them on
+        // screen instead of off it.
+        let rx = ((f64::from(o.x) * scale).round() as i32).min(fw - rw as i32).max(0);
+        let ry = ((f64::from(o.y) * scale).round() as i32).min(fh - rh as i32).max(0);
+        rects.push(gst_video::VideoOverlayRectangle::new_raw(
+            &buf,
+            rx,
+            ry,
+            rw,
+            rh,
+            gst_video::VideoOverlayFormatFlags::empty(),
+        ));
+    }
+    (!rects.is_empty())
+        .then(|| gst_video::VideoOverlayComposition::new(rects.iter()).ok())
+        .flatten()
+}
+
+#[cfg(test)]
+mod tests {
+    /// The on-disk format must survive a round trip — the hub writes
+    /// it, a worker on another machine reads it, and nothing else
+    /// checks the two agree.
+    #[test]
+    fn sets_round_trip() {
+        let blocks = vec![
+            (100u64, None, vec![1u8, 2, 3]),
+            (2_000, Some(3_000), vec![9u8; 40]),
+        ];
+        let bytes = super::encode_sets("S_HDMV/PGS", Some(b"size: 720x576"), &blocks);
+        let (codec, private, out) = super::decode_sets(&bytes).unwrap();
+        assert_eq!(codec, "S_HDMV/PGS");
+        assert_eq!(private.as_deref(), Some(&b"size: 720x576"[..]));
+        assert_eq!(out, blocks);
+    }
+
+    /// Manual: BURN_SETS=/path/to.sets cargo test -p kahawai-media \
+    ///   sets_file_from_env -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn sets_file_from_env() {
+        let Ok(path) = std::env::var("BURN_SETS") else { return };
+        let data = std::fs::read(&path).unwrap();
+        let (codec, private, blocks) = super::decode_sets(&data).unwrap();
+        println!(
+            "codec {codec:?} · private {} bytes · {} blocks",
+            private.as_ref().map_or(0, |p| p.len()),
+            blocks.len()
+        );
+        let t = super::build(&codec, private.as_deref(), &blocks);
+        println!("timeline entries: {}", t.len());
+    }
 }

@@ -572,6 +572,7 @@ fn plumb_parsed_pad(
     subs_seen: &Arc<std::sync::atomic::AtomicUsize>,
     subs_dir: &std::path::Path,
     burn: &Option<std::sync::Arc<crate::burnin::Timeline>>,
+    burn_start_ms: u64,
     // False for the second and later parts of a multi-part source: the
     // tracks are the same ones continuing, so extracting them again would
     // overwrite the first part's files with a stream that starts at its
@@ -658,7 +659,7 @@ fn plumb_parsed_pad(
         }
     }
     if routable(&name, &plan) {
-        route_stream(pipe, waiting, &qsrc, &advertised, plan, gate, burn);
+        route_stream(pipe, waiting, &qsrc, &advertised, plan, gate, burn, burn_start_ms);
         return;
     }
 
@@ -671,7 +672,7 @@ fn plumb_parsed_pad(
             && let gst::EventView::Caps(c) = ev.view()
             && qpad.peer().is_none()
         {
-            route_stream(&pipe, &waiting, qpad, &c.caps_owned(), plan, &gate, &burn);
+            route_stream(&pipe, &waiting, qpad, &c.caps_owned(), plan, &gate, &burn, burn_start_ms);
         }
         gst::PadProbeReturn::Ok
     });
@@ -894,6 +895,7 @@ fn route_stream(
     plan: RemuxPlan,
     gate: &Option<Arc<SeekGate>>,
     burn: &Option<std::sync::Arc<crate::burnin::Timeline>>,
+    burn_start_ms: u64,
 ) {
     let caps_name = caps.structure(0).map(|s| s.name().to_string()).unwrap_or_default();
     let mode = mode_for(&caps_name, &plan);
@@ -905,7 +907,7 @@ fn route_stream(
             if kind == "video" {
                 build_video_encode_chain(
                     pipe, from, sinkpad, gate, plan.video_kbps, plan.max_height, plan.tone_map,
-                    burn.clone(),
+                    burn.clone(), burn_start_ms,
                 );
             } else {
                 build_audio_encode_chain(pipe, from, sinkpad, &caps_name, gate, plan.max_channels);
@@ -1182,6 +1184,10 @@ fn build_video_encode_chain(
     max_height: Option<u32>,
     tone_map: bool,
     burn: Option<std::sync::Arc<crate::burnin::Timeline>>,
+    // The session's start offset: the burn's time base is measured
+    // against it (frame timestamps are absolute on some boxes and
+    // rebased to the seek point on others).
+    burn_start_ms: u64,
 ) {
     let Some(enc_name) = h264_encoder() else {
         tracing::error!("video encode routed with no verified H.264 encoder");
@@ -1265,7 +1271,7 @@ fn build_video_encode_chain(
     // the rectangles scale to the frame the encoder actually sees).
     let burn_el: Vec<gst::Element> = burn
         .filter(|t| !t.is_empty())
-        .and_then(crate::burnin::overlay_element)
+        .and_then(|t| crate::burnin::blend_element(t, burn_start_ms))
         .into_iter()
         .collect();
     if burn_el.is_empty() {
@@ -1739,7 +1745,7 @@ pub fn start_paced(
     sink: Option<&str>,
     pace: Option<PaceConfig>,
 ) -> Result<RemuxJob> {
-    start_parts(out_dir, plan, vec![source], start_ms, sink, pace)
+    start_parts(out_dir, plan, vec![source], start_ms, sink, pace, None)
 }
 
 /// One pipeline spanning a multi-part source, in timeline order.
@@ -1758,6 +1764,7 @@ pub fn start_paced(
 /// during playback outright (both measured — see `concat_spike`). A seek
 /// therefore stays what it is today, a restart in the target part, and
 /// this function is handed the parts from that point on.
+#[allow(clippy::too_many_arguments)] // one pipeline, spelled out
 pub fn start_parts(
     out_dir: &Path,
     plan: RemuxPlan,
@@ -1765,6 +1772,9 @@ pub fn start_parts(
     start_ms: u64,
     sink: Option<&str>,
     pace: Option<PaceConfig>,
+    // HUB-32b: display sets read for us (mediahost-side). None = walk
+    // the source index ourselves, affordable only for local sources.
+    burn_sets: Option<&Path>,
 ) -> Result<RemuxJob> {
     crate::init()?;
     anyhow::ensure!(!sources.is_empty(), "no source parts to remux");
@@ -1777,8 +1787,26 @@ pub fn start_parts(
     // costs a few scattered kilobytes and leaves nothing behind). Doing
     // it up front — rather than following the demuxer's subtitle pad —
     // is what makes a session that STARTS mid-set show that set.
-    let burn_timeline = match plan.burn_subtitle {
-        Some(idx) => {
+    let burn_timeline = match (burn_sets, plan.burn_subtitle) {
+        // Handed to us: no walk at all, and correct wherever the
+        // source lives.
+        (Some(path), _) => match crate::burnin::timeline_from_file(path) {
+            Ok(Some(t)) if !t.is_empty() => {
+                tracing::info!(sets = %path.display(), entries = t.len(),
+                    "burn-in: display sets loaded");
+                Some(std::sync::Arc::new(t))
+            }
+            Ok(_) => {
+                tracing::warn!(sets = %path.display(), "burn-in: display sets empty");
+                None
+            }
+            Err(e) => {
+                tracing::warn!(sets = %path.display(), error = format!("{e:#}"),
+                    "burn-in: display sets unreadable");
+                None
+            }
+        },
+        (None, Some(idx)) => {
             let t0 = std::time::Instant::now();
             // Bounded: a session must start even when the timeline
             // cannot be had. Local sources finish in milliseconds; a
@@ -1804,7 +1832,7 @@ pub fn start_parts(
                 }
             }
         }
-        None => None,
+        (None, None) => None,
     };
 
     let pipeline = gst::Pipeline::new();
@@ -1891,7 +1919,7 @@ pub fn start_parts(
         pb.connect_pad_added(move |_, pad| {
             plumb_parsed_pad(
                 &pipe, &waiting2, pad, plan, &gate2, &audio_seen, &video_seen, &subs_seen,
-                &subs_dir, &burn_tl, n == 0,
+                &subs_dir, &burn_tl, start_ms, n == 0,
             );
         });
     }
@@ -2047,7 +2075,7 @@ mod multipart {
             ..Default::default()
         };
         // 2 s into a 5 s first part.
-        let job = start_parts(&out, plan, sources, 2_000, None, None).unwrap();
+        let job = start_parts(&out, plan, sources, 2_000, None, None, None).unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
         while !job.finished() && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(100));
@@ -2089,7 +2117,7 @@ mod multipart {
             video_track: 0,
             ..Default::default()
         };
-        let job = start_parts(&out, plan, sources, 0, None, None).unwrap();
+        let job = start_parts(&out, plan, sources, 0, None, None, None).unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
         while !job.finished() && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(100));
