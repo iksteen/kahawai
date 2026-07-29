@@ -20,6 +20,7 @@ use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 
+use crate::remux::RemuxSource;
 use crate::subtitles::{
     ass_dialogue, clean_cue_text, compose_header, decode_text, Cue, Extracted,
 };
@@ -33,14 +34,16 @@ pub fn extract_sparse(path: &Path) -> Result<Option<Vec<(usize, Extracted)>>> {
         return Ok(None);
     }
     file.seek(SeekFrom::Start(0))?;
+    drop(file);
+    let src = Box::new(crate::remux::FileSource::open(path)?);
     if magic[..4] == [0x1A, 0x45, 0xDF, 0xA3] {
-        return mkv_extract(file).map(Some).or_else(|e| {
+        return mkv_extract(src).map(Some).or_else(|e| {
             tracing::debug!(error = format!("{e:#}"), "mkv sparse parse failed; falling back");
             Ok(None)
         });
     }
     if &magic[4..8] == b"ftyp" {
-        return mp4_extract(file).map(Some).or_else(|e| {
+        return mp4_extract(src).map(Some).or_else(|e| {
             tracing::debug!(error = format!("{e:#}"), "mp4 sparse parse failed; falling back");
             Ok(None)
         });
@@ -50,8 +53,13 @@ pub fn extract_sparse(path: &Path) -> Result<Option<Vec<(usize, Extracted)>>> {
 
 // ---------- shared low-level reader ----------
 
+/// The parser reads only at offsets it computes, never sequentially,
+/// so any random-access source will do: a local file for the
+/// mediahost's extraction pass, and the session's own lease-backed
+/// reader when a pipeline worker needs the same index (burn-in builds
+/// its display-set timeline that way — see `extract_image_track`).
 struct Reader {
-    file: File,
+    src: Box<dyn RemuxSource>,
     len: u64,
     /// Readahead window: header walks issue thousands of tiny reads;
     /// over network filesystems each would be a round trip.
@@ -62,8 +70,9 @@ struct Reader {
 const READAHEAD: usize = 256 * 1024;
 
 impl Reader {
-    fn new(file: File, len: u64) -> Self {
-        Self { file, len, win_start: 0, win: Vec::new() }
+    fn new(src: Box<dyn RemuxSource>) -> Self {
+        let len = src.size();
+        Self { src, len, win_start: 0, win: Vec::new() }
     }
 
     fn read_at(&mut self, off: u64, n: usize) -> Result<Vec<u8>> {
@@ -75,9 +84,15 @@ impl Reader {
             if want < n {
                 bail!("read past eof");
             }
-            self.file.seek(SeekFrom::Start(off))?;
             let mut buf = vec![0u8; want];
-            self.file.read_exact(&mut buf)?;
+            let mut got = 0usize;
+            while got < want {
+                let k = self.src.read_at(off + got as u64, &mut buf[got..])?;
+                if k == 0 {
+                    bail!("short read at {off}");
+                }
+                got += k;
+            }
             self.win_start = off;
             self.win = buf;
         }
@@ -185,8 +200,18 @@ struct MkvTrack {
     number: u64,
     /// Position among all subtitle tracks — the `e{n}` key index.
     sub_index: usize,
+    /// Matroska CodecID: `S_TEXT/*`, `S_HDMV/PGS`, `S_VOBSUB`.
+    codec: String,
     is_ass: bool,
     header: Option<String>,
+    /// CodecPrivate — the VobSub .idx text (palette + display size).
+    private: Option<Vec<u8>>,
+}
+
+impl MkvTrack {
+    fn is_text(&self) -> bool {
+        self.codec.starts_with("S_TEXT/")
+    }
 }
 
 struct MkvIndex {
@@ -296,19 +321,22 @@ fn mkv_read_index(r: &mut Reader) -> Result<MkvIndex> {
                         })?;
                         if ttype == 0x11 {
                             // Subtitle track: always consumes an e{n} slot.
-                            let is_text = codec.starts_with("S_TEXT/");
-                            if is_text {
-                                let is_ass = codec.contains("ASS") || codec.contains("SSA");
-                                idx.tracks.push(MkvTrack {
-                                    number,
-                                    sub_index: sub_seen,
-                                    is_ass,
-                                    header: private
-                                        .as_deref()
-                                        .filter(|_| is_ass)
-                                        .map(decode_text),
-                                });
-                            }
+                            // Image tracks are indexed too — burn-in reads
+                            // their blocks through the same walk — and the
+                            // block collection filters per caller so a text
+                            // extraction never drags PGS payloads along.
+                            let is_ass = codec.contains("ASS") || codec.contains("SSA");
+                            idx.tracks.push(MkvTrack {
+                                number,
+                                sub_index: sub_seen,
+                                codec: codec.clone(),
+                                is_ass,
+                                header: private
+                                    .as_deref()
+                                    .filter(|_| is_ass)
+                                    .map(decode_text),
+                                private: private.clone(),
+                            });
                             sub_seen += 1;
                         }
                     }
@@ -385,9 +413,9 @@ fn mkv_read_index(r: &mut Reader) -> Result<MkvIndex> {
 /// the Attachments element when the SeekHead promises one, otherwise
 /// hops top-level elements by declared size. Non-matroska → empty.
 pub fn declare_attachments(path: &Path) -> Result<Vec<kahawai_core::media::Attachment>> {
-    let file = File::open(path)?;
-    let len = file.metadata()?.len();
-    let mut r = Reader::new(file, len);
+    let src = Box::new(crate::remux::FileSource::open(path)?);
+    let len = src.size();
+    let mut r = Reader::new(src);
 
     let head = r.read_at(0, 32.min(len as usize))?;
     let Ok((id, il)) = ebml_id(&head) else { return Ok(Vec::new()) };
@@ -698,14 +726,70 @@ fn scan_cluster(data: &[u8], wanted: &[u64], out: &mut Vec<(u64, SubBlock)>) -> 
     })
 }
 
-fn mkv_extract(file: File) -> Result<Vec<(usize, Extracted)>> {
-    let len = file.metadata()?.len();
-    let mut r = Reader::new(file, len);
+/// One image subtitle track's raw display-set blocks, in file order.
+/// The caller decodes them (`imagesubs`) — this layer only finds the
+/// bytes without demuxing the whole file.
+pub struct ImageTrack {
+    /// Matroska CodecID (`S_HDMV/PGS`, `S_VOBSUB`).
+    pub codec: String,
+    /// CodecPrivate: the VobSub `.idx` text (palette, display size).
+    pub codec_private: Option<Vec<u8>>,
+    /// (presentation ms, payload) per block.
+    pub blocks: Vec<(u64, Vec<u8>)>,
+}
+
+/// Index-driven read of ONE image subtitle track (`e{sub_index}`).
+/// `None` when the container or its index doesn't permit the sparse
+/// path, or that track is not an image track — callers then have no
+/// timeline and skip burn-in rather than guessing.
+pub fn extract_image_track(
+    src: Box<dyn RemuxSource>,
+    sub_index: usize,
+) -> Result<Option<ImageTrack>> {
+    let mut r = Reader::new(src);
+    let magic = r.read_at(0, 4)?;
+    if magic != [0x1A, 0x45, 0xDF, 0xA3] {
+        return Ok(None); // mp4 image subtitles do not occur in practice
+    }
+    match mkv_walk(r, Some(sub_index)) {
+        Ok(out) => Ok(out.image),
+        Err(e) => {
+            tracing::debug!(error = format!("{e:#}"), "mkv sparse image walk failed");
+            Ok(None)
+        }
+    }
+}
+
+struct MkvOut {
+    text: Vec<(usize, Extracted)>,
+    image: Option<ImageTrack>,
+}
+
+fn mkv_extract(src: Box<dyn RemuxSource>) -> Result<Vec<(usize, Extracted)>> {
+    Ok(mkv_walk(Reader::new(src), None)?.text)
+}
+
+/// The shared walk. `image = Some(sub_index)` collects that one image
+/// track's blocks; `None` collects every text track's.
+fn mkv_walk(mut r: Reader, image: Option<usize>) -> Result<MkvOut> {
     let idx = mkv_read_index(&mut r)?;
     if idx.tracks.is_empty() {
-        return Ok(Vec::new());
+        return Ok(MkvOut { text: Vec::new(), image: None });
     }
-    let wanted: Vec<u64> = idx.tracks.iter().map(|t| t.number).collect();
+    // Collect blocks only for the tracks this caller will assemble: a
+    // text extraction must not read (or hold) a film's worth of PGS.
+    let wanted: Vec<u64> = match image {
+        Some(want) => idx
+            .tracks
+            .iter()
+            .filter(|t| t.sub_index == want && !t.is_text())
+            .map(|t| t.number)
+            .collect(),
+        None => idx.tracks.iter().filter(|t| t.is_text()).map(|t| t.number).collect(),
+    };
+    if wanted.is_empty() {
+        return Ok(MkvOut { text: Vec::new(), image: None });
+    }
     let mut blocks: Vec<(u64, SubBlock)> = Vec::new();
 
     let exact = !idx.sub_cues.is_empty()
@@ -774,7 +858,9 @@ fn mkv_extract(file: File) -> Result<Vec<(usize, Extracted)>> {
         }
     } else {
         // Header walk: hop every cluster, skip non-subtitle payloads.
-        let Some(mut pos) = idx.first_cluster else { return Ok(Vec::new()) };
+        let Some(mut pos) = idx.first_cluster else {
+            return Ok(MkvOut { text: Vec::new(), image: None });
+        };
         tracing::debug!("sparse mkv: cluster header walk");
         while pos < r.len {
             let head = match r.read_at(pos, 16.min((r.len - pos) as usize)) {
@@ -800,8 +886,33 @@ fn mkv_extract(file: File) -> Result<Vec<(usize, Extracted)>> {
     // Assemble per track.
     let scale = idx.timestamp_scale;
     let to_ms = |ticks: u64| ticks.saturating_mul(scale) / 1_000_000;
+
+    // Image track: hand back the raw display-set blocks, timed.
+    if let Some(want) = image {
+        let Some(t) = idx.tracks.iter().find(|t| t.sub_index == want && !t.is_text()) else {
+            return Ok(MkvOut { text: Vec::new(), image: None });
+        };
+        let mut out: Vec<(u64, Vec<u8>)> = blocks
+            .iter()
+            .filter(|(_, b)| b.track == t.number)
+            .map(|(cluster_ts, b)| {
+                let ticks = cluster_ts.saturating_add_signed(i64::from(b.rel_time));
+                (to_ms(ticks), b.payload.clone())
+            })
+            .collect();
+        out.sort_by_key(|(ms, _)| *ms);
+        return Ok(MkvOut {
+            text: Vec::new(),
+            image: Some(ImageTrack {
+                codec: t.codec.clone(),
+                codec_private: t.private.clone(),
+                blocks: out,
+            }),
+        });
+    }
+
     let mut out = Vec::new();
-    for t in &idx.tracks {
+    for t in idx.tracks.iter().filter(|t| t.is_text()) {
         let mut cues: Vec<Cue> = Vec::new();
         let mut raw_events: Vec<(u64, u64, String)> = Vec::new();
         for (cluster_ts, b) in blocks.iter().filter(|(_, b)| b.track == t.number) {
@@ -833,7 +944,7 @@ fn mkv_extract(file: File) -> Result<Vec<(usize, Extracted)>> {
         });
         out.push((t.sub_index, Extracted { cues, ass }));
     }
-    Ok(out)
+    Ok(MkvOut { text: out, image: None })
 }
 
 // EBML writers (Exact-path rewrapping + tests).
@@ -861,9 +972,8 @@ fn encode_element(id: u32, body: &[u8]) -> Vec<u8> {
 
 // ---------- MP4 ----------
 
-fn mp4_extract(file: File) -> Result<Vec<(usize, Extracted)>> {
-    let len = file.metadata()?.len();
-    let mut r = Reader::new(file, len);
+fn mp4_extract(src: Box<dyn RemuxSource>) -> Result<Vec<(usize, Extracted)>> {
+    let mut r = Reader::new(src);
     // Find moov at top level.
     let mut pos = 0u64;
     let mut moov: Option<Vec<u8>> = None;
@@ -1076,6 +1186,39 @@ fn find_box<'a>(data: &'a [u8], kind: &[u8; 4]) -> Option<&'a [u8]> {
 
 #[cfg(test)]
 mod tests {
+    /// Manual: IMGSUB_SRC=/path/to/file.mkv cargo test -p kahawai-media \
+    ///   image_track_from_env -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn image_track_from_env() {
+        let Ok(path) = std::env::var("IMGSUB_SRC") else { return };
+        let idx: usize = std::env::var("IMGSUB_IDX").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let src = Box::new(crate::remux::FileSource::open(std::path::Path::new(&path)).unwrap());
+        let t0 = std::time::Instant::now();
+        let track = super::extract_image_track(src, idx).unwrap().expect("no image track");
+        let bytes: usize = track.blocks.iter().map(|(_, b)| b.len()).sum();
+        println!(
+            "codec {} · {} blocks · {} KiB · {:.2}s",
+            track.codec,
+            track.blocks.len(),
+            bytes / 1024,
+            t0.elapsed().as_secs_f64()
+        );
+        // Decode them the way burn-in will, and report the timeline.
+        let mut dec = crate::imagesubs::PgsDecoder::default();
+        let mut sets = 0usize;
+        let mut first = None;
+        for (ms, payload) in &track.blocks {
+            if let Ok(Some(set)) = dec.feed(payload) {
+                sets += 1;
+                if first.is_none() && !set.objects.is_empty() {
+                    first = Some((*ms, set.canvas_w, set.canvas_h, set.objects.len()));
+                }
+            }
+        }
+        println!("decoded display sets: {sets} · first with objects: {first:?}");
+    }
+
     use super::*;
     use std::io::Write;
 
