@@ -23,10 +23,6 @@ float pq_eotf(float ep) {
   return pow(max(p - c1, 0.0) / (c2 - c3 * p), 1.0 / m1); // 1.0 = 10000 nits
 }
 
-float oetf709(float l) {
-  return (l < 0.018) ? 4.5 * l : 1.0993 * pow(l, 0.45) - 0.0993;
-}
-
 void main() {
   vec3 e = texture2D(tex, v_texcoord).rgb;
   vec3 lin = vec3(pq_eotf(e.r), pq_eotf(e.g), pq_eotf(e.b)) * 10000.0;
@@ -38,11 +34,30 @@ void main() {
   // brights; switch to maxRGB scaling if that ever shows.
   float w = 1000.0 / 203.0;
   vec3 y = x * (1.0 + x / (w * w)) / (1.0 + x);
-  // BT.2020 → BT.709 primaries, linear light, hard clip.
+  // BT.2020 → BT.709 primaries, linear light.
   mat3 m = mat3(
      1.6605, -0.1246, -0.0182,
     -0.5876,  1.1329, -0.1006,
     -0.0728, -0.0083,  1.1187);
-  vec3 r709 = clamp(m * y, 0.0, 1.0);
-  gl_FragColor = vec4(oetf709(r709.r), oetf709(r709.g), oetf709(r709.b), 1.0);
+  vec3 r = m * y;
+  // Gamut: desaturate toward luma just enough to fit — a hard clip
+  // pins wide-gamut colors to the 709 boundary at MAXIMUM saturation
+  // (neon reds on real footage, owner-observed); this keeps hue and
+  // luminance and gives up only chroma.
+  float Y = clamp(dot(r, vec3(0.2126, 0.7152, 0.0722)), 0.0, 1.0);
+  // Only out-of-range channels constrain: r.c > 1 implies r.c - Y >=
+  // 1 - Y >= 0, so each divisor is safe where its branch is taken.
+  float f = 1.0;
+  if (r.r > 1.0) f = min(f, (1.0 - Y) / (r.r - Y));
+  if (r.g > 1.0) f = min(f, (1.0 - Y) / (r.g - Y));
+  if (r.b > 1.0) f = min(f, (1.0 - Y) / (r.b - Y));
+  if (r.r < 0.0) f = min(f, Y / (Y - r.r));
+  if (r.g < 0.0) f = min(f, Y / (Y - r.g));
+  if (r.b < 0.0) f = min(f, Y / (Y - r.b));
+  vec3 fit = clamp(vec3(Y) + (r - vec3(Y)) * f, 0.0, 1.0);
+  // Display-referred output: inverse BT.1886 (gamma 2.4), NOT the
+  // BT.709 camera OETF — encoding with the OETF while displays decode
+  // at 2.4 nets gamma ~1.2: darker, harder, oversaturated (the same
+  // owner-observed complaint; BT.2446 tone maps into display gamma).
+  gl_FragColor = vec4(pow(fit.r, 1.0 / 2.4), pow(fit.g, 1.0 / 2.4), pow(fit.b, 1.0 / 2.4), 1.0);
 }
