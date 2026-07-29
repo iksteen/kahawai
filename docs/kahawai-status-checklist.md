@@ -151,9 +151,11 @@ How something works and why it was built that way belong in
       ceilings, bandwidth cap (pref + profile), channel downmix,
       subtitle tiers with graphics_overlay/ass_render gating. Missing:
       HDR tone-map (15a), OCR (32c), burn-in
-- [ ] HUB-15a HDR→SDR tone-mapping tier: GL shader segment built + live
-      (tonemap.frag, TC-1 `tonemap` report, doctor row, placement
-      preference, verdict). Open: owner quality review vs real HDR matrix
+- [x] HUB-15a HDR→SDR tone-mapping tier: GL shader (BT.2390 EETF,
+      scene-adaptive peak probe, libplacebo-fitted display mapping),
+      TC-1 `tonemap` report, doctor row, placement preference, verdict.
+      Quality gate: 10-title matrix vs mpv/libplacebo, percentile-curve
+      RMS 0.050, bias −0.005
 - [x] HUB-16 Cheapest-path preference incl. SOURCE choice: every
       candidate judged, direct > copy > audio-enc > video-enc, rank ties
 - [x] HUB-17 HLS delivery for remux/transcode (EVENT playlists, mid-stream seek)
