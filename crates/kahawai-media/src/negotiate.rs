@@ -167,7 +167,18 @@ pub fn negotiate(
 
     // Copy admissibility per stream, before muxability (direct play
     // has no muxer; TS-muxability gates only the remux path).
-    let v_client_ok = v.is_some_and(|v| video_fits(profile, v)) && !over_cap;
+    //
+    // HUB-15a decision arm: an hdr10 copy to a client that cannot
+    // display HDR is only admissible when we cannot do better. With a
+    // tone-map-capable executor the encode wins — Firefox decodes HEVC
+    // but renders PQ untouched (washed out); Chrome/Safari tone-map in
+    // their compositor and declare hdr:true, keeping their copies.
+    // Without a capable box, the copy stands (washed beats a washed
+    // encode with generation loss). HLG never vetoes: it is
+    // SDR-compatible by design.
+    let hdr_veto =
+        tonemap && !profile.hdr && v.is_some_and(|s| s.hdr.as_deref() == Some("hdr10"));
+    let v_client_ok = v.is_some_and(|v| video_fits(profile, v)) && !over_cap && !hdr_veto;
     let a_client_ok = a.is_some_and(|a| {
         profile.audio.contains(&a.codec)
             && (profile.max_audio_channels == 0 || a.channels <= profile.max_audio_channels)
@@ -391,8 +402,9 @@ mod tests {
             SubtitleStream { format: "ass".into(), language: None },
             SubtitleStream { format: "pgs".into(), language: None },
         ];
-        let sp = negotiate(&p, &info, 0, 0, true, None, true);
-        assert_eq!(sp.cost, Cost::Copy, "HDR never flips a copy — the client's decoder maps");
+        // No capable box: the copy stands, the verdict says as-is.
+        let sp = negotiate(&p, &info, 0, 0, true, None, false);
+        assert_eq!(sp.cost, Cost::Copy, "without tone-map capability the copy stands");
         assert!(sp.video_verdict.contains("as-is"), "verdict: {}", sp.video_verdict);
         assert!(!sp.plan.tone_map, "copies never tone-map");
         assert_eq!(sp.subtitles[0].tier, SubtitleTier::Text);
@@ -428,6 +440,35 @@ mod tests {
         let info = media("matroska", Some(hlg), Some(au("aac", 2)));
         let sp = negotiate(&no_hevc, &info, 0, 0, true, None, true);
         assert!(!sp.plan.tone_map, "HLG is SDR-compatible by design — no map");
+    }
+
+    /// The Firefox case: the client DECODES hevc but cannot DISPLAY
+    /// hdr10 (profile.hdr false). With a capable box the copy is
+    /// vetoed and the encode tone-maps; a client declaring hdr:true
+    /// (Chrome/Safari — they tone-map themselves) keeps the copy.
+    #[test]
+    fn hdr10_copy_vetoed_when_client_cannot_display_it() {
+        let mut p = chrome(); // hdr: false, decodes hevc
+        assert!(p.video.iter().any(|c| c.codec == "hevc"), "fixture must decode hevc");
+        let pq = VideoStream { hdr: Some("hdr10".into()), ..vs("hevc") };
+        let info = media("matroska", Some(pq), Some(au("aac", 2)));
+
+        let sp = negotiate(&p, &info, 0, 0, true, None, true);
+        assert_eq!(sp.cost, Cost::VideoEncode, "copyable codec still encodes: {}", sp.video_verdict);
+        assert!(sp.plan.tone_map);
+        assert!(sp.video_verdict.contains("tone-mapped"), "verdict: {}", sp.video_verdict);
+
+        p.hdr = true;
+        let sp = negotiate(&p, &info, 0, 0, true, None, true);
+        assert_eq!(sp.cost, Cost::Copy, "hdr-capable client keeps the copy");
+        assert!(!sp.plan.tone_map);
+
+        // HLG never vetoes a copy — SDR-compatible by design.
+        p.hdr = false;
+        let hlg = VideoStream { hdr: Some("hlg".into()), ..vs("hevc") };
+        let info = media("matroska", Some(hlg), Some(au("aac", 2)));
+        let sp = negotiate(&p, &info, 0, 0, true, None, true);
+        assert_eq!(sp.cost, Cost::Copy);
     }
 
     /// Multiple caps per codec compose: an exact source-aware probe and

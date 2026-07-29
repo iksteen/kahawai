@@ -121,7 +121,12 @@ export function buildProfile(
       audio: AUDIO_PROBES.filter(([, m]) => supported(m)).map(([n]) => n),
       // Browsers downmix natively; a ceiling would force re-encodes.
       max_audio_channels: 0,
-      hdr: window.matchMedia?.('(dynamic-range: high)')?.matches ?? false,
+      // "hdr" = this browser will DISPLAY HDR acceptably. Chrome and
+      // Safari tone-map PQ in their compositor even on SDR displays;
+      // Firefox decodes HEVC but renders PQ untouched (washed out), so
+      // it must ask the server to tone-map (HUB-15a). No feature probe
+      // exposes "I tone-map" — this is genuinely behavioral.
+      hdr: !navigator.userAgent.includes('Firefox'),
       ass_render: true, // JASSUB is bundled
       graphics_overlay: true, // canvas display-set renderer is bundled
     }

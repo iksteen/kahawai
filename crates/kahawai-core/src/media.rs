@@ -110,8 +110,11 @@ pub struct CapabilityProfile {
     pub max_audio_channels: u32,
     pub max_height: Option<u32>,
     pub max_fps: Option<u32>,
-    /// Client can display HDR. Until HUB-15a lands this only shapes
-    /// the verdict text, never the decision.
+    /// Client will DISPLAY HDR bytes acceptably — either a real HDR
+    /// pipeline, or compositor tone mapping (Chrome/Safari do this on
+    /// SDR displays; Firefox does not and renders PQ washed-out).
+    /// false + an hdr10 source vetoes copy/direct when the server can
+    /// tone-map an encode instead (HUB-15a decision arm).
     pub hdr: bool,
     /// min()-ed with the user's stored bandwidth pref by the hub.
     pub max_bandwidth_kbps: Option<u32>,
