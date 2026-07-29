@@ -23,17 +23,46 @@ float pq_eotf(float ep) {
   return pow(max(p - c1, 0.0) / (c2 - c3 * p), 1.0 / m1); // 1.0 = 10000 nits
 }
 
+float pq_encode(float y) { // inverse: linear (1.0 = 10000 nits) -> PQ code
+  float p = pow(max(y, 0.0), m1);
+  return pow((c1 + c2 * p) / (1.0 + c3 * p), m2);
+}
+
+// BT.2390 EETF in the PQ domain, 1000-nit source → 203-nit SDR white:
+// IDENTITY below the knee (the whole midrange keeps its intended
+// brightness — the extended-Reinhard curve this replaces compressed
+// everything, landing reference white at 52% and reading flat next to
+// libplacebo), Hermite rolloff above it. Constants precomputed:
+// PQ(1000)=0.751827096, PQ(203)=0.580688881, maxTgt=tgtE/maxE,
+// KS=1.5*maxTgt-0.5.
+const float maxE = 0.751827096;
+const float maxTgt = 0.772370248;
+const float KS = 0.658555373;
+
+float eetf(float e) { // e = pixel PQ code / maxE, in [0,1]
+  if (e <= KS) return e;
+  float t = (e - KS) / (1.0 - KS);
+  float t2 = t * t;
+  float t3 = t2 * t;
+  return (2.0 * t3 - 3.0 * t2 + 1.0) * KS + (t3 - 2.0 * t2 + t) * (1.0 - KS)
+       + (-2.0 * t3 + 3.0 * t2) * maxTgt;
+}
+
 void main() {
   vec3 e = texture2D(tex, v_texcoord).rgb;
-  vec3 lin = vec3(pq_eotf(e.r), pq_eotf(e.g), pq_eotf(e.b)) * 10000.0;
-  // Exposure: 1.0 at SDR reference white (BT.2408: 203 nits).
-  vec3 x = lin / 203.0;
-  // ponytail: fixed 1000-nit mastering peak; read the file's
-  // mastering-display SEI and pass a uniform if 4000-nit masters
-  // ever look flat. Per-channel Reinhard shifts hue on extreme
-  // brights; switch to maxRGB scaling if that ever shows.
-  float w = 1000.0 / 203.0;
-  vec3 y = x * (1.0 + x / (w * w)) / (1.0 + x);
+  vec3 lin = vec3(pq_eotf(e.r), pq_eotf(e.g), pq_eotf(e.b));
+  // Hue-preserving: tone-map the maxRGB component through the EETF
+  // and scale the pixel by the single resulting ratio (per-channel
+  // application shifts hue and saturation on brights — the libplacebo
+  // comparison made the difference owner-visible).
+  // ponytail: fixed 1000-nit assumed mastering peak; read the file's
+  // mastering-display SEI into a uniform if 4000-nit masters ever
+  // look flat.
+  float mx = max(lin.r, max(lin.g, lin.b));
+  float mp = pq_eotf(clamp(eetf(pq_encode(mx) / maxE), 0.0, 1.0) * maxE);
+  // Normalize so 203 nits (SDR reference white, BT.2408) = 1.0; the
+  // EETF's rolloff tops out exactly there, so y is display-referred.
+  vec3 y = lin * (mp / max(mx, 1e-9)) * (10000.0 / 203.0);
   // BT.2020 → BT.709 primaries, linear light.
   mat3 m = mat3(
      1.6605, -0.1246, -0.0182,
