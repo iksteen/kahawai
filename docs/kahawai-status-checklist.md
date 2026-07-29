@@ -36,6 +36,13 @@ How something works and why it was built that way belong in
 - [x] AR-9 Control plane client ↔ hub only
 - [x] AR-10 Direct play mediahost → hub → client with byte ranges; hub-side remux
 - [x] AR-11 Transcoder pulls source bytes via hub-brokered leases
+- [ ] AR-13 Capability as a cross-module contract. Client profiles
+      (HUB-14) and transcoder inventories (TC-1) are declared and
+      dry-run-verified, masks make client declarations falsifiable, and
+      version markers are gated at the handshake instead (protocol 2).
+      Missing: mediahosts declare nothing (MH-12), and no declaration
+      carries a rate, so a box reporting a filter it runs at 0.65×
+      realtime is indistinguishable from one running it at 5× (HUB-36)
 - [x] AR-12 Control/byte plane isolation: separate connections, no shared
       flow-control window (the frozen-heartbeat lesson, codified)
 
@@ -73,6 +80,11 @@ How something works and why it was built that way belong in
       on reconnect, in-sync = no manifest/no walk; FilesSeen reconciliation
 - [x] MH-11 Three-tier job runner: urgent extraction > ED2K > subtitle
       pre-warm, idle = no scan and no lease being served
+- [ ] MH-12 Mediahost capability declaration. Nothing is declared: the
+      hub infers extraction support from whether an answer arrives, and
+      infers locality not at all — a caller that assumes local access
+      gets ~4 KB/s through the byte plane and no session survives it
+      (worked around per feature, not declared)
 
 ## Hub — registry, resolution, enrichment
 
@@ -217,6 +229,12 @@ How something works and why it was built that way belong in
 - [x] HUB-35 Granular refresh: library-refresh endpoint fanning out
       per-collection scan requests, per-collection live progress in the
       admin overview, global rescan removed (endpoint + button)
+- [ ] HUB-36 Pace-aware placement. Placement weighs codec fit, a
+      hardware flag and session count — never throughput, though TC-4
+      already reports a realtime multiple per session. Measured cost of
+      the gap: 2160p HDR runs ~0.65× realtime on one transcoder and
+      several times realtime on another, and the hub cannot tell them
+      apart, so a 4K HDR job lands on either
 
 ## Transcoder (TC)
 
