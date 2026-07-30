@@ -1344,12 +1344,19 @@ const AAC_LAYOUTS: &[(u32, u64)] = &[(8, 0xc3f), (8, 0xff), (6, 0x3f), (2, 0x3),
 /// - *EOS-only checking.* Decode failures are per-buffer WARNINGS in
 ///   GStreamer; a pipeline whose every frame fails still ends in EOS.
 ///   Success is decoded BUFFERS ARRIVING, nothing less.
-fn aac_accepts(enc: &str, channels: u32, mask: Option<u64>) -> bool {
-    static SEEN: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<(u32, Option<u64>), bool>>,
-    > = std::sync::OnceLock::new();
+/// - *Probing the pin without the source.* A count-only pin passed when
+///   audiotestsrc freely negotiated the encoder's favourite layout —
+///   but the REAL chain's audioconvert prefers passthrough, handed the
+///   encoder the source's side-surround caps it accepts-and-mis-signals,
+///   and shipped the broken stream the probe had just blessed. The probe
+///   therefore stages the source's own (channels, mask) upstream of the
+///   pin, exactly like the pipeline it stands in for.
+fn aac_accepts(enc: &str, source: (u32, u64), channels: u32, mask: Option<u64>) -> bool {
+    type Key = ((u32, u64), u32, Option<u64>);
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<Key, bool>>> =
+        std::sync::OnceLock::new();
     let seen = SEEN.get_or_init(Default::default);
-    if let Some(hit) = seen.lock().unwrap().get(&(channels, mask)) {
+    if let Some(hit) = seen.lock().unwrap().get(&(source, channels, mask)) {
         return *hit;
     }
     // avdec_aac is libav — the same decoder family as ffmpeg and the
@@ -1357,13 +1364,20 @@ fn aac_accepts(enc: &str, channels: u32, mask: Option<u64>) -> bool {
     // decoders may share the encoder's dialect and false-pass.
     const DECODERS: &[&str] = &["avdec_aac", "fdkaacdec", "faad"];
     let dec = DECODERS.iter().find(|d| gst::ElementFactory::find(d).is_some());
-    let want = match mask {
+    let (sch, smask) = source;
+    let src = if smask != 0 {
+        format!("audio/x-raw,channels={sch},channel-mask=(bitmask)0x{smask:x}")
+    } else {
+        format!("audio/x-raw,channels={sch}")
+    };
+    let pin = match mask {
         Some(m) => format!("audio/x-raw,channels={channels},channel-mask=(bitmask)0x{m:x}"),
         None => format!("audio/x-raw,channels={channels}"),
     };
     let ok = match dec {
         Some(dec) => dry_run_yields_output(&format!(
-            "audiotestsrc num-buffers=10 ! audioconvert ! audioresample ! {want} \
+            "audiotestsrc num-buffers=10 ! audioconvert ! {src} \
+             ! audioconvert ! {pin} ! audioresample \
              ! {enc} ! aacparse ! mpegtsmux ! tsdemux ! aacparse ! {dec} \
              ! audio/x-raw,channels={channels} ! fakesink name=probesink"
         )),
@@ -1373,12 +1387,13 @@ fn aac_accepts(enc: &str, channels: u32, mask: Option<u64>) -> bool {
         None => {
             channels <= 6
                 && dry_run(&format!(
-                    "audiotestsrc num-buffers=5 ! audioconvert ! audioresample ! {want} ! {enc} ! fakesink"
+                    "audiotestsrc num-buffers=5 ! audioconvert ! {src} \
+                     ! audioconvert ! {pin} ! audioresample ! {enc} ! fakesink"
                 ))
         }
     };
-    tracing::debug!(encoder = enc, channels, ?mask, accepted = ok, "AAC layout probe");
-    seen.lock().unwrap().insert((channels, mask), ok);
+    tracing::debug!(encoder = enc, ?source, channels, ?mask, accepted = ok, "AAC layout probe");
+    seen.lock().unwrap().insert((source, channels, mask), ok);
     ok
 }
 
@@ -1454,7 +1469,7 @@ fn aac_input_layout(
         .chain(AAC_LAYOUTS.iter().map(|(n, _)| *n))
         .filter(move |n| *n <= bound)
         .map(|n| (n, None));
-    positioned.chain(count_only).find(|(n, m)| aac_accepts(enc, *n, *m))
+    positioned.chain(count_only).find(|(n, m)| aac_accepts(enc, (channels, mask), *n, *m))
 }
 
 /// Pin the encoder's input layout from the decoded caps, on the caps
@@ -3058,7 +3073,10 @@ mod tests {
             return;
         };
         let (n, m) = aac_input_layout(enc, 8, 0xc3f, None).expect("no layout accepted for 7.1");
-        assert!(aac_accepts(enc, n, m), "chose a layout the encoder cannot round-trip: {n}ch/{m:?}");
+        assert!(
+            aac_accepts(enc, (8, 0xc3f), n, m),
+            "chose a layout the encoder cannot round-trip: {n}ch/{m:?}"
+        );
         if let Some(m) = m {
             assert_eq!(m & 0xc3f, m, "invented positions the source lacks: 0x{m:x}");
         }
