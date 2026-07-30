@@ -218,8 +218,9 @@ How something works and why it was built that way belong in
       (mediahost-extracted display sets, seek-exact timeline, explicit
       blend in the encode chain)
 - [x] HUB-32c OCR text tier: Tesseract via leptess (MIT — subtile-ocr
-      dropped, no copyleft), default-on `ocr` feature, per-track button +
-      row in the UI, `tier: ocr` spares the burn encode, doctor row.
+      dropped, no copyleft), default-on `ocr` feature, idle sweep over
+      the whole library (playback outranks it) + per-track button as the
+      urgent path, `tier: ocr` spares the burn encode, doctor row.
       Deferred: per-session text-over-tiles preference for overlay
       clients, and the bandwidth-threshold selection (needs measurement)
 - [x] HUB-33 Dual-audio defaults, one mechanism: the hub stores a plain

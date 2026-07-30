@@ -479,6 +479,10 @@ async fn run_hub_inner(
                 api_key: cfg.subtitles.opensubtitles.api_key.clone(),
             }),
     );
+    // HUB-32c: idle OCR sweep — every image subtitle track grows a text
+    // row eventually, without anyone pressing the button.
+    #[cfg(feature = "ocr")]
+    subtitles.spawn_ocr_sweep(registry.clone(), sessions.clone());
     let enricher = Arc::new(kahawai_hub::enrich::Enricher::new(cfg.data_dir.clone()));
     // HUB-9: local .nfo files are read over the byte plane, like artwork.
     enricher.attach_sessions(sessions.clone());

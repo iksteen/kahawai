@@ -552,6 +552,27 @@ impl Subtitles {
         sub_index: usize,
         user_id: &str,
     ) -> Result<String> {
+        // One generation per (item, track) at a time: the idle sweep and
+        // the button race here, and losing the race means the work is
+        // already done — return the winner's row instead of redoing it.
+        let lock = {
+            let mut map = self.inflight.lock().unwrap();
+            map.entry(format!("ocr:{item_id}:{sub_index}"))
+                .or_default()
+                .clone()
+        };
+        let _guard = lock.lock_owned().await;
+        if let Some(id) = sqlx::query_scalar::<_, i64>(
+            "SELECT id FROM downloaded_subtitles
+             WHERE item_id = ? AND provider = 'ocr' AND release_name LIKE ?",
+        )
+        .bind(item_id)
+        .bind(format!("ocr:e{sub_index}:%"))
+        .fetch_optional(registry.db())
+        .await?
+        {
+            return Ok(format!("d{id}"));
+        }
         let (module_id, collection_id, path_rel, info) = source_row(registry, item_id).await?;
         let stream = info
             .subtitles
@@ -621,6 +642,104 @@ impl Subtitles {
         tracing::info!(item = item_id, track = sub_index, %model, cues = n_cues,
             "image subtitle OCRed to text");
         Ok(format!("d{id}"))
+    }
+
+    /// HUB-32c idle sweep: OCR every image subtitle track in the library
+    /// that lacks a text row, one at a time, only while nothing is
+    /// playing. The cost model that makes this defensible: the sets
+    /// extraction is a sparse index walk on the mediahost (kilobytes,
+    /// idle-tier there) and ~15 s of hub CPU per track, once ever —
+    /// peanuts next to the ED2K pass that reads every byte of every
+    /// file. The per-track button stays as the urgent path.
+    #[cfg(feature = "ocr")]
+    pub fn spawn_ocr_sweep(
+        self: &Arc<Self>,
+        registry: Arc<Registry>,
+        sessions: Arc<crate::sessions::Sessions>,
+    ) {
+        let subs = self.clone();
+        tokio::spawn(async move {
+            // Let links and reconnect scans settle first.
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            // Tracks that failed stay failed for this hub run — a
+            // corrupt track must not become a 15-second crash loop.
+            let mut failed: std::collections::HashSet<(String, usize)> = Default::default();
+            loop {
+                let candidates = subs.ocr_candidates(&registry).await;
+                let mut generated = 0usize;
+                for (item_id, idx) in candidates {
+                    if failed.contains(&(item_id.clone(), idx)) {
+                        continue;
+                    }
+                    // Idle means idle: playback outranks the sweep.
+                    while !sessions.list().is_empty() {
+                        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                    }
+                    // Validate against the source the generator will
+                    // actually use (indexes are per-source), and only
+                    // try where the model and the mediahost exist.
+                    let Ok((module_id, _, _, info)) = source_row(&registry, &item_id).await else {
+                        failed.insert((item_id, idx));
+                        continue;
+                    };
+                    let Some(stream) = info.subtitles.get(idx) else {
+                        failed.insert((item_id, idx));
+                        continue;
+                    };
+                    if !matches!(stream.format.as_str(), "pgs" | "vobsub" | "dvdsub")
+                        || crate::ocr::model_for(stream.language.as_deref()).is_none()
+                    {
+                        failed.insert((item_id, idx));
+                        continue;
+                    }
+                    if !registry.is_connected(&module_id) {
+                        continue; // not a failure — retry when it returns
+                    }
+                    match subs
+                        .ocr_generate(&registry, &item_id, idx, "idle-sweep")
+                        .await
+                    {
+                        Ok(_) => generated += 1,
+                        Err(e) => {
+                            tracing::warn!(item = %item_id, track = idx,
+                                error = format!("{e:#}"), "idle OCR failed; skipping this run");
+                            failed.insert((item_id, idx));
+                        }
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                }
+                if generated > 0 {
+                    tracing::info!(generated, "idle OCR sweep round complete");
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(600)).await;
+            }
+        });
+    }
+
+    /// Image subtitle tracks with no OCR text row yet, as (item, track
+    /// index) pairs. Indexes come from each source's own stream list and
+    /// are re-validated against the generator's source pick.
+    #[cfg(feature = "ocr")]
+    async fn ocr_candidates(&self, registry: &Registry) -> Vec<(String, usize)> {
+        sqlx::query_as::<_, (String, i64)>(
+            "SELECT DISTINCT s.item_id, j.key
+             FROM item_sources s
+             JOIN files f ON (f.module_id, f.collection_id, f.path_rel)
+                           = (s.module_id, s.collection_id, s.path_rel),
+                  json_each(f.streams_json, '$.subtitles') j
+             WHERE json_extract(j.value, '$.format') IN ('pgs', 'vobsub', 'dvdsub')
+               AND NOT EXISTS (
+                     SELECT 1 FROM downloaded_subtitles d
+                     WHERE d.item_id = s.item_id AND d.provider = 'ocr'
+                       AND d.release_name LIKE 'ocr:e' || j.key || ':%')
+             ORDER BY s.item_id",
+        )
+        .fetch_all(registry.db())
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(id, idx)| (id, idx as usize))
+        .collect()
     }
 
     /// Remove a downloaded subtitle (row + cached body).
