@@ -18,4 +18,5 @@ tempfile = { workspace = true }
 gstreamer-app = "0.25.2"
 gstreamer-video = "0.25"
 flate2 = { workspace = true }
+zstd = { workspace = true }
 

@@ -702,7 +702,9 @@ impl Subtitles {
                     // Validate against the source the generator will
                     // actually use (indexes are per-source), and only
                     // try where the model and the mediahost exist.
-                    let Ok((module_id, _, _, info)) = source_row(&registry, &item_id).await else {
+                    let Ok((module_id, collection_id, path_rel, info)) =
+                        source_row(&registry, &item_id).await
+                    else {
                         failed.insert((item_id, idx));
                         continue;
                     };
@@ -710,14 +712,31 @@ impl Subtitles {
                         failed.insert((item_id, idx));
                         continue;
                     };
-                    if !matches!(stream.format.as_str(), "pgs" | "vobsub" | "dvdsub")
-                        || crate::ocr::model_for(stream.language.as_deref()).is_none()
-                    {
+                    if !matches!(stream.format.as_str(), "pgs" | "vobsub" | "dvdsub") {
                         failed.insert((item_id, idx));
                         continue;
                     }
                     if !registry.is_connected(&module_id) {
                         continue; // not a failure — retry when it returns
+                    }
+                    // No Tesseract model for this track's language: OCR
+                    // is off the table, but the display sets are still
+                    // warmed into the cache — a later burn-in session
+                    // start then reads a file instead of waiting out
+                    // the mediahost walk.
+                    if crate::ocr::model_for(stream.language.as_deref()).is_none() {
+                        let _ = subs
+                            .image_sets(
+                                &registry,
+                                &module_id,
+                                &collection_id,
+                                &path_rel,
+                                idx,
+                                SETS_WAIT_IDLE,
+                            )
+                            .await;
+                        failed.insert((item_id, idx));
+                        continue;
                     }
                     match subs
                         .ocr_generate_within(&registry, &item_id, idx, "idle-sweep", SETS_WAIT_IDLE)
@@ -875,7 +894,7 @@ impl Subtitles {
                 )
             })
             .collect();
-        let bytes = kahawai_media::burnin::encode_sets(
+        let bytes = kahawai_media::burnin::encode_sets_zstd(
             &msg.codec,
             (!msg.codec_private.is_empty()).then_some(&msg.codec_private[..]),
             &blocks,
