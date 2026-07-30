@@ -1324,28 +1324,51 @@ fn build_video_encode_chain(
 /// SL SR (standard 7.1), 0xff instead adds FLC FRC (7.1 "front wide").
 const AAC_LAYOUTS: &[(u32, u64)] = &[(8, 0xff), (8, 0x63f), (6, 0x3f), (2, 0x3), (1, 0x4)];
 
-/// Does the AAC encoder accept this exact layout? Measured, once per
-/// layout, because the pad template lies: fdkaacenc advertises
-/// `channels={1,2,3,4,5,6,8}` unconditionally but at 8 accepts only the
-/// front-wide layout and refuses standard 7.1 outright.
+/// Can the AAC encoder carry this layout — measured by ROUND TRIP, once
+/// per layout: encode it, decode it back, and require the channel count
+/// to survive.
 ///
-/// Caps it will not take do not fail the link. Negotiation quietly
-/// fixates on the template's FIRST value instead, and the encode becomes
-/// mono (fdk-aac on Linux) or a 4.0-labelled stream whose payload is 5.1
-/// and decodes nowhere (fdk-aac on macOS — every frame "channel element
-/// 1.1 is not allocated"). That is what a DTS 7.1 track shipped to the
-/// browser as "the file is corrupt", with nothing in any log.
-fn aac_accepts(enc: &str, channels: u32, mask: u64) -> bool {
-    static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<(u32, u64), bool>>> =
-        std::sync::OnceLock::new();
+/// Asking only whether the link forms is not enough, and that is the
+/// whole lesson of this bug. The pad template lies (fdkaacenc advertises
+/// `channels={1,2,3,4,5,6,8}` unconditionally, then at 8 accepts only the
+/// front-wide layout and refuses standard side-surround 7.1). Caps it
+/// will not take do not fail the link either: negotiation quietly
+/// fixates on the template's first value and the encode becomes mono.
+/// Worse, the fdk-aac build on macOS TAKES caps it then mis-signals —
+/// a 4.0-labelled stream whose payload is 5.1, "channel element 1.1 is
+/// not allocated" on every frame, undecodable everywhere. A decoder is
+/// the only thing that notices, so the probe carries one.
+///
+/// `mask` None = pin the count only and let the encoder pick positions;
+/// a mis-signalling encoder fails the round trip either way.
+fn aac_accepts(enc: &str, channels: u32, mask: Option<u64>) -> bool {
+    static SEEN: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<(u32, Option<u64>), bool>>,
+    > = std::sync::OnceLock::new();
     let seen = SEEN.get_or_init(Default::default);
     if let Some(hit) = seen.lock().unwrap().get(&(channels, mask)) {
         return *hit;
     }
-    let ok = dry_run(&format!(
-        "audiotestsrc num-buffers=5 ! audioconvert ! audioresample \
-         ! audio/x-raw,channels={channels},channel-mask=(bitmask)0x{mask:x} ! {enc} ! fakesink"
-    ));
+    let want = match mask {
+        Some(m) => format!("audio/x-raw,channels={channels},channel-mask=(bitmask)0x{m:x}"),
+        None => format!("audio/x-raw,channels={channels}"),
+    };
+    // The decoder half is what catches mis-signalling: the capsfilter
+    // after it fails to negotiate when the stream decodes to a different
+    // channel count than went in. Without an AAC decoder on this box the
+    // probe degrades to the link-forms question — better than nothing,
+    // and the platforms we ship to all have libav.
+    let ok = if gst::ElementFactory::find("avdec_aac").is_some() {
+        dry_run(&format!(
+            "audiotestsrc num-buffers=10 ! audioconvert ! audioresample ! {want} \
+             ! {enc} ! aacparse ! avdec_aac ! audio/x-raw,channels={channels} ! fakesink"
+        ))
+    } else {
+        dry_run(&format!(
+            "audiotestsrc num-buffers=5 ! audioconvert ! audioresample ! {want} ! {enc} ! fakesink"
+        ))
+    };
+    tracing::debug!(encoder = enc, channels, ?mask, accepted = ok, "AAC layout probe");
     seen.lock().unwrap().insert((channels, mask), ok);
     ok
 }
@@ -1353,23 +1376,39 @@ fn aac_accepts(enc: &str, channels: u32, mask: u64) -> bool {
 /// The layout to pin on the encoder's input for a decoded stream of
 /// `channels`/`mask`, never above `ceiling` (the client's, HUB-15).
 ///
-/// The source's own layout when the encoder takes it — a 7.1 file the
-/// encoder can carry stays 7.1. Otherwise the largest layout it does
-/// take whose positions the source actually HAS, so what happens is a
+/// The source's own layout when the encoder round-trips it — a 7.1 file
+/// the encoder can carry stays 7.1. Otherwise the largest layout it does
+/// carry whose positions the source actually HAS, so what happens is a
 /// real fold (7.1 side surround → 5.1) and never a relabel of surround
-/// content into front-wide channels the source never had. None = even
-/// mono was refused; leave negotiation alone and let the encoder's own
-/// error surface.
-fn aac_input_layout(enc: &str, channels: u32, mask: u64, ceiling: Option<u32>) -> Option<(u32, u64)> {
+/// content into front-wide channels the source never had. Positioned
+/// candidates come first; count-only ones follow, because an encoder can
+/// refuse an explicit mask it is perfectly able to produce itself.
+/// None = nothing round-tripped, down to mono: leave negotiation alone
+/// so the encoder's own behaviour, good or bad, is what ships.
+fn aac_input_layout(
+    enc: &str,
+    channels: u32,
+    mask: u64,
+    ceiling: Option<u32>,
+) -> Option<(u32, Option<u64>)> {
     let bound = ceiling.filter(|c| *c > 0).map_or(channels, |c| c.min(channels));
     // An unpositioned stream (mask 0, common for mono/stereo) claims no
     // positions, so nothing is a relabel and every small enough layout
     // is fair game.
     let has_positions = |m: u64| mask == 0 || m & mask == m;
-    std::iter::once((channels, mask))
+    let positioned = std::iter::once((channels, Some(mask)))
         .filter(|_| mask != 0 && channels <= bound)
-        .chain(AAC_LAYOUTS.iter().copied().filter(|(n, m)| *n <= bound && has_positions(*m)))
-        .find(|(n, m)| aac_accepts(enc, *n, *m))
+        .chain(
+            AAC_LAYOUTS
+                .iter()
+                .filter(|(n, m)| *n <= bound && has_positions(*m))
+                .map(|(n, m)| (*n, Some(*m))),
+        );
+    let count_only = std::iter::once(channels)
+        .chain(AAC_LAYOUTS.iter().map(|(n, _)| *n))
+        .filter(move |n| *n <= bound)
+        .map(|n| (n, None));
+    positioned.chain(count_only).find(|(n, m)| aac_accepts(enc, *n, *m))
 }
 
 /// Pin the encoder's input layout from the decoded caps, on the caps
@@ -1395,20 +1434,21 @@ fn install_layout_pin(pad: &gst::Pad, filter: &gst::Element, ceiling: Option<u32
         }
         match aac_input_layout(&enc, channels, mask, ceiling) {
             Some((n, m)) => {
-                let caps = gst::Caps::builder("audio/x-raw")
-                    .field("channels", n as i32)
-                    .field("channel-mask", gst::Bitmask::new(m))
-                    .build();
-                filter.set_property("caps", &caps);
-                if n != channels {
-                    tracing::info!(
-                        source_channels = channels,
-                        source_mask = format!("0x{mask:x}"),
-                        encoded_channels = n,
-                        encoder = %enc,
-                        "audio downmixed: the encoder does not accept the source layout"
-                    );
+                let mut b = gst::Caps::builder("audio/x-raw").field("channels", n as i32);
+                if let Some(m) = m {
+                    b = b.field("channel-mask", gst::Bitmask::new(m));
                 }
+                filter.set_property("caps", &b.build());
+                // Logged unconditionally: the one thing this bug proved is
+                // that a silent audio path is an unverifiable one.
+                tracing::info!(
+                    source_channels = channels,
+                    source_mask = format!("0x{mask:x}"),
+                    encoded_channels = n,
+                    encoded_mask = m.map(|m| format!("0x{m:x}")).unwrap_or_else(|| "any".into()),
+                    encoder = %enc,
+                    "AAC input layout pinned"
+                );
             }
             None => tracing::warn!(
                 channels,
@@ -2972,8 +3012,10 @@ mod tests {
             return;
         };
         let (n, m) = aac_input_layout(enc, 8, 0x63f, None).expect("no layout accepted for 7.1");
-        assert!(aac_accepts(enc, n, m), "chose a layout {n}ch/0x{m:x} the encoder refuses");
-        assert_eq!(m & 0x63f, m, "invented positions the source lacks: 0x{m:x}");
+        assert!(aac_accepts(enc, n, m), "chose a layout the encoder cannot round-trip: {n}ch/{m:?}");
+        if let Some(m) = m {
+            assert_eq!(m & 0x63f, m, "invented positions the source lacks: 0x{m:x}");
+        }
         assert!(n >= 6, "7.1 collapsed to {n} channels");
         // The client's ceiling still bounds the choice (HUB-15).
         let (capped, _) = aac_input_layout(enc, 8, 0x63f, Some(2)).expect("no layout under ceiling");
