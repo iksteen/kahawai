@@ -4,6 +4,12 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+# Forwarded to the hub (HUB-32c): default-on OCR, droppable for
+# Tesseract-free builds.
+default = ["ocr"]
+ocr = ["kahawai-hub/ocr"]
+
 [dependencies]
 kahawai-core = { workspace = true }
 kahawai-hub = { workspace = true }

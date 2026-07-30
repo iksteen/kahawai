@@ -41,6 +41,13 @@ pub struct Timeline {
     entries: Vec<Entry>,
 }
 
+/// One display set, borrowed from a [`Timeline`] (see [`Timeline::sets`]).
+pub struct SetView<'a> {
+    pub start_ms: u64,
+    pub end_ms: u64,
+    pub objects: &'a [ImageObject],
+}
+
 impl Timeline {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
@@ -48,6 +55,18 @@ impl Timeline {
 
     pub fn len(&self) -> usize {
         self.entries.len()
+    }
+
+    /// Read view over the display sets, for consumers that are not the
+    /// blender — the OCR tier (HUB-32c) walks every set once. Empty
+    /// object lists (screen clears) are included: they bound the
+    /// previous set's display window.
+    pub fn sets(&self) -> impl Iterator<Item = SetView<'_>> {
+        self.entries.iter().map(|e| SetView {
+            start_ms: e.start_ms,
+            end_ms: e.end_ms,
+            objects: &e.objects,
+        })
     }
 
     /// The set covering `ms`, if any. Binary search: called per frame.

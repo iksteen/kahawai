@@ -12,7 +12,9 @@ license = "MIT"
 
 [workspace.dependencies]
 kahawai-core = { path = "crates/kahawai-core" }
-kahawai-hub = { path = "crates/kahawai-hub" }
+# default-features off here so the kahawai binary's `ocr` feature is the
+# one switch for the Tesseract linkage (a member cannot override this).
+kahawai-hub = { path = "crates/kahawai-hub", default-features = false }
 kahawai-media = { path = "crates/kahawai-media" }
 kahawai-mediahost = { path = "crates/kahawai-mediahost" }
 kahawai-proto = { path = "crates/kahawai-proto" }

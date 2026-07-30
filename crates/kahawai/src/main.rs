@@ -284,6 +284,10 @@ fn doctor_checks(cfg: &config::Config) -> Vec<kahawai_media::doctor::Check> {
             _ => Check::warn(name, format!("{} does not exist", dir.display())),
         }
     };
+    // HUB-32c: Tesseract is a runtime dependency of the OCR tier;
+    // absence degrades (tier skipped) but must be visible.
+    #[cfg(feature = "ocr")]
+    checks.push(kahawai_hub::ocr::doctor_check());
     checks.push(dir_check("hub data dir", &cfg.hub.data_dir, true));
     checks.push(dir_check(
         "mediahost state dir",

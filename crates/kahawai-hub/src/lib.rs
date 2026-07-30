@@ -12,6 +12,8 @@ pub mod gate;
 pub mod leases;
 pub mod link_service;
 pub mod metrics;
+#[cfg(feature = "ocr")]
+pub mod ocr;
 pub mod opensubtitles;
 pub mod pki;
 pub mod providers;

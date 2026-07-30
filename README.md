@@ -133,12 +133,11 @@ to that bundle — for this open-source project that amounts to shipping the
 license notices and pointing at the (already public) sources, or simply
 excluding the GPL plugin set.
 
-One planned feature carries its own note: the OCR subtitle tier (turning
-PGS/VobSub image subtitles into text) will link
-[`subtile-ocr`](https://lib.rs/crates/subtile-ocr), which is GPL-3.0. Once it
-lands, binaries built with that default-on cargo feature are combined works
-distributed under GPL-3.0 terms — the source stays MIT, and building with
-`--no-default-features` keeps a copyleft-free binary.
+The OCR subtitle tier (turning PGS/VobSub image subtitles into text) links
+Tesseract via [`leptess`](https://lib.rs/crates/leptess) (MIT; Tesseract and
+Leptonica are Apache-2.0/BSD-style), so it carries no copyleft consequence.
+Building with `--no-default-features` drops the Tesseract linkage entirely
+for minimal deployments.
 
 Metadata courtesy of [TMDB](https://www.themoviedb.org/) and
 [TheTVDB](https://thetvdb.com/) when configured; both require the in-app

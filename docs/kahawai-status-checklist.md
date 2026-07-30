@@ -217,8 +217,11 @@ How something works and why it was built that way belong in
       own rendering; burn-in fallback for clients that cannot composite
       (mediahost-extracted display sets, seek-exact timeline, explicit
       blend in the encode chain)
-- [ ] HUB-32c OCR text tier (subtile-ocr/Tesseract, default-on cargo feature)
-      *(not built; GPL-3.0 licensing consequence pre-documented in README)*
+- [x] HUB-32c OCR text tier: Tesseract via leptess (MIT — subtile-ocr
+      dropped, no copyleft), default-on `ocr` feature, per-track button +
+      row in the UI, `tier: ocr` spares the burn encode, doctor row.
+      Deferred: per-session text-over-tiles preference for overlay
+      clients, and the bandwidth-threshold selection (needs measurement)
 - [x] HUB-33 Dual-audio defaults, one mechanism: the hub stores a plain
       per-user KV (/api/v1/prefs) and picks nothing. Settings page holds
       per-media-type ordered language lists for audio ('original'
@@ -302,9 +305,10 @@ How something works and why it was built that way belong in
       served at all), SIGHUP reload for what can change under a running
       process.
 - [x] NFR-7 Versioned client API (`/api/v1`)
-- [x] NFR-8 Codec support delegated to system GStreamer; MIT with the OCR
-      feature's GPL-3.0 combined-work consequence pre-documented in README
-      (applies when HUB-32c lands; --no-default-features stays copyleft-free)
+- [x] NFR-8 Codec support delegated to system GStreamer; MIT throughout —
+      the OCR tier links leptess/Tesseract (MIT/Apache-2.0), not
+      subtile-ocr, so no GPL combined-work consequence exists;
+      --no-default-features additionally drops the Tesseract linkage
 
 ## v1 acceptance criteria
 

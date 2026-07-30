@@ -124,7 +124,7 @@ impl Subtitles {
         let mut out = entries(&info);
         // HUB-24: subtitles the user downloaded from external providers.
         let rows = sqlx::query(
-            "SELECT id, language, format, release_name FROM downloaded_subtitles
+            "SELECT id, provider, language, format, release_name FROM downloaded_subtitles
              WHERE item_id = ? ORDER BY id",
         )
         .bind(item_id)
@@ -134,7 +134,13 @@ impl Subtitles {
             let format: String = r.get("format");
             out.push(SubtitleEntry {
                 key: format!("d{}", r.get::<i64, _>("id")),
-                kind: "downloaded",
+                // "ocr" is user-visible: machine-derived text is
+                // imperfect by nature and must say so (HUB-32c).
+                kind: if r.get::<String, _>("provider") == "ocr" {
+                    "ocr"
+                } else {
+                    "downloaded"
+                },
                 format: format.clone(),
                 language: r.get::<Option<String>, _>("language"),
                 flattened: matches!(format.as_str(), "ass" | "ssa"),
@@ -532,6 +538,91 @@ impl Subtitles {
         Ok((format!("d{id}"), provider.quota()))
     }
 
+    /// HUB-32c: OCR one embedded image subtitle track into a text track.
+    /// The result rides the downloaded-subtitles machinery with
+    /// `provider = 'ocr'` and `release_name = "ocr:e{n}:{model}"` — the
+    /// structured name is what ties the text row back to its image
+    /// stream. Regeneration replaces the previous row for that stream.
+    /// Returns the new subtitle key (`d{id}`).
+    #[cfg(feature = "ocr")]
+    pub async fn ocr_generate(
+        &self,
+        registry: &Registry,
+        item_id: &str,
+        sub_index: usize,
+        user_id: &str,
+    ) -> Result<String> {
+        let (module_id, collection_id, path_rel, info) = source_row(registry, item_id).await?;
+        let stream = info
+            .subtitles
+            .get(sub_index)
+            .with_context(|| format!("no subtitle stream e{sub_index}"))?;
+        anyhow::ensure!(
+            matches!(stream.format.as_str(), "pgs" | "vobsub" | "dvdsub"),
+            "e{sub_index} is {}, not an image subtitle",
+            stream.format
+        );
+        let language = stream.language.clone();
+        let model = crate::ocr::model_for(language.as_deref()).with_context(|| {
+            format!(
+                "no Tesseract model for language {:?} — install its traineddata",
+                language.as_deref().unwrap_or("(untagged)")
+            )
+        })?;
+        // The display sets: cached from any earlier burn/overlay use, or
+        // walked by the mediahost now. A viewer may be waiting (the
+        // urgent case), so the wait is bounded like the burn path's.
+        let sets = self
+            .image_sets(
+                registry,
+                &module_id,
+                &collection_id,
+                &path_rel,
+                sub_index,
+                std::time::Duration::from_secs(20),
+            )
+            .await
+            .context("display sets unavailable (mediahost offline or unindexed track)")?;
+        let cues = tokio::task::spawn_blocking({
+            let sets = sets.clone();
+            let model = model.clone();
+            move || crate::ocr::ocr_sets_file(&sets, &model)
+        })
+        .await??;
+        let n_cues = cues.len();
+        let ex = Extracted { cues, ass: None };
+
+        // Replace, not accumulate: one OCR row per image stream.
+        let name = format!("ocr:e{sub_index}:{model}");
+        let stale: Vec<i64> = sqlx::query_scalar(
+            "SELECT id FROM downloaded_subtitles
+             WHERE item_id = ? AND provider = 'ocr' AND release_name LIKE ?",
+        )
+        .bind(item_id)
+        .bind(format!("ocr:e{sub_index}:%"))
+        .fetch_all(registry.db())
+        .await?;
+        for id in stale {
+            let _ = self.delete_downloaded(registry, id).await;
+        }
+        let id: i64 = sqlx::query_scalar(
+            "INSERT INTO downloaded_subtitles
+               (item_id, provider, language, format, release_name, downloaded_by)
+             VALUES (?, 'ocr', ?, 'srt', ?, ?) RETURNING id",
+        )
+        .bind(item_id)
+        .bind(&language)
+        .bind(&name)
+        .bind(user_id)
+        .fetch_one(registry.db())
+        .await?;
+        std::fs::create_dir_all(&self.dir)?;
+        std::fs::write(self.downloaded_path(id), serde_json::to_vec(&ex)?)?;
+        tracing::info!(item = item_id, track = sub_index, %model, cues = n_cues,
+            "image subtitle OCRed to text");
+        Ok(format!("d{id}"))
+    }
+
     /// Remove a downloaded subtitle (row + cached body).
     pub async fn delete_downloaded(&self, registry: &Registry, id: i64) -> Result<bool> {
         let n = sqlx::query("DELETE FROM downloaded_subtitles WHERE id = ?")
@@ -797,6 +888,30 @@ fn is_font(a: &kahawai_core::media::Attachment) -> bool {
         || n.ends_with(".ttf")
         || n.ends_with(".otf")
         || n.ends_with(".ttc")
+}
+
+/// Embedded image-track indexes that already have an OCR text row
+/// (HUB-32c) — negotiation prefers text over burn for these. Parsed
+/// from the structured release_name; errors read as "none".
+pub async fn ocr_sub_indexes(db: &sqlx::SqlitePool, item_id: &str) -> Vec<usize> {
+    let names: Vec<String> = sqlx::query_scalar(
+        "SELECT release_name FROM downloaded_subtitles
+         WHERE item_id = ? AND provider = 'ocr'",
+    )
+    .bind(item_id)
+    .fetch_all(db)
+    .await
+    .unwrap_or_default();
+    names
+        .iter()
+        .filter_map(|n| n.strip_prefix("ocr:e")?.split(':').next()?.parse().ok())
+        .collect()
+}
+
+/// [`ocr_sub_indexes`] as a per-stream flag vec for `negotiate()`.
+pub async fn ocr_flags(db: &sqlx::SqlitePool, item_id: &str, n_subs: usize) -> Vec<bool> {
+    let idx = ocr_sub_indexes(db, item_id).await;
+    (0..n_subs).map(|i| idx.contains(&i)).collect()
 }
 
 fn entries(info: &kahawai_core::media::MediaInfo) -> Vec<SubtitleEntry> {

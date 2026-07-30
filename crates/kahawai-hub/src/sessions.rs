@@ -666,6 +666,9 @@ impl Sessions {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
         };
+        // HUB-32c: which embedded image tracks already have an OCR text
+        // row — those prefer text over burn in the negotiation.
+        let ocr_subs = crate::subtitles::ocr_sub_indexes(registry.db(), item_id).await;
         let negotiate_with =
             |parts: &[PartSource], info: &kahawai_core::media::MediaInfo, burn_capable: bool| {
                 let est_kbps = info
@@ -702,6 +705,9 @@ impl Sessions {
                     est_kbps,
                     tonemap,
                     burn_capable,
+                    &(0..info.subtitles.len())
+                        .map(|i| ocr_subs.contains(&i))
+                        .collect::<Vec<_>>(),
                 )
             };
         // HUB-32b: the timeline comes from the mediahost, which walks
@@ -1548,6 +1554,9 @@ impl Sessions {
                 .parts
                 .first()
                 .is_some_and(|p| self.reads_locally(&p.module_id));
+            let ocr_flags =
+                crate::subtitles::ocr_flags(registry.db(), &session.item_id, info.subtitles.len())
+                    .await;
             let sp = kahawai_media::negotiate::negotiate(
                 &session.profile,
                 &info,
@@ -1557,6 +1566,7 @@ impl Sessions {
                 None,
                 tonemap,
                 burn_capable,
+                &ocr_flags,
             );
             plan = sp.plan;
             anyhow::ensure!(plan.playable(), "selected track is not playable");

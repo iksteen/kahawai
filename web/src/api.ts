@@ -199,7 +199,7 @@ export const fetchChildren = (id: string) =>
 
 export type Subtitle = {
   key: string
-  kind: 'embedded' | 'sidecar' | 'downloaded'
+  kind: 'embedded' | 'sidecar' | 'downloaded' | 'ocr'
   format: string
   language: string | null
   flattened: boolean
@@ -262,6 +262,11 @@ export function quotaLabel(q: SubtitleQuota | null): string {
 
 export const deleteDownloadedSubtitle = (id: number) =>
   json<{ removed: boolean }>(`/api/v1/subtitles/downloaded/${id}`, { method: 'DELETE' })
+
+/// HUB-32c: OCR an embedded image track (key e{n}) into a text track.
+/// Synchronous — a feature film takes ~30 s; the result is cached.
+export const ocrSubtitle = (itemId: string, key: string) =>
+  json<{ key: string }>(`/api/v1/items/${itemId}/subtitles/${key}/ocr`, { method: 'POST' })
 
 export const fetchFonts = (itemId: string) =>
   json<{ fonts: string[] }>(`/api/v1/items/${itemId}/fonts`)

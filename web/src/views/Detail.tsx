@@ -10,6 +10,7 @@ import {
   searchSubtitles,
   downloadSubtitle,
   deleteDownloadedSubtitle,
+  ocrSubtitle,
   quotaLabel,
   type SubtitleQuota,
   type Subtitle,
@@ -97,6 +98,8 @@ export default function Detail({
   // empty = no preference, search every language.
   const [subLangs, setSubLangs] = useState<string[]>([])
   const [subBusy, setSubBusy] = useState(false)
+  // HUB-32c: which image track is being OCRed (~30 s for a film).
+  const [ocrBusy, setOcrBusy] = useState<string | null>(null)
   const [subNote, setSubNote] = useState('')
   const [subQuota, setSubQuota] = useState<SubtitleQuota | null>(null)
   const [error, setError] = useState('')
@@ -498,11 +501,13 @@ export default function Detail({
       </p>
       <ul className="rows subs-list">
         {subs
-          .filter((s) => s.kind === 'downloaded')
+          .filter((s) => s.kind === 'downloaded' || s.kind === 'ocr')
           .map((s) => (
             <li key={s.key}>
               <span className="chips">
-                <span className="chip">downloaded</span>
+                {/* "ocr" stays visible: machine-read text is imperfect
+                    by nature and must say so (HUB-32c). */}
+                <span className="chip">{s.kind}</span>
                 <span>{s.language ?? '?'} · {s.format}</span>
               </span>
               <button
@@ -514,6 +519,34 @@ export default function Detail({
                 }
               >
                 Remove
+              </button>
+            </li>
+          ))}
+        {/* HUB-32c: image tracks with no OCR text yet can grow one. */}
+        {subs
+          .filter(
+            (s) =>
+              s.image &&
+              !subs.some((t) => t.kind === 'ocr' && (t.language ?? '?') === (s.language ?? '?')),
+          )
+          .map((s) => (
+            <li key={`ocr-${s.key}`}>
+              <span className="chips">
+                <span className="chip dim">{s.format}</span>
+                <span>{s.language ?? '?'} · image only</span>
+              </span>
+              <button
+                className="btn ghost small"
+                disabled={ocrBusy !== null}
+                onClick={() => {
+                  setOcrBusy(s.key)
+                  ocrSubtitle(item.id, s.key)
+                    .then(reloadSubs)
+                    .catch((e) => setError(String(e)))
+                    .finally(() => setOcrBusy(null))
+                }}
+              >
+                {ocrBusy === s.key ? 'Reading…' : '→ text (OCR)'}
               </button>
             </li>
           ))}

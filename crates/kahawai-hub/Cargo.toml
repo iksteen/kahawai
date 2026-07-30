@@ -4,7 +4,16 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+# HUB-32c OCR tier. Default-on; --no-default-features drops the
+# Tesseract/Leptonica linkage for minimal deployments. All-MIT-side
+# linkage (leptess MIT, tesseract Apache-2.0) — subtile-ocr (GPL) is
+# deliberately NOT used: we already decode PGS and VobSub to bitmaps.
+default = ["ocr"]
+ocr = ["dep:leptess"]
+
 [dependencies]
+leptess = { version = "0.14", optional = true }
 kahawai-core = { workspace = true }
 kahawai-media = { workspace = true }
 kahawai-proto = { workspace = true }

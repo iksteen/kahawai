@@ -83,6 +83,7 @@ pub fn router(
             "/api/v1/subtitles/downloaded/{sid}",
             axum::routing::delete(subtitle_delete),
         )
+        .route("/api/v1/items/{id}/subtitles/{key}/ocr", post(subtitle_ocr))
         .route(
             "/api/v1/items/{id}/subtitles/{file}",
             get(item_subtitle_file),
@@ -499,6 +500,40 @@ async fn subtitle_download(
         .await
         .map_err(|e| (StatusCode::BAD_GATEWAY, format!("{e:#}")))?;
     Ok(Json(json!({ "key": key, "quota": quota })))
+}
+
+/// HUB-32c: OCR an embedded image subtitle track (key "e{n}") into a
+/// text track. Synchronous — a feature film OCRs in ~30 s and the
+/// caller is a human who pressed a button; the result is cached, so it
+/// runs once per track. Feature-gated: without `ocr` the route answers
+/// with what is missing rather than 404.
+async fn subtitle_ocr(
+    State(state): State<AppState>,
+    Path((id, key)): Path<(String, String)>,
+    axum::Extension(claims): axum::Extension<crate::auth::Claims>,
+) -> Result<Json<Value>, ApiError> {
+    let index: usize = key.strip_prefix('e').and_then(|n| n.parse().ok()).ok_or((
+        StatusCode::BAD_REQUEST,
+        "key must be an embedded track (e{n})".into(),
+    ))?;
+    #[cfg(feature = "ocr")]
+    {
+        let new_key = state
+            .subtitles
+            .ocr_generate(&state.registry, &id, index, &claims.sub)
+            .await
+            .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, format!("{e:#}")))?;
+        Ok(Json(json!({ "key": new_key })))
+    }
+    #[cfg(not(feature = "ocr"))]
+    {
+        let _ = (index, claims);
+        Err((
+            StatusCode::NOT_IMPLEMENTED,
+            "this build has no OCR support (compiled with --no-default-features)".into(),
+        )
+            .into())
+    }
 }
 
 async fn subtitle_delete(

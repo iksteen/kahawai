@@ -278,6 +278,9 @@ fn sweep_one(
         kahawai_media::remux::tonemap_available(),
         // The sweep reads local files: the burn-in index walk is free.
         true,
+        // No OCR store outside the hub: the sweep judges sources, not
+        // the hub's caches.
+        &[],
     );
     let plan = sp.plan;
     if sp.cost == kahawai_media::negotiate::Cost::Unplayable {
