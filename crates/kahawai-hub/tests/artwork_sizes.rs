@@ -42,21 +42,34 @@ fn startup_drops_retired_sizes_and_orphans_but_nothing_else() {
     // changed — the directory name carries the number, so a re-numbered
     // size is a different directory and this covers both.
     touch(&dir.join("size-tiny-16/aaaa000000000001"));
-    touch(&dir.join(format!("size-{live_name}-{}", live_px + 1)).join("aaaa000000000001"));
+    touch(
+        &dir.join(format!("size-{live_name}-{}", live_px + 1))
+            .join("aaaa000000000001"),
+    );
 
     open(dir);
 
-    assert!(dir.join("aaaa000000000001").exists(), "originals are never touched");
+    assert!(
+        dir.join("aaaa000000000001").exists(),
+        "originals are never touched"
+    );
     assert!(dir.join("tmdb-bbbb000000000002").exists());
-    assert!(live.join("aaaa000000000001").exists(), "a live size with its original stays");
+    assert!(
+        live.join("aaaa000000000001").exists(),
+        "a live size with its original stays"
+    );
     assert!(live.join("tmdb-bbbb000000000002").exists());
     assert!(
         !live.join("cccc000000000003").exists(),
         "a copy whose original is gone can never be served"
     );
-    assert!(!dir.join("size-tiny-16").exists(), "a retired size goes wholesale");
     assert!(
-        !dir.join(format!("size-{live_name}-{}", live_px + 1)).exists(),
+        !dir.join("size-tiny-16").exists(),
+        "a retired size goes wholesale"
+    );
+    assert!(
+        !dir.join(format!("size-{live_name}-{}", live_px + 1))
+            .exists(),
         "re-numbering a size retires the old pixel count"
     );
 }

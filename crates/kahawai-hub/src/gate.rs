@@ -20,15 +20,18 @@ use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use tokio::sync::Mutex;
 use tokio::time::Instant;
 
 /// MusicBrainz rejects anonymous/library user agents outright and
 /// requires "application name/version ( contact )" — every provider
 /// gets the same honest identification.
-const UA: &str =
-    concat!("kahawai/", env!("CARGO_PKG_VERSION"), " ( https://github.com/iksteen/kahawai )");
+const UA: &str = concat!(
+    "kahawai/",
+    env!("CARGO_PKG_VERSION"),
+    " ( https://github.com/iksteen/kahawai )"
+);
 
 /// Fallback when a 429/503 carries no usable `Retry-After`.
 const DEFAULT_PENALTY: Duration = Duration::from_secs(60);
@@ -84,7 +87,9 @@ pub struct Http {
 
 impl Http {
     pub fn new() -> Result<Self> {
-        Ok(Self { client: reqwest::Client::builder().user_agent(UA).build()? })
+        Ok(Self {
+            client: reqwest::Client::builder().user_agent(UA).build()?,
+        })
     }
 
     pub fn get(&self, url: impl reqwest::IntoUrl) -> reqwest::RequestBuilder {
@@ -110,7 +115,11 @@ impl Http {
     pub async fn send(&self, req: reqwest::RequestBuilder) -> Result<reqwest::Response> {
         let (client, req) = req.build_split();
         let req = req.context("building provider request")?;
-        let host = req.url().host_str().unwrap_or_default().to_ascii_lowercase();
+        let host = req
+            .url()
+            .host_str()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
         let queue = {
             let mut queues = queues().lock().await;
             queues
@@ -139,7 +148,11 @@ impl Http {
             *next = Instant::now() + penalty;
             tracing::warn!(host, status = %resp.status(), secs = penalty.as_secs(),
                 "provider rate-limited us; going quiet");
-            bail!("{host} rate-limited us ({}); quiet for {}s", resp.status(), penalty.as_secs());
+            bail!(
+                "{host} rate-limited us ({}); quiet for {}s",
+                resp.status(),
+                penalty.as_secs()
+            );
         }
         Ok(resp)
     }
@@ -149,7 +162,12 @@ impl Http {
 /// default penalty — no provider we talk to uses it.
 fn retry_after(resp: &reqwest::Response) -> Option<Duration> {
     let v = resp.headers().get(reqwest::header::RETRY_AFTER)?;
-    v.to_str().ok()?.trim().parse::<u64>().ok().map(Duration::from_secs)
+    v.to_str()
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .map(Duration::from_secs)
 }
 
 #[cfg(test)]
@@ -176,7 +194,11 @@ mod tests {
     }
 
     async fn parked_for(url: &str) -> Duration {
-        let host = reqwest::Url::parse(url).unwrap().host_str().unwrap().to_string();
+        let host = reqwest::Url::parse(url)
+            .unwrap()
+            .host_str()
+            .unwrap()
+            .to_string();
         let q = queues().lock().await.get(&host).unwrap().clone();
         let at = *q.lock().await;
         at.saturating_duration_since(Instant::now())
@@ -185,13 +207,20 @@ mod tests {
     #[tokio::test]
     async fn paces_and_backs_off() {
         let http = Http::new().unwrap();
-        let ok = server("127.0.0.1", "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi").await;
+        let ok = server(
+            "127.0.0.1",
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi",
+        )
+        .await;
         let start = Instant::now();
         for _ in 0..2 {
             http.send(http.get(&ok)).await.unwrap();
         }
         // The second request waits out the unknown-host default.
-        assert!(start.elapsed() >= Duration::from_millis(450), "requests were not paced");
+        assert!(
+            start.elapsed() >= Duration::from_millis(450),
+            "requests were not paced"
+        );
 
         // A 429 is an error, and parks that provider for what it asked.
         let busy = server(
@@ -200,7 +229,10 @@ mod tests {
         )
         .await;
         assert!(http.send(http.get(&busy)).await.is_err());
-        assert!(parked_for(&busy).await > Duration::from_secs(80), "Retry-After ignored");
+        assert!(
+            parked_for(&busy).await > Duration::from_secs(80),
+            "Retry-After ignored"
+        );
         // ...and only that provider: the healthy one is free again.
         assert!(parked_for(&ok).await < Duration::from_secs(1));
 

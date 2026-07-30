@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use kahawai_proto::v1::{ByteChunk, ReadRequest};
 use rand_core::{OsRng, RngCore};
 use tokio::sync::{mpsc, oneshot};
@@ -45,7 +45,11 @@ impl Lease {
     /// Stream `len` bytes starting at `offset`. Reads are serialized per
     /// lease; blocks are requested one at a time so an abandoned consumer
     /// stops the transfer at the next block boundary.
-    pub fn read_range(&self, offset: u64, len: u64) -> ReceiverStream<Result<bytes::Bytes, std::io::Error>> {
+    pub fn read_range(
+        &self,
+        offset: u64,
+        len: u64,
+    ) -> ReceiverStream<Result<bytes::Bytes, std::io::Error>> {
         let (out_tx, out_rx) = mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(8);
         let inner = self.0.clone();
         tokio::spawn(async move {
@@ -57,7 +61,10 @@ impl Lease {
                 let block = BLOCK.min(end - cur);
                 if inner
                     .req_tx
-                    .send(Ok(ReadRequest { offset: cur, len: block }))
+                    .send(Ok(ReadRequest {
+                        offset: cur,
+                        len: block,
+                    }))
                     .await
                     .is_err()
                 {
@@ -187,7 +194,10 @@ impl Lease {
                 }
             }
         });
-        Lease(Arc::new(LeaseInner { req_tx, chunk_rx: tokio::sync::Mutex::new(chunk_rx) }))
+        Lease(Arc::new(LeaseInner {
+            req_tx,
+            chunk_rx: tokio::sync::Mutex::new(chunk_rx),
+        }))
     }
 }
 

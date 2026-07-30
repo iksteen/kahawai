@@ -13,7 +13,7 @@
 
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 const API: &str = "https://api.opensubtitles.com/api/v1";
@@ -145,7 +145,10 @@ impl OpenSubtitles {
             username,
             password,
             token: tokio::sync::Mutex::new(None),
-            quota: std::sync::Mutex::new(Quota { per_account, ..Default::default() }),
+            quota: std::sync::Mutex::new(Quota {
+                per_account,
+                ..Default::default()
+            }),
             quota_checked: tokio::sync::Mutex::new(None),
         }
     }
@@ -180,7 +183,11 @@ impl OpenSubtitles {
             .json(&serde_json::json!({ "username": user, "password": pass }));
         let resp = self.http.send(req).await?;
         if !resp.status().is_success() {
-            bail!("OpenSubtitles login failed: {} {}", resp.status(), resp.text().await.unwrap_or_default());
+            bail!(
+                "OpenSubtitles login failed: {} {}",
+                resp.status(),
+                resp.text().await.unwrap_or_default()
+            );
         }
         let token = resp.json::<LoginResp>().await?.token;
         *self.token.lock().await = Some(token.clone());
@@ -223,7 +230,9 @@ fn parse_reset_secs(s: &str) -> Option<i64> {
 /// only appear at all in an unfiltered search).
 fn rank_candidates(out: &mut [Candidate], languages: &[String]) {
     let lang_rank = |l: &Option<String>| -> usize {
-        let Some(l) = l.as_deref() else { return usize::MAX };
+        let Some(l) = l.as_deref() else {
+            return usize::MAX;
+        };
         let l = l.to_ascii_lowercase();
         languages
             .iter()
@@ -318,13 +327,19 @@ impl SubtitleProvider for OpenSubtitles {
         }
 
         let req = self.req(reqwest::Method::GET, "/subtitles").query(&params);
-        let resp =
-            self.http.send(req).await?.error_for_status().context("OpenSubtitles search")?;
+        let resp = self
+            .http
+            .send(req)
+            .await?
+            .error_for_status()
+            .context("OpenSubtitles search")?;
         let parsed: Resp = resp.json().await?;
         let mut out = Vec::new();
         for item in parsed.data {
             let a = item.attributes;
-            let Some(f) = a.files.into_iter().next() else { continue };
+            let Some(f) = a.files.into_iter().next() else {
+                continue;
+            };
             out.push(Candidate {
                 provider: "opensubtitles",
                 file_id: f.file_id.to_string(),
@@ -362,7 +377,9 @@ impl SubtitleProvider for OpenSubtitles {
             return;
         }
         *self.quota_checked.lock().await = Some(tokio::time::Instant::now());
-        let Ok(Some(token)) = self.token().await else { return };
+        let Ok(Some(token)) = self.token().await else {
+            return;
+        };
         #[derive(Deserialize)]
         struct Resp {
             data: UserInfo,
@@ -374,8 +391,15 @@ impl SubtitleProvider for OpenSubtitles {
             #[serde(default)]
             remaining_downloads: Option<i64>,
         }
-        let req = self.req(reqwest::Method::GET, "/infos/user").bearer_auth(&token);
-        let got = self.http.send(req).await.ok().filter(|r| r.status().is_success());
+        let req = self
+            .req(reqwest::Method::GET, "/infos/user")
+            .bearer_auth(&token);
+        let got = self
+            .http
+            .send(req)
+            .await
+            .ok()
+            .filter(|r| r.status().is_success());
         let Some(resp) = got else { return };
         if let Ok(parsed) = resp.json::<Resp>().await {
             let mut q = self.quota.lock().unwrap();
@@ -417,10 +441,18 @@ impl SubtitleProvider for OpenSubtitles {
             bail!(
                 "OpenSubtitles download quota exhausted{} — it resets 24 h after your first \
                  download today",
-                if token.is_some() { "" } else { " (anonymous: 5 per 24 h; add an account for more)" }
+                if token.is_some() {
+                    ""
+                } else {
+                    " (anonymous: 5 per 24 h; add an account for more)"
+                }
             );
         }
-        let dl: DlResp = resp.error_for_status().context("OpenSubtitles download")?.json().await?;
+        let dl: DlResp = resp
+            .error_for_status()
+            .context("OpenSubtitles download")?
+            .json()
+            .await?;
         {
             // HUB-24: remember what's left so every response can say so.
             let mut q = self.quota.lock().unwrap();
@@ -429,19 +461,28 @@ impl SubtitleProvider for OpenSubtitles {
             q.resets_in_secs = dl.reset_time_utc.as_deref().and_then(parse_reset_secs);
         }
         let req = self.http.get(&dl.link).header("User-Agent", USER_AGENT);
-        let bytes = self.http.send(req).await?.error_for_status()?.bytes().await?.to_vec();
+        let bytes = self
+            .http
+            .send(req)
+            .await?
+            .error_for_status()?
+            .bytes()
+            .await?
+            .to_vec();
         // OpenSubtitles serves .srt overwhelmingly; sniff ASS.
-        let format = if dl
-            .file_name
-            .as_deref()
-            .is_some_and(|n| n.to_ascii_lowercase().ends_with(".ass") || n.to_ascii_lowercase().ends_with(".ssa"))
-            || bytes.starts_with(b"[Script Info]")
+        let format = if dl.file_name.as_deref().is_some_and(|n| {
+            n.to_ascii_lowercase().ends_with(".ass") || n.to_ascii_lowercase().ends_with(".ssa")
+        }) || bytes.starts_with(b"[Script Info]")
         {
             "ass"
         } else {
             "srt"
         };
-        Ok(Downloaded { bytes, format: format.into(), release_name: dl.file_name })
+        Ok(Downloaded {
+            bytes,
+            format: format.into(),
+            release_name: dl.file_name,
+        })
     }
 }
 
@@ -465,7 +506,10 @@ mod tests {
 
     #[test]
     fn parses_the_reset_phrase() {
-        assert_eq!(parse_reset_secs("23 hours and 12 minutes"), Some(23 * 3600 + 12 * 60));
+        assert_eq!(
+            parse_reset_secs("23 hours and 12 minutes"),
+            Some(23 * 3600 + 12 * 60)
+        );
         assert_eq!(parse_reset_secs("45 minutes"), Some(45 * 60));
         assert_eq!(parse_reset_secs("30 seconds"), Some(30));
         assert_eq!(parse_reset_secs("tomorrow"), None);
@@ -491,11 +535,11 @@ mod tests {
         assert_eq!(
             order,
             vec![
-                ("en".into(), true),   // hash + first preferred language
-                ("nl".into(), true),   // hash + second
-                ("de".into(), true),   // hash, unrequested language
+                ("en".into(), true), // hash + first preferred language
+                ("nl".into(), true), // hash + second
+                ("de".into(), true), // hash, unrequested language
                 ("pt-BR".into(), true),
-                ("en".into(), false),  // no hash, however popular
+                ("en".into(), false), // no hash, however popular
             ]
         );
     }

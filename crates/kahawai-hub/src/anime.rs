@@ -33,12 +33,21 @@ async fn cached_download(
     max_age: Duration,
 ) -> Result<()> {
     if let Ok(meta) = std::fs::metadata(path)
-        && meta.modified().ok().and_then(|m| m.elapsed().ok()).map(|a| a < max_age).unwrap_or(false)
+        && meta
+            .modified()
+            .ok()
+            .and_then(|m| m.elapsed().ok())
+            .map(|a| a < max_age)
+            .unwrap_or(false)
     {
         return Ok(());
     }
     tracing::info!(url, "refreshing anime data file");
-    match http.send(http.get(url)).await.and_then(|r| Ok(r.error_for_status()?)) {
+    match http
+        .send(http.get(url))
+        .await
+        .and_then(|r| Ok(r.error_for_status()?))
+    {
         Ok(resp) => {
             let bytes = resp.bytes().await?;
             if let Some(dir) = path.parent() {
@@ -108,7 +117,10 @@ impl AnidbTitles {
                 _ => 2,
             });
             let mut seen = std::collections::HashSet::new();
-            let aids: Vec<u32> = v.into_iter().filter(|(a, _)| seen.insert(*a)).collect::<Vec<_>>()
+            let aids: Vec<u32> = v
+                .into_iter()
+                .filter(|(a, _)| seen.insert(*a))
+                .collect::<Vec<_>>()
                 .into_iter()
                 .map(|(a, _)| a)
                 .collect();
@@ -120,7 +132,10 @@ impl AnidbTitles {
 
     /// Candidate aids for a local title, best first.
     pub fn candidates(&self, title: &str) -> Vec<u32> {
-        self.index.get(&crate::enrich::fold(title)).cloned().unwrap_or_default()
+        self.index
+            .get(&crate::enrich::fold(title))
+            .cloned()
+            .unwrap_or_default()
     }
 }
 
@@ -158,7 +173,10 @@ fn tmdb_ids<'de, D: serde::Deserializer<'de>>(d: D) -> Result<TmdbIds, D::Error>
     #[derive(Deserialize)]
     #[serde(untagged)]
     enum V {
-        Obj { movie: Option<OneOrMany>, tv: Option<OneOrMany> },
+        Obj {
+            movie: Option<OneOrMany>,
+            tv: Option<OneOrMany>,
+        },
         Bare(u32),
         Other(serde::de::IgnoredAny),
     }
@@ -168,8 +186,14 @@ fn tmdb_ids<'de, D: serde::Deserializer<'de>>(d: D) -> Result<TmdbIds, D::Error>
         None => None,
     };
     Ok(match V::deserialize(d) {
-        Ok(V::Obj { movie, tv }) => TmdbIds { movie: first(movie), tv: first(tv) },
-        Ok(V::Bare(n)) => TmdbIds { movie: Some(n), tv: Some(n) },
+        Ok(V::Obj { movie, tv }) => TmdbIds {
+            movie: first(movie),
+            tv: first(tv),
+        },
+        Ok(V::Bare(n)) => TmdbIds {
+            movie: Some(n),
+            tv: Some(n),
+        },
         _ => TmdbIds::default(),
     })
 }
@@ -219,11 +243,20 @@ impl AnimeLists {
             }
         }
         // Lowest AniDB id ≈ first season/original entry.
-        for v in by_tvdb.values_mut().chain(by_tmdb.values_mut()).chain(by_anilist.values_mut()) {
+        for v in by_tvdb
+            .values_mut()
+            .chain(by_tmdb.values_mut())
+            .chain(by_anilist.values_mut())
+        {
             v.sort_unstable();
         }
         tracing::info!(entries = by_anidb.len(), "anime-lists mapping ready");
-        Ok(Self { by_anidb, by_tvdb, by_tmdb, by_anilist })
+        Ok(Self {
+            by_anidb,
+            by_tvdb,
+            by_tmdb,
+            by_anilist,
+        })
     }
 
     pub fn by_anidb(&self, aid: u32) -> Option<&Mapping> {
@@ -234,7 +267,9 @@ impl AnimeLists {
     /// manually matched item adopt anime ids WITHOUT re-deciding its
     /// identity.
     pub fn reverse(&self, provider: &str, provider_id: &str) -> Vec<u32> {
-        let Ok(id) = provider_id.parse::<u32>() else { return Vec::new() };
+        let Ok(id) = provider_id.parse::<u32>() else {
+            return Vec::new();
+        };
         match provider {
             "tvdb" => self.by_tvdb.get(&id).cloned().unwrap_or_default(),
             "tmdb" => self.by_tmdb.get(&id).cloned().unwrap_or_default(),
@@ -305,7 +340,10 @@ pub struct AnilistRelationNode {
 
 impl AnilistMedia {
     pub fn display_title(&self) -> Option<String> {
-        self.title.english.clone().or_else(|| self.title.romaji.clone())
+        self.title
+            .english
+            .clone()
+            .or_else(|| self.title.romaji.clone())
     }
 
     /// Original language from the country of origin (anime is tagged by
@@ -321,7 +359,12 @@ impl AnilistMedia {
 
     pub fn premiered(&self) -> Option<String> {
         let d = self.start_date.as_ref()?;
-        Some(format!("{:04}-{:02}-{:02}", d.year?, d.month.unwrap_or(1), d.day.unwrap_or(1)))
+        Some(format!(
+            "{:04}-{:02}-{:02}",
+            d.year?,
+            d.month.unwrap_or(1),
+            d.day.unwrap_or(1)
+        ))
     }
 
     /// AniList descriptions carry light HTML; flatten it.
@@ -367,15 +410,23 @@ impl Anilist {
             .http
             .post(ANILIST_URL)
             .json(&serde_json::json!({"query": query, "variables": variables}));
-        let resp =
-            self.http.send(req).await?.error_for_status()?.json::<serde_json::Value>().await?;
+        let resp = self
+            .http
+            .send(req)
+            .await?
+            .error_for_status()?
+            .json::<serde_json::Value>()
+            .await?;
         // GraphQL reports failure in-band: a 200 whose body carries
         // `errors` must surface as an error, not deserialize into
         // "no such anime" — that once became a permanent recorded miss.
         if let Some(errs) = resp.get("errors").and_then(|e| e.as_array())
             && !errs.is_empty()
         {
-            anyhow::bail!("anilist graphql error: {}", errs[0]["message"].as_str().unwrap_or("?"));
+            anyhow::bail!(
+                "anilist graphql error: {}",
+                errs[0]["message"].as_str().unwrap_or("?")
+            );
         }
         Ok(resp)
     }
@@ -460,11 +511,7 @@ pub async fn anidb_episode_titles(
 
 /// One page every two seconds, and a 24 h silence if they ban us: both
 /// live in the gate, keyed on api.anidb.net.
-async fn fetch_anime_xml(
-    http: &crate::gate::Http,
-    path: &Path,
-    aid: u32,
-) -> Result<String> {
+async fn fetch_anime_xml(http: &crate::gate::Http, path: &Path, aid: u32) -> Result<String> {
     let req = http.get("http://api.anidb.net:9001/httpapi").query(&[
         ("request", "anime"),
         ("client", HTTP_CLIENT),
@@ -528,11 +575,16 @@ pub async fn anidb_anime_info(
         .to_string();
     // The official English title where one exists, else the main
     // (romaji) title — the preference the rest of the pipeline shows.
-    let titles: Vec<_> = doc.descendants().filter(|n| n.has_tag_name("title")).collect();
+    let titles: Vec<_> = doc
+        .descendants()
+        .filter(|n| n.has_tag_name("title"))
+        .collect();
     let title = titles
         .iter()
-        .find(|n| n.attribute("type") == Some("official")
-            && n.attribute(("http://www.w3.org/XML/1998/namespace", "lang")) == Some("en"))
+        .find(|n| {
+            n.attribute("type") == Some("official")
+                && n.attribute(("http://www.w3.org/XML/1998/namespace", "lang")) == Some("en")
+        })
         .or_else(|| titles.iter().find(|n| n.attribute("type") == Some("main")))
         .and_then(|n| n.text())
         .unwrap_or("")
@@ -549,18 +601,27 @@ pub async fn anidb_anime_info(
         .and_then(|n| n.text())
         .and_then(|c| c.parse().ok());
     anyhow::ensure!(!title.is_empty(), "anidb xml for {aid} carries no title");
-    Ok(AnidbAnimeInfo { kind, title, year, episode_count })
+    Ok(AnidbAnimeInfo {
+        kind,
+        title,
+        year,
+        episode_count,
+    })
 }
 
 fn parse_episode_titles(xml: &str) -> Result<std::collections::HashMap<i64, String>> {
     let doc = roxmltree::Document::parse(xml)?;
     let mut out = std::collections::HashMap::new();
     for ep in doc.descendants().filter(|n| n.has_tag_name("episode")) {
-        let Some(epno) = ep.children().find(|n| n.has_tag_name("epno")) else { continue };
+        let Some(epno) = ep.children().find(|n| n.has_tag_name("epno")) else {
+            continue;
+        };
         if epno.attribute("type") != Some("1") {
             continue; // specials/credits/trailers live in their own space
         }
-        let Some(n) = epno.text().and_then(|t| t.trim().parse::<i64>().ok()) else { continue };
+        let Some(n) = epno.text().and_then(|t| t.trim().parse::<i64>().ok()) else {
+            continue;
+        };
         let title_for = |lang: &str| {
             ep.children()
                 .find(|c| {
@@ -616,12 +677,19 @@ mod tests {
     fn description_flattening() {
         let m = AnilistMedia {
             id: 1,
-            title: AnilistTitle { romaji: Some("X".into()), english: None },
+            title: AnilistTitle {
+                romaji: Some("X".into()),
+                english: None,
+            },
             country_of_origin: None,
             description: Some("Line one.<br><br>\n<i>Note.</i>".into()),
             cover_image: None,
             average_score: Some(78.0),
-            start_date: Some(AnilistDate { year: Some(2011), month: Some(4), day: None }),
+            start_date: Some(AnilistDate {
+                year: Some(2011),
+                month: Some(4),
+                day: None,
+            }),
             format: Some("TV".into()),
             genres: None,
             relations: None,

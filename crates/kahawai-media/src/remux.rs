@@ -113,8 +113,7 @@ pub fn aac_encoder() -> Option<&'static str> {
 /// QSV, VideoToolbox), then software. Dry-run verification is what makes this list
 /// safe — a hw element on a box without the driver fails the probe and
 /// the next one wins (TC-1/TC-6).
-pub const H264_ENCODERS: &[&str] =
-    &[
+pub const H264_ENCODERS: &[&str] = &[
     "vah264enc",
     "vaapih264enc",
     "nvh264enc",
@@ -221,7 +220,12 @@ pub fn decoder_caps_names() -> Vec<String> {
         f.static_pad_templates()
             .into_iter()
             .filter(|t| t.direction() == gst::PadDirection::Sink)
-            .flat_map(|t| t.caps().iter().map(|s| s.name().to_string()).collect::<Vec<_>>())
+            .flat_map(|t| {
+                t.caps()
+                    .iter()
+                    .map(|s| s.name().to_string())
+                    .collect::<Vec<_>>()
+            })
             .collect::<Vec<_>>()
     })
     .collect();
@@ -234,12 +238,9 @@ pub fn decoder_caps_names() -> Vec<String> {
 /// registry (never hand-list what it can tell us).
 pub(crate) fn can_decode(caps_name: &str) -> bool {
     let caps = gst::Caps::new_empty_simple(caps_name);
-    gst::ElementFactory::factories_with_type(
-        gst::ElementFactoryType::DECODER,
-        gst::Rank::MARGINAL,
-    )
-    .iter()
-    .any(|f| f.can_sink_any_caps(&caps))
+    gst::ElementFactory::factories_with_type(gst::ElementFactoryType::DECODER, gst::Rank::MARGINAL)
+        .iter()
+        .any(|f| f.can_sink_any_caps(&caps))
 }
 
 /// What happens to one stream kind in a session (HUB-16 decision order:
@@ -263,7 +264,10 @@ pub struct Target {
 }
 
 /// hls.js/MSE baseline: H.264 video; AAC or MP3 audio.
-pub const WEB_TARGET: Target = Target { video: &["h264"], audio: &["aac", "mp3"] };
+pub const WEB_TARGET: Target = Target {
+    video: &["h264"],
+    audio: &["aac", "mp3"],
+};
 
 /// Per-kind session plan — the single source of truth shared between
 /// session planning and pipeline routing, so the muxer pads requested up
@@ -323,8 +327,7 @@ pub fn plan_streams(
     let video = if selected_v.is_some_and(|v| copyable("video", &v.codec, target.video)) {
         StreamMode::Copy
     } else if h264_encoder().is_some()
-        && selected_v
-            .is_some_and(|v| codec_to_caps_name("video", &v.codec).is_some_and(can_decode))
+        && selected_v.is_some_and(|v| codec_to_caps_name("video", &v.codec).is_some_and(can_decode))
     {
         StreamMode::Encode
     } else {
@@ -336,29 +339,28 @@ pub fn plan_streams(
     let audio = if selected.is_some_and(|a| copyable("audio", &a.codec, target.audio)) {
         StreamMode::Copy
     } else if aac_encoder().is_some()
-        && selected
-            .is_some_and(|a| codec_to_caps_name("audio", &a.codec).is_some_and(can_decode))
+        && selected.is_some_and(|a| codec_to_caps_name("audio", &a.codec).is_some_and(can_decode))
     {
         StreamMode::Encode
     } else {
         StreamMode::Off
     };
-    RemuxPlan { video, audio, audio_track, video_track, ..Default::default() }
+    RemuxPlan {
+        video,
+        audio,
+        audio_track,
+        video_track,
+        ..Default::default()
+    }
 }
 
 /// Human-readable per-kind verdict for the playback-info overlay
 /// (§4.3b spirit: the player reports which path was taken and why —
 /// nothing converts silently).
-pub fn plan_summary(
-    info: &kahawai_core::media::MediaInfo,
-    plan: &RemuxPlan,
-) -> (String, String) {
+pub fn plan_summary(info: &kahawai_core::media::MediaInfo, plan: &RemuxPlan) -> (String, String) {
     let names = ts_muxable_names();
-    let kind_summary = |kind: &str,
-                        codecs: Vec<&str>,
-                        mode: StreamMode,
-                        target_codec: &str| {
-        match mode {
+    let kind_summary =
+        |kind: &str, codecs: Vec<&str>, mode: StreamMode, target_codec: &str| match mode {
             StreamMode::Copy => codecs
                 .iter()
                 .find(|c| codec_to_caps_name(kind, c).is_some_and(|n| names.contains(n)))
@@ -379,18 +381,25 @@ pub fn plan_summary(
                     format!("{} dropped (needs transcoder)", codecs[0])
                 }
             }
-        }
-    };
+        };
     (
         kind_summary(
             "video",
-            info.video.get(plan.video_track).map(|v| v.codec.as_str()).into_iter().collect(),
+            info.video
+                .get(plan.video_track)
+                .map(|v| v.codec.as_str())
+                .into_iter()
+                .collect(),
             plan.video,
             "h264",
         ),
         kind_summary(
             "audio",
-            info.audio.get(plan.audio_track).map(|a| a.codec.as_str()).into_iter().collect(),
+            info.audio
+                .get(plan.audio_track)
+                .map(|a| a.codec.as_str())
+                .into_iter()
+                .collect(),
             plan.audio,
             "aac",
         ),
@@ -426,7 +435,9 @@ fn parser_for(caps: &gst::CapsRef) -> Option<&'static str> {
     };
     // Availability-guarded (plugin-fallback strategy): missing parser →
     // try a direct link rather than failing outright.
-    gst::ElementFactory::find(element).is_some().then_some(element)
+    gst::ElementFactory::find(element)
+        .is_some()
+        .then_some(element)
 }
 
 /// H.26x streams with B-frames need PTS/DTS recomputed from picture order
@@ -440,7 +451,9 @@ fn timestamper_for(caps: &gst::CapsRef) -> Option<&'static str> {
         "video/x-h265" => "h265timestamper",
         _ => return None,
     };
-    gst::ElementFactory::find(element).is_some().then_some(element)
+    gst::ElementFactory::find(element)
+        .is_some()
+        .then_some(element)
 }
 
 /// hlssink2 pads requested up front (splitmuxsink wants them before start);
@@ -484,7 +497,8 @@ impl SeekGate {
                 gst::PadProbeType::BLOCK | gst::PadProbeType::BUFFER,
                 move |_, _| {
                     if !counted.swap(true, std::sync::atomic::Ordering::SeqCst) {
-                        gate.triggered.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        gate.triggered
+                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     }
                     gst::PadProbeReturn::Ok
                 },
@@ -602,7 +616,10 @@ fn plumb_parsed_pad(
         .and_then(|s| s.caps())
         .or_else(|| pad.current_caps())
         .unwrap_or_else(gst::Caps::new_empty);
-    let name = advertised.structure(0).map(|s| s.name().to_string()).unwrap_or_default();
+    let name = advertised
+        .structure(0)
+        .map(|s| s.name().to_string())
+        .unwrap_or_default();
     // Track selection: only the plan's audio track proceeds (demux order
     // matches discovery order — the assumption subtitle extraction
     // already relies on). Streams whose advertised caps hide their
@@ -660,7 +677,16 @@ fn plumb_parsed_pad(
         }
     }
     if routable(&name, &plan) {
-        route_stream(pipe, waiting, &qsrc, &advertised, plan, gate, burn, burn_start_ms);
+        route_stream(
+            pipe,
+            waiting,
+            &qsrc,
+            &advertised,
+            plan,
+            gate,
+            burn,
+            burn_start_ms,
+        );
         return;
     }
 
@@ -673,7 +699,16 @@ fn plumb_parsed_pad(
             && let gst::EventView::Caps(c) = ev.view()
             && qpad.peer().is_none()
         {
-            route_stream(&pipe, &waiting, qpad, &c.caps_owned(), plan, &gate, &burn, burn_start_ms);
+            route_stream(
+                &pipe,
+                &waiting,
+                qpad,
+                &c.caps_owned(),
+                plan,
+                &gate,
+                &burn,
+                burn_start_ms,
+            );
         }
         gst::PadProbeReturn::Ok
     });
@@ -693,7 +728,10 @@ fn tap_text_track(
     caps_name: &str,
 ) {
     let is_ass = caps_name.contains("ssa") || caps_name.contains("ass");
-    let path = dir.join(format!("subs-e{idx}.{}", if is_ass { "ass" } else { "jsonl" }));
+    let path = dir.join(format!(
+        "subs-e{idx}.{}",
+        if is_ass { "ass" } else { "jsonl" }
+    ));
     let mut file = match std::fs::File::create(&path) {
         Ok(f) => f,
         Err(e) => {
@@ -715,7 +753,9 @@ fn tap_text_track(
             .structure(0)
             .and_then(|s| s.get::<gst::Buffer>("codec_data").ok())
             .and_then(|b| {
-                b.map_readable().ok().map(|m| crate::subtitles::decode_text(m.as_slice()))
+                b.map_readable()
+                    .ok()
+                    .map(|m| crate::subtitles::decode_text(m.as_slice()))
             })
             .unwrap_or_default();
         let _ = file.write_all(crate::subtitles::compose_header(&header).as_bytes());
@@ -733,8 +773,7 @@ fn tap_text_track(
                     && let Ok(map) = buffer.map_readable()
                 {
                     let start = pts.mseconds();
-                    let end =
-                        start + buffer.duration().map(|d| d.mseconds()).unwrap_or(3000);
+                    let end = start + buffer.duration().map(|d| d.mseconds()).unwrap_or(3000);
                     let raw = crate::subtitles::decode_text(map.as_slice());
                     if is_ass {
                         if let Some(line) = crate::subtitles::ass_dialogue(&raw, start, end) {
@@ -799,11 +838,13 @@ fn tap_image_track(
     let (vob_palette, vob_size) = caps
         .structure(0)
         .and_then(|s| s.get::<gst::Buffer>("codec_data").ok())
-        .and_then(|b| b.map_readable().ok().map(|m| {
-            let text = crate::subtitles::decode_text(m.as_slice());
-            let size = crate::imagesubs::vobsub_size(&text);
-            (crate::imagesubs::vobsub_palette(&text), size)
-        }))
+        .and_then(|b| {
+            b.map_readable().ok().map(|m| {
+                let text = crate::subtitles::decode_text(m.as_slice());
+                let size = crate::imagesubs::vobsub_size(&text);
+                (crate::imagesubs::vobsub_palette(&text), size)
+            })
+        })
         .unwrap_or_default();
     let vob_size = vob_size.unwrap_or((720, 576));
 
@@ -846,9 +887,14 @@ fn tap_image_track(
                     } else if let Ok(Some(obj)) =
                         crate::imagesubs::vobsub_decode(map.as_slice(), &vob_palette)
                     {
-                        let end = ms
-                            + buffer.duration().map(|d| d.mseconds()).unwrap_or(5000);
-                        write_set(&file, ms, vob_size.0, vob_size.1, std::slice::from_ref(&obj));
+                        let end = ms + buffer.duration().map(|d| d.mseconds()).unwrap_or(5000);
+                        write_set(
+                            &file,
+                            ms,
+                            vob_size.0,
+                            vob_size.1,
+                            std::slice::from_ref(&obj),
+                        );
                         write_set(&file, end, vob_size.0, vob_size.1, &[]);
                     }
                 }
@@ -899,17 +945,31 @@ fn route_stream(
     burn: &Option<std::sync::Arc<crate::burnin::Timeline>>,
     burn_start_ms: u64,
 ) {
-    let caps_name = caps.structure(0).map(|s| s.name().to_string()).unwrap_or_default();
+    let caps_name = caps
+        .structure(0)
+        .map(|s| s.name().to_string())
+        .unwrap_or_default();
     let mode = mode_for(&caps_name, &plan);
     // Encode: claim the kind's muxer pad for the decode→re-encode branch.
     if mode == StreamMode::Encode && can_decode(&caps_name) {
-        let kind = if caps_name.starts_with("video/") { "video" } else { "audio" };
+        let kind = if caps_name.starts_with("video/") {
+            "video"
+        } else {
+            "audio"
+        };
         if let Some(sinkpad) = waiting.lock().unwrap().remove(kind) {
             tracing::info!(caps = %caps_name, kind, "transcoding stream");
             if kind == "video" {
                 build_video_encode_chain(
-                    pipe, from, sinkpad, gate, plan.video_kbps, plan.max_height, plan.tone_map,
-                    burn.clone(), burn_start_ms,
+                    pipe,
+                    from,
+                    sinkpad,
+                    gate,
+                    plan.video_kbps,
+                    plan.max_height,
+                    plan.tone_map,
+                    burn.clone(),
+                    burn_start_ms,
                 );
             } else {
                 build_audio_encode_chain(pipe, from, sinkpad, &caps_name, gate, plan.max_channels);
@@ -925,7 +985,10 @@ fn route_stream(
             let mut tail = from.clone();
             // parser → timestamper, each present only when it applies;
             // every hop is pure repackaging, no decode.
-            for name in [parser_for(caps), timestamper_for(caps)].into_iter().flatten() {
+            for name in [parser_for(caps), timestamper_for(caps)]
+                .into_iter()
+                .flatten()
+            {
                 let el = gst::ElementFactory::make(name).build().unwrap();
                 // HLS requires independently decodable segments: h26x
                 // parameter sets must ride every keyframe, or only the
@@ -982,9 +1045,15 @@ pub fn tonemap_available() -> bool {
     static VERIFIED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *VERIFIED.get_or_init(|| {
         if crate::init().is_err()
-            || ["glupload", "glcolorconvert", "glshader", "gldownload", "capssetter"]
-                .iter()
-                .any(|n| gst::ElementFactory::find(n).is_none())
+            || [
+                "glupload",
+                "glcolorconvert",
+                "glshader",
+                "gldownload",
+                "capssetter",
+            ]
+            .iter()
+            .any(|n| gst::ElementFactory::find(n).is_none())
         {
             return false;
         }
@@ -1121,7 +1190,11 @@ fn attach_peak_probe(upload: &gst::Element, shader: &gst::Element) {
         let nits = (pq_eotf(p999 as f64 / 1023.0) * 10000.0).clamp(203.0, 4000.0);
         // Instant attack (a clipped flash is worse than a dim one),
         // ~2 s decay at 24 fps.
-        st.0 = if nits > st.0 { nits } else { st.0 * 0.98 + nits * 0.02 };
+        st.0 = if nits > st.0 {
+            nits
+        } else {
+            st.0 * 0.98 + nits * 0.02
+        };
         if (st.0 - st.1).abs() / st.1 > 0.01 {
             st.1 = st.0;
             let max_e = pq_encode(st.0 / 10000.0);
@@ -1165,15 +1238,27 @@ fn tonemap_segment() -> Vec<gst::Element> {
     // none after this segment) refuses system-memory RGBA — observed as
     // not-negotiated on the J5005. Every encoder we place takes NV12.
     let nv12 = gst::ElementFactory::make("capsfilter")
-        .property("caps", gst::Caps::builder("video/x-raw").field("format", "NV12").build())
+        .property(
+            "caps",
+            gst::Caps::builder("video/x-raw")
+                .field("format", "NV12")
+                .build(),
+        )
         .build()
         .unwrap();
     let relabel = gst::ElementFactory::make("capssetter")
-        .property("caps", gst::Caps::builder("video/x-raw").field("colorimetry", "bt709").build())
+        .property(
+            "caps",
+            gst::Caps::builder("video/x-raw")
+                .field("colorimetry", "bt709")
+                .build(),
+        )
         .build()
         .unwrap();
     attach_peak_probe(&upload, &shader);
-    vec![upload, to_rgba, rgba, shader, from_rgba, download, nv12, relabel]
+    vec![
+        upload, to_rgba, rgba, shader, from_rgba, download, nv12, relabel,
+    ]
 }
 
 #[allow(clippy::too_many_arguments)] // one plan, spelled out
@@ -1365,7 +1450,9 @@ fn aac_accepts(enc: &str, source: (u32, u64), channels: u32, mask: Option<u64>) 
     // browsers, i.e. the strictness that actually matters. Other gst
     // decoders may share the encoder's dialect and false-pass.
     const DECODERS: &[&str] = &["avdec_aac", "fdkaacdec", "faad"];
-    let dec = DECODERS.iter().find(|d| gst::ElementFactory::find(d).is_some());
+    let dec = DECODERS
+        .iter()
+        .find(|d| gst::ElementFactory::find(d).is_some());
     let (sch, smask) = source;
     let src = if smask != 0 {
         format!("audio/x-raw,channels={sch},channel-mask=(bitmask)0x{smask:x}")
@@ -1394,7 +1481,14 @@ fn aac_accepts(enc: &str, source: (u32, u64), channels: u32, mask: Option<u64>) 
                 ))
         }
     };
-    tracing::debug!(encoder = enc, ?source, channels, ?mask, accepted = ok, "AAC layout probe");
+    tracing::debug!(
+        encoder = enc,
+        ?source,
+        channels,
+        ?mask,
+        accepted = ok,
+        "AAC layout probe"
+    );
     seen.lock().unwrap().insert((source, channels, mask), ok);
     ok
 }
@@ -1410,9 +1504,7 @@ fn dry_run_yields_output(launch: &str) -> bool {
         return false;
     };
     let count = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let Some(sinkpad) =
-        pipe.by_name("probesink").and_then(|s| s.static_pad("sink"))
-    else {
+    let Some(sinkpad) = pipe.by_name("probesink").and_then(|s| s.static_pad("sink")) else {
         return false;
     };
     let c = count.clone();
@@ -1454,7 +1546,9 @@ fn aac_input_layout(
     mask: u64,
     ceiling: Option<u32>,
 ) -> Option<(u32, Option<u64>)> {
-    let bound = ceiling.filter(|c| *c > 0).map_or(channels, |c| c.min(channels));
+    let bound = ceiling
+        .filter(|c| *c > 0)
+        .map_or(channels, |c| c.min(channels));
     // An unpositioned stream (mask 0, common for mono/stereo) claims no
     // positions, so nothing is a relabel and every small enough layout
     // is fair game.
@@ -1471,7 +1565,9 @@ fn aac_input_layout(
         .chain(AAC_LAYOUTS.iter().map(|(n, _)| *n))
         .filter(move |n| *n <= bound)
         .map(|n| (n, None));
-    positioned.chain(count_only).find(|(n, m)| aac_accepts(enc, (channels, mask), *n, *m))
+    positioned
+        .chain(count_only)
+        .find(|(n, m)| aac_accepts(enc, (channels, mask), *n, *m))
 }
 
 /// Pin the encoder's input layout from the decoded caps, on the caps
@@ -1491,7 +1587,10 @@ fn install_layout_pin(pad: &gst::Pad, filter: &gst::Element, ceiling: Option<u32
             return gst::PadProbeReturn::Remove;
         };
         let channels: u32 = s.get::<i32>("channels").unwrap_or(0).max(0) as u32;
-        let mask = s.get::<gst::Bitmask>("channel-mask").map(|b| *b).unwrap_or(0);
+        let mask = s
+            .get::<gst::Bitmask>("channel-mask")
+            .map(|b| *b)
+            .unwrap_or(0);
         if channels == 0 {
             return gst::PadProbeReturn::Remove;
         }
@@ -1552,7 +1651,15 @@ fn build_audio_encode_chain(
             .build()
             .unwrap();
         let dec = gst::ElementFactory::make("avdec_eac3").build().unwrap();
-        build_audio_tail(pipe, from, sinkpad, enc_name, &[setter, dec], gate, max_channels);
+        build_audio_tail(
+            pipe,
+            from,
+            sinkpad,
+            enc_name,
+            &[setter, dec],
+            gate,
+            max_channels,
+        );
         return;
     }
     let decode = gst::ElementFactory::make("decodebin").build().unwrap();
@@ -1733,13 +1840,27 @@ fn make_hls_sink(out_dir: &Path, prefer: Option<&str>) -> Result<(gst::Element, 
     // element exists; otherwise the usual best-available order.
     let name = prefer
         .and_then(|p| {
-            HLS_SINKS.iter().find(|n| **n == p && gst::ElementFactory::find(n).is_some())
+            HLS_SINKS
+                .iter()
+                .find(|n| **n == p && gst::ElementFactory::find(n).is_some())
         })
-        .or_else(|| HLS_SINKS.iter().find(|n| gst::ElementFactory::find(n).is_some()))
+        .or_else(|| {
+            HLS_SINKS
+                .iter()
+                .find(|n| gst::ElementFactory::find(n).is_some())
+        })
         .context("no HLS sink element (hlssink3/hlssink2) — see `kahawai doctor`")?;
     let sink = gst::ElementFactory::make(name).build()?;
-    set_prop_if_present(&sink, "location", out_dir.join("segment%05d.ts").to_str().unwrap());
-    set_prop_if_present(&sink, "playlist-location", out_dir.join("master.m3u8").to_str().unwrap());
+    set_prop_if_present(
+        &sink,
+        "location",
+        out_dir.join("segment%05d.ts").to_str().unwrap(),
+    );
+    set_prop_if_present(
+        &sink,
+        "playlist-location",
+        out_dir.join("master.m3u8").to_str().unwrap(),
+    );
     set_prop_if_present(&sink, "target-duration", 4u32);
     // Keep every segment and playlist entry (VOD-style growing playlist).
     set_prop_if_present(&sink, "playlist-length", 0u32);
@@ -2018,7 +2139,11 @@ pub fn start_parts(
                     None
                 }
                 Err(e) => {
-                    tracing::warn!(track = idx, error = format!("{e:#}"), "burn-in: timeline failed");
+                    tracing::warn!(
+                        track = idx,
+                        error = format!("{e:#}"),
+                        "burn-in: timeline failed"
+                    );
                     None
                 }
             }
@@ -2051,7 +2176,11 @@ pub fn start_parts(
         .map(|_| Arc::new(Mutex::new(std::collections::HashMap::new())))
         .collect();
     for kind in ["video", "audio"] {
-        let wanted = if kind == "video" { plan.has_video() } else { plan.has_audio() };
+        let wanted = if kind == "video" {
+            plan.has_video()
+        } else {
+            plan.has_audio()
+        };
         if !wanted {
             continue;
         }
@@ -2075,7 +2204,9 @@ pub fn start_parts(
         src.link(&pad).context("linking concat to the muxer")?;
         // Request order IS play order — one pad per part, in sequence.
         for slot in per_part.iter() {
-            let sink = concat.request_pad_simple("sink_%u").context("concat sink pad")?;
+            let sink = concat
+                .request_pad_simple("sink_%u")
+                .context("concat sink pad")?;
             slot.lock().unwrap().insert(kind, sink);
         }
     }
@@ -2109,8 +2240,18 @@ pub fn start_parts(
         let burn_tl = burn_timeline.clone();
         pb.connect_pad_added(move |_, pad| {
             plumb_parsed_pad(
-                &pipe, &waiting2, pad, plan, &gate2, &audio_seen, &video_seen, &subs_seen,
-                &subs_dir, &burn_tl, start_ms, n == 0,
+                &pipe,
+                &waiting2,
+                pad,
+                plan,
+                &gate2,
+                &audio_seen,
+                &video_seen,
+                &subs_seen,
+                &subs_dir,
+                &burn_tl,
+                start_ms,
+                n == 0,
             );
         });
     }
@@ -2171,7 +2312,10 @@ pub fn start_parts(
             gst::SeekType::None,
             gst::ClockTime::NONE,
         );
-        anyhow::ensure!(parsebin.send_event(seek), "demuxer refused the start-offset seek");
+        anyhow::ensure!(
+            parsebin.send_event(seek),
+            "demuxer refused the start-offset seek"
+        );
         gate.open_reporting(out_dir.join("start.pos"));
     }
     if start_ms == 0 {
@@ -2180,7 +2324,12 @@ pub fn start_parts(
         let _ = std::fs::write(out_dir.join("start.pos"), "0");
     }
     pipeline.set_state(gst::State::Playing)?;
-    Ok(RemuxJob { pipeline, error, finished, stopping })
+    Ok(RemuxJob {
+        pipeline,
+        error,
+        finished,
+        stopping,
+    })
 }
 
 impl RemuxJob {
@@ -2195,7 +2344,8 @@ impl RemuxJob {
 
     /// Hard stop (session teardown).
     pub fn stop(&self) {
-        self.stopping.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.stopping
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         let _ = self.pipeline.set_state(gst::State::Null);
     }
 
@@ -2251,7 +2401,10 @@ mod multipart {
             return;
         }
         let dir = tempfile::tempdir().unwrap();
-        let parts = [part(dir.path(), "a1.mkv", "smpte"), part(dir.path(), "a2.mkv", "ball")];
+        let parts = [
+            part(dir.path(), "a1.mkv", "smpte"),
+            part(dir.path(), "a2.mkv", "ball"),
+        ];
         let out = dir.path().join("hls");
         std::fs::create_dir_all(&out).unwrap();
         let sources: Vec<Box<dyn RemuxSource>> = parts
@@ -2271,7 +2424,11 @@ mod multipart {
         while !job.finished() && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
-        assert!(job.failed().is_none(), "pipeline failed: {:?}", job.failed());
+        assert!(
+            job.failed().is_none(),
+            "pipeline failed: {:?}",
+            job.failed()
+        );
         let pos: u64 = std::fs::read_to_string(out.join("start.pos"))
             .expect("no start.pos written")
             .trim()
@@ -2279,8 +2436,14 @@ mod multipart {
             .expect("start.pos is not a number");
         // Keyframe-snapped at or before the request, never zero — zero is
         // what the second part's branch reports for itself.
-        assert!(pos > 500, "start.pos {pos} — a later part's zero won the minimum");
-        assert!(pos <= 2_000, "start.pos {pos} is past the requested resume point");
+        assert!(
+            pos > 500,
+            "start.pos {pos} — a later part's zero won the minimum"
+        );
+        assert!(
+            pos <= 2_000,
+            "start.pos {pos} is past the requested resume point"
+        );
     }
 
     /// Two 5 s parts, one playlist, no seam: the muxer never learns the
@@ -2293,7 +2456,10 @@ mod multipart {
             return;
         }
         let dir = tempfile::tempdir().unwrap();
-        let parts = [part(dir.path(), "cd1.mkv", "smpte"), part(dir.path(), "cd2.mkv", "ball")];
+        let parts = [
+            part(dir.path(), "cd1.mkv", "smpte"),
+            part(dir.path(), "cd2.mkv", "ball"),
+        ];
         let out = dir.path().join("hls");
         std::fs::create_dir_all(&out).unwrap();
 
@@ -2313,7 +2479,11 @@ mod multipart {
         while !job.finished() && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
-        assert!(job.failed().is_none(), "pipeline failed: {:?}", job.failed());
+        assert!(
+            job.failed().is_none(),
+            "pipeline failed: {:?}",
+            job.failed()
+        );
         assert!(job.finished(), "pipeline never finished");
 
         let playlist =
@@ -2323,9 +2493,18 @@ mod multipart {
             .filter_map(|l| l.strip_prefix("#EXTINF:"))
             .filter_map(|l| l.trim_end_matches(',').parse::<f64>().ok())
             .sum();
-        assert!(total > 9.0, "playlist covers {total}s — the second part never played");
-        assert!(!playlist.contains("EXT-X-DISCONTINUITY"), "the timeline broke at the seam");
-        assert!(playlist.contains("EXT-X-ENDLIST"), "playlist never finalised");
+        assert!(
+            total > 9.0,
+            "playlist covers {total}s — the second part never played"
+        );
+        assert!(
+            !playlist.contains("EXT-X-DISCONTINUITY"),
+            "the timeline broke at the seam"
+        );
+        assert!(
+            playlist.contains("EXT-X-ENDLIST"),
+            "playlist never finalised"
+        );
     }
 }
 
@@ -2370,7 +2549,9 @@ mod concat_spike {
         for part in parts {
             let src = seekable_appsrc(Box::new(FileSource::open(part).unwrap()));
             let parsebin = gst::ElementFactory::make("parsebin").build().unwrap();
-            pipeline.add_many([src.upcast_ref::<gst::Element>(), &parsebin]).unwrap();
+            pipeline
+                .add_many([src.upcast_ref::<gst::Element>(), &parsebin])
+                .unwrap();
             src.link(&parsebin).unwrap();
             let concat = concat.clone();
             let pipe = pipeline.downgrade();
@@ -2416,8 +2597,10 @@ mod concat_spike {
             return;
         }
         let dir = tempfile::tempdir().unwrap();
-        let parts =
-            [fixture(dir.path(), "p1.mkv", "smpte"), fixture(dir.path(), "p2.mkv", "ball")];
+        let parts = [
+            fixture(dir.path(), "p1.mkv", "smpte"),
+            fixture(dir.path(), "p2.mkv", "ball"),
+        ];
         let out = dir.path().join("hls");
         std::fs::create_dir_all(&out).unwrap();
 
@@ -2440,7 +2623,10 @@ mod concat_spike {
 
         let msg = run_to_eos(&pipeline, 60);
         assert!(
-            matches!(msg.as_ref().map(|m| m.view()), Some(gst::MessageView::Eos(_))),
+            matches!(
+                msg.as_ref().map(|m| m.view()),
+                Some(gst::MessageView::Eos(_))
+            ),
             "pipeline did not reach EOS: {msg:?}"
         );
 
@@ -2452,9 +2638,18 @@ mod concat_spike {
             .sum();
         // Two 5 s parts arriving as one stream, and NO discontinuity tag:
         // the muxer never learns there was a boundary.
-        assert!(total > 9.0, "playlist covers only {total}s — the second part is missing");
-        assert!(!playlist.contains("EXT-X-DISCONTINUITY"), "timeline broke at the seam");
-        assert!(playlist.contains("EXT-X-ENDLIST"), "playlist never finalised");
+        assert!(
+            total > 9.0,
+            "playlist covers only {total}s — the second part is missing"
+        );
+        assert!(
+            !playlist.contains("EXT-X-DISCONTINUITY"),
+            "timeline broke at the seam"
+        );
+        assert!(
+            playlist.contains("EXT-X-ENDLIST"),
+            "playlist never finalised"
+        );
     }
 
     /// HALF TWO: can the concatenated timeline be SEEKED, or must a seek
@@ -2466,23 +2661,27 @@ mod concat_spike {
     fn seeking_across_the_concat_boundary() {
         crate::init().unwrap();
         let dir = tempfile::tempdir().unwrap();
-        let parts =
-            [fixture(dir.path(), "s1.mkv", "smpte"), fixture(dir.path(), "s2.mkv", "ball")];
+        let parts = [
+            fixture(dir.path(), "s1.mkv", "smpte"),
+            fixture(dir.path(), "s2.mkv", "ball"),
+        ];
         let (pipeline, tail) = concat_pipeline(&parts, &["h264parse", "fakesink"]);
         tail.set_property("sync", false);
 
         // First buffer PTS after the seek: where playback actually resumed.
         let seen: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
         let seen2 = seen.clone();
-        tail.static_pad("sink").unwrap().add_probe(gst::PadProbeType::BUFFER, move |_, info| {
-            if let Some(gst::PadProbeData::Buffer(b)) = &info.data {
-                let mut s = seen2.lock().unwrap();
-                if s.is_none() {
-                    *s = b.pts().map(|p| p.mseconds());
+        tail.static_pad("sink")
+            .unwrap()
+            .add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+                if let Some(gst::PadProbeData::Buffer(b)) = &info.data {
+                    let mut s = seen2.lock().unwrap();
+                    if s.is_none() {
+                        *s = b.pts().map(|p| p.mseconds());
+                    }
                 }
-            }
-            gst::PadProbeReturn::Ok
-        });
+                gst::PadProbeReturn::Ok
+            });
 
         // (a) seek from PAUSED, after preroll.
         pipeline.set_state(gst::State::Paused).unwrap();
@@ -2494,14 +2693,23 @@ mod concat_spike {
         );
         let msg = run_to_eos(&pipeline, 60);
         let from_paused = *seen.lock().unwrap();
-        eprintln!("SPIKE paused-seek accepted={paused_ok:?} first_pts={from_paused:?}ms eos={}",
-            matches!(msg.as_ref().map(|m| m.view()), Some(gst::MessageView::Eos(_))));
+        eprintln!(
+            "SPIKE paused-seek accepted={paused_ok:?} first_pts={from_paused:?}ms eos={}",
+            matches!(
+                msg.as_ref().map(|m| m.view()),
+                Some(gst::MessageView::Eos(_))
+            )
+        );
         // Characterisation, deliberately pinned to today's behaviour: the
         // seek is ACCEPTED and then ignored — playback resumes at zero,
         // not at 7 s. Anything built on concat seeks would look correct in
         // a paused test and silently restart the film in a real player.
         assert!(paused_ok.is_ok(), "a paused seek used to be accepted");
-        assert_eq!(from_paused, Some(0), "concat now honours seeks — revisit the design");
+        assert_eq!(
+            from_paused,
+            Some(0),
+            "concat now honours seeks — revisit the design"
+        );
 
         // (b) the realistic case: scrub while playing.
         let (pipeline, tail) = concat_pipeline(&parts, &["h264parse", "fakesink"]);
@@ -2510,16 +2718,19 @@ mod concat_spike {
         let live2 = live.clone();
         let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let armed2 = armed.clone();
-        tail.static_pad("sink").unwrap().add_probe(gst::PadProbeType::BUFFER, move |_, info| {
-            if let Some(gst::PadProbeData::Buffer(b)) = &info.data
-                && armed2.load(std::sync::atomic::Ordering::SeqCst) {
+        tail.static_pad("sink")
+            .unwrap()
+            .add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+                if let Some(gst::PadProbeData::Buffer(b)) = &info.data
+                    && armed2.load(std::sync::atomic::Ordering::SeqCst)
+                {
                     let mut s = live2.lock().unwrap();
                     if s.is_none() {
                         *s = b.pts().map(|p| p.mseconds());
                     }
                 }
-            gst::PadProbeReturn::Ok
-        });
+                gst::PadProbeReturn::Ok
+            });
         pipeline.set_state(gst::State::Playing).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(1500));
         armed.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -2528,13 +2739,21 @@ mod concat_spike {
             gst::ClockTime::from_mseconds(7_000),
         );
         let msg2 = run_to_eos(&pipeline, 60);
-        eprintln!("SPIKE live-seek accepted={live_ok:?} first_pts={:?}ms eos={}",
+        eprintln!(
+            "SPIKE live-seek accepted={live_ok:?} first_pts={:?}ms eos={}",
             *live.lock().unwrap(),
-            matches!(msg2.as_ref().map(|m| m.view()), Some(gst::MessageView::Eos(_))));
+            matches!(
+                msg2.as_ref().map(|m| m.view()),
+                Some(gst::MessageView::Eos(_))
+            )
+        );
         // Seeking while PLAYING is refused outright. If this ever starts
         // succeeding, one pipeline could serve seeks too and the
         // restart-per-part path could go.
-        assert!(live_ok.is_err(), "concat now accepts a live seek — revisit the design");
+        assert!(
+            live_ok.is_err(),
+            "concat now accepts a live seek — revisit the design"
+        );
         // Recorded, not asserted: this test exists to MEASURE, and the
         // answer decides the design. Whatever it prints is the finding.
     }
@@ -2559,15 +2778,18 @@ mod tests {
             &[gst::MessageType::Eos, gst::MessageType::Error],
         );
         pipe.set_state(gst::State::Null).unwrap();
-        assert_eq!(msg.map(|m| m.type_()), Some(gst::MessageType::Eos), "fixture build failed");
+        assert_eq!(
+            msg.map(|m| m.type_()),
+            Some(gst::MessageType::Eos),
+            "fixture build failed"
+        );
 
         for (track, want_width) in [(0usize, 64u32), (1, 128)] {
             let info = crate::discover(&mkv, std::time::Duration::from_secs(10)).unwrap();
             assert_eq!(info.video.len(), 2, "{info:?}");
             let plan = plan_streams(&info, &WEB_TARGET, 0, track);
             let out = tempfile::tempdir().unwrap();
-            let job =
-                start(out.path(), plan, Box::new(FileSource::open(&mkv).unwrap())).unwrap();
+            let job = start(out.path(), plan, Box::new(FileSource::open(&mkv).unwrap())).unwrap();
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
             while !job.finished() && std::time::Instant::now() < deadline {
                 std::thread::sleep(std::time::Duration::from_millis(50));
@@ -2610,15 +2832,18 @@ mod tests {
             &[gst::MessageType::Eos, gst::MessageType::Error],
         );
         pipe.set_state(gst::State::Null).unwrap();
-        assert_eq!(msg.map(|m| m.type_()), Some(gst::MessageType::Eos), "fixture build failed");
+        assert_eq!(
+            msg.map(|m| m.type_()),
+            Some(gst::MessageType::Eos),
+            "fixture build failed"
+        );
 
         for (track, want_channels) in [(0u32, 2u32), (1, 1)] {
             let info = crate::discover(&mkv, std::time::Duration::from_secs(10)).unwrap();
             assert_eq!(info.audio.len(), 2, "{info:?}");
             let plan = plan_streams(&info, &WEB_TARGET, track as usize, 0);
             let out = tempfile::tempdir().unwrap();
-            let job =
-                start(out.path(), plan, Box::new(FileSource::open(&mkv).unwrap())).unwrap();
+            let job = start(out.path(), plan, Box::new(FileSource::open(&mkv).unwrap())).unwrap();
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
             while !job.finished() && std::time::Instant::now() < deadline {
                 std::thread::sleep(std::time::Duration::from_millis(50));
@@ -2642,7 +2867,17 @@ mod tests {
     use super::*;
     use std::time::{Duration, Instant};
 
-    const COPY_AV: RemuxPlan = RemuxPlan { video: StreamMode::Copy, audio: StreamMode::Copy, audio_track: 0, video_track: 0, video_kbps: None, max_height: None, max_channels: None, tone_map: false, burn_subtitle: None };
+    const COPY_AV: RemuxPlan = RemuxPlan {
+        video: StreamMode::Copy,
+        audio: StreamMode::Copy,
+        audio_track: 0,
+        video_track: 0,
+        video_kbps: None,
+        max_height: None,
+        max_channels: None,
+        tone_map: false,
+        burn_subtitle: None,
+    };
 
     /// Manual repro: REMUX_SRC=/path/to/file cargo test -p kahawai-media \
     ///   remux_file_from_env -- --ignored --nocapture
@@ -2663,7 +2898,11 @@ mod tests {
         assert!(job.finished(), "did not finish");
         let playlist = std::fs::read_to_string(out.path().join("master.m3u8")).unwrap();
         let segs = std::fs::read_dir(out.path()).unwrap().count();
-        eprintln!("OK: {} entries in dir, ENDLIST={}", segs, playlist.contains("#EXT-X-ENDLIST"));
+        eprintln!(
+            "OK: {} entries in dir, ENDLIST={}",
+            segs,
+            playlist.contains("#EXT-X-ENDLIST")
+        );
     }
 
     #[test]
@@ -2675,14 +2914,26 @@ mod tests {
         assert_eq!(ts_compatible("text/x-raw"), None);
         // Every answer must agree with the muxer's own template.
         let names = ts_muxable_names();
-        assert_eq!(ts_compatible("audio/x-eac3").is_some(), names.contains("audio/x-eac3"));
-        assert_eq!(ts_compatible("audio/x-dts").is_some(), names.contains("audio/x-dts"));
+        assert_eq!(
+            ts_compatible("audio/x-eac3").is_some(),
+            names.contains("audio/x-eac3")
+        );
+        assert_eq!(
+            ts_compatible("audio/x-dts").is_some(),
+            names.contains("audio/x-dts")
+        );
 
         // Flags derive from the same truth: eac3-only audio yields
         // has_audio only if the muxer takes eac3 (it does not, today).
         let info = kahawai_core::media::MediaInfo {
-            video: vec![kahawai_core::media::VideoStream { codec: "hevc".into(), ..Default::default() }],
-            audio: vec![kahawai_core::media::AudioStream { codec: "eac3".into(), ..Default::default() }],
+            video: vec![kahawai_core::media::VideoStream {
+                codec: "hevc".into(),
+                ..Default::default()
+            }],
+            audio: vec![kahawai_core::media::AudioStream {
+                codec: "eac3".into(),
+                ..Default::default()
+            }],
             ..Default::default()
         };
         let plan = plan_streams(&info, &WEB_TARGET, 0, 0);
@@ -2705,18 +2956,33 @@ mod tests {
         ))
         .unwrap();
         p.set_state(gst::State::Playing).unwrap();
-        p.bus().unwrap().timed_pop_filtered(gst::ClockTime::from_seconds(30), &[gst::MessageType::Eos]).unwrap();
+        p.bus()
+            .unwrap()
+            .timed_pop_filtered(gst::ClockTime::from_seconds(30), &[gst::MessageType::Eos])
+            .unwrap();
         p.set_state(gst::State::Null).unwrap();
 
         let out = tempfile::tempdir().unwrap();
-        let job = start(out.path(), COPY_AV, Box::new(FileSource::open(&src_path).unwrap())).unwrap();
+        let job = start(
+            out.path(),
+            COPY_AV,
+            Box::new(FileSource::open(&src_path).unwrap()),
+        )
+        .unwrap();
         let deadline = Instant::now() + Duration::from_secs(30);
         while !job.finished() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(50));
         }
-        assert!(job.finished(), "uneven-track remux deadlocked (queue-sizing regression)");
+        assert!(
+            job.finished(),
+            "uneven-track remux deadlocked (queue-sizing regression)"
+        );
         assert!(job.failed().is_none(), "remux failed: {:?}", job.failed());
-        assert!(std::fs::read_to_string(out.path().join("master.m3u8")).unwrap().contains("#EXT-X-ENDLIST"));
+        assert!(
+            std::fs::read_to_string(out.path().join("master.m3u8"))
+                .unwrap()
+                .contains("#EXT-X-ENDLIST")
+        );
     }
 
     /// The corpus sweep's first catch: MP4 with the moov atom at the end
@@ -2730,12 +2996,20 @@ mod tests {
         crate::testutil::render_h264_aac_mp4(&src_path);
 
         let out = tempfile::tempdir().unwrap();
-        let job = start(out.path(), COPY_AV, Box::new(FileSource::open(&src_path).unwrap())).unwrap();
+        let job = start(
+            out.path(),
+            COPY_AV,
+            Box::new(FileSource::open(&src_path).unwrap()),
+        )
+        .unwrap();
         let deadline = Instant::now() + Duration::from_secs(30);
         while !job.finished() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(50));
         }
-        assert!(job.finished(), "moov-at-end mp4 remux did not finish (push-mode regression)");
+        assert!(
+            job.finished(),
+            "moov-at-end mp4 remux did not finish (push-mode regression)"
+        );
         assert!(job.failed().is_none(), "remux failed: {:?}", job.failed());
         let playlist = std::fs::read_to_string(out.path().join("master.m3u8")).unwrap();
         assert!(playlist.contains("#EXT-X-ENDLIST"));
@@ -2765,28 +3039,54 @@ mod tests {
 
         let info = crate::discover(&src_path, Duration::from_secs(30)).unwrap();
         let plan = plan_streams(&info, &WEB_TARGET, 0, 0);
-        assert_eq!(plan.audio, StreamMode::Encode, "eac3 should plan as Encode: {info:?}");
+        assert_eq!(
+            plan.audio,
+            StreamMode::Encode,
+            "eac3 should plan as Encode: {info:?}"
+        );
         assert_eq!(plan.video, StreamMode::Copy);
 
         let out = tempfile::tempdir().unwrap();
-        let job = start(out.path(), plan, Box::new(FileSource::open(&src_path).unwrap())).unwrap();
+        let job = start(
+            out.path(),
+            plan,
+            Box::new(FileSource::open(&src_path).unwrap()),
+        )
+        .unwrap();
         let deadline = Instant::now() + Duration::from_secs(60);
         while !job.finished() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(50));
         }
         assert!(job.finished(), "transcode did not finish");
-        assert!(job.failed().is_none(), "transcode failed: {:?}", job.failed());
-        assert!(std::fs::read_to_string(out.path().join("master.m3u8"))
-            .unwrap()
-            .contains("#EXT-X-ENDLIST"));
+        assert!(
+            job.failed().is_none(),
+            "transcode failed: {:?}",
+            job.failed()
+        );
+        assert!(
+            std::fs::read_to_string(out.path().join("master.m3u8"))
+                .unwrap()
+                .contains("#EXT-X-ENDLIST")
+        );
 
         // The produced segment must carry AAC audio and h264 video.
-        let seg = crate::discover(&out.path().join("segment00000.ts"), Duration::from_secs(30))
-            .unwrap();
-        assert_eq!(seg.video.len(), 1, "video missing from transcoded segment: {seg:?}");
+        let seg =
+            crate::discover(&out.path().join("segment00000.ts"), Duration::from_secs(30)).unwrap();
+        assert_eq!(
+            seg.video.len(),
+            1,
+            "video missing from transcoded segment: {seg:?}"
+        );
         assert_eq!(seg.video[0].codec, "h264");
-        assert_eq!(seg.audio.len(), 1, "audio missing from transcoded segment: {seg:?}");
-        assert_eq!(seg.audio[0].codec, "aac", "audio not transcoded to AAC: {seg:?}");
+        assert_eq!(
+            seg.audio.len(),
+            1,
+            "audio missing from transcoded segment: {seg:?}"
+        );
+        assert_eq!(
+            seg.audio[0].codec, "aac",
+            "audio not transcoded to AAC: {seg:?}"
+        );
     }
 
     /// M3: video no browser decodes (MPEG-4 Part 2) is transcoded to
@@ -2811,21 +3111,42 @@ mod tests {
 
         let info = crate::discover(&src_path, Duration::from_secs(30)).unwrap();
         let plan = plan_streams(&info, &WEB_TARGET, 0, 0);
-        assert_eq!(plan.video, StreamMode::Encode, "mpeg4 should plan as Encode: {info:?}");
+        assert_eq!(
+            plan.video,
+            StreamMode::Encode,
+            "mpeg4 should plan as Encode: {info:?}"
+        );
         assert_eq!(plan.audio, StreamMode::Copy, "aac should copy: {info:?}");
 
         let out = tempfile::tempdir().unwrap();
-        let job = start(out.path(), plan, Box::new(FileSource::open(&src_path).unwrap())).unwrap();
+        let job = start(
+            out.path(),
+            plan,
+            Box::new(FileSource::open(&src_path).unwrap()),
+        )
+        .unwrap();
         let deadline = Instant::now() + Duration::from_secs(60);
         while !job.finished() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(50));
         }
         assert!(job.finished(), "video transcode did not finish");
-        assert!(job.failed().is_none(), "video transcode failed: {:?}", job.failed());
+        assert!(
+            job.failed().is_none(),
+            "video transcode failed: {:?}",
+            job.failed()
+        );
         let seg =
             crate::discover(&out.path().join("segment00000.ts"), Duration::from_secs(30)).unwrap();
-        assert_eq!(seg.video.first().map(|v| v.codec.as_str()), Some("h264"), "{seg:?}");
-        assert_eq!(seg.audio.first().map(|a| a.codec.as_str()), Some("aac"), "{seg:?}");
+        assert_eq!(
+            seg.video.first().map(|v| v.codec.as_str()),
+            Some("h264"),
+            "{seg:?}"
+        );
+        assert_eq!(
+            seg.audio.first().map(|a| a.codec.as_str()),
+            Some("aac"),
+            "{seg:?}"
+        );
     }
 
     /// §6 seek story: starting at an offset produces only the tail.
@@ -2849,7 +3170,11 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
         }
         assert!(job.finished(), "offset remux did not finish");
-        assert!(job.failed().is_none(), "offset remux failed: {:?}", job.failed());
+        assert!(
+            job.failed().is_none(),
+            "offset remux failed: {:?}",
+            job.failed()
+        );
         let playlist = std::fs::read_to_string(out.path().join("master.m3u8")).unwrap();
         assert!(playlist.contains("#EXT-X-ENDLIST"));
         let total: f64 = playlist
@@ -2881,18 +3206,31 @@ mod tests {
 
         let info = crate::discover(&src_path, Duration::from_secs(30)).unwrap();
         let plan = plan_streams(&info, &WEB_TARGET, 0, 0);
-        assert_eq!(plan.audio, StreamMode::Encode, "flac should plan Encode: {info:?}");
+        assert_eq!(
+            plan.audio,
+            StreamMode::Encode,
+            "flac should plan Encode: {info:?}"
+        );
 
         let out = tempfile::tempdir().unwrap();
         // The flac fixture is ~5 s; start at 2.5 s → expect a ~2.5 s tail.
-        let job = start_at(out.path(), plan, Box::new(FileSource::open(&src_path).unwrap()), 2_500)
-            .unwrap();
+        let job = start_at(
+            out.path(),
+            plan,
+            Box::new(FileSource::open(&src_path).unwrap()),
+            2_500,
+        )
+        .unwrap();
         let deadline = Instant::now() + Duration::from_secs(60);
         while !job.finished() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(50));
         }
         assert!(job.finished(), "offset encode remux did not finish");
-        assert!(job.failed().is_none(), "offset encode remux failed: {:?}", job.failed());
+        assert!(
+            job.failed().is_none(),
+            "offset encode remux failed: {:?}",
+            job.failed()
+        );
         let playlist = std::fs::read_to_string(out.path().join("master.m3u8")).unwrap();
         let total: f64 = playlist
             .lines()
@@ -2932,14 +3270,23 @@ mod tests {
         };
         let _ = info;
         let out = tempfile::tempdir().unwrap();
-        let job =
-            start_at(out.path(), plan, Box::new(FileSource::open(&src_path).unwrap()), 0).unwrap();
+        let job = start_at(
+            out.path(),
+            plan,
+            Box::new(FileSource::open(&src_path).unwrap()),
+            0,
+        )
+        .unwrap();
         let deadline = Instant::now() + Duration::from_secs(60);
         while !job.finished() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(50));
         }
         assert!(job.finished(), "param encode did not finish");
-        assert!(job.failed().is_none(), "param encode failed: {:?}", job.failed());
+        assert!(
+            job.failed().is_none(),
+            "param encode failed: {:?}",
+            job.failed()
+        );
 
         // Probe the first produced segment: the ceiling and downmix are
         // facts about the OUTPUT, not the plan.
@@ -2954,7 +3301,10 @@ mod tests {
             "height {} exceeds the ceiling",
             seg_info.video[0].height
         );
-        assert_eq!(seg_info.audio[0].channels, 1, "downmix to mono did not happen");
+        assert_eq!(
+            seg_info.audio[0].channels, 1,
+            "downmix to mono did not happen"
+        );
     }
 
     /// HUB-32b burn-in end to end: a PGS source encoded with
@@ -2969,8 +3319,13 @@ mod tests {
     #[ignore]
     fn burn_in_from_env() {
         crate::init().unwrap();
-        let Ok(src) = std::env::var("BURN_SRC") else { return };
-        let at: u64 = std::env::var("BURN_AT_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        let Ok(src) = std::env::var("BURN_SRC") else {
+            return;
+        };
+        let at: u64 = std::env::var("BURN_AT_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
         let plan = RemuxPlan {
             video: StreamMode::Encode,
             audio: StreamMode::Off,
@@ -2994,7 +3349,11 @@ mod tests {
         while !job.finished() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(100));
         }
-        assert!(job.failed().is_none(), "burn-in run failed: {:?}", job.failed());
+        assert!(
+            job.failed().is_none(),
+            "burn-in run failed: {:?}",
+            job.failed()
+        );
         let seg = std::fs::read_dir(out.path())
             .unwrap()
             .filter_map(|e| e.ok().map(|e| e.path()))
@@ -3041,14 +3400,23 @@ mod tests {
             burn_subtitle: None,
         };
         let out = tempfile::tempdir().unwrap();
-        let job =
-            start_at(out.path(), plan, Box::new(FileSource::open(&src_path).unwrap()), 0).unwrap();
+        let job = start_at(
+            out.path(),
+            plan,
+            Box::new(FileSource::open(&src_path).unwrap()),
+            0,
+        )
+        .unwrap();
         let deadline = Instant::now() + Duration::from_secs(60);
         while !job.finished() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(50));
         }
         assert!(job.finished(), "downmix encode did not finish");
-        assert!(job.failed().is_none(), "downmix encode failed: {:?}", job.failed());
+        assert!(
+            job.failed().is_none(),
+            "downmix encode failed: {:?}",
+            job.failed()
+        );
         let seg = std::fs::read_dir(out.path())
             .unwrap()
             .filter_map(|e| e.ok().map(|e| e.path()))
@@ -3083,7 +3451,8 @@ mod tests {
         }
         assert!(n >= 6, "7.1 collapsed to {n} channels");
         // The client's ceiling still bounds the choice (HUB-15).
-        let (capped, _) = aac_input_layout(enc, 8, 0xc3f, Some(2)).expect("no layout under ceiling");
+        let (capped, _) =
+            aac_input_layout(enc, 8, 0xc3f, Some(2)).expect("no layout under ceiling");
         assert_eq!(capped, 2, "stereo ceiling ignored");
     }
 
@@ -3120,14 +3489,23 @@ mod tests {
             burn_subtitle: None,
         };
         let out = tempfile::tempdir().unwrap();
-        let job =
-            start_at(out.path(), plan, Box::new(FileSource::open(&src_path).unwrap()), 0).unwrap();
+        let job = start_at(
+            out.path(),
+            plan,
+            Box::new(FileSource::open(&src_path).unwrap()),
+            0,
+        )
+        .unwrap();
         let deadline = Instant::now() + Duration::from_secs(60);
         while !job.finished() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(50));
         }
         assert!(job.finished(), "unbounded encode did not finish");
-        assert!(job.failed().is_none(), "unbounded encode failed: {:?}", job.failed());
+        assert!(
+            job.failed().is_none(),
+            "unbounded encode failed: {:?}",
+            job.failed()
+        );
         let seg = std::fs::read_dir(out.path())
             .unwrap()
             .filter_map(|e| e.ok().map(|e| e.path()))
@@ -3169,7 +3547,11 @@ mod tests {
         let src_path = dir.path().join("in.mkv");
         crate::testutil::render_pq_hevc_mkv(&src_path);
         let info = crate::discover(&src_path, Duration::from_secs(30)).unwrap();
-        assert_eq!(info.video[0].hdr.as_deref(), Some("hdr10"), "fixture must probe hdr10");
+        assert_eq!(
+            info.video[0].hdr.as_deref(),
+            Some("hdr10"),
+            "fixture must probe hdr10"
+        );
 
         let plan = RemuxPlan {
             video: StreamMode::Encode,
@@ -3183,14 +3565,23 @@ mod tests {
             burn_subtitle: None,
         };
         let out = tempfile::tempdir().unwrap();
-        let job =
-            start_at(out.path(), plan, Box::new(FileSource::open(&src_path).unwrap()), 0).unwrap();
+        let job = start_at(
+            out.path(),
+            plan,
+            Box::new(FileSource::open(&src_path).unwrap()),
+            0,
+        )
+        .unwrap();
         let deadline = Instant::now() + Duration::from_secs(60);
         while !job.finished() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(50));
         }
         assert!(job.finished(), "tone-map encode did not finish");
-        assert!(job.failed().is_none(), "tone-map encode failed: {:?}", job.failed());
+        assert!(
+            job.failed().is_none(),
+            "tone-map encode failed: {:?}",
+            job.failed()
+        );
         let seg = std::fs::read_dir(out.path())
             .unwrap()
             .filter_map(|e| e.ok().map(|e| e.path()))
@@ -3231,7 +3622,12 @@ mod tests {
         crate::testutil::render_h264_aac_mkv(&src_path);
 
         let out = tempfile::tempdir().unwrap();
-        let job = start(out.path(), COPY_AV, Box::new(FileSource::open(&src_path).unwrap())).unwrap();
+        let job = start(
+            out.path(),
+            COPY_AV,
+            Box::new(FileSource::open(&src_path).unwrap()),
+        )
+        .unwrap();
 
         let deadline = Instant::now() + Duration::from_secs(30);
         while !job.finished() && Instant::now() < deadline {
@@ -3241,8 +3637,14 @@ mod tests {
         assert!(job.failed().is_none(), "remux failed: {:?}", job.failed());
 
         let playlist = std::fs::read_to_string(out.path().join("master.m3u8")).unwrap();
-        assert!(playlist.contains("segment00000.ts"), "playlist:\n{playlist}");
-        assert!(playlist.contains("#EXT-X-ENDLIST"), "playlist not finalized");
+        assert!(
+            playlist.contains("segment00000.ts"),
+            "playlist:\n{playlist}"
+        );
+        assert!(
+            playlist.contains("#EXT-X-ENDLIST"),
+            "playlist not finalized"
+        );
         if gst::ElementFactory::find("hlssink3").is_some() {
             assert!(
                 playlist.contains("#EXT-X-PLAYLIST-TYPE:EVENT"),
@@ -3251,11 +3653,8 @@ mod tests {
         }
 
         // The segment still carries h264 — remux, not transcode.
-        let info = crate::discover(
-            &out.path().join("segment00000.ts"),
-            Duration::from_secs(15),
-        )
-        .unwrap();
+        let info =
+            crate::discover(&out.path().join("segment00000.ts"), Duration::from_secs(15)).unwrap();
         assert_eq!(info.container.as_deref(), Some("mpegts"));
         assert_eq!(info.video.len(), 1);
         assert_eq!(info.video[0].codec, "h264");
@@ -3278,16 +3677,34 @@ mod tests {
             // DTS (N/A); with B-frames the muxer can also emit them out of
             // decode order. Either makes hls.js reject the segment
             // (`bufferAppendError`) while mpv tolerates it.
-            assert_eq!(missing, 0, "{}: {missing} video packets with no DTS", seg.display());
-            assert_eq!(non_mono, 0, "{}: {non_mono} non-monotonic video DTS", seg.display());
+            assert_eq!(
+                missing,
+                0,
+                "{}: {missing} video packets with no DTS",
+                seg.display()
+            );
+            assert_eq!(
+                non_mono,
+                0,
+                "{}: {non_mono} non-monotonic video DTS",
+                seg.display()
+            );
         }
     }
 
     /// Ffprobe a segment's video packets; return `(missing_dts, non_monotonic)`.
     fn video_dts_defects(seg: &std::path::Path) -> (usize, usize) {
         let out = std::process::Command::new("ffprobe")
-            .args(["-v", "error", "-select_streams", "v", "-show_entries",
-                   "packet=dts", "-of", "csv=p=0"])
+            .args([
+                "-v",
+                "error",
+                "-select_streams",
+                "v",
+                "-show_entries",
+                "packet=dts",
+                "-of",
+                "csv=p=0",
+            ])
             .arg(seg)
             .output()
             .expect("ffprobe required for the remux DTS test");

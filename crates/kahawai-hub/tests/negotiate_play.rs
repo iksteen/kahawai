@@ -37,18 +37,27 @@ fn test_router(
         auth,
         sessions,
         enrollments,
-        Arc::new(kahawai_hub::subtitles::Subtitles::new(tempfile::tempdir().unwrap().keep())),
+        Arc::new(kahawai_hub::subtitles::Subtitles::new(
+            tempfile::tempdir().unwrap().keep(),
+        )),
         Arc::new(kahawai_hub::artwork::Artwork::new(
             tempfile::tempdir().unwrap().keep(),
-            Arc::new(kahawai_hub::enrich::Enricher::new(tempfile::tempdir().unwrap().keep())),
+            Arc::new(kahawai_hub::enrich::Enricher::new(
+                tempfile::tempdir().unwrap().keep(),
+            )),
         )),
-        Arc::new(kahawai_hub::enrich::Enricher::new(tempfile::tempdir().unwrap().keep())),
+        Arc::new(kahawai_hub::enrich::Enricher::new(
+            tempfile::tempdir().unwrap().keep(),
+        )),
         kahawai_hub::api::NetOptions::default(),
     )
 }
 
 async fn body_bytes(resp: axum::response::Response) -> Vec<u8> {
-    axum::body::to_bytes(resp.into_body(), 64 << 20).await.unwrap().to_vec()
+    axum::body::to_bytes(resp.into_body(), 64 << 20)
+        .await
+        .unwrap()
+        .to_vec()
 }
 
 #[tokio::test]
@@ -73,7 +82,9 @@ async fn negotiation_picks_cheapest_source_and_honors_caps() {
     };
     let (mp4_facts, mkv_facts) = {
         let (mp4, mkv) = (mp4.clone(), mkv.clone());
-        tokio::task::spawn_blocking(move || (file_facts(&mp4), file_facts(&mkv))).await.unwrap()
+        tokio::task::spawn_blocking(move || (file_facts(&mp4), file_facts(&mkv)))
+            .await
+            .unwrap()
     };
     let collections = vec![CollectionConfig {
         name: "movies".into(),
@@ -95,15 +106,20 @@ async fn negotiation_picks_cheapest_source_and_honors_caps() {
     .unwrap();
     let db = kahawai_hub::db::open_in_memory().await.unwrap();
     let registry = Arc::new(Registry::new(db.clone(), allowed.clone()));
-    let sessions =
-        Arc::new(kahawai_hub::sessions::Sessions::new(tempfile::tempdir().unwrap().keep()));
+    let sessions = Arc::new(kahawai_hub::sessions::Sessions::new(
+        tempfile::tempdir().unwrap().keep(),
+    ));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let hub_addr = format!("localhost:{}", listener.local_addr().unwrap().port());
     let link_svc = MediahostLinkService::new(
         registry.clone(),
         sessions.clone(),
-        Arc::new(kahawai_hub::subtitles::Subtitles::new(tempfile::tempdir().unwrap().keep())),
-        Arc::new(kahawai_hub::enrich::Enricher::new(tempfile::tempdir().unwrap().keep())),
+        Arc::new(kahawai_hub::subtitles::Subtitles::new(
+            tempfile::tempdir().unwrap().keep(),
+        )),
+        Arc::new(kahawai_hub::enrich::Enricher::new(
+            tempfile::tempdir().unwrap().keep(),
+        )),
     );
     tokio::spawn(async move {
         tonic::transport::Server::builder()
@@ -122,7 +138,9 @@ async fn negotiation_picks_cheapest_source_and_honors_caps() {
         ca_pem: ca.ca_cert_pem().to_string(),
     };
     let client_tls = kahawai_transport::mtls::mtls_client_config(&id).unwrap();
-    let channel = kahawai_transport::tls::grpc_channel_with(&hub_addr, client_tls).await.unwrap();
+    let channel = kahawai_transport::tls::grpc_channel_with(&hub_addr, client_tls)
+        .await
+        .unwrap();
     let mut client = pb::mediahost_link_client::MediahostLinkClient::new(channel.clone());
     let (tx, rx) = tokio::sync::mpsc::channel(8);
     tx.send(pb::HostToHub {
@@ -134,8 +152,11 @@ async fn negotiation_picks_cheapest_source_and_honors_caps() {
     })
     .await
     .unwrap();
-    let mut inbound =
-        client.link(tokio_stream::wrappers::ReceiverStream::new(rx)).await.unwrap().into_inner();
+    let mut inbound = client
+        .link(tokio_stream::wrappers::ReceiverStream::new(rx))
+        .await
+        .unwrap()
+        .into_inner();
     inbound.message().await.unwrap().unwrap(); // HelloAck
     for msg in [
         pb::host_to_hub::Msg::AnnounceCollection(pb::AnnounceCollection {
@@ -175,14 +196,24 @@ async fn negotiation_picks_cheapest_source_and_honors_caps() {
             if let Some(pb::hub_to_host::Msg::OpenRead(req)) = m.msg {
                 let path = kahawai_mediahost::serve::resolve_path(&collections, &req);
                 let ch = serve_channel.clone();
-                tokio::spawn(kahawai_mediahost::serve::serve_lease(ch, req.lease_token, path));
+                tokio::spawn(kahawai_mediahost::serve::serve_lease(
+                    ch,
+                    req.lease_token,
+                    path,
+                ));
             }
         }
     });
 
-    let auth = Arc::new(kahawai_hub::auth::Auth::new(db.clone(), pki.path()).await.unwrap());
-    let pair =
-        auth.complete_setup(&auth.setup_token().unwrap(), "admin", "password-123").await.unwrap();
+    let auth = Arc::new(
+        kahawai_hub::auth::Auth::new(db.clone(), pki.path())
+            .await
+            .unwrap(),
+    );
+    let pair = auth
+        .complete_setup(&auth.setup_token().unwrap(), "admin", "password-123")
+        .await
+        .unwrap();
     let bearer = format!("Bearer {}", pair.access_token);
     let api = test_router(registry.clone(), auth, sessions.clone());
 
@@ -251,7 +282,10 @@ async fn negotiation_picks_cheapest_source_and_honors_caps() {
     let (status, v) = start(serde_json::json!({ "item_id": item_id })).await;
     assert_eq!(status, StatusCode::CREATED, "{v}");
     assert_eq!(v["mode"], "direct", "cheapest source must win: {v}");
-    assert_eq!(v["content_type"], "video/mp4", "the mp4 source was the direct one");
+    assert_eq!(
+        v["content_type"], "video/mp4",
+        "the mp4 source was the direct one"
+    );
     end(&v).await;
 
     // 2. A profile that also demuxes matroska: the MKV direct-plays too,
@@ -282,7 +316,13 @@ async fn negotiation_picks_cheapest_source_and_honors_caps() {
     assert_eq!(status, StatusCode::CREATED, "{v}");
     assert_eq!(v["mode"], "remux", "cap must forbid direct: {v}");
     let video_verdict = v["streams"]["video"].as_str().unwrap();
-    assert!(video_verdict.contains("bandwidth cap"), "verdict: {video_verdict}");
-    assert!(v["streams"]["subtitles"].is_array(), "negotiated sessions carry sub verdicts");
+    assert!(
+        video_verdict.contains("bandwidth cap"),
+        "verdict: {video_verdict}"
+    );
+    assert!(
+        v["streams"]["subtitles"].is_array(),
+        "negotiated sessions carry sub verdicts"
+    );
     end(&v).await;
 }

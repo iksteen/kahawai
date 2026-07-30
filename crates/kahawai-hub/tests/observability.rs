@@ -19,10 +19,14 @@ const SCRAPE_TOKEN: &str = "scrape-me-8f2c";
 async fn harness() -> (axum::Router, String) {
     let dir = tempfile::tempdir().unwrap();
     let db = kahawai_hub::db::open(dir.path()).await.unwrap();
-    let registry = Arc::new(kahawai_hub::registry::Registry::new(db.clone(), Default::default()));
+    let registry = Arc::new(kahawai_hub::registry::Registry::new(
+        db.clone(),
+        Default::default(),
+    ));
     let auth = Arc::new(kahawai_hub::auth::Auth::new(db, dir.path()).await.unwrap());
-    let sessions =
-        Arc::new(kahawai_hub::sessions::Sessions::new(tempfile::tempdir().unwrap().keep()));
+    let sessions = Arc::new(kahawai_hub::sessions::Sessions::new(
+        tempfile::tempdir().unwrap().keep(),
+    ));
     let ca = Arc::new(
         kahawai_hub::pki::HubCa::load_or_create(tempfile::tempdir().unwrap().keep().as_path())
             .unwrap(),
@@ -39,7 +43,9 @@ async fn harness() -> (axum::Router, String) {
         auth.clone(),
         sessions,
         enrollments,
-        Arc::new(kahawai_hub::subtitles::Subtitles::new(tempfile::tempdir().unwrap().keep())),
+        Arc::new(kahawai_hub::subtitles::Subtitles::new(
+            tempfile::tempdir().unwrap().keep(),
+        )),
         Arc::new(kahawai_hub::artwork::Artwork::new(
             tempfile::tempdir().unwrap().keep(),
             enricher.clone(),
@@ -51,11 +57,7 @@ async fn harness() -> (axum::Router, String) {
         },
     );
     let token = auth
-        .complete_setup(
-            &auth.setup_token().unwrap(),
-            "admin",
-            "hunter22222hunter",
-        )
+        .complete_setup(&auth.setup_token().unwrap(), "admin", "hunter22222hunter")
         .await
         .unwrap();
     std::mem::forget(dir); // the router holds paths under it
@@ -63,7 +65,9 @@ async fn harness() -> (axum::Router, String) {
 }
 
 async fn body_text(resp: axum::response::Response) -> String {
-    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .unwrap();
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
@@ -80,7 +84,10 @@ async fn health_answers_without_a_credential_and_metrics_does_not() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let v: serde_json::Value = serde_json::from_str(&body_text(resp).await).unwrap();
-    assert_eq!(v["status"], "ok", "a hub with no satellites is not unhealthy");
+    assert_eq!(
+        v["status"], "ok",
+        "a hub with no satellites is not unhealthy"
+    );
     assert!(v["version"].is_string());
 
     // Metrics need their OWN static token: an access token lives 15
@@ -104,7 +111,11 @@ async fn health_answers_without_a_credential_and_metrics_does_not() {
         )
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "a login token must not scrape");
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "a login token must not scrape"
+    );
 
     let resp = api
         .clone()
@@ -127,10 +138,19 @@ async fn health_answers_without_a_credential_and_metrics_does_not() {
         "kahawai_files",
         "kahawai_items_unmatched",
     ] {
-        assert!(text.contains(&format!("# TYPE {name} ")), "{name} has no TYPE line");
-        assert!(text.contains(&format!("# HELP {name} ")), "{name} has no HELP line");
+        assert!(
+            text.contains(&format!("# TYPE {name} ")),
+            "{name} has no TYPE line"
+        );
+        assert!(
+            text.contains(&format!("# HELP {name} ")),
+            "{name} has no HELP line"
+        );
     }
-    for line in text.lines().filter(|l| !l.starts_with('#') && !l.is_empty()) {
+    for line in text
+        .lines()
+        .filter(|l| !l.starts_with('#') && !l.is_empty())
+    {
         assert!(
             line.rsplit(' ').next().unwrap().parse::<f64>().is_ok(),
             "not a number: {line}"
@@ -147,10 +167,14 @@ async fn health_answers_without_a_credential_and_metrics_does_not() {
 async fn metrics_are_not_served_when_no_token_is_configured() {
     let dir = tempfile::tempdir().unwrap();
     let db = kahawai_hub::db::open(dir.path()).await.unwrap();
-    let registry = Arc::new(kahawai_hub::registry::Registry::new(db.clone(), Default::default()));
+    let registry = Arc::new(kahawai_hub::registry::Registry::new(
+        db.clone(),
+        Default::default(),
+    ));
     let auth = Arc::new(kahawai_hub::auth::Auth::new(db, dir.path()).await.unwrap());
-    let sessions =
-        Arc::new(kahawai_hub::sessions::Sessions::new(tempfile::tempdir().unwrap().keep()));
+    let sessions = Arc::new(kahawai_hub::sessions::Sessions::new(
+        tempfile::tempdir().unwrap().keep(),
+    ));
     let ca = Arc::new(
         kahawai_hub::pki::HubCa::load_or_create(tempfile::tempdir().unwrap().keep().as_path())
             .unwrap(),
@@ -167,7 +191,9 @@ async fn metrics_are_not_served_when_no_token_is_configured() {
         auth,
         sessions,
         enrollments,
-        Arc::new(kahawai_hub::subtitles::Subtitles::new(tempfile::tempdir().unwrap().keep())),
+        Arc::new(kahawai_hub::subtitles::Subtitles::new(
+            tempfile::tempdir().unwrap().keep(),
+        )),
         Arc::new(kahawai_hub::artwork::Artwork::new(
             tempfile::tempdir().unwrap().keep(),
             enricher.clone(),
@@ -183,7 +209,11 @@ async fn metrics_are_not_served_when_no_token_is_configured() {
         if let Some(h) = header {
             req = req.header("authorization", h);
         }
-        let resp = api.clone().oneshot(req.body(Body::empty()).unwrap()).await.unwrap();
+        let resp = api
+            .clone()
+            .oneshot(req.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND, "header {header:?}");
     }
 

@@ -16,7 +16,10 @@ use kahawai_transport::identity::SatelliteIdentity;
 use tower::ServiceExt;
 
 async fn body_bytes(resp: axum::response::Response) -> Vec<u8> {
-    axum::body::to_bytes(resp.into_body(), 64 << 20).await.unwrap().to_vec()
+    axum::body::to_bytes(resp.into_body(), 64 << 20)
+        .await
+        .unwrap()
+        .to_vec()
 }
 
 #[tokio::test]
@@ -56,8 +59,9 @@ async fn remux_to_hls_end_to_end() {
     .unwrap();
     let db = kahawai_hub::db::open_in_memory().await.unwrap();
     let registry = Arc::new(Registry::new(db.clone(), allowed.clone()));
-    let sessions =
-        Arc::new(kahawai_hub::sessions::Sessions::new(tempfile::tempdir().unwrap().keep()));
+    let sessions = Arc::new(kahawai_hub::sessions::Sessions::new(
+        tempfile::tempdir().unwrap().keep(),
+    ));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let hub_addr = format!("localhost:{}", listener.local_addr().unwrap().port());
     let link_svc = MediahostLinkService::new(
@@ -89,16 +93,16 @@ async fn remux_to_hls_end_to_end() {
         ca_pem: ca.ca_cert_pem().to_string(),
     };
     let client_tls = kahawai_transport::mtls::mtls_client_config(&id).unwrap();
-    let channel = kahawai_transport::tls::grpc_channel_with(&hub_addr, client_tls).await.unwrap();
+    let channel = kahawai_transport::tls::grpc_channel_with(&hub_addr, client_tls)
+        .await
+        .unwrap();
     let mut client = pb::mediahost_link_client::MediahostLinkClient::new(channel.clone());
     let (tx, rx) = tokio::sync::mpsc::channel(8);
-    for msg in [
-        pb::host_to_hub::Msg::Hello(pb::Hello {
-            protocol_major: kahawai_proto::PROTOCOL_MAJOR,
-            protocol_minor: kahawai_proto::PROTOCOL_MINOR,
-            name: "nas".into(),
-        }),
-    ] {
+    for msg in [pb::host_to_hub::Msg::Hello(pb::Hello {
+        protocol_major: kahawai_proto::PROTOCOL_MAJOR,
+        protocol_minor: kahawai_proto::PROTOCOL_MINOR,
+        name: "nas".into(),
+    })] {
         tx.send(pb::HostToHub { msg: Some(msg) }).await.unwrap();
     }
     let mut inbound = client
@@ -134,13 +138,21 @@ async fn remux_to_hls_end_to_end() {
             if let Some(pb::hub_to_host::Msg::OpenRead(req)) = m.msg {
                 let path = kahawai_mediahost::serve::resolve_path(&collections, &req);
                 let ch = serve_channel.clone();
-                tokio::spawn(kahawai_mediahost::serve::serve_lease(ch, req.lease_token, path));
+                tokio::spawn(kahawai_mediahost::serve::serve_lease(
+                    ch,
+                    req.lease_token,
+                    path,
+                ));
             }
         }
     });
 
     // API with auth.
-    let auth = Arc::new(kahawai_hub::auth::Auth::new(db.clone(), pki.path()).await.unwrap());
+    let auth = Arc::new(
+        kahawai_hub::auth::Auth::new(db.clone(), pki.path())
+            .await
+            .unwrap(),
+    );
     let pair = auth
         .complete_setup(&auth.setup_token().unwrap(), "admin", "password-123")
         .await
@@ -157,7 +169,11 @@ async fn remux_to_hls_end_to_end() {
     // Wait for item, then start a REMUX session.
     let item_id = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
-            let resp = api.clone().oneshot(get("/api/v1/items".into())).await.unwrap();
+            let resp = api
+                .clone()
+                .oneshot(get("/api/v1/items".into()))
+                .await
+                .unwrap();
             let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
             if let Some(id) = v["items"].get(0).and_then(|i| i["id"].as_str()) {
                 return id.to_string();
@@ -203,12 +219,17 @@ async fn remux_to_hls_end_to_end() {
     })
     .await
     .expect("playlist never finalized");
-    assert!(playlist.contains("segment00000.ts"), "playlist:\n{playlist}");
+    assert!(
+        playlist.contains("segment00000.ts"),
+        "playlist:\n{playlist}"
+    );
 
     // Fetch the first segment: real TS bytes.
     let resp = api
         .clone()
-        .oneshot(get(format!("/api/v1/playback/sessions/{session_id}/segment00000.ts")))
+        .oneshot(get(format!(
+            "/api/v1/playback/sessions/{session_id}/segment00000.ts"
+        )))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -220,7 +241,9 @@ async fn remux_to_hls_end_to_end() {
     // Traversal and junk names are rejected.
     let resp = api
         .clone()
-        .oneshot(get(format!("/api/v1/playback/sessions/{session_id}/..%2Fescape.ts")))
+        .oneshot(get(format!(
+            "/api/v1/playback/sessions/{session_id}/..%2Fescape.ts"
+        )))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
@@ -255,7 +278,9 @@ async fn remux_to_hls_end_to_end() {
         loop {
             let resp = api
                 .clone()
-                .oneshot(get(format!("/api/v1/playback/sessions/{session_id}/master.m3u8")))
+                .oneshot(get(format!(
+                    "/api/v1/playback/sessions/{session_id}/master.m3u8"
+                )))
                 .await
                 .unwrap();
             if resp.status() == StatusCode::OK {
@@ -311,5 +336,23 @@ fn test_router(
         std::time::Duration::from_secs(900),
         90,
     ));
-    kahawai_hub::api::router(registry, auth, sessions, enrollments, Arc::new(kahawai_hub::subtitles::Subtitles::new(tempfile::tempdir().unwrap().keep())), Arc::new(kahawai_hub::artwork::Artwork::new(tempfile::tempdir().unwrap().keep(), Arc::new(kahawai_hub::enrich::Enricher::new(tempfile::tempdir().unwrap().keep())))), Arc::new(kahawai_hub::enrich::Enricher::new(tempfile::tempdir().unwrap().keep())), kahawai_hub::api::NetOptions::default())
+    kahawai_hub::api::router(
+        registry,
+        auth,
+        sessions,
+        enrollments,
+        Arc::new(kahawai_hub::subtitles::Subtitles::new(
+            tempfile::tempdir().unwrap().keep(),
+        )),
+        Arc::new(kahawai_hub::artwork::Artwork::new(
+            tempfile::tempdir().unwrap().keep(),
+            Arc::new(kahawai_hub::enrich::Enricher::new(
+                tempfile::tempdir().unwrap().keep(),
+            )),
+        )),
+        Arc::new(kahawai_hub::enrich::Enricher::new(
+            tempfile::tempdir().unwrap().keep(),
+        )),
+        kahawai_hub::api::NetOptions::default(),
+    )
 }

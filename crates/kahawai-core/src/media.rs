@@ -140,7 +140,10 @@ impl Default for CapabilityProfile {
     fn default() -> Self {
         Self {
             containers: vec!["mp4".into(), "webm".into()],
-            video: vec![VideoCap { codec: "h264".into(), ..Default::default() }],
+            video: vec![VideoCap {
+                codec: "h264".into(),
+                ..Default::default()
+            }],
             audio: vec!["aac".into(), "mp3".into()],
             max_audio_channels: 0,
             max_height: None,

@@ -18,7 +18,11 @@ fn serve_file(listener: UnixListener, path: &Path) {
         let offset = u64::from_le_bytes(req[..8].try_into().unwrap()) as usize;
         let len = u64::from_le_bytes(req[8..].try_into().unwrap()) as usize;
         let end = (offset + len).min(data.len());
-        let chunk = if offset < data.len() { &data[offset..end] } else { &[][..] };
+        let chunk = if offset < data.len() {
+            &data[offset..end]
+        } else {
+            &[][..]
+        };
         if conn.write_all(&(chunk.len() as u64).to_le_bytes()).is_err() {
             break;
         }
@@ -76,14 +80,20 @@ fn worker_paces_against_viewer_position() {
         if let Some(s) = child.try_wait().unwrap() {
             break s;
         }
-        assert!(Instant::now() < deadline, "worker did not resume after viewer advanced");
+        assert!(
+            Instant::now() < deadline,
+            "worker did not resume after viewer advanced"
+        );
         std::thread::sleep(Duration::from_millis(100));
     };
     assert!(status.success(), "worker exited with {status}");
     server.join().unwrap();
     let playlist = std::fs::read_to_string(out.join("master.m3u8")).unwrap();
-    assert!(playlist.contains("#EXT-X-ENDLIST"), "not finalized:
-{playlist}");
+    assert!(
+        playlist.contains("#EXT-X-ENDLIST"),
+        "not finalized:
+{playlist}"
+    );
 }
 
 #[test]
@@ -122,6 +132,9 @@ fn worker_remuxes_over_socket() {
     server.join().unwrap();
 
     let playlist = std::fs::read_to_string(out.join("master.m3u8")).unwrap();
-    assert!(playlist.contains("#EXT-X-ENDLIST"), "playlist not finalized: {playlist}");
+    assert!(
+        playlist.contains("#EXT-X-ENDLIST"),
+        "playlist not finalized: {playlist}"
+    );
     assert!(out.join("segment00000.ts").exists());
 }

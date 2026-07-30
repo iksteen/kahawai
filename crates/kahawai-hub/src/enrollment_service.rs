@@ -8,8 +8,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use kahawai_proto::v1::enrollment_server::{Enrollment as EnrollmentRpc, EnrollmentServer};
 use kahawai_proto::v1::{
-    status_response, Approved as ApprovedMsg, Pending as PendingMsg, Rejected, StatusRequest,
-    StatusResponse, SubmitRequest, SubmitResponse,
+    Approved as ApprovedMsg, Pending as PendingMsg, Rejected, StatusRequest, StatusResponse,
+    SubmitRequest, SubmitResponse, status_response,
 };
 use tonic::{Request, Response, Status};
 
@@ -85,7 +85,12 @@ impl EnrollmentService {
             (summary, approved.pending, approved.signed.fingerprint)
         };
         self.registry
-            .record_satellite(&pending.module_id, &pending.module_type, &pending.name, &fingerprint)
+            .record_satellite(
+                &pending.module_id,
+                &pending.module_type,
+                &pending.name,
+                &fingerprint,
+            )
             .await?;
         Ok(summary)
     }
@@ -109,7 +114,10 @@ impl EnrollmentService {
 }
 
 fn unix_now() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
 }
 
 #[tonic::async_trait]
@@ -126,7 +134,9 @@ impl EnrollmentRpc for EnrollmentService {
                 ttl_seconds: self.ttl.as_secs(),
             })),
             Err(EnrollError::Duplicate) => Err(Status::already_exists("already pending")),
-            Err(EnrollError::Full) => Err(Status::resource_exhausted("too many pending enrollments")),
+            Err(EnrollError::Full) => {
+                Err(Status::resource_exhausted("too many pending enrollments"))
+            }
             Err(e) => Err(Status::invalid_argument(e.to_string())),
         }
     }
@@ -145,7 +155,12 @@ impl EnrollmentRpc for EnrollmentService {
                 cert_pem: cert_pem.clone(),
                 ca_cert_pem: self.ca.ca_cert_pem().to_string(),
             })
-        } else if inner.enrollments.list().iter().any(|p| p.csr_fingerprint == fp) {
+        } else if inner
+            .enrollments
+            .list()
+            .iter()
+            .any(|p| p.csr_fingerprint == fp)
+        {
             status_response::State::Pending(PendingMsg {})
         } else {
             // Deliberately vague (SEC-3: never hint how close anything was).
@@ -153,6 +168,9 @@ impl EnrollmentRpc for EnrollmentService {
                 reason: "unknown, expired, or rejected".into(),
             })
         };
-        Ok(Response::new(StatusResponse { state: Some(state), hub_unix_time: unix_now() }))
+        Ok(Response::new(StatusResponse {
+            state: Some(state),
+            hub_unix_time: unix_now(),
+        }))
     }
 }

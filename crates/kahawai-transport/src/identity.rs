@@ -63,8 +63,7 @@ pub fn store_renewal(state_dir: &Path, id: &SatelliteIdentity) -> Result<()> {
 }
 
 pub fn store(state_dir: &Path, id: &SatelliteIdentity) -> Result<()> {
-    fs::create_dir_all(state_dir)
-        .with_context(|| format!("creating {}", state_dir.display()))?;
+    fs::create_dir_all(state_dir).with_context(|| format!("creating {}", state_dir.display()))?;
     // A fresh enrollment supersedes any renewal overlay.
     let _ = fs::remove_file(state_dir.join(RENEWAL_FILE));
     fs::write(state_dir.join("module_id"), &id.module_id)?;

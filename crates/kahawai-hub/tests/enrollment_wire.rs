@@ -25,7 +25,9 @@ async fn spawn_hub(svc: EnrollmentService, ca: &HubCa) -> std::net::SocketAddr {
 }
 
 /// Bounded wait — a broken flow must fail the test, never hang it.
-async fn wait_for_pending(svc: &EnrollmentService) -> Vec<kahawai_hub::enrollment_service::PendingInfo> {
+async fn wait_for_pending(
+    svc: &EnrollmentService,
+) -> Vec<kahawai_hub::enrollment_service::PendingInfo> {
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let p = svc.pending();
@@ -71,10 +73,11 @@ async fn full_enrollment_flow() {
     let code = enrollment_code(&pending[0].csr_der);
     svc.approve(&code).await.unwrap();
     // Approval records the satellite row (SEC-4 bookkeeping).
-    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM satellites WHERE module_type = 'mediahost'")
-        .fetch_one(registry.db())
-        .await
-        .unwrap();
+    let n: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM satellites WHERE module_type = 'mediahost'")
+            .fetch_one(registry.db())
+            .await
+            .unwrap();
     assert_eq!(n, 1);
 
     let id = tokio::time::timeout(Duration::from_secs(15), satellite)
@@ -85,12 +88,17 @@ async fn full_enrollment_flow() {
     // Identity persisted: key stays local (0600), CA pinned.
     assert_eq!(id.ca_pem, ca.ca_cert_pem());
     assert!(id.cert_pem.contains("BEGIN CERTIFICATE"));
-    let reloaded = kahawai_transport::identity::load(state.path()).unwrap().unwrap();
+    let reloaded = kahawai_transport::identity::load(state.path())
+        .unwrap()
+        .unwrap();
     assert_eq!(reloaded.module_id, id.module_id);
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(state.path().join("sat.key")).unwrap().permissions().mode();
+        let mode = std::fs::metadata(state.path().join("sat.key"))
+            .unwrap()
+            .permissions()
+            .mode();
         assert_eq!(mode & 0o777, 0o600);
     }
 

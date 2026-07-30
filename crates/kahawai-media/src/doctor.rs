@@ -24,13 +24,28 @@ pub struct Check {
 
 impl Check {
     pub fn ok(name: impl Into<String>, detail: impl Into<String>) -> Self {
-        Self { name: name.into(), status: Status::Ok, detail: detail.into(), essential: false }
+        Self {
+            name: name.into(),
+            status: Status::Ok,
+            detail: detail.into(),
+            essential: false,
+        }
     }
     pub fn warn(name: impl Into<String>, detail: impl Into<String>) -> Self {
-        Self { name: name.into(), status: Status::Warn, detail: detail.into(), essential: false }
+        Self {
+            name: name.into(),
+            status: Status::Warn,
+            detail: detail.into(),
+            essential: false,
+        }
     }
     pub fn fail(name: impl Into<String>, detail: impl Into<String>, essential: bool) -> Self {
-        Self { name: name.into(), status: Status::Fail, detail: detail.into(), essential }
+        Self {
+            name: name.into(),
+            status: Status::Fail,
+            detail: detail.into(),
+            essential,
+        }
     }
 }
 
@@ -38,13 +53,55 @@ impl Check {
 /// recommend-preferred: if matched by a fallback, suggest installing the
 /// first-listed element)
 const MATRIX: &[(&str, &[&str], bool, &str, bool)] = &[
-    ("typefind", &["typefind"], true, "media discovery is impossible", false),
-    ("stream parsing", &["parsebin"], true, "discovery and remux are impossible", false),
-    ("demux mkv", &["matroskademux"], true, "MKV/WebM sources unusable", false),
-    ("demux mp4", &["qtdemux"], true, "MP4/MOV sources unusable", false),
-    ("parse h264", &["h264parse"], true, "H.264 streams cannot be handled", false),
-    ("parse hevc", &["h265parse"], false, "HEVC streams cannot be parsed", false),
-    ("hls sink", &["hlssink3", "hlssink2"], false, "in-hub HLS remux unavailable", true),
+    (
+        "typefind",
+        &["typefind"],
+        true,
+        "media discovery is impossible",
+        false,
+    ),
+    (
+        "stream parsing",
+        &["parsebin"],
+        true,
+        "discovery and remux are impossible",
+        false,
+    ),
+    (
+        "demux mkv",
+        &["matroskademux"],
+        true,
+        "MKV/WebM sources unusable",
+        false,
+    ),
+    (
+        "demux mp4",
+        &["qtdemux"],
+        true,
+        "MP4/MOV sources unusable",
+        false,
+    ),
+    (
+        "parse h264",
+        &["h264parse"],
+        true,
+        "H.264 streams cannot be handled",
+        false,
+    ),
+    (
+        "parse hevc",
+        &["h265parse"],
+        false,
+        "HEVC streams cannot be parsed",
+        false,
+    ),
+    (
+        "hls sink",
+        &["hlssink3", "hlssink2"],
+        false,
+        "in-hub HLS remux unavailable",
+        true,
+    ),
     (
         "h264 dts fix",
         &["h264timestamper"],
@@ -65,37 +122,58 @@ const MATRIX: &[(&str, &[&str], bool, &str, bool)] = &[
         false,
         "HLS uses TS segments only (install gst-plugins-rs for fMP4/CMAF)",
         false,
-     ),
+    ),
     (
         "decode h264",
         &["vah264dec", "nvh264dec", "avdec_h264", "openh264dec"],
         false,
         "H.264 sources cannot be transcoded (direct play only)",
         false,
-     ),
+    ),
     (
         "decode hevc",
         &["vah265dec", "nvh265dec", "avdec_h265"],
         false,
         "HEVC sources will always fail to transcode",
         false,
-     ),
+    ),
     (
         "encode h264",
-        &["vah264enc", "vaapih264enc", "nvh264enc", "qsvh264enc", "vtenc_h264_hw", "vtenc_h264", "x264enc", "openh264enc"],
+        &[
+            "vah264enc",
+            "vaapih264enc",
+            "nvh264enc",
+            "qsvh264enc",
+            "vtenc_h264_hw",
+            "vtenc_h264",
+            "x264enc",
+            "openh264enc",
+        ],
         false,
         "no video transcoding to H.264",
         false,
-     ),
+    ),
     (
         "encode aac",
         &["fdkaacenc", "avenc_aac", "voaacenc"],
         false,
         "no audio transcoding to AAC",
         false,
-     ),
-    ("decode aac", &["fdkaacdec", "avdec_aac"], false, "AAC audio cannot be transcoded", false),
-    ("decode ac3", &["a52dec", "avdec_ac3"], false, "AC-3 audio cannot be transcoded", false),
+    ),
+    (
+        "decode aac",
+        &["fdkaacdec", "avdec_aac"],
+        false,
+        "AAC audio cannot be transcoded",
+        false,
+    ),
+    (
+        "decode ac3",
+        &["a52dec", "avdec_ac3"],
+        false,
+        "AC-3 audio cannot be transcoded",
+        false,
+    ),
     (
         "decode eac3",
         &["avdec_eac3"],
@@ -103,7 +181,13 @@ const MATRIX: &[(&str, &[&str], bool, &str, bool)] = &[
         "E-AC-3 audio cannot be transcoded (silent in browsers) — install gst-libav",
         false,
     ),
-    ("decode dts", &["avdec_dca", "dcadec", "dtsdec"], false, "DTS audio cannot be transcoded", false),
+    (
+        "decode dts",
+        &["avdec_dca", "dcadec", "dtsdec"],
+        false,
+        "DTS audio cannot be transcoded",
+        false,
+    ),
     (
         "decode truehd",
         &["avdec_truehd"],
@@ -111,9 +195,27 @@ const MATRIX: &[(&str, &[&str], bool, &str, bool)] = &[
         "TrueHD audio cannot be transcoded — install gst-libav",
         false,
     ),
-    ("decode vorbis/opus", &["vorbisdec", "opusdec"], false, "ogg audio cannot be transcoded", false),
-    ("subtitle parse", &["subparse"], false, "text subtitle conversion unavailable", false),
-    ("ass burn-in", &["assrender"], false, "ASS burn-in unavailable (flatten only, HUB-32a)", false),
+    (
+        "decode vorbis/opus",
+        &["vorbisdec", "opusdec"],
+        false,
+        "ogg audio cannot be transcoded",
+        false,
+    ),
+    (
+        "subtitle parse",
+        &["subparse"],
+        false,
+        "text subtitle conversion unavailable",
+        false,
+    ),
+    (
+        "ass burn-in",
+        &["assrender"],
+        false,
+        "ASS burn-in unavailable (flatten only, HUB-32a)",
+        false,
+    ),
 ];
 
 /// GStreamer version + feature-matrix inventory. Reused by `doctor` and by
@@ -128,10 +230,16 @@ pub fn gstreamer_checks() -> Vec<Check> {
     out.push(Check::ok("gstreamer", format!("{maj}.{min}.{micro}")));
 
     for (name, elements, essential, cost, recommend) in MATRIX {
-        match elements.iter().find(|e| gst::ElementFactory::find(e).is_some()) {
+        match elements
+            .iter()
+            .find(|e| gst::ElementFactory::find(e).is_some())
+        {
             Some(found) if *recommend && *found != elements[0] => out.push(Check::ok(
                 *name,
-                format!("via {found} — {} preferred, consider installing it", elements[0]),
+                format!(
+                    "via {found} — {} preferred, consider installing it",
+                    elements[0]
+                ),
             )),
             Some(found) => out.push(Check::ok(*name, format!("via {found}"))),
             None if *essential => out.push(Check::fail(
@@ -202,8 +310,16 @@ pub fn gstreamer_checks() -> Vec<Check> {
     });
 
     for (row, verified, disabled) in [
-        ("encode aac", crate::remux::aac_encoder(), "audio transcode disabled"),
-        ("encode h264", crate::remux::h264_encoder(), "video transcode disabled"),
+        (
+            "encode aac",
+            crate::remux::aac_encoder(),
+            "audio transcode disabled",
+        ),
+        (
+            "encode h264",
+            crate::remux::h264_encoder(),
+            "video transcode disabled",
+        ),
     ] {
         if let Some(c) = out.iter_mut().find(|c| c.name == row)
             && c.status == Status::Ok
@@ -250,7 +366,9 @@ fn dts_hd_check() -> Check {
 
 /// True if any essential check failed.
 pub fn has_essential_failure(checks: &[Check]) -> bool {
-    checks.iter().any(|c| c.status == Status::Fail && c.essential)
+    checks
+        .iter()
+        .any(|c| c.status == Status::Fail && c.essential)
 }
 
 #[cfg(test)]
@@ -274,7 +392,10 @@ mod tests {
 
         // The DTS-HD row must answer for THIS box's effective ranks:
         // ok only when avdec_dca actually wins the autoplug.
-        let dts = checks.iter().find(|c| c.name == "dts-hd full decode").unwrap();
+        let dts = checks
+            .iter()
+            .find(|c| c.name == "dts-hd full decode")
+            .unwrap();
         let shadowed = ["dtsdec", "dcadec"].iter().any(|n| {
             gst::ElementFactory::find(n).is_some_and(|f| {
                 f.rank() > gst::Rank::NONE

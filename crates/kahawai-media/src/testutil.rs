@@ -78,6 +78,10 @@ pub fn render(launch: &str) {
             &[gst::MessageType::Eos, gst::MessageType::Error],
         )
         .expect("fixture pipeline stalled");
-    assert_eq!(msg.type_(), gst::MessageType::Eos, "fixture pipeline failed");
+    assert_eq!(
+        msg.type_(),
+        gst::MessageType::Eos,
+        "fixture pipeline failed"
+    );
     p.set_state(gst::State::Null).unwrap();
 }

@@ -4,8 +4,8 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::SqlitePool;
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 
 pub async fn open(data_dir: &Path) -> Result<SqlitePool> {
     std::fs::create_dir_all(data_dir)
@@ -195,10 +195,12 @@ pub async fn open_in_memory() -> Result<SqlitePool> {
 async fn install_derived(pool: &SqlitePool) -> Result<()> {
     // Safe by construction: the statement is generated from a fixed field
     // table in providers.rs, with no caller input anywhere in it.
-    sqlx::raw_sql(sqlx::AssertSqlSafe(crate::providers::resolved_metadata_sql()))
-        .execute(pool)
-        .await
-        .context("installing resolved_metadata")?;
+    sqlx::raw_sql(sqlx::AssertSqlSafe(
+        crate::providers::resolved_metadata_sql(),
+    ))
+    .execute(pool)
+    .await
+    .context("installing resolved_metadata")?;
 
     let want = crate::providers::repick_triggers();
     let have: Vec<(String, String)> = sqlx::query_as(
@@ -217,10 +219,12 @@ async fn install_derived(pool: &SqlitePool) -> Result<()> {
 
     let mut tx = pool.begin().await?;
     for (name, _) in have.iter().chain(want.iter()) {
-        sqlx::raw_sql(sqlx::AssertSqlSafe(format!("DROP TRIGGER IF EXISTS {name}")))
-            .execute(&mut *tx)
-            .await
-            .with_context(|| format!("dropping trigger {name}"))?;
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "DROP TRIGGER IF EXISTS {name}"
+        )))
+        .execute(&mut *tx)
+        .await
+        .with_context(|| format!("dropping trigger {name}"))?;
     }
     for (name, sql) in &want {
         sqlx::raw_sql(sqlx::AssertSqlSafe(sql.clone()))
@@ -229,8 +233,13 @@ async fn install_derived(pool: &SqlitePool) -> Result<()> {
             .with_context(|| format!("installing trigger {name}"))?;
     }
     // What the old definitions maintained is now of unknown provenance.
-    crate::providers::reassign(&mut tx, None, None).await.context("rebuilding item_match")?;
+    crate::providers::reassign(&mut tx, None, None)
+        .await
+        .context("rebuilding item_match")?;
     tx.commit().await?;
-    tracing::info!(triggers = want.len(), "assignment triggers installed; item_match rebuilt");
+    tracing::info!(
+        triggers = want.len(),
+        "assignment triggers installed; item_match rebuilt"
+    );
     Ok(())
 }

@@ -70,7 +70,11 @@ pub fn timeline(
     let Some(track) = crate::subindex::extract_image_track(src, sub_index, budget)? else {
         return Ok(None);
     };
-    Ok(Some(build(&track.codec, track.codec_private.as_deref(), &track.blocks)))
+    Ok(Some(build(
+        &track.codec,
+        track.codec_private.as_deref(),
+        &track.blocks,
+    )))
 }
 
 /// Decode raw display-set blocks into a timeline. Shared by both
@@ -146,11 +150,7 @@ fn build(
 /// (start_ms, duration_ms, codec payload).
 pub type SetBlock = (u64, Option<u64>, Vec<u8>);
 
-pub fn encode_sets(
-    codec: &str,
-    codec_private: Option<&[u8]>,
-    blocks: &[SetBlock],
-) -> Vec<u8> {
+pub fn encode_sets(codec: &str, codec_private: Option<&[u8]>, blocks: &[SetBlock]) -> Vec<u8> {
     let mut out = Vec::with_capacity(4096);
     out.extend_from_slice(b"KBS1");
     out.extend_from_slice(&(codec.len() as u16).to_le_bytes());
@@ -171,7 +171,9 @@ fn decode_sets(data: &[u8]) -> Result<(String, Option<Vec<u8>>, Vec<SetBlock>)> 
     let mut p = 0usize;
     fn take<'a>(data: &'a [u8], p: &mut usize, n: usize) -> Result<&'a [u8]> {
         let end = p.checked_add(n).filter(|e| *e <= data.len());
-        let Some(end) = end else { anyhow::bail!("display-set file truncated") };
+        let Some(end) = end else {
+            anyhow::bail!("display-set file truncated")
+        };
         let out = &data[*p..end];
         *p = end;
         Ok(out)
@@ -180,14 +182,19 @@ fn decode_sets(data: &[u8]) -> Result<(String, Option<Vec<u8>>, Vec<SetBlock>)> 
     let n = u16::from_le_bytes(take(data, &mut p, 2)?.try_into().unwrap()) as usize;
     let codec = String::from_utf8_lossy(take(data, &mut p, n)?).to_string();
     let n = u32::from_le_bytes(take(data, &mut p, 4)?.try_into().unwrap()) as usize;
-    let codec_private =
-        (n > 0).then(|| take(data, &mut p, n).map(<[u8]>::to_vec)).transpose()?;
+    let codec_private = (n > 0)
+        .then(|| take(data, &mut p, n).map(<[u8]>::to_vec))
+        .transpose()?;
     let mut blocks = Vec::new();
     while p < data.len() {
         let start = u64::from_le_bytes(take(data, &mut p, 8)?.try_into().unwrap());
         let dur = u64::from_le_bytes(take(data, &mut p, 8)?.try_into().unwrap());
         let n = u32::from_le_bytes(take(data, &mut p, 4)?.try_into().unwrap()) as usize;
-        blocks.push((start, (dur > 0).then_some(dur), take(data, &mut p, n)?.to_vec()));
+        blocks.push((
+            start,
+            (dur > 0).then_some(dur),
+            take(data, &mut p, n)?.to_vec(),
+        ));
     }
     Ok((codec, codec_private, blocks))
 }
@@ -211,10 +218,7 @@ pub fn timeline_from_file(path: &std::path::Path) -> Result<Option<Timeline>> {
 /// correctly on another (NVENC, which makes no such claim) — a
 /// difference no amount of reading the pipeline reveals. Blending here
 /// is unconditional and needs nothing of the encoder.
-pub fn blend_element(
-    timeline: std::sync::Arc<Timeline>,
-    start_ms: u64,
-) -> Option<gst::Element> {
+pub fn blend_element(timeline: std::sync::Arc<Timeline>, start_ms: u64) -> Option<gst::Element> {
     let el = gst::ElementFactory::make("identity").build().ok()?;
     let pad = el.static_pad("src")?;
     // A display set spans dozens of frames and its rectangles are
@@ -266,10 +270,18 @@ pub fn blend_element(
         if b == u64::MAX {
             // Rebased streams start near zero; absolute ones start at
             // (or after) the offset the session asked for.
-            b = if start_ms > 1_000 && ms + 1_000 < start_ms { start_ms } else { 0 };
+            b = if start_ms > 1_000 && ms + 1_000 < start_ms {
+                start_ms
+            } else {
+                0
+            };
             base.store(b, std::sync::atomic::Ordering::Relaxed);
-            tracing::info!(first_pts_ms = ms, start_ms, offset_ms = b,
-                "burn-in: frame time base measured");
+            tracing::info!(
+                first_pts_ms = ms,
+                start_ms,
+                offset_ms = b,
+                "burn-in: frame time base measured"
+            );
         }
         let Some(idx) = timeline.at(ms + b) else {
             say(&format!("no set at {}ms", ms + b));
@@ -314,8 +326,11 @@ fn compose(entry: &Entry, fw: i32, fh: i32) -> Option<gst_video::VideoOverlayCom
     // against mpv, which renders it 2:1). A zero canvas (VobSub with
     // no declared size) means the objects already speak frame
     // coordinates.
-    let scale =
-        if entry.canvas_w > 0 { f64::from(fw) / f64::from(entry.canvas_w) } else { 1.0 };
+    let scale = if entry.canvas_w > 0 {
+        f64::from(fw) / f64::from(entry.canvas_w)
+    } else {
+        1.0
+    };
     let mut rects = Vec::with_capacity(entry.objects.len());
     for o in &entry.objects {
         if o.w == 0 || o.h == 0 {
@@ -344,8 +359,12 @@ fn compose(entry: &Entry, fw: i32, fh: i32) -> Option<gst_video::VideoOverlayCom
         // A canvas taller than the picture (cropped scope) puts
         // bottom-anchored subtitles past the last row; keep them on
         // screen instead of off it.
-        let rx = ((f64::from(o.x) * scale).round() as i32).min(fw - rw as i32).max(0);
-        let ry = ((f64::from(o.y) * scale).round() as i32).min(fh - rh as i32).max(0);
+        let rx = ((f64::from(o.x) * scale).round() as i32)
+            .min(fw - rw as i32)
+            .max(0);
+        let ry = ((f64::from(o.y) * scale).round() as i32)
+            .min(fh - rh as i32)
+            .max(0);
         rects.push(gst_video::VideoOverlayRectangle::new_raw(
             &buf,
             rx,
@@ -383,7 +402,9 @@ mod tests {
     #[test]
     #[ignore]
     fn sets_file_from_env() {
-        let Ok(path) = std::env::var("BURN_SETS") else { return };
+        let Ok(path) = std::env::var("BURN_SETS") else {
+            return;
+        };
         let data = std::fs::read(&path).unwrap();
         let (codec, private, blocks) = super::decode_sets(&data).unwrap();
         println!(

@@ -9,7 +9,9 @@ use kahawai_hub::registry::Registry;
 use tower::ServiceExt;
 
 async fn body_json(resp: axum::response::Response) -> serde_json::Value {
-    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .unwrap();
     serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)
 }
 
@@ -34,7 +36,13 @@ async fn setup_then_auth_flow() {
     let registry = Arc::new(Registry::new(db.clone(), Default::default()));
     let auth = Arc::new(Auth::new(db.clone(), dir.path()).await.unwrap());
     let setup_token = auth.setup_token().expect("fresh hub must be in setup mode");
-    let api = test_router(registry, auth.clone(), Arc::new(kahawai_hub::sessions::Sessions::new(tempfile::tempdir().unwrap().keep())));
+    let api = test_router(
+        registry,
+        auth.clone(),
+        Arc::new(kahawai_hub::sessions::Sessions::new(
+            tempfile::tempdir().unwrap().keep(),
+        )),
+    );
 
     // Setup mode: nothing else is reachable (OPS-1)…
     let resp = api
@@ -46,7 +54,10 @@ async fn setup_then_auth_flow() {
     // …and login is blocked too.
     let resp = api
         .clone()
-        .oneshot(post("/api/v1/auth/token", serde_json::json!({"username": "a", "password": "b"})))
+        .oneshot(post(
+            "/api/v1/auth/token",
+            serde_json::json!({"username": "a", "password": "b"}),
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -95,7 +106,11 @@ async fn setup_then_auth_flow() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-    let resp = api.clone().oneshot(get_authed("/api/v1/items", &access)).await.unwrap();
+    let resp = api
+        .clone()
+        .oneshot(get_authed("/api/v1/items", &access))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
     // Login: wrong password rejected, right password issues tokens.
@@ -121,7 +136,10 @@ async fn setup_then_auth_flow() {
     // Refresh rotates: new pair works, the old refresh token is dead.
     let resp = api
         .clone()
-        .oneshot(post("/api/v1/auth/refresh", serde_json::json!({"refresh_token": refresh})))
+        .oneshot(post(
+            "/api/v1/auth/refresh",
+            serde_json::json!({"refresh_token": refresh}),
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -129,17 +147,28 @@ async fn setup_then_auth_flow() {
     assert!(rotated["access_token"].as_str().is_some());
     let resp = api
         .clone()
-        .oneshot(post("/api/v1/auth/refresh", serde_json::json!({"refresh_token": refresh})))
+        .oneshot(post(
+            "/api/v1/auth/refresh",
+            serde_json::json!({"refresh_token": refresh}),
+        ))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "refresh tokens are single-use");
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "refresh tokens are single-use"
+    );
 
     // CLI reset-password: old password dies, new one works.
-    kahawai_hub::auth::reset_password(&db, "ingmar", "new-password-9").await.unwrap();
+    kahawai_hub::auth::reset_password(&db, "ingmar", "new-password-9")
+        .await
+        .unwrap();
     assert!(auth.login("ingmar", "hunter22222").await.is_err());
     assert!(auth.login("ingmar", "new-password-9").await.is_ok());
     assert!(
-        kahawai_hub::auth::reset_password(&db, "ghost", "whatever-pass").await.is_err(),
+        kahawai_hub::auth::reset_password(&db, "ghost", "whatever-pass")
+            .await
+            .is_err(),
         "unknown user must error"
     );
 
@@ -188,7 +217,9 @@ async fn setup_then_auth_flow() {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK, "{uri}");
         assert_eq!(resp.headers()["content-type"], "text/html; charset=utf-8");
-        let body = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
         assert!(String::from_utf8_lossy(&body).contains("kahawai"));
     }
 }
@@ -209,7 +240,25 @@ fn test_router(
         std::time::Duration::from_secs(900),
         90,
     ));
-    kahawai_hub::api::router(registry, auth, sessions, enrollments, Arc::new(kahawai_hub::subtitles::Subtitles::new(tempfile::tempdir().unwrap().keep())), Arc::new(kahawai_hub::artwork::Artwork::new(tempfile::tempdir().unwrap().keep(), Arc::new(kahawai_hub::enrich::Enricher::new(tempfile::tempdir().unwrap().keep())))), Arc::new(kahawai_hub::enrich::Enricher::new(tempfile::tempdir().unwrap().keep())), kahawai_hub::api::NetOptions::default())
+    kahawai_hub::api::router(
+        registry,
+        auth,
+        sessions,
+        enrollments,
+        Arc::new(kahawai_hub::subtitles::Subtitles::new(
+            tempfile::tempdir().unwrap().keep(),
+        )),
+        Arc::new(kahawai_hub::artwork::Artwork::new(
+            tempfile::tempdir().unwrap().keep(),
+            Arc::new(kahawai_hub::enrich::Enricher::new(
+                tempfile::tempdir().unwrap().keep(),
+            )),
+        )),
+        Arc::new(kahawai_hub::enrich::Enricher::new(
+            tempfile::tempdir().unwrap().keep(),
+        )),
+        kahawai_hub::api::NetOptions::default(),
+    )
 }
 
 #[tokio::test]
@@ -233,7 +282,9 @@ async fn items_filter_by_library() {
     let api = test_router(
         registry.clone(),
         auth.clone(),
-        Arc::new(kahawai_hub::sessions::Sessions::new(tempfile::tempdir().unwrap().keep())),
+        Arc::new(kahawai_hub::sessions::Sessions::new(
+            tempfile::tempdir().unwrap().keep(),
+        )),
     );
     let resp = api
         .clone()
@@ -243,9 +294,15 @@ async fn items_filter_by_library() {
         ))
         .await
         .unwrap();
-    let token = body_json(resp).await["access_token"].as_str().unwrap().to_string();
+    let token = body_json(resp).await["access_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
 
-    registry.record_satellite("01HOST", "mediahost", "nas", "fp").await.unwrap();
+    registry
+        .record_satellite("01HOST", "mediahost", "nas", "fp")
+        .await
+        .unwrap();
     registry
         .announce_collection("01HOST", "movies", "movies", &["/srv/movies".into()])
         .await
@@ -259,13 +316,21 @@ async fn items_filter_by_library() {
         .await
         .unwrap();
     registry
-        .upsert_files("01HOST", "series", vec![rec("Andor/Season 1/Andor.S01E01.mkv", 200)])
+        .upsert_files(
+            "01HOST",
+            "series",
+            vec![rec("Andor/Season 1/Andor.S01E01.mkv", 200)],
+        )
         .await
         .unwrap();
 
-    let libs =
-        body_json(api.clone().oneshot(get_authed("/api/v1/libraries", &token)).await.unwrap())
-            .await;
+    let libs = body_json(
+        api.clone()
+            .oneshot(get_authed("/api/v1/libraries", &token))
+            .await
+            .unwrap(),
+    )
+    .await;
     let lib_id = |name: &str| {
         libs["libraries"]
             .as_array()
@@ -288,12 +353,20 @@ async fn items_filter_by_library() {
             .map(|i| i["title"].as_str().unwrap().to_string())
             .collect::<Vec<_>>()
     };
-    let all =
-        body_json(api.clone().oneshot(get_authed("/api/v1/items", &token)).await.unwrap()).await;
+    let all = body_json(
+        api.clone()
+            .oneshot(get_authed("/api/v1/items", &token))
+            .await
+            .unwrap(),
+    )
+    .await;
     assert_eq!(titles(&all), ["Andor", "Heat"]);
     let movies = body_json(
         api.clone()
-            .oneshot(get_authed(&format!("/api/v1/items?library={}", lib_id("movies")), &token))
+            .oneshot(get_authed(
+                &format!("/api/v1/items?library={}", lib_id("movies")),
+                &token,
+            ))
             .await
             .unwrap(),
     )
@@ -301,7 +374,10 @@ async fn items_filter_by_library() {
     assert_eq!(titles(&movies), ["Heat"]);
     let series = body_json(
         api.clone()
-            .oneshot(get_authed(&format!("/api/v1/items?library={}", lib_id("series")), &token))
+            .oneshot(get_authed(
+                &format!("/api/v1/items?library={}", lib_id("series")),
+                &token,
+            ))
             .await
             .unwrap(),
     )
@@ -319,22 +395,33 @@ async fn items_filter_by_library() {
 
     // Item detail carries navigation lineage: episode → its parent show.
     let movie_id = movies["items"][0]["id"].as_str().unwrap();
-    let detail =
-        body_json(api.clone().oneshot(get_authed(&format!("/api/v1/items/{movie_id}"), &token)).await.unwrap())
-            .await;
+    let detail = body_json(
+        api.clone()
+            .oneshot(get_authed(&format!("/api/v1/items/{movie_id}"), &token))
+            .await
+            .unwrap(),
+    )
+    .await;
     assert!(detail["parent_id"].is_null());
     let show_id = series["items"][0]["id"].as_str().unwrap();
     let children = body_json(
         api.clone()
-            .oneshot(get_authed(&format!("/api/v1/items/{show_id}/children"), &token))
+            .oneshot(get_authed(
+                &format!("/api/v1/items/{show_id}/children"),
+                &token,
+            ))
             .await
             .unwrap(),
     )
     .await;
     let ep_id = children["children"][0]["id"].as_str().unwrap();
-    let detail =
-        body_json(api.clone().oneshot(get_authed(&format!("/api/v1/items/{ep_id}"), &token)).await.unwrap())
-            .await;
+    let detail = body_json(
+        api.clone()
+            .oneshot(get_authed(&format!("/api/v1/items/{ep_id}"), &token))
+            .await
+            .unwrap(),
+    )
+    .await;
     assert_eq!(detail["parent_id"].as_str().unwrap(), show_id);
 }
 
@@ -348,7 +435,9 @@ async fn admin_creates_users() {
     let api = test_router(
         registry,
         auth,
-        Arc::new(kahawai_hub::sessions::Sessions::new(tempfile::tempdir().unwrap().keep())),
+        Arc::new(kahawai_hub::sessions::Sessions::new(
+            tempfile::tempdir().unwrap().keep(),
+        )),
     );
     let resp = api
         .clone()
@@ -358,7 +447,10 @@ async fn admin_creates_users() {
         ))
         .await
         .unwrap();
-    let admin_token = body_json(resp).await["access_token"].as_str().unwrap().to_string();
+    let admin_token = body_json(resp).await["access_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
 
     let create = |token: String, body: serde_json::Value| {
         let api = api.clone();
@@ -391,7 +483,10 @@ async fn admin_creates_users() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    let user_token = body_json(resp).await["access_token"].as_str().unwrap().to_string();
+    let user_token = body_json(resp).await["access_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
     let resp = create(
         user_token,
         serde_json::json!({"username": "sneaky", "password": "longenough"}),
@@ -405,8 +500,11 @@ async fn admin_creates_users() {
     )
     .await;
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-    let resp =
-        create(admin_token, serde_json::json!({"username": "shorty", "password": "short"})).await;
+    let resp = create(
+        admin_token,
+        serde_json::json!({"username": "shorty", "password": "short"}),
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
@@ -494,9 +592,15 @@ async fn bootstrap_states_setup_and_auth_without_a_token() {
     let api = test_router(
         registry,
         auth.clone(),
-        Arc::new(kahawai_hub::sessions::Sessions::new(tempfile::tempdir().unwrap().keep())),
+        Arc::new(kahawai_hub::sessions::Sessions::new(
+            tempfile::tempdir().unwrap().keep(),
+        )),
     );
-    let probe = || Request::get("/api/v1/bootstrap").body(Body::empty()).unwrap();
+    let probe = || {
+        Request::get("/api/v1/bootstrap")
+            .body(Body::empty())
+            .unwrap()
+    };
 
     // Reachable in setup mode, unlike everything behind require_auth.
     let resp = api.clone().oneshot(probe()).await.unwrap();
@@ -539,7 +643,10 @@ async fn bootstrap_states_setup_and_auth_without_a_token() {
         .as_str()
         .unwrap()
         .to_string();
-    let resp = api.oneshot(get_authed("/api/v1/bootstrap", &token)).await.unwrap();
+    let resp = api
+        .oneshot(get_authed("/api/v1/bootstrap", &token))
+        .await
+        .unwrap();
     assert_eq!(body_json(resp).await["authenticated"], true);
 }
 
@@ -549,7 +656,9 @@ async fn expired_refresh_tokens_prune_at_open() {
     let dir = tempfile::tempdir().unwrap();
     let db = kahawai_hub::db::open(dir.path()).await.unwrap();
     let auth = Auth::new(db.clone(), dir.path()).await.unwrap();
-    auth.complete_setup(&auth.setup_token().unwrap(), "u", "hunter22222hunter").await.unwrap();
+    auth.complete_setup(&auth.setup_token().unwrap(), "u", "hunter22222hunter")
+        .await
+        .unwrap();
     sqlx::query(
         "INSERT INTO refresh_tokens (token_hash, user_id, expires_at)
          SELECT 'dead', id, unixepoch() - 1 FROM users LIMIT 1",
@@ -566,10 +675,11 @@ async fn expired_refresh_tokens_prune_at_open() {
     .unwrap();
 
     let _ = Auth::new(db.clone(), dir.path()).await.unwrap();
-    let left: Vec<String> =
-        sqlx::query_scalar("SELECT token_hash FROM refresh_tokens WHERE token_hash IN ('dead','live')")
-            .fetch_all(&db)
-            .await
-            .unwrap();
+    let left: Vec<String> = sqlx::query_scalar(
+        "SELECT token_hash FROM refresh_tokens WHERE token_hash IN ('dead','live')",
+    )
+    .fetch_all(&db)
+    .await
+    .unwrap();
     assert_eq!(left, ["live"], "expired pruned, live kept");
 }

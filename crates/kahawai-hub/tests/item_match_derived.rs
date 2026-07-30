@@ -120,17 +120,27 @@ async fn the_assignment_follows_every_input_with_nothing_called() {
 
     // A miss is an answer, and still not a match.
     answer(&db, "i1", "tvdb", "", "miss").await;
-    assert_eq!(assigned(&db, "i1").await, None, "a recorded miss is not an assignment");
+    assert_eq!(
+        assigned(&db, "i1").await,
+        None,
+        "a recorded miss is not an assignment"
+    );
     assert_eq!(drifted(&db).await, 0);
 
     // The first real answer takes it.
     answer(&db, "i1", "tvdb", "414734", "auto").await;
-    assert_eq!(assigned(&db, "i1").await, Some(("tvdb".into(), "414734".into(), false)));
+    assert_eq!(
+        assigned(&db, "i1").await,
+        Some(("tvdb".into(), "414734".into(), false))
+    );
     assert_eq!(drifted(&db).await, 0);
 
     // TMDB ranks ahead of TVDB for movies, so its answer takes over.
     answer(&db, "i1", "tmdb", "63", "auto").await;
-    assert_eq!(assigned(&db, "i1").await, Some(("tmdb".into(), "63".into(), false)));
+    assert_eq!(
+        assigned(&db, "i1").await,
+        Some(("tmdb".into(), "63".into(), false))
+    );
     assert_eq!(drifted(&db).await, 0);
 
     // Reordering the chain moves the assignment, with no provider asked.
@@ -142,7 +152,10 @@ async fn the_assignment_follows_every_input_with_nothing_called() {
         .execute(&db)
         .await
         .unwrap();
-    assert_eq!(assigned(&db, "i1").await, Some(("tvdb".into(), "414734".into(), false)));
+    assert_eq!(
+        assigned(&db, "i1").await,
+        Some(("tvdb".into(), "414734".into(), false))
+    );
     assert_eq!(drifted(&db).await, 0);
 
     // Refusing the winner hands it to the runner-up.
@@ -153,7 +166,10 @@ async fn the_assignment_follows_every_input_with_nothing_called() {
     .execute(&db)
     .await
     .unwrap();
-    assert_eq!(assigned(&db, "i1").await, Some(("tmdb".into(), "63".into(), false)));
+    assert_eq!(
+        assigned(&db, "i1").await,
+        Some(("tmdb".into(), "63".into(), false))
+    );
     assert_eq!(drifted(&db).await, 0);
 
     // A pin outranks the chain, the confidence order and local alike.
@@ -166,10 +182,16 @@ async fn the_assignment_follows_every_input_with_nothing_called() {
     .unwrap();
     // ...except this one is still refused, and a refused record is not a
     // candidate at all — so the pin has nothing to win with.
-    assert_eq!(assigned(&db, "i1").await, Some(("tmdb".into(), "63".into(), false)));
+    assert_eq!(
+        assigned(&db, "i1").await,
+        Some(("tmdb".into(), "63".into(), false))
+    );
     assert_eq!(drifted(&db).await, 0);
 
-    sqlx::query("DELETE FROM rejected_matches WHERE item_id = 'i1'").execute(&db).await.unwrap();
+    sqlx::query("DELETE FROM rejected_matches WHERE item_id = 'i1'")
+        .execute(&db)
+        .await
+        .unwrap();
     assert_eq!(
         assigned(&db, "i1").await,
         Some(("tvdb".into(), "414734".into(), true)),
@@ -188,17 +210,28 @@ async fn the_assignment_follows_every_input_with_nothing_called() {
     assert_eq!(drifted(&db).await, 0);
 
     // Withdrawing the pin lets local through.
-    sqlx::query("DELETE FROM manual_match WHERE item_id = 'i1'").execute(&db).await.unwrap();
-    assert_eq!(assigned(&db, "i1").await, Some(("local".into(), "nfo-1".into(), false)));
-    assert_eq!(drifted(&db).await, 0);
-
-    // Downgrading the winning answer to a miss retires it.
-    sqlx::query("UPDATE provider_metadata SET provider_id = '', confidence = 'miss'
-                  WHERE item_id = 'i1' AND provider = 'local'")
+    sqlx::query("DELETE FROM manual_match WHERE item_id = 'i1'")
         .execute(&db)
         .await
         .unwrap();
-    assert_eq!(assigned(&db, "i1").await, Some(("tvdb".into(), "414734".into(), false)));
+    assert_eq!(
+        assigned(&db, "i1").await,
+        Some(("local".into(), "nfo-1".into(), false))
+    );
+    assert_eq!(drifted(&db).await, 0);
+
+    // Downgrading the winning answer to a miss retires it.
+    sqlx::query(
+        "UPDATE provider_metadata SET provider_id = '', confidence = 'miss'
+                  WHERE item_id = 'i1' AND provider = 'local'",
+    )
+    .execute(&db)
+    .await
+    .unwrap();
+    assert_eq!(
+        assigned(&db, "i1").await,
+        Some(("tvdb".into(), "414734".into(), false))
+    );
     assert_eq!(drifted(&db).await, 0);
 
     // Deleting every answer leaves no assignment at all.
@@ -218,7 +251,11 @@ async fn the_assignment_follows_every_input_with_nothing_called() {
     .execute(&db)
     .await
     .unwrap();
-    assert_eq!(drifted(&db).await, 1, "an assignment no answer backs must read as drift");
+    assert_eq!(
+        drifted(&db).await,
+        1,
+        "an assignment no answer backs must read as drift"
+    );
 }
 
 /// A pin whose record is withdrawn cannot keep an assignment alive — the
@@ -237,7 +274,10 @@ async fn a_pin_whose_answer_disappears_does_not_strand_an_assignment() {
     .execute(&db)
     .await
     .unwrap();
-    assert_eq!(assigned(&db, "i1").await, Some(("tvdb".into(), "414734".into(), true)));
+    assert_eq!(
+        assigned(&db, "i1").await,
+        Some(("tvdb".into(), "414734".into(), true))
+    );
 
     sqlx::query("DELETE FROM provider_metadata WHERE item_id = 'i1' AND provider = 'tvdb'")
         .execute(&db)
@@ -296,7 +336,10 @@ async fn moving_a_source_between_collections_re_ranks_the_item() {
     // entry for it at all, so the media type alone decides the winner.
     answer(&db, "i1", "tmdb", "63", "auto").await;
     answer(&db, "i1", "anime", "17", "auto").await;
-    assert_eq!(assigned(&db, "i1").await, Some(("tmdb".into(), "63".into(), false)));
+    assert_eq!(
+        assigned(&db, "i1").await,
+        Some(("tmdb".into(), "63".into(), false))
+    );
     assert_eq!(drifted(&db).await, 0);
 
     sqlx::query("UPDATE item_sources SET module_id = 'c-anime' WHERE item_id = 'i1'")
@@ -304,7 +347,10 @@ async fn moving_a_source_between_collections_re_ranks_the_item() {
         .await
         .unwrap();
     let m = assigned(&db, "i1").await.unwrap();
-    assert_eq!(m.0, "anime", "the item is anime now, and the anime chain ranks anime first");
+    assert_eq!(
+        m.0, "anime",
+        "the item is anime now, and the anime chain ranks anime first"
+    );
     assert_eq!(
         sqlx::query_scalar::<_, String>("SELECT media_type FROM item_match WHERE item_id = 'i1'")
             .fetch_one(&db)
@@ -319,6 +365,9 @@ async fn moving_a_source_between_collections_re_ranks_the_item() {
         .execute(&db)
         .await
         .unwrap();
-    assert_eq!(assigned(&db, "i1").await, Some(("tmdb".into(), "63".into(), false)));
+    assert_eq!(
+        assigned(&db, "i1").await,
+        Some(("tmdb".into(), "63".into(), false))
+    );
     assert_eq!(drifted(&db).await, 0);
 }

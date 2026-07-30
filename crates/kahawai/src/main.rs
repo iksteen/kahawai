@@ -8,7 +8,11 @@ use clap::{Parser, Subcommand};
 mod config;
 
 #[derive(Parser)]
-#[command(name = "kahawai", version, about = "Self-hosted media streaming server")]
+#[command(
+    name = "kahawai",
+    version,
+    about = "Self-hosted media streaming server"
+)]
 struct Cli {
     /// Path to the TOML config file. Default: ./kahawai.toml, else
     /// $XDG_CONFIG_HOME/kahawai/kahawai.toml for non-system users.
@@ -105,8 +109,7 @@ enum HubCmd {
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 
@@ -125,10 +128,12 @@ async fn main() -> Result<()> {
     }
     match cli.command {
         Cmd::Hub { cmd: None } => run_hub(cfg.hub, config_used).await,
-        Cmd::Hub { cmd: Some(HubCmd::ResetPassword { username }) } => {
-            reset_password(cfg.hub, &username).await
-        }
-        Cmd::Hub { cmd: Some(HubCmd::Backup { dest }) } => {
+        Cmd::Hub {
+            cmd: Some(HubCmd::ResetPassword { username }),
+        } => reset_password(cfg.hub, &username).await,
+        Cmd::Hub {
+            cmd: Some(HubCmd::Backup { dest }),
+        } => {
             let m = kahawai_hub::backup::backup(&cfg.hub.data_dir, config_used.as_deref(), &dest)
                 .await?;
             println!(
@@ -142,7 +147,9 @@ async fn main() -> Result<()> {
             );
             Ok(())
         }
-        Cmd::Hub { cmd: Some(HubCmd::Restore { src, force }) } => {
+        Cmd::Hub {
+            cmd: Some(HubCmd::Restore { src, force }),
+        } => {
             let m = kahawai_hub::backup::restore(&src, &cfg.hub.data_dir, force)?;
             println!(
                 "restored a snapshot taken at {} (kahawai {}) into {}",
@@ -154,7 +161,24 @@ async fn main() -> Result<()> {
         }
         Cmd::Mediahost => run_mediahost(cfg.mediahost).await,
         Cmd::Doctor { json } => doctor(&cfg, json),
-        Cmd::RemuxWorker { socket, out_dir, size, video, audio, audio_track, video_track, start_ms, sink, parts, video_kbps, max_height, max_channels, tone_map, burn_sub, burn_sets } => {
+        Cmd::RemuxWorker {
+            socket,
+            out_dir,
+            size,
+            video,
+            audio,
+            audio_track,
+            video_track,
+            start_ms,
+            sink,
+            parts,
+            video_kbps,
+            max_height,
+            max_channels,
+            tone_map,
+            burn_sub,
+            burn_sets,
+        } => {
             // Die WITH the supervisor: kill_on_drop only fires inside a
             // living parent, so a hub/transcoder restart used to orphan
             // pipeline workers indefinitely (one survived three days).
@@ -185,7 +209,14 @@ async fn main() -> Result<()> {
                 tone_map,
                 burn_subtitle: burn_sub,
             };
-            kahawai_media::worker::run_parts(&all, &out_dir, plan, start_ms, sink.as_deref(), burn_sets.as_deref())
+            kahawai_media::worker::run_parts(
+                &all,
+                &out_dir,
+                plan,
+                start_ms,
+                sink.as_deref(),
+                burn_sets.as_deref(),
+            )
         }
         Cmd::Transcoder => {
             kahawai_transcoder::run(
@@ -220,7 +251,11 @@ fn doctor_checks(cfg: &config::Config) -> Vec<kahawai_media::doctor::Check> {
     checks.push(if now > year_2025 {
         Check::ok("system clock", "sane")
     } else {
-        Check::fail("system clock", "before 2025 — fix NTP or certificates will fail", true)
+        Check::fail(
+            "system clock",
+            "before 2025 — fix NTP or certificates will fail",
+            true,
+        )
     });
 
     let dir_check = |name: &str, dir: &std::path::Path, must_write: bool| {
@@ -250,10 +285,18 @@ fn doctor_checks(cfg: &config::Config) -> Vec<kahawai_media::doctor::Check> {
         }
     };
     checks.push(dir_check("hub data dir", &cfg.hub.data_dir, true));
-    checks.push(dir_check("mediahost state dir", &cfg.mediahost.state_dir, true));
+    checks.push(dir_check(
+        "mediahost state dir",
+        &cfg.mediahost.state_dir,
+        true,
+    ));
     for c in &cfg.mediahost.collections {
         for root in &c.roots {
-            checks.push(dir_check(&format!("collection \"{}\" root", c.name), root, false));
+            checks.push(dir_check(
+                &format!("collection \"{}\" root", c.name),
+                root,
+                false,
+            ));
         }
     }
 
@@ -336,7 +379,7 @@ async fn reset_password(cfg: config::HubConfig, username: &str) -> Result<()> {
     eprint!("New password for {username}: ");
     let mut pw = String::new();
     std::io::stdin().read_line(&mut pw)?;
-    let pw = pw.trim_end_matches ('\n');
+    let pw = pw.trim_end_matches('\n');
     anyhow::ensure!(pw.len() >= 8, "password must be at least 8 characters");
     kahawai_hub::auth::reset_password(&db, username, pw).await?;
     println!("password updated; existing sessions revoked");
@@ -372,7 +415,10 @@ async fn run_hub_inner(
     // The satellites table IS the mTLS allowlist (SEC-5): load it, then
     // the registry keeps it in sync on approve/delete.
     let allowed = kahawai_transport::mtls::AllowedCerts::default();
-    let registry = Arc::new(kahawai_hub::registry::Registry::new(db.clone(), allowed.clone()));
+    let registry = Arc::new(kahawai_hub::registry::Registry::new(
+        db.clone(),
+        allowed.clone(),
+    ));
     let admitted = registry.load_allowlist().await?;
     tracing::info!(admitted, "mTLS allowlist loaded");
     let auth = Arc::new(kahawai_hub::auth::Auth::new(db.clone(), &cfg.data_dir).await?);
@@ -464,14 +510,9 @@ async fn run_hub_inner(
         });
         let state_dir = mh.state_dir.clone();
         tokio::spawn(async move {
-            if let Err(e) = kahawai_mediahost::run_local(
-                mh.collections,
-                mh.rescan_minutes,
-                &state_dir,
-                tx,
-                rx,
-            )
-            .await
+            if let Err(e) =
+                kahawai_mediahost::run_local(mh.collections, mh.rescan_minutes, &state_dir, tx, rx)
+                    .await
             {
                 tracing::error!(error = format!("{e:#}"), "in-process mediahost exited");
             }
@@ -501,9 +542,9 @@ async fn run_hub_inner(
         let proxy_trust = proxy_trust.clone();
         let config_path = config_path.clone();
         tokio::spawn(async move {
-            let Ok(mut hup) = tokio::signal::unix::signal(
-                tokio::signal::unix::SignalKind::hangup(),
-            ) else {
+            let Ok(mut hup) =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+            else {
                 return;
             };
             while hup.recv().await.is_some() {
@@ -526,7 +567,16 @@ async fn run_hub_inner(
             }
         });
     }
-    let api = kahawai_hub::api::router(registry.clone(), auth, sessions.clone(), Arc::new(svc.clone()), subtitles.clone(), artwork, enricher.clone(), net);
+    let api = kahawai_hub::api::router(
+        registry.clone(),
+        auth,
+        sessions.clone(),
+        Arc::new(svc.clone()),
+        subtitles.clone(),
+        artwork,
+        enricher.clone(),
+        net,
+    );
     tokio::spawn(async move {
         let api = api.into_make_service_with_connect_info::<std::net::SocketAddr>();
         if let Err(e) = axum::serve(api_listener, api).await {
@@ -573,6 +623,12 @@ async fn run_hub_inner(
 }
 
 async fn run_mediahost(cfg: config::MediahostConfig) -> Result<()> {
-    kahawai_mediahost::run(&cfg.hub, &cfg.state_dir, &cfg.name, cfg.collections, cfg.rescan_minutes)
-        .await
+    kahawai_mediahost::run(
+        &cfg.hub,
+        &cfg.state_dir,
+        &cfg.name,
+        cfg.collections,
+        cfg.rescan_minutes,
+    )
+    .await
 }

@@ -30,7 +30,9 @@ impl ProxyTrust {
             };
             nets.push(net);
         }
-        Ok(Self { nets: std::sync::RwLock::new(nets) })
+        Ok(Self {
+            nets: std::sync::RwLock::new(nets),
+        })
     }
 
     /// Adopt a new list in place. Rejects the whole set on a bad entry —
@@ -145,7 +147,10 @@ mod tests {
             Some(ip("203.0.113.9"))
         );
         // No header at all still falls back to the peer.
-        assert_eq!(t.client_ip(Some(ip("172.18.0.2")), None), Some(ip("172.18.0.2")));
+        assert_eq!(
+            t.client_ip(Some(ip("172.18.0.2")), None),
+            Some(ip("172.18.0.2"))
+        );
     }
 
     #[test]

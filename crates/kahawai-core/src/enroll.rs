@@ -17,7 +17,12 @@ pub fn enrollment_code(csr_der: &[u8]) -> String {
 /// Compare an admin-entered code against a CSR, tolerating case and a
 /// missing/misplaced dash. Exact match on the normalized form only (SEC-3).
 pub fn code_matches(entered: &str, csr_der: &[u8]) -> bool {
-    let normalize = |s: &str| s.chars().filter(|c| *c != '-').collect::<String>().to_ascii_uppercase();
+    let normalize = |s: &str| {
+        s.chars()
+            .filter(|c| *c != '-')
+            .collect::<String>()
+            .to_ascii_uppercase()
+    };
     normalize(entered) == normalize(&enrollment_code(csr_der))
 }
 

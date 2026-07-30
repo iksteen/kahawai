@@ -4,11 +4,11 @@
 use std::path::Path;
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use kahawai_core::enroll::enrollment_code;
 use kahawai_core::pki::new_satellite_csr;
 use kahawai_proto::v1::enrollment_client::EnrollmentClient;
-use kahawai_proto::v1::{status_response, StatusRequest, SubmitRequest};
+use kahawai_proto::v1::{StatusRequest, SubmitRequest, status_response};
 
 use crate::identity::{self, SatelliteIdentity};
 
@@ -33,13 +33,20 @@ pub async fn ensure_identity(
     let bundle = new_satellite_csr(module_type, &module_id, name)?;
     let code = enrollment_code(&bundle.csr_der);
     // The one thing the human at this console must see (SEC-2):
-    println!("\n  Enrollment code: {code}\n  Enter this code on the hub to approve this {module_type}.\n");
+    println!(
+        "\n  Enrollment code: {code}\n  Enter this code on the hub to approve this {module_type}.\n"
+    );
 
     let channel = crate::tls::grpc_channel_unverified(hub_addr).await?;
     let mut client = EnrollmentClient::new(channel);
 
     loop {
-        match client.submit(SubmitRequest { csr_der: bundle.csr_der.clone() }).await {
+        match client
+            .submit(SubmitRequest {
+                csr_der: bundle.csr_der.clone(),
+            })
+            .await
+        {
             Ok(_) => {}
             // Already pending (e.g. we polled, hub still has it) — fine.
             Err(s) if s.code() == tonic::Code::AlreadyExists => {}
@@ -49,7 +56,9 @@ pub async fn ensure_identity(
         loop {
             tokio::time::sleep(POLL_INTERVAL).await;
             let resp = client
-                .status(StatusRequest { csr_fingerprint: kahawai_core::pki::cert_fingerprint(&bundle.csr_der) })
+                .status(StatusRequest {
+                    csr_fingerprint: kahawai_core::pki::cert_fingerprint(&bundle.csr_der),
+                })
                 .await
                 .context("polling enrollment status")?
                 .into_inner();

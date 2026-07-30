@@ -188,7 +188,10 @@ pub const MEDIA_TYPES: [&str; 4] = ["movies", "series", "anime", "music"];
 /// A collection's media type as a chain name. Anything unrecognised
 /// enriches as movies rather than silently having no chain at all.
 pub fn media_type_key(media_type: &str) -> &'static str {
-    MEDIA_TYPES.into_iter().find(|m| *m == media_type).unwrap_or("movies")
+    MEDIA_TYPES
+        .into_iter()
+        .find(|m| *m == media_type)
+        .unwrap_or("movies")
 }
 
 /// The normative provider order for a media type — the default, and the
@@ -231,7 +234,10 @@ pub async fn chain_in_force(db: &SqlitePool, media_type: &str) -> Vec<String> {
     .await
     .unwrap_or_default();
     if stored.is_empty() {
-        return chain_for(media_type).iter().map(|s| s.to_string()).collect();
+        return chain_for(media_type)
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
     }
     stored
 }
@@ -399,16 +405,25 @@ fn repick_body(item: Option<&str>, media_type: Option<&str>) -> String {
         "{}; {};",
         DROP_STALE_ASSIGNMENT
             .replace("(?1 IS NULL OR item_id = ?1)", &eq("item_id", item))
-            .replace("(?2 IS NULL OR media_type = ?2)", &eq("media_type", media_type)),
+            .replace(
+                "(?2 IS NULL OR media_type = ?2)",
+                &eq("media_type", media_type)
+            ),
         PICK_ASSIGNMENT
             .replace("(?1 IS NULL OR i.id = ?1)", &eq("i.id", item))
-            .replace("(?2 IS NULL OR t.media_type = ?2)", &eq("t.media_type", media_type))
+            .replace(
+                "(?2 IS NULL OR t.media_type = ?2)",
+                &eq("t.media_type", media_type)
+            )
     );
     // Those replacements match on the filters' exact text. If one is
     // reworded and a `.replace` silently stops matching, the placeholder
     // survives — and a placeholder that reaches SQLite as part of a
     // trigger is a scan that nobody notices until the catalogue is big.
-    assert!(!body.contains('?'), "a repick filter was not substituted:\n{body}");
+    assert!(
+        !body.contains('?'),
+        "a repick filter was not substituted:\n{body}"
+    );
     body
 }
 
@@ -433,9 +448,7 @@ pub fn repick_triggers() -> Vec<(String, String)> {
     // The item an `item_sources` row decides for: episodes and tracks
     // give their PARENT its media type, never themselves one.
     let src_item = |side: &str| {
-        format!(
-            "COALESCE((SELECT parent_id FROM items WHERE id = {side}.item_id), {side}.item_id)"
-        )
+        format!("COALESCE((SELECT parent_id FROM items WHERE id = {side}.item_id), {side}.item_id)")
     };
     // A scan inserts item_sources in bulk for items nothing has enriched
     // yet, where the pick has nothing to find. Skip those outright.
@@ -462,7 +475,13 @@ pub fn repick_triggers() -> Vec<(String, String)> {
     // the sort key (0035's own triggers), never which record an item is.
     let by_new_item = repick_body(Some("NEW.item_id"), None);
     let by_old_item = repick_body(Some("OLD.item_id"), None);
-    add("repick_answer_ins", "INSERT", "provider_metadata", None, by_new_item.clone());
+    add(
+        "repick_answer_ins",
+        "INSERT",
+        "provider_metadata",
+        None,
+        by_new_item.clone(),
+    );
     add(
         "repick_answer_upd",
         "UPDATE OF provider_id, confidence",
@@ -479,7 +498,13 @@ pub fn repick_triggers() -> Vec<(String, String)> {
     );
 
     // Chain order: one media type's worth of items, all of them.
-    add("repick_rank_ins", "INSERT", "provider_ranks", None, repick_body(None, Some("NEW.media_type")));
+    add(
+        "repick_rank_ins",
+        "INSERT",
+        "provider_ranks",
+        None,
+        repick_body(None, Some("NEW.media_type")),
+    );
     add(
         "repick_rank_upd",
         "UPDATE OF rank",
@@ -487,10 +512,22 @@ pub fn repick_triggers() -> Vec<(String, String)> {
         None,
         repick_body(None, Some("NEW.media_type")),
     );
-    add("repick_rank_del", "DELETE", "provider_ranks", None, repick_body(None, Some("OLD.media_type")));
+    add(
+        "repick_rank_del",
+        "DELETE",
+        "provider_ranks",
+        None,
+        repick_body(None, Some("OLD.media_type")),
+    );
 
     // Refusals.
-    add("repick_reject_ins", "INSERT", "rejected_matches", None, by_new_item.clone());
+    add(
+        "repick_reject_ins",
+        "INSERT",
+        "rejected_matches",
+        None,
+        by_new_item.clone(),
+    );
     add(
         "repick_reject_del",
         "DELETE",
@@ -500,7 +537,13 @@ pub fn repick_triggers() -> Vec<(String, String)> {
     );
 
     // Human pins.
-    add("repick_pin_ins", "INSERT", "manual_match", None, by_new_item.clone());
+    add(
+        "repick_pin_ins",
+        "INSERT",
+        "manual_match",
+        None,
+        by_new_item.clone(),
+    );
     add(
         "repick_pin_upd",
         "UPDATE OF provider, provider_id",
@@ -508,7 +551,13 @@ pub fn repick_triggers() -> Vec<(String, String)> {
         None,
         by_new_item,
     );
-    add("repick_pin_del", "DELETE", "manual_match", Some(survives.into()), by_old_item);
+    add(
+        "repick_pin_del",
+        "DELETE",
+        "manual_match",
+        Some(survives.into()),
+        by_old_item,
+    );
 
     // Which collection an item's files live in decides its media type,
     // and the media type decides the chain — so moving a source can move
@@ -567,7 +616,11 @@ pub(crate) async fn reassign(
         .bind(media_type)
         .execute(&mut *tx)
         .await?;
-    sqlx::query(PICK_ASSIGNMENT).bind(item_id).bind(media_type).execute(&mut *tx).await?;
+    sqlx::query(PICK_ASSIGNMENT)
+        .bind(item_id)
+        .bind(media_type)
+        .execute(&mut *tx)
+        .await?;
     Ok(())
 }
 
@@ -612,7 +665,13 @@ pub async fn reschedule(db: &SqlitePool, item_id: &str, provider: &str, reason: 
     .bind(due)
     .execute(db)
     .await;
-    tracing::debug!(item_id, provider, retry_in_s = due, reason, "provider deferred");
+    tracing::debug!(
+        item_id,
+        provider,
+        retry_in_s = due,
+        reason,
+        "provider deferred"
+    );
 }
 
 /// This provider answered (or declined on the merits): stop tracking it.
@@ -707,7 +766,10 @@ pub const QUERY_REV: i64 = 1;
 /// its deciding inputs. SQL twin in the selection queries:
 /// `i.norm_title || '|' || COALESCE(i.year, '')`.
 pub fn title_anchor(norm_title: &str, year: Option<i64>) -> String {
-    format!("{norm_title}|{}", year.map(|y| y.to_string()).unwrap_or_default())
+    format!(
+        "{norm_title}|{}",
+        year.map(|y| y.to_string()).unwrap_or_default()
+    )
 }
 
 /// The music question. SQL twin:
@@ -812,9 +874,16 @@ pub async fn store_answer(
     // provided by convention and this provides by construction. It also
     // takes one multi-statement transaction off the path seven writers
     // share.
-    bind_answer(sqlx::query(STORE_ANSWER), item_id, provider, provider_id, confidence, &fields)
-        .execute(db)
-        .await?;
+    bind_answer(
+        sqlx::query(STORE_ANSWER),
+        item_id,
+        provider,
+        provider_id,
+        confidence,
+        &fields,
+    )
+    .execute(db)
+    .await?;
     Ok(())
 }
 
@@ -884,9 +953,16 @@ pub async fn assign_manual(
     fields: Fields,
 ) -> Result<()> {
     let mut tx = db.begin().await?;
-    bind_answer(sqlx::query(STORE_ANSWER), item_id, provider, provider_id, "auto", &fields)
-        .execute(&mut *tx)
-        .await?;
+    bind_answer(
+        sqlx::query(STORE_ANSWER),
+        item_id,
+        provider,
+        provider_id,
+        "auto",
+        &fields,
+    )
+    .execute(&mut *tx)
+    .await?;
     // A pin and a refusal of the same record contradict each other. The
     // pin is the newer statement, so it is the one that stands — and it
     // has to land BEFORE the pick, which treats a refused record as no
@@ -1012,7 +1088,10 @@ impl ProviderSet {
     }
 
     pub fn get(&self, name: &str) -> Option<&dyn Provider> {
-        self.providers.iter().find(|p| p.name() == name).map(|p| p.as_ref())
+        self.providers
+            .iter()
+            .find(|p| p.name() == name)
+            .map(|p| p.as_ref())
     }
 
     pub async fn finish(&self) {
@@ -1083,8 +1162,7 @@ impl ProviderSet {
                     // established earlier. It erased a manual match once.
                     if !answered(db, &item.id, name).await {
                         let _ =
-                            store_answer(db, &item.id, name, "", "miss", Fields::default())
-                                .await;
+                            store_answer(db, &item.id, name, "", "miss", Fields::default()).await;
                     }
                     settled(db, &item.id, name).await;
                 }
@@ -1107,20 +1185,52 @@ impl ProviderSet {
 /// projection pair is deliberately decided by ONE test — a season from
 /// TVDB with an episode number from TMDB would be nonsense.
 const RESOLVED_FIELDS: [(&str, &str, &str); 10] = [
-    ("title", "NULLIF(pm.title, '') IS NOT NULL", "NULLIF(pm.title, '')"),
-    ("overview", "NULLIF(pm.overview, '') IS NOT NULL", "NULLIF(pm.overview, '')"),
-    ("poster_path", "NULLIF(pm.poster_path, '') IS NOT NULL", "NULLIF(pm.poster_path, '')"),
-    ("premiered", "NULLIF(pm.premiered, '') IS NOT NULL", "NULLIF(pm.premiered, '')"),
+    (
+        "title",
+        "NULLIF(pm.title, '') IS NOT NULL",
+        "NULLIF(pm.title, '')",
+    ),
+    (
+        "overview",
+        "NULLIF(pm.overview, '') IS NOT NULL",
+        "NULLIF(pm.overview, '')",
+    ),
+    (
+        "poster_path",
+        "NULLIF(pm.poster_path, '') IS NOT NULL",
+        "NULLIF(pm.poster_path, '')",
+    ),
+    (
+        "premiered",
+        "NULLIF(pm.premiered, '') IS NOT NULL",
+        "NULLIF(pm.premiered, '')",
+    ),
     (
         "original_language",
         "NULLIF(pm.original_language, '') IS NOT NULL",
         "NULLIF(pm.original_language, '')",
     ),
-    ("genres", "NULLIF(pm.genres, '') IS NOT NULL", "NULLIF(pm.genres, '')"),
-    ("cast_json", "NULLIF(pm.cast_json, '') IS NOT NULL", "NULLIF(pm.cast_json, '')"),
+    (
+        "genres",
+        "NULLIF(pm.genres, '') IS NOT NULL",
+        "NULLIF(pm.genres, '')",
+    ),
+    (
+        "cast_json",
+        "NULLIF(pm.cast_json, '') IS NOT NULL",
+        "NULLIF(pm.cast_json, '')",
+    ),
     ("rating", "pm.rating IS NOT NULL", "pm.rating"),
-    ("proj_season", "pm.proj_season IS NOT NULL", "pm.proj_season"),
-    ("proj_episode", "pm.proj_season IS NOT NULL", "pm.proj_episode"),
+    (
+        "proj_season",
+        "pm.proj_season IS NOT NULL",
+        "pm.proj_season",
+    ),
+    (
+        "proj_episode",
+        "pm.proj_season IS NOT NULL",
+        "pm.proj_episode",
+    ),
 ];
 
 /// The read model: an item's fields resolved from the providers' answers,

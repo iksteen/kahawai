@@ -60,7 +60,11 @@ fn variant_dir(name: &str, px: u32) -> String {
 
 impl Artwork {
     pub fn new(dir: PathBuf, enricher: Arc<crate::enrich::Enricher>) -> Self {
-        let art = Self { dir, enricher, inflight: Default::default() };
+        let art = Self {
+            dir,
+            enricher,
+            inflight: Default::default(),
+        };
         art.sweep_stale_sizes();
         art
     }
@@ -79,9 +83,13 @@ impl Artwork {
     /// Best effort throughout. An unreadable cache directory costs disk,
     /// never correctness, and originals are never touched.
     fn sweep_stale_sizes(&self) {
-        let keep: Vec<String> =
-            SIZES.iter().map(|(name, px)| variant_dir(name, *px)).collect();
-        let Ok(entries) = std::fs::read_dir(&self.dir) else { return };
+        let keep: Vec<String> = SIZES
+            .iter()
+            .map(|(name, px)| variant_dir(name, *px))
+            .collect();
+        let Ok(entries) = std::fs::read_dir(&self.dir) else {
+            return;
+        };
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
             if !name.starts_with("size-") {
@@ -98,7 +106,9 @@ impl Artwork {
                 }
                 continue;
             }
-            let Ok(copies) = std::fs::read_dir(entry.path()) else { continue };
+            let Ok(copies) = std::fs::read_dir(entry.path()) else {
+                continue;
+            };
             let mut orphans = 0u32;
             for copy in copies.flatten() {
                 // Same file name as the original it was made from, one
@@ -132,7 +142,9 @@ impl Artwork {
         let Some((bytes, ctype, key)) = self.original(registry, sessions, item_id).await? else {
             return Ok(None);
         };
-        let Some(name) = size else { return Ok(Some((bytes, ctype))) };
+        let Some(name) = size else {
+            return Ok(Some((bytes, ctype)));
+        };
         let Some((_, px)) = SIZES.iter().find(|(n, _)| *n == name) else {
             tracing::debug!(size = %name, "unknown artwork size; serving the original");
             return Ok(Some((bytes, ctype)));
@@ -165,7 +177,10 @@ impl Artwork {
         sessions: &Sessions,
         item_id: &str,
     ) -> Result<Option<(Vec<u8>, &'static str)>> {
-        Ok(self.original(registry, sessions, item_id).await?.map(|(b, c, _)| (b, c)))
+        Ok(self
+            .original(registry, sessions, item_id)
+            .await?
+            .map(|(b, c, _)| (b, c)))
     }
 
     /// As [`Artwork::get`], plus the cache key the bytes are stored
@@ -192,7 +207,12 @@ impl Artwork {
             return Ok(None);
         };
 
-        let ctype = match art_rel.rsplit('.').next().map(str::to_ascii_lowercase).as_deref() {
+        let ctype = match art_rel
+            .rsplit('.')
+            .next()
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
             Some("png") => "image/png",
             Some("webp") => "image/webp",
             _ => "image/jpeg",
@@ -213,8 +233,9 @@ impl Artwork {
         if let Ok(bytes) = std::fs::read(&cache_path) {
             return Ok(Some((bytes, ctype, cache_key)));
         }
-        let lease =
-            sessions.open_lease(registry, &module_id, &collection_id, &art_rel).await?;
+        let lease = sessions
+            .open_lease(registry, &module_id, &collection_id, &art_rel)
+            .await?;
         let bytes = read_all(lease).await?;
         std::fs::create_dir_all(&self.dir)?;
         std::fs::write(&cache_path, &bytes)?;
@@ -224,12 +245,11 @@ impl Artwork {
 
 impl Artwork {
     /// A poster held by the provider itself, cached like local artwork.
-    async fn remote_poster(
-        &self,
-        poster: &str,
-    ) -> Result<Option<(Vec<u8>, &'static str, String)>> {
-        let cache_key =
-            format!("tmdb-{:016x}", xxhash_rust::xxh3::xxh3_64(poster.as_bytes()));
+    async fn remote_poster(&self, poster: &str) -> Result<Option<(Vec<u8>, &'static str, String)>> {
+        let cache_key = format!(
+            "tmdb-{:016x}",
+            xxhash_rust::xxh3::xxh3_64(poster.as_bytes())
+        );
         let lock = {
             let mut map = self.inflight.lock().unwrap();
             map.entry(cache_key.clone()).or_default().clone()

@@ -109,16 +109,24 @@ async fn bare_files_bind_to_what_their_hash_names() {
     let q = |sql: &'static str| {
         let db = db.clone();
         async move {
-            sqlx::query(sql).execute(&db).await.unwrap_or_else(|e| panic!("{sql}\n  -> {e}"))
+            sqlx::query(sql)
+                .execute(&db)
+                .await
+                .unwrap_or_else(|e| panic!("{sql}\n  -> {e}"))
         }
     };
     q("INSERT INTO anime_ids (item_id, anidb_id) VALUES ('show', 1234)").await;
-    q("INSERT INTO items (id, kind, title, norm_title) VALUES ('film','movie','A Film','a film')").await;
+    q("INSERT INTO items (id, kind, title, norm_title) VALUES ('film','movie','A Film','a film')")
+        .await;
     q("INSERT INTO anime_ids (item_id, anidb_id) VALUES ('film', 9999)").await;
 
     // Three bare files: a creditless opening (C2) of the show, the
     // movie's own bytes ("1"), and one whose anime is not on the shelf.
-    for (path, hash) in [("ncop.mkv", "h-nc"), ("film.mkv", "h-film"), ("stray.mkv", "h-stray")] {
+    for (path, hash) in [
+        ("ncop.mkv", "h-nc"),
+        ("film.mkv", "h-film"),
+        ("stray.mkv", "h-stray"),
+    ] {
         sqlx::query(
             "INSERT INTO files (module_id, collection_id, path_rel, size, mtime_unix,
                                 head_xxh3, tail_xxh3, oshash, streams_json, subs_extracted, ed2k)
@@ -130,17 +138,30 @@ async fn bare_files_bind_to_what_their_hash_names() {
         .await
         .unwrap();
     }
-    q("INSERT INTO ed2k_aid (ed2k, aid, eid, epno, gid, group_name, updated_at)
-       VALUES ('h-nc', 1234, 1, 'C2', 7, 'Grp', unixepoch())").await;
-    q("INSERT INTO ed2k_aid (ed2k, aid, eid, epno, gid, group_name, updated_at)
-       VALUES ('h-film', 9999, 2, '1', 7, 'Grp', unixepoch())").await;
-    q("INSERT INTO ed2k_aid (ed2k, aid, eid, epno, gid, group_name, updated_at)
-       VALUES ('h-stray', 5555, 3, '1', 7, 'Grp', unixepoch())").await;
+    q(
+        "INSERT INTO ed2k_aid (ed2k, aid, eid, epno, gid, group_name, updated_at)
+       VALUES ('h-nc', 1234, 1, 'C2', 7, 'Grp', unixepoch())",
+    )
+    .await;
+    q(
+        "INSERT INTO ed2k_aid (ed2k, aid, eid, epno, gid, group_name, updated_at)
+       VALUES ('h-film', 9999, 2, '1', 7, 'Grp', unixepoch())",
+    )
+    .await;
+    q(
+        "INSERT INTO ed2k_aid (ed2k, aid, eid, epno, gid, group_name, updated_at)
+       VALUES ('h-stray', 5555, 3, '1', 7, 'Grp', unixepoch())",
+    )
+    .await;
 
     let bound = enricher.bind_bare_files(&db).await.unwrap();
     assert_eq!(bound, 2);
     assert_eq!(slot_of(&db, "ncop.mkv").await.0, Some(0));
-    assert_eq!(slot_of(&db, "ncop.mkv").await.1, 102, "C2 lands in the credits band");
+    assert_eq!(
+        slot_of(&db, "ncop.mkv").await.1,
+        102,
+        "C2 lands in the credits band"
+    );
     let film: String =
         sqlx::query_scalar("SELECT item_id FROM item_sources WHERE path_rel='film.mkv'")
             .fetch_one(&db)
@@ -200,8 +221,7 @@ async fn ownerless_movies_are_minted_or_adopted_from_the_hash() {
         ("adopt.mkv", "h-ad", 600),
         ("lone-ova.mkv", "h-lo", 700),
         ("serial-ova.mkv", "h-so", 800),
-    ]
-    {
+    ] {
         sqlx::query(
             "INSERT INTO files (module_id, collection_id, path_rel, size, mtime_unix,
                                 head_xxh3, tail_xxh3, oshash, streams_json, subs_extracted, ed2k)
@@ -234,7 +254,11 @@ async fn ownerless_movies_are_minted_or_adopted_from_the_hash() {
     .fetch_optional(&db)
     .await
     .unwrap();
-    assert_eq!(lone.as_deref(), Some("Lone OVA"), "single-episode OVA minted as a movie");
+    assert_eq!(
+        lone.as_deref(),
+        Some("Lone OVA"),
+        "single-episode OVA minted as a movie"
+    );
     let serial: Option<String> = sqlx::query_scalar(
         "SELECT s.item_id FROM item_sources s WHERE s.path_rel='serial-ova.mkv'",
     )
@@ -250,13 +274,16 @@ async fn ownerless_movies_are_minted_or_adopted_from_the_hash() {
     .fetch_one(&db)
     .await
     .unwrap();
-    assert_eq!((akira.0.as_str(), akira.1), ("Akira", Some(1988)), "minted from the XML");
-    let aid_of: i64 =
-        sqlx::query_scalar("SELECT anidb_id FROM anime_ids WHERE item_id = ?")
-            .bind(&akira.2)
-            .fetch_one(&db)
-            .await
-            .unwrap();
+    assert_eq!(
+        (akira.0.as_str(), akira.1),
+        ("Akira", Some(1988)),
+        "minted from the XML"
+    );
+    let aid_of: i64 = sqlx::query_scalar("SELECT anidb_id FROM anime_ids WHERE item_id = ?")
+        .bind(&akira.2)
+        .fetch_one(&db)
+        .await
+        .unwrap();
     assert_eq!(aid_of, 979);
 
     let adopted: String =
@@ -264,7 +291,10 @@ async fn ownerless_movies_are_minted_or_adopted_from_the_hash() {
             .fetch_one(&db)
             .await
             .unwrap();
-    assert_eq!(adopted, "twin", "an aid-less twin is adopted, not duplicated");
+    assert_eq!(
+        adopted, "twin",
+        "an aid-less twin is adopted, not duplicated"
+    );
 
     let stray: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM item_sources WHERE path_rel='stray-ep.mkv'")
@@ -278,7 +308,10 @@ async fn ownerless_movies_are_minted_or_adopted_from_the_hash() {
             .fetch_one(&db)
             .await
             .unwrap();
-    assert_eq!(shows, 4, "show harness + akira + twin + lone OVA, nothing else");
+    assert_eq!(
+        shows, 4,
+        "show harness + akira + twin + lone OVA, nothing else"
+    );
 }
 
 /// A file WE parked in season 0 on a name guess is reclaimed by a
@@ -288,7 +321,10 @@ async fn ownerless_movies_are_minted_or_adopted_from_the_hash() {
 async fn a_regular_hash_number_reclaims_a_season_zero_parking() {
     let (enricher, db, _dir) = harness().await;
     episode(&db, "parked", Some(0), 1, AID, "3").await;
-    let moves = enricher.bind_hashed_episodes(&db, "show", AID).await.unwrap();
+    let moves = enricher
+        .bind_hashed_episodes(&db, "show", AID)
+        .await
+        .unwrap();
     assert_eq!(moves.len(), 1);
     assert_eq!((moves[0].from, moves[0].to), ((Some(0), 1), (None, 3)));
     assert_eq!(slot_of(&db, "parked.mkv").await.0, None);
@@ -301,11 +337,13 @@ async fn the_hash_wins_over_the_filename() {
     episode(&db, "e5", None, 5, AID, "05").await;
     episode(&db, "e6", None, 6, AID, "5").await; // misnumbered rip of ep 5
     // The user watched it under the wrong number.
-    sqlx::query("INSERT INTO users (id, username, password_hash, is_admin, created_at)
-                 VALUES ('u','u','x',0,unixepoch())")
-        .execute(&db)
-        .await
-        .unwrap();
+    sqlx::query(
+        "INSERT INTO users (id, username, password_hash, is_admin, created_at)
+                 VALUES ('u','u','x',0,unixepoch())",
+    )
+    .execute(&db)
+    .await
+    .unwrap();
     sqlx::query(
         "INSERT INTO watch_state (user_id, item_id, position_ms, duration_ms, played, play_count, updated_at)
          VALUES ('u','e6',120000,1200000,1,1,unixepoch())",
@@ -314,7 +352,10 @@ async fn the_hash_wins_over_the_filename() {
     .await
     .unwrap();
 
-    let moves = enricher.bind_hashed_episodes(&db, "show", AID).await.unwrap();
+    let moves = enricher
+        .bind_hashed_episodes(&db, "show", AID)
+        .await
+        .unwrap();
     assert_eq!(moves.len(), 1);
     assert_eq!((moves[0].from, moves[0].to), ((None, 6), (None, 5)));
 
@@ -328,15 +369,17 @@ async fn the_hash_wins_over_the_filename() {
         .await
         .unwrap();
     assert_eq!(ghost, 0, "a sourceless misnumbered episode must not linger");
-    let watched: String =
-        sqlx::query_scalar("SELECT item_id FROM watch_state WHERE user_id='u'")
-            .fetch_one(&db)
-            .await
-            .unwrap();
+    let watched: String = sqlx::query_scalar("SELECT item_id FROM watch_state WHERE user_id='u'")
+        .fetch_one(&db)
+        .await
+        .unwrap();
     assert_eq!(watched, "e5");
 
     // Idempotent: nothing left to move.
-    let again = enricher.bind_hashed_episodes(&db, "show", AID).await.unwrap();
+    let again = enricher
+        .bind_hashed_episodes(&db, "show", AID)
+        .await
+        .unwrap();
     assert!(again.is_empty(), "{again:?}");
 }
 
@@ -353,22 +396,37 @@ async fn specials_land_in_season_zero_and_the_rest_is_left_alone() {
     // Season-keyed episode: AniDB numbering is not this space; left.
     episode(&db, "skeyed", Some(2), 3, AID, "4").await;
 
-    let moves = enricher.bind_hashed_episodes(&db, "show", AID).await.unwrap();
+    let moves = enricher
+        .bind_hashed_episodes(&db, "show", AID)
+        .await
+        .unwrap();
     assert_eq!(moves.len(), 2, "{moves:?}");
 
     let sp = slot_of(&db, "sp.mkv").await;
     assert_eq!((sp.0, sp.1), (Some(0), 2), "special bound into season 0");
     let op = slot_of(&db, "op.mkv").await;
-    assert_eq!((op.0, op.1), (Some(0), 101), "credits into season 0's C band");
-    assert_eq!(slot_of(&db, "other.mkv").await, (None, 40, "other".into()), "cross-aid stays put");
-    assert_eq!(slot_of(&db, "skeyed.mkv").await, (Some(2), 3, "skeyed".into()));
+    assert_eq!(
+        (op.0, op.1),
+        (Some(0), 101),
+        "credits into season 0's C band"
+    );
+    assert_eq!(
+        slot_of(&db, "other.mkv").await,
+        (None, 40, "other".into()),
+        "cross-aid stays put"
+    );
+    assert_eq!(
+        slot_of(&db, "skeyed.mkv").await,
+        (Some(2), 3, "skeyed".into())
+    );
 
     // The created season-0 item carried the file's own title.
-    let title: String =
-        sqlx::query_scalar("SELECT title FROM items WHERE parent_id='show' AND season=0 AND episode=2")
-            .fetch_one(&db)
-            .await
-            .unwrap();
+    let title: String = sqlx::query_scalar(
+        "SELECT title FROM items WHERE parent_id='show' AND season=0 AND episode=2",
+    )
+    .fetch_one(&db)
+    .await
+    .unwrap();
     assert_eq!(title, "title sp");
 }
 
@@ -380,13 +438,14 @@ async fn specials_land_in_season_zero_and_the_rest_is_left_alone() {
 #[tokio::test]
 async fn selection_follows_the_question_not_the_miss() {
     let (enricher, db, _dir) = harness().await;
-    let registry =
-        kahawai_hub::registry::Registry::new(db.clone(), Default::default());
-    async fn selected(
-        registry: &kahawai_hub::registry::Registry,
-        enricher: &Enricher,
-    ) -> bool {
-        enricher.select_anime_items(registry).await.unwrap().iter().any(|i| i.id == "show")
+    let registry = kahawai_hub::registry::Registry::new(db.clone(), Default::default());
+    async fn selected(registry: &kahawai_hub::registry::Registry, enricher: &Enricher) -> bool {
+        enricher
+            .select_anime_items(registry)
+            .await
+            .unwrap()
+            .iter()
+            .any(|i| i.id == "show")
     }
     // Membership in an anime collection (the harness show has no source
     // yet — give it one, unhashed so the hash branch stays quiet).
@@ -404,7 +463,10 @@ async fn selection_follows_the_question_not_the_miss() {
     .unwrap();
 
     // Never asked: the name question is owed.
-    assert!(selected(&registry, &enricher).await, "fresh item must be due");
+    assert!(
+        selected(&registry, &enricher).await,
+        "fresh item must be due"
+    );
 
     // A recorded miss alone does NOT settle it — only the question does.
     sqlx::query(
@@ -423,14 +485,20 @@ async fn selection_follows_the_question_not_the_miss() {
         &kahawai_hub::providers::title_anchor("x", None),
     )
     .await;
-    assert!(!selected(&registry, &enricher).await, "asked question settles it");
+    assert!(
+        !selected(&registry, &enricher).await,
+        "asked question settles it"
+    );
 
     // A rename changes the question: due again, exactly once.
     sqlx::query("UPDATE items SET title='Y', norm_title='y' WHERE id='show'")
         .execute(&db)
         .await
         .unwrap();
-    assert!(selected(&registry, &enricher).await, "rename re-opens the question");
+    assert!(
+        selected(&registry, &enricher).await,
+        "rename re-opens the question"
+    );
     kahawai_hub::providers::record_question(
         &db,
         "show",
@@ -453,7 +521,10 @@ async fn selection_follows_the_question_not_the_miss() {
     .execute(&db)
     .await
     .unwrap();
-    assert!(!selected(&registry, &enricher).await, "identity beats any rename");
+    assert!(
+        !selected(&registry, &enricher).await,
+        "identity beats any rename"
+    );
 
     // …until the identity brings a NEW question: the bridge fetch by
     // mapped id is owed despite an old tvdb title-search miss.
@@ -470,7 +541,13 @@ async fn selection_follows_the_question_not_the_miss() {
     .execute(&db)
     .await
     .unwrap();
-    assert!(selected(&registry, &enricher).await, "mapped id is a new question");
+    assert!(
+        selected(&registry, &enricher).await,
+        "mapped id is a new question"
+    );
     kahawai_hub::providers::record_question(&db, "show", "tvdb", "mapped_id", "98611").await;
-    assert!(!selected(&registry, &enricher).await, "bridge question spent");
+    assert!(
+        !selected(&registry, &enricher).await,
+        "bridge question spent"
+    );
 }

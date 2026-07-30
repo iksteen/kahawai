@@ -22,7 +22,10 @@ fn pattern(len: usize) -> Vec<u8> {
 }
 
 async fn body_bytes(resp: axum::response::Response) -> Vec<u8> {
-    axum::body::to_bytes(resp.into_body(), 64 << 20).await.unwrap().to_vec()
+    axum::body::to_bytes(resp.into_body(), 64 << 20)
+        .await
+        .unwrap()
+        .to_vec()
 }
 
 #[tokio::test]
@@ -51,7 +54,9 @@ async fn direct_play_ranges_end_to_end() {
     .unwrap();
     let db = kahawai_hub::db::open_in_memory().await.unwrap();
     let registry = Arc::new(Registry::new(db.clone(), allowed.clone()));
-    let sessions = Arc::new(kahawai_hub::sessions::Sessions::new(tempfile::tempdir().unwrap().keep()));
+    let sessions = Arc::new(kahawai_hub::sessions::Sessions::new(
+        tempfile::tempdir().unwrap().keep(),
+    ));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let hub_addr = format!("localhost:{}", listener.local_addr().unwrap().port());
     let link_svc = MediahostLinkService::new(
@@ -84,7 +89,9 @@ async fn direct_play_ranges_end_to_end() {
         ca_pem: ca.ca_cert_pem().to_string(),
     };
     let client_tls = kahawai_transport::mtls::mtls_client_config(&id).unwrap();
-    let channel = kahawai_transport::tls::grpc_channel_with(&hub_addr, client_tls).await.unwrap();
+    let channel = kahawai_transport::tls::grpc_channel_with(&hub_addr, client_tls)
+        .await
+        .unwrap();
     let mut client = pb::mediahost_link_client::MediahostLinkClient::new(channel.clone());
     let (tx, rx) = tokio::sync::mpsc::channel(8);
     let send = |msg: pb::host_to_hub::Msg| {
@@ -103,11 +110,13 @@ async fn direct_play_ranges_end_to_end() {
         .unwrap()
         .into_inner();
     inbound.message().await.unwrap().unwrap(); // HelloAck
-    send(pb::host_to_hub::Msg::AnnounceCollection(pb::AnnounceCollection {
-        id: "movies".into(),
-        media_type: "movies".into(),
-        roots: vec![root.path().display().to_string()],
-    }))
+    send(pb::host_to_hub::Msg::AnnounceCollection(
+        pb::AnnounceCollection {
+            id: "movies".into(),
+            media_type: "movies".into(),
+            roots: vec![root.path().display().to_string()],
+        },
+    ))
     .await;
     send(pb::host_to_hub::Msg::FileUpsert(pb::FileUpsert {
         collection_id: "movies".into(),
@@ -130,14 +139,20 @@ async fn direct_play_ranges_end_to_end() {
             if let Some(pb::hub_to_host::Msg::OpenRead(req)) = m.msg {
                 let path = kahawai_mediahost::serve::resolve_path(&serve_collections, &req);
                 let ch = serve_channel.clone();
-                tokio::spawn(kahawai_mediahost::serve::serve_lease(ch, req.lease_token, path));
+                tokio::spawn(kahawai_mediahost::serve::serve_lease(
+                    ch,
+                    req.lease_token,
+                    path,
+                ));
             }
         }
     });
 
     // API with auth completed.
     let auth = Arc::new(
-        kahawai_hub::auth::Auth::new(db.clone(), pki.path()).await.unwrap(),
+        kahawai_hub::auth::Auth::new(db.clone(), pki.path())
+            .await
+            .unwrap(),
     );
     let pair = auth
         .complete_setup(&auth.setup_token().unwrap(), "admin", "password-123")
@@ -159,8 +174,7 @@ async fn direct_play_ranges_end_to_end() {
                 )
                 .await
                 .unwrap();
-            let v: serde_json::Value =
-                serde_json::from_slice(&body_bytes(resp).await).unwrap();
+            let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
             if let Some(id) = v["items"].get(0).and_then(|i| i["id"].as_str()) {
                 return id.to_string();
             }
@@ -177,7 +191,9 @@ async fn direct_play_ranges_end_to_end() {
             Request::post("/api/v1/playback/sessions")
                 .header("authorization", bearer.clone())
                 .header("content-type", "application/json")
-                .body(Body::from(format!("{{\"item_id\":\"{item_id}\",\"mode\":\"direct\"}}")))
+                .body(Body::from(format!(
+                    "{{\"item_id\":\"{item_id}\",\"mode\":\"direct\"}}"
+                )))
                 .unwrap(),
         )
         .await
@@ -215,7 +231,9 @@ async fn direct_play_ranges_end_to_end() {
     assert_eq!(body_bytes(resp).await, content[4194000..4195000]);
 
     // Open-ended and suffix ranges (what players actually send).
-    let resp = get(Some(&format!("bytes={}-", FILE_LEN - 100))).await.unwrap();
+    let resp = get(Some(&format!("bytes={}-", FILE_LEN - 100)))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
     assert_eq!(body_bytes(resp).await, content[FILE_LEN - 100..]);
     let resp = get(Some("bytes=-123")).await.unwrap();
@@ -255,7 +273,9 @@ async fn direct_play_ranges_end_to_end() {
             Request::post("/api/v1/playback/sessions")
                 .header("authorization", bearer)
                 .header("content-type", "application/json")
-                .body(Body::from(format!("{{\"item_id\":\"{item_id}\",\"mode\":\"direct\"}}")))
+                .body(Body::from(format!(
+                    "{{\"item_id\":\"{item_id}\",\"mode\":\"direct\"}}"
+                )))
                 .unwrap(),
         )
         .await
@@ -279,5 +299,23 @@ fn test_router(
         std::time::Duration::from_secs(900),
         90,
     ));
-    kahawai_hub::api::router(registry, auth, sessions, enrollments, Arc::new(kahawai_hub::subtitles::Subtitles::new(tempfile::tempdir().unwrap().keep())), Arc::new(kahawai_hub::artwork::Artwork::new(tempfile::tempdir().unwrap().keep(), Arc::new(kahawai_hub::enrich::Enricher::new(tempfile::tempdir().unwrap().keep())))), Arc::new(kahawai_hub::enrich::Enricher::new(tempfile::tempdir().unwrap().keep())), kahawai_hub::api::NetOptions::default())
+    kahawai_hub::api::router(
+        registry,
+        auth,
+        sessions,
+        enrollments,
+        Arc::new(kahawai_hub::subtitles::Subtitles::new(
+            tempfile::tempdir().unwrap().keep(),
+        )),
+        Arc::new(kahawai_hub::artwork::Artwork::new(
+            tempfile::tempdir().unwrap().keep(),
+            Arc::new(kahawai_hub::enrich::Enricher::new(
+                tempfile::tempdir().unwrap().keep(),
+            )),
+        )),
+        Arc::new(kahawai_hub::enrich::Enricher::new(
+            tempfile::tempdir().unwrap().keep(),
+        )),
+        kahawai_hub::api::NetOptions::default(),
+    )
 }

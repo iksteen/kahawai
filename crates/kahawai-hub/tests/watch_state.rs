@@ -15,7 +15,9 @@ use kahawai_transport::identity::SatelliteIdentity;
 use tower::ServiceExt;
 
 async fn body_json(resp: axum::response::Response) -> serde_json::Value {
-    let b = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+    let b = axum::body::to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .unwrap();
     serde_json::from_slice(&b).unwrap_or(serde_json::Value::Null)
 }
 
@@ -81,7 +83,9 @@ async fn progress_resume_played_caps_and_idle() {
         ca_pem: ca.ca_cert_pem().to_string(),
     };
     let client_tls = kahawai_transport::mtls::mtls_client_config(&id).unwrap();
-    let channel = kahawai_transport::tls::grpc_channel_with(&hub_addr, client_tls).await.unwrap();
+    let channel = kahawai_transport::tls::grpc_channel_with(&hub_addr, client_tls)
+        .await
+        .unwrap();
     let mut client = pb::mediahost_link_client::MediahostLinkClient::new(channel.clone());
     let (tx, rx) = tokio::sync::mpsc::channel(8);
     tx.send(pb::HostToHub {
@@ -134,7 +138,11 @@ async fn progress_resume_played_caps_and_idle() {
         }
     });
 
-    let auth = Arc::new(kahawai_hub::auth::Auth::new(db.clone(), pki.path()).await.unwrap());
+    let auth = Arc::new(
+        kahawai_hub::auth::Auth::new(db.clone(), pki.path())
+            .await
+            .unwrap(),
+    );
     let pair = auth
         .complete_setup(&auth.setup_token().unwrap(), "admin", "password-123")
         .await
@@ -142,7 +150,10 @@ async fn progress_resume_played_caps_and_idle() {
     let bearer = format!("Bearer {}", pair.access_token);
     let api = test_router(registry.clone(), auth, sessions.clone());
     let get = |uri: String| {
-        Request::get(uri).header("authorization", bearer.clone()).body(Body::empty()).unwrap()
+        Request::get(uri)
+            .header("authorization", bearer.clone())
+            .body(Body::empty())
+            .unwrap()
     };
     let post = |uri: String, body: serde_json::Value| {
         Request::post(uri)
@@ -155,7 +166,13 @@ async fn progress_resume_played_caps_and_idle() {
     // Wait for the item.
     let item_id = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
-            let v = body_json(api.clone().oneshot(get("/api/v1/items".into())).await.unwrap()).await;
+            let v = body_json(
+                api.clone()
+                    .oneshot(get("/api/v1/items".into()))
+                    .await
+                    .unwrap(),
+            )
+            .await;
             if let Some(id) = v["items"].get(0).and_then(|i| i["id"].as_str()) {
                 return id.to_string();
             }
@@ -166,7 +183,13 @@ async fn progress_resume_played_caps_and_idle() {
     .unwrap();
 
     // Fresh item: no watch state.
-    let v = body_json(api.clone().oneshot(get("/api/v1/items".into())).await.unwrap()).await;
+    let v = body_json(
+        api.clone()
+            .oneshot(get("/api/v1/items".into()))
+            .await
+            .unwrap(),
+    )
+    .await;
     assert_eq!(v["items"][0]["resume_position_ms"], serde_json::Value::Null);
     assert_eq!(v["items"][0]["played"], false);
 
@@ -178,7 +201,10 @@ async fn progress_resume_played_caps_and_idle() {
     };
     let resp = start_session().await.unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);
-    let s1 = body_json(resp).await["session_id"].as_str().unwrap().to_string();
+    let s1 = body_json(resp).await["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
 
     // Progress at 50%: resume position stored, not played.
     let resp = api
@@ -190,7 +216,13 @@ async fn progress_resume_played_caps_and_idle() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    let v = body_json(api.clone().oneshot(get("/api/v1/items".into())).await.unwrap()).await;
+    let v = body_json(
+        api.clone()
+            .oneshot(get("/api/v1/items".into()))
+            .await
+            .unwrap(),
+    )
+    .await;
     assert_eq!(v["items"][0]["resume_position_ms"], 50_000);
     assert_eq!(v["items"][0]["played"], false);
 
@@ -206,8 +238,13 @@ async fn progress_resume_played_caps_and_idle() {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
     }
-    let v = body_json(api.clone().oneshot(get(format!("/api/v1/items/{item_id}"))).await.unwrap())
-        .await;
+    let v = body_json(
+        api.clone()
+            .oneshot(get(format!("/api/v1/items/{item_id}")))
+            .await
+            .unwrap(),
+    )
+    .await;
     assert_eq!(v["played"], true);
     assert_eq!(v["play_count"], 1);
     assert_eq!(v["resume_position_ms"], 97_000);
@@ -216,7 +253,11 @@ async fn progress_resume_played_caps_and_idle() {
     let resp = start_session().await.unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);
     let resp = start_session().await.unwrap();
-    assert_eq!(resp.status(), StatusCode::CONFLICT, "cap of 2 sessions per user");
+    assert_eq!(
+        resp.status(),
+        StatusCode::CONFLICT,
+        "cap of 2 sessions per user"
+    );
 
     // Idle reaping: stop touching; the janitor ends both within ~2 s.
     tokio::time::timeout(Duration::from_secs(10), async {
@@ -258,5 +299,23 @@ fn test_router(
         std::time::Duration::from_secs(900),
         90,
     ));
-    kahawai_hub::api::router(registry, auth, sessions, enrollments, Arc::new(kahawai_hub::subtitles::Subtitles::new(tempfile::tempdir().unwrap().keep())), Arc::new(kahawai_hub::artwork::Artwork::new(tempfile::tempdir().unwrap().keep(), Arc::new(kahawai_hub::enrich::Enricher::new(tempfile::tempdir().unwrap().keep())))), Arc::new(kahawai_hub::enrich::Enricher::new(tempfile::tempdir().unwrap().keep())), kahawai_hub::api::NetOptions::default())
+    kahawai_hub::api::router(
+        registry,
+        auth,
+        sessions,
+        enrollments,
+        Arc::new(kahawai_hub::subtitles::Subtitles::new(
+            tempfile::tempdir().unwrap().keep(),
+        )),
+        Arc::new(kahawai_hub::artwork::Artwork::new(
+            tempfile::tempdir().unwrap().keep(),
+            Arc::new(kahawai_hub::enrich::Enricher::new(
+                tempfile::tempdir().unwrap().keep(),
+            )),
+        )),
+        Arc::new(kahawai_hub::enrich::Enricher::new(
+            tempfile::tempdir().unwrap().keep(),
+        )),
+        kahawai_hub::api::NetOptions::default(),
+    )
 }

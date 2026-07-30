@@ -2,10 +2,10 @@
 //! binary, served on the same listener as the API. The SPA is a pure client
 //! of the public API — no private endpoints.
 
-use axum::http::{header, StatusCode, Uri};
+use axum::Router;
+use axum::http::{StatusCode, Uri, header};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::get;
-use axum::Router;
 
 #[derive(rust_embed::Embed)]
 #[folder = "../../web/dist"]
@@ -35,7 +35,7 @@ fn spa_response(path: &str) -> Response {
                     StatusCode::NOT_FOUND,
                     "web UI not embedded in this build (web/dist missing at compile time)",
                 )
-                    .into_response()
+                    .into_response();
             }
         },
     };

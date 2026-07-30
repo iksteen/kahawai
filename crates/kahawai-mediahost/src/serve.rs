@@ -4,7 +4,7 @@
 
 use std::path::PathBuf;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use kahawai_proto::v1::mediahost_link_client::MediahostLinkClient;
 use kahawai_proto::v1::{ByteChunk, OpenRead};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
@@ -61,7 +61,9 @@ pub async fn serve_lease(
     // First chunk binds the token; carry a resolution error if there is one.
     let (bind_error, file) = match path {
         Ok(p) => {
-            let f = tokio::fs::File::open(&p).await.with_context(|| format!("opening {}", p.display()))?;
+            let f = tokio::fs::File::open(&p)
+                .await
+                .with_context(|| format!("opening {}", p.display()))?;
             (String::new(), Some(f))
         }
         Err(e) => (format!("{e:#}"), None),

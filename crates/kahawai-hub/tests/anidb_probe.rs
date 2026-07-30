@@ -17,13 +17,22 @@ use kahawai_hub::registry::Registry;
 #[tokio::test]
 #[ignore = "sends a real packet to AniDB; run by hand"]
 async fn probe_anidb_once() {
-    let data_dir = std::path::PathBuf::from(std::env::var("HOME").unwrap())
-        .join(".local/share/kahawai");
+    let data_dir =
+        std::path::PathBuf::from(std::env::var("HOME").unwrap()).join(".local/share/kahawai");
     let db = kahawai_hub::db::open(&data_dir).await.expect("open hub db");
     let registry = Registry::new(db, Default::default());
-    let user = registry.get_setting(kahawai_hub::anidb::USER_SETTING).await.unwrap();
-    let pass = registry.get_setting(kahawai_hub::anidb::PASS_SETTING).await.unwrap();
-    let key = registry.get_setting(kahawai_hub::anidb::APIKEY_SETTING).await.unwrap();
+    let user = registry
+        .get_setting(kahawai_hub::anidb::USER_SETTING)
+        .await
+        .unwrap();
+    let pass = registry
+        .get_setting(kahawai_hub::anidb::PASS_SETTING)
+        .await
+        .unwrap();
+    let key = registry
+        .get_setting(kahawai_hub::anidb::APIKEY_SETTING)
+        .await
+        .unwrap();
     let (Some(user), Some(pass)) = (user, pass) else {
         eprintln!("PROBE: no anidb credentials configured");
         return;

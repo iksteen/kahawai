@@ -38,7 +38,10 @@ struct Bench {
 /// not an empty catalogue.
 async fn seed(dir: &std::path::Path, items: usize) -> Bench {
     let db = kahawai_hub::db::open(dir).await.unwrap();
-    let registry = Arc::new(kahawai_hub::registry::Registry::new(db.clone(), Default::default()));
+    let registry = Arc::new(kahawai_hub::registry::Registry::new(
+        db.clone(),
+        Default::default(),
+    ));
     let auth = Arc::new(kahawai_hub::auth::Auth::new(db.clone(), dir).await.unwrap());
 
     let library = "01BENCHLIBRARY0000000000".to_string();
@@ -144,10 +147,14 @@ async fn seed(dir: &std::path::Path, items: usize) -> Bench {
         // with what the triggers already wrote.
     }
     tx.commit().await.unwrap();
-    eprintln!("  seeded {items} items over {MEDIAHOSTS} collections in {:?}", t0.elapsed());
+    eprintln!(
+        "  seeded {items} items over {MEDIAHOSTS} collections in {:?}",
+        t0.elapsed()
+    );
 
-    let sessions =
-        Arc::new(kahawai_hub::sessions::Sessions::new(tempfile::tempdir().unwrap().keep()));
+    let sessions = Arc::new(kahawai_hub::sessions::Sessions::new(
+        tempfile::tempdir().unwrap().keep(),
+    ));
     let ca = Arc::new(
         kahawai_hub::pki::HubCa::load_or_create(tempfile::tempdir().unwrap().keep().as_path())
             .unwrap(),
@@ -164,7 +171,9 @@ async fn seed(dir: &std::path::Path, items: usize) -> Bench {
         auth.clone(),
         sessions,
         enrollments,
-        Arc::new(kahawai_hub::subtitles::Subtitles::new(tempfile::tempdir().unwrap().keep())),
+        Arc::new(kahawai_hub::subtitles::Subtitles::new(
+            tempfile::tempdir().unwrap().keep(),
+        )),
         Arc::new(kahawai_hub::artwork::Artwork::new(
             tempfile::tempdir().unwrap().keep(),
             enricher.clone(),
@@ -177,7 +186,12 @@ async fn seed(dir: &std::path::Path, items: usize) -> Bench {
         .await
         .unwrap()
         .access_token;
-    Bench { api, token, library, db }
+    Bench {
+        api,
+        token,
+        library,
+        db,
+    }
 }
 
 impl Bench {
@@ -208,7 +222,9 @@ impl Bench {
                 .await
                 .unwrap();
             assert!(resp.status().is_success(), "{uri} -> {}", resp.status());
-            let b = axum::body::to_bytes(resp.into_body(), 1 << 30).await.unwrap();
+            let b = axum::body::to_bytes(resp.into_body(), 1 << 30)
+                .await
+                .unwrap();
             let took = t.elapsed();
             all.push(format!("{:.1}", took.as_secs_f64() * 1e3));
             worst = worst.max(took);
@@ -228,47 +244,75 @@ async fn browse_latency_and_scale() {
     for items in [50_000usize, 250_000] {
         // KEEP_BENCH_DB=/path leaves the seeded database behind so a plan
         // can be read against the real thing rather than a smaller stand-in.
-        let keep = std::env::var("KEEP_BENCH_DB").ok().map(|p| format!("{p}-{items}"));
+        let keep = std::env::var("KEEP_BENCH_DB")
+            .ok()
+            .map(|p| format!("{p}-{items}"));
         let dir = tempfile::tempdir().unwrap();
         if let Some(k) = &keep {
             std::fs::create_dir_all(k).unwrap();
         }
         eprintln!("\n=== {items} items");
-        let path: &std::path::Path =
-            keep.as_ref().map(std::path::Path::new).unwrap_or(dir.path());
+        let path: &std::path::Path = keep
+            .as_ref()
+            .map(std::path::Path::new)
+            .unwrap_or(dir.path());
         let b = seed(path, items).await;
 
-        let files: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM files").fetch_one(&b.db).await.unwrap();
+        let files: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM files")
+            .fetch_one(&b.db)
+            .await
+            .unwrap();
         let (whole, bytes) = b.time("/api/v1/items", 3).await;
-        let (scoped, _) =
-            b.time(&format!("/api/v1/items?library={}", b.library), 3).await;
+        let (scoped, _) = b
+            .time(&format!("/api/v1/items?library={}", b.library), 3)
+            .await;
         // The page a user actually lands on, and one deep in the middle:
         // an OFFSET still walks the rows it skips, so the last page is
         // the honest worst case, not the first.
         let (deep, _) = b
-            .time(&format!("/api/v1/items?library={}&offset={}", b.library, items - 200), 3)
+            .time(
+                &format!("/api/v1/items?library={}&offset={}", b.library, items - 200),
+                3,
+            )
             .await;
-        let (search, _) =
-            b.time(&format!("/api/v1/items?library={}&q=film+1234", b.library), 3).await;
+        let (search, _) = b
+            .time(
+                &format!("/api/v1/items?library={}&q=film+1234", b.library),
+                3,
+            )
+            .await;
         // The adversarial search: every seeded title contains "film", so
         // this needle matches the entire catalogue — the page streams but
         // the count must still visit everything.
-        let (search_dense, _) =
-            b.time(&format!("/api/v1/items?library={}&q=film", b.library), 3).await;
+        let (search_dense, _) = b
+            .time(&format!("/api/v1/items?library={}&q=film", b.library), 3)
+            .await;
 
-        let (detail, _) =
-            b.time(&format!("/api/v1/items/01BENCHITEM{:015}", items / 2), 5).await;
+        let (detail, _) = b
+            .time(&format!("/api/v1/items/01BENCHITEM{:015}", items / 2), 5)
+            .await;
 
         eprintln!("  files             {files}");
-        eprintln!("  GET /items        {:>8.1} ms  ({:.1} MB)", whole.as_secs_f64() * 1e3,
-                  bytes as f64 / 1e6);
-        eprintln!("  GET /items?library{:>8.1} ms  (first page)", scoped.as_secs_f64() * 1e3);
+        eprintln!(
+            "  GET /items        {:>8.1} ms  ({:.1} MB)",
+            whole.as_secs_f64() * 1e3,
+            bytes as f64 / 1e6
+        );
+        eprintln!(
+            "  GET /items?library{:>8.1} ms  (first page)",
+            scoped.as_secs_f64() * 1e3
+        );
         eprintln!("  ...last page      {:>8.1} ms", deep.as_secs_f64() * 1e3);
         eprintln!("  ...search         {:>8.1} ms", search.as_secs_f64() * 1e3);
-        eprintln!("  ...search (dense) {:>8.1} ms", search_dense.as_secs_f64() * 1e3);
+        eprintln!(
+            "  ...search (dense) {:>8.1} ms",
+            search_dense.as_secs_f64() * 1e3
+        );
 
-        eprintln!("  GET /items/{{id}}   {:>8.1} ms", detail.as_secs_f64() * 1e3);
+        eprintln!(
+            "  GET /items/{{id}}   {:>8.1} ms",
+            detail.as_secs_f64() * 1e3
+        );
 
         // The write side of the trigger-driven pick. A reorder recomputes
         // every item of the media type — accepted deliberately, so the
@@ -277,8 +321,10 @@ async fn browse_latency_and_scale() {
         kahawai_hub::providers::set_chain(&b.db, "movies", &["tvdb".into(), "tmdb".into()])
             .await
             .unwrap();
-        eprintln!("  chain reorder     {:>8.1} ms  (re-picks every item)",
-                  t.elapsed().as_secs_f64() * 1e3);
+        eprintln!(
+            "  chain reorder     {:>8.1} ms  (re-picks every item)",
+            t.elapsed().as_secs_f64() * 1e3
+        );
 
         // And the hottest write path in the system: a rescan announcing
         // sources in bulk. The trigger's WHEN guard is what keeps this
@@ -299,8 +345,10 @@ async fn browse_latency_and_scale() {
             .unwrap();
         }
         tx.commit().await.unwrap();
-        eprintln!("  1000 item_sources {:>8.1} ms  (scan path)",
-                  t.elapsed().as_secs_f64() * 1e3);
+        eprintln!(
+            "  1000 item_sources {:>8.1} ms  (scan path)",
+            t.elapsed().as_secs_f64() * 1e3
+        );
 
         let t = Instant::now();
         let n: i64 = sqlx::query_scalar(
@@ -309,8 +357,10 @@ async fn browse_latency_and_scale() {
         .fetch_one(&b.db)
         .await
         .unwrap();
-        eprintln!("  view over {n:>6}    {:>8.1} ms  (SQL only, no serialisation)",
-                  t.elapsed().as_secs_f64() * 1e3);
+        eprintln!(
+            "  view over {n:>6}    {:>8.1} ms  (SQL only, no serialisation)",
+            t.elapsed().as_secs_f64() * 1e3
+        );
 
         // The enrichment pass's standing tax: the question-gated
         // selection at the top of every run (provider_queries, 0044).
@@ -326,12 +376,19 @@ async fn browse_latency_and_scale() {
                 .await
                 .unwrap();
             let took = t.elapsed();
-            assert!(rows.is_empty(), "quiescent selection must be empty, got {}", rows.len());
+            assert!(
+                rows.is_empty(),
+                "quiescent selection must be empty, got {}",
+                rows.len()
+            );
             runs_q.push(format!("{:.1}", took.as_secs_f64() * 1e3));
             sel_idle = sel_idle.max(took);
         }
-        eprintln!("  selection (idle)  {:>8.1} ms  runs: {}", sel_idle.as_secs_f64() * 1e3,
-                  runs_q.join(", "));
+        eprintln!(
+            "  selection (idle)  {:>8.1} ms  runs: {}",
+            sel_idle.as_secs_f64() * 1e3,
+            runs_q.join(", ")
+        );
 
         // With work owed: strip 1000 items' answers — no question rows
         // exist for them, so exactly those must surface as due.
@@ -356,8 +413,11 @@ async fn browse_latency_and_scale() {
             runs_d.push(format!("{:.1}", took.as_secs_f64() * 1e3));
             sel_due = sel_due.max(took);
         }
-        eprintln!("  selection (1000 due){:>6.1} ms  runs: {}", sel_due.as_secs_f64() * 1e3,
-                  runs_d.join(", "));
+        eprintln!(
+            "  selection (1000 due){:>6.1} ms  runs: {}",
+            sel_due.as_secs_f64() * 1e3,
+            runs_d.join(", ")
+        );
 
         // NFR-1 states the target at 50k; recorded at BOTH sizes, since
         // NFR-2 asks the shape to hold at 250k and a page should not care
@@ -392,10 +452,15 @@ async fn browse_latency_and_scale() {
         // matters, the lever is a partial index
         // (provider_metadata(provider, item_id) WHERE provider_id <> '')
         // to drive from the answered side — unbuilt, no need yet.
-        let (idle_limit, due_limit) = if items > 100_000 { (5_000u128, 5_500) } else { (1_200, 1_300) };
-        for (what, took, limit) in
-            [("selection idle", sel_idle, idle_limit), ("selection 1000 due", sel_due, due_limit)]
-        {
+        let (idle_limit, due_limit) = if items > 100_000 {
+            (5_000u128, 5_500)
+        } else {
+            (1_200, 1_300)
+        };
+        for (what, took, limit) in [
+            ("selection idle", sel_idle, idle_limit),
+            ("selection 1000 due", sel_due, due_limit),
+        ] {
             if took.as_millis() > limit {
                 missed.push(format!(
                     "{what} at {items} items took {:.1} ms, tripwire {limit} ms",

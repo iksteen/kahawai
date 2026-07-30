@@ -18,12 +18,10 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 
 use crate::remux::RemuxSource;
-use crate::subtitles::{
-    ass_dialogue, clean_cue_text, compose_header, decode_text, Cue, Extracted,
-};
+use crate::subtitles::{Cue, Extracted, ass_dialogue, clean_cue_text, compose_header, decode_text};
 
 /// Extract all text subtitle tracks via index-driven reads, or `None`
 /// when this file's structure doesn't permit it (caller falls back).
@@ -38,13 +36,19 @@ pub fn extract_sparse(path: &Path) -> Result<Option<Vec<(usize, Extracted)>>> {
     let mut src = crate::remux::FileSource::open(path)?;
     if magic[..4] == [0x1A, 0x45, 0xDF, 0xA3] {
         return mkv_extract(&mut src).map(Some).or_else(|e| {
-            tracing::debug!(error = format!("{e:#}"), "mkv sparse parse failed; falling back");
+            tracing::debug!(
+                error = format!("{e:#}"),
+                "mkv sparse parse failed; falling back"
+            );
             Ok(None)
         });
     }
     if &magic[4..8] == b"ftyp" {
         return mp4_extract(&mut src).map(Some).or_else(|e| {
-            tracing::debug!(error = format!("{e:#}"), "mp4 sparse parse failed; falling back");
+            tracing::debug!(
+                error = format!("{e:#}"),
+                "mp4 sparse parse failed; falling back"
+            );
             Ok(None)
         });
     }
@@ -78,7 +82,13 @@ const READAHEAD: usize = 256 * 1024;
 impl<'a> Reader<'a> {
     fn new(src: &'a mut dyn RemuxSource) -> Self {
         let len = src.size();
-        Self { src, len, win_start: 0, win: Vec::new(), deadline: None }
+        Self {
+            src,
+            len,
+            win_start: 0,
+            win: Vec::new(),
+            deadline: None,
+        }
     }
 
     fn with_budget(src: &'a mut dyn RemuxSource, budget: std::time::Duration) -> Self {
@@ -94,10 +104,11 @@ impl<'a> Reader<'a> {
             bail!("index walk exceeded its read budget");
         }
         let end = off + n as u64;
-        let in_window = off >= self.win_start
-            && end <= self.win_start + self.win.len() as u64;
+        let in_window = off >= self.win_start && end <= self.win_start + self.win.len() as u64;
         if !in_window {
-            let want = n.max(READAHEAD).min((self.len.saturating_sub(off)) as usize);
+            let want = n
+                .max(READAHEAD)
+                .min((self.len.saturating_sub(off)) as usize);
             if want < n {
                 bail!("read past eof");
             }
@@ -355,7 +366,9 @@ fn mkv_read_index(r: &mut Reader) -> Result<MkvIndex> {
             Err(_) => break,
         };
         let Ok((id, il)) = ebml_id(&head) else { break };
-        let Ok((size, sl)) = ebml_size(&head[il..]) else { break };
+        let Ok((size, sl)) = ebml_size(&head[il..]) else {
+            break;
+        };
         let body = pos + il as u64 + sl as u64;
         let Some(size) = size else { break };
         match id {
@@ -425,10 +438,7 @@ fn mkv_read_index(r: &mut Reader) -> Result<MkvIndex> {
                                 sub_index: sub_seen,
                                 codec: codec.clone(),
                                 is_ass,
-                                header: private
-                                    .as_deref()
-                                    .filter(|_| is_ass)
-                                    .map(decode_text),
+                                header: private.as_deref().filter(|_| is_ass).map(decode_text),
                                 private: private.clone(),
                                 compression: compression.clone(),
                             });
@@ -471,12 +481,11 @@ fn mkv_read_index(r: &mut Reader) -> Result<MkvIndex> {
                     Ok(true)
                 })?;
             }
-            CLUSTER
-                if idx.first_cluster.is_none() => {
-                    idx.first_cluster = Some(pos);
-                }
-                // Tracks/Cues may still be ahead (SeekHead pending covers
-                // the usual layouts); keep hopping — header reads only.
+            CLUSTER if idx.first_cluster.is_none() => {
+                idx.first_cluster = Some(pos);
+            }
+            // Tracks/Cues may still be ahead (SeekHead pending covers
+            // the usual layouts); keep hopping — header reads only.
             _ => {}
         }
         // Jump to any SeekHead-promised sections we haven't visited,
@@ -513,7 +522,9 @@ pub fn declare_attachments(path: &Path) -> Result<Vec<kahawai_core::media::Attac
     let mut r = Reader::new(&mut src);
 
     let head = r.read_at(0, 32.min(len as usize))?;
-    let Ok((id, il)) = ebml_id(&head) else { return Ok(Vec::new()) };
+    let Ok((id, il)) = ebml_id(&head) else {
+        return Ok(Vec::new());
+    };
     if id != EBML_HEADER {
         return Ok(Vec::new());
     }
@@ -536,7 +547,9 @@ pub fn declare_attachments(path: &Path) -> Result<Vec<kahawai_core::media::Attac
         }
         let Ok(head) = r.read_at(pos, 16) else { break };
         let Ok((id, il)) = ebml_id(&head) else { break };
-        let Ok((size, sl)) = ebml_size(&head[il..]) else { break };
+        let Ok((size, sl)) = ebml_size(&head[il..]) else {
+            break;
+        };
         let body = pos + il as u64 + sl as u64;
         let Some(size) = size else { break };
         match id {
@@ -707,7 +720,9 @@ fn walk_cluster_sparse(
         }
         let head = r.read_at(p, peek_n)?;
         let Ok((id, il)) = ebml_id(&head) else { break };
-        let Ok((size, sl)) = ebml_size(&head[il..]) else { break };
+        let Ok((size, sl)) = ebml_size(&head[il..]) else {
+            break;
+        };
         let Some(size) = size else { break };
         let body = p + (il + sl) as u64;
         match id {
@@ -871,7 +886,10 @@ fn mkv_extract(src: &mut dyn RemuxSource) -> Result<Vec<(usize, Extracted)>> {
 fn mkv_walk(mut r: Reader<'_>, image: Option<usize>) -> Result<MkvOut> {
     let idx = mkv_read_index(&mut r)?;
     if idx.tracks.is_empty() {
-        return Ok(MkvOut { text: Vec::new(), image: None });
+        return Ok(MkvOut {
+            text: Vec::new(),
+            image: None,
+        });
     }
     // Collect blocks only for the tracks this caller will assemble: a
     // text extraction must not read (or hold) a film's worth of PGS.
@@ -882,15 +900,22 @@ fn mkv_walk(mut r: Reader<'_>, image: Option<usize>) -> Result<MkvOut> {
             .filter(|t| t.sub_index == want && !t.is_text())
             .map(|t| t.number)
             .collect(),
-        None => idx.tracks.iter().filter(|t| t.is_text()).map(|t| t.number).collect(),
+        None => idx
+            .tracks
+            .iter()
+            .filter(|t| t.is_text())
+            .map(|t| t.number)
+            .collect(),
     };
     if wanted.is_empty() {
-        return Ok(MkvOut { text: Vec::new(), image: None });
+        return Ok(MkvOut {
+            text: Vec::new(),
+            image: None,
+        });
     }
     let mut blocks: Vec<(u64, SubBlock)> = Vec::new();
 
-    let exact = !idx.sub_cues.is_empty()
-        && idx.sub_cues.iter().all(|(_, _, rel, _)| rel.is_some());
+    let exact = !idx.sub_cues.is_empty() && idx.sub_cues.iter().all(|(_, _, rel, _)| rel.is_some());
     if exact {
         // Exact: every subtitle block is cue-addressed. Read each
         // cluster's timestamp once, then just the BlockGroups.
@@ -956,7 +981,10 @@ fn mkv_walk(mut r: Reader<'_>, image: Option<usize>) -> Result<MkvOut> {
     } else {
         // Header walk: hop every cluster, skip non-subtitle payloads.
         let Some(mut pos) = idx.first_cluster else {
-            return Ok(MkvOut { text: Vec::new(), image: None });
+            return Ok(MkvOut {
+                text: Vec::new(),
+                image: None,
+            });
         };
         tracing::debug!("sparse mkv: cluster header walk");
         while pos < r.len {
@@ -965,16 +993,12 @@ fn mkv_walk(mut r: Reader<'_>, image: Option<usize>) -> Result<MkvOut> {
                 Err(_) => break,
             };
             let Ok((id, il)) = ebml_id(&head) else { break };
-            let Ok((size, sl)) = ebml_size(&head[il..]) else { break };
+            let Ok((size, sl)) = ebml_size(&head[il..]) else {
+                break;
+            };
             let Some(size) = size else { break };
             if id == CLUSTER {
-                walk_cluster_sparse(
-                    &mut r,
-                    pos + (il + sl) as u64,
-                    size,
-                    &wanted,
-                    &mut blocks,
-                )?;
+                walk_cluster_sparse(&mut r, pos + (il + sl) as u64, size, &wanted, &mut blocks)?;
             }
             pos += (il + sl) as u64 + size;
         }
@@ -986,15 +1010,26 @@ fn mkv_walk(mut r: Reader<'_>, image: Option<usize>) -> Result<MkvOut> {
 
     // Image track: hand back the raw display-set blocks, timed.
     if let Some(want) = image {
-        let Some(t) = idx.tracks.iter().find(|t| t.sub_index == want && !t.is_text()) else {
-            return Ok(MkvOut { text: Vec::new(), image: None });
+        let Some(t) = idx
+            .tracks
+            .iter()
+            .find(|t| t.sub_index == want && !t.is_text())
+        else {
+            return Ok(MkvOut {
+                text: Vec::new(),
+                image: None,
+            });
         };
         let mut out: Vec<(u64, Option<u64>, Vec<u8>)> = blocks
             .iter()
             .filter(|(_, b)| b.track == t.number)
             .map(|(cluster_ts, b)| {
                 let ticks = cluster_ts.saturating_add_signed(i64::from(b.rel_time));
-                (to_ms(ticks), b.duration.map(&to_ms), decompress(&b.payload, t.compression.as_ref()))
+                (
+                    to_ms(ticks),
+                    b.duration.map(&to_ms),
+                    decompress(&b.payload, t.compression.as_ref()),
+                )
             })
             .collect();
         out.sort_by_key(|(ms, _, _)| *ms);
@@ -1015,7 +1050,10 @@ fn mkv_walk(mut r: Reader<'_>, image: Option<usize>) -> Result<MkvOut> {
         for (cluster_ts, b) in blocks.iter().filter(|(_, b)| b.track == t.number) {
             let start_ticks = cluster_ts.saturating_add_signed(i64::from(b.rel_time));
             let start = to_ms(start_ticks);
-            let end = b.duration.map(|d| to_ms(start_ticks + d)).unwrap_or(start + 3000);
+            let end = b
+                .duration
+                .map(|d| to_ms(start_ticks + d))
+                .unwrap_or(start + 3000);
             let raw = decode_text(&decompress(&b.payload, t.compression.as_ref()));
             let text = if t.is_ass {
                 raw_events.push((start, end, raw.clone()));
@@ -1024,24 +1062,35 @@ fn mkv_walk(mut r: Reader<'_>, image: Option<usize>) -> Result<MkvOut> {
                 clean_cue_text(&raw)
             };
             if !text.is_empty() {
-                cues.push(Cue { start_ms: start, end_ms: end, text });
+                cues.push(Cue {
+                    start_ms: start,
+                    end_ms: end,
+                    text,
+                });
             }
         }
         cues.sort_by_key(|c| c.start_ms);
-        let ass = t.header.clone().filter(|_| !raw_events.is_empty()).map(|h| {
-            let mut s = compose_header(&h);
-            raw_events.sort_by_key(|(a, _, _)| *a);
-            for (st, en, raw) in &raw_events {
-                if let Some(line) = ass_dialogue(raw, *st, *en) {
-                    s.push_str(&line);
-                    s.push('\n');
+        let ass = t
+            .header
+            .clone()
+            .filter(|_| !raw_events.is_empty())
+            .map(|h| {
+                let mut s = compose_header(&h);
+                raw_events.sort_by_key(|(a, _, _)| *a);
+                for (st, en, raw) in &raw_events {
+                    if let Some(line) = ass_dialogue(raw, *st, *en) {
+                        s.push_str(&line);
+                        s.push('\n');
+                    }
                 }
-            }
-            s
-        });
+                s
+            });
         out.push((t.sub_index, Extracted { cues, ass }));
     }
-    Ok(MkvOut { text: out, image: None })
+    Ok(MkvOut {
+        text: out,
+        image: None,
+    })
 }
 
 // EBML writers (Exact-path rewrapping + tests).
@@ -1102,8 +1151,12 @@ fn mp4_extract(src: &mut dyn RemuxSource) -> Result<Vec<(usize, Extracted)>> {
         if kind != *b"trak" {
             return Ok(());
         }
-        let Some(mdia) = find_box(body, b"mdia") else { return Ok(()) };
-        let Some(hdlr) = find_box(mdia, b"hdlr") else { return Ok(()) };
+        let Some(mdia) = find_box(body, b"mdia") else {
+            return Ok(());
+        };
+        let Some(hdlr) = find_box(mdia, b"hdlr") else {
+            return Ok(());
+        };
         if hdlr.len() < 12 {
             return Ok(());
         }
@@ -1115,14 +1168,20 @@ fn mp4_extract(src: &mut dyn RemuxSource) -> Result<Vec<(usize, Extracted)>> {
         let idx = sub_seen;
         sub_seen += 1;
 
-        let Some(mdhd) = find_box(mdia, b"mdhd") else { return Ok(()) };
+        let Some(mdhd) = find_box(mdia, b"mdhd") else {
+            return Ok(());
+        };
         let timescale = if mdhd[0] == 1 {
             u32::from_be_bytes(mdhd[20..24].try_into().unwrap())
         } else {
             u32::from_be_bytes(mdhd[12..16].try_into().unwrap())
         } as u64;
-        let Some(minf) = find_box(mdia, b"minf") else { return Ok(()) };
-        let Some(stbl) = find_box(minf, b"stbl") else { return Ok(()) };
+        let Some(minf) = find_box(mdia, b"minf") else {
+            return Ok(());
+        };
+        let Some(stbl) = find_box(minf, b"stbl") else {
+            return Ok(());
+        };
 
         // Sample format: only plain text codecs here.
         let format = find_box(stbl, b"stsd")
@@ -1133,7 +1192,9 @@ fn mp4_extract(src: &mut dyn RemuxSource) -> Result<Vec<(usize, Extracted)>> {
             return Ok(());
         }
 
-        let Some(samples) = mp4_sample_table(stbl, timescale) else { return Ok(()) };
+        let Some(samples) = mp4_sample_table(stbl, timescale) else {
+            return Ok(());
+        };
         let mut cues = Vec::new();
         for (off, size, start_ms, dur_ms) in samples {
             if !(2..=1 << 20).contains(&size) {
@@ -1150,7 +1211,11 @@ fn mp4_extract(src: &mut dyn RemuxSource) -> Result<Vec<(usize, Extracted)>> {
             }
             let text = clean_cue_text(&decode_text(&data[2..2 + tlen]));
             if !text.is_empty() {
-                cues.push(Cue { start_ms, end_ms: start_ms + dur_ms.max(1), text });
+                cues.push(Cue {
+                    start_ms,
+                    end_ms: start_ms + dur_ms.max(1),
+                    text,
+                });
             }
         }
         cues.sort_by_key(|c| c.start_ms);
@@ -1177,9 +1242,8 @@ fn mp4_sample_table(stbl: &[u8], timescale: u64) -> Option<Vec<(u64, u64, u64, u
         if uniform != 0 {
             Some(uniform)
         } else {
-            stsz.get(12 + i * 4..16 + i * 4).map(|b| {
-                u32::from_be_bytes(b.try_into().unwrap()) as u64
-            })
+            stsz.get(12 + i * 4..16 + i * 4)
+                .map(|b| u32::from_be_bytes(b.try_into().unwrap()) as u64)
         }
     };
 
@@ -1211,7 +1275,9 @@ fn mp4_sample_table(stbl: &[u8], timescale: u64) -> Option<Vec<(u64, u64, u64, u
     let nchunks = u32::from_be_bytes(chunk_offsets.get(4..8)?.try_into().ok()?) as usize;
     let chunk_off = |i: usize| -> Option<u64> {
         if co64 {
-            chunk_offsets.get(8 + i * 8..16 + i * 8).map(|b| u64::from_be_bytes(b.try_into().unwrap()))
+            chunk_offsets
+                .get(8 + i * 8..16 + i * 8)
+                .map(|b| u64::from_be_bytes(b.try_into().unwrap()))
         } else {
             chunk_offsets
                 .get(8 + i * 4..12 + i * 4)
@@ -1224,7 +1290,9 @@ fn mp4_sample_table(stbl: &[u8], timescale: u64) -> Option<Vec<(u64, u64, u64, u
     let mut entry = 0usize;
     for chunk in 0..nchunks {
         while entry + 1 < nchunk_entries
-            && stsc_entry(entry + 1).map(|(first, _)| first <= chunk as u64 + 1).unwrap_or(false)
+            && stsc_entry(entry + 1)
+                .map(|(first, _)| first <= chunk as u64 + 1)
+                .unwrap_or(false)
         {
             entry += 1;
         }
@@ -1253,7 +1321,10 @@ fn walk_boxes(data: &[u8], mut f: impl FnMut([u8; 4], &[u8]) -> Result<()>) -> R
             if pos + 16 > data.len() {
                 break;
             }
-            (u64::from_be_bytes(data[pos + 8..pos + 16].try_into().unwrap()) as usize, 16)
+            (
+                u64::from_be_bytes(data[pos + 8..pos + 16].try_into().unwrap()) as usize,
+                16,
+            )
         } else if size32 == 0 {
             (data.len() - pos, 8)
         } else {
@@ -1288,8 +1359,13 @@ mod tests {
     #[test]
     #[ignore]
     fn image_track_from_env() {
-        let Ok(path) = std::env::var("IMGSUB_SRC") else { return };
-        let idx: usize = std::env::var("IMGSUB_IDX").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let Ok(path) = std::env::var("IMGSUB_SRC") else {
+            return;
+        };
+        let idx: usize = std::env::var("IMGSUB_IDX")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
         let mut src = crate::remux::FileSource::open(std::path::Path::new(&path)).unwrap();
         let t0 = std::time::Instant::now();
         let track = super::extract_image_track(&mut src, idx, std::time::Duration::from_secs(60))
@@ -1334,7 +1410,10 @@ mod tests {
     /// A minimal in-memory MKV: header, segment(info, tracks(1 ass sub
     /// track), cluster(ts + one BlockGroup dialogue), optional cues).
     fn tiny_mkv(with_sub_cues: bool) -> Vec<u8> {
-        let info = ebml(INFO, &ebml(TIMESTAMP_SCALE, &1_000_000u64.to_be_bytes()[5..]));
+        let info = ebml(
+            INFO,
+            &ebml(TIMESTAMP_SCALE, &1_000_000u64.to_be_bytes()[5..]),
+        );
         let track_entry = [
             ebml(TRACK_NUMBER, &[3]),
             ebml(TRACK_TYPE, &[0x11]),
@@ -1455,9 +1534,17 @@ mod tests {
             )
         };
         let seek_len = seek(0).len() as u64; // position encoding is fixed-size via encode_uint? guard below
-        let segment_body =
-            [seek(seek_len), attachments.clone(), ebml(CLUSTER, &[0u8; 8])].concat();
-        assert_eq!(seek(seek_len).len() as u64, seek_len, "seek element size must be stable");
+        let segment_body = [
+            seek(seek_len),
+            attachments.clone(),
+            ebml(CLUSTER, &[0u8; 8]),
+        ]
+        .concat();
+        assert_eq!(
+            seek(seek_len).len() as u64,
+            seek_len,
+            "seek element size must be stable"
+        );
 
         let mut file = ebml(EBML_HEADER, &[]);
         file.extend(ebml(SEGMENT, &segment_body));
@@ -1471,12 +1558,19 @@ mod tests {
         assert_eq!(atts[0].mime_type, "font/ttf");
         assert_eq!(atts[1].file_name, "Font2.otf");
         // The declared ranges must slice out exactly the payloads.
-        assert_eq!(&file[atts[0].offset as usize..(atts[0].offset + atts[0].size) as usize], font1);
-        assert_eq!(&file[atts[1].offset as usize..(atts[1].offset + atts[1].size) as usize], font2);
+        assert_eq!(
+            &file[atts[0].offset as usize..(atts[0].offset + atts[0].size) as usize],
+            font1
+        );
+        assert_eq!(
+            &file[atts[1].offset as usize..(atts[1].offset + atts[1].size) as usize],
+            font2
+        );
 
         // Non-matroska input declares nothing.
         let mut junk = tempfile::NamedTempFile::new().unwrap();
-        junk.write_all(b"\x00\x00\x00\x20ftypisommp4-not-mkv-junk-padding").unwrap();
+        junk.write_all(b"\x00\x00\x00\x20ftypisommp4-not-mkv-junk-padding")
+            .unwrap();
         junk.flush().unwrap();
         assert!(declare_attachments(junk.path()).unwrap().is_empty());
     }
@@ -1516,7 +1610,9 @@ mod tests {
     fn corpus_equivalence() {
         let path = std::path::PathBuf::from(std::env::var("KAHAWAI_SPARSE_CHECK").unwrap());
         let t0 = std::time::Instant::now();
-        let sparse = extract_sparse(&path).unwrap().expect("file should be sparse-readable");
+        let sparse = extract_sparse(&path)
+            .unwrap()
+            .expect("file should be sparse-readable");
         println!("sparse pass: {:?}", t0.elapsed());
         if std::env::var("KAHAWAI_SPARSE_ONLY").is_ok() {
             return;
@@ -1532,8 +1628,11 @@ mod tests {
             }
             assert_eq!(sx.ass, gx.ass, "ass reconstruction on track {si}");
         }
-        println!("OK: {} tracks, {} cues", sparse.len(),
-            sparse.iter().map(|(_, e)| e.cues.len()).sum::<usize>());
+        println!(
+            "OK: {} tracks, {} cues",
+            sparse.len(),
+            sparse.iter().map(|(_, e)| e.cues.len()).sum::<usize>()
+        );
     }
 
     #[test]

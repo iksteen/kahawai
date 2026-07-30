@@ -10,7 +10,7 @@ use kahawai_hub::pki::HubCa;
 use kahawai_hub::registry::{PlacementNeed, Registry};
 use kahawai_hub::transcoder_link::TranscoderLinkService;
 use kahawai_proto::v1::transcoder_link_client::TranscoderLinkClient;
-use kahawai_proto::v1::{tc_to_hub, CapabilityReport, EncoderCap, Hello, TcToHub};
+use kahawai_proto::v1::{CapabilityReport, EncoderCap, Hello, TcToHub, tc_to_hub};
 use kahawai_transport::identity::SatelliteIdentity;
 use kahawai_transport::mtls::AllowedCerts;
 
@@ -49,7 +49,13 @@ async fn spawn_hub() -> Hub {
             .await
             .unwrap();
     });
-    Hub { addr, registry, allowed, ca, _pki: pki }
+    Hub {
+        addr,
+        registry,
+        allowed,
+        ca,
+        _pki: pki,
+    }
 }
 
 fn enroll(hub: &Hub, module_type: &str, module_id: &str, name: &str) -> SatelliteIdentity {
@@ -61,7 +67,8 @@ fn enroll(hub: &Hub, module_type: &str, module_id: &str, name: &str) -> Satellit
         cert_pem: signed.cert_pem,
         ca_pem: hub.ca.ca_cert_pem().to_string(),
     };
-    hub.allowed.insert(&kahawai_transport::mtls::cert_fingerprint_pem(&id.cert_pem).unwrap());
+    hub.allowed
+        .insert(&kahawai_transport::mtls::cert_fingerprint_pem(&id.cert_pem).unwrap());
     id
 }
 
@@ -93,7 +100,9 @@ async fn open_link(
     tonic::Streaming<kahawai_proto::v1::HubToTc>,
 ) {
     let tls = kahawai_transport::mtls::mtls_client_config(id).unwrap();
-    let channel = kahawai_transport::tls::grpc_channel_with(hub_addr, tls).await.unwrap();
+    let channel = kahawai_transport::tls::grpc_channel_with(hub_addr, tls)
+        .await
+        .unwrap();
     let mut client = TranscoderLinkClient::new(channel);
     let (tx, rx) = tokio::sync::mpsc::channel(4);
     tx.send(TcToHub {
@@ -119,17 +128,31 @@ async fn transcoder_registers_capabilities_and_clears_on_disconnect() {
     let id = enroll(&hub, "transcoder", "01TC", "gpu-box");
     // The overview reads the satellites table: record enrollment like the
     // real approval path does.
-    hub.registry.record_satellite("01TC", "transcoder", "gpu-box", "fp-tc").await.unwrap();
+    hub.registry
+        .record_satellite("01TC", "transcoder", "gpu-box", "fp-tc")
+        .await
+        .unwrap();
 
     let (tx, mut inbound) = open_link(&hub.addr, &id, "gpu-box").await;
     let first = inbound.message().await.unwrap().unwrap();
-    assert!(matches!(first.msg, Some(kahawai_proto::v1::hub_to_tc::Msg::HelloAck(_))));
+    assert!(matches!(
+        first.msg,
+        Some(kahawai_proto::v1::hub_to_tc::Msg::HelloAck(_))
+    ));
 
     tx.send(TcToHub {
         msg: Some(tc_to_hub::Msg::Capabilities(CapabilityReport {
             encoders: vec![
-                EncoderCap { codec: "h264".into(), element: "x264enc".into(), hardware: false },
-                EncoderCap { codec: "aac".into(), element: "fdkaacenc".into(), hardware: false },
+                EncoderCap {
+                    codec: "h264".into(),
+                    element: "x264enc".into(),
+                    hardware: false,
+                },
+                EncoderCap {
+                    codec: "aac".into(),
+                    element: "fdkaacenc".into(),
+                    hardware: false,
+                },
             ],
             max_sessions: 2,
             decode_caps: vec!["video/x-av1".into(), "audio/x-flac".into()],
@@ -164,7 +187,10 @@ async fn transcoder_registers_capabilities_and_clears_on_disconnect() {
     let av1 = need(&["video/x-av1"]);
     assert_eq!(hub.registry.pick_transcoder(&av1).as_deref(), Some("01TC"));
     // Decode fit: a source this box cannot decode is not placeable here.
-    assert_eq!(hub.registry.pick_transcoder(&need(&["video/x-daala"])), None);
+    assert_eq!(
+        hub.registry.pick_transcoder(&need(&["video/x-daala"])),
+        None
+    );
     // Capacity: max_sessions = 2 is a hard cap.
     hub.registry.tc_session_started("01TC");
     hub.registry.tc_session_started("01TC");
@@ -181,7 +207,8 @@ async fn transcoder_registers_capabilities_and_clears_on_disconnect() {
     reborn.load_allowlist().await.unwrap();
     let sats = reborn.satellites_overview().await.unwrap();
     assert!(
-        sats.iter().any(|s| s["module_id"] == "01TC" && s["disabled"] == true),
+        sats.iter()
+            .any(|s| s["module_id"] == "01TC" && s["disabled"] == true),
         "disabled flag not persisted: {sats:?}"
     );
 
@@ -194,9 +221,7 @@ async fn transcoder_registers_capabilities_and_clears_on_disconnect() {
         &hub.registry,
         |sats| {
             sats.iter().any(|s| {
-                s["module_id"] == "01TC"
-                    && s["connected"] == false
-                    && s["capabilities"].is_null()
+                s["module_id"] == "01TC" && s["connected"] == false && s["capabilities"].is_null()
             })
         },
         "capabilities cleared on disconnect",
@@ -210,7 +235,9 @@ async fn mediahost_cert_is_refused_on_transcoder_link() {
     let id = enroll(&hub, "mediahost", "01MH", "nas");
 
     let tls = kahawai_transport::mtls::mtls_client_config(&id).unwrap();
-    let channel = kahawai_transport::tls::grpc_channel_with(&hub.addr, tls).await.unwrap();
+    let channel = kahawai_transport::tls::grpc_channel_with(&hub.addr, tls)
+        .await
+        .unwrap();
     let mut client = TranscoderLinkClient::new(channel);
     let (tx, rx) = tokio::sync::mpsc::channel(4);
     tx.send(TcToHub {
@@ -222,7 +249,9 @@ async fn mediahost_cert_is_refused_on_transcoder_link() {
     })
     .await
     .unwrap();
-    let result = client.link(tokio_stream::wrappers::ReceiverStream::new(rx)).await;
+    let result = client
+        .link(tokio_stream::wrappers::ReceiverStream::new(rx))
+        .await;
     match result {
         Err(status) => assert_eq!(status.code(), tonic::Code::PermissionDenied),
         Ok(mut stream) => {

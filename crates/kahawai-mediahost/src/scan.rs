@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use kahawai_proto::v1::{host_to_hub, FileError, FileRecord, FileUpsert, HostToHub, ScanProgress};
+use kahawai_proto::v1::{FileError, FileRecord, FileUpsert, HostToHub, ScanProgress, host_to_hub};
 use serde::Deserialize;
 use tokio::sync::mpsc::Sender;
 
@@ -95,8 +95,7 @@ pub async fn scan_collection(
     let force = std::sync::Arc::new(force_dirs);
     for root in &cfg.roots {
         let root = root.clone();
-        let paths =
-            tokio::task::spawn_blocking(move || walk(&root, include_audio)).await??;
+        let paths = tokio::task::spawn_blocking(move || walk(&root, include_audio)).await??;
         // Stat in batches ON THE BLOCKING POOL: a network mount makes
         // each stat a round trip, and doing tens of thousands of them
         // inline starved async peers of this task for tens of seconds.
@@ -115,22 +114,18 @@ pub async fn scan_collection(
                                 .unwrap_or(&path)
                                 .to_string_lossy()
                                 .into_owned();
-                            let unchanged = !path
-                                .parent()
-                                .is_some_and(|p| force2.contains(p))
+                            let unchanged = !path.parent().is_some_and(|p| force2.contains(p))
                                 && known2.get(&rel).is_some_and(|(size, mtime, sidecars)| {
-                                    let stat_matches =
-                                        std::fs::metadata(&path).is_ok_and(|m| {
-                                            m.len() == *size
-                                                && m.modified()
-                                                    .ok()
-                                                    .and_then(|t| {
-                                                        t.duration_since(std::time::UNIX_EPOCH)
-                                                            .ok()
-                                                    })
-                                                    .map(|d| d.as_secs() as i64)
-                                                    == Some(*mtime)
-                                        });
+                                    let stat_matches = std::fs::metadata(&path).is_ok_and(|m| {
+                                        m.len() == *size
+                                            && m.modified()
+                                                .ok()
+                                                .and_then(|t| {
+                                                    t.duration_since(std::time::UNIX_EPOCH).ok()
+                                                })
+                                                .map(|d| d.as_secs() as i64)
+                                                == Some(*mtime)
+                                    });
                                     // Size and mtime describe the MEDIA file and do
                                     // not move when a .nfo or a cover appears beside
                                     // it, so a sidecar dropped in next to an
@@ -155,39 +150,38 @@ pub async fn scan_collection(
                     }
                     continue;
                 }
-            let (r, p) = (root_local.clone(), path.clone());
-            let record =
-                tokio::task::spawn_blocking(move || inspect(&r, &p)).await?;
-            match record {
-                Ok((size, mtime_unix, head_xxh3, tail_xxh3, oshash, info)) => {
-                    scanned += 1;
-                    batch.push(FileRecord {
-                        path_rel: rel,
-                        size,
-                        mtime_unix,
-                        head_xxh3,
-                        tail_xxh3,
-                        oshash,
-                        streams_json: serde_json::to_string(&info)?,
-                    });
-                    if batch.len() >= BATCH {
-                        send_upsert(&tx, &cfg.name, std::mem::take(&mut batch)).await?;
+                let (r, p) = (root_local.clone(), path.clone());
+                let record = tokio::task::spawn_blocking(move || inspect(&r, &p)).await?;
+                match record {
+                    Ok((size, mtime_unix, head_xxh3, tail_xxh3, oshash, info)) => {
+                        scanned += 1;
+                        batch.push(FileRecord {
+                            path_rel: rel,
+                            size,
+                            mtime_unix,
+                            head_xxh3,
+                            tail_xxh3,
+                            oshash,
+                            streams_json: serde_json::to_string(&info)?,
+                        });
+                        if batch.len() >= BATCH {
+                            send_upsert(&tx, &cfg.name, std::mem::take(&mut batch)).await?;
+                        }
+                    }
+                    Err(e) => {
+                        failed += 1;
+                        tracing::warn!(path = %path.display(), error = format!("{e:#}"), "scan failed");
+                        tx.send(HostToHub {
+                            msg: Some(host_to_hub::Msg::FileError(FileError {
+                                collection_id: cfg.name.clone(),
+                                path_rel: rel,
+                                error: format!("{e:#}"),
+                            })),
+                        })
+                        .await
+                        .context("link closed")?;
                     }
                 }
-                Err(e) => {
-                    failed += 1;
-                    tracing::warn!(path = %path.display(), error = format!("{e:#}"), "scan failed");
-                    tx.send(HostToHub {
-                        msg: Some(host_to_hub::Msg::FileError(FileError {
-                            collection_id: cfg.name.clone(),
-                            path_rel: rel,
-                            error: format!("{e:#}"),
-                        })),
-                    })
-                    .await
-                    .context("link closed")?;
-                }
-            }
             }
             // Interim progress once per stat batch, counting skips too —
             // an incremental rescan of an unchanged collection is mostly
@@ -243,7 +237,11 @@ async fn send_seen(tx: &Sender<HostToHub>, collection: &str, paths: Vec<String>)
     .context("link closed")
 }
 
-async fn send_upsert(tx: &Sender<HostToHub>, collection: &str, files: Vec<FileRecord>) -> Result<()> {
+async fn send_upsert(
+    tx: &Sender<HostToHub>,
+    collection: &str,
+    files: Vec<FileRecord>,
+) -> Result<()> {
     tx.send(HostToHub {
         msg: Some(host_to_hub::Msg::FileUpsert(FileUpsert {
             collection_id: collection.to_string(),
@@ -262,11 +260,15 @@ fn walk(root: &Path, include_audio: bool) -> Result<Vec<(PathBuf, PathBuf)>> {
         if !entry.file_type().is_file() {
             continue;
         }
-        let is_media = entry.path().extension().and_then(|e| e.to_str()).is_some_and(|e| {
-            let e = e.to_ascii_lowercase();
-            MEDIA_EXTS.contains(&e.as_str())
-                || (include_audio && AUDIO_EXTS.contains(&e.as_str()))
-        });
+        let is_media = entry
+            .path()
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| {
+                let e = e.to_ascii_lowercase();
+                MEDIA_EXTS.contains(&e.as_str())
+                    || (include_audio && AUDIO_EXTS.contains(&e.as_str()))
+            });
         if is_media {
             out.push((root.to_path_buf(), entry.into_path()));
         }
@@ -324,8 +326,11 @@ fn find_artwork(root: &Path, media: &Path) -> Option<String> {
     const NAMES: &[&str] = &["cover", "folder", "poster", "front"];
     const EXTS: &[&str] = &["jpg", "jpeg", "png", "webp"];
     let dir = media.parent()?;
-    let entries: Vec<PathBuf> =
-        std::fs::read_dir(dir).ok()?.flatten().map(|e| e.path()).collect();
+    let entries: Vec<PathBuf> = std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .collect();
     for name in NAMES {
         for p in &entries {
             let stem_ok = p
@@ -337,7 +342,12 @@ fn find_artwork(root: &Path, media: &Path) -> Option<String> {
                 .and_then(|x| x.to_str())
                 .is_some_and(|x| EXTS.contains(&x.to_ascii_lowercase().as_str()));
             if stem_ok && ext_ok {
-                return Some(p.strip_prefix(root).unwrap_or(p).to_string_lossy().into_owned());
+                return Some(
+                    p.strip_prefix(root)
+                        .unwrap_or(p)
+                        .to_string_lossy()
+                        .into_owned(),
+                );
             }
         }
     }
@@ -350,7 +360,12 @@ fn find_artwork(root: &Path, media: &Path) -> Option<String> {
 /// lives and the file is tiny.
 fn find_nfo(root: &Path, media: &Path) -> Option<String> {
     let dir = media.parent()?;
-    let rel = |p: &Path| p.strip_prefix(root).unwrap_or(p).to_string_lossy().into_owned();
+    let rel = |p: &Path| {
+        p.strip_prefix(root)
+            .unwrap_or(p)
+            .to_string_lossy()
+            .into_owned()
+    };
     let beside = media.with_extension("nfo");
     if beside.is_file() {
         return Some(rel(&beside));
@@ -364,19 +379,25 @@ fn find_nfo(root: &Path, media: &Path) -> Option<String> {
     None
 }
 
-const SUBTITLE_EXTS: &[(&str, &str)] = &[("srt", "srt"), ("ass", "ass"), ("ssa", "ass"), ("vtt", "vtt")];
+const SUBTITLE_EXTS: &[(&str, &str)] = &[
+    ("srt", "srt"),
+    ("ass", "ass"),
+    ("ssa", "ass"),
+    ("vtt", "vtt"),
+];
 
 /// Sidecar subtitles (MH-4): files in the media file's directory named
 /// `<stem>.<ext>` or `<stem>.<tokens>.<ext>`; the first token after the
 /// stem is recorded verbatim as the language ("Movie.en.srt" → "en").
 fn find_sidecars(root: &Path, media: &Path) -> Vec<kahawai_core::media::SidecarSubtitle> {
     let mut out = Vec::new();
-    let (Some(stem), Some(dir)) =
-        (media.file_stem().and_then(|s| s.to_str()), media.parent())
+    let (Some(stem), Some(dir)) = (media.file_stem().and_then(|s| s.to_str()), media.parent())
     else {
         return out;
     };
-    let Ok(entries) = std::fs::read_dir(dir) else { return out };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return out;
+    };
     for entry in entries.flatten() {
         let p = entry.path();
         let (Some(name), Some(ext)) = (
@@ -385,8 +406,9 @@ fn find_sidecars(root: &Path, media: &Path) -> Vec<kahawai_core::media::SidecarS
         ) else {
             continue;
         };
-        let Some((_, format)) =
-            SUBTITLE_EXTS.iter().find(|(e, _)| e.eq_ignore_ascii_case(ext))
+        let Some((_, format)) = SUBTITLE_EXTS
+            .iter()
+            .find(|(e, _)| e.eq_ignore_ascii_case(ext))
         else {
             continue;
         };
@@ -397,14 +419,22 @@ fn find_sidecars(root: &Path, media: &Path) -> Vec<kahawai_core::media::SidecarS
             continue;
         }
         let middle_end = name.len() - ext.len() - 1;
-        let middle = if stem.len() + 1 < middle_end { &name[stem.len() + 1..middle_end] } else { "" };
+        let middle = if stem.len() + 1 < middle_end {
+            &name[stem.len() + 1..middle_end]
+        } else {
+            ""
+        };
         let language = middle
             .split('.')
             .next()
             .filter(|t| !t.is_empty() && t.len() <= 10)
             .map(|t| t.to_lowercase());
         out.push(kahawai_core::media::SidecarSubtitle {
-            path_rel: p.strip_prefix(root).unwrap_or(&p).to_string_lossy().into_owned(),
+            path_rel: p
+                .strip_prefix(root)
+                .unwrap_or(&p)
+                .to_string_lossy()
+                .into_owned(),
             format: format.to_string(),
             language,
         });
@@ -476,7 +506,11 @@ mod tests {
         // And removal is symmetric — the case that left a stale answer
         // pointing at a .nfo nobody could read.
         std::fs::remove_file(root.join("Solaris (1972).nfo")).unwrap();
-        assert_ne!(sidecar_sig(root, &media), both, "a vanished .nfo must change it");
+        assert_ne!(
+            sidecar_sig(root, &media),
+            both,
+            "a vanished .nfo must change it"
+        );
     }
 
     /// The hub's spelling, copied here on purpose: if `sidecar_sig` on
@@ -488,8 +522,6 @@ mod tests {
         }
         format!("n:{nfo}|a:{artwork}")
     }
-
-    
 
     #[test]
     fn oshash_of_zeros_is_the_size() {
@@ -535,7 +567,13 @@ mod tests {
         let subs = find_sidecars(root, &root.join("m/Heat (1995).mkv"));
         let got: Vec<(&str, &str, Option<&str>)> = subs
             .iter()
-            .map(|s| (s.path_rel.as_str(), s.format.as_str(), s.language.as_deref()))
+            .map(|s| {
+                (
+                    s.path_rel.as_str(),
+                    s.format.as_str(),
+                    s.language.as_deref(),
+                )
+            })
             .collect();
         assert_eq!(
             got,

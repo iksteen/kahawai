@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
-use kahawai_proto::v1::{tc_to_hub, ArtifactData, SessionError, SessionReady, TcToHub};
+use kahawai_proto::v1::{ArtifactData, SessionError, SessionReady, TcToHub, tc_to_hub};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 
@@ -84,8 +84,17 @@ impl Runner {
     ) {
         let result = self
             .start_inner(
-                &session_id, size, video, audio, audio_track, video_track, start_ms, sink,
-                &tail_sizes, encode_params, burn_sets,
+                &session_id,
+                size,
+                video,
+                audio,
+                audio_track,
+                video_track,
+                start_ms,
+                sink,
+                &tail_sizes,
+                encode_params,
+                burn_sets,
             )
             .await;
         let msg = match result {
@@ -129,7 +138,9 @@ impl Runner {
     ) -> Result<()> {
         // Replace any previous run first (seek-restart reuses the id).
         self.end(session_id).await;
-        let run = self.run_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let run = self
+            .run_seq
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let dir = self.scratch_root.join(session_id).join(format!("r{run}"));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
@@ -140,7 +151,9 @@ impl Runner {
         // serves; the hub holds a lease per part.
         let mut socks: Vec<(std::path::PathBuf, u64)> = Vec::with_capacity(1 + tail_sizes.len());
         let mut bridges = Vec::with_capacity(1 + tail_sizes.len());
-        for (part, part_size) in std::iter::once(size).chain(tail_sizes.iter().copied()).enumerate()
+        for (part, part_size) in std::iter::once(size)
+            .chain(tail_sizes.iter().copied())
+            .enumerate()
         {
             let sock = if part == 0 {
                 dir.join("worker.sock")
@@ -204,7 +217,11 @@ impl Runner {
                     .args(["--audio-track", &audio_track.to_string()])
                     .args(["--video-track", &video_track.to_string()])
                     .args(["--start-ms", &start_ms.to_string()])
-                    .args(if sink.is_empty() { vec![] } else { vec!["--sink".into(), sink.to_string()] })
+                    .args(if sink.is_empty() {
+                        vec![]
+                    } else {
+                        vec!["--sink".into(), sink.to_string()]
+                    })
                     .stderr(std::process::Stdio::from(log))
                     .kill_on_drop(true)
                     .spawn()
@@ -237,7 +254,12 @@ impl Runner {
                 let err2 = err.clone();
                 let handle = tokio::task::spawn_blocking(move || {
                     if let Err(e) = kahawai_media::worker::run_parts(
-                        &all, &dir, plan, start_ms, sink_owned.as_deref(), sets_path.as_deref(),
+                        &all,
+                        &dir,
+                        plan,
+                        start_ms,
+                        sink_owned.as_deref(),
+                        sets_path.as_deref(),
                     ) {
                         tracing::warn!(error = format!("{e:#}"), "in-process worker failed");
                         *err2.lock().unwrap() = Some(format!("{e:#}"));
@@ -246,10 +268,14 @@ impl Runner {
                 Worker::InProcess(handle, err)
             }
         };
-        self.sessions
-            .lock()
-            .unwrap()
-            .insert(session_id.to_string(), Session { dir: dir.clone(), worker, bridge });
+        self.sessions.lock().unwrap().insert(
+            session_id.to_string(),
+            Session {
+                dir: dir.clone(),
+                worker,
+                bridge,
+            },
+        );
 
         // Post-ready supervision: a worker dying mid-session becomes a
         // SessionError so the hub can reschedule (AR-6).
@@ -368,7 +394,9 @@ impl Runner {
             let offset = u64::from_le_bytes(req[..8].try_into().unwrap());
             let len = u64::from_le_bytes(req[8..].try_into().unwrap())
                 .min(kahawai_media::worker::MAX_READ);
-            let req_id = self.next_req.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let req_id = self
+                .next_req
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let (tx, rx) = oneshot::channel();
             self.pending_reads.lock().unwrap().insert(req_id, tx);
             self.link
@@ -411,7 +439,12 @@ impl Runner {
         // Names come from client URLs upstream; the hub sanitizes, but
         // never trust a path component here either.
         let sane = !name.contains('/') && !name.contains("..");
-        let path = self.sessions.lock().unwrap().get(session_id).map(|s| s.dir.join(name));
+        let path = self
+            .sessions
+            .lock()
+            .unwrap()
+            .get(session_id)
+            .map(|s| s.dir.join(name));
         let data = match (sane, path) {
             (true, Some(p)) => std::fs::read(&p).map_err(|e| e.to_string()),
             (false, _) => Err("invalid artifact name".into()),

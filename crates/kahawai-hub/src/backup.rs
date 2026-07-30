@@ -23,7 +23,7 @@
 
 use std::path::Path;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 /// Written beside the snapshot so a restore can tell what it is holding —
@@ -63,14 +63,19 @@ fn now_unix() -> i64 {
 /// restored hub keeps its ports, keys and provider settings.
 pub async fn backup(data_dir: &Path, config: Option<&Path>, dest: &Path) -> Result<Manifest> {
     if dest.exists() {
-        bail!("{} already exists — snapshots are never merged", dest.display());
+        bail!(
+            "{} already exists — snapshots are never merged",
+            dest.display()
+        );
     }
     std::fs::create_dir_all(dest).with_context(|| format!("creating {}", dest.display()))?;
 
     // The database first, and through sqlite rather than the filesystem:
     // copying hub.db while the hub runs would catch a torn page or miss
     // the WAL entirely. VACUUM INTO serialises against writers itself.
-    let pool = crate::db::open(data_dir).await.context("opening the hub database")?;
+    let pool = crate::db::open(data_dir)
+        .await
+        .context("opening the hub database")?;
     let db_out = dest.join("hub.db");
     let taken_at = now_unix();
     sqlx::query("VACUUM INTO ?")
@@ -181,8 +186,8 @@ fn copy_tree(from: &Path, to: &Path) -> Result<(u64, u64)> {
             files += n;
             bytes += b;
         } else {
-            bytes += std::fs::copy(&src, &dst)
-                .with_context(|| format!("copying {}", src.display()))?;
+            bytes +=
+                std::fs::copy(&src, &dst).with_context(|| format!("copying {}", src.display()))?;
             files += 1;
         }
     }

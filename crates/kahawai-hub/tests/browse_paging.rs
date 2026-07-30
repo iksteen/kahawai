@@ -17,10 +17,18 @@ use tower::ServiceExt;
 async fn harness() -> (axum::Router, String, sqlx::SqlitePool) {
     let dir = tempfile::tempdir().unwrap();
     let db = kahawai_hub::db::open(dir.path()).await.unwrap();
-    let registry = Arc::new(kahawai_hub::registry::Registry::new(db.clone(), Default::default()));
-    let auth = Arc::new(kahawai_hub::auth::Auth::new(db.clone(), dir.path()).await.unwrap());
-    let sessions =
-        Arc::new(kahawai_hub::sessions::Sessions::new(tempfile::tempdir().unwrap().keep()));
+    let registry = Arc::new(kahawai_hub::registry::Registry::new(
+        db.clone(),
+        Default::default(),
+    ));
+    let auth = Arc::new(
+        kahawai_hub::auth::Auth::new(db.clone(), dir.path())
+            .await
+            .unwrap(),
+    );
+    let sessions = Arc::new(kahawai_hub::sessions::Sessions::new(
+        tempfile::tempdir().unwrap().keep(),
+    ));
     let ca = Arc::new(
         kahawai_hub::pki::HubCa::load_or_create(tempfile::tempdir().unwrap().keep().as_path())
             .unwrap(),
@@ -37,7 +45,9 @@ async fn harness() -> (axum::Router, String, sqlx::SqlitePool) {
         auth.clone(),
         sessions,
         enrollments,
-        Arc::new(kahawai_hub::subtitles::Subtitles::new(tempfile::tempdir().unwrap().keep())),
+        Arc::new(kahawai_hub::subtitles::Subtitles::new(
+            tempfile::tempdir().unwrap().keep(),
+        )),
         Arc::new(kahawai_hub::artwork::Artwork::new(
             tempfile::tempdir().unwrap().keep(),
             enricher.clone(),
@@ -66,7 +76,9 @@ async fn page(api: &axum::Router, token: &str, uri: &str) -> serde_json::Value {
         .await
         .unwrap();
     assert!(resp.status().is_success(), "{uri} -> {}", resp.status());
-    let b = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+    let b = axum::body::to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .unwrap();
     serde_json::from_slice(&b).unwrap()
 }
 
@@ -174,35 +186,54 @@ async fn search_finds_artists_and_episode_titles() {
     let q = |sql: &'static str| {
         let db = db.clone();
         async move {
-            sqlx::query(sql).execute(&db).await.unwrap_or_else(|e| panic!("{sql}\n  -> {e}"))
+            sqlx::query(sql)
+                .execute(&db)
+                .await
+                .unwrap_or_else(|e| panic!("{sql}\n  -> {e}"))
         }
     };
     q("INSERT INTO libraries (id, name, media_type) VALUES ('L','l','series')").await;
     q("INSERT INTO satellites (module_id, module_type, name, cert_fingerprint, enrolled_at, disabled)
        VALUES ('m','mediahost','m','',unixepoch(),0)").await;
-    q("INSERT INTO collections (module_id, collection_id, media_type, roots_json, sync_version)
-       VALUES ('m','c','series','[\"/m\"]',1)").await;
+    q(
+        "INSERT INTO collections (module_id, collection_id, media_type, roots_json, sync_version)
+       VALUES ('m','c','series','[\"/m\"]',1)",
+    )
+    .await;
     q("INSERT INTO library_collections (library_id, module_id, collection_id) VALUES ('L','m','c')").await;
 
     // An album by an accented artist. norm_artist is what the write
     // sites store; here it is set the way the registry would.
-    q("INSERT INTO items (id, kind, title, norm_title, artist, norm_artist)
-       VALUES ('alb','album','Ace of Spades','ace of spades','Motörhead','motorhead')").await;
+    q(
+        "INSERT INTO items (id, kind, title, norm_title, artist, norm_artist)
+       VALUES ('alb','album','Ace of Spades','ace of spades','Motörhead','motorhead')",
+    )
+    .await;
 
     // A show whose episode has a projected title that is NOT in the
     // filename — the 19% case.
-    q("INSERT INTO items (id, kind, title, norm_title) VALUES ('sh','show','A Show','a show')").await;
-    q("INSERT INTO items (id, kind, title, norm_title, parent_id, season, episode)
-       VALUES ('ep','episode','S03E14','s03e14','sh',3,14)").await;
-    q("INSERT INTO item_sources (item_id, module_id, collection_id, path_rel)
-       VALUES ('ep','m','c','s03e14.mkv')").await;
+    q("INSERT INTO items (id, kind, title, norm_title) VALUES ('sh','show','A Show','a show')")
+        .await;
+    q(
+        "INSERT INTO items (id, kind, title, norm_title, parent_id, season, episode)
+       VALUES ('ep','episode','S03E14','s03e14','sh',3,14)",
+    )
+    .await;
+    q(
+        "INSERT INTO item_sources (item_id, module_id, collection_id, path_rel)
+       VALUES ('ep','m','c','s03e14.mkv')",
+    )
+    .await;
     kahawai_hub::providers::store_answer(
         &db,
         "sh",
         "tvdb",
         "81189",
         "auto",
-        kahawai_hub::providers::Fields { title: Some("A Show".into()), ..Default::default() },
+        kahawai_hub::providers::Fields {
+            title: Some("A Show".into()),
+            ..Default::default()
+        },
     )
     .await
     .unwrap();
@@ -211,8 +242,12 @@ async fn search_finds_artists_and_episode_titles() {
 
     // The artist, typed without the umlaut.
     let v = page(&api, &token, "/api/v1/items?q=motorhead").await;
-    let ids: Vec<&str> =
-        v["items"].as_array().unwrap().iter().map(|i| i["id"].as_str().unwrap()).collect();
+    let ids: Vec<&str> = v["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["id"].as_str().unwrap())
+        .collect();
     assert_eq!(ids, ["alb"], "folded artist search must find the album");
 
     // The episode, by a title that appears in no filename — scoped to
@@ -221,21 +256,37 @@ async fn search_finds_artists_and_episode_titles() {
     let hits = v["items"].as_array().unwrap();
     assert_eq!(hits.len(), 1, "episode must be found in its show's library");
     assert_eq!(hits[0]["id"], "ep");
-    assert_eq!(hits[0]["title"], "Ozymandias", "resolved title, not the filename");
-    assert_eq!(hits[0]["parent_title"], "A Show", "a hit named like 8 others needs its show");
+    assert_eq!(
+        hits[0]["title"], "Ozymandias",
+        "resolved title, not the filename"
+    );
+    assert_eq!(
+        hits[0]["parent_title"], "A Show",
+        "a hit named like 8 others needs its show"
+    );
 
     // Tracks match by TITLE, never by artist: "motorhead" must not bury
     // the album under a row per song, but the song itself is findable.
-    q("INSERT INTO items (id, kind, title, norm_title, parent_id, artist, norm_artist)
-       VALUES ('trk','track','Overkill','overkill','alb','Motörhead','motorhead')").await;
+    q(
+        "INSERT INTO items (id, kind, title, norm_title, parent_id, artist, norm_artist)
+       VALUES ('trk','track','Overkill','overkill','alb','Motörhead','motorhead')",
+    )
+    .await;
     let v = page(&api, &token, "/api/v1/items?q=motorhead").await;
-    assert_eq!(v["items"].as_array().unwrap().len(), 1, "still just the album");
+    assert_eq!(
+        v["items"].as_array().unwrap().len(),
+        1,
+        "still just the album"
+    );
 
     let v = page(&api, &token, "/api/v1/items?q=overkill").await;
     let hits = v["items"].as_array().unwrap();
     assert_eq!(hits.len(), 1, "the track is findable by its title");
     assert_eq!(hits[0]["id"], "trk");
-    assert_eq!(hits[0]["parent_id"], "alb", "a track hit carries the album to open");
+    assert_eq!(
+        hits[0]["parent_id"], "alb",
+        "a track hit carries the album to open"
+    );
     assert_eq!(hits[0]["parent_title"], "Ace of Spades");
 }
 
@@ -247,23 +298,35 @@ async fn image_subtitles_are_gated_on_graphics_overlay() {
     let q = |sql: &'static str| {
         let db = db.clone();
         async move {
-            sqlx::query(sql).execute(&db).await.unwrap_or_else(|e| panic!("{sql}\n  -> {e}"))
+            sqlx::query(sql)
+                .execute(&db)
+                .await
+                .unwrap_or_else(|e| panic!("{sql}\n  -> {e}"))
         }
     };
     q("INSERT INTO satellites (module_id, module_type, name, cert_fingerprint, enrolled_at, disabled)
        VALUES ('m2','mediahost','m2','',unixepoch(),0)").await;
-    q("INSERT INTO collections (module_id, collection_id, media_type, roots_json, sync_version)
-       VALUES ('m2','c2','movies','[\"/m\"]',1)").await;
+    q(
+        "INSERT INTO collections (module_id, collection_id, media_type, roots_json, sync_version)
+       VALUES ('m2','c2','movies','[\"/m\"]',1)",
+    )
+    .await;
     q("INSERT INTO items (id, kind, title, norm_title) VALUES ('subs-item','movie','Subbed','subbed')").await;
-    q(r#"INSERT INTO files (module_id, collection_id, path_rel, size, mtime_unix,
+    q(
+        r#"INSERT INTO files (module_id, collection_id, path_rel, size, mtime_unix,
                             head_xxh3, tail_xxh3, oshash, subs_extracted, streams_json)
        VALUES ('m2','c2','subbed.mkv', 700, 1, 0, 0, 0, 0,
                '{"container":"matroska",
                  "subtitles":[{"format":"srt","language":"en"},
                               {"format":"ass","language":"en"},
-                              {"format":"pgs","language":"en"}]}')"#).await;
-    q("INSERT INTO item_sources (item_id, module_id, collection_id, path_rel)
-       VALUES ('subs-item','m2','c2','subbed.mkv')").await;
+                              {"format":"pgs","language":"en"}]}')"#,
+    )
+    .await;
+    q(
+        "INSERT INTO item_sources (item_id, module_id, collection_id, path_rel)
+       VALUES ('subs-item','m2','c2','subbed.mkv')",
+    )
+    .await;
 
     let formats = |v: &serde_json::Value| -> Vec<String> {
         v["subtitles"]
@@ -274,9 +337,23 @@ async fn image_subtitles_are_gated_on_graphics_overlay() {
             .collect()
     };
     let all = page(&api, &token, "/api/v1/items/subs-item/subtitles").await;
-    assert!(formats(&all).contains(&"pgs".to_string()), "default keeps image subs: {all}");
-    let gated =
-        page(&api, &token, "/api/v1/items/subs-item/subtitles?graphics_overlay=false").await;
-    assert!(!formats(&gated).contains(&"pgs".to_string()), "gated must omit pgs: {gated}");
-    assert_eq!(formats(&gated).len(), formats(&all).len() - 1, "only the image entry drops");
+    assert!(
+        formats(&all).contains(&"pgs".to_string()),
+        "default keeps image subs: {all}"
+    );
+    let gated = page(
+        &api,
+        &token,
+        "/api/v1/items/subs-item/subtitles?graphics_overlay=false",
+    )
+    .await;
+    assert!(
+        !formats(&gated).contains(&"pgs".to_string()),
+        "gated must omit pgs: {gated}"
+    );
+    assert_eq!(
+        formats(&gated).len(),
+        formats(&all).len() - 1,
+        "only the image entry drops"
+    );
 }

@@ -3,9 +3,7 @@
 //! precedence can be re-decided locally — these tests are what keeps
 //! that property true.
 
-use kahawai_hub::providers::{
-    chain_in_force, media_type_of_item, set_chain, store_answer, Fields,
-};
+use kahawai_hub::providers::{Fields, chain_in_force, media_type_of_item, set_chain, store_answer};
 use sqlx::Row;
 use sqlx::SqlitePool;
 
@@ -19,7 +17,10 @@ async fn item(db: &SqlitePool, id: &str) {
         .unwrap();
 }
 
-async fn merged(db: &SqlitePool, id: &str) -> (String, Option<String>, Option<String>, Option<f64>) {
+async fn merged(
+    db: &SqlitePool,
+    id: &str,
+) -> (String, Option<String>, Option<String>, Option<f64>) {
     let r = sqlx::query(
         "SELECT provider, title, overview, rating FROM resolved_metadata WHERE item_id = ?",
     )
@@ -27,7 +28,12 @@ async fn merged(db: &SqlitePool, id: &str) -> (String, Option<String>, Option<St
     .fetch_one(db)
     .await
     .unwrap();
-    (r.get("provider"), r.get("title"), r.get("overview"), r.get("rating"))
+    (
+        r.get("provider"),
+        r.get("title"),
+        r.get("overview"),
+        r.get("rating"),
+    )
 }
 
 fn answer(title: &str, overview: Option<&str>, rating: Option<f64>) -> Fields {
@@ -48,9 +54,16 @@ async fn earlier_provider_wins_a_field_and_later_ones_fill_the_holes() {
     assert_eq!(chain, vec!["tmdb", "tvdb"]);
 
     // TMDB matched, but has no synopsis and no rating for this one.
-    store_answer(&db, "i1", "tmdb", "550", "auto", answer("Fight Club", None, None))
-        .await
-        .unwrap();
+    store_answer(
+        &db,
+        "i1",
+        "tmdb",
+        "550",
+        "auto",
+        answer("Fight Club", None, None),
+    )
+    .await
+    .unwrap();
     // TVDB, ranked below, has a title AND the synopsis TMDB lacked.
     store_answer(
         &db,
@@ -58,7 +71,12 @@ async fn earlier_provider_wins_a_field_and_later_ones_fill_the_holes() {
         "tvdb",
         "77",
         "auto",
-        answer("Fight Club (1999)", Some("A ticking-time-bomb insomniac..."), Some(8.4)))
+        answer(
+            "Fight Club (1999)",
+            Some("A ticking-time-bomb insomniac..."),
+            Some(8.4),
+        ),
+    )
     .await
     .unwrap();
 
@@ -74,24 +92,46 @@ async fn reordering_re_decides_ownership_without_asking_anyone() {
     let dir = tempfile::tempdir().unwrap();
     let db = kahawai_hub::db::open(dir.path()).await.unwrap();
     item(&db, "i1").await;
-    store_answer(&db, "i1", "tmdb", "550", "auto", answer("TMDB title", Some("tmdb"), None))
-        .await
-        .unwrap();
-    store_answer(&db, "i1", "tvdb", "77", "auto", answer("TVDB title", Some("tvdb"), None))
-        .await
-        .unwrap();
+    store_answer(
+        &db,
+        "i1",
+        "tmdb",
+        "550",
+        "auto",
+        answer("TMDB title", Some("tmdb"), None),
+    )
+    .await
+    .unwrap();
+    store_answer(
+        &db,
+        "i1",
+        "tvdb",
+        "77",
+        "auto",
+        answer("TVDB title", Some("tvdb"), None),
+    )
+    .await
+    .unwrap();
     assert_eq!(merged(&db, "i1").await.1.as_deref(), Some("TMDB title"));
 
     // Rank TVDB above TMDB. No provider is contacted: the answers are
     // already on disk, which is the whole reason this is affordable.
-    set_chain(&db, "movies", &["tvdb".into(), "tmdb".into()]).await.unwrap();
+    set_chain(&db, "movies", &["tvdb".into(), "tmdb".into()])
+        .await
+        .unwrap();
     let (provider, title, overview, _) = merged(&db, "i1").await;
-    assert_eq!(title.as_deref(), Some("TVDB title"), "the reorder took effect");
+    assert_eq!(
+        title.as_deref(),
+        Some("TVDB title"),
+        "the reorder took effect"
+    );
     assert_eq!(overview.as_deref(), Some("tvdb"));
     assert_eq!(provider, "tvdb", "identity follows the order too");
 
     // And back again — nothing was lost in the first merge.
-    set_chain(&db, "movies", &["tmdb".into(), "tvdb".into()]).await.unwrap();
+    set_chain(&db, "movies", &["tmdb".into(), "tvdb".into()])
+        .await
+        .unwrap();
     assert_eq!(merged(&db, "i1").await.1.as_deref(), Some("TMDB title"));
 }
 
@@ -100,22 +140,45 @@ async fn a_manual_pick_outranks_every_provider_and_survives_reorders() {
     let dir = tempfile::tempdir().unwrap();
     let db = kahawai_hub::db::open(dir.path()).await.unwrap();
     item(&db, "i1").await;
-    store_answer(&db, "i1", "tmdb", "550", "auto", answer("Robot Wars", None, None))
-        .await
-        .unwrap();
-    // A human corrected it to the TVDB record.
-    kahawai_hub::providers::assign_manual(
-        &db, "i1", "tvdb", "77", answer("Robot Wars (1993)", None, None),
+    store_answer(
+        &db,
+        "i1",
+        "tmdb",
+        "550",
+        "auto",
+        answer("Robot Wars", None, None),
     )
     .await
     .unwrap();
-    assert_eq!(merged(&db, "i1").await.1.as_deref(), Some("Robot Wars (1993)"));
+    // A human corrected it to the TVDB record.
+    kahawai_hub::providers::assign_manual(
+        &db,
+        "i1",
+        "tvdb",
+        "77",
+        answer("Robot Wars (1993)", None, None),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        merged(&db, "i1").await.1.as_deref(),
+        Some("Robot Wars (1993)")
+    );
 
     // TMDB is ranked first and re-runs — the human's answer still wins.
-    set_chain(&db, "movies", &["tmdb".into(), "tvdb".into()]).await.unwrap();
+    set_chain(&db, "movies", &["tmdb".into(), "tvdb".into()])
+        .await
+        .unwrap();
     let (provider, title, ..) = merged(&db, "i1").await;
-    assert_eq!(title.as_deref(), Some("Robot Wars (1993)"), "a reorder cannot undo a human");
-    assert_eq!(provider, "tvdb", "and it stays attributed to the real service");
+    assert_eq!(
+        title.as_deref(),
+        Some("Robot Wars (1993)"),
+        "a reorder cannot undo a human"
+    );
+    assert_eq!(
+        provider, "tvdb",
+        "and it stays attributed to the real service"
+    );
 }
 
 #[tokio::test]
@@ -125,7 +188,11 @@ async fn a_stored_order_that_is_not_a_permutation_is_refused() {
     // Dropping a provider would silently disable it; adding an unknown
     // one would silently do nothing.
     assert!(set_chain(&db, "movies", &["tmdb".into()]).await.is_err());
-    assert!(set_chain(&db, "movies", &["tmdb".into(), "imdb".into()]).await.is_err());
+    assert!(
+        set_chain(&db, "movies", &["tmdb".into(), "imdb".into()])
+            .await
+            .is_err()
+    );
     assert_eq!(chain_in_force(&db, "movies").await, vec!["tmdb", "tvdb"]);
 }
 
@@ -159,7 +226,10 @@ async fn an_items_media_type_comes_from_the_collection_it_lives_in() {
     .await
     .unwrap();
     assert_eq!(media_type_of_item(&db, "i1").await, "anime");
-    assert_eq!(chain_in_force(&db, "anime").await, vec!["anime", "tmdb", "tvdb"]);
+    assert_eq!(
+        chain_in_force(&db, "anime").await,
+        vec!["anime", "tmdb", "tvdb"]
+    );
 }
 
 /// The anime composite stores its half under `anilist`; it must still
@@ -194,26 +264,40 @@ async fn the_anime_composites_answer_ranks_as_the_chain_entry() {
     .execute(&db)
     .await
     .unwrap();
-    store_answer(&db, "i1", "anilist", "9253", "auto", answer("Steins;Gate", None, None))
-        .await
-        .unwrap();
+    store_answer(
+        &db,
+        "i1",
+        "anilist",
+        "9253",
+        "auto",
+        answer("Steins;Gate", None, None),
+    )
+    .await
+    .unwrap();
     store_answer(
         &db,
         "i1",
         "tmdb",
         "42509",
         "auto",
-        answer("Steins Gate", Some("A rag-tag group..."), Some(8.5)))
+        answer("Steins Gate", Some("A rag-tag group..."), Some(8.5)),
+    )
     .await
     .unwrap();
 
     let (provider, title, overview, rating) = merged(&db, "i1").await;
-    assert_eq!(title.as_deref(), Some("Steins;Gate"), "AniList title outranks TMDB's");
+    assert_eq!(
+        title.as_deref(),
+        Some("Steins;Gate"),
+        "AniList title outranks TMDB's"
+    );
     assert_eq!(provider, "anilist", "identity stays with the anime chain");
-    assert!(overview.is_some(), "but TMDB supplied the synopsis AniList lacked");
+    assert!(
+        overview.is_some(),
+        "but TMDB supplied the synopsis AniList lacked"
+    );
     assert_eq!(rating, Some(8.5));
 }
-
 
 /// A provider that could not be reached is not a hole in the data: it
 /// comes back due, with backoff, so a ban or a 429 costs a delay rather
@@ -236,16 +320,20 @@ async fn an_unreachable_provider_is_rescheduled_not_dropped() {
     assert_eq!(row.get::<i64, _>("attempts"), 1);
     assert!(row.get::<String, _>("reason").contains("banned"));
     let first: i64 = row.get("in_s");
-    assert!(first > 0 && first <= 900, "first retry is soon-ish: {first}s");
+    assert!(
+        first > 0 && first <= 900,
+        "first retry is soon-ish: {first}s"
+    );
     assert!(due_items(&db, 10).await.is_empty(), "not due yet");
 
     // Repeated refusals back off further, never faster.
     reschedule(&db, "i1", "anime", "anidb banned us").await;
-    let second: i64 =
-        sqlx::query_scalar("SELECT due_at - unixepoch() FROM enrichment_queue WHERE item_id = 'i1'")
-            .fetch_one(&db)
-            .await
-            .unwrap();
+    let second: i64 = sqlx::query_scalar(
+        "SELECT due_at - unixepoch() FROM enrichment_queue WHERE item_id = 'i1'",
+    )
+    .fetch_one(&db)
+    .await
+    .unwrap();
     assert!(second > first, "backoff grew: {first} -> {second}");
 
     // Once it answers, the debt is cleared.
@@ -281,10 +369,12 @@ async fn due_work_is_offered_to_the_next_run() {
 async fn episodes_are_never_left_queued() {
     let dir = tempfile::tempdir().unwrap();
     let db = kahawai_hub::db::open(dir.path()).await.unwrap();
-    sqlx::query("INSERT INTO items (id, kind, title, norm_title) VALUES ('ep', 'episode', 'e', 'e')")
-        .execute(&db)
-        .await
-        .unwrap();
+    sqlx::query(
+        "INSERT INTO items (id, kind, title, norm_title) VALUES ('ep', 'episode', 'e', 'e')",
+    )
+    .execute(&db)
+    .await
+    .unwrap();
     item(&db, "show1").await;
     for id in ["ep", "show1"] {
         sqlx::query(
@@ -308,7 +398,11 @@ async fn episodes_are_never_left_queued() {
         .fetch_all(&db)
         .await
         .unwrap();
-    assert_eq!(left, vec!["show1".to_string()], "episode work must not linger");
+    assert_eq!(
+        left,
+        vec!["show1".to_string()],
+        "episode work must not linger"
+    );
 }
 
 /// Movies and series share a DEFAULT order, not a chain. Ranking TVDB
@@ -316,7 +410,7 @@ async fn episodes_are_never_left_queued() {
 /// requirement is about the defaults being equal, nothing more.
 #[tokio::test]
 async fn series_has_its_own_chain_independent_of_movies() {
-    use kahawai_hub::providers::{chain_for, media_type_key, MEDIA_TYPES};
+    use kahawai_hub::providers::{MEDIA_TYPES, chain_for, media_type_key};
     let dir = tempfile::tempdir().unwrap();
     let db = kahawai_hub::db::open(dir.path()).await.unwrap();
     assert!(MEDIA_TYPES.contains(&"series"));
@@ -327,7 +421,9 @@ async fn series_has_its_own_chain_independent_of_movies() {
 
     // Seeded separately, and moving one leaves the other alone.
     assert_eq!(chain_in_force(&db, "series").await, vec!["tmdb", "tvdb"]);
-    set_chain(&db, "series", &["tvdb".into(), "tmdb".into()]).await.unwrap();
+    set_chain(&db, "series", &["tvdb".into(), "tmdb".into()])
+        .await
+        .unwrap();
     assert_eq!(chain_in_force(&db, "series").await, vec!["tvdb", "tmdb"]);
     assert_eq!(
         chain_in_force(&db, "movies").await,
@@ -358,19 +454,33 @@ async fn a_complete_row_does_not_stop_the_chain() {
             rating: Some(8.4),
             premiered: Some("1999-10-15".into()),
             ..Default::default()
-        })
+        },
+    )
     .await
     .unwrap();
     // TVDB is asked anyway and its answer is kept, ready to win if the
     // order changes later.
-    store_answer(&db, "i1", "tvdb", "77", "auto", answer("TVDB title", Some("tvdb"), None))
-        .await
-        .unwrap();
+    store_answer(
+        &db,
+        "i1",
+        "tvdb",
+        "77",
+        "auto",
+        answer("TVDB title", Some("tvdb"), None),
+    )
+    .await
+    .unwrap();
     assert_eq!(merged(&db, "i1").await.1.as_deref(), Some("Fight Club"));
 
-    set_chain(&db, "movies", &["tvdb".into(), "tmdb".into()]).await.unwrap();
+    set_chain(&db, "movies", &["tvdb".into(), "tmdb".into()])
+        .await
+        .unwrap();
     let (provider, title, overview, rating) = merged(&db, "i1").await;
-    assert_eq!(title.as_deref(), Some("TVDB title"), "the reorder now has data to pick");
+    assert_eq!(
+        title.as_deref(),
+        Some("TVDB title"),
+        "the reorder now has data to pick"
+    );
     assert_eq!(overview.as_deref(), Some("tvdb"));
     assert_eq!(provider, "tvdb");
     assert_eq!(rating, Some(8.4), "and TMDB still supplies what TVDB lacks");
@@ -385,9 +495,16 @@ async fn a_weak_non_owner_does_not_donate_fields() {
     let dir = tempfile::tempdir().unwrap();
     let db = kahawai_hub::db::open(dir.path()).await.unwrap();
     item(&db, "i1").await;
-    store_answer(&db, "i1", "tmdb", "550", "auto", answer("Solaris", None, None))
-        .await
-        .unwrap();
+    store_answer(
+        &db,
+        "i1",
+        "tmdb",
+        "550",
+        "auto",
+        answer("Solaris", None, None),
+    )
+    .await
+    .unwrap();
     // TVDB matched something it is not sure about.
     store_answer(
         &db,
@@ -395,7 +512,8 @@ async fn a_weak_non_owner_does_not_donate_fields() {
         "tvdb",
         "999",
         "weak",
-        answer("Solaris (remake)", Some("wrong film's synopsis"), Some(3.0)))
+        answer("Solaris (remake)", Some("wrong film's synopsis"), Some(3.0)),
+    )
     .await
     .unwrap();
     let (provider, title, overview, rating) = merged(&db, "i1").await;
@@ -407,18 +525,32 @@ async fn a_weak_non_owner_does_not_donate_fields() {
     // Ranking it first does NOT hand it the item: rank breaks ties
     // between comparable matches, it does not promote a guess over a
     // certainty.
-    set_chain(&db, "movies", &["tvdb".into(), "tmdb".into()]).await.unwrap();
+    set_chain(&db, "movies", &["tvdb".into(), "tmdb".into()])
+        .await
+        .unwrap();
     let (provider, _, overview, _) = merged(&db, "i1").await;
     assert_eq!(provider, "tmdb", "the confident match keeps the item");
-    assert_eq!(overview, None, "and the weak stranger still donates nothing");
+    assert_eq!(
+        overview, None,
+        "and the weak stranger still donates nothing"
+    );
 
     // It does own an item nobody else could identify, and then its own
     // data is all there is.
     item(&db, "i2").await;
-    store_answer(&db, "i2", "tmdb", "", "miss", Fields::default()).await.unwrap();
-    store_answer(&db, "i2", "tvdb", "999", "weak", answer("Obscure", Some("only guess"), None))
+    store_answer(&db, "i2", "tmdb", "", "miss", Fields::default())
         .await
         .unwrap();
+    store_answer(
+        &db,
+        "i2",
+        "tvdb",
+        "999",
+        "weak",
+        answer("Obscure", Some("only guess"), None),
+    )
+    .await
+    .unwrap();
     let (provider, _, overview, _) = merged(&db, "i2").await;
     assert_eq!(provider, "tvdb");
     assert_eq!(overview.as_deref(), Some("only guess"));
@@ -433,12 +565,26 @@ async fn a_confident_match_outranks_a_weak_one_whatever_the_order() {
     let dir = tempfile::tempdir().unwrap();
     let db = kahawai_hub::db::open(dir.path()).await.unwrap();
     item(&db, "i1").await;
-    store_answer(&db, "i1", "tmdb", "111", "weak", answer("Being Human?", None, None))
-        .await
-        .unwrap();
-    store_answer(&db, "i1", "tvdb", "222", "auto", answer("Being Human", Some("bbc"), None))
-        .await
-        .unwrap();
+    store_answer(
+        &db,
+        "i1",
+        "tmdb",
+        "111",
+        "weak",
+        answer("Being Human?", None, None),
+    )
+    .await
+    .unwrap();
+    store_answer(
+        &db,
+        "i1",
+        "tvdb",
+        "222",
+        "auto",
+        answer("Being Human", Some("bbc"), None),
+    )
+    .await
+    .unwrap();
 
     let (provider, title, overview, _) = merged(&db, "i1").await;
     assert_eq!(provider, "tvdb", "the certain match keeps the item");
@@ -447,12 +593,19 @@ async fn a_confident_match_outranks_a_weak_one_whatever_the_order() {
 
     // A human's correction beats both, from either provider.
     kahawai_hub::providers::assign_manual(
-        &db, "i1", "tmdb", "333", answer("Being Human (US)", None, None),
+        &db,
+        "i1",
+        "tmdb",
+        "333",
+        answer("Being Human (US)", None, None),
     )
     .await
     .unwrap();
     assert_eq!(merged(&db, "i1").await.0, "tmdb");
-    assert_eq!(merged(&db, "i1").await.1.as_deref(), Some("Being Human (US)"));
+    assert_eq!(
+        merged(&db, "i1").await.1.as_deref(),
+        Some("Being Human (US)")
+    );
 
     // A confident non-owner still fills what the manual pick lacks —
     // a hand-matched item should not lose the poster TVDB has.
@@ -462,7 +615,11 @@ async fn a_confident_match_outranks_a_weak_one_whatever_the_order() {
         "tvdb",
         "222",
         "auto",
-        Fields { poster_path: Some("/art.jpg".into()), ..Default::default() })
+        Fields {
+            poster_path: Some("/art.jpg".into()),
+            ..Default::default()
+        },
+    )
     .await
     .unwrap();
     let poster: Option<String> =
@@ -479,10 +636,13 @@ async fn a_confident_match_outranks_a_weak_one_whatever_the_order() {
 /// (2023) — which is what the file plainly meant.
 #[test]
 fn a_stated_year_beats_an_exact_title_with_no_year() {
-    use kahawai_hub::enrich::{pick_candidate, Candidate};
+    use kahawai_hub::enrich::{Candidate, pick_candidate};
     let old_show = Candidate::for_test(19069, "The Continental", None);
-    let right = Candidate::for_test(72710, "The Continental: From the World of John Wick",
-        Some("2023-09-22"));
+    let right = Candidate::for_test(
+        72710,
+        "The Continental: From the World of John Wick",
+        Some("2023-09-22"),
+    );
     // TMDB returns the relevant one first, the exact-title one second.
     let cands = vec![right, old_show];
     let (picked, conf) = pick_candidate(&cands, "The Continental", Some(2023)).unwrap();
@@ -510,19 +670,32 @@ async fn a_second_manual_pick_replaces_the_first() {
     let db = kahawai_hub::db::open(dir.path()).await.unwrap();
     item(&db, "i1").await;
     kahawai_hub::providers::assign_manual(
-        &db, "i1", "tvdb", "414734", answer("The Continental (2023)", None, None),
+        &db,
+        "i1",
+        "tvdb",
+        "414734",
+        answer("The Continental (2023)", None, None),
     )
     .await
     .unwrap();
-    assert_eq!(assigned(&db, "i1").await, Some(("tvdb".into(), "414734".into(), true)));
+    assert_eq!(
+        assigned(&db, "i1").await,
+        Some(("tvdb".into(), "414734".into(), true))
+    );
 
     kahawai_hub::providers::assign_manual(
-        &db, "i1", "tmdb", "72710",
+        &db,
+        "i1",
+        "tmdb",
+        "72710",
         answer("The Continental: From the World of John Wick", None, None),
     )
     .await
     .unwrap();
-    assert_eq!(assigned(&db, "i1").await, Some(("tmdb".into(), "72710".into(), true)));
+    assert_eq!(
+        assigned(&db, "i1").await,
+        Some(("tmdb".into(), "72710".into(), true))
+    );
     assert_eq!(
         merged(&db, "i1").await.1.as_deref(),
         Some("The Continental: From the World of John Wick")
@@ -538,7 +711,13 @@ async fn assigned(db: &SqlitePool, id: &str) -> Option<(String, String, bool)> {
         .fetch_optional(db)
         .await
         .unwrap()
-        .map(|r| (r.get("provider"), r.get("provider_id"), r.get::<i64, _>("manual") != 0))
+        .map(|r| {
+            (
+                r.get("provider"),
+                r.get("provider_id"),
+                r.get::<i64, _>("manual") != 0,
+            )
+        })
 }
 
 async fn answer_row(db: &SqlitePool, id: &str, provider: &str, pid: &str, strength: &str) {
@@ -568,12 +747,17 @@ async fn strong_beats_weak_across_the_preference_order() {
     item(&db, "i1").await;
     answer_row(&db, "i1", "tmdb", "111", "weak").await; // ranks FIRST for movies
     answer_row(&db, "i1", "tvdb", "222", "auto").await;
-    assert_eq!(assigned(&db, "i1").await, Some(("tvdb".into(), "222".into(), false)));
+    assert_eq!(
+        assigned(&db, "i1").await,
+        Some(("tvdb".into(), "222".into(), false))
+    );
 
     // Equal strength: now the order decides, and a reorder moves it.
     answer_row(&db, "i1", "tmdb", "111", "auto").await;
     assert_eq!(assigned(&db, "i1").await.unwrap().0, "tmdb");
-    set_chain(&db, "movies", &["tvdb".into(), "tmdb".into()]).await.unwrap();
+    set_chain(&db, "movies", &["tvdb".into(), "tmdb".into()])
+        .await
+        .unwrap();
     assert_eq!(assigned(&db, "i1").await.unwrap().0, "tvdb");
 }
 
@@ -588,7 +772,11 @@ async fn a_later_preferred_answer_replaces_an_automatic_match() {
     assert_eq!(assigned(&db, "i1").await.unwrap().0, "tvdb");
 
     answer_row(&db, "i1", "tmdb", "111", "auto").await;
-    assert_eq!(assigned(&db, "i1").await.unwrap().0, "tmdb", "the preferred provider takes over");
+    assert_eq!(
+        assigned(&db, "i1").await.unwrap().0,
+        "tmdb",
+        "the preferred provider takes over"
+    );
 }
 
 /// Only misses, or nothing at all, means NO assignment row — absence is
@@ -617,7 +805,13 @@ async fn a_bridged_answer_never_owns_the_item() {
     answer_row(&db, "i1", "anilist", "9253", "auto").await;
     answer_row(&db, "i1", "tmdb", "42509", "bridged").await;
     // Rank TMDB above the anime composite; the bridge still cannot win.
-    set_chain(&db, "anime", &["tmdb".into(), "anime".into(), "tvdb".into()]).await.unwrap();
+    set_chain(
+        &db,
+        "anime",
+        &["tmdb".into(), "anime".into(), "tvdb".into()],
+    )
+    .await
+    .unwrap();
     assert_eq!(assigned(&db, "i1").await.unwrap().0, "anilist");
 
     // And a bridged answer alone leaves the item unassigned.
@@ -644,7 +838,11 @@ async fn refused_records_are_skipped_until_something_new_appears() {
     .execute(&db)
     .await
     .unwrap();
-    assert_eq!(assigned(&db, "i1").await, None, "the refused record is dropped");
+    assert_eq!(
+        assigned(&db, "i1").await,
+        None,
+        "the refused record is dropped"
+    );
     // The answers themselves survive a rejection.
     let kept: i64 = sqlx::query_scalar("SELECT count(*) FROM provider_metadata WHERE item_id='i1'")
         .fetch_one(&db)
@@ -692,16 +890,31 @@ async fn a_manual_assignment_is_never_recomputed() {
     let db = kahawai_hub::db::open(dir.path()).await.unwrap();
     item(&db, "i1").await;
     kahawai_hub::providers::assign_manual(
-        &db, "i1", "tvdb", "414734",
-        Fields { title: Some("hand picked".into()), ..Default::default() })
+        &db,
+        "i1",
+        "tvdb",
+        "414734",
+        Fields {
+            title: Some("hand picked".into()),
+            ..Default::default()
+        },
+    )
     .await
     .unwrap();
-    assert_eq!(assigned(&db, "i1").await, Some(("tvdb".into(), "414734".into(), true)));
+    assert_eq!(
+        assigned(&db, "i1").await,
+        Some(("tvdb".into(), "414734".into(), true))
+    );
 
     // TMDB ranks first and answers strongly: the pin still holds.
     answer_row(&db, "i1", "tmdb", "111", "auto").await;
-    set_chain(&db, "movies", &["tmdb".into(), "tvdb".into()]).await.unwrap();
-    assert_eq!(assigned(&db, "i1").await, Some(("tvdb".into(), "414734".into(), true)));
+    set_chain(&db, "movies", &["tmdb".into(), "tvdb".into()])
+        .await
+        .unwrap();
+    assert_eq!(
+        assigned(&db, "i1").await,
+        Some(("tvdb".into(), "414734".into(), true))
+    );
 }
 
 /// "Yes, that one" on an automatic match. It must survive exactly what a
@@ -714,10 +927,18 @@ async fn confirming_an_automatic_match_makes_it_as_durable_as_a_pin() {
     let db = kahawai_hub::db::open(dir.path()).await.unwrap();
     item(&db, "i1").await;
     answer_row(&db, "i1", "tvdb", "414734", "auto").await;
-    assert_eq!(assigned(&db, "i1").await, Some(("tvdb".into(), "414734".into(), false)));
+    assert_eq!(
+        assigned(&db, "i1").await,
+        Some(("tvdb".into(), "414734".into(), false))
+    );
 
-    kahawai_hub::providers::confirm_assignment(&db, "i1").await.unwrap();
-    assert_eq!(assigned(&db, "i1").await, Some(("tvdb".into(), "414734".into(), true)));
+    kahawai_hub::providers::confirm_assignment(&db, "i1")
+        .await
+        .unwrap();
+    assert_eq!(
+        assigned(&db, "i1").await,
+        Some(("tvdb".into(), "414734".into(), true))
+    );
     // Confirming records the same pin a hand-picked match does — it is
     // the input the assignment is then derived from.
     assert_eq!(
@@ -733,7 +954,9 @@ async fn confirming_an_automatic_match_makes_it_as_durable_as_a_pin() {
     // A better-ranked strong answer arrives afterwards. Before confirming
     // it would have taken the item; now it may only describe it.
     answer_row(&db, "i1", "tmdb", "111", "auto").await;
-    set_chain(&db, "movies", &["tmdb".into(), "tvdb".into()]).await.unwrap();
+    set_chain(&db, "movies", &["tmdb".into(), "tvdb".into()])
+        .await
+        .unwrap();
     assert_eq!(
         assigned(&db, "i1").await,
         Some(("tvdb".into(), "414734".into(), true)),
@@ -753,8 +976,14 @@ async fn rejecting_keeps_the_answers_and_schedules_another_look() {
     answer_row(&db, "i1", "tvdb", "", "miss").await;
     assert!(assigned(&db, "i1").await.is_some());
 
-    kahawai_hub::providers::reject_matches(&db, "i1").await.unwrap();
-    assert_eq!(assigned(&db, "i1").await, None, "no assignment after a rejection");
+    kahawai_hub::providers::reject_matches(&db, "i1")
+        .await
+        .unwrap();
+    assert_eq!(
+        assigned(&db, "i1").await,
+        None,
+        "no assignment after a rejection"
+    );
     let answers: i64 =
         sqlx::query_scalar("SELECT count(*) FROM provider_metadata WHERE item_id = 'i1'")
             .fetch_one(&db)
@@ -773,7 +1002,10 @@ async fn rejecting_keeps_the_answers_and_schedules_another_look() {
     .fetch_one(&db)
     .await
     .unwrap();
-    assert_eq!(queued, 1, "the refused provider gets another look after a cooldown");
+    assert_eq!(
+        queued, 1,
+        "the refused provider gets another look after a cooldown"
+    );
 
     // Re-running the pick does not resurrect the refused record.
     assert_eq!(assigned(&db, "i1").await, None);
@@ -806,14 +1038,17 @@ async fn concurrent_answers_leave_one_correct_assignment() {
             x.unwrap();
             y.unwrap();
         }
-        let rows: i64 =
-            sqlx::query_scalar("SELECT count(*) FROM item_match WHERE item_id = ?")
-                .bind(&id)
-                .fetch_one(&db)
-                .await
-                .unwrap();
+        let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM item_match WHERE item_id = ?")
+            .bind(&id)
+            .fetch_one(&db)
+            .await
+            .unwrap();
         assert_eq!(rows, 1, "{id}: exactly one assignment");
-        assert_eq!(assigned(&db, &id).await.unwrap().0, "tmdb", "{id}: the preferred provider");
+        assert_eq!(
+            assigned(&db, &id).await.unwrap().0,
+            "tmdb",
+            "{id}: the preferred provider"
+        );
     }
 }
 
@@ -825,12 +1060,26 @@ async fn the_view_side_fills_from_the_preference_order() {
     let db = kahawai_hub::db::open(dir.path()).await.unwrap();
     item(&db, "i1").await;
     // TMDB is assigned but has no synopsis; TVDB has one.
-    store_answer(&db, "i1", "tmdb", "550", "auto", answer("Fight Club", None, Some(8.4)))
-        .await
-        .unwrap();
-    store_answer(&db, "i1", "tvdb", "77", "auto", answer("FC", Some("a synopsis"), None))
-        .await
-        .unwrap();
+    store_answer(
+        &db,
+        "i1",
+        "tmdb",
+        "550",
+        "auto",
+        answer("Fight Club", None, Some(8.4)),
+    )
+    .await
+    .unwrap();
+    store_answer(
+        &db,
+        "i1",
+        "tvdb",
+        "77",
+        "auto",
+        answer("FC", Some("a synopsis"), None),
+    )
+    .await
+    .unwrap();
     let r = sqlx::query(
         "SELECT provider, title, overview, rating, confidence FROM resolved_metadata
           WHERE item_id = 'i1'",
@@ -839,8 +1088,16 @@ async fn the_view_side_fills_from_the_preference_order() {
     .await
     .unwrap();
     assert_eq!(r.get::<String, _>("provider"), "tmdb");
-    assert_eq!(r.get::<String, _>("title"), "Fight Club", "the assigned provider's title");
-    assert_eq!(r.get::<String, _>("overview"), "a synopsis", "side-filled from TVDB");
+    assert_eq!(
+        r.get::<String, _>("title"),
+        "Fight Club",
+        "the assigned provider's title"
+    );
+    assert_eq!(
+        r.get::<String, _>("overview"),
+        "a synopsis",
+        "side-filled from TVDB"
+    );
     assert_eq!(r.get::<f64, _>("rating"), 8.4);
     assert_eq!(r.get::<String, _>("confidence"), "auto");
 }
@@ -859,25 +1116,55 @@ async fn the_view_resolves_an_episode_through_its_show() {
     .await
     .unwrap();
     // The show is assigned to TVDB (TMDB missed it).
-    store_answer(&db, "show1", "tmdb", "", "miss", Fields::default()).await.unwrap();
-    store_answer(&db, "show1", "tvdb", "9", "auto", answer("The Show", None, None))
+    store_answer(&db, "show1", "tmdb", "", "miss", Fields::default())
         .await
         .unwrap();
+    store_answer(
+        &db,
+        "show1",
+        "tvdb",
+        "9",
+        "auto",
+        answer("The Show", None, None),
+    )
+    .await
+    .unwrap();
     // Both providers answered for the episode itself.
-    store_answer(&db, "ep1", "tmdb", "1", "auto", answer("tmdb episode", None, None))
-        .await
-        .unwrap();
-    store_answer(&db, "ep1", "tvdb", "2", "auto", answer("tvdb episode", Some("t"), None))
-        .await
-        .unwrap();
+    store_answer(
+        &db,
+        "ep1",
+        "tmdb",
+        "1",
+        "auto",
+        answer("tmdb episode", None, None),
+    )
+    .await
+    .unwrap();
+    store_answer(
+        &db,
+        "ep1",
+        "tvdb",
+        "2",
+        "auto",
+        answer("tvdb episode", Some("t"), None),
+    )
+    .await
+    .unwrap();
 
     let title: String =
         sqlx::query_scalar("SELECT title FROM resolved_metadata WHERE item_id = 'ep1'")
             .fetch_one(&db)
             .await
             .unwrap();
-    assert_eq!(title, "tvdb episode", "the episode follows the show's provider, not the rank");
-    assert_eq!(assigned(&db, "ep1").await, None, "and still has no assignment of its own");
+    assert_eq!(
+        title, "tvdb episode",
+        "the episode follows the show's provider, not the rank"
+    );
+    assert_eq!(
+        assigned(&db, "ep1").await,
+        None,
+        "and still has no assignment of its own"
+    );
 }
 
 /// The flattening rule from the module doc, as a runnable check: a
@@ -908,7 +1195,6 @@ async fn the_view_stays_flattenable() {
     );
 }
 
-
 /// HUB-9: local is not in any chain and leads anyway. A .nfo wins the
 /// fields it states; the search results fill in the rest.
 #[tokio::test]
@@ -916,15 +1202,32 @@ async fn local_metadata_leads_the_chain() {
     let dir = tempfile::tempdir().unwrap();
     let db = kahawai_hub::db::open(dir.path()).await.unwrap();
     assert_eq!(chain_in_force(&db, "movies").await, vec!["tmdb", "tvdb"]);
-    assert_eq!(chain_in_force(&db, "anime").await, vec!["anime", "tmdb", "tvdb"]);
+    assert_eq!(
+        chain_in_force(&db, "anime").await,
+        vec!["anime", "tmdb", "tvdb"]
+    );
 
     item(&db, "i1").await;
-    store_answer(&db, "i1", "tmdb", "593", "auto", answer("Solaris (1972)", Some("tmdb plot"), Some(8.0)))
-        .await
-        .unwrap();
     store_answer(
-        &db, "i1", "local", "nfo", "auto",
-        Fields { title: Some("Solyaris".into()), ..Default::default() },
+        &db,
+        "i1",
+        "tmdb",
+        "593",
+        "auto",
+        answer("Solaris (1972)", Some("tmdb plot"), Some(8.0)),
+    )
+    .await
+    .unwrap();
+    store_answer(
+        &db,
+        "i1",
+        "local",
+        "nfo",
+        "auto",
+        Fields {
+            title: Some("Solyaris".into()),
+            ..Default::default()
+        },
     )
     .await
     .unwrap();
@@ -940,11 +1243,19 @@ async fn local_metadata_leads_the_chain() {
 
     // It is not orderable: there is no position to move it to, and a
     // chain naming it is refused rather than quietly accepted.
-    assert!(set_chain(&db, "movies", &["tmdb".into(), "local".into(), "tvdb".into()])
+    assert!(
+        set_chain(
+            &db,
+            "movies",
+            &["tmdb".into(), "local".into(), "tvdb".into()]
+        )
         .await
-        .is_err());
+        .is_err()
+    );
     // Reordering what IS in the chain leaves local in front.
-    set_chain(&db, "movies", &["tvdb".into(), "tmdb".into()]).await.unwrap();
+    set_chain(&db, "movies", &["tvdb".into(), "tmdb".into()])
+        .await
+        .unwrap();
     assert_eq!(assigned(&db, "i1").await.unwrap().0, "local");
     assert_eq!(merged(&db, "i1").await.1.as_deref(), Some("Solyaris"));
 }
@@ -957,12 +1268,26 @@ async fn a_pin_elsewhere_displaces_the_nfo() {
     let dir = tempfile::tempdir().unwrap();
     let db = kahawai_hub::db::open(dir.path()).await.unwrap();
     item(&db, "i1").await;
-    store_answer(&db, "i1", "tmdb", "593", "auto", answer("Solaris", Some("tmdb plot"), None))
-        .await
-        .unwrap();
     store_answer(
-        &db, "i1", "local", "nfo", "auto",
-        Fields { title: Some("Solyaris".into()), ..Default::default() },
+        &db,
+        "i1",
+        "tmdb",
+        "593",
+        "auto",
+        answer("Solaris", Some("tmdb plot"), None),
+    )
+    .await
+    .unwrap();
+    store_answer(
+        &db,
+        "i1",
+        "local",
+        "nfo",
+        "auto",
+        Fields {
+            title: Some("Solyaris".into()),
+            ..Default::default()
+        },
     )
     .await
     .unwrap();
@@ -971,20 +1296,34 @@ async fn a_pin_elsewhere_displaces_the_nfo() {
     // The pick carries the record's own fields, as the API does when a
     // human chooses one out of the search results.
     kahawai_hub::providers::assign_manual(
-        &db, "i1", "tmdb", "593",
+        &db,
+        "i1",
+        "tmdb",
+        "593",
         answer("Solaris", Some("tmdb plot"), None),
     )
     .await
     .unwrap();
     let (provider, title, _, _) = merged(&db, "i1").await;
     assert_eq!(provider, "tmdb");
-    assert_eq!(title.as_deref(), Some("Solaris"), "the pin is not overridden by the .nfo");
+    assert_eq!(
+        title.as_deref(),
+        Some("Solaris"),
+        "the pin is not overridden by the .nfo"
+    );
 
     // A cover claims no record, so a pin about identity never displaces
     // it — that is the whole reason it answers with an empty id.
     store_answer(
-        &db, "i1", "local", "", "auto",
-        Fields { poster_path: Some("local://cover.jpg".into()), ..Default::default() },
+        &db,
+        "i1",
+        "local",
+        "",
+        "auto",
+        Fields {
+            poster_path: Some("local://cover.jpg".into()),
+            ..Default::default()
+        },
     )
     .await
     .unwrap();
@@ -1026,18 +1365,29 @@ async fn local_artwork_supplies_the_poster_but_never_the_identity() {
         "local",
         "",
         "auto",
-        Fields { poster_path: Some("local://cover.jpg".into()), ..Default::default() },
+        Fields {
+            poster_path: Some("local://cover.jpg".into()),
+            ..Default::default()
+        },
     )
     .await
     .unwrap();
 
-    let r = sqlx::query("SELECT provider, title, poster_path FROM resolved_metadata WHERE item_id = 'i1'")
-        .fetch_one(&db)
-        .await
-        .unwrap();
-    assert_eq!(r.get::<Option<String>, _>("poster_path").as_deref(), Some("local://cover.jpg"));
+    let r = sqlx::query(
+        "SELECT provider, title, poster_path FROM resolved_metadata WHERE item_id = 'i1'",
+    )
+    .fetch_one(&db)
+    .await
+    .unwrap();
+    assert_eq!(
+        r.get::<Option<String>, _>("poster_path").as_deref(),
+        Some("local://cover.jpg")
+    );
     assert_eq!(r.get::<String, _>("provider"), "tmdb");
-    assert_eq!(r.get::<Option<String>, _>("title").as_deref(), Some("Fight Club"));
+    assert_eq!(
+        r.get::<Option<String>, _>("title").as_deref(),
+        Some("Fight Club")
+    );
 
     // And the assignment itself is TMDB's, not local's.
     let m: Option<String> =

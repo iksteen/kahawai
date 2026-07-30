@@ -8,19 +8,26 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
-use kahawai_proto::v1::{hub_to_host, HubToHost, OpenRead};
+use anyhow::{Context, Result, bail};
+use kahawai_proto::v1::{HubToHost, OpenRead, hub_to_host};
 use sqlx::Row;
 
-use crate::leases::{new_lease_token, Lease, Leases};
+use crate::leases::{Lease, Leases, new_lease_token};
 use crate::registry::Registry;
 
 pub enum Mode {
-    Direct { lease: Lease },
-    Remux { dir: PathBuf, runner: Mutex<RemuxRunner> },
+    Direct {
+        lease: Lease,
+    },
+    Remux {
+        dir: PathBuf,
+        runner: Mutex<RemuxRunner>,
+    },
     /// Dispatched to a transcoder module; artifacts proxied on demand.
     /// The module can change: AR-6 reschedules onto a new box.
-    Transcode { transcoder: Mutex<String> },
+    Transcode {
+        transcoder: Mutex<String>,
+    },
 }
 
 /// How a remux/transcode pipeline runs. The hub always spawns the
@@ -159,10 +166,7 @@ impl PendingSeek {
 
 /// Index of the part containing `abs_ms`.
 fn part_index(parts: &[PartSource], abs_ms: u64) -> usize {
-    parts
-        .iter()
-        .rposition(|p| abs_ms >= p.base_ms)
-        .unwrap_or(0)
+    parts.iter().rposition(|p| abs_ms >= p.base_ms).unwrap_or(0)
 }
 
 impl Session {
@@ -233,9 +237,13 @@ async fn serve_reads(mut conn: tokio::net::UnixStream, lease: Lease, size: u64) 
             return Ok(()); // worker closed the socket (EOS or teardown)
         }
         let offset = u64::from_le_bytes(req[..8].try_into().unwrap());
-        let len = u64::from_le_bytes(req[8..].try_into().unwrap())
-            .min(kahawai_media::worker::MAX_READ);
-        let want = if offset >= size { 0 } else { len.min(size - offset) };
+        let len =
+            u64::from_le_bytes(req[8..].try_into().unwrap()).min(kahawai_media::worker::MAX_READ);
+        let want = if offset >= size {
+            0
+        } else {
+            len.min(size - offset)
+        };
         let mut buf = Vec::with_capacity(want as usize);
         if want > 0 {
             let mut stream = lease.read_range(offset, want).into_inner();
@@ -300,8 +308,9 @@ pub struct Sessions {
     /// Sessions awaiting the transcoder's ready/error verdict.
     pending_ready: Mutex<HashMap<String, tokio::sync::oneshot::Sender<Result<(), String>>>>,
     /// In-flight artifact fetches, keyed by (session, name).
-    artifact_waiting:
-        Mutex<HashMap<(String, String), tokio::sync::mpsc::Sender<kahawai_proto::v1::ArtifactData>>>,
+    artifact_waiting: Mutex<
+        HashMap<(String, String), tokio::sync::mpsc::Sender<kahawai_proto::v1::ArtifactData>>,
+    >,
     /// Registry handle for teardown messages from the sync `end()` path
     /// (set once at startup; None only in tests without dispatch).
     registry_for_teardown: Mutex<Option<Arc<Registry>>>,
@@ -346,8 +355,8 @@ impl Sessions {
     pub fn spawn_janitor(self: &Arc<Self>) {
         let sessions = self.clone();
         // Check at half the timeout (tests use tiny timeouts), capped at 15 s.
-        let period = (sessions.idle_timeout / 2)
-            .clamp(Duration::from_millis(50), Duration::from_secs(15));
+        let period =
+            (sessions.idle_timeout / 2).clamp(Duration::from_millis(50), Duration::from_secs(15));
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(period);
             loop {
@@ -379,8 +388,9 @@ impl Sessions {
     ) -> Result<(String, String, u64, kahawai_core::media::MediaInfo, Lease)> {
         let (parts, info) = self.source_parts(registry, item_id).await?;
         let p = &parts[0];
-        let lease =
-            self.open_lease(registry, &p.module_id, &p.collection_id, &p.path_rel).await?;
+        let lease = self
+            .open_lease(registry, &p.module_id, &p.collection_id, &p.path_rel)
+            .await?;
         Ok((p.module_id.clone(), p.path_rel.clone(), p.size, info, lease))
     }
 
@@ -516,7 +526,9 @@ impl Sessions {
         }
         // The part set (if any) as one trailing candidate, via the
         // existing assembly which already handles ordering and dedup.
-        if rows.iter().any(|r| r.get::<Option<i64>, _>("part").is_some())
+        if rows
+            .iter()
+            .any(|r| r.get::<Option<i64>, _>("part").is_some())
             && let Ok(ps) = self.source_parts(registry, item_id).await
             && ps.0.len() > 1
         {
@@ -574,7 +586,9 @@ impl Sessions {
                 path_rel: path_rel.to_string(),
             })),
         };
-        self.leases.establish(&token, registry.send_to_host(module_id, msg)).await
+        self.leases
+            .establish(&token, registry.send_to_host(module_id, msg))
+            .await
     }
 
     /// Start a session for an item. With an explicit `mode` (scripts,
@@ -624,53 +638,52 @@ impl Sessions {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
         };
-        let negotiate_with = |parts: &[PartSource],
-                              info: &kahawai_core::media::MediaInfo,
-                              burn_capable: bool| {
-            let est_kbps = info
-                .duration_ms
-                .filter(|d| *d > 0)
-                .map(|d| ((parts.iter().map(|p| p.size).sum::<u64>() * 8) / d) as u32);
-            // HUB-15a: would the box that runs a video encode of THIS
-            // source tone-map? Same placement question the real dispatch
-            // asks (ponytail: probed with encode_audio=false — a fleet
-            // where that changes the pick diverges cosmetically; the
-            // worker-side guard keeps the failure soft).
-            let need = crate::registry::PlacementNeed {
-                encode_video: true,
-                encode_audio: false,
-                video_caps: kahawai_media::remux::source_caps_names("video", info),
-                audio_caps: vec![],
-                needs_tonemap: true,
+        let negotiate_with =
+            |parts: &[PartSource], info: &kahawai_core::media::MediaInfo, burn_capable: bool| {
+                let est_kbps = info
+                    .duration_ms
+                    .filter(|d| *d > 0)
+                    .map(|d| ((parts.iter().map(|p| p.size).sum::<u64>() * 8) / d) as u32);
+                // HUB-15a: would the box that runs a video encode of THIS
+                // source tone-map? Same placement question the real dispatch
+                // asks (ponytail: probed with encode_audio=false — a fleet
+                // where that changes the pick diverges cosmetically; the
+                // worker-side guard keeps the failure soft).
+                let need = crate::registry::PlacementNeed {
+                    encode_video: true,
+                    encode_audio: false,
+                    video_caps: kahawai_media::remux::source_caps_names("video", info),
+                    audio_caps: vec![],
+                    needs_tonemap: true,
+                };
+                let tonemap = match registry.pick_transcoder(&need) {
+                    Some(tc) => registry.transcoder_reports_tonemap(&tc),
+                    None => kahawai_media::remux::tonemap_available(),
+                };
+                // HUB-32b: the timeline comes from the mediahost, which
+                // walks its own disk in milliseconds (the hub cannot: every
+                // read would cross the byte plane at ~4 KB/s). Offer the
+                // tier while that host is reachable; `burn_sets` below is
+                // what actually decides, and a failure there re-plans.
+                kahawai_media::negotiate::negotiate(
+                    &profile,
+                    info,
+                    audio_track as usize,
+                    video_track as usize,
+                    parts.len() == 1,
+                    est_kbps,
+                    tonemap,
+                    burn_capable,
+                )
             };
-            let tonemap = match registry.pick_transcoder(&need) {
-                Some(tc) => registry.transcoder_reports_tonemap(&tc),
-                None => kahawai_media::remux::tonemap_available(),
-            };
-            // HUB-32b: the timeline comes from the mediahost, which
-            // walks its own disk in milliseconds (the hub cannot: every
-            // read would cross the byte plane at ~4 KB/s). Offer the
-            // tier while that host is reachable; `burn_sets` below is
-            // what actually decides, and a failure there re-plans.
-            kahawai_media::negotiate::negotiate(
-                &profile,
-                info,
-                audio_track as usize,
-                video_track as usize,
-                parts.len() == 1,
-                est_kbps,
-                tonemap,
-                burn_capable,
-            )
-        };
         // HUB-32b: the timeline comes from the mediahost, which walks
         // its own disk in milliseconds — the hub cannot, every read
         // would cross the byte plane at ~4 KB/s. Offer the tier while
         // that host is reachable; the sets themselves decide below.
         let negotiate_one = |parts: &[PartSource], info: &kahawai_core::media::MediaInfo| {
-            let capable = parts
-                .first()
-                .is_some_and(|p| registry.is_connected(&p.module_id) || self.reads_locally(&p.module_id));
+            let capable = parts.first().is_some_and(|p| {
+                registry.is_connected(&p.module_id) || self.reads_locally(&p.module_id)
+            });
             negotiate_with(parts, info, capable)
         };
         let (parts, info, sp, mode) = match mode {
@@ -722,8 +735,11 @@ impl Sessions {
                 )
                 .await;
             if burn_sets.is_none() {
-                tracing::warn!(item = item_id, track = idx,
-                    "burn-in: no display sets; re-planning without it");
+                tracing::warn!(
+                    item = item_id,
+                    track = idx,
+                    "burn-in: no display sets; re-planning without it"
+                );
                 sp = negotiate_with(&parts, &info, false);
             }
         }
@@ -741,8 +757,14 @@ impl Sessions {
         let local_ms = start_ms.saturating_sub(part.base_ms);
         let (module_id, path_rel, size) =
             (part.module_id.clone(), part.path_rel.clone(), part.size);
-        let lease =
-            self.open_lease(registry, &part.module_id, &part.collection_id, &part.path_rel).await?;
+        let lease = self
+            .open_lease(
+                registry,
+                &part.module_id,
+                &part.collection_id,
+                &part.path_rel,
+            )
+            .await?;
 
         let id = ulid::Ulid::generate().to_string();
         let mut chosen_sink = String::new();
@@ -759,8 +781,10 @@ impl Sessions {
                 if !plan.playable() {
                     bail!("no playable streams — this source needs the video transcoder");
                 }
-                verdict =
-                    Some((negotiated.video_verdict.clone(), negotiated.audio_verdict.clone()));
+                verdict = Some((
+                    negotiated.video_verdict.clone(),
+                    negotiated.audio_verdict.clone(),
+                ));
                 session_plan = Some(plan);
                 use kahawai_media::remux::StreamMode;
                 session_needs = crate::registry::PlacementNeed {
@@ -790,24 +814,38 @@ impl Sessions {
                         // hlssink2 (upstream fix pending).
                         if let Err(first) = self
                             .start_transcode(
-                                registry, &tc, &id, plan,
+                                registry,
+                                &tc,
+                                &id,
+                                plan,
                                 self.open_part_leases(registry, &parts, start_idx).await?,
-                                start_idx, local_ms, "", sets_bytes.clone(),
+                                start_idx,
+                                local_ms,
+                                "",
+                                sets_bytes.clone(),
                             )
                             .await
                         {
                             tracing::warn!(session = %id, error = format!("{first:#}"),
                                 "start failed; retrying with fallback sink");
                             self.start_transcode(
-                                registry, &tc, &id, plan,
+                                registry,
+                                &tc,
+                                &id,
+                                plan,
                                 self.open_part_leases(registry, &parts, start_idx).await?,
-                                start_idx, local_ms, "hlssink2", sets_bytes.clone(),
+                                start_idx,
+                                local_ms,
+                                "hlssink2",
+                                sets_bytes.clone(),
                             )
                             .await
                             .with_context(|| format!("first attempt: {first:#}"))?;
                             chosen_sink = "hlssink2".into();
                         }
-                        Mode::Transcode { transcoder: Mutex::new(tc) }
+                        Mode::Transcode {
+                            transcoder: Mutex::new(tc),
+                        }
                     }
                     None => {
                         let tail = self.open_part_leases(registry, &parts, start_idx).await?;
@@ -822,7 +860,14 @@ impl Sessions {
                                 let tail =
                                     self.open_part_leases(registry, &parts, start_idx).await?;
                                 let r = self
-                                    .start_remux(&id, plan, tail, local_ms, "hlssink2", burn_sets.as_deref())
+                                    .start_remux(
+                                        &id,
+                                        plan,
+                                        tail,
+                                        local_ms,
+                                        "hlssink2",
+                                        burn_sets.as_deref(),
+                                    )
                                     .await
                                     .with_context(|| format!("first attempt: {first:#}"))?;
                                 chosen_sink = "hlssink2".into();
@@ -846,7 +891,11 @@ impl Sessions {
             module_id,
             size,
             container: info.container.clone(),
-            duration_ms: if parts.len() > 1 { Some(total_ms) } else { info.duration_ms },
+            duration_ms: if parts.len() > 1 {
+                Some(total_ms)
+            } else {
+                info.duration_ms
+            },
             parts,
             current_part: std::sync::atomic::AtomicUsize::new(start_idx),
             mode: session_mode,
@@ -863,7 +912,10 @@ impl Sessions {
             needs: session_needs,
             touched: Mutex::new(std::time::Instant::now()),
         });
-        self.active.lock().unwrap().insert(session.id.clone(), session.clone());
+        self.active
+            .lock()
+            .unwrap()
+            .insert(session.id.clone(), session.clone());
         tracing::info!(session = %session.id, item = item_id, path = %path_rel, mode, "session started");
         registry.emit(serde_json::json!({ "kind": "sessions" }));
         Ok(session)
@@ -885,7 +937,12 @@ impl Sessions {
         let mut out = Vec::with_capacity(parts.len().saturating_sub(from));
         for part in &parts[from..] {
             let lease = self
-                .open_lease(registry, &part.module_id, &part.collection_id, &part.path_rel)
+                .open_lease(
+                    registry,
+                    &part.module_id,
+                    &part.collection_id,
+                    &part.path_rel,
+                )
                 .await?;
             out.push((lease, part.size));
         }
@@ -980,12 +1037,20 @@ impl Sessions {
                     .args(["--audio-track", &plan.audio_track.to_string()])
                     .args(["--video-track", &plan.video_track.to_string()])
                     .args(["--start-ms", &start_ms.to_string()])
-                    .args(if sink.is_empty() { vec![] } else { vec!["--sink".into(), sink.to_string()] })
+                    .args(if sink.is_empty() {
+                        vec![]
+                    } else {
+                        vec!["--sink".into(), sink.to_string()]
+                    })
                     .stderr(std::process::Stdio::from(log))
                     .kill_on_drop(true)
                     .spawn()
                     .with_context(|| format!("spawning worker {}", exe.display()))?;
-                tracing::info!(session = session_id, pid = child.id(), "pipeline worker spawned");
+                tracing::info!(
+                    session = session_id,
+                    pid = child.id(),
+                    "pipeline worker spawned"
+                );
                 RemuxRunner::Worker(Mutex::new(child))
             }
             None => {
@@ -996,8 +1061,11 @@ impl Sessions {
                 let sources: Vec<Box<dyn kahawai_media::remux::RemuxSource>> = parts
                     .into_iter()
                     .map(|(lease, size)| {
-                        Box::new(LeaseSource { lease, size, handle: handle.clone() })
-                            as Box<dyn kahawai_media::remux::RemuxSource>
+                        Box::new(LeaseSource {
+                            lease,
+                            size,
+                            handle: handle.clone(),
+                        }) as Box<dyn kahawai_media::remux::RemuxSource>
                     })
                     .collect();
                 // start_at blocks while prerolling for an offset seek —
@@ -1089,8 +1157,14 @@ impl Sessions {
         anyhow::ensure!(!parts.is_empty(), "no source parts to dispatch");
         let size = parts[0].1;
         let tail_sizes: Vec<u64> = parts[1..].iter().map(|(_, n)| *n).collect();
-        self.tc_leases.lock().unwrap().insert(session_id.to_string(), (parts, part_idx));
-        self.pending_ready.lock().unwrap().insert(session_id.to_string(), ready_tx);
+        self.tc_leases
+            .lock()
+            .unwrap()
+            .insert(session_id.to_string(), (parts, part_idx));
+        self.pending_ready
+            .lock()
+            .unwrap()
+            .insert(session_id.to_string(), ready_tx);
 
         let start = kahawai_proto::v1::HubToTc {
             msg: Some(kahawai_proto::v1::hub_to_tc::Msg::StartSession(
@@ -1211,11 +1285,19 @@ impl Sessions {
         let held = self.tc_leases.lock().unwrap().get(session_id).cloned();
         let Some((lease, size)) = held.and_then(|(parts, _)| parts.get(part as usize).cloned())
         else {
-            tracing::debug!(session = session_id, part, "source read for unknown session/part");
+            tracing::debug!(
+                session = session_id,
+                part,
+                "source read for unknown session/part"
+            );
             return;
         };
         let len = len.min(kahawai_media::worker::MAX_READ);
-        let want = if offset >= size { 0 } else { len.min(size - offset) };
+        let want = if offset >= size {
+            0
+        } else {
+            len.min(size - offset)
+        };
         let mut buf = Vec::with_capacity(want as usize);
         if want > 0 {
             let mut stream = lease.read_range(offset, want).into_inner();
@@ -1243,7 +1325,11 @@ impl Sessions {
             )),
         };
         if let Err(e) = registry.send_to_tc(transcoder, msg).await {
-            tracing::debug!(session = session_id, error = format!("{e:#}"), "source data undeliverable");
+            tracing::debug!(
+                session = session_id,
+                error = format!("{e:#}"),
+                "source data undeliverable"
+            );
         }
     }
 
@@ -1272,7 +1358,10 @@ impl Sessions {
         let transcoder = transcoder.as_str();
         let key = (session.id.clone(), name.to_string());
         let (tx, mut rx) = tokio::sync::mpsc::channel(64);
-        self.artifact_waiting.lock().unwrap().insert(key.clone(), tx);
+        self.artifact_waiting
+            .lock()
+            .unwrap()
+            .insert(key.clone(), tx);
         let cleanup = || {
             self.artifact_waiting.lock().unwrap().remove(&key);
         };
@@ -1328,9 +1417,17 @@ impl Sessions {
         let session = self.get(id).context("no such session")?;
         // Register the intent; a burst coalesces to the newest one.
         let my_gen = {
-            let generation = session.seek_gen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            let generation = session
+                .seek_gen
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
             let mut pending = session.pending_seek.lock().unwrap();
-            let next = PendingSeek { generation, position_ms, audio_track, video_track };
+            let next = PendingSeek {
+                generation,
+                position_ms,
+                audio_track,
+                video_track,
+            };
             *pending = Some(PendingSeek::merge(pending.take(), next));
             generation
         };
@@ -1348,7 +1445,8 @@ impl Sessions {
                 };
                 // Inner spawn: a PANIC in the restart still publishes —
                 // an unpublished generation would hang every waiter.
-                let (this2, registry2, session2) = (this.clone(), registry.clone(), session.clone());
+                let (this2, registry2, session2) =
+                    (this.clone(), registry.clone(), session.clone());
                 let outcome = match tokio::spawn(async move {
                     this2.execute_seek(&registry2, &session2, todo).await
                 })
@@ -1388,7 +1486,12 @@ impl Sessions {
         session: &Arc<Session>,
         todo: PendingSeek,
     ) -> Result<u64> {
-        let PendingSeek { position_ms, audio_track, video_track, .. } = todo;
+        let PendingSeek {
+            position_ms,
+            audio_track,
+            video_track,
+            ..
+        } = todo;
         let mut plan =
             (*session.plan.lock().unwrap()).context("session has no restartable pipeline")?;
         session.touch();
@@ -1397,8 +1500,7 @@ impl Sessions {
         if want_audio != plan.audio_track || want_video != plan.video_track {
             // Switching tracks re-plans: the new track's codec decides
             // copy vs encode, not the old one's.
-            let (_, _, _, info) =
-                crate::subtitles::source_row(registry, &session.item_id).await?;
+            let (_, _, _, info) = crate::subtitles::source_row(registry, &session.item_id).await?;
             // HUB-15a: the executor is already chosen here — ask IT.
             let tonemap = match &session.mode {
                 Mode::Transcode { transcoder } => {
@@ -1430,13 +1532,18 @@ impl Sessions {
         // Map the absolute position onto the right part (single-part
         // sessions: part 0, local == absolute).
         let idx = part_index(&session.parts, position_ms);
-        let part = session.parts.get(idx).context("session has no parts")?.clone();
+        let part = session
+            .parts
+            .get(idx)
+            .context("session has no parts")?
+            .clone();
         let local_ms = position_ms.saturating_sub(part.base_ms);
-        session.current_part.store(idx, std::sync::atomic::Ordering::SeqCst);
+        session
+            .current_part
+            .store(idx, std::sync::atomic::Ordering::SeqCst);
         match &session.mode {
             Mode::Remux { dir, runner } => {
-                let old =
-                    std::mem::replace(&mut *runner.lock().unwrap(), RemuxRunner::Stopped);
+                let old = std::mem::replace(&mut *runner.lock().unwrap(), RemuxRunner::Stopped);
                 old.stop_and_wait().await;
                 let _ = std::fs::remove_dir_all(dir);
                 // The old worker's lease died with it; open a fresh one
@@ -1448,7 +1555,16 @@ impl Sessions {
                 // now, never for a boundary.
                 let sink = session.sink.lock().unwrap().clone();
                 let tail = self.open_part_leases(registry, &session.parts, idx).await?;
-                let fresh = match self.start_remux(&session.id, plan, tail, local_ms, &sink, session.burn_sets.as_deref()).await
+                let fresh = match self
+                    .start_remux(
+                        &session.id,
+                        plan,
+                        tail,
+                        local_ms,
+                        &sink,
+                        session.burn_sets.as_deref(),
+                    )
+                    .await
                 {
                     Ok(r) => r,
                     Err(first) if sink != "hlssink2" => {
@@ -1456,10 +1572,16 @@ impl Sessions {
                         // content crashes hlssink3 on EVERY restart.
                         tracing::warn!(session = %session.id, error = format!("{first:#}"),
                             "seek restart failed; retrying with fallback sink");
-                        let tail =
-                            self.open_part_leases(registry, &session.parts, idx).await?;
+                        let tail = self.open_part_leases(registry, &session.parts, idx).await?;
                         let r = self
-                            .start_remux(&session.id, plan, tail, local_ms, "hlssink2", session.burn_sets.as_deref())
+                            .start_remux(
+                                &session.id,
+                                plan,
+                                tail,
+                                local_ms,
+                                "hlssink2",
+                                session.burn_sets.as_deref(),
+                            )
                             .await
                             .with_context(|| format!("first attempt: {first:#}"))?;
                         *session.sink.lock().unwrap() = "hlssink2".into();
@@ -1477,7 +1599,9 @@ impl Sessions {
                         &tc,
                         kahawai_proto::v1::HubToTc {
                             msg: Some(kahawai_proto::v1::hub_to_tc::Msg::EndSession(
-                                kahawai_proto::v1::EndSession { session_id: session.id.clone() },
+                                kahawai_proto::v1::EndSession {
+                                    session_id: session.id.clone(),
+                                },
                             )),
                         },
                     )
@@ -1495,8 +1619,18 @@ impl Sessions {
                 let sink = session.sink.lock().unwrap().clone();
                 if let Err(first) = self
                     .start_transcode(
-                        registry, &tc, &session.id, plan, parts, idx, local_ms, &sink,
-                        session.burn_sets.as_ref().map(|p| std::fs::read(p).unwrap_or_default())
+                        registry,
+                        &tc,
+                        &session.id,
+                        plan,
+                        parts,
+                        idx,
+                        local_ms,
+                        &sink,
+                        session
+                            .burn_sets
+                            .as_ref()
+                            .map(|p| std::fs::read(p).unwrap_or_default())
                             .unwrap_or_default(),
                     )
                     .await
@@ -1506,11 +1640,20 @@ impl Sessions {
                     }
                     tracing::warn!(session = %session.id, error = format!("{first:#}"),
                         "seek restart failed; retrying with fallback sink");
-                    let parts =
-                        self.open_part_leases(registry, &session.parts, idx).await?;
+                    let parts = self.open_part_leases(registry, &session.parts, idx).await?;
                     self.start_transcode(
-                        registry, &tc, &session.id, plan, parts, idx, local_ms, "hlssink2",
-                        session.burn_sets.as_ref().map(|p| std::fs::read(p).unwrap_or_default())
+                        registry,
+                        &tc,
+                        &session.id,
+                        plan,
+                        parts,
+                        idx,
+                        local_ms,
+                        "hlssink2",
+                        session
+                            .burn_sets
+                            .as_ref()
+                            .map(|p| std::fs::read(p).unwrap_or_default())
                             .unwrap_or_default(),
                     )
                     .await
@@ -1583,9 +1726,15 @@ impl Sessions {
         .await?
         .unwrap_or(0);
         let idx = part_index(&session.parts, position_ms.max(0) as u64);
-        let part = session.parts.get(idx).context("session has no parts")?.clone();
+        let part = session
+            .parts
+            .get(idx)
+            .context("session has no parts")?
+            .clone();
         let local_ms = (position_ms.max(0) as u64).saturating_sub(part.base_ms);
-        session.current_part.store(idx, std::sync::atomic::Ordering::SeqCst);
+        session
+            .current_part
+            .store(idx, std::sync::atomic::Ordering::SeqCst);
         // Reuse the hub-held lease when the position is still in its
         // part — the mediahost may be unreachable during a fleet blip.
         let held = self.tc_leases.lock().unwrap().remove(id);
@@ -1598,7 +1747,8 @@ impl Sessions {
             .as_ref()
             .map(|p| std::fs::read(p).unwrap_or_default())
             .unwrap_or_default();
-        self.start_transcode(registry, &new_tc, id, plan, parts, idx, local_ms, "", sets).await?;
+        self.start_transcode(registry, &new_tc, id, plan, parts, idx, local_ms, "", sets)
+            .await?;
         *transcoder.lock().unwrap() = new_tc.clone();
         Ok(new_tc)
     }
@@ -1675,7 +1825,7 @@ impl Sessions {
 
 #[cfg(test)]
 mod tests {
-    use super::{part_index, PartSource};
+    use super::{PartSource, part_index};
 
     fn part(base_ms: u64, duration_ms: u64) -> PartSource {
         PartSource {
@@ -1746,6 +1896,9 @@ mod seek_merge_tests {
             audio_track: Some(0),
             video_track: None,
         };
-        assert_eq!(PendingSeek::merge(Some(merged), re_switch).audio_track, Some(0));
+        assert_eq!(
+            PendingSeek::merge(Some(merged), re_switch).audio_track,
+            Some(0)
+        );
     }
 }

@@ -20,7 +20,10 @@ fn rec(path: &str, size: u64) -> FileUpsertRecord {
 async fn resolves_series_into_shows_and_episodes() {
     let db = kahawai_hub::db::open_in_memory().await.unwrap();
     let registry = Registry::new(db.clone(), Default::default());
-    registry.record_satellite("01HOST", "mediahost", "nas", "fp").await.unwrap();
+    registry
+        .record_satellite("01HOST", "mediahost", "nas", "fp")
+        .await
+        .unwrap();
     registry
         .announce_collection("01HOST", "series", "series", &["/srv/series".into()])
         .await
@@ -32,9 +35,15 @@ async fn resolves_series_into_shows_and_episodes() {
             "series",
             vec![
                 rec("Andor/Season 1/Star Wars - Andor - S01E01 - Kassa.mkv", 100),
-                rec("Andor/Season 1/Star Wars - Andor - S01E02 - That Would Be Me.mkv", 101),
+                rec(
+                    "Andor/Season 1/Star Wars - Andor - S01E02 - That Would Be Me.mkv",
+                    101,
+                ),
                 rec("Andor/Season 2/Andor.S02E01.1080p.mkv", 102),
-                rec("The Wire (2002)/Season 3/The.Wire.S03E11.Middle.Ground.mkv", 103),
+                rec(
+                    "The Wire (2002)/Season 3/The.Wire.S03E11.Middle.Ground.mkv",
+                    103,
+                ),
                 // Unparseable: stored as a file, resolved to nothing.
                 rec("Andor/Season 1/behind-the-scenes.mkv", 104),
             ],
@@ -83,7 +92,10 @@ async fn resolves_series_into_shows_and_episodes() {
         .upsert_files(
             "01HOST",
             "series",
-            vec![rec("Andor/Season 1/Star Wars - Andor - S01E01 - Kassa.mkv", 100)],
+            vec![rec(
+                "Andor/Season 1/Star Wars - Andor - S01E01 - Kassa.mkv",
+                100,
+            )],
         )
         .await
         .unwrap();
@@ -104,7 +116,10 @@ async fn resolves_series_into_shows_and_episodes() {
     .into_iter()
     .map(String::from)
     .collect();
-    registry.reconcile_files("01HOST", "series", &keep).await.unwrap();
+    registry
+        .reconcile_files("01HOST", "series", &keep)
+        .await
+        .unwrap();
     let titles: Vec<String> =
         sqlx::query_scalar("SELECT title FROM items WHERE kind = 'show' ORDER BY title")
             .fetch_all(&db)
@@ -117,7 +132,10 @@ async fn resolves_series_into_shows_and_episodes() {
 async fn libraries_auto_provision_and_enforce_types() {
     let db = kahawai_hub::db::open_in_memory().await.unwrap();
     let registry = Registry::new(db.clone(), Default::default());
-    registry.record_satellite("01HOST", "mediahost", "nas", "fp").await.unwrap();
+    registry
+        .record_satellite("01HOST", "mediahost", "nas", "fp")
+        .await
+        .unwrap();
     registry
         .announce_collection("01HOST", "movies", "movies", &["/srv/movies".into()])
         .await
@@ -150,8 +168,14 @@ async fn libraries_auto_provision_and_enforce_types() {
     assert!(err.to_string().contains("type mismatch"), "{err:#}");
 
     // Manual library of the right type accepts it.
-    let extra = registry.create_library("everything-movies", "movies").await.unwrap();
-    registry.attach_collection(&extra, "01HOST", "movies").await.unwrap();
+    let extra = registry
+        .create_library("everything-movies", "movies")
+        .await
+        .unwrap();
+    registry
+        .attach_collection(&extra, "01HOST", "movies")
+        .await
+        .unwrap();
     // Bad media type rejected outright.
     assert!(registry.create_library("nope", "podcasts").await.is_err());
     // Delete cascades memberships.
@@ -162,7 +186,10 @@ async fn libraries_auto_provision_and_enforce_types() {
 async fn resolves_music_into_albums_and_tracks() {
     let db = kahawai_hub::db::open_in_memory().await.unwrap();
     let registry = Registry::new(db.clone(), Default::default());
-    registry.record_satellite("01HOST", "mediahost", "nas", "fp").await.unwrap();
+    registry
+        .record_satellite("01HOST", "mediahost", "nas", "fp")
+        .await
+        .unwrap();
     registry
         .announce_collection("01HOST", "music", "music", &["/srv/music".into()])
         .await
@@ -179,11 +206,16 @@ async fn resolves_music_into_albums_and_tracks() {
             }
         })
         .to_string(),
-        ..rec("Rotting Christ/Khronos (2000)/Rotting Christ - Khronos - 01 - WRONG.flac", 10)
+        ..rec(
+            "Rotting Christ/Khronos (2000)/Rotting Christ - Khronos - 01 - WRONG.flac",
+            10,
+        )
     };
     // Untagged: the Lidarr filename fallback fires.
-    let untagged =
-        rec("Rotting Christ/Khronos (2000)/Rotting Christ - Khronos - 02 - If It Ends Tomorrow.flac", 11);
+    let untagged = rec(
+        "Rotting Christ/Khronos (2000)/Rotting Christ - Khronos - 02 - If It Ends Tomorrow.flac",
+        11,
+    );
     // Same album name, different artist: must be a separate album.
     let other = FileUpsertRecord {
         streams_json: serde_json::json!({
@@ -199,20 +231,23 @@ async fn resolves_music_into_albums_and_tracks() {
         .await
         .unwrap();
 
-    let albums: Vec<(String, String, Option<i64>)> = sqlx::query(
-        "SELECT title, artist, year FROM items WHERE kind = 'album' ORDER BY artist",
-    )
-    .fetch_all(&db)
-    .await
-    .unwrap()
-    .into_iter()
-    .map(|r| (r.get("title"), r.get("artist"), r.get("year")))
-    .collect();
+    let albums: Vec<(String, String, Option<i64>)> =
+        sqlx::query("SELECT title, artist, year FROM items WHERE kind = 'album' ORDER BY artist")
+            .fetch_all(&db)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| (r.get("title"), r.get("artist"), r.get("year")))
+            .collect();
     assert_eq!(
         albums,
         vec![
             ("Khronos".to_string(), "Other Band".to_string(), None),
-            ("Khronos".to_string(), "Rotting Christ".to_string(), Some(2000)),
+            (
+                "Khronos".to_string(),
+                "Rotting Christ".to_string(),
+                Some(2000)
+            ),
         ],
         "{albums:?}"
     );
@@ -231,7 +266,10 @@ async fn resolves_music_into_albums_and_tracks() {
     .collect();
     assert_eq!(
         tracks,
-        vec![(1, "Thou Art Blind".to_string()), (2, "If It Ends Tomorrow".to_string())],
+        vec![
+            (1, "Thou Art Blind".to_string()),
+            (2, "If It Ends Tomorrow".to_string())
+        ],
         "tags must beat the WRONG filename title: {tracks:?}"
     );
 
@@ -244,7 +282,10 @@ async fn resolves_music_into_albums_and_tracks() {
     .into_iter()
     .map(String::from)
     .collect();
-    registry.reconcile_files("01HOST", "music", &keep).await.unwrap();
+    registry
+        .reconcile_files("01HOST", "music", &keep)
+        .await
+        .unwrap();
     let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM items WHERE kind = 'album'")
         .fetch_one(&db)
         .await

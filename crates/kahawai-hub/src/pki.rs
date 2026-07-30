@@ -10,8 +10,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use rcgen::{
-    BasicConstraints, CertificateParams, CertificateSigningRequestParams, CertifiedIssuer,
-    DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
+    BasicConstraints, CertificateParams, CertificateSigningRequestParams, CertifiedIssuer, DnType,
+    ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
 };
 use time::{Duration, OffsetDateTime};
 
@@ -43,7 +43,11 @@ impl HubCa {
             .map_err(|e| anyhow::anyhow!("decoding ca.crt PEM: {e}"))?;
         let ca_fingerprint = kahawai_core::pki::cert_fingerprint(&pem.contents);
         tracing::info!(ca = %ca_fingerprint, "hub CA ready");
-        Ok(Self { issuer, ca_cert_pem, ca_fingerprint })
+        Ok(Self {
+            issuer,
+            ca_cert_pem,
+            ca_fingerprint,
+        })
     }
 
     /// The CA certificate satellites pin (SEC-4).
@@ -61,7 +65,9 @@ impl HubCa {
     pub fn issue_server_cert(&self, hostnames: &[String]) -> Result<(String, String)> {
         let key = KeyPair::generate()?;
         let mut params = CertificateParams::new(hostnames.to_vec())?;
-        params.distinguished_name.push(DnType::CommonName, "Kahawai Hub");
+        params
+            .distinguished_name
+            .push(DnType::CommonName, "Kahawai Hub");
         let now = OffsetDateTime::now_utc();
         params.not_before = now - LEAF_BACKDATE;
         params.not_after = now + Duration::days(90);
@@ -96,12 +102,15 @@ impl HubCa {
 /// this against the mTLS peer's identity — a satellite can only renew
 /// itself.
 pub fn csr_module_uri(csr_der: &[u8]) -> Result<Option<String>> {
-    let csr = CertificateSigningRequestParams::from_der(&csr_der.into())
-        .context("parsing CSR")?;
-    Ok(csr.params.subject_alt_names.iter().find_map(|san| match san {
-        rcgen::SanType::URI(u) => Some(u.as_str().to_string()),
-        _ => None,
-    }))
+    let csr = CertificateSigningRequestParams::from_der(&csr_der.into()).context("parsing CSR")?;
+    Ok(csr
+        .params
+        .subject_alt_names
+        .iter()
+        .find_map(|san| match san {
+            rcgen::SanType::URI(u) => Some(u.as_str().to_string()),
+            _ => None,
+        }))
 }
 
 /// Generate the CA keypair + self-signed cert and persist them (first start).
@@ -153,8 +162,7 @@ mod tests {
 
     #[test]
     fn csr_uri_is_extracted_and_verifiable() {
-        let bundle =
-            kahawai_core::pki::new_satellite_csr("mediahost", "01ABC", "nas").unwrap();
+        let bundle = kahawai_core::pki::new_satellite_csr("mediahost", "01ABC", "nas").unwrap();
         let uri = csr_module_uri(&bundle.csr_der).unwrap();
         assert_eq!(uri.as_deref(), Some("kahawai://mediahost/01ABC"));
     }
@@ -169,7 +177,10 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = fs::metadata(dir.path().join("ca.key")).unwrap().permissions().mode();
+            let mode = fs::metadata(dir.path().join("ca.key"))
+                .unwrap()
+                .permissions()
+                .mode();
             assert_eq!(mode & 0o777, 0o600);
         }
         // Reload gives the same CA, not a new one.

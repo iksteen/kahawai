@@ -23,7 +23,11 @@ pub struct RenewalService {
 
 impl RenewalService {
     pub fn new(ca: Arc<HubCa>, registry: Arc<Registry>, cert_days: u32) -> Self {
-        Self { ca, registry, cert_days }
+        Self {
+            ca,
+            registry,
+            cert_days,
+        }
     }
 
     pub fn into_server(self) -> RenewalServer<Self> {
@@ -45,7 +49,9 @@ impl Renewal for RenewalService {
         let expected = kahawai_core::pki::module_uri(&peer.module_type, &peer.module_id);
         if claimed.as_deref() != Some(expected.as_str()) {
             tracing::warn!(module_id = %peer.module_id, ?claimed, "renewal CSR identity mismatch");
-            return Err(Status::permission_denied("CSR identity does not match the connection"));
+            return Err(Status::permission_denied(
+                "CSR identity does not match the connection",
+            ));
         }
         let signed = self
             .ca
@@ -56,6 +62,8 @@ impl Renewal for RenewalService {
             .await
             .map_err(|e| Status::internal(format!("recording renewal: {e:#}")))?;
         tracing::info!(module_id = %peer.module_id, fingerprint = %signed.fingerprint, "renewed satellite certificate issued");
-        Ok(Response::new(RenewResponse { cert_pem: signed.cert_pem }))
+        Ok(Response::new(RenewResponse {
+            cert_pem: signed.cert_pem,
+        }))
     }
 }

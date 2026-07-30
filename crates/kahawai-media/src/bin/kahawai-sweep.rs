@@ -18,13 +18,13 @@
 //! kills hung children.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 const MEDIA_EXTS: &[&str] = &[
-    "mkv", "mp4", "m4v", "webm", "avi", "mov", "ts", "m2ts", "ogv",
-    "flac", "mp3", "ogg", "oga", "opus", "m4a", "aac", "wav",
+    "mkv", "mp4", "m4v", "webm", "avi", "mov", "ts", "m2ts", "ogv", "flac", "mp3", "ogg", "oga",
+    "opus", "m4a", "aac", "wav",
 ];
 const HEAD_BYTES: u64 = 48 * 1024 * 1024;
 /// In-child pipeline deadline; the parent's watchdog is the backstop.
@@ -81,7 +81,10 @@ fn main() {
     // Child mode: sweep exactly one file, print "<tag>\t<detail>", exit 0.
     if let Some(path) = one {
         kahawai_media::init().expect("gstreamer init");
-        let has_ffprobe = std::process::Command::new("ffprobe").arg("-version").output().is_ok();
+        let has_ffprobe = std::process::Command::new("ffprobe")
+            .arg("-version")
+            .output()
+            .is_ok();
         let (verdict, detail) = sweep_one(&path, full, has_ffprobe, &profile);
         println!("{}\t{}", verdict.tag().trim_end(), detail);
         return;
@@ -92,7 +95,11 @@ fn main() {
         std::process::exit(2);
     };
 
-    if std::process::Command::new("ffprobe").arg("-version").output().is_err() {
+    if std::process::Command::new("ffprobe")
+        .arg("-version")
+        .output()
+        .is_err()
+    {
         eprintln!("note: ffprobe not found — segment DTS checks skipped");
     }
 
@@ -100,8 +107,12 @@ fn main() {
     walk(&dir, &mut files);
     files.sort();
     files.truncate(limit);
-    eprintln!("sweeping {} files with {} jobs ({})", files.len(), jobs,
-        if full { "full files" } else { "first 48 MiB" });
+    eprintln!(
+        "sweeping {} files with {} jobs ({})",
+        files.len(),
+        jobs,
+        if full { "full files" } else { "first 48 MiB" }
+    );
 
     let exe = std::env::current_exe().expect("current_exe");
     let next = AtomicUsize::new(0);
@@ -109,13 +120,15 @@ fn main() {
     let started = Instant::now();
     std::thread::scope(|scope| {
         for _ in 0..jobs.max(1) {
-            scope.spawn(|| loop {
-                let i = next.fetch_add(1, Ordering::Relaxed);
-                let Some(path) = files.get(i) else { break };
-                let (verdict, detail) = sweep_in_child(&exe, path, full);
-                let rel = path.strip_prefix(&dir).unwrap_or(path);
-                println!("{} {} {}", verdict.tag(), rel.display(), detail);
-                counts.lock().unwrap()[verdict as usize] += 1;
+            scope.spawn(|| {
+                loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(path) = files.get(i) else { break };
+                    let (verdict, detail) = sweep_in_child(&exe, path, full);
+                    let rel = path.strip_prefix(&dir).unwrap_or(path);
+                    println!("{} {} {}", verdict.tag(), rel.display(), detail);
+                    counts.lock().unwrap()[verdict as usize] += 1;
+                }
             });
         }
     });
@@ -143,7 +156,8 @@ fn sweep_in_child(exe: &Path, path: &Path, full: bool) -> (Verdict, String) {
     if full {
         cmd.arg("--full");
     }
-    cmd.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => return (Verdict::Fail, format!("[spawn] {e}")),
@@ -223,7 +237,9 @@ impl kahawai_media::remux::RemuxSource for BudgetSource {
 }
 
 fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
     for e in entries.flatten() {
         let p = e.path();
         if p.is_dir() {
@@ -296,8 +312,7 @@ fn sweep_one(
     };
     let budget = BudgetSource::new(src, if full { u64::MAX } else { HEAD_BYTES });
     let truncated = budget.exhausted.clone();
-    let job = match kahawai_media::remux::start(out.path(), plan, Box::new(budget))
-    {
+    let job = match kahawai_media::remux::start(out.path(), plan, Box::new(budget)) {
         Ok(j) => j,
         Err(e) => return (Verdict::Fail, format!("[start] {e:#}")),
     };
@@ -307,7 +322,10 @@ fn sweep_one(
     }
     if !job.finished() {
         job.stop();
-        return (Verdict::Fail, format!("[hang] pipeline never finished; {codecs}"));
+        return (
+            Verdict::Fail,
+            format!("[hang] pipeline never finished; {codecs}"),
+        );
     }
 
     // 4. Validate what came out.
@@ -356,10 +374,16 @@ fn sweep_one(
         if let Some(first) = sorted.first() {
             let (has_v, has_a) = segment_stream_kinds(first);
             if plan.has_video() && !has_v {
-                return (Verdict::Fail, format!("[missing video] planned but absent — {codecs}"));
+                return (
+                    Verdict::Fail,
+                    format!("[missing video] planned but absent — {codecs}"),
+                );
             }
             if plan.has_audio() && !has_a {
-                return (Verdict::Fail, format!("[missing audio] planned but absent — {codecs}"));
+                return (
+                    Verdict::Fail,
+                    format!("[missing audio] planned but absent — {codecs}"),
+                );
             }
         }
     }
@@ -385,15 +409,30 @@ fn describe(info: &kahawai_core::media::MediaInfo) -> String {
     format!(
         "[{} v={} a={}]",
         info.container.as_deref().unwrap_or("?"),
-        if v.is_empty() { "-".into() } else { v.join(",") },
-        if a.is_empty() { "-".into() } else { a.join(",") },
+        if v.is_empty() {
+            "-".into()
+        } else {
+            v.join(",")
+        },
+        if a.is_empty() {
+            "-".into()
+        } else {
+            a.join(",")
+        },
     )
 }
 
 /// Which stream kinds a segment actually contains, via ffprobe.
 fn segment_stream_kinds(seg: &Path) -> (bool, bool) {
     let Ok(out) = std::process::Command::new("ffprobe")
-        .args(["-v", "error", "-show_entries", "stream=codec_type", "-of", "csv=p=0"])
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "stream=codec_type",
+            "-of",
+            "csv=p=0",
+        ])
         .arg(seg)
         .output()
     else {
@@ -406,7 +445,16 @@ fn segment_stream_kinds(seg: &Path) -> (bool, bool) {
 /// (missing_dts, non_monotonic) video packets per segment, via ffprobe.
 fn video_dts_defects(seg: &Path) -> (usize, usize) {
     let out = std::process::Command::new("ffprobe")
-        .args(["-v", "error", "-select_streams", "v", "-show_entries", "packet=dts", "-of", "csv=p=0"])
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "v",
+            "-show_entries",
+            "packet=dts",
+            "-of",
+            "csv=p=0",
+        ])
         .arg(seg)
         .output();
     let Ok(out) = out else { return (0, 0) };

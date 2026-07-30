@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use kahawai_proto::v1::mediahost_link_server::{MediahostLink, MediahostLinkServer};
 use kahawai_proto::v1::{
-    host_to_hub, hub_to_host, ByteChunk, HelloAck, HostToHub, HubToHost, ReadRequest,
+    ByteChunk, HelloAck, HostToHub, HubToHost, ReadRequest, host_to_hub, hub_to_host,
 };
 use kahawai_proto::{PROTOCOL_MAJOR, PROTOCOL_MINOR};
 use kahawai_transport::mtls::peer_identity;
@@ -30,7 +30,12 @@ impl MediahostLinkService {
         subtitles: Arc<crate::subtitles::Subtitles>,
         enricher: Arc<crate::enrich::Enricher>,
     ) -> Self {
-        Self { registry, sessions, subtitles, enricher }
+        Self {
+            registry,
+            sessions,
+            subtitles,
+            enricher,
+        }
     }
 
     pub fn into_server(self) -> MediahostLinkServer<Self> {
@@ -70,8 +75,7 @@ pub fn local_link(
                 continue;
             }
             if let Err(e) =
-                handle_host_msg(&registry, &subtitles, &enricher, &module_id, msg, &mut seen)
-                    .await
+                handle_host_msg(&registry, &subtitles, &enricher, &module_id, msg, &mut seen).await
             {
                 tracing::error!(%module_id, error = format!("{e:#}"), "handling local link message");
             }
@@ -99,7 +103,9 @@ impl MediahostLink for MediahostLinkService {
         let mut inbound = request.into_inner();
         // First message must be Hello (AR-7).
         let hello = match inbound.message().await? {
-            Some(HostToHub { msg: Some(host_to_hub::Msg::Hello(h)) }) => h,
+            Some(HostToHub {
+                msg: Some(host_to_hub::Msg::Hello(h)),
+            }) => h,
             _ => return Err(Status::failed_precondition("first message must be Hello")),
         };
         if hello.protocol_major != PROTOCOL_MAJOR {
@@ -114,7 +120,12 @@ impl MediahostLink for MediahostLinkService {
         let outer_subtitles = self.subtitles.clone();
         let outer_enricher = self.enricher.clone();
         let module_id = peer.module_id.clone();
-        registry.connected(&module_id, &peer.module_type, &hello.name, &peer.fingerprint);
+        registry.connected(
+            &module_id,
+            &peer.module_type,
+            &hello.name,
+            &peer.fingerprint,
+        );
         if let Err(e) = registry.settle_renewal(&module_id, &peer.fingerprint).await {
             tracing::warn!(%module_id, error = format!("{e:#}"), "renewal settlement failed");
         }
@@ -137,8 +148,7 @@ impl MediahostLink for MediahostLinkService {
             // reading: while it was blocked on DB work, heartbeats sat
             // unread in the stream and the 35 s liveness timeout fired
             // spuriously mid-scan — killing the scan it was serving.
-            let (work_tx, mut work_rx) =
-                tokio::sync::mpsc::channel::<host_to_hub::Msg>(64);
+            let (work_tx, mut work_rx) = tokio::sync::mpsc::channel::<host_to_hub::Msg>(64);
             let worker = {
                 let registry = registry.clone();
                 let module_id = module_id.clone();
@@ -162,11 +172,9 @@ impl MediahostLink for MediahostLinkService {
             };
             // Heartbeats arrive every 10 s; three missed = dead link.
             loop {
-                let msg = tokio::time::timeout(
-                    std::time::Duration::from_secs(35),
-                    inbound.message(),
-                )
-                .await;
+                let msg =
+                    tokio::time::timeout(std::time::Duration::from_secs(35), inbound.message())
+                        .await;
                 let msg = match msg {
                     Ok(m) => m,
                     Err(_) => {
@@ -300,7 +308,9 @@ async fn handle_host_msg(
                     streams_json: f.streams_json,
                 })
                 .collect();
-            let n = registry.upsert_files(module_id, &u.collection_id, files).await?;
+            let n = registry
+                .upsert_files(module_id, &u.collection_id, files)
+                .await?;
             tracing::debug!(%module_id, collection = %u.collection_id, files = n, "file upsert");
         }
         host_to_hub::Msg::FileError(e) => {
@@ -338,7 +348,9 @@ async fn handle_host_msg(
             // manifest, no walk, no reconciliation churn on restart.
             if r.sync_version != 0
                 && r.sync_version
-                    == registry.collection_sync_version(module_id, &r.collection_id).await?
+                    == registry
+                        .collection_sync_version(module_id, &r.collection_id)
+                        .await?
             {
                 let msg = kahawai_proto::v1::HubToHost {
                     msg: Some(kahawai_proto::v1::hub_to_host::Msg::Manifest(
@@ -420,7 +432,9 @@ async fn handle_host_msg(
             tracing::info!(%module_id, collection = %p.collection_id,
                 scanned = p.scanned, failed = p.failed, skipped = p.skipped, "scan complete");
             if let Some(paths) = seen.remove(&p.collection_id) {
-                registry.reconcile_files(module_id, &p.collection_id, &paths).await?;
+                registry
+                    .reconcile_files(module_id, &p.collection_id, &paths)
+                    .await?;
             }
             if p.sync_version != 0 {
                 registry
@@ -491,7 +505,13 @@ async fn handle_host_msg(
                         path = %h.path_rel, "mediahost reports filename CRC32 mismatch");
                 }
                 let stored = registry
-                    .record_ed2k(module_id, &fh.collection_id, &h.path_rel, &h.ed2k_hex, h.size)
+                    .record_ed2k(
+                        module_id,
+                        &fh.collection_id,
+                        &h.path_rel,
+                        &h.ed2k_hex,
+                        h.size,
+                    )
                     .await?;
                 if !stored {
                     tracing::debug!(%module_id, path = %h.path_rel,
@@ -550,7 +570,10 @@ async fn push_attachments_worklist(
     module_id: &str,
     collection_id: &str,
 ) {
-    let paths = match registry.attachments_worklist(module_id, collection_id).await {
+    let paths = match registry
+        .attachments_worklist(module_id, collection_id)
+        .await
+    {
         Ok(p) => p,
         Err(e) => {
             tracing::warn!(%module_id, collection = %collection_id,

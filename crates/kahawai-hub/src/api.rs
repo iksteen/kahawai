@@ -11,7 +11,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sqlx::Row;
 
 use crate::auth::Auth;
@@ -75,31 +75,58 @@ pub fn router(
         .route("/api/v1/items/{id}/artwork", get(item_artwork))
         .route("/api/v1/items/{id}/subtitles", get(item_subtitles))
         .route("/api/v1/items/{id}/subtitles/search", post(subtitle_search))
-        .route("/api/v1/items/{id}/subtitles/download", post(subtitle_download))
+        .route(
+            "/api/v1/items/{id}/subtitles/download",
+            post(subtitle_download),
+        )
         .route(
             "/api/v1/subtitles/downloaded/{sid}",
             axum::routing::delete(subtitle_delete),
         )
-        .route("/api/v1/items/{id}/subtitles/{file}", get(item_subtitle_file))
+        .route(
+            "/api/v1/items/{id}/subtitles/{file}",
+            get(item_subtitle_file),
+        )
         .route("/api/v1/items/{id}/fonts", get(item_fonts))
         .route("/api/v1/items/{id}/fonts/{n}", get(item_font))
         .route("/api/v1/prefs", get(get_prefs).put(put_pref))
         .route("/api/v1/events", get(events))
         .route("/api/v1/playback/sessions", post(start_session))
-        .route("/api/v1/playback/sessions/{id}", axum::routing::delete(end_session))
+        .route(
+            "/api/v1/playback/sessions/{id}",
+            axum::routing::delete(end_session),
+        )
         .route("/api/v1/playback/sessions/{id}/stream", get(stream_session))
-        .route("/api/v1/playback/sessions/{id}/progress", post(post_progress))
+        .route(
+            "/api/v1/playback/sessions/{id}/progress",
+            post(post_progress),
+        )
         .route("/api/v1/playback/sessions/{id}/seek", post(seek_session))
         .route("/api/v1/playback/sessions/{id}/{file}", get(session_file))
-        .route_layer(axum::middleware::from_fn_with_state(state.clone(), require_auth));
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            require_auth,
+        ));
     let admin = Router::new()
         .route("/admin/v1/enrollments", get(admin_enrollments))
         .route("/admin/v1/enrollments/approve", post(admin_approve))
         .route("/admin/v1/satellites", get(admin_satellites))
-        .route("/admin/v1/satellites/{id}", axum::routing::delete(admin_delete_satellite))
-        .route("/admin/v1/satellites/{id}/disabled", post(admin_set_disabled))
-        .route("/admin/v1/libraries", get(admin_libraries).post(admin_create_library))
-        .route("/admin/v1/libraries/{id}", axum::routing::delete(admin_delete_library))
+        .route(
+            "/admin/v1/satellites/{id}",
+            axum::routing::delete(admin_delete_satellite),
+        )
+        .route(
+            "/admin/v1/satellites/{id}/disabled",
+            post(admin_set_disabled),
+        )
+        .route(
+            "/admin/v1/libraries",
+            get(admin_libraries).post(admin_create_library),
+        )
+        .route(
+            "/admin/v1/libraries/{id}",
+            axum::routing::delete(admin_delete_library),
+        )
         .route(
             "/admin/v1/libraries/{id}/collections",
             post(admin_attach_collection),
@@ -111,20 +138,35 @@ pub fn router(
         .route("/admin/v1/collections", get(admin_collections))
         .route("/admin/v1/users", post(admin_create_user))
         .route("/admin/v1/providers", get(admin_providers))
-        .route("/admin/v1/providers/chains/{media_type}", post(admin_set_chain))
+        .route(
+            "/admin/v1/providers/chains/{media_type}",
+            post(admin_set_chain),
+        )
         .route("/admin/v1/providers/tmdb", post(admin_set_tmdb))
         .route("/admin/v1/providers/tvdb", post(admin_set_tvdb))
         .route("/admin/v1/providers/anidb", post(admin_set_anidb))
         .route("/admin/v1/providers/anidb/verify", post(admin_verify_anidb))
-        .route("/admin/v1/enrich", get(admin_enrich_status).post(admin_enrich_run))
-        .route("/admin/v1/libraries/{id}/refresh", post(admin_refresh_library))
+        .route(
+            "/admin/v1/enrich",
+            get(admin_enrich_status).post(admin_enrich_run),
+        )
+        .route(
+            "/admin/v1/libraries/{id}/refresh",
+            post(admin_refresh_library),
+        )
         .route("/admin/v1/enrich/review", get(admin_review_list))
         .route("/admin/v1/enrich/search", post(admin_review_search))
         .route("/admin/v1/items/{id}/match", post(admin_apply_match))
         .route("/admin/v1/sessions", get(admin_sessions))
-        .route("/admin/v1/sessions/{id}", axum::routing::delete(admin_end_session))
+        .route(
+            "/admin/v1/sessions/{id}",
+            axum::routing::delete(admin_end_session),
+        )
         .route_layer(axum::middleware::from_fn(require_admin))
-        .route_layer(axum::middleware::from_fn_with_state(state.clone(), require_auth));
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            require_auth,
+        ));
     let mut app = Router::new()
         .merge(admin)
         // NFR-6: public on purpose. It names modules and their state and
@@ -240,15 +282,14 @@ async fn metrics(
     if !ct_eq(presented.as_bytes(), expected.as_bytes()) {
         return Err((StatusCode::UNAUTHORIZED, "bad metrics token".into()));
     }
-    let snap = crate::metrics::gather(
-        &state.registry,
-        &state.sessions,
-        state.enricher.data_dir(),
-    )
-    .await
-    .map_err(internal)?;
+    let snap = crate::metrics::gather(&state.registry, &state.sessions, state.enricher.data_dir())
+        .await
+        .map_err(internal)?;
     Ok((
-        [(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
         crate::metrics::render(&snap),
     )
         .into_response())
@@ -261,13 +302,9 @@ async fn metrics(
 /// that fails the whole server because one Pi is unplugged gets muted.
 /// The body carries the detail, and `status` distinguishes the two.
 async fn health(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
-    let snap = crate::metrics::gather(
-        &state.registry,
-        &state.sessions,
-        state.enricher.data_dir(),
-    )
-    .await
-    .map_err(internal)?;
+    let snap = crate::metrics::gather(&state.registry, &state.sessions, state.enricher.data_dir())
+        .await
+        .map_err(internal)?;
     Ok(Json(crate::metrics::health(&snap)))
 }
 
@@ -292,7 +329,10 @@ async fn require_auth(
     }
     let claims = presented_token(&req)
         .and_then(|t| state.auth.verify(&t).ok())
-        .ok_or((StatusCode::UNAUTHORIZED, "invalid or missing token".to_string()))?;
+        .ok_or((
+            StatusCode::UNAUTHORIZED,
+            "invalid or missing token".to_string(),
+        ))?;
     req.extensions_mut().insert(claims);
     Ok(next.run(req).await)
 }
@@ -404,7 +444,9 @@ async fn admin_set_chain(
     crate::providers::set_chain(state.registry.db(), &media_type, &body.order)
         .await
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;
-    state.registry.emit(json!({ "kind": "enrich", "chain": media_type }));
+    state
+        .registry
+        .emit(json!({ "kind": "enrich", "chain": media_type }));
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -447,7 +489,13 @@ async fn subtitle_download(
 ) -> Result<Json<Value>, ApiError> {
     let (key, quota) = state
         .subtitles
-        .download_external(&state.registry, &id, &body.file_id, body.language, &claims.sub)
+        .download_external(
+            &state.registry,
+            &id,
+            &body.file_id,
+            body.language,
+            &claims.sub,
+        )
         .await
         .map_err(|e| (StatusCode::BAD_GATEWAY, format!("{e:#}")))?;
     Ok(Json(json!({ "key": key, "quota": quota })))
@@ -467,8 +515,16 @@ async fn subtitle_delete(
 
 /// Re-validate the STORED AniDB credentials (no resend needed).
 async fn admin_verify_anidb(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
-    let user = state.registry.get_setting(crate::anidb::USER_SETTING).await.map_err(internal)?;
-    let pass = state.registry.get_setting(crate::anidb::PASS_SETTING).await.map_err(internal)?;
+    let user = state
+        .registry
+        .get_setting(crate::anidb::USER_SETTING)
+        .await
+        .map_err(internal)?;
+    let pass = state
+        .registry
+        .get_setting(crate::anidb::PASS_SETTING)
+        .await
+        .map_err(internal)?;
     let key = state
         .registry
         .get_setting(crate::anidb::APIKEY_SETTING)
@@ -476,16 +532,20 @@ async fn admin_verify_anidb(State(state): State<AppState>) -> Result<Json<Value>
         .map_err(internal)?
         .filter(|k| !k.is_empty());
     let (Some(user), Some(pass)) = (user, pass) else {
-        return Err((StatusCode::BAD_REQUEST, "no AniDB account configured".into()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "no AniDB account configured".into(),
+        ));
     };
-    match crate::anidb::Anidb::login(state.enricher.data_dir(), &user, &pass, key.as_deref())
-        .await
+    match crate::anidb::Anidb::login(state.enricher.data_dir(), &user, &pass, key.as_deref()).await
     {
         Ok(client) => {
             client.finish().await;
             Ok(Json(json!({ "verified": true })))
         }
-        Err(e) => Ok(Json(json!({ "verified": false, "error": format!("{e:#}") }))),
+        Err(e) => Ok(Json(
+            json!({ "verified": false, "error": format!("{e:#}") }),
+        )),
     }
 }
 
@@ -506,10 +566,21 @@ async fn admin_set_anidb(
 ) -> Result<Json<Value>, ApiError> {
     let (user, pass) = (body.username.trim(), body.password.trim());
     if user.is_empty() || pass.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "username and password required".into()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "username and password required".into(),
+        ));
     }
-    state.registry.set_setting(crate::anidb::USER_SETTING, user).await.map_err(internal)?;
-    state.registry.set_setting(crate::anidb::PASS_SETTING, pass).await.map_err(internal)?;
+    state
+        .registry
+        .set_setting(crate::anidb::USER_SETTING, user)
+        .await
+        .map_err(internal)?;
+    state
+        .registry
+        .set_setting(crate::anidb::PASS_SETTING, pass)
+        .await
+        .map_err(internal)?;
     // Empty key = clear it (plaintext session); the login path treats
     // an empty stored key as absent.
     state
@@ -528,9 +599,7 @@ async fn admin_set_anidb(
         .await
         .map_err(internal)?
         .filter(|k| !k.is_empty());
-    match crate::anidb::Anidb::login(state.enricher.data_dir(), user, pass, key.as_deref())
-        .await
-    {
+    match crate::anidb::Anidb::login(state.enricher.data_dir(), user, pass, key.as_deref()).await {
         Ok(client) => {
             client.finish().await;
             let enricher = state.enricher.clone();
@@ -542,7 +611,9 @@ async fn admin_set_anidb(
             });
             Ok(Json(json!({ "saved": true, "verified": true })))
         }
-        Err(e) => Ok(Json(json!({ "saved": true, "verified": false, "error": format!("{e:#}") }))),
+        Err(e) => Ok(Json(
+            json!({ "saved": true, "verified": false, "error": format!("{e:#}") }),
+        )),
     }
 }
 
@@ -674,7 +745,9 @@ async fn request_scan(state: &AppState, module_id: &str, collection_id: &str) ->
     }
     let msg = kahawai_proto::v1::HubToHost {
         msg: Some(kahawai_proto::v1::hub_to_host::Msg::RescanRequest(
-            kahawai_proto::v1::RescanRequest { collection_id: collection_id.to_string() },
+            kahawai_proto::v1::RescanRequest {
+                collection_id: collection_id.to_string(),
+            },
         )),
     };
     state.registry.send_to_host(module_id, msg).await.is_ok()
@@ -734,7 +807,13 @@ async fn admin_review_search(
 ) -> Result<Json<Value>, ApiError> {
     let candidates = state
         .enricher
-        .search_candidates(&state.registry, &body.kind, &body.query, body.year, body.item.as_deref())
+        .search_candidates(
+            &state.registry,
+            &body.kind,
+            &body.query,
+            body.year,
+            body.item.as_deref(),
+        )
         .await
         .map_err(internal)?;
     Ok(Json(json!({ "candidates": candidates })))
@@ -760,7 +839,9 @@ async fn admin_apply_match(
         "confirm" => {
             // Pin what is already assigned: automatic re-picking then leaves
             // it alone, whatever a later answer or a reorder says.
-            crate::providers::confirm_assignment(db, &id).await.map_err(internal)?;
+            crate::providers::confirm_assignment(db, &id)
+                .await
+                .map_err(internal)?;
         }
         "reject" => {
             // The refused records are remembered and the assignment goes;
@@ -768,10 +849,14 @@ async fn admin_apply_match(
             // provider, AniDB included, for one click — and it is the
             // refused set, not their absence, that keeps the item
             // unassigned until a provider offers something new.
-            crate::providers::reject_matches(db, &id).await.map_err(internal)?;
+            crate::providers::reject_matches(db, &id)
+                .await
+                .map_err(internal)?;
         }
         "pick" => {
-            let c = body.candidate.ok_or((StatusCode::BAD_REQUEST, "candidate required".into()))?;
+            let c = body
+                .candidate
+                .ok_or((StatusCode::BAD_REQUEST, "candidate required".into()))?;
             let provider = body
                 .provider
                 .ok_or((StatusCode::BAD_REQUEST, "provider required".into()))?;
@@ -819,11 +904,17 @@ async fn admin_create_user(
         .create_user(&body.username, &body.password, body.admin)
         .await
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;
-    Ok(Json(json!({ "id": id, "username": body.username, "admin": body.admin })))
+    Ok(Json(
+        json!({ "id": id, "username": body.username, "admin": body.admin }),
+    ))
 }
 
 async fn admin_satellites(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
-    let sats = state.registry.satellites_overview().await.map_err(internal)?;
+    let sats = state
+        .registry
+        .satellites_overview()
+        .await
+        .map_err(internal)?;
     Ok(Json(json!({ "satellites": sats })))
 }
 
@@ -839,7 +930,9 @@ async fn admin_delete_satellite(
         .delete_satellite(&id)
         .await
         .map_err(|e| (StatusCode::NOT_FOUND, format!("{e:#}")))?;
-    Ok(Json(json!({ "deleted": id, "removed": fingerprint, "sessions_ended": ended })))
+    Ok(Json(
+        json!({ "deleted": id, "removed": fingerprint, "sessions_ended": ended }),
+    ))
 }
 
 #[derive(serde::Deserialize)]
@@ -850,12 +943,20 @@ struct SetDisabled {
 /// Admin drain toggle: placement skips a disabled satellite; running
 /// sessions finish on their own.
 async fn admin_libraries(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
-    let libraries = state.registry.libraries_overview().await.map_err(internal)?;
+    let libraries = state
+        .registry
+        .libraries_overview()
+        .await
+        .map_err(internal)?;
     Ok(Json(json!({ "libraries": libraries })))
 }
 
 async fn admin_collections(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
-    let collections = state.registry.collections_overview().await.map_err(internal)?;
+    let collections = state
+        .registry
+        .collections_overview()
+        .await
+        .map_err(internal)?;
     Ok(Json(json!({ "collections": collections })))
 }
 
@@ -932,7 +1033,11 @@ async fn admin_set_disabled(
     Path(id): Path<String>,
     Json(body): Json<SetDisabled>,
 ) -> Result<StatusCode, ApiError> {
-    state.registry.set_disabled(&id, body.disabled).await.map_err(internal)?;
+    state
+        .registry
+        .set_disabled(&id, body.disabled)
+        .await
+        .map_err(internal)?;
     tracing::info!(module_id = %id, disabled = body.disabled, "satellite placement toggle");
     Ok(StatusCode::NO_CONTENT)
 }
@@ -945,11 +1050,12 @@ async fn admin_sessions(State(state): State<AppState>) -> Result<Json<Value>, Ap
             .fetch_optional(state.registry.db())
             .await
             .map_err(internal)?;
-        let username: Option<String> = sqlx::query_scalar("SELECT username FROM users WHERE id = ?")
-            .bind(&s.user_id)
-            .fetch_optional(state.registry.db())
-            .await
-            .map_err(internal)?;
+        let username: Option<String> =
+            sqlx::query_scalar("SELECT username FROM users WHERE id = ?")
+                .bind(&s.user_id)
+                .fetch_optional(state.registry.db())
+                .await
+                .map_err(internal)?;
         out.push(json!({
             "session_id": s.id,
             "username": username,
@@ -1048,7 +1154,9 @@ async fn login(
     let user_key = format!("u:{}", body.username.to_lowercase());
     let ip_key = ip.map(|i| format!("ip:{i}"));
     let locked = state.auth.throttle.locked(&user_key).or_else(|| {
-        ip_key.as_deref().and_then(|k| state.auth.throttle.locked(k))
+        ip_key
+            .as_deref()
+            .and_then(|k| state.auth.throttle.locked(k))
     });
     if let Some(wait) = locked {
         tracing::warn!(username = %body.username, ip = ?ip, "login throttled");
@@ -1085,11 +1193,12 @@ async fn refresh(
     State(state): State<AppState>,
     Json(body): Json<RefreshRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    let tokens = state
-        .auth
-        .refresh(&body.refresh_token)
-        .await
-        .map_err(|_| (StatusCode::UNAUTHORIZED, "invalid refresh token".to_string()))?;
+    let tokens = state.auth.refresh(&body.refresh_token).await.map_err(|_| {
+        (
+            StatusCode::UNAUTHORIZED,
+            "invalid refresh token".to_string(),
+        )
+    })?;
     Ok(Json(json!(tokens)))
 }
 
@@ -1123,12 +1232,10 @@ async fn events(State(state): State<AppState>) -> impl axum::response::IntoRespo
     use axum::response::sse::{Event, KeepAlive, Sse};
     use tokio_stream::StreamExt;
     let rx = state.registry.subscribe_events();
-    let stream = tokio_stream::wrappers::BroadcastStream::new(rx)
-        .filter_map(|v| {
-            v.ok().map(|v| {
-                Ok::<_, std::convert::Infallible>(Event::default().data(v.to_string()))
-            })
-        });
+    let stream = tokio_stream::wrappers::BroadcastStream::new(rx).filter_map(|v| {
+        v.ok()
+            .map(|v| Ok::<_, std::convert::Infallible>(Event::default().data(v.to_string())))
+    });
     // OPS-8: tell buffering proxies (nginx) to pass events through live.
     (
         axum::response::AppendHeaders([("x-accel-buffering", "no")]),
@@ -1277,7 +1384,13 @@ async fn seek_session(
 ) -> Result<Json<Value>, ApiError> {
     let part_base_ms = state
         .sessions
-        .seek(&state.registry, &id, body.position_ms, body.audio_track, body.video_track)
+        .seek(
+            &state.registry,
+            &id,
+            body.position_ms,
+            body.audio_track,
+            body.video_track,
+        )
         .await
         .map_err(|e| {
             // Every failed seek tells its story here, not just the ones
@@ -1291,11 +1404,13 @@ async fn seek_session(
     // NOW so the overlay never lies about the current streams.
     let session = state.sessions.get(&id);
     let streams = session.as_ref().and_then(|s| {
-        s.verdict.lock().unwrap().as_ref().map(|(video, audio)| {
-            json!({ "video": video, "audio": audio, "subtitles": s.sub_verdicts })
-        })
+        s.verdict.lock().unwrap().as_ref().map(
+            |(video, audio)| json!({ "video": video, "audio": audio, "subtitles": s.sub_verdicts }),
+        )
     });
-    Ok(Json(json!({ "part_base_ms": part_base_ms, "streams": streams })))
+    Ok(Json(
+        json!({ "part_base_ms": part_base_ms, "streams": streams }),
+    ))
 }
 
 async fn end_session(
@@ -1364,7 +1479,6 @@ fn parse_range(header: Option<&str>, size: u64) -> Result<Option<(u64, u64)>, ()
     }
 }
 
-
 async fn stream_session(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -1378,7 +1492,9 @@ async fn stream_session(
     let crate::sessions::Mode::Direct { lease } = &session.mode else {
         return Err((StatusCode::CONFLICT, "not a direct-play session".into()));
     };
-    let range = headers.get(axum::http::header::RANGE).and_then(|v| v.to_str().ok());
+    let range = headers
+        .get(axum::http::header::RANGE)
+        .and_then(|v| v.to_str().ok());
 
     let (status, offset, len) = match parse_range(range, session.size) {
         Ok(None) => (StatusCode::OK, 0, session.size),
@@ -1467,7 +1583,11 @@ async fn item_subtitles(
     Path(id): Path<String>,
     Query(caps): Query<SubtitleCaps>,
 ) -> Result<Json<Value>, ApiError> {
-    let mut subs = state.subtitles.list(&state.registry, &id).await.map_err(internal)?;
+    let mut subs = state
+        .subtitles
+        .list(&state.registry, &id)
+        .await
+        .map_err(internal)?;
     // A client that cannot composite display sets has no use for image
     // subtitles — offering one it cannot render is worse than absence
     // (the session verdict already names the missing tiers, HUB-32b).
@@ -1498,7 +1618,10 @@ async fn item_subtitle_file(
             .await
             .map_err(internal)?;
         let headers = [
-            (axum::http::header::CONTENT_TYPE, "text/x-ssa; charset=utf-8"),
+            (
+                axum::http::header::CONTENT_TYPE,
+                "text/x-ssa; charset=utf-8",
+            ),
             (axum::http::header::CACHE_CONTROL, "private, max-age=3600"),
         ];
         return Ok(match body {
@@ -1515,7 +1638,13 @@ async fn item_subtitle_file(
     let key = file.strip_suffix(".vtt").unwrap_or(&file);
     let vtt = state
         .subtitles
-        .vtt(&state.registry, &state.sessions, &id, key, q.shift_ms.round() as i64)
+        .vtt(
+            &state.registry,
+            &state.sessions,
+            &id,
+            key,
+            q.shift_ms.round() as i64,
+        )
         .await
         .map_err(internal)?;
     Ok((
@@ -1735,7 +1864,10 @@ async fn list_items(
     // Folded once here, matched against norm_title (already folded) and
     // the resolved title, so a search finds an item by what it is called
     // now as well as by its filename.
-    let needle = q.q.as_deref().map(crate::enrich::fold).filter(|s| !s.is_empty());
+    let needle =
+        q.q.as_deref()
+            .map(crate::enrich::fold)
+            .filter(|s| !s.is_empty());
     let db = state.registry.db();
 
     // Three explicit shapes rather than one query with
@@ -1865,11 +1997,12 @@ async fn list_items(
                 .fetch_all(db)
                 .await
                 .map_err(internal)?;
-            let total: i64 =
-                sqlx::query_scalar("SELECT COUNT(*) FROM items WHERE kind NOT IN ('episode', 'track')")
-                    .fetch_one(db)
-                    .await
-                    .map_err(internal)?;
+            let total: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM items WHERE kind NOT IN ('episode', 'track')",
+            )
+            .fetch_one(db)
+            .await
+            .map_err(internal)?;
             (rows, total)
         }
     };
@@ -1969,12 +2102,12 @@ async fn item_detail(
          LEFT JOIN resolved_metadata pmd ON pmd.item_id = p.id
          WHERE i.id = ?",
     )
-        .bind(&claims.sub)
-        .bind(&id)
-        .fetch_optional(state.registry.db())
-        .await
-        .map_err(internal)?
-        .ok_or((StatusCode::NOT_FOUND, "no such item".to_string()))?;
+    .bind(&claims.sub)
+    .bind(&id)
+    .fetch_optional(state.registry.db())
+    .await
+    .map_err(internal)?
+    .ok_or((StatusCode::NOT_FOUND, "no such item".to_string()))?;
 
     let sources = sqlx::query(
         "SELECT s.module_id, s.collection_id, s.path_rel, f.size, f.streams_json,
@@ -1998,9 +2131,8 @@ async fn item_detail(
         .iter()
         .map(|r| {
             let module_id: String = r.get("module_id");
-            let streams: Value =
-                serde_json::from_str(r.get::<String, _>("streams_json").as_str())
-                    .unwrap_or(Value::Null);
+            let streams: Value = serde_json::from_str(r.get::<String, _>("streams_json").as_str())
+                .unwrap_or(Value::Null);
             json!({
                 "module_id": module_id,
                 "collection_id": r.get::<String, _>("collection_id"),
@@ -2091,7 +2223,6 @@ async fn item_detail(
     Ok(Json(out))
 }
 
-
 #[derive(Deserialize)]
 struct ProgressRequest {
     position_ms: u64,
@@ -2114,7 +2245,9 @@ async fn post_progress(
     }
     session.touch();
     // Pacing (§4.6): the worker throttles its lead over this position.
-    state.sessions.viewer_position(&state.registry, &id, body.position_ms);
+    state
+        .sessions
+        .viewer_position(&state.registry, &id, body.position_ms);
 
     let duration = session.duration_ms;
     let finished = duration.is_some_and(|d| d > 0 && body.position_ms * 10 >= d * 9);
@@ -2151,7 +2284,9 @@ async fn transcode_file(
     file: &str,
 ) -> Result<Response, ApiError> {
     let valid = !file.starts_with('.')
-        && file.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+        && file
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
     if !valid {
         return Err((StatusCode::BAD_REQUEST, "invalid file name".into()));
     }
@@ -2193,7 +2328,9 @@ async fn session_file(
     // session dies, or a seek-restart truncates it (the player then
     // re-opens against the new origin).
     if file.starts_with("subs-") && (file.ends_with(".ass") || file.ends_with(".jsonl")) {
-        let valid = file[5..].chars().all(|c| c.is_ascii_alphanumeric() || c == '.');
+        let valid = file[5..]
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.');
         if !valid {
             return Err((StatusCode::BAD_REQUEST, "invalid file name".into()));
         }
@@ -2211,15 +2348,18 @@ async fn session_file(
             let appear_deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
             loop {
                 // Re-resolve each cycle: seek-restarts swap the dir.
-                let Some(session) = sessions.get(&sid) else { break };
+                let Some(session) = sessions.get(&sid) else {
+                    break;
+                };
                 session.touch();
                 let snapshot: Option<Vec<u8>> = match &session.mode {
                     crate::sessions::Mode::Remux { dir, .. } => {
                         tokio::fs::read(dir.join(&file)).await.ok()
                     }
-                    crate::sessions::Mode::Transcode { .. } => {
-                        sessions.fetch_artifact(&registry, &session, &file).await.ok()
-                    }
+                    crate::sessions::Mode::Transcode { .. } => sessions
+                        .fetch_artifact(&registry, &session, &file)
+                        .await
+                        .ok(),
                     crate::sessions::Mode::Direct { .. } => break,
                 };
                 match snapshot {
@@ -2241,8 +2381,7 @@ async fn session_file(
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             }
         });
-        let body =
-            axum::body::Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx));
+        let body = axum::body::Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx));
         return Ok(axum::response::Response::builder()
             .status(StatusCode::OK)
             .header("content-type", ctype)
@@ -2261,7 +2400,9 @@ async fn session_file(
     };
     let dir = &dir;
     let valid = !file.starts_with('.')
-        && file.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+        && file
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
     if !valid {
         return Err((StatusCode::BAD_REQUEST, "invalid file name".into()));
     }
@@ -2299,7 +2440,10 @@ mod tests {
         assert_eq!(parse_range(Some("bytes=500-"), size), Ok(Some((500, 500))));
         assert_eq!(parse_range(Some("bytes=-200"), size), Ok(Some((800, 200))));
         // End clamped to size.
-        assert_eq!(parse_range(Some("bytes=900-5000"), size), Ok(Some((900, 100))));
+        assert_eq!(
+            parse_range(Some("bytes=900-5000"), size),
+            Ok(Some((900, 100)))
+        );
         // Suffix longer than the file → whole file.
         assert_eq!(parse_range(Some("bytes=-5000"), size), Ok(Some((0, 1000))));
         // Unsatisfiable / malformed.

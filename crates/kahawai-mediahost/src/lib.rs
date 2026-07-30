@@ -9,9 +9,11 @@ pub mod serve;
 use std::path::Path;
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use kahawai_proto::v1::mediahost_link_client::MediahostLinkClient;
-use kahawai_proto::v1::{host_to_hub, hub_to_host, AnnounceCollection, Heartbeat, Hello, HostToHub, HubToHost};
+use kahawai_proto::v1::{
+    AnnounceCollection, Heartbeat, Hello, HostToHub, HubToHost, host_to_hub, hub_to_host,
+};
 use kahawai_proto::{PROTOCOL_MAJOR, PROTOCOL_MINOR};
 use scan::CollectionConfig;
 use tokio_stream::wrappers::ReceiverStream;
@@ -59,8 +61,8 @@ pub async fn run(
     collections: Vec<CollectionConfig>,
     rescan_minutes: u64,
 ) -> Result<()> {
-    let mut id = kahawai_transport::enroll::ensure_identity(hub_addr, state_dir, "mediahost", name)
-        .await?;
+    let mut id =
+        kahawai_transport::enroll::ensure_identity(hub_addr, state_dir, "mediahost", name).await?;
 
     loop {
         // SEC-7: renew before (re)connecting when inside the window, and
@@ -68,7 +70,10 @@ pub async fn run(
         match kahawai_transport::renew::maybe_renew(hub_addr, state_dir, "mediahost", name).await {
             Ok(Some(renewed)) => id = renewed,
             Ok(None) => {}
-            Err(e) => tracing::warn!(error = format!("{e:#}"), "certificate renewal failed; retrying later"),
+            Err(e) => tracing::warn!(
+                error = format!("{e:#}"),
+                "certificate renewal failed; retrying later"
+            ),
         }
         let tls = kahawai_transport::mtls::mtls_client_config(&id)?;
         let renewal_due = kahawai_transport::renew::seconds_until_renewal_due(&id.cert_pem)
@@ -161,7 +166,9 @@ impl TriggerSink {
         if let Err(tokio::sync::mpsc::error::TrySendError::Full(t)) = self.tx.try_send(t) {
             tracing::debug!("trigger queue full; merging into overflow");
             let mut slot = self.overflow.lock().unwrap();
-            slot.get_or_insert_with(ScanTrigger::default).force_dirs.extend(t.force_dirs);
+            slot.get_or_insert_with(ScanTrigger::default)
+                .force_dirs
+                .extend(t.force_dirs);
             drop(slot);
             // Wake the orchestrator if space appeared meanwhile; if the
             // queue is still full, its items already guarantee a wake.
@@ -178,7 +185,10 @@ pub struct Engine {
     triggers: std::collections::HashMap<String, TriggerSink>,
     manifest_waiters: std::sync::Arc<
         std::sync::Mutex<
-            std::collections::HashMap<String, tokio::sync::mpsc::Sender<kahawai_proto::v1::Manifest>>,
+            std::collections::HashMap<
+                String,
+                tokio::sync::mpsc::Sender<kahawai_proto::v1::Manifest>,
+            >,
         >,
     >,
     hash_tx: tokio::sync::mpsc::Sender<hasher::JobMsg>,
@@ -193,32 +203,38 @@ impl Engine {
         state_dir: &Path,
         tx: tokio::sync::mpsc::Sender<HostToHub>,
     ) -> Engine {
-    // Manifest responses are routed to the scan task of their collection.
-    let manifest_waiters: std::sync::Arc<
-        std::sync::Mutex<
-            std::collections::HashMap<String, tokio::sync::mpsc::Sender<kahawai_proto::v1::Manifest>>,
-        >,
-    > = Default::default();
-    let mut guards: Vec<tokio::task::JoinHandle<()>> = Vec::new();
-    let mut triggers: std::collections::HashMap<String, TriggerSink> = Default::default();
-    let activity = Activity::default();
-    // ED2K hasher (MH-9): consumes hub Hashlists, chugs only when idle.
-    let (hash_tx, hash_rx) = tokio::sync::mpsc::channel::<hasher::JobMsg>(32);
-    guards.push(tokio::spawn(hasher::run(
-        hash_rx,
-        tx.clone(),
-        collections.to_vec(),
-        activity.clone(),
-    )));
-    for c in collections {
-        let (ttx, mut trx) = tokio::sync::mpsc::channel::<ScanTrigger>(8);
-        let sink = TriggerSink { tx: ttx, overflow: Default::default() };
-        triggers.insert(c.name.clone(), sink.clone());
-        let overflow = sink.overflow.clone();
-        let (c, tx, waiters) = (c.clone(), tx.clone(), manifest_waiters.clone());
-        let activity = activity.clone();
-        let ver_path = state_dir.join("sync").join(format!("{}.ver", c.name));
-        guards.push(tokio::spawn(async move {
+        // Manifest responses are routed to the scan task of their collection.
+        let manifest_waiters: std::sync::Arc<
+            std::sync::Mutex<
+                std::collections::HashMap<
+                    String,
+                    tokio::sync::mpsc::Sender<kahawai_proto::v1::Manifest>,
+                >,
+            >,
+        > = Default::default();
+        let mut guards: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+        let mut triggers: std::collections::HashMap<String, TriggerSink> = Default::default();
+        let activity = Activity::default();
+        // ED2K hasher (MH-9): consumes hub Hashlists, chugs only when idle.
+        let (hash_tx, hash_rx) = tokio::sync::mpsc::channel::<hasher::JobMsg>(32);
+        guards.push(tokio::spawn(hasher::run(
+            hash_rx,
+            tx.clone(),
+            collections.to_vec(),
+            activity.clone(),
+        )));
+        for c in collections {
+            let (ttx, mut trx) = tokio::sync::mpsc::channel::<ScanTrigger>(8);
+            let sink = TriggerSink {
+                tx: ttx,
+                overflow: Default::default(),
+            };
+            triggers.insert(c.name.clone(), sink.clone());
+            let overflow = sink.overflow.clone();
+            let (c, tx, waiters) = (c.clone(), tx.clone(), manifest_waiters.clone());
+            let activity = activity.clone();
+            let ver_path = state_dir.join("sync").join(format!("{}.ver", c.name));
+            guards.push(tokio::spawn(async move {
             // The persisted scan generation: bumped after every
             // completed cycle, compared by the hub on reconnect.
             let mut version: u64 = std::fs::read_to_string(&ver_path)
@@ -256,44 +272,47 @@ impl Engine {
                 }
             }
         }));
-        sink.send(ScanTrigger { initial: true, ..Default::default() }); // startup scan
-    }
+            sink.send(ScanTrigger {
+                initial: true,
+                ..Default::default()
+            }); // startup scan
+        }
 
-    // Filesystem watcher → debounced per-collection triggers. Watcher
-    // failures degrade to sweep-only operation, never fatal.
-    {
-        let (etx, mut erx) = tokio::sync::mpsc::unbounded_channel::<std::path::PathBuf>();
-        let watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-            let Ok(ev) = res else { return };
-            // Only content changes. Access and metadata events fire for
-            // MERE READS on fuse mounts — forwarding those made the
-            // scanner's own discovery reads re-trigger scans forever
-            // (77 self-inflicted rescans before this filter existed).
-            // Unknown/Any kinds are dropped too: the periodic sweep is
-            // the safety net, a feedback loop has none.
-            use notify::event::{EventKind, ModifyKind};
-            let relevant = matches!(
-                ev.kind,
-                EventKind::Create(_)
-                    | EventKind::Remove(_)
-                    | EventKind::Modify(ModifyKind::Data(_) | ModifyKind::Name(_))
-            );
-            if !relevant {
-                return;
-            }
-            for p in ev.paths {
-                let _ = etx.send(p);
-            }
-        });
-        match watcher {
-            Ok(watcher) => {
-                let roots: Vec<(String, std::path::PathBuf)> = collections
-                    .iter()
-                    .flat_map(|c| c.roots.iter().map(|r| (c.name.clone(), r.clone())))
-                    .collect();
-                let watch_roots = roots.clone();
-                let triggers2 = triggers.clone();
-                guards.push(tokio::spawn(async move {
+        // Filesystem watcher → debounced per-collection triggers. Watcher
+        // failures degrade to sweep-only operation, never fatal.
+        {
+            let (etx, mut erx) = tokio::sync::mpsc::unbounded_channel::<std::path::PathBuf>();
+            let watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+                let Ok(ev) = res else { return };
+                // Only content changes. Access and metadata events fire for
+                // MERE READS on fuse mounts — forwarding those made the
+                // scanner's own discovery reads re-trigger scans forever
+                // (77 self-inflicted rescans before this filter existed).
+                // Unknown/Any kinds are dropped too: the periodic sweep is
+                // the safety net, a feedback loop has none.
+                use notify::event::{EventKind, ModifyKind};
+                let relevant = matches!(
+                    ev.kind,
+                    EventKind::Create(_)
+                        | EventKind::Remove(_)
+                        | EventKind::Modify(ModifyKind::Data(_) | ModifyKind::Name(_))
+                );
+                if !relevant {
+                    return;
+                }
+                for p in ev.paths {
+                    let _ = etx.send(p);
+                }
+            });
+            match watcher {
+                Ok(watcher) => {
+                    let roots: Vec<(String, std::path::PathBuf)> = collections
+                        .iter()
+                        .flat_map(|c| c.roots.iter().map(|r| (c.name.clone(), r.clone())))
+                        .collect();
+                    let watch_roots = roots.clone();
+                    let triggers2 = triggers.clone();
+                    guards.push(tokio::spawn(async move {
                     // Installing recursive watches walks every directory
                     // — minutes over sshfs. Done here, off the link's
                     // critical path: blocking it starved the inbound
@@ -352,26 +371,26 @@ impl Engine {
                         }
                     }
                 }));
-            }
-            Err(e) => tracing::warn!(error = %e, "no filesystem watcher; relying on sweeps"),
-        }
-    }
-
-    // Backup sweep (periodic full incremental pass).
-    if rescan_minutes > 0 {
-        let triggers2 = triggers.clone();
-        guards.push(tokio::spawn(async move {
-            let mut t =
-                tokio::time::interval(std::time::Duration::from_secs(rescan_minutes * 60));
-            t.tick().await; // the startup scan already covered "now"
-            loop {
-                t.tick().await;
-                for tt in triggers2.values() {
-                    tt.send(ScanTrigger::default());
                 }
+                Err(e) => tracing::warn!(error = %e, "no filesystem watcher; relying on sweeps"),
             }
-        }));
-    }
+        }
+
+        // Backup sweep (periodic full incremental pass).
+        if rescan_minutes > 0 {
+            let triggers2 = triggers.clone();
+            guards.push(tokio::spawn(async move {
+                let mut t =
+                    tokio::time::interval(std::time::Duration::from_secs(rescan_minutes * 60));
+                t.tick().await; // the startup scan already covered "now"
+                loop {
+                    t.tick().await;
+                    for tt in triggers2.values() {
+                        tt.send(ScanTrigger::default());
+                    }
+                }
+            }));
+        }
         Engine {
             triggers,
             manifest_waiters,
@@ -395,8 +414,12 @@ impl Engine {
                 None
             }
             hub_to_host::Msg::Manifest(m) => {
-                let sender =
-                    self.manifest_waiters.lock().unwrap().get(&m.collection_id).cloned();
+                let sender = self
+                    .manifest_waiters
+                    .lock()
+                    .unwrap()
+                    .get(&m.collection_id)
+                    .cloned();
                 if let Some(s) = sender {
                     let _ = s.try_send(m);
                 }
@@ -407,7 +430,9 @@ impl Engine {
                 None
             }
             hub_to_host::Msg::AttachmentsWorklist(w) => {
-                let _ = self.hash_tx.try_send(hasher::JobMsg::AttachmentsWorklist(w));
+                let _ = self
+                    .hash_tx
+                    .try_send(hasher::JobMsg::AttachmentsWorklist(w));
                 None
             }
             hub_to_host::Msg::SubsWorklist(w) => {
@@ -489,7 +514,6 @@ async fn link_once(
 
     let engine = Engine::start(collections, rescan_minutes, state_dir, tx.clone());
 
-
     let mut ticker = tokio::time::interval(HEARTBEAT_INTERVAL);
     loop {
         tokio::select! {
@@ -561,10 +585,12 @@ async fn scan_cycle(
     let (mtx, mrx) = tokio::sync::mpsc::channel(16);
     waiters.lock().unwrap().insert(c.name.clone(), mtx);
     tx.send(HostToHub {
-        msg: Some(host_to_hub::Msg::ManifestRequest(kahawai_proto::v1::ManifestRequest {
-            collection_id: c.name.clone(),
-            sync_version: handshake_version,
-        })),
+        msg: Some(host_to_hub::Msg::ManifestRequest(
+            kahawai_proto::v1::ManifestRequest {
+                collection_id: c.name.clone(),
+                sync_version: handshake_version,
+            },
+        )),
     })
     .await
     .context("link closed before manifest request")?;

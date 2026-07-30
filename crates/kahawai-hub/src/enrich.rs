@@ -5,8 +5,8 @@
 //! recorded `miss` so the next run doesn't re-search it. The admin can
 //! re-run after fixing titles; a review queue (HUB-8) comes later.
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -81,7 +81,11 @@ fn parse_epno(epno: &str) -> Option<Epno> {
         'O' => 400,
         _ => return None,
     };
-    chars.as_str().parse::<i64>().ok().map(|n| Epno::Zero(band + n))
+    chars
+        .as_str()
+        .parse::<i64>()
+        .ok()
+        .map(|n| Epno::Zero(band + n))
 }
 
 fn fmt_slot(season: Option<i64>, episode: i64) -> String {
@@ -298,7 +302,6 @@ pub const GENERIC_SELECTION_SQL: &str =
                         OR s2.item_id IN (SELECT id FROM items WHERE parent_id = i.id)))
              ORDER BY i.title";
 
-
 /// Is this error, anywhere in its chain, an HTTP 404? A mapped id that
 /// the provider answers 404 for is an ANSWER — "no such record" (legacy
 /// series ids TVDB v4 dropped, movies that changed namespace) — and
@@ -315,11 +318,27 @@ fn is_http_404(e: &anyhow::Error) -> bool {
 pub(crate) fn fold(s: &str) -> String {
     use unicode_normalization::UnicodeNormalization;
     const WORDS: &[(&str, &str)] = &[
-        ("zero", "0"), ("one", "1"), ("two", "2"), ("three", "3"), ("four", "4"),
-        ("five", "5"), ("six", "6"), ("seven", "7"), ("eight", "8"), ("nine", "9"),
-        ("ten", "10"), ("eleven", "11"), ("twelve", "12"), ("thirteen", "13"),
-        ("fourteen", "14"), ("fifteen", "15"), ("sixteen", "16"), ("seventeen", "17"),
-        ("eighteen", "18"), ("nineteen", "19"), ("twenty", "20"),
+        ("zero", "0"),
+        ("one", "1"),
+        ("two", "2"),
+        ("three", "3"),
+        ("four", "4"),
+        ("five", "5"),
+        ("six", "6"),
+        ("seven", "7"),
+        ("eight", "8"),
+        ("nine", "9"),
+        ("ten", "10"),
+        ("eleven", "11"),
+        ("twelve", "12"),
+        ("thirteen", "13"),
+        ("fourteen", "14"),
+        ("fifteen", "15"),
+        ("sixteen", "16"),
+        ("seventeen", "17"),
+        ("eighteen", "18"),
+        ("nineteen", "19"),
+        ("twenty", "20"),
     ];
     let s = s.replace(['&', '+'], " and ");
     let base: String = kahawai_core::names::normalize_title(&s)
@@ -327,8 +346,16 @@ pub(crate) fn fold(s: &str) -> String {
         .filter(|c| !unicode_normalization::char::is_combining_mark(*c))
         .collect();
     const ROMAN: &[(&str, &str)] = &[
-        ("ii", "2"), ("iii", "3"), ("iv", "4"), ("vi", "6"), ("vii", "7"),
-        ("viii", "8"), ("ix", "9"), ("xi", "11"), ("xii", "12"), ("xiii", "13"),
+        ("ii", "2"),
+        ("iii", "3"),
+        ("iv", "4"),
+        ("vi", "6"),
+        ("vii", "7"),
+        ("viii", "8"),
+        ("ix", "9"),
+        ("xi", "11"),
+        ("xii", "12"),
+        ("xiii", "13"),
     ];
     base.split_whitespace()
         .map(|w| {
@@ -378,7 +405,13 @@ impl Enricher {
         })
     }
 
-    async fn search(&self, key: &str, kind: &str, title: &str, year: Option<i64>) -> Result<Vec<Candidate>> {
+    async fn search(
+        &self,
+        key: &str,
+        kind: &str,
+        title: &str,
+        year: Option<i64>,
+    ) -> Result<Vec<Candidate>> {
         let endpoint = if kind == "movie" { "movie" } else { "tv" };
         let mut req = self
             .http
@@ -401,7 +434,11 @@ impl Enricher {
             "TMDB rejected the API key"
         );
         let resp = resp.error_for_status().context("tmdb response")?;
-        Ok(resp.json::<SearchResponse>().await.context("tmdb json")?.results)
+        Ok(resp
+            .json::<SearchResponse>()
+            .await
+            .context("tmdb json")?
+            .results)
     }
 
     /// TheTVDB v4: login yields a bearer token (valid for weeks; we
@@ -421,20 +458,24 @@ impl Enricher {
         }
         let resp = self
             .http
-            .send(self.http.post("https://api4.thetvdb.com/v4/login").json(&body))
+            .send(
+                self.http
+                    .post("https://api4.thetvdb.com/v4/login")
+                    .json(&body),
+            )
             .await
             .context("tvdb login request")?
             .error_for_status()
             .context("tvdb login rejected (key/pin?)")?;
-        Ok(resp.json::<LoginResp>().await.context("tvdb login json")?.data.token)
+        Ok(resp
+            .json::<LoginResp>()
+            .await
+            .context("tvdb login json")?
+            .data
+            .token)
     }
 
-    async fn tvdb_search(
-        &self,
-        token: &str,
-        kind: &str,
-        title: &str,
-    ) -> Result<Vec<Candidate>> {
+    async fn tvdb_search(&self, token: &str, kind: &str, title: &str) -> Result<Vec<Candidate>> {
         #[derive(Deserialize)]
         struct SearchResult {
             #[serde(default)]
@@ -490,12 +531,7 @@ impl Enricher {
     }
 
     /// One episode's provider data, normalized across TMDB/TVDB.
-    async fn tmdb_season(
-        &self,
-        key: &str,
-        show_id: &str,
-        season: i64,
-    ) -> Result<Vec<EpisodeData>> {
+    async fn tmdb_season(&self, key: &str, show_id: &str, season: i64) -> Result<Vec<EpisodeData>> {
         #[derive(Deserialize)]
         struct Ep {
             episode_number: i64,
@@ -516,15 +552,21 @@ impl Enricher {
             #[serde(default)]
             episodes: Vec<Ep>,
         }
-        let mut req = self
-            .http
-            .get(format!("https://api.themoviedb.org/3/tv/{show_id}/season/{season}"));
+        let mut req = self.http.get(format!(
+            "https://api.themoviedb.org/3/tv/{show_id}/season/{season}"
+        ));
         if key.starts_with("eyJ") {
             req = req.bearer_auth(key);
         } else {
             req = req.query(&[("api_key", key)]);
         }
-        let s: Season = self.http.send(req).await?.error_for_status()?.json().await?;
+        let s: Season = self
+            .http
+            .send(req)
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
         Ok(s.episodes
             .into_iter()
             .map(|e| EpisodeData {
@@ -555,13 +597,21 @@ impl Enricher {
             #[serde(default)]
             seasons: Vec<S>,
         }
-        let mut req = self.http.get(format!("https://api.themoviedb.org/3/tv/{show_id}"));
+        let mut req = self
+            .http
+            .get(format!("https://api.themoviedb.org/3/tv/{show_id}"));
         if key.starts_with("eyJ") {
             req = req.bearer_auth(key);
         } else {
             req = req.query(&[("api_key", key)]);
         }
-        let s: Show = self.http.send(req).await?.error_for_status()?.json().await?;
+        let s: Show = self
+            .http
+            .send(req)
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
         Ok(s.seasons
             .into_iter()
             .filter(|s| s.season_number > 0)
@@ -584,8 +634,10 @@ impl Enricher {
             .tvdb_episodes(token, series_id, order, Some("eng"))
             .await
             .unwrap_or_default();
-        let by_id: std::collections::HashMap<String, EpisodeData> =
-            eng.into_iter().map(|e| (e.provider_id.clone(), e)).collect();
+        let by_id: std::collections::HashMap<String, EpisodeData> = eng
+            .into_iter()
+            .map(|e| (e.provider_id.clone(), e))
+            .collect();
         for e in &mut out {
             if let Some(t) = by_id.get(&e.provider_id) {
                 if t.title.is_some() {
@@ -757,15 +809,25 @@ impl Enricher {
                 registry: Arc::clone(registry),
             }));
         }
-        set.add(Box::new(TmdbProvider { enricher: self.clone(), key: key.clone() }));
+        set.add(Box::new(TmdbProvider {
+            enricher: self.clone(),
+            key: key.clone(),
+        }));
         if let Some(token) = tvdb_token.clone() {
-            set.add(Box::new(TvdbProvider { enricher: self.clone(), token }));
+            set.add(Box::new(TvdbProvider {
+                enricher: self.clone(),
+                token,
+            }));
         }
         // Recover any bridge ids that went missing before deciding what
         // needs work — a rebuilt id is one less item to re-identify.
-        let lists_for_rebuild = crate::anime::AnimeLists::load(&self.http, &self.data_dir).await.ok();
+        let lists_for_rebuild = crate::anime::AnimeLists::load(&self.http, &self.data_dir)
+            .await
+            .ok();
         match Self::rebuild_anime_ids(registry.db(), lists_for_rebuild.as_ref()).await {
-            Ok(n) if n > 0 => tracing::info!(rows = n, "anime bridge ids rebuilt from stored answers"),
+            Ok(n) if n > 0 => {
+                tracing::info!(rows = n, "anime bridge ids rebuilt from stored answers")
+            }
             Ok(_) => {}
             Err(e) => tracing::warn!(error = format!("{e:#}"), "anime id rebuild failed"),
         }
@@ -795,11 +857,16 @@ impl Enricher {
             match self.build_anime_provider(registry).await {
                 Ok(p) => set.add(Box::new(p)),
                 Err(e) => {
-                    tracing::warn!(error = format!("{e:#}"), "anime provider unavailable this run")
+                    tracing::warn!(
+                        error = format!("{e:#}"),
+                        "anime provider unavailable this run"
+                    )
                 }
             }
         }
-        set.add(Box::new(MusicbrainzProvider { enricher: self.clone() }));
+        set.add(Box::new(MusicbrainzProvider {
+            enricher: self.clone(),
+        }));
         let providers = Arc::new(set);
 
         // Anime chain first (HUB-29): sequential — its providers pace
@@ -823,7 +890,9 @@ impl Enricher {
                 row.get::<Option<i64>, _>("year"),
             );
             let media_type = crate::providers::media_type_key(
-                row.get::<Option<String>, _>("media_type").as_deref().unwrap_or_default(),
+                row.get::<Option<String>, _>("media_type")
+                    .as_deref()
+                    .unwrap_or_default(),
             );
             // A movie in its own subdirectory carries a second identity:
             // the directory name, often cleaner than the release-junk
@@ -883,7 +952,10 @@ impl Enricher {
         );
         tracing::info!(matched = m, weak = w, missed = x, "enrichment run complete");
         registry.emit(serde_json::json!({ "kind": "enrich", "running": false }));
-        if let Err(e) = self.enrich_episodes(registry, &key, tvdb_token.as_ref()).await {
+        if let Err(e) = self
+            .enrich_episodes(registry, &key, tvdb_token.as_ref())
+            .await
+        {
             tracing::warn!(error = format!("{e:#}"), "episode enrichment failed");
         }
         if let Err(e) = self.backfill_details(registry, &key).await {
@@ -993,7 +1065,12 @@ impl Enricher {
                 }
             }
             if (n + 1) % 100 == 0 {
-                tracing::info!(done = n + 1, total = albums.len(), matched, "music enrichment progress");
+                tracing::info!(
+                    done = n + 1,
+                    total = albums.len(),
+                    matched,
+                    "music enrichment progress"
+                );
             }
         }
         tracing::info!(matched, missed, "music enrichment complete");
@@ -1003,8 +1080,11 @@ impl Enricher {
     /// Strictly verified release-group search: the fold of title AND
     /// artist must match a candidate exactly — never guess.
     async fn musicbrainz_album(&self, title: &str, artist: &str) -> Result<Option<MbReleaseGroup>> {
-        let query = format!("releasegroup:\"{}\" AND artist:\"{}\"",
-            title.replace('"', ""), artist.replace('"', ""));
+        let query = format!(
+            "releasegroup:\"{}\" AND artist:\"{}\"",
+            title.replace('"', ""),
+            artist.replace('"', "")
+        );
         let encoded: String = query
             .bytes()
             .flat_map(|b| match b {
@@ -1014,15 +1094,22 @@ impl Enricher {
                 _ => format!("%{b:02X}").chars().collect(),
             })
             .collect();
-        let url = format!(
-            "https://musicbrainz.org/ws/2/release-group?query={encoded}&fmt=json&limit=8"
-        );
+        let url =
+            format!("https://musicbrainz.org/ws/2/release-group?query={encoded}&fmt=json&limit=8");
         // MB allows one request per second per IP and answers 503 to
         // everything above it; the gate holds us to that, and carries
         // the identifying UA it also requires.
-        let resp: serde_json::Value =
-            self.http.send(self.http.get(&url)).await?.error_for_status()?.json().await?;
-        let groups = resp["release-groups"].as_array().cloned().unwrap_or_default();
+        let resp: serde_json::Value = self
+            .http
+            .send(self.http.get(&url))
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let groups = resp["release-groups"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
         let want_title = fold(title);
         let want_artist = fold(artist);
         for g in &groups {
@@ -1034,7 +1121,10 @@ impl Enricher {
                 .as_array()
                 .map(|credits| {
                     credits.iter().any(|c| {
-                        c["name"].as_str().map(|n| fold(n) == want_artist).unwrap_or(false)
+                        c["name"]
+                            .as_str()
+                            .map(|n| fold(n) == want_artist)
+                            .unwrap_or(false)
                             || c["artist"]["name"]
                                 .as_str()
                                 .map(|n| fold(n) == want_artist)
@@ -1200,7 +1290,11 @@ impl Enricher {
         // Reuse the process's session; only authenticate when there
         // isn't one (first run, or the last one went stale).
         if self.anidb.lock().await.is_some() {
-            return Ok(AnimeProvider { enricher: self.clone(), titles, lists });
+            return Ok(AnimeProvider {
+                enricher: self.clone(),
+                titles,
+                lists,
+            });
         }
         let anidb = match (
             registry.get_setting(crate::anidb::USER_SETTING).await?,
@@ -1211,12 +1305,14 @@ impl Enricher {
                     .get_setting(crate::anidb::APIKEY_SETTING)
                     .await?
                     .filter(|k| !k.is_empty());
-                match crate::anidb::Anidb::login(&self.data_dir, &user, &pass, key.as_deref())
-                    .await
+                match crate::anidb::Anidb::login(&self.data_dir, &user, &pass, key.as_deref()).await
                 {
                     Ok(c) => Some(c),
                     Err(e) => {
-                        tracing::warn!(error = format!("{e:#}"), "anidb login failed; title matching only");
+                        tracing::warn!(
+                            error = format!("{e:#}"),
+                            "anidb login failed; title matching only"
+                        );
                         None
                     }
                 }
@@ -1237,23 +1333,27 @@ impl Enricher {
         .await?;
         for row in stale {
             let aid = row.get::<i64, _>("anidb_id") as u32;
-            let Some(m) = lists.by_anidb(aid) else { continue };
+            let Some(m) = lists.by_anidb(aid) else {
+                continue;
+            };
             let tmdb = m.tmdb_for(&row.get::<String, _>("kind"));
             if m.tvdb_id.is_none() && tmdb.is_none() {
                 continue;
             }
-            sqlx::query(
-                "UPDATE anime_ids SET mapped_tvdb = ?, mapped_tmdb = ? WHERE item_id = ?",
-            )
-            .bind(m.tvdb_id)
-            .bind(tmdb)
-            .bind(row.get::<String, _>("item_id"))
-            .execute(registry.db())
-            .await?;
+            sqlx::query("UPDATE anime_ids SET mapped_tvdb = ?, mapped_tmdb = ? WHERE item_id = ?")
+                .bind(m.tvdb_id)
+                .bind(tmdb)
+                .bind(row.get::<String, _>("item_id"))
+                .execute(registry.db())
+                .await?;
             tracing::info!(aid, tvdb = ?m.tvdb_id, tmdb = ?tmdb, "mapped ids backfilled");
         }
         *self.anidb.lock().await = anidb;
-        Ok(AnimeProvider { enricher: self.clone(), titles, lists })
+        Ok(AnimeProvider {
+            enricher: self.clone(),
+            titles,
+            lists,
+        })
     }
 
     async fn enrich_anime(
@@ -1275,7 +1375,10 @@ impl Enricher {
         .fetch_all(registry.db())
         .await?;
         for (show_id, aid) in &identified {
-            match self.bind_hashed_episodes(registry.db(), show_id, *aid as u32).await {
+            match self
+                .bind_hashed_episodes(registry.db(), show_id, *aid as u32)
+                .await
+            {
                 Ok(moves) if !moves.is_empty() => {
                     tracing::info!(show = %show_id, moved = moves.len(),
                         "episodes re-bound to hash identity");
@@ -1293,7 +1396,10 @@ impl Enricher {
         {
             let mut guard = self.anidb.lock().await;
             if let Some(client) = guard.as_mut() {
-                match self.resolve_bare_hashes(registry.db(), client, HASH_LOOKUP_BUDGET).await {
+                match self
+                    .resolve_bare_hashes(registry.db(), client, HASH_LOOKUP_BUDGET)
+                    .await
+                {
                     Ok(n) => lookups += n,
                     Err(e) => {
                         tracing::warn!(error = format!("{e:#}"), "bare-file hash lookups failed")
@@ -1333,15 +1439,20 @@ impl Enricher {
                             )
                             .await
                             .unwrap_or_else(|e| {
-                                tracing::warn!(error = format!("{e:#}"),
-                                    "episode hash lookups failed; binding what is cached");
+                                tracing::warn!(
+                                    error = format!("{e:#}"),
+                                    "episode hash lookups failed; binding what is cached"
+                                );
                                 0
                             }),
                         _ => 0,
                     }
                 };
                 lookups += asked;
-                match self.bind_hashed_episodes(registry.db(), &item.id, aid).await {
+                match self
+                    .bind_hashed_episodes(registry.db(), &item.id, aid)
+                    .await
+                {
                     Ok(moves) if !moves.is_empty() => {
                         tracing::info!(title = %item.title, moved = moves.len(),
                             "episodes re-bound to hash identity");
@@ -1356,7 +1467,8 @@ impl Enricher {
                 None => {
                     tracing::debug!(title = %item.title, "no anime identity; recording miss");
                     if !item.identified {
-                        self.store_generic(registry.db(), &item.id, "anime", None).await?;
+                        self.store_generic(registry.db(), &item.id, "anime", None)
+                            .await?;
                     }
                 }
             }
@@ -1393,14 +1505,16 @@ impl Enricher {
         else {
             return Ok(None);
         };
-        let (ed2k, size) = (row.get::<String, _>("ed2k"), row.get::<i64, _>("size") as u64);
+        let (ed2k, size) = (
+            row.get::<String, _>("ed2k"),
+            row.get::<i64, _>("size") as u64,
+        );
 
-        if let Some(cached) = sqlx::query_scalar::<_, Option<i64>>(
-            "SELECT aid FROM ed2k_aid WHERE ed2k = ?",
-        )
-        .bind(&ed2k)
-        .fetch_optional(db)
-        .await?
+        if let Some(cached) =
+            sqlx::query_scalar::<_, Option<i64>>("SELECT aid FROM ed2k_aid WHERE ed2k = ?")
+                .bind(&ed2k)
+                .fetch_optional(db)
+                .await?
         {
             return Ok(cached.map(|a| a as u32));
         }
@@ -1410,11 +1524,13 @@ impl Enricher {
             tracing::info!(aid = h.aid, epno = %h.epno, group = %h.group_name,
                 "anidb exact file identification");
         }
-        sqlx::query("INSERT OR REPLACE INTO ed2k_aid (ed2k, aid, updated_at) VALUES (?, ?, unixepoch())")
-            .bind(&ed2k)
-            .bind(aid)
-            .execute(db)
-            .await?;
+        sqlx::query(
+            "INSERT OR REPLACE INTO ed2k_aid (ed2k, aid, updated_at) VALUES (?, ?, unixepoch())",
+        )
+        .bind(&ed2k)
+        .bind(aid)
+        .execute(db)
+        .await?;
         Ok(aid)
     }
 
@@ -1645,11 +1761,7 @@ impl Enricher {
     /// twin exists under the same normalized title and year (a TMDB
     /// title-match of the same film), minted from AniDB's answer
     /// otherwise. Returns None for non-movie types.
-    async fn mint_movie_for_aid(
-        &self,
-        db: &sqlx::SqlitePool,
-        aid: u32,
-    ) -> Result<Option<String>> {
+    async fn mint_movie_for_aid(&self, db: &sqlx::SqlitePool, aid: u32) -> Result<Option<String>> {
         let info = crate::anime::anidb_anime_info(&self.http, &self.data_dir, aid).await?;
         // Movie-shaped: AniDB's Movie type, or a single-episode OVA/Web
         // entry — one sitting, no series structure to invent. Multi-
@@ -1755,8 +1867,10 @@ impl Enricher {
                     "file belongs to a different anidb entry; not rebinding");
                 continue;
             }
-            let (cur_season, cur_ep) =
-                (r.get::<Option<i64>, _>("season"), r.get::<i64, _>("episode"));
+            let (cur_season, cur_ep) = (
+                r.get::<Option<i64>, _>("season"),
+                r.get::<i64, _>("episode"),
+            );
             let target = match parse_epno(&epno) {
                 Some(Epno::Regular(n)) => {
                     // Meaningful where the show's own numbering IS
@@ -1882,8 +1996,14 @@ impl Enricher {
             && let Some(anilist_id) = m.anilist_id
             && let Some(media) = self.anilist.media_by_id(anilist_id).await?
         {
-            self.store_anime(db, item_id, kind, &media, Some(aid), Some(m)).await?;
-            tracing::info!(title, anilist = media.id, anidb = aid, "anime matched (ed2k exact)");
+            self.store_anime(db, item_id, kind, &media, Some(aid), Some(m))
+                .await?;
+            tracing::info!(
+                title,
+                anilist = media.id,
+                anidb = aid,
+                "anime matched (ed2k exact)"
+            );
             return Ok(true);
         }
         let reverse: Vec<u32> = existing
@@ -1941,12 +2061,15 @@ impl Enricher {
                     chosen = Some((aid, media)); // fallback: best-ranked
                 }
             }
-            let Some((aid, media)) = chosen else { return Ok(false) };
+            let Some((aid, media)) = chosen else {
+                return Ok(false);
+            };
             (media, Some(aid))
         };
 
         let mapping = anidb_id.and_then(|aid| lists.by_anidb(aid));
-        self.store_anime(db, item_id, kind, &media, anidb_id, mapping).await?;
+        self.store_anime(db, item_id, kind, &media, anidb_id, mapping)
+            .await?;
         tracing::info!(title, anilist = media.id, anidb = anidb_id, "anime matched");
         Ok(true)
     }
@@ -2021,8 +2144,14 @@ impl Enricher {
                 };
                 let keep = matches!(
                     kind_raw.as_str(),
-                    "SEQUEL" | "PREQUEL" | "SIDE_STORY" | "ALTERNATIVE" | "PARENT"
-                        | "FULL_STORY" | "SUMMARY" | "SPIN_OFF"
+                    "SEQUEL"
+                        | "PREQUEL"
+                        | "SIDE_STORY"
+                        | "ALTERNATIVE"
+                        | "PARENT"
+                        | "FULL_STORY"
+                        | "SUMMARY"
+                        | "SPIN_OFF"
                 );
                 if !keep || node.format.as_deref() == Some("MUSIC") {
                     continue;
@@ -2035,7 +2164,12 @@ impl Enricher {
                 .bind(item_id)
                 .bind(kind_raw.to_lowercase())
                 .bind(node.id)
-                .bind(node.title.english.clone().or_else(|| node.title.romaji.clone()))
+                .bind(
+                    node.title
+                        .english
+                        .clone()
+                        .or_else(|| node.title.romaji.clone()),
+                )
                 .execute(db)
                 .await?;
             }
@@ -2137,11 +2271,7 @@ impl Enricher {
     /// API: /movie/63 returns genres and 68 cast entries in one response),
     /// so adding cast costs no extra provider traffic — which is the only
     /// reason it is affordable at all under HUB-7 pacing.
-    async fn backfill_details(
-        self: &Arc<Self>,
-        registry: &Registry,
-        tmdb_key: &str,
-    ) -> Result<()> {
+    async fn backfill_details(self: &Arc<Self>, registry: &Registry, tmdb_key: &str) -> Result<()> {
         let rows = sqlx::query(
             "SELECT pm.item_id, i.kind, pm.provider_id AS tmdb_id
              FROM provider_metadata pm JOIN items i ON i.id = pm.item_id
@@ -2202,7 +2332,12 @@ impl Enricher {
                     .http
                     .get(format!("https://api.themoviedb.org/3/{path}/{tmdb_id}"))
                     .query(&[("api_key", key.as_str()), ("append_to_response", "credits")]);
-                let det = match this.http.send(req).await.and_then(|r| Ok(r.error_for_status()?)) {
+                let det = match this
+                    .http
+                    .send(req)
+                    .await
+                    .and_then(|r| Ok(r.error_for_status()?))
+                {
                     Ok(resp) => match resp.json::<Details>().await {
                         Ok(det) => det,
                         Err(e) => {
@@ -2227,9 +2362,7 @@ impl Enricher {
                     .unwrap_or_default()
                     .into_iter()
                     .take(Self::CAST_LIMIT)
-                    .map(|p| {
-                        serde_json::json!({ "name": p.name, "character": p.character })
-                    })
+                    .map(|p| serde_json::json!({ "name": p.name, "character": p.character }))
                     .collect();
                 let _ = sqlx::query(
                     "UPDATE provider_metadata
@@ -2320,7 +2453,12 @@ impl Enricher {
             .fetch_all(registry.db())
             .await?
             .into_iter()
-            .map(|r| (r.get::<String, _>("provider"), r.get::<String, _>("provider_id")))
+            .map(|r| {
+                (
+                    r.get::<String, _>("provider"),
+                    r.get::<String, _>("provider_id"),
+                )
+            })
             .collect();
             for (p, mapped) in [
                 ("tvdb", row.get::<Option<i64>, _>("mapped_tvdb")),
@@ -2342,7 +2480,15 @@ impl Enricher {
                 tasks.spawn(async move {
                     let _permit = sem.acquire().await;
                     if let Err(e) = this
-                        .enrich_show_episodes(&db, &show, &provider, &pid, &key, token.as_deref(), aid)
+                        .enrich_show_episodes(
+                            &db,
+                            &show,
+                            &provider,
+                            &pid,
+                            &key,
+                            token.as_deref(),
+                            aid,
+                        )
                         .await
                     {
                         tracing::warn!(show = %show, provider = %provider,
@@ -2375,7 +2521,9 @@ impl Enricher {
         .bind(show_id)
         .fetch_all(db)
         .await?;
-        let absolute = eps.iter().any(|r| r.get::<Option<i64>, _>("season").is_none());
+        let absolute = eps
+            .iter()
+            .any(|r| r.get::<Option<i64>, _>("season").is_none());
 
         // Provider episodes, keyed however our items are keyed.
         let mut by_key: std::collections::HashMap<(Option<i64>, i64), EpisodeData> =
@@ -2406,8 +2554,10 @@ impl Enricher {
                 // The default order carries absoluteNumber where TVDB
                 // curates it (usual for anime) — that join IS the
                 // season projection.
-                for e in
-                    self.tvdb_episodes(token, pid, "default", None).await.unwrap_or_default()
+                for e in self
+                    .tvdb_episodes(token, pid, "default", None)
+                    .await
+                    .unwrap_or_default()
                 {
                     if let (Some(abs), Some(s)) = (e.absolute, e.season) {
                         proj.insert(abs, (s, e.episode));
@@ -2467,13 +2617,10 @@ impl Enricher {
                     if let Some((s, n)) = absolute_to_seasoned(&seasons, abs) {
                         proj.insert(abs, (s, n));
                         if let std::collections::hash_map::Entry::Vacant(e) = fetched.entry(s) {
-                            let list =
-                                self.tmdb_season(tmdb_key, pid, s).await.unwrap_or_default();
+                            let list = self.tmdb_season(tmdb_key, pid, s).await.unwrap_or_default();
                             e.insert(list);
                         }
-                        if let Some(e) =
-                            fetched[&s].iter().find(|e| e.episode == n).cloned()
-                        {
+                        if let Some(e) = fetched[&s].iter().find(|e| e.episode == n).cloned() {
                             by_key.insert((None, abs), e);
                         }
                     }
@@ -2519,11 +2666,18 @@ impl Enricher {
 
         let mut wrote = 0;
         for r in &eps {
-            let key = (r.get::<Option<i64>, _>("season"), r.get::<i64, _>("episode"));
+            let key = (
+                r.get::<Option<i64>, _>("season"),
+                r.get::<i64, _>("episode"),
+            );
             let Some(e) = by_key.get(&key) else { continue };
             let item_id: String = r.get("id");
             // Season projection applies to absolute-numbered rows only.
-            let p = if key.0.is_none() { proj.get(&key.1) } else { None };
+            let p = if key.0.is_none() {
+                proj.get(&key.1)
+            } else {
+                None
+            };
             // An episode's description is a provider answer like any
             // other (HUB-5) — one provider supplies it today, but it
             // goes through the same store, so a merge can never revert
@@ -2563,7 +2717,10 @@ impl Enricher {
         // times in one day, re-fetching whole episode lists each time).
         let mut unmatched = 0;
         for r in &eps {
-            let key = (r.get::<Option<i64>, _>("season"), r.get::<i64, _>("episode"));
+            let key = (
+                r.get::<Option<i64>, _>("season"),
+                r.get::<i64, _>("episode"),
+            );
             if by_key.contains_key(&key) {
                 continue;
             }
@@ -2579,8 +2736,12 @@ impl Enricher {
             .await?;
             unmatched += 1;
         }
-        tracing::info!(show = show_id, episodes = wrote, unmatched,
-            "episode metadata stored");
+        tracing::info!(
+            show = show_id,
+            episodes = wrote,
+            unmatched,
+            "episode metadata stored"
+        );
         Ok(())
     }
 
@@ -2698,7 +2859,11 @@ impl Enricher {
         } else {
             format!("https://image.tmdb.org/t/p/w500{poster_path}")
         };
-        let resp = self.http.send(self.http.get(&url)).await?.error_for_status()?;
+        let resp = self
+            .http
+            .send(self.http.get(&url))
+            .await?
+            .error_for_status()?;
         Ok(resp.bytes().await?.to_vec())
     }
 }
@@ -2764,7 +2929,10 @@ mod tests {
     #[test]
     fn picks_conservatively() {
         // Exact title + year → auto, even when it's not the first result.
-        let cands = vec![cand(1, "Heat Wave", "1995-01-01"), cand(2, "Heat", "1995-12-15")];
+        let cands = vec![
+            cand(1, "Heat Wave", "1995-01-01"),
+            cand(2, "Heat", "1995-12-15"),
+        ];
         let (c, conf) = pick_candidate(&cands, "Heat", Some(1995)).unwrap();
         assert_eq!((c.id, conf), (2, "auto"));
         // Year mismatch beyond ±1 disqualifies the title match.
@@ -2786,14 +2954,20 @@ mod tests {
         let (_, conf) = pick_candidate(&lp, "Leon The Professional", None).unwrap();
         assert_eq!(conf, "auto");
         // Number words fold: "12 Monkeys" == "Twelve Monkeys".
-        let tm = vec![cand(7, "Twelve Monkeys", "1995-12-29"), cand(8, "12 Rounds", "2009-03-19")];
+        let tm = vec![
+            cand(7, "Twelve Monkeys", "1995-12-29"),
+            cand(8, "12 Rounds", "2009-03-19"),
+        ];
         let (c, conf) = pick_candidate(&tm, "12 Monkeys", None).unwrap();
         assert_eq!((c.id, conf), (7, "auto"));
         // Roman numerals fold (2+ chars only — "I" and "V" are words).
         let mib = vec![cand(13, "Men in Black II", "2002-07-03")];
         let (c, conf) = pick_candidate(&mib, "Men in Black 2", None).unwrap();
         assert_eq!((c.id, conf), (13, "auto"));
-        let vfv = vec![cand(14, "V for Vendetta", "2006-03-15"), cand(15, "5 for Vendetta", "2000-01-01")];
+        let vfv = vec![
+            cand(14, "V for Vendetta", "2006-03-15"),
+            cand(15, "5 for Vendetta", "2000-01-01"),
+        ];
         let (c, _) = pick_candidate(&vfv, "V for Vendetta", None).unwrap();
         assert_eq!(c.id, 14);
         // Acronym spacing: "S H I E L D" == "S.H.I.E.L.D.".
@@ -2826,7 +3000,8 @@ impl Enricher {
         provider: &str,
         pick: Option<&(Candidate, &'static str)>,
     ) -> Result<()> {
-        self.store_answer_for(db, item_id, provider, pick, "movies").await
+        self.store_answer_for(db, item_id, provider, pick, "movies")
+            .await
     }
 
     /// Record one provider's answer and re-merge the item (HUB-5).
@@ -2855,15 +3030,8 @@ impl Enricher {
             genres: None,
             cast_json: None,
         };
-        crate::providers::store_answer(
-            db,
-            item_id,
-            provider,
-            &provider_id,
-            confidence,
-            fields,
-        )
-        .await
+        crate::providers::store_answer(db, item_id, provider, &provider_id, confidence, fields)
+            .await
     }
 
     /// TheTVDB record by id — the bridged path, same rule as TMDB's:
@@ -2894,7 +3062,9 @@ impl Enricher {
         let path = if kind == "movie" { "movies" } else { "series" };
         let req = self
             .http
-            .get(format!("https://api4.thetvdb.com/v4/{path}/{tvdb_id}/extended"))
+            .get(format!(
+                "https://api4.thetvdb.com/v4/{path}/{tvdb_id}/extended"
+            ))
             .bearer_auth(token);
         let r: Resp = self
             .http
@@ -2927,7 +3097,9 @@ impl Enricher {
         tmdb_id: i64,
     ) -> Result<Candidate> {
         let path = if kind == "movie" { "movie" } else { "tv" };
-        let mut req = self.http.get(format!("https://api.themoviedb.org/3/{path}/{tmdb_id}"));
+        let mut req = self
+            .http
+            .get(format!("https://api.themoviedb.org/3/{path}/{tmdb_id}"));
         if key.starts_with("eyJ") {
             req = req.bearer_auth(key);
         } else {
@@ -2996,13 +3168,14 @@ impl TmdbProvider {
             ("anime", None) => return Ok(crate::providers::Outcome::NotApplicable),
             _ => {
                 let anchor = crate::providers::title_anchor(&item.norm_title, item.year);
-                if !crate::providers::question_pending(db, &item.id, "tmdb", "title", &anchor)
-                    .await
+                if !crate::providers::question_pending(db, &item.id, "tmdb", "title", &anchor).await
                 {
                     return Ok(crate::providers::Outcome::NotApplicable);
                 }
-                let cands =
-                    self.enricher.search(&self.key, &item.kind, &item.title, item.year).await?;
+                let cands = self
+                    .enricher
+                    .search(&self.key, &item.kind, &item.title, item.year)
+                    .await?;
                 crate::providers::record_question(db, &item.id, "tmdb", "title", &anchor).await;
                 match pick_candidate(&cands, &item.title, item.year) {
                     Some((c, _)) => c.clone(),
@@ -3027,7 +3200,6 @@ impl TmdbProvider {
         Ok(crate::providers::Outcome::Contributed)
     }
 }
-
 
 #[async_trait::async_trait]
 impl crate::providers::Provider for TmdbProvider {
@@ -3089,7 +3261,10 @@ impl crate::providers::Provider for TmdbProvider {
                 variants.push(words[..words.len() - 2].join(" "));
             }
             for (vi, q) in variants.iter().enumerate() {
-                let cands = self.enricher.search(&self.key, &item.kind, q, item.year).await?;
+                let cands = self
+                    .enricher
+                    .search(&self.key, &item.kind, q, item.year)
+                    .await?;
                 if let Some((c, conf)) = pick_candidate(&cands, title, item.year) {
                     picked = Some((c.clone(), conf));
                     if vi > 0 {
@@ -3105,7 +3280,10 @@ impl crate::providers::Provider for TmdbProvider {
             && let Some(alt) = &item.alt
         {
             let alt_year = alt.year.map(|y| y as i64).or(item.year);
-            let cands = self.enricher.search(&self.key, &item.kind, &alt.title, alt_year).await?;
+            let cands = self
+                .enricher
+                .search(&self.key, &item.kind, &alt.title, alt_year)
+                .await?;
             if let Some(a) = &alt_anchor {
                 crate::providers::record_question(db, &item.id, "tmdb", "title", a).await;
             }
@@ -3117,7 +3295,9 @@ impl crate::providers::Provider for TmdbProvider {
         match picked {
             Some(pick) => {
                 let conf = pick.1;
-                self.enricher.store_generic(db, &item.id, "tmdb", Some(&pick)).await?;
+                self.enricher
+                    .store_generic(db, &item.id, "tmdb", Some(&pick))
+                    .await?;
                 Ok(crate::providers::Outcome::Matched(conf))
             }
             None => Ok(crate::providers::Outcome::Declined),
@@ -3165,11 +3345,14 @@ impl crate::providers::Provider for TvdbProvider {
             if !crate::providers::question_pending(db, &item.id, "tvdb", "mapped_id", &q).await {
                 return Ok(crate::providers::Outcome::NotApplicable);
             }
-            let c = match self.enricher.tvdb_details(&self.token, &item.kind, tvdb_id).await {
+            let c = match self
+                .enricher
+                .tvdb_details(&self.token, &item.kind, tvdb_id)
+                .await
+            {
                 Ok(c) => c,
                 Err(e) if is_http_404(&e) => {
-                    crate::providers::record_question(db, &item.id, "tvdb", "mapped_id", &q)
-                        .await;
+                    crate::providers::record_question(db, &item.id, "tvdb", "mapped_id", &q).await;
                     return Ok(crate::providers::Outcome::Declined);
                 }
                 Err(e) => return Err(e),
@@ -3185,12 +3368,17 @@ impl crate::providers::Provider for TvdbProvider {
         if !crate::providers::question_pending(db, &item.id, "tvdb", "title", &anchor).await {
             return Ok(crate::providers::Outcome::Declined);
         }
-        let cands = self.enricher.tvdb_search(&self.token, &item.kind, &item.title).await?;
+        let cands = self
+            .enricher
+            .tvdb_search(&self.token, &item.kind, &item.title)
+            .await?;
         crate::providers::record_question(db, &item.id, "tvdb", "title", &anchor).await;
         match pick_candidate(&cands, &item.title, item.year) {
             Some((c, conf)) => {
                 let pick = (c.clone(), conf);
-                self.enricher.store_generic(db, &item.id, "tvdb", Some(&pick)).await?;
+                self.enricher
+                    .store_generic(db, &item.id, "tvdb", Some(&pick))
+                    .await?;
                 tracing::debug!(title = %item.title, "matched via TVDB fallback");
                 Ok(crate::providers::Outcome::Matched(conf))
             }
@@ -3231,7 +3419,10 @@ impl crate::providers::Provider for AnimeProvider {
                 match self.enricher.anidb_identify(db, client, &item.id).await {
                     Ok(aid) => exact_aid = aid,
                     Err(e) => {
-                        tracing::warn!(error = format!("{e:#}"), "anidb lookup failed; disabling for this run");
+                        tracing::warn!(
+                            error = format!("{e:#}"),
+                            "anidb lookup failed; disabling for this run"
+                        );
                         *guard = None;
                     }
                 }
@@ -3304,10 +3495,8 @@ impl crate::providers::Provider for MusicbrainzProvider {
         let (Some(artist), "album") = (&item.artist, item.kind.as_str()) else {
             return Ok(crate::providers::Outcome::NotApplicable);
         };
-        let anchor =
-            crate::providers::music_anchor(item.norm_artist.as_deref(), &item.norm_title);
-        if !crate::providers::question_pending(db, &item.id, "musicbrainz", "title", &anchor)
-            .await
+        let anchor = crate::providers::music_anchor(item.norm_artist.as_deref(), &item.norm_title);
+        if !crate::providers::question_pending(db, &item.id, "musicbrainz", "title", &anchor).await
         {
             return Ok(crate::providers::Outcome::Declined);
         }
@@ -3382,7 +3571,9 @@ fn parse_nfo(xml: &str) -> Option<(crate::providers::Fields, Option<String>)> {
     let fields = crate::providers::Fields {
         title: text("title").or_else(|| text("originaltitle")),
         overview: text("plot").or_else(|| text("outline")),
-        rating: text("rating").and_then(|r| r.parse::<f64>().ok()).filter(|r| *r > 0.0),
+        rating: text("rating")
+            .and_then(|r| r.parse::<f64>().ok())
+            .filter(|r| *r > 0.0),
         premiered,
         genres: (!genres.is_empty()).then(|| serde_json::to_string(&genres).unwrap_or_default()),
         ..Default::default()
@@ -3425,11 +3616,13 @@ impl crate::providers::Provider for LocalProvider {
             // identity from a .nfo nobody can read. Deleting the answer is
             // the whole obligation: the item is handed back to whichever
             // provider actually has it by the trigger on this statement.
-            let stale = sqlx::query("DELETE FROM provider_metadata WHERE item_id = ? AND provider = 'local'")
-                .bind(&item.id)
-                .execute(db)
-                .await?
-                .rows_affected();
+            let stale = sqlx::query(
+                "DELETE FROM provider_metadata WHERE item_id = ? AND provider = 'local'",
+            )
+            .bind(&item.id)
+            .execute(db)
+            .await?
+            .rows_affected();
             if stale > 0 {
                 tracing::info!(item = %item.id, "local metadata withdrawn; its sidecars are gone");
             }
@@ -3460,7 +3653,10 @@ impl crate::providers::Provider for LocalProvider {
                 // The path identifies the record when the file states no
                 // id: two items never share one .nfo.
                 provider_id = unique.unwrap_or(nfo_rel.clone());
-                fields = crate::providers::Fields { poster_path: fields.poster_path, ..parsed };
+                fields = crate::providers::Fields {
+                    poster_path: fields.poster_path,
+                    ..parsed
+                };
                 tracing::debug!(item = %item.id, nfo = %nfo_rel, "local metadata adopted");
             }
         }
@@ -3533,7 +3729,11 @@ mod nfo_tests {
         // A bare <year> still dates the item.
         assert_eq!(f.premiered.as_deref(), Some("1972-01-01"));
         assert_eq!(f.genres.as_deref(), Some(r#"["Science Fiction","Drama"]"#));
-        assert_eq!(id.as_deref(), Some("593"), "the curated id identifies the record");
+        assert_eq!(
+            id.as_deref(),
+            Some("593"),
+            "the curated id identifies the record"
+        );
 
         // <premiered> beats a <year>, and a file with only a title counts.
         let (f, id) = parse_nfo(
@@ -3541,7 +3741,10 @@ mod nfo_tests {
         )
         .unwrap();
         assert_eq!(f.premiered.as_deref(), Some("2022-09-21"));
-        assert_eq!(id, None, "no id in the file: the caller falls back to the path");
+        assert_eq!(
+            id, None,
+            "no id in the file: the caller falls back to the path"
+        );
 
         // Nothing usable is not an answer — better no row than an empty one.
         assert!(parse_nfo("<movie><thumb>poster.jpg</thumb></movie>").is_none());
@@ -3608,12 +3811,21 @@ mod candidate_rank_tests {
         rank_candidates(&mut cands, "Kite", Some(1998), false);
         let titles: Vec<(&str, &str)> = cands
             .iter()
-            .map(|c| (c["title"].as_str().unwrap(), &c["release_date"].as_str().unwrap()[..4]))
+            .map(|c| {
+                (
+                    c["title"].as_str().unwrap(),
+                    &c["release_date"].as_str().unwrap()[..4],
+                )
+            })
             .collect();
         assert_eq!(
             titles,
-            [("Kite", "1998"), ("Kite", "2014"), ("Kite Liberator", "2008"),
-             ("One Day A Letter Arrives", "2015")],
+            [
+                ("Kite", "1998"),
+                ("Kite", "2014"),
+                ("Kite Liberator", "2008"),
+                ("One Day A Letter Arrives", "2015")
+            ],
             "exact + year first, prefix next, unrelated last whatever its rating"
         );
     }
@@ -3628,7 +3840,10 @@ mod candidate_rank_tests {
         };
         let mut anime = mk();
         rank_candidates(&mut anime, "Kite", None, true);
-        assert_eq!(anime[0]["provider"], "anilist", "anime item: anilist leads its rating notwithstanding");
+        assert_eq!(
+            anime[0]["provider"], "anilist",
+            "anime item: anilist leads its rating notwithstanding"
+        );
         let mut generic = mk();
         rank_candidates(&mut generic, "Kite", None, false);
         assert_eq!(generic[0]["provider"], "tmdb", "generic item: tmdb leads");

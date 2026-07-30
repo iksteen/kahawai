@@ -9,13 +9,13 @@ use std::io::Read;
 use std::time::Duration;
 
 use kahawai_proto::v1::{
-    host_to_hub, AttachmentsWorklist, ExtractSubs, FileAttachments, FileHash, FileHashes,
-    FileSubtitles, Hashlist, HostToHub, SubTrack, SubsWorklist,
+    AttachmentsWorklist, ExtractSubs, FileAttachments, FileHash, FileHashes, FileSubtitles,
+    Hashlist, HostToHub, SubTrack, SubsWorklist, host_to_hub,
 };
 
-use crate::ed2k::{self, Ed2k, CHUNK};
-use crate::scan::CollectionConfig;
 use crate::Activity;
+use crate::ed2k::{self, CHUNK, Ed2k};
+use crate::scan::CollectionConfig;
 
 /// Pause between chunks even when idle: bounds the read rate (~95 MB/s)
 /// so the hasher never monopolizes the disk it shares with everything else.
@@ -115,7 +115,14 @@ pub async fn run(
                     Err(_) => break,
                 }
             };
-            intake(msg, &mut urgent, &mut urgent_image, &mut ed2k, &mut subs, &mut atts);
+            intake(
+                msg,
+                &mut urgent,
+                &mut urgent_image,
+                &mut ed2k,
+                &mut subs,
+                &mut atts,
+            );
         }
 
         // Tier order: urgent (never idle-gated — the active lease IS the
@@ -125,8 +132,14 @@ pub async fn run(
             continue;
         }
         if let Some(e) = urgent_image.pop_front() {
-            extract_image_and_send(&collections, &e.collection_id, &e.path_rel, e.sub_index, &tx)
-                .await;
+            extract_image_and_send(
+                &collections,
+                &e.collection_id,
+                &e.path_rel,
+                e.sub_index,
+                &tx,
+            )
+            .await;
             continue;
         }
         if let Some((collection_id, path_rel)) = ed2k.q.pop_front() {
@@ -167,7 +180,14 @@ pub async fn run(
             while activity.busy() {
                 match tokio::time::timeout(BUSY_POLL, rx.recv()).await {
                     Ok(Some(m)) => {
-                        if intake(m, &mut urgent, &mut urgent_image, &mut ed2k, &mut subs, &mut atts) {
+                        if intake(
+                            m,
+                            &mut urgent,
+                            &mut urgent_image,
+                            &mut ed2k,
+                            &mut subs,
+                            &mut atts,
+                        ) {
                             preempted = true;
                             break;
                         }
@@ -245,8 +265,11 @@ async fn extract_image_and_send(
     tx: &tokio::sync::mpsc::Sender<HostToHub>,
 ) {
     let started = std::time::Instant::now();
-    let (collections2, cid, prel) =
-        (collections.to_vec(), collection_id.to_string(), path_rel.to_string());
+    let (collections2, cid, prel) = (
+        collections.to_vec(),
+        collection_id.to_string(),
+        path_rel.to_string(),
+    );
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
         let path = crate::serve::resolve_rel(&collections2, &cid, &prel)?;
         let mut src = kahawai_media::remux::FileSource::open(&path)?;
@@ -263,8 +286,11 @@ async fn extract_image_and_send(
     let msg = match result {
         Ok(Ok(Some(track))) => {
             tracing::info!(
-                collection = collection_id, path = path_rel, track = sub_index,
-                blocks = track.blocks.len(), ms = started.elapsed().as_millis(),
+                collection = collection_id,
+                path = path_rel,
+                track = sub_index,
+                blocks = track.blocks.len(),
+                ms = started.elapsed().as_millis(),
                 "image display sets extracted"
             );
             kahawai_proto::v1::ImageSubtitles {
@@ -276,11 +302,13 @@ async fn extract_image_and_send(
                 blocks: track
                     .blocks
                     .into_iter()
-                    .map(|(start_ms, dur, payload)| kahawai_proto::v1::ImageSubBlock {
-                        start_ms,
-                        duration_ms: dur.unwrap_or(0),
-                        payload,
-                    })
+                    .map(
+                        |(start_ms, dur, payload)| kahawai_proto::v1::ImageSubBlock {
+                            start_ms,
+                            duration_ms: dur.unwrap_or(0),
+                            payload,
+                        },
+                    )
                     .collect(),
                 error: String::new(),
             }
@@ -304,7 +332,9 @@ async fn extract_image_and_send(
         }
     };
     let _ = tx
-        .send(HostToHub { msg: Some(host_to_hub::Msg::ImageSubtitles(msg)) })
+        .send(HostToHub {
+            msg: Some(host_to_hub::Msg::ImageSubtitles(msg)),
+        })
         .await;
 }
 
@@ -317,32 +347,29 @@ async fn extract_and_send(
     tx: &tokio::sync::mpsc::Sender<HostToHub>,
 ) {
     let started = std::time::Instant::now();
-    let result: anyhow::Result<(u64, Vec<(usize, kahawai_media::subtitles::Extracted)>)> =
-        async {
-            let path = crate::serve::resolve_rel(collections, collection_id, path_rel)?;
-            let size = std::fs::metadata(&path)?.len();
-            let tracks = tokio::task::spawn_blocking(move || {
-                // Sparse first (index-driven reads, no demux); trust it
-                // only when it actually produced events — a parser gap
-                // must never look like "no subtitles".
-                match kahawai_media::subindex::extract_sparse(&path) {
-                    Ok(Some(tracks))
-                        if tracks.iter().any(|(_, ex)| !ex.cues.is_empty()) =>
-                    {
-                        tracing::debug!(path = %path.display(), "sparse extraction");
-                        Ok(tracks)
-                    }
-                    _ => {
-                        tracing::debug!(path = %path.display(), "sequential extraction");
-                        let source = kahawai_media::remux::FileSource::open(&path)?;
-                        kahawai_media::subtitles::extract_embedded_all(Box::new(source))
-                    }
+    let result: anyhow::Result<(u64, Vec<(usize, kahawai_media::subtitles::Extracted)>)> = async {
+        let path = crate::serve::resolve_rel(collections, collection_id, path_rel)?;
+        let size = std::fs::metadata(&path)?.len();
+        let tracks = tokio::task::spawn_blocking(move || {
+            // Sparse first (index-driven reads, no demux); trust it
+            // only when it actually produced events — a parser gap
+            // must never look like "no subtitles".
+            match kahawai_media::subindex::extract_sparse(&path) {
+                Ok(Some(tracks)) if tracks.iter().any(|(_, ex)| !ex.cues.is_empty()) => {
+                    tracing::debug!(path = %path.display(), "sparse extraction");
+                    Ok(tracks)
                 }
-            })
-            .await??;
-            Ok((size, tracks))
-        }
-        .await;
+                _ => {
+                    tracing::debug!(path = %path.display(), "sequential extraction");
+                    let source = kahawai_media::remux::FileSource::open(&path)?;
+                    kahawai_media::subtitles::extract_embedded_all(Box::new(source))
+                }
+            }
+        })
+        .await??;
+        Ok((size, tracks))
+    }
+    .await;
 
     let msg = match result {
         Ok((size, tracks)) => {
@@ -376,7 +403,9 @@ async fn extract_and_send(
         }
     };
     let _ = tx
-        .send(HostToHub { msg: Some(host_to_hub::Msg::FileSubtitles(msg)) })
+        .send(HostToHub {
+            msg: Some(host_to_hub::Msg::FileSubtitles(msg)),
+        })
         .await;
 }
 

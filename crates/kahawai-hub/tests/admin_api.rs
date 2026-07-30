@@ -17,7 +17,9 @@ use sqlx::Row;
 use tower::ServiceExt;
 
 async fn body_json(resp: axum::response::Response) -> serde_json::Value {
-    let b = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+    let b = axum::body::to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .unwrap();
     serde_json::from_slice(&b).unwrap_or(serde_json::Value::Null)
 }
 
@@ -40,8 +42,9 @@ async fn admin_flow_enrollments_satellites_archive_restore() {
     let ca = Arc::new(HubCa::load_or_create(dir.path()).unwrap());
     let allowed = AllowedCerts::default();
     let registry = Arc::new(Registry::new(db.clone(), allowed.clone()));
-    let sessions =
-        Arc::new(kahawai_hub::sessions::Sessions::new(tempfile::tempdir().unwrap().keep()));
+    let sessions = Arc::new(kahawai_hub::sessions::Sessions::new(
+        tempfile::tempdir().unwrap().keep(),
+    ));
     let enrollments = Arc::new(EnrollmentService::new(
         ca.clone(),
         registry.clone(),
@@ -56,23 +59,54 @@ async fn admin_flow_enrollments_satellites_archive_restore() {
     let admin_bearer = format!("Bearer {}", pair.access_token);
 
     // A non-admin user, created directly (no user management API yet).
-    sqlx::query("INSERT INTO users (id, username, password_hash, is_admin) VALUES ('u2','pleb',?,0)")
-        .bind(kahawai_hub::auth::hash_password("pleb-password").unwrap())
-        .execute(&db)
-        .await
-        .unwrap();
+    sqlx::query(
+        "INSERT INTO users (id, username, password_hash, is_admin) VALUES ('u2','pleb',?,0)",
+    )
+    .bind(kahawai_hub::auth::hash_password("pleb-password").unwrap())
+    .execute(&db)
+    .await
+    .unwrap();
     let pleb = auth.login("pleb", "pleb-password").await.unwrap();
     let pleb_bearer = format!("Bearer {}", pleb.access_token);
 
-    let api = kahawai_hub::api::router(registry.clone(), auth, sessions, enrollments.clone(), Arc::new(kahawai_hub::subtitles::Subtitles::new(tempfile::tempdir().unwrap().keep())), Arc::new(kahawai_hub::artwork::Artwork::new(tempfile::tempdir().unwrap().keep(), Arc::new(kahawai_hub::enrich::Enricher::new(tempfile::tempdir().unwrap().keep())))), Arc::new(kahawai_hub::enrich::Enricher::new(tempfile::tempdir().unwrap().keep())), kahawai_hub::api::NetOptions::default());
+    let api = kahawai_hub::api::router(
+        registry.clone(),
+        auth,
+        sessions,
+        enrollments.clone(),
+        Arc::new(kahawai_hub::subtitles::Subtitles::new(
+            tempfile::tempdir().unwrap().keep(),
+        )),
+        Arc::new(kahawai_hub::artwork::Artwork::new(
+            tempfile::tempdir().unwrap().keep(),
+            Arc::new(kahawai_hub::enrich::Enricher::new(
+                tempfile::tempdir().unwrap().keep(),
+            )),
+        )),
+        Arc::new(kahawai_hub::enrich::Enricher::new(
+            tempfile::tempdir().unwrap().keep(),
+        )),
+        kahawai_hub::api::NetOptions::default(),
+    );
     let get = |uri: &str, bearer: &str| {
-        Request::get(uri).header("authorization", bearer.to_string()).body(Body::empty()).unwrap()
+        Request::get(uri)
+            .header("authorization", bearer.to_string())
+            .body(Body::empty())
+            .unwrap()
     };
 
     // Admin gate: pleb is refused, admin passes.
-    let resp = api.clone().oneshot(get("/admin/v1/satellites", &pleb_bearer)).await.unwrap();
+    let resp = api
+        .clone()
+        .oneshot(get("/admin/v1/satellites", &pleb_bearer))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-    let resp = api.clone().oneshot(get("/admin/v1/satellites", &admin_bearer)).await.unwrap();
+    let resp = api
+        .clone()
+        .oneshot(get("/admin/v1/satellites", &admin_bearer))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
     // Enrollment via HTTP: submit a CSR (gRPC surface, called in-process),
@@ -84,7 +118,13 @@ async fn admin_flow_enrollments_satellites_archive_restore() {
         }))
         .await
         .unwrap();
-    let v = body_json(api.clone().oneshot(get("/admin/v1/enrollments", &admin_bearer)).await.unwrap()).await;
+    let v = body_json(
+        api.clone()
+            .oneshot(get("/admin/v1/enrollments", &admin_bearer))
+            .await
+            .unwrap(),
+    )
+    .await;
     assert_eq!(v["pending"][0]["module_id"], "01ADM");
 
     let wrong = api
@@ -122,22 +162,39 @@ async fn admin_flow_enrollments_satellites_archive_restore() {
     assert_eq!(resp.status(), StatusCode::OK);
 
     // The satellite row exists and shows disconnected.
-    let v = body_json(api.clone().oneshot(get("/admin/v1/satellites", &admin_bearer)).await.unwrap()).await;
+    let v = body_json(
+        api.clone()
+            .oneshot(get("/admin/v1/satellites", &admin_bearer))
+            .await
+            .unwrap(),
+    )
+    .await;
     let sat = &v["satellites"][0];
     assert_eq!(sat["module_id"], "01ADM");
     assert_eq!(sat["connected"], false);
     let fp = sat["cert_fingerprint"].as_str().unwrap().to_string();
-    assert!(allowed.contains(&fp), "approval must admit the cert (SEC-5)");
+    assert!(
+        allowed.contains(&fp),
+        "approval must admit the cert (SEC-5)"
+    );
 
     // Give it a collection, a file, and admin watch state on the item.
-    registry.announce_collection("01ADM", "movies", "movies", &[]).await.unwrap();
+    registry
+        .announce_collection("01ADM", "movies", "movies", &[])
+        .await
+        .unwrap();
     registry
         .upsert_files("01ADM", "movies", vec![rec("Heat (1995).mkv", 100, 11, 22)])
         .await
         .unwrap();
-    let item: String = sqlx::query_scalar("SELECT id FROM items").fetch_one(&db).await.unwrap();
-    let admin_id: String =
-        sqlx::query_scalar("SELECT id FROM users WHERE username = 'admin'").fetch_one(&db).await.unwrap();
+    let item: String = sqlx::query_scalar("SELECT id FROM items")
+        .fetch_one(&db)
+        .await
+        .unwrap();
+    let admin_id: String = sqlx::query_scalar("SELECT id FROM users WHERE username = 'admin'")
+        .fetch_one(&db)
+        .await
+        .unwrap();
     sqlx::query(
         "INSERT INTO watch_state (user_id, item_id, position_ms, played, play_count)
          VALUES (?, ?, 4321, 1, 2)",
@@ -160,37 +217,71 @@ async fn admin_flow_enrollments_satellites_archive_restore() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    assert!(!allowed.contains(&fp), "deletion must remove the cert from the allowlist (SEC-6)");
-    let counts: (i64, i64, i64, i64) = (
-        sqlx::query_scalar("SELECT COUNT(*) FROM files").fetch_one(&db).await.unwrap(),
-        sqlx::query_scalar("SELECT COUNT(*) FROM items").fetch_one(&db).await.unwrap(),
-        sqlx::query_scalar("SELECT COUNT(*) FROM watch_state").fetch_one(&db).await.unwrap(),
-        sqlx::query_scalar("SELECT COUNT(*) FROM watch_state_archive").fetch_one(&db).await.unwrap(),
+    assert!(
+        !allowed.contains(&fp),
+        "deletion must remove the cert from the allowlist (SEC-6)"
     );
-    assert_eq!(counts, (0, 0, 0, 1), "cascade deleted, watch state archived");
-    let audit: Vec<String> =
-        sqlx::query_scalar("SELECT action FROM satellite_audit ORDER BY id")
-            .fetch_all(&db)
+    let counts: (i64, i64, i64, i64) = (
+        sqlx::query_scalar("SELECT COUNT(*) FROM files")
+            .fetch_one(&db)
             .await
-            .unwrap();
-    assert_eq!(audit, vec!["enrolled".to_string(), "deleted".to_string()], "audit trail");
-
-    // The same bytes return on a DIFFERENT host: watch state restored.
-    registry.announce_collection("01NEW", "movies", "movies", &[]).await.unwrap();
-    registry
-        .upsert_files("01NEW", "movies", vec![rec("moved/Heat 1995.mkv", 100, 11, 22)])
+            .unwrap(),
+        sqlx::query_scalar("SELECT COUNT(*) FROM items")
+            .fetch_one(&db)
+            .await
+            .unwrap(),
+        sqlx::query_scalar("SELECT COUNT(*) FROM watch_state")
+            .fetch_one(&db)
+            .await
+            .unwrap(),
+        sqlx::query_scalar("SELECT COUNT(*) FROM watch_state_archive")
+            .fetch_one(&db)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(
+        counts,
+        (0, 0, 0, 1),
+        "cascade deleted, watch state archived"
+    );
+    let audit: Vec<String> = sqlx::query_scalar("SELECT action FROM satellite_audit ORDER BY id")
+        .fetch_all(&db)
         .await
         .unwrap();
-    let restored: (i64, i64) = sqlx::query_as(
-        "SELECT position_ms, play_count FROM watch_state WHERE user_id = ?",
-    )
-    .bind(&admin_id)
-    .fetch_one(&db)
-    .await
-    .unwrap();
-    assert_eq!(restored, (4321, 2), "watch state restored by content identity");
-    let archived: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM watch_state_archive").fetch_one(&db).await.unwrap();
+    assert_eq!(
+        audit,
+        vec!["enrolled".to_string(), "deleted".to_string()],
+        "audit trail"
+    );
+
+    // The same bytes return on a DIFFERENT host: watch state restored.
+    registry
+        .announce_collection("01NEW", "movies", "movies", &[])
+        .await
+        .unwrap();
+    registry
+        .upsert_files(
+            "01NEW",
+            "movies",
+            vec![rec("moved/Heat 1995.mkv", 100, 11, 22)],
+        )
+        .await
+        .unwrap();
+    let restored: (i64, i64) =
+        sqlx::query_as("SELECT position_ms, play_count FROM watch_state WHERE user_id = ?")
+            .bind(&admin_id)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    assert_eq!(
+        restored,
+        (4321, 2),
+        "watch state restored by content identity"
+    );
+    let archived: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM watch_state_archive")
+        .fetch_one(&db)
+        .await
+        .unwrap();
     assert_eq!(archived, 0, "archive row consumed");
 }
 
@@ -201,23 +292,40 @@ async fn review_queue_flow() {
     let dir = tempfile::tempdir().unwrap();
     let db = kahawai_hub::db::open(dir.path()).await.unwrap();
     let registry = Arc::new(Registry::new(db.clone(), Default::default()));
-    let auth = Arc::new(kahawai_hub::auth::Auth::new(db.clone(), dir.path()).await.unwrap());
+    let auth = Arc::new(
+        kahawai_hub::auth::Auth::new(db.clone(), dir.path())
+            .await
+            .unwrap(),
+    );
     let setup = auth.setup_token().unwrap();
-    let sessions =
-        Arc::new(kahawai_hub::sessions::Sessions::new(tempfile::tempdir().unwrap().keep()));
-    let ca = Arc::new(HubCa::load_or_create(tempfile::tempdir().unwrap().keep().as_path()).unwrap());
-    let enr = Arc::new(EnrollmentService::new(ca, registry.clone(), std::time::Duration::from_secs(60), 90));
+    let sessions = Arc::new(kahawai_hub::sessions::Sessions::new(
+        tempfile::tempdir().unwrap().keep(),
+    ));
+    let ca =
+        Arc::new(HubCa::load_or_create(tempfile::tempdir().unwrap().keep().as_path()).unwrap());
+    let enr = Arc::new(EnrollmentService::new(
+        ca,
+        registry.clone(),
+        std::time::Duration::from_secs(60),
+        90,
+    ));
     let api = kahawai_hub::api::router(
         registry.clone(),
         auth,
         sessions,
         enr,
-        Arc::new(kahawai_hub::subtitles::Subtitles::new(tempfile::tempdir().unwrap().keep())),
+        Arc::new(kahawai_hub::subtitles::Subtitles::new(
+            tempfile::tempdir().unwrap().keep(),
+        )),
         Arc::new(kahawai_hub::artwork::Artwork::new(
             tempfile::tempdir().unwrap().keep(),
-            Arc::new(kahawai_hub::enrich::Enricher::new(tempfile::tempdir().unwrap().keep())),
+            Arc::new(kahawai_hub::enrich::Enricher::new(
+                tempfile::tempdir().unwrap().keep(),
+            )),
         )),
-        Arc::new(kahawai_hub::enrich::Enricher::new(tempfile::tempdir().unwrap().keep())),
+        Arc::new(kahawai_hub::enrich::Enricher::new(
+            tempfile::tempdir().unwrap().keep(),
+        )),
         kahawai_hub::api::NetOptions::default(),
     );
     let resp = api
@@ -233,10 +341,16 @@ async fn review_queue_flow() {
         )
         .await
         .unwrap();
-    let token = body_json(resp).await["access_token"].as_str().unwrap().to_string();
+    let token = body_json(resp).await["access_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
 
     // Two movie items with metadata states: one miss, one weak.
-    registry.record_satellite("01HOST", "mediahost", "nas", "fp").await.unwrap();
+    registry
+        .record_satellite("01HOST", "mediahost", "nas", "fp")
+        .await
+        .unwrap();
     registry
         .announce_collection("01HOST", "movies", "movies", &["/srv/m".into()])
         .await
@@ -245,12 +359,17 @@ async fn review_queue_flow() {
         .upsert_files(
             "01HOST",
             "movies",
-            vec![rec("Foobar.mkv", 10, 1, 1), rec("Weakling (1999).mkv", 11, 2, 2)],
+            vec![
+                rec("Foobar.mkv", 10, 1, 1),
+                rec("Weakling (1999).mkv", 11, 2, 2),
+            ],
         )
         .await
         .unwrap();
-    let miss_id: String =
-        sqlx::query_scalar("SELECT id FROM items WHERE title = 'Foobar'").fetch_one(&db).await.unwrap();
+    let miss_id: String = sqlx::query_scalar("SELECT id FROM items WHERE title = 'Foobar'")
+        .fetch_one(&db)
+        .await
+        .unwrap();
     let weak_id: String = sqlx::query_scalar("SELECT id FROM items WHERE title = 'Weakling'")
         .fetch_one(&db)
         .await
@@ -284,7 +403,13 @@ async fn review_queue_flow() {
         .unwrap()
     };
 
-    let v = body_json(api.clone().oneshot(authed("GET", "/admin/v1/enrich/review".into(), None)).await.unwrap()).await;
+    let v = body_json(
+        api.clone()
+            .oneshot(authed("GET", "/admin/v1/enrich/review".into(), None))
+            .await
+            .unwrap(),
+    )
+    .await;
     let entries = v["entries"].as_array().unwrap();
     assert_eq!(entries.len(), 2, "{v}");
     assert_eq!(entries[0]["confidence"], "miss"); // misses sort first
@@ -319,20 +444,33 @@ async fn review_queue_flow() {
         assert_eq!(resp.status(), axum::http::StatusCode::OK, "{action}");
     }
 
-    let states: Vec<(String, String)> =
-        sqlx::query("SELECT item_id, confidence FROM resolved_metadata
-                      WHERE confidence IS NOT NULL ORDER BY item_id")
-            .fetch_all(&db)
-            .await
+    let states: Vec<(String, String)> = sqlx::query(
+        "SELECT item_id, confidence FROM resolved_metadata
+                      WHERE confidence IS NOT NULL ORDER BY item_id",
+    )
+    .fetch_all(&db)
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|r| (r.get("item_id"), r.get("confidence")))
+    .collect();
+    let get = |id: &str| {
+        states
+            .iter()
+            .find(|(i, _)| i == id)
+            .map(|(_, c)| c.as_str())
             .unwrap()
-            .into_iter()
-            .map(|r| (r.get("item_id"), r.get("confidence")))
-            .collect();
-    let get = |id: &str| states.iter().find(|(i, _)| i == id).map(|(_, c)| c.as_str()).unwrap();
+    };
     assert_eq!(get(&miss_id), "manual");
     assert_eq!(get(&weak_id), "rejected");
     // The picked title shows through the display API.
-    let v = body_json(api.clone().oneshot(authed("GET", format!("/api/v1/items/{miss_id}"), None)).await.unwrap()).await;
+    let v = body_json(
+        api.clone()
+            .oneshot(authed("GET", format!("/api/v1/items/{miss_id}"), None))
+            .await
+            .unwrap(),
+    )
+    .await;
     assert_eq!(v["title"], "The Matrix");
     assert_eq!(v["year"], 1999);
 }

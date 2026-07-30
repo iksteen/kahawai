@@ -8,13 +8,15 @@
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Context, Result};
-use figment::providers::{Env, Format, Toml};
+use anyhow::{Context, Result, bail};
 use figment::Figment;
+use figment::providers::{Env, Format, Toml};
 use serde::Deserialize;
 
 fn home() -> Option<PathBuf> {
-    std::env::var_os("HOME").filter(|h| !h.is_empty()).map(PathBuf::from)
+    std::env::var_os("HOME")
+        .filter(|h| !h.is_empty())
+        .map(PathBuf::from)
 }
 
 fn is_system_user() -> bool {
@@ -34,7 +36,9 @@ fn default_hub_data_dir() -> PathBuf {
     if is_system_user() {
         "/var/lib/kahawai".into()
     } else {
-        xdg_dir("XDG_DATA_HOME", ".local/share").unwrap().join("kahawai")
+        xdg_dir("XDG_DATA_HOME", ".local/share")
+            .unwrap()
+            .join("kahawai")
     }
 }
 
@@ -57,7 +61,9 @@ fn default_config_path() -> PathBuf {
     if cwd.exists() || is_system_user() {
         return cwd;
     }
-    xdg_dir("XDG_CONFIG_HOME", ".config").unwrap().join("kahawai/kahawai.toml")
+    xdg_dir("XDG_CONFIG_HOME", ".config")
+        .unwrap()
+        .join("kahawai/kahawai.toml")
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -212,7 +218,11 @@ pub fn load(explicit: Option<&Path>) -> Result<(Config, Option<PathBuf>)> {
         // Only KAHAWAI_<SECTION>__<KEY> shapes are config; other
         // KAHAWAI_* vars (worker knobs like KAHAWAI_PACE_WINDOW_MS)
         // must not crash the loader as unknown fields.
-        .merge(Env::prefixed("KAHAWAI_").filter(|k| k.as_str().contains('.') || k.as_str().contains("__")).split("__"))
+        .merge(
+            Env::prefixed("KAHAWAI_")
+                .filter(|k| k.as_str().contains('.') || k.as_str().contains("__"))
+                .split("__"),
+        )
         .extract()
         .with_context(|| format!("loading config from {}", path.display()))?;
     Ok((cfg, used))
@@ -241,7 +251,10 @@ mod tests {
             assert!(used.is_none());
             assert_eq!(cfg.hub.bind, "127.0.0.1:8420".parse().unwrap());
             assert_eq!(cfg.hub.satellite_bind, "0.0.0.0:8421".parse().unwrap());
-            assert_eq!(cfg.hub.data_dir, PathBuf::from("/home/test/.local/share/kahawai"));
+            assert_eq!(
+                cfg.hub.data_dir,
+                PathBuf::from("/home/test/.local/share/kahawai")
+            );
             assert_eq!(
                 cfg.mediahost.state_dir,
                 PathBuf::from("/home/test/.local/share/kahawai-mediahost")

@@ -21,7 +21,11 @@ pub struct Ed2k {
 
 impl Default for Ed2k {
     fn default() -> Self {
-        Self { chunk_hasher: Md4::new(), chunk_fill: 0, chunks: Vec::new() }
+        Self {
+            chunk_hasher: Md4::new(),
+            chunk_fill: 0,
+            chunks: Vec::new(),
+        }
     }
 }
 
@@ -97,7 +101,10 @@ mod tests {
     #[test]
     fn exact_chunk_multiple_uses_emule_null_chunk() {
         // Kimundi/ed2k "Red" vector: 9,728,000 bytes of 0x55.
-        assert_eq!(ed2k(&vec![0x55u8; CHUNK]), "49e80f377b7e4e706dbd3ecc89f39306");
+        assert_eq!(
+            ed2k(&vec![0x55u8; CHUNK]),
+            "49e80f377b7e4e706dbd3ecc89f39306"
+        );
     }
 
     #[test]
@@ -129,7 +136,10 @@ mod tests {
         );
         assert_eq!(filename_crc32("Show - 01 (DEADBEEF).mkv"), Some(0xDEADBEEF));
         // The LAST tag wins; resolution groups aren't 8 hex digits.
-        assert_eq!(filename_crc32("[ABCD1234] then [12345678].mkv"), Some(0x12345678));
+        assert_eq!(
+            filename_crc32("[ABCD1234] then [12345678].mkv"),
+            Some(0x12345678)
+        );
         assert_eq!(filename_crc32("no tag here (1280x720).mkv"), None);
     }
 }

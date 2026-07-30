@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use kahawai_proto::v1::transcoder_link_server::{TranscoderLink, TranscoderLinkServer};
-use kahawai_proto::v1::{hub_to_tc, tc_to_hub, HelloAck, HubToTc, TcToHub, Ping};
+use kahawai_proto::v1::{HelloAck, HubToTc, Ping, TcToHub, hub_to_tc, tc_to_hub};
 use kahawai_proto::{PROTOCOL_MAJOR, PROTOCOL_MINOR};
 use kahawai_transport::mtls::peer_identity;
 use tokio_stream::wrappers::ReceiverStream;
@@ -57,7 +57,9 @@ impl TranscoderLink for TranscoderLinkService {
 
         let mut inbound = request.into_inner();
         let hello = match inbound.message().await? {
-            Some(TcToHub { msg: Some(tc_to_hub::Msg::Hello(h)) }) => h,
+            Some(TcToHub {
+                msg: Some(tc_to_hub::Msg::Hello(h)),
+            }) => h,
             _ => return Err(Status::failed_precondition("first message must be Hello")),
         };
         if hello.protocol_major != PROTOCOL_MAJOR {
@@ -71,7 +73,12 @@ impl TranscoderLink for TranscoderLinkService {
         let registry = self.registry.clone();
         let sessions = self.sessions.clone();
         let module_id = peer.module_id.clone();
-        registry.connected(&module_id, &peer.module_type, &hello.name, &peer.fingerprint);
+        registry.connected(
+            &module_id,
+            &peer.module_type,
+            &hello.name,
+            &peer.fingerprint,
+        );
         if let Err(e) = registry.settle_renewal(&module_id, &peer.fingerprint).await {
             tracing::warn!(%module_id, error = format!("{e:#}"), "renewal settlement failed");
         }
@@ -99,7 +106,9 @@ impl TranscoderLink for TranscoderLinkService {
                 let mut tick = tokio::time::interval(std::time::Duration::from_secs(10));
                 loop {
                     tick.tick().await;
-                    let ping = HubToTc { msg: Some(hub_to_tc::Msg::Ping(Ping {})) };
+                    let ping = HubToTc {
+                        msg: Some(hub_to_tc::Msg::Ping(Ping {})),
+                    };
                     if ping_tx.send(Ok(ping)).await.is_err() {
                         return;
                     }
@@ -107,11 +116,9 @@ impl TranscoderLink for TranscoderLinkService {
             });
             let _abort_pinger = AbortOnDrop(pinger);
             loop {
-                let msg = tokio::time::timeout(
-                    std::time::Duration::from_secs(35),
-                    inbound.message(),
-                )
-                .await;
+                let msg =
+                    tokio::time::timeout(std::time::Duration::from_secs(35), inbound.message())
+                        .await;
                 let msg = match msg {
                     Ok(m) => m,
                     Err(_) => {
@@ -165,7 +172,15 @@ impl TranscoderLink for TranscoderLinkService {
                             let module_id = module_id.clone();
                             tokio::spawn(async move {
                                 sessions
-                                    .source_read(&registry, &module_id, &r.session_id, r.offset, r.len, r.req, r.part)
+                                    .source_read(
+                                        &registry,
+                                        &module_id,
+                                        &r.session_id,
+                                        r.offset,
+                                        r.len,
+                                        r.req,
+                                        r.part,
+                                    )
                                     .await;
                             });
                         }
@@ -184,7 +199,9 @@ impl TranscoderLink for TranscoderLinkService {
             registry.unregister_tc_link(&module_id);
             registry.clear_transcoder_caps(&module_id);
             registry.disconnected(&module_id);
-            let (moved, ended) = sessions.reschedule_for_transcoder(&registry, &module_id).await;
+            let (moved, ended) = sessions
+                .reschedule_for_transcoder(&registry, &module_id)
+                .await;
             if moved + ended > 0 {
                 tracing::warn!(%module_id, moved, ended, "transcoder lost; sessions rescheduled/ended");
             }

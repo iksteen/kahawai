@@ -35,7 +35,9 @@ async fn spawn_hub() -> Hub {
     let registry = Arc::new(Registry::new(db, allowed.clone()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = format!("localhost:{}", listener.local_addr().unwrap().port());
-    let sessions = Arc::new(kahawai_hub::sessions::Sessions::new(tempfile::tempdir().unwrap().keep()));
+    let sessions = Arc::new(kahawai_hub::sessions::Sessions::new(
+        tempfile::tempdir().unwrap().keep(),
+    ));
     let svc = MediahostLinkService::new(
         registry.clone(),
         sessions.clone(),
@@ -53,14 +55,22 @@ async fn spawn_hub() -> Hub {
             .await
             .unwrap();
     });
-    Hub { addr, _sessions: sessions, registry, allowed, ca, _pki: pki }
+    Hub {
+        addr,
+        _sessions: sessions,
+        registry,
+        allowed,
+        ca,
+        _pki: pki,
+    }
 }
 
 /// Enroll a satellite directly against the CA and admit it on the hub's
 /// allowlist (the wire flow has its own test).
 fn enroll(hub: &Hub, module_id: &str, name: &str) -> SatelliteIdentity {
     let id = sign_only(&hub.ca, module_id, name);
-    hub.allowed.insert(&kahawai_transport::mtls::cert_fingerprint_pem(&id.cert_pem).unwrap());
+    hub.allowed
+        .insert(&kahawai_transport::mtls::cert_fingerprint_pem(&id.cert_pem).unwrap());
     id
 }
 
@@ -96,16 +106,20 @@ async fn enrolled_mediahost_links_and_disconnect_is_tracked() {
     let link = tokio::spawn(async move {
         // run() loops forever; we only need it to connect once.
         let tls = kahawai_transport::mtls::mtls_client_config(&id).unwrap();
-        let channel = kahawai_transport::tls::grpc_channel_with(&addr, tls).await.unwrap();
+        let channel = kahawai_transport::tls::grpc_channel_with(&addr, tls)
+            .await
+            .unwrap();
         let mut client =
             kahawai_proto::v1::mediahost_link_client::MediahostLinkClient::new(channel);
         let (tx, rx) = tokio::sync::mpsc::channel(4);
         tx.send(kahawai_proto::v1::HostToHub {
-            msg: Some(kahawai_proto::v1::host_to_hub::Msg::Hello(kahawai_proto::v1::Hello {
-                protocol_major: kahawai_proto::PROTOCOL_MAJOR,
-                protocol_minor: kahawai_proto::PROTOCOL_MINOR,
-                name: "nas".into(),
-            })),
+            msg: Some(kahawai_proto::v1::host_to_hub::Msg::Hello(
+                kahawai_proto::v1::Hello {
+                    protocol_major: kahawai_proto::PROTOCOL_MAJOR,
+                    protocol_minor: kahawai_proto::PROTOCOL_MINOR,
+                    name: "nas".into(),
+                },
+            )),
         })
         .await
         .unwrap();
@@ -155,7 +169,12 @@ async fn enrolled_mediahost_links_and_disconnect_is_tracked() {
 
     let registry = hub.registry.clone();
     wait_until(
-        || registry.snapshot().iter().any(|(id, s)| id == "01LINK" && s.connected),
+        || {
+            registry
+                .snapshot()
+                .iter()
+                .any(|(id, s)| id == "01LINK" && s.connected)
+        },
         "mediahost to appear connected",
     )
     .await;
@@ -192,13 +211,21 @@ async fn enrolled_mediahost_links_and_disconnect_is_tracked() {
     drop(inbound);
     let registry = hub.registry.clone();
     wait_until(
-        || registry.snapshot().iter().any(|(id, s)| id == "01LINK" && !s.connected),
+        || {
+            registry
+                .snapshot()
+                .iter()
+                .any(|(id, s)| id == "01LINK" && !s.connected)
+        },
         "mediahost to be marked disconnected",
     )
     .await;
     let cols = hub.registry.collections().await.unwrap();
     let col = cols.iter().find(|c| c.module_id == "01LINK").unwrap();
-    assert!(!col.available, "collection must be unavailable after disconnect");
+    assert!(
+        !col.available,
+        "collection must be unavailable after disconnect"
+    );
     assert_eq!(col.file_count, 1, "files must survive a disconnect (AR-6)");
 }
 
@@ -206,7 +233,9 @@ async fn enrolled_mediahost_links_and_disconnect_is_tracked() {
 async fn no_client_cert_cannot_link() {
     let hub = spawn_hub().await;
     // Channel with server-only TLS (the enrollment-style channel).
-    let channel = kahawai_transport::tls::grpc_channel_unverified(&hub.addr).await.unwrap();
+    let channel = kahawai_transport::tls::grpc_channel_unverified(&hub.addr)
+        .await
+        .unwrap();
     let mut client = kahawai_proto::v1::mediahost_link_client::MediahostLinkClient::new(channel);
     let (_tx, rx) = tokio::sync::mpsc::channel::<kahawai_proto::v1::HostToHub>(1);
     let err = client
@@ -256,15 +285,19 @@ async fn try_link(addr: &str, id: &SatelliteIdentity) -> Result<(), Box<dyn std:
             kahawai_proto::v1::mediahost_link_client::MediahostLinkClient::new(channel);
         let (tx, rx) = tokio::sync::mpsc::channel::<kahawai_proto::v1::HostToHub>(1);
         tx.send(kahawai_proto::v1::HostToHub {
-            msg: Some(kahawai_proto::v1::host_to_hub::Msg::Hello(kahawai_proto::v1::Hello {
-                protocol_major: kahawai_proto::PROTOCOL_MAJOR,
-                protocol_minor: kahawai_proto::PROTOCOL_MINOR,
-                name: "probe".into(),
-            })),
+            msg: Some(kahawai_proto::v1::host_to_hub::Msg::Hello(
+                kahawai_proto::v1::Hello {
+                    protocol_major: kahawai_proto::PROTOCOL_MAJOR,
+                    protocol_minor: kahawai_proto::PROTOCOL_MINOR,
+                    name: "probe".into(),
+                },
+            )),
         })
         .await
         .ok();
-        client.link(tokio_stream::wrappers::ReceiverStream::new(rx)).await?;
+        client
+            .link(tokio_stream::wrappers::ReceiverStream::new(rx))
+            .await?;
         Ok(())
     };
     tokio::time::timeout(Duration::from_secs(10), attempt)

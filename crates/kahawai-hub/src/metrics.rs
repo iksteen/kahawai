@@ -47,7 +47,11 @@ pub struct ModuleHealth {
 }
 
 /// One scrape. Cheap by construction; see the module note.
-pub async fn gather(registry: &Registry, sessions: &Sessions, data_dir: &std::path::Path) -> Result<Snapshot> {
+pub async fn gather(
+    registry: &Registry,
+    sessions: &Sessions,
+    data_dir: &std::path::Path,
+) -> Result<Snapshot> {
     let db = registry.db();
     let modules = registry
         .satellites_overview()
@@ -63,7 +67,10 @@ pub async fn gather(registry: &Registry, sessions: &Sessions, data_dir: &std::pa
         .collect();
 
     let one = |sql: &'static str| async move {
-        sqlx::query_scalar::<_, i64>(sql).fetch_one(db).await.unwrap_or(0)
+        sqlx::query_scalar::<_, i64>(sql)
+            .fetch_one(db)
+            .await
+            .unwrap_or(0)
     };
     Ok(Snapshot {
         modules,
@@ -72,16 +79,12 @@ pub async fn gather(registry: &Registry, sessions: &Sessions, data_dir: &std::pa
         files: one("SELECT COUNT(*) FROM files").await,
         file_bytes: one("SELECT COALESCE(SUM(size), 0) FROM files").await,
         subtitle_files: one("SELECT COUNT(*) FROM downloaded_subtitles").await,
-        enrichment_due: one(
-            "SELECT COUNT(*) FROM enrichment_queue WHERE due_at <= unixepoch()",
-        )
-        .await,
+        enrichment_due: one("SELECT COUNT(*) FROM enrichment_queue WHERE due_at <= unixepoch()")
+            .await,
         // The number worth alerting on: items nothing has identified.
-        unmatched_items: one(
-            "SELECT COUNT(*) FROM items i
+        unmatched_items: one("SELECT COUNT(*) FROM items i
               WHERE i.kind IN ('movie', 'show', 'album')
-                AND NOT EXISTS (SELECT 1 FROM item_match m WHERE m.item_id = i.id)",
-        )
+                AND NOT EXISTS (SELECT 1 FROM item_match m WHERE m.item_id = i.id)")
         .await,
         anidb_banned_secs: crate::anidb::ban_remaining(data_dir).unwrap_or(0),
     })
@@ -102,7 +105,10 @@ pub fn render(s: &Snapshot) -> String {
         &mut out,
         "kahawai_build_info",
         "Build version, as a label on a constant 1.",
-        format!("kahawai_build_info{{version=\"{}\"}} 1\n", env!("CARGO_PKG_VERSION")),
+        format!(
+            "kahawai_build_info{{version=\"{}\"}} 1\n",
+            env!("CARGO_PKG_VERSION")
+        ),
     );
 
     // Per module, so a dashboard can show which satellite went away
@@ -118,7 +124,12 @@ pub fn render(s: &Snapshot) -> String {
             u8::from(m.connected)
         );
     }
-    g(&mut out, "kahawai_module_up", "1 when a satellite's link is live.", lines);
+    g(
+        &mut out,
+        "kahawai_module_up",
+        "1 when a satellite's link is live.",
+        lines,
+    );
 
     let mut lines = String::new();
     for m in &s.modules {
@@ -138,11 +149,27 @@ pub fn render(s: &Snapshot) -> String {
     );
 
     for (name, help, value) in [
-        ("kahawai_sessions_active", "Playback sessions alive now.", s.sessions_active as i64),
+        (
+            "kahawai_sessions_active",
+            "Playback sessions alive now.",
+            s.sessions_active as i64,
+        ),
         ("kahawai_items", "Catalogue items, all kinds.", s.items),
-        ("kahawai_files", "Files known across every collection.", s.files),
-        ("kahawai_file_bytes", "Total size of known files.", s.file_bytes),
-        ("kahawai_subtitle_files", "Subtitles held in the store.", s.subtitle_files),
+        (
+            "kahawai_files",
+            "Files known across every collection.",
+            s.files,
+        ),
+        (
+            "kahawai_file_bytes",
+            "Total size of known files.",
+            s.file_bytes,
+        ),
+        (
+            "kahawai_subtitle_files",
+            "Subtitles held in the store.",
+            s.subtitle_files,
+        ),
         (
             "kahawai_enrichment_due",
             "Items a provider owes an answer for, due now.",
@@ -170,8 +197,11 @@ pub fn render(s: &Snapshot) -> String {
 /// still serving everything the other modules hold, and a monitor that
 /// pages for one unplugged Pi at 3am is a monitor people mute.
 pub fn health(s: &Snapshot) -> serde_json::Value {
-    let offline: Vec<&ModuleHealth> =
-        s.modules.iter().filter(|m| !m.connected && !m.disabled).collect();
+    let offline: Vec<&ModuleHealth> = s
+        .modules
+        .iter()
+        .filter(|m| !m.connected && !m.disabled)
+        .collect();
     let status = if offline.is_empty() { "ok" } else { "degraded" };
     json!({
         "status": status,

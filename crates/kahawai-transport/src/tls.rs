@@ -34,7 +34,8 @@ pub fn server_config(cert_pem: &str, key_pem: &str) -> Result<Arc<ServerConfig>>
     let certs: Vec<CertificateDer> = CertificateDer::pem_slice_iter(cert_pem.as_bytes())
         .collect::<Result<_, _>>()
         .context("parsing server cert PEM")?;
-    let key = PrivateKeyDer::from_pem_slice(key_pem.as_bytes()).context("parsing server key PEM")?;
+    let key =
+        PrivateKeyDer::from_pem_slice(key_pem.as_bytes()).context("parsing server key PEM")?;
     let cfg = ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certs, key)
@@ -96,10 +97,16 @@ pub async fn grpc_channel_with(
         let tls = tls.clone();
         async move {
             let tcp = TcpStream::connect(&addr).await?;
-            let host = addr.rsplit_once(':').map(|(h, _)| h).unwrap_or(&addr).to_string();
+            let host = addr
+                .rsplit_once(':')
+                .map(|(h, _)| h)
+                .unwrap_or(&addr)
+                .to_string();
             let sni = ServerName::try_from(host)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-            let stream = tokio_rustls::TlsConnector::from(tls).connect(sni, tcp).await?;
+            let stream = tokio_rustls::TlsConnector::from(tls)
+                .connect(sni, tcp)
+                .await?;
             Ok::<_, io::Error>(TokioIo::new(stream))
         }
     });

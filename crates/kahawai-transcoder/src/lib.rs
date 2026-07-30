@@ -8,9 +8,11 @@ pub mod sessions;
 use std::path::Path;
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use kahawai_proto::v1::transcoder_link_client::TranscoderLinkClient;
-use kahawai_proto::v1::{hub_to_tc, tc_to_hub, CapabilityReport, EncoderCap, Heartbeat, Hello, TcToHub};
+use kahawai_proto::v1::{
+    CapabilityReport, EncoderCap, Heartbeat, Hello, TcToHub, hub_to_tc, tc_to_hub,
+};
 use kahawai_proto::{PROTOCOL_MAJOR, PROTOCOL_MINOR};
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -41,13 +43,15 @@ fn prevent_app_nap() {
         type Msg0 = unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void;
         type Msg1 =
             unsafe extern "C" fn(*mut c_void, *mut c_void, *const std::ffi::c_char) -> *mut c_void;
-        type Msg2 =
-            unsafe extern "C" fn(*mut c_void, *mut c_void, u64, *mut c_void) -> *mut c_void;
+        type Msg2 = unsafe extern "C" fn(*mut c_void, *mut c_void, u64, *mut c_void) -> *mut c_void;
         let msg0: Msg0 = std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
         let msg1: Msg1 = std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
         let msg2: Msg2 = std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
 
-        let pi = msg0(objc_getClass(c"NSProcessInfo".as_ptr()), sel_registerName(c"processInfo".as_ptr()));
+        let pi = msg0(
+            objc_getClass(c"NSProcessInfo".as_ptr()),
+            sel_registerName(c"processInfo".as_ptr()),
+        );
         let reason = msg1(
             objc_getClass(c"NSString".as_ptr()),
             sel_registerName(c"stringWithUTF8String:".as_ptr()),
@@ -86,7 +90,10 @@ pub async fn run(
         match kahawai_transport::renew::maybe_renew(hub_addr, state_dir, "transcoder", name).await {
             Ok(Some(renewed)) => id = renewed,
             Ok(None) => {}
-            Err(e) => tracing::warn!(error = format!("{e:#}"), "certificate renewal failed; retrying later"),
+            Err(e) => tracing::warn!(
+                error = format!("{e:#}"),
+                "certificate renewal failed; retrying later"
+            ),
         }
         let tls = kahawai_transport::mtls::mtls_client_config(&id)?;
         let renewal_due = kahawai_transport::renew::seconds_until_renewal_due(&id.cert_pem)
@@ -111,7 +118,11 @@ fn probe_capabilities(max_sessions: u32) -> Result<CapabilityReport> {
         .into_iter()
         .map(|(codec, element, hardware)| {
             tracing::info!(codec, element, hardware, "encoder verified");
-            EncoderCap { codec: codec.into(), element: element.into(), hardware }
+            EncoderCap {
+                codec: codec.into(),
+                element: element.into(),
+                hardware,
+            }
         })
         .collect();
     if encoders.is_empty() {
@@ -121,7 +132,12 @@ fn probe_capabilities(max_sessions: u32) -> Result<CapabilityReport> {
     tracing::info!(decoders = decode_caps.len(), "decoder inventory");
     let tonemap = kahawai_media::remux::tonemap_available();
     tracing::info!(tonemap, "HDR tone-map segment (HUB-15a)");
-    Ok(CapabilityReport { encoders, max_sessions, decode_caps, tonemap })
+    Ok(CapabilityReport {
+        encoders,
+        max_sessions,
+        decode_caps,
+        tonemap,
+    })
 }
 
 /// One link session: Hello/HelloAck, capability registration, then
@@ -172,9 +188,11 @@ pub async fn link_once(
         None => bail!("hub closed the link before HelloAck"),
     }
 
-    tx.send(TcToHub { msg: Some(tc_to_hub::Msg::Capabilities(capabilities)) })
-        .await
-        .context("link closed before capability report")?;
+    tx.send(TcToHub {
+        msg: Some(tc_to_hub::Msg::Capabilities(capabilities)),
+    })
+    .await
+    .context("link closed before capability report")?;
 
     let runner = sessions::Runner::new(scratch.to_path_buf(), worker_exe.clone(), tx.clone());
     let result = link_loop(&tx, &mut inbound, &runner).await;

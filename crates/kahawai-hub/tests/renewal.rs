@@ -10,7 +10,9 @@ async fn setup(dir: &std::path::Path) -> (Registry, AllowedCerts) {
     let db = kahawai_hub::db::open(dir).await.unwrap();
     let allowed = AllowedCerts::default();
     let reg = Registry::new(db, allowed.clone());
-    reg.record_satellite("01MH", "mediahost", "nas", "fp-old").await.unwrap();
+    reg.record_satellite("01MH", "mediahost", "nas", "fp-old")
+        .await
+        .unwrap();
     (reg, allowed)
 }
 
@@ -39,7 +41,10 @@ async fn renewal_admits_new_before_old_is_retired() {
         .await
         .unwrap();
     assert_eq!(row.get::<String, _>("cert_fingerprint"), "fp-new");
-    assert!(row.get::<Option<String>, _>("pending_fingerprint").is_none());
+    assert!(
+        row.get::<Option<String>, _>("pending_fingerprint")
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -50,7 +55,10 @@ async fn retried_renewal_supersedes_the_pending_one() {
     reg.record_renewal("01MH", "fp-lost").await.unwrap();
     reg.record_renewal("01MH", "fp-new").await.unwrap();
     assert!(allowed.contains("fp-old"));
-    assert!(!allowed.contains("fp-lost"), "superseded pending must be evicted");
+    assert!(
+        !allowed.contains("fp-lost"),
+        "superseded pending must be evicted"
+    );
     assert!(allowed.contains("fp-new"));
 }
 
@@ -84,7 +92,9 @@ async fn startup_load_admits_pending_within_grace_and_sweeps_lapsed() {
     {
         let (reg, _) = setup(dir.path()).await;
         reg.record_renewal("01MH", "fp-fresh").await.unwrap();
-        reg.record_satellite("01TC", "transcoder", "gpu", "fp-tc").await.unwrap();
+        reg.record_satellite("01TC", "transcoder", "gpu", "fp-tc")
+            .await
+            .unwrap();
         reg.record_renewal("01TC", "fp-stale").await.unwrap();
         sqlx::query("UPDATE satellites SET pending_issued_at = unixepoch() - 90000 WHERE module_id = '01TC'")
             .execute(reg.db())
@@ -98,7 +108,13 @@ async fn startup_load_admits_pending_within_grace_and_sweeps_lapsed() {
     let reg = Registry::new(db, allowed.clone());
     reg.load_allowlist().await.unwrap();
     assert!(allowed.contains("fp-old"));
-    assert!(allowed.contains("fp-fresh"), "pending within grace stays admitted");
+    assert!(
+        allowed.contains("fp-fresh"),
+        "pending within grace stays admitted"
+    );
     assert!(allowed.contains("fp-tc"));
-    assert!(!allowed.contains("fp-stale"), "lapsed pending swept at startup");
+    assert!(
+        !allowed.contains("fp-stale"),
+        "lapsed pending swept at startup"
+    );
 }

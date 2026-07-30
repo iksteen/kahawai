@@ -8,9 +8,9 @@ pub mod negotiate;
 pub mod remux;
 pub mod subindex;
 pub mod subtitles;
-pub mod worker;
 #[doc(hidden)]
 pub mod testutil;
+pub mod worker;
 
 use std::path::Path;
 use std::sync::OnceLock;
@@ -50,7 +50,6 @@ pub fn init() -> Result<()> {
 pub fn demote_elements(names: &[String]) -> Result<()> {
     init()?;
     for name in names {
-        
         match gst::ElementFactory::find(name) {
             Some(f) => {
                 f.set_rank(gst::Rank::NONE);
@@ -138,9 +137,10 @@ fn map_info(info: &DiscovererInfo) -> MediaInfo {
             .as_ref()
             .and_then(|c| c.structure(0).map(|st| st.name().to_string()))
             .unwrap_or_default();
-        let version = caps
-            .as_ref()
-            .and_then(|c| c.structure(0).and_then(|st| st.get::<i32>("mpegversion").ok()));
+        let version = caps.as_ref().and_then(|c| {
+            c.structure(0)
+                .and_then(|st| st.get::<i32>("mpegversion").ok())
+        });
         let layer = caps
             .as_ref()
             .and_then(|c| c.structure(0).and_then(|st| st.get::<i32>("layer").ok()));
@@ -297,8 +297,16 @@ mod tests {
     fn hdr_classification_reads_gst_enum_not_h273() {
         assert_eq!(classify_hdr(Some("bt2100-pq")).as_deref(), Some("hdr10"));
         assert_eq!(classify_hdr(Some("bt2100-hlg")).as_deref(), Some("hlg"));
-        assert_eq!(classify_hdr(Some("0:6:14:7")).as_deref(), Some("hdr10"), "14 = SMPTE2084");
-        assert_eq!(classify_hdr(Some("0:6:15:7")).as_deref(), Some("hlg"), "15 = ARIB STD-B67");
+        assert_eq!(
+            classify_hdr(Some("0:6:14:7")).as_deref(),
+            Some("hdr10"),
+            "14 = SMPTE2084"
+        );
+        assert_eq!(
+            classify_hdr(Some("0:6:15:7")).as_deref(),
+            Some("hlg"),
+            "15 = ARIB STD-B67"
+        );
         assert_eq!(classify_hdr(Some("0:6:16:7")), None, "16 = BT601, not PQ");
         assert_eq!(classify_hdr(Some("bt709")), None);
         assert_eq!(classify_hdr(None), None);
@@ -340,8 +348,14 @@ mod tests {
         assert_eq!((info.video[0].width, info.video[0].height), (320, 240));
         assert_eq!(info.video[0].fps, Some((25, 1)));
         // MH-3 extension: x264enc+h264parse emit profile/level in caps.
-        assert!(info.video[0].profile.is_some(), "caps profile must be extracted");
-        assert!(info.video[0].level.is_some(), "caps level must be extracted");
+        assert!(
+            info.video[0].profile.is_some(),
+            "caps profile must be extracted"
+        );
+        assert!(
+            info.video[0].level.is_some(),
+            "caps level must be extracted"
+        );
         assert_eq!(info.video[0].hdr, None, "SDR testsrc must not read as HDR");
         assert_eq!(info.audio.len(), 1);
         assert_eq!(info.audio[0].codec, "vorbis");
@@ -362,10 +376,20 @@ mod tests {
         }"#;
         let info: kahawai_core::media::MediaInfo = serde_json::from_str(old).unwrap();
         let v = &info.video[0];
-        assert_eq!((v.profile.as_deref(), v.level.as_deref(), v.bitrate_kbps, v.hdr.as_deref()),
-                   (None, None, None, None));
+        assert_eq!(
+            (
+                v.profile.as_deref(),
+                v.level.as_deref(),
+                v.bitrate_kbps,
+                v.hdr.as_deref()
+            ),
+            (None, None, None, None)
+        );
         let a = &info.audio[0];
-        assert_eq!((a.bitrate_kbps, a.layout.as_deref(), a.channels), (None, None, 6));
+        assert_eq!(
+            (a.bitrate_kbps, a.layout.as_deref(), a.channels),
+            (None, None, 6)
+        );
     }
 
     #[test]

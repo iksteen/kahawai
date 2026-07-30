@@ -19,7 +19,10 @@ use kahawai_transport::identity::SatelliteIdentity;
 use tower::ServiceExt;
 
 async fn body_bytes(resp: axum::response::Response) -> Vec<u8> {
-    axum::body::to_bytes(resp.into_body(), 64 << 20).await.unwrap().to_vec()
+    axum::body::to_bytes(resp.into_body(), 64 << 20)
+        .await
+        .unwrap()
+        .to_vec()
 }
 
 fn enroll(
@@ -42,7 +45,9 @@ fn enroll(
 
 #[tokio::test]
 async fn dispatches_encode_session_to_transcoder() {
-    let _ = tracing_subscriber::fmt().with_env_filter("info,kahawai_hub=debug").try_init();
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("info,kahawai_hub=debug")
+        .try_init();
     if kahawai_media::remux::aac_encoder().is_none() {
         eprintln!("skipping: no verified AAC encoder");
         return;
@@ -83,8 +88,9 @@ async fn dispatches_encode_session_to_transcoder() {
     .unwrap();
     let db = kahawai_hub::db::open_in_memory().await.unwrap();
     let registry = Arc::new(Registry::new(db.clone(), allowed.clone()));
-    let sessions =
-        Arc::new(kahawai_hub::sessions::Sessions::new(tempfile::tempdir().unwrap().keep()));
+    let sessions = Arc::new(kahawai_hub::sessions::Sessions::new(
+        tempfile::tempdir().unwrap().keep(),
+    ));
     sessions.attach_registry(registry.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let hub_addr = format!("localhost:{}", listener.local_addr().unwrap().port());
@@ -111,7 +117,9 @@ async fn dispatches_encode_session_to_transcoder() {
     // Fake mediahost: link, announce, upsert, serve OpenReads.
     let id = enroll(&ca, &allowed, "mediahost", "01HOST", "nas");
     let client_tls = kahawai_transport::mtls::mtls_client_config(&id).unwrap();
-    let channel = kahawai_transport::tls::grpc_channel_with(&hub_addr, client_tls).await.unwrap();
+    let channel = kahawai_transport::tls::grpc_channel_with(&hub_addr, client_tls)
+        .await
+        .unwrap();
     let mut client = pb::mediahost_link_client::MediahostLinkClient::new(channel.clone());
     let (tx, rx) = tokio::sync::mpsc::channel(8);
     tx.send(pb::HostToHub {
@@ -156,7 +164,11 @@ async fn dispatches_encode_session_to_transcoder() {
             if let Some(pb::hub_to_host::Msg::OpenRead(req)) = m.msg {
                 let path = kahawai_mediahost::serve::resolve_path(&collections, &req);
                 let ch = serve_channel.clone();
-                tokio::spawn(kahawai_mediahost::serve::serve_lease(ch, req.lease_token, path));
+                tokio::spawn(kahawai_mediahost::serve::serve_lease(
+                    ch,
+                    req.lease_token,
+                    path,
+                ));
             }
         }
     });
@@ -190,7 +202,11 @@ async fn dispatches_encode_session_to_transcoder() {
     });
 
     // API.
-    let auth = Arc::new(kahawai_hub::auth::Auth::new(db.clone(), pki.path()).await.unwrap());
+    let auth = Arc::new(
+        kahawai_hub::auth::Auth::new(db.clone(), pki.path())
+            .await
+            .unwrap(),
+    );
     let pair = auth
         .complete_setup(&auth.setup_token().unwrap(), "admin", "password-123")
         .await
@@ -198,13 +214,20 @@ async fn dispatches_encode_session_to_transcoder() {
     let bearer = format!("Bearer {}", pair.access_token);
     let api = test_router(registry.clone(), auth, sessions.clone());
     let get = |uri: String| {
-        Request::get(uri).header("authorization", bearer.clone()).body(Body::empty()).unwrap()
+        Request::get(uri)
+            .header("authorization", bearer.clone())
+            .body(Body::empty())
+            .unwrap()
     };
 
     // Wait for the item AND the transcoder registration.
     let item_id = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
-            let resp = api.clone().oneshot(get("/api/v1/items".into())).await.unwrap();
+            let resp = api
+                .clone()
+                .oneshot(get("/api/v1/items".into()))
+                .await
+                .unwrap();
             let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
             if let Some(id) = v["items"].get(0).and_then(|i| i["id"].as_str()) {
                 return id.to_string();
@@ -236,7 +259,9 @@ async fn dispatches_encode_session_to_transcoder() {
             Request::post("/api/v1/playback/sessions")
                 .header("authorization", bearer.clone())
                 .header("content-type", "application/json")
-                .body(Body::from(format!("{{\"item_id\":\"{item_id}\",\"mode\":\"remux\"}}")))
+                .body(Body::from(format!(
+                    "{{\"item_id\":\"{item_id}\",\"mode\":\"remux\"}}"
+                )))
                 .unwrap(),
         )
         .await
@@ -263,12 +288,17 @@ async fn dispatches_encode_session_to_transcoder() {
     })
     .await
     .expect("playlist never finalized");
-    assert!(playlist.contains("segment00000.ts"), "playlist:\n{playlist}");
+    assert!(
+        playlist.contains("segment00000.ts"),
+        "playlist:\n{playlist}"
+    );
 
     // First segment: real TS bytes, audio transcoded to AAC.
     let resp = api
         .clone()
-        .oneshot(get(format!("/api/v1/playback/sessions/{session_id}/segment00000.ts")))
+        .oneshot(get(format!(
+            "/api/v1/playback/sessions/{session_id}/segment00000.ts"
+        )))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -283,8 +313,16 @@ async fn dispatches_encode_session_to_transcoder() {
     })
     .await
     .unwrap();
-    assert_eq!(seg_info.audio.first().map(|a| a.codec.as_str()), Some("aac"), "{seg_info:?}");
-    assert_eq!(seg_info.video.first().map(|v| v.codec.as_str()), Some("h264"), "{seg_info:?}");
+    assert_eq!(
+        seg_info.audio.first().map(|a| a.codec.as_str()),
+        Some("aac"),
+        "{seg_info:?}"
+    );
+    assert_eq!(
+        seg_info.video.first().map(|v| v.codec.as_str()),
+        Some("h264"),
+        "{seg_info:?}"
+    );
 
     // Seek-restart a dispatched session (the stale-read regression:
     // the old worker's in-flight source read must not poison the new
@@ -333,7 +371,10 @@ async fn dispatches_encode_session_to_transcoder() {
     // AR-6: a second transcoder joins, the first dies mid-session —
     // the hub reschedules onto the survivor and playback recovers.
     let tc2_id = enroll(&ca, &allowed, "transcoder", "02TC", "backup-box");
-    registry.record_satellite("02TC", "transcoder", "backup-box", "fp-02tc").await.unwrap();
+    registry
+        .record_satellite("02TC", "transcoder", "backup-box", "fp-02tc")
+        .await
+        .unwrap();
     let tc2_tls = kahawai_transport::mtls::mtls_client_config(&tc2_id).unwrap();
     let tc2_scratch = tempfile::tempdir().unwrap();
     let hub_addr3 = hub_addr.clone();
@@ -350,14 +391,22 @@ async fn dispatches_encode_session_to_transcoder() {
             tonemap: false,
         };
         let _ = kahawai_transcoder::link_once(
-            &hub_addr3, tc2_tls, "backup-box", caps, &tc2_path, &None,
+            &hub_addr3,
+            tc2_tls,
+            "backup-box",
+            caps,
+            &tc2_path,
+            &None,
         )
         .await;
     });
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let sats = registry.satellites_overview().await.unwrap();
-            if sats.iter().any(|s| s["module_id"] == "02TC" && s["connected"] == true) {
+            if sats
+                .iter()
+                .any(|s| s["module_id"] == "02TC" && s["connected"] == true)
+            {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -381,7 +430,10 @@ async fn dispatches_encode_session_to_transcoder() {
     })
     .await
     .expect("session never recovered on the backup transcoder");
-    assert!(recovered.contains("segment"), "recovered playlist empty:\n{recovered}");
+    assert!(
+        recovered.contains("segment"),
+        "recovered playlist empty:\n{recovered}"
+    );
     assert!(
         sessions.get(&session_id).is_some(),
         "session should survive the transcoder loss"
@@ -419,5 +471,23 @@ fn test_router(
         std::time::Duration::from_secs(900),
         90,
     ));
-    kahawai_hub::api::router(registry, auth, sessions, enrollments, Arc::new(kahawai_hub::subtitles::Subtitles::new(tempfile::tempdir().unwrap().keep())), Arc::new(kahawai_hub::artwork::Artwork::new(tempfile::tempdir().unwrap().keep(), Arc::new(kahawai_hub::enrich::Enricher::new(tempfile::tempdir().unwrap().keep())))), Arc::new(kahawai_hub::enrich::Enricher::new(tempfile::tempdir().unwrap().keep())), kahawai_hub::api::NetOptions::default())
+    kahawai_hub::api::router(
+        registry,
+        auth,
+        sessions,
+        enrollments,
+        Arc::new(kahawai_hub::subtitles::Subtitles::new(
+            tempfile::tempdir().unwrap().keep(),
+        )),
+        Arc::new(kahawai_hub::artwork::Artwork::new(
+            tempfile::tempdir().unwrap().keep(),
+            Arc::new(kahawai_hub::enrich::Enricher::new(
+                tempfile::tempdir().unwrap().keep(),
+            )),
+        )),
+        Arc::new(kahawai_hub::enrich::Enricher::new(
+            tempfile::tempdir().unwrap().keep(),
+        )),
+        kahawai_hub::api::NetOptions::default(),
+    )
 }

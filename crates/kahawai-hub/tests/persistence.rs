@@ -26,7 +26,9 @@ async fn files_and_items_survive_restart() {
     {
         let db = kahawai_hub::db::open(dir.path()).await.unwrap();
         let reg = Registry::new(db.clone(), Default::default());
-        reg.announce_collection("01H", "movies", "movies", &[]).await.unwrap();
+        reg.announce_collection("01H", "movies", "movies", &[])
+            .await
+            .unwrap();
         reg.upsert_files(
             "01H",
             "movies",
@@ -50,7 +52,10 @@ async fn files_and_items_survive_restart() {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(dir.path().join("hub.db")).unwrap().permissions().mode();
+        let mode = std::fs::metadata(dir.path().join("hub.db"))
+            .unwrap()
+            .permissions()
+            .mode();
         assert_eq!(mode & 0o777, 0o600, "hub.db must be 0600");
     }
 
@@ -69,13 +74,23 @@ async fn files_and_items_survive_restart() {
     .unwrap();
     assert_eq!(
         titles,
-        vec![("Heat".into(), Some(1995), 2), ("Ronin".into(), Some(1998), 1)]
+        vec![
+            ("Heat".into(), Some(1995), 2),
+            ("Ronin".into(), Some(1998), 1)
+        ]
     );
 
     // Browse API over the same state (setup + login first).
-    let auth = Arc::new(kahawai_hub::auth::Auth::new(db.clone(), dir.path()).await.unwrap());
+    let auth = Arc::new(
+        kahawai_hub::auth::Auth::new(db.clone(), dir.path())
+            .await
+            .unwrap(),
+    );
     let token = auth.setup_token().unwrap();
-    let pair = auth.complete_setup(&token, "admin", "password-123").await.unwrap();
+    let pair = auth
+        .complete_setup(&token, "admin", "password-123")
+        .await
+        .unwrap();
     let bearer = format!("Bearer {}", pair.access_token);
     let get = |uri: String| {
         axum::http::Request::get(uri)
@@ -83,14 +98,22 @@ async fn files_and_items_survive_restart() {
             .body(axum::body::Body::empty())
             .unwrap()
     };
-    let api = test_router(reg.clone(), auth, Arc::new(kahawai_hub::sessions::Sessions::new(tempfile::tempdir().unwrap().keep())));
+    let api = test_router(
+        reg.clone(),
+        auth,
+        Arc::new(kahawai_hub::sessions::Sessions::new(
+            tempfile::tempdir().unwrap().keep(),
+        )),
+    );
     let resp = api
         .clone()
         .oneshot(get("/api/v1/items".into()))
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
-    let body = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+    let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     let items = json["items"].as_array().unwrap();
     assert_eq!(items.len(), 2);
@@ -105,7 +128,9 @@ async fn files_and_items_survive_restart() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
-    let body = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+    let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     let sources = json["sources"].as_array().unwrap();
     assert_eq!(sources.len(), 2);
@@ -123,7 +148,9 @@ async fn reconcile_drops_files_missing_from_scan() {
     let dir = tempfile::tempdir().unwrap();
     let db = kahawai_hub::db::open(dir.path()).await.unwrap();
     let reg = Registry::new(db.clone(), Default::default());
-    reg.announce_collection("01H", "movies", "movies", &[]).await.unwrap();
+    reg.announce_collection("01H", "movies", "movies", &[])
+        .await
+        .unwrap();
     reg.upsert_files(
         "01H",
         "movies",
@@ -152,15 +179,27 @@ async fn reconcile_drops_files_missing_from_scan() {
     let removed = reg.reconcile_files("01H", "movies", &seen).await.unwrap();
     assert_eq!(removed, 1);
 
-    let files: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM files").fetch_one(&db).await.unwrap();
-    let items: Vec<String> = sqlx::query_scalar("SELECT title FROM items").fetch_all(&db).await.unwrap();
-    let watch: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM watch_state").fetch_one(&db).await.unwrap();
+    let files: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM files")
+        .fetch_one(&db)
+        .await
+        .unwrap();
+    let items: Vec<String> = sqlx::query_scalar("SELECT title FROM items")
+        .fetch_all(&db)
+        .await
+        .unwrap();
+    let watch: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM watch_state")
+        .fetch_one(&db)
+        .await
+        .unwrap();
     assert_eq!(files, 1);
     assert_eq!(items, vec!["Heat".to_string()]);
     assert_eq!(watch, 0, "watch state cascades with the removed item");
 
     // Idempotent when nothing changed.
-    assert_eq!(reg.reconcile_files("01H", "movies", &seen).await.unwrap(), 0);
+    assert_eq!(
+        reg.reconcile_files("01H", "movies", &seen).await.unwrap(),
+        0
+    );
 }
 
 /// Router with default admin plumbing for tests that don't exercise it.
@@ -179,7 +218,25 @@ fn test_router(
         std::time::Duration::from_secs(900),
         90,
     ));
-    kahawai_hub::api::router(registry, auth, sessions, enrollments, Arc::new(kahawai_hub::subtitles::Subtitles::new(tempfile::tempdir().unwrap().keep())), Arc::new(kahawai_hub::artwork::Artwork::new(tempfile::tempdir().unwrap().keep(), Arc::new(kahawai_hub::enrich::Enricher::new(tempfile::tempdir().unwrap().keep())))), Arc::new(kahawai_hub::enrich::Enricher::new(tempfile::tempdir().unwrap().keep())), kahawai_hub::api::NetOptions::default())
+    kahawai_hub::api::router(
+        registry,
+        auth,
+        sessions,
+        enrollments,
+        Arc::new(kahawai_hub::subtitles::Subtitles::new(
+            tempfile::tempdir().unwrap().keep(),
+        )),
+        Arc::new(kahawai_hub::artwork::Artwork::new(
+            tempfile::tempdir().unwrap().keep(),
+            Arc::new(kahawai_hub::enrich::Enricher::new(
+                tempfile::tempdir().unwrap().keep(),
+            )),
+        )),
+        Arc::new(kahawai_hub::enrich::Enricher::new(
+            tempfile::tempdir().unwrap().keep(),
+        )),
+        kahawai_hub::api::NetOptions::default(),
+    )
 }
 
 /// Incremental rescan (MH-5): a second scan that reports unchanged files
@@ -201,12 +258,12 @@ async fn manifest_and_files_seen_survive_rescan() {
     .unwrap();
     let db = kahawai_hub::db::open_in_memory().await.unwrap();
     let registry = Arc::new(Registry::new(db.clone(), allowed.clone()));
-    let sessions =
-        Arc::new(kahawai_hub::sessions::Sessions::new(tempfile::tempdir().unwrap().keep()));
+    let sessions = Arc::new(kahawai_hub::sessions::Sessions::new(
+        tempfile::tempdir().unwrap().keep(),
+    ));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let hub_addr = format!("localhost:{}", listener.local_addr().unwrap().port());
-    let link_svc =
-        kahawai_hub::link_service::MediahostLinkService::new(
+    let link_svc = kahawai_hub::link_service::MediahostLinkService::new(
         registry.clone(),
         sessions.clone(),
         std::sync::Arc::new(kahawai_hub::subtitles::Subtitles::new(
@@ -239,8 +296,9 @@ async fn manifest_and_files_seen_survive_rescan() {
         let hub_addr = hub_addr.clone();
         let client_tls = client_tls.clone();
         async move {
-            let channel =
-                kahawai_transport::tls::grpc_channel_with(&hub_addr, client_tls).await.unwrap();
+            let channel = kahawai_transport::tls::grpc_channel_with(&hub_addr, client_tls)
+                .await
+                .unwrap();
             let mut client = pb::mediahost_link_client::MediahostLinkClient::new(channel);
             let (tx, rx) = tokio::sync::mpsc::channel(8);
             tx.send(pb::HostToHub {
@@ -259,11 +317,13 @@ async fn manifest_and_files_seen_survive_rescan() {
                 .into_inner();
             inbound.message().await.unwrap().unwrap(); // HelloAck
             tx.send(pb::HostToHub {
-                msg: Some(pb::host_to_hub::Msg::AnnounceCollection(pb::AnnounceCollection {
-                    id: "movies".into(),
-                    media_type: "movies".into(),
-                    roots: vec!["/srv/movies".into()],
-                })),
+                msg: Some(pb::host_to_hub::Msg::AnnounceCollection(
+                    pb::AnnounceCollection {
+                        id: "movies".into(),
+                        media_type: "movies".into(),
+                        roots: vec!["/srv/movies".into()],
+                    },
+                )),
             })
             .await
             .unwrap();
@@ -360,7 +420,10 @@ async fn manifest_and_files_seen_survive_rescan() {
         .fetch_one(&db)
         .await
         .unwrap();
-    assert_eq!(n, 1, "FilesSeen must protect unchanged files from reconciliation");
+    assert_eq!(
+        n, 1,
+        "FilesSeen must protect unchanged files from reconciliation"
+    );
     let items: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM items")
         .fetch_one(&db)
         .await
@@ -379,7 +442,10 @@ async fn manifest_and_files_seen_survive_rescan() {
 async fn multipart_movies_group_into_one_item() {
     let db = kahawai_hub::db::open_in_memory().await.unwrap();
     let registry = Registry::new(db.clone(), Default::default());
-    registry.record_satellite("01HOST", "mediahost", "nas", "fp").await.unwrap();
+    registry
+        .record_satellite("01HOST", "mediahost", "nas", "fp")
+        .await
+        .unwrap();
     registry
         .announce_collection("01HOST", "movies", "movies", &["/srv/movies".into()])
         .await

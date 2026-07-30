@@ -7,8 +7,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::{bail, Context, Result};
-use kahawai_media::subtitles::{decode_text, is_text_format, parse, to_vtt, Extracted};
+use anyhow::{Context, Result, bail};
+use kahawai_media::subtitles::{Extracted, decode_text, is_text_format, parse, to_vtt};
 use serde::Serialize;
 use sqlx::Row;
 
@@ -45,9 +45,7 @@ pub enum AssBody {
 fn cache_key(module_id: &str, collection_id: &str, path_rel: &str, key: &str) -> String {
     format!(
         "v2-{:016x}-{key}",
-        xxhash_rust::xxh3::xxh3_64(
-            format!("{module_id}\n{collection_id}\n{path_rel}").as_bytes()
-        )
+        xxhash_rust::xxh3::xxh3_64(format!("{module_id}\n{collection_id}\n{path_rel}").as_bytes())
     )
 }
 
@@ -256,7 +254,10 @@ impl Subtitles {
                     }
                 }
                 Ok(Err(e)) => {
-                    tracing::warn!(error = format!("{e:#}"), "streamed subtitle extraction failed")
+                    tracing::warn!(
+                        error = format!("{e:#}"),
+                        "streamed subtitle extraction failed"
+                    )
                 }
                 Err(e) => tracing::warn!(error = %e, "subtitle extraction task panicked"),
             }
@@ -300,8 +301,10 @@ impl Subtitles {
         }
         let ex: Extracted = if let Some(n) = key.strip_prefix('s') {
             let idx: usize = n.parse().context("bad sidecar key")?;
-            let sidecar =
-                info.external_subtitles.get(idx).context("sidecar index out of range")?;
+            let sidecar = info
+                .external_subtitles
+                .get(idx)
+                .context("sidecar index out of range")?;
             let lease = sessions
                 .open_lease(registry, &module_id, &collection_id, &sidecar.path_rel)
                 .await?;
@@ -338,8 +341,9 @@ impl Subtitles {
                 }
                 self.store_extracted(&module_id, &collection_id, &path_rel, &format!("e{i}"), &ex)?;
             }
-            return requested
-                .with_context(|| format!("no cues extracted (track {idx} missing or not a text track)"));
+            return requested.with_context(|| {
+                format!("no cues extracted (track {idx} missing or not a text track)")
+            });
         } else {
             bail!("bad subtitle key: {key}");
         };
@@ -362,7 +366,10 @@ impl Subtitles {
         item_id: &str,
         languages: Vec<String>,
         user_id: &str,
-    ) -> Result<(Vec<crate::opensubtitles::Candidate>, crate::opensubtitles::Quota)> {
+    ) -> Result<(
+        Vec<crate::opensubtitles::Candidate>,
+        crate::opensubtitles::Quota,
+    )> {
         let provider = self.external_provider(registry, user_id).await?;
         provider.refresh_quota().await;
         let row = sqlx::query(
@@ -476,7 +483,9 @@ impl Subtitles {
             // Year is the SHOW's start year for episodes, which the API
             // ANDs against the episode's air year — precise enough
             // without it once season+episode are set.
-            year: (!is_episode).then(|| row.get::<Option<i64>, _>("search_year")).flatten(),
+            year: (!is_episode)
+                .then(|| row.get::<Option<i64>, _>("search_year"))
+                .flatten(),
             season,
             episode,
             languages,
@@ -544,7 +553,10 @@ impl Subtitles {
         ex: &Extracted,
     ) -> Result<()> {
         std::fs::create_dir_all(&self.dir)?;
-        let path = self.dir.join(format!("{}.json", cache_key(module_id, collection_id, path_rel, key)));
+        let path = self.dir.join(format!(
+            "{}.json",
+            cache_key(module_id, collection_id, path_rel, key)
+        ));
         std::fs::write(&path, serde_json::to_vec(ex)?)?;
         Ok(())
     }
@@ -568,9 +580,10 @@ impl Subtitles {
         wait: std::time::Duration,
     ) -> Option<std::path::PathBuf> {
         let key = format!("i{sub_index}");
-        let cache_path = self
-            .dir
-            .join(format!("{}.sets", cache_key(module_id, collection_id, path_rel, &key)));
+        let cache_path = self.dir.join(format!(
+            "{}.sets",
+            cache_key(module_id, collection_id, path_rel, &key)
+        ));
         if tokio::fs::metadata(&cache_path).await.is_ok() {
             return Some(cache_path);
         }
@@ -613,13 +626,20 @@ impl Subtitles {
         msg: &kahawai_proto::v1::ImageSubtitles,
     ) -> Result<()> {
         let key = format!("i{}", msg.sub_index);
-        let path = self
-            .dir
-            .join(format!("{}.sets", cache_key(module_id, &msg.collection_id, &msg.path_rel, &key)));
+        let path = self.dir.join(format!(
+            "{}.sets",
+            cache_key(module_id, &msg.collection_id, &msg.path_rel, &key)
+        ));
         let blocks: Vec<(u64, Option<u64>, Vec<u8>)> = msg
             .blocks
             .iter()
-            .map(|b| (b.start_ms, (b.duration_ms > 0).then_some(b.duration_ms), b.payload.clone()))
+            .map(|b| {
+                (
+                    b.start_ms,
+                    (b.duration_ms > 0).then_some(b.duration_ms),
+                    b.payload.clone(),
+                )
+            })
             .collect();
         let bytes = kahawai_media::burnin::encode_sets(
             &msg.codec,
@@ -655,8 +675,10 @@ impl Subtitles {
         registry.send_to_host(module_id, msg).await.ok()?;
         tracing::info!(collection = %collection_id, path = %path_rel,
             "urgent subtitle extraction requested from mediahost");
-        let cache_path =
-            self.dir.join(format!("{}.json", cache_key(module_id, collection_id, path_rel, key)));
+        let cache_path = self.dir.join(format!(
+            "{}.json",
+            cache_key(module_id, collection_id, path_rel, key)
+        ));
         // The mediahost is never slower than dragging the file over the
         // lease ourselves — wait while its link is alive (10 min sanity
         // cap); the lease fallback is for disconnects, not slowness.
@@ -732,8 +754,11 @@ impl Subtitles {
                         );
                         out.push((a.file_name, buf));
                     }
-                    tracing::info!(item = item_id, fonts = out.len(),
-                        "fonts read from declared ranges");
+                    tracing::info!(
+                        item = item_id,
+                        fonts = out.len(),
+                        "fonts read from declared ranges"
+                    );
                     out
                 }
             }
@@ -825,7 +850,12 @@ pub(crate) async fn source_row(
         .context("no sources for item")?;
     let info: kahawai_core::media::MediaInfo =
         serde_json::from_str(row.get::<String, _>("streams_json").as_str()).unwrap_or_default();
-    Ok((row.get("module_id"), row.get("collection_id"), row.get("path_rel"), info))
+    Ok((
+        row.get("module_id"),
+        row.get("collection_id"),
+        row.get("path_rel"),
+        info,
+    ))
 }
 
 /// Drain a whole (small) file through a lease in chunks.
@@ -849,4 +879,3 @@ async fn read_all(lease: crate::leases::Lease) -> Result<Vec<u8>> {
         }
     }
 }
-

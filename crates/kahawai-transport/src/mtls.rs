@@ -18,8 +18,8 @@ use std::sync::{Arc, RwLock};
 use anyhow::{Context, Result};
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, UnixTime};
-use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 use rustls::server::WebPkiClientVerifier;
+use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 use rustls::{ClientConfig, DistinguishedName, RootCertStore, ServerConfig};
 
 use crate::identity::SatelliteIdentity;
@@ -129,7 +129,9 @@ impl ClientCertVerifier for AllowlistVerifier {
         intermediates: &[CertificateDer<'_>],
         now: UnixTime,
     ) -> Result<ClientCertVerified, rustls::Error> {
-        let verified = self.inner.verify_client_cert(end_entity, intermediates, now)?;
+        let verified = self
+            .inner
+            .verify_client_cert(end_entity, intermediates, now)?;
         let fp = kahawai_core::pki::cert_fingerprint(end_entity.as_ref());
         if !self.allowed.contains(&fp) {
             tracing::warn!(fingerprint = %fp, "refusing certificate not on the allowlist");

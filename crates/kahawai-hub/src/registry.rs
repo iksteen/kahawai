@@ -67,7 +67,10 @@ pub struct PlacementNeed {
 pub const RENEWAL_GRACE_SECS: i64 = 24 * 3600;
 
 fn unix_now() -> i64 {
-    SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64
+    SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
 }
 
 pub struct Registry {
@@ -78,7 +81,12 @@ pub struct Registry {
     /// Live capability reports from connected transcoders (TC-1); cleared
     /// on disconnect — a report is only valid while the link is up.
     transcoder_caps: Mutex<HashMap<String, serde_json::Value>>,
-    tc_links: Mutex<HashMap<String, tokio::sync::mpsc::Sender<Result<kahawai_proto::v1::HubToTc, tonic::Status>>>>,
+    tc_links: Mutex<
+        HashMap<
+            String,
+            tokio::sync::mpsc::Sender<Result<kahawai_proto::v1::HubToTc, tonic::Status>>,
+        >,
+    >,
     /// Dispatched sessions per transcoder (inverse-load placement).
     tc_load: Mutex<HashMap<String, usize>>,
     /// Admin-disabled satellites: placement skips them; active sessions
@@ -86,7 +94,12 @@ pub struct Registry {
     /// the satellites table if drain-across-restarts is ever needed.
     disabled: Mutex<std::collections::HashSet<String>>,
     /// Command senders for connected hosts' Link streams.
-    links: Mutex<HashMap<String, tokio::sync::mpsc::Sender<Result<kahawai_proto::v1::HubToHost, tonic::Status>>>>,
+    links: Mutex<
+        HashMap<
+            String,
+            tokio::sync::mpsc::Sender<Result<kahawai_proto::v1::HubToHost, tonic::Status>>,
+        >,
+    >,
     /// Live per-collection scan progress (HUB-35): last report wins.
     scan_progress: Mutex<HashMap<(String, String), ScanState>>,
     /// Deep-refresh marks: the next manifest request for (module,
@@ -149,7 +162,13 @@ impl Registry {
     ) {
         self.scan_progress.lock().unwrap().insert(
             (module_id.to_string(), collection_id.to_string()),
-            ScanState { scanned, failed, skipped, complete, updated: SystemTime::now() },
+            ScanState {
+                scanned,
+                failed,
+                skipped,
+                complete,
+                updated: SystemTime::now(),
+            },
         );
         self.emit(serde_json::json!({
             "kind": "scan",
@@ -170,8 +189,7 @@ impl Registry {
             .unwrap()
             .get(&(module_id.to_string(), collection_id.to_string()))
             .filter(|s| {
-                !s.complete
-                    || s.updated.elapsed().unwrap_or_default() < Duration::from_secs(60)
+                !s.complete || s.updated.elapsed().unwrap_or_default() < Duration::from_secs(60)
             })
             .cloned()
     }
@@ -211,7 +229,8 @@ impl Registry {
         let n = rows.len();
         let mut disabled = self.disabled.lock().unwrap();
         for row in rows {
-            self.allowed.insert(&row.get::<String, _>("cert_fingerprint"));
+            self.allowed
+                .insert(&row.get::<String, _>("cert_fingerprint"));
             if let Some(pending) = row.get::<Option<String>, _>("pending_fingerprint") {
                 self.allowed.insert(&pending);
             }
@@ -227,12 +246,11 @@ impl Registry {
     /// returns — i.e. before the certificate ever leaves the hub.
     pub async fn record_renewal(&self, module_id: &str, new_fingerprint: &str) -> Result<()> {
         let mut tx = self.db.begin().await?;
-        let old_pending: Option<Option<String>> = sqlx::query_scalar(
-            "SELECT pending_fingerprint FROM satellites WHERE module_id = ?",
-        )
-        .bind(module_id)
-        .fetch_optional(&mut *tx)
-        .await?;
+        let old_pending: Option<Option<String>> =
+            sqlx::query_scalar("SELECT pending_fingerprint FROM satellites WHERE module_id = ?")
+                .bind(module_id)
+                .fetch_optional(&mut *tx)
+                .await?;
         anyhow::ensure!(old_pending.is_some(), "unknown satellite {module_id}");
         sqlx::query(
             "UPDATE satellites SET pending_fingerprint = ?, pending_issued_at = unixepoch()
@@ -253,9 +271,10 @@ impl Registry {
         self.allowed.insert(new_fingerprint);
         // A superseded pending renewal (satellite retried) is dead weight.
         if let Some(Some(old)) = old_pending
-            && old != new_fingerprint {
-                self.allowed.remove(&old);
-            }
+            && old != new_fingerprint
+        {
+            self.allowed.remove(&old);
+        }
         Ok(())
     }
 
@@ -263,11 +282,7 @@ impl Registry {
     /// Copy-forward first: identical content identity elsewhere (renames,
     /// moves, duplicates) donates its hash — full reads happen at most
     /// once per content identity, with the files table as the journal.
-    pub async fn ed2k_worklist(
-        &self,
-        module_id: &str,
-        collection_id: &str,
-    ) -> Result<Vec<String>> {
+    pub async fn ed2k_worklist(&self, module_id: &str, collection_id: &str) -> Result<Vec<String>> {
         let media_type: Option<String> = sqlx::query_scalar(
             "SELECT media_type FROM collections WHERE module_id = ? AND collection_id = ?",
         )
@@ -348,7 +363,10 @@ impl Registry {
         .bind(collection_id)
         .fetch_optional(&self.db)
         .await?;
-        if !matches!(media_type.as_deref(), Some("movies") | Some("series") | Some("anime")) {
+        if !matches!(
+            media_type.as_deref(),
+            Some("movies") | Some("series") | Some("anime")
+        ) {
             return Ok(Vec::new());
         }
         let paths = sqlx::query_scalar(
@@ -398,11 +416,7 @@ impl Registry {
     /// Efficiency ladder step 2: video-collection files with embedded
     /// text subtitle tracks not yet extracted — the background pre-warm
     /// worklist, drained below ED2K on the mediahost.
-    pub async fn subs_worklist(
-        &self,
-        module_id: &str,
-        collection_id: &str,
-    ) -> Result<Vec<String>> {
+    pub async fn subs_worklist(&self, module_id: &str, collection_id: &str) -> Result<Vec<String>> {
         let media_type: Option<String> = sqlx::query_scalar(
             "SELECT media_type FROM collections WHERE module_id = ? AND collection_id = ?",
         )
@@ -410,7 +424,10 @@ impl Registry {
         .bind(collection_id)
         .fetch_optional(&self.db)
         .await?;
-        if !matches!(media_type.as_deref(), Some("movies") | Some("series") | Some("anime")) {
+        if !matches!(
+            media_type.as_deref(),
+            Some("movies") | Some("series") | Some("anime")
+        ) {
             return Ok(Vec::new());
         }
         let paths = sqlx::query_scalar(
@@ -548,7 +565,9 @@ impl Registry {
             .get(module_id)
             .cloned()
             .with_context(|| format!("mediahost {module_id} is not connected"))?;
-        tx.send(Ok(msg)).await.map_err(|_| anyhow::anyhow!("link to {module_id} closed"))
+        tx.send(Ok(msg))
+            .await
+            .map_err(|_| anyhow::anyhow!("link to {module_id} closed"))
     }
 
     pub fn db(&self) -> &SqlitePool {
@@ -670,7 +689,8 @@ impl Registry {
         .execute(&self.db)
         .await?;
         tracing::info!(%module_id, collection = collection_id, media_type, "collection announced");
-        self.ensure_library(module_id, collection_id, media_type).await?;
+        self.ensure_library(module_id, collection_id, media_type)
+            .await?;
         Ok(())
     }
 
@@ -692,12 +712,11 @@ impl Registry {
         if assigned > 0 {
             return Ok(());
         }
-        let lib: Option<(String, String)> = sqlx::query_as(
-            "SELECT id, media_type FROM libraries WHERE name = ?",
-        )
-        .bind(collection_id)
-        .fetch_optional(&self.db)
-        .await?;
+        let lib: Option<(String, String)> =
+            sqlx::query_as("SELECT id, media_type FROM libraries WHERE name = ?")
+                .bind(collection_id)
+                .fetch_optional(&self.db)
+                .await?;
         let lib_id = match lib {
             Some((id, ty)) if ty == media_type => id,
             Some(_) => {
@@ -707,7 +726,8 @@ impl Registry {
             }
             None => self.create_library(collection_id, media_type).await?,
         };
-        self.attach_collection(&lib_id, module_id, collection_id).await?;
+        self.attach_collection(&lib_id, module_id, collection_id)
+            .await?;
         Ok(())
     }
 
@@ -844,8 +864,10 @@ impl Registry {
         Ok(rows
             .iter()
             .map(|r| {
-                let (module_id, collection_id) =
-                    (r.get::<String, _>("module_id"), r.get::<String, _>("collection_id"));
+                let (module_id, collection_id) = (
+                    r.get::<String, _>("module_id"),
+                    r.get::<String, _>("collection_id"),
+                );
                 let scan = self.scan_state(&module_id, &collection_id);
                 serde_json::json!({
                     "module_id": module_id,
@@ -874,8 +896,7 @@ impl Registry {
         .fetch_optional(&self.db)
         .await?;
         let resolve_movies = media_type.as_deref() == Some("movies");
-        let resolve_series =
-            matches!(media_type.as_deref(), Some("series") | Some("anime"));
+        let resolve_series = matches!(media_type.as_deref(), Some("series") | Some("anime"));
         let anime = media_type.as_deref() == Some("anime");
         let resolve_music = media_type.as_deref() == Some("music");
 
@@ -1259,10 +1280,12 @@ impl Registry {
     /// content identity first (HUB-20), so moves/renames and returning
     /// media keep their history.
     pub async fn get_setting(&self, key: &str) -> Result<Option<String>> {
-        Ok(sqlx::query_scalar("SELECT value FROM settings WHERE key = ?")
-            .bind(key)
-            .fetch_optional(&self.db)
-            .await?)
+        Ok(
+            sqlx::query_scalar("SELECT value FROM settings WHERE key = ?")
+                .bind(key)
+                .fetch_optional(&self.db)
+                .await?,
+        )
     }
 
     pub async fn set_setting(&self, key: &str, value: &str) -> Result<()> {
@@ -1417,7 +1440,10 @@ impl Registry {
             "decode_caps": caps.decode_caps,
             "tonemap": caps.tonemap,
         });
-        self.transcoder_caps.lock().unwrap().insert(module_id.to_string(), json);
+        self.transcoder_caps
+            .lock()
+            .unwrap()
+            .insert(module_id.to_string(), json);
     }
 
     pub fn mark_deep_rescan(&self, module_id: &str, collection_id: &str) {
@@ -1456,7 +1482,10 @@ impl Registry {
         module_id: &str,
         tx: tokio::sync::mpsc::Sender<Result<kahawai_proto::v1::HubToTc, tonic::Status>>,
     ) {
-        self.tc_links.lock().unwrap().insert(module_id.to_string(), tx);
+        self.tc_links
+            .lock()
+            .unwrap()
+            .insert(module_id.to_string(), tx);
     }
 
     pub fn unregister_tc_link(&self, module_id: &str) {
@@ -1476,11 +1505,18 @@ impl Registry {
             .get(module_id)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("transcoder {module_id} not connected"))?;
-        tx.send(Ok(msg)).await.map_err(|_| anyhow::anyhow!("transcoder link closed"))
+        tx.send(Ok(msg))
+            .await
+            .map_err(|_| anyhow::anyhow!("transcoder link closed"))
     }
 
     pub fn tc_session_started(&self, module_id: &str) {
-        *self.tc_load.lock().unwrap().entry(module_id.to_string()).or_insert(0) += 1;
+        *self
+            .tc_load
+            .lock()
+            .unwrap()
+            .entry(module_id.to_string())
+            .or_insert(0) += 1;
     }
 
     pub fn tc_session_ended(&self, module_id: &str) {
@@ -1595,13 +1631,12 @@ impl Registry {
     /// Returns the removed fingerprint. Transient disconnects never come
     /// here.
     pub async fn delete_satellite(&self, module_id: &str) -> Result<String> {
-        let fingerprint: String = sqlx::query_scalar(
-            "SELECT cert_fingerprint FROM satellites WHERE module_id = ?",
-        )
-        .bind(module_id)
-        .fetch_optional(&self.db)
-        .await?
-        .with_context(|| format!("no such satellite: {module_id}"))?;
+        let fingerprint: String =
+            sqlx::query_scalar("SELECT cert_fingerprint FROM satellites WHERE module_id = ?")
+                .bind(module_id)
+                .fetch_optional(&self.db)
+                .await?
+                .with_context(|| format!("no such satellite: {module_id}"))?;
 
         let mut tx = self.db.begin().await?;
         sqlx::query(

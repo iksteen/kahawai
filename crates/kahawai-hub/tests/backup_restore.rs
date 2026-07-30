@@ -19,14 +19,19 @@ async fn a_snapshot_restores_the_database_pki_and_subtitles() {
     // A hub with state worth keeping: a user, a satellite's fingerprint,
     // the CA that admits it, a downloaded subtitle, and a token secret.
     let db = kahawai_hub::db::open(live.path()).await.unwrap();
-    sqlx::query("INSERT INTO items (id, kind, title, norm_title) VALUES ('i1','movie','Solaris','solaris')")
-        .execute(&db)
-        .await
-        .unwrap();
+    sqlx::query(
+        "INSERT INTO items (id, kind, title, norm_title) VALUES ('i1','movie','Solaris','solaris')",
+    )
+    .execute(&db)
+    .await
+    .unwrap();
     db.close().await;
     write(&live.path().join("pki/ca.crt"), "CERTIFICATE");
     write(&live.path().join("pki/ca.key"), "PRIVATE KEY");
-    write(&live.path().join("subtitles/abc/def.srt"), "1\n00:00:01,000 --> 00:00:02,000\nhi\n");
+    write(
+        &live.path().join("subtitles/abc/def.srt"),
+        "1\n00:00:01,000 --> 00:00:02,000\nhi\n",
+    );
     write(&live.path().join("jwt.secret"), "s3cret");
     // Caches, which must NOT travel: re-derivable, and far larger.
     write(&live.path().join("artwork/deadbeef"), "JPEG");
@@ -35,15 +40,26 @@ async fn a_snapshot_restores_the_database_pki_and_subtitles() {
     let cfg = live.path().join("kahawai.toml");
     write(&cfg, "[hub]\nbind = \"127.0.0.1:8420\"\n");
 
-    let m = kahawai_hub::backup::backup(live.path(), Some(&cfg), &snap).await.unwrap();
-    assert!(m.has_pki, "a snapshot without the CA cannot reconnect satellites");
+    let m = kahawai_hub::backup::backup(live.path(), Some(&cfg), &snap)
+        .await
+        .unwrap();
+    assert!(
+        m.has_pki,
+        "a snapshot without the CA cannot reconnect satellites"
+    );
     assert!(m.has_config);
     assert_eq!(m.subtitle_files, 1);
     assert!(m.db_bytes > 0);
 
     // The exclusions are the point of the requirement, not an oversight.
-    assert!(!snap.join("artwork").exists(), "the image cache is re-derivable");
-    assert!(!snap.join("anime").exists(), "provider caches are re-derivable");
+    assert!(
+        !snap.join("artwork").exists(),
+        "the image cache is re-derivable"
+    );
+    assert!(
+        !snap.join("anime").exists(),
+        "provider caches are re-derivable"
+    );
 
     // Restore onto a FRESH install, as the requirement words it.
     let fresh = tempfile::tempdir().unwrap();
@@ -54,7 +70,10 @@ async fn a_snapshot_restores_the_database_pki_and_subtitles() {
         "PRIVATE KEY",
         "the CA is what lets existing satellites back in"
     );
-    assert_eq!(std::fs::read_to_string(fresh.path().join("jwt.secret")).unwrap(), "s3cret");
+    assert_eq!(
+        std::fs::read_to_string(fresh.path().join("jwt.secret")).unwrap(),
+        "s3cret"
+    );
     assert!(fresh.path().join("subtitles/abc/def.srt").exists());
 
     // And the database is a working one, not just bytes.
@@ -72,8 +91,14 @@ async fn a_restore_refuses_to_overwrite_without_being_told() {
     let live = tempfile::tempdir().unwrap();
     let snap = tempfile::tempdir().unwrap();
     let snap = snap.path().join("snapshot");
-    kahawai_hub::db::open(live.path()).await.unwrap().close().await;
-    kahawai_hub::backup::backup(live.path(), None, &snap).await.unwrap();
+    kahawai_hub::db::open(live.path())
+        .await
+        .unwrap()
+        .close()
+        .await;
+    kahawai_hub::backup::backup(live.path(), None, &snap)
+        .await
+        .unwrap();
 
     // The data dir already holds a database — quietly replacing it while
     // a hub might be running is how you lose the state you meant to keep.
@@ -86,10 +111,16 @@ async fn a_restore_refuses_to_overwrite_without_being_told() {
 async fn backup_refuses_an_existing_destination() {
     let live = tempfile::tempdir().unwrap();
     let dest = tempfile::tempdir().unwrap();
-    kahawai_hub::db::open(live.path()).await.unwrap().close().await;
+    kahawai_hub::db::open(live.path())
+        .await
+        .unwrap()
+        .close()
+        .await;
     // Merging into a directory would blend two snapshots into one that
     // never existed.
-    let err = kahawai_hub::backup::backup(live.path(), None, dest.path()).await.unwrap_err();
+    let err = kahawai_hub::backup::backup(live.path(), None, dest.path())
+        .await
+        .unwrap_err();
     assert!(format!("{err:#}").contains("already exists"), "{err:#}");
 }
 
@@ -116,7 +147,9 @@ async fn a_snapshot_is_taken_while_the_hub_keeps_writing() {
             }
         })
     };
-    let m = kahawai_hub::backup::backup(live.path(), None, &snap).await.unwrap();
+    let m = kahawai_hub::backup::backup(live.path(), None, &snap)
+        .await
+        .unwrap();
     writer.await.unwrap();
     assert!(m.db_bytes > 0);
 
@@ -125,7 +158,10 @@ async fn a_snapshot_is_taken_while_the_hub_keeps_writing() {
     let restored = tempfile::tempdir().unwrap();
     kahawai_hub::backup::restore(&snap, restored.path(), false).unwrap();
     let db2 = kahawai_hub::db::open(restored.path()).await.unwrap();
-    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM items").fetch_one(&db2).await.unwrap();
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM items")
+        .fetch_one(&db2)
+        .await
+        .unwrap();
     assert!(n <= 200, "snapshot cannot hold more than was written: {n}");
     db2.close().await;
     db.close().await;

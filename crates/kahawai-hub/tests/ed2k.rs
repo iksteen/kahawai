@@ -19,12 +19,22 @@ fn rec(path: &str, size: u64, mtime: i64) -> FileUpsertRecord {
 async fn setup(dir: &std::path::Path) -> Registry {
     let db = kahawai_hub::db::open(dir).await.unwrap();
     let reg = Registry::new(db, Default::default());
-    reg.announce_collection("01H", "anime", "anime", &[]).await.unwrap();
-    reg.announce_collection("01H", "movies", "movies", &[]).await.unwrap();
-    reg.upsert_files("01H", "anime", vec![rec("[G] Show - 01 [ABCD1234].mkv", 100, 1)])
+    reg.announce_collection("01H", "anime", "anime", &[])
         .await
         .unwrap();
-    reg.upsert_files("01H", "movies", vec![rec("Heat (1995).mkv", 200, 1)]).await.unwrap();
+    reg.announce_collection("01H", "movies", "movies", &[])
+        .await
+        .unwrap();
+    reg.upsert_files(
+        "01H",
+        "anime",
+        vec![rec("[G] Show - 01 [ABCD1234].mkv", 100, 1)],
+    )
+    .await
+    .unwrap();
+    reg.upsert_files("01H", "movies", vec![rec("Heat (1995).mkv", 200, 1)])
+        .await
+        .unwrap();
     reg
 }
 
@@ -38,11 +48,19 @@ async fn worklist_is_anime_only_and_shrinks_as_hashes_land() {
     assert_eq!(work, vec!["[G] Show - 01 [ABCD1234].mkv".to_string()]);
 
     // Stale result (size moved on): dropped, still on the list.
-    assert!(!reg.record_ed2k("01H", "anime", &work[0], "aa".repeat(16).as_str(), 999).await.unwrap());
+    assert!(
+        !reg.record_ed2k("01H", "anime", &work[0], "aa".repeat(16).as_str(), 999)
+            .await
+            .unwrap()
+    );
     assert_eq!(reg.ed2k_worklist("01H", "anime").await.unwrap().len(), 1);
 
     // Matching result: stored, list empty.
-    assert!(reg.record_ed2k("01H", "anime", &work[0], "ab".repeat(16).as_str(), 100).await.unwrap());
+    assert!(
+        reg.record_ed2k("01H", "anime", &work[0], "ab".repeat(16).as_str(), 100)
+            .await
+            .unwrap()
+    );
     assert!(reg.ed2k_worklist("01H", "anime").await.unwrap().is_empty());
 }
 
@@ -51,23 +69,35 @@ async fn copy_forward_and_content_change_semantics() {
     let dir = tempfile::tempdir().unwrap();
     let reg = setup(dir.path()).await;
     let hash = "cd".repeat(16);
-    reg.record_ed2k("01H", "anime", "[G] Show - 01 [ABCD1234].mkv", &hash, 100).await.unwrap();
+    reg.record_ed2k("01H", "anime", "[G] Show - 01 [ABCD1234].mkv", &hash, 100)
+        .await
+        .unwrap();
 
     // A rename/copy with identical content identity inherits the hash —
     // no second full read ever happens for known content.
-    reg.upsert_files("01H", "anime", vec![rec("renamed/Show - 01.mkv", 100, 1)]).await.unwrap();
+    reg.upsert_files("01H", "anime", vec![rec("renamed/Show - 01.mkv", 100, 1)])
+        .await
+        .unwrap();
     assert!(reg.ed2k_worklist("01H", "anime").await.unwrap().is_empty());
 
     // Unchanged re-upsert (forced re-inspection) keeps the hash…
-    reg.upsert_files("01H", "anime", vec![rec("[G] Show - 01 [ABCD1234].mkv", 100, 1)])
-        .await
-        .unwrap();
+    reg.upsert_files(
+        "01H",
+        "anime",
+        vec![rec("[G] Show - 01 [ABCD1234].mkv", 100, 1)],
+    )
+    .await
+    .unwrap();
     assert!(reg.ed2k_worklist("01H", "anime").await.unwrap().is_empty());
 
     // …but a content change (new mtime/size) clears it for rehashing.
-    reg.upsert_files("01H", "anime", vec![rec("[G] Show - 01 [ABCD1234].mkv", 101, 2)])
-        .await
-        .unwrap();
+    reg.upsert_files(
+        "01H",
+        "anime",
+        vec![rec("[G] Show - 01 [ABCD1234].mkv", 101, 2)],
+    )
+    .await
+    .unwrap();
     assert_eq!(
         reg.ed2k_worklist("01H", "anime").await.unwrap(),
         vec!["[G] Show - 01 [ABCD1234].mkv".to_string()]
@@ -79,24 +109,29 @@ async fn anime_collection_resolves_movies_but_not_extras() {
     let dir = tempfile::tempdir().unwrap();
     let db = kahawai_hub::db::open(dir.path()).await.unwrap();
     let reg = Registry::new(db.clone(), Default::default());
-    reg.announce_collection("01H", "anime", "anime", &[]).await.unwrap();
+    reg.announce_collection("01H", "anime", "anime", &[])
+        .await
+        .unwrap();
     reg.upsert_files(
         "01H",
         "anime",
         vec![
             rec("Howls Moving Castle (2004).mkv", 700, 1),
-            rec("[Coalgirls]_Ao_no_Exorcist_NCED2_(1280x720)_[9634C2F9].mkv", 50, 1),
+            rec(
+                "[Coalgirls]_Ao_no_Exorcist_NCED2_(1280x720)_[9634C2F9].mkv",
+                50,
+                1,
+            ),
         ],
     )
     .await
     .unwrap();
 
-    let movie: Option<(String, Option<i64>)> = sqlx::query_as(
-        "SELECT title, year FROM items WHERE kind = 'movie'",
-    )
-    .fetch_optional(&db)
-    .await
-    .unwrap();
+    let movie: Option<(String, Option<i64>)> =
+        sqlx::query_as("SELECT title, year FROM items WHERE kind = 'movie'")
+            .fetch_optional(&db)
+            .await
+            .unwrap();
     let (title, year) = movie.expect("anime movie resolved as a movie item");
     assert_eq!(title, "Howls Moving Castle");
     assert_eq!(year, Some(2004));
@@ -115,6 +150,10 @@ async fn anime_collection_resolves_movies_but_not_extras() {
     .await
     .unwrap();
     let (season, episode, show) = nc.expect("NC extra bound under its show");
-    assert_eq!((season, episode), (Some(0), 122), "NCED2 lands in the ED credits band");
+    assert_eq!(
+        (season, episode),
+        (Some(0), 122),
+        "NCED2 lands in the ED credits band"
+    );
     assert_eq!(show, "Ao no Exorcist");
 }

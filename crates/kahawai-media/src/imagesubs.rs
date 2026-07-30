@@ -5,7 +5,7 @@
 //! Both decoders consume the post-demux Matroska block payloads (gst
 //! has already undone any track-level compression).
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 
 /// One rendered subtitle object, positioned on the composition canvas.
 pub struct ImageObject {
@@ -131,14 +131,19 @@ impl PgsDecoder {
                         if body.len() < 11 {
                             continue;
                         }
-                        let declared =
-                            (u32::from_be_bytes([0, body[4], body[5], body[6]]) as usize)
-                                .saturating_sub(4); // w+h counted in data_len
+                        let declared = (u32::from_be_bytes([0, body[4], body[5], body[6]])
+                            as usize)
+                            .saturating_sub(4); // w+h counted in data_len
                         let w = u16::from_be_bytes([body[7], body[8]]) as u32;
                         let h = u16::from_be_bytes([body[9], body[10]]) as u32;
                         self.pending.insert(
                             oid,
-                            PgsObject { w, h, rle: body[11..].to_vec(), declared_len: declared },
+                            PgsObject {
+                                w,
+                                h,
+                                rle: body[11..].to_vec(),
+                                declared_len: declared,
+                            },
                         );
                     } else if let Some(p) = self.pending.get_mut(&oid) {
                         p.rle.extend_from_slice(&body[4..]);
@@ -154,19 +159,37 @@ impl PgsDecoder {
             }
         }
 
-        let Some((w, h, palette_id, refs)) = composition else { return Ok(None) };
-        let palette = self.palettes.get(&palette_id).cloned().unwrap_or_else(|| vec![[0; 4]; 256]);
+        let Some((w, h, palette_id, refs)) = composition else {
+            return Ok(None);
+        };
+        let palette = self
+            .palettes
+            .get(&palette_id)
+            .cloned()
+            .unwrap_or_else(|| vec![[0; 4]; 256]);
         let mut objects = Vec::new();
         for (oid, x, y) in refs {
-            let Some(obj) = self.objects.get(&oid) else { continue };
+            let Some(obj) = self.objects.get(&oid) else {
+                continue;
+            };
             if obj.rle.len() < obj.declared_len {
                 continue; // incomplete fragment chain
             }
             if let Ok(rgba) = pgs_rle_decode(&obj.rle, obj.w, obj.h, &palette) {
-                objects.push(ImageObject { x, y, w: obj.w, h: obj.h, rgba });
+                objects.push(ImageObject {
+                    x,
+                    y,
+                    w: obj.w,
+                    h: obj.h,
+                    rgba,
+                });
             }
         }
-        Ok(Some(DisplaySet { canvas_w: w, canvas_h: h, objects }))
+        Ok(Some(DisplaySet {
+            canvas_w: w,
+            canvas_h: h,
+            objects,
+        }))
     }
 }
 
@@ -270,11 +293,21 @@ pub fn vobsub_decode(spu: &[u8], palette16: &[[u8; 3]]) -> Result<Option<ImageOb
             0x00 | 0x01 => pos += 1, // force/start display
             0x02 => break,           // stop display (timing comes from the block)
             0x03 => {
-                pal_idx = [spu[pos + 1] >> 4, spu[pos + 1] & 0xF, spu[pos + 2] >> 4, spu[pos + 2] & 0xF];
+                pal_idx = [
+                    spu[pos + 1] >> 4,
+                    spu[pos + 1] & 0xF,
+                    spu[pos + 2] >> 4,
+                    spu[pos + 2] & 0xF,
+                ];
                 pos += 3;
             }
             0x04 => {
-                alpha = [spu[pos + 1] >> 4, spu[pos + 1] & 0xF, spu[pos + 2] >> 4, spu[pos + 2] & 0xF];
+                alpha = [
+                    spu[pos + 1] >> 4,
+                    spu[pos + 1] & 0xF,
+                    spu[pos + 2] >> 4,
+                    spu[pos + 2] & 0xF,
+                ];
                 pos += 3;
             }
             0x05 => {
@@ -308,7 +341,11 @@ pub fn vobsub_decode(spu: &[u8], palette16: &[[u8; 3]]) -> Result<Option<ImageOb
         let mut nib = start * 2; // nibble index into spu
         let read = |n: usize| -> u8 {
             let byte = spu.get(n / 2).copied().unwrap_or(0);
-            if n.is_multiple_of(2) { byte >> 4 } else { byte & 0xF }
+            if n.is_multiple_of(2) {
+                byte >> 4
+            } else {
+                byte & 0xF
+            }
         };
         let mut y = field;
         let mut x = 0usize;
@@ -348,7 +385,13 @@ pub fn vobsub_decode(spu: &[u8], palette16: &[[u8; 3]]) -> Result<Option<ImageOb
             }
         }
     }
-    Ok(Some(ImageObject { x: x1 as u32, y: y1 as u32, w: w as u32, h: h as u32, rgba: out }))
+    Ok(Some(ImageObject {
+        x: x1 as u32,
+        y: y1 as u32,
+        w: w as u32,
+        h: h as u32,
+        rgba: out,
+    }))
 }
 
 /// Encode an RGBA object as a PNG (for the JSONL tap stream).
@@ -411,8 +454,13 @@ mod tests {
             b.extend_from_slice(&900u16.to_be_bytes());
             b
         };
-        let block =
-            [seg(0x16, &pcs), seg(0x14, &pds), seg(0x15, &ods), seg(0x80, &[])].concat();
+        let block = [
+            seg(0x16, &pcs),
+            seg(0x14, &pds),
+            seg(0x15, &ods),
+            seg(0x80, &[]),
+        ]
+        .concat();
 
         let mut dec = PgsDecoder::default();
         let set = dec.feed(&block).unwrap().expect("display set");
@@ -455,7 +503,13 @@ mod tests {
 
     #[test]
     fn png_encodes() {
-        let obj = ImageObject { x: 0, y: 0, w: 2, h: 2, rgba: vec![255; 16] };
+        let obj = ImageObject {
+            x: 0,
+            y: 0,
+            w: 2,
+            h: 2,
+            rgba: vec![255; 16],
+        };
         let png = to_png(&obj).unwrap();
         assert_eq!(&png[1..4], b"PNG");
     }

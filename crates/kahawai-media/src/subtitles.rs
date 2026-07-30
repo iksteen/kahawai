@@ -6,7 +6,7 @@
 //! Dialogue lines) for client-side rendering (HUB-32); the flattened
 //! cues remain available for the HUB-32a fallback path.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use gstreamer as gst;
 use gstreamer::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -20,7 +20,10 @@ pub struct Cue {
 
 /// Formats this module can turn into WebVTT.
 pub fn is_text_format(format: &str) -> bool {
-    matches!(format, "srt" | "subrip" | "ass" | "ssa" | "webvtt" | "vtt" | "text")
+    matches!(
+        format,
+        "srt" | "subrip" | "ass" | "ssa" | "webvtt" | "vtt" | "text"
+    )
 }
 
 /// Decode subtitle file bytes: UTF-8 (with or without BOM), falling back
@@ -135,17 +138,26 @@ fn parse_srt(content: &str) -> Vec<Cue> {
     for block in content.replace('\r', "").split("\n\n") {
         let mut lines = block.lines().peekable();
         // Optional numeric counter line.
-        if lines.peek().is_some_and(|l| l.trim().parse::<u64>().is_ok()) {
+        if lines
+            .peek()
+            .is_some_and(|l| l.trim().parse::<u64>().is_ok())
+        {
             lines.next();
         }
         let Some(timing) = lines.next() else { continue };
-        let Some((start, end)) = timing.split_once("-->") else { continue };
+        let Some((start, end)) = timing.split_once("-->") else {
+            continue;
+        };
         let (Some(start), Some(end)) = (parse_timestamp(start), parse_timestamp(end)) else {
             continue;
         };
         let text = clean_cue_text(&lines.collect::<Vec<_>>().join("\n"));
         if !text.is_empty() {
-            cues.push(Cue { start_ms: start, end_ms: end, text });
+            cues.push(Cue {
+                start_ms: start,
+                end_ms: end,
+                text,
+            });
         }
     }
     cues
@@ -171,7 +183,9 @@ fn parse_vtt(content: &str) -> Vec<Cue> {
             lines.next();
         }
         let Some(timing) = lines.next() else { continue };
-        let Some((start, rest)) = timing.split_once("-->") else { continue };
+        let Some((start, rest)) = timing.split_once("-->") else {
+            continue;
+        };
         // Cue settings may follow the end timestamp.
         let end = rest.split_whitespace().next().unwrap_or("");
         let (Some(start), Some(end)) = (parse_timestamp(start), parse_timestamp(end)) else {
@@ -179,7 +193,11 @@ fn parse_vtt(content: &str) -> Vec<Cue> {
         };
         let text = clean_cue_text(&lines.collect::<Vec<_>>().join("\n"));
         if !text.is_empty() {
-            cues.push(Cue { start_ms: start, end_ms: end, text });
+            cues.push(Cue {
+                start_ms: start,
+                end_ms: end,
+                text,
+            });
         }
     }
     cues
@@ -204,16 +222,21 @@ fn parse_ass(content: &str) -> Vec<Cue> {
             fields = fmt.split(',').map(|f| f.trim().to_lowercase()).collect();
             continue;
         }
-        let Some(dialogue) = line.strip_prefix("Dialogue:") else { continue };
+        let Some(dialogue) = line.strip_prefix("Dialogue:") else {
+            continue;
+        };
         if fields.is_empty() {
             continue;
         }
         let parts: Vec<&str> = dialogue.splitn(fields.len(), ',').collect();
         let field = |name: &str| {
-            fields.iter().position(|f| f == name).and_then(|i| parts.get(i)).copied()
+            fields
+                .iter()
+                .position(|f| f == name)
+                .and_then(|i| parts.get(i))
+                .copied()
         };
-        let (Some(start), Some(end), Some(text)) =
-            (field("start"), field("end"), field("text"))
+        let (Some(start), Some(end), Some(text)) = (field("start"), field("end"), field("text"))
         else {
             continue;
         };
@@ -222,7 +245,9 @@ fn parse_ass(content: &str) -> Vec<Cue> {
             let (hms, cc) = s.trim().rsplit_once('.')?;
             let cc: u64 = cc.parse().ok()?;
             let p: Vec<&str> = hms.split(':').collect();
-            let [h, m, sec] = p.as_slice() else { return None };
+            let [h, m, sec] = p.as_slice() else {
+                return None;
+            };
             Some(
                 ((h.parse::<u64>().ok()? * 60 + m.parse::<u64>().ok()?) * 60
                     + sec.parse::<u64>().ok()?)
@@ -230,10 +255,16 @@ fn parse_ass(content: &str) -> Vec<Cue> {
                     + cc * 10,
             )
         };
-        let (Some(start), Some(end)) = (ts(start), ts(end)) else { continue };
+        let (Some(start), Some(end)) = (ts(start), ts(end)) else {
+            continue;
+        };
         let text = clean_cue_text(text);
         if !text.is_empty() {
-            cues.push(Cue { start_ms: start, end_ms: end, text });
+            cues.push(Cue {
+                start_ms: start,
+                end_ms: end,
+                text,
+            });
         }
     }
     cues.sort_by_key(|c| c.start_ms);
@@ -256,9 +287,19 @@ pub(crate) fn ass_dialogue(raw: &str, start_ms: u64, end_ms: u64) -> Option<Stri
     let (_read_order, rest) = raw.split_once(',')?;
     let (layer, rest) = rest.split_once(',')?;
     let ts = |ms: u64| {
-        format!("{}:{:02}:{:02}.{:02}", ms / 3_600_000, ms / 60_000 % 60, ms / 1000 % 60, ms % 1000 / 10)
+        format!(
+            "{}:{:02}:{:02}.{:02}",
+            ms / 3_600_000,
+            ms / 60_000 % 60,
+            ms / 1000 % 60,
+            ms % 1000 / 10
+        )
     };
-    Some(format!("Dialogue: {layer},{},{},{rest}", ts(start_ms), ts(end_ms)))
+    Some(format!(
+        "Dialogue: {layer},{},{},{rest}",
+        ts(start_ms),
+        ts(end_ms)
+    ))
 }
 
 /// One streamed extraction event (HUB-32 streaming: subtitles usable
@@ -404,7 +445,9 @@ fn extract_embedded_core(
         pad.link(&fake.static_pad("sink").unwrap()).ok();
     });
 
-    pipeline.set_state(gst::State::Playing).context("starting subtitle extraction")?;
+    pipeline
+        .set_state(gst::State::Playing)
+        .context("starting subtitle extraction")?;
     let bus = pipeline.bus().unwrap();
     let mut result = Ok(());
     let mut drain = |taps: &mut Vec<Tap>| {
@@ -431,7 +474,11 @@ fn extract_embedded_core(
                         clean_cue_text(&raw)
                     };
                     if !text.is_empty() {
-                        tap.cues.push(Cue { start_ms: start, end_ms: end, text });
+                        tap.cues.push(Cue {
+                            start_ms: start,
+                            end_ms: end,
+                            text,
+                        });
                     }
                 }
             }
@@ -477,7 +524,13 @@ fn extract_embedded_core(
                 }
                 out
             });
-            (tap.idx, Extracted { cues: tap.cues, ass })
+            (
+                tap.idx,
+                Extracted {
+                    cues: tap.cues,
+                    ass,
+                },
+            )
         })
         .collect())
 }
@@ -503,7 +556,9 @@ pub fn extract_fonts(source: Box<dyn crate::remux::RemuxSource>) -> Result<Vec<(
         fake.sync_state_with_parent().ok();
         pad.link(&fake.static_pad("sink").unwrap()).ok();
     });
-    pipeline.set_state(gst::State::Playing).context("starting font extraction")?;
+    pipeline
+        .set_state(gst::State::Playing)
+        .context("starting font extraction")?;
     let bus = pipeline.bus().unwrap();
     let mut fonts = Vec::new();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
@@ -518,8 +573,12 @@ pub fn extract_fonts(source: Box<dyn crate::remux::RemuxSource>) -> Result<Vec<(
             gst::MessageView::Tag(t) => {
                 let tags = t.tags();
                 for i in 0..tags.size_by_name("attachment") {
-                    let Some(v) = tags.index_generic("attachment", i) else { continue };
-                    let Ok(sample) = v.get::<gst::Sample>() else { continue };
+                    let Some(v) = tags.index_generic("attachment", i) else {
+                        continue;
+                    };
+                    let Ok(sample) = v.get::<gst::Sample>() else {
+                        continue;
+                    };
                     let is_font = sample
                         .caps()
                         .and_then(|c| c.structure(0))
@@ -554,7 +613,6 @@ pub fn extract_fonts(source: Box<dyn crate::remux::RemuxSource>) -> Result<Vec<(
     Ok(fonts)
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -565,7 +623,14 @@ mod tests {
                    2\n00:01:00,000 --> 00:01:02,250\nSecond line\nwraps\n\n";
         let cues = parse("srt", srt).unwrap();
         assert_eq!(cues.len(), 2);
-        assert_eq!(cues[0], Cue { start_ms: 1500, end_ms: 3000, text: "Hello <i>world</i>".into() });
+        assert_eq!(
+            cues[0],
+            Cue {
+                start_ms: 1500,
+                end_ms: 3000,
+                text: "Hello <i>world</i>".into()
+            }
+        );
         assert_eq!(cues[1].text, "Second line\nwraps");
         let vtt = to_vtt(&cues, 0);
         assert!(vtt.starts_with("WEBVTT\n\n00:00:01.500 --> 00:00:03.000\nHello <i>world</i>\n"));
@@ -574,8 +639,16 @@ mod tests {
     #[test]
     fn vtt_shift_drops_prehistory() {
         let cues = vec![
-            Cue { start_ms: 1000, end_ms: 2000, text: "gone".into() },
-            Cue { start_ms: 5000, end_ms: 7000, text: "kept".into() },
+            Cue {
+                start_ms: 1000,
+                end_ms: 2000,
+                text: "gone".into(),
+            },
+            Cue {
+                start_ms: 5000,
+                end_ms: 7000,
+                text: "kept".into(),
+            },
         ];
         let vtt = to_vtt(&cues, -3000);
         assert!(!vtt.contains("gone"));
@@ -590,8 +663,22 @@ mod tests {
             Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,Earlier, with, commas\n";
         let cues = parse("ass", ass).unwrap();
         assert_eq!(cues.len(), 2);
-        assert_eq!(cues[0], Cue { start_ms: 1000, end_ms: 2000, text: "Earlier, with, commas".into() });
-        assert_eq!(cues[1], Cue { start_ms: 5000, end_ms: 7500, text: "Sign text\nline two".into() });
+        assert_eq!(
+            cues[0],
+            Cue {
+                start_ms: 1000,
+                end_ms: 2000,
+                text: "Earlier, with, commas".into()
+            }
+        );
+        assert_eq!(
+            cues[1],
+            Cue {
+                start_ms: 5000,
+                end_ms: 7500,
+                text: "Sign text\nline two".into()
+            }
+        );
     }
 
     #[test]
@@ -600,7 +687,14 @@ mod tests {
                    00:00:03.000 --> 00:00:04.000\n<font color=\"red\">styled</font>\n\n";
         let cues = parse("vtt", vtt).unwrap();
         assert_eq!(cues.len(), 2);
-        assert_eq!(cues[0], Cue { start_ms: 1000, end_ms: 2000, text: "Cue one".into() });
+        assert_eq!(
+            cues[0],
+            Cue {
+                start_ms: 1000,
+                end_ms: 2000,
+                text: "Cue one".into()
+            }
+        );
         assert_eq!(cues[1].text, "styled"); // font tags stripped
     }
 
@@ -656,6 +750,9 @@ mod tests {
     #[test]
     fn reconstructs_ass_dialogue_lines() {
         let line = ass_dialogue("17,0,Default,,0,0,0,,{\\an8}Sign", 61_500, 63_750).unwrap();
-        assert_eq!(line, "Dialogue: 0,0:01:01.50,0:01:03.75,Default,,0,0,0,,{\\an8}Sign");
+        assert_eq!(
+            line,
+            "Dialogue: 0,0:01:01.50,0:01:03.75,Default,,0,0,0,,{\\an8}Sign"
+        );
     }
 }

@@ -72,7 +72,14 @@ pub fn run(
     start_ms: u64,
     sink: Option<&str>,
 ) -> Result<()> {
-    run_parts(&[(socket.to_path_buf(), size)], out_dir, plan, start_ms, sink, None)
+    run_parts(
+        &[(socket.to_path_buf(), size)],
+        out_dir,
+        plan,
+        start_ms,
+        sink,
+        None,
+    )
 }
 
 /// Multi-part entry point: one socket per part, in timeline order, joined
@@ -92,7 +99,10 @@ pub fn run_parts(
     for (socket, size) in parts {
         let stream = UnixStream::connect(socket)
             .with_context(|| format!("connecting to {}", socket.display()))?;
-        sources.push(Box::new(SocketSource { stream, size: *size }));
+        sources.push(Box::new(SocketSource {
+            stream,
+            size: *size,
+        }));
     }
     // Pacing window (§4.6): transcode ahead of the viewer, but not the
     // whole film. The supervisor keeps `viewer.pos` fresh (absolute ms,
@@ -107,7 +117,15 @@ pub fn run_parts(
         floor_ms: start_ms,
         viewer_file: out_dir.join("viewer.pos"),
     };
-    let job = remux::start_parts(out_dir, plan, sources, start_ms, sink, Some(pace), burn_sets)?;
+    let job = remux::start_parts(
+        out_dir,
+        plan,
+        sources,
+        start_ms,
+        sink,
+        Some(pace),
+        burn_sets,
+    )?;
     while !job.finished() {
         std::thread::sleep(std::time::Duration::from_millis(100));
     }

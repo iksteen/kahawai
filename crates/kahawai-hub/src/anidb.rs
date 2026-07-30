@@ -25,7 +25,7 @@
 use std::time::Duration;
 
 use aes::cipher::{BlockCipherDecrypt, BlockCipherEncrypt, KeyInit};
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use md5::{Digest, Md5};
 
 const SERVER: &str = "api.anidb.net:9000";
@@ -141,7 +141,10 @@ struct Bucket {
 
 impl Bucket {
     fn new() -> Self {
-        Self { tokens: BURST_PACKETS, at: None }
+        Self {
+            tokens: BURST_PACKETS,
+            at: None,
+        }
     }
 
     /// Spend one packet, returning how long the caller must wait first.
@@ -219,7 +222,10 @@ impl Anidb {
             },
         };
         let bound_port = socket.local_addr().map(|a| a.port()).unwrap_or(0);
-        socket.connect(SERVER).await.context("resolving api.anidb.net")?;
+        socket
+            .connect(SERVER)
+            .await
+            .context("resolving api.anidb.net")?;
         let mut client = Self {
             socket,
             data_dir: data_dir.to_path_buf(),
@@ -230,10 +236,10 @@ impl Anidb {
             tag_seq: 0,
         };
 
-
         if let Some(key) = api_key.filter(|k| !k.is_empty()) {
-            let (code, rest) =
-                client.command(&format!("ENCRYPT user={user}&type=1")).await?;
+            let (code, rest) = client
+                .command(&format!("ENCRYPT user={user}&type=1"))
+                .await?;
             match code {
                 209 => {}
                 309 => bail!(
@@ -257,7 +263,10 @@ impl Anidb {
         // probed over an encrypted channel.
         if !st.session.is_empty() && st.port != 0 && st.port == bound_port {
             client.session = st.session;
-            match client.command(&format!("UPTIME s={}", client.session)).await {
+            match client
+                .command(&format!("UPTIME s={}", client.session))
+                .await
+            {
                 Ok((208, _)) => {
                     tracing::info!(port = bound_port, "anidb session resumed (no re-auth)");
                     return Ok(client);
@@ -272,7 +281,10 @@ impl Anidb {
                     client.session.clear();
                 }
                 Err(e) => {
-                    tracing::debug!(error = format!("{e:#}"), "session probe failed; authenticating");
+                    tracing::debug!(
+                        error = format!("{e:#}"),
+                        "session probe failed; authenticating"
+                    );
                     client.session.clear();
                 }
             }
@@ -285,8 +297,11 @@ impl Anidb {
             .await?;
         match code {
             200 | 201 => {
-                client.session =
-                    rest.split_whitespace().next().unwrap_or_default().to_string();
+                client.session = rest
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or_default()
+                    .to_string();
                 anyhow::ensure!(!client.session.is_empty(), "no session key in AUTH reply");
                 save_state(
                     data_dir,
@@ -343,7 +358,13 @@ impl Anidb {
             320 => Ok(None),
             501 | 506 => {
                 let st = load_state(&self.data_dir);
-                save_state(&self.data_dir, &State { session: String::new(), ..st });
+                save_state(
+                    &self.data_dir,
+                    &State {
+                        session: String::new(),
+                        ..st
+                    },
+                );
                 bail!("anidb session lost: {code}")
             }
             555 => {
@@ -378,7 +399,12 @@ impl Anidb {
     /// Wait until both halves of the flood rule allow another packet.
     /// `retry` widens the short-term gap for a timeout re-send.
     async fn pace(&mut self, retry: u32) {
-        let owed = pace_delay(&mut self.bucket, self.last_send, retry, tokio::time::Instant::now());
+        let owed = pace_delay(
+            &mut self.bucket,
+            self.last_send,
+            retry,
+            tokio::time::Instant::now(),
+        );
         if !owed.is_zero() {
             tokio::time::sleep(owed).await;
         }
@@ -407,8 +433,9 @@ impl Anidb {
                     // decrypt us (wrong UDP API key) and for some raw
                     // errors — fall back so the real message surfaces.
                     let raw = match &self.cipher {
-                        Some(c) => aes_ecb(c, &buf[..n], false)
-                            .unwrap_or_else(|_| buf[..n].to_vec()),
+                        Some(c) => {
+                            aes_ecb(c, &buf[..n], false).unwrap_or_else(|_| buf[..n].to_vec())
+                        }
                         None => buf[..n].to_vec(),
                     };
                     let text = String::from_utf8_lossy(&raw).to_string();
@@ -421,8 +448,10 @@ impl Anidb {
                         None => bail!("anidb reply tag mismatch: {text}"),
                     };
                     let (code_s, msg) = rest.split_once(' ').unwrap_or((rest, ""));
-                    let code: u16 =
-                        code_s.trim().parse().with_context(|| format!("unparseable reply: {text}"))?;
+                    let code: u16 = code_s
+                        .trim()
+                        .parse()
+                        .with_context(|| format!("unparseable reply: {text}"))?;
                     if code == 598 && self.cipher.is_some() {
                         bail!(
                             "AniDB could not decrypt our packets — the UDP API key \
@@ -450,7 +479,10 @@ fn aes_ecb(cipher: &aes::Aes128, data: &[u8], encrypt: bool) -> Result<Vec<u8>> 
         }
         Ok(buf)
     } else {
-        anyhow::ensure!(data.len().is_multiple_of(16) && !data.is_empty(), "bad ciphertext length");
+        anyhow::ensure!(
+            data.len().is_multiple_of(16) && !data.is_empty(),
+            "bad ciphertext length"
+        );
         let mut buf = data.to_vec();
         for chunk in buf.chunks_exact_mut(16) {
             cipher.decrypt_block(chunk.try_into().expect("16-byte block"));
@@ -493,7 +525,10 @@ mod tests {
         // ...and the run as a whole stays under the sustained rate.
         let elapsed = (now - start).as_secs_f64();
         let floor = (50.0 - BURST_PACKETS) * SUSTAINED_SPACING.as_secs_f64();
-        assert!(elapsed >= floor - 0.01, "50 packets in {elapsed:.1}s, floor {floor:.1}s");
+        assert!(
+            elapsed >= floor - 0.01,
+            "50 packets in {elapsed:.1}s, floor {floor:.1}s"
+        );
     }
 
     /// A timed-out packet is re-sent no sooner than a widened gap — the
@@ -557,9 +592,18 @@ mod tests {
     #[tokio::test]
     async fn a_recorded_ban_blocks_login_without_contact() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(ban_remaining(dir.path()).is_none(), "clean state is not banned");
+        assert!(
+            ban_remaining(dir.path()).is_none(),
+            "clean state is not banned"
+        );
 
-        save_state(dir.path(), &State { banned_until: now_unix() + 3600, ..Default::default() });
+        save_state(
+            dir.path(),
+            &State {
+                banned_until: now_unix() + 3600,
+                ..Default::default()
+            },
+        );
         let left = ban_remaining(dir.path()).expect("ban recorded");
         assert!(left > 3500 && left <= 3600, "{left}");
 
@@ -575,7 +619,13 @@ mod tests {
     #[test]
     fn a_lapsed_ban_is_no_longer_enforced() {
         let dir = tempfile::tempdir().unwrap();
-        save_state(dir.path(), &State { banned_until: now_unix() - 1, ..Default::default() });
+        save_state(
+            dir.path(),
+            &State {
+                banned_until: now_unix() - 1,
+                ..Default::default()
+            },
+        );
         assert!(ban_remaining(dir.path()).is_none());
     }
 
@@ -586,7 +636,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         save_state(
             dir.path(),
-            &State { session: "key".into(), port: 45678, banned_until: 0 },
+            &State {
+                session: "key".into(),
+                port: 45678,
+                banned_until: 0,
+            },
         );
         let st = load_state(dir.path());
         assert_eq!((st.session.as_str(), st.port), ("key", 45678));
@@ -618,7 +672,11 @@ mod tests {
         }
         let idled = t0 + SUSTAINED_SPACING * 100;
         for _ in 0..BURST_PACKETS as u32 {
-            assert_eq!(b.take(idled), Duration::ZERO, "idling should refill the burst");
+            assert_eq!(
+                b.take(idled),
+                Duration::ZERO,
+                "idling should refill the burst"
+            );
         }
         assert!(b.take(idled) > Duration::ZERO, "but never beyond it");
     }

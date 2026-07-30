@@ -47,7 +47,11 @@ impl Enrollments {
     pub fn new(ttl: Duration) -> Self {
         // ponytail: fixed cap; per-source rate limiting arrives with the
         // network listener (SEC-3 logs/limits are transport concerns).
-        Self { pending: Vec::new(), ttl, max_pending: 32 }
+        Self {
+            pending: Vec::new(),
+            ttl,
+            max_pending: 32,
+        }
     }
 
     /// Store a submitted CSR as pending (SEC-3: never auto-signed).
@@ -56,7 +60,11 @@ impl Enrollments {
         let (module_type, module_id, name) =
             parse_identity(&csr_der).ok_or(EnrollError::InvalidCsr)?;
         let csr_fingerprint = cert_fingerprint(&csr_der);
-        if self.pending.iter().any(|p| p.csr_fingerprint == csr_fingerprint) {
+        if self
+            .pending
+            .iter()
+            .any(|p| p.csr_fingerprint == csr_fingerprint)
+        {
             return Err(EnrollError::Duplicate);
         }
         if self.pending.len() >= self.max_pending {
@@ -78,7 +86,11 @@ impl Enrollments {
     /// bundle for the satellite. No match → error, nothing signed (SEC-3).
     pub fn approve(&mut self, code: &str, ca: &HubCa, validity_days: u32) -> Result<Approved> {
         self.expire();
-        let idx = match self.pending.iter().position(|p| code_matches(code, &p.csr_der)) {
+        let idx = match self
+            .pending
+            .iter()
+            .position(|p| code_matches(code, &p.csr_der))
+        {
             Some(idx) => idx,
             None => {
                 // §7.2: a code the admin can't confirm marks the pending CSR
@@ -168,8 +180,14 @@ mod tests {
         let code = enrollment_code(&bundle.csr_der);
 
         let p = e.submit(bundle.csr_der.clone()).unwrap();
-        assert_eq!((p.module_type.as_str(), p.module_id.as_str(), p.name.as_str()),
-                   ("mediahost", "01H", "nas"));
+        assert_eq!(
+            (
+                p.module_type.as_str(),
+                p.module_id.as_str(),
+                p.name.as_str()
+            ),
+            ("mediahost", "01H", "nas")
+        );
 
         let approved = e.approve(&code, &ca, 90).unwrap();
         assert!(approved.signed.cert_pem.contains("BEGIN CERTIFICATE"));
@@ -190,10 +208,16 @@ mod tests {
     fn wrong_code_with_multiple_pending_removes_nothing() {
         let (_d, ca) = ca();
         let mut e = Enrollments::new(Duration::from_secs(900));
-        e.submit(new_satellite_csr("mediahost", "01A", "a").unwrap().csr_der).unwrap();
-        e.submit(new_satellite_csr("mediahost", "01B", "b").unwrap().csr_der).unwrap();
+        e.submit(new_satellite_csr("mediahost", "01A", "a").unwrap().csr_der)
+            .unwrap();
+        e.submit(new_satellite_csr("mediahost", "01B", "b").unwrap().csr_der)
+            .unwrap();
         assert!(e.approve("AAAA-AAAA", &ca, 90).is_err());
-        assert_eq!(e.list().len(), 2, "a typo must not nuke unrelated enrollments");
+        assert_eq!(
+            e.list().len(),
+            2,
+            "a typo must not nuke unrelated enrollments"
+        );
     }
 
     #[test]
@@ -212,11 +236,17 @@ mod tests {
     fn rejects_foreign_and_duplicate_csrs() {
         let (_d, _ca) = ca();
         let mut e = Enrollments::new(Duration::from_secs(900));
-        assert_eq!(e.submit(b"garbage".to_vec()).unwrap_err(), EnrollError::InvalidCsr);
+        assert_eq!(
+            e.submit(b"garbage".to_vec()).unwrap_err(),
+            EnrollError::InvalidCsr
+        );
 
         let bundle = new_satellite_csr("mediahost", "01H", "nas").unwrap();
         e.submit(bundle.csr_der.clone()).unwrap();
-        assert_eq!(e.submit(bundle.csr_der).unwrap_err(), EnrollError::Duplicate);
+        assert_eq!(
+            e.submit(bundle.csr_der).unwrap_err(),
+            EnrollError::Duplicate
+        );
     }
 
     #[test]

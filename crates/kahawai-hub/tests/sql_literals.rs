@@ -104,13 +104,24 @@ async fn every_sql_literal_parses_against_the_schema() {
             checked += 1;
             // Preparing is enough: it resolves every table and column
             // without touching a row.
-            if let Err(e) = db.prepare(sqlx::AssertSqlSafe(lit.clone()).into_sql_str()).await {
+            if let Err(e) = db
+                .prepare(sqlx::AssertSqlSafe(lit.clone()).into_sql_str())
+                .await
+            {
                 let name = path.file_name().unwrap().to_string_lossy().to_string();
                 broken.push(format!("{name}:{line}: {e}"));
             }
         }
     }
 
-    assert!(checked > 50, "found only {checked} statements — the scanner stopped working");
-    assert!(broken.is_empty(), "{} unparseable statements:\n{}", broken.len(), broken.join("\n"));
+    assert!(
+        checked > 50,
+        "found only {checked} statements — the scanner stopped working"
+    );
+    assert!(
+        broken.is_empty(),
+        "{} unparseable statements:\n{}",
+        broken.len(),
+        broken.join("\n")
+    );
 }

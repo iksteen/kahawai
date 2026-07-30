@@ -21,8 +21,21 @@ pub struct MovieGuess {
 /// so "(Director's Cut)" and a bare year survive.
 pub fn strip_release_tags(name: &str) -> String {
     const TAGS: &[&str] = &[
-        "dual", "audio", "dub", "dubbed", "sub", "subbed", "subs", "eng", "uncut",
-        "ova", "ona", "remaster", "remastered", "batch", "uncensored",
+        "dual",
+        "audio",
+        "dub",
+        "dubbed",
+        "sub",
+        "subbed",
+        "subs",
+        "eng",
+        "uncut",
+        "ova",
+        "ona",
+        "remaster",
+        "remastered",
+        "batch",
+        "uncensored",
     ];
     let mut out = name.trim_end().to_string();
     while let Some(open) = out.rfind('(') {
@@ -186,7 +199,10 @@ pub fn parse_music(path_rel: &str) -> Option<MusicGuess> {
         return None;
     }
     let artist = if artist_dir.is_empty() {
-        segs.first().map(|s| s.trim()).filter(|s| !s.is_empty())?.to_string()
+        segs.first()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())?
+            .to_string()
     } else {
         artist_dir.trim().to_string()
     };
@@ -311,9 +327,7 @@ pub fn parse_anime(path_rel: &str) -> Option<EpisodeGuess> {
         match c {
             '[' | '(' => depth += 1,
             ']' | ')' => depth = depth.saturating_sub(1),
-            _ if depth == 0 => {
-                cleaned.push(if matches!(c, '.' | '_') { ' ' } else { c })
-            }
+            _ if depth == 0 => cleaned.push(if matches!(c, '.' | '_') { ' ' } else { c }),
             _ => {}
         }
     }
@@ -425,32 +439,33 @@ pub fn parse_anime(path_rel: &str) -> Option<EpisodeGuess> {
         // "[Grp] Show - 05 Special Training" is episode 5.
         (_, Some((i, band, index, consumed, span)))
             if consumed.is_some()
-                || tokens[i].chars().next_back().is_some_and(|c| c.is_ascii_digit()) =>
+                || tokens[i]
+                    .chars()
+                    .next_back()
+                    .is_some_and(|c| c.is_ascii_digit()) =>
         {
-            {
-                let b = band?;
-                let title = if i == 0 {
-                    top_dir(path_rel).unwrap_or("Unknown Show").to_string()
+            let b = band?;
+            let title = if i == 0 {
+                top_dir(path_rel).unwrap_or("Unknown Show").to_string()
+            } else {
+                tokens[..i].join(" ")
+            };
+            let show_guess = match top_dir(path_rel) {
+                Some(top) => parse_movie(top),
+                None => parse_movie(&title),
+            };
+            return Some(EpisodeGuess {
+                show_title: if show_guess.title.is_empty() {
+                    title
                 } else {
-                    tokens[..i].join(" ")
-                };
-                let show_guess = match top_dir(path_rel) {
-                    Some(top) => parse_movie(top),
-                    None => parse_movie(&title),
-                };
-                return Some(EpisodeGuess {
-                    show_title: if show_guess.title.is_empty() {
-                        title
-                    } else {
-                        show_guess.title
-                    },
-                    show_year: show_guess.year,
-                    season: Some(0),
-                    episode: b + index,
-                    episode_end: span.map(|s| b + s),
-                    episode_title: None,
-                });
-            }
+                    show_guess.title
+                },
+                show_year: show_guess.year,
+                season: Some(0),
+                episode: b + index,
+                episode_end: span.map(|s| b + s),
+                episode_title: None,
+            });
         }
         (Some(triple), _) => triple,
         // MOVIE: not an episode of anything. Bail out entirely so the
@@ -468,7 +483,11 @@ pub fn parse_anime(path_rel: &str) -> Option<EpisodeGuess> {
                 None => parse_movie(&title),
             };
             return Some(EpisodeGuess {
-                show_title: if show_guess.title.is_empty() { title } else { show_guess.title },
+                show_title: if show_guess.title.is_empty() {
+                    title
+                } else {
+                    show_guess.title
+                },
                 show_year: show_guess.year,
                 // The same season-0 bands the hash binder uses; if AniDB
                 // knows the file, the hash refines the slot later.
@@ -491,7 +510,11 @@ pub fn parse_anime(path_rel: &str) -> Option<EpisodeGuess> {
     };
     let ep_title = tokens[idx + 1..].join(" ");
     Some(EpisodeGuess {
-        show_title: if show_guess.title.is_empty() { title } else { show_guess.title },
+        show_title: if show_guess.title.is_empty() {
+            title
+        } else {
+            show_guess.title
+        },
         show_year: show_guess.year,
         season: None, // absolute numbering is authoritative
         episode,
@@ -518,8 +541,19 @@ fn num_range(t: &str) -> Option<(u32, u32)> {
 /// Uppercase roman numerals I..XIII — the range fansub packs use.
 fn roman(t: &str) -> Option<u32> {
     Some(match t {
-        "I" => 1, "II" => 2, "III" => 3, "IV" => 4, "V" => 5, "VI" => 6, "VII" => 7,
-        "VIII" => 8, "IX" => 9, "X" => 10, "XI" => 11, "XII" => 12, "XIII" => 13,
+        "I" => 1,
+        "II" => 2,
+        "III" => 3,
+        "IV" => 4,
+        "V" => 5,
+        "VI" => 6,
+        "VII" => 7,
+        "VIII" => 8,
+        "IX" => 9,
+        "X" => 10,
+        "XI" => 11,
+        "XII" => 12,
+        "XIII" => 13,
         _ => return None,
     })
 }
@@ -553,7 +587,9 @@ fn parse_sxxeyy(tok: &str) -> Option<(u32, u32, Option<u32>)> {
 
 fn is_season_dir(dir: &str) -> bool {
     let d = dir.to_ascii_lowercase();
-    d.starts_with("season") || d.starts_with("staffel") || d.starts_with("series ")
+    d.starts_with("season")
+        || d.starts_with("staffel")
+        || d.starts_with("series ")
         || d.trim().parse::<u32>().is_ok()
         || d.starts_with("specials")
 }
@@ -628,15 +664,37 @@ mod tests {
         let cases = [
             (
                 "Andor/Season 1/Star Wars - Andor - S01E02 - That Would Be Me.mkv",
-                "Andor", None, 1, 2, Some("That Would Be Me"),
+                "Andor",
+                None,
+                1,
+                2,
+                Some("That Would Be Me"),
             ),
             (
                 "The Wire (2002)/Season 3/The.Wire.S03E11.Middle.Ground.720p.mkv",
-                "The Wire", Some(2002), 3, 11, Some("Middle Ground 720p"),
+                "The Wire",
+                Some(2002),
+                3,
+                11,
+                Some("Middle Ground 720p"),
             ),
             ("Alphas/alphas s02e05.mkv", "Alphas", None, 2, 5, None),
-            ("Show/Specials/Show - S00E01 - Pilot.mkv", "Show", None, 0, 1, Some("Pilot")),
-            ("Lost/Season 1/Lost - S01E01E02 - Pilot.mkv", "Lost", None, 1, 1, Some("Pilot")),
+            (
+                "Show/Specials/Show - S00E01 - Pilot.mkv",
+                "Show",
+                None,
+                0,
+                1,
+                Some("Pilot"),
+            ),
+            (
+                "Lost/Season 1/Lost - S01E01E02 - Pilot.mkv",
+                "Lost",
+                None,
+                1,
+                1,
+                Some("Pilot"),
+            ),
         ];
         for (path, show, year, s, e, ep_title) in cases {
             let g = parse_episode(path).unwrap_or_else(|| panic!("no parse: {path}"));
@@ -688,27 +746,45 @@ mod tests {
         let cases: &[(&str, &str, Option<u16>, Option<u32>, u32)] = &[
             (
                 "Ao No Exorcist/Ao no Exorcist (720p, BluRay) [Coalgirls]/[Coalgirls]_Ao_no_Exorcist_11_(1280x720_Blu-Ray_FLAC)_[865A19CF].mkv",
-                "Ao No Exorcist", None, None, 11,
+                "Ao No Exorcist",
+                None,
+                None,
+                11,
             ),
             (
                 "Dragon Ball Super/[AnimeRG] Dragon Ball Super - 001 [720p] [x264] [pseudo].mkv",
-                "Dragon Ball Super", None, None, 1,
+                "Dragon Ball Super",
+                None,
+                None,
+                1,
             ),
             (
                 "Hellsing Ultimate/[CBM]_Hellsing_Ultimate_-_01_-_[1080p-AC3]_[7B4A1D84].mkv",
-                "Hellsing Ultimate", None, None, 1,
+                "Hellsing Ultimate",
+                None,
+                None,
+                1,
             ),
             (
                 "Pokemon/Season 01/Pokemon 01x01 Pokemon! I Choose You!.mkv",
-                "Pokemon", None, Some(1), 1,
+                "Pokemon",
+                None,
+                Some(1),
+                1,
             ),
             (
                 "Rozen Maiden (2013)/Rozen Maiden (2013) - S01E01 - Alice Game.mkv",
-                "Rozen Maiden", Some(2013), Some(1), 1,
+                "Rozen Maiden",
+                Some(2013),
+                Some(1),
+                1,
             ),
             (
                 "Serial Experiments Lain/Serial.Experiments.Lain.E01.1080p.Bluray.AV1.Opus.DualAudio-AeTHER.mkv",
-                "Serial Experiments Lain", None, None, 1,
+                "Serial Experiments Lain",
+                None,
+                None,
+                1,
             ),
             // Episode version markers.
             ("Show/[Grp] Show - 05v2 [720p].mkv", "Show", None, None, 5),
@@ -726,11 +802,23 @@ mod tests {
     fn parses_common_shapes() {
         let cases = [
             ("Heat (1995).mkv", "Heat", Some(1995)),
-            ("The.Matrix.1999.1080p.BluRay.x264-GRP.mkv", "The Matrix", Some(1999)),
+            (
+                "The.Matrix.1999.1080p.BluRay.x264-GRP.mkv",
+                "The Matrix",
+                Some(1999),
+            ),
             ("Moana 2 (2024).mkv", "Moana 2", Some(2024)),
-            ("2001 A Space Odyssey (1968).mkv", "2001 A Space Odyssey", Some(1968)),
+            (
+                "2001 A Space Odyssey (1968).mkv",
+                "2001 A Space Odyssey",
+                Some(1968),
+            ),
             ("Primer.mkv", "Primer", None),
-            ("Blade_Runner_[1982]_Final_Cut.mkv", "Blade Runner", Some(1982)),
+            (
+                "Blade_Runner_[1982]_Final_Cut.mkv",
+                "Blade Runner",
+                Some(1982),
+            ),
         ];
         for (input, title, year) in cases {
             let g = parse_movie(input);
@@ -759,8 +847,9 @@ mod tests {
         // Real extensions still strip.
         assert_eq!(parse_movie("Mr. Brooks (2007).mkv").title, "Mr Brooks");
         // Episode paths pick up the full show name.
-        let g = parse_episode("Mr. Robot/Season 01/Mr. Robot - S01E01 - eps1.0_hellofriend.mov.mp4")
-            .unwrap();
+        let g =
+            parse_episode("Mr. Robot/Season 01/Mr. Robot - S01E01 - eps1.0_hellofriend.mov.mp4")
+                .unwrap();
         assert_eq!(g.show_title, "Mr Robot");
         assert_eq!((g.season, g.episode), (Some(1), 1));
     }
@@ -768,11 +857,17 @@ mod tests {
     #[test]
     fn parses_multipart_movies() {
         let g = parse_movie("12 Monkeys - CD1.avi");
-        assert_eq!((g.title.as_str(), g.year, g.part), ("12 Monkeys", None, Some(1)));
+        assert_eq!(
+            (g.title.as_str(), g.year, g.part),
+            ("12 Monkeys", None, Some(1))
+        );
         let g = parse_movie("300 - CD2.avi");
         assert_eq!((g.title.as_str(), g.part), ("300", Some(2)));
         let g = parse_movie("Alexander.2004.Disc 2.DVDRip.avi");
-        assert_eq!((g.title.as_str(), g.year, g.part), ("Alexander", Some(2004), Some(2)));
+        assert_eq!(
+            (g.title.as_str(), g.year, g.part),
+            ("Alexander", Some(2004), Some(2))
+        );
         // "Part N" is a TITLE, never a part marker.
         let g = parse_movie("Harry Potter and the Deathly Hallows Part 2 (2011).mkv");
         assert_eq!(g.part, None);
@@ -818,18 +913,42 @@ mod tests {
     fn release_revision_reads_tags_not_titles() {
         use super::release_revision as rev;
         // The real corrected releases in the live collection.
-        assert_eq!(rev("Avengers.Infinity.War.2018.BDRip.1080p.PROPER.X265.Ac3-GANJAMAN.mkv"), 2);
-        assert_eq!(rev("Captain.America.Civil.War.2016.PROPER.REMASTERED.1080p.BluRay.x265.mp4"), 2);
-        assert_eq!(rev("Kingsman.The.Golden.Circle.2017.REPACK.1080p.BluRay.DD.7.1.X265-Ralphy.mkv"), 2);
+        assert_eq!(
+            rev("Avengers.Infinity.War.2018.BDRip.1080p.PROPER.X265.Ac3-GANJAMAN.mkv"),
+            2
+        );
+        assert_eq!(
+            rev("Captain.America.Civil.War.2016.PROPER.REMASTERED.1080p.BluRay.x265.mp4"),
+            2
+        );
+        assert_eq!(
+            rev("Kingsman.The.Golden.Circle.2017.REPACK.1080p.BluRay.DD.7.1.X265-Ralphy.mkv"),
+            2
+        );
         assert_eq!(rev("Obsession.[2026].[1080p.BluRay.x265].[REPACK].mkv"), 2);
-        assert_eq!(rev("The.Chronicles.of.Riddick.Dark.Fury.2004.Repack.1080p.BRRip.mkv"), 2);
+        assert_eq!(
+            rev("The.Chronicles.of.Riddick.Dark.Fury.2004.Repack.1080p.BRRip.mkv"),
+            2
+        );
         assert_eq!(rev("Mr.Robot.S02E06.PROPER.HDTV.x264-KILLERS[ettv].mkv"), 2);
         // Titles that merely contain the words — every one from the same
         // collection, every one a plain release.
-        assert_eq!(rev("The Boys (2019) - S02E02 - Proper Preparation and Planning (1080p).mkv"), 1);
-        assert_eq!(rev("Atypical - S01E08 - The Silencing Properties of Snow.mkv"), 1);
-        assert_eq!(rev("Silicon Valley - S04E03 - Intellectual Property.mkv"), 1);
-        assert_eq!(rev("Republica - Republica - 12 - Out of This World (Proper Night Out mix).flac"), 1);
+        assert_eq!(
+            rev("The Boys (2019) - S02E02 - Proper Preparation and Planning (1080p).mkv"),
+            1
+        );
+        assert_eq!(
+            rev("Atypical - S01E08 - The Silencing Properties of Snow.mkv"),
+            1
+        );
+        assert_eq!(
+            rev("Silicon Valley - S04E03 - Intellectual Property.mkv"),
+            1
+        );
+        assert_eq!(
+            rev("Republica - Republica - 12 - Out of This World (Proper Night Out mix).flac"),
+            1
+        );
         assert_eq!(rev("Judas Priest - Turbo - 03 - Private Property.flac"), 1);
         // Anime versions, attached to the episode number.
         assert_eq!(rev("[Grp] Show - 05v2 [720p][A1B2C3D4].mkv"), 2);
@@ -863,9 +982,15 @@ mod tests {
         );
         // A designator with an explicit index beats a title number; the
         // real thing, from a borrowed collection.
-        assert_eq!(slot("X/Cyber City Oedo 808 Ova 02 The Decoy Program.mkv"), Some((Some(0), 2)));
+        assert_eq!(
+            slot("X/Cyber City Oedo 808 Ova 02 The Decoy Program.mkv"),
+            Some((Some(0), 2))
+        );
         // An indexless designator AFTER a real episode number loses.
-        assert_eq!(slot("Macross Plus (Dual-Audio)/Mcross + - 02 - OVA.mkv"), Some((None, 2)));
+        assert_eq!(
+            slot("Macross Plus (Dual-Audio)/Mcross + - 02 - OVA.mkv"),
+            Some((None, 2))
+        );
         // Roman-numbered OVA packs, from a borrowed collection where all
         // four Hellsings piled onto slot 1.
         assert_eq!(slot("X/Hellsing Ultimate OVA I.mkv"), Some((Some(0), 1)));
@@ -874,15 +999,25 @@ mod tests {
         assert_eq!(slot("[Grp] Show - OVA [720p].mkv"), Some((Some(0), 1)));
         assert_eq!(slot("[Grp] Show - OVA 2 [720p].mkv"), Some((Some(0), 2)));
         assert_eq!(slot("[Grp] Show - SP03.mkv"), Some((Some(0), 3)));
-        assert_eq!(slot("Show/Specials/Show - Special 2.mkv"), Some((Some(0), 2)));
+        assert_eq!(
+            slot("Show/Specials/Show - Special 2.mkv"),
+            Some((Some(0), 2))
+        );
         // A real episode number outranks a designator in the title.
-        assert_eq!(slot("[Grp] Show - 05 Special Training.mkv"), Some((None, 5)));
+        assert_eq!(
+            slot("[Grp] Show - 05 Special Training.mkv"),
+            Some((None, 5))
+        );
         // SxxEyy names never reach the fansub branch at all — the shield
         // for the live collection's episode titles.
-        assert_eq!(slot("Pokemon/Season 04/Pokemon 04x23 Houndoom's Special Delivery.mkv"),
-                   Some((Some(4), 23)));
-        assert_eq!(slot("Pokemon/Season 14/Pokemon 14x40 Zorua The Movie! Legend.mkv"),
-                   Some((Some(14), 40)));
+        assert_eq!(
+            slot("Pokemon/Season 04/Pokemon 04x23 Houndoom's Special Delivery.mkv"),
+            Some((Some(4), 23))
+        );
+        assert_eq!(
+            slot("Pokemon/Season 14/Pokemon 14x40 Zorua The Movie! Legend.mkv"),
+            Some((Some(14), 40))
+        );
         // MOVIE bails out to the movie/hash path rather than inventing
         // an episode from a stray number.
         assert_eq!(slot("[Grp] Show - Movie 2 [1080p].mkv"), None);
@@ -900,13 +1035,25 @@ mod tests {
         assert_eq!(strip("Hellsing Ultimate (Dual-Audio)"), "Hellsing Ultimate");
         assert_eq!(strip("8 Man After (Eng.-Dub)"), "8 Man After");
         assert_eq!(strip("Mezzo Forte (Uncut) (Dual Audio)"), "Mezzo Forte");
-        assert_eq!(strip("BALDR FORCE EXE Resolution (OVA)"), "BALDR FORCE EXE Resolution");
+        assert_eq!(
+            strip("BALDR FORCE EXE Resolution (OVA)"),
+            "BALDR FORCE EXE Resolution"
+        );
         // Not release-speak: kept.
-        assert_eq!(strip("Blade Runner (Director's Cut)"), "Blade Runner (Director's Cut)");
+        assert_eq!(
+            strip("Blade Runner (Director's Cut)"),
+            "Blade Runner (Director's Cut)"
+        );
         assert_eq!(strip("Fate/stay night (2014)"), "Fate/stay night (2014)");
         assert_eq!(strip("Akira"), "Akira");
         // And the parse itself now sheds the tag from a directory name.
-        assert_eq!(super::parse_movie("1001 Nights (Dual-Audio)").title, "1001 Nights");
-        assert_eq!(super::parse_movie("Armitage Dual Matrix [2002] (Dual-Audio)").year, Some(2002));
+        assert_eq!(
+            super::parse_movie("1001 Nights (Dual-Audio)").title,
+            "1001 Nights"
+        );
+        assert_eq!(
+            super::parse_movie("Armitage Dual Matrix [2002] (Dual-Audio)").year,
+            Some(2002)
+        );
     }
 }

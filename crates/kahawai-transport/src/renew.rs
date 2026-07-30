@@ -9,8 +9,8 @@ use std::time::SystemTime;
 
 use anyhow::{Context, Result};
 use kahawai_core::pki::new_satellite_csr;
-use kahawai_proto::v1::renewal_client::RenewalClient;
 use kahawai_proto::v1::RenewRequest;
+use kahawai_proto::v1::renewal_client::RenewalClient;
 
 use crate::identity::{self, SatelliteIdentity};
 
@@ -52,7 +52,9 @@ pub async fn maybe_renew(
     let tls = crate::mtls::mtls_client_config(&id)?;
     let channel = crate::tls::grpc_channel_with(hub_addr, tls).await?;
     let resp = RenewalClient::new(channel)
-        .renew(RenewRequest { csr_der: bundle.csr_der })
+        .renew(RenewRequest {
+            csr_der: bundle.csr_der,
+        })
         .await
         .context("renewal request")?
         .into_inner();

@@ -9,11 +9,11 @@
 use std::path::Path;
 use std::sync::Mutex;
 
-use anyhow::{bail, Context, Result};
-use rand_core::{OsRng, RngCore};
-use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
+use anyhow::{Context, Result, bail};
 use argon2::Argon2;
+use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation};
+use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{Row, SqlitePool};
@@ -137,7 +137,11 @@ pub fn hash_password(password: &str) -> Result<String> {
 
 fn verify_password(password: &str, hash: &str) -> bool {
     PasswordHash::new(hash)
-        .map(|h| Argon2::default().verify_password(password.as_bytes(), &h).is_ok())
+        .map(|h| {
+            Argon2::default()
+                .verify_password(password.as_bytes(), &h)
+                .is_ok()
+        })
         .unwrap_or(false)
 }
 
@@ -171,12 +175,16 @@ impl Auth {
             tracing::info!(pruned, "expired refresh tokens removed");
         }
 
-        let users: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users").fetch_one(&db).await?;
+        let users: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
+            .fetch_one(&db)
+            .await?;
         let setup_token = if users == 0 {
             let raw = random_token(4).to_uppercase();
             let token = format!("{}-{}", &raw[..4], &raw[4..]);
             // OPS-1: printed to the console; gates the one-time setup flow.
-            println!("\n  Setup token: {token}\n  Open the web UI (or POST /api/v1/setup) to create the admin account.\n");
+            println!(
+                "\n  Setup token: {token}\n  Open the web UI (or POST /api/v1/setup) to create the admin account.\n"
+            );
             Some(token)
         } else {
             None
@@ -221,12 +229,14 @@ impl Auth {
         }
         let id = ulid::Ulid::generate().to_string();
         let hash = hash_password(password)?;
-        sqlx::query("INSERT INTO users (id, username, password_hash, is_admin) VALUES (?, ?, ?, 1)")
-            .bind(&id)
-            .bind(username.trim())
-            .bind(&hash)
-            .execute(&self.db)
-            .await?;
+        sqlx::query(
+            "INSERT INTO users (id, username, password_hash, is_admin) VALUES (?, ?, ?, 1)",
+        )
+        .bind(&id)
+        .bind(username.trim())
+        .bind(&hash)
+        .execute(&self.db)
+        .await?;
         *self.setup_token.lock().unwrap() = None;
         tracing::info!(username, "initial admin created; setup complete");
         self.issue_tokens(&id, username.trim(), true).await
@@ -239,28 +249,32 @@ impl Auth {
         }
         let id = ulid::Ulid::generate().to_string();
         let hash = hash_password(password)?;
-        sqlx::query("INSERT INTO users (id, username, password_hash, is_admin) VALUES (?, ?, ?, ?)")
-            .bind(&id)
-            .bind(username.trim())
-            .bind(&hash)
-            .bind(admin)
-            .execute(&self.db)
-            .await
-            .map_err(|e| match e {
-                sqlx::Error::Database(ref db) if db.is_unique_violation() => {
-                    anyhow::anyhow!("username already exists")
-                }
-                e => e.into(),
-            })?;
+        sqlx::query(
+            "INSERT INTO users (id, username, password_hash, is_admin) VALUES (?, ?, ?, ?)",
+        )
+        .bind(&id)
+        .bind(username.trim())
+        .bind(&hash)
+        .bind(admin)
+        .execute(&self.db)
+        .await
+        .map_err(|e| match e {
+            sqlx::Error::Database(ref db) if db.is_unique_violation() => {
+                anyhow::anyhow!("username already exists")
+            }
+            e => e.into(),
+        })?;
         tracing::info!(username, admin, "user created");
         Ok(id)
     }
 
     pub async fn login(&self, username: &str, password: &str) -> Result<TokenPair> {
-        let row = sqlx::query("SELECT id, username, password_hash, is_admin FROM users WHERE username = ?")
-            .bind(username.trim())
-            .fetch_optional(&self.db)
-            .await?;
+        let row = sqlx::query(
+            "SELECT id, username, password_hash, is_admin FROM users WHERE username = ?",
+        )
+        .bind(username.trim())
+        .fetch_optional(&self.db)
+        .await?;
         // Verify against a dummy hash when the user is unknown so timing
         // doesn't reveal account existence.
         static DUMMY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
@@ -273,8 +287,12 @@ impl Auth {
         if !verify_password(password, &hash) {
             bail!("invalid credentials");
         }
-        self.issue_tokens(&row.get::<String, _>("id"), &row.get::<String, _>("username"), row.get::<i64, _>("is_admin") != 0)
-            .await
+        self.issue_tokens(
+            &row.get::<String, _>("id"),
+            &row.get::<String, _>("username"),
+            row.get::<i64, _>("is_admin") != 0,
+        )
+        .await
     }
 
     /// Rotate a refresh token: single use, server-side revocation.
@@ -313,13 +331,19 @@ impl Auth {
         };
         let access_token = jsonwebtoken::encode(&Header::default(), &claims, &self.enc)?;
         let refresh_token = random_token(32);
-        sqlx::query("INSERT INTO refresh_tokens (token_hash, user_id, expires_at) VALUES (?, ?, ?)")
-            .bind(hash_token(&refresh_token))
-            .bind(user_id)
-            .bind(now_unix() + REFRESH_TTL_SECS)
-            .execute(&self.db)
-            .await?;
-        Ok(TokenPair { access_token, refresh_token, expires_in: ACCESS_TTL_SECS })
+        sqlx::query(
+            "INSERT INTO refresh_tokens (token_hash, user_id, expires_at) VALUES (?, ?, ?)",
+        )
+        .bind(hash_token(&refresh_token))
+        .bind(user_id)
+        .bind(now_unix() + REFRESH_TTL_SECS)
+        .execute(&self.db)
+        .await?;
+        Ok(TokenPair {
+            access_token,
+            refresh_token,
+            expires_in: ACCESS_TTL_SECS,
+        })
     }
 
     pub fn verify(&self, bearer: &str) -> Result<Claims> {
