@@ -14,6 +14,8 @@ pub struct SatelliteState {
     pub module_type: String,
     pub name: String,
     pub cert_fingerprint: String,
+    /// The binary's build stamp from its Hello (commit + date).
+    pub build: String,
     pub connected: bool,
     pub last_seen: SystemTime,
 }
@@ -576,18 +578,26 @@ impl Registry {
 
     // ---- runtime connection state ----
 
-    pub fn connected(&self, module_id: &str, module_type: &str, name: &str, fingerprint: &str) {
+    pub fn connected(
+        &self,
+        module_id: &str,
+        module_type: &str,
+        name: &str,
+        fingerprint: &str,
+        build: &str,
+    ) {
         self.connected.lock().unwrap().insert(
             module_id.to_string(),
             SatelliteState {
                 module_type: module_type.to_string(),
                 name: name.to_string(),
                 cert_fingerprint: fingerprint.to_string(),
+                build: build.to_string(),
                 connected: true,
                 last_seen: SystemTime::now(),
             },
         );
-        tracing::info!(%module_id, module_type, name, "satellite connected");
+        tracing::info!(%module_id, module_type, name, build, "satellite connected");
         self.emit(serde_json::json!({
             "kind": "satellite", "module_id": module_id, "connected": true,
         }));
@@ -1618,6 +1628,7 @@ impl Registry {
                     "cert_fingerprint": r.get::<String, _>("cert_fingerprint"),
                     "enrolled_at": r.get::<i64, _>("enrolled_at"),
                     "connected": state.is_some_and(|s| s.connected),
+                    "build": state.map(|s| s.build.as_str()),
                     "capabilities": caps.get(&id),
                     "disabled": self.disabled.lock().unwrap().contains(&id),
                 })

@@ -295,6 +295,8 @@ DELETE /admin/v1/satellites/{id}            # delete = allowlist removal + casca
 
 *Falsifiability.* Any client declaration can be masked from the player (HUB-14), which is the only practical way to reach the branches a real browser never takes — and the mask found a live defect within minutes of existing (a stereo channel ceiling that delivered mono). A capability nobody can force is a capability nobody tests.
 
+*Honest degradation has a channel.* The verdict is computed before the pipeline runs, so anything the pipeline learns afterwards would die in the worker's log — which is exactly how a DTS-HD 7.1 track shipped as an undecodable stream with every log green. Workers therefore report **session facts**: one JSONL line per fact (`kahawai-media::facts`) in the run directory, written the moment a pipeline callback learns something the plan did not know (the AAC layout pin folding 7.1 → 5.1, or finding no encodable layout at all). The supervisor — transcoder and hub run the same worker, so both read the same file — collects them when the playlist goes ready: the transcoder attaches them to `SessionReady` (protocol 2.2), the hub folds them into the per-kind verdict, and the client's `streams.audio` reads `dts → aac (transcoded) · 7.1 → 5.1`. Folding is idempotent because a seek-restart re-learns the same facts. The same Hello that gates the protocol now carries a **build stamp** (commit + date, stamped by `kahawai-core`'s build script), logged at `satellite connected` and surfaced in `/admin/v1/satellites` — "which build is that box running?" was, for one whole evening, answerable only by ssh.
+
 Pure function, exhaustively unit-tested:
 
 ```rust

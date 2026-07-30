@@ -287,6 +287,10 @@ message Hello {
   uint32 protocol_major = 1;
   uint32 protocol_minor = 2;
   string name = 3;
+  // Build stamp of the connecting binary (commit + build time), logged
+  // by the hub so "which build is that box running?" is answerable from
+  // the hub's own log instead of a shell on the satellite.
+  string build = 4;
 }
 
 message HelloAck {
@@ -321,6 +325,20 @@ message TcToHub {
 
 message SessionReady {
   string session_id = 1;
+  // Facts the pipeline learned while prerolling that the negotiation
+  // could not know (AR-13 honest degradation): e.g. the encoder folded
+  // 7.1 to 5.1, discovered only when the decoder's caps arrived. The
+  // hub folds them into the session verdict, so the client is told what
+  // is actually playing rather than what was planned.
+  repeated SessionFact facts = 2;
+}
+
+message SessionFact {
+  // Which verdict this amends: "audio" | "video". Unknown kinds are
+  // surfaced but amend nothing.
+  string kind = 1;
+  // Short human phrase in the decision's terms, e.g. "7.1 → 5.1".
+  string detail = 2;
 }
 
 message SessionError {

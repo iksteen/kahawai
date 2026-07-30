@@ -110,6 +110,7 @@ async fn open_link(
             protocol_major: kahawai_proto::PROTOCOL_MAJOR,
             protocol_minor: kahawai_proto::PROTOCOL_MINOR,
             name: name.into(),
+            build: String::new(),
         })),
     })
     .await
@@ -245,6 +246,7 @@ async fn mediahost_cert_is_refused_on_transcoder_link() {
             protocol_major: kahawai_proto::PROTOCOL_MAJOR,
             protocol_minor: kahawai_proto::PROTOCOL_MINOR,
             name: "nas".into(),
+            build: String::new(),
         })),
     })
     .await

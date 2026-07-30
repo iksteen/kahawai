@@ -487,6 +487,7 @@ async fn link_once(
             protocol_major: PROTOCOL_MAJOR,
             protocol_minor: PROTOCOL_MINOR,
             name: name.to_string(),
+            build: kahawai_core::build_stamp().into(),
         })),
     })
     .await

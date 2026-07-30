@@ -686,6 +686,7 @@ fn plumb_parsed_pad(
             gate,
             burn,
             burn_start_ms,
+            subs_dir,
         );
         return;
     }
@@ -694,6 +695,7 @@ fn plumb_parsed_pad(
     let waiting = waiting.clone();
     let gate = gate.clone();
     let burn = burn.clone();
+    let facts_dir = subs_dir.to_path_buf();
     qsrc.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |qpad, info| {
         if let Some(gst::PadProbeData::Event(ev)) = &info.data
             && let gst::EventView::Caps(c) = ev.view()
@@ -708,6 +710,7 @@ fn plumb_parsed_pad(
                 &gate,
                 &burn,
                 burn_start_ms,
+                &facts_dir,
             );
         }
         gst::PadProbeReturn::Ok
@@ -944,6 +947,7 @@ fn route_stream(
     gate: &Option<Arc<SeekGate>>,
     burn: &Option<std::sync::Arc<crate::burnin::Timeline>>,
     burn_start_ms: u64,
+    facts_dir: &std::path::Path,
 ) {
     let caps_name = caps
         .structure(0)
@@ -972,7 +976,15 @@ fn route_stream(
                     burn_start_ms,
                 );
             } else {
-                build_audio_encode_chain(pipe, from, sinkpad, &caps_name, gate, plan.max_channels);
+                build_audio_encode_chain(
+                    pipe,
+                    from,
+                    sinkpad,
+                    &caps_name,
+                    gate,
+                    plan.max_channels,
+                    facts_dir,
+                );
             }
             return;
         }
@@ -1528,6 +1540,17 @@ fn dry_run_yields_output(launch: &str) -> bool {
     eos && count.load(std::sync::atomic::Ordering::Relaxed) > 0
 }
 
+/// Channel count as the phrase a viewer knows it by.
+fn layout_label(channels: u32) -> String {
+    match channels {
+        1 => "mono".into(),
+        2 => "stereo".into(),
+        6 => "5.1".into(),
+        8 => "7.1".into(),
+        n => format!("{n}ch"),
+    }
+}
+
 /// The layout to pin on the encoder's input for a decoded stream of
 /// `channels`/`mask`, never above `ceiling` (the client's, HUB-15).
 ///
@@ -1573,9 +1596,16 @@ fn aac_input_layout(
 /// Pin the encoder's input layout from the decoded caps, on the caps
 /// event that precedes the first buffer — i.e. before the encoder
 /// negotiates, which is the whole point (see [`aac_accepts`]).
-fn install_layout_pin(pad: &gst::Pad, filter: &gst::Element, ceiling: Option<u32>, enc: &str) {
+fn install_layout_pin(
+    pad: &gst::Pad,
+    filter: &gst::Element,
+    ceiling: Option<u32>,
+    enc: &str,
+    facts_dir: &std::path::Path,
+) {
     let filter = filter.clone();
     let enc = enc.to_string();
+    let facts_dir = facts_dir.to_path_buf();
     pad.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |_, info| {
         let Some(gst::PadProbeData::Event(ev)) = &info.data else {
             return gst::PadProbeReturn::Ok;
@@ -1611,13 +1641,28 @@ fn install_layout_pin(pad: &gst::Pad, filter: &gst::Element, ceiling: Option<u32
                     encoder = %enc,
                     "AAC input layout pinned"
                 );
+                // A fold is a fact the verdict promised nothing about.
+                if n != channels {
+                    crate::facts::report(
+                        &facts_dir,
+                        "audio",
+                        format!("{} → {}", layout_label(channels), layout_label(n)),
+                    );
+                }
             }
-            None => tracing::warn!(
-                channels,
-                mask = format!("0x{mask:x}"),
-                encoder = %enc,
-                "no AAC input layout accepted; leaving negotiation to the encoder"
-            ),
+            None => {
+                tracing::warn!(
+                    channels,
+                    mask = format!("0x{mask:x}"),
+                    encoder = %enc,
+                    "no AAC input layout accepted; leaving negotiation to the encoder"
+                );
+                crate::facts::report(
+                    &facts_dir,
+                    "audio",
+                    format!("{} has no encodable layout", layout_label(channels)),
+                );
+            }
         }
         gst::PadProbeReturn::Remove
     });
@@ -1630,6 +1675,7 @@ fn build_audio_encode_chain(
     caps_name: &str,
     gate: &Option<Arc<SeekGate>>,
     max_channels: Option<u32>,
+    facts_dir: &std::path::Path,
 ) {
     let Some(enc_name) = aac_encoder() else {
         // Planner guarantees this; guard anyway (fakesink beats a stall).
@@ -1659,6 +1705,7 @@ fn build_audio_encode_chain(
             &[setter, dec],
             gate,
             max_channels,
+            facts_dir,
         );
         return;
     }
@@ -1693,11 +1740,12 @@ fn build_audio_encode_chain(
     let convert_sink = convert.static_pad("sink").unwrap();
     let pin_target = limiter.clone();
     let pin_enc = enc_name.to_string();
+    let pin_dir = facts_dir.to_path_buf();
     decode.connect_pad_added(move |_, pad| {
         if convert_sink.is_linked() {
             return; // first decoded stream wins
         }
-        install_layout_pin(pad, &pin_target, max_channels, &pin_enc);
+        install_layout_pin(pad, &pin_target, max_channels, &pin_enc, &pin_dir);
         if let Err(e) = pad.link(&convert_sink) {
             tracing::warn!(error = %e, "remux: decodebin → encode chain link failed");
         }
@@ -1711,6 +1759,7 @@ fn build_audio_encode_chain(
 /// front elements → audioconvert → audioresample → encoder → aacparse →
 /// muxer pad. Used when the decoder must be chosen explicitly instead of
 /// trusting decodebin's caps-based autoplug.
+#[allow(clippy::too_many_arguments)] // internal fan-out point: one call site
 fn build_audio_tail(
     pipe: &gst::Pipeline,
     from: &gst::Pad,
@@ -1719,6 +1768,7 @@ fn build_audio_tail(
     front: &[gst::Element],
     gate: &Option<Arc<SeekGate>>,
     max_channels: Option<u32>,
+    facts_dir: &std::path::Path,
 ) {
     let convert = gst::ElementFactory::make("audioconvert").build().unwrap();
     let limiter = gst::ElementFactory::make("capsfilter").build().unwrap();
@@ -1730,7 +1780,7 @@ fn build_audio_tail(
     // The explicit decoder's own src pad carries the decoded caps, so the
     // layout is pinned from there instead of a decodebin pad-added.
     if let Some(src) = front.last().and_then(|el| el.static_pad("src")) {
-        install_layout_pin(&src, &limiter, max_channels, enc_name);
+        install_layout_pin(&src, &limiter, max_channels, enc_name, facts_dir);
     }
 
     let mut chain: Vec<&gst::Element> = front.iter().collect();
@@ -3426,6 +3476,18 @@ mod tests {
         assert_eq!(
             seg_info.audio[0].channels, 2,
             "stereo ceiling must produce stereo, not mono"
+        );
+        // The fold is also a session fact (AR-13): the supervisor reads
+        // these at ready and amends the verdict with what actually
+        // happened to the channel count.
+        let facts = crate::facts::read(out.path());
+        assert_eq!(
+            facts,
+            vec![crate::facts::Fact {
+                kind: "audio".into(),
+                detail: "5.1 → stereo".into()
+            }],
+            "the downmix must be reported as a fact"
         );
     }
 

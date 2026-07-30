@@ -3,6 +3,7 @@
 
 pub mod burnin;
 pub mod doctor;
+pub mod facts;
 pub mod imagesubs;
 pub mod negotiate;
 pub mod remux;

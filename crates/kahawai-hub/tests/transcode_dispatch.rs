@@ -127,6 +127,7 @@ async fn dispatches_encode_session_to_transcoder() {
             protocol_major: kahawai_proto::PROTOCOL_MAJOR,
             protocol_minor: kahawai_proto::PROTOCOL_MINOR,
             name: "nas".into(),
+            build: String::new(),
         })),
     })
     .await

@@ -277,6 +277,33 @@ type LocalResolver = std::sync::Arc<dyn Fn(&str, &str) -> Result<std::path::Path
 /// inside the client's own patience.
 const BURN_SETS_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
 
+/// Fold a worker's session facts (AR-13) into the per-kind verdict, so
+/// "dts → aac (transcoded)" becomes "dts → aac (transcoded) · 7.1 → 5.1".
+/// Idempotent — a seek-restart re-learns the same facts and must not
+/// stutter them — and unknown kinds are logged rather than lost.
+fn fold_facts(verdict: &mut Option<(String, String)>, facts: &[kahawai_media::facts::Fact]) {
+    let Some((video, audio)) = verdict.as_mut() else {
+        return;
+    };
+    for f in facts {
+        let slot = match f.kind.as_str() {
+            "audio" => &mut *audio,
+            "video" => &mut *video,
+            other => {
+                tracing::warn!(kind = other, detail = %f.detail, "unroutable session fact");
+                continue;
+            }
+        };
+        if !slot.contains(&f.detail) {
+            slot.push_str(&format!(" · {}", f.detail));
+        }
+    }
+}
+
+/// The transcoder's answer to a dispatch: ready (with the worker's
+/// session facts, AR-13) or an error string.
+type ReadyVerdict = Result<Vec<kahawai_media::facts::Fact>, String>;
+
 /// Leases for every part of one session (with sizes), plus the index
 /// of the part playback started in.
 type PartLeases = (Vec<(Lease, u64)>, usize);
@@ -305,8 +332,9 @@ pub struct Sessions {
     /// each by index. Second element is the starting part's index, so a
     /// seek that stays inside it can reuse these leases.
     tc_leases: Mutex<HashMap<String, PartLeases>>,
-    /// Sessions awaiting the transcoder's ready/error verdict.
-    pending_ready: Mutex<HashMap<String, tokio::sync::oneshot::Sender<Result<(), String>>>>,
+    /// Sessions awaiting the transcoder's ready/error verdict; Ok
+    /// carries the worker's session facts (AR-13).
+    pending_ready: Mutex<HashMap<String, tokio::sync::oneshot::Sender<ReadyVerdict>>>,
     /// In-flight artifact fetches, keyed by (session, name).
     artifact_waiting: Mutex<
         HashMap<(String, String), tokio::sync::mpsc::Sender<kahawai_proto::v1::ArtifactData>>,
@@ -812,7 +840,7 @@ impl Sessions {
                         // TC-6: one retry on the fallback HLS sink — two
                         // library files crash hlssink3 but mux fine on
                         // hlssink2 (upstream fix pending).
-                        if let Err(first) = self
+                        let facts = match self
                             .start_transcode(
                                 registry,
                                 &tc,
@@ -826,30 +854,36 @@ impl Sessions {
                             )
                             .await
                         {
-                            tracing::warn!(session = %id, error = format!("{first:#}"),
-                                "start failed; retrying with fallback sink");
-                            self.start_transcode(
-                                registry,
-                                &tc,
-                                &id,
-                                plan,
-                                self.open_part_leases(registry, &parts, start_idx).await?,
-                                start_idx,
-                                local_ms,
-                                "hlssink2",
-                                sets_bytes.clone(),
-                            )
-                            .await
-                            .with_context(|| format!("first attempt: {first:#}"))?;
-                            chosen_sink = "hlssink2".into();
-                        }
+                            Ok(f) => f,
+                            Err(first) => {
+                                tracing::warn!(session = %id, error = format!("{first:#}"),
+                                    "start failed; retrying with fallback sink");
+                                let f = self
+                                    .start_transcode(
+                                        registry,
+                                        &tc,
+                                        &id,
+                                        plan,
+                                        self.open_part_leases(registry, &parts, start_idx).await?,
+                                        start_idx,
+                                        local_ms,
+                                        "hlssink2",
+                                        sets_bytes.clone(),
+                                    )
+                                    .await
+                                    .with_context(|| format!("first attempt: {first:#}"))?;
+                                chosen_sink = "hlssink2".into();
+                                f
+                            }
+                        };
+                        fold_facts(&mut verdict, &facts);
                         Mode::Transcode {
                             transcoder: Mutex::new(tc),
                         }
                     }
                     None => {
                         let tail = self.open_part_leases(registry, &parts, start_idx).await?;
-                        let runner = match self
+                        let (runner, facts) = match self
                             .start_remux(&id, plan, tail, local_ms, "", burn_sets.as_deref())
                             .await
                         {
@@ -874,6 +908,7 @@ impl Sessions {
                                 r
                             }
                         };
+                        fold_facts(&mut verdict, &facts);
                         Mode::Remux {
                             runner: Mutex::new(runner),
                             dir: self.scratch_root.join(&id),
@@ -961,7 +996,7 @@ impl Sessions {
         sink: &str,
         // HUB-32b: display sets the mediahost walked for us.
         sets: Option<&std::path::Path>,
-    ) -> Result<RemuxRunner> {
+    ) -> Result<(RemuxRunner, Vec<kahawai_media::facts::Fact>)> {
         let dir = self.scratch_root.join(session_id);
         // ALWAYS from a clean dir: a crashed first attempt leaves its
         // socket (EADDRINUSE killed the TC-6 fallback) and a stale
@@ -1126,7 +1161,7 @@ impl Sessions {
                 RemuxRunner::Stopped => unreachable!("start_remux never yields Stopped"),
             }
             if playlist_ready(&playlist) {
-                return Ok(runner);
+                return Ok((runner, kahawai_media::facts::read(&dir)));
             }
             if std::time::Instant::now() > deadline {
                 runner.stop();
@@ -1152,7 +1187,7 @@ impl Sessions {
         // HUB-32b: a dispatched worker can no more walk the source
         // index than the hub can, so the display sets ride along.
         burn_sets: Vec<u8>,
-    ) -> Result<()> {
+    ) -> Result<Vec<kahawai_media::facts::Fact>> {
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         anyhow::ensure!(!parts.is_empty(), "no source parts to dispatch");
         let size = parts[0].1;
@@ -1197,10 +1232,10 @@ impl Sessions {
             return Err(e);
         }
         match tokio::time::timeout(Duration::from_secs(40), ready_rx).await {
-            Ok(Ok(Ok(()))) => {
+            Ok(Ok(Ok(facts))) => {
                 registry.tc_session_started(transcoder);
                 tracing::info!(session = session_id, transcoder, "session dispatched");
-                Ok(())
+                Ok(facts)
             }
             Ok(Ok(Err(e))) => {
                 cleanup(self);
@@ -1261,7 +1296,7 @@ impl Sessions {
     /// Link-facing: the transcoder reported the session ready or failed.
     /// Returns whether a pending start consumed the verdict (false → the
     /// session was already running; the caller may reschedule).
-    pub fn transcode_verdict(&self, session_id: &str, result: Result<(), String>) -> bool {
+    pub fn transcode_verdict(&self, session_id: &str, result: ReadyVerdict) -> bool {
         if let Some(tx) = self.pending_ready.lock().unwrap().remove(session_id) {
             let _ = tx.send(result);
             true
@@ -1589,6 +1624,8 @@ impl Sessions {
                     }
                     Err(e) => return Err(e),
                 };
+                let (fresh, facts) = fresh;
+                fold_facts(&mut session.verdict.lock().unwrap(), &facts);
                 *runner.lock().unwrap() = fresh;
                 Ok(part.base_ms)
             }
@@ -1825,7 +1862,37 @@ impl Sessions {
 
 #[cfg(test)]
 mod tests {
-    use super::{PartSource, part_index};
+    use super::{PartSource, fold_facts, part_index};
+
+    /// Facts amend the verdict by kind, exactly once — a seek-restart
+    /// re-learns the same fold and must not stutter it — and unknown
+    /// kinds change nothing.
+    #[test]
+    fn facts_fold_into_the_verdict_idempotently() {
+        let fact = |kind: &str, detail: &str| kahawai_media::facts::Fact {
+            kind: kind.into(),
+            detail: detail.into(),
+        };
+        let mut verdict = Some((
+            "hevc → h264 (transcoded)".to_string(),
+            "dts → aac (transcoded)".to_string(),
+        ));
+        let facts = vec![
+            fact("audio", "7.1 → 5.1"),
+            fact("video", "tone-map"),
+            fact("weird", "x"),
+        ];
+        fold_facts(&mut verdict, &facts);
+        fold_facts(&mut verdict, &facts); // the seek-restart
+        let (video, audio) = verdict.unwrap();
+        assert_eq!(audio, "dts → aac (transcoded) · 7.1 → 5.1");
+        assert_eq!(video, "hevc → h264 (transcoded) · tone-map");
+
+        // No verdict (direct play) — nothing to amend, no panic.
+        let mut none = None;
+        fold_facts(&mut none, &facts);
+        assert_eq!(none, None);
+    }
 
     fn part(base_ms: u64, duration_ms: u64) -> PartSource {
         PartSource {

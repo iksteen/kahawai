@@ -62,7 +62,13 @@ pub fn local_link(
 ) {
     let (host_tx, mut host_rx) = tokio::sync::mpsc::channel::<HostToHub>(64);
     let (hub_tx, hub_rx) = tokio::sync::mpsc::channel::<Result<HubToHost, Status>>(16);
-    registry.connected(module_id, "mediahost", name, "in-process");
+    registry.connected(
+        module_id,
+        "mediahost",
+        name,
+        "in-process",
+        kahawai_core::build_stamp(),
+    );
     registry.register_link(module_id, hub_tx);
     let module_id = module_id.to_string();
     tokio::spawn(async move {
@@ -125,6 +131,7 @@ impl MediahostLink for MediahostLinkService {
             &peer.module_type,
             &hello.name,
             &peer.fingerprint,
+            &hello.build,
         );
         if let Err(e) = registry.settle_renewal(&module_id, &peer.fingerprint).await {
             tracing::warn!(%module_id, error = format!("{e:#}"), "renewal settlement failed");

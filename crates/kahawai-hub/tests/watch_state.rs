@@ -93,6 +93,7 @@ async fn progress_resume_played_caps_and_idle() {
             protocol_major: kahawai_proto::PROTOCOL_MAJOR,
             protocol_minor: kahawai_proto::PROTOCOL_MINOR,
             name: "nas".into(),
+            build: String::new(),
         })),
     })
     .await

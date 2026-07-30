@@ -78,6 +78,7 @@ impl TranscoderLink for TranscoderLinkService {
             &peer.module_type,
             &hello.name,
             &peer.fingerprint,
+            &hello.build,
         );
         if let Err(e) = registry.settle_renewal(&module_id, &peer.fingerprint).await {
             tracing::warn!(%module_id, error = format!("{e:#}"), "renewal settlement failed");
@@ -140,7 +141,15 @@ impl TranscoderLink for TranscoderLinkService {
                             registry.set_transcoder_caps(&module_id, &caps);
                         }
                         tc_to_hub::Msg::SessionReady(r) => {
-                            sessions.transcode_verdict(&r.session_id, Ok(()));
+                            let facts = r
+                                .facts
+                                .into_iter()
+                                .map(|f| kahawai_media::facts::Fact {
+                                    kind: f.kind,
+                                    detail: f.detail,
+                                })
+                                .collect();
+                            sessions.transcode_verdict(&r.session_id, Ok(facts));
                         }
                         tc_to_hub::Msg::SessionError(e) => {
                             // Pre-ready: fail the pending start. Post-ready

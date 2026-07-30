@@ -40,6 +40,10 @@ How something works and why it was built that way belong in
       (HUB-14) and transcoder inventories (TC-1) are declared and
       dry-run-verified, masks make client declarations falsifiable, and
       version markers are gated at the handshake instead (protocol 2).
+      Honest degradation: workers report preroll facts (facts.jsonl →
+      SessionReady → verdict), so a 7.1→5.1 fold reaches the client
+      instead of only the segment bytes; Hello carries a build stamp so
+      the hub log answers which build each satellite runs (protocol 2.2).
       Missing: mediahosts declare nothing (MH-12), and no declaration
       carries a rate, so a box reporting a filter it runs at 0.65×
       realtime is indistinguishable from one running it at 5× (HUB-36)

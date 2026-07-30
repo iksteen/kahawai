@@ -9,7 +9,9 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
-use kahawai_proto::v1::{ArtifactData, SessionError, SessionReady, TcToHub, tc_to_hub};
+use kahawai_proto::v1::{
+    ArtifactData, SessionError, SessionFact, SessionReady, TcToHub, tc_to_hub,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 
@@ -67,7 +69,6 @@ impl Runner {
     }
 
     #[allow(clippy::too_many_arguments)] // wire-shaped plumbing
-    #[allow(clippy::too_many_arguments)] // wire-shaped plumbing
     pub async fn start(
         self: &Arc<Self>,
         session_id: String,
@@ -98,11 +99,22 @@ impl Runner {
             )
             .await;
         let msg = match result {
-            Ok(()) => {
-                tracing::info!(session = %session_id, "session ready");
+            Ok(dir) => {
+                // What the worker learned during preroll (AR-13): read
+                // once at ready and sent with it, so the hub can fold
+                // the facts into the verdict it is about to answer with.
+                let facts: Vec<SessionFact> = kahawai_media::facts::read(&dir)
+                    .into_iter()
+                    .map(|f| SessionFact {
+                        kind: f.kind,
+                        detail: f.detail,
+                    })
+                    .collect();
+                tracing::info!(session = %session_id, facts = facts.len(), "session ready");
                 TcToHub {
                     msg: Some(tc_to_hub::Msg::SessionReady(SessionReady {
                         session_id: session_id.clone(),
+                        facts,
                     })),
                 }
             }
@@ -120,7 +132,6 @@ impl Runner {
         let _ = self.link.send(msg).await;
     }
 
-    #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)] // wire-shaped plumbing
     async fn start_inner(
         self: &Arc<Self>,
@@ -135,7 +146,7 @@ impl Runner {
         tail_sizes: &[u64],
         (video_kbps, max_height, max_channels, tone_map, burn_subtitle): (u32, u32, u32, bool, u32),
         burn_sets: Vec<u8>,
-    ) -> Result<()> {
+    ) -> Result<PathBuf> {
         // Replace any previous run first (seek-restart reuses the id).
         self.end(session_id).await;
         let run = self
@@ -336,7 +347,7 @@ impl Runner {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
             if ready(&playlist) {
-                return Ok(());
+                return Ok(dir);
             }
             {
                 let mut sessions = self.sessions.lock().unwrap();
@@ -350,7 +361,7 @@ impl Runner {
                             // pipeline that COMPLETED (short content
                             // remuxes faster than this poll).
                             if status.success() && ready(&playlist) {
-                                return Ok(());
+                                return Ok(dir);
                             }
                             let log =
                                 std::fs::read_to_string(dir.join("worker.log")).unwrap_or_default();
@@ -363,7 +374,7 @@ impl Runner {
                         if handle.is_finished() {
                             let detail = err.lock().unwrap().clone();
                             if detail.is_none() && ready(&playlist) {
-                                return Ok(());
+                                return Ok(dir);
                             }
                             let detail = detail.unwrap_or_default();
                             anyhow::bail!("in-process worker exited before the playlist: {detail}");

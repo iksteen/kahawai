@@ -118,6 +118,7 @@ async fn enrolled_mediahost_links_and_disconnect_is_tracked() {
                     protocol_major: kahawai_proto::PROTOCOL_MAJOR,
                     protocol_minor: kahawai_proto::PROTOCOL_MINOR,
                     name: "nas".into(),
+                    build: String::new(),
                 },
             )),
         })
@@ -290,6 +291,7 @@ async fn try_link(addr: &str, id: &SatelliteIdentity) -> Result<(), Box<dyn std:
                     protocol_major: kahawai_proto::PROTOCOL_MAJOR,
                     protocol_minor: kahawai_proto::PROTOCOL_MINOR,
                     name: "probe".into(),
+                    build: String::new(),
                 },
             )),
         })
