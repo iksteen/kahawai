@@ -103,7 +103,7 @@ const MATRIX: &[(&str, &[&str], bool, &str, bool)] = &[
         "E-AC-3 audio cannot be transcoded (silent in browsers) — install gst-libav",
         false,
     ),
-    ("decode dts", &["dcadec", "avdec_dca"], false, "DTS audio cannot be transcoded", false),
+    ("decode dts", &["avdec_dca", "dcadec", "dtsdec"], false, "DTS audio cannot be transcoded", false),
     (
         "decode truehd",
         &["avdec_truehd"],
@@ -174,6 +174,17 @@ pub fn gstreamer_checks() -> Vec<Check> {
         ),
     });
 
+    // The decode-dts row above says whether DTS decodes at all; this one
+    // says WHICH decoder decodebin will pick, because that decides how
+    // much of a DTS-HD track survives. libdca (dtsdec/dcadec) ships at
+    // rank primary and only decodes the lossy 5.1 core — the lossless
+    // XLL extension (and its 7.1) is discarded with nothing in any log.
+    // avdec_dca (rank marginal) decodes all of it. Found live: the same
+    // file came out 5.1-core on the box with libdca and 7.1 on the box
+    // without. Ranks are read AFTER config demotions apply, so a box
+    // fixed via [transcoder] demote_decoders reports ok here.
+    out.push(dts_hd_check());
+
     // TC-1: encoders that will actually run sessions are dry-run-verified,
     // not just present — a broken element (or a hw element without its
     // driver) surfaces here, not mid-session.
@@ -209,6 +220,34 @@ pub fn gstreamer_checks() -> Vec<Check> {
     out
 }
 
+fn dts_hd_check() -> Check {
+    const NAME: &str = "dts-hd full decode";
+    let rank = |name: &str| {
+        gst::ElementFactory::find(name)
+            .filter(|f| f.rank() > gst::Rank::NONE) // rank NONE = out of autoplug
+            .map(|f| f.rank())
+    };
+    let Some(full) = rank("avdec_dca") else {
+        return Check::warn(
+            NAME,
+            "avdec_dca unavailable — DTS-HD sources decode only the lossy 5.1 core \
+             (or not at all); install gst-libav",
+        );
+    };
+    let shadow = ["dtsdec", "dcadec"].iter().find(|n| rank(n) >= Some(full));
+    match shadow {
+        Some(name) => Check::warn(
+            NAME,
+            format!(
+                "{name} (libdca, core-only) outranks avdec_dca — DTS-HD tracks lose \
+                 their lossless extension and decode as lossy 5.1; add \"{name}\" to \
+                 [transcoder] demote_decoders"
+            ),
+        ),
+        None => Check::ok(NAME, "via avdec_dca (core + lossless XLL extension)"),
+    }
+}
+
 /// True if any essential check failed.
 pub fn has_essential_failure(checks: &[Check]) -> bool {
     checks.iter().any(|c| c.status == Status::Fail && c.essential)
@@ -232,6 +271,22 @@ mod tests {
                 assert!(c.detail.contains('—'), "no cost message: {c:?}");
             }
         }
+
+        // The DTS-HD row must answer for THIS box's effective ranks:
+        // ok only when avdec_dca actually wins the autoplug.
+        let dts = checks.iter().find(|c| c.name == "dts-hd full decode").unwrap();
+        let shadowed = ["dtsdec", "dcadec"].iter().any(|n| {
+            gst::ElementFactory::find(n).is_some_and(|f| {
+                f.rank() > gst::Rank::NONE
+                    && gst::ElementFactory::find("avdec_dca")
+                        .is_some_and(|full| f.rank() >= full.rank())
+            })
+        });
+        assert_eq!(
+            dts.status,
+            if shadowed { Status::Warn } else { Status::Ok },
+            "dts-hd check disagrees with the registry: {dts:?}"
+        );
 
         // Fallback rows are OK but recommend the preferred element.
         let hls = checks.iter().find(|c| c.name == "hls sink").unwrap();

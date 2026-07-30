@@ -204,6 +204,10 @@ async fn main() -> Result<()> {
 /// filesystem and clock checks from the loaded config.
 fn doctor_checks(cfg: &config::Config) -> Vec<kahawai_media::doctor::Check> {
     use kahawai_media::doctor::Check;
+    // The workers apply these before building pipelines, so the doctor
+    // must too — otherwise it reports the ranks of a registry no session
+    // actually uses (and flags a shadow the config already demoted).
+    let _ = kahawai_media::demote_elements(&cfg.transcoder.demote_decoders);
     let mut checks = kahawai_media::doctor::gstreamer_checks();
 
     // Clock sanity: satellites on RTC-less boxes boot in the past (OPS-4).
