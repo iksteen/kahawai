@@ -1320,27 +1320,30 @@ fn build_video_encode_chain(
 /// aacparse (raw→ADTS for the TS muxer) → muxer pad. The only decode/
 /// encode work in the hub, and audio-only by design: a few % CPU.
 /// Canonical AAC input layouts, most channels first. `channel-mask` bits
-/// are GStreamer positions: 0x3f = 5.1 (FL FR FC LFE RL RR), 0x63f adds
-/// SL SR (standard 7.1), 0xff instead adds FLC FRC (7.1 "front wide").
-const AAC_LAYOUTS: &[(u32, u64)] = &[(8, 0xff), (8, 0x63f), (6, 0x3f), (2, 0x3), (1, 0x4)];
+/// are GStreamer positions: 0x3f = 5.1 (FL FR FC LFE RL RR), 0xc3f adds
+/// SL SR (standard side-surround 7.1 — what DTS-HD 7.1 decodes to),
+/// 0xff instead adds FLC FRC (7.1 "front wide").
+const AAC_LAYOUTS: &[(u32, u64)] = &[(8, 0xc3f), (8, 0xff), (6, 0x3f), (2, 0x3), (1, 0x4)];
 
-/// Can the AAC encoder carry this layout — measured by ROUND TRIP, once
-/// per layout: encode it, decode it back, and require the channel count
-/// to survive.
+/// Can the AAC encoder carry this layout ALL THE WAY to the client —
+/// measured once per layout by the real tail: encode, mux into MPEG-TS,
+/// demux, decode, and require decoded audio to actually come out.
 ///
-/// Asking only whether the link forms is not enough, and that is the
-/// whole lesson of this bug. The pad template lies (fdkaacenc advertises
-/// `channels={1,2,3,4,5,6,8}` unconditionally, then at 8 accepts only the
-/// front-wide layout and refuses standard side-surround 7.1). Caps it
-/// will not take do not fail the link either: negotiation quietly
-/// fixates on the template's first value and the encode becomes mono.
-/// Worse, the fdk-aac build on macOS TAKES caps it then mis-signals —
-/// a 4.0-labelled stream whose payload is 5.1, "channel element 1.1 is
-/// not allocated" on every frame, undecodable everywhere. A decoder is
-/// the only thing that notices, so the probe carries one.
-///
-/// `mask` None = pin the count only and let the encoder pick positions;
-/// a mis-signalling encoder fails the round trip either way.
+/// Every weaker probe was tried, and each one passed a broken path:
+/// - *Does the link form?* The pad template lies (fdkaacenc advertises
+///   `channels={1,2,3,4,5,6,8}` unconditionally, then refuses standard
+///   side-surround 7.1 caps), and refused caps do not even fail the
+///   link — negotiation fixates on the template's first value and the
+///   encode silently becomes mono.
+/// - *Does a decoder linked directly to the encoder work?* False pass:
+///   the decoder reads the channel config from the caps' codec_data,
+///   which never survives TS. In ADTS there is only a 3-bit config
+///   field, fdk's 8-channel modes are not expressible in it, and the
+///   stream decodes nowhere — "channel element 1.1 is not allocated"
+///   on every frame, on every ffmpeg, on both fleets.
+/// - *EOS-only checking.* Decode failures are per-buffer WARNINGS in
+///   GStreamer; a pipeline whose every frame fails still ends in EOS.
+///   Success is decoded BUFFERS ARRIVING, nothing less.
 fn aac_accepts(enc: &str, channels: u32, mask: Option<u64>) -> bool {
     static SEEN: std::sync::OnceLock<
         std::sync::Mutex<std::collections::HashMap<(u32, Option<u64>), bool>>,
@@ -1349,28 +1352,71 @@ fn aac_accepts(enc: &str, channels: u32, mask: Option<u64>) -> bool {
     if let Some(hit) = seen.lock().unwrap().get(&(channels, mask)) {
         return *hit;
     }
+    // avdec_aac is libav — the same decoder family as ffmpeg and the
+    // browsers, i.e. the strictness that actually matters. Other gst
+    // decoders may share the encoder's dialect and false-pass.
+    const DECODERS: &[&str] = &["avdec_aac", "fdkaacdec", "faad"];
+    let dec = DECODERS.iter().find(|d| gst::ElementFactory::find(d).is_some());
     let want = match mask {
         Some(m) => format!("audio/x-raw,channels={channels},channel-mask=(bitmask)0x{m:x}"),
         None => format!("audio/x-raw,channels={channels}"),
     };
-    // The decoder half is what catches mis-signalling: the capsfilter
-    // after it fails to negotiate when the stream decodes to a different
-    // channel count than went in. Without an AAC decoder on this box the
-    // probe degrades to the link-forms question — better than nothing,
-    // and the platforms we ship to all have libav.
-    let ok = if gst::ElementFactory::find("avdec_aac").is_some() {
-        dry_run(&format!(
+    let ok = match dec {
+        Some(dec) => dry_run_yields_output(&format!(
             "audiotestsrc num-buffers=10 ! audioconvert ! audioresample ! {want} \
-             ! {enc} ! aacparse ! avdec_aac ! audio/x-raw,channels={channels} ! fakesink"
-        ))
-    } else {
-        dry_run(&format!(
-            "audiotestsrc num-buffers=5 ! audioconvert ! audioresample ! {want} ! {enc} ! fakesink"
-        ))
+             ! {enc} ! aacparse ! mpegtsmux ! tsdemux ! aacparse ! {dec} \
+             ! audio/x-raw,channels={channels} ! fakesink name=probesink"
+        )),
+        // No decoder at all: nothing can verify the bitstream, so only
+        // layouts that every known fdk/libav build signals correctly in
+        // ADTS are trusted (5.1 and below).
+        None => {
+            channels <= 6
+                && dry_run(&format!(
+                    "audiotestsrc num-buffers=5 ! audioconvert ! audioresample ! {want} ! {enc} ! fakesink"
+                ))
+        }
     };
     tracing::debug!(encoder = enc, channels, ?mask, accepted = ok, "AAC layout probe");
     seen.lock().unwrap().insert((channels, mask), ok);
     ok
+}
+
+/// [`dry_run`], plus the requirement that at least one buffer reaches the
+/// sink named `probesink` — the difference between "the pipeline ended"
+/// and "the pipeline produced anything" (see [`aac_accepts`]).
+fn dry_run_yields_output(launch: &str) -> bool {
+    let Ok(p) = gst::parse::launch(launch) else {
+        return false;
+    };
+    let Some(pipe) = p.downcast_ref::<gst::Pipeline>() else {
+        return false;
+    };
+    let count = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let Some(sinkpad) =
+        pipe.by_name("probesink").and_then(|s| s.static_pad("sink"))
+    else {
+        return false;
+    };
+    let c = count.clone();
+    sinkpad.add_probe(gst::PadProbeType::BUFFER, move |_, _| {
+        c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        gst::PadProbeReturn::Ok
+    });
+    if p.set_state(gst::State::Playing).is_err() {
+        return false;
+    }
+    let eos = p
+        .bus()
+        .and_then(|bus| {
+            bus.timed_pop_filtered(
+                gst::ClockTime::from_seconds(5),
+                &[gst::MessageType::Eos, gst::MessageType::Error],
+            )
+        })
+        .is_some_and(|msg| msg.type_() == gst::MessageType::Eos);
+    let _ = p.set_state(gst::State::Null);
+    eos && count.load(std::sync::atomic::Ordering::Relaxed) > 0
 }
 
 /// The layout to pin on the encoder's input for a decoded stream of
@@ -3011,14 +3057,14 @@ mod tests {
             eprintln!("skipping: no AAC encoder");
             return;
         };
-        let (n, m) = aac_input_layout(enc, 8, 0x63f, None).expect("no layout accepted for 7.1");
+        let (n, m) = aac_input_layout(enc, 8, 0xc3f, None).expect("no layout accepted for 7.1");
         assert!(aac_accepts(enc, n, m), "chose a layout the encoder cannot round-trip: {n}ch/{m:?}");
         if let Some(m) = m {
-            assert_eq!(m & 0x63f, m, "invented positions the source lacks: 0x{m:x}");
+            assert_eq!(m & 0xc3f, m, "invented positions the source lacks: 0x{m:x}");
         }
         assert!(n >= 6, "7.1 collapsed to {n} channels");
         // The client's ceiling still bounds the choice (HUB-15).
-        let (capped, _) = aac_input_layout(enc, 8, 0x63f, Some(2)).expect("no layout under ceiling");
+        let (capped, _) = aac_input_layout(enc, 8, 0xc3f, Some(2)).expect("no layout under ceiling");
         assert_eq!(capped, 2, "stereo ceiling ignored");
     }
 
