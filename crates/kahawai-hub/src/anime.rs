@@ -160,7 +160,7 @@ fn tmdb_ids<'de, D: serde::Deserializer<'de>>(d: D) -> Result<TmdbIds, D::Error>
     enum V {
         Obj { movie: Option<OneOrMany>, tv: Option<OneOrMany> },
         Bare(u32),
-        Other(serde_json::Value),
+        Other(serde::de::IgnoredAny),
     }
     let first = |v: Option<OneOrMany>| match v {
         Some(OneOrMany::One(n)) => Some(n),

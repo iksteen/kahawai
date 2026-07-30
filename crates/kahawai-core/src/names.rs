@@ -25,8 +25,7 @@ pub fn strip_release_tags(name: &str) -> String {
         "ova", "ona", "remaster", "remastered", "batch", "uncensored",
     ];
     let mut out = name.trim_end().to_string();
-    loop {
-        let Some(open) = out.rfind('(') else { break };
+    while let Some(open) = out.rfind('(') {
         if !out.ends_with(')') {
             break;
         }
@@ -428,31 +427,29 @@ pub fn parse_anime(path_rel: &str) -> Option<EpisodeGuess> {
             if consumed.is_some()
                 || tokens[i].chars().next_back().is_some_and(|c| c.is_ascii_digit()) =>
         {
-            match band {
-                None => return None,
-                Some(b) => {
-                    let title = if i == 0 {
-                        top_dir(path_rel).unwrap_or("Unknown Show").to_string()
+            {
+                let b = band?;
+                let title = if i == 0 {
+                    top_dir(path_rel).unwrap_or("Unknown Show").to_string()
+                } else {
+                    tokens[..i].join(" ")
+                };
+                let show_guess = match top_dir(path_rel) {
+                    Some(top) => parse_movie(top),
+                    None => parse_movie(&title),
+                };
+                return Some(EpisodeGuess {
+                    show_title: if show_guess.title.is_empty() {
+                        title
                     } else {
-                        tokens[..i].join(" ")
-                    };
-                    let show_guess = match top_dir(path_rel) {
-                        Some(top) => parse_movie(top),
-                        None => parse_movie(&title),
-                    };
-                    return Some(EpisodeGuess {
-                        show_title: if show_guess.title.is_empty() {
-                            title
-                        } else {
-                            show_guess.title
-                        },
-                        show_year: show_guess.year,
-                        season: Some(0),
-                        episode: b + index,
-                        episode_end: span.map(|s| b + s),
-                        episode_title: None,
-                    });
-                }
+                        show_guess.title
+                    },
+                    show_year: show_guess.year,
+                    season: Some(0),
+                    episode: b + index,
+                    episode_end: span.map(|s| b + s),
+                    episode_title: None,
+                });
             }
         }
         (Some(triple), _) => triple,

@@ -30,8 +30,9 @@ use crate::remux::RemuxSource;
 struct Entry {
     start_ms: u64,
     end_ms: u64,
+    // Width only: scaling is uniform by width ratio (see compose), so a
+    // canvas height would be dead weight here.
     canvas_w: u32,
-    canvas_h: u32,
     objects: Vec<ImageObject>,
 }
 
@@ -98,7 +99,7 @@ fn build(
         // the decoder answers None until a set is complete.
         let (canvas, objects) = if is_pgs {
             match pgs.feed(payload) {
-                Ok(Some(set)) => ((set.canvas_w, set.canvas_h), set.objects),
+                Ok(Some(set)) => (set.canvas_w, set.objects),
                 _ => continue,
             }
         } else {
@@ -106,7 +107,7 @@ fn build(
                 // No declared size: the coordinates are the frame's own
                 // (scale 1.0 downstream), which is the historical
                 // assumption and right for same-resolution rips.
-                Ok(Some(obj)) => (vob_canvas.unwrap_or((0, 0)), vec![obj]),
+                Ok(Some(obj)) => (vob_canvas.map(|(w, _)| w).unwrap_or(0), vec![obj]),
                 _ => continue,
             }
         };
@@ -116,8 +117,7 @@ fn build(
         entries.push(Entry {
             start_ms: *ms,
             end_ms: dur.map(|d| ms + d).unwrap_or(u64::MAX),
-            canvas_w: canvas.0,
-            canvas_h: canvas.1,
+            canvas_w: canvas,
             objects,
         });
     }
@@ -142,10 +142,14 @@ fn build(
 /// `KBS1` | codec (u16 len + utf8) | codec_private (u32 len + bytes)
 /// then per block: start_ms u64 | duration_ms u64 | len u32 | payload.
 /// All little-endian; duration 0 = undeclared.
+/// One subtitle block as carried in the KBS1 sets file:
+/// (start_ms, duration_ms, codec payload).
+pub type SetBlock = (u64, Option<u64>, Vec<u8>);
+
 pub fn encode_sets(
     codec: &str,
     codec_private: Option<&[u8]>,
-    blocks: &[(u64, Option<u64>, Vec<u8>)],
+    blocks: &[SetBlock],
 ) -> Vec<u8> {
     let mut out = Vec::with_capacity(4096);
     out.extend_from_slice(b"KBS1");
@@ -163,7 +167,7 @@ pub fn encode_sets(
     out
 }
 
-fn decode_sets(data: &[u8]) -> Result<(String, Option<Vec<u8>>, Vec<(u64, Option<u64>, Vec<u8>)>)> {
+fn decode_sets(data: &[u8]) -> Result<(String, Option<Vec<u8>>, Vec<SetBlock>)> {
     let mut p = 0usize;
     fn take<'a>(data: &'a [u8], p: &mut usize, n: usize) -> Result<&'a [u8]> {
         let end = p.checked_add(n).filter(|e| *e <= data.len());

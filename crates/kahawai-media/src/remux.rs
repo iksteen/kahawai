@@ -561,6 +561,7 @@ fn routable(caps_name: &str, plan: &RemuxPlan) -> bool {
     }
 }
 
+#[allow(clippy::too_many_arguments)] // internal fan-out point: one call site
 fn plumb_parsed_pad(
     pipe: &gst::Pipeline,
     waiting: &WaitingPads,
@@ -887,6 +888,7 @@ fn guard_pts(pad: &gst::Pad) {
     });
 }
 
+#[allow(clippy::too_many_arguments)] // internal fan-out point: one call site
 fn route_stream(
     pipe: &gst::Pipeline,
     waiting: &WaitingPads,
@@ -1499,7 +1501,7 @@ fn install_layout_pin(pad: &gst::Pad, filter: &gst::Element, ceiling: Option<u32
                 if let Some(m) = m {
                     b = b.field("channel-mask", gst::Bitmask::new(m));
                 }
-                filter.set_property("caps", &b.build());
+                filter.set_property("caps", b.build());
                 // Logged unconditionally: the one thing this bug proved is
                 // that a silent audio path is an unverifiable one.
                 tracing::info!(
@@ -2509,14 +2511,13 @@ mod concat_spike {
         let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let armed2 = armed.clone();
         tail.static_pad("sink").unwrap().add_probe(gst::PadProbeType::BUFFER, move |_, info| {
-            if let Some(gst::PadProbeData::Buffer(b)) = &info.data {
-                if armed2.load(std::sync::atomic::Ordering::SeqCst) {
+            if let Some(gst::PadProbeData::Buffer(b)) = &info.data
+                && armed2.load(std::sync::atomic::Ordering::SeqCst) {
                     let mut s = live2.lock().unwrap();
                     if s.is_none() {
                         *s = b.pts().map(|p| p.mseconds());
                     }
                 }
-            }
             gst::PadProbeReturn::Ok
         });
         pipeline.set_state(gst::State::Playing).unwrap();

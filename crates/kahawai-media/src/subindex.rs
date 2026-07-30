@@ -994,7 +994,7 @@ fn mkv_walk(mut r: Reader<'_>, image: Option<usize>) -> Result<MkvOut> {
             .filter(|(_, b)| b.track == t.number)
             .map(|(cluster_ts, b)| {
                 let ticks = cluster_ts.saturating_add_signed(i64::from(b.rel_time));
-                (to_ms(ticks), b.duration.map(|d| to_ms(d)), decompress(&b.payload, t.compression.as_ref()))
+                (to_ms(ticks), b.duration.map(&to_ms), decompress(&b.payload, t.compression.as_ref()))
             })
             .collect();
         out.sort_by_key(|(ms, _, _)| *ms);

@@ -51,7 +51,10 @@ impl PgsDecoder {
     /// new screen state, or None when the set only carries definitions.
     pub fn feed(&mut self, data: &[u8]) -> Result<Option<DisplaySet>> {
         let mut pos = 0usize;
-        let mut composition: Option<(u32, u32, u8, Vec<(u16, u32, u32)>)> = None;
+        // PCS accumulator: canvas w/h, palette id, and the composition's
+        // (object id, x, y) references, filled by later segments.
+        type Pcs = (u32, u32, u8, Vec<(u16, u32, u32)>);
+        let mut composition: Option<Pcs> = None;
         while pos + 3 <= data.len() {
             let seg_type = data[pos];
             let size = u16::from_be_bytes([data[pos + 1], data[pos + 2]]) as usize;
@@ -323,13 +326,13 @@ pub fn vobsub_decode(spu: &[u8], palette16: &[[u8; 3]]) -> Result<Option<ImageOb
                         nib += 1;
                         if v < 4 {
                             // 0x000c: fill to end of line.
-                            v |= ((w - x) << 2);
+                            v |= (w - x) << 2;
                         }
                     }
                 }
             }
             let run = (v >> 2).min(w - x);
-            let color = (v & 3);
+            let color = v & 3;
             let pi = pal_idx[3 - color] as usize; // control order is reversed
             let a = alpha[3 - color];
             let rgb = palette16.get(pi).copied().unwrap_or([0, 0, 0]);

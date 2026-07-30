@@ -269,6 +269,10 @@ type LocalResolver = std::sync::Arc<dyn Fn(&str, &str) -> Result<std::path::Path
 /// inside the client's own patience.
 const BURN_SETS_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
 
+/// Leases for every part of one session (with sizes), plus the index
+/// of the part playback started in.
+type PartLeases = (Vec<(Lease, u64)>, usize);
+
 pub struct Sessions {
     pub leases: Leases,
     /// AR-5: the in-process mediahost, if any — (module_id, path
@@ -292,7 +296,7 @@ pub struct Sessions {
     /// order: the transcoder joins them into one pipeline and asks for
     /// each by index. Second element is the starting part's index, so a
     /// seek that stays inside it can reuse these leases.
-    tc_leases: Mutex<HashMap<String, (Vec<(Lease, u64)>, usize)>>,
+    tc_leases: Mutex<HashMap<String, PartLeases>>,
     /// Sessions awaiting the transcoder's ready/error verdict.
     pending_ready: Mutex<HashMap<String, tokio::sync::oneshot::Sender<Result<(), String>>>>,
     /// In-flight artifact fetches, keyed by (session, name).

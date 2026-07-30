@@ -489,7 +489,7 @@ mod tests {
         format!("n:{nfo}|a:{artwork}")
     }
 
-    use super::*;
+    
 
     #[test]
     fn oshash_of_zeros_is_the_size() {

@@ -16,9 +16,11 @@
 //! * **A 555 stops everything** — AniDB bans have no fixed duration:
 //!   they decay after ~24 h ONLY if the client stops calling, and every
 //!   attempt while banned extends them. So a ban is recorded on disk
-//!   and suppresses all contact until it lapses. The client identity is the registered `kahawai`
-//! app; the account is the admin's (settings). Optionally encrypts the
-//! session with the profile's UDP API key (AES-128-ECB per spec).
+//!   and suppresses all contact until it lapses.
+//!
+//! The client identity is the registered `kahawai` app; the account is
+//! the admin's (settings). Optionally encrypts the session with the
+//! profile's UDP API key (AES-128-ECB per spec).
 
 use std::time::Duration;
 
@@ -448,13 +450,13 @@ fn aes_ecb(cipher: &aes::Aes128, data: &[u8], encrypt: bool) -> Result<Vec<u8>> 
         }
         Ok(buf)
     } else {
-        anyhow::ensure!(data.len() % 16 == 0 && !data.is_empty(), "bad ciphertext length");
+        anyhow::ensure!(data.len().is_multiple_of(16) && !data.is_empty(), "bad ciphertext length");
         let mut buf = data.to_vec();
         for chunk in buf.chunks_exact_mut(16) {
             cipher.decrypt_block(chunk.try_into().expect("16-byte block"));
         }
         let pad = *buf.last().unwrap() as usize;
-        anyhow::ensure!(pad >= 1 && pad <= 16 && pad <= buf.len(), "bad padding");
+        anyhow::ensure!((1..=16).contains(&pad) && pad <= buf.len(), "bad padding");
         buf.truncate(buf.len() - pad);
         Ok(buf)
     }

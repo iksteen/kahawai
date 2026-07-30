@@ -74,7 +74,6 @@ async fn reordering_re_decides_ownership_without_asking_anyone() {
     let dir = tempfile::tempdir().unwrap();
     let db = kahawai_hub::db::open(dir.path()).await.unwrap();
     item(&db, "i1").await;
-    let chain = chain_in_force(&db, "movies").await;
     store_answer(&db, "i1", "tmdb", "550", "auto", answer("TMDB title", Some("tmdb"), None))
         .await
         .unwrap();
@@ -101,7 +100,6 @@ async fn a_manual_pick_outranks_every_provider_and_survives_reorders() {
     let dir = tempfile::tempdir().unwrap();
     let db = kahawai_hub::db::open(dir.path()).await.unwrap();
     item(&db, "i1").await;
-    let chain = chain_in_force(&db, "movies").await;
     store_answer(&db, "i1", "tmdb", "550", "auto", answer("Robot Wars", None, None))
         .await
         .unwrap();
@@ -346,7 +344,6 @@ async fn a_complete_row_does_not_stop_the_chain() {
     let dir = tempfile::tempdir().unwrap();
     let db = kahawai_hub::db::open(dir.path()).await.unwrap();
     item(&db, "i1").await;
-    let chain = chain_in_force(&db, "movies").await;
     // TMDB answered completely.
     store_answer(
         &db,
@@ -388,7 +385,6 @@ async fn a_weak_non_owner_does_not_donate_fields() {
     let dir = tempfile::tempdir().unwrap();
     let db = kahawai_hub::db::open(dir.path()).await.unwrap();
     item(&db, "i1").await;
-    let chain = chain_in_force(&db, "movies").await;
     store_answer(&db, "i1", "tmdb", "550", "auto", answer("Solaris", None, None))
         .await
         .unwrap();
@@ -437,7 +433,6 @@ async fn a_confident_match_outranks_a_weak_one_whatever_the_order() {
     let dir = tempfile::tempdir().unwrap();
     let db = kahawai_hub::db::open(dir.path()).await.unwrap();
     item(&db, "i1").await;
-    let chain = chain_in_force(&db, "movies").await; // tmdb, tvdb
     store_answer(&db, "i1", "tmdb", "111", "weak", answer("Being Human?", None, None))
         .await
         .unwrap();
@@ -696,7 +691,6 @@ async fn a_manual_assignment_is_never_recomputed() {
     let dir = tempfile::tempdir().unwrap();
     let db = kahawai_hub::db::open(dir.path()).await.unwrap();
     item(&db, "i1").await;
-    let chain = chain_in_force(&db, "movies").await;
     kahawai_hub::providers::assign_manual(
         &db, "i1", "tvdb", "414734",
         Fields { title: Some("hand picked".into()), ..Default::default() })
@@ -830,7 +824,6 @@ async fn the_view_side_fills_from_the_preference_order() {
     let dir = tempfile::tempdir().unwrap();
     let db = kahawai_hub::db::open(dir.path()).await.unwrap();
     item(&db, "i1").await;
-    let chain = chain_in_force(&db, "movies").await;
     // TMDB is assigned but has no synopsis; TVDB has one.
     store_answer(&db, "i1", "tmdb", "550", "auto", answer("Fight Club", None, Some(8.4)))
         .await
@@ -865,7 +858,6 @@ async fn the_view_resolves_an_episode_through_its_show() {
     .execute(&db)
     .await
     .unwrap();
-    let chain = chain_in_force(&db, "movies").await;
     // The show is assigned to TVDB (TMDB missed it).
     store_answer(&db, "show1", "tmdb", "", "miss", Fields::default()).await.unwrap();
     store_answer(&db, "show1", "tvdb", "9", "auto", answer("The Show", None, None))

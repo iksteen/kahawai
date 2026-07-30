@@ -181,7 +181,7 @@ pub fn pick_candidate<'c>(
     // read as "Heat" plus a subtitle.
     let subtitled = |c: &Candidate| {
         c.title
-            .split_once(|ch| matches!(ch, ':' | '-' | '\u{2013}' | '\u{2014}'))
+            .split_once([':', '-', '\u{2013}', '\u{2014}'])
             .is_some_and(|(head, _)| fold(head) == norm)
     };
 
@@ -2466,10 +2466,10 @@ impl Enricher {
                 for abs in 1..=max_abs {
                     if let Some((s, n)) = absolute_to_seasoned(&seasons, abs) {
                         proj.insert(abs, (s, n));
-                        if !fetched.contains_key(&s) {
+                        if let std::collections::hash_map::Entry::Vacant(e) = fetched.entry(s) {
                             let list =
                                 self.tmdb_season(tmdb_key, pid, s).await.unwrap_or_default();
-                            fetched.insert(s, list);
+                            e.insert(list);
                         }
                         if let Some(e) =
                             fetched[&s].iter().find(|e| e.episode == n).cloned()
@@ -2518,10 +2518,6 @@ impl Enricher {
         }
 
         let mut wrote = 0;
-        // Episodes inherit their show's chain: same media type, same
-        // precedence, so a reorder covers them too.
-        let media_type = crate::providers::media_type_of_item(db, show_id).await;
-        let chain = crate::providers::chain_in_force(db, &media_type).await;
         for r in &eps {
             let key = (r.get::<Option<i64>, _>("season"), r.get::<i64, _>("episode"));
             let Some(e) = by_key.get(&key) else { continue };
@@ -2840,7 +2836,7 @@ impl Enricher {
         item_id: &str,
         provider: &str,
         pick: Option<&(Candidate, &'static str)>,
-        media_type: &str,
+        _media_type: &str,
     ) -> Result<()> {
         let (provider_id, confidence, c) = match pick {
             Some((c, conf)) => (c.id.to_string(), *conf, Some(c)),
@@ -2859,7 +2855,6 @@ impl Enricher {
             genres: None,
             cast_json: None,
         };
-        let chain = crate::providers::chain_in_force(db, media_type).await;
         crate::providers::store_answer(
             db,
             item_id,

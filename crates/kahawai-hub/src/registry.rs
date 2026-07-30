@@ -252,11 +252,10 @@ impl Registry {
         tx.commit().await?;
         self.allowed.insert(new_fingerprint);
         // A superseded pending renewal (satellite retried) is dead weight.
-        if let Some(Some(old)) = old_pending {
-            if old != new_fingerprint {
+        if let Some(Some(old)) = old_pending
+            && old != new_fingerprint {
                 self.allowed.remove(&old);
             }
-        }
         Ok(())
     }
 

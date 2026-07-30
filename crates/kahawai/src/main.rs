@@ -21,6 +21,7 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)] // one value per process; size is noise
 enum Cmd {
     /// Run hub, mediahost, and transcoder in a single process.
     AllInOne,

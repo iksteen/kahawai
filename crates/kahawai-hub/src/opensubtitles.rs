@@ -241,62 +241,6 @@ fn rank_candidates(out: &mut [Candidate], languages: &[String]) {
     });
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn cand(lang: &str, hash: bool, downloads: i64) -> Candidate {
-        Candidate {
-            provider: "opensubtitles",
-            file_id: format!("{lang}-{downloads}"),
-            language: Some(lang.into()),
-            release_name: None,
-            hash_match: hash,
-            downloads,
-            uploader: None,
-            rating: None,
-            fps: None,
-        }
-    }
-
-    #[test]
-    fn parses_the_reset_phrase() {
-        assert_eq!(parse_reset_secs("23 hours and 12 minutes"), Some(23 * 3600 + 12 * 60));
-        assert_eq!(parse_reset_secs("45 minutes"), Some(45 * 60));
-        assert_eq!(parse_reset_secs("30 seconds"), Some(30));
-        assert_eq!(parse_reset_secs("tomorrow"), None);
-    }
-
-    /// The ranking the UI depends on: hash matches first, then the
-    /// caller's language order, then popularity.
-    #[test]
-    fn ranks_hash_then_language_order_then_popularity() {
-        let want = ["en".to_string(), "nl".to_string()];
-        let mut out = vec![
-            cand("nl", true, 500),
-            cand("de", true, 9999), // not requested: after both wanted
-            cand("en", true, 10),
-            cand("en", false, 9999), // no hash: below every hash match
-            cand("pt-BR", true, 1),
-        ];
-        rank_candidates(&mut out, &want);
-        let order: Vec<_> = out
-            .iter()
-            .map(|c| (c.language.clone().unwrap(), c.hash_match))
-            .collect();
-        assert_eq!(
-            order,
-            vec![
-                ("en".into(), true),   // hash + first preferred language
-                ("nl".into(), true),   // hash + second
-                ("de".into(), true),   // hash, unrequested language
-                ("pt-BR".into(), true),
-                ("en".into(), false),  // no hash, however popular
-            ]
-        );
-    }
-}
-
 #[async_trait::async_trait]
 impl SubtitleProvider for OpenSubtitles {
     fn name(&self) -> &'static str {
@@ -498,5 +442,61 @@ impl SubtitleProvider for OpenSubtitles {
             "srt"
         };
         Ok(Downloaded { bytes, format: format.into(), release_name: dl.file_name })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cand(lang: &str, hash: bool, downloads: i64) -> Candidate {
+        Candidate {
+            provider: "opensubtitles",
+            file_id: format!("{lang}-{downloads}"),
+            language: Some(lang.into()),
+            release_name: None,
+            hash_match: hash,
+            downloads,
+            uploader: None,
+            rating: None,
+            fps: None,
+        }
+    }
+
+    #[test]
+    fn parses_the_reset_phrase() {
+        assert_eq!(parse_reset_secs("23 hours and 12 minutes"), Some(23 * 3600 + 12 * 60));
+        assert_eq!(parse_reset_secs("45 minutes"), Some(45 * 60));
+        assert_eq!(parse_reset_secs("30 seconds"), Some(30));
+        assert_eq!(parse_reset_secs("tomorrow"), None);
+    }
+
+    /// The ranking the UI depends on: hash matches first, then the
+    /// caller's language order, then popularity.
+    #[test]
+    fn ranks_hash_then_language_order_then_popularity() {
+        let want = ["en".to_string(), "nl".to_string()];
+        let mut out = vec![
+            cand("nl", true, 500),
+            cand("de", true, 9999), // not requested: after both wanted
+            cand("en", true, 10),
+            cand("en", false, 9999), // no hash: below every hash match
+            cand("pt-BR", true, 1),
+        ];
+        rank_candidates(&mut out, &want);
+        let order: Vec<_> = out
+            .iter()
+            .map(|c| (c.language.clone().unwrap(), c.hash_match))
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                ("en".into(), true),   // hash + first preferred language
+                ("nl".into(), true),   // hash + second
+                ("de".into(), true),   // hash, unrequested language
+                ("pt-BR".into(), true),
+                ("en".into(), false),  // no hash, however popular
+            ]
+        );
     }
 }

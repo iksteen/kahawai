@@ -162,6 +162,10 @@ fn burn_wanted(profile: &CapabilityProfile, info: &MediaInfo, burn_capable: bool
 /// display-set timeline can actually be read where the encode will
 /// run (index walks are disk-speed locally and round-trip-bound over
 /// a lease — measured at ~4 KB/s, which no session can wait for).
+// The argument list IS the decision's input space (HUB-14/15): profile,
+// source, track choices, and the per-box facts. Bundling them into a
+// struct would just move the same eight names one hop away.
+#[allow(clippy::too_many_arguments)]
 pub fn negotiate(
     profile: &CapabilityProfile,
     info: &MediaInfo,

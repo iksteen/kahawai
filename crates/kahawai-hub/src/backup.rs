@@ -21,7 +21,7 @@
 //! manifest records when the database was taken rather than when the
 //! command finished.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
