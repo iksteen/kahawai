@@ -40,6 +40,16 @@ pub enum AssBody {
     Stream(tokio::sync::mpsc::Receiver<String>),
 }
 
+/// How long OCR generation waits for the mediahost's display-set walk.
+/// Urgent (a human pressed the button): bounded like the burn path.
+/// Idle (the sweep): nobody is waiting, and giving up early only wastes
+/// the walk — the sets still arrive and get cached, but the track sits
+/// in the failed set until the next hub run.
+#[cfg(feature = "ocr")]
+const SETS_WAIT_URGENT: std::time::Duration = std::time::Duration::from_secs(20);
+#[cfg(feature = "ocr")]
+const SETS_WAIT_IDLE: std::time::Duration = std::time::Duration::from_secs(180);
+
 /// Cache key for one subtitle track of one source file — shared by the
 /// lazy extractors and the mediahost ingestion path.
 fn cache_key(module_id: &str, collection_id: &str, path_rel: &str, key: &str) -> String {
@@ -552,6 +562,20 @@ impl Subtitles {
         sub_index: usize,
         user_id: &str,
     ) -> Result<String> {
+        // A human pressed the button: bounded like the burn path's wait.
+        self.ocr_generate_within(registry, item_id, sub_index, user_id, SETS_WAIT_URGENT)
+            .await
+    }
+
+    #[cfg(feature = "ocr")]
+    async fn ocr_generate_within(
+        &self,
+        registry: &Registry,
+        item_id: &str,
+        sub_index: usize,
+        user_id: &str,
+        sets_wait: std::time::Duration,
+    ) -> Result<String> {
         // One generation per (item, track) at a time: the idle sweep and
         // the button race here, and losing the race means the work is
         // already done — return the winner's row instead of redoing it.
@@ -600,7 +624,7 @@ impl Subtitles {
                 &collection_id,
                 &path_rel,
                 sub_index,
-                std::time::Duration::from_secs(20),
+                sets_wait,
             )
             .await
             .context("display sets unavailable (mediahost offline or unindexed track)")?;
@@ -696,7 +720,7 @@ impl Subtitles {
                         continue; // not a failure — retry when it returns
                     }
                     match subs
-                        .ocr_generate(&registry, &item_id, idx, "idle-sweep")
+                        .ocr_generate_within(&registry, &item_id, idx, "idle-sweep", SETS_WAIT_IDLE)
                         .await
                     {
                         Ok(_) => generated += 1,
