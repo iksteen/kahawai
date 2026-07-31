@@ -1320,6 +1320,17 @@ fn build_video_encode_chain(
     // Sane defaults, guarded per element (props differ across encoders).
     // nvh264enc/x264enc take kbit/s. The plan may clamp (bandwidth cap).
     set_prop_str_if_present(&enc, "bitrate", &video_kbps.unwrap_or(6000).to_string());
+    // Keyframe every ~2 s (48 frames at the film rates that dominate
+    // this library): segments split at keyframes, and the session-start
+    // gate waits for THREE segments — with encoder-default GOPs that
+    // was ~10 s of content and a 7 s start on a 4K HDR encode (measured;
+    // the encode itself ran 1.8× realtime and was not the problem).
+    // ~2 s segments put the same gate at ~6 s of content. Copy-remux is
+    // unaffected: splits follow the source's own keyframes either way.
+    // One name per encoder family, each guarded:
+    set_prop_str_if_present(&enc, "gop-size", "48"); // nvenc, qsv
+    set_prop_str_if_present(&enc, "key-int-max", "48"); // x264, va
+    set_prop_str_if_present(&enc, "max-keyframe-interval", "48"); // vtenc
     let parse = gst::ElementFactory::make("h264parse").build().unwrap();
     // Parameter sets on every keyframe (independently decodable segments).
     set_prop_if_present(&parse, "config-interval", -1i32);
@@ -1911,7 +1922,13 @@ fn make_hls_sink(out_dir: &Path, prefer: Option<&str>) -> Result<(gst::Element, 
         "playlist-location",
         out_dir.join("master.m3u8").to_str().unwrap(),
     );
-    set_prop_if_present(&sink, "target-duration", 4u32);
+    // Segments cut at the first keyframe AT OR PAST the target, so with
+    // the encoders' 2 s GOP every segment runs slightly OVER 2 s — and
+    // the spec requires TARGETDURATION >= ceil(max segment duration),
+    // which hlssink3 writes verbatim from this property. 3 is therefore
+    // the smallest spec-valid value for ~2 s segments (2 produced
+    // playlists that violated it).
+    set_prop_if_present(&sink, "target-duration", 3u32);
     // Keep every segment and playlist entry (VOD-style growing playlist).
     set_prop_if_present(&sink, "playlist-length", 0u32);
     set_prop_if_present(&sink, "max-files", 0u32); // hlssink2

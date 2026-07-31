@@ -263,11 +263,34 @@ async fn serve_reads(mut conn: tokio::net::UnixStream, lease: Lease, size: u64) 
 
 /// A playlist is client-ready with ≥3 segments (~10 s of runway) or an
 /// ENDLIST (short source: whatever exists is all there is).
+/// What "enough runway" means, measured on real starts (2026-07-31,
+/// Firefox): hls.js reveals new segments only on its EVENT-playlist
+/// reloads (~every target-duration, 3 s), and production jitters (one
+/// heavy GOP took 3.5 s against a ~2 s cadence) — so playback stalls
+/// whenever buffered content dips under ~production-gap + reload ≈
+/// 6.5 s before the encoder's lead has grown past it. Hand-off with
+/// ~4 s of content buffered stalled twice; ~5 s stalled once at 12 s.
+/// The gate is therefore CONTENT seconds, not a segment count — three
+/// segments can be as little as 4 s when scene-cut keyframes shorten
+/// them. ENDLIST (a finished short encode) is always ready.
 fn playlist_ready(path: &std::path::Path) -> bool {
     match std::fs::read_to_string(path) {
-        Ok(p) => p.contains("#EXT-X-ENDLIST") || p.matches("#EXTINF").count() >= 3,
+        Ok(p) => p.contains("#EXT-X-ENDLIST") || playlist_span_secs(&p) >= 6.5,
         Err(_) => false,
     }
+}
+
+/// Total seconds of content a playlist advertises (Σ EXTINF).
+fn playlist_span_secs(playlist: &str) -> f64 {
+    playlist
+        .lines()
+        .filter_map(|l| {
+            l.strip_prefix("#EXTINF:")?
+                .trim_end_matches(',')
+                .parse::<f64>()
+                .ok()
+        })
+        .sum()
 }
 
 type LocalResolver = std::sync::Arc<dyn Fn(&str, &str) -> Result<std::path::PathBuf> + Send + Sync>;

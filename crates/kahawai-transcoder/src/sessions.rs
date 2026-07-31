@@ -341,7 +341,20 @@ impl Runner {
         // failed if the worker dies first.
         let playlist = dir.join("master.m3u8");
         let ready = |p: &std::path::Path| match std::fs::read_to_string(p) {
-            Ok(t) => t.contains("#EXT-X-ENDLIST") || t.matches("#EXTINF").count() >= 3,
+            // Content seconds, not segment count — see the hub's
+            // playlist_ready for the measured reasoning.
+            Ok(t) => {
+                t.contains("#EXT-X-ENDLIST")
+                    || t.lines()
+                        .filter_map(|l| {
+                            l.strip_prefix("#EXTINF:")?
+                                .trim_end_matches(',')
+                                .parse::<f64>()
+                                .ok()
+                        })
+                        .sum::<f64>()
+                        >= 6.5
+            }
             Err(_) => false,
         };
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
