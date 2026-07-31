@@ -360,6 +360,8 @@ pub fn negotiate(
                 })
         }),
         tone_map,
+        // Phase D replaces these with the two-candidate target pick.
+        ..Default::default()
     };
 
     let cost = if direct {

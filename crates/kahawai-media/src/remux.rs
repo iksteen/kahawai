@@ -153,7 +153,7 @@ pub const AV1_ENCODERS: &[&str] = &[
     "nvav1enc",
     "qsvav1enc",
     "svtav1enc",
-    "rav1e",
+    "rav1enc",
     "av1enc",
 ];
 
@@ -186,7 +186,7 @@ pub fn encoder_capabilities() -> Vec<(&'static str, &'static str, bool)> {
         "openh264enc",
         "x265enc",
         "svtav1enc",
-        "rav1e",
+        "rav1enc",
         "av1enc",
     ];
     let mut caps = Vec::new();
@@ -317,6 +317,83 @@ pub const WEB_TARGET: Target = Target {
     audio: &["aac", "mp3"],
 };
 
+/// HUB-15b encode targets and the segment container that carries them.
+/// Small Copy enums because RemuxPlan crosses the worker CLI and the
+/// protobuf wire; unknown strings parse to the legacy default so an
+/// old sender never breaks a new binary.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum VideoTarget {
+    #[default]
+    H264,
+    Hevc,
+    Av1,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AudioTarget {
+    #[default]
+    Aac,
+    Opus,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SegmentFormat {
+    /// MPEG-TS segments via hlssink3/hlssink2 — the proven path; every
+    /// h264/aac session rides it unchanged.
+    #[default]
+    Ts,
+    /// Fragmented-MP4 segments via isofmp4mux + the fmp4sink writer —
+    /// the only container that carries hevc/av1/opus to browsers.
+    Fmp4,
+}
+
+impl VideoTarget {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::H264 => "h264",
+            Self::Hevc => "hevc",
+            Self::Av1 => "av1",
+        }
+    }
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "hevc" => Self::Hevc,
+            "av1" => Self::Av1,
+            _ => Self::H264,
+        }
+    }
+}
+
+impl AudioTarget {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Aac => "aac",
+            Self::Opus => "opus",
+        }
+    }
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "opus" => Self::Opus,
+            _ => Self::Aac,
+        }
+    }
+}
+
+impl SegmentFormat {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Ts => "ts",
+            Self::Fmp4 => "fmp4",
+        }
+    }
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "fmp4" => Self::Fmp4,
+            _ => Self::Ts,
+        }
+    }
+}
+
 /// Per-kind session plan — the single source of truth shared between
 /// session planning and pipeline routing, so the muxer pads requested up
 /// front always match the streams that will actually be linked.
@@ -342,6 +419,12 @@ pub struct RemuxPlan {
     /// themselves. Forces the video encode that carries it.
     pub burn_subtitle: Option<usize>,
     pub max_channels: Option<u32>,
+    /// HUB-15b: what the encode arms produce and which segment
+    /// container carries the session. Defaults = the historical
+    /// h264/aac/TS behavior.
+    pub video_codec: VideoTarget,
+    pub audio_codec: AudioTarget,
+    pub segment_format: SegmentFormat,
 }
 
 impl RemuxPlan {
@@ -439,7 +522,7 @@ pub fn plan_summary(info: &kahawai_core::media::MediaInfo, plan: &RemuxPlan) -> 
                 .into_iter()
                 .collect(),
             plan.video,
-            "h264",
+            plan.video_codec.as_str(),
         ),
         kind_summary(
             "audio",
@@ -449,7 +532,7 @@ pub fn plan_summary(info: &kahawai_core::media::MediaInfo, plan: &RemuxPlan) -> 
                 .into_iter()
                 .collect(),
             plan.audio,
-            "aac",
+            plan.audio_codec.as_str(),
         ),
     )
 }
@@ -1017,6 +1100,7 @@ fn route_stream(
                     from,
                     sinkpad,
                     gate,
+                    plan.video_codec,
                     plan.video_kbps,
                     plan.max_height,
                     plan.tone_map,
@@ -1030,6 +1114,7 @@ fn route_stream(
                     sinkpad,
                     &caps_name,
                     gate,
+                    plan.audio_codec,
                     plan.max_channels,
                     facts_dir,
                 );
@@ -1327,6 +1412,7 @@ fn build_video_encode_chain(
     from: &gst::Pad,
     sinkpad: gst::Pad,
     gate: &Option<Arc<SeekGate>>,
+    target: VideoTarget,
     video_kbps: Option<u32>,
     max_height: Option<u32>,
     tone_map: bool,
@@ -1336,8 +1422,16 @@ fn build_video_encode_chain(
     // rebased to the seek point on others).
     burn_start_ms: u64,
 ) {
-    let Some(enc_name) = h264_encoder() else {
-        tracing::error!("video encode routed with no verified H.264 encoder");
+    let (encoder, parser) = match target {
+        VideoTarget::H264 => (h264_encoder(), "h264parse"),
+        VideoTarget::Hevc => (hevc_encoder(), "h265parse"),
+        VideoTarget::Av1 => (av1_encoder(), "av1parse"),
+    };
+    let Some(enc_name) = encoder else {
+        tracing::error!(
+            target = target.as_str(),
+            "video encode routed with no verified encoder"
+        );
         return;
     };
     let decode = gst::ElementFactory::make("decodebin").build().unwrap();
@@ -1365,9 +1459,19 @@ fn build_video_encode_chain(
         .map(|n| gst::ElementFactory::make(n).build().unwrap())
         .collect();
     let enc = gst::ElementFactory::make(enc_name).build().unwrap();
-    // Sane defaults, guarded per element (props differ across encoders).
-    // nvh264enc/x264enc take kbit/s. The plan may clamp (bandwidth cap).
-    set_prop_str_if_present(&enc, "bitrate", &video_kbps.unwrap_or(6000).to_string());
+    // Sane defaults, guarded per element (props differ across encoders;
+    // verified by gst-inspect per candidate):
+    //   bitrate         kbit/s  nv*enc, qsv*, va*, x264enc, x265enc, vtenc_*
+    //   bitrate         bit/s   rav1enc (the one bps outlier)
+    //   target-bitrate  kbit/s  svtav1enc, av1enc (neither has `bitrate`)
+    // The plan may clamp (bandwidth cap).
+    let kbps = video_kbps.unwrap_or(6000);
+    if enc_name == "rav1enc" {
+        set_prop_str_if_present(&enc, "bitrate", &(kbps * 1000).to_string());
+    } else {
+        set_prop_str_if_present(&enc, "bitrate", &kbps.to_string());
+        set_prop_str_if_present(&enc, "target-bitrate", &kbps.to_string());
+    }
     // Keyframe every ~2 s (48 frames at the film rates that dominate
     // this library): segments split at keyframes, and the session-start
     // gate waits for THREE segments — with encoder-default GOPs that
@@ -1377,10 +1481,14 @@ fn build_video_encode_chain(
     // unaffected: splits follow the source's own keyframes either way.
     // One name per encoder family, each guarded:
     set_prop_str_if_present(&enc, "gop-size", "48"); // nvenc, qsv
-    set_prop_str_if_present(&enc, "key-int-max", "48"); // x264, va
+    set_prop_str_if_present(&enc, "key-int-max", "48"); // x264, x265, va
     set_prop_str_if_present(&enc, "max-keyframe-interval", "48"); // vtenc
-    let parse = gst::ElementFactory::make("h264parse").build().unwrap();
-    // Parameter sets on every keyframe (independently decodable segments).
+    set_prop_str_if_present(&enc, "intra-period-length", "48"); // svtav1enc
+    set_prop_str_if_present(&enc, "max-key-frame-interval", "48"); // rav1enc
+    set_prop_str_if_present(&enc, "keyframe-max-dist", "48"); // av1enc
+    let parse = gst::ElementFactory::make(parser).build().unwrap();
+    // Parameter sets on every keyframe (independently decodable
+    // segments). h26xparse only; av1parse has no such knob.
     set_prop_if_present(&parse, "config-interval", -1i32);
 
     // HUB-15 resolution ceiling: a RANGE capsfilter after videoscale, so
@@ -1733,12 +1841,20 @@ fn build_audio_encode_chain(
     sinkpad: gst::Pad,
     caps_name: &str,
     gate: &Option<Arc<SeekGate>>,
+    target: AudioTarget,
     max_channels: Option<u32>,
     facts_dir: &std::path::Path,
 ) {
-    let Some(enc_name) = aac_encoder() else {
+    let encoder = match target {
+        AudioTarget::Aac => aac_encoder(),
+        AudioTarget::Opus => opus_encoder(),
+    };
+    let Some(enc_name) = encoder else {
         // Planner guarantees this; guard anyway (fakesink beats a stall).
-        tracing::error!("audio encode routed with no verified AAC encoder");
+        tracing::error!(
+            target = target.as_str(),
+            "audio encode routed with no verified encoder"
+        );
         return;
     };
     // The AC-3 family's caps cannot be trusted: ac3parse labels E-AC-3
@@ -1761,6 +1877,7 @@ fn build_audio_encode_chain(
             from,
             sinkpad,
             enc_name,
+            target,
             &[setter, dec],
             gate,
             max_channels,
@@ -1777,10 +1894,23 @@ fn build_audio_encode_chain(
     let limiter = gst::ElementFactory::make("capsfilter").build().unwrap();
     let resample = gst::ElementFactory::make("audioresample").build().unwrap();
     let enc = gst::ElementFactory::make(enc_name).build().unwrap();
+    // 192000: bit/s on fdkaacenc/avenc_aac AND opusenc — same string.
     set_prop_str_if_present(&enc, "bitrate", "192000");
-    let parse = gst::ElementFactory::make("aacparse").build().unwrap();
+    // AAC rides through aacparse (ADTS/raw negotiation with the muxer);
+    // opusenc's output needs no parser.
+    let parse: Option<gst::Element> = match target {
+        AudioTarget::Aac => Some(gst::ElementFactory::make("aacparse").build().unwrap()),
+        AudioTarget::Opus => {
+            // The layout-pin machinery below exists because fdkaacenc
+            // lies about 7.1; opusenc does not — its ceiling is a plain
+            // caps bound (channel-mapping-family covers ≤8ch).
+            opus_limit(&limiter, max_channels);
+            None
+        }
+    };
 
-    let chain: Vec<&gst::Element> = vec![&convert, &limiter, &resample, &enc, &parse];
+    let mut chain: Vec<&gst::Element> = vec![&convert, &limiter, &resample, &enc];
+    chain.extend(parse.iter());
     pipe.add(&decode).unwrap();
     pipe.add_many(chain.iter().copied()).unwrap();
     gst::Element::link_many(chain.iter().copied()).unwrap();
@@ -1788,7 +1918,7 @@ fn build_audio_encode_chain(
     for el in &chain {
         el.sync_state_with_parent().unwrap();
     }
-    let out = parse.static_pad("src").unwrap();
+    let out = chain.last().unwrap().static_pad("src").unwrap();
     guard_pts(&out);
     if let Some(g) = gate {
         g.install(&out);
@@ -1804,7 +1934,9 @@ fn build_audio_encode_chain(
         if convert_sink.is_linked() {
             return; // first decoded stream wins
         }
-        install_layout_pin(pad, &pin_target, max_channels, &pin_enc, &pin_dir);
+        if target == AudioTarget::Aac {
+            install_layout_pin(pad, &pin_target, max_channels, &pin_enc, &pin_dir);
+        }
         if let Err(e) = pad.link(&convert_sink) {
             tracing::warn!(error = %e, "remux: decodebin → encode chain link failed");
         }
@@ -1812,6 +1944,19 @@ fn build_audio_encode_chain(
     if let Err(e) = from.link(&decode.static_pad("sink").unwrap()) {
         tracing::warn!(error = %e, "remux: → decodebin link failed");
     }
+}
+
+/// Opus channel bound: a plain caps range up to min(ceiling, 8) —
+/// opusenc handles multichannel natively (channel-mapping-family 1),
+/// so no accept-probe is needed, just the client's ceiling.
+fn opus_limit(limiter: &gst::Element, max_channels: Option<u32>) {
+    let max = max_channels.unwrap_or(8).min(8) as i32;
+    limiter.set_property(
+        "caps",
+        gst::Caps::builder("audio/x-raw")
+            .field("channels", gst::IntRange::new(1, max))
+            .build(),
+    );
 }
 
 /// Static front-end variant of the audio encode chain: `from` →
@@ -1824,6 +1969,7 @@ fn build_audio_tail(
     from: &gst::Pad,
     sinkpad: gst::Pad,
     enc_name: &str,
+    target: AudioTarget,
     front: &[gst::Element],
     gate: &Option<Arc<SeekGate>>,
     max_channels: Option<u32>,
@@ -1834,22 +1980,31 @@ fn build_audio_tail(
     let resample = gst::ElementFactory::make("audioresample").build().unwrap();
     let enc = gst::ElementFactory::make(enc_name).build().unwrap();
     set_prop_str_if_present(&enc, "bitrate", "192000");
-    let parse = gst::ElementFactory::make("aacparse").build().unwrap();
+    let parse: Option<gst::Element> = match target {
+        AudioTarget::Aac => Some(gst::ElementFactory::make("aacparse").build().unwrap()),
+        AudioTarget::Opus => {
+            opus_limit(&limiter, max_channels);
+            None
+        }
+    };
 
     // The explicit decoder's own src pad carries the decoded caps, so the
     // layout is pinned from there instead of a decodebin pad-added.
-    if let Some(src) = front.last().and_then(|el| el.static_pad("src")) {
+    if target == AudioTarget::Aac
+        && let Some(src) = front.last().and_then(|el| el.static_pad("src"))
+    {
         install_layout_pin(&src, &limiter, max_channels, enc_name, facts_dir);
     }
 
     let mut chain: Vec<&gst::Element> = front.iter().collect();
-    chain.extend([&convert, &limiter, &resample, &enc, &parse]);
+    chain.extend([&convert, &limiter, &resample, &enc]);
+    chain.extend(parse.iter());
     pipe.add_many(chain.iter().copied()).unwrap();
     gst::Element::link_many(chain.iter().copied()).unwrap();
     for el in &chain {
         el.sync_state_with_parent().unwrap();
     }
-    let out = parse.static_pad("src").unwrap();
+    let out = chain.last().unwrap().static_pad("src").unwrap();
     guard_pts(&out);
     if let Some(g) = gate {
         g.install(&out);

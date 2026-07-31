@@ -458,6 +458,13 @@ message StartSession {
   // source index than the hub can — every read would cross the byte
   // plane. Empty = nothing to burn.
   bytes burn_sets = 15;
+  // HUB-15b encode targets and segment container. Empty = the legacy
+  // h264 / aac / ts. Safe by construction on old transcoders: placement
+  // hard-filters on the reported encoder set, and an old binary never
+  // reports hevc/av1/opus, so a non-default value cannot reach one.
+  string video_codec = 16; // h264 | hevc | av1
+  string audio_codec = 17; // aac | opus
+  string container = 18;   // ts | fmp4
 }
 
 message EndSession {

@@ -176,7 +176,7 @@ const MATRIX: &[(&str, &[&str], bool, &str, bool)] = &[
             "nvav1enc",
             "qsvav1enc",
             "svtav1enc",
-            "rav1e",
+            "rav1enc",
             "av1enc",
         ],
         false,

@@ -81,6 +81,8 @@ impl Runner {
         sink: &str,
         tail_sizes: Vec<u64>,
         encode_params: (u32, u32, u32, bool, u32),
+        // HUB-15b (video_codec, audio_codec, container); empty = legacy.
+        targets: (String, String, String),
         burn_sets: Vec<u8>,
     ) {
         let result = self
@@ -95,6 +97,7 @@ impl Runner {
                 sink,
                 &tail_sizes,
                 encode_params,
+                targets,
                 burn_sets,
             )
             .await;
@@ -145,6 +148,7 @@ impl Runner {
         sink: &str,
         tail_sizes: &[u64],
         (video_kbps, max_height, max_channels, tone_map, burn_subtitle): (u32, u32, u32, bool, u32),
+        (video_codec, audio_codec, container): (String, String, String),
         burn_sets: Vec<u8>,
     ) -> Result<PathBuf> {
         // Replace any previous run first (seek-restart reuses the id).
@@ -222,6 +226,15 @@ impl Runner {
                         .with_context(|| format!("writing {}", p.display()))?;
                     cmd.args(["--burn-sets", &p.to_string_lossy()]);
                 }
+                if !video_codec.is_empty() {
+                    cmd.args(["--video-codec", &video_codec]);
+                }
+                if !audio_codec.is_empty() {
+                    cmd.args(["--audio-codec", &audio_codec]);
+                }
+                if !container.is_empty() {
+                    cmd.args(["--container", &container]);
+                }
                 let child = cmd
                     .args(["--video", video])
                     .args(["--audio", audio])
@@ -251,6 +264,9 @@ impl Runner {
                     max_channels: (max_channels > 0).then_some(max_channels),
                     tone_map,
                     burn_subtitle: (burn_subtitle > 0).then(|| (burn_subtitle - 1) as usize),
+                    video_codec: kahawai_media::remux::VideoTarget::from_str(&video_codec),
+                    audio_codec: kahawai_media::remux::AudioTarget::from_str(&audio_codec),
+                    segment_format: kahawai_media::remux::SegmentFormat::from_str(&container),
                 };
                 let (all, dir) = (socks.clone(), dir.clone());
                 let sink_owned = (!sink.is_empty()).then(|| sink.to_string());

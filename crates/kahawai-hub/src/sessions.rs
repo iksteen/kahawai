@@ -1238,6 +1238,9 @@ impl Sessions {
                 let child = cmd
                     .args(["--video", kahawai_media::worker::mode_arg(plan.video)])
                     .args(["--audio", kahawai_media::worker::mode_arg(plan.audio)])
+                    .args(["--video-codec", plan.video_codec.as_str()])
+                    .args(["--audio-codec", plan.audio_codec.as_str()])
+                    .args(["--container", plan.segment_format.as_str()])
                     .args(["--audio-track", &plan.audio_track.to_string()])
                     .args(["--video-track", &plan.video_track.to_string()])
                     .args(["--start-ms", &start_ms.to_string()])
@@ -1389,6 +1392,9 @@ impl Sessions {
                     // 1-based on the wire: 0 means "burn nothing".
                     burn_subtitle: plan.burn_subtitle.map_or(0, |n| n as u32 + 1),
                     burn_sets: burn_sets.clone(),
+                    video_codec: plan.video_codec.as_str().into(),
+                    audio_codec: plan.audio_codec.as_str().into(),
+                    container: plan.segment_format.as_str().into(),
                 },
             )),
         };

@@ -75,6 +75,14 @@ pub struct WorkerArgs {
     /// index itself (every read crosses the byte plane).
     #[arg(long)]
     pub burn_sets: Option<PathBuf>,
+    /// HUB-15b encode targets + segment container; unknown values fall
+    /// back to the legacy h264/aac/ts.
+    #[arg(long, default_value = "h264")]
+    pub video_codec: String,
+    #[arg(long, default_value = "aac")]
+    pub audio_codec: String,
+    #[arg(long, default_value = "ts")]
+    pub container: String,
 }
 
 #[cfg(any(feature = "hub", feature = "transcoder"))]
@@ -108,6 +116,9 @@ pub fn run_remux_worker(cfg: &config::Config, w: WorkerArgs) -> Result<()> {
         max_channels: w.max_channels,
         tone_map: w.tone_map,
         burn_subtitle: w.burn_sub,
+        video_codec: kahawai_media::remux::VideoTarget::from_str(&w.video_codec),
+        audio_codec: kahawai_media::remux::AudioTarget::from_str(&w.audio_codec),
+        segment_format: kahawai_media::remux::SegmentFormat::from_str(&w.container),
     };
     kahawai_media::worker::run_parts(
         &all,
