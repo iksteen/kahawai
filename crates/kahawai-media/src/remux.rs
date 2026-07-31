@@ -1851,12 +1851,14 @@ impl RemuxSource for FileSource {
 }
 
 enum FeedCmd {
-    /// (bytes wanted, feed generation at request time) — a Need stamped
-    /// before a seek must never be served after it: with slow sources
-    /// (lease/socket) a stale read can land after flush-stop and push
-    /// old-position bytes into the new segment, which the demuxer then
-    /// parses as garbage ("large block, file might be corrupt").
-    Need(u32, u64),
+    /// Feed generation at request time — a Need stamped before a seek
+    /// must never be served after it: with slow sources (lease/socket)
+    /// a stale block can land after flush-stop and push old-position
+    /// bytes into the new segment, which the demuxer then parses as
+    /// garbage ("large block, file might be corrupt"). The byte count
+    /// appsrc asks for is irrelevant since the prefetch ring sized its
+    /// blocks already.
+    Need(u64),
 }
 
 pub struct RemuxJob {
@@ -2023,10 +2025,56 @@ pub fn start_full(
     start_paced(out_dir, plan, source, start_ms, sink, None)
 }
 
-/// A seekable appsrc fed from a `RemuxSource` by a dedicated thread.
-/// appsrc callbacks run on GStreamer threads and must not block on I/O;
-/// they forward commands to the feeder thread, which owns the source.
+/// A seekable appsrc fed from a `RemuxSource` through a PREFETCH RING:
+/// a reader thread streams ahead of the pipeline into a bounded buffer,
+/// and stalls when it is full — "stream until pushback", expressed
+/// locally instead of as flow-control games on the shared control link
+/// (AR-12: never head-of-line-block the heartbeats).
+///
+/// Why a ring at all: the old feeder read one 256 KB block per appsrc
+/// Need, serially — and for a dispatched worker every block is a full
+/// worker→transcoder→hub→lease round trip. Measured on a 4K HDR title:
+/// the byte plane delivered ~2 MB/s (≈ the file's own bitrate), capping
+/// EVERY session near 1.0× realtime while the same pipeline ran 4–6.6×
+/// against a local file — a video COPY session crawled identically,
+/// which is what convicted transport over compute. Large blocks
+/// amortize the round trip; the ring overlaps fetch with the pipeline.
+///
+/// Seek correctness is generation-based, as before: a block read for
+/// generation N is dropped once a seek bumps to N+1, so a slow in-
+/// flight read can never land pre-seek bytes after flush-stop.
 pub(crate) fn seekable_appsrc(mut source: Box<dyn RemuxSource>) -> AppSrc {
+    /// One fetch, sized to amortize the byte-plane round trip.
+    const READ_BLOCK: usize = 2 * 1024 * 1024;
+    /// Ring capacity — the pushback point. 16 MB ≈ 9 s of a 4K HDR
+    /// film ahead of the pipeline, bounded per part-source.
+    const RING_BYTES: usize = 16 * 1024 * 1024;
+
+    struct Ring {
+        blocks: std::collections::VecDeque<(u64, Vec<u8>)>,
+        bytes: usize,
+        /// Bumped by seek_data; blocks and Needs from an older
+        /// generation are stale and dropped.
+        generation: u64,
+        /// Where the reader resumes after a seek.
+        seek_to: Option<u64>,
+        /// Reader reached EOF (for the current generation).
+        eos: bool,
+        /// Reader hit a fatal read error.
+        failed: bool,
+    }
+    let ring = Arc::new((
+        Mutex::new(Ring {
+            blocks: std::collections::VecDeque::new(),
+            bytes: 0,
+            generation: 0,
+            seek_to: None,
+            eos: false,
+            failed: false,
+        }),
+        std::sync::Condvar::new(),
+    ));
+
     let appsrc = AppSrc::builder()
         .stream_type(gstreamer_app::AppStreamType::Seekable)
         .block(true)
@@ -2035,80 +2083,135 @@ pub(crate) fn seekable_appsrc(mut source: Box<dyn RemuxSource>) -> AppSrc {
     appsrc.set_size(source.size() as i64);
 
     let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<FeedCmd>();
-    // Seeks apply synchronously in the callback (generation bump + new
-    // position); the feeder picks both up before serving any Need.
-    let generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let seek_to: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
     // Held by the feeder for the duration of each Need. seek_data takes
     // it after bumping the generation: any in-flight feed then finishes
     // inside the flush (its push fails Flushing — appsrc unblocks
-    // producers before invoking seek_data), so a slow source read can
-    // never land pre-seek bytes after flush-stop.
+    // producers before invoking seek_data), so a stale block can never
+    // land after flush-stop.
     let busy: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
-    let gen_need = generation.clone();
-    let gen_seek = generation.clone();
-    let seek_cb = seek_to.clone();
+
+    let ring_need = ring.clone();
+    let ring_seek = ring.clone();
     let busy_seek = busy.clone();
     appsrc.set_callbacks(
         gstreamer_app::AppSrcCallbacks::builder()
-            .need_data(move |_, length| {
-                let _ = cmd_tx.send(FeedCmd::Need(
-                    length,
-                    gen_need.load(std::sync::atomic::Ordering::SeqCst),
-                ));
+            .need_data(move |_, _length| {
+                let stamp = ring_need.0.lock().unwrap().generation;
+                let _ = cmd_tx.send(FeedCmd::Need(stamp));
             })
             .seek_data(move |_, offset| {
-                *seek_cb.lock().unwrap() = Some(offset);
-                gen_seek.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                {
+                    let (lock, cv) = &*ring_seek;
+                    let mut r = lock.lock().unwrap();
+                    r.generation += 1;
+                    r.seek_to = Some(offset);
+                    r.blocks.clear();
+                    r.bytes = 0;
+                    r.eos = false;
+                    cv.notify_all();
+                }
                 drop(busy_seek.lock().unwrap());
                 true
             })
             .build(),
     );
-    let feeder_src = appsrc.clone();
-    let gen_feed = generation;
-    let seek_feed = seek_to;
+
+    // Reader: streams ahead until the ring pushes back. Owns the source.
+    let ring_rd = ring.clone();
     std::thread::spawn(move || {
         let mut pos: u64 = 0;
-        let mut at_eos = false;
-        while let Ok(cmd) = cmd_rx.recv() {
-            match cmd {
-                FeedCmd::Need(length, stamp) => {
-                    let _busy = busy.lock().unwrap();
-                    if let Some(target) = seek_feed.lock().unwrap().take() {
-                        pos = target;
-                        at_eos = false;
-                    }
-                    if stamp != gen_feed.load(std::sync::atomic::Ordering::SeqCst) {
-                        continue; // stamped before a seek: stale, drop
-                    }
-                    if at_eos {
-                        continue;
-                    }
-                    let want = (length as usize).clamp(256 * 1024, 4 * 1024 * 1024);
-                    let mut buf = vec![0u8; want];
-                    match source.read_at(pos, &mut buf) {
-                        Ok(0) => {
-                            at_eos = true;
-                            let _ = feeder_src.end_of_stream();
+        let mut my_gen: u64 = 0;
+        loop {
+            // Wait for room (or a reason to reposition/stop).
+            {
+                let (lock, cv) = &*ring_rd;
+                let mut r = lock.lock().unwrap();
+                loop {
+                    if r.generation != my_gen {
+                        my_gen = r.generation;
+                        if let Some(t) = r.seek_to.take() {
+                            pos = t;
                         }
-                        Ok(n) => {
-                            buf.truncate(n);
-                            let mut b = gst::Buffer::from_mut_slice(buf);
-                            b.get_mut().unwrap().set_offset(pos);
-                            pos += n as u64;
-                            if feeder_src.push_buffer(b).is_err() {
-                                // Flushing (seek in progress) or shutdown;
-                                // either a Seek command follows or recv fails.
-                                continue;
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!(error = %e, "remux source read failed; ending stream");
-                            at_eos = true;
-                            let _ = feeder_src.end_of_stream();
-                        }
+                        break;
                     }
+                    if r.failed || (!r.eos && r.bytes < RING_BYTES) {
+                        break;
+                    }
+                    r = cv.wait(r).unwrap();
+                }
+                if r.failed {
+                    return;
+                }
+                if r.eos {
+                    continue; // parked until a seek revives us
+                }
+            }
+            let mut buf = vec![0u8; READ_BLOCK];
+            let result = source.read_at(pos, &mut buf);
+            let (lock, cv) = &*ring_rd;
+            let mut r = lock.lock().unwrap();
+            if r.generation != my_gen {
+                continue; // seek raced the read: bytes are stale
+            }
+            match result {
+                Ok(0) => {
+                    r.eos = true;
+                    cv.notify_all();
+                }
+                Ok(n) => {
+                    buf.truncate(n);
+                    r.bytes += n;
+                    r.blocks.push_back((pos, buf));
+                    pos += n as u64;
+                    cv.notify_all();
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "remux source read failed; ending stream");
+                    r.failed = true;
+                    cv.notify_all();
+                }
+            }
+        }
+    });
+
+    // Feeder: serves appsrc Needs from the ring. No I/O of its own.
+    let feeder_src = appsrc.clone();
+    let ring_fd = ring;
+    std::thread::spawn(move || {
+        while let Ok(FeedCmd::Need(stamp)) = cmd_rx.recv() {
+            let _busy = busy.lock().unwrap();
+            let block = {
+                let (lock, cv) = &*ring_fd;
+                let mut r = lock.lock().unwrap();
+                loop {
+                    if r.generation != stamp {
+                        break None; // stamped before a seek: stale, drop
+                    }
+                    if let Some((off, bytes)) = r.blocks.pop_front() {
+                        r.bytes -= bytes.len();
+                        cv.notify_all(); // room: wake the reader
+                        break Some(Ok((off, bytes)));
+                    }
+                    if r.eos {
+                        break Some(Err(true));
+                    }
+                    if r.failed {
+                        break Some(Err(false));
+                    }
+                    r = cv.wait(r).unwrap();
+                }
+            };
+            match block {
+                None => continue,
+                Some(Err(_eos_or_fail)) => {
+                    let _ = feeder_src.end_of_stream();
+                }
+                Some(Ok((offset, bytes))) => {
+                    let mut b = gst::Buffer::from_mut_slice(bytes);
+                    b.get_mut().unwrap().set_offset(offset);
+                    // Err = Flushing (seek in progress) or shutdown;
+                    // either a new Need follows or recv fails.
+                    let _ = feeder_src.push_buffer(b);
                 }
             }
         }
