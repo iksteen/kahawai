@@ -99,8 +99,9 @@ export default function CapabilityDebug({
     <div className="caps-panel mono">
       <div className="dim caps-intro">
         Unchecking removes a capability from the profile sent to the hub — and from what this
-        player renders — so the negotiation takes the branch a lesser client would. Encodes always
-        target h264/aac, so dropping those forces a transcode you can still watch.
+        player renders — so the negotiation takes the branch a lesser client would. Encodes target
+        h264/aac, so dropping those makes sources that need an encode honestly UNPLAYABLE — that
+        refusal is the branch under test.
       </div>
 
       {codecRow(

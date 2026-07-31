@@ -253,11 +253,20 @@ pub fn negotiate(
         .flatten();
 
     // Remux/transcode verdict per stream.
+    // An encode is only admissible when the client accepts its TARGET.
+    // This used to be skipped ("everything plays h264/aac"), which made
+    // the capability mask a liar: a profile without h264 still received
+    // h264, so the branch a codec-less client would take was untestable
+    // — and a real client without the codec would get an unwatchable
+    // stream with a confident verdict (found via the mask, HUB-14).
+    let client_takes_h264 = profile.video.iter().any(|c| c.codec == "h264");
+    let client_takes_aac = profile.audio.iter().any(|c| c == "aac");
     let video = if v
         .is_some_and(|s| v_client_ok && muxable("video", &s.codec) && burn_subtitle.is_none())
     {
         StreamMode::Copy
-    } else if h264_encoder().is_some()
+    } else if client_takes_h264
+        && h264_encoder().is_some()
         && v.is_some_and(|s| codec_to_caps_name("video", &s.codec).is_some_and(can_decode))
     {
         StreamMode::Encode
@@ -266,7 +275,8 @@ pub fn negotiate(
     };
     let audio = if a.is_some_and(|s| a_client_ok && muxable("audio", &s.codec)) {
         StreamMode::Copy
-    } else if aac_encoder().is_some()
+    } else if client_takes_aac
+        && aac_encoder().is_some()
         && a.is_some_and(|s| codec_to_caps_name("audio", &s.codec).is_some_and(can_decode))
     {
         StreamMode::Encode
@@ -310,7 +320,12 @@ pub fn negotiate(
 
     let cost = if direct {
         Cost::Direct
-    } else if !plan.playable() {
+    } else if !plan.playable() || (v.is_some() && video == StreamMode::Off) {
+        // A source WITH video whose video cannot be delivered is
+        // unplayable, full stop — an audio-only stream of a film with a
+        // confident verdict is worse than a refusal. (Audio-less
+        // sources still play as video-only, and music has no video row
+        // to lose.)
         Cost::Unplayable
     } else if video == StreamMode::Encode {
         Cost::VideoEncode
@@ -322,18 +337,33 @@ pub fn negotiate(
 
     // Verdicts: the established plan_summary strings, plus negotiation
     // notes nothing else can know.
-    let (mut video_verdict, audio_verdict) = plan_summary(info, &plan);
+    let (mut video_verdict, mut audio_verdict) = plan_summary(info, &plan);
     if direct {
         video_verdict = match v {
             Some(s) => format!("{} direct", s.codec),
             None => "none".into(),
         };
     }
+    // Off because the client refuses the encode TARGET: name the actual
+    // blocker, not a generic "off" (this is the state the mask creates).
+    if video == StreamMode::Off && !client_takes_h264 && v.is_some() && !v_client_ok {
+        video_verdict = format!(
+            "{} → none (client accepts neither the source nor h264)",
+            v.map(|s| s.codec.as_str()).unwrap_or("video")
+        );
+    }
+    if audio == StreamMode::Off && !client_takes_aac && a.is_some() && !a_client_ok {
+        audio_verdict = format!(
+            "{} → none (client accepts neither the source nor aac)",
+            a.map(|s| s.codec.as_str()).unwrap_or("audio")
+        );
+    }
     if plan.tone_map {
         video_verdict.push_str(" · hdr10 → sdr (tone-mapped)");
     } else if let Some(s) = v
         && s.hdr.is_some()
         && !profile.hdr
+        && video != StreamMode::Off
     {
         // Copies: the client's decoder tone-maps better than we can.
         // Encodes without a capable box: the honest truth (HUB-15a).
@@ -995,6 +1025,46 @@ mod tests {
             sp.plan.video,
             StreamMode::Copy,
             "any admitting cap suffices"
+        );
+    }
+
+    /// The mask's sharpest edge (HUB-14): a client that does not list
+    /// the encode target gets a REFUSAL, not the target anyway. This
+    /// was designed wrong originally — "everything plays h264/aac" —
+    /// which made a masked h264 undetectable and a real codec-less
+    /// client unwatchable-with-a-confident-verdict.
+    #[test]
+    fn no_encode_target_in_profile_means_no_encode() {
+        let mut p = chrome();
+        p.video.retain(|c| c.codec != "h264");
+        // HEVC source the client also cannot copy (profile lists only
+        // h264-family after the mask): encode is the only path, and the
+        // client refuses its target.
+        let mut hevc = chrome();
+        hevc.video.retain(|_| false);
+        let info = media("matroska", Some(vs("hevc")), Some(au("aac", 2)));
+        let mut q = chrome();
+        q.video.retain(|c| c.codec != "hevc" && c.codec != "h264");
+        let sp = negotiate(&q, &info, 0, 0, true, None, false, true, &[]);
+        assert_eq!(sp.plan.video, StreamMode::Off, "{}", sp.video_verdict);
+        assert_eq!(sp.cost, Cost::Unplayable);
+        assert!(
+            sp.video_verdict.contains("client accepts neither"),
+            "verdict must name the blocker: {}",
+            sp.video_verdict
+        );
+
+        // Audio side: dts source, aac masked out — audio goes Off while
+        // the video copy stands.
+        let mut r = chrome();
+        r.audio.retain(|a| a != "aac");
+        let info = media("matroska", Some(vs("h264")), Some(au("dts", 6)));
+        let sp = negotiate(&r, &info, 0, 0, true, None, false, true, &[]);
+        assert_eq!(sp.plan.audio, StreamMode::Off, "{}", sp.audio_verdict);
+        assert!(
+            sp.audio_verdict.contains("client accepts neither"),
+            "verdict must name the blocker: {}",
+            sp.audio_verdict
         );
     }
 

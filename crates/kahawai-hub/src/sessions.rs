@@ -801,7 +801,14 @@ impl Sessions {
             }
         }
         if sp.cost == kahawai_media::negotiate::Cost::Unplayable && mode != "direct" {
-            bail!("no playable streams — this source needs the video transcoder");
+            // The verdict names the actual blocker — a client refusing
+            // the encode target reads very differently from a fleet
+            // with no transcoder (HUB-14 honesty; found via the mask).
+            bail!(
+                "no playable streams: {} · {}",
+                sp.video_verdict,
+                sp.audio_verdict
+            );
         }
         let negotiated = sp;
         let mode = mode.as_str();
@@ -836,7 +843,11 @@ impl Sessions {
                 // single source of truth with the pipeline's link logic.
                 let plan = negotiated.plan;
                 if !plan.playable() {
-                    bail!("no playable streams — this source needs the video transcoder");
+                    bail!(
+                        "no playable streams: {} · {}",
+                        negotiated.video_verdict,
+                        negotiated.audio_verdict
+                    );
                 }
                 verdict = Some((
                     negotiated.video_verdict.clone(),
