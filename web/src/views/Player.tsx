@@ -715,7 +715,12 @@ export default function Player({
           playsInline
           crossOrigin="use-credentials"
         >
-          {subKey && !useAss && !liveText && !useImage && (
+          {/* The .vtt <track> is strictly the TEXT fallback. A burn
+              track renders in the picture and a 'none' track renders
+              nowhere — requesting a text form of an image track left a
+              <track> load pending forever, which kept Firefox's own
+              buffering overlay latched over a playing video. */}
+          {selected && selected.delivery === 'text' && !liveText && (
             <track
               key={`${subKey}-${trackEpoch}`}
               default

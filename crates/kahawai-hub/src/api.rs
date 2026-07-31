@@ -1663,6 +1663,24 @@ async fn item_subtitle_file(
     // The public keyspace is TRACK IDS ({id}.vtt / {id}.ass); the
     // resolver maps them onto the internal cache/pipeline notation.
     let resolve = |raw: &str| -> Option<i64> { raw.parse().ok() };
+    // Image tracks have no text form — their deliveries are overlay
+    // and burn. Refuse FAST: the extraction ladder would otherwise
+    // stall for tens of seconds asking the mediahost for cues that
+    // cannot exist, and a pending <track> load keeps the browser's own
+    // buffering overlay latched over a playing video (found live:
+    // Firefox + a burn track's phantom .vtt request).
+    let refuse_image = |track: &crate::tracks::Track| -> Result<(), ApiError> {
+        if crate::tracks::is_image_format(&track.format) {
+            return Err(ApiError::from((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!(
+                    "track {} is {} (image): no text form — use overlay or burn delivery",
+                    track.id, track.format
+                ),
+            )));
+        }
+        Ok(())
+    };
     if let Some(raw) = file.strip_suffix(".ass") {
         let track_id = resolve(raw)
             .ok_or_else(|| ApiError::from((StatusCode::BAD_REQUEST, "bad track id".to_string())))?;
@@ -1671,6 +1689,7 @@ async fn item_subtitle_file(
             .internal_key(&state.registry, track_id)
             .await
             .map_err(|e| (StatusCode::NOT_FOUND, format!("{e:#}")))?;
+        refuse_image(&track)?;
         let key = track.internal_key();
         let body = state
             .subtitles
@@ -1703,6 +1722,7 @@ async fn item_subtitle_file(
         .internal_key(&state.registry, track_id)
         .await
         .map_err(|e| (StatusCode::NOT_FOUND, format!("{e:#}")))?;
+    refuse_image(&track)?;
     let vtt = state
         .subtitles
         .vtt(
