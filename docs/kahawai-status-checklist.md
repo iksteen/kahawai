@@ -223,6 +223,12 @@ How something works and why it was built that way belong in
       own rendering; burn-in fallback for clients that cannot composite
       (mediahost-extracted display sets, seek-exact timeline, explicit
       blend in the encode chain)
+- [ ] HUB-15b Multiple encode targets (h264 → hevc → av1 by client
+      acceptance × placed-box encoders). Not built: the encode target is
+      hard-coded h264/aac, so a no-h264 client is refused on hardware
+      that encodes HEVC/AV1 natively. Gate: the fMP4/CMAF segment path
+      (TS cannot carry AV1/VP9) — cmafmux is a doctor row, not yet a
+      sink option
 - [x] HUB-32c OCR text tier: Tesseract via leptess (MIT — subtile-ocr
       dropped, no copyleft), default-on `ocr` feature, idle sweep over
       the whole library (playback outranks it) + per-track button as the
