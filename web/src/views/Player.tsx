@@ -388,11 +388,29 @@ export default function Player({
       if (idx !== drawnIdx) {
         drawnIdx = idx
         const set = idx >= 0 ? sets[idx] : null
-        canvas.width = set?.cw || 1920
-        canvas.height = set?.ch || 1080
+        // The canvas backs the FRAME, and composition space maps onto
+        // it UNIFORMLY by width (mirror of the burn path's compose():
+        // a 3840x1600 scope film carries subs authored against
+        // 1920x1080, and stretching the composition canvas to the
+        // content box scaled the axes independently — text 1.35x too
+        // wide vs burn-in/mpv). Bottom-anchored subs on a canvas
+        // taller than the picture clamp back on screen, like burn.
+        const vw = video.videoWidth || 1920
+        const vh = video.videoHeight || 1080
+        canvas.width = vw
+        canvas.height = vh
         const ctx = canvas.getContext('2d')!
-        ctx.clearRect(0, 0, canvas.width, canvas.height)
-        if (set) for (const o of set.objects) ctx.drawImage(o.img, o.x, o.y)
+        ctx.clearRect(0, 0, vw, vh)
+        if (set) {
+          const scale = set.cw > 0 ? vw / set.cw : 1
+          for (const o of set.objects) {
+            const w = Math.max(1, Math.round(o.img.width * scale))
+            const h = Math.max(1, Math.round(o.img.height * scale))
+            const x = Math.max(0, Math.min(Math.round(o.x * scale), vw - w))
+            const y = Math.max(0, Math.min(Math.round(o.y * scale), vh - h))
+            ctx.drawImage(o.img, x, y, w, h)
+          }
+        }
       }
       place()
     }
