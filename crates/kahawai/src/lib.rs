@@ -7,10 +7,14 @@
 //! linked); it now just gates the Tesseract linkage for hub builds.
 
 use std::path::PathBuf;
+#[cfg(feature = "hub")]
 use std::sync::Arc;
+#[cfg(feature = "hub")]
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
+#[cfg(any(feature = "hub", feature = "transcoder"))]
+use anyhow::Context;
 
 pub mod config;
 
