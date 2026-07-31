@@ -172,6 +172,8 @@ export default function Player({
     setAudioTrack(audio)
     setVideoTrack(video_)
     setSeeking(true)
+    hlsRef.current?.stopLoad() // the restart 404s the old run's segments
+    video.pause()
     try {
       const absMs = offsetRef.current + video.currentTime * 1000
       const r = await seekSession(session.session_id, absMs, audio, video_)
@@ -577,6 +579,12 @@ export default function Player({
       return
     }
     setSeeking(true)
+    // The restart replaces the run server-side: every not-yet-fetched
+    // segment of the OLD run is about to 404. Stop loading and freeze
+    // the picture so the wait is visible instead of the player merrily
+    // playing on while spraying 404s in the console.
+    hlsRef.current?.stopLoad()
+    video.pause()
     try {
       const r = await seekSession(session.session_id, targetMs)
       partBaseRef.current = r.part_base_ms ?? 0
@@ -669,6 +677,11 @@ export default function Player({
             />
           )}
         </video>
+        {seeking && (
+          <div className="seek-veil" aria-label="Restarting stream">
+            <span className="seek-veil-spin">&#10227;</span>
+          </div>
+        )}
         {/* Native fullscreen would take only the <video>, stranding the
             JASSUB canvas; this fullscreens the box holding both. */}
         <button

@@ -272,6 +272,25 @@ h2 { font-size: 14px; font-weight: 650; color: var(--dim); letter-spacing: 0.08e
   opacity: 0.5;
   cursor: progress;
 }
+/* Deep seek / track switch: the hub is restarting the pipeline. The
+   picture freezes (deliberately); this says why. */
+.seek-veil {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.45);
+  pointer-events: none;
+}
+.seek-veil-spin {
+  font-size: 42px;
+  color: var(--teal);
+  animation: seek-veil-rotate 1.1s linear infinite;
+}
+@keyframes seek-veil-rotate {
+  to { transform: rotate(360deg); }
+}
 .seekbar-fill {
   height: 100%;
   background: color-mix(in srgb, var(--teal) 45%, transparent);
