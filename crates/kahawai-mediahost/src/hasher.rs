@@ -272,6 +272,23 @@ async fn extract_image_and_send(
     );
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
         let path = crate::serve::resolve_rel(&collections2, &cid, &prel)?;
+        // A `.idx` path means a VobSub sidecar pair, not a container:
+        // `sub_index` is the track index INSIDE the idx, and the result
+        // is shaped exactly like a demuxed S_VOBSUB track (idx text as
+        // codec_private), so nothing downstream tells them apart.
+        if path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("idx"))
+        {
+            let idx = std::fs::read_to_string(&path)?;
+            let sub = std::fs::read(path.with_extension("sub"))?;
+            let blocks = kahawai_media::vobsub_file::extract_track(&idx, &sub, sub_index)?;
+            return Ok(Some(kahawai_media::subindex::ImageTrack {
+                codec: "S_VOBSUB".into(),
+                codec_private: Some(idx.into_bytes()),
+                blocks,
+            }));
+        }
         let mut src = kahawai_media::remux::FileSource::open(&path)?;
         // Local disk: no budget needed, and a header walk is still
         // only a few percent of the file.

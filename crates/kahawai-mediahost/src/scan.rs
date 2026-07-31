@@ -437,9 +437,33 @@ fn find_sidecars(root: &Path, media: &Path) -> Vec<kahawai_core::media::SidecarS
                 .into_owned(),
             format: format.to_string(),
             language,
+            track: None,
         });
     }
-    out.sort_by(|a, b| a.path_rel.cmp(&b.path_rel));
+    // VobSub pairs: `<stem>.idx` + `<stem>.sub` — image subtitles, one
+    // entry per track inside the .idx (a single pair commonly carries
+    // several languages). The .idx is small text; reading it at scan is
+    // how the languages become known at all — the filename says nothing.
+    let idx = dir.join(format!("{stem}.idx"));
+    if idx.is_file()
+        && dir.join(format!("{stem}.sub")).is_file()
+        && let Ok(text) = std::fs::read_to_string(&idx)
+    {
+        let path_rel = idx
+            .strip_prefix(root)
+            .unwrap_or(&idx)
+            .to_string_lossy()
+            .into_owned();
+        for t in kahawai_media::vobsub_file::parse_idx(&text) {
+            out.push(kahawai_core::media::SidecarSubtitle {
+                path_rel: path_rel.clone(),
+                format: "vobsub".into(),
+                language: t.language,
+                track: Some(t.id),
+            });
+        }
+    }
+    out.sort_by(|a, b| (&a.path_rel, a.track).cmp(&(&b.path_rel, b.track)));
     out
 }
 

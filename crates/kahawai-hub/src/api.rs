@@ -502,32 +502,35 @@ async fn subtitle_download(
     Ok(Json(json!({ "key": key, "quota": quota })))
 }
 
-/// HUB-32c: OCR an embedded image subtitle track (key "e{n}") into a
-/// text track. Synchronous — a feature film OCRs in ~30 s and the
-/// caller is a human who pressed a button; the result is cached, so it
-/// runs once per track. Feature-gated: without `ocr` the route answers
-/// with what is missing rather than 404.
+/// HUB-32c: OCR an image subtitle track — embedded ("e{n}") or a
+/// VobSub sidecar track ("s{n}") — into a text track. Synchronous — a
+/// feature film OCRs in ~30 s and the caller is a human who pressed a
+/// button; the result is cached, so it runs once per track.
+/// Feature-gated: without `ocr` the route answers with what is missing
+/// rather than 404.
 async fn subtitle_ocr(
     State(state): State<AppState>,
     Path((id, key)): Path<(String, String)>,
     axum::Extension(claims): axum::Extension<crate::auth::Claims>,
 ) -> Result<Json<Value>, ApiError> {
-    let index: usize = key.strip_prefix('e').and_then(|n| n.parse().ok()).ok_or((
-        StatusCode::BAD_REQUEST,
-        "key must be an embedded track (e{n})".into(),
-    ))?;
+    if !key.starts_with(['e', 's']) || !key[1..].chars().all(|c| c.is_ascii_digit()) {
+        return Err(ApiError::from((
+            StatusCode::BAD_REQUEST,
+            "key must be an embedded (e{n}) or sidecar (s{n}) track".to_string(),
+        )));
+    }
     #[cfg(feature = "ocr")]
     {
         let new_key = state
             .subtitles
-            .ocr_generate(&state.registry, &id, index, &claims.sub)
+            .ocr_generate(&state.registry, &id, &key, &claims.sub)
             .await
             .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, format!("{e:#}")))?;
         Ok(Json(json!({ "key": new_key })))
     }
     #[cfg(not(feature = "ocr"))]
     {
-        let _ = (index, claims);
+        let _ = claims;
         Err((
             StatusCode::NOT_IMPLEMENTED,
             "this build has no OCR support (compiled with --no-default-features)".into(),

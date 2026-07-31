@@ -11,6 +11,7 @@ pub mod subindex;
 pub mod subtitles;
 #[doc(hidden)]
 pub mod testutil;
+pub mod vobsub_file;
 pub mod worker;
 
 use std::path::Path;

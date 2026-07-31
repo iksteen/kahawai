@@ -167,8 +167,14 @@ pub struct SubtitleStream {
 pub struct SidecarSubtitle {
     /// Path relative to the collection root (same keying as the media file).
     pub path_rel: String,
-    /// "srt", "ass", "vtt" — from the file extension.
+    /// "srt", "ass", "vtt" from the file extension — or "vobsub" for an
+    /// `.idx`/`.sub` pair (image subtitles; `path_rel` is the .idx).
     pub format: String,
-    /// Language token from the filename ("Movie.en.srt" → "en"), verbatim.
+    /// Language token from the filename ("Movie.en.srt" → "en") — or,
+    /// for vobsub, the track's own `id:` from inside the .idx.
     pub language: Option<String>,
+    /// VobSub only: the track index within the .idx (one sidecar file
+    /// can carry many languages; each becomes its own entry).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub track: Option<u32>,
 }

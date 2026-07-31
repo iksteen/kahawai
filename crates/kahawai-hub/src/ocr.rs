@@ -137,7 +137,7 @@ pub fn ocr_sets_file(sets: &std::path::Path, model: &str) -> Result<Vec<Cue>> {
             };
             let text = text.trim();
             if !text.is_empty() {
-                lines.extend(text.lines().map(|l| l.trim().to_string()));
+                lines.extend(text.lines().map(|l| fix_pipe_i(l.trim())));
             }
         }
         if lines.is_empty() {
@@ -160,6 +160,25 @@ pub fn ocr_sets_file(sets: &std::path::Path, model: &str) -> Result<Vec<Cue>> {
     }
     anyhow::ensure!(!cues.is_empty(), "OCR produced no text");
     Ok(cues)
+}
+
+/// The classic VobSub OCR artifact: DVD fonts render capital I as a
+/// bare vertical bar, which Tesseract reads as '|'. A pipe never
+/// starts a subtitle line and never sits between letters in real
+/// dialogue, so word-position replacement is safe (measured: "| know."
+/// and "| picked him up" on the first real sidecar tried).
+fn fix_pipe_i(line: &str) -> String {
+    line.split(' ')
+        .map(|w| match w {
+            "|" => "I",
+            "|'m" => "I'm",
+            "|'ll" => "I'll",
+            "|'ve" => "I've",
+            "|'d" => "I'd",
+            _ => w,
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Glyph ink → black on white, in Tesseract's terms. Bitmap subtitle
@@ -217,6 +236,15 @@ fn gray_bmp(gray: &[u8], w: u32, h: u32) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pipe_reads_as_capital_i_in_word_position() {
+        assert_eq!(fix_pipe_i("| know."), "I know.");
+        assert_eq!(fix_pipe_i("|'m here"), "I'm here");
+        assert_eq!(fix_pipe_i("A | B"), "A I B");
+        // Inside a word or glued to text: not ours to guess.
+        assert_eq!(fix_pipe_i("a|b"), "a|b");
+    }
 
     #[test]
     fn lang_mapping_resolves_and_gates_on_installed_models() {

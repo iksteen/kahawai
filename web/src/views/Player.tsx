@@ -205,7 +205,9 @@ export default function Player({
   // growing document). Falls back to the item-level .vtt <track> when
   // the tap yields nothing (old satellite, no pipeline).
   const [vttFallback, setVttFallback] = useState(false)
-  const useImage = !!selected && !!selected.image
+  // Sidecar image tracks (.idx/.sub) have no session tap to feed the
+  // overlay; their serving path is the OCR text row (HUB-32c).
+  const useImage = !!selected && !!selected.image && selected.kind === 'embedded'
   // Keyed on the FORMAT, not on useAss: the pipeline taps an ASS track
   // as .ass and never writes the .jsonl this path reads, so a client
   // that declined ASS rendering must go straight to the flattened

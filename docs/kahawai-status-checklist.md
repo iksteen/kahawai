@@ -70,7 +70,12 @@ How something works and why it was built that way belong in
 - [x] MH-4 Sidecars + artwork + attachment declaration: embedded fonts are
       declared (name/mime/byte range, payload never read) in the file record
       at scan via a sparse EBML walk; pre-existing records are backfilled by
-      an idle worklist (cheapest tier, SeekHead-guided early stop)
+      an idle worklist (cheapest tier, SeekHead-guided early stop).
+      VobSub sidecar pairs (.idx/.sub) are discovered at scan, one entry
+      per track inside the .idx, and served through the image pipeline
+      (extraction/OCR; no tap, so no overlay/burn).
+      Known gap: a sidecar appearing next to an UNCHANGED media file is
+      missed by the MH-5 identity fast-path until the file itself changes
 - [x] MH-5 Content identity (size/mtime fast path; head/tail xxh3 + oshash) with
       incremental rescan (manifest + FilesSeen reconciliation, sync-version handshake)
 - [x] MH-6 Byte-range lease serving (dedicated byte-plane connection)
@@ -221,6 +226,7 @@ How something works and why it was built that way belong in
       dropped, no copyleft), default-on `ocr` feature, idle sweep over
       the whole library (playback outranks it) + per-track button as the
       urgent path, `tier: ocr` spares the burn encode, doctor row.
+      Covers embedded image tracks AND VobSub sidecar tracks (s-keys).
       Deferred: per-session text-over-tiles preference for overlay
       clients, and the bandwidth-threshold selection (needs measurement)
 - [x] HUB-33 Dual-audio defaults, one mechanism: the hub stores a plain

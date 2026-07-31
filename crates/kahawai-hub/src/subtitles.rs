@@ -559,11 +559,11 @@ impl Subtitles {
         &self,
         registry: &Registry,
         item_id: &str,
-        sub_index: usize,
+        key: &str,
         user_id: &str,
     ) -> Result<String> {
         // A human pressed the button: bounded like the burn path's wait.
-        self.ocr_generate_within(registry, item_id, sub_index, user_id, SETS_WAIT_URGENT)
+        self.ocr_generate_within(registry, item_id, key, user_id, SETS_WAIT_URGENT)
             .await
     }
 
@@ -572,7 +572,7 @@ impl Subtitles {
         &self,
         registry: &Registry,
         item_id: &str,
-        sub_index: usize,
+        key: &str,
         user_id: &str,
         sets_wait: std::time::Duration,
     ) -> Result<String> {
@@ -581,7 +581,7 @@ impl Subtitles {
         // already done — return the winner's row instead of redoing it.
         let lock = {
             let mut map = self.inflight.lock().unwrap();
-            map.entry(format!("ocr:{item_id}:{sub_index}"))
+            map.entry(format!("ocr:{item_id}:{key}"))
                 .or_default()
                 .clone()
         };
@@ -591,23 +591,49 @@ impl Subtitles {
              WHERE item_id = ? AND provider = 'ocr' AND release_name LIKE ?",
         )
         .bind(item_id)
-        .bind(format!("ocr:e{sub_index}:%"))
+        .bind(format!("ocr:{key}:%"))
         .fetch_optional(registry.db())
         .await?
         {
             return Ok(format!("d{id}"));
         }
-        let (module_id, collection_id, path_rel, info) = source_row(registry, item_id).await?;
-        let stream = info
-            .subtitles
-            .get(sub_index)
-            .with_context(|| format!("no subtitle stream e{sub_index}"))?;
-        anyhow::ensure!(
-            matches!(stream.format.as_str(), "pgs" | "vobsub" | "dvdsub"),
-            "e{sub_index} is {}, not an image subtitle",
-            stream.format
-        );
-        let language = stream.language.clone();
+        let (module_id, collection_id, media_rel, info) = source_row(registry, item_id).await?;
+        // What the extraction addresses: the media file + embedded track
+        // index for e-keys; the .idx sidecar + its internal track for
+        // s-keys (the mediahost keys off the .idx extension).
+        let (path_rel, sub_index, language) = match key.split_at(1) {
+            ("e", n) => {
+                let i: usize = n.parse().with_context(|| format!("bad key {key}"))?;
+                let stream = info
+                    .subtitles
+                    .get(i)
+                    .with_context(|| format!("no subtitle stream {key}"))?;
+                anyhow::ensure!(
+                    matches!(stream.format.as_str(), "pgs" | "vobsub" | "dvdsub"),
+                    "{key} is {}, not an image subtitle",
+                    stream.format
+                );
+                (media_rel, i, stream.language.clone())
+            }
+            ("s", n) => {
+                let i: usize = n.parse().with_context(|| format!("bad key {key}"))?;
+                let ext = info
+                    .external_subtitles
+                    .get(i)
+                    .with_context(|| format!("no sidecar {key}"))?;
+                anyhow::ensure!(
+                    ext.format == "vobsub",
+                    "{key} is {}, not an image sidecar",
+                    ext.format
+                );
+                (
+                    ext.path_rel.clone(),
+                    ext.track.unwrap_or(0) as usize,
+                    ext.language.clone(),
+                )
+            }
+            _ => bail!("key must be an embedded (e) or sidecar (s) subtitle, got {key}"),
+        };
         let model = crate::ocr::model_for(language.as_deref()).with_context(|| {
             format!(
                 "no Tesseract model for language {:?} — install its traineddata",
@@ -638,13 +664,13 @@ impl Subtitles {
         let ex = Extracted { cues, ass: None };
 
         // Replace, not accumulate: one OCR row per image stream.
-        let name = format!("ocr:e{sub_index}:{model}");
+        let name = format!("ocr:{key}:{model}");
         let stale: Vec<i64> = sqlx::query_scalar(
             "SELECT id FROM downloaded_subtitles
              WHERE item_id = ? AND provider = 'ocr' AND release_name LIKE ?",
         )
         .bind(item_id)
-        .bind(format!("ocr:e{sub_index}:%"))
+        .bind(format!("ocr:{key}:%"))
         .fetch_all(registry.db())
         .await?;
         for id in stale {
@@ -687,12 +713,12 @@ impl Subtitles {
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
             // Tracks that failed stay failed for this hub run — a
             // corrupt track must not become a 15-second crash loop.
-            let mut failed: std::collections::HashSet<(String, usize)> = Default::default();
+            let mut failed: std::collections::HashSet<(String, String)> = Default::default();
             loop {
                 let candidates = subs.ocr_candidates(&registry).await;
                 let mut generated = 0usize;
-                for (item_id, idx) in candidates {
-                    if failed.contains(&(item_id.clone(), idx)) {
+                for (item_id, key) in candidates {
+                    if failed.contains(&(item_id.clone(), key.clone())) {
                         continue;
                     }
                     // Idle means idle: playback outranks the sweep.
@@ -702,20 +728,41 @@ impl Subtitles {
                     // Validate against the source the generator will
                     // actually use (indexes are per-source), and only
                     // try where the model and the mediahost exist.
-                    let Ok((module_id, collection_id, path_rel, info)) =
+                    let Ok((module_id, collection_id, media_rel, info)) =
                         source_row(&registry, &item_id).await
                     else {
-                        failed.insert((item_id, idx));
+                        failed.insert((item_id, key));
                         continue;
                     };
-                    let Some(stream) = info.subtitles.get(idx) else {
-                        failed.insert((item_id, idx));
+                    // (extraction path, extraction index, language) for
+                    // either key kind — mirrors ocr_generate's resolve.
+                    let resolved = match key.split_at(1) {
+                        ("e", n) => n.parse::<usize>().ok().and_then(|i| {
+                            info.subtitles
+                                .get(i)
+                                .filter(|s| {
+                                    matches!(s.format.as_str(), "pgs" | "vobsub" | "dvdsub")
+                                })
+                                .map(|s| (media_rel.clone(), i, s.language.clone()))
+                        }),
+                        ("s", n) => n.parse::<usize>().ok().and_then(|i| {
+                            info.external_subtitles
+                                .get(i)
+                                .filter(|s| s.format == "vobsub")
+                                .map(|s| {
+                                    (
+                                        s.path_rel.clone(),
+                                        s.track.unwrap_or(0) as usize,
+                                        s.language.clone(),
+                                    )
+                                })
+                        }),
+                        _ => None,
+                    };
+                    let Some((extract_rel, extract_idx, language)) = resolved else {
+                        failed.insert((item_id, key));
                         continue;
                     };
-                    if !matches!(stream.format.as_str(), "pgs" | "vobsub" | "dvdsub") {
-                        failed.insert((item_id, idx));
-                        continue;
-                    }
                     if !registry.is_connected(&module_id) {
                         continue; // not a failure — retry when it returns
                     }
@@ -724,29 +771,35 @@ impl Subtitles {
                     // warmed into the cache — a later burn-in session
                     // start then reads a file instead of waiting out
                     // the mediahost walk.
-                    if crate::ocr::model_for(stream.language.as_deref()).is_none() {
+                    if crate::ocr::model_for(language.as_deref()).is_none() {
                         let _ = subs
                             .image_sets(
                                 &registry,
                                 &module_id,
                                 &collection_id,
-                                &path_rel,
-                                idx,
+                                &extract_rel,
+                                extract_idx,
                                 SETS_WAIT_IDLE,
                             )
                             .await;
-                        failed.insert((item_id, idx));
+                        failed.insert((item_id, key));
                         continue;
                     }
                     match subs
-                        .ocr_generate_within(&registry, &item_id, idx, "idle-sweep", SETS_WAIT_IDLE)
+                        .ocr_generate_within(
+                            &registry,
+                            &item_id,
+                            &key,
+                            "idle-sweep",
+                            SETS_WAIT_IDLE,
+                        )
                         .await
                     {
                         Ok(_) => generated += 1,
                         Err(e) => {
-                            tracing::warn!(item = %item_id, track = idx,
+                            tracing::warn!(item = %item_id, key = %key,
                                 error = format!("{e:#}"), "idle OCR failed; skipping this run");
-                            failed.insert((item_id, idx));
+                            failed.insert((item_id, key));
                         }
                     }
                     tokio::time::sleep(std::time::Duration::from_secs(10)).await;
@@ -763,9 +816,11 @@ impl Subtitles {
     /// index) pairs. Indexes come from each source's own stream list and
     /// are re-validated against the generator's source pick.
     #[cfg(feature = "ocr")]
-    async fn ocr_candidates(&self, registry: &Registry) -> Vec<(String, usize)> {
-        sqlx::query_as::<_, (String, i64)>(
-            "SELECT DISTINCT s.item_id, j.key
+    async fn ocr_candidates(&self, registry: &Registry) -> Vec<(String, String)> {
+        // Embedded image tracks (e-keys) and VobSub sidecar tracks
+        // (s-keys), keyed the way the subtitle API keys them.
+        sqlx::query_as::<_, (String, String)>(
+            "SELECT DISTINCT s.item_id, 'e' || j.key
              FROM item_sources s
              JOIN files f ON (f.module_id, f.collection_id, f.path_rel)
                            = (s.module_id, s.collection_id, s.path_rel),
@@ -775,14 +830,22 @@ impl Subtitles {
                      SELECT 1 FROM downloaded_subtitles d
                      WHERE d.item_id = s.item_id AND d.provider = 'ocr'
                        AND d.release_name LIKE 'ocr:e' || j.key || ':%')
-             ORDER BY s.item_id",
+             UNION
+             SELECT DISTINCT s.item_id, 's' || j.key
+             FROM item_sources s
+             JOIN files f ON (f.module_id, f.collection_id, f.path_rel)
+                           = (s.module_id, s.collection_id, s.path_rel),
+                  json_each(f.streams_json, '$.external_subtitles') j
+             WHERE json_extract(j.value, '$.format') = 'vobsub'
+               AND NOT EXISTS (
+                     SELECT 1 FROM downloaded_subtitles d
+                     WHERE d.item_id = s.item_id AND d.provider = 'ocr'
+                       AND d.release_name LIKE 'ocr:s' || j.key || ':%')
+             ORDER BY 1",
         )
         .fetch_all(registry.db())
         .await
         .unwrap_or_default()
-        .into_iter()
-        .map(|(id, idx)| (id, idx as usize))
-        .collect()
     }
 
     /// Remove a downloaded subtitle (row + cached body).
@@ -1098,7 +1161,10 @@ fn entries(info: &kahawai_core::media::MediaInfo) -> Vec<SubtitleEntry> {
             format: s.format.clone(),
             language: s.language.clone(),
             flattened: s.format == "ass",
-            image: false,
+            // An .idx/.sub pair: image subtitles with no VTT form. No
+            // session tap exists for a sidecar, so their serving path
+            // is the OCR text tier.
+            image: s.format == "vobsub",
         });
     }
     out
