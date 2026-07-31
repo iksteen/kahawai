@@ -4,24 +4,58 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+# One package, four binaries — each built with only the features (and
+# therefore dependencies) its module needs. `cargo build` (default
+# features) produces all four, full-fat, for the dev box; deployments
+# build one lean flavor:
+#
+#   cargo build --release --no-default-features --features transcoder \
+#       --bin kahawai-transcoder
+#
+# `required-features` keeps a lean build from even attempting the bins
+# whose modules are compiled out.
 [features]
-# Forwarded to the hub (HUB-32c): default-on OCR, droppable for
-# Tesseract-free builds.
-default = ["ocr"]
-ocr = ["kahawai-hub/ocr"]
+default = ["hub", "mediahost", "transcoder", "ocr"]
+hub = ["dep:kahawai-hub", "dep:sqlx", "dep:axum"]
+mediahost = ["dep:kahawai-mediahost"]
+transcoder = ["dep:kahawai-transcoder"]
+# HUB-32c Tesseract linkage for hub builds. Historically the GPL escape
+# hatch for subtile-ocr; that crate was never linked (leptess is MIT),
+# so today this only drops the Tesseract system dependency.
+ocr = ["hub", "kahawai-hub/ocr"]
+
+[[bin]]
+name = "kahawai"
+path = "src/bin/kahawai.rs"
+required-features = ["hub", "mediahost", "transcoder"]
+
+[[bin]]
+name = "kahawai-hub"
+path = "src/bin/kahawai-hubd.rs"
+required-features = ["hub"]
+
+[[bin]]
+name = "kahawai-mediahost"
+path = "src/bin/kahawai-mediahostd.rs"
+required-features = ["mediahost"]
+
+[[bin]]
+name = "kahawai-transcoder"
+path = "src/bin/kahawai-transcoderd.rs"
+required-features = ["transcoder"]
 
 [dependencies]
 kahawai-core = { workspace = true }
-kahawai-hub = { workspace = true }
+kahawai-hub = { workspace = true, optional = true }
 kahawai-media = { workspace = true }
-kahawai-mediahost = { workspace = true }
-kahawai-transcoder = { workspace = true }
+kahawai-mediahost = { workspace = true, optional = true }
+kahawai-transcoder = { workspace = true, optional = true }
 kahawai-transport = { workspace = true }
 anyhow = { workspace = true }
 tokio = { workspace = true }
 tonic = { workspace = true }
-sqlx = { workspace = true }
-axum = { workspace = true }
+sqlx = { workspace = true, optional = true }
+axum = { workspace = true, optional = true }
 serde_json = { workspace = true }
 clap = { workspace = true }
 libc = { workspace = true }

@@ -1,240 +1,139 @@
+//! Shared runtime for the kahawai binaries. One package, four bins —
+//! `kahawai` (everything, incl. all-in-one), `kahawai-hub`,
+//! `kahawai-mediahost`, `kahawai-transcoder` — each built with only the
+//! features (and therefore dependencies) its module needs: a satellite
+//! binary carries no SQLite, no axum, no Tesseract. The `ocr` feature
+//! is a leftover licensing switch in name only (subtile-ocr was never
+//! linked); it now just gates the Tesseract linkage for hub builds.
+
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
 
-mod config;
+pub mod config;
 
-#[derive(Parser)]
-#[command(
-    name = "kahawai",
-    version,
-    about = "Self-hosted media streaming server"
-)]
-struct Cli {
-    /// Path to the TOML config file. Default: ./kahawai.toml, else
-    /// $XDG_CONFIG_HOME/kahawai/kahawai.toml for non-system users.
-    /// Env overrides: KAHAWAI_<SECTION>__<KEY>.
-    #[arg(short, long, global = true)]
-    config: Option<PathBuf>,
-
-    #[command(subcommand)]
-    command: Cmd,
-}
-
-#[derive(Subcommand)]
-#[allow(clippy::large_enum_variant)] // one value per process; size is noise
-enum Cmd {
-    /// Run hub, mediahost, and transcoder in a single process.
-    AllInOne,
-    /// Run the hub (the module clients talk to).
-    Hub {
-        #[command(subcommand)]
-        cmd: Option<HubCmd>,
-    },
-    /// Run a mediahost (announces collections from local disks).
-    Mediahost,
-    /// Run a transcoder.
-    Transcoder,
-    /// Check the environment: GStreamer inventory, directories, clock (OPS-3).
-    Doctor {
-        /// Machine-readable output.
-        #[arg(long)]
-        json: bool,
-    },
-    /// Internal: per-session pipeline worker, spawned by the hub (§1.1
-    /// crash isolation). Reads source bytes from the parent's socket.
-    #[command(hide = true)]
-    RemuxWorker {
-        socket: PathBuf,
-        out_dir: PathBuf,
-        size: u64,
-        #[arg(long, default_value = "off")]
-        video: String,
-        #[arg(long, default_value = "off")]
-        audio: String,
-        #[arg(long, default_value_t = 0)]
-        audio_track: usize,
-        #[arg(long, default_value_t = 0)]
-        video_track: usize,
-        #[arg(long, default_value_t = 0)]
-        start_ms: u64,
-        #[arg(long)]
-        sink: Option<String>,
-        /// Additional parts of a split source, in timeline order, as
-        /// `<socket>:<size>`. The positional socket/size is part one.
-        #[arg(long = "part")]
-        parts: Vec<String>,
-        /// HUB-15 encode parameters; absent = historical fixed values.
-        #[arg(long)]
-        video_kbps: Option<u32>,
-        #[arg(long)]
-        max_height: Option<u32>,
-        #[arg(long)]
-        max_channels: Option<u32>,
-        /// HUB-15a: tone-map HDR to SDR in the video encode chain.
-        #[arg(long)]
-        tone_map: bool,
-        /// HUB-32b: burn this image subtitle track (e{n}) into the picture.
-        #[arg(long)]
-        burn_sub: Option<usize>,
-        /// Display sets to burn, extracted by the mediahost. Present for
-        /// every dispatched session — a worker cannot walk the source
-        /// index itself (every read crosses the byte plane).
-        #[arg(long)]
-        burn_sets: Option<PathBuf>,
-    },
-}
-
-#[derive(Subcommand)]
-enum HubCmd {
-    /// Overwrite a user's password (reads the new password from stdin).
-    ResetPassword { username: String },
-    /// Snapshot the hub (OPS-5) — database, PKI, subtitles, config —
-    /// without stopping it. Image and provider caches are left out: a
-    /// running hub fetches those again.
-    Backup { dest: PathBuf },
-    /// Restore a snapshot into this hub's data dir. Stop the hub first.
-    Restore {
-        src: PathBuf,
-        /// Replace an existing database.
-        #[arg(long)]
-        force: bool,
-    },
-}
-
-#[tokio::main]
-async fn main() -> Result<()> {
+pub fn init_tracing() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
+}
 
-    let cli = Cli::parse();
-    let (cfg, config_used) = config::load(cli.config.as_deref())?;
-    match &config_used {
+/// Load config and log where it came from — every binary starts here.
+pub fn load_config(path: Option<&std::path::Path>) -> Result<(config::Config, Option<PathBuf>)> {
+    let (cfg, used) = config::load(path)?;
+    match &used {
         Some(p) => tracing::info!(config = %p.display(), "loaded config"),
         None => tracing::info!("no config file found; using built-in defaults"),
     }
+    Ok((cfg, used))
+}
 
-    match &cli.command {
-        Cmd::Hub { cmd: None } | Cmd::Mediahost | Cmd::Transcoder | Cmd::AllInOne => {
-            startup_checks(&cfg)?
+/// The per-session pipeline worker (§1.1 crash isolation), spawned by
+/// the hub and the transcoder as `<current_exe> remux-worker ...` — so
+/// every binary that supervises sessions carries this arm.
+#[cfg(any(feature = "hub", feature = "transcoder"))]
+#[derive(clap::Args)]
+pub struct WorkerArgs {
+    pub socket: PathBuf,
+    pub out_dir: PathBuf,
+    pub size: u64,
+    #[arg(long, default_value = "off")]
+    pub video: String,
+    #[arg(long, default_value = "off")]
+    pub audio: String,
+    #[arg(long, default_value_t = 0)]
+    pub audio_track: usize,
+    #[arg(long, default_value_t = 0)]
+    pub video_track: usize,
+    #[arg(long, default_value_t = 0)]
+    pub start_ms: u64,
+    #[arg(long)]
+    pub sink: Option<String>,
+    /// Additional parts of a split source, in timeline order, as
+    /// `<socket>:<size>`. The positional socket/size is part one.
+    #[arg(long = "part")]
+    pub parts: Vec<String>,
+    /// HUB-15 encode parameters; absent = historical fixed values.
+    #[arg(long)]
+    pub video_kbps: Option<u32>,
+    #[arg(long)]
+    pub max_height: Option<u32>,
+    #[arg(long)]
+    pub max_channels: Option<u32>,
+    /// HUB-15a: tone-map HDR to SDR in the video encode chain.
+    #[arg(long)]
+    pub tone_map: bool,
+    /// HUB-32b: burn this image subtitle track (e{n}) into the picture.
+    #[arg(long)]
+    pub burn_sub: Option<usize>,
+    /// Display sets to burn, extracted by the mediahost. Present for
+    /// every dispatched session — a worker cannot walk the source
+    /// index itself (every read crosses the byte plane).
+    #[arg(long)]
+    pub burn_sets: Option<PathBuf>,
+}
+
+#[cfg(any(feature = "hub", feature = "transcoder"))]
+pub fn run_remux_worker(cfg: &config::Config, w: WorkerArgs) -> Result<()> {
+    // Die WITH the supervisor: kill_on_drop only fires inside a
+    // living parent, so a hub/transcoder restart used to orphan
+    // pipeline workers indefinitely (one survived three days).
+    // PDEATHSIG is the kernel's guarantee; the getppid check
+    // closes the race where the parent died before prctl ran.
+    #[cfg(target_os = "linux")]
+    unsafe {
+        libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+        if libc::getppid() == 1 {
+            anyhow::bail!("supervisor already gone; not starting");
         }
-        _ => {}
     }
-    match cli.command {
-        Cmd::Hub { cmd: None } => run_hub(cfg.hub, config_used).await,
-        Cmd::Hub {
-            cmd: Some(HubCmd::ResetPassword { username }),
-        } => reset_password(cfg.hub, &username).await,
-        Cmd::Hub {
-            cmd: Some(HubCmd::Backup { dest }),
-        } => {
-            let m = kahawai_hub::backup::backup(&cfg.hub.data_dir, config_used.as_deref(), &dest)
-                .await?;
-            println!(
-                "snapshot written to {}\n  database   {:.1} MB\n  subtitles  {} files, {:.1} MB\n  pki        {}\n  config     {}",
-                dest.display(),
-                m.db_bytes as f64 / 1e6,
-                m.subtitle_files,
-                m.subtitle_bytes as f64 / 1e6,
-                if m.has_pki { "included" } else { "absent" },
-                if m.has_config { "included" } else { "absent" },
-            );
-            Ok(())
-        }
-        Cmd::Hub {
-            cmd: Some(HubCmd::Restore { src, force }),
-        } => {
-            let m = kahawai_hub::backup::restore(&src, &cfg.hub.data_dir, force)?;
-            println!(
-                "restored a snapshot taken at {} (kahawai {}) into {}",
-                m.taken_at,
-                m.kahawai_version,
-                cfg.hub.data_dir.display()
-            );
-            Ok(())
-        }
-        Cmd::Mediahost => run_mediahost(cfg.mediahost).await,
-        Cmd::Doctor { json } => doctor(&cfg, json),
-        Cmd::RemuxWorker {
-            socket,
-            out_dir,
-            size,
-            video,
-            audio,
-            audio_track,
-            video_track,
-            start_ms,
-            sink,
-            parts,
-            video_kbps,
-            max_height,
-            max_channels,
-            tone_map,
-            burn_sub,
-            burn_sets,
-        } => {
-            // Die WITH the supervisor: kill_on_drop only fires inside a
-            // living parent, so a hub/transcoder restart used to orphan
-            // pipeline workers indefinitely (one survived three days).
-            // PDEATHSIG is the kernel's guarantee; the getppid check
-            // closes the race where the parent died before prctl ran.
-            #[cfg(target_os = "linux")]
-            unsafe {
-                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
-                if libc::getppid() == 1 {
-                    anyhow::bail!("supervisor already gone; not starting");
-                }
-            }
-            // Blocking by design: this process exists only for the pipeline.
-            kahawai_media::demote_elements(&cfg.transcoder.demote_decoders)?;
-            let mut all = vec![(socket, size)];
-            for p in &parts {
-                let (sock, sz) = p.rsplit_once(':').context("--part wants <socket>:<size>")?;
-                all.push((PathBuf::from(sock), sz.parse().context("--part size")?));
-            }
-            let plan = kahawai_media::remux::RemuxPlan {
-                video: kahawai_media::worker::parse_mode(&video),
-                audio: kahawai_media::worker::parse_mode(&audio),
-                audio_track,
-                video_track,
-                video_kbps,
-                max_height,
-                max_channels,
-                tone_map,
-                burn_subtitle: burn_sub,
-            };
-            kahawai_media::worker::run_parts(
-                &all,
-                &out_dir,
-                plan,
-                start_ms,
-                sink.as_deref(),
-                burn_sets.as_deref(),
-            )
-        }
-        Cmd::Transcoder => {
-            kahawai_transcoder::run(
-                &cfg.transcoder.hub,
-                &cfg.transcoder.state_dir,
-                &cfg.transcoder.name,
-                cfg.transcoder.max_sessions,
-                std::env::current_exe().ok(),
-            )
-            .await
-        }
-        Cmd::AllInOne => run_all_in_one(cfg, config_used).await,
+    // Blocking by design: this process exists only for the pipeline.
+    kahawai_media::demote_elements(&cfg.transcoder.demote_decoders)?;
+    let mut all = vec![(w.socket, w.size)];
+    for p in &w.parts {
+        let (sock, sz) = p.rsplit_once(':').context("--part wants <socket>:<size>")?;
+        all.push((PathBuf::from(sock), sz.parse().context("--part size")?));
     }
+    let plan = kahawai_media::remux::RemuxPlan {
+        video: kahawai_media::worker::parse_mode(&w.video),
+        audio: kahawai_media::worker::parse_mode(&w.audio),
+        audio_track: w.audio_track,
+        video_track: w.video_track,
+        video_kbps: w.video_kbps,
+        max_height: w.max_height,
+        max_channels: w.max_channels,
+        tone_map: w.tone_map,
+        burn_subtitle: w.burn_sub,
+    };
+    kahawai_media::worker::run_parts(
+        &all,
+        &w.out_dir,
+        plan,
+        w.start_ms,
+        w.sink.as_deref(),
+        w.burn_sets.as_deref(),
+    )
+}
+
+#[cfg(feature = "transcoder")]
+pub async fn run_transcoder(cfg: &config::Config) -> Result<()> {
+    kahawai_transcoder::run(
+        &cfg.transcoder.hub,
+        &cfg.transcoder.state_dir,
+        &cfg.transcoder.name,
+        cfg.transcoder.max_sessions,
+        std::env::current_exe().ok(),
+    )
+    .await
 }
 
 /// Environment checks (OPS-3): shared GStreamer inventory plus per-module
 /// filesystem and clock checks from the loaded config.
-fn doctor_checks(cfg: &config::Config) -> Vec<kahawai_media::doctor::Check> {
+pub fn doctor_checks(cfg: &config::Config) -> Vec<kahawai_media::doctor::Check> {
     use kahawai_media::doctor::Check;
     // The workers apply these before building pipelines, so the doctor
     // must too — otherwise it reports the ranks of a registry no session
@@ -284,25 +183,33 @@ fn doctor_checks(cfg: &config::Config) -> Vec<kahawai_media::doctor::Check> {
             _ => Check::warn(name, format!("{} does not exist", dir.display())),
         }
     };
+    // Per-module rows only where the module can actually run in this
+    // binary — a transcoder build has no hub data dir to fret about.
     // HUB-32c: Tesseract is a runtime dependency of the OCR tier;
     // absence degrades (tier skipped) but must be visible.
     #[cfg(feature = "ocr")]
     checks.push(kahawai_hub::ocr::doctor_check());
+    #[cfg(feature = "hub")]
     checks.push(dir_check("hub data dir", &cfg.hub.data_dir, true));
-    checks.push(dir_check(
-        "mediahost state dir",
-        &cfg.mediahost.state_dir,
-        true,
-    ));
-    for c in &cfg.mediahost.collections {
-        for root in &c.roots {
-            checks.push(dir_check(
-                &format!("collection \"{}\" root", c.name),
-                root,
-                false,
-            ));
+    #[cfg(feature = "mediahost")]
+    {
+        checks.push(dir_check(
+            "mediahost state dir",
+            &cfg.mediahost.state_dir,
+            true,
+        ));
+        for c in &cfg.mediahost.collections {
+            for root in &c.roots {
+                checks.push(dir_check(
+                    &format!("collection \"{}\" root", c.name),
+                    root,
+                    false,
+                ));
+            }
         }
     }
+    #[cfg(not(all(feature = "hub", feature = "mediahost")))]
+    let _ = &dir_check;
 
     // Hardware acceleration is optional but worth surfacing.
     // Linux-only: DRI render nodes are how VA-API reaches the GPU, and
@@ -340,7 +247,7 @@ fn doctor_checks(cfg: &config::Config) -> Vec<kahawai_media::doctor::Check> {
     checks
 }
 
-fn doctor(cfg: &config::Config, json: bool) -> Result<()> {
+pub fn doctor(cfg: &config::Config, json: bool) -> Result<()> {
     use kahawai_media::doctor::Status;
     let checks = doctor_checks(cfg);
     if json {
@@ -362,7 +269,7 @@ fn doctor(cfg: &config::Config, json: bool) -> Result<()> {
 }
 
 /// Startup gate: log warnings, abort on essential failures (OPS-3).
-fn startup_checks(cfg: &config::Config) -> Result<()> {
+pub fn startup_checks(cfg: &config::Config) -> Result<()> {
     use kahawai_media::doctor::Status;
     let checks = doctor_checks(cfg);
     for c in &checks {
@@ -378,7 +285,8 @@ fn startup_checks(cfg: &config::Config) -> Result<()> {
     Ok(())
 }
 
-async fn reset_password(cfg: config::HubConfig, username: &str) -> Result<()> {
+#[cfg(feature = "hub")]
+pub async fn reset_password(cfg: config::HubConfig, username: &str) -> Result<()> {
     let db = kahawai_hub::db::open(&cfg.data_dir).await?;
     eprint!("New password for {username}: ");
     let mut pw = String::new();
@@ -390,7 +298,8 @@ async fn reset_password(cfg: config::HubConfig, username: &str) -> Result<()> {
     Ok(())
 }
 
-async fn run_hub(cfg: config::HubConfig, config_path: Option<PathBuf>) -> Result<()> {
+#[cfg(feature = "hub")]
+pub async fn run_hub(cfg: config::HubConfig, config_path: Option<PathBuf>) -> Result<()> {
     run_hub_inner(cfg, None, config_path).await
 }
 
@@ -398,7 +307,8 @@ async fn run_hub(cfg: config::HubConfig, config_path: Option<PathBuf>) -> Result
 /// unchanged, transport replaced by channels, byte plane replaced by
 /// direct file reads. The satellite listener stays up: external
 /// mediahosts/transcoders enroll and dial in exactly as in modular mode.
-async fn run_all_in_one(cfg: config::Config, config_path: Option<PathBuf>) -> Result<()> {
+#[cfg(all(feature = "hub", feature = "mediahost"))]
+pub async fn run_all_in_one(cfg: config::Config, config_path: Option<PathBuf>) -> Result<()> {
     anyhow::ensure!(
         !cfg.mediahost.collections.is_empty(),
         "all-in-one needs at least one [[mediahost.collections]] entry"
@@ -406,6 +316,7 @@ async fn run_all_in_one(cfg: config::Config, config_path: Option<PathBuf>) -> Re
     run_hub_inner(cfg.hub, Some(cfg.mediahost), config_path).await
 }
 
+#[cfg(feature = "hub")]
 async fn run_hub_inner(
     cfg: config::HubConfig,
     local_mediahost: Option<config::MediahostConfig>,
@@ -502,6 +413,12 @@ async fn run_hub_inner(
             }
         });
     }
+    #[cfg(not(feature = "mediahost"))]
+    anyhow::ensure!(
+        local_mediahost.is_none(),
+        "this binary was built without the in-process mediahost (feature `mediahost`)"
+    );
+    #[cfg(feature = "mediahost")]
     if let Some(mh) = local_mediahost {
         const LOCAL_ID: &str = "local";
         registry.ensure_local_satellite(LOCAL_ID, &mh.name).await?;
@@ -630,7 +547,8 @@ async fn run_hub_inner(
         .context("satellite listener failed")
 }
 
-async fn run_mediahost(cfg: config::MediahostConfig) -> Result<()> {
+#[cfg(feature = "mediahost")]
+pub async fn run_mediahost(cfg: config::MediahostConfig) -> Result<()> {
     kahawai_mediahost::run(
         &cfg.hub,
         &cfg.state_dir,

@@ -127,17 +127,35 @@ deploy() {
     # live under $HOME, and interpolating them here would ship the DEV
     # BOX's home directory to the mac — where the keychain then never
     # exists and every deploy silently falls back to ad-hoc signing.
-    ssh "$host" "IDENTITY='$IDENTITY' BUNDLE_ID='$BUNDLE_ID' AGENT='$AGENT' bash -s" <<'REMOTE'
+    # The synced tree has no .git, so the build stamp rides an env var
+    # (kahawai-core/build.rs honors KAHAWAI_BUILD over git).
+    local stamp
+    stamp="$(git -C "$repo" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+    git -C "$repo" diff --quiet 2>/dev/null || stamp="$stamp+dirty"
+    stamp="$stamp $(git -C "$repo" log -1 --format=%cs HEAD 2>/dev/null || true)"
+    ssh "$host" "IDENTITY='$IDENTITY' BUNDLE_ID='$BUNDLE_ID' AGENT='$AGENT' KAHAWAI_BUILD='$stamp' bash -s" <<'REMOTE'
 set -euo pipefail
 export PATH="$PATH:/opt/homebrew/bin:/usr/local/bin:$HOME/.cargo/bin"
 KEYCHAIN="$HOME/Library/Keychains/kahawai-signing.keychain-db"
 PASSFILE="$HOME/.config/kahawai/signing-keychain.pass"
 cd ~/kahawai-src
-# Satellite build: no OCR feature — the mac runs only the transcoder,
-# and the full build would demand tesseract/leptonica from Homebrew for
-# a tier that executes hub-side.
-cargo build --release --no-default-features 2>&1 | tail -1
-BIN=target/release/kahawai
+# Satellite build: the lean transcoder binary — no hub, no mediahost,
+# no Tesseract (which Homebrew would otherwise have to provide for a
+# tier that executes hub-side).
+export KAHAWAI_BUILD
+cargo build --release --no-default-features --features transcoder \
+    --bin kahawai-transcoder 2>&1 | tail -1
+BIN=target/release/kahawai-transcoder
+# The launchd agent must point at the new binary (older setups ran
+# `.../kahawai transcoder`); rewrite + bootstrap when it differs.
+PLIST="$HOME/Library/LaunchAgents/$AGENT.plist"
+if ! plutil -p "$PLIST" | grep -q "kahawai-transcoder"; then
+    plutil -replace ProgramArguments -json \
+        "[\"$HOME/kahawai-src/target/release/kahawai-transcoder\"]" "$PLIST"
+    launchctl bootout "gui/$(id -u)/$AGENT" 2>/dev/null || true
+    launchctl bootstrap "gui/$(id -u)" "$PLIST"
+    echo "launchd agent repointed at kahawai-transcoder"
+fi
 if security find-identity -v -p codesigning "$KEYCHAIN" 2>/dev/null | grep -q "$IDENTITY"; then
     security unlock-keychain -p "$(cat "$PASSFILE")" "$KEYCHAIN"
     # NOT --options runtime: Hardened Runtime turns on library

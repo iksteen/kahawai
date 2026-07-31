@@ -11,15 +11,9 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use kahawai_proto::v1::{FileError, FileRecord, FileUpsert, HostToHub, ScanProgress, host_to_hub};
-use serde::Deserialize;
 use tokio::sync::mpsc::Sender;
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct CollectionConfig {
-    pub name: String,
-    pub media_type: String,
-    pub roots: Vec<PathBuf>,
-}
+pub use kahawai_core::media::CollectionConfig;
 
 const AUDIO_EXTS: &[&str] = &["flac", "mp3", "m4a", "ogg", "opus", "wav", "aac", "wma"];
 

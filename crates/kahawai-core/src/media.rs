@@ -178,3 +178,14 @@ pub struct SidecarSubtitle {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub track: Option<u32>,
 }
+
+/// One mediahost collection as configured (name, media type, roots).
+/// Lives in core because every binary parses the full config file —
+/// including builds that carry no mediahost module at all.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CollectionConfig {
+    pub name: String,
+    pub media_type: String,
+    pub roots: Vec<std::path::PathBuf>,
+}

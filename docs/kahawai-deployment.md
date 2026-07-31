@@ -170,6 +170,14 @@ grant keys on the identity and survives rebuilds.
 # deliberately not scriptable, which is why setup is separate.
 scripts/kahawai-mac.sh setup
 
+# Per-module binaries: deployments run the lean flavor —
+#   cargo build --release --no-default-features --features mediahost --bin kahawai-mediahost
+#   cargo build --release --no-default-features --features transcoder --bin kahawai-transcoder
+#   cargo build --release --no-default-features --features hub,ocr --bin kahawai-hub
+# (the `kahawai` binary keeps everything, incl. all-in-one, for the dev
+# box). silence: scripts/kahawai-silence.sh builds both satellite
+# binaries here (same arch) and ships + restarts them.
+#
 # from the dev box, per deploy: sync tracked files + web/dist, build,
 # sign, restart the launchd agent, wait for the link.
 scripts/kahawai-mac.sh deploy [user@host]

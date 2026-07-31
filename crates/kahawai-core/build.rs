@@ -4,6 +4,15 @@
 use std::process::Command;
 
 fn main() {
+    // Deploys that rsync tracked files ship no .git (the mac): the
+    // deploy script passes the stamp it read from the dev checkout.
+    println!("cargo:rerun-if-env-changed=KAHAWAI_BUILD");
+    if let Ok(v) = std::env::var("KAHAWAI_BUILD")
+        && !v.is_empty()
+    {
+        println!("cargo:rustc-env=KAHAWAI_BUILD={}", v.trim());
+        return;
+    }
     let git = |args: &[&str]| {
         Command::new("git")
             .args(args)

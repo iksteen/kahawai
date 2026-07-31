@@ -153,7 +153,7 @@ pub struct MediahostConfig {
     pub hub: String,
     pub state_dir: PathBuf,
     pub name: String,
-    pub collections: Vec<kahawai_mediahost::scan::CollectionConfig>,
+    pub collections: Vec<kahawai_core::media::CollectionConfig>,
     /// Backup sweep interval (minutes; 0 disables). The primary change
     /// detector is the filesystem watcher — which network mounts like
     /// sshfs can't serve, so the sweep catches what inotify can't see.
