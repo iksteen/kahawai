@@ -184,9 +184,32 @@ async fn transcoder_registers_capabilities_and_clears_on_disconnect() {
         video_caps: video_caps.iter().map(|s| s.to_string()).collect(),
         audio_caps: vec!["audio/x-flac".into()],
         needs_tonemap: false,
+        ..Default::default()
     };
     let av1 = need(&["video/x-av1"]);
     assert_eq!(hub.registry.pick_transcoder(&av1).as_deref(), Some("01TC"));
+    // HUB-15b: the encode target is a HARD filter — this box reported
+    // only h264/aac, so an hevc-target need skips it; naming what it
+    // has (or nothing, = any) matches.
+    let hevc_need = PlacementNeed {
+        video_codec: "hevc".into(),
+        ..need(&["video/x-av1"])
+    };
+    assert_eq!(hub.registry.pick_transcoder(&hevc_need), None);
+    let h264_need = PlacementNeed {
+        video_codec: "h264".into(),
+        audio_codec: "aac".into(),
+        ..need(&["video/x-av1"])
+    };
+    assert_eq!(
+        hub.registry.pick_transcoder(&h264_need).as_deref(),
+        Some("01TC")
+    );
+    assert_eq!(
+        hub.registry.transcoder_encoders("01TC"),
+        vec!["h264".to_string(), "aac".to_string()],
+        "encoder set readable for negotiation"
+    );
     // Decode fit: a source this box cannot decode is not placeable here.
     assert_eq!(
         hub.registry.pick_transcoder(&need(&["video/x-daala"])),

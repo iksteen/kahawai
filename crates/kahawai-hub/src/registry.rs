@@ -63,6 +63,12 @@ pub struct PlacementNeed {
     /// HUB-15a: the plan tone-maps — prefer a box reporting the GL
     /// segment (preference, not filter).
     pub needs_tonemap: bool,
+    /// HUB-15b: the encode TARGET codec ("h264"/"hevc"/"av1", empty =
+    /// any video encoder qualifies). A HARD filter, unlike tone-map: a
+    /// box without the target's encoder cannot degrade gracefully.
+    pub video_codec: String,
+    /// Same for audio ("aac"/"opus", empty = any).
+    pub audio_codec: String,
 }
 
 /// SEC-7: how long a renewed-but-unused fingerprint stays admitted.
@@ -1513,6 +1519,23 @@ impl Registry {
             .remove(&(module_id.to_string(), collection_id.to_string()))
     }
 
+    /// HUB-15b: the verified encoder codec names a transcoder reported
+    /// ("h264", "hevc", "aac", …) — what negotiation may pick as an
+    /// encode target when this box would run the session.
+    pub fn transcoder_encoders(&self, module_id: &str) -> Vec<String> {
+        self.transcoder_caps
+            .lock()
+            .unwrap()
+            .get(module_id)
+            .and_then(|c| c.get("encoders")?.as_array().cloned())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|e| e["codec"].as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// HUB-15a: does this transcoder report the GL tone-map segment?
     pub fn transcoder_reports_tonemap(&self, module_id: &str) -> bool {
         self.transcoder_caps
@@ -1606,7 +1629,17 @@ impl Registry {
             .filter_map(|(id, c)| {
                 let encoders = c.get("encoders")?.as_array()?;
                 let has = |codec: &str| encoders.iter().any(|e| e["codec"] == codec);
-                if (need.encode_video && !has("h264")) || (need.encode_audio && !has("aac")) {
+                // HUB-15b: match the TARGET the plan asks for; an empty
+                // need means "any encoder of that kind".
+                let video_ok = || match need.video_codec.as_str() {
+                    "" => ["h264", "hevc", "av1"].iter().any(|c| has(c)),
+                    c => has(c),
+                };
+                let audio_ok = || match need.audio_codec.as_str() {
+                    "" => ["aac", "opus"].iter().any(|c| has(c)),
+                    c => has(c),
+                };
+                if (need.encode_video && !video_ok()) || (need.encode_audio && !audio_ok()) {
                     return None;
                 }
                 // Decode fit: the box must decode at least one source
@@ -1631,9 +1664,15 @@ impl Registry {
                 if max > 0 && current >= max {
                     return None; // at capacity (TC-6)
                 }
-                let hw = encoders
-                    .iter()
-                    .any(|e| e["codec"] == "h264" && e["hardware"] == true);
+                // Rank hardware on the codec the session will actually
+                // run (empty need: any hw video encoder counts).
+                let hw = encoders.iter().any(|e| {
+                    e["hardware"] == true
+                        && match need.video_codec.as_str() {
+                            "" => true,
+                            c => e["codec"] == c,
+                        }
+                });
                 // HUB-15a: an HDR encode prefers a box that can tone-map
                 // — a preference, not a filter: with no capable box the
                 // job still runs (worker encodes as-is, verdict said so).

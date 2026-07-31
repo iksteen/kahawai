@@ -118,9 +118,10 @@ const MATRIX: &[(&str, &[&str], bool, &str, bool)] = &[
     ),
     (
         "mux fmp4/cmaf",
-        &["cmafmux", "isofmp4mux"],
+        &["isofmp4mux"],
         false,
-        "HLS uses TS segments only (install gst-plugins-rs for fMP4/CMAF)",
+        "non-h264 encode targets unavailable — HLS uses TS segments only \
+         (install gst-plugins-rs fmp4 for the HUB-15b fMP4 path)",
         false,
     ),
     (
@@ -154,10 +155,46 @@ const MATRIX: &[(&str, &[&str], bool, &str, bool)] = &[
         false,
     ),
     (
+        "encode hevc",
+        &[
+            "vah265enc",
+            "vaapih265enc",
+            "nvh265enc",
+            "qsvh265enc",
+            "vtenc_h265_hw",
+            "vtenc_h265",
+            "x265enc",
+        ],
+        false,
+        "no hevc encode target — clients without h264 fall back to refusal",
+        false,
+    ),
+    (
+        "encode av1",
+        &[
+            "vaav1enc",
+            "nvav1enc",
+            "qsvav1enc",
+            "svtav1enc",
+            "rav1e",
+            "av1enc",
+        ],
+        false,
+        "no av1 encode target",
+        false,
+    ),
+    (
         "encode aac",
         &["fdkaacenc", "avenc_aac", "voaacenc"],
         false,
         "no audio transcoding to AAC",
+        false,
+    ),
+    (
+        "encode opus",
+        &["opusenc"],
+        false,
+        "no opus encode target — clients without aac fall back to refusal",
         false,
     ),
     (
@@ -319,6 +356,21 @@ pub fn gstreamer_checks() -> Vec<Check> {
             "encode h264",
             crate::remux::h264_encoder(),
             "video transcode disabled",
+        ),
+        (
+            "encode hevc",
+            crate::remux::hevc_encoder(),
+            "hevc target disabled",
+        ),
+        (
+            "encode av1",
+            crate::remux::av1_encoder(),
+            "av1 target disabled",
+        ),
+        (
+            "encode opus",
+            crate::remux::opus_encoder(),
+            "opus target disabled",
         ),
     ] {
         if let Some(c) = out.iter_mut().find(|c| c.name == row)

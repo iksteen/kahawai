@@ -89,30 +89,44 @@ pub(crate) fn codec_to_caps_name<'a>(kind: &str, codec: &'a str) -> Option<&'a s
 /// element is discovered at startup, not mid-session).
 pub const AAC_ENCODERS: &[&str] = &["fdkaacenc", "avenc_aac", "voaacenc"];
 
+/// First encoder in `list` that exists AND survives its dry run —
+/// shared by every per-codec discovery fn below. The dry run is what
+/// makes preference lists safe: a hw element on a box without the
+/// driver fails the probe and the next one wins (TC-1/TC-6).
+fn verified_encoder(list: &[&'static str], dry: fn(&str) -> bool) -> Option<&'static str> {
+    let _ = crate::init();
+    list.iter().copied().find(|name| {
+        if gst::ElementFactory::find(name).is_none() {
+            return false;
+        }
+        let ok = dry(name);
+        if !ok {
+            tracing::warn!(encoder = name, "encoder failed dry-run; trying next");
+        }
+        ok
+    })
+}
+
 /// Best available AAC encoder, verified once by a dry-run pipeline
 /// (`audiotestsrc ! ... ! encoder ! fakesink` to EOS). None → no audio
 /// transcoding on this machine.
 pub fn aac_encoder() -> Option<&'static str> {
     static VERIFIED: std::sync::OnceLock<Option<&'static str>> = std::sync::OnceLock::new();
-    *VERIFIED.get_or_init(|| {
-        let _ = crate::init();
-        AAC_ENCODERS.iter().copied().find(|name| {
-            if gst::ElementFactory::find(name).is_none() {
-                return false;
-            }
-            let ok = dry_run_encoder(name);
-            if !ok {
-                tracing::warn!(encoder = name, "AAC encoder failed dry-run; trying next");
-            }
-            ok
-        })
-    })
+    *VERIFIED.get_or_init(|| verified_encoder(AAC_ENCODERS, dry_run_encoder))
+}
+
+/// Opus encoder (HUB-15b audio target for non-aac clients). One
+/// candidate: opusenc ships with gst-plugins-base and there is no
+/// hardware Opus encoder in the wild.
+pub const OPUS_ENCODERS: &[&str] = &["opusenc"];
+
+pub fn opus_encoder() -> Option<&'static str> {
+    static VERIFIED: std::sync::OnceLock<Option<&'static str>> = std::sync::OnceLock::new();
+    *VERIFIED.get_or_init(|| verified_encoder(OPUS_ENCODERS, dry_run_encoder))
 }
 
 /// H.264 encoders in preference order: hardware first (VA-API, NVENC,
-/// QSV, VideoToolbox), then software. Dry-run verification is what makes this list
-/// safe — a hw element on a box without the driver fails the probe and
-/// the next one wins (TC-1/TC-6).
+/// QSV, VideoToolbox), then software.
 pub const H264_ENCODERS: &[&str] = &[
     "vah264enc",
     "vaapih264enc",
@@ -124,37 +138,71 @@ pub const H264_ENCODERS: &[&str] = &[
     "openh264enc",
 ];
 
+/// HEVC and AV1 encode targets (HUB-15b), same hardware-first shape.
+pub const HEVC_ENCODERS: &[&str] = &[
+    "vah265enc",
+    "vaapih265enc",
+    "nvh265enc",
+    "qsvh265enc",
+    "vtenc_h265_hw",
+    "vtenc_h265",
+    "x265enc",
+];
+pub const AV1_ENCODERS: &[&str] = &[
+    "vaav1enc",
+    "nvav1enc",
+    "qsvav1enc",
+    "svtav1enc",
+    "rav1e",
+    "av1enc",
+];
+
 /// Best available H.264 encoder, dry-run-verified once. None → this box
 /// cannot transcode video.
 pub fn h264_encoder() -> Option<&'static str> {
     static VERIFIED: std::sync::OnceLock<Option<&'static str>> = std::sync::OnceLock::new();
-    *VERIFIED.get_or_init(|| {
-        let _ = crate::init();
-        H264_ENCODERS.iter().copied().find(|name| {
-            if gst::ElementFactory::find(name).is_none() {
-                return false;
-            }
-            let ok = dry_run_video_encoder(name);
-            if !ok {
-                tracing::warn!(encoder = name, "H.264 encoder failed dry-run; trying next");
-            }
-            ok
-        })
-    })
+    *VERIFIED.get_or_init(|| verified_encoder(H264_ENCODERS, dry_run_video_encoder))
+}
+
+pub fn hevc_encoder() -> Option<&'static str> {
+    static VERIFIED: std::sync::OnceLock<Option<&'static str>> = std::sync::OnceLock::new();
+    *VERIFIED.get_or_init(|| verified_encoder(HEVC_ENCODERS, dry_run_video_encoder))
+}
+
+pub fn av1_encoder() -> Option<&'static str> {
+    static VERIFIED: std::sync::OnceLock<Option<&'static str>> = std::sync::OnceLock::new();
+    *VERIFIED.get_or_init(|| verified_encoder(AV1_ENCODERS, dry_run_video_encoder))
 }
 
 /// Verified encoder capabilities for the transcoder's registration
 /// report (TC-1): (codec, element, hardware) triples that survived a
 /// dry run. Hardware = anything before the software entries in the
-/// preference lists (placement prefers hw boxes).
+/// preference lists (placement prefers hw boxes). A `hevc:`/`av1:`/
+/// `opus:` entry appearing here is what makes the box eligible for
+/// that encode target (HUB-15b) — placement hard-filters on it.
 pub fn encoder_capabilities() -> Vec<(&'static str, &'static str, bool)> {
-    const SW_VIDEO: &[&str] = &["x264enc", "openh264enc"];
+    const SW_VIDEO: &[&str] = &[
+        "x264enc",
+        "openh264enc",
+        "x265enc",
+        "svtav1enc",
+        "rav1e",
+        "av1enc",
+    ];
     let mut caps = Vec::new();
-    if let Some(el) = h264_encoder() {
-        caps.push(("h264", el, !SW_VIDEO.contains(&el)));
+    for (codec, el) in [
+        ("h264", h264_encoder()),
+        ("hevc", hevc_encoder()),
+        ("av1", av1_encoder()),
+    ] {
+        if let Some(el) = el {
+            caps.push((codec, el, !SW_VIDEO.contains(&el)));
+        }
     }
-    if let Some(el) = aac_encoder() {
-        caps.push(("aac", el, false));
+    for (codec, el) in [("aac", aac_encoder()), ("opus", opus_encoder())] {
+        if let Some(el) = el {
+            caps.push((codec, el, false));
+        }
     }
     caps
 }

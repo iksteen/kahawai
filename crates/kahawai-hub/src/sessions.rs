@@ -792,6 +792,11 @@ impl Sessions {
                     video_caps: kahawai_media::remux::source_caps_names("video", info),
                     audio_caps: vec![],
                     needs_tonemap: true,
+                    // HUB-15b phase A shim: the plan is still hard-coded
+                    // h264/aac, so a box reporting only hevc/av1 must
+                    // not be picked. Phase D fills these from the plan.
+                    video_codec: "h264".into(),
+                    audio_codec: "aac".into(),
                 };
                 let tonemap = match registry.pick_transcoder(&need) {
                     Some(tc) => registry.transcoder_reports_tonemap(&tc),
@@ -976,6 +981,9 @@ impl Sessions {
                     video_caps: kahawai_media::remux::source_caps_names("video", &info),
                     audio_caps: kahawai_media::remux::source_caps_names("audio", &info),
                     needs_tonemap: plan.tone_map,
+                    // HUB-15b phase A shim, see the speculative probe.
+                    video_codec: "h264".into(),
+                    audio_codec: "aac".into(),
                 };
                 // Encode work goes to the fleet when one is available
                 // (§4.5); pure remux — and encode with no fleet — stays
