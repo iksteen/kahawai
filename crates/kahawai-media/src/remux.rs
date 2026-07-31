@@ -347,6 +347,7 @@ pub enum SegmentFormat {
     Fmp4,
 }
 
+#[allow(clippy::should_implement_trait)] // infallible, legacy-defaulting — not the trait
 impl VideoTarget {
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -364,6 +365,7 @@ impl VideoTarget {
     }
 }
 
+#[allow(clippy::should_implement_trait)] // infallible, legacy-defaulting — not the trait
 impl AudioTarget {
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -379,6 +381,7 @@ impl AudioTarget {
     }
 }
 
+#[allow(clippy::should_implement_trait)] // infallible, legacy-defaulting — not the trait
 impl SegmentFormat {
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -1835,6 +1838,7 @@ fn install_layout_pin(
     });
 }
 
+#[allow(clippy::too_many_arguments)] // one plan, spelled out
 fn build_audio_encode_chain(
     pipe: &gst::Pipeline,
     from: &gst::Pad,
@@ -3250,6 +3254,9 @@ mod tests {
         max_channels: None,
         tone_map: false,
         burn_subtitle: None,
+        video_codec: VideoTarget::H264,
+        audio_codec: AudioTarget::Aac,
+        segment_format: SegmentFormat::Ts,
     };
 
     /// Manual repro: REMUX_SRC=/path/to/file cargo test -p kahawai-media \
@@ -3640,6 +3647,7 @@ mod tests {
             max_channels: Some(1),
             tone_map: false,
             burn_subtitle: None,
+            ..Default::default()
         };
         let _ = info;
         let out = tempfile::tempdir().unwrap();
@@ -3709,6 +3717,7 @@ mod tests {
             max_channels: None,
             tone_map: false,
             burn_subtitle: Some(0),
+            ..Default::default()
         };
         let out = tempfile::tempdir().unwrap();
         let job = start_at(
@@ -3771,6 +3780,7 @@ mod tests {
             max_channels: Some(2),
             tone_map: false,
             burn_subtitle: None,
+            ..Default::default()
         };
         let out = tempfile::tempdir().unwrap();
         let job = start_at(
@@ -3872,6 +3882,7 @@ mod tests {
             max_channels: None, // what the web client sends: no ceiling
             tone_map: false,
             burn_subtitle: None,
+            ..Default::default()
         };
         let out = tempfile::tempdir().unwrap();
         let job = start_at(
@@ -3948,6 +3959,7 @@ mod tests {
             max_channels: None,
             tone_map: true,
             burn_subtitle: None,
+            ..Default::default()
         };
         let out = tempfile::tempdir().unwrap();
         let job = start_at(
