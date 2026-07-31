@@ -151,14 +151,35 @@ should poll — it reports every module, and a satellite being away is
 
 ## macOS satellites
 
-A macOS transcoder needs one thing no other platform does: a stable
-code signature. The transcoder dials the hub over the LAN, so macOS 15+
-gates it behind **Local Network** privacy, and that grant is keyed to
-the binary's code signature. An ad-hoc signature is keyed by cdhash,
-which changes with every rebuild — so every rebuild silently loses
-network access (`No route to host` in a reconnect loop) until someone
-re-approves it in System Settings. Signed with a stable identity, the
-grant keys on the identity and survives rebuilds.
+A macOS transcoder dials the hub over the LAN, so macOS 15+ gates it
+behind **Local Network** privacy: `No route to host` in a reconnect
+loop until someone clicks the dialog. Corrected 2026-07-31, against
+TN3179 and measured on the mini — the earlier claim that a stable
+self-signed identity would hold the grant was wrong:
+
+- The grant is tracked by code signature **only for Apple-issued
+  identities** (a real Team ID). A self-signed identity is treated
+  like ad-hoc, and the state then keys on the executable's `LC_UUID` —
+  which changes on **every rebuild**. No local identity can fix that.
+- launchd **daemons** are auto-allowed; launchd **agents** (ours) are
+  not. Command-line tools run over ssh are auto-allowed too — which is
+  why the problem never reproduces in an ssh session, only under the
+  agent.
+
+The durable fix is the administrative allowlist — per interface, so a
+wired satellite uses the Ethernet key (run ON the mac, once):
+
+```sh
+sudo defaults write /Library/Preferences/com.apple.network.local-network \
+    AllowedEthernetLocalNetworkAddresses -array "192.168.0.0/24"
+```
+
+That bypasses per-app grants for the listed CIDRs and survives every
+rebuild, rename and re-sign. (The alternative with the same effect is
+converting the agent to a launchd daemon — auto-allowed by design and
+starts at boot, at the cost of verifying VideoToolbox behaves the same
+outside a GUI session.) The self-signed identity stays: it keeps the
+signature itself stable, which macOS wants for everything else.
 
 `scripts/kahawai-mac.sh` owns both halves:
 

@@ -149,7 +149,10 @@ BIN=target/release/kahawai-transcoder
 # The launchd agent must point at the new binary (older setups ran
 # `.../kahawai transcoder`); rewrite + bootstrap when it differs.
 PLIST="$HOME/Library/LaunchAgents/$AGENT.plist"
-if ! plutil -p "$PLIST" | grep -q "kahawai-transcoder"; then
+# Check the PROGRAM, not the whole plist: the log path also contains
+# "kahawai-transcoder" and matched a naive grep on the first try.
+if [ "$(plutil -extract ProgramArguments.0 raw "$PLIST" 2>/dev/null)" \
+     != "$HOME/kahawai-src/target/release/kahawai-transcoder" ]; then
     plutil -replace ProgramArguments -json \
         "[\"$HOME/kahawai-src/target/release/kahawai-transcoder\"]" "$PLIST"
     launchctl bootout "gui/$(id -u)/$AGENT" 2>/dev/null || true
