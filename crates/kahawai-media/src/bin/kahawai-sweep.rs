@@ -282,6 +282,12 @@ fn sweep_one(
         // the hub's caches.
         &[],
         None,
+        // The sweep runs where it encodes: its own verified encoders
+        // are the fleet.
+        &kahawai_media::remux::encoder_capabilities()
+            .iter()
+            .map(|(c, _, _)| c.to_string())
+            .collect::<Vec<_>>(),
     );
     let plan = sp.plan;
     if sp.cost == kahawai_media::negotiate::Cost::Unplayable {

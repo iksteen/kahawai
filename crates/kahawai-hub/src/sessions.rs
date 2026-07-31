@@ -174,6 +174,16 @@ impl PendingSeek {
     }
 }
 
+/// The local process's verified encoder codec names — negotiation's
+/// target pool when no fleet box would run the encode (HUB-15b),
+/// mirroring the tonemap_available() fallback.
+fn local_encoder_names() -> Vec<String> {
+    kahawai_media::remux::encoder_capabilities()
+        .iter()
+        .map(|(c, _, _)| c.to_string())
+        .collect()
+}
+
 /// The negotiation speaks stream indexes; the API speaks unified track
 /// rows. Stamp each verdict with the id of the embedded row bound to
 /// the session's source (missing rows read as None — a source scanned
@@ -792,15 +802,22 @@ impl Sessions {
                     video_caps: kahawai_media::remux::source_caps_names("video", info),
                     audio_caps: vec![],
                     needs_tonemap: true,
-                    // HUB-15b phase A shim: the plan is still hard-coded
-                    // h264/aac, so a box reporting only hevc/av1 must
-                    // not be picked. Phase D fills these from the plan.
-                    video_codec: "h264".into(),
-                    audio_codec: "aac".into(),
+                    // Codec-agnostic probe: "which box would run an
+                    // encode of this source at all" — its verified
+                    // encoder set then becomes negotiation's target
+                    // pool (HUB-15b), same shape as the tone-map fact.
+                    video_codec: String::new(),
+                    audio_codec: String::new(),
                 };
-                let tonemap = match registry.pick_transcoder(&need) {
-                    Some(tc) => registry.transcoder_reports_tonemap(&tc),
-                    None => kahawai_media::remux::tonemap_available(),
+                let (tonemap, targets) = match registry.pick_transcoder(&need) {
+                    Some(tc) => (
+                        registry.transcoder_reports_tonemap(&tc),
+                        registry.transcoder_encoders(&tc),
+                    ),
+                    None => (
+                        kahawai_media::remux::tonemap_available(),
+                        local_encoder_names(),
+                    ),
                 };
                 // HUB-32b: the timeline comes from the mediahost, which
                 // walks its own disk in milliseconds (the hub cannot: every
@@ -829,6 +846,7 @@ impl Sessions {
                         })
                         .unwrap_or_default(),
                     pick_for(parts),
+                    &targets,
                 )
             };
         // HUB-32b: the timeline comes from the mediahost, which walks
@@ -981,9 +999,18 @@ impl Sessions {
                     video_caps: kahawai_media::remux::source_caps_names("video", &info),
                     audio_caps: kahawai_media::remux::source_caps_names("audio", &info),
                     needs_tonemap: plan.tone_map,
-                    // HUB-15b phase A shim, see the speculative probe.
-                    video_codec: "h264".into(),
-                    audio_codec: "aac".into(),
+                    // HUB-15b: the chosen TARGETS are hard placement
+                    // filters (empty when the stream doesn't encode).
+                    video_codec: if plan.video == StreamMode::Encode {
+                        plan.video_codec.as_str().to_string()
+                    } else {
+                        String::new()
+                    },
+                    audio_codec: if plan.audio == StreamMode::Encode {
+                        plan.audio_codec.as_str().to_string()
+                    } else {
+                        String::new()
+                    },
                 };
                 // Encode work goes to the fleet when one is available
                 // (§4.5); pure remux — and encode with no fleet — stays
@@ -1018,6 +1045,12 @@ impl Sessions {
                             .await
                         {
                             Ok(f) => f,
+                            Err(first)
+                                if plan.segment_format
+                                    != kahawai_media::remux::SegmentFormat::Ts =>
+                            {
+                                return Err(first); // fmp4 has no sink fallback
+                            }
                             Err(first) => {
                                 tracing::warn!(session = %id, error = format!("{first:#}"),
                                     "start failed; retrying with fallback sink");
@@ -1051,6 +1084,12 @@ impl Sessions {
                             .await
                         {
                             Ok(r) => r,
+                            Err(first)
+                                if plan.segment_format
+                                    != kahawai_media::remux::SegmentFormat::Ts =>
+                            {
+                                return Err(first); // fmp4 has no sink fallback
+                            }
                             Err(first) => {
                                 tracing::warn!(session = %id, error = format!("{first:#}"),
                                     "start failed; retrying with fallback sink");
@@ -1813,6 +1852,16 @@ impl Sessions {
                 || session.parts.first().is_some_and(|p| {
                     registry.is_connected(&p.module_id) || self.reads_locally(&p.module_id)
                 });
+            // HUB-15b: re-plans may only pick targets the ALREADY
+            // CHOSEN executor encodes — the session does not move boxes
+            // on a track switch.
+            let targets = match &session.mode {
+                Mode::Transcode { transcoder } => {
+                    let tc = transcoder.lock().unwrap().clone();
+                    registry.transcoder_encoders(&tc)
+                }
+                _ => local_encoder_names(),
+            };
             let ocr_set = crate::subtitles::ocr_stream_set(registry.db(), &session.item_id).await;
             let ocr_flags = session
                 .parts
@@ -1840,6 +1889,7 @@ impl Sessions {
                 // The session's explicit burn keeps forcing across
                 // track switches — its sets are already in hand.
                 *session.burn_pick.lock().unwrap(),
+                &targets,
             );
             plan = sp.plan;
             anyhow::ensure!(plan.playable(), "selected track is not playable");
@@ -1889,7 +1939,10 @@ impl Sessions {
                     .await
                 {
                     Ok(r) => r,
-                    Err(first) if sink != "hlssink2" => {
+                    Err(first)
+                        if sink != "hlssink2"
+                            && plan.segment_format == kahawai_media::remux::SegmentFormat::Ts =>
+                    {
                         // The same TC-6 fallback the start path has: some
                         // content crashes hlssink3 on EVERY restart.
                         tracing::warn!(session = %session.id, error = format!("{first:#}"),
@@ -1964,7 +2017,9 @@ impl Sessions {
                     )
                     .await
                 {
-                    if sink == "hlssink2" {
+                    if sink == "hlssink2"
+                        || plan.segment_format != kahawai_media::remux::SegmentFormat::Ts
+                    {
                         return Err(first);
                     }
                     tracing::warn!(session = %session.id, error = format!("{first:#}"),

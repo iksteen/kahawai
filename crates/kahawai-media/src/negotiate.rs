@@ -15,8 +15,8 @@
 use kahawai_core::media::{CapabilityProfile, MediaInfo};
 
 use crate::remux::{
-    RemuxPlan, StreamMode, aac_encoder, can_decode, codec_to_caps_name, h264_encoder, plan_summary,
-    ts_muxable_names,
+    AudioTarget, RemuxPlan, SegmentFormat, StreamMode, VideoTarget, can_decode, codec_to_caps_name,
+    plan_summary,
 };
 
 /// HUB-16 cost order; `Ord` IS the preference (smaller = cheaper).
@@ -215,13 +215,15 @@ pub fn negotiate(
     // encode that carries them is forced. Still needs `burn_capable`;
     // picks that name a non-image track are ignored.
     burn_pick: Option<BurnPick>,
+    // HUB-15b: the verified encoder codec names of the box that would
+    // run an encode ("h264"/"hevc"/"av1"/"aac"/"opus") — an executor
+    // fact like `tonemap`, fetched from the speculatively placed
+    // transcoder or the local probes. Encode targets are picked from
+    // this set ∩ the client profile, in ubiquity order.
+    targets: &[String],
 ) -> SourcePlan {
     let audio_track = audio_track.min(info.audio.len().saturating_sub(1));
     let video_track = video_track.min(info.video.len().saturating_sub(1));
-    let names = ts_muxable_names();
-    let muxable = |kind: &str, codec: &str| {
-        codec_to_caps_name(kind, codec).is_some_and(|n| names.contains(n))
-    };
     let cap = profile.max_bandwidth_kbps;
     let over_cap = cap.is_some_and(|c| est_kbps.is_some_and(|e| e > c));
 
@@ -297,35 +299,107 @@ pub fn negotiate(
             .flatten()
     });
 
-    // Remux/transcode verdict per stream.
-    // An encode is only admissible when the client accepts its TARGET.
-    // This used to be skipped ("everything plays h264/aac"), which made
-    // the capability mask a liar: a profile without h264 still received
-    // h264, so the branch a codec-less client would take was untestable
-    // — and a real client without the codec would get an unwatchable
-    // stream with a confident verdict (found via the mask, HUB-14).
-    let client_takes_h264 = profile.video.iter().any(|c| c.codec == "h264");
-    let client_takes_aac = profile.audio.iter().any(|c| c == "aac");
+    // Remux/transcode arms, per CANDIDATE CONTAINER (HUB-15b).
+    // An encode is only admissible when the client accepts its TARGET
+    // (the capability-mask honesty rule, HUB-14) AND the executor
+    // verifiably encodes it AND the container carries it. TS keeps
+    // exactly h264/aac (hevc-in-TS has patchy client support); fMP4
+    // offers the full ubiquity ladders. The two candidates are judged
+    // by Cost and a tie goes to TS — so every session that worked
+    // before is byte-identical, and fMP4 appears only where it is
+    // strictly cheaper (av1/vp9 copies) or the only playable path
+    // (no-h264 clients on hevc/av1-encoding fleets).
     let burn_active = burn_subtitle.is_some() || forced_burn.is_some();
-    let video = if v.is_some_and(|s| v_client_ok && muxable("video", &s.codec) && !burn_active) {
-        StreamMode::Copy
-    } else if client_takes_h264
-        && h264_encoder().is_some()
-        && v.is_some_and(|s| codec_to_caps_name("video", &s.codec).is_some_and(can_decode))
-    {
-        StreamMode::Encode
+    let candidate =
+        |format: SegmentFormat| -> (StreamMode, VideoTarget, StreamMode, AudioTarget, (u8, Cost)) {
+            let (v_ladder, a_ladder): (&[VideoTarget], &[AudioTarget]) = match format {
+                SegmentFormat::Ts => (&[VideoTarget::H264], &[AudioTarget::Aac]),
+                SegmentFormat::Fmp4 => (
+                    &[VideoTarget::H264, VideoTarget::Hevc, VideoTarget::Av1],
+                    &[AudioTarget::Aac, AudioTarget::Opus],
+                ),
+            };
+            let names = crate::remux::muxable_names(format);
+            let muxable = |kind: &str, codec: &str| {
+                // isofmp4mux's `audio/mpeg` template is mpegversion 4 only,
+                // and codec_to_caps_name collides mp3 onto the same name.
+                if format == SegmentFormat::Fmp4 && codec == "mp3" {
+                    return false;
+                }
+                codec_to_caps_name(kind, codec).is_some_and(|n| names.contains(n))
+            };
+            let vt = v_ladder
+                .iter()
+                .copied()
+                .find(|t| {
+                    profile.video.iter().any(|c| c.codec == t.as_str())
+                        && targets.iter().any(|e| e == t.as_str())
+                })
+                .unwrap_or_default();
+            let client_takes_video_target = v_ladder.iter().any(|t| {
+                profile.video.iter().any(|c| c.codec == t.as_str())
+                    && targets.iter().any(|e| e == t.as_str())
+            });
+            let at = a_ladder
+                .iter()
+                .copied()
+                .find(|t| {
+                    profile.audio.iter().any(|c| c == t.as_str())
+                        && targets.iter().any(|e| e == t.as_str())
+                })
+                .unwrap_or_default();
+            let client_takes_audio_target = a_ladder.iter().any(|t| {
+                profile.audio.iter().any(|c| c == t.as_str())
+                    && targets.iter().any(|e| e == t.as_str())
+            });
+            let video = if v
+                .is_some_and(|s| v_client_ok && muxable("video", &s.codec) && !burn_active)
+            {
+                StreamMode::Copy
+            } else if client_takes_video_target
+                && v.is_some_and(|s| codec_to_caps_name("video", &s.codec).is_some_and(can_decode))
+            {
+                StreamMode::Encode
+            } else {
+                StreamMode::Off
+            };
+            let audio = if a.is_some_and(|s| a_client_ok && muxable("audio", &s.codec)) {
+                StreamMode::Copy
+            } else if client_takes_audio_target
+                && a.is_some_and(|s| codec_to_caps_name("audio", &s.codec).is_some_and(can_decode))
+            {
+                StreamMode::Encode
+            } else {
+                StreamMode::Off
+            };
+            let cost = if direct {
+                Cost::Direct
+            } else if (video == StreamMode::Off && audio == StreamMode::Off)
+                || (v.is_some() && video == StreamMode::Off)
+            {
+                Cost::Unplayable
+            } else if video == StreamMode::Encode {
+                Cost::VideoEncode
+            } else if audio == StreamMode::Encode {
+                Cost::AudioEncode
+            } else {
+                Cost::Copy
+            };
+            // Cost cannot see a dropped audio stream (video-off is already
+            // Unplayable): an aac-less client's TS candidate copies video
+            // and silently drops audio, "cheaper" than fMP4 delivering
+            // opus. Delivering beats saving an encode.
+            let dropped = (a.is_some() && audio == StreamMode::Off) as u8;
+            (video, vt, audio, at, (dropped, cost))
+        };
+    let ts = candidate(SegmentFormat::Ts);
+    let f4 = candidate(SegmentFormat::Fmp4);
+    // Fewest dropped streams, then cheapest, tie → TS: the proven path
+    // wins unless fMP4 delivers more or strictly cheaper.
+    let (segment_format, (video, video_target, audio, audio_target, _key)) = if f4.4 < ts.4 {
+        (SegmentFormat::Fmp4, f4)
     } else {
-        StreamMode::Off
-    };
-    let audio = if a.is_some_and(|s| a_client_ok && muxable("audio", &s.codec)) {
-        StreamMode::Copy
-    } else if client_takes_aac
-        && aac_encoder().is_some()
-        && a.is_some_and(|s| codec_to_caps_name("audio", &s.codec).is_some_and(can_decode))
-    {
-        StreamMode::Encode
-    } else {
-        StreamMode::Off
+        (SegmentFormat::Ts, ts)
     };
 
     // HUB-15a: tone-map only when the pixels get rewritten anyway (an
@@ -360,8 +434,9 @@ pub fn negotiate(
                 })
         }),
         tone_map,
-        // Phase D replaces these with the two-candidate target pick.
-        ..Default::default()
+        video_codec: video_target,
+        audio_codec: audio_target,
+        segment_format,
     };
 
     let cost = if direct {
@@ -390,18 +465,38 @@ pub fn negotiate(
             None => "none".into(),
         };
     }
-    // Off because the client refuses the encode TARGET: name the actual
-    // blocker, not a generic "off" (this is the state the mask creates).
-    if video == StreamMode::Off && !client_takes_h264 && v.is_some() && !v_client_ok {
+    // Off because no target survived (client ∩ fleet is empty for the
+    // richest container): name the actual blocker and what the fleet
+    // offers, not a generic "off" (the state the mask creates).
+    let offered = |kind: &str| -> String {
+        let ladder: &[&str] = if kind == "video" {
+            &["h264", "hevc", "av1"]
+        } else {
+            &["aac", "opus"]
+        };
+        let have: Vec<&str> = ladder
+            .iter()
+            .copied()
+            .filter(|t| targets.iter().any(|e| e == t))
+            .collect();
+        if have.is_empty() {
+            format!("no {kind} encoder on the fleet")
+        } else {
+            format!("fleet encodes {}", have.join(", "))
+        }
+    };
+    if video == StreamMode::Off && v.is_some() && !v_client_ok {
         video_verdict = format!(
-            "{} → none (client accepts neither the source nor h264)",
-            v.map(|s| s.codec.as_str()).unwrap_or("video")
+            "{} → none (client accepts neither the source nor any offered target — {})",
+            v.map(|s| s.codec.as_str()).unwrap_or("video"),
+            offered("video")
         );
     }
-    if audio == StreamMode::Off && !client_takes_aac && a.is_some() && !a_client_ok {
+    if audio == StreamMode::Off && a.is_some() && !a_client_ok {
         audio_verdict = format!(
-            "{} → none (client accepts neither the source nor aac)",
-            a.map(|s| s.codec.as_str()).unwrap_or("audio")
+            "{} → none (client accepts neither the source nor any offered target — {})",
+            a.map(|s| s.codec.as_str()).unwrap_or("audio"),
+            offered("audio")
         );
     }
     if plan.tone_map {
@@ -417,6 +512,14 @@ pub fn negotiate(
     }
     if over_cap && !direct && video == StreamMode::Encode {
         video_verdict.push_str(" · bandwidth cap");
+    }
+    if !direct && plan.segment_format == SegmentFormat::Fmp4 {
+        // The requirement wants the container named with the target.
+        if v.is_some() {
+            video_verdict.push_str(" · fmp4 segments");
+        } else {
+            audio_verdict.push_str(" · fmp4 segments");
+        }
     }
 
     let subtitles = info
@@ -506,6 +609,14 @@ mod tests {
             ..Default::default()
         }
     }
+    /// Full-fleet targets: what the dev box actually verifies.
+    fn fleet() -> Vec<String> {
+        ["h264", "hevc", "av1", "aac", "opus"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    }
+
     fn chrome() -> CapabilityProfile {
         CapabilityProfile {
             containers: vec!["mp4".into(), "webm".into()],
@@ -524,6 +635,142 @@ mod tests {
         }
     }
 
+    /// HUB-15b: the encode target follows client ∩ fleet in ubiquity
+    /// order, and the container follows the cheapest candidate with a
+    /// tie to TS. The un-collapsing this requirement is about: a
+    /// no-h264 client on an hevc-encoding fleet gets an hevc encode in
+    /// fMP4 instead of a refusal.
+    #[test]
+    fn encode_targets_follow_client_and_fleet() {
+        crate::init().unwrap();
+        // An hevc-only client (the {"video":["h264"]} mask off state),
+        // hevc source that needs an encode (tone-map forces it).
+        let mut p = chrome();
+        p.video.retain(|c| c.codec == "hevc");
+        let mut info = media("matroska", Some(vs("hevc")), Some(au("aac", 2)));
+        info.video[0].hdr = Some("hdr10".into());
+        let sp = negotiate(&p, &info, 0, 0, true, None, true, true, &[], None, &fleet());
+        assert_eq!(sp.cost, Cost::VideoEncode, "{}", sp.video_verdict);
+        assert_eq!(sp.plan.video_codec, VideoTarget::Hevc);
+        assert_eq!(sp.plan.segment_format, SegmentFormat::Fmp4);
+        assert!(
+            sp.video_verdict.contains("hevc (transcoded)")
+                && sp.video_verdict.contains("fmp4 segments"),
+            "verdict must state codec and container: {}",
+            sp.video_verdict
+        );
+
+        // Same client, fleet without hevc: honest refusal naming the offer.
+        let h264_only: Vec<String> = ["h264", "aac"].iter().map(|s| s.to_string()).collect();
+        let sp = negotiate(
+            &p,
+            &info,
+            0,
+            0,
+            true,
+            None,
+            true,
+            true,
+            &[],
+            None,
+            &h264_only,
+        );
+        assert_eq!(sp.cost, Cost::Unplayable);
+        assert!(
+            sp.video_verdict.contains("fleet encodes h264"),
+            "refusal names the fleet: {}",
+            sp.video_verdict
+        );
+
+        // h264-accepting client: ubiquity order keeps h264/TS even
+        // though the fleet could do hevc — proven path on ties.
+        let sp = negotiate(
+            &chrome(),
+            &info,
+            0,
+            0,
+            true,
+            None,
+            true,
+            true,
+            &[],
+            None,
+            &fleet(),
+        );
+        assert_eq!(sp.plan.video_codec, VideoTarget::H264);
+        assert_eq!(sp.plan.segment_format, SegmentFormat::Ts);
+
+        // Opus: an aac-less client's audio target.
+        let mut p = chrome();
+        p.audio.retain(|c| c == "opus");
+        let info = media("matroska", Some(vs("h264")), Some(au("dts", 6)));
+        let sp = negotiate(
+            &p,
+            &info,
+            0,
+            0,
+            true,
+            None,
+            false,
+            true,
+            &[],
+            None,
+            &fleet(),
+        );
+        assert_eq!(sp.cost, Cost::AudioEncode, "{}", sp.audio_verdict);
+        assert_eq!(sp.plan.audio_codec, AudioTarget::Opus);
+        assert_eq!(sp.plan.segment_format, SegmentFormat::Fmp4);
+    }
+
+    /// AV1/VP9 sources with capable clients flip from today's forced
+    /// h264 encode to an fMP4 COPY — strictly cheaper, which is what
+    /// lets fMP4 win the candidate comparison without a policy knob.
+    #[test]
+    fn av1_copy_rides_fmp4() {
+        crate::init().unwrap();
+        let mut p = chrome();
+        p.video.push(VideoCap {
+            codec: "av1".into(),
+            ..Default::default()
+        });
+        let info = media("matroska", Some(vs("av1")), Some(au("aac", 2)));
+        let sp = negotiate(
+            &p,
+            &info,
+            0,
+            0,
+            true,
+            None,
+            false,
+            true,
+            &[],
+            None,
+            &fleet(),
+        );
+        assert_eq!(sp.cost, Cost::Copy, "{}", sp.video_verdict);
+        assert_eq!(sp.plan.video, StreamMode::Copy);
+        assert_eq!(sp.plan.segment_format, SegmentFormat::Fmp4);
+
+        // Without av1 in the profile the old behavior stands: encode
+        // to h264 in TS.
+        let sp = negotiate(
+            &chrome(),
+            &info,
+            0,
+            0,
+            true,
+            None,
+            false,
+            true,
+            &[],
+            None,
+            &fleet(),
+        );
+        assert_eq!(sp.cost, Cost::VideoEncode);
+        assert_eq!(sp.plan.video_codec, VideoTarget::H264);
+        assert_eq!(sp.plan.segment_format, SegmentFormat::Ts);
+    }
+
     #[test]
     fn decision_table() {
         let p = chrome();
@@ -539,6 +786,7 @@ mod tests {
             true,
             &[],
             None,
+            &fleet(),
         );
         assert_eq!(sp.cost, Cost::Direct);
         assert!(sp.direct);
@@ -554,6 +802,7 @@ mod tests {
             true,
             &[],
             None,
+            &fleet(),
         );
         assert_eq!(sp.cost, Cost::Copy);
         assert_eq!(sp.plan.video, StreamMode::Copy);
@@ -569,6 +818,7 @@ mod tests {
             true,
             &[],
             None,
+            &fleet(),
         );
         assert_eq!(sp.cost, Cost::AudioEncode);
         assert_eq!(sp.plan.max_channels, None);
@@ -584,6 +834,7 @@ mod tests {
             true,
             &[],
             None,
+            &fleet(),
         );
         assert_eq!(sp.plan.video, StreamMode::Copy);
         let mut no_hevc = chrome();
@@ -599,6 +850,7 @@ mod tests {
             true,
             &[],
             None,
+            &fleet(),
         );
         assert_eq!(sp.cost, Cost::VideoEncode);
         assert_eq!(sp.plan.video_kbps, Some(6000));
@@ -614,6 +866,7 @@ mod tests {
             true,
             &[],
             None,
+            &fleet(),
         );
         assert_ne!(sp.cost, Cost::Direct);
     }
@@ -639,6 +892,7 @@ mod tests {
             true,
             &[],
             None,
+            &fleet(),
         );
         assert_eq!(sp.cost, Cost::VideoEncode);
         assert_eq!(sp.plan.max_height, Some(1080));
@@ -664,6 +918,7 @@ mod tests {
             true,
             &[],
             None,
+            &fleet(),
         );
         assert_eq!(sp.cost, Cost::VideoEncode);
         let unknown = vs("h264"); // no profile field → permissive
@@ -678,6 +933,7 @@ mod tests {
             true,
             &[],
             None,
+            &fleet(),
         );
         assert_eq!(sp.cost, Cost::Copy, "unknown profile must not veto a copy");
         // Bandwidth cap: 14 Mbit estimate vs 8 Mbit cap → no direct, encode clamped.
@@ -694,6 +950,7 @@ mod tests {
             true,
             &[],
             None,
+            &fleet(),
         );
         assert_ne!(sp.cost, Cost::Direct);
         assert_eq!(sp.plan.video_kbps, Some(800));
@@ -711,6 +968,7 @@ mod tests {
             true,
             &[],
             None,
+            &fleet(),
         );
         assert_eq!(sp.cost, Cost::AudioEncode);
         assert_eq!(sp.plan.max_channels, Some(2));
@@ -743,7 +1001,19 @@ mod tests {
         let mut p = p;
         p.graphics_overlay = true;
         // No capable box: the copy stands, the verdict says as-is.
-        let sp = negotiate(&p, &info, 0, 0, true, None, false, true, &[], None);
+        let sp = negotiate(
+            &p,
+            &info,
+            0,
+            0,
+            true,
+            None,
+            false,
+            true,
+            &[],
+            None,
+            &fleet(),
+        );
         assert_eq!(
             sp.cost,
             Cost::Copy,
@@ -765,7 +1035,19 @@ mod tests {
         let mut able = chrome();
         able.ass_render = true;
         able.graphics_overlay = true;
-        let sp = negotiate(&able, &info, 0, 0, true, None, false, true, &[], None);
+        let sp = negotiate(
+            &able,
+            &info,
+            0,
+            0,
+            true,
+            None,
+            false,
+            true,
+            &[],
+            None,
+            &fleet(),
+        );
         assert_eq!(sp.subtitles[1].tier, SubtitleTier::Text);
         assert_eq!(sp.subtitles[2].tier, SubtitleTier::Graphics);
     }
@@ -788,6 +1070,7 @@ mod tests {
             true,
             &[],
             None,
+            &fleet(),
         );
         assert_eq!(sp.plan.audio, StreamMode::Encode);
         assert_eq!(sp.plan.max_channels, Some(2), "5.1 → the client's ceiling");
@@ -803,6 +1086,7 @@ mod tests {
             true,
             &[],
             None,
+            &fleet(),
         );
         assert_eq!(
             sp.plan.max_channels,
@@ -823,6 +1107,7 @@ mod tests {
             true,
             &[],
             None,
+            &fleet(),
         );
         assert_eq!(sp.plan.max_channels, None);
     }
@@ -841,7 +1126,19 @@ mod tests {
             language: None,
         }];
 
-        let sp = negotiate(&p, &info, 0, 0, true, None, false, true, &[], None);
+        let sp = negotiate(
+            &p,
+            &info,
+            0,
+            0,
+            true,
+            None,
+            false,
+            true,
+            &[],
+            None,
+            &fleet(),
+        );
         assert_eq!(
             sp.cost,
             Cost::VideoEncode,
@@ -854,12 +1151,24 @@ mod tests {
         // Direct play is off the table for the same reason.
         let mut mp4 = info.clone();
         mp4.container = Some("mp4".into());
-        let sp = negotiate(&p, &mp4, 0, 0, true, None, false, true, &[], None);
+        let sp = negotiate(&p, &mp4, 0, 0, true, None, false, true, &[], None, &fleet());
         assert!(!sp.direct, "cannot burn into a file served as-is");
 
         // A compositing client keeps its cheap path and its overlay.
         p.graphics_overlay = true;
-        let sp = negotiate(&p, &info, 0, 0, true, None, false, true, &[], None);
+        let sp = negotiate(
+            &p,
+            &info,
+            0,
+            0,
+            true,
+            None,
+            false,
+            true,
+            &[],
+            None,
+            &fleet(),
+        );
         assert_eq!(sp.cost, Cost::Copy);
         assert_eq!(sp.plan.burn_subtitle, None);
         assert_eq!(sp.subtitles[0].tier, SubtitleTier::Graphics);
@@ -867,7 +1176,19 @@ mod tests {
         // HUB-32c: with an OCR text track cached, the non-compositing
         // client is served text — the copy survives, nothing is burned.
         p.graphics_overlay = false;
-        let sp = negotiate(&p, &info, 0, 0, true, None, false, true, &[true], None);
+        let sp = negotiate(
+            &p,
+            &info,
+            0,
+            0,
+            true,
+            None,
+            false,
+            true,
+            &[true],
+            None,
+            &fleet(),
+        );
         assert_eq!(
             sp.cost,
             Cost::Copy,
@@ -880,12 +1201,36 @@ mod tests {
         // And direct play comes back for the same reason.
         let mut mp4 = info.clone();
         mp4.container = Some("mp4".into());
-        let sp = negotiate(&p, &mp4, 0, 0, true, None, false, true, &[true], None);
+        let sp = negotiate(
+            &p,
+            &mp4,
+            0,
+            0,
+            true,
+            None,
+            false,
+            true,
+            &[true],
+            None,
+            &fleet(),
+        );
         assert!(sp.direct, "OCR text restores direct play");
 
         // The compositing client is unaffected: overlay beats text.
         p.graphics_overlay = true;
-        let sp = negotiate(&p, &info, 0, 0, true, None, false, true, &[true], None);
+        let sp = negotiate(
+            &p,
+            &info,
+            0,
+            0,
+            true,
+            None,
+            false,
+            true,
+            &[true],
+            None,
+            &fleet(),
+        );
         assert_eq!(sp.subtitles[0].tier, SubtitleTier::Graphics);
     }
 
@@ -913,6 +1258,7 @@ mod tests {
             true,
             &[true],
             Some(BurnPick::Embedded(0)),
+            &fleet(),
         );
         assert_eq!(sp.cost, Cost::VideoEncode, "{}", sp.video_verdict);
         assert_eq!(sp.plan.burn_subtitle, Some(0));
@@ -932,6 +1278,7 @@ mod tests {
             false,
             &[],
             Some(BurnPick::Embedded(0)),
+            &fleet(),
         );
         assert_eq!(sp.plan.burn_subtitle, None);
 
@@ -947,6 +1294,7 @@ mod tests {
             true,
             &[],
             Some(BurnPick::Embedded(7)),
+            &fleet(),
         );
         assert_eq!(sp.plan.burn_subtitle, None);
         assert_eq!(sp.cost, Cost::Copy);
@@ -973,6 +1321,7 @@ mod tests {
             true,
             &[],
             Some(BurnPick::Sidecar(0)),
+            &fleet(),
         );
         assert_eq!(sp.cost, Cost::VideoEncode, "{}", sp.video_verdict);
         assert_eq!(sp.plan.burn_subtitle, None);
@@ -993,7 +1342,19 @@ mod tests {
             language: None,
         }];
 
-        let sp = negotiate(&p, &info, 0, 0, true, None, false, false, &[], None);
+        let sp = negotiate(
+            &p,
+            &info,
+            0,
+            0,
+            true,
+            None,
+            false,
+            false,
+            &[],
+            None,
+            &fleet(),
+        );
         assert_eq!(sp.cost, Cost::Copy, "no capability, no gratuitous encode");
         assert_eq!(sp.plan.burn_subtitle, None);
         assert_eq!(sp.subtitles[0].tier, SubtitleTier::Unavailable);
@@ -1015,7 +1376,19 @@ mod tests {
             format: "srt".into(),
             language: None,
         }];
-        let sp = negotiate(&p, &info, 0, 0, true, None, false, true, &[], None);
+        let sp = negotiate(
+            &p,
+            &info,
+            0,
+            0,
+            true,
+            None,
+            false,
+            true,
+            &[],
+            None,
+            &fleet(),
+        );
         assert_eq!(sp.cost, Cost::Copy);
         assert_eq!(sp.plan.burn_subtitle, None);
     }
@@ -1032,7 +1405,19 @@ mod tests {
         };
         let info = media("matroska", Some(pq), Some(au("aac", 2)));
 
-        let sp = negotiate(&no_hevc, &info, 0, 0, true, None, true, true, &[], None);
+        let sp = negotiate(
+            &no_hevc,
+            &info,
+            0,
+            0,
+            true,
+            None,
+            true,
+            true,
+            &[],
+            None,
+            &fleet(),
+        );
         assert_eq!(sp.cost, Cost::VideoEncode);
         assert!(sp.plan.tone_map);
         assert!(
@@ -1041,7 +1426,19 @@ mod tests {
             sp.video_verdict
         );
 
-        let sp = negotiate(&no_hevc, &info, 0, 0, true, None, false, true, &[], None);
+        let sp = negotiate(
+            &no_hevc,
+            &info,
+            0,
+            0,
+            true,
+            None,
+            false,
+            true,
+            &[],
+            None,
+            &fleet(),
+        );
         assert!(!sp.plan.tone_map, "no capable box → encode as-is");
         assert!(
             sp.video_verdict.contains("as-is"),
@@ -1054,7 +1451,19 @@ mod tests {
             ..vs("hevc")
         };
         let info = media("matroska", Some(hlg), Some(au("aac", 2)));
-        let sp = negotiate(&no_hevc, &info, 0, 0, true, None, true, true, &[], None);
+        let sp = negotiate(
+            &no_hevc,
+            &info,
+            0,
+            0,
+            true,
+            None,
+            true,
+            true,
+            &[],
+            None,
+            &fleet(),
+        );
         assert!(
             !sp.plan.tone_map,
             "HLG is SDR-compatible by design — no map"
@@ -1078,7 +1487,7 @@ mod tests {
         };
         let info = media("matroska", Some(pq), Some(au("aac", 2)));
 
-        let sp = negotiate(&p, &info, 0, 0, true, None, true, true, &[], None);
+        let sp = negotiate(&p, &info, 0, 0, true, None, true, true, &[], None, &fleet());
         assert_eq!(
             sp.cost,
             Cost::VideoEncode,
@@ -1093,7 +1502,7 @@ mod tests {
         );
 
         p.hdr = true;
-        let sp = negotiate(&p, &info, 0, 0, true, None, true, true, &[], None);
+        let sp = negotiate(&p, &info, 0, 0, true, None, true, true, &[], None, &fleet());
         assert_eq!(sp.cost, Cost::Copy, "hdr-capable client keeps the copy");
         assert!(!sp.plan.tone_map);
 
@@ -1104,7 +1513,7 @@ mod tests {
             ..vs("hevc")
         };
         let info = media("matroska", Some(hlg), Some(au("aac", 2)));
-        let sp = negotiate(&p, &info, 0, 0, true, None, true, true, &[], None);
+        let sp = negotiate(&p, &info, 0, 0, true, None, true, true, &[], None, &fleet());
         assert_eq!(sp.cost, Cost::Copy);
     }
 
@@ -1135,6 +1544,7 @@ mod tests {
             true,
             &[],
             None,
+            &fleet(),
         );
         assert_eq!(sp.plan.video, StreamMode::Copy);
         let over = VideoStream {
@@ -1153,6 +1563,7 @@ mod tests {
             true,
             &[],
             None,
+            &fleet(),
         );
         assert_eq!(
             sp.cost,
@@ -1181,6 +1592,7 @@ mod tests {
             true,
             &[],
             None,
+            &fleet(),
         );
         assert_eq!(
             sp.plan.video,
@@ -1206,7 +1618,19 @@ mod tests {
         let info = media("matroska", Some(vs("hevc")), Some(au("aac", 2)));
         let mut q = chrome();
         q.video.retain(|c| c.codec != "hevc" && c.codec != "h264");
-        let sp = negotiate(&q, &info, 0, 0, true, None, false, true, &[], None);
+        let sp = negotiate(
+            &q,
+            &info,
+            0,
+            0,
+            true,
+            None,
+            false,
+            true,
+            &[],
+            None,
+            &fleet(),
+        );
         assert_eq!(sp.plan.video, StreamMode::Off, "{}", sp.video_verdict);
         assert_eq!(sp.cost, Cost::Unplayable);
         assert!(
@@ -1215,12 +1639,26 @@ mod tests {
             sp.video_verdict
         );
 
-        // Audio side: dts source, aac masked out — audio goes Off while
-        // the video copy stands.
+        // Audio side: dts source, BOTH encode targets masked out —
+        // audio goes Off while the video copy stands. (aac alone
+        // masked now honestly delivers opus, HUB-15b — covered in
+        // encode_targets_follow_client_and_fleet.)
         let mut r = chrome();
-        r.audio.retain(|a| a != "aac");
+        r.audio.retain(|a| a != "aac" && a != "opus");
         let info = media("matroska", Some(vs("h264")), Some(au("dts", 6)));
-        let sp = negotiate(&r, &info, 0, 0, true, None, false, true, &[], None);
+        let sp = negotiate(
+            &r,
+            &info,
+            0,
+            0,
+            true,
+            None,
+            false,
+            true,
+            &[],
+            None,
+            &fleet(),
+        );
         assert_eq!(sp.plan.audio, StreamMode::Off, "{}", sp.audio_verdict);
         assert!(
             sp.audio_verdict.contains("client accepts neither"),
@@ -1242,7 +1680,19 @@ mod tests {
         ] {
             let info = media("matroska", v, a);
             let old = crate::remux::plan_streams(&info, &crate::remux::WEB_TARGET, 0, 0);
-            let new = negotiate(&p, &info, 0, 0, true, None, false, true, &[], None);
+            let new = negotiate(
+                &p,
+                &info,
+                0,
+                0,
+                true,
+                None,
+                false,
+                true,
+                &[],
+                None,
+                &fleet(),
+            );
             assert_eq!(new.plan.video, old.video, "video parity for {info:?}");
             assert_eq!(new.plan.audio, old.audio, "audio parity for {info:?}");
         }

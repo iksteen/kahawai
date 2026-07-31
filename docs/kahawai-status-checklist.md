@@ -176,6 +176,19 @@ How something works and why it was built that way belong in
 - [x] HUB-15a HDR→SDR tone-mapping tier: GL shader (BT.2390 EETF,
       scene-adaptive peak probe, libplacebo-matched display mapping),
       TC-1 `tonemap` report, doctor row, placement preference, verdict
+- [x] HUB-15b Multiple encode targets: ubiquity ladders h264 → hevc →
+      av1 / aac → opus, picked per session from client profile ∩ the
+      placed box's dry-run-verified encoder set (codec is a HARD
+      placement filter; hw rank follows the asked codec). Container by
+      candidate cost with ties to TS — h264/aac sessions byte-identical,
+      fMP4 (isofmp4mux + own segmenter: init.mp4/.m4s/EVENT playlist,
+      muxed A/V in one stream) only where it delivers more (opus to
+      aac-less clients beats dropping audio) or cheaper (av1/vp9
+      COPIES, previously forced h264 encodes). Verdicts state codec and
+      container; refusals name what the fleet offers. Wire fields 16-18
+      + worker flags, empty = legacy; old satellites safe by
+      construction (they never report the new codecs). TC-6 sink
+      fallback is TS-only; fmp4 failures fail loudly
 - [x] HUB-16 Cheapest-path preference incl. SOURCE choice: every
       candidate judged, direct > copy > audio-enc > video-enc, rank ties
 - [x] HUB-17 HLS delivery for remux/transcode (EVENT playlists, mid-stream seek)
@@ -223,12 +236,6 @@ How something works and why it was built that way belong in
       own rendering; burn-in fallback for clients that cannot composite
       (mediahost-extracted display sets, seek-exact timeline, explicit
       blend in the encode chain)
-- [ ] HUB-15b Multiple encode targets (h264 → hevc → av1 by client
-      acceptance × placed-box encoders). Not built: the encode target is
-      hard-coded h264/aac, so a no-h264 client is refused on hardware
-      that encodes HEVC/AV1 natively. Gate: the fMP4/CMAF segment path
-      (TS cannot carry AV1/VP9) — cmafmux is a doctor row, not yet a
-      sink option
 - [x] HUB-32c OCR text tier: Tesseract via leptess (MIT — subtile-ocr
       dropped, no copyleft), default-on `ocr` feature, idle sweep over
       the whole library (playback outranks it) + per-track button as the
