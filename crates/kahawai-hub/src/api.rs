@@ -523,7 +523,7 @@ async fn subtitle_ocr(
     }
     #[cfg(not(feature = "ocr"))]
     {
-        let _ = (claims, track_id);
+        let _ = (claims, track_id, state);
         Err((
             StatusCode::NOT_IMPLEMENTED,
             "this build has no OCR support (compiled with --no-default-features)".into(),
