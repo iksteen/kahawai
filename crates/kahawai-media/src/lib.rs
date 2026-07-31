@@ -4,6 +4,7 @@
 pub mod burnin;
 pub mod doctor;
 pub mod facts;
+pub mod fmp4sink;
 pub mod imagesubs;
 pub mod negotiate;
 pub mod remux;

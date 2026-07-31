@@ -44,9 +44,43 @@ pub(crate) fn ts_muxable_names() -> &'static std::collections::HashSet<String> {
     })
 }
 
-/// Which muxer pad kind a parsed stream belongs on, if TS can carry it.
-fn ts_compatible(caps_name: &str) -> Option<&'static str> {
-    if !ts_muxable_names().contains(caps_name) {
+/// Same oracle for the fMP4 path, off isofmp4mux's own templates
+/// (h264/h265/vp9/av1 + aac/opus/flac/eac3). The template's
+/// `audio/mpeg` is mpegversion-4-only, but `codec_to_caps_name` maps
+/// mp3 onto the same name — excluded by codec name in negotiate's
+/// muxable closure, which is the only place that starts from codecs.
+pub(crate) fn fmp4_muxable_names() -> &'static std::collections::HashSet<String> {
+    static NAMES: std::sync::OnceLock<std::collections::HashSet<String>> =
+        std::sync::OnceLock::new();
+    NAMES.get_or_init(|| {
+        let mut names = std::collections::HashSet::new();
+        let _ = crate::init();
+        let Some(factory) = gst::ElementFactory::find("isofmp4mux") else {
+            return names;
+        };
+        for tmpl in factory.static_pad_templates() {
+            if tmpl.direction() == gst::PadDirection::Sink {
+                for s in tmpl.caps().iter() {
+                    names.insert(s.name().to_string());
+                }
+            }
+        }
+        names
+    })
+}
+
+/// The chosen container's muxable-names set.
+pub(crate) fn muxable_names(format: SegmentFormat) -> &'static std::collections::HashSet<String> {
+    match format {
+        SegmentFormat::Ts => ts_muxable_names(),
+        SegmentFormat::Fmp4 => fmp4_muxable_names(),
+    }
+}
+
+/// Which muxer pad kind a parsed stream belongs on, if the session's
+/// segment container can carry it.
+fn sink_compatible(caps_name: &str, format: SegmentFormat) -> Option<&'static str> {
+    if !muxable_names(format).contains(caps_name) {
         return None;
     }
     if caps_name.starts_with("video/") {
@@ -703,7 +737,7 @@ fn mode_for(caps_name: &str, plan: &RemuxPlan) -> StreamMode {
 /// Would route_stream do something useful with a stream of these caps?
 fn routable(caps_name: &str, plan: &RemuxPlan) -> bool {
     match mode_for(caps_name, plan) {
-        StreamMode::Copy => ts_compatible(caps_name).is_some(),
+        StreamMode::Copy => sink_compatible(caps_name, plan.segment_format).is_some(),
         StreamMode::Encode => can_decode(caps_name),
         StreamMode::Off => false,
     }
@@ -1126,7 +1160,10 @@ fn route_stream(
         }
     }
     let target = (mode == StreamMode::Copy)
-        .then(|| ts_compatible(&caps_name).and_then(|kind| waiting.lock().unwrap().remove(kind)))
+        .then(|| {
+            sink_compatible(&caps_name, plan.segment_format)
+                .and_then(|kind| waiting.lock().unwrap().remove(kind))
+        })
         .flatten();
     match target {
         Some(sinkpad) => {
@@ -2529,8 +2566,21 @@ pub fn start_parts(
     };
 
     let pipeline = gst::Pipeline::new();
-    let (hlssink, _sink_name) = make_hls_sink(out_dir, sink)?;
-    pipeline.add(&hlssink)?;
+    // The segment sink pair: TS = the hlssink family (TC-6 prefer
+    // override intact); fMP4 = isofmp4mux + the fmp4sink writer. The
+    // sink override is a TS-crash workaround and means nothing here.
+    enum SegSink {
+        Ts(gst::Element),
+        Fmp4(gst::Element),
+    }
+    let hlssink = match plan.segment_format {
+        SegmentFormat::Ts => {
+            let (el, _name) = make_hls_sink(out_dir, sink)?;
+            pipeline.add(&el)?;
+            SegSink::Ts(el)
+        }
+        SegmentFormat::Fmp4 => SegSink::Fmp4(crate::fmp4sink::attach(&pipeline, out_dir)?),
+    };
 
     // The first part owns the start offset and the seek gate; later parts
     // are held by concat until it EOSes, then play from their own zero.
@@ -2561,9 +2611,13 @@ pub fn start_parts(
         if !wanted {
             continue;
         }
-        let pad = hlssink
-            .request_pad_simple(kind)
-            .with_context(|| format!("requesting {kind} pad"))?;
+        // TS sinks name their pads; the fMP4 mux counts them — the
+        // loop order (video first) puts video on track 0 either way.
+        let pad = match &hlssink {
+            SegSink::Ts(el) => el.request_pad_simple(kind),
+            SegSink::Fmp4(mux) => mux.request_pad_simple("sink_%u"),
+        }
+        .with_context(|| format!("requesting {kind} pad"))?;
         if let Some(cfg) = &pace {
             install_pace_probe(&pad, cfg.clone(), stopping.clone());
         }
@@ -3289,17 +3343,23 @@ mod tests {
     fn ts_compat_follows_muxer_templates() {
         crate::init().unwrap();
         // Basics that any mpegtsmux supports.
-        assert_eq!(ts_compatible("video/x-h264"), Some("video"));
-        assert_eq!(ts_compatible("audio/mpeg"), Some("audio"));
-        assert_eq!(ts_compatible("text/x-raw"), None);
+        assert_eq!(
+            sink_compatible("video/x-h264", SegmentFormat::Ts),
+            Some("video")
+        );
+        assert_eq!(
+            sink_compatible("audio/mpeg", SegmentFormat::Ts),
+            Some("audio")
+        );
+        assert_eq!(sink_compatible("text/x-raw", SegmentFormat::Ts), None);
         // Every answer must agree with the muxer's own template.
         let names = ts_muxable_names();
         assert_eq!(
-            ts_compatible("audio/x-eac3").is_some(),
+            sink_compatible("audio/x-eac3", SegmentFormat::Ts).is_some(),
             names.contains("audio/x-eac3")
         );
         assert_eq!(
-            ts_compatible("audio/x-dts").is_some(),
+            sink_compatible("audio/x-dts", SegmentFormat::Ts).is_some(),
             names.contains("audio/x-dts")
         );
 
@@ -3686,6 +3746,190 @@ mod tests {
             seg_info.audio[0].channels, 1,
             "downmix to mono did not happen"
         );
+    }
+
+    /// HUB-15b fMP4 path end to end: encode h264/aac into fragmented
+    /// MP4 — init.mp4 + .m4s segments + an EVENT playlist whose EXTINF
+    /// lines the readiness gates can read, ENDLIST at EOS, and the
+    /// init+segment concatenation must decode.
+    #[test]
+    fn fmp4_sink_produces_init_segments_and_playlist() {
+        crate::init().unwrap();
+        if !crate::testutil::has_element("isofmp4mux") || h264_encoder().is_none() {
+            return; // doctor territory, not this test's
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let src_path = dir.path().join("in.mkv");
+        crate::testutil::render_h264_flac_mkv(&src_path); // 5 s, 320x240
+
+        let plan = RemuxPlan {
+            video: StreamMode::Encode,
+            audio: StreamMode::Encode,
+            video_kbps: Some(500),
+            segment_format: SegmentFormat::Fmp4,
+            ..Default::default()
+        };
+        let out = tempfile::tempdir().unwrap();
+        let job = start_at(
+            out.path(),
+            plan,
+            Box::new(FileSource::open(&src_path).unwrap()),
+            0,
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !job.finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(job.finished(), "fmp4 encode did not finish");
+        assert!(
+            job.failed().is_none(),
+            "fmp4 encode failed: {:?}",
+            job.failed()
+        );
+
+        let init = out.path().join("init.mp4");
+        assert!(init.exists(), "no init.mp4");
+        let mut segs: Vec<_> = std::fs::read_dir(out.path())
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|x| x == "m4s"))
+            .collect();
+        segs.sort();
+        assert!(!segs.is_empty(), "no .m4s segments");
+
+        let playlist = std::fs::read_to_string(out.path().join("master.m3u8")).unwrap();
+        assert!(
+            playlist.contains("#EXT-X-MAP:URI=\"init.mp4\""),
+            "{playlist}"
+        );
+        assert!(playlist.contains("#EXT-X-ENDLIST"), "{playlist}");
+        let extinf_sum: f64 = playlist
+            .lines()
+            .filter_map(|l| l.strip_prefix("#EXTINF:"))
+            .filter_map(|l| l.trim_end_matches(',').parse::<f64>().ok())
+            .sum();
+        assert!(
+            (4.0..7.0).contains(&extinf_sum),
+            "EXTINF sum {extinf_sum} for a ~5 s source: {playlist}"
+        );
+
+        // The stream itself: init + all segments = a decodable fMP4.
+        let joined = out.path().join("joined.mp4");
+        let mut bytes = std::fs::read(&init).unwrap();
+        for s in &segs {
+            bytes.extend(std::fs::read(s).unwrap());
+        }
+        std::fs::write(&joined, bytes).unwrap();
+        let info = crate::discover(&joined, Duration::from_secs(30)).unwrap();
+        assert_eq!(info.video[0].codec, "h264", "{info:?}");
+        assert_eq!(info.audio[0].codec, "aac", "{info:?}");
+    }
+
+    /// The same path with an offset start: the seek gate and start.pos
+    /// machinery must work through a virgin isofmp4mux.
+    #[test]
+    fn fmp4_sink_offset_start() {
+        crate::init().unwrap();
+        if !crate::testutil::has_element("isofmp4mux") || h264_encoder().is_none() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let src_path = dir.path().join("in.mkv");
+        crate::testutil::render_h264_flac_mkv(&src_path);
+        let plan = RemuxPlan {
+            video: StreamMode::Encode,
+            audio: StreamMode::Encode,
+            video_kbps: Some(500),
+            segment_format: SegmentFormat::Fmp4,
+            ..Default::default()
+        };
+        let out = tempfile::tempdir().unwrap();
+        let job = start_at(
+            out.path(),
+            plan,
+            Box::new(FileSource::open(&src_path).unwrap()),
+            2000,
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !job.finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            job.finished() && job.failed().is_none(),
+            "{:?}",
+            job.failed()
+        );
+        let pos: f64 = std::fs::read_to_string(out.path().join("start.pos"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        // Keyframe-snapped at or before the target, and the produced
+        // content is the remainder only.
+        assert!(pos <= 2000.0, "start.pos {pos}");
+        let playlist = std::fs::read_to_string(out.path().join("master.m3u8")).unwrap();
+        let extinf_sum: f64 = playlist
+            .lines()
+            .filter_map(|l| l.strip_prefix("#EXTINF:"))
+            .filter_map(|l| l.trim_end_matches(',').parse::<f64>().ok())
+            .sum();
+        assert!(
+            extinf_sum < 5.0,
+            "offset run produced the whole file: {playlist}"
+        );
+    }
+
+    /// An HEVC COPY into fMP4 (the container that admits it honestly)
+    /// — the copy path negotiates hvc1/au with the mux during caps
+    /// negotiation, no capsfilter needed.
+    #[test]
+    fn fmp4_sink_carries_hevc_copy() {
+        crate::init().unwrap();
+        if !crate::testutil::has_element("isofmp4mux") || !crate::testutil::has_element("x265enc") {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let src_path = dir.path().join("in.mkv");
+        crate::testutil::render_pq_hevc_mkv(&src_path);
+        let plan = RemuxPlan {
+            video: StreamMode::Copy,
+            audio: StreamMode::Encode,
+            segment_format: SegmentFormat::Fmp4,
+            ..Default::default()
+        };
+        let out = tempfile::tempdir().unwrap();
+        let job = start_at(
+            out.path(),
+            plan,
+            Box::new(FileSource::open(&src_path).unwrap()),
+            0,
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !job.finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            job.finished() && job.failed().is_none(),
+            "{:?}",
+            job.failed()
+        );
+        let mut bytes = std::fs::read(out.path().join("init.mp4")).unwrap();
+        let mut segs: Vec<_> = std::fs::read_dir(out.path())
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|x| x == "m4s"))
+            .collect();
+        segs.sort();
+        for s in &segs {
+            bytes.extend(std::fs::read(s).unwrap());
+        }
+        let joined = out.path().join("joined.mp4");
+        std::fs::write(&joined, bytes).unwrap();
+        let info = crate::discover(&joined, Duration::from_secs(30)).unwrap();
+        assert_eq!(info.video[0].codec, "hevc", "{info:?}");
     }
 
     /// HUB-32b burn-in end to end: a PGS source encoded with

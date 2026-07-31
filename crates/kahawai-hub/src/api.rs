@@ -2386,6 +2386,9 @@ async fn transcode_file(
         "application/vnd.apple.mpegurl"
     } else if file == "start.pos" {
         "text/plain"
+    } else if file.ends_with(".m4s") || file.ends_with(".mp4") {
+        // HUB-15b fMP4 path: init.mp4 + segment%05d.m4s.
+        "video/mp4"
     } else {
         "video/mp2t"
     };
@@ -2511,6 +2514,9 @@ async fn session_file(
         "application/vnd.apple.mpegurl"
     } else if file.ends_with(".ts") {
         "video/mp2t"
+    } else if file.ends_with(".m4s") || file.ends_with(".mp4") {
+        // HUB-15b fMP4 path: init.mp4 + segment%05d.m4s.
+        "video/mp4"
     } else if file == "start.pos" {
         // True playlist origin after keyframe snapping (§6): players
         // align subtitles and the seekbar to it.
