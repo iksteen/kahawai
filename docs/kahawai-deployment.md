@@ -175,11 +175,15 @@ sudo defaults write /Library/Preferences/com.apple.network.local-network \
 ```
 
 That bypasses per-app grants for the listed CIDRs and survives every
-rebuild, rename and re-sign. (The alternative with the same effect is
-converting the agent to a launchd daemon — auto-allowed by design and
-starts at boot, at the cost of verifying VideoToolbox behaves the same
-outside a GUI session.) The self-signed identity stays: it keeps the
-signature itself stable, which macOS wants for everything else.
+rebuild, rename and re-sign — belt. The braces, live since 2026-07-31:
+the transcoder is a launchd **daemon** (system domain, `UserName` the
+deploy user), which is auto-allowed by design and starts at boot with
+no login session. VideoToolbox hw encode and the GL tone-map segment
+both dry-run-verified under the daemon; `kahawai-mac.sh setup` installs
+it (the one sudo step), and deploys stay sudo-free — they kill the
+process and `KeepAlive` respawns it. The self-signed identity stays:
+it keeps the signature itself stable, which macOS wants for everything
+else.
 
 `scripts/kahawai-mac.sh` owns both halves:
 

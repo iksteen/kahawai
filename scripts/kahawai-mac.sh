@@ -26,6 +26,44 @@ PASSFILE="$HOME/.config/kahawai/signing-keychain.pass"
 BUNDLE_ID=org.thegraveyard.kahawai
 AGENT=org.thegraveyard.kahawai.transcoder
 
+# The transcoder runs as a launchd DAEMON, not an agent: daemons are
+# auto-allowed by Local Network privacy (TN3179 — the self-signed
+# identity can NOT hold that grant; only Apple-issued ones are
+# signature-tracked, everything else keys on the per-build LC_UUID) and
+# start at boot without a login session. VideoToolbox hw encode and the
+# GL tone-map segment both verified under the daemon (2026-07-31).
+# Sudo happens here, once; deploys just pkill and KeepAlive respawns.
+install_daemon() {
+    local plist="/Library/LaunchDaemons/$AGENT.plist"
+    [ -f "$plist" ] && { echo "daemon already installed" >&2; return 0; }
+    # Retire a pre-daemon user agent so two supervisors never race.
+    launchctl bootout "gui/$(id -u)/$AGENT" 2>/dev/null || true
+    rm -f "$HOME/Library/LaunchAgents/$AGENT.plist"
+    tmpd=$(mktemp)
+    cat > "$tmpd" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>$AGENT</string>
+    <key>ProgramArguments</key>
+    <array><string>$HOME/kahawai-src/target/release/kahawai-transcoder</string></array>
+    <key>UserName</key><string>$(id -un)</string>
+    <key>WorkingDirectory</key><string>$HOME</string>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><true/>
+    <key>StandardOutPath</key><string>$HOME/kahawai-transcoder.log</string>
+    <key>StandardErrorPath</key><string>$HOME/kahawai-transcoder.log</string>
+</dict>
+</plist>
+PLIST
+    echo "installing the launchd daemon (sudo)" >&2
+    sudo install -o root -g wheel -m 644 "$tmpd" "$plist"
+    sudo launchctl bootstrap system "$plist"
+    rm -f "$tmpd"
+    echo "daemon installed and started" >&2
+}
+
 setup() {
     [ "$(uname)" = Darwin ] || { echo "run setup ON the mac" >&2; exit 2; }
     mkdir -p "$(dirname "$PASSFILE")" && chmod 700 "$(dirname "$PASSFILE")"
@@ -99,6 +137,7 @@ EOF
     if codesign --force --sign "$IDENTITY" --keychain "$KEYCHAIN" \
         --identifier "$BUNDLE_ID" "$probe" 2>&1; then
         echo "setup done — signing works. Deploy: scripts/kahawai-mac.sh deploy" >&2
+        install_daemon
     else
         echo "setup INCOMPLETE: the identity exists but codesign refuses it." >&2
         echo "Open Keychain Access, find \"$IDENTITY\" in the" >&2
@@ -146,18 +185,12 @@ export KAHAWAI_BUILD
 cargo build --release --no-default-features --features transcoder \
     --bin kahawai-transcoder 2>&1 | tail -1
 BIN=target/release/kahawai-transcoder
-# The launchd agent must point at the new binary (older setups ran
-# `.../kahawai transcoder`); rewrite + bootstrap when it differs.
-PLIST="$HOME/Library/LaunchAgents/$AGENT.plist"
-# Check the PROGRAM, not the whole plist: the log path also contains
-# "kahawai-transcoder" and matched a naive grep on the first try.
-if [ "$(plutil -extract ProgramArguments.0 raw "$PLIST" 2>/dev/null)" \
-     != "$HOME/kahawai-src/target/release/kahawai-transcoder" ]; then
-    plutil -replace ProgramArguments -json \
-        "[\"$HOME/kahawai-src/target/release/kahawai-transcoder\"]" "$PLIST"
-    launchctl bootout "gui/$(id -u)/$AGENT" 2>/dev/null || true
-    launchctl bootstrap "gui/$(id -u)" "$PLIST"
-    echo "launchd agent repointed at kahawai-transcoder"
+# The transcoder runs as a launchd DAEMON (system domain): daemons are
+# auto-allowed by Local Network privacy (TN3179) and start at boot.
+# Deploys stay sudo-free: KeepAlive respawns the process we kill.
+if [ ! -f "/Library/LaunchDaemons/$AGENT.plist" ]; then
+    echo "WARNING: no LaunchDaemon installed — see docs/kahawai-deployment.md" >&2
+    echo "         (one-time sudo install); falling back to the user agent." >&2
 fi
 if security find-identity -v -p codesigning "$KEYCHAIN" 2>/dev/null | grep -q "$IDENTITY"; then
     security unlock-keychain -p "$(cat "$PASSFILE")" "$KEYCHAIN"
@@ -188,7 +221,14 @@ else
     echo "         the binary stays ad-hoc signed and macOS will drop its" >&2
     echo "         Local Network permission — expect 'No route to host'." >&2
 fi
-launchctl kickstart -k "gui/$(id -u)/$AGENT"
+# Daemon: kill and let KeepAlive respawn (kickstart on the system
+# domain would need sudo). Agent fallback: kickstart as before.
+if [ -f "/Library/LaunchDaemons/$AGENT.plist" ]; then
+    pkill -f "kahawai-src/target/release/kahawai-transcoder" || true
+    pkill -f "kahawai-src/target/release/kahawai transcoder" || true
+else
+    launchctl kickstart -k "gui/$(id -u)/$AGENT"
+fi
 REMOTE
 
     echo "==> waiting for the link" >&2
