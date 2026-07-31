@@ -1237,6 +1237,23 @@ impl Registry {
                 .execute(&mut *tx)
                 .await?;
 
+                // Subtitle tracks are first-class rows synced from the
+                // probe (unification, 2026-07-31): only changed files
+                // reach this loop, so syncing here IS scan-sync.
+                if let Ok(info) =
+                    serde_json::from_str::<kahawai_core::media::MediaInfo>(&f.streams_json)
+                {
+                    crate::tracks::sync_source_tracks(
+                        &mut tx,
+                        &item_id,
+                        module_id,
+                        collection_id,
+                        &f.path_rel,
+                        &info,
+                    )
+                    .await?;
+                }
+
                 // HUB-20/MH-5: the same bytes came back (any host, any
                 // path) — restore archived watch state. Live rows win.
                 sqlx::query(
@@ -1428,7 +1445,7 @@ impl Registry {
                 .bind(path)
                 .execute(&mut *tx)
                 .await?;
-            for table in ["item_sources", "files"] {
+            for table in ["subtitle_tracks", "item_sources", "files"] {
                 // Safe by construction: `table` comes from the literal array
                 // above, never from a caller.
                 sqlx::query(sqlx::AssertSqlSafe(format!(
@@ -1698,6 +1715,7 @@ impl Registry {
         .execute(&mut *tx)
         .await?;
         for sql in [
+            "DELETE FROM subtitle_tracks WHERE module_id = ?",
             "DELETE FROM item_sources WHERE module_id = ?",
             "DELETE FROM files WHERE module_id = ?",
             "DELETE FROM collections WHERE module_id = ?",

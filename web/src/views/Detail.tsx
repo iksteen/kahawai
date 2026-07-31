@@ -9,9 +9,10 @@ import {
   resolveTracks,
   searchSubtitles,
   downloadSubtitle,
-  deleteDownloadedSubtitle,
+  deleteSubtitle,
   ocrSubtitle,
   quotaLabel,
+  isImageSub,
   type SubtitleQuota,
   type Subtitle,
   type SubtitleCandidate,
@@ -491,7 +492,7 @@ export default function Detail({
           managing downloads, so the file's own tracks are one line. */}
       <p className="dim">
         {(() => {
-          const own = subs.filter((s) => s.kind !== 'downloaded')
+          const own = subs.filter((s) => s.origin === 'embedded' || s.origin === 'sidecar')
           if (own.length === 0) return 'No subtitles in the file.'
           const langs = [...new Set(own.map((s) => s.language ?? '?'))]
           return `${own.length} in the file: ${langs.slice(0, 12).join(', ')}${
@@ -501,19 +502,19 @@ export default function Detail({
       </p>
       <ul className="rows subs-list">
         {subs
-          .filter((s) => s.kind === 'downloaded' || s.kind === 'ocr')
+          .filter((s) => s.origin === 'downloaded' || s.origin === 'ocr')
           .map((s) => (
-            <li key={s.key}>
+            <li key={s.id}>
               <span className="chips">
                 {/* "ocr" stays visible: machine-read text is imperfect
                     by nature and must say so (HUB-32c). */}
-                <span className="chip">{s.kind}</span>
+                <span className="chip">{s.origin}</span>
                 <span>{s.language ?? '?'} · {s.format}</span>
               </span>
               <button
                 className="btn ghost small"
                 onClick={() =>
-                  deleteDownloadedSubtitle(Number(s.key.slice(1)))
+                  deleteSubtitle(s.id)
                     .then(reloadSubs)
                     .catch((e) => setError(String(e)))
                 }
@@ -522,15 +523,18 @@ export default function Detail({
               </button>
             </li>
           ))}
-        {/* HUB-32c: image tracks with no OCR text yet can grow one. */}
+        {/* HUB-32c: image tracks with no OCR text derived from them
+            yet can grow one — per stream, keyed by lineage, so two
+            same-language image tracks each get their own button. */}
         {subs
           .filter(
             (s) =>
-              s.image &&
-              !subs.some((t) => t.kind === 'ocr' && (t.language ?? '?') === (s.language ?? '?')),
+              isImageSub(s) &&
+              (s.origin === 'embedded' || s.origin === 'sidecar') &&
+              !subs.some((t) => t.origin === 'ocr' && t.derived_from === s.id),
           )
           .map((s) => (
-            <li key={`ocr-${s.key}`}>
+            <li key={`ocr-${s.id}`}>
               <span className="chips">
                 <span className="chip dim">{s.format}</span>
                 <span>{s.language ?? '?'} · image only</span>
@@ -539,14 +543,14 @@ export default function Detail({
                 className="btn ghost small"
                 disabled={ocrBusy !== null}
                 onClick={() => {
-                  setOcrBusy(s.key)
-                  ocrSubtitle(item.id, s.key)
+                  setOcrBusy(String(s.id))
+                  ocrSubtitle(s.id)
                     .then(reloadSubs)
                     .catch((e) => setError(String(e)))
                     .finally(() => setOcrBusy(null))
                 }}
               >
-                {ocrBusy === s.key ? 'Reading…' : '→ text (OCR)'}
+                {ocrBusy === String(s.id) ? 'Reading…' : '→ text (OCR)'}
               </button>
             </li>
           ))}

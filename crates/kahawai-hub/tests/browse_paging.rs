@@ -290,10 +290,11 @@ async fn search_finds_artists_and_episode_titles() {
     assert_eq!(hits[0]["parent_title"], "Ace of Spades");
 }
 
-/// HUB-32b: a client that cannot composite display sets is not offered
-/// image subtitles; capability-less requests keep seeing everything.
+/// Unification: capability never filters the list — it changes each
+/// track's computed delivery. A no-overlay client still sees the PGS
+/// track; with no burn-capable host it reads `delivery: none`.
 #[tokio::test]
-async fn image_subtitles_are_gated_on_graphics_overlay() {
+async fn capability_changes_delivery_not_existence() {
     let (api, token, db) = harness().await;
     let q = |sql: &'static str| {
         let db = db.clone();
@@ -327,33 +328,118 @@ async fn image_subtitles_are_gated_on_graphics_overlay() {
        VALUES ('subs-item','m2','c2','subbed.mkv')",
     )
     .await;
+    // What a scan would materialize (tests seed by SQL, so no
+    // sync_source_tracks ran).
+    q(
+        "INSERT INTO subtitle_tracks (item_id, origin, module_id, collection_id,
+                                      path_rel, stream_index, format, language)
+       VALUES ('subs-item','embedded','m2','c2','subbed.mkv',0,'srt','en'),
+              ('subs-item','embedded','m2','c2','subbed.mkv',1,'ass','en'),
+              ('subs-item','embedded','m2','c2','subbed.mkv',2,'pgs','en')",
+    )
+    .await;
 
-    let formats = |v: &serde_json::Value| -> Vec<String> {
+    let delivery_of = |v: &serde_json::Value, format: &str| -> String {
         v["subtitles"]
             .as_array()
             .unwrap()
             .iter()
-            .map(|s| s["format"].as_str().unwrap().to_string())
-            .collect()
+            .find(|s| s["format"] == format)
+            .unwrap_or_else(|| panic!("{format} must be listed: {v}"))["delivery"]
+            .as_str()
+            .unwrap()
+            .to_string()
     };
     let all = page(&api, &token, "/api/v1/items/subs-item/subtitles").await;
-    assert!(
-        formats(&all).contains(&"pgs".to_string()),
-        "default keeps image subs: {all}"
-    );
+    assert_eq!(all["subtitles"].as_array().unwrap().len(), 3);
+    assert_eq!(delivery_of(&all, "pgs"), "overlay");
+    assert_eq!(delivery_of(&all, "ass"), "ass");
+    assert_eq!(delivery_of(&all, "srt"), "text");
+
     let gated = page(
         &api,
         &token,
-        "/api/v1/items/subs-item/subtitles?graphics_overlay=false",
+        "/api/v1/items/subs-item/subtitles?graphics_overlay=false&ass_render=false",
     )
     .await;
-    assert!(
-        !formats(&gated).contains(&"pgs".to_string()),
-        "gated must omit pgs: {gated}"
-    );
     assert_eq!(
-        formats(&gated).len(),
-        formats(&all).len() - 1,
-        "only the image entry drops"
+        gated["subtitles"].as_array().unwrap().len(),
+        3,
+        "capability must not filter: {gated}"
     );
+    // m2 is enrolled but not CONNECTED, so no burn either: none.
+    assert_eq!(delivery_of(&gated, "pgs"), "none");
+    assert_eq!(delivery_of(&gated, "ass"), "text");
+}
+
+/// Unification materialization: a rescan preserves row ids while a
+/// stream keeps its position (preferences pin ids, so churn would
+/// orphan them); a vanished stream deletes its row and lineage links
+/// go NULL rather than dangling.
+#[tokio::test]
+async fn scan_sync_preserves_track_ids() {
+    let (_api, _token, db) = harness().await;
+    sqlx::query("INSERT INTO items (id, kind, title, norm_title) VALUES ('it','movie','M','m')")
+        .execute(&db)
+        .await
+        .unwrap();
+    let info: kahawai_core::media::MediaInfo = serde_json::from_str(
+        r#"{"subtitles":[{"format":"srt","language":"en"},{"format":"pgs","language":"nl"}],
+            "external_subtitles":[{"path_rel":"m.idx","format":"vobsub","language":"en","track":0}]}"#,
+    )
+    .unwrap();
+    let sync = |info: kahawai_core::media::MediaInfo| {
+        let db = db.clone();
+        async move {
+            let mut tx = db.begin().await.unwrap();
+            kahawai_hub::tracks::sync_source_tracks(&mut tx, "it", "m", "c", "m.mkv", &info)
+                .await
+                .unwrap();
+            tx.commit().await.unwrap();
+        }
+    };
+    sync(info.clone()).await;
+    let ids = |origin: &'static str| {
+        let db = db.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT id FROM subtitle_tracks WHERE origin = ? ORDER BY stream_index",
+            )
+            .bind(origin)
+            .fetch_all(&db)
+            .await
+            .unwrap()
+        }
+    };
+    let first = ids("embedded").await;
+    assert_eq!(first.len(), 2);
+    assert_eq!(ids("sidecar").await.len(), 1);
+
+    // An OCR row derived from the PGS track.
+    let ocr: i64 = sqlx::query_scalar(
+        "INSERT INTO subtitle_tracks (item_id, origin, format, machine, derived_from)
+         VALUES ('it','ocr','srt',1,?) RETURNING id",
+    )
+    .bind(first[1])
+    .fetch_one(&db)
+    .await
+    .unwrap();
+
+    // Rescan, same streams: ids survive.
+    sync(info.clone()).await;
+    assert_eq!(ids("embedded").await, first, "rescan must preserve ids");
+
+    // The PGS stream vanishes: its row goes, the OCR row stays but its
+    // lineage link nulls (ON DELETE SET NULL).
+    let mut less = info.clone();
+    less.subtitles.truncate(1);
+    sync(less).await;
+    assert_eq!(ids("embedded").await, vec![first[0]]);
+    let link: Option<i64> =
+        sqlx::query_scalar("SELECT derived_from FROM subtitle_tracks WHERE id = ?")
+            .bind(ocr)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    assert_eq!(link, None, "lineage must null, not dangle");
 }

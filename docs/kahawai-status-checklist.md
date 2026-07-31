@@ -233,15 +233,27 @@ How something works and why it was built that way belong in
       dropped, no copyleft), default-on `ocr` feature, idle sweep over
       the whole library (playback outranks it) + per-track button as the
       urgent path, `tier: ocr` spares the burn encode, doctor row.
-      Covers embedded image tracks AND VobSub sidecar tracks (s-keys).
-      Deferred: per-session text-over-tiles preference for overlay
-      clients, and the bandwidth-threshold selection (needs measurement)
+      Covers embedded image tracks AND VobSub sidecar tracks.
+      Deferred: the bandwidth-threshold selection (needs measurement)
+- [x] Subtitle unification (HUB-32c mechanics amendment, 2026-07-31):
+      one `subtitle_tracks` keyspace for every origin
+      (embedded/sidecar/downloaded/ocr), synced at scan with stable ids,
+      OCR lineage via `derived_from` (per source — the multi-source flag
+      bug died with the name parsing). Capability adjusts each track's
+      computed delivery (text/ass/overlay/burn/none), never existence;
+      the UI disables instead of the API filtering. Explicit burn: an
+      image track picked by id forces the encode (overrides overlay +
+      OCR sparing; VobSub sidecars burn via handed sets), applied at
+      start or switched mid-session through the seek-restart (track id;
+      0 withdraws). Verdicts carry track ids and re-plans refresh them.
+      Per-item `subs.track` memory can now pin a downloaded/OCR row
 - [x] HUB-33 Dual-audio defaults, one mechanism: the hub stores a plain
       per-user KV (/api/v1/prefs) and picks nothing. Settings page holds
       per-media-type ordered language lists for audio ('original'
       resolves via the stored original_language) and subtitles; explicit
       in-player changes are remembered per series/movie. Resolution is
-      client-side: series memory > per-type settings > track 0 / no subs
+      client-side: item track id (subs.track, unification) > series
+      memory > per-type settings > track 0 / no subs
 - [x] HUB-34 Retrieval efficiency ladder: cache/sidecar → live session tap →
       mediahost sparse/sequential extraction → hub lease, cached at-most-once
       — fonts included: declared attachment ranges serve via exact lease

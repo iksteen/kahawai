@@ -78,7 +78,10 @@ pub async fn gather(
         items: one("SELECT COUNT(*) FROM items").await,
         files: one("SELECT COUNT(*) FROM files").await,
         file_bytes: one("SELECT COALESCE(SUM(size), 0) FROM files").await,
-        subtitle_files: one("SELECT COUNT(*) FROM downloaded_subtitles").await,
+        subtitle_files: one(
+            "SELECT COUNT(*) FROM subtitle_tracks WHERE origin IN ('downloaded', 'ocr')",
+        )
+        .await,
         enrichment_due: one("SELECT COUNT(*) FROM enrichment_queue WHERE due_at <= unixepoch()")
             .await,
         // The number worth alerting on: items nothing has identified.

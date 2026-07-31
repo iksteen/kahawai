@@ -33,6 +33,15 @@ pub struct SubtitleEntry {
     pub image: bool,
 }
 
+/// One track plus what it means for the requesting client.
+#[derive(serde::Serialize)]
+pub struct TrackListing {
+    #[serde(flatten)]
+    pub track: crate::tracks::Track,
+    pub delivery: crate::tracks::Delivery,
+    pub note: &'static str,
+}
+
 /// A served ASS script: complete (cache/sidecar) or streamed while the
 /// extraction pass runs.
 pub enum AssBody {
@@ -127,37 +136,50 @@ impl Subtitles {
         )))
     }
 
-    /// The subtitle tracks we can serve for an item, from the same source
-    /// `open_source` would pick (largest, preferring connected hosts).
-    pub async fn list(&self, registry: &Registry, item_id: &str) -> Result<Vec<SubtitleEntry>> {
-        let (_, _, _, info) = source_row(registry, item_id).await?;
-        let mut out = entries(&info);
-        // HUB-24: subtitles the user downloaded from external providers.
-        let rows = sqlx::query(
-            "SELECT id, provider, language, format, release_name FROM downloaded_subtitles
-             WHERE item_id = ? ORDER BY id",
+    /// Every track of the item, from the unified table — bound to the
+    /// same source `open_source` would pick, plus the hub-stored rows.
+    /// Capability adjusts each track's DELIVERY, never its existence
+    /// (the UI disables `none`; the API always lists).
+    pub async fn list(
+        &self,
+        registry: &Registry,
+        item_id: &str,
+        ass_render: bool,
+        graphics_overlay: bool,
+    ) -> Result<Vec<TrackListing>> {
+        let (module_id, collection_id, path_rel, _info) = source_row(registry, item_id).await?;
+        let tracks = crate::tracks::for_item_source(
+            registry.db(),
+            item_id,
+            &module_id,
+            &collection_id,
+            &path_rel,
         )
-        .bind(item_id)
-        .fetch_all(registry.db())
         .await?;
-        for r in &rows {
-            let format: String = r.get("format");
-            out.push(SubtitleEntry {
-                key: format!("d{}", r.get::<i64, _>("id")),
-                // "ocr" is user-visible: machine-derived text is
-                // imperfect by nature and must say so (HUB-32c).
-                kind: if r.get::<String, _>("provider") == "ocr" {
-                    "ocr"
-                } else {
-                    "downloaded"
-                },
-                format: format.clone(),
-                language: r.get::<Option<String>, _>("language"),
-                flattened: matches!(format.as_str(), "ass" | "ssa"),
-                image: false,
-            });
-        }
-        Ok(out)
+        // Burn needs the display sets readable where the encode runs —
+        // a connected mediahost extracts them (HUB-32b).
+        let burn_capable = registry.is_connected(&module_id);
+        Ok(tracks
+            .into_iter()
+            .map(|t| {
+                let (delivery, note) =
+                    crate::tracks::delivery(&t, ass_render, graphics_overlay, burn_capable);
+                TrackListing {
+                    track: t,
+                    delivery,
+                    note,
+                }
+            })
+            .collect())
+    }
+
+    /// The internal key (`e{n}`/`s{n}`/`d{id}`) a track id resolves to —
+    /// the notation the caches and the pipeline still speak. Public API
+    /// surfaces speak track ids only.
+    pub async fn internal_key(&self, registry: &Registry, id: i64) -> Result<crate::tracks::Track> {
+        crate::tracks::get(registry.db(), id)
+            .await?
+            .with_context(|| format!("no subtitle track {id}"))
     }
 
     /// WebVTT for one subtitle key, cue timestamps shifted by `shift_ms`
@@ -191,6 +213,12 @@ impl Subtitles {
         item_id: &str,
         key: &str,
     ) -> Result<AssBody> {
+        // Downloaded/OCR ASS serves from the stored body — a hole in
+        // the old keyspace (only embedded/sidecar could serve .ass).
+        if key.starts_with('d') {
+            let ex = self.load(registry, sessions, item_id, key).await?;
+            return Ok(AssBody::Full(ex.ass.context("subtitle has no ASS form")?));
+        }
         let (module_id, collection_id, path_rel, info) = source_row(registry, item_id).await?;
         let entry = entries(&info)
             .into_iter()
@@ -519,7 +547,7 @@ impl Subtitles {
         file_id: &str,
         language: Option<String>,
         user_id: &str,
-    ) -> Result<(String, crate::opensubtitles::Quota)> {
+    ) -> Result<(i64, crate::opensubtitles::Quota)> {
         let provider = self.external_provider(registry, user_id).await?;
         let dl = provider.download(file_id).await?;
         let text = decode_text(&dl.bytes);
@@ -530,110 +558,131 @@ impl Subtitles {
             ass: matches!(dl.format.as_str(), "ass" | "ssa").then_some(text),
         };
         let id: i64 = sqlx::query_scalar(
-            "INSERT INTO downloaded_subtitles
-               (item_id, provider, language, format, release_name, downloaded_by)
-             VALUES (?, ?, ?, ?, ?, ?) RETURNING id",
+            "INSERT INTO subtitle_tracks
+               (item_id, origin, format, language, label, provider, created_by)
+             VALUES (?, 'downloaded', ?, ?, ?, ?, ?) RETURNING id",
         )
         .bind(item_id)
-        .bind(provider.name())
-        .bind(&language)
         .bind(&dl.format)
+        .bind(&language)
         .bind(&dl.release_name)
+        .bind(provider.name())
         .bind(user_id)
         .fetch_one(registry.db())
         .await?;
         std::fs::create_dir_all(&self.dir)?;
         std::fs::write(self.downloaded_path(id), serde_json::to_vec(&ex)?)?;
         tracing::info!(item = item_id, id, format = %dl.format, "external subtitle downloaded");
-        Ok((format!("d{id}"), provider.quota()))
+        Ok((id, provider.quota()))
     }
 
-    /// HUB-32c: OCR one embedded image subtitle track into a text track.
-    /// The result rides the downloaded-subtitles machinery with
-    /// `provider = 'ocr'` and `release_name = "ocr:e{n}:{model}"` — the
-    /// structured name is what ties the text row back to its image
-    /// stream. Regeneration replaces the previous row for that stream.
-    /// Returns the new subtitle key (`d{id}`).
+    /// HUB-32c: OCR an image subtitle track (embedded or VobSub
+    /// sidecar) into a new text track. The result is a first-class
+    /// `ocr` row whose `derived_from` points at the image track — that
+    /// linkage is what regeneration replaces by and what the sweep and
+    /// negotiation dedupe on. Returns the new track id.
     #[cfg(feature = "ocr")]
     pub async fn ocr_generate(
         &self,
         registry: &Registry,
-        item_id: &str,
-        key: &str,
+        parent_id: i64,
         user_id: &str,
-    ) -> Result<String> {
+    ) -> Result<i64> {
         // A human pressed the button: bounded like the burn path's wait.
-        self.ocr_generate_within(registry, item_id, key, user_id, SETS_WAIT_URGENT)
+        self.ocr_generate_within(registry, parent_id, user_id, SETS_WAIT_URGENT)
             .await
+    }
+
+    /// Where the mediahost extraction addresses a track's display sets:
+    /// (module, collection, path to walk, index within it, language).
+    /// Embedded tracks walk the media container; VobSub sidecars walk
+    /// the .idx (the mediahost keys off the extension), addressed by
+    /// the in-idx track id from the external_subtitles entry.
+    pub(crate) async fn extract_ref(
+        &self,
+        registry: &Registry,
+        track: &crate::tracks::Track,
+    ) -> Result<(String, String, String, usize, Option<String>)> {
+        anyhow::ensure!(
+            crate::tracks::is_image_format(&track.format),
+            "track {} is {}, not an image subtitle",
+            track.id,
+            track.format
+        );
+        let (module_id, collection_id, media_rel) = (
+            track
+                .module_id
+                .clone()
+                .context("hub-stored track has no source to extract")?,
+            track.collection_id.clone().unwrap_or_default(),
+            track.path_rel.clone().unwrap_or_default(),
+        );
+        let idx = track.stream_index.unwrap_or(0) as usize;
+        match track.origin.as_str() {
+            "embedded" => Ok((
+                module_id,
+                collection_id,
+                media_rel,
+                idx,
+                track.language.clone(),
+            )),
+            "sidecar" => {
+                let streams: String = sqlx::query_scalar(
+                    "SELECT streams_json FROM files
+                     WHERE (module_id, collection_id, path_rel) = (?, ?, ?)",
+                )
+                .bind(&module_id)
+                .bind(&collection_id)
+                .bind(&media_rel)
+                .fetch_one(registry.db())
+                .await?;
+                let info: kahawai_core::media::MediaInfo = serde_json::from_str(&streams)?;
+                let ext = info
+                    .external_subtitles
+                    .get(idx)
+                    .with_context(|| format!("sidecar entry {idx} vanished"))?;
+                Ok((
+                    module_id,
+                    collection_id,
+                    ext.path_rel.clone(),
+                    ext.track.unwrap_or(0) as usize,
+                    ext.language.clone().or_else(|| track.language.clone()),
+                ))
+            }
+            other => bail!("cannot OCR a track of origin {other}"),
+        }
     }
 
     #[cfg(feature = "ocr")]
     async fn ocr_generate_within(
         &self,
         registry: &Registry,
-        item_id: &str,
-        key: &str,
+        parent_id: i64,
         user_id: &str,
         sets_wait: std::time::Duration,
-    ) -> Result<String> {
-        // One generation per (item, track) at a time: the idle sweep and
-        // the button race here, and losing the race means the work is
+    ) -> Result<i64> {
+        // One generation per parent at a time: the idle sweep and the
+        // button race here, and losing the race means the work is
         // already done — return the winner's row instead of redoing it.
         let lock = {
             let mut map = self.inflight.lock().unwrap();
-            map.entry(format!("ocr:{item_id}:{key}"))
-                .or_default()
-                .clone()
+            map.entry(format!("ocr:{parent_id}")).or_default().clone()
         };
         let _guard = lock.lock_owned().await;
         if let Some(id) = sqlx::query_scalar::<_, i64>(
-            "SELECT id FROM downloaded_subtitles
-             WHERE item_id = ? AND provider = 'ocr' AND release_name LIKE ?",
+            "SELECT id FROM subtitle_tracks WHERE derived_from = ? AND origin = 'ocr'",
         )
-        .bind(item_id)
-        .bind(format!("ocr:{key}:%"))
+        .bind(parent_id)
         .fetch_optional(registry.db())
         .await?
         {
-            return Ok(format!("d{id}"));
+            return Ok(id);
         }
-        let (module_id, collection_id, media_rel, info) = source_row(registry, item_id).await?;
-        // What the extraction addresses: the media file + embedded track
-        // index for e-keys; the .idx sidecar + its internal track for
-        // s-keys (the mediahost keys off the .idx extension).
-        let (path_rel, sub_index, language) = match key.split_at(1) {
-            ("e", n) => {
-                let i: usize = n.parse().with_context(|| format!("bad key {key}"))?;
-                let stream = info
-                    .subtitles
-                    .get(i)
-                    .with_context(|| format!("no subtitle stream {key}"))?;
-                anyhow::ensure!(
-                    matches!(stream.format.as_str(), "pgs" | "vobsub" | "dvdsub"),
-                    "{key} is {}, not an image subtitle",
-                    stream.format
-                );
-                (media_rel, i, stream.language.clone())
-            }
-            ("s", n) => {
-                let i: usize = n.parse().with_context(|| format!("bad key {key}"))?;
-                let ext = info
-                    .external_subtitles
-                    .get(i)
-                    .with_context(|| format!("no sidecar {key}"))?;
-                anyhow::ensure!(
-                    ext.format == "vobsub",
-                    "{key} is {}, not an image sidecar",
-                    ext.format
-                );
-                (
-                    ext.path_rel.clone(),
-                    ext.track.unwrap_or(0) as usize,
-                    ext.language.clone(),
-                )
-            }
-            _ => bail!("key must be an embedded (e) or sidecar (s) subtitle, got {key}"),
-        };
+        let parent = crate::tracks::get(registry.db(), parent_id)
+            .await?
+            .with_context(|| format!("no subtitle track {parent_id}"))?;
+        let (module_id, collection_id, extract_rel, extract_idx, language) =
+            self.extract_ref(registry, &parent).await?;
         let model = crate::ocr::model_for(language.as_deref()).with_context(|| {
             format!(
                 "no Tesseract model for language {:?} — install its traineddata",
@@ -648,8 +697,8 @@ impl Subtitles {
                 registry,
                 &module_id,
                 &collection_id,
-                &path_rel,
-                sub_index,
+                &extract_rel,
+                extract_idx,
                 sets_wait,
             )
             .await
@@ -663,35 +712,24 @@ impl Subtitles {
         let n_cues = cues.len();
         let ex = Extracted { cues, ass: None };
 
-        // Replace, not accumulate: one OCR row per image stream.
-        let name = format!("ocr:{key}:{model}");
-        let stale: Vec<i64> = sqlx::query_scalar(
-            "SELECT id FROM downloaded_subtitles
-             WHERE item_id = ? AND provider = 'ocr' AND release_name LIKE ?",
-        )
-        .bind(item_id)
-        .bind(format!("ocr:{key}:%"))
-        .fetch_all(registry.db())
-        .await?;
-        for id in stale {
-            let _ = self.delete_downloaded(registry, id).await;
-        }
         let id: i64 = sqlx::query_scalar(
-            "INSERT INTO downloaded_subtitles
-               (item_id, provider, language, format, release_name, downloaded_by)
-             VALUES (?, 'ocr', ?, 'srt', ?, ?) RETURNING id",
+            "INSERT INTO subtitle_tracks
+               (item_id, origin, format, language, label, provider, machine,
+                created_by, derived_from)
+             VALUES (?, 'ocr', 'srt', ?, ?, 'ocr', 1, ?, ?) RETURNING id",
         )
-        .bind(item_id)
+        .bind(&parent.item_id)
         .bind(&language)
-        .bind(&name)
+        .bind(&model)
         .bind(user_id)
+        .bind(parent_id)
         .fetch_one(registry.db())
         .await?;
         std::fs::create_dir_all(&self.dir)?;
         std::fs::write(self.downloaded_path(id), serde_json::to_vec(&ex)?)?;
-        tracing::info!(item = item_id, track = sub_index, %model, cues = n_cues,
-            "image subtitle OCRed to text");
-        Ok(format!("d{id}"))
+        tracing::info!(item = %parent.item_id, parent = parent_id, track = id,
+            %model, cues = n_cues, "image subtitle OCRed to text");
+        Ok(id)
     }
 
     /// HUB-32c idle sweep: OCR every image subtitle track in the library
@@ -713,54 +751,29 @@ impl Subtitles {
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
             // Tracks that failed stay failed for this hub run — a
             // corrupt track must not become a 15-second crash loop.
-            let mut failed: std::collections::HashSet<(String, String)> = Default::default();
+            let mut failed: std::collections::HashSet<i64> = Default::default();
             loop {
                 let candidates = subs.ocr_candidates(&registry).await;
                 let mut generated = 0usize;
-                for (item_id, key) in candidates {
-                    if failed.contains(&(item_id.clone(), key.clone())) {
+                for id in candidates {
+                    if failed.contains(&id) {
                         continue;
                     }
                     // Idle means idle: playback outranks the sweep.
                     while !sessions.list().is_empty() {
                         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
                     }
-                    // Validate against the source the generator will
-                    // actually use (indexes are per-source), and only
-                    // try where the model and the mediahost exist.
-                    let Ok((module_id, collection_id, media_rel, info)) =
-                        source_row(&registry, &item_id).await
-                    else {
-                        failed.insert((item_id, key));
+                    // The row may have vanished under a rescan since the
+                    // candidate query ran; only try where the model and
+                    // the mediahost exist.
+                    let Ok(Some(track)) = crate::tracks::get(registry.db(), id).await else {
+                        failed.insert(id);
                         continue;
                     };
-                    // (extraction path, extraction index, language) for
-                    // either key kind — mirrors ocr_generate's resolve.
-                    let resolved = match key.split_at(1) {
-                        ("e", n) => n.parse::<usize>().ok().and_then(|i| {
-                            info.subtitles
-                                .get(i)
-                                .filter(|s| {
-                                    matches!(s.format.as_str(), "pgs" | "vobsub" | "dvdsub")
-                                })
-                                .map(|s| (media_rel.clone(), i, s.language.clone()))
-                        }),
-                        ("s", n) => n.parse::<usize>().ok().and_then(|i| {
-                            info.external_subtitles
-                                .get(i)
-                                .filter(|s| s.format == "vobsub")
-                                .map(|s| {
-                                    (
-                                        s.path_rel.clone(),
-                                        s.track.unwrap_or(0) as usize,
-                                        s.language.clone(),
-                                    )
-                                })
-                        }),
-                        _ => None,
-                    };
-                    let Some((extract_rel, extract_idx, language)) = resolved else {
-                        failed.insert((item_id, key));
+                    let Ok((module_id, collection_id, extract_rel, extract_idx, language)) =
+                        subs.extract_ref(&registry, &track).await
+                    else {
+                        failed.insert(id);
                         continue;
                     };
                     if !registry.is_connected(&module_id) {
@@ -782,24 +795,18 @@ impl Subtitles {
                                 SETS_WAIT_IDLE,
                             )
                             .await;
-                        failed.insert((item_id, key));
+                        failed.insert(id);
                         continue;
                     }
                     match subs
-                        .ocr_generate_within(
-                            &registry,
-                            &item_id,
-                            &key,
-                            "idle-sweep",
-                            SETS_WAIT_IDLE,
-                        )
+                        .ocr_generate_within(&registry, id, "idle-sweep", SETS_WAIT_IDLE)
                         .await
                     {
                         Ok(_) => generated += 1,
                         Err(e) => {
-                            tracing::warn!(item = %item_id, key = %key,
+                            tracing::warn!(track = id, item = %track.item_id,
                                 error = format!("{e:#}"), "idle OCR failed; skipping this run");
-                            failed.insert((item_id, key));
+                            failed.insert(id);
                         }
                     }
                     tokio::time::sleep(std::time::Duration::from_secs(10)).await;
@@ -812,50 +819,40 @@ impl Subtitles {
         });
     }
 
-    /// Image subtitle tracks with no OCR text row yet, as (item, track
-    /// index) pairs. Indexes come from each source's own stream list and
-    /// are re-validated against the generator's source pick.
+    /// Image subtitle tracks with no OCR text row derived from them
+    /// yet — the sweep's work list, ordered so one item finishes before
+    /// the next begins.
     #[cfg(feature = "ocr")]
-    async fn ocr_candidates(&self, registry: &Registry) -> Vec<(String, String)> {
-        // Embedded image tracks (e-keys) and VobSub sidecar tracks
-        // (s-keys), keyed the way the subtitle API keys them.
-        sqlx::query_as::<_, (String, String)>(
-            "SELECT DISTINCT s.item_id, 'e' || j.key
-             FROM item_sources s
-             JOIN files f ON (f.module_id, f.collection_id, f.path_rel)
-                           = (s.module_id, s.collection_id, s.path_rel),
-                  json_each(f.streams_json, '$.subtitles') j
-             WHERE json_extract(j.value, '$.format') IN ('pgs', 'vobsub', 'dvdsub')
+    async fn ocr_candidates(&self, registry: &Registry) -> Vec<i64> {
+        sqlx::query_scalar(
+            "SELECT t.id FROM subtitle_tracks t
+             WHERE t.origin IN ('embedded', 'sidecar')
+               AND t.format IN ('pgs', 'vobsub', 'dvdsub')
                AND NOT EXISTS (
-                     SELECT 1 FROM downloaded_subtitles d
-                     WHERE d.item_id = s.item_id AND d.provider = 'ocr'
-                       AND d.release_name LIKE 'ocr:e' || j.key || ':%')
-             UNION
-             SELECT DISTINCT s.item_id, 's' || j.key
-             FROM item_sources s
-             JOIN files f ON (f.module_id, f.collection_id, f.path_rel)
-                           = (s.module_id, s.collection_id, s.path_rel),
-                  json_each(f.streams_json, '$.external_subtitles') j
-             WHERE json_extract(j.value, '$.format') = 'vobsub'
-               AND NOT EXISTS (
-                     SELECT 1 FROM downloaded_subtitles d
-                     WHERE d.item_id = s.item_id AND d.provider = 'ocr'
-                       AND d.release_name LIKE 'ocr:s' || j.key || ':%')
-             ORDER BY 1",
+                     SELECT 1 FROM subtitle_tracks d
+                     WHERE d.derived_from = t.id AND d.origin = 'ocr')
+             ORDER BY t.item_id, t.id",
         )
         .fetch_all(registry.db())
         .await
         .unwrap_or_default()
     }
 
-    /// Remove a downloaded subtitle (row + cached body).
-    pub async fn delete_downloaded(&self, registry: &Registry, id: i64) -> Result<bool> {
-        let n = sqlx::query("DELETE FROM downloaded_subtitles WHERE id = ?")
-            .bind(id)
-            .execute(registry.db())
-            .await?
-            .rows_affected();
-        let _ = std::fs::remove_file(self.downloaded_path(id));
+    /// Remove a hub-stored track (downloaded/OCR: row + cached body).
+    /// Scan-owned rows refuse — deleting one would only last until the
+    /// next rescan re-materializes it.
+    pub async fn delete_track(&self, registry: &Registry, id: i64) -> Result<bool> {
+        let n = sqlx::query(
+            "DELETE FROM subtitle_tracks
+             WHERE id = ? AND origin IN ('downloaded', 'ocr')",
+        )
+        .bind(id)
+        .execute(registry.db())
+        .await?
+        .rows_affected();
+        if n > 0 {
+            let _ = std::fs::remove_file(self.downloaded_path(id));
+        }
         Ok(n > 0)
     }
 
@@ -1115,28 +1112,50 @@ fn is_font(a: &kahawai_core::media::Attachment) -> bool {
         || n.ends_with(".ttc")
 }
 
-/// Embedded image-track indexes that already have an OCR text row
-/// (HUB-32c) — negotiation prefers text over burn for these. Parsed
-/// from the structured release_name; errors read as "none".
-pub async fn ocr_sub_indexes(db: &sqlx::SqlitePool, item_id: &str) -> Vec<usize> {
-    let names: Vec<String> = sqlx::query_scalar(
-        "SELECT release_name FROM downloaded_subtitles
-         WHERE item_id = ? AND provider = 'ocr'",
+/// HUB-32c: which embedded streams of an item already have an OCR text
+/// track derived from them — negotiation prefers text over burn for
+/// those. Keyed (module, collection, path, stream index) because rows
+/// bind to their source: multi-source items get each source's own
+/// answer, which the old item-wide release_name parse got wrong.
+pub async fn ocr_stream_set(
+    db: &sqlx::SqlitePool,
+    item_id: &str,
+) -> std::collections::HashSet<(String, String, String, i64)> {
+    sqlx::query_as(
+        "SELECT t.module_id, t.collection_id, t.path_rel, t.stream_index
+         FROM subtitle_tracks t
+         WHERE t.item_id = ? AND t.origin = 'embedded'
+           AND EXISTS (
+                 SELECT 1 FROM subtitle_tracks d
+                 WHERE d.derived_from = t.id AND d.origin = 'ocr')",
     )
     .bind(item_id)
     .fetch_all(db)
     .await
-    .unwrap_or_default();
-    names
-        .iter()
-        .filter_map(|n| n.strip_prefix("ocr:e")?.split(':').next()?.parse().ok())
-        .collect()
+    .unwrap_or_default()
+    .into_iter()
+    .collect()
 }
 
-/// [`ocr_sub_indexes`] as a per-stream flag vec for `negotiate()`.
-pub async fn ocr_flags(db: &sqlx::SqlitePool, item_id: &str, n_subs: usize) -> Vec<bool> {
-    let idx = ocr_sub_indexes(db, item_id).await;
-    (0..n_subs).map(|i| idx.contains(&i)).collect()
+/// [`ocr_stream_set`] as `negotiate()`'s per-stream flag vec, for the
+/// source one plan is judging.
+pub fn ocr_flags_for(
+    set: &std::collections::HashSet<(String, String, String, i64)>,
+    module_id: &str,
+    collection_id: &str,
+    path_rel: &str,
+    n_subs: usize,
+) -> Vec<bool> {
+    (0..n_subs)
+        .map(|i| {
+            set.contains(&(
+                module_id.to_string(),
+                collection_id.to_string(),
+                path_rel.to_string(),
+                i as i64,
+            ))
+        })
+        .collect()
 }
 
 fn entries(info: &kahawai_core::media::MediaInfo) -> Vec<SubtitleEntry> {

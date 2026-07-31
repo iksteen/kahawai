@@ -104,14 +104,20 @@ pub struct Session {
     /// NOW, not what played at session start.
     pub verdict: Mutex<Option<(String, String)>>,
     /// Per-subtitle-stream tier verdicts (HUB-32a/b) — additive in the
-    /// API response.
-    pub sub_verdicts: Vec<kahawai_media::negotiate::SubtitleVerdict>,
+    /// API response. LIVE state like `verdict`: a track-switch re-plan
+    /// must say what is happening NOW.
+    pub sub_verdicts: Mutex<Vec<kahawai_media::negotiate::SubtitleVerdict>>,
     /// The effective capability profile (client's or fallback, cap
     /// merged) — re-plans on track switches negotiate against IT.
     profile: kahawai_core::media::CapabilityProfile,
     /// HUB-32b: the display sets this session burns, if any. A seek
-    /// restarts the pipeline, which must burn the same subtitles.
-    burn_sets: Option<std::path::PathBuf>,
+    /// restarts the pipeline, which must burn the same subtitles. LIVE:
+    /// a mid-session subtitle pick swaps them.
+    burn_sets: Mutex<Option<std::path::PathBuf>>,
+    /// An explicit image-track pick (subtitle unification): seeks and
+    /// track-switch re-plans keep forcing the burn it asked for, and a
+    /// new pick replaces it.
+    burn_pick: Mutex<Option<kahawai_media::negotiate::BurnPick>>,
     /// The HLS sink this session's content actually works on. Some
     /// files crash hlssink3 (TC-6); once the fallback saved a start or
     /// a seek, every later restart uses it directly instead of paying
@@ -147,6 +153,9 @@ struct PendingSeek {
     position_ms: u64,
     audio_track: Option<u32>,
     video_track: Option<u32>,
+    /// The burn pick changed (subtitle unification): re-plan even when
+    /// the audio/video tracks stayed put.
+    replan_subs: bool,
 }
 
 impl PendingSeek {
@@ -157,10 +166,39 @@ impl PendingSeek {
             Some(p) => PendingSeek {
                 audio_track: next.audio_track.or(p.audio_track),
                 video_track: next.video_track.or(p.video_track),
+                replan_subs: next.replan_subs || p.replan_subs,
                 ..next
             },
             None => next,
         }
+    }
+}
+
+/// The negotiation speaks stream indexes; the API speaks unified track
+/// rows. Stamp each verdict with the id of the embedded row bound to
+/// the session's source (missing rows read as None — a source scanned
+/// before the unification migration ran).
+async fn fill_verdict_track_ids(
+    registry: &Registry,
+    parts: &[PartSource],
+    verdicts: &mut [kahawai_media::negotiate::SubtitleVerdict],
+) {
+    let Some(p) = parts.first() else { return };
+    let map: std::collections::HashMap<i64, i64> = sqlx::query_as(
+        "SELECT stream_index, id FROM subtitle_tracks
+         WHERE origin = 'embedded'
+           AND (module_id, collection_id, path_rel) = (?, ?, ?)",
+    )
+    .bind(&p.module_id)
+    .bind(&p.collection_id)
+    .bind(&p.path_rel)
+    .fetch_all(registry.db())
+    .await
+    .unwrap_or_default()
+    .into_iter()
+    .collect();
+    for v in verdicts.iter_mut() {
+        v.track_id = map.get(&(v.index as i64)).copied();
     }
 }
 
@@ -662,6 +700,7 @@ impl Sessions {
         start_ms: u64,
         audio_track: u32,
         video_track: u32,
+        subtitle_track: Option<i64>,
     ) -> Result<Arc<Session>> {
         let user_active = self
             .active
@@ -690,8 +729,52 @@ impl Sessions {
             (a, b) => a.or(b),
         };
         // HUB-32c: which embedded image tracks already have an OCR text
-        // row — those prefer text over burn in the negotiation.
-        let ocr_subs = crate::subtitles::ocr_sub_indexes(registry.db(), item_id).await;
+        // track derived from them — those prefer text over burn in the
+        // negotiation. Fetched once, keyed per source.
+        let ocr_set = crate::subtitles::ocr_stream_set(registry.db(), item_id).await;
+        // Subtitle unification: an explicit IMAGE track pick forces its
+        // burn — overriding both the overlay preference and the
+        // OCR-spares-burn rule. Text/ass/downloaded picks have no plan
+        // impact (the client fetches them itself). The row binds to a
+        // source, so the pick also pins source selection to it: judging
+        // other sources would silently drop the burn the user asked for.
+        let picked_row = match subtitle_track {
+            Some(tid) => {
+                let t = crate::tracks::get(registry.db(), tid)
+                    .await?
+                    .with_context(|| format!("no subtitle track {tid}"))?;
+                anyhow::ensure!(
+                    t.item_id == item_id,
+                    "subtitle track {tid} belongs to another item"
+                );
+                Some(t)
+            }
+            None => None,
+        };
+        let burn_row = picked_row
+            .filter(|t| crate::tracks::is_image_format(&t.format))
+            .filter(|t| t.module_id.is_some() && t.stream_index.is_some());
+        let pick_for = |parts: &[PartSource]| -> Option<kahawai_media::negotiate::BurnPick> {
+            let t = burn_row.as_ref()?;
+            let p = parts.first()?;
+            if (
+                t.module_id.as_deref(),
+                t.collection_id.as_deref(),
+                t.path_rel.as_deref(),
+            ) != (
+                Some(p.module_id.as_str()),
+                Some(p.collection_id.as_str()),
+                Some(p.path_rel.as_str()),
+            ) {
+                return None;
+            }
+            let i = t.stream_index? as usize;
+            match t.origin.as_str() {
+                "embedded" => Some(kahawai_media::negotiate::BurnPick::Embedded(i)),
+                "sidecar" => Some(kahawai_media::negotiate::BurnPick::Sidecar(i)),
+                _ => None,
+            }
+        };
         let negotiate_with =
             |parts: &[PartSource], info: &kahawai_core::media::MediaInfo, burn_capable: bool| {
                 let est_kbps = info
@@ -728,9 +811,19 @@ impl Sessions {
                     est_kbps,
                     tonemap,
                     burn_capable,
-                    &(0..info.subtitles.len())
-                        .map(|i| ocr_subs.contains(&i))
-                        .collect::<Vec<_>>(),
+                    &parts
+                        .first()
+                        .map(|p| {
+                            crate::subtitles::ocr_flags_for(
+                                &ocr_set,
+                                &p.module_id,
+                                &p.collection_id,
+                                &p.path_rel,
+                                info.subtitles.len(),
+                            )
+                        })
+                        .unwrap_or_default(),
+                    pick_for(parts),
                 )
             };
         // HUB-32b: the timeline comes from the mediahost, which walks
@@ -755,7 +848,16 @@ impl Sessions {
             // HUB-14/16: judge every candidate, cheapest sufficient
             // path wins, rank breaks ties.
             None => {
-                let candidates = self.candidate_sources(registry, item_id).await?;
+                let mut candidates = self.candidate_sources(registry, item_id).await?;
+                // A burn pick pins the source it binds to: judging the
+                // others would let a cheaper copy win and silently drop
+                // the burn the user explicitly selected.
+                if burn_row.is_some() {
+                    candidates.retain(|(parts, _)| pick_for(parts).is_some());
+                    if candidates.is_empty() {
+                        bail!("the picked subtitle track's source is not available");
+                    }
+                }
                 if candidates.is_empty() {
                     bail!("no source is currently available (mediahost offline)");
                 }
@@ -778,7 +880,18 @@ impl Sessions {
         // than an encode that burns nothing.
         let mut burn_sets: Option<std::path::PathBuf> = None;
         let mut sp = sp;
-        if let Some(idx) = sp.plan.burn_subtitle
+        // What to walk: the media file at the embedded index, or — for
+        // a sidecar pick — the .idx at its in-idx track.
+        let sets_ref = match (sp.plan.burn_subtitle, sp.burn_sidecar) {
+            (Some(idx), _) => parts.first().map(|p| (p.path_rel.clone(), idx)),
+            (None, Some(i)) => info
+                .external_subtitles
+                .get(i)
+                .filter(|e| e.format == "vobsub")
+                .map(|e| (e.path_rel.clone(), e.track.unwrap_or(0) as usize)),
+            (None, None) => None,
+        };
+        if let Some((walk_rel, walk_idx)) = sets_ref
             && let Some(part) = parts.first()
         {
             burn_sets = subtitles
@@ -786,17 +899,19 @@ impl Sessions {
                     registry,
                     &part.module_id,
                     &part.collection_id,
-                    &part.path_rel,
-                    idx,
+                    &walk_rel,
+                    walk_idx,
                     BURN_SETS_WAIT,
                 )
                 .await;
             if burn_sets.is_none() {
                 tracing::warn!(
                     item = item_id,
-                    track = idx,
+                    track = walk_idx,
                     "burn-in: no display sets; re-planning without it"
                 );
+                // burn_capable=false also voids the pick: negotiate
+                // ignores a pick it cannot honor.
                 sp = negotiate_with(&parts, &info, false);
             }
         }
@@ -959,6 +1074,11 @@ impl Sessions {
             other => bail!("unknown mode {other:?} (direct|remux)"),
         };
 
+        // Fill the unified track ids into the verdicts: the negotiation
+        // speaks stream indexes, the API speaks track rows.
+        let mut sub_verdicts = negotiated.subtitles;
+        fill_verdict_track_ids(registry, &parts, &mut sub_verdicts).await;
+        let burn_pick = burn_sets.as_ref().and_then(|_| pick_for(&parts));
         let session = Arc::new(Session {
             id,
             user_id: user_id.to_string(),
@@ -975,8 +1095,9 @@ impl Sessions {
             current_part: std::sync::atomic::AtomicUsize::new(start_idx),
             mode: session_mode,
             verdict: Mutex::new(verdict),
-            sub_verdicts: negotiated.subtitles,
-            burn_sets: burn_sets.clone(),
+            sub_verdicts: Mutex::new(sub_verdicts),
+            burn_sets: Mutex::new(burn_sets.clone()),
+            burn_pick: Mutex::new(burn_pick),
             profile,
             sink: Mutex::new(chosen_sink),
             seek_lock: tokio::sync::Mutex::new(()),
@@ -1481,15 +1602,98 @@ impl Sessions {
     /// now begins at the offset.
     /// Returns the timeline base of the part the restart landed in
     /// (players add it to the pipeline's local start.pos).
+    #[allow(clippy::too_many_arguments)] // request-shaped plumbing
     pub async fn seek(
         self: &Arc<Self>,
         registry: &Arc<Registry>,
+        subtitles: &crate::subtitles::Subtitles,
         id: &str,
         position_ms: u64,
         audio_track: Option<u32>,
         video_track: Option<u32>,
+        subtitle_track: Option<i64>,
     ) -> Result<u64> {
         let session = self.get(id).context("no such session")?;
+        // Subtitle unification: an explicit pick may change what burns.
+        // Resolved HERE, in request context (bounded like a session
+        // start), so the detached executor only restarts with state
+        // already in hand.
+        let mut replan_subs = false;
+        if let Some(tid) = subtitle_track
+            && tid <= 0
+        {
+            // Sentinel: withdraw an explicit burn ("subtitles off" /
+            // a client-rendered track picked after a burn).
+            if session.burn_pick.lock().unwrap().take().is_some() {
+                *session.burn_sets.lock().unwrap() = None;
+                replan_subs = true;
+            }
+        } else if let Some(tid) = subtitle_track {
+            let track = crate::tracks::get(registry.db(), tid)
+                .await?
+                .with_context(|| format!("no subtitle track {tid}"))?;
+            anyhow::ensure!(
+                track.item_id == session.item_id,
+                "subtitle track {tid} belongs to another item"
+            );
+            let part = session.parts.first().context("session has no parts")?;
+            let is_image = crate::tracks::is_image_format(&track.format);
+            let new_pick = (is_image
+                && track.module_id.as_deref() == Some(part.module_id.as_str())
+                && track.collection_id.as_deref() == Some(part.collection_id.as_str())
+                && track.path_rel.as_deref() == Some(part.path_rel.as_str()))
+            .then(|| {
+                let i = track.stream_index.unwrap_or(0) as usize;
+                match track.origin.as_str() {
+                    "embedded" => Some(kahawai_media::negotiate::BurnPick::Embedded(i)),
+                    "sidecar" => Some(kahawai_media::negotiate::BurnPick::Sidecar(i)),
+                    _ => None,
+                }
+            })
+            .flatten();
+            if is_image && new_pick.is_none() {
+                bail!(
+                    "track {tid} is not part of the playing source; restart the session to burn it"
+                );
+            }
+            // Auto-burn already burning this very stream: adopt the
+            // pick without touching the sets (no refetch needed).
+            let already = matches!(new_pick,
+                Some(kahawai_media::negotiate::BurnPick::Embedded(i))
+                    if session.plan.lock().unwrap().is_some_and(|pl| pl.burn_subtitle == Some(i)));
+            if already {
+                *session.burn_pick.lock().unwrap() = new_pick;
+            } else if new_pick != *session.burn_pick.lock().unwrap() {
+                let sets = match new_pick {
+                    Some(_) => {
+                        let (module_id, collection_id, walk_rel, walk_idx, _) =
+                            subtitles.extract_ref(registry, &track).await?;
+                        let sets = subtitles
+                            .image_sets(
+                                registry,
+                                &module_id,
+                                &collection_id,
+                                &walk_rel,
+                                walk_idx,
+                                BURN_SETS_WAIT,
+                            )
+                            .await;
+                        anyhow::ensure!(
+                            sets.is_some(),
+                            "no display sets for track {tid} (mediahost offline or unindexed)"
+                        );
+                        sets
+                    }
+                    // Un-burn: the pick is withdrawn. The re-plan's auto
+                    // rules may still burn (no-overlay client, no OCR) —
+                    // then the pipeline walks the source itself.
+                    None => None,
+                };
+                *session.burn_sets.lock().unwrap() = sets;
+                *session.burn_pick.lock().unwrap() = new_pick;
+                replan_subs = true;
+            }
+        }
         // Register the intent; a burst coalesces to the newest one.
         let my_gen = {
             let generation = session
@@ -1502,6 +1706,7 @@ impl Sessions {
                 position_ms,
                 audio_track,
                 video_track,
+                replan_subs,
             };
             *pending = Some(PendingSeek::merge(pending.take(), next));
             generation
@@ -1565,6 +1770,7 @@ impl Sessions {
             position_ms,
             audio_track,
             video_track,
+            replan_subs,
             ..
         } = todo;
         let mut plan =
@@ -1572,9 +1778,10 @@ impl Sessions {
         session.touch();
         let want_audio = audio_track.map(|t| t as usize).unwrap_or(plan.audio_track);
         let want_video = video_track.map(|t| t as usize).unwrap_or(plan.video_track);
-        if want_audio != plan.audio_track || want_video != plan.video_track {
+        if want_audio != plan.audio_track || want_video != plan.video_track || replan_subs {
             // Switching tracks re-plans: the new track's codec decides
-            // copy vs encode, not the old one's.
+            // copy vs encode, not the old one's — and a burn-pick
+            // change re-plans even with the same tracks.
             let (_, _, _, info) = crate::subtitles::source_row(registry, &session.item_id).await?;
             // HUB-15a: the executor is already chosen here — ask IT.
             let tonemap = match &session.mode {
@@ -1584,13 +1791,28 @@ impl Sessions {
                 }
                 _ => kahawai_media::remux::tonemap_available(),
             };
-            let burn_capable = session
+            // Mirrors the start path (connected counts: the mediahost
+            // walks its own index); sets already fetched into scratch
+            // make the burn unconditionally real — a re-plan must not
+            // drop a burn whose data is in hand.
+            let burn_capable = session.burn_sets.lock().unwrap().is_some()
+                || session.parts.first().is_some_and(|p| {
+                    registry.is_connected(&p.module_id) || self.reads_locally(&p.module_id)
+                });
+            let ocr_set = crate::subtitles::ocr_stream_set(registry.db(), &session.item_id).await;
+            let ocr_flags = session
                 .parts
                 .first()
-                .is_some_and(|p| self.reads_locally(&p.module_id));
-            let ocr_flags =
-                crate::subtitles::ocr_flags(registry.db(), &session.item_id, info.subtitles.len())
-                    .await;
+                .map(|p| {
+                    crate::subtitles::ocr_flags_for(
+                        &ocr_set,
+                        &p.module_id,
+                        &p.collection_id,
+                        &p.path_rel,
+                        info.subtitles.len(),
+                    )
+                })
+                .unwrap_or_default();
             let sp = kahawai_media::negotiate::negotiate(
                 &session.profile,
                 &info,
@@ -1601,11 +1823,17 @@ impl Sessions {
                 tonemap,
                 burn_capable,
                 &ocr_flags,
+                // The session's explicit burn keeps forcing across
+                // track switches — its sets are already in hand.
+                *session.burn_pick.lock().unwrap(),
             );
             plan = sp.plan;
             anyhow::ensure!(plan.playable(), "selected track is not playable");
             *session.verdict.lock().unwrap() =
                 Some((sp.video_verdict.clone(), sp.audio_verdict.clone()));
+            let mut subs = sp.subtitles;
+            fill_verdict_track_ids(registry, &session.parts, &mut subs).await;
+            *session.sub_verdicts.lock().unwrap() = subs;
             *session.plan.lock().unwrap() = Some(plan);
         }
         // Map the absolute position onto the right part (single-part
@@ -1633,6 +1861,7 @@ impl Sessions {
                 // the restart stays, but it only ever happens for a seek
                 // now, never for a boundary.
                 let sink = session.sink.lock().unwrap().clone();
+                let burn_sets = session.burn_sets.lock().unwrap().clone();
                 let tail = self.open_part_leases(registry, &session.parts, idx).await?;
                 let fresh = match self
                     .start_remux(
@@ -1641,7 +1870,7 @@ impl Sessions {
                         tail,
                         local_ms,
                         &sink,
-                        session.burn_sets.as_deref(),
+                        burn_sets.as_deref(),
                     )
                     .await
                 {
@@ -1659,7 +1888,7 @@ impl Sessions {
                                 tail,
                                 local_ms,
                                 "hlssink2",
-                                session.burn_sets.as_deref(),
+                                burn_sets.as_deref(),
                             )
                             .await
                             .with_context(|| format!("first attempt: {first:#}"))?;
@@ -1698,6 +1927,15 @@ impl Sessions {
                     _ => self.open_part_leases(registry, &session.parts, idx).await?,
                 };
                 let sink = session.sink.lock().unwrap().clone();
+                // Read outside the call: a guard held across .await
+                // would poison the future's Send-ness.
+                let sets_bytes = session
+                    .burn_sets
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .map(|p| std::fs::read(p).unwrap_or_default())
+                    .unwrap_or_default();
                 if let Err(first) = self
                     .start_transcode(
                         registry,
@@ -1708,11 +1946,7 @@ impl Sessions {
                         idx,
                         local_ms,
                         &sink,
-                        session
-                            .burn_sets
-                            .as_ref()
-                            .map(|p| std::fs::read(p).unwrap_or_default())
-                            .unwrap_or_default(),
+                        sets_bytes.clone(),
                     )
                     .await
                 {
@@ -1731,11 +1965,7 @@ impl Sessions {
                         idx,
                         local_ms,
                         "hlssink2",
-                        session
-                            .burn_sets
-                            .as_ref()
-                            .map(|p| std::fs::read(p).unwrap_or_default())
-                            .unwrap_or_default(),
+                        sets_bytes,
                     )
                     .await
                     .with_context(|| format!("first attempt: {first:#}"))?;
@@ -1825,6 +2055,8 @@ impl Sessions {
         };
         let sets = session
             .burn_sets
+            .lock()
+            .unwrap()
             .as_ref()
             .map(|p| std::fs::read(p).unwrap_or_default())
             .unwrap_or_default();
@@ -1985,12 +2217,14 @@ mod seek_merge_tests {
     #[test]
     fn scrub_keeps_the_queued_track_switch() {
         let switch = PendingSeek {
+            replan_subs: false,
             generation: 1,
             position_ms: 1000,
             audio_track: Some(1),
             video_track: None,
         };
         let scrub = PendingSeek {
+            replan_subs: false,
             generation: 2,
             position_ms: 9000,
             audio_track: None,
@@ -2002,6 +2236,7 @@ mod seek_merge_tests {
         assert_eq!(merged.audio_track, Some(1), "track choice survives");
         // And an explicit newer choice overrides an older one.
         let re_switch = PendingSeek {
+            replan_subs: false,
             generation: 3,
             position_ms: 9000,
             audio_track: Some(0),

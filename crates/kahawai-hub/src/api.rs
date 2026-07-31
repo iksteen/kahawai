@@ -80,10 +80,10 @@ pub fn router(
             post(subtitle_download),
         )
         .route(
-            "/api/v1/subtitles/downloaded/{sid}",
+            "/api/v1/subtitles/{track_id}",
             axum::routing::delete(subtitle_delete),
         )
-        .route("/api/v1/items/{id}/subtitles/{key}/ocr", post(subtitle_ocr))
+        .route("/api/v1/subtitles/{track_id}/ocr", post(subtitle_ocr))
         .route(
             "/api/v1/items/{id}/subtitles/{file}",
             get(item_subtitle_file),
@@ -481,14 +481,14 @@ struct SubtitleDownloadRequest {
 }
 
 /// HUB-24: user-initiated download; the result becomes a normal
-/// subtitle track on the item ("d{id}").
+/// subtitle track on the item.
 async fn subtitle_download(
     State(state): State<AppState>,
     Path(id): Path<String>,
     axum::Extension(claims): axum::Extension<crate::auth::Claims>,
     Json(body): Json<SubtitleDownloadRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    let (key, quota) = state
+    let (track_id, quota) = state
         .subtitles
         .download_external(
             &state.registry,
@@ -499,38 +499,31 @@ async fn subtitle_download(
         )
         .await
         .map_err(|e| (StatusCode::BAD_GATEWAY, format!("{e:#}")))?;
-    Ok(Json(json!({ "key": key, "quota": quota })))
+    Ok(Json(json!({ "track_id": track_id, "quota": quota })))
 }
 
-/// HUB-32c: OCR an image subtitle track — embedded ("e{n}") or a
-/// VobSub sidecar track ("s{n}") — into a text track. Synchronous — a
-/// feature film OCRs in ~30 s and the caller is a human who pressed a
-/// button; the result is cached, so it runs once per track.
-/// Feature-gated: without `ocr` the route answers with what is missing
-/// rather than 404.
+/// HUB-32c: OCR an image subtitle track (embedded or VobSub sidecar)
+/// into a text track. Synchronous — a feature film OCRs in ~30 s and
+/// the caller is a human who pressed a button; the result is cached,
+/// so it runs once per track. Feature-gated: without `ocr` the route
+/// answers with what is missing rather than 404.
 async fn subtitle_ocr(
     State(state): State<AppState>,
-    Path((id, key)): Path<(String, String)>,
+    Path(track_id): Path<i64>,
     axum::Extension(claims): axum::Extension<crate::auth::Claims>,
 ) -> Result<Json<Value>, ApiError> {
-    if !key.starts_with(['e', 's']) || !key[1..].chars().all(|c| c.is_ascii_digit()) {
-        return Err(ApiError::from((
-            StatusCode::BAD_REQUEST,
-            "key must be an embedded (e{n}) or sidecar (s{n}) track".to_string(),
-        )));
-    }
     #[cfg(feature = "ocr")]
     {
-        let new_key = state
+        let new_id = state
             .subtitles
-            .ocr_generate(&state.registry, &id, &key, &claims.sub)
+            .ocr_generate(&state.registry, track_id, &claims.sub)
             .await
             .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, format!("{e:#}")))?;
-        Ok(Json(json!({ "key": new_key })))
+        Ok(Json(json!({ "track_id": new_id })))
     }
     #[cfg(not(feature = "ocr"))]
     {
-        let _ = claims;
+        let _ = (claims, track_id);
         Err((
             StatusCode::NOT_IMPLEMENTED,
             "this build has no OCR support (compiled with --no-default-features)".into(),
@@ -539,13 +532,15 @@ async fn subtitle_ocr(
     }
 }
 
+/// Remove a hub-stored (downloaded/OCR) track. Scan-owned tracks
+/// refuse with 404-shaped `removed: false`.
 async fn subtitle_delete(
     State(state): State<AppState>,
-    Path(sid): Path<i64>,
+    Path(track_id): Path<i64>,
 ) -> Result<Json<Value>, ApiError> {
     let removed = state
         .subtitles
-        .delete_downloaded(&state.registry, sid)
+        .delete_track(&state.registry, track_id)
         .await
         .map_err(internal)?;
     Ok(Json(json!({ "removed": removed })))
@@ -1260,6 +1255,11 @@ struct StartSessionRequest {
     audio_track: u32,
     #[serde(default)]
     video_track: u32,
+    /// Unified subtitle track id (subtitle unification). An IMAGE
+    /// track pick forces its burn-in and pins the source it binds to;
+    /// text picks are a no-op here (the client fetches them itself).
+    #[serde(default)]
+    subtitle_track: Option<i64>,
 }
 
 /// HUB-11 event channel: server-sent invalidation hints ({kind, ...}).
@@ -1363,6 +1363,7 @@ async fn start_session(
             body.start_ms,
             body.audio_track,
             body.video_track,
+            body.subtitle_track,
         )
         .await
         .map_err(|e| (StatusCode::CONFLICT, format!("{e:#}")))?;
@@ -1399,7 +1400,7 @@ async fn start_session(
                 "audio": audio,
                 // Additive (HUB-32a/b): per-subtitle tier verdicts on
                 // negotiated sessions; [] on explicit-mode sessions.
-                "subtitles": session.sub_verdicts,
+                "subtitles": *session.sub_verdicts.lock().unwrap(),
             })),
         })),
     ))
@@ -1411,6 +1412,11 @@ struct SeekRequest {
     /// Switch tracks during the restart (HUB-27).
     audio_track: Option<u32>,
     video_track: Option<u32>,
+    /// Switch the burned subtitle mid-session (unified track id): an
+    /// image track starts burning it, a text track withdraws an
+    /// explicit burn. Absent = keep as is.
+    #[serde(default)]
+    subtitle_track: Option<i64>,
 }
 
 /// Seek-restart (§6): restart the session's pipeline at the offset.
@@ -1424,10 +1430,12 @@ async fn seek_session(
         .sessions
         .seek(
             &state.registry,
+            &state.subtitles,
             &id,
             body.position_ms,
             body.audio_track,
             body.video_track,
+            body.subtitle_track,
         )
         .await
         .map_err(|e| {
@@ -1442,9 +1450,10 @@ async fn seek_session(
     // NOW so the overlay never lies about the current streams.
     let session = state.sessions.get(&id);
     let streams = session.as_ref().and_then(|s| {
-        s.verdict.lock().unwrap().as_ref().map(
-            |(video, audio)| json!({ "video": video, "audio": audio, "subtitles": s.sub_verdicts }),
-        )
+        s.verdict.lock().unwrap().as_ref().map(|(video, audio)| {
+            json!({ "video": video, "audio": audio,
+                        "subtitles": *s.sub_verdicts.lock().unwrap() })
+        })
     });
     Ok(Json(
         json!({ "part_base_ms": part_base_ms, "streams": streams }),
@@ -1611,9 +1620,12 @@ async fn item_artwork(
 
 #[derive(Deserialize)]
 struct SubtitleCaps {
-    /// HUB-32b: absent = true, so clients predating capability
-    /// declaration keep seeing everything.
+    /// Capability bits feed each track's computed DELIVERY; absent =
+    /// true, so a declaration-less client sees the richest reading.
+    /// Nothing is filtered out any more — a track a client cannot
+    /// render lists as `delivery: none` and the UI disables it.
     graphics_overlay: Option<bool>,
+    ass_render: Option<bool>,
 }
 
 async fn item_subtitles(
@@ -1621,17 +1633,16 @@ async fn item_subtitles(
     Path(id): Path<String>,
     Query(caps): Query<SubtitleCaps>,
 ) -> Result<Json<Value>, ApiError> {
-    let mut subs = state
+    let subs = state
         .subtitles
-        .list(&state.registry, &id)
+        .list(
+            &state.registry,
+            &id,
+            caps.ass_render.unwrap_or(true),
+            caps.graphics_overlay.unwrap_or(true),
+        )
         .await
         .map_err(internal)?;
-    // A client that cannot composite display sets has no use for image
-    // subtitles — offering one it cannot render is worse than absence
-    // (the session verdict already names the missing tiers, HUB-32b).
-    if caps.graphics_overlay == Some(false) {
-        subs.retain(|s| !s.image);
-    }
     Ok(Json(json!({ "subtitles": subs })))
 }
 
@@ -1649,10 +1660,21 @@ async fn item_subtitle_file(
     Path((id, file)): Path<(String, String)>,
     Query(q): Query<VttQuery>,
 ) -> Result<Response, ApiError> {
-    if let Some(key) = file.strip_suffix(".ass") {
+    // The public keyspace is TRACK IDS ({id}.vtt / {id}.ass); the
+    // resolver maps them onto the internal cache/pipeline notation.
+    let resolve = |raw: &str| -> Option<i64> { raw.parse().ok() };
+    if let Some(raw) = file.strip_suffix(".ass") {
+        let track_id = resolve(raw)
+            .ok_or_else(|| ApiError::from((StatusCode::BAD_REQUEST, "bad track id".to_string())))?;
+        let track = state
+            .subtitles
+            .internal_key(&state.registry, track_id)
+            .await
+            .map_err(|e| (StatusCode::NOT_FOUND, format!("{e:#}")))?;
+        let key = track.internal_key();
         let body = state
             .subtitles
-            .ass_body(&state.registry, &state.sessions, &id, key)
+            .ass_body(&state.registry, &state.sessions, &id, &key)
             .await
             .map_err(internal)?;
         let headers = [
@@ -1673,14 +1695,21 @@ async fn item_subtitle_file(
             }
         });
     }
-    let key = file.strip_suffix(".vtt").unwrap_or(&file);
+    let raw = file.strip_suffix(".vtt").unwrap_or(&file);
+    let track_id = resolve(raw)
+        .ok_or_else(|| ApiError::from((StatusCode::BAD_REQUEST, "bad track id".to_string())))?;
+    let track = state
+        .subtitles
+        .internal_key(&state.registry, track_id)
+        .await
+        .map_err(|e| (StatusCode::NOT_FOUND, format!("{e:#}")))?;
     let vtt = state
         .subtitles
         .vtt(
             &state.registry,
             &state.sessions,
             &id,
-            key,
+            &track.internal_key(),
             q.shift_ms.round() as i64,
         )
         .await
@@ -2372,6 +2401,20 @@ async fn session_file(
         if !valid {
             return Err((StatusCode::BAD_REQUEST, "invalid file name".into()));
         }
+        // The public keyspace is the track id; the pipeline writes
+        // internal stream-index names (subs-e{n}.*). Translate here —
+        // only embedded tracks are in the pipeline, so only they tap.
+        let file = match file[5..].split_once('.') {
+            Some((num, ext)) if num.chars().all(|c| c.is_ascii_digit()) => {
+                let track = crate::tracks::get(state.registry.db(), num.parse().unwrap())
+                    .await
+                    .map_err(internal)?
+                    .filter(|t| t.origin == "embedded")
+                    .ok_or((StatusCode::NOT_FOUND, "no such embedded track".to_string()))?;
+                format!("subs-{}.{ext}", track.internal_key())
+            }
+            _ => file.clone(),
+        };
         let ctype = if file.ends_with(".ass") {
             "text/x-ssa; charset=utf-8"
         } else {

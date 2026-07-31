@@ -82,6 +82,8 @@ export default function Player({
   const [audioTrack, setAudioTrack] = useState(0)
   // Ordered subtitle-language wishlist; [] → subtitles stay off.
   const subsPrefRef = useRef<string[]>([])
+  // Exact-track memory for THIS item (subtitle unification).
+  const subTrackPrefRef = useRef<number | null>(null)
   const [videoTracks, setVideoTracks] = useState<
     { codec: string; width: number; height: number }[]
   >([])
@@ -92,6 +94,8 @@ export default function Player({
   // Live stream verdicts: a track switch re-plans server-side and the
   // overlay must describe what plays NOW.
   const [streams, setStreams] = useState(session.streams)
+  const streamsRef = useRef(session.streams)
+  streamsRef.current = streams
 
   useEffect(() => {
     // One resolution (HUB-33), same helper Detail used to start the
@@ -117,15 +121,33 @@ export default function Player({
         )
         setAudioTrack(r.audioTrack)
         subsPrefRef.current = r.subs
-        // HUB-32b: a client that declares no display-set compositing
-        // is not offered image subtitles at all.
-        return fetchSubtitles(item.id, capsRef.current.graphics_overlay)
+        subTrackPrefRef.current = r.subTrack
+        // The full list, with delivery computed from THIS client's
+        // capability bits (nothing is filtered any more).
+        return fetchSubtitles(item.id, capsRef.current.graphics_overlay, capsRef.current.ass_render)
       })
       .then((r) => {
         setSubs(r.subtitles)
-        // Auto-pick the first wishlist match; never overrides a choice.
-        const pick = pickSubtitle(subsPrefRef.current, r.subtitles)
-        if (pick) setSubKey((cur) => cur || pick.key)
+        // Exact-track memory first (the only spelling that can name a
+        // downloaded/OCR row), then the language wishlist. Never
+        // overrides a choice already made.
+        const exact = r.subtitles.find(
+          (s) => s.id === subTrackPrefRef.current && s.delivery !== 'none',
+        )
+        const pick = exact ?? pickSubtitle(subsPrefRef.current, r.subtitles)
+        if (pick) {
+          setSubKey((cur) => cur || String(pick.id))
+          // A remembered burn re-applies via the seek-restart — but
+          // only when the session is not already burning it.
+          if (
+            pick.delivery === 'burn' &&
+            !streamsRef.current?.subtitles?.some(
+              (v) => v.track_id === pick.id && v.tier === 'burn',
+            )
+          ) {
+            void switchBurn(pick.id)
+          }
+        }
       })
       .catch(() => {
         setSubs([])
@@ -188,6 +210,31 @@ export default function Player({
     }
   }
 
+  // Burn transitions reuse the seek-restart machinery (§6): the
+  // pipeline restarts at the current position with the new burn state
+  // (id > 0 burns that track, 0 withdraws an explicit burn).
+  const switchBurn = async (trackId: number) => {
+    const video = videoRef.current
+    if (!video) return
+    setSeeking(true)
+    hlsRef.current?.stopLoad()
+    video.pause()
+    try {
+      const absMs = offsetRef.current + video.currentTime * 1000
+      const r = await seekSession(session.session_id, absMs, undefined, undefined, trackId)
+      if (r.streams) setStreams(r.streams)
+      partBaseRef.current = r.part_base_ms ?? 0
+      offsetRef.current = Math.round(absMs)
+      setPosMs(offsetRef.current)
+      setTrackEpoch((e) => e + 1)
+      attach()
+    } catch (e) {
+      setCapsError(String(e))
+    } finally {
+      setSeeking(false)
+    }
+  }
+
   // <track> is lazy about mode; force the selected one to display.
   useEffect(() => {
     const tracks = videoRef.current?.textTracks
@@ -195,21 +242,20 @@ export default function Player({
     for (const t of Array.from(tracks)) t.mode = subKey ? 'showing' : 'disabled'
   }, [subKey, trackEpoch])
 
-  const selected = subs.find((s) => s.key === subKey)
+  const selected = subs.find((s) => String(s.id) === subKey)
   const isAss = !!selected && (selected.format === 'ass' || selected.format === 'ssa')
-  // HUB-32a: faithful ASS rendering only when this client DECLARES it.
-  // Without the declaration the hub plans the flattened-to-VTT tier and
-  // the player must actually take it — otherwise a masked run would
-  // change the verdict text and nothing else.
-  const useAss = isAss && capsRef.current.ass_render
+  // The hub computed each track's delivery from this client's declared
+  // bits — the player takes exactly that reading, so a masked run
+  // changes behavior, not just verdict text.
+  const useAss = !!selected && selected.delivery === 'ass'
   // Embedded non-ASS on an HLS session rides the live session tap and
   // feeds cues via the TextTrack API (a <track> can't consume a
   // growing document). Falls back to the item-level .vtt <track> when
   // the tap yields nothing (old satellite, no pipeline).
   const [vttFallback, setVttFallback] = useState(false)
   // Sidecar image tracks (.idx/.sub) have no session tap to feed the
-  // overlay; their serving path is the OCR text row (HUB-32c).
-  const useImage = !!selected && !!selected.image && selected.kind === 'embedded'
+  // overlay; the hub says so via delivery (burn or none for them).
+  const useImage = !!selected && selected.delivery === 'overlay'
   // Keyed on the FORMAT, not on useAss: the pipeline taps an ASS track
   // as .ass and never writes the .jsonl this path reads, so a client
   // that declined ASS rendering must go straight to the flattened
@@ -219,7 +265,8 @@ export default function Player({
     !!selected &&
     !isAss &&
     !useImage &&
-    selected.kind === 'embedded' &&
+    selected.origin === 'embedded' &&
+    selected.delivery === 'text' &&
     !vttFallback
   const jsTrackRef = useRef<TextTrack | null>(null)
 
@@ -246,7 +293,7 @@ export default function Player({
     clear()
     ;(async () => {
       const base = session.stream_url.replace(/[^/]*$/, '')
-      const resp = await fetch(`${base}subs-${selected.key}.jsonl`, { signal: ac.signal })
+      const resp = await fetch(`${base}subs-${selected.id}.jsonl`, { signal: ac.signal })
       if (!resp.ok || !resp.body) {
         setVttFallback(true)
         return
@@ -356,7 +403,7 @@ export default function Player({
 
     ;(async () => {
       const base = session.stream_url.replace(/[^/]*$/, '')
-      const resp = await fetch(`${base}subs-${selected.key}.jsonl`, { signal: ac.signal })
+      const resp = await fetch(`${base}subs-${selected.id}.jsonl`, { signal: ac.signal })
       if (!resp.ok || !resp.body) return
       const reader = resp.body.getReader()
       const dec = new TextDecoder()
@@ -477,12 +524,12 @@ export default function Player({
       // position. Sidecars and non-HLS fall back to the item endpoint
       // (whole-file extraction, streamed).
       let fed = false
-      if (isHls && selected.key.startsWith('e')) {
+      if (isHls && selected.origin === 'embedded') {
         const base = session.stream_url.replace(/[^/]*$/, '')
-        fed = await feed(`${base}subs-${selected.key}.ass`).catch(() => false)
+        fed = await feed(`${base}subs-${selected.id}.ass`).catch(() => false)
       }
       if (!fed && !dead) {
-        await feed(`/api/v1/items/${item.id}/subtitles/${selected.key}.ass`).catch(() => {})
+        await feed(`/api/v1/items/${item.id}/subtitles/${selected.id}.ass`).catch(() => {})
       }
     })().catch(() => {
       /* aborted or stream error; VTT fallback stays available */
@@ -750,16 +797,25 @@ export default function Player({
             value={subKey}
             onChange={(e) => {
               const key = e.target.value
+              const prev = subs.find((x) => String(x.id) === subKey)
+              const s = subs.find((x) => String(x.id) === key)
               setSubKey(key)
-              // Remember the explicit choice for this series (HUB-33).
-              const s = subs.find((x) => x.key === key)
+              // Two memory layers (HUB-33): the series remembers the
+              // language; THIS item remembers the exact row — the only
+              // spelling that can name a downloaded/OCR track.
               const value = key === '' ? 'off' : (s?.language ?? 'any').toLowerCase()
               void putPref(seriesRef.current, 'subs', value).catch(() => {})
+              void putPref(item.id, 'subs.track', key).catch(() => {})
+              // Burn transitions live server-side: picking a burn
+              // track restarts the pipeline with it; leaving one
+              // withdraws it (0 = clear).
+              if (s?.delivery === 'burn') void switchBurn(s.id)
+              else if (prev?.delivery === 'burn') void switchBurn(0)
             }}
           >
             <option value="">Off</option>
             {subs.map((s) => (
-              <option key={s.key} value={s.key}>
+              <option key={s.id} value={String(s.id)} disabled={s.delivery === 'none'}>
                 {subtitleLabel(s)}
               </option>
             ))}

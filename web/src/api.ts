@@ -197,22 +197,32 @@ export const artworkUrl = (id: string, version?: number | null, size?: 'thumb' |
 export const fetchChildren = (id: string) =>
   json<{ children: Item[] }>(`/api/v1/items/${id}/children`)
 
+/// One unified track row (subtitle unification): the id is THE key for
+/// serving, selection, OCR, deletion and preference memory. `delivery`
+/// is computed per request from the capability bits — capability never
+/// filters the list, it changes what a track means for this client.
+export type SubtitleDelivery = 'text' | 'ass' | 'overlay' | 'burn' | 'none'
 export type Subtitle = {
-  key: string
-  kind: 'embedded' | 'sidecar' | 'downloaded' | 'ocr'
+  id: number
+  origin: 'embedded' | 'sidecar' | 'downloaded' | 'ocr'
+  stream_index: number | null
   format: string
   language: string | null
-  flattened: boolean
-  image?: boolean
+  label: string | null
+  machine: boolean
+  derived_from: number | null
+  delivery: SubtitleDelivery
+  note: string
 }
 
-/// HUB-32b: a client that cannot composite bitmap display sets asks the
-/// hub not to offer image subtitles at all — an entry it could never
-/// render is worse than its absence. The declaration comes from the
-/// capability profile (so a debug mask flips it like a real client).
-export const fetchSubtitles = (itemId: string, graphicsOverlay = true) =>
+export const isImageSub = (s: Subtitle) => ['pgs', 'vobsub', 'dvdsub'].includes(s.format)
+
+/// The capability bits feed each track's computed delivery; the list is
+/// always complete (a track this client cannot render says so via
+/// `delivery: 'none'` and the UI disables it).
+export const fetchSubtitles = (itemId: string, graphicsOverlay = true, assRender = true) =>
   json<{ subtitles: Subtitle[] }>(
-    `/api/v1/items/${itemId}/subtitles${graphicsOverlay ? '' : '?graphics_overlay=false'}`,
+    `/api/v1/items/${itemId}/subtitles?graphics_overlay=${graphicsOverlay}&ass_render=${assRender}`,
   )
 
 /// HUB-21/22/24: external subtitle search + download.
@@ -244,7 +254,7 @@ export const searchSubtitles = (itemId: string, languages: string[]) =>
   )
 
 export const downloadSubtitle = (itemId: string, fileId: string, language: string | null) =>
-  json<{ key: string; quota: SubtitleQuota }>(`/api/v1/items/${itemId}/subtitles/download`, {
+  json<{ track_id: number; quota: SubtitleQuota }>(`/api/v1/items/${itemId}/subtitles/download`, {
     method: 'POST',
     body: JSON.stringify({ file_id: fileId, language }),
   })
@@ -260,22 +270,31 @@ export function quotaLabel(q: SubtitleQuota | null): string {
   return `${q.remaining}${q.total ? ` of ${q.total}` : ''} downloads left today${resets}${scope}`
 }
 
-export const deleteDownloadedSubtitle = (id: number) =>
-  json<{ removed: boolean }>(`/api/v1/subtitles/downloaded/${id}`, { method: 'DELETE' })
+/// Hub-stored tracks (downloaded/OCR) only; scan-owned rows refuse.
+export const deleteSubtitle = (id: number) =>
+  json<{ removed: boolean }>(`/api/v1/subtitles/${id}`, { method: 'DELETE' })
 
-/// HUB-32c: OCR an embedded image track (key e{n}) into a text track.
-/// Synchronous — a feature film takes ~30 s; the result is cached.
-export const ocrSubtitle = (itemId: string, key: string) =>
-  json<{ key: string }>(`/api/v1/items/${itemId}/subtitles/${key}/ocr`, { method: 'POST' })
+/// HUB-32c: OCR an image track (embedded or VobSub sidecar) into a new
+/// text track. Synchronous — a feature film takes ~30 s; cached, and
+/// the new row's `derived_from` points at the image track.
+export const ocrSubtitle = (trackId: number) =>
+  json<{ track_id: number }>(`/api/v1/subtitles/${trackId}/ocr`, { method: 'POST' })
 
 export const fetchFonts = (itemId: string) =>
   json<{ fonts: string[] }>(`/api/v1/items/${itemId}/fonts`)
 
-// ASS renders faithfully via JASSUB in this player (HUB-32), so the
-// flattened warning is history here; other clients still get .vtt.
+// One uniform label across origins; delivery adds the honest suffix
+// (a burn restarts the session; 'none' renders disabled).
 export const subtitleLabel = (s: Subtitle) =>
   `${s.language ?? 'unknown'} · ${s.format}` +
-  (s.kind === 'sidecar' ? ' · file' : s.kind === 'downloaded' ? ' · downloaded' : '')
+  (s.origin === 'sidecar'
+    ? ' · file'
+    : s.origin === 'downloaded'
+      ? ' · downloaded'
+      : s.origin === 'ocr'
+        ? ' · ocr'
+        : '') +
+  (s.delivery === 'burn' ? ' · burn-in' : s.delivery === 'none' ? ' · unavailable' : '')
 
 export type LibrarySummary = { id: string; name: string; media_type: string }
 
@@ -323,9 +342,10 @@ export async function fetchItem(id: string): Promise<ItemDetail> {
 
 export type SubtitleVerdict = {
   index: number
+  track_id?: number | null
   format: string
   language?: string | null
-  tier: 'text' | 'convert' | 'graphics' | 'unavailable'
+  tier: 'text' | 'convert' | 'graphics' | 'ocr' | 'burn' | 'unavailable'
   note: string
 }
 export type StreamVerdict = { video: string; audio: string; subtitles?: SubtitleVerdict[] }
@@ -352,6 +372,7 @@ export function startSession(
   startMs = 0,
   audioTrack = 0,
   videoTrack = 0,
+  subtitleTrack?: number,
 ): Promise<Session> {
   return json('/api/v1/playback/sessions', {
     method: 'POST',
@@ -361,6 +382,9 @@ export function startSession(
       start_ms: Math.round(startMs),
       audio_track: audioTrack,
       video_track: videoTrack,
+      // An IMAGE track id forces its burn-in from the first segment;
+      // text tracks need no session involvement.
+      subtitle_track: subtitleTrack ?? null,
     }),
   })
 }
@@ -413,7 +437,7 @@ export function resolveTracks(
   mediaType: string,
   originalLanguage: string | null | undefined,
   audio: { language?: string | null }[],
-): { audioTrack: number; subs: string[] } {
+): { audioTrack: number; subs: string[]; subTrack: number | null } {
   const get = (scope: string, key: string) =>
     prefs.find((p) => p.scope === scope && p.key === key)?.value
   const list = (v?: string) =>
@@ -473,7 +497,12 @@ export function resolveTracks(
       : subsMem
         ? [subsMem]
         : list(get('', `subs.${mediaType}`))
-  return { audioTrack: audioTrack ?? 0, subs }
+  // Top precedence (subtitle unification): THIS item's exact track id
+  // — the only spelling that can name a specific downloaded/OCR row.
+  // Callers honor it iff the id is still in the fetched list.
+  const exactSub = get(itemId, 'subs.track')
+  const subTrack = exactSub && /^\d+$/.test(exactSub) ? Number(exactSub) : null
+  return { audioTrack: audioTrack ?? 0, subs, subTrack }
 }
 
 /// First subtitle matching the wishlist, in wishlist order ('any'
@@ -482,12 +511,16 @@ export function pickSubtitle(
   wishlist: string[],
   subs: Subtitle[],
 ): Subtitle | null {
+  // Language wishes auto-pick only client-rendered tracks: silently
+  // forcing a burn (a video encode restart) is never what a language
+  // preference means — burns are explicit picks.
+  const auto = (s: Subtitle) => s.delivery === 'text' || s.delivery === 'ass' || s.delivery === 'overlay'
   for (const want of wishlist) {
     const hit =
       want === 'any'
-        ? subs.find((s) => !s.image)
+        ? subs.find((s) => auto(s) && !isImageSub(s))
         : subs.find(
-            (s) => !s.image && (s.language ?? '').toLowerCase().slice(0, 2) === want.slice(0, 2),
+            (s) => auto(s) && !isImageSub(s) && (s.language ?? '').toLowerCase().slice(0, 2) === want.slice(0, 2),
           )
     if (hit) return hit
   }
@@ -525,6 +558,7 @@ export function seekSession(
   positionMs: number,
   audioTrack?: number,
   videoTrack?: number,
+  subtitleTrack?: number,
 ): Promise<{ part_base_ms: number; streams?: StreamVerdict | null }> {
   return json(`/api/v1/playback/sessions/${sessionId}/seek`, {
     method: 'POST',
@@ -532,6 +566,9 @@ export function seekSession(
       position_ms: Math.round(positionMs),
       audio_track: audioTrack ?? null,
       video_track: videoTrack ?? null,
+      // An image track id switches the burn mid-session; 0 withdraws
+      // an explicit burn; absent = keep as is.
+      subtitle_track: subtitleTrack ?? null,
     }),
   })
 }

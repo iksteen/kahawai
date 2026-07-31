@@ -22,5 +22,6 @@ pub mod registry;
 pub mod renewal_service;
 pub mod sessions;
 pub mod subtitles;
+pub mod tracks;
 pub mod transcoder_link;
 pub mod web;

@@ -9,10 +9,10 @@
 //! already decode, and dropping it keeps `ocr`-enabled binaries free of
 //! copyleft obligations (NFR-8).
 //!
-//! Results ride the `downloaded_subtitles` machinery with
-//! `provider='ocr'`: stored, listed, served, selected, and deleted
-//! exactly like a provider download, marked machine-derived in the API.
-//! Cached per (source stream, model): regenerating first deletes.
+//! Results are first-class `subtitle_tracks` rows (origin `ocr`,
+//! `derived_from` = the image-track row read): stored, listed, served,
+//! selected, and deleted exactly like a provider download, marked
+//! machine-derived in the API. Regeneration replaces by parent.
 //!
 //! Quality, measured on real tracks (Babylon 5 PGS 1080p, conf 70–91;
 //! a 2160p PGS track, conf 84–91): glyphs are bright-on-transparent,

@@ -281,6 +281,7 @@ fn sweep_one(
         // No OCR store outside the hub: the sweep judges sources, not
         // the hub's caches.
         &[],
+        None,
     );
     let plan = sp.plan;
     if sp.cost == kahawai_media::negotiate::Cost::Unplayable {
