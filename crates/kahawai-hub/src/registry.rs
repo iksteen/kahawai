@@ -1352,7 +1352,8 @@ impl Registry {
         let rows = sqlx::query(
             "SELECT path_rel, size, mtime_unix,
                     COALESCE(json_extract(streams_json, '$.nfo'), '') AS nfo,
-                    COALESCE(json_extract(streams_json, '$.artwork'), '') AS art
+                    COALESCE(json_extract(streams_json, '$.artwork'), '') AS art,
+                    COALESCE(json_extract(streams_json, '$.external_subtitles'), '[]') AS subs
              FROM files WHERE module_id = ? AND collection_id = ?",
         )
         .bind(module_id)
@@ -1361,22 +1362,45 @@ impl Registry {
         .await?;
         Ok(rows
             .into_iter()
-            .map(|r| kahawai_proto::v1::FileStat {
-                path_rel: r.get("path_rel"),
-                size: r.get::<i64, _>("size") as u64,
-                mtime_unix: r.get("mtime_unix"),
-                sidecars: Self::sidecar_sig(&r.get::<String, _>("nfo"), &r.get::<String, _>("art")),
+            .map(|r| {
+                // Distinct paths in sorted order — one .idx carries many
+                // tracks but is one file on disk.
+                let mut subs: Vec<String> =
+                    serde_json::from_str::<Vec<serde_json::Value>>(&r.get::<String, _>("subs"))
+                        .unwrap_or_default()
+                        .iter()
+                        .filter_map(|v| v.get("path_rel")?.as_str().map(str::to_string))
+                        .collect();
+                subs.sort();
+                subs.dedup();
+                kahawai_proto::v1::FileStat {
+                    path_rel: r.get("path_rel"),
+                    size: r.get::<i64, _>("size") as u64,
+                    mtime_unix: r.get("mtime_unix"),
+                    sidecars: Self::sidecar_sig(
+                        &r.get::<String, _>("nfo"),
+                        &r.get::<String, _>("art"),
+                        &subs,
+                    ),
+                }
             })
             .collect())
     }
 
     /// One line describing a file's sidecars, compared verbatim on both
     /// sides. Order is fixed so the same pair always spells the same way.
-    pub fn sidecar_sig(nfo: &str, artwork: &str) -> String {
-        if nfo.is_empty() && artwork.is_empty() {
+    /// Compared VERBATIM against the mediahost's own spelling
+    /// (`kahawai_mediahost::scan::sidecar_sig`) — the two must build the
+    /// same string from their own views (DB here, disk there). `subs`
+    /// covers subtitle sidecars (.srt/.ass/.vtt and .idx pairs): without
+    /// them in the signature, a pair dropped next to an unchanged movie
+    /// stayed invisible until the movie itself changed (measured: all 42
+    /// real .idx pairs in this library).
+    pub fn sidecar_sig(nfo: &str, artwork: &str, subs: &[String]) -> String {
+        if nfo.is_empty() && artwork.is_empty() && subs.is_empty() {
             return String::new();
         }
-        format!("n:{nfo}|a:{artwork}")
+        format!("n:{nfo}|a:{artwork}|s:{}", subs.join(","))
     }
 
     pub async fn reconcile_files(

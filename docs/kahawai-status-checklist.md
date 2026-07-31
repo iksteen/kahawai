@@ -74,8 +74,9 @@ How something works and why it was built that way belong in
       VobSub sidecar pairs (.idx/.sub) are discovered at scan, one entry
       per track inside the .idx, and served through the image pipeline
       (extraction/OCR; no tap, so no overlay/burn).
-      Known gap: a sidecar appearing next to an UNCHANGED media file is
-      missed by the MH-5 identity fast-path until the file itself changes
+      Subtitle sidecars are part of the MH-5 sidecar signature, so a
+      pair appearing next to an unchanged media file busts the fast-path
+      and is discovered on the next scan
 - [x] MH-5 Content identity (size/mtime fast path; head/tail xxh3 + oshash) with
       incremental rescan (manifest + FilesSeen reconciliation, sync-version handshake)
 - [x] MH-6 Byte-range lease serving (dedicated byte-plane connection)

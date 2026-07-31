@@ -133,7 +133,10 @@ export PATH="$PATH:/opt/homebrew/bin:/usr/local/bin:$HOME/.cargo/bin"
 KEYCHAIN="$HOME/Library/Keychains/kahawai-signing.keychain-db"
 PASSFILE="$HOME/.config/kahawai/signing-keychain.pass"
 cd ~/kahawai-src
-cargo build --release 2>&1 | tail -1
+# Satellite build: no OCR feature — the mac runs only the transcoder,
+# and the full build would demand tesseract/leptonica from Homebrew for
+# a tier that executes hub-side.
+cargo build --release --no-default-features 2>&1 | tail -1
 BIN=target/release/kahawai
 if security find-identity -v -p codesigning "$KEYCHAIN" 2>/dev/null | grep -q "$IDENTITY"; then
     security unlock-keychain -p "$(cat "$PASSFILE")" "$KEYCHAIN"

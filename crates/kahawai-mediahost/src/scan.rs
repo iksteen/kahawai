@@ -316,10 +316,19 @@ fn inspect(root: &Path, path: &Path) -> Result<Inspected> {
 fn sidecar_sig(root: &Path, media: &Path) -> String {
     let nfo = find_nfo(root, media).unwrap_or_default();
     let art = find_artwork(root, media).unwrap_or_default();
-    if nfo.is_empty() && art.is_empty() {
+    // Subtitle sidecars too (.srt/.ass/.vtt, .idx pairs): a pair
+    // appearing next to an UNCHANGED movie must bust the identity
+    // fast-path, or it stays invisible until the movie changes.
+    let mut subs: Vec<String> = find_sidecars(root, media)
+        .into_iter()
+        .map(|s| s.path_rel)
+        .collect();
+    subs.sort();
+    subs.dedup();
+    if nfo.is_empty() && art.is_empty() && subs.is_empty() {
         return String::new();
     }
-    format!("n:{nfo}|a:{art}")
+    format!("n:{nfo}|a:{art}|s:{}", subs.join(","))
 }
 
 fn find_artwork(root: &Path, media: &Path) -> Option<String> {
@@ -513,18 +522,21 @@ mod tests {
         // Nothing beside it: empty on both sides, so an item with no
         // sidecars never looks changed.
         assert_eq!(sidecar_sig(root, &media), "");
-        assert_eq!(kahawai_hub_sig("", ""), "");
+        assert_eq!(kahawai_hub_sig("", "", &[]), "");
 
         std::fs::write(root.join("Solaris (1972).nfo"), b"<movie/>").unwrap();
         let with_nfo = sidecar_sig(root, &media);
-        assert_eq!(with_nfo, kahawai_hub_sig("Solaris (1972).nfo", ""));
+        assert_eq!(with_nfo, kahawai_hub_sig("Solaris (1972).nfo", "", &[]));
         assert_ne!(with_nfo, "", "a dropped-in .nfo must change the signature");
 
         // Artwork is matched by name (cover/folder/poster/front), not
         // by the media's stem.
         std::fs::write(root.join("cover.jpg"), b"JPEG").unwrap();
         let both = sidecar_sig(root, &media);
-        assert_eq!(both, kahawai_hub_sig("Solaris (1972).nfo", "cover.jpg"));
+        assert_eq!(
+            both,
+            kahawai_hub_sig("Solaris (1972).nfo", "cover.jpg", &[])
+        );
         assert_ne!(both, with_nfo, "artwork appearing must change it too");
 
         // And removal is symmetric — the case that left a stale answer
@@ -535,16 +547,36 @@ mod tests {
             both,
             "a vanished .nfo must change it"
         );
+
+        // A subtitle sidecar appearing beside an unchanged file must
+        // change the signature too — the gap that hid 42 real .idx
+        // pairs: the idx counts ONCE however many tracks it carries,
+        // and the hub spells it from external_subtitles path_rels.
+        let before = sidecar_sig(root, &media);
+        std::fs::write(
+            root.join("Solaris (1972).idx"),
+            b"id: en, index: 0
+id: nl, index: 1
+",
+        )
+        .unwrap();
+        std::fs::write(root.join("Solaris (1972).sub"), b"").unwrap();
+        let with_subs = sidecar_sig(root, &media);
+        assert_ne!(with_subs, before, "an .idx pair appearing must change it");
+        assert_eq!(
+            with_subs,
+            kahawai_hub_sig("", "cover.jpg", &["Solaris (1972).idx".to_string()])
+        );
     }
 
     /// The hub's spelling, copied here on purpose: if `sidecar_sig` on
     /// either side is edited alone, this test fails rather than the
     /// library silently rescanning forever.
-    fn kahawai_hub_sig(nfo: &str, artwork: &str) -> String {
-        if nfo.is_empty() && artwork.is_empty() {
+    fn kahawai_hub_sig(nfo: &str, artwork: &str, subs: &[String]) -> String {
+        if nfo.is_empty() && artwork.is_empty() && subs.is_empty() {
             return String::new();
         }
-        format!("n:{nfo}|a:{artwork}")
+        format!("n:{nfo}|a:{artwork}|s:{}", subs.join(","))
     }
 
     #[test]
