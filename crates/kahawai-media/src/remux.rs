@@ -2244,6 +2244,21 @@ fn make_hls_sink(out_dir: &Path, prefer: Option<&str>) -> Result<(gst::Element, 
     // the smallest spec-valid value for ~2 s segments (2 produced
     // playlists that violated it).
     set_prop_if_present(&sink, "target-duration", 3u32);
+    // ...but the sink ALSO requests a keyframe every target-duration by
+    // default, which is a second cut source racing the encoders' 48-frame
+    // GOP above. The two cadences are incommensurable by construction —
+    // ours counts frames, the sink's counts seconds — so they interleave:
+    // measured 1.96 s and 1.04 s segments alternating, each pair summing
+    // to the 3 s target, averaging 1.67 s. Every short segment costs a
+    // keyframe nobody asked for. The sink's own docs say the requests
+    // exist for input that lacks regular keyframes; ours has them by
+    // construction, so turn the requests off and let the GOP alone decide.
+    // Measured with them off: a clean 1.96 s per segment (avg 2.002, max
+    // 2.377 at EOS — which is why target-duration stays 3 and not 2).
+    // Copy sessions are unaffected either way: with no encoder upstream
+    // there is nothing to honour a keyframe request, so their splits
+    // already followed the source's own keyframes.
+    set_prop_if_present(&sink, "send-keyframe-requests", false);
     // Keep every segment and playlist entry (VOD-style growing playlist).
     set_prop_if_present(&sink, "playlist-length", 0u32);
     set_prop_if_present(&sink, "max-files", 0u32); // hlssink2
@@ -3211,6 +3226,85 @@ mod concat_spike {
         );
         pipeline.set_state(gst::State::Null).unwrap();
         msg
+    }
+
+    /// One cut source, not two. hlssink3 requests a keyframe every
+    /// `target-duration` by default, which races the GOP the encode
+    /// chain pins in FRAMES — the two cadences cannot line up, so the
+    /// sink cut twice per window: 1.96 s and 1.04 s segments
+    /// alternating, each pair summing to the 3 s target, every short
+    /// one costing a keyframe. Built through `make_hls_sink` so the
+    /// production configuration is what is under test.
+    #[test]
+    fn segments_run_one_gop_each() {
+        crate::init().unwrap();
+        for el in ["hlssink3", "x264enc"] {
+            if gst::ElementFactory::find(el).is_none() {
+                eprintln!("no {el}; skipped");
+                return;
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("hls");
+        std::fs::create_dir_all(&out).unwrap();
+        let (sink, _) = make_hls_sink(&out, Some("hlssink3")).unwrap();
+
+        let pipeline = gst::Pipeline::new();
+        let src = gst::ElementFactory::make("videotestsrc")
+            .property("num-buffers", 480i32) // 20 s at 23.976
+            .build()
+            .unwrap();
+        let caps = gst::ElementFactory::make("capsfilter")
+            .property(
+                "caps",
+                gst::Caps::builder("video/x-raw")
+                    .field("framerate", gst::Fraction::new(24000, 1001))
+                    .field("width", 320i32)
+                    .field("height", 180i32)
+                    .build(),
+            )
+            .build()
+            .unwrap();
+        // Same 48-frame GOP the encode chain pins.
+        let enc = gst::ElementFactory::make("x264enc")
+            .property("key-int-max", 48u32)
+            .build()
+            .unwrap();
+        let parse = gst::ElementFactory::make("h264parse").build().unwrap();
+        pipeline
+            .add_many([&src, &caps, &enc, &parse, &sink])
+            .unwrap();
+        gst::Element::link_many([&src, &caps, &enc, &parse]).unwrap();
+        let pad = sink.request_pad_simple("video").unwrap();
+        parse
+            .static_pad("src")
+            .unwrap()
+            .link(&pad)
+            .expect("linking to the sink");
+
+        let msg = run_to_eos(&pipeline, 60);
+        assert!(
+            matches!(msg.map(|m| m.type_()), Some(gst::MessageType::Eos)),
+            "pipeline did not reach EOS"
+        );
+
+        let pl = std::fs::read_to_string(out.join("master.m3u8")).unwrap();
+        let durs: Vec<f64> = pl
+            .lines()
+            .filter_map(|l| l.strip_prefix("#EXTINF:"))
+            .filter_map(|l| l.trim_end_matches(',').parse().ok())
+            .collect();
+        assert!(durs.len() >= 4, "too few segments to judge:\n{pl}");
+        // The last segment is whatever content remained at EOS; every
+        // other one is a whole GOP. A short segment among them is the
+        // sink cutting on its own schedule again.
+        let (body, _) = durs.split_at(durs.len() - 1);
+        let shortest = body.iter().cloned().fold(f64::INFINITY, f64::min);
+        let longest = body.iter().cloned().fold(0.0, f64::max);
+        assert!(
+            longest - shortest < 0.2,
+            "segments are not one GOP each (min {shortest:.3}, max {longest:.3}): {body:?}"
+        );
     }
 
     /// HALF ONE: does concat, fed by the production appsrc, produce a

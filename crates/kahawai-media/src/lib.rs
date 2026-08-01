@@ -23,7 +23,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use gstreamer as gst;
 use gstreamer_pbutils::prelude::*;
-use gstreamer_pbutils::{Discoverer, DiscovererInfo, DiscovererStreamInfo};
+use gstreamer_pbutils::{Discoverer, DiscovererAudioInfo, DiscovererInfo, DiscovererStreamInfo};
 use kahawai_core::media::{AudioStream, MediaInfo, SubtitleStream, VideoStream};
 
 pub fn init() -> Result<()> {
@@ -136,7 +136,12 @@ fn map_info(info: &DiscovererInfo) -> MediaInfo {
     }
 
     for s in info.audio_streams().into_iter().filter(is_terminal) {
-        let caps = s.caps();
+        // Codec, width and layout come from the widest link; language and
+        // bitrate from the parsed one, which is usually the only link
+        // carrying them (the container entry above reports neither).
+        let s = &s;
+        let widest = widest_audio(s);
+        let caps = widest.caps();
         let name = caps
             .as_ref()
             .and_then(|c| c.structure(0).map(|st| st.name().to_string()))
@@ -155,10 +160,15 @@ fn map_info(info: &DiscovererInfo) -> MediaInfo {
         });
         out.audio.push(AudioStream {
             codec: normalize_audio_codec(&name, version, layer),
-            channels: s.channels(),
-            sample_rate: s.sample_rate(),
-            language: s.language().map(|l| l.to_string()),
-            bitrate_kbps: (s.bitrate() > 0).then(|| s.bitrate() / 1000),
+            channels: widest.channels(),
+            sample_rate: widest.sample_rate(),
+            language: s
+                .language()
+                .or_else(|| widest.language())
+                .map(|l| l.to_string()),
+            bitrate_kbps: (s.bitrate() > 0)
+                .then(|| s.bitrate() / 1000)
+                .or_else(|| (widest.bitrate() > 0).then(|| widest.bitrate() / 1000)),
             layout,
         });
     }
@@ -225,6 +235,37 @@ fn is_terminal<T: gst::glib::prelude::IsA<DiscovererStreamInfo>>(s: &T) -> bool 
 
 fn caps_name(s: &DiscovererStreamInfo) -> Option<String> {
     s.caps()?.structure(0).map(|st| st.name().to_string())
+}
+
+/// The WIDEST entry in an audio parse chain — the one that describes the
+/// whole stream rather than a piece of it.
+///
+/// Terminal-entry-wins is right for a mislabeled track (container tagged
+/// E-AC-3 over an AC-3 bitstream: the parser knows better), but wrong for
+/// Dolby Digital Plus. A DD+ 7.1 track arrives as an `E-AC-3, 8 channels`
+/// container entry with ac3parse's view nested underneath it — `AC-3,
+/// 6 channels`, the independent substream ALONE, because the parser
+/// splits each block into core plus extension and only describes the
+/// core. Taking the terminal entry reported "ac3 5.1" for a 7.1 E-AC-3
+/// track, which is what the session verdict then told the user.
+///
+/// A parser can only ever describe a SUBSET of a multi-substream stream,
+/// never a superset, so the widest link in the chain is the stream
+/// itself. Ties keep the terminal entry, which leaves the mislabeled
+/// case correct: there both links carry the same channel count, and the
+/// parser's codec name is the one that matches the bitstream.
+fn widest_audio(s: &DiscovererAudioInfo) -> DiscovererAudioInfo {
+    let mut best = s.clone();
+    let mut cur = AsRef::<DiscovererStreamInfo>::as_ref(s).previous();
+    while let Some(p) = cur {
+        if let Ok(a) = p.clone().downcast::<DiscovererAudioInfo>()
+            && a.channels() > best.channels()
+        {
+            best = a;
+        }
+        cur = p.previous();
+    }
+    best
 }
 
 fn normalize_container(caps_name: &str) -> String {
