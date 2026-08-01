@@ -89,6 +89,29 @@ pub struct WorkerArgs {
     pub container: String,
 }
 
+/// HUB-36: measure this box's encoders and write the benchmark cache,
+/// then exit. Runs as a CHILD PROCESS for the same reason pipelines do
+/// (§1.1): this is GStreamer work, and GStreamer work takes processes
+/// down. Measured live — svtav1enc on the J5005 killed the transcoder
+/// outright mid-benchmark, silently, taking a serving satellite with
+/// it. A dead child is a missing measurement; a dead satellite is an
+/// outage.
+#[cfg(any(feature = "hub", feature = "transcoder"))]
+pub fn run_benchmark(cfg: &config::Config, cache: PathBuf) -> Result<()> {
+    kahawai_media::demote_elements(&cfg.transcoder.demote_decoders)?;
+    let elements: Vec<&str> = [
+        kahawai_media::remux::h264_encoder(),
+        kahawai_media::remux::hevc_encoder(),
+        kahawai_media::remux::av1_encoder(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    let r = kahawai_media::bench::measure(&elements, kahawai_media::remux::tonemap_available());
+    kahawai_media::bench::store(&cache, &r);
+    Ok(())
+}
+
 #[cfg(any(feature = "hub", feature = "transcoder"))]
 pub fn run_remux_worker(cfg: &config::Config, w: WorkerArgs) -> Result<()> {
     // Die WITH the supervisor: kill_on_drop only fires inside a
@@ -346,36 +369,41 @@ pub async fn run_all_in_one(cfg: config::Config, config_path: Option<PathBuf>) -
 #[cfg(feature = "hub")]
 fn spawn_local_benchmark(cache: PathBuf, registry: Arc<kahawai_hub::registry::Registry>) {
     const SETTLE: Duration = Duration::from_secs(60);
+    const BENCH_BUDGET: Duration = Duration::from_secs(300);
     if let Some(cached) = kahawai_media::bench::load(&cache) {
         registry.set_local_bench(cached);
     }
     tokio::spawn(async move {
         tokio::time::sleep(SETTLE).await;
-        let measured = match tokio::task::spawn_blocking(|| {
-            let elements: Vec<&str> = [
-                kahawai_media::remux::h264_encoder(),
-                kahawai_media::remux::hevc_encoder(),
-                kahawai_media::remux::av1_encoder(),
-            ]
-            .into_iter()
-            .flatten()
-            .collect();
-            kahawai_media::bench::measure(&elements, kahawai_media::remux::tonemap_available())
-        })
-        .await
-        {
-            Ok(m) => m,
-            Err(e) => {
-                tracing::warn!(error = %e, "local benchmark task failed");
+        // Child process, for the reason pipelines are children: this is
+        // GStreamer work, and it killed a satellite outright when it
+        // ran in-process (svtav1enc on the J5005, HUB-36).
+        let Ok(exe) = std::env::current_exe() else {
+            return;
+        };
+        let child = tokio::process::Command::new(exe)
+            .arg("benchmark")
+            .arg("--cache")
+            .arg(&cache)
+            .kill_on_drop(true)
+            .status();
+        match tokio::time::timeout(BENCH_BUDGET, child).await {
+            Ok(Ok(st)) if st.success() => {}
+            other => {
+                tracing::warn!(?other, "local benchmark child did not finish cleanly");
                 return;
             }
-        };
-        kahawai_media::bench::store(&cache, &measured);
-        tracing::info!(
-            encoders = measured.encoders.len(),
-            "local encoder speeds measured (HUB-36)"
-        );
-        registry.set_local_bench(measured);
+        }
+        match kahawai_media::bench::load(&cache) {
+            Some(measured) => {
+                tracing::info!(
+                    encoders = measured.encoders.len(),
+                    "local encoder speeds measured (HUB-36)"
+                );
+                registry.set_local_bench(measured);
+            }
+            None => tracing::warn!("local benchmark child wrote no usable cache"),
+        }
     });
 }
 

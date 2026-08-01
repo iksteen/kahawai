@@ -187,30 +187,49 @@ fn spawn_benchmark(
     tx: tokio::sync::watch::Sender<CapabilityReport>,
 ) {
     const SETTLE: std::time::Duration = std::time::Duration::from_secs(60);
+    /// Generous: a weak box measuring software AV1 is slow but not
+    /// broken. Past this it is presumed wedged and killed.
+    const BENCH_BUDGET: std::time::Duration = std::time::Duration::from_secs(300);
     let (path, state_dir) = (bench_cache(state_dir), state_dir.to_path_buf());
     tokio::spawn(async move {
         tokio::time::sleep(SETTLE).await;
         let cached = kahawai_media::bench::load(&path);
-        let measured = match tokio::task::spawn_blocking(move || {
-            let elements: Vec<&str> = [
-                kahawai_media::remux::h264_encoder(),
-                kahawai_media::remux::hevc_encoder(),
-                kahawai_media::remux::av1_encoder(),
-            ]
-            .into_iter()
-            .flatten()
-            .collect();
-            kahawai_media::bench::measure(&elements, kahawai_media::remux::tonemap_available())
-        })
-        .await
-        {
-            Ok(m) => m,
-            Err(e) => {
-                tracing::warn!(error = %e, "benchmark task failed");
+        // In a CHILD process: this is GStreamer work and GStreamer work
+        // takes processes down. Measured live — svtav1enc on the J5005
+        // killed the transcoder outright, silently, mid-benchmark. A
+        // dead child costs a measurement; a dead satellite is an
+        // outage (§1.1, same reason pipelines are supervised children).
+        let Ok(exe) = std::env::current_exe() else {
+            return;
+        };
+        let child = tokio::process::Command::new(exe)
+            .arg("benchmark")
+            .arg("--cache")
+            .arg(&path)
+            .kill_on_drop(true)
+            .status();
+        match tokio::time::timeout(BENCH_BUDGET, child).await {
+            Ok(Ok(st)) if st.success() => {}
+            Ok(Ok(st)) => {
+                tracing::warn!(status = ?st, "benchmark child exited badly; keeping cached speeds");
                 return;
             }
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "benchmark child failed to run");
+                return;
+            }
+            Err(_) => {
+                tracing::warn!(
+                    budget_s = BENCH_BUDGET.as_secs(),
+                    "benchmark child exceeded its budget; keeping cached speeds"
+                );
+                return;
+            }
+        }
+        let Some(measured) = kahawai_media::bench::load(&path) else {
+            tracing::warn!("benchmark child wrote no usable cache");
+            return;
         };
-        kahawai_media::bench::store(&path, &measured);
         let news = cached
             .as_ref()
             .is_none_or(|c| kahawai_media::bench::drifted(c, &measured));

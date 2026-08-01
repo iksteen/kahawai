@@ -50,6 +50,12 @@ enum Cmd {
     /// crash isolation). Reads source bytes from the parent's socket.
     #[command(hide = true)]
     RemuxWorker(WorkerArgs),
+    /// HUB-36: measure encoders into a cache file, then exit.
+    #[command(hide = true)]
+    Benchmark {
+        #[arg(long)]
+        cache: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -117,6 +123,7 @@ async fn main() -> Result<()> {
         Cmd::Mediahost => kahawai::run_mediahost(cfg.mediahost).await,
         Cmd::Doctor { json } => kahawai::doctor(&cfg, json),
         Cmd::RemuxWorker(w) => kahawai::run_remux_worker(&cfg, w),
+        Cmd::Benchmark { cache } => kahawai::run_benchmark(&cfg, cache),
         Cmd::Transcoder => kahawai::run_transcoder(&cfg).await,
         Cmd::AllInOne => kahawai::run_all_in_one(cfg, config_used).await,
     }

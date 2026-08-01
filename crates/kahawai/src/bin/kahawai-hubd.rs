@@ -40,6 +40,12 @@ enum Cmd {
     },
     #[command(hide = true)]
     RemuxWorker(WorkerArgs),
+    /// HUB-36: measure encoders into a cache file, then exit.
+    #[command(hide = true)]
+    Benchmark {
+        #[arg(long)]
+        cache: PathBuf,
+    },
 }
 
 #[tokio::main]
@@ -74,5 +80,6 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Some(Cmd::RemuxWorker(w)) => kahawai::run_remux_worker(&cfg, w),
+        Some(Cmd::Benchmark { cache }) => kahawai::run_benchmark(&cfg, cache),
     }
 }
