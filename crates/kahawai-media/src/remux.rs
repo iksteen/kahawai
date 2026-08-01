@@ -2243,7 +2243,15 @@ fn make_hls_sink(out_dir: &Path, prefer: Option<&str>) -> Result<(gst::Element, 
     // which hlssink3 writes verbatim from this property. 3 is therefore
     // the smallest spec-valid value for ~2 s segments (2 produced
     // playlists that violated it).
-    set_prop_if_present(&sink, "target-duration", 3u32);
+    // With keyframe requests off (below) this no longer decides where
+    // anything is cut — measured: target 2 and target 3 both yield the
+    // same 2.002 s segments — it is purely the TARGETDURATION written
+    // to the playlist, and that is a bound we must actually honour.
+    // Segments are one GOP (~2 s), but an encoder is free to treat its
+    // keyframe interval as advisory: vtenc skipped one in a 60-segment
+    // session, producing a 3.885 s segment that TARGETDURATION 3 would
+    // have declared impossible. 4 covers a doubled GOP.
+    set_prop_if_present(&sink, "target-duration", 4u32);
     // ...but the sink ALSO requests a keyframe every target-duration by
     // default, which is a second cut source racing the encoders' 48-frame
     // GOP above. The two cadences are incommensurable by construction —
