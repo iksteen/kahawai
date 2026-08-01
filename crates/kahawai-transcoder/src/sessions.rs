@@ -47,6 +47,9 @@ pub struct Runner {
     /// previous worker must not satisfy the new worker's read.
     pending_reads: Mutex<HashMap<u64, oneshot::Sender<Vec<u8>>>>,
     next_req: std::sync::atomic::AtomicU64,
+    /// Stderr of the most recently failed worker, handed to the hub
+    /// with the SessionError so it outlives this scratch dir.
+    last_worker_log: Mutex<Option<String>>,
 }
 
 impl Runner {
@@ -65,6 +68,7 @@ impl Runner {
             pending_reads: Mutex::new(HashMap::new()),
             next_req: std::sync::atomic::AtomicU64::new(1),
             run_seq: std::sync::atomic::AtomicU64::new(1),
+            last_worker_log: Mutex::new(None),
         })
     }
 
@@ -128,6 +132,12 @@ impl Runner {
                     msg: Some(tc_to_hub::Msg::SessionError(SessionError {
                         session_id: session_id.clone(),
                         error: format!("{e:#}"),
+                        worker_log: self
+                            .last_worker_log
+                            .lock()
+                            .unwrap()
+                            .take()
+                            .unwrap_or_default(),
                     })),
                 }
             }
@@ -342,6 +352,13 @@ impl Runner {
                                     msg: Some(tc_to_hub::Msg::SessionError(SessionError {
                                         session_id: sid.clone(),
                                         error: "worker died mid-session".into(),
+                                        // Mid-session death: same
+                                        // evidence, same reason to keep
+                                        // it (this dir is about to go).
+                                        worker_log: std::fs::read_to_string(
+                                            run_dir.join("worker.log"),
+                                        )
+                                        .unwrap_or_default(),
                                     })),
                                 })
                                 .await;
@@ -396,6 +413,12 @@ impl Runner {
                                 std::fs::read_to_string(dir.join("worker.log")).unwrap_or_default();
                             let tail: String =
                                 log.lines().rev().take(4).collect::<Vec<_>>().join(" | ");
+                            // Keep the WHOLE stderr for the hub: this
+                            // dir is wiped by the very next attempt, and
+                            // a panic's message — the only line naming
+                            // the cause — is above the frames the tail
+                            // quotes.
+                            *self.last_worker_log.lock().unwrap() = Some(log);
                             anyhow::bail!("worker exited at start ({status}): {tail}");
                         }
                     }

@@ -152,6 +152,17 @@ impl TranscoderLink for TranscoderLinkService {
                             sessions.transcode_verdict(&r.session_id, Ok(facts));
                         }
                         tc_to_hub::Msg::SessionError(e) => {
+                            // A satellite's scratch dir is wiped by its
+                            // own next attempt, so its worker stderr
+                            // only survives if it lands here.
+                            if let Some(data_dir) = sessions.data_dir() {
+                                crate::crashlog::store(
+                                    data_dir,
+                                    &e.session_id,
+                                    &module_id,
+                                    &e.worker_log,
+                                );
+                            }
                             // Pre-ready: fail the pending start. Post-ready
                             // (worker died mid-session): reschedule (AR-6).
                             if !sessions.transcode_verdict(&e.session_id, Err(e.error.clone())) {

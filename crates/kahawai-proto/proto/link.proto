@@ -344,6 +344,14 @@ message SessionFact {
 message SessionError {
   string session_id = 1;
   string error = 2;
+  // The failed worker's stderr, tail-capped. A pipeline worker that
+  // aborts writes its Rust panic — message, file and line — to stderr,
+  // and that is the only place the cause appears; the `error` string
+  // above carries just the last few lines, which on a panic are the
+  // backtrace frames and not the message. The satellite's own copy is
+  // deleted by the very next attempt, so it ships here to be kept with
+  // the hub's (crates/kahawai-hub/src/crashlog.rs).
+  string worker_log = 3;
 }
 
 // Transcoder pulls source bytes. `req` correlates request/response:

@@ -420,6 +420,12 @@ impl Sessions {
         Self::with_limits(scratch_root, 4, Duration::from_secs(90))
     }
 
+    /// Where diagnostics live: the scratch root is `<data_dir>/sessions`,
+    /// so its parent is the data dir.
+    pub fn data_dir(&self) -> Option<&std::path::Path> {
+        self.scratch_root.parent()
+    }
+
     pub fn with_limits(scratch_root: PathBuf, max_per_user: usize, idle_timeout: Duration) -> Self {
         // Sessions never survive a restart; stale scratch is garbage.
         let _ = std::fs::remove_dir_all(&scratch_root);
@@ -1365,6 +1371,13 @@ impl Sessions {
                                 std::fs::read_to_string(dir.join("worker.log")).unwrap_or_default();
                             let tail: String =
                                 log.lines().rev().take(4).collect::<Vec<_>>().join(" | ");
+                            // Keep the stderr BEFORE the retry wipes this
+                            // dir: a panic's message names the file and
+                            // line, and the four lines quoted below are
+                            // the frames after it, which name nothing.
+                            if let Some(data_dir) = self.scratch_root.parent() {
+                                crate::crashlog::store(data_dir, session_id, "local", &log);
+                            }
                             bail!("pipeline worker exited at start ({status}): {tail}");
                         }
                     }
