@@ -116,6 +116,7 @@ pub fn run_parts(
             .unwrap_or(120_000),
         floor_ms: start_ms,
         viewer_file: out_dir.join("viewer.pos"),
+        out_dir: out_dir.to_path_buf(),
     };
     let job = remux::start_parts(
         out_dir,

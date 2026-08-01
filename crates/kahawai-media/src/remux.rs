@@ -2216,12 +2216,82 @@ pub struct PaceConfig {
     pub window_ms: u64,
     pub floor_ms: u64,
     pub viewer_file: std::path::PathBuf,
+    /// HUB-36: where to drop `pace.json` — the run dir, alongside
+    /// `start.pos` and `viewer.pos`.
+    pub out_dir: std::path::PathBuf,
+}
+
+/// HUB-36: how fast this box ACTUALLY produced content, measured only
+/// while nothing was holding it back.
+///
+/// The trap this exists to dodge: steady-state production is throttled
+/// to viewer+window by the probe below, so a session measured end to
+/// end reports ~1.0× **because we paced it** — the number would say
+/// "every box is realtime" and rank nothing. Honest pace is visible
+/// only while the throttle is asleep: from the first buffer until the
+/// window check first fails (or a cap, for a box slow enough never to
+/// fill the window). Post-seek catch-up is un-throttled by the same
+/// definition, and each seek-restart is a fresh worker, so it gets its
+/// own sample.
+struct PaceMeter {
+    t0: Option<std::time::Instant>,
+    first_ms: u64,
+    done: bool,
+}
+
+/// A sample needs this much CONTENT to mean anything — below it the
+/// ratio is dominated by preroll burst rather than throughput.
+const PACE_MIN_CONTENT: u64 = 5_000;
+/// …and this much WALL time, only to keep timer jitter out. It is
+/// deliberately small: a fast box produces the whole pacing window in
+/// under a second, and rejecting that would discard precisely the
+/// boxes worth ranking highest (found by test — a local copy-remux
+/// cleared a 6 s window in ~0.3 s and reported nothing at all).
+const PACE_MIN_WALL: u64 = 1_000;
+/// A box near 1.0× may never fill the window; stop measuring anyway.
+const PACE_CAP: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// content-ms over wall-ms as a realtime multiple, or None when the
+/// sample is too short on either axis to mean anything (the opening
+/// seconds are preroll burst, not throughput).
+pub(crate) fn pace_multiple(content_ms: u64, wall_ms: u64) -> Option<f64> {
+    if wall_ms < PACE_MIN_WALL || content_ms < PACE_MIN_CONTENT {
+        return None;
+    }
+    Some(content_ms as f64 / wall_ms as f64)
+}
+
+impl PaceMeter {
+    /// Close the measurement and write it out. `produced_ms` is the
+    /// position of the buffer that ended it.
+    fn finish(&mut self, produced_ms: u64, out_dir: &std::path::Path) {
+        self.done = true;
+        let Some(t0) = self.t0 else { return };
+        let wall = t0.elapsed();
+        let content = produced_ms.saturating_sub(self.first_ms);
+        let Some(multiple) = pace_multiple(content, wall.as_millis() as u64) else {
+            return; // too short to mean anything
+        };
+        let path = out_dir.join("pace.json");
+        let body = format!("{{\"multiple\":{multiple:.3}}}");
+        if let Err(e) = std::fs::write(&path, body) {
+            tracing::debug!(error = %e, "pace sample not written");
+            return;
+        }
+        tracing::info!(
+            multiple = format!("{multiple:.2}"),
+            content_ms = content,
+            wall_ms = wall.as_millis() as u64,
+            "un-throttled production measured (HUB-36)"
+        );
+    }
 }
 
 fn install_pace_probe(
     pad: &gst::Pad,
     cfg: Arc<PaceConfig>,
     stopping: Arc<std::sync::atomic::AtomicBool>,
+    meter: Option<Arc<Mutex<PaceMeter>>>,
 ) {
     pad.add_probe(gst::PadProbeType::BUFFER, move |pad, info| {
         if let Some(gst::PadProbeData::Buffer(b)) = &info.data
@@ -2238,6 +2308,18 @@ fn install_pace_probe(
                 return gst::PadProbeReturn::Ok;
             };
             let produced_ms = cfg.floor_ms + rt.mseconds();
+            // HUB-36: the clock starts at the first buffer of the run.
+            if let Some(m) = &meter {
+                let mut m = m.lock().unwrap();
+                if !m.done && m.t0.is_none() {
+                    m.t0 = Some(std::time::Instant::now());
+                    m.first_ms = produced_ms;
+                } else if !m.done && m.t0.is_some_and(|t| t.elapsed() >= PACE_CAP) {
+                    // Never filled the window — a ~1.0x box. Its speed
+                    // is exactly what the last minute showed.
+                    m.finish(produced_ms, &cfg.out_dir);
+                }
+            }
             loop {
                 if stopping.load(std::sync::atomic::Ordering::SeqCst) {
                     break;
@@ -2249,6 +2331,16 @@ fn install_pace_probe(
                     .max(cfg.floor_ms);
                 if produced_ms <= viewer + cfg.window_ms {
                     break;
+                }
+                // THE signal: production has outrun the viewer window,
+                // so from here on the throttle — not the box — sets the
+                // rate. Whatever we measured up to now is the honest
+                // number; everything after would read ~1.0x.
+                if let Some(m) = &meter {
+                    let mut m = m.lock().unwrap();
+                    if !m.done {
+                        m.finish(produced_ms, &cfg.out_dir);
+                    }
                 }
                 std::thread::sleep(std::time::Duration::from_millis(200));
             }
@@ -2599,6 +2691,13 @@ pub fn start_parts(
     anyhow::ensure!(plan.playable(), "nothing to remux");
     let stopping = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let pace = pace.map(Arc::new);
+    let mut pace_meter = pace.as_ref().map(|_| {
+        Arc::new(Mutex::new(PaceMeter {
+            t0: None,
+            first_ms: 0,
+            done: false,
+        }))
+    });
     let per_part: Vec<WaitingPads> = (0..parsebins.len())
         .map(|_| Arc::new(Mutex::new(std::collections::HashMap::new())))
         .collect();
@@ -2619,7 +2718,11 @@ pub fn start_parts(
         }
         .with_context(|| format!("requesting {kind} pad"))?;
         if let Some(cfg) = &pace {
-            install_pace_probe(&pad, cfg.clone(), stopping.clone());
+            // HUB-36: meter the first pad only — video when the plan has
+            // it (loop order), which is the stream whose production rate
+            // placement cares about.
+            let m = pace_meter.take();
+            install_pace_probe(&pad, cfg.clone(), stopping.clone(), m);
         }
         if !multipart {
             per_part[0].lock().unwrap().insert(kind, pad);
@@ -3746,6 +3849,60 @@ mod tests {
             seg_info.audio[0].channels, 1,
             "downmix to mono did not happen"
         );
+    }
+
+    /// HUB-36: the sample-validity rule. Short samples are preroll
+    /// burst, not throughput, and must not reach the pace table.
+    #[test]
+    fn pace_multiple_discards_short_samples() {
+        // 30 s of content in 10 s of wall = 3x realtime.
+        assert_eq!(pace_multiple(30_000, 10_000), Some(3.0));
+        // A box at exactly realtime.
+        assert_eq!(pace_multiple(20_000, 20_000), Some(1.0));
+        // Slower than realtime is a legitimate, important measurement.
+        assert_eq!(pace_multiple(6_500, 10_000), Some(0.65));
+        // A fast box: the whole window in ~1 s of wall. This MUST be
+        // measurable — it is the case placement most wants to know.
+        assert_eq!(pace_multiple(120_000, 6_000), Some(20.0));
+        assert_eq!(pace_multiple(20_000, 1_000), Some(20.0));
+        // Sub-second: timer jitter, not a measurement.
+        assert_eq!(pace_multiple(30_000, 999), None);
+        // Too little content: a stalled start says nothing either.
+        assert_eq!(pace_multiple(4_999, 30_000), None);
+        assert_eq!(pace_multiple(0, 0), None);
+    }
+
+    /// The write path: a finalized meter leaves a parseable pace.json
+    /// where the harvesters look for it.
+    #[test]
+    fn pace_meter_writes_its_sample() {
+        let out = tempfile::tempdir().unwrap();
+        let mut m = PaceMeter {
+            t0: Some(Instant::now() - Duration::from_secs(4)),
+            first_ms: 1_000,
+            done: false,
+        };
+        // 4 s of wall, 13 s of content produced since first_ms.
+        m.finish(14_000, out.path());
+        assert!(m.done, "a finished meter never measures twice");
+        let body = std::fs::read_to_string(out.path().join("pace.json")).unwrap();
+        let v: f64 = body
+            .trim()
+            .trim_start_matches("{\"multiple\":")
+            .trim_end_matches('}')
+            .parse()
+            .unwrap_or_else(|e| panic!("unparseable {body:?}: {e}"));
+        assert!((v - 3.25).abs() < 0.1, "expected ~3.25x, got {v} ({body})");
+
+        // A too-short sample writes nothing rather than lying.
+        let out2 = tempfile::tempdir().unwrap();
+        let mut short = PaceMeter {
+            t0: Some(Instant::now() - Duration::from_millis(200)),
+            first_ms: 0,
+            done: false,
+        };
+        short.finish(1_000, out2.path());
+        assert!(!out2.path().join("pace.json").exists());
     }
 
     /// HUB-15b fMP4 path end to end: encode h264/aac into fragmented
