@@ -1399,7 +1399,7 @@ fn attach_peak_probe(upload: &gst::Element, shader: &gst::Element) {
 /// system memory, then capssetter rewrites the colorimetry tag to
 /// bt709 so the encoder's VUI tells the player the truth (the shader
 /// changed the pixels; nothing else knows to change the label).
-fn tonemap_segment() -> Vec<gst::Element> {
+pub(crate) fn tonemap_segment() -> Vec<gst::Element> {
     let upload = gst::ElementFactory::make("glupload").build().unwrap();
     let to_rgba = gst::ElementFactory::make("glcolorconvert").build().unwrap();
     let rgba = gst::ElementFactory::make("capsfilter")
