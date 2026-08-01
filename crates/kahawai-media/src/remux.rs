@@ -2664,6 +2664,29 @@ pub fn start_parts(
     burn_sets: Option<&Path>,
 ) -> Result<RemuxJob> {
     crate::init()?;
+    // Dolby Digital Plus reaches us as ONE container block holding an
+    // AC-3 core plus its E-AC-3 extension substream. ac3parse splits
+    // that block into two "frames" and interpolates a timestamp
+    // between them, so a 32 ms unit leaves the parser as two buffers
+    // 16 ms apart — and the audio timeline comes out at HALF the audio
+    // content, i.e. sound racing the picture 2:1 (measured on a DD+ 7.1
+    // title: 60 s of samples stamped across 30 s; 2815 AAC frames of
+    // content muxed against 30 s of video). avdec_eac3 — which
+    // build_audio_encode_chain forces for the whole AC-3 family anyway
+    // — decodes the intact block correctly, and yields the full 7.1
+    // that the split path silently reduces to the 5.1 core. So while
+    // the audio is being decoded the parser buys nothing and costs
+    // sync; demote it and let parsebin expose the block whole.
+    //
+    // Decode only: a COPY still needs the parser's framed caps to mux.
+    // The rank is process-global, which is safe precisely because every
+    // real pipeline runs in its own `remux-worker` child — one run per
+    // process, both from the transcoder and from the hub.
+    if plan.audio == StreamMode::Encode
+        && let Some(f) = gst::ElementFactory::find("ac3parse")
+    {
+        f.set_rank(gst::Rank::NONE);
+    }
     anyhow::ensure!(!sources.is_empty(), "no source parts to remux");
     let multipart = sources.len() > 1;
     let mut sources = sources;
