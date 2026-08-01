@@ -186,16 +186,20 @@ async fn dispatches_encode_session_to_transcoder() {
                 codec: "aac".into(),
                 element: "fdkaacenc".into(),
                 hardware: false,
+                speed_1080: 0.0,
+                speed_2160: 0.0,
             }],
             max_sessions: 2,
             decode_caps: vec![], // empty = assume capable (OPS-7)
             tonemap: false,
+            tonemap_speed_1080: 0.0,
+            tonemap_speed_2160: 0.0,
         };
         let _ = kahawai_transcoder::link_once(
             &hub_addr2,
             tc_tls,
             "encoder-box",
-            caps,
+            tokio::sync::watch::channel(caps).1,
             &scratch_path,
             &None,
         )
@@ -386,16 +390,20 @@ async fn dispatches_encode_session_to_transcoder() {
                 codec: "aac".into(),
                 element: "fdkaacenc".into(),
                 hardware: false,
+                speed_1080: 0.0,
+                speed_2160: 0.0,
             }],
             max_sessions: 2,
             decode_caps: vec![],
             tonemap: false,
+            tonemap_speed_1080: 0.0,
+            tonemap_speed_2160: 0.0,
         };
         let _ = kahawai_transcoder::link_once(
             &hub_addr3,
             tc2_tls,
             "backup-box",
-            caps,
+            tokio::sync::watch::channel(caps).1,
             &tc2_path,
             &None,
         )

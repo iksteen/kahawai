@@ -81,7 +81,12 @@ pub async fn run(
     let mut id =
         kahawai_transport::enroll::ensure_identity(hub_addr, state_dir, "transcoder", name).await?;
 
-    let capabilities = probe_capabilities(max_sessions)?;
+    let capabilities = probe_capabilities(max_sessions, state_dir)?;
+    // HUB-36: the report is live state, not a constant — the background
+    // benchmark republishes it when measured speeds drift, and every
+    // reconnect picks up the freshest one.
+    let (caps_tx, caps_rx) = tokio::sync::watch::channel(capabilities);
+    spawn_benchmark(state_dir, max_sessions, caps_tx);
     let scratch = state_dir.join("sessions");
 
     loop {
@@ -100,7 +105,7 @@ pub async fn run(
             .unwrap_or(i64::MAX)
             .max(3600) as u64;
         tokio::select! {
-            r = link_once(hub_addr, tls.clone(), name, capabilities.clone(), &scratch, &worker_exe) => match r {
+            r = link_once(hub_addr, tls.clone(), name, caps_rx.clone(), &scratch, &worker_exe) => match r {
                 Ok(()) => tracing::warn!("hub closed the link; reconnecting"),
                 Err(e) => tracing::warn!(error = format!("{e:#}"), "link failed; reconnecting"),
             },
@@ -112,16 +117,36 @@ pub async fn run(
     }
 }
 
-/// TC-1 capability probe: what this machine can verifiably encode.
-fn probe_capabilities(max_sessions: u32) -> Result<CapabilityReport> {
+/// Where this box remembers what it measured about itself (HUB-36).
+fn bench_cache(state_dir: &Path) -> std::path::PathBuf {
+    state_dir.join("benchmarks.json")
+}
+
+/// TC-1 capability probe: what this machine can verifiably encode, and
+/// HUB-36: how fast, from the on-disk benchmark cache. A cache miss
+/// reports zeros — "unmeasured", which every consumer reads as "no
+/// data, assume sufficient" — and the background re-measure fills them
+/// in a minute later. Link-up is never delayed by benchmarking.
+fn probe_capabilities(max_sessions: u32, state_dir: &Path) -> Result<CapabilityReport> {
+    let bench = kahawai_media::bench::load(&bench_cache(state_dir)).unwrap_or_default();
     let encoders: Vec<EncoderCap> = kahawai_media::remux::encoder_capabilities()
         .into_iter()
         .map(|(codec, element, hardware)| {
-            tracing::info!(codec, element, hardware, "encoder verified");
+            let s = bench.encoders.get(element).copied().unwrap_or_default();
+            tracing::info!(
+                codec,
+                element,
+                hardware,
+                at_1080 = s.s1080,
+                at_2160 = s.s2160,
+                "encoder verified"
+            );
             EncoderCap {
                 codec: codec.into(),
                 element: element.into(),
                 hardware,
+                speed_1080: s.s1080,
+                speed_2160: s.s2160,
             }
         })
         .collect();
@@ -131,13 +156,76 @@ fn probe_capabilities(max_sessions: u32) -> Result<CapabilityReport> {
     let decode_caps = kahawai_media::remux::decoder_caps_names();
     tracing::info!(decoders = decode_caps.len(), "decoder inventory");
     let tonemap = kahawai_media::remux::tonemap_available();
-    tracing::info!(tonemap, "HDR tone-map segment (HUB-15a)");
+    let tm = bench.tonemap.unwrap_or_default();
+    tracing::info!(
+        tonemap,
+        at_1080 = tm.s1080,
+        at_2160 = tm.s2160,
+        "HDR tone-map segment (HUB-15a)"
+    );
     Ok(CapabilityReport {
         encoders,
         max_sessions,
         decode_caps,
         tonemap,
+        tonemap_speed_1080: tm.s1080,
+        tonemap_speed_2160: tm.s2160,
     })
+}
+
+/// HUB-36 cache-but-verify: measure in the background, store, and
+/// publish a refreshed report when reality has drifted from what the
+/// cache claimed. Runs once per process, after a settle delay so a
+/// session started right at boot is not fighting the benchmark for the
+/// encoder.
+/// ponytail: fixed settle instead of gating on Runner idleness —
+/// sessions in the first minute of a satellite's life are rare; gate
+/// on idleness if one ever gets starved.
+fn spawn_benchmark(
+    state_dir: &Path,
+    max_sessions: u32,
+    tx: tokio::sync::watch::Sender<CapabilityReport>,
+) {
+    const SETTLE: std::time::Duration = std::time::Duration::from_secs(60);
+    let (path, state_dir) = (bench_cache(state_dir), state_dir.to_path_buf());
+    tokio::spawn(async move {
+        tokio::time::sleep(SETTLE).await;
+        let cached = kahawai_media::bench::load(&path);
+        let measured = match tokio::task::spawn_blocking(move || {
+            let elements: Vec<&str> = [
+                kahawai_media::remux::h264_encoder(),
+                kahawai_media::remux::hevc_encoder(),
+                kahawai_media::remux::av1_encoder(),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+            kahawai_media::bench::measure(&elements, kahawai_media::remux::tonemap_available())
+        })
+        .await
+        {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(error = %e, "benchmark task failed");
+                return;
+            }
+        };
+        kahawai_media::bench::store(&path, &measured);
+        let news = cached
+            .as_ref()
+            .is_none_or(|c| kahawai_media::bench::drifted(c, &measured));
+        if !news {
+            tracing::debug!("benchmarks unchanged; cached report stands");
+            return;
+        }
+        match probe_capabilities(max_sessions, &state_dir) {
+            Ok(fresh) => {
+                tracing::info!("measured speeds changed; refreshing the capability report");
+                let _ = tx.send(fresh);
+            }
+            Err(e) => tracing::warn!(error = format!("{e:#}"), "re-probe after benchmark failed"),
+        }
+    });
 }
 
 /// One link session: Hello/HelloAck, capability registration, then
@@ -146,7 +234,7 @@ pub async fn link_once(
     hub_addr: &str,
     tls: std::sync::Arc<rustls::ClientConfig>,
     name: &str,
-    capabilities: CapabilityReport,
+    capabilities: tokio::sync::watch::Receiver<CapabilityReport>,
     scratch: &Path,
     worker_exe: &Option<std::path::PathBuf>,
 ) -> Result<()> {
@@ -189,14 +277,21 @@ pub async fn link_once(
         None => bail!("hub closed the link before HelloAck"),
     }
 
+    let mut capabilities = capabilities;
+    // Clone out of the watch BEFORE awaiting: the borrow guard is not
+    // Send, and holding it across the send would poison the future.
+    let current = {
+        capabilities.mark_unchanged();
+        capabilities.borrow().clone()
+    };
     tx.send(TcToHub {
-        msg: Some(tc_to_hub::Msg::Capabilities(capabilities)),
+        msg: Some(tc_to_hub::Msg::Capabilities(current)),
     })
     .await
     .context("link closed before capability report")?;
 
     let runner = sessions::Runner::new(scratch.to_path_buf(), worker_exe.clone(), tx.clone());
-    let result = link_loop(&tx, &mut inbound, &runner).await;
+    let result = link_loop(&tx, &mut inbound, &runner, &mut capabilities).await;
     runner.end_all().await;
     result
 }
@@ -205,10 +300,23 @@ async fn link_loop(
     tx: &tokio::sync::mpsc::Sender<TcToHub>,
     inbound: &mut tonic::Streaming<kahawai_proto::v1::HubToTc>,
     runner: &std::sync::Arc<sessions::Runner>,
+    capabilities: &mut tokio::sync::watch::Receiver<CapabilityReport>,
 ) -> Result<()> {
     let mut ticker = tokio::time::interval(HEARTBEAT_INTERVAL);
     loop {
         tokio::select! {
+            // HUB-36: the background benchmark measured something the
+            // cache did not know. The hub re-applies every report it
+            // receives, so re-sending IS the refresh.
+            Ok(()) = capabilities.changed() => {
+                let fresh = capabilities.borrow_and_update().clone();
+                if tx.send(TcToHub { msg: Some(tc_to_hub::Msg::Capabilities(fresh)) })
+                    .await
+                    .is_err()
+                {
+                    bail!("link sender closed");
+                }
+            }
             _ = ticker.tick() => {
                 if tx.send(TcToHub { msg: Some(tc_to_hub::Msg::Heartbeat(Heartbeat {})) })
                     .await

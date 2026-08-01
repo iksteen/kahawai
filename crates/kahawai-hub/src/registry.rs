@@ -89,6 +89,10 @@ pub struct Registry {
     /// Live capability reports from connected transcoders (TC-1); cleared
     /// on disconnect — a report is only valid while the link is up.
     transcoder_caps: Mutex<HashMap<String, serde_json::Value>>,
+    /// HUB-36: what the HUB's own box measured about itself. The hub is
+    /// an executor too (encode with no fleet stays local), so it needs
+    /// the same numbers to compete for placement.
+    local_bench: Mutex<Option<kahawai_media::bench::BenchResults>>,
     tc_links: Mutex<
         HashMap<
             String,
@@ -141,6 +145,7 @@ impl Registry {
             connected: Mutex::new(HashMap::new()),
             links: Mutex::new(HashMap::new()),
             transcoder_caps: Mutex::new(HashMap::new()),
+            local_bench: Mutex::new(None),
             tc_links: Mutex::new(HashMap::new()),
             tc_load: Mutex::new(HashMap::new()),
             disabled: Mutex::new(std::collections::HashSet::new()),
@@ -1491,11 +1496,15 @@ impl Registry {
             "encoders": caps.encoders.iter()
                 .map(|e| serde_json::json!({
                     "codec": e.codec, "element": e.element, "hardware": e.hardware,
+                    // HUB-36: 0 = unmeasured (legacy box or pre-benchmark).
+                    "speed_1080": e.speed_1080, "speed_2160": e.speed_2160,
                 }))
                 .collect::<Vec<_>>(),
             "max_sessions": caps.max_sessions,
             "decode_caps": caps.decode_caps,
             "tonemap": caps.tonemap,
+            "tonemap_speed_1080": caps.tonemap_speed_1080,
+            "tonemap_speed_2160": caps.tonemap_speed_2160,
         });
         self.transcoder_caps
             .lock()
@@ -1534,6 +1543,50 @@ impl Registry {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// HUB-36: publish what the hub's own box measured (background
+    /// benchmark at startup).
+    pub fn set_local_bench(&self, b: kahawai_media::bench::BenchResults) {
+        *self.local_bench.lock().unwrap() = Some(b);
+    }
+
+    /// The hub box's own measured speeds, if the benchmark has landed.
+    pub fn local_bench(&self) -> Option<kahawai_media::bench::BenchResults> {
+        self.local_bench.lock().unwrap().clone()
+    }
+
+    /// HUB-36: a transcoder's measured speed for one codec at a source
+    /// height, as a realtime multiple. None = unmeasured, which callers
+    /// read as "no data", never as slow.
+    pub fn transcoder_speed(&self, module_id: &str, codec: &str, height: u32) -> Option<f32> {
+        let caps = self.transcoder_caps.lock().unwrap();
+        let e = caps
+            .get(module_id)?
+            .get("encoders")?
+            .as_array()?
+            .iter()
+            .find(|e| e["codec"] == codec)?;
+        let key = if height > 1080 {
+            "speed_2160"
+        } else {
+            "speed_1080"
+        };
+        let v = e.get(key)?.as_f64()? as f32;
+        (v > 0.0).then_some(v)
+    }
+
+    /// Same for the GL tone-map segment (HUB-15a's boolean, measured).
+    pub fn transcoder_tonemap_speed(&self, module_id: &str, height: u32) -> Option<f32> {
+        let caps = self.transcoder_caps.lock().unwrap();
+        let c = caps.get(module_id)?;
+        let key = if height > 1080 {
+            "tonemap_speed_2160"
+        } else {
+            "tonemap_speed_1080"
+        };
+        let v = c.get(key)?.as_f64()? as f32;
+        (v > 0.0).then_some(v)
     }
 
     /// HUB-15a: does this transcoder report the GL tone-map segment?

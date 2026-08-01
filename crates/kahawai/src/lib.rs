@@ -154,7 +154,15 @@ pub fn doctor_checks(cfg: &config::Config) -> Vec<kahawai_media::doctor::Check> 
     // must too — otherwise it reports the ranks of a registry no session
     // actually uses (and flags a shadow the config already demoted).
     let _ = kahawai_media::demote_elements(&cfg.transcoder.demote_decoders);
-    let mut checks = kahawai_media::doctor::gstreamer_checks();
+    // HUB-36: whichever role this box plays, its benchmark cache lives
+    // beside that role's state; show measured speeds when they exist.
+    let bench_cache = [
+        cfg.hub.data_dir.join("benchmarks.json"),
+        cfg.transcoder.state_dir.join("benchmarks.json"),
+    ]
+    .into_iter()
+    .find(|p| p.exists());
+    let mut checks = kahawai_media::doctor::gstreamer_checks(bench_cache.as_deref());
 
     // Clock sanity: satellites on RTC-less boxes boot in the past (OPS-4).
     let year_2025 = 1735689600;
@@ -331,6 +339,46 @@ pub async fn run_all_in_one(cfg: config::Config, config_path: Option<PathBuf>) -
     run_hub_inner(cfg.hub, Some(cfg.mediahost), config_path).await
 }
 
+/// HUB-36: measure this box's encoders in the background and hand the
+/// results to the registry, so local execution competes for placement
+/// on the same measured footing as the fleet. Cached on disk, keyed by
+/// GStreamer version; a drifted measurement simply overwrites it.
+#[cfg(feature = "hub")]
+fn spawn_local_benchmark(cache: PathBuf, registry: Arc<kahawai_hub::registry::Registry>) {
+    const SETTLE: Duration = Duration::from_secs(60);
+    if let Some(cached) = kahawai_media::bench::load(&cache) {
+        registry.set_local_bench(cached);
+    }
+    tokio::spawn(async move {
+        tokio::time::sleep(SETTLE).await;
+        let measured = match tokio::task::spawn_blocking(|| {
+            let elements: Vec<&str> = [
+                kahawai_media::remux::h264_encoder(),
+                kahawai_media::remux::hevc_encoder(),
+                kahawai_media::remux::av1_encoder(),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+            kahawai_media::bench::measure(&elements, kahawai_media::remux::tonemap_available())
+        })
+        .await
+        {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(error = %e, "local benchmark task failed");
+                return;
+            }
+        };
+        kahawai_media::bench::store(&cache, &measured);
+        tracing::info!(
+            encoders = measured.encoders.len(),
+            "local encoder speeds measured (HUB-36)"
+        );
+        registry.set_local_bench(measured);
+    });
+}
+
 #[cfg(feature = "hub")]
 async fn run_hub_inner(
     cfg: config::HubConfig,
@@ -354,6 +402,10 @@ async fn run_hub_inner(
     ));
     let admitted = registry.load_allowlist().await?;
     tracing::info!(admitted, "mTLS allowlist loaded");
+    // HUB-36: the hub is an executor too (an encode with no fleet stays
+    // local), so it measures itself on the same cache-but-verify terms
+    // as a satellite — off the startup path, published when it lands.
+    spawn_local_benchmark(cfg.data_dir.join("benchmarks.json"), registry.clone());
     let auth = Arc::new(kahawai_hub::auth::Auth::new(db.clone(), &cfg.data_dir).await?);
     let sessions = Arc::new(
         kahawai_hub::sessions::Sessions::new(cfg.data_dir.join("sessions"))

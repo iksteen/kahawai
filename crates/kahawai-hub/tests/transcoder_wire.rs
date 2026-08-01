@@ -148,16 +148,22 @@ async fn transcoder_registers_capabilities_and_clears_on_disconnect() {
                     codec: "h264".into(),
                     element: "x264enc".into(),
                     hardware: false,
+                    speed_1080: 0.0,
+                    speed_2160: 0.0,
                 },
                 EncoderCap {
                     codec: "aac".into(),
                     element: "fdkaacenc".into(),
                     hardware: false,
+                    speed_1080: 0.0,
+                    speed_2160: 0.0,
                 },
             ],
             max_sessions: 2,
             decode_caps: vec!["video/x-av1".into(), "audio/x-flac".into()],
             tonemap: false,
+            tonemap_speed_1080: 0.0,
+            tonemap_speed_2160: 0.0,
         })),
     })
     .await

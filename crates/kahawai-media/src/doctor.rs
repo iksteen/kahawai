@@ -257,7 +257,10 @@ const MATRIX: &[(&str, &[&str], bool, &str, bool)] = &[
 
 /// GStreamer version + feature-matrix inventory. Reused by `doctor` and by
 /// module startup (warnings logged, essential failures fatal).
-pub fn gstreamer_checks() -> Vec<Check> {
+/// `bench_cache`: where this box keeps its HUB-36 measurements, so the
+/// encoder rows can state speed. The doctor never benchmarks itself —
+/// that is a ~40 s job owned by the hub/satellite background task.
+pub fn gstreamer_checks(bench_cache: Option<&std::path::Path>) -> Vec<Check> {
     let mut out = Vec::new();
     if let Err(e) = crate::init() {
         out.push(Check::fail("gstreamer", format!("{e:#}"), true));
@@ -335,8 +338,21 @@ pub fn gstreamer_checks() -> Vec<Check> {
     // driver) surfaces here, not mid-session.
     // HUB-15a: HDR→SDR is a GL shader segment, not a matrix row — all
     // five elements must be present together or the tier is absent.
+    let bench = bench_cache.and_then(crate::bench::load);
+    let speeds = |s: Option<crate::bench::Speeds>| match s {
+        Some(s) if s.s1080 > 0.0 || s.s2160 > 0.0 => {
+            format!(", {:.1}x @1080p / {:.1}x @2160p", s.s1080, s.s2160)
+        }
+        _ => ", speed not yet measured".to_string(),
+    };
     out.push(if crate::remux::tonemap_available() {
-        Check::ok("hdr tone-map", "GL shader segment (glshader + capssetter)")
+        Check::ok(
+            "hdr tone-map",
+            format!(
+                "GL shader segment (glshader + capssetter){}",
+                speeds(bench.as_ref().and_then(|b| b.tonemap))
+            ),
+        )
     } else {
         Check::warn(
             "hdr tone-map",
@@ -377,7 +393,17 @@ pub fn gstreamer_checks() -> Vec<Check> {
             && c.status == Status::Ok
         {
             match verified {
-                Some(name) => c.detail = format!("via {name} (dry-run verified)"),
+                Some(name) => {
+                    // Audio encoders run hundreds of times realtime
+                    // everywhere; only video speeds are measured.
+                    let s = bench.as_ref().and_then(|b| b.encoders.get(name).copied());
+                    let note = if s.is_some() {
+                        speeds(s)
+                    } else {
+                        String::new()
+                    };
+                    c.detail = format!("via {name} (dry-run verified){note}");
+                }
                 None => {
                     c.status = Status::Warn;
                     c.detail = format!("installed but dry-run failed — {disabled}");
@@ -429,7 +455,7 @@ mod tests {
 
     #[test]
     fn full_gst_install_passes_essentials() {
-        let checks = gstreamer_checks();
+        let checks = gstreamer_checks(None);
         assert!(checks.len() > 10);
         assert!(
             !has_essential_failure(&checks),
