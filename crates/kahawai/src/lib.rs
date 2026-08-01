@@ -107,8 +107,14 @@ pub fn run_benchmark(cfg: &config::Config, cache: PathBuf) -> Result<()> {
     .into_iter()
     .flatten()
     .collect();
-    let r = kahawai_media::bench::measure(&elements, kahawai_media::remux::tonemap_available());
-    kahawai_media::bench::store(&cache, &r);
+    // Writes after every element: this process may not survive the
+    // next one (svtav1enc segfaults on the J5005), and the results
+    // already gathered are worth keeping.
+    kahawai_media::bench::measure_into(
+        &elements,
+        kahawai_media::remux::tonemap_available(),
+        &cache,
+    );
     Ok(())
 }
 
@@ -389,10 +395,9 @@ fn spawn_local_benchmark(cache: PathBuf, registry: Arc<kahawai_hub::registry::Re
             .status();
         match tokio::time::timeout(BENCH_BUDGET, child).await {
             Ok(Ok(st)) if st.success() => {}
-            other => {
-                tracing::warn!(?other, "local benchmark child did not finish cleanly");
-                return;
-            }
+            // A crash still leaves what it measured before dying; the
+            // child persists after every element for exactly this.
+            other => tracing::warn!(?other, "local benchmark child did not finish cleanly"),
         }
         match kahawai_media::bench::load(&cache) {
             Some(measured) => {

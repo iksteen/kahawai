@@ -241,9 +241,76 @@ fn moved(a: Option<f32>, b: Option<f32>) -> bool {
 }
 
 /// Measure every given encoder element (and the tone-map segment when
-/// asked) at both resolutions. Blocking and slow by nature — ~40 s
-/// worst case for three encoders plus tone-map — so callers run it on
-/// a blocking thread, off the startup path.
+/// asked) at both resolutions, writing `cache` after EACH element.
+///
+/// Incremental because the measurement can take the process with it:
+/// svtav1enc segfaults on the J5005 at 1080p (exit 139), where its
+/// 320x240 startup dry-run passes happily. A crash used to lose every
+/// result gathered before it; now the two encoders measured first
+/// survive, and only the one that died is missing.
+pub fn measure_into(elements: &[&str], tonemap: bool, cache: &Path) -> BenchResults {
+    let mut out = BenchResults {
+        gst: gst_version(),
+        ..Default::default()
+    };
+    if crate::init().is_err() {
+        return out;
+    }
+    let tmp = std::env::temp_dir().join("kahawai-bench");
+    let _ = std::fs::create_dir_all(&tmp);
+    for el in elements {
+        out.encoders
+            .insert((*el).to_string(), measure_one(el, &tmp));
+        // Persist before touching the next element: it may not return.
+        store(cache, &out);
+    }
+    if tonemap {
+        let s = Speeds {
+            s1080: measure_tonemap(1920, 1080),
+            s2160: measure_tonemap(3840, 2160),
+        };
+        tracing::info!(at_1080 = ?s.s1080, at_2160 = ?s.s2160, "tone-map speed measured");
+        out.tonemap = Some(s);
+        store(cache, &out);
+    }
+    out
+}
+
+/// One element at both resolutions.
+fn measure_one(el: &str, tmp: &Path) -> Speeds {
+    let s1080 = measure_encoder(el, 1080, tmp);
+    // Do not run a 2160p measurement whose answer is already bounded.
+    // A box below realtime at 1080p is ~4x worse at 4K (four times the
+    // pixels), which no threshold can rescue — and running it anyway is
+    // expensive in the worst way: silence sat for MINUTES inside a
+    // software-AV1 4K encode, because the wall cap bounds the
+    // measurement window but not GStreamer's teardown of a mid-frame
+    // encoder. Derived, and logged as such.
+    let s2160 = match s1080 {
+        Some(v) if v < SKIP_2160_BELOW => {
+            let derived = v / 4.0;
+            tracing::info!(
+                element = el,
+                at_1080 = v,
+                derived_2160 = derived,
+                "2160p derived from 1080p — already below realtime, and the \
+                 measurement itself costs minutes on a box this slow"
+            );
+            Some(derived)
+        }
+        _ => measure_encoder(el, 2160, tmp),
+    };
+    let s = Speeds { s1080, s2160 };
+    tracing::info!(
+        element = el,
+        at_1080 = ?s.s1080,
+        at_2160 = ?s.s2160,
+        "encoder speed measured"
+    );
+    s
+}
+
+/// In-memory variant, for callers with nowhere to persist (tests).
 pub fn measure(elements: &[&str], tonemap: bool) -> BenchResults {
     let mut out = BenchResults {
         gst: gst_version(),
@@ -252,51 +319,18 @@ pub fn measure(elements: &[&str], tonemap: bool) -> BenchResults {
     if crate::init().is_err() {
         return out;
     }
-    // Reference clips are unpacked once per run.
     let tmp = std::env::temp_dir().join("kahawai-bench");
     let _ = std::fs::create_dir_all(&tmp);
     for el in elements {
-        let s1080 = measure_encoder(el, 1080, &tmp);
-        // Do not run a 2160p measurement whose answer is already
-        // bounded. A box below realtime at 1080p is ~4x worse at 4K
-        // (four times the pixels), which no threshold can rescue — and
-        // running it anyway is expensive in the worst way: silence sat
-        // for MINUTES inside a software-AV1 4K encode, because the wall
-        // cap bounds the measurement window but not GStreamer's
-        // teardown of a mid-frame encoder. Derived, and logged as such.
-        let s2160 = match s1080 {
-            Some(v) if v < SKIP_2160_BELOW => {
-                let derived = v / 4.0;
-                tracing::info!(
-                    element = el,
-                    at_1080 = v,
-                    derived_2160 = derived,
-                    "2160p derived from 1080p — already below realtime, and the \
-                     measurement itself costs minutes on a box this slow"
-                );
-                Some(derived)
-            }
-            _ => measure_encoder(el, 2160, &tmp),
-        };
-        let s = Speeds { s1080, s2160 };
-        tracing::info!(
-            element = el,
-            at_1080 = s.s1080,
-            at_2160 = s.s2160,
-            "encoder speed measured"
-        );
-        out.encoders.insert((*el).to_string(), s);
+        out.encoders
+            .insert((*el).to_string(), measure_one(el, &tmp));
     }
     if tonemap {
         let s = Speeds {
             s1080: measure_tonemap(1920, 1080),
             s2160: measure_tonemap(3840, 2160),
         };
-        tracing::info!(
-            at_1080 = s.s1080,
-            at_2160 = s.s2160,
-            "tone-map speed measured"
-        );
+        tracing::info!(at_1080 = ?s.s1080, at_2160 = ?s.s2160, "tone-map speed measured");
         out.tonemap = Some(s);
     }
     out

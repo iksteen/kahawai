@@ -211,8 +211,14 @@ fn spawn_benchmark(
         match tokio::time::timeout(BENCH_BUDGET, child).await {
             Ok(Ok(st)) if st.success() => {}
             Ok(Ok(st)) => {
-                tracing::warn!(status = ?st, "benchmark child exited badly; keeping cached speeds");
-                return;
+                // A crash mid-run still leaves everything measured
+                // before it (the child writes after each element), and
+                // partial truth beats none: silence's vah264enc and
+                // vah265enc numbers survive svtav1enc segfaulting.
+                tracing::warn!(
+                    status = ?st,
+                    "benchmark child died; using whatever it managed to write"
+                );
             }
             Ok(Err(e)) => {
                 tracing::warn!(error = %e, "benchmark child failed to run");
