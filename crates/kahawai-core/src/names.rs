@@ -260,6 +260,7 @@ pub fn parse_episode(path_rel: &str) -> Option<EpisodeGuess> {
         .map(|c| if matches!(c, '.' | '_') { ' ' } else { c })
         .collect();
     let cleaned = split_glued_marker(&cleaned);
+    let cleaned = join_split_marker(&cleaned);
     let tokens: Vec<&str> = cleaned.split_whitespace().collect();
     let (idx, season, episode, episode_end) = tokens.iter().enumerate().find_map(|(i, t)| {
         parse_sxxeyy(t)
@@ -603,6 +604,55 @@ fn split_glued_marker(s: &str) -> String {
     out
 }
 
+/// The mirror of `split_glued_marker`: a season and episode written as
+/// two SEPARATE tokens ("Madam Secretary - S05 E05 - Ghosts"), which
+/// `parse_sxxeyy` cannot see because it needs both halves in one token.
+/// Join them back into "S05E05" and the ordinary parse takes over —
+/// including its multi-episode handling, since "S05 E05-E06" joins to a
+/// form it already understands.
+///
+/// Both halves must match EXACTLY, with no surrounding punctuation to
+/// trim: the pattern is narrow on purpose, because "S" plus digits
+/// followed by "E" plus digits is a shape a title could otherwise
+/// stumble into. 144 files in one library, all of Madam Secretary and
+/// Humans, scanned but never resolved to an episode because of this.
+fn join_split_marker(s: &str) -> String {
+    let toks: Vec<&str> = s.split_whitespace().collect();
+    let mut out: Vec<String> = Vec::with_capacity(toks.len());
+    let mut i = 0;
+    while i < toks.len() {
+        if i + 1 < toks.len() && is_season_token(toks[i]) && is_episode_token(toks[i + 1]) {
+            out.push(format!("{}{}", toks[i], toks[i + 1]));
+            i += 2;
+        } else {
+            out.push(toks[i].to_string());
+            i += 1;
+        }
+    }
+    out.join(" ")
+}
+
+/// `S5` / `S05` and nothing else.
+fn is_season_token(t: &str) -> bool {
+    matches!(t.strip_prefix(['s', 'S']),
+        Some(d) if (1..=2).contains(&d.len()) && d.chars().all(|c| c.is_ascii_digit()))
+}
+
+/// `E05`, and the range forms `E05-E06` / `E05-06` that `parse_sxxeyy`
+/// accepts once glued to a season.
+fn is_episode_token(t: &str) -> bool {
+    let Some(rest) = t.strip_prefix(['e', 'E']) else {
+        return false;
+    };
+    let digits = |d: &str| (1..=3).contains(&d.len()) && d.chars().all(|c| c.is_ascii_digit());
+    match rest.split_once('-') {
+        Some((first, tail)) => {
+            digits(first) && digits(tail.strip_prefix(['e', 'E']).unwrap_or(tail))
+        }
+        None => digits(rest),
+    }
+}
+
 fn parse_sxxeyy(tok: &str) -> Option<(u32, u32, Option<u32>)> {
     let t = tok.trim_matches(|c: char| !c.is_ascii_alphanumeric());
     let rest = t.strip_prefix(['s', 'S'])?;
@@ -737,14 +787,7 @@ mod tests {
             // Show name glued straight to the marker by a bare hyphen,
             // no surrounding space (the on-disk shape that shipped with
             // zero series ever resolving into items).
-            (
-                "1883/Season01/1883-S01E01.mkv",
-                "1883",
-                None,
-                1,
-                1,
-                None,
-            ),
+            ("1883/Season01/1883-S01E01.mkv", "1883", None, 1, 1, None),
             (
                 "30.Rock/Season01/30.Rock-S01E02.mkv",
                 "30 Rock",
@@ -752,6 +795,27 @@ mod tests {
                 1,
                 2,
                 None,
+            ),
+            // Season and episode as separate tokens — the whole of
+            // Madam Secretary and Humans on this library, scanned but
+            // never resolved. Exact on-disk shapes.
+            (
+                "Madam Secretary/Madam Secretary - S05 E05 - Ghosts (720p - AMZN Web-DL).mp4",
+                "Madam Secretary",
+                None,
+                5,
+                5,
+                Some("Ghosts (720p - AMZN Web-DL)"),
+            ),
+            (
+                "Humans/HUMANS - S03 E01 - Episode 01 (1080p - BluRay).mp4",
+                // Identity comes from the DIRECTORY, not the shoutier
+                // filename — the parser already prefers it, and should.
+                "Humans",
+                None,
+                3,
+                1,
+                Some("Episode 01 (1080p - BluRay)"),
             ),
         ];
         for (path, show, year, s, e, ep_title) in cases {
