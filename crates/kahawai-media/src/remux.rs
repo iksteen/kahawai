@@ -1363,6 +1363,48 @@ const TGT_E: f64 = 0.580688881;
 /// measured ~0.7 signal on real scene highlights where libplacebo
 /// reaches ~0.98 (the owner's "grey smear"): typical frames peak at
 /// 200–800 nits, far below mastering ceilings.
+/// Sample every 16th row and column of a luma plane into `out` as
+/// 10-bit codes (~32k samples at 4K: enough for p99.9, cheap enough
+/// for every frame).
+///
+/// Pure and bounds-checked on purpose. It runs inside a pad probe
+/// called from C, where a panic cannot unwind and ABORTS the worker,
+/// and it is fed whatever buffer layout a decoder chose: `stride` is
+/// the FRAME's, which for a padded buffer exceeds the one the caps
+/// imply, and the final row may be short where the allocator packed
+/// tightly. Neither may index past the plane.
+pub(crate) fn sample_luma(
+    data: &[u8],
+    stride: usize,
+    w: usize,
+    h: usize,
+    ten_bit: bool,
+    out: &mut Vec<u16>,
+) {
+    let bpp = if ten_bit { 2 } else { 1 };
+    if stride < w * bpp {
+        return; // nonsense geometry: sample nothing rather than guess
+    }
+    let mut y = 0;
+    while y < h {
+        let Some(row) = data.get(y * stride..(y * stride + w * bpp).min(data.len())) else {
+            break;
+        };
+        let mut x = 0;
+        while x * bpp + bpp <= row.len() && x < w {
+            out.push(if ten_bit {
+                let lo = row[x * 2] as u16;
+                let hi = row[x * 2 + 1] as u16;
+                ((hi << 8) | lo) >> 6 // P010: 10 bits in the high bits
+            } else {
+                (row[x] as u16) << 2
+            });
+            x += 16;
+        }
+        y += 16;
+    }
+}
+
 fn attach_peak_probe(upload: &gst::Element, shader: &gst::Element) {
     let pad = upload.static_pad("sink").unwrap();
     let shader = shader.clone();
@@ -1402,37 +1444,10 @@ fn attach_peak_probe(upload: &gst::Element, shader: &gst::Element) {
         // vanished when the client forced HDR (no tone-map, no probe).
         let stride = frame.plane_stride()[0].max(0) as usize;
         let (w, h) = (frame.width() as usize, frame.height() as usize);
-        let bpp = if ten_bit { 2 } else { 1 };
-        if stride < w * bpp {
-            return gst::PadProbeReturn::Ok; // nonsense geometry; skip
-        }
         let mut st = state.lock().unwrap();
         let (_, _, ref mut samples) = *st;
         samples.clear();
-        // Every 16th row/col: ~32k samples at 4K — enough for p99.9,
-        // cheap enough for every frame.
-        let mut y = 0;
-        while y < h {
-            // Bounds-checked: a short final row (tight packing) or any
-            // residual stride disagreement ends the walk instead of
-            // taking the process down.
-            let Some(row) = data.get(y * stride..(y * stride + w * bpp).min(data.len())) else {
-                break;
-            };
-            let mut x = 0;
-            while x * bpp + bpp <= row.len() && x < w {
-                let code = if ten_bit {
-                    let lo = row[x * 2] as u16;
-                    let hi = row[x * 2 + 1] as u16;
-                    ((hi << 8) | lo) >> 6 // P010: 10 bits in the high bits
-                } else {
-                    (row[x] as u16) << 2
-                };
-                samples.push(code);
-                x += 16;
-            }
-            y += 16;
-        }
+        sample_luma(data, stride, w, h, ten_bit, samples);
         if samples.is_empty() {
             return gst::PadProbeReturn::Ok;
         }
@@ -3903,6 +3918,55 @@ mod tests {
             seg_info.audio[0].channels, 1,
             "downmix to mono did not happen"
         );
+    }
+
+    /// The tone-map peak probe must survive every buffer layout a
+    /// decoder can hand it. It runs in a pad probe called from C, so a
+    /// panic there aborts the WORKER — reported from the field as a
+    /// SIGABRT at session start on an HDR title, which disappeared when
+    /// the client forced HDR (no tone-map, no probe). The original code
+    /// took `stride` from the CAPS while reading the mapped FRAME, so a
+    /// padded buffer walked off the plane.
+    #[test]
+    fn peak_probe_survives_any_plane_layout() {
+        let (w, h) = (1920usize, 1038); // the reported geometry
+        let mut out = Vec::new();
+
+        // Tightly packed 10-bit: stride == w*2, data exactly h rows.
+        let tight = vec![0x80u8; w * 2 * h];
+        sample_luma(&tight, w * 2, w, h, true, &mut out);
+        assert!(!out.is_empty(), "a well-formed plane must sample");
+
+        // PADDED: the decoder's real stride exceeds w*2 (libav pads to
+        // its own alignment). Reading it with the caps stride is the
+        // bug; reading it with the frame's must simply work.
+        let padded_stride = w * 2 + 128;
+        let padded = vec![0x80u8; padded_stride * h];
+        out.clear();
+        sample_luma(&padded, padded_stride, w, h, true, &mut out);
+        assert!(!out.is_empty(), "padded plane must sample");
+
+        // The crash shape: a plane sized for a TIGHT layout, read with
+        // a PADDED stride. Every byte beyond the end must be declined,
+        // not indexed.
+        out.clear();
+        sample_luma(&tight, padded_stride, w, h, true, &mut out);
+
+        // And the reverse, plus degenerate geometry — none may panic.
+        out.clear();
+        sample_luma(&padded, w * 2, w, h, true, &mut out);
+        out.clear();
+        sample_luma(&[], w * 2, w, h, true, &mut out);
+        assert!(out.is_empty());
+        sample_luma(&tight, 0, w, h, true, &mut out); // stride < w*bpp
+        assert!(out.is_empty(), "nonsense geometry samples nothing");
+        sample_luma(&tight, w * 2, 0, 0, true, &mut out);
+        assert!(out.is_empty());
+        // 8-bit path, short final row (tight packing after the last row).
+        let short = vec![0x40u8; w * (h - 1) + 3];
+        out.clear();
+        sample_luma(&short, w, w, h, false, &mut out);
+        assert!(!out.is_empty());
     }
 
     /// HUB-36: the sample-validity rule. Short samples are preroll
