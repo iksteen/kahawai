@@ -44,6 +44,25 @@ pub struct ModuleHealth {
     pub kind: String,
     pub connected: bool,
     pub disabled: bool,
+    /// Git stamp the satellite reported at its handshake — the only
+    /// reliable way to see a fleet running mixed versions (a stale
+    /// binary is otherwise invisible: it just reports fewer facts).
+    pub build: String,
+    /// HUB-36: measured encode speeds this box reported, as
+    /// (codec, element, hardware, realtime multiple at 1080p, at 2160p).
+    /// Empty for mediahosts and for satellites too old to measure.
+    pub encoders: Vec<EncoderSpeed>,
+    /// The GL tone-map segment, measured the same way (0 = unmeasured).
+    pub tonemap_1080: f64,
+    pub tonemap_2160: f64,
+}
+
+pub struct EncoderSpeed {
+    pub codec: String,
+    pub element: String,
+    pub hardware: bool,
+    pub s1080: f64,
+    pub s2160: f64,
 }
 
 /// One scrape. Cheap by construction; see the module note.
@@ -57,12 +76,32 @@ pub async fn gather(
         .satellites_overview()
         .await?
         .into_iter()
-        .map(|v| ModuleHealth {
-            module_id: v["module_id"].as_str().unwrap_or_default().to_string(),
-            name: v["name"].as_str().unwrap_or_default().to_string(),
-            kind: v["module_type"].as_str().unwrap_or_default().to_string(),
-            connected: v["connected"].as_bool().unwrap_or(false),
-            disabled: v["disabled"].as_bool().unwrap_or(false),
+        .map(|v| {
+            let caps = &v["capabilities"];
+            ModuleHealth {
+                module_id: v["module_id"].as_str().unwrap_or_default().to_string(),
+                name: v["name"].as_str().unwrap_or_default().to_string(),
+                kind: v["module_type"].as_str().unwrap_or_default().to_string(),
+                connected: v["connected"].as_bool().unwrap_or(false),
+                disabled: v["disabled"].as_bool().unwrap_or(false),
+                build: v["build"].as_str().unwrap_or_default().to_string(),
+                encoders: caps["encoders"]
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .map(|e| EncoderSpeed {
+                                codec: e["codec"].as_str().unwrap_or_default().to_string(),
+                                element: e["element"].as_str().unwrap_or_default().to_string(),
+                                hardware: e["hardware"].as_bool().unwrap_or(false),
+                                s1080: e["speed_1080"].as_f64().unwrap_or(0.0),
+                                s2160: e["speed_2160"].as_f64().unwrap_or(0.0),
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                tonemap_1080: caps["tonemap_speed_1080"].as_f64().unwrap_or(0.0),
+                tonemap_2160: caps["tonemap_speed_2160"].as_f64().unwrap_or(0.0),
+            }
         })
         .collect();
 
@@ -151,6 +190,74 @@ pub fn render(s: &Snapshot) -> String {
         lines,
     );
 
+    // Fleet versions: a satellite three commits behind reports fewer
+    // facts rather than failing, so the stamp is the only tell.
+    let mut lines = String::new();
+    for m in &s.modules {
+        let _ = writeln!(
+            lines,
+            "kahawai_module_build_info{{module=\"{}\",name=\"{}\",kind=\"{}\",build=\"{}\"}} 1",
+            m.module_id,
+            escape(&m.name),
+            m.kind,
+            escape(&m.build)
+        );
+    }
+    g(
+        &mut out,
+        "kahawai_module_build_info",
+        "Satellite build stamp, as a label on a constant 1.",
+        lines,
+    );
+
+    // HUB-36: measured encode speed per box, as realtime multiples
+    // against a 24 fps reference. 0 means UNMEASURED (a satellite older
+    // than the benchmark, or one whose background pass has not landed)
+    // — not "infinitely slow"; placement reads it the same way.
+    let mut lines = String::new();
+    for m in &s.modules {
+        for e in &m.encoders {
+            for (res, v) in [("1080", e.s1080), ("2160", e.s2160)] {
+                let _ = writeln!(
+                    lines,
+                    "kahawai_encoder_speed_realtime{{module=\"{}\",name=\"{}\",codec=\"{}\",element=\"{}\",hardware=\"{}\",height=\"{res}\"}} {v}",
+                    m.module_id,
+                    escape(&m.name),
+                    e.codec,
+                    e.element,
+                    e.hardware
+                );
+            }
+        }
+    }
+    g(
+        &mut out,
+        "kahawai_encoder_speed_realtime",
+        "Measured encode speed as a realtime multiple (0 = unmeasured).",
+        lines,
+    );
+
+    let mut lines = String::new();
+    for m in &s.modules {
+        if m.tonemap_1080 == 0.0 && m.tonemap_2160 == 0.0 {
+            continue;
+        }
+        for (res, v) in [("1080", m.tonemap_1080), ("2160", m.tonemap_2160)] {
+            let _ = writeln!(
+                lines,
+                "kahawai_tonemap_speed_realtime{{module=\"{}\",name=\"{}\",height=\"{res}\"}} {v}",
+                m.module_id,
+                escape(&m.name)
+            );
+        }
+    }
+    g(
+        &mut out,
+        "kahawai_tonemap_speed_realtime",
+        "Measured HDR tone-map speed as a realtime multiple (HUB-15a/36).",
+        lines,
+    );
+
     for (name, help, value) in [
         (
             "kahawai_sessions_active",
@@ -217,6 +324,22 @@ pub fn health(s: &Snapshot) -> serde_json::Value {
             // A disabled module is not unhealthy — somebody meant it.
             "status": if m.disabled { "disabled" }
                       else if m.connected { "ok" } else { "offline" },
+            "build": m.build,
+            // HUB-36: what this box can encode and how fast it measured
+            // itself. Omitted entirely for modules that report none, so
+            // a mediahost's entry stays as small as it was.
+            "encoders": if m.encoders.is_empty() { serde_json::Value::Null } else {
+                m.encoders.iter().map(|e| json!({
+                    "codec": e.codec,
+                    "element": e.element,
+                    "hardware": e.hardware,
+                    // 0 = unmeasured, never "slow".
+                    "realtime_1080": e.s1080,
+                    "realtime_2160": e.s2160,
+                })).collect::<Vec<_>>().into()
+            },
+            "tonemap_realtime_1080": m.tonemap_1080,
+            "tonemap_realtime_2160": m.tonemap_2160,
         })).collect::<Vec<_>>(),
     })
 }
