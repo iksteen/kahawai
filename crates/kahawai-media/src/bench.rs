@@ -114,12 +114,22 @@ pub struct BenchResults {
     pub tonemap: Option<Speeds>,
 }
 
+/// The floor a completed-but-barely-productive run reports. A box that
+/// ran the full window and produced fewer than two frames has no
+/// interval to time, but it is NOT unmeasured — it is catastrophically
+/// slow, and 0.0 would read as "no data, assume sufficient" and send
+/// it 4K work. Measured live: silence encodes 2160p AV1 in software at
+/// under one frame per five seconds. This is an upper bound on that.
+const SPEED_FLOOR: f32 = 1.0 / (5.0 * REFERENCE_FPS);
+
 /// Speed of `frames` buffers over `wall`, as a realtime multiple.
-/// Fewer than two buffers is no measurement at all (the first one
-/// starts the clock).
-pub fn speed(frames: u64, wall: Duration) -> f32 {
+/// Fewer than two buffers gives no interval to measure; `ran` says
+/// whether the pipeline nonetheless completed its window, which is the
+/// difference between "too slow to time" (a real, tiny speed) and
+/// "never ran" (unmeasured, 0.0).
+pub fn speed(frames: u64, wall: Duration, ran: bool) -> f32 {
     if frames < 2 || wall.is_zero() {
-        return 0.0;
+        return if ran && frames >= 1 { SPEED_FLOOR } else { 0.0 };
     }
     ((frames - 1) as f32 / wall.as_secs_f32()) / REFERENCE_FPS
 }
@@ -231,16 +241,53 @@ pub fn measure(elements: &[&str], tonemap: bool) -> BenchResults {
     out
 }
 
-/// `videotestsrc pattern=snow ! caps ! videoconvert ! ENC ! fakesink`,
-/// counting encoded buffers.
+/// A raw format this encoder takes directly, preferring NV12 (what
+/// every hardware encoder here wants). Feeding the encoder's own
+/// format keeps a colour conversion out of the measurement — the
+/// benchmark is supposed to time the ENCODER, not our pixel plumbing,
+/// and different boxes prefer different formats.
+fn native_format(element: &str) -> Option<String> {
+    let f = gst::ElementFactory::find(element)?;
+    let mut formats = Vec::new();
+    for t in f.static_pad_templates() {
+        if t.direction() != gst::PadDirection::Sink {
+            continue;
+        }
+        for st in t.caps().iter() {
+            if st.name() != "video/x-raw" {
+                continue;
+            }
+            match st.get::<gst::List>("format") {
+                Ok(list) => formats.extend(list.iter().filter_map(|v| v.get::<String>().ok())),
+                Err(_) => {
+                    if let Ok(one) = st.get::<String>("format") {
+                        formats.push(one);
+                    }
+                }
+            }
+        }
+    }
+    if formats.iter().any(|f| f == "NV12") {
+        return Some("NV12".into());
+    }
+    formats.into_iter().next()
+}
+
+/// `appsrc(native fmt) ! ENC ! fakesink`, counting encoded buffers.
 fn measure_encoder(element: &str, w: i32, h: i32) -> f32 {
     let Ok(enc) = gst::ElementFactory::make(element).build() else {
         return 0.0;
     };
-    let Some(convert) = make("videoconvert") else {
-        return 0.0;
-    };
-    run_counting(&[convert, enc], w, h, false)
+    // Fall back to a converter only when the template says nothing
+    // useful — an unnecessary conversion would be charged to the
+    // encoder, which is exactly the mis-measurement to avoid.
+    match native_format(element) {
+        Some(fmt) => run_counting(&[enc], w, h, &fmt),
+        None => match make("videoconvert") {
+            Some(c) => run_counting(&[c, enc], w, h, "I420"),
+            None => 0.0,
+        },
+    }
 }
 
 /// The real tone-map segment, fed 10-bit: the GL upload/download round
@@ -255,7 +302,9 @@ fn measure_tonemap(w: i32, h: i32) -> f32 {
     };
     let mut chain = vec![convert];
     chain.extend(crate::remux::tonemap_segment());
-    run_counting(&chain, w, h, true)
+    // The GL segment genuinely wants 10-bit in: that upload/download
+    // round trip IS the cost being measured (HUB-15a).
+    run_counting(&chain, w, h, "I420_10LE")
 }
 
 fn make(name: &str) -> Option<gst::Element> {
@@ -281,11 +330,12 @@ fn noise_frame(bytes: usize, seed: u64) -> Vec<u8> {
 /// Push pre-generated noise through `chain` as fast as it is accepted
 /// and time the output. The source is a memcpy from the pool, so the
 /// clock measures `chain`, not frame generation.
-fn run_counting(chain: &[gst::Element], w: i32, h: i32, ten_bit: bool) -> f32 {
+fn run_counting(chain: &[gst::Element], w: i32, h: i32, format: &str) -> f32 {
     let pipe = gst::Pipeline::new();
-    let format = if ten_bit { "I420_10LE" } else { "I420" };
-    // I420 is 1.5 bytes/pixel; the 10-bit variant doubles it.
-    let frame_bytes = (w as usize * h as usize * 3 / 2) * if ten_bit { 2 } else { 1 };
+    // Every format here is 4:2:0 (1.5 bytes/pixel); 10-bit doubles it.
+    // A wrong size only means a differently-shaped noise frame, which
+    // the encoder is equally happy to compress.
+    let frame_bytes = (w as usize * h as usize * 3 / 2) * if format.contains("10") { 2 } else { 1 };
     let pool: Vec<gst::Buffer> = (0..POOL)
         .map(|i| {
             gst::Buffer::from_mut_slice(noise_frame(frame_bytes, 0x9E37_79B9_7F4A_7C15 ^ i as u64))
@@ -298,10 +348,18 @@ fn run_counting(chain: &[gst::Element], w: i32, h: i32, ten_bit: bool) -> f32 {
         .field("height", h)
         .field("framerate", gst::Fraction::new(REFERENCE_FPS as i32, 1))
         .build();
+    // Keep the encoder FED. appsrc defaults to a 200 KB internal queue
+    // — smaller than one 4K frame (12.4 MB) — which lock-steps the feed
+    // to one frame in flight and measures the harness instead of the
+    // encoder. Hardware encoders pipeline deeply (VideoToolbox most of
+    // all), so give them a pool's worth of runway and let block=true
+    // pace the loop once it is full.
     let src = gstreamer_app::AppSrc::builder()
         .caps(&caps)
         .format(gst::Format::Time)
         .is_live(false)
+        .block(true)
+        .max_bytes((frame_bytes * POOL) as u64)
         .build();
     // sync=false: measure how fast it CAN run, not the clock.
     let Ok(sink) = gst::ElementFactory::make("fakesink")
@@ -389,8 +447,11 @@ fn run_counting(chain: &[gst::Element], w: i32, h: i32, ten_bit: bool) -> f32 {
     let n = frames.load(Ordering::Relaxed);
     let _ = pipe.set_state(gst::State::Null);
     // n counts buffers AFTER the first, and `speed` subtracts one more
-    // for the interval count — hand it the total.
-    speed(n + 1, elapsed)
+    // for the interval count — hand it the total. `ran` is true when
+    // the encoder produced anything at all: that distinguishes "so slow
+    // it managed one frame in the whole window" from "never started".
+    let produced_any = started.lock().unwrap().is_some();
+    speed(n + 1, elapsed, produced_any)
 }
 
 #[cfg(test)]
@@ -401,13 +462,21 @@ mod tests {
     fn speed_math_and_degenerate_inputs() {
         // 24 fps produced in one second of wall time = 1.0× realtime.
         // 25 buffers = 24 intervals.
-        assert!((speed(25, Duration::from_secs(1)) - 1.0).abs() < 0.001);
-        assert!((speed(25, Duration::from_secs(4)) - 0.25).abs() < 0.001);
-        assert!((speed(241, Duration::from_secs(1)) - 10.0).abs() < 0.001);
-        // Nothing measurable.
-        assert_eq!(speed(1, Duration::from_secs(1)), 0.0);
-        assert_eq!(speed(0, Duration::from_secs(1)), 0.0);
-        assert_eq!(speed(100, Duration::ZERO), 0.0);
+        assert!((speed(25, Duration::from_secs(1), true) - 1.0).abs() < 0.001);
+        assert!((speed(25, Duration::from_secs(4), true) - 0.25).abs() < 0.001);
+        assert!((speed(241, Duration::from_secs(1), true) - 10.0).abs() < 0.001);
+
+        // Ran but produced one lonely frame: catastrophically slow, NOT
+        // unmeasured. Reporting 0.0 here would read downstream as "no
+        // data, assume sufficient" and send 4K AV1 to a J5005 — the
+        // exact box that cannot do it (measured live).
+        assert_eq!(speed(1, Duration::from_secs(5), true), SPEED_FLOOR);
+        const { assert!(SPEED_FLOOR > 0.0 && SPEED_FLOOR < 0.01) };
+
+        // Never produced anything: genuinely unmeasured.
+        assert_eq!(speed(0, Duration::from_secs(1), true), 0.0);
+        assert_eq!(speed(1, Duration::from_secs(1), false), 0.0);
+        assert_eq!(speed(100, Duration::ZERO, false), 0.0);
     }
 
     #[test]
