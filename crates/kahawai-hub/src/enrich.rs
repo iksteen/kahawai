@@ -228,7 +228,10 @@ pub fn pick_candidate<'c>(
 /// out to their own pass). Extracted so `scale_bench` can time the real
 /// statement: this runs at the top of every enrichment pass, so its
 /// quiescent cost at catalogue scale is a standing tax. Binds ?1 =
-/// [`crate::providers::QUERY_REV`].
+/// [`crate::providers::QUERY_REV`], ?2 = whether a TVDB key is
+/// configured — an unconfigured searcher never asks and never records
+/// its question, so counting it as owing work would re-select every
+/// matched item on every run, forever.
 pub const GENERIC_SELECTION_SQL: &str =
             "SELECT i.id, i.kind, i.title, i.norm_title, i.year,
                     (SELECT s.path_rel FROM item_sources s
@@ -249,9 +252,12 @@ pub const GENERIC_SELECTION_SQL: &str =
                     -- real answer stands. Never-matched, renamed and
                     -- QUERY_REV-bumped items all land here; misses never
                     -- gate. tmdb/tvdb are the generic pass's network
-                    -- searchers (mirrors the ProviderSet the pass builds).
+                    -- searchers, and the list must mirror the ProviderSet
+                    -- the pass actually builds: tvdb counts only when its
+                    -- key is configured (?2).
                     EXISTS (
-                      SELECT 1 FROM (SELECT 'tmdb' AS p UNION ALL SELECT 'tvdb') sp
+                      SELECT 1 FROM (SELECT 'tmdb' AS p
+                                     UNION ALL SELECT 'tvdb' WHERE ?2) sp
                       WHERE NOT EXISTS (
                           SELECT 1 FROM provider_metadata pm
                           WHERE pm.item_id = i.id AND pm.provider = sp.p
@@ -783,7 +789,12 @@ impl Enricher {
         };
         // TVDB is the backup resolver: only consulted when the TMDB
         // ladder comes up empty, same strict verifier.
-        let tvdb_token = match registry.get_setting(TVDB_KEY_SETTING).await? {
+        let tvdb_key = registry.get_setting(TVDB_KEY_SETTING).await?;
+        // The selection counts tvdb as owing work while a key exists,
+        // even if this run's login fails: the work stays owed and a
+        // later run collects it. No key = no debt.
+        let tvdb_configured = tvdb_key.is_some();
+        let tvdb_token = match tvdb_key {
             Some(tk) => {
                 let pin = registry.get_setting(TVDB_PIN_SETTING).await?;
                 match self.tvdb_login(&tk, pin.as_deref()).await {
@@ -876,6 +887,7 @@ impl Enricher {
         }
         let items = sqlx::query(GENERIC_SELECTION_SQL)
             .bind(crate::providers::QUERY_REV)
+            .bind(tvdb_configured)
             .fetch_all(registry.db())
             .await?;
         tracing::info!(items = items.len(), "enrichment run starting");
@@ -935,11 +947,15 @@ impl Enricher {
                         this.progress.1.fetch_add(1, Ordering::SeqCst);
                     }
                     Some(_) => {}
+                    // No miss row from here: the walker's Declined arm
+                    // records misses, guarded so a decline never
+                    // overwrites a standing answer. A chain declines in
+                    // full whenever every question is already on file —
+                    // routine on a restart — and an unconditional miss
+                    // upsert here erased the whole catalogue's matches
+                    // each time the hub came up.
                     None => {
                         this.progress.2.fetch_add(1, Ordering::SeqCst);
-                        if let Err(e) = this.store_generic(&db, &item.id, "tmdb", None).await {
-                            tracing::warn!(title = %item.title, error = %e, "miss upsert failed");
-                        }
                     }
                 }
             });
@@ -1049,20 +1065,11 @@ impl Enricher {
                 identified: false,
                 owner: None,
             };
+            // Same rule as the generic pass: the walker records misses,
+            // never the caller — a fully-declined chain is not a miss.
             match providers.run_chain("music", registry.db(), &item).await {
                 Some(_) => matched += 1,
-                None => {
-                    missed += 1;
-                    crate::providers::store_answer(
-                        registry.db(),
-                        &item.id,
-                        "musicbrainz",
-                        "",
-                        "miss",
-                        Default::default(),
-                    )
-                    .await?;
-                }
+                None => missed += 1,
             }
             if (n + 1) % 100 == 0 {
                 tracing::info!(
@@ -1461,16 +1468,12 @@ impl Enricher {
                     Err(e) => tracing::warn!(error = format!("{e:#}"), "episode binding failed"),
                 }
             }
+            // Same rule as the generic pass: the walker records misses,
+            // never the caller — a fully-declined chain is not a miss.
             match providers.run_chain("anime", registry.db(), item).await {
                 Some("settled") => {}
                 Some(_) => done += 1,
-                None => {
-                    tracing::debug!(title = %item.title, "no anime identity; recording miss");
-                    if !item.identified {
-                        self.store_generic(registry.db(), &item.id, "anime", None)
-                            .await?;
-                    }
-                }
+                None => tracing::debug!(title = %item.title, "no anime identity this run"),
             }
         }
         tracing::info!(matched = done, "anime enrichment complete");

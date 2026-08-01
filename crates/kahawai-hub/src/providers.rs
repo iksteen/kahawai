@@ -1101,8 +1101,11 @@ impl ProviderSet {
     }
 
     /// Walk the media type's chain for one item. Returns the outcome
-    /// confidence, or None when every provider declined (the caller
-    /// records the miss).
+    /// confidence, or None when every provider declined. Misses are
+    /// recorded HERE, in the Declined arm, and nowhere else: a caller
+    /// treating None as "record a miss" would overwrite standing
+    /// answers, because a chain declines in full whenever every
+    /// question is already on file — routine on a restart.
     ///
     /// HUB-5 first-claim-wins is per FIELD, so a match no longer ends
     /// the walk: the chain continues while anything is still missing,

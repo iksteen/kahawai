@@ -1405,3 +1405,148 @@ async fn local_artwork_supplies_the_poster_but_never_the_identity() {
             .unwrap();
     assert!(ranked.is_empty(), "local must not be rankable");
 }
+
+// ---------- a declined chain is not a miss ----------
+
+/// A provider that declines every item — which is exactly what every
+/// real provider does on a restart, when its questions are already on
+/// file and no network request is due.
+struct DecliningProvider(&'static str);
+
+#[async_trait::async_trait]
+impl kahawai_hub::providers::Provider for DecliningProvider {
+    fn name(&self) -> &'static str {
+        self.0
+    }
+    async fn enrich(
+        &self,
+        _db: &SqlitePool,
+        _item: &kahawai_hub::providers::ItemRef,
+    ) -> anyhow::Result<kahawai_hub::providers::Outcome> {
+        Ok(kahawai_hub::providers::Outcome::Declined)
+    }
+}
+
+fn item_ref(id: &str) -> kahawai_hub::providers::ItemRef {
+    kahawai_hub::providers::ItemRef {
+        id: id.into(),
+        kind: "movie".into(),
+        title: id.into(),
+        norm_title: id.into(),
+        year: None,
+        artist: None,
+        norm_artist: None,
+        alt: None,
+        existing: None,
+        manual: false,
+        known_aid: None,
+        identified: false,
+        owner: None,
+    }
+}
+
+/// The restart wipe of 2026-08-01: every question already recorded, so
+/// every provider declines, the chain returns None — and the standing
+/// answers must come through untouched. The unconditional miss upsert
+/// this guards against erased the whole catalogue's matches (and their
+/// posters) on every hub restart.
+#[tokio::test]
+async fn a_fully_declined_chain_never_wipes_a_standing_answer() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    item(&db, "i1").await;
+    store_answer(
+        &db,
+        "i1",
+        "tmdb",
+        "550",
+        "auto",
+        Fields {
+            title: Some("Fight Club".into()),
+            poster_path: Some("/p.jpg".into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(assigned(&db, "i1").await.unwrap().0, "tmdb");
+
+    let mut set = kahawai_hub::providers::ProviderSet::default();
+    set.add(Box::new(DecliningProvider("tmdb")));
+    let out = set.run_chain("movies", &db, &item_ref("i1")).await;
+    assert!(out.is_none(), "everyone declined");
+
+    let (conf, poster): (String, Option<String>) = sqlx::query_as(
+        "SELECT confidence, poster_path FROM provider_metadata
+          WHERE item_id = 'i1' AND provider = 'tmdb'",
+    )
+    .fetch_one(&db)
+    .await
+    .unwrap();
+    assert_eq!(conf, "auto", "the answer survived the declined chain");
+    assert_eq!(poster.as_deref(), Some("/p.jpg"));
+    assert_eq!(
+        assigned(&db, "i1").await.unwrap().0,
+        "tmdb",
+        "and the assignment with it"
+    );
+}
+
+/// The walker still records the miss for an item nobody has anything on
+/// — "consulted, nothing found" is presentation the UI needs.
+#[tokio::test]
+async fn a_declined_chain_records_a_miss_only_where_nothing_stands() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    item(&db, "i1").await;
+
+    let mut set = kahawai_hub::providers::ProviderSet::default();
+    set.add(Box::new(DecliningProvider("tmdb")));
+    assert!(set.run_chain("movies", &db, &item_ref("i1")).await.is_none());
+
+    let (pid, conf): (String, String) = sqlx::query_as(
+        "SELECT provider_id, confidence FROM provider_metadata
+          WHERE item_id = 'i1' AND provider = 'tmdb'",
+    )
+    .fetch_one(&db)
+    .await
+    .unwrap();
+    assert_eq!((pid.as_str(), conf.as_str()), ("", "miss"));
+    assert_eq!(assigned(&db, "i1").await, None);
+}
+
+/// The selection must mirror the providers the pass actually builds: a
+/// searcher with no key never asks and never records its question, so
+/// counting it as owing work would re-select every matched item on
+/// every run — which is what kept feeding the restart wipe above.
+#[tokio::test]
+async fn an_unconfigured_searcher_owes_no_work() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    item(&db, "i1").await;
+    store_answer(
+        &db,
+        "i1",
+        "tmdb",
+        "550",
+        "auto",
+        answer("Fight Club", None, None),
+    )
+    .await
+    .unwrap();
+
+    let due = |tvdb: bool| {
+        let db = db.clone();
+        async move {
+            sqlx::query(kahawai_hub::enrich::GENERIC_SELECTION_SQL)
+                .bind(kahawai_hub::providers::QUERY_REV)
+                .bind(tvdb)
+                .fetch_all(&db)
+                .await
+                .unwrap()
+                .len()
+        }
+    };
+    assert_eq!(due(false).await, 0, "tmdb answered, tvdb not configured");
+    assert_eq!(due(true).await, 1, "a configured tvdb still owes its look");
+}
