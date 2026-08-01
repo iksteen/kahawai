@@ -1476,6 +1476,12 @@ fn attach_peak_probe(upload: &gst::Element, shader: &gst::Element) {
     });
 }
 
+/// What the tone-map segment may hand the encoder behind it. NV12
+/// first: the hardware encoders take it directly, so they keep
+/// negotiating it. I420 is what openh264enc — sink template I420 and
+/// nothing else — needs to be linkable at all.
+pub(crate) const TONEMAP_OUT_FORMATS: [&str; 2] = ["NV12", "I420"];
+
 /// The GL tone-map segment: upload → RGBA → PQ→SDR shader → back to
 /// system memory, then capssetter rewrites the colorimetry tag to
 /// bt709 so the encoder's VUI tells the player the truth (the shader
@@ -1499,15 +1505,27 @@ pub(crate) fn tonemap_segment() -> Vec<gst::Element> {
         .unwrap();
     let from_rgba = gst::ElementFactory::make("glcolorconvert").build().unwrap();
     let download = gst::ElementFactory::make("gldownload").build().unwrap();
-    // NV12 pinned HERE, GPU-side: without it glcolorconvert stays RGBA
-    // and a VA encoder with no converter between (the non-CUDA path has
-    // none after this segment) refuses system-memory RGBA — observed as
-    // not-negotiated on the J5005. Every encoder we place takes NV12.
+    // Pinned HERE, GPU-side: without it glcolorconvert stays RGBA and a
+    // VA encoder with no converter between (the non-CUDA path has none
+    // after this segment) refuses system-memory RGBA — observed as
+    // not-negotiated on the J5005.
+    //
+    // A LIST, not NV12 alone. "Every encoder we place takes NV12" was
+    // written for the hardware ones and is false for openh264enc, whose
+    // sink template is I420 and nothing else: pinning NV12 left the
+    // segment's trailing capssetter unlinkable to it, and because the
+    // chain is linked from a pad-added callback the `unwrap` on that
+    // link became a non-unwinding panic — SIGABRT, no session error, on
+    // every HDR title a software-encoder box was asked to tone-map
+    // (field report 2026-08-01; the user's workaround was forcing HDR on
+    // in the browser, which skips this segment entirely). NV12 stays
+    // first so hardware still negotiates it; I420 is what makes the
+    // software path exist at all.
     let nv12 = gst::ElementFactory::make("capsfilter")
         .property(
             "caps",
             gst::Caps::builder("video/x-raw")
-                .field("format", "NV12")
+                .field("format", gst::List::new(TONEMAP_OUT_FORMATS))
                 .build(),
         )
         .build()
@@ -1525,6 +1543,42 @@ pub(crate) fn tonemap_segment() -> Vec<gst::Element> {
     vec![
         upload, to_rgba, rgba, shader, from_rgba, download, nv12, relabel,
     ]
+}
+
+/// Link an encode branch and bring it up, reporting failure instead of
+/// panicking.
+///
+/// Every caller runs inside a `pad-added` callback, where a Rust panic
+/// cannot unwind out of the C frame and aborts the process instead: no
+/// session error, no verdict, no TC-6 retry (the sink is downstream of
+/// the panic, so its retry never sees one) — just SIGABRT. Both steps
+/// here are genuinely fallible: linking is caps-dependent, and a state
+/// change can be refused. `openh264enc` accepts I420 and nothing else,
+/// so a tone-mapped chain pinned to NV12 could not link to it, and the
+/// `unwrap` that used to be here turned a format mismatch into a dead
+/// player for every HDR title on a software-encoder box (field report
+/// 2026-08-01).
+///
+/// Returns false when the branch could not be brought up; the caller
+/// abandons it and the session fails on its missing playlist, with the
+/// reason in the log.
+#[must_use]
+fn link_and_start(chain: &[&gst::Element], also: Option<&gst::Element>) -> bool {
+    if let Err(e) = gst::Element::link_many(chain.iter().copied()) {
+        tracing::error!(error = %e, "encode chain failed to link; session will fail");
+        return false;
+    }
+    for el in also.into_iter().chain(chain.iter().copied()) {
+        if let Err(e) = el.sync_state_with_parent() {
+            tracing::error!(
+                element = %el.name(),
+                error = %e,
+                "encode element refused its state; session will fail"
+            );
+            return false;
+        }
+    }
+    true
 }
 
 #[allow(clippy::too_many_arguments)] // one plan, spelled out
@@ -1663,10 +1717,8 @@ fn build_video_encode_chain(
     chain.push(&parse);
     pipe.add(&decode).unwrap();
     pipe.add_many(chain.iter().copied()).unwrap();
-    gst::Element::link_many(chain.iter().copied()).unwrap();
-    decode.sync_state_with_parent().unwrap();
-    for el in &chain {
-        el.sync_state_with_parent().unwrap();
+    if !link_and_start(&chain, Some(&decode)) {
+        return;
     }
     let out = parse.static_pad("src").unwrap();
     guard_pts(&out);
@@ -2023,10 +2075,8 @@ fn build_audio_encode_chain(
     chain.extend(parse.iter());
     pipe.add(&decode).unwrap();
     pipe.add_many(chain.iter().copied()).unwrap();
-    gst::Element::link_many(chain.iter().copied()).unwrap();
-    decode.sync_state_with_parent().unwrap();
-    for el in &chain {
-        el.sync_state_with_parent().unwrap();
+    if !link_and_start(&chain, Some(&decode)) {
+        return;
     }
     let out = chain.last().unwrap().static_pad("src").unwrap();
     guard_pts(&out);
@@ -2110,9 +2160,8 @@ fn build_audio_tail(
     chain.extend([&convert, &limiter, &resample, &enc]);
     chain.extend(parse.iter());
     pipe.add_many(chain.iter().copied()).unwrap();
-    gst::Element::link_many(chain.iter().copied()).unwrap();
-    for el in &chain {
-        el.sync_state_with_parent().unwrap();
+    if !link_and_start(&chain, None) {
+        return;
     }
     let out = chain.last().unwrap().static_pad("src").unwrap();
     guard_pts(&out);
@@ -3242,6 +3291,61 @@ mod concat_spike {
         );
         pipeline.set_state(gst::State::Null).unwrap();
         msg
+    }
+
+    /// Whatever the tone-map segment pins must be linkable to EVERY
+    /// encoder we might place behind it. It pinned NV12 alone, which no
+    /// hardware encoder minded and openh264enc (sink template: I420,
+    /// nothing else) could not accept — and since the chain is linked
+    /// from a pad-added callback, the failed link panicked where a
+    /// panic cannot unwind: SIGABRT, no session error, on every HDR
+    /// title a software-encoder box was asked to tone-map.
+    #[test]
+    fn tonemap_output_suits_every_encoder_we_place() {
+        crate::init().unwrap();
+        // Feature-agnostic: hardware sink templates are published under
+        // memory:CUDAMemory/GLMemory/VAMemory, and it is the FORMAT
+        // agreement being checked here, not the memory space.
+        let mut want = gst::Caps::builder("video/x-raw")
+            .field("format", gst::List::new(TONEMAP_OUT_FORMATS))
+            .build();
+        want.get_mut()
+            .unwrap()
+            .set_features(0, Some(gst::CapsFeatures::new_any()));
+
+        let mut checked = 0;
+        for name in [
+            "openh264enc",
+            "x264enc",
+            "x265enc",
+            "nvh264enc",
+            "nvh265enc",
+            "vah264enc",
+            "vah265enc",
+            "vtenc_h264_hw",
+            "vtenc_h265_hw",
+            "svtav1enc",
+        ] {
+            let Some(f) = gst::ElementFactory::find(name) else {
+                continue;
+            };
+            let sink: Vec<gst::Caps> = f
+                .static_pad_templates()
+                .into_iter()
+                .filter(|t| t.direction() == gst::PadDirection::Sink)
+                .map(|t| t.caps())
+                .collect();
+            if sink.is_empty() {
+                continue;
+            }
+            assert!(
+                sink.iter().any(|c| !c.intersect(&want).is_empty()),
+                "{name} accepts none of {TONEMAP_OUT_FORMATS:?}; the tone-map \
+                 segment could not link to it. Its sink caps: {sink:?}"
+            );
+            checked += 1;
+        }
+        assert!(checked > 0, "no encoders on this box to check against");
     }
 
     /// One cut source, not two. hlssink3 requests a keyframe every
