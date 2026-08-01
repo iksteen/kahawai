@@ -1379,6 +1379,7 @@ fn attach_peak_probe(upload: &gst::Element, shader: &gst::Element) {
             return gst::PadProbeReturn::Ok;
         };
         use gst_video::VideoFormat;
+        use gst_video::prelude::VideoFrameExt;
         let ten_bit = match vinfo.format() {
             VideoFormat::P01010le | VideoFormat::I42010le => true,
             VideoFormat::Nv12 | VideoFormat::I420 => false,
@@ -1390,8 +1391,21 @@ fn attach_peak_probe(upload: &gst::Element, shader: &gst::Element) {
         let Ok(data) = frame.plane_data(0) else {
             return gst::PadProbeReturn::Ok;
         };
-        let stride = vinfo.stride()[0] as usize;
-        let (w, h) = (vinfo.width() as usize, vinfo.height() as usize);
+        // Stride and size come from the FRAME, never from the caps.
+        // A decoder pads its buffers to suit itself — likely whenever
+        // the coded size exceeds the display size, e.g. 1920x1038,
+        // whose coded height is 1040 — so the caps-derived stride can
+        // be smaller than the real one, and `y * stride` then indexes
+        // past the plane. This probe runs in a pad probe called from C,
+        // where a panic cannot unwind and ABORTS the worker: reported
+        // as a SIGABRT at session start on an HDR title, and it
+        // vanished when the client forced HDR (no tone-map, no probe).
+        let stride = frame.plane_stride()[0].max(0) as usize;
+        let (w, h) = (frame.width() as usize, frame.height() as usize);
+        let bpp = if ten_bit { 2 } else { 1 };
+        if stride < w * bpp {
+            return gst::PadProbeReturn::Ok; // nonsense geometry; skip
+        }
         let mut st = state.lock().unwrap();
         let (_, _, ref mut samples) = *st;
         samples.clear();
@@ -1399,9 +1413,14 @@ fn attach_peak_probe(upload: &gst::Element, shader: &gst::Element) {
         // cheap enough for every frame.
         let mut y = 0;
         while y < h {
-            let row = &data[y * stride..];
+            // Bounds-checked: a short final row (tight packing) or any
+            // residual stride disagreement ends the walk instead of
+            // taking the process down.
+            let Some(row) = data.get(y * stride..(y * stride + w * bpp).min(data.len())) else {
+                break;
+            };
             let mut x = 0;
-            while x < w {
+            while x * bpp + bpp <= row.len() && x < w {
                 let code = if ten_bit {
                     let lo = row[x * 2] as u16;
                     let hi = row[x * 2 + 1] as u16;
