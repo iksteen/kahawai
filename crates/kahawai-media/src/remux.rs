@@ -208,6 +208,29 @@ pub fn av1_encoder() -> Option<&'static str> {
     *VERIFIED.get_or_init(|| verified_encoder(AV1_ENCODERS, dry_run_video_encoder))
 }
 
+/// The converter chain that feeds an encoder, by encoder family. The
+/// benchmark (HUB-36) builds the SAME chain so its numbers describe the
+/// pipeline that will actually run — a synthetic feed measured the
+/// wrong thing entirely on VideoToolbox (0.80x synthetic vs 3.54x in a
+/// real session, measured 2026-08-01).
+///
+/// videoconvert first for the nv family: exotic decoder outputs
+/// (palettized RGB8P from msrle-era AVIs) never reach the CUDA
+/// elements, which only take common formats; it is passthrough for
+/// anything sane. Costs NVDEC→NVENC zero-copy (CUDA output can't cross
+/// videoconvert, so hw decoders fall back to system memory) — measured
+/// acceptable.
+pub(crate) fn encode_converter_names(enc_name: &str) -> Vec<&'static str> {
+    if enc_name.starts_with("nv") {
+        vec!["videoconvert", "cudaupload", "cudaconvert"]
+    } else {
+        vec!["cudadownload", "videoconvert"]
+    }
+    .into_iter()
+    .filter(|n| gst::ElementFactory::find(n).is_some())
+    .collect()
+}
+
 /// Verified encoder capabilities for the transcoder's registration
 /// report (TC-1): (codec, element, hardware) triples that survived a
 /// dry run. Hardware = anything before the software entries in the
@@ -1481,19 +1504,7 @@ fn build_video_encode_chain(
     // memory; cudaconvert handles format — zero copy for NVDEC→NVENC).
     // Other targets: cudadownload first (passthrough for system memory),
     // then videoconvert. All availability-guarded.
-    let converter_names: Vec<&str> = if enc_name.starts_with("nv") {
-        // videoconvert first: exotic decoder outputs (palettized RGB8P
-        // from msrle-era AVIs) never reach the CUDA elements, which only
-        // take common formats; it is passthrough for anything sane. Costs
-        // NVDEC→NVENC zero-copy (CUDA output can't cross videoconvert, so
-        // hw decoders fall back to system memory) — measured acceptable.
-        vec!["videoconvert", "cudaupload", "cudaconvert"]
-    } else {
-        vec!["cudadownload", "videoconvert"]
-    }
-    .into_iter()
-    .filter(|n| gst::ElementFactory::find(n).is_some())
-    .collect();
+    let converter_names = encode_converter_names(enc_name);
     let converters: Vec<gst::Element> = converter_names
         .iter()
         .map(|n| gst::ElementFactory::make(n).build().unwrap())

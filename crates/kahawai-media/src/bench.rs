@@ -25,19 +25,40 @@
 //! Encoder properties stay at element defaults for the same
 //! comparability reason: this measures the box, not our tuning.
 //!
-//! ## The source must not be the bottleneck
+//! ## Why a real clip, decoded in a loop
 //!
-//! `videotestsrc pattern=snow` CANNOT feed this measurement: measured
-//! on the dev box, its generator alone produces 2.98× realtime at
-//! 1080p and 0.78× at 2160p — so a first cut of this module reported
-//! every encoder at 2.7–3.5× / 0.56–0.73× (nvh264enc "slower" than
-//! x264enc), i.e. it measured the noise generator on the CPU and would
-//! have ranked boxes by RNG speed. The frames are therefore generated
-//! ONCE into a small pool with a cheap PRNG and pushed cyclically from
-//! `appsrc`, so the only thing under the clock is the encoder. The
-//! pool holds several distinct frames because a repeated frame makes
-//! every P-frame free — the encoder would predict it perfectly and
-//! report a fantasy.
+//! The measurement transcodes a checked-in reference clip
+//! (`assets/ref-{1080p,2160p}.h264`, ~0.2 MB of Annex-B noise) through
+//! the SAME element chain a session builds — decoder, the encoder's
+//! own converter chain, encoder — looping the clip until the time cap.
+//!
+//! Two earlier shapes were wrong, both caught by measurement:
+//!
+//! 1. `videotestsrc pattern=snow` feeding the encoder measured the
+//!    NOISE GENERATOR: it produces 2.98× at 1080p and 0.78× at 2160p on
+//!    the dev box, and every encoder duly reported 2.7–3.5× / 0.56–0.73×
+//!    with nvh264enc "slower" than x264enc. It would have ranked boxes
+//!    by CPU RNG speed.
+//! 2. Pushing pre-generated raw frames from `appsrc` fixed that but
+//!    measured the FEED PATH, and that bias is vendor-specific: system
+//!    memory into VideoToolbox is slow, while a real session hands the
+//!    encoder IOSurface-backed frames from the decoder with no copy.
+//!    Measured on an M4: 0.80× synthetic vs **3.54× in a real
+//!    session** — a 4.4× under-report, on exactly the axis placement
+//!    ranks. NVENC showed no such gap (5.9× synthetic, 6.26× real), so
+//!    the error silently favoured one vendor over another.
+//!
+//! Decoding a real bitstream reproduces the zero-copy decoder→encoder
+//! path where the hardware has one. Annex-B is used because
+//! elementary streams concatenate cleanly, so `multifilesrc loop=true`
+//! is the whole looping mechanism — no seeking, no container headers
+//! repeating. The content is noise so it stays incompressible and
+//! motion estimation cannot cheat; it is checked in rather than
+//! generated so every box encodes byte-identical input.
+//!
+//! The number therefore describes a REFERENCE TRANSCODE (h264 in,
+//! target out) rather than an encoder in isolation. That is the more
+//! useful quantity: it is the shape of the work placement dispatches.
 //!
 //! ## What a number means
 //!
@@ -65,18 +86,23 @@ use serde::{Deserialize, Serialize};
 /// The reference frame rate a multiple is expressed against.
 const REFERENCE_FPS: f32 = 24.0;
 
-/// Frames pushed per measurement — 10 s of reference content, which
-/// the wall cap usually cuts short on slow boxes.
-const FRAMES: i32 = 240;
+/// Frames pushed into the synthetic (tone-map) feed — 10 s of
+/// reference content, which the wall cap usually cuts short.
+const FRAMES: usize = 240;
 
 /// Wall-clock ceiling per measurement, matching the dry-run budget:
 /// a box slower than this reports what it managed, honestly.
 const CAP: Duration = Duration::from_secs(5);
 
-/// Distinct noise frames cycled into the encoder. Must exceed the
-/// reference-frame depth of common encoders (1–4) so no P-frame ever
-/// finds its own content again; the pool is otherwise as small as
-/// possible because 4K frames are megabytes each.
+/// Reference clips: 24 frames (1 s at the reference rate) of Annex-B
+/// noise each, looped until the cap.
+const REF_1080: &[u8] = include_bytes!("../assets/ref-1080p.h264");
+const REF_2160: &[u8] = include_bytes!("../assets/ref-2160p.h264");
+/// Loops requested; the wall cap usually ends the run first.
+const LOOPS: i32 = 60;
+/// Distinct noise frames cycled into the GL tone-map measurement — more
+/// than any encoder's reference depth, so nothing is trivially
+/// predictable.
 const POOL: usize = 6;
 
 /// Realtime multiples for one element at the two resolutions that
@@ -213,10 +239,13 @@ pub fn measure(elements: &[&str], tonemap: bool) -> BenchResults {
     if crate::init().is_err() {
         return out;
     }
+    // Reference clips are unpacked once per run.
+    let tmp = std::env::temp_dir().join("kahawai-bench");
+    let _ = std::fs::create_dir_all(&tmp);
     for el in elements {
         let s = Speeds {
-            s1080: measure_encoder(el, 1920, 1080),
-            s2160: measure_encoder(el, 3840, 2160),
+            s1080: measure_encoder(el, 1080, &tmp),
+            s2160: measure_encoder(el, 2160, &tmp),
         };
         tracing::info!(
             element = el,
@@ -241,53 +270,77 @@ pub fn measure(elements: &[&str], tonemap: bool) -> BenchResults {
     out
 }
 
-/// A raw format this encoder takes directly, preferring NV12 (what
-/// every hardware encoder here wants). Feeding the encoder's own
-/// format keeps a colour conversion out of the measurement — the
-/// benchmark is supposed to time the ENCODER, not our pixel plumbing,
-/// and different boxes prefer different formats.
-fn native_format(element: &str) -> Option<String> {
-    let f = gst::ElementFactory::find(element)?;
-    let mut formats = Vec::new();
-    for t in f.static_pad_templates() {
-        if t.direction() != gst::PadDirection::Sink {
-            continue;
-        }
-        for st in t.caps().iter() {
-            if st.name() != "video/x-raw" {
-                continue;
-            }
-            match st.get::<gst::List>("format") {
-                Ok(list) => formats.extend(list.iter().filter_map(|v| v.get::<String>().ok())),
-                Err(_) => {
-                    if let Ok(one) = st.get::<String>("format") {
-                        formats.push(one);
-                    }
-                }
-            }
-        }
+/// Transcode the reference clip for this resolution through the real
+/// chain shape and time the encoder's output.
+fn measure_encoder(element: &str, height: i32, dir: &Path) -> f32 {
+    let (clip, name) = if height > 1080 {
+        (REF_2160, "ref-2160p.h264")
+    } else {
+        (REF_1080, "ref-1080p.h264")
+    };
+    // multifilesrc wants a path; the clip is a couple of hundred KB.
+    let path = dir.join(name);
+    if !path.exists() && std::fs::write(&path, clip).is_err() {
+        return 0.0;
     }
-    if formats.iter().any(|f| f == "NV12") {
-        return Some("NV12".into());
-    }
-    formats.into_iter().next()
-}
 
-/// `appsrc(native fmt) ! ENC ! fakesink`, counting encoded buffers.
-fn measure_encoder(element: &str, w: i32, h: i32) -> f32 {
+    let pipe = gst::Pipeline::new();
+    let Ok(src) = gst::ElementFactory::make("multifilesrc")
+        .property("location", path.to_string_lossy().as_ref())
+        .property("loop", true)
+        .property("num-buffers", LOOPS)
+        .build()
+    else {
+        return 0.0;
+    };
+    // parsebin over an explicit h264parse: it also picks the decoder's
+    // preferred stream-format, which is what a session does.
+    let (Some(parse), Some(decode)) = (make("h264parse"), make("decodebin")) else {
+        return 0.0;
+    };
     let Ok(enc) = gst::ElementFactory::make(element).build() else {
         return 0.0;
     };
-    // Fall back to a converter only when the template says nothing
-    // useful — an unnecessary conversion would be charged to the
-    // encoder, which is exactly the mis-measurement to avoid.
-    match native_format(element) {
-        Some(fmt) => run_counting(&[enc], w, h, &fmt),
-        None => match make("videoconvert") {
-            Some(c) => run_counting(&[c, enc], w, h, "I420"),
-            None => 0.0,
-        },
+    let Ok(sink) = gst::ElementFactory::make("fakesink")
+        .property("sync", false)
+        .build()
+    else {
+        return 0.0;
+    };
+    // The SAME converters the encode chain uses — that is the point.
+    let converters: Vec<gst::Element> = crate::remux::encode_converter_names(element)
+        .iter()
+        .filter_map(|n| make(n))
+        .collect();
+
+    if pipe.add_many([&src, &parse, &decode]).is_err()
+        || pipe.add_many(&converters).is_err()
+        || pipe.add_many([&enc, &sink]).is_err()
+    {
+        return 0.0;
     }
+    if gst::Element::link_many([&src, &parse, &decode]).is_err() {
+        let _ = pipe.set_state(gst::State::Null);
+        return 0.0;
+    }
+    let mut tail: Vec<&gst::Element> = converters.iter().collect();
+    tail.push(&enc);
+    tail.push(&sink);
+    if gst::Element::link_many(tail.clone()).is_err() {
+        let _ = pipe.set_state(gst::State::Null);
+        return 0.0;
+    }
+    // decodebin's src pad appears once caps are known.
+    let head = tail[0].clone();
+    decode.connect_pad_added(move |_, pad| {
+        if let Some(sink_pad) = head.static_pad("sink")
+            && !sink_pad.is_linked()
+        {
+            let _ = pad.link(&sink_pad);
+        }
+    });
+
+    count_through(&pipe, &enc, || {})
 }
 
 /// The real tone-map segment, fed 10-bit: the GL upload/download round
@@ -327,9 +380,71 @@ fn noise_frame(bytes: usize, seed: u64) -> Vec<u8> {
     out
 }
 
+/// Run a built pipeline to EOS or the cap, counting buffers out of
+/// `at`. The clock starts at the first buffer: preroll, GL context
+/// creation and encoder init are one-off, while sustain is not.
+fn count_through(pipe: &gst::Pipeline, at: &gst::Element, on_playing: impl FnOnce()) -> f32 {
+    let frames = std::sync::Arc::new(AtomicU64::new(0));
+    let started: std::sync::Arc<std::sync::Mutex<Option<Instant>>> = Default::default();
+    let Some(out_pad) = at.static_pad("src") else {
+        let _ = pipe.set_state(gst::State::Null);
+        return 0.0;
+    };
+    {
+        let (frames, started) = (frames.clone(), started.clone());
+        out_pad.add_probe(gst::PadProbeType::BUFFER, move |_, _| {
+            let mut s = started.lock().unwrap();
+            if s.is_none() {
+                *s = Some(Instant::now());
+            } else {
+                frames.fetch_add(1, Ordering::Relaxed);
+            }
+            gst::PadProbeReturn::Ok
+        });
+    }
+    if pipe.set_state(gst::State::Playing).is_err() {
+        let _ = pipe.set_state(gst::State::Null);
+        return 0.0;
+    }
+    // Probe attached, pipeline rolling: only now may a feeder start, so
+    // the first buffer produced is the first buffer counted.
+    on_playing();
+    let deadline = Instant::now() + CAP;
+    // Wait for the run to finish or the cap to expire, whichever comes
+    // first; a slow box simply reports the frames it managed.
+    if let Some(bus) = pipe.bus() {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if let Some(msg) = bus.timed_pop_filtered(
+            gst::ClockTime::from_nseconds(left.as_nanos() as u64),
+            &[gst::MessageType::Eos, gst::MessageType::Error],
+        ) && msg.type_() == gst::MessageType::Error
+        {
+            if let gst::MessageView::Error(e) = msg.view() {
+                tracing::debug!(
+                    src = %e.src().map(|s| s.name().to_string()).unwrap_or_default(),
+                    error = %e.error(),
+                    "benchmark pipeline failed"
+                );
+            }
+            let _ = pipe.set_state(gst::State::Null);
+            return 0.0;
+        }
+    }
+    let elapsed = started
+        .lock()
+        .unwrap()
+        .map(|t| t.elapsed())
+        .unwrap_or_default();
+    let n = frames.load(Ordering::Relaxed);
+    let produced_any = started.lock().unwrap().is_some();
+    let _ = pipe.set_state(gst::State::Null);
+    speed(n + 1, elapsed, produced_any)
+}
+
 /// Push pre-generated noise through `chain` as fast as it is accepted
-/// and time the output. The source is a memcpy from the pool, so the
-/// clock measures `chain`, not frame generation.
+/// and time the output. Still the honest shape for the TONE-MAP
+/// measurement: the real chain also hands the GL segment system
+/// memory (decode → videoconvert → glupload).
 fn run_counting(chain: &[gst::Element], w: i32, h: i32, format: &str) -> f32 {
     let pipe = gst::Pipeline::new();
     // Every format here is 4:2:0 (1.5 bytes/pixel); 10-bit doubles it.
@@ -383,75 +498,38 @@ fn run_counting(chain: &[gst::Element], w: i32, h: i32, format: &str) -> f32 {
         return 0.0;
     }
 
-    // Count on the LAST chain element's src pad: what came out of the
-    // thing under test, after any parser in the segment.
-    let frames = std::sync::Arc::new(AtomicU64::new(0));
-    let started: std::sync::Arc<std::sync::Mutex<Option<Instant>>> = Default::default();
-    let Some(out_pad) = chain.last().and_then(|e| e.static_pad("src")) else {
-        let _ = pipe.set_state(gst::State::Null);
-        return 0.0;
-    };
-    {
-        let (frames, started) = (frames.clone(), started.clone());
-        out_pad.add_probe(gst::PadProbeType::BUFFER, move |_, _| {
-            // The clock starts at the first buffer: preroll, GL context
-            // creation and encoder init are one-off, sustain is not.
-            let mut s = started.lock().unwrap();
-            if s.is_none() {
-                *s = Some(Instant::now());
-            } else {
-                frames.fetch_add(1, Ordering::Relaxed);
-            }
-            gst::PadProbeReturn::Ok
-        });
-    }
-
-    if pipe.set_state(gst::State::Playing).is_err() {
-        let _ = pipe.set_state(gst::State::Null);
-        return 0.0;
-    }
-
-    // Feed from this thread: push_buffer blocks on the appsrc queue,
-    // so the encoder's own speed paces the loop.
+    // Fed from a side thread STARTED BY THE COUNTER: push_buffer blocks
+    // on the appsrc queue, so the chain's own speed paces the loop.
+    // Waiting on the pipeline's state here instead does not work — GL
+    // pipelines change state asynchronously and the wait outlived the
+    // cap, silently reporting 0.00x for the tone-map.
+    let last = chain.last().cloned();
     let spf = gst::ClockTime::SECOND.nseconds() as f64 / REFERENCE_FPS as f64;
-    let deadline = Instant::now() + CAP;
-    for i in 0..FRAMES {
-        if Instant::now() >= deadline {
-            break;
-        }
-        let mut buf = pool[i as usize % POOL].clone();
-        {
-            let b = buf.make_mut();
-            b.set_pts(gst::ClockTime::from_nseconds((i as f64 * spf) as u64));
-            b.set_duration(gst::ClockTime::from_nseconds(spf as u64));
-        }
-        if src.push_buffer(buf).is_err() {
-            break;
-        }
+    let feed = move || {
+        std::thread::spawn(move || {
+            for i in 0..FRAMES {
+                // copy(), not clone(): a clone SHARES the buffer, so
+                // get_mut() returns None and the loop would break before
+                // pushing anything (measured: a silent 0.00x tone-map).
+                // A shallow copy has its own metadata and shares the
+                // pixel memory, so stamping PTS costs nothing.
+                let mut buf = pool[i % POOL].copy();
+                {
+                    let Some(b) = buf.get_mut() else { break };
+                    b.set_pts(gst::ClockTime::from_nseconds((i as f64 * spf) as u64));
+                    b.set_duration(gst::ClockTime::from_nseconds(spf as u64));
+                }
+                if src.push_buffer(buf).is_err() {
+                    break;
+                }
+            }
+            let _ = src.end_of_stream();
+        });
+    };
+    match last {
+        Some(el) => count_through(&pipe, &el, feed),
+        None => 0.0,
     }
-    let _ = src.end_of_stream();
-
-    // Drain what is still in flight, bounded by the same cap.
-    if let Some(bus) = pipe.bus() {
-        let left = deadline.saturating_duration_since(Instant::now());
-        let _ = bus.timed_pop_filtered(
-            gst::ClockTime::from_nseconds(left.as_nanos() as u64),
-            &[gst::MessageType::Eos, gst::MessageType::Error],
-        );
-    }
-    let elapsed = started
-        .lock()
-        .unwrap()
-        .map(|t| t.elapsed())
-        .unwrap_or_default();
-    let n = frames.load(Ordering::Relaxed);
-    let _ = pipe.set_state(gst::State::Null);
-    // n counts buffers AFTER the first, and `speed` subtracts one more
-    // for the interval count — hand it the total. `ran` is true when
-    // the encoder produced anything at all: that distinguishes "so slow
-    // it managed one frame in the whole window" from "never started".
-    let produced_any = started.lock().unwrap().is_some();
-    speed(n + 1, elapsed, produced_any)
 }
 
 #[cfg(test)]
