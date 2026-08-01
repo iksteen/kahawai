@@ -1482,6 +1482,63 @@ fn attach_peak_probe(upload: &gst::Element, shader: &gst::Element) {
 /// nothing else — needs to be linkable at all.
 pub(crate) const TONEMAP_OUT_FORMATS: [&str; 2] = ["NV12", "I420"];
 
+/// Hold encoded video back until the first KEYFRAME, asking the encoder
+/// for one as soon as data actually flows.
+///
+/// Installed only on a seeked start. The first fragment a player gets
+/// must stand alone — there are no earlier parameter sets to fall back
+/// on — and an encoder resuming mid-stream does not reliably lead with
+/// an IDR.
+///
+/// The request is sent from INSIDE the probe, on the first buffer we
+/// drop, and that timing is the point: sent while building the pipeline
+/// it reaches an encoder that is not playing yet and does nothing
+/// (measured — the first attempt at this fix changed exactly nothing).
+/// By the time a buffer arrives here the chain is running, so the event
+/// lands. `hlssink3`'s own fragment-boundary requests prove the encoder
+/// honours them; this just needs one earlier.
+///
+/// BUFFER **and** BUFFER_LIST: a parser is free to push lists, and a
+/// BUFFER-only probe never sees those — the other half of why the first
+/// attempt was a no-op.
+fn open_on_keyframe(pad: &gst::Pad) {
+    let asked = std::sync::atomic::AtomicBool::new(false);
+    let dropped = std::sync::atomic::AtomicUsize::new(0);
+    pad.add_probe(
+        gst::PadProbeType::BUFFER | gst::PadProbeType::BUFFER_LIST,
+        move |pad, info| {
+            let leads_with_keyframe = match &info.data {
+                Some(gst::PadProbeData::Buffer(b)) => {
+                    !b.flags().contains(gst::BufferFlags::DELTA_UNIT)
+                }
+                // A list is keyframe-led if its FIRST buffer is: that is
+                // what the muxer will see at the head of the fragment.
+                Some(gst::PadProbeData::BufferList(l)) => l
+                    .get(0)
+                    .is_some_and(|b| !b.flags().contains(gst::BufferFlags::DELTA_UNIT)),
+                _ => return gst::PadProbeReturn::Ok,
+            };
+            if leads_with_keyframe {
+                tracing::info!(
+                    dropped = dropped.load(std::sync::atomic::Ordering::SeqCst),
+                    "seeked start: keyframe reached, video opened"
+                );
+                return gst::PadProbeReturn::Remove;
+            }
+            if !asked.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                let sent = pad.send_event(
+                    gst_video::UpstreamForceKeyUnitEvent::builder()
+                        .all_headers(true)
+                        .build(),
+                );
+                tracing::info!(sent, "seeked start: asked the encoder for a keyframe");
+            }
+            dropped.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            gst::PadProbeReturn::Drop
+        },
+    );
+}
+
 /// The GL tone-map segment: upload → RGBA → PQ→SDR shader → back to
 /// system memory, then capssetter rewrites the colorimetry tag to
 /// bt709 so the encoder's VUI tells the player the truth (the shader
@@ -1728,6 +1785,14 @@ fn build_video_encode_chain(
     let out = parse.static_pad("src").unwrap();
     guard_pts(&out);
     if let Some(g) = gate {
+        // A SEEKED start must still hand the muxer a keyframe FIRST.
+        // Measured on VideoToolbox: start_ms=0 gives segment00000 its
+        // IDR and parameter sets, start_ms=300000 gives 48 slices and
+        // none of the three — undecodable, so the player wedges at the
+        // resume point while the worker produces minutes of good
+        // segments behind it. NVENC leads with an IDR and never showed
+        // it, which is why every local test passed.
+        open_on_keyframe(&out);
         g.install(&out);
     }
     if let Err(e) = out.link(&sinkpad) {
