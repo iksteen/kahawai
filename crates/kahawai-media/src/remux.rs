@@ -1635,20 +1635,25 @@ fn build_video_encode_chain(
         set_prop_str_if_present(&enc, "bitrate", &kbps.to_string());
         set_prop_str_if_present(&enc, "target-bitrate", &kbps.to_string());
     }
-    // Keyframe every ~2 s (48 frames at the film rates that dominate
-    // this library): segments split at keyframes, and the session-start
-    // gate waits for THREE segments — with encoder-default GOPs that
-    // was ~10 s of content and a 7 s start on a 4K HDR encode (measured;
+    // A BACKSTOP, not the cadence. The sink asks for a keyframe at every
+    // fragment boundary (see make_hls_sink) and that is what actually
+    // cuts segments; this only bounds the GOP for an encoder that
+    // ignores the request, where the alternative is an encoder-default
+    // GOP of ~10 s and a 7 s session start on a 4K HDR encode (measured;
     // the encode itself ran 1.8× realtime and was not the problem).
-    // ~2 s segments put the same gate at ~6 s of content. Copy-remux is
-    // unaffected: splits follow the source's own keyframes either way.
+    //
+    // Deliberately FAR longer than the fragment interval. A pin near it
+    // competes with the sink's request — the two cadences count
+    // different things, frames against seconds, so they cannot line up
+    // and the sink cuts at both, which is how segments came out 1.96 s
+    // and 1.04 s alternating. Ten seconds never fires first in practice.
     // One name per encoder family, each guarded:
-    set_prop_str_if_present(&enc, "gop-size", "48"); // nvenc, qsv
-    set_prop_str_if_present(&enc, "key-int-max", "48"); // x264, x265, va
-    set_prop_str_if_present(&enc, "max-keyframe-interval", "48"); // vtenc
-    set_prop_str_if_present(&enc, "intra-period-length", "48"); // svtav1enc
-    set_prop_str_if_present(&enc, "max-key-frame-interval", "48"); // rav1enc
-    set_prop_str_if_present(&enc, "keyframe-max-dist", "48"); // av1enc
+    set_prop_str_if_present(&enc, "gop-size", "240"); // nvenc, qsv
+    set_prop_str_if_present(&enc, "key-int-max", "240"); // x264, x265, va
+    set_prop_str_if_present(&enc, "max-keyframe-interval", "240"); // vtenc
+    set_prop_str_if_present(&enc, "intra-period-length", "240"); // svtav1enc
+    set_prop_str_if_present(&enc, "max-key-frame-interval", "240"); // rav1enc
+    set_prop_str_if_present(&enc, "keyframe-max-dist", "240"); // av1enc
     let parse = gst::ElementFactory::make(parser).build().unwrap();
     // Parameter sets on every keyframe (independently decodable
     // segments). h26xparse only; av1parse has no such knob.
@@ -2292,38 +2297,24 @@ fn make_hls_sink(out_dir: &Path, prefer: Option<&str>) -> Result<(gst::Element, 
     // which hlssink3 writes verbatim from this property. 3 is therefore
     // the smallest spec-valid value for ~2 s segments (2 produced
     // playlists that violated it).
-    // With the sink's keyframe requests off (below), this selects how
-    // many WHOLE GOPs go in a segment: the sink packs them while the
-    // total stays under the target. With a ~2 s GOP, 3 takes one (two
-    // would be 3.96) and 4 takes two — measured live, raising it to 4
-    // doubled every segment to ~3.9 s and would have doubled the
-    // session-start gate with it. So 3, which keeps one GOP per segment
-    // and the gate at ~6 s of content.
+    // The fragment interval the sink asks keyframes at, and therefore
+    // the segment length: ~2 s keeps the session-start gate (three
+    // segments) at ~6 s of content.
+    set_prop_if_present(&sink, "target-duration", 2u32);
+    // ON, and load-bearing: the request is what puts a keyframe at the
+    // START of the first fragment. Turned off for one evening to stop
+    // the sink racing a frame-based GOP pin, it made segment00000
+    // undecodable — the fragment opened before the encoder's first IDR,
+    // so the segment carried slices with no SPS/PPS and every player
+    // wedged on it at ~1 s while the worker happily produced two minutes
+    // more. The double-cut it was meant to fix was cosmetic; this was
+    // not. The pin above is now a far-away backstop instead, so the two
+    // no longer compete.
     //
-    // Residual, accepted: an encoder may treat its keyframe interval as
-    // advisory — vtenc skipped one in a 60-segment session, yielding a
-    // 3.885 s segment against a declared 3. Rare (1 in 60) and benign
-    // in players, which use TARGETDURATION to time playlist reloads
-    // rather than as a hard bound. The real fix is a GOP derived from
-    // the source framerate, so the sink's time-based requests and the
-    // frame-based GOP coincide instead of interleaving and the requests
-    // can come back as a cap; that is a bigger change than this one.
-    set_prop_if_present(&sink, "target-duration", 3u32);
-    // ...but the sink ALSO requests a keyframe every target-duration by
-    // default, which is a second cut source racing the encoders' 48-frame
-    // GOP above. The two cadences are incommensurable by construction —
-    // ours counts frames, the sink's counts seconds — so they interleave:
-    // measured 1.96 s and 1.04 s segments alternating, each pair summing
-    // to the 3 s target, averaging 1.67 s. Every short segment costs a
-    // keyframe nobody asked for. The sink's own docs say the requests
-    // exist for input that lacks regular keyframes; ours has them by
-    // construction, so turn the requests off and let the GOP alone decide.
-    // Measured with them off: a clean 1.96 s per segment (avg 2.002, max
-    // 2.377 at EOS — which is why target-duration stays 3 and not 2).
     // Copy sessions are unaffected either way: with no encoder upstream
     // there is nothing to honour a keyframe request, so their splits
-    // already followed the source's own keyframes.
-    set_prop_if_present(&sink, "send-keyframe-requests", false);
+    // follow the source's own keyframes.
+    set_prop_if_present(&sink, "send-keyframe-requests", true);
     // Keep every segment and playlist entry (VOD-style growing playlist).
     set_prop_if_present(&sink, "playlist-length", 0u32);
     set_prop_if_present(&sink, "max-files", 0u32); // hlssink2
@@ -3348,13 +3339,91 @@ mod concat_spike {
         assert!(checked > 0, "no encoders on this box to check against");
     }
 
-    /// One cut source, not two. hlssink3 requests a keyframe every
-    /// `target-duration` by default, which races the GOP the encode
-    /// chain pins in FRAMES — the two cadences cannot line up, so the
-    /// sink cut twice per window: 1.96 s and 1.04 s segments
-    /// alternating, each pair summing to the 3 s target, every short
-    /// one costing a keyframe. Built through `make_hls_sink` so the
-    /// production configuration is what is under test.
+    /// The FIRST segment must be independently decodable, which is the
+    /// property that actually reaches a viewer: a player that cannot
+    /// decode segment 0 wedges at the start of the session no matter
+    /// how healthy everything downstream is.
+    ///
+    /// HONEST LIMIT: this asserts the invariant but does NOT reproduce
+    /// the failure that motivated it. That one needed a SEEKED start on
+    /// a real source through vtenc — segment00000 carried slices with no
+    /// SPS/PPS while the worker produced two minutes of good segments
+    /// behind it. Here x264enc's first output is an IDR whatever the
+    /// sink asks for, so this passes with the regression reintroduced
+    /// (verified). It guards the invariant for the plain path; catching
+    /// the seeked one needs a fixture on the real start_at path.
+    #[test]
+    fn the_first_segment_is_independently_decodable() {
+        crate::init().unwrap();
+        for el in ["hlssink3", "x264enc"] {
+            if gst::ElementFactory::find(el).is_none() {
+                eprintln!("no {el}; skipped");
+                return;
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("hls");
+        std::fs::create_dir_all(&out).unwrap();
+        let (sink, _) = make_hls_sink(&out, Some("hlssink3")).unwrap();
+        let pipeline = gst::Pipeline::new();
+        let src = gst::ElementFactory::make("videotestsrc")
+            .property("num-buffers", 240i32)
+            .build()
+            .unwrap();
+        let caps = gst::ElementFactory::make("capsfilter")
+            .property(
+                "caps",
+                gst::Caps::builder("video/x-raw")
+                    .field("framerate", gst::Fraction::new(24000, 1001))
+                    .field("width", 320i32)
+                    .field("height", 180i32)
+                    .build(),
+            )
+            .build()
+            .unwrap();
+        // No keyframe pin at all: the sink's request is what must put an
+        // IDR at the head of fragment one.
+        let enc = gst::ElementFactory::make("x264enc").build().unwrap();
+        let parse = gst::ElementFactory::make("h264parse")
+            .property("config-interval", -1i32)
+            .build()
+            .unwrap();
+        pipeline
+            .add_many([&src, &caps, &enc, &parse, &sink])
+            .unwrap();
+        gst::Element::link_many([&src, &caps, &enc, &parse]).unwrap();
+        let pad = sink.request_pad_simple("video").unwrap();
+        parse.static_pad("src").unwrap().link(&pad).unwrap();
+        let msg = run_to_eos(&pipeline, 60);
+        assert!(
+            matches!(msg.map(|m| m.type_()), Some(gst::MessageType::Eos)),
+            "pipeline did not reach EOS"
+        );
+
+        let first = out.join("segment00000.ts");
+        let bytes = std::fs::read(&first).expect("no first segment");
+        // Walk the TS payload for H.264 start codes. Parameter sets and
+        // an IDR must BOTH be present, or the segment cannot stand on
+        // its own — which is all a player gets at session start.
+        let mut kinds = std::collections::HashSet::new();
+        for w in bytes.windows(4) {
+            if w[0] == 0 && w[1] == 0 && w[2] == 1 {
+                kinds.insert(w[3] & 0x1f);
+            }
+        }
+        assert!(kinds.contains(&7), "segment00000 has no SPS: {kinds:?}");
+        assert!(kinds.contains(&8), "segment00000 has no PPS: {kinds:?}");
+        assert!(kinds.contains(&5), "segment00000 has no IDR: {kinds:?}");
+    }
+
+    /// One cut source, not two. The sink's keyframe request defines the
+    /// fragment; the encode chain's GOP pin is a far-away backstop that
+    /// must never fire first. Pinned NEAR the fragment interval the two
+    /// cadences compete — they count different things, frames against
+    /// seconds — and the sink cuts at both: 1.96 s and 1.04 s segments
+    /// alternating, every short one costing a keyframe. Built through
+    /// `make_hls_sink` so the production configuration is under test,
+    /// and with production's backstop rather than a competing pin.
     #[test]
     fn segments_run_one_gop_each() {
         crate::init().unwrap();
@@ -3385,9 +3454,10 @@ mod concat_spike {
             )
             .build()
             .unwrap();
-        // Same 48-frame GOP the encode chain pins.
+        // The backstop production uses: far longer than the fragment
+        // interval, so the sink's request is what actually cuts.
         let enc = gst::ElementFactory::make("x264enc")
-            .property("key-int-max", 48u32)
+            .property("key-int-max", 240u32)
             .build()
             .unwrap();
         let parse = gst::ElementFactory::make("h264parse").build().unwrap();
