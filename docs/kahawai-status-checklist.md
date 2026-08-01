@@ -169,10 +169,10 @@ How something works and why it was built that way belong in
 - [x] HUB-14 Capability-profile negotiation: browser-probed profile with
       every play request, hub decides per stream (`negotiate.rs`,
       `tests/negotiate_play.rs`); explicit mode = operator force
-- [ ] HUB-15 Negotiation matrix: codec/profile/level, resolution/fps
+- [x] HUB-15 Negotiation matrix: codec/profile/level, resolution/fps
       ceilings, bandwidth cap (pref + profile), channel downmix,
-      subtitle tiers with graphics_overlay/ass_render gating. Missing:
-      HDR tone-map (15a), OCR (32c), burn-in
+      subtitle tiers with graphics_overlay/ass_render gating, HDR
+      tone-map (15a), OCR (32c), burn-in (32b), encode targets (15b)
 - [x] HUB-15a HDR→SDR tone-mapping tier: GL shader (BT.2390 EETF,
       scene-adaptive peak probe, libplacebo-matched display mapping),
       TC-1 `tonemap` report, doctor row, placement preference, verdict
