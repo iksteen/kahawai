@@ -314,6 +314,23 @@ How something works and why it was built that way belong in
       throttling (rightmost-untrusted, spoof-safe), configurable CORS
       allowlist, SSE X-Accel-Buffering: no, docs/kahawai-deployment.md
       (nginx + traefik examples, wasm MIME note)
+- [ ] OPS-9 Decoder rank calibration, measured and remediable. Two
+      halves, neither built:
+      (a) a doctor check that TIMES hardware decoders outranking
+      software against the bench.rs reference clip and warns when the
+      hardware path is slower (Gemini Lake: vah265dec ~6 fps vs
+      avdec_h265 ~121 — presence checks cannot see this); today the
+      slow VA-API decoders are known only from the hand-written
+      demote_decoders list on silence;
+      (b) `doctor --fix` writing the demotions this box needs into its
+      own config — [transcoder] for what playback autoplugs, [mediahost]
+      for what discovery does — idempotent, comment-preserving, never
+      removing a human's entry.
+      The DTS half of the detection EXISTS and warns (dtsdec/libdca
+      outranks avdec_dca), which is the point: it warned unread while a
+      scan filed 312 DTS files as 5.1, fixed 2026-08-01 by hand-editing
+      TOML on the satellite. A check whose remedy is a hand-edited file
+      per box is a check that gets ignored.
 
 ## Non-functional (NFR)
 
