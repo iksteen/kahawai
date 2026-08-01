@@ -276,6 +276,14 @@ impl Runner {
                     } else {
                         vec!["--sink".into(), sink.to_string()]
                     })
+                    // BOTH streams. stderr alone captured GStreamer's
+                    // C-side output and Rust panics — which is why crash
+                    // capture worked — while every tracing::info! the
+                    // worker emits went to stdout and was discarded with
+                    // the detached parent's. A hung session therefore
+                    // left no trace of what the pipeline thought it was
+                    // doing, which cost an evening of guessing.
+                    .stdout(std::process::Stdio::from(log.try_clone()?))
                     .stderr(std::process::Stdio::from(log))
                     .kill_on_drop(true)
                     .spawn()
