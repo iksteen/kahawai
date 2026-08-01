@@ -288,30 +288,32 @@ pub fn vobsub_decode(spu: &[u8], palette16: &[[u8; 3]]) -> Result<Option<ImageOb
     let (mut x1, mut x2, mut y1, mut y2) = (0usize, 0usize, 0usize, 0usize);
     let (mut top_at, mut bot_at) = (0usize, 0usize);
     let mut pos = ctrl_at + 4; // skip date + next-seq offset of first block
+    // Every operand read is bounds-checked: a truncated record ends the
+    // walk instead of indexing past the buffer. This decoder runs on a
+    // GStreamer streaming thread inside an appsink callback — C calling
+    // Rust — where a panic cannot unwind and aborts the PROCESS. Real
+    // rips carry truncated SPUs (issue #1: a malformed packet killed
+    // the worker with SIGABRT, and the sink fallback retried into the
+    // identical crash because it happens upstream of the sink).
+    // Whatever was parsed before the truncation still stands; the
+    // checks below decide whether it amounts to a usable object.
     while pos < spu.len() {
+        let operand = |n: usize| spu.get(pos + 1..pos + 1 + n);
         match spu[pos] {
             0x00 | 0x01 => pos += 1, // force/start display
             0x02 => break,           // stop display (timing comes from the block)
             0x03 => {
-                pal_idx = [
-                    spu[pos + 1] >> 4,
-                    spu[pos + 1] & 0xF,
-                    spu[pos + 2] >> 4,
-                    spu[pos + 2] & 0xF,
-                ];
+                let Some(b) = operand(2) else { break };
+                pal_idx = [b[0] >> 4, b[0] & 0xF, b[1] >> 4, b[1] & 0xF];
                 pos += 3;
             }
             0x04 => {
-                alpha = [
-                    spu[pos + 1] >> 4,
-                    spu[pos + 1] & 0xF,
-                    spu[pos + 2] >> 4,
-                    spu[pos + 2] & 0xF,
-                ];
+                let Some(b) = operand(2) else { break };
+                alpha = [b[0] >> 4, b[0] & 0xF, b[1] >> 4, b[1] & 0xF];
                 pos += 3;
             }
             0x05 => {
-                let b = &spu[pos + 1..pos + 7];
+                let Some(b) = operand(6) else { break };
                 x1 = (b[0] as usize) << 4 | (b[1] >> 4) as usize;
                 x2 = ((b[1] & 0xF) as usize) << 8 | b[2] as usize;
                 y1 = (b[3] as usize) << 4 | (b[4] >> 4) as usize;
@@ -319,8 +321,9 @@ pub fn vobsub_decode(spu: &[u8], palette16: &[[u8; 3]]) -> Result<Option<ImageOb
                 pos += 7;
             }
             0x06 => {
-                top_at = u16::from_be_bytes([spu[pos + 1], spu[pos + 2]]) as usize;
-                bot_at = u16::from_be_bytes([spu[pos + 3], spu[pos + 4]]) as usize;
+                let Some(b) = operand(4) else { break };
+                top_at = u16::from_be_bytes([b[0], b[1]]) as usize;
+                bot_at = u16::from_be_bytes([b[2], b[3]]) as usize;
                 pos += 5;
             }
             0xFF => break,
@@ -512,5 +515,68 @@ mod tests {
         };
         let png = to_png(&obj).unwrap();
         assert_eq!(&png[1..4], b"PNG");
+    }
+
+    /// A minimal but VALID VobSub SPU: 2x2 subtitle, full control
+    /// sequence (palette, alpha, coords, data offsets), then RLE.
+    fn sample_spu() -> Vec<u8> {
+        // Control block starts after the two RLE fields.
+        let rle: [u8; 4] = [0x51, 0x00, 0x51, 0x00]; // one run per field
+        let data_at = 4usize; // header is 4 bytes
+        let top = data_at;
+        let bot = data_at + 2;
+        let ctrl_at = data_at + rle.len();
+        let mut spu = Vec::new();
+        spu.extend_from_slice(&[0, 0]); // total size (patched below)
+        spu.extend_from_slice(&(ctrl_at as u16).to_be_bytes());
+        spu.extend_from_slice(&rle);
+        // control block: date(2) + next-seq(2), then records
+        spu.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+        spu.extend_from_slice(&[0x03, 0x01, 0x23]); // palette indexes
+        spu.extend_from_slice(&[0x04, 0xFF, 0xF0]); // alpha
+        // coords: x 0..1, y 0..1
+        spu.extend_from_slice(&[0x05, 0x00, 0x00, 0x10, 0x00, 0x00, 0x10]);
+        spu.extend_from_slice(&[0x06]); // data offsets
+        spu.extend_from_slice(&(top as u16).to_be_bytes());
+        spu.extend_from_slice(&(bot as u16).to_be_bytes());
+        spu.push(0xFF);
+        let n = spu.len() as u16;
+        spu[0..2].copy_from_slice(&n.to_be_bytes());
+        spu
+    }
+
+    /// Issue #1: a truncated SPU must never panic. This decoder runs in
+    /// a GStreamer appsink callback — C calling Rust — so a panic there
+    /// cannot unwind and ABORTS the worker process, killing the session
+    /// outright (and the sink-fallback retry hits the identical crash,
+    /// because this is upstream of the sink). Real rips carry truncated
+    /// packets, so every prefix of a valid SPU is a case we must
+    /// survive: return None or an Err, never unwind.
+    #[test]
+    fn truncated_vobsub_spu_never_panics() {
+        let full = sample_spu();
+        let palette = vec![[0u8, 0, 0]; 16];
+        // The intact packet decodes to a real object.
+        let ok = vobsub_decode(&full, &palette).expect("valid SPU errored");
+        assert!(ok.is_some(), "sample SPU should decode");
+
+        // Every prefix, including the empty one.
+        for n in 0..=full.len() {
+            let r = std::panic::catch_unwind(|| vobsub_decode(&full[..n], &palette));
+            assert!(r.is_ok(), "panicked on a {n}-byte prefix of a valid SPU");
+        }
+
+        // And a control offset pointing past the end, plus records that
+        // claim operands the buffer does not contain.
+        for evil in [
+            vec![0x00, 0x08, 0xFF, 0xFF, 0x00, 0x00],
+            vec![0x00, 0x0A, 0x00, 0x04, 0, 0, 0, 0, 0x05],
+            vec![0x00, 0x0A, 0x00, 0x04, 0, 0, 0, 0, 0x06, 0x00],
+            vec![0x00, 0x0A, 0x00, 0x04, 0, 0, 0, 0, 0x03],
+            vec![0x00, 0x0A, 0x00, 0x04, 0, 0, 0, 0, 0x04, 0x01],
+        ] {
+            let r = std::panic::catch_unwind(|| vobsub_decode(&evil, &palette));
+            assert!(r.is_ok(), "panicked on malformed SPU {evil:?}");
+        }
     }
 }

@@ -1074,13 +1074,37 @@ fn tap_image_track(
                     && let Ok(map) = buffer.map_readable()
                 {
                     let ms = pts.mseconds();
+                    // Belt and braces around the decoders (issue #1):
+                    // this callback is invoked by C, so a panic here
+                    // cannot unwind and ABORTS the worker — killing the
+                    // session, and killing the sink-fallback retry with
+                    // it, since this runs upstream of the sink. The
+                    // decoders are bounds-checked; this makes the NEXT
+                    // parser bug a dropped subtitle instead of a dead
+                    // session. Same reasoning as guard_pts.
+                    let guard = |f: &mut dyn FnMut()| {
+                        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).is_err() {
+                            tracing::error!(
+                                pts_ms = ms,
+                                "image subtitle decoder panicked; dropping this packet"
+                            );
+                        }
+                    };
                     if is_pgs {
-                        if let Ok(Some(set)) = pgs.feed(map.as_slice()) {
+                        let mut fed = None;
+                        guard(&mut || fed = pgs.feed(map.as_slice()).ok().flatten());
+                        if let Some(set) = fed {
                             write_set(&file, ms, set.canvas_w, set.canvas_h, &set.objects);
                         }
-                    } else if let Ok(Some(obj)) =
-                        crate::imagesubs::vobsub_decode(map.as_slice(), &vob_palette)
-                    {
+                    } else if let Some(obj) = {
+                        let mut decoded = None;
+                        guard(&mut || {
+                            decoded = crate::imagesubs::vobsub_decode(map.as_slice(), &vob_palette)
+                                .ok()
+                                .flatten()
+                        });
+                        decoded
+                    } {
                         let end = ms + buffer.duration().map(|d| d.mseconds()).unwrap_or(5000);
                         write_set(
                             &file,
