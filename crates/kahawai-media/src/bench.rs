@@ -147,6 +147,22 @@ pub struct BenchResults {
     pub encoders: BTreeMap<String, Speeds>,
     /// The GL tone-map segment, measured through the real chain.
     pub tonemap: Option<Speeds>,
+    /// Elements this run STARTED measuring, written before each attempt.
+    /// One listed here with no entry in `encoders` took the process
+    /// down — which is a capability fact, not a gap: svtav1enc
+    /// segfaults at 1080p on the J5005 while passing its 320x240
+    /// startup dry-run, so a report built from dry runs alone
+    /// advertises an encoder that crashes in session.
+    #[serde(default)]
+    pub attempted: Vec<String>,
+}
+
+impl BenchResults {
+    /// Did measuring this element kill the benchmark? True only when it
+    /// was attempted and produced nothing.
+    pub fn crashed(&self, element: &str) -> bool {
+        self.attempted.iter().any(|e| e == element) && !self.encoders.contains_key(element)
+    }
 }
 
 /// The floor a completed-but-barely-productive run reports. A box that
@@ -258,12 +274,10 @@ pub fn measure_into(elements: &[&str], tonemap: bool, cache: &Path) -> BenchResu
     }
     let tmp = std::env::temp_dir().join("kahawai-bench");
     let _ = std::fs::create_dir_all(&tmp);
-    for el in elements {
-        out.encoders
-            .insert((*el).to_string(), measure_one(el, &tmp));
-        // Persist before touching the next element: it may not return.
-        store(cache, &out);
-    }
+    // Tone-map FIRST: it is cheap, it is HUB-15a's whole signal, and a
+    // crash-prone encoder later in the list must not cost it. Silence
+    // reported `null` forever because svtav1enc killed the child before
+    // this ran — on the very box whose GL round trip motivated HUB-36.
     if tonemap {
         let s = Speeds {
             s1080: measure_tonemap(1920, 1080),
@@ -271,6 +285,16 @@ pub fn measure_into(elements: &[&str], tonemap: bool, cache: &Path) -> BenchResu
         };
         tracing::info!(at_1080 = ?s.s1080, at_2160 = ?s.s2160, "tone-map speed measured");
         out.tonemap = Some(s);
+        store(cache, &out);
+    }
+    for el in elements {
+        // Record the attempt BEFORE making it: if this element takes the
+        // process down, the next run can tell "crashed" from "never
+        // asked".
+        out.attempted.push((*el).to_string());
+        store(cache, &out);
+        out.encoders
+            .insert((*el).to_string(), measure_one(el, &tmp));
         store(cache, &out);
     }
     out
@@ -676,6 +700,30 @@ mod tests {
         assert_eq!(load(&dir.path().join("nope.json")), None);
         std::fs::write(&path, b"{ not json").unwrap();
         assert_eq!(load(&path), None);
+    }
+
+    /// A crash is a capability fact: attempted, produced nothing.
+    /// Distinguishing it from "never asked" is what stops a box
+    /// advertising an encoder that segfaults in session (silence,
+    /// svtav1enc at 1080p — its 320x240 dry-run passes).
+    #[test]
+    fn crashed_distinguishes_attempted_from_unasked() {
+        let mut r = BenchResults {
+            gst: gst_version(),
+            ..Default::default()
+        };
+        r.attempted.push("svtav1enc".into());
+        r.attempted.push("vah264enc".into());
+        r.encoders.insert(
+            "vah264enc".into(),
+            Speeds {
+                s1080: Some(5.1),
+                s2160: Some(1.4),
+            },
+        );
+        assert!(r.crashed("svtav1enc"), "attempted, no result => crashed");
+        assert!(!r.crashed("vah264enc"), "attempted and measured");
+        assert!(!r.crashed("nvh264enc"), "never attempted is not a crash");
     }
 
     #[test]

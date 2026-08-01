@@ -131,6 +131,22 @@ fn probe_capabilities(max_sessions: u32, state_dir: &Path) -> Result<CapabilityR
     let bench = kahawai_media::bench::load(&bench_cache(state_dir)).unwrap_or_default();
     let encoders: Vec<EncoderCap> = kahawai_media::remux::encoder_capabilities()
         .into_iter()
+        // An element that CRASHED the benchmark is not a capability.
+        // The startup dry-run only proves it loads: svtav1enc passes at
+        // 320x240 on the J5005 and segfaults at 1080p, so without this
+        // the box advertises av1 and takes a real session down with it.
+        .filter(|(codec, element, _)| {
+            let dead = bench.crashed(element);
+            if dead {
+                tracing::warn!(
+                    codec,
+                    element,
+                    "not advertising: this element crashed the benchmark, so it \
+                     cannot be trusted with a session"
+                );
+            }
+            !dead
+        })
         .map(|(codec, element, hardware)| {
             let s = bench.encoders.get(element).copied().unwrap_or_default();
             tracing::info!(
