@@ -2243,15 +2243,23 @@ fn make_hls_sink(out_dir: &Path, prefer: Option<&str>) -> Result<(gst::Element, 
     // which hlssink3 writes verbatim from this property. 3 is therefore
     // the smallest spec-valid value for ~2 s segments (2 produced
     // playlists that violated it).
-    // With keyframe requests off (below) this no longer decides where
-    // anything is cut — measured: target 2 and target 3 both yield the
-    // same 2.002 s segments — it is purely the TARGETDURATION written
-    // to the playlist, and that is a bound we must actually honour.
-    // Segments are one GOP (~2 s), but an encoder is free to treat its
-    // keyframe interval as advisory: vtenc skipped one in a 60-segment
-    // session, producing a 3.885 s segment that TARGETDURATION 3 would
-    // have declared impossible. 4 covers a doubled GOP.
-    set_prop_if_present(&sink, "target-duration", 4u32);
+    // With the sink's keyframe requests off (below), this selects how
+    // many WHOLE GOPs go in a segment: the sink packs them while the
+    // total stays under the target. With a ~2 s GOP, 3 takes one (two
+    // would be 3.96) and 4 takes two — measured live, raising it to 4
+    // doubled every segment to ~3.9 s and would have doubled the
+    // session-start gate with it. So 3, which keeps one GOP per segment
+    // and the gate at ~6 s of content.
+    //
+    // Residual, accepted: an encoder may treat its keyframe interval as
+    // advisory — vtenc skipped one in a 60-segment session, yielding a
+    // 3.885 s segment against a declared 3. Rare (1 in 60) and benign
+    // in players, which use TARGETDURATION to time playlist reloads
+    // rather than as a hard bound. The real fix is a GOP derived from
+    // the source framerate, so the sink's time-based requests and the
+    // frame-based GOP coincide instead of interleaving and the requests
+    // can come back as a cap; that is a bigger change than this one.
+    set_prop_if_present(&sink, "target-duration", 3u32);
     // ...but the sink ALSO requests a keyframe every target-duration by
     // default, which is a second cut source racing the encoders' 48-frame
     // GOP above. The two cadences are incommensurable by construction —
