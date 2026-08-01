@@ -44,9 +44,10 @@ How something works and why it was built that way belong in
       SessionReady → verdict), so a 7.1→5.1 fold reaches the client
       instead of only the segment bytes; Hello carries a build stamp so
       the hub log answers which build each satellite runs (protocol 2.2).
-      Missing: mediahosts declare nothing (MH-12), and no declaration
-      carries a rate, so a box reporting a filter it runs at 0.65×
-      realtime is indistinguishable from one running it at 5× (HUB-36)
+      Transcoder declarations now carry a RATE (HUB-36), so a box
+      running a filter at 0.65× is no longer indistinguishable from one
+      running it at 5×.
+      Missing: mediahosts declare nothing (MH-12)
 - [x] AR-12 Control/byte plane isolation: separate connections, no shared
       flow-control window (the frozen-heartbeat lesson, codified)
 
@@ -269,19 +270,26 @@ How something works and why it was built that way belong in
 - [x] HUB-35 Granular refresh: library-refresh endpoint fanning out
       per-collection scan requests, per-collection live progress in the
       admin overview, global rescan removed (endpoint + button)
-- [ ] HUB-36 Pace-aware placement. Placement weighs codec fit, a
-      hardware flag and session count — never throughput, though TC-4
-      already reports a realtime multiple per session. Measured cost of
-      the gap: 2160p HDR runs ~0.65× realtime on one transcoder and
-      several times realtime on another, and the hub cannot tell them
-      apart, so a 4K HDR job lands on either
+- [x] HUB-36 Pace-aware placement, on measured capability. Boxes
+      benchmark encoders and the GL tone-map; workers meter the
+      un-throttled phase of real sessions into a persisted per-(box,
+      work class) EWMA; placement ranks on it and states a
+      below-realtime prediction in the verdict rather than letting a
+      viewer discover it. Design in implementation §4.5.
+      NOTE this requirement's original text asserted that TC-4 "already
+      reports a realtime multiple per session". It did not — nothing
+      measured pace before this work. Corrected at TC-4.
 
 ## Transcoder (TC)
 
 - [x] TC-1 Capability probe reported on registration
 - [x] TC-2 Capability + inverse-load placement; admin enable/disable
 - [x] TC-3 Sessions fully specified by the hub
-- [x] TC-4 Dynamic GStreamer pipelines, HLS segments, supervised worker process
+- [x] TC-4 Dynamic GStreamer pipelines, HLS segments, supervised worker
+      process. Progress reporting is PARTIAL, and the requirement was
+      long recorded as if it were not: a per-run pace sample exists
+      (HUB-36 — the un-throttled phase, once per run), but there is
+      still no continuous progress percentage per session
 - [x] TC-5 Cancellable sessions; transcode-ahead pacing window
 - [ ] TC-6 Resource ceilings *(max_sessions enforced; CPU/GPU shares and
       scratch-disk quota/eviction not enforced)*

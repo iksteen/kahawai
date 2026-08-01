@@ -186,6 +186,59 @@ function TmdbSection({ onNotice, tick }: { onNotice: (s: string) => void; tick: 
   )
 }
 
+/// A realtime multiple, or nothing at all. Never "0×": zero on the wire
+/// means unmeasured, and printing it as a speed would read as a box that
+/// cannot encode (HUB-36).
+function mult(v?: number | null): string | null {
+  return typeof v === 'number' && v > 0 ? `${v.toFixed(1)}×` : null
+}
+
+/// `6.2× / 2.1×` — 1080p and 2160p, dropping whichever was not measured.
+function pair(a?: number | null, b?: number | null): string | null {
+  const parts = [mult(a), mult(b)].filter((x): x is string => x !== null)
+  return parts.length ? parts.join(' / ') : null
+}
+
+/// What a transcoder was MEASURED doing, under what it claims it can do.
+/// Benchmarks are per element; `pace` is per class of real work and
+/// overrides them in placement, so it is shown apart and last.
+function MeasuredFacts({ s }: { s: Satellite }) {
+  const caps = s.capabilities
+  const encoders = caps?.encoders ?? []
+  const tm = pair(caps?.tonemap_speed_1080, caps?.tonemap_speed_2160)
+  const link =
+    typeof s.link_bytes_per_sec === 'number' && s.link_bytes_per_sec > 0
+      ? `${(s.link_bytes_per_sec / 1_000_000).toFixed(1)} MB/s`
+      : null
+  const pace = s.pace ?? []
+  if (!encoders.length && !tm && !link && !pace.length) return null
+  return (
+    <span className="chips dim">
+      {encoders.map((e) => {
+        const sp = pair(e.speed_1080, e.speed_2160)
+        return (
+          <span className="chip" key={e.element} title={e.element}>
+            {e.codec}
+            {e.hardware ? ' hw' : ''}
+            {sp ? ` ${sp}` : ' —'}
+          </span>
+        )
+      })}
+      {tm && <span className="chip">tone-map {tm}</span>}
+      {link && <span className="chip">link {link}</span>}
+      {pace.map((p) => (
+        <span
+          className={p.multiple < 1 ? 'chip warn' : 'chip'}
+          key={p.class}
+          title="measured on real sessions; overrides the benchmark"
+        >
+          {p.class} {p.multiple.toFixed(1)}×
+        </span>
+      ))}
+    </span>
+  )
+}
+
 export default function Admin() {
   const [pending, setPending] = useState<PendingEnrollment[]>([])
   const [satellites, setSatellites] = useState<Satellite[]>([])
@@ -324,6 +377,7 @@ export default function Admin() {
               <span className="mono dim">{s.cert_fingerprint.slice(0, 16)}…</span>
               {s.disabled && <span className="chip warn">disabled</span>}
             </span>
+            {s.module_type === 'transcoder' && <MeasuredFacts s={s} />}
             <span>
               {s.module_type === 'transcoder' && (
                 <button

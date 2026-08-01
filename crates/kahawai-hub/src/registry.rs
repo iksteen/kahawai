@@ -2021,11 +2021,22 @@ impl Registry {
         .await?;
         let connected = self.connected.lock().unwrap().clone();
         let caps = self.transcoder_caps.lock().unwrap().clone();
+        // HUB-36: what each box has been MEASURED doing, beside what it
+        // claims it can do. Sorted so the admin page renders stably
+        // rather than in hash order.
+        let pace = self.tc_pace.lock().unwrap().clone();
+        let link_rates = self.tc_link_rate.lock().unwrap().clone();
         Ok(rows
             .iter()
             .map(|r| {
                 let id: String = r.get("module_id");
                 let state = connected.get(&id);
+                let mut observed: Vec<(&str, f64)> = pace
+                    .iter()
+                    .filter(|((m, _), _)| *m == id)
+                    .map(|((_, class), v)| (class.as_str(), *v))
+                    .collect();
+                observed.sort_by(|a, b| a.0.cmp(b.0));
                 serde_json::json!({
                     "module_id": id,
                     "module_type": r.get::<String, _>("module_type"),
@@ -2036,6 +2047,12 @@ impl Registry {
                     "build": state.map(|s| s.build.as_str()),
                     "capabilities": caps.get(&id),
                     "disabled": self.disabled.lock().unwrap().contains(&id),
+                    // Measured, not claimed: per work class, and the
+                    // source-plane rate this box actually sustained.
+                    "pace": observed.iter()
+                        .map(|(c, v)| serde_json::json!({"class": c, "multiple": v}))
+                        .collect::<Vec<_>>(),
+                    "link_bytes_per_sec": link_rates.get(&id),
                 })
             })
             .collect())

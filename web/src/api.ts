@@ -597,6 +597,29 @@ export type PendingEnrollment = {
   name: string
 }
 
+/// One verified encoder and what it was measured doing (HUB-36).
+/// Speeds are realtime multiples; null = never measured, which is not
+/// the same as slow.
+export type EncoderCap = {
+  codec: string
+  element: string
+  hardware: boolean
+  speed_1080?: number | null
+  speed_2160?: number | null
+}
+
+export type SatelliteCaps = {
+  encoders?: EncoderCap[]
+  max_sessions?: number
+  tonemap?: boolean
+  tonemap_speed_1080?: number | null
+  tonemap_speed_2160?: number | null
+}
+
+/// What a box has ACHIEVED on a kind of work, as opposed to what its
+/// benchmark claims. `class` is `{res}|{src}|{dst}[|tm]`.
+export type PaceRow = { class: string; multiple: number }
+
 export type Satellite = {
   module_id: string
   module_type: string
@@ -604,6 +627,9 @@ export type Satellite = {
   cert_fingerprint: string
   connected: boolean
   disabled: boolean
+  capabilities?: SatelliteCaps | null
+  pace?: PaceRow[]
+  link_bytes_per_sec?: number | null
 }
 
 export type AdminSession = {
