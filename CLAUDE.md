@@ -72,12 +72,20 @@ restarts it for you. State lives under the XDG data dir
 Restarting it after a fix is routine work; do it rather than asking:
 
 ```sh
-cargo build                     # FIRST: sqlx::migrate! embeds migration
-                                # SQL at compile time, so an un-rebuilt
-                                # binary re-applies the OLD sql
-pkill -f '^\./target/debug/kahawai hub'
-nohup ./target/debug/kahawai hub >> ~/.local/share/kahawai/hub.log 2>&1 &
+scripts/kahawai-restart.sh hub --build       # or all-in-one|transcoder
 ```
+
+Use the script, do not hand-write the kill. It rebuilds (sqlx::migrate!
+embeds migration SQL at compile time, so an un-rebuilt binary re-applies
+the OLD sql), stops, **verifies the process actually died**, starts
+detached, and **verifies the pid changed**. Both checks exist because
+their absence is invisible: a `pkill -f 'kahawai hub'` also matches the
+wrapper shell running it and kills that instead (exit 144, hub still
+alive, looks exactly like success), and an anchored pattern aimed at
+`target/debug` silently misses a hub running from `target/release`. If
+you ever do write one by hand, bracket a character — `'[k]ahawai hub'`
+— which cannot match its own command line. A PreToolUse hook blocks the
+unsafe forms.
 
 Then verify: `_sqlx_migrations` version, process up, log tail. Migrations
 apply only at hub startup, so an un-restarted hub is a schema behind.
