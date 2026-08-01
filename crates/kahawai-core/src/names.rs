@@ -263,11 +263,21 @@ pub fn parse_episode(path_rel: &str) -> Option<EpisodeGuess> {
     let cleaned = join_split_marker(&cleaned);
     let cleaned = split_trailing_marker(&cleaned);
     let tokens: Vec<&str> = cleaned.split_whitespace().collect();
-    let (idx, season, episode, episode_end) = tokens.iter().enumerate().find_map(|(i, t)| {
+    let lettered = tokens.iter().enumerate().find_map(|(i, t)| {
         parse_sxxeyy(t)
             .or_else(|| parse_nnxnn(t).map(|(s, e)| (s, e, None)))
             .map(|(s, e, end)| (i, s, e, end))
-    })?;
+    });
+    // Compact scene numbering is tried ONLY when nothing lettered
+    // matched, which is what bounds its blast radius to files that
+    // resolve to nothing today.
+    let (idx, season, episode, episode_end) = match lettered {
+        Some(found) => found,
+        None => {
+            let (i, s, e) = parse_scene_compact(stem, &tokens)?;
+            (i, s, e, None)
+        }
+    };
 
     // Show identity: the top-level directory when there is one (skipping
     // season dirs), else the filename tokens before SxxEyy.
@@ -633,6 +643,62 @@ fn join_split_marker(s: &str) -> String {
     out.join(" ")
 }
 
+/// Scene compact numbering: `helix.213.hdtv-lol.mp4` — one digit of
+/// season, two of episode, no `S`/`E` letters anywhere.
+///
+/// Three bare digits are far more ambiguous than `s##e##`, so the digits
+/// alone can never be the evidence. Everything that could be confused
+/// with them is a DIFFERENT SHAPE of name, and that is what this gates
+/// on — the release convention, not the number:
+///
+///   * anime absolute numbering (`[AnimeRG] Dragon Ball Super - 110
+///     [720p]`) would read as S01E10, and it would reach here because
+///     `parse_anime` tries `parse_episode` first. Fansub names carry
+///     brackets and spaces; a scene name has neither.
+///   * titles that ARE numbers (`Cyber City Oedo 808 Ova 01`, three
+///     files in this library) would read as S08E08. Spaces again, and
+///     a title-number sits at the FRONT — hence `i > 0`.
+///   * years used for disambiguation are four digits, and `The 4400`
+///     is four digits, so `exactly three` excludes both outright.
+///
+/// A scene name is dot-separated with no whitespace and no brackets,
+/// and ends in a `-group` tag; the marker is never the first token and
+/// always has the source/codec run after it. Callers reach this only
+/// when no lettered marker matched anywhere, so a file that parses
+/// today cannot change.
+fn parse_scene_compact(stem: &str, tokens: &[&str]) -> Option<(usize, u32, u32)> {
+    if stem.contains(char::is_whitespace)
+        || stem.contains(['[', ']', '(', ')'])
+        || !stem.contains('.')
+    {
+        return None;
+    }
+    // `-group` suffix: the last dot-separated segment carries it.
+    if !stem
+        .rsplit('.')
+        .next()
+        .is_some_and(|last| last.contains('-'))
+    {
+        return None;
+    }
+    tokens.iter().enumerate().skip(1).find_map(|(i, t)| {
+        let b = t.as_bytes();
+        // Exactly three digits, season 1-9: a leading zero is anime
+        // absolute numbering ("- 010 -"), never a season.
+        if b.len() != 3 || !b.iter().all(|c| c.is_ascii_digit()) || b[0] == b'0' {
+            return None;
+        }
+        // Something must follow — a scene name always runs on into the
+        // source and codec, and a trailing number is not a marker.
+        if i + 1 >= tokens.len() {
+            return None;
+        }
+        let s = (b[0] - b'0') as u32;
+        let e = ((b[1] - b'0') * 10 + (b[2] - b'0')) as u32;
+        Some((i, s, e))
+    })
+}
+
 /// The third gluing: a marker welded to the END of the stem with no
 /// separator at all, not even a hyphen — `teneighty-mfs04e01.mkv`, a
 /// release group's tag running straight into the numbering. Neither
@@ -784,6 +850,43 @@ pub fn release_revision(path_rel: &str) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    /// Three bare digits are the most dangerous shape in this file, so
+    /// the negatives matter more than the positive. Each of these was a
+    /// real worry, and two of them are real files.
+    fn compact_scene_numbering_stays_inside_its_shape() {
+        // What it is for: scene form, one digit season + two episode.
+        let g = parse_episode("Helix/Season 02/helix.213.hdtv-lol.mp4").expect("helix");
+        assert_eq!(
+            (g.show_title.as_str(), g.season, g.episode),
+            ("Helix", Some(2), 13)
+        );
+
+        // A title that IS a number. 808 must never read as S08E08 —
+        // space-separated, and the number leads the title.
+        let g =
+            parse_anime("Cyber City Oedo 808/Cyber City Oedo 808 Ova 01 Memories of the Past.mkv");
+        assert_ne!(
+            g.as_ref().map(|g| (g.season, g.episode)),
+            Some((Some(8), 8)),
+            "a numeric title was read as a season/episode"
+        );
+
+        // Anime absolute numbering reaches parse_episode FIRST (via
+        // parse_anime), so 110 must not become S01E10.
+        assert!(
+            parse_episode("[AnimeRG] Dragon Ball Super - 110 [720p] [x264].mkv").is_none(),
+            "fansub absolute numbering matched the compact form"
+        );
+
+        // Four digits are never a compact marker: disambiguation years,
+        // and shows whose title is a four-digit number.
+        assert!(parse_episode("The.4400.2004.1080p.WEB.x264-GRP.mkv").is_none());
+
+        // A leading title-number is not a marker (i > 0).
+        assert!(parse_episode("300.2006.1080p.BluRay.x264-GRP.mkv").is_none());
+    }
 
     #[test]
     fn parses_episodes() {
