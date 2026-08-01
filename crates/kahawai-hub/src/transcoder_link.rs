@@ -140,6 +140,52 @@ impl TranscoderLink for TranscoderLinkService {
                             );
                             registry.set_transcoder_caps(&module_id, &caps);
                         }
+                        // HUB-36 phase 4: what this box ACHIEVED. The
+                        // sample carries only a session id — the class
+                        // of work it belongs to is the hub's, derived
+                        // when the session was planned, so the two can
+                        // never disagree about what was measured.
+                        tc_to_hub::Msg::PaceReport(report) => {
+                            registry.set_link_rate(&module_id, report.link_bytes_per_sec);
+                            for s in report.samples {
+                                let Some(class) = sessions.pace_class(&s.session_id) else {
+                                    // Session gone, or a copy-only run
+                                    // that never had a class: nothing to
+                                    // attribute this to.
+                                    continue;
+                                };
+                                let m = s.multiple as f64;
+                                if !m.is_finite() || m <= 0.0 {
+                                    continue;
+                                }
+                                match crate::pace::fold(
+                                    registry.db(),
+                                    &module_id,
+                                    &class,
+                                    m,
+                                    std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .map(|d| d.as_secs() as i64)
+                                        .unwrap_or(0),
+                                )
+                                .await
+                                {
+                                    Ok(next) => {
+                                        registry.set_pace(&module_id, &class, next);
+                                        tracing::info!(
+                                            %module_id, class,
+                                            sample = %format!("{m:.2}"),
+                                            estimate = %format!("{next:.2}"),
+                                            "pace folded"
+                                        );
+                                    }
+                                    Err(e) => tracing::warn!(
+                                        %module_id, class, error = format!("{e:#}"),
+                                        "pace fold failed"
+                                    ),
+                                }
+                            }
+                        }
                         tc_to_hub::Msg::SessionReady(r) => {
                             let facts = r
                                 .facts

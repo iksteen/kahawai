@@ -101,6 +101,16 @@ pub struct Registry {
     >,
     /// Dispatched sessions per transcoder (inverse-load placement).
     tc_load: Mutex<HashMap<String, usize>>,
+    /// HUB-36: measured pace per `(module_id, work_class)`, loaded from
+    /// `transcoder_pace` at startup and written through on every fold.
+    /// In memory because placement is synchronous and must not await a
+    /// query to choose a box.
+    tc_pace: Mutex<HashMap<(String, String), f64>>,
+    /// Source-plane bytes/sec per transcoder, as IT measured. Deliberately
+    /// NOT persisted (see the pace module doc): a rate describes one
+    /// connection over one network, and a stale one lies confidently.
+    /// Cleared on disconnect for the same reason.
+    tc_link_rate: Mutex<HashMap<String, u64>>,
     /// Admin-disabled satellites: placement skips them; active sessions
     /// finish. ponytail: in-memory (an ops/testing toggle) — persist in
     /// the satellites table if drain-across-restarts is ever needed.
@@ -148,6 +158,8 @@ impl Registry {
             local_bench: Mutex::new(None),
             tc_links: Mutex::new(HashMap::new()),
             tc_load: Mutex::new(HashMap::new()),
+            tc_pace: Mutex::new(HashMap::new()),
+            tc_link_rate: Mutex::new(HashMap::new()),
             disabled: Mutex::new(std::collections::HashSet::new()),
             scan_progress: Mutex::new(HashMap::new()),
             deep_rescan: Mutex::new(std::collections::HashSet::new()),
@@ -1618,6 +1630,10 @@ impl Registry {
     pub fn unregister_tc_link(&self, module_id: &str) {
         self.tc_links.lock().unwrap().remove(module_id);
         self.tc_load.lock().unwrap().remove(module_id);
+        // The measured pace SURVIVES a disconnect — it describes the
+        // hardware, which is still whatever it was. The link rate does
+        // not: it described a connection that no longer exists.
+        self.tc_link_rate.lock().unwrap().remove(module_id);
     }
 
     pub async fn send_to_tc(
@@ -1635,6 +1651,53 @@ impl Registry {
         tx.send(Ok(msg))
             .await
             .map_err(|_| anyhow::anyhow!("transcoder link closed"))
+    }
+
+    /// HUB-36: seed the in-memory pace map from what previous runs
+    /// learned. Called once at startup — placement is synchronous and
+    /// cannot await a query per candidate.
+    pub async fn load_pace(&self) -> Result<usize> {
+        let rows = crate::pace::load_all(&self.db).await?;
+        let n = rows.len();
+        let mut map = self.tc_pace.lock().unwrap();
+        for (module_id, class, multiple) in rows {
+            map.insert((module_id, class), multiple);
+        }
+        Ok(n)
+    }
+
+    /// Write through after a fold, so placement sees the new estimate
+    /// without re-reading the table.
+    pub fn set_pace(&self, module_id: &str, class: &str, multiple: f64) {
+        self.tc_pace
+            .lock()
+            .unwrap()
+            .insert((module_id.to_string(), class.to_string()), multiple);
+    }
+
+    /// What this box has been measured to achieve on this kind of work,
+    /// or None if it has never done any.
+    pub fn pace_of(&self, module_id: &str, class: &str) -> Option<f64> {
+        self.tc_pace
+            .lock()
+            .unwrap()
+            .get(&(module_id.to_string(), class.to_string()))
+            .copied()
+    }
+
+    /// 0 from the wire means "not measured", never "no bandwidth".
+    pub fn set_link_rate(&self, module_id: &str, bytes_per_sec: u64) {
+        if bytes_per_sec == 0 {
+            return;
+        }
+        self.tc_link_rate
+            .lock()
+            .unwrap()
+            .insert(module_id.to_string(), bytes_per_sec);
+    }
+
+    pub fn link_rate_of(&self, module_id: &str) -> Option<u64> {
+        self.tc_link_rate.lock().unwrap().get(module_id).copied()
     }
 
     pub fn tc_session_started(&self, module_id: &str) {
@@ -1811,6 +1874,9 @@ impl Registry {
             "DELETE FROM item_sources WHERE module_id = ?",
             "DELETE FROM files WHERE module_id = ?",
             "DELETE FROM collections WHERE module_id = ?",
+            // HUB-36: what it achieved described hardware the fleet no
+            // longer has. A re-enrolment mints a new id and learns again.
+            "DELETE FROM transcoder_pace WHERE module_id = ?",
             "DELETE FROM satellites WHERE module_id = ?",
         ] {
             sqlx::query(sql).bind(module_id).execute(&mut *tx).await?;

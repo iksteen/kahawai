@@ -461,6 +461,13 @@ async fn run_hub_inner(
     ));
     let admitted = registry.load_allowlist().await?;
     tracing::info!(admitted, "mTLS allowlist loaded");
+    // HUB-36 phase 4: what the fleet has been measured to achieve, so a
+    // hub restart does not throw away the learning and start guessing
+    // from benchmarks again.
+    match registry.load_pace().await {
+        Ok(n) => tracing::info!(classes = n, "measured pace loaded"),
+        Err(e) => tracing::warn!(error = format!("{e:#}"), "pace table unreadable"),
+    }
     // HUB-36: the hub is an executor too (an encode with no fleet stays
     // local), so it measures itself on the same cache-but-verify terms
     // as a satellite — off the startup path, published when it lands.

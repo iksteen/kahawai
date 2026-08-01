@@ -16,6 +16,7 @@ pub mod metrics;
 #[cfg(feature = "ocr")]
 pub mod ocr;
 pub mod opensubtitles;
+pub mod pace;
 pub mod pki;
 pub mod providers;
 pub mod proxy;

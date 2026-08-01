@@ -320,7 +320,28 @@ message TcToHub {
     // split out if profiling demands).
     SourceRead source_read = 6;
     ArtifactData artifact_data = 7;
+    // HUB-36: what this box actually achieved, sent on the heartbeat
+    // tick. A NEW kind rather than fields inside Heartbeat{}, which is
+    // shared with the mediahost link.
+    PaceReport pace_report = 8;
   }
+}
+
+// One finished run's un-throttled production rate. The transcoder
+// reports only what it measured; the hub owns the work-class the
+// sample belongs to, because it holds the MediaInfo and the plan and
+// the two must never disagree.
+message PaceSample {
+  string session_id = 1;
+  // Realtime multiple: content seconds produced per wall second.
+  float multiple = 2;
+}
+
+message PaceReport {
+  repeated PaceSample samples = 1;
+  // Bytes/sec the source plane sustained on large reads, EWMA. 0 =
+  // nothing large enough measured yet — absence, not "no bandwidth".
+  uint64 link_bytes_per_sec = 2;
 }
 
 message SessionReady {

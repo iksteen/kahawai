@@ -128,6 +128,12 @@ pub struct Session {
     plan: Mutex<Option<kahawai_media::remux::RemuxPlan>>,
     /// Placement requirements — reused when rescheduling (AR-6).
     needs: crate::registry::PlacementNeed,
+    /// HUB-36 work class this session's encode belongs to, or empty
+    /// when there is no encode to learn from. Fixed at planning time:
+    /// a track switch re-plans the AUDIO, which does not change what
+    /// the video costs, and letting it drift would attribute a sample
+    /// to work the box never did.
+    pub pace_class: String,
     /// Serializes seek-restarts. A scrub fires seeks faster than a
     /// restart completes, and two interleaved restarts wipe each
     /// other's scratch dir mid-bind (observed as intermittent 409s).
@@ -979,6 +985,11 @@ impl Sessions {
         let mut verdict = None;
         let mut session_plan = None;
         let mut session_needs = crate::registry::PlacementNeed::default();
+        // HUB-36: the kind of work this session IS, derived here because
+        // this is where the plan and the source metadata are both in
+        // scope. Whatever box runs it reports a pace sample against this
+        // string, so the two can never describe different things.
+        let mut session_class = String::new();
         let session_mode = match mode {
             "direct" => Mode::Direct { lease },
             "remux" => {
@@ -1018,6 +1029,18 @@ impl Sessions {
                         String::new()
                     },
                 };
+                // Only an ENCODE has a pace worth learning: a copy runs
+                // at whatever the link allows and says nothing about
+                // this box's compute.
+                if plan.video == StreamMode::Encode {
+                    let v = info.video.first();
+                    session_class = crate::pace::work_class(
+                        v.map_or(0, |v| v.height),
+                        v.map_or("", |v| v.codec.as_str()),
+                        plan.video_codec.as_str(),
+                        plan.tone_map,
+                    );
+                }
                 // Encode work goes to the fleet when one is available
                 // (§4.5); pure remux — and encode with no fleet — stays
                 // in the local supervised worker.
@@ -1159,6 +1182,7 @@ impl Sessions {
             seek_done: tokio::sync::watch::channel((0, Ok(0))).0,
             plan: Mutex::new(session_plan),
             needs: session_needs,
+            pace_class: session_class,
             touched: Mutex::new(std::time::Instant::now()),
         });
         self.active
@@ -2174,6 +2198,15 @@ impl Sessions {
 
     pub fn get(&self, id: &str) -> Option<Arc<Session>> {
         self.active.lock().unwrap().get(id).cloned()
+    }
+
+    /// HUB-36: the kind of work a session is, for attributing a pace
+    /// sample. None when the session has ended (its sample arrived on
+    /// the next heartbeat and lost the race) or when it never encoded
+    /// video and so has nothing to teach.
+    pub fn pace_class(&self, id: &str) -> Option<String> {
+        let s = self.active.lock().unwrap().get(id).cloned()?;
+        (!s.pace_class.is_empty()).then(|| s.pace_class.clone())
     }
 
     /// Remove a session: direct leases drop (closing the byte channel);

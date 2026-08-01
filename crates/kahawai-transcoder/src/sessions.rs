@@ -50,7 +50,25 @@ pub struct Runner {
     /// Stderr of the most recently failed worker, handed to the hub
     /// with the SessionError so it outlives this scratch dir.
     last_worker_log: Mutex<Option<String>>,
+    /// HUB-36 phase 4: pace samples harvested from finished runs,
+    /// waiting for the next heartbeat tick to carry them.
+    pending_pace: Mutex<Vec<kahawai_proto::v1::PaceSample>>,
+    /// Bytes/sec the source plane sustains, EWMA over LARGE reads only
+    /// (see `LINK_MIN_READ`). None until one is seen — a box that has
+    /// only ever served small reads has no measured bandwidth, which is
+    /// not the same as having none.
+    link_rate: Mutex<Option<f64>>,
 }
+
+/// Reads below this measure latency, not bandwidth: the round trip
+/// dominates and the resulting figure says more about the hub's event
+/// loop than about the link.
+const LINK_MIN_READ: usize = 1024 * 1024;
+
+/// Link-rate EWMA weight. Lower than the hub's pace weight because a
+/// single read races against whatever else shares the wire; the rate
+/// should drift toward the sustained truth rather than chase spikes.
+const LINK_ALPHA: f64 = 0.2;
 
 impl Runner {
     pub fn new(
@@ -69,6 +87,8 @@ impl Runner {
             next_req: std::sync::atomic::AtomicU64::new(1),
             run_seq: std::sync::atomic::AtomicU64::new(1),
             last_worker_log: Mutex::new(None),
+            pending_pace: Mutex::new(Vec::new()),
+            link_rate: Mutex::new(None),
         })
     }
 
@@ -324,6 +344,11 @@ impl Runner {
                 // Poll: the child handle lives in the sessions map.
                 loop {
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    // HUB-36: the worker writes pace.json once, when the
+                    // throttle first engages. Take it here — this poll
+                    // already watches the run dir, and the dir is gone
+                    // the moment the session ends or a seek replaces it.
+                    runner.take_pace(&sid, &run_dir);
                     let gone = {
                         let mut sessions = runner.sessions.lock().unwrap();
                         match sessions.get_mut(&sid) {
@@ -476,6 +501,7 @@ impl Runner {
                 .context("link closed")?;
             // Bounded wait: if the hub dropped the read (lease gone,
             // session torn down) the worker must error out, not hang.
+            let started = std::time::Instant::now();
             let data = match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
                 Ok(Ok(data)) => data,
                 Ok(Err(_)) | Err(_) => {
@@ -483,9 +509,76 @@ impl Runner {
                     anyhow::bail!("source read {req_id} unanswered");
                 }
             };
+            // Timed at the LEASE round trip, not the local write: this
+            // is what the source plane sustains for this box (HUB-36).
+            self.fold_link_rate(data.len(), started.elapsed());
             conn.write_all(&(data.len() as u64).to_le_bytes()).await?;
             conn.write_all(&data).await?;
         }
+    }
+
+    /// Take this run's pace sample if the worker has written one.
+    ///
+    /// Renamed rather than read-and-remembered: the file's ABSENCE is
+    /// the "already taken" flag, which survives this watcher being
+    /// replaced by a seek-restart's and costs no extra state. Keeping
+    /// the renamed copy leaves the number visible in the run dir for
+    /// anyone reading it by hand.
+    fn take_pace(&self, session_id: &str, run_dir: &std::path::Path) {
+        let path = run_dir.join("pace.json");
+        let Ok(body) = std::fs::read_to_string(&path) else {
+            return;
+        };
+        let _ = std::fs::rename(&path, run_dir.join("pace.taken.json"));
+        // {"multiple":3.42} — hand-rolled rather than pulling serde in
+        // for one field, and a torn read simply yields no sample.
+        let Some(v) = body
+            .split_once(':')
+            .and_then(|(_, rest)| rest.trim_matches(['}', ' ', '\n']).parse::<f32>().ok())
+        else {
+            tracing::debug!(session = %session_id, body = %body, "unparseable pace sample");
+            return;
+        };
+        if !v.is_finite() || v <= 0.0 {
+            return;
+        }
+        tracing::info!(session = %session_id, multiple = %format!("{v:.2}"), "pace sample harvested");
+        self.pending_pace
+            .lock()
+            .unwrap()
+            .push(kahawai_proto::v1::PaceSample {
+                session_id: session_id.to_string(),
+                multiple: v,
+            });
+    }
+
+    /// Drain what the next heartbeat should carry. None when there is
+    /// nothing to say — an idle box should not add traffic to its own
+    /// keepalive.
+    pub fn take_pace_report(&self) -> Option<kahawai_proto::v1::PaceReport> {
+        let samples = std::mem::take(&mut *self.pending_pace.lock().unwrap());
+        let rate = *self.link_rate.lock().unwrap();
+        if samples.is_empty() && rate.is_none() {
+            return None;
+        }
+        Some(kahawai_proto::v1::PaceReport {
+            samples,
+            link_bytes_per_sec: rate.unwrap_or(0.0) as u64,
+        })
+    }
+
+    /// Fold one completed source read into the link-rate EWMA. Small
+    /// reads are ignored (see `LINK_MIN_READ`).
+    fn fold_link_rate(&self, bytes: usize, elapsed: std::time::Duration) {
+        if bytes < LINK_MIN_READ || elapsed.is_zero() {
+            return;
+        }
+        let bps = bytes as f64 / elapsed.as_secs_f64();
+        let mut cur = self.link_rate.lock().unwrap();
+        *cur = Some(match *cur {
+            Some(prev) => LINK_ALPHA * bps + (1.0 - LINK_ALPHA) * prev,
+            None => bps,
+        });
     }
 
     /// Hub answered a source read. Stale responses (request id no

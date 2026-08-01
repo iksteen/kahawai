@@ -368,6 +368,16 @@ async fn link_loop(
                 {
                     bail!("link sender closed");
                 }
+                // HUB-36: rides the existing tick, and only when there
+                // is something to say. Sent AFTER the heartbeat so a
+                // link that is dying still gets its keepalive first.
+                if let Some(report) = runner.take_pace_report()
+                    && tx.send(TcToHub { msg: Some(tc_to_hub::Msg::PaceReport(report)) })
+                        .await
+                        .is_err()
+                {
+                    bail!("link sender closed");
+                }
             }
             msg = inbound.message() => {
                 match msg {
