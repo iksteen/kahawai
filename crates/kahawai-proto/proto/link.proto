@@ -392,9 +392,9 @@ message CapabilityReport {
   // HUB-36: the same segment MEASURED, as realtime multiples against a
   // 24 fps reference. "Available" said yes for a box that sustains
   // 1.7x at 1080p and 0.65x at 2160p — it answered "can you" where
-  // placement needed "can you keep up". 0 = unmeasured.
-  float tonemap_speed_1080 = 5;
-  float tonemap_speed_2160 = 6;
+  // placement needed "can you keep up". Absent = unmeasured.
+  optional float tonemap_speed_1080 = 5;
+  optional float tonemap_speed_2160 = 6;
 }
 
 message EncoderCap {
@@ -402,13 +402,17 @@ message EncoderCap {
   string element = 2; // the verified GStreamer element
   bool hardware = 3;  // hw-accelerated (placement prefers these)
   // HUB-36: measured realtime multiples (frames/sec / 24) at 1080p and
-  // 2160p. 0 = unmeasured — a legacy satellite, or the first boot
-  // before the background benchmark lands; consumers read that as "no
-  // data, assume sufficient", which is exactly today's behaviour.
+  // 2160p, from a reference transcode. ABSENT means unmeasured — a
+  // legacy satellite, or the first boot before the background
+  // benchmark lands — which consumers read as "no data, assume
+  // sufficient". A PRESENT near-zero value means the opposite:
+  // measured, and catastrophically slow. Explicit presence keeps those
+  // two apart; a 0.0 sentinel conflated them and would have sent 4K
+  // AV1 to the one box that cannot do it.
   // Video codecs only: audio encodes run hundreds of times realtime on
   // every box, and a number that never decides anything is noise.
-  float speed_1080 = 4;
-  float speed_2160 = 5;
+  optional float speed_1080 = 4;
+  optional float speed_2160 = 5;
 }
 
 message HubToTc {

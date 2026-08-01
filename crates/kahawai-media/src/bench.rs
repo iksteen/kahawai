@@ -106,23 +106,28 @@ const LOOPS: i32 = 60;
 const POOL: usize = 6;
 
 /// Realtime multiples for one element at the two resolutions that
-/// matter. 0.0 = unmeasured.
+/// matter.
+///
+/// `None` = UNMEASURED: no data, which every consumer reads as "assume
+/// sufficient". `Some(v)` with a tiny v is the OPPOSITE conclusion —
+/// measured, and catastrophically slow. Those two must never share an
+/// inhabitant: under a 0.0 sentinel the one box that cannot transcode
+/// 4K AV1 looked exactly like a box nobody had asked yet.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct Speeds {
-    pub s1080: f32,
-    pub s2160: f32,
+    pub s1080: Option<f32>,
+    pub s2160: Option<f32>,
 }
 
 impl Speeds {
     /// The measurement for a source of this height (the plan's own
     /// bucket boundary: anything above 1080p is "4K work").
     pub fn at(&self, height: u32) -> Option<f32> {
-        let v = if height > 1080 {
+        if height > 1080 {
             self.s2160
         } else {
             self.s1080
-        };
-        (v > 0.0).then_some(v)
+        }
     }
 }
 
@@ -145,19 +150,20 @@ pub struct BenchResults {
 /// interval to time, but it is NOT unmeasured — it is catastrophically
 /// slow, and 0.0 would read as "no data, assume sufficient" and send
 /// it 4K work. Measured live: silence encodes 2160p AV1 in software at
-/// under one frame per five seconds. This is an upper bound on that.
+/// under one frame per five seconds. Reported as `Some(_)` — measured
+/// and dreadful, which is the opposite conclusion from `None`.
 const SPEED_FLOOR: f32 = 1.0 / (5.0 * REFERENCE_FPS);
 
 /// Speed of `frames` buffers over `wall`, as a realtime multiple.
 /// Fewer than two buffers gives no interval to measure; `ran` says
-/// whether the pipeline nonetheless completed its window, which is the
-/// difference between "too slow to time" (a real, tiny speed) and
-/// "never ran" (unmeasured, 0.0).
-pub fn speed(frames: u64, wall: Duration, ran: bool) -> f32 {
+/// whether the pipeline nonetheless produced something, which is the
+/// difference between "too slow to time" (`Some(SPEED_FLOOR)`, a real
+/// upper bound) and "never ran" (`None`, unmeasured).
+pub fn speed(frames: u64, wall: Duration, ran: bool) -> Option<f32> {
     if frames < 2 || wall.is_zero() {
-        return if ran && frames >= 1 { SPEED_FLOOR } else { 0.0 };
+        return (ran && frames >= 1).then_some(SPEED_FLOOR);
     }
-    ((frames - 1) as f32 / wall.as_secs_f32()) / REFERENCE_FPS
+    Some(((frames - 1) as f32 / wall.as_secs_f32()) / REFERENCE_FPS)
 }
 
 /// The GStreamer version string used as the cache key.
@@ -220,11 +226,14 @@ pub fn drifted(old: &BenchResults, new: &BenchResults) -> bool {
     }
 }
 
-fn moved(a: f32, b: f32) -> bool {
-    if a <= 0.0 || b <= 0.0 {
-        return a != b; // measured ↔ unmeasured is always news
+fn moved(a: Option<f32>, b: Option<f32>) -> bool {
+    match (a, b) {
+        // Gaining or losing a measurement is always news.
+        (Some(_), None) | (None, Some(_)) => true,
+        (None, None) => false,
+        (Some(a), Some(b)) if a > 0.0 => ((a - b).abs() / a) >= 0.25,
+        (Some(a), Some(b)) => a != b,
     }
-    ((a - b).abs() / a) >= 0.25
 }
 
 /// Measure every given encoder element (and the tone-map segment when
@@ -272,7 +281,7 @@ pub fn measure(elements: &[&str], tonemap: bool) -> BenchResults {
 
 /// Transcode the reference clip for this resolution through the real
 /// chain shape and time the encoder's output.
-fn measure_encoder(element: &str, height: i32, dir: &Path) -> f32 {
+fn measure_encoder(element: &str, height: i32, dir: &Path) -> Option<f32> {
     let (clip, name) = if height > 1080 {
         (REF_2160, "ref-2160p.h264")
     } else {
@@ -281,7 +290,7 @@ fn measure_encoder(element: &str, height: i32, dir: &Path) -> f32 {
     // multifilesrc wants a path; the clip is a couple of hundred KB.
     let path = dir.join(name);
     if !path.exists() && std::fs::write(&path, clip).is_err() {
-        return 0.0;
+        return None;
     }
 
     let pipe = gst::Pipeline::new();
@@ -291,21 +300,21 @@ fn measure_encoder(element: &str, height: i32, dir: &Path) -> f32 {
         .property("num-buffers", LOOPS)
         .build()
     else {
-        return 0.0;
+        return None;
     };
     // parsebin over an explicit h264parse: it also picks the decoder's
     // preferred stream-format, which is what a session does.
     let (Some(parse), Some(decode)) = (make("h264parse"), make("decodebin")) else {
-        return 0.0;
+        return None;
     };
     let Ok(enc) = gst::ElementFactory::make(element).build() else {
-        return 0.0;
+        return None;
     };
     let Ok(sink) = gst::ElementFactory::make("fakesink")
         .property("sync", false)
         .build()
     else {
-        return 0.0;
+        return None;
     };
     // The SAME converters the encode chain uses — that is the point.
     let converters: Vec<gst::Element> = crate::remux::encode_converter_names(element)
@@ -317,18 +326,18 @@ fn measure_encoder(element: &str, height: i32, dir: &Path) -> f32 {
         || pipe.add_many(&converters).is_err()
         || pipe.add_many([&enc, &sink]).is_err()
     {
-        return 0.0;
+        return None;
     }
     if gst::Element::link_many([&src, &parse, &decode]).is_err() {
         let _ = pipe.set_state(gst::State::Null);
-        return 0.0;
+        return None;
     }
     let mut tail: Vec<&gst::Element> = converters.iter().collect();
     tail.push(&enc);
     tail.push(&sink);
     if gst::Element::link_many(tail.clone()).is_err() {
         let _ = pipe.set_state(gst::State::Null);
-        return 0.0;
+        return None;
     }
     // decodebin's src pad appears once caps are known.
     let head = tail[0].clone();
@@ -346,14 +355,11 @@ fn measure_encoder(element: &str, height: i32, dir: &Path) -> f32 {
 /// The real tone-map segment, fed 10-bit: the GL upload/download round
 /// trip is the cost that made a J5005 0.65× (HUB-15a), and 8-bit input
 /// would not exercise it honestly.
-fn measure_tonemap(w: i32, h: i32) -> f32 {
+fn measure_tonemap(w: i32, h: i32) -> Option<f32> {
     if !crate::remux::tonemap_available() {
-        return 0.0;
+        return None;
     }
-    let Some(convert) = make("videoconvert") else {
-        return 0.0;
-    };
-    let mut chain = vec![convert];
+    let mut chain = vec![make("videoconvert")?];
     chain.extend(crate::remux::tonemap_segment());
     // The GL segment genuinely wants 10-bit in: that upload/download
     // round trip IS the cost being measured (HUB-15a).
@@ -383,12 +389,16 @@ fn noise_frame(bytes: usize, seed: u64) -> Vec<u8> {
 /// Run a built pipeline to EOS or the cap, counting buffers out of
 /// `at`. The clock starts at the first buffer: preroll, GL context
 /// creation and encoder init are one-off, while sustain is not.
-fn count_through(pipe: &gst::Pipeline, at: &gst::Element, on_playing: impl FnOnce()) -> f32 {
+fn count_through(
+    pipe: &gst::Pipeline,
+    at: &gst::Element,
+    on_playing: impl FnOnce(),
+) -> Option<f32> {
     let frames = std::sync::Arc::new(AtomicU64::new(0));
     let started: std::sync::Arc<std::sync::Mutex<Option<Instant>>> = Default::default();
     let Some(out_pad) = at.static_pad("src") else {
         let _ = pipe.set_state(gst::State::Null);
-        return 0.0;
+        return None;
     };
     {
         let (frames, started) = (frames.clone(), started.clone());
@@ -404,7 +414,7 @@ fn count_through(pipe: &gst::Pipeline, at: &gst::Element, on_playing: impl FnOnc
     }
     if pipe.set_state(gst::State::Playing).is_err() {
         let _ = pipe.set_state(gst::State::Null);
-        return 0.0;
+        return None;
     }
     // Probe attached, pipeline rolling: only now may a feeder start, so
     // the first buffer produced is the first buffer counted.
@@ -427,7 +437,7 @@ fn count_through(pipe: &gst::Pipeline, at: &gst::Element, on_playing: impl FnOnc
                 );
             }
             let _ = pipe.set_state(gst::State::Null);
-            return 0.0;
+            return None;
         }
     }
     let elapsed = started
@@ -445,7 +455,7 @@ fn count_through(pipe: &gst::Pipeline, at: &gst::Element, on_playing: impl FnOnc
 /// and time the output. Still the honest shape for the TONE-MAP
 /// measurement: the real chain also hands the GL segment system
 /// memory (decode → videoconvert → glupload).
-fn run_counting(chain: &[gst::Element], w: i32, h: i32, format: &str) -> f32 {
+fn run_counting(chain: &[gst::Element], w: i32, h: i32, format: &str) -> Option<f32> {
     let pipe = gst::Pipeline::new();
     // Every format here is 4:2:0 (1.5 bytes/pixel); 10-bit doubles it.
     // A wrong size only means a differently-shaped noise frame, which
@@ -481,21 +491,21 @@ fn run_counting(chain: &[gst::Element], w: i32, h: i32, format: &str) -> f32 {
         .property("sync", false)
         .build()
     else {
-        return 0.0;
+        return None;
     };
 
     if pipe.add(src.upcast_ref::<gst::Element>()).is_err()
         || pipe.add(&sink).is_err()
         || pipe.add_many(chain).is_err()
     {
-        return 0.0;
+        return None;
     }
     let mut all: Vec<&gst::Element> = vec![src.upcast_ref()];
     all.extend(chain.iter());
     all.push(&sink);
     if gst::Element::link_many(all).is_err() {
         let _ = pipe.set_state(gst::State::Null);
-        return 0.0;
+        return None;
     }
 
     // Fed from a side thread STARTED BY THE COUNTER: push_buffer blocks
@@ -528,7 +538,7 @@ fn run_counting(chain: &[gst::Element], w: i32, h: i32, format: &str) -> f32 {
     };
     match last {
         Some(el) => count_through(&pipe, &el, feed),
-        None => 0.0,
+        None => None,
     }
 }
 
@@ -538,30 +548,34 @@ mod tests {
 
     #[test]
     fn speed_math_and_degenerate_inputs() {
+        let near = |got: Option<f32>, want: f32| {
+            let g = got.unwrap_or_else(|| panic!("expected a measurement, got None"));
+            assert!((g - want).abs() < 0.001, "got {g}, want {want}");
+        };
         // 24 fps produced in one second of wall time = 1.0× realtime.
         // 25 buffers = 24 intervals.
-        assert!((speed(25, Duration::from_secs(1), true) - 1.0).abs() < 0.001);
-        assert!((speed(25, Duration::from_secs(4), true) - 0.25).abs() < 0.001);
-        assert!((speed(241, Duration::from_secs(1), true) - 10.0).abs() < 0.001);
+        near(speed(25, Duration::from_secs(1), true), 1.0);
+        near(speed(25, Duration::from_secs(4), true), 0.25);
+        near(speed(241, Duration::from_secs(1), true), 10.0);
 
-        // Ran but produced one lonely frame: catastrophically slow, NOT
-        // unmeasured. Reporting 0.0 here would read downstream as "no
-        // data, assume sufficient" and send 4K AV1 to a J5005 — the
-        // exact box that cannot do it (measured live).
-        assert_eq!(speed(1, Duration::from_secs(5), true), SPEED_FLOOR);
+        // Ran but produced one lonely frame: MEASURED and dreadful, not
+        // unmeasured. The two must stay distinguishable — downstream
+        // reads absence as "assume sufficient", which would send 4K AV1
+        // to the J5005, the one box that cannot do it (measured live).
+        assert_eq!(speed(1, Duration::from_secs(5), true), Some(SPEED_FLOOR));
         const { assert!(SPEED_FLOOR > 0.0 && SPEED_FLOOR < 0.01) };
 
         // Never produced anything: genuinely unmeasured.
-        assert_eq!(speed(0, Duration::from_secs(1), true), 0.0);
-        assert_eq!(speed(1, Duration::from_secs(1), false), 0.0);
-        assert_eq!(speed(100, Duration::ZERO, false), 0.0);
+        assert_eq!(speed(0, Duration::from_secs(1), true), None);
+        assert_eq!(speed(1, Duration::from_secs(1), false), None);
+        assert_eq!(speed(100, Duration::ZERO, false), None);
     }
 
     #[test]
     fn speeds_bucket_by_height() {
         let s = Speeds {
-            s1080: 6.0,
-            s2160: 2.0,
+            s1080: Some(6.0),
+            s2160: Some(2.0),
         };
         assert_eq!(s.at(1080), Some(6.0));
         assert_eq!(s.at(720), Some(6.0));
@@ -582,13 +596,13 @@ mod tests {
         r.encoders.insert(
             "nvh265enc".into(),
             Speeds {
-                s1080: 6.2,
-                s2160: 2.1,
+                s1080: Some(6.2),
+                s2160: Some(2.1),
             },
         );
         r.tonemap = Some(Speeds {
-            s1080: 3.0,
-            s2160: 0.65,
+            s1080: Some(3.0),
+            s2160: Some(0.65),
         });
         store(&path, &r); // also creates the directory
         assert_eq!(load(&path), Some(r.clone()));
@@ -617,8 +631,8 @@ mod tests {
             r.encoders.insert(
                 "x265enc".into(),
                 Speeds {
-                    s1080: v,
-                    s2160: v / 3.0,
+                    s1080: Some(v),
+                    s2160: Some(v / 3.0),
                 },
             );
             r
@@ -638,8 +652,8 @@ mod tests {
         // So is the tone-map tier appearing or vanishing.
         let mut tm = base(1.0);
         tm.tonemap = Some(Speeds {
-            s1080: 2.0,
-            s2160: 0.6,
+            s1080: Some(2.0),
+            s2160: Some(0.6),
         });
         assert!(drifted(&base(1.0), &tm));
         assert!(drifted(&tm, &base(1.0)));
@@ -655,12 +669,11 @@ mod tests {
         };
         let r = measure(&[el], false);
         let s = r.encoders.get(el).copied().unwrap_or_default();
-        assert!(
-            s.s1080 > 0.0 && s.s1080.is_finite(),
-            "{el} measured {s:?} at 1080p"
-        );
-        assert!(s.s2160 >= 0.0 && s.s2160.is_finite(), "{el} 2160p: {s:?}");
-        // Sanity: nothing on earth encodes 1080p at 10000× realtime.
-        assert!(s.s1080 < 10_000.0, "{el} implausible: {s:?}");
+        let v = s
+            .s1080
+            .unwrap_or_else(|| panic!("{el} reported no 1080p measurement: {s:?}"));
+        assert!(v > 0.0 && v.is_finite(), "{el} measured {s:?} at 1080p");
+        // Sanity: nothing on earth transcodes 1080p at 10000× realtime.
+        assert!(v < 10_000.0, "{el} implausible: {s:?}");
     }
 }

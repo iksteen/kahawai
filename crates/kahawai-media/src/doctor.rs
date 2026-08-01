@@ -339,11 +339,19 @@ pub fn gstreamer_checks(bench_cache: Option<&std::path::Path>) -> Vec<Check> {
     // HUB-15a: HDR→SDR is a GL shader segment, not a matrix row — all
     // five elements must be present together or the tier is absent.
     let bench = bench_cache.and_then(crate::bench::load);
-    let speeds = |s: Option<crate::bench::Speeds>| match s {
-        Some(s) if s.s1080 > 0.0 || s.s2160 > 0.0 => {
-            format!(", {:.1}x @1080p / {:.1}x @2160p", s.s1080, s.s2160)
+    // Absent measurements say so; a measured-but-dreadful number is
+    // printed as the number, which is the point of the distinction.
+    let speeds = |s: Option<crate::bench::Speeds>| {
+        let one = |v: Option<f32>| match v {
+            Some(v) => format!("{v:.2}x"),
+            None => "n/a".to_string(),
+        };
+        match s {
+            Some(s) if s.s1080.is_some() || s.s2160.is_some() => {
+                format!(", {} @1080p / {} @2160p", one(s.s1080), one(s.s2160))
+            }
+            _ => ", speed not yet measured".to_string(),
         }
-        _ => ", speed not yet measured".to_string(),
     };
     out.push(if crate::remux::tonemap_available() {
         Check::ok(

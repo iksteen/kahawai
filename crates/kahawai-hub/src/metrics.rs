@@ -52,17 +52,22 @@ pub struct ModuleHealth {
     /// (codec, element, hardware, realtime multiple at 1080p, at 2160p).
     /// Empty for mediahosts and for satellites too old to measure.
     pub encoders: Vec<EncoderSpeed>,
-    /// The GL tone-map segment, measured the same way (0 = unmeasured).
-    pub tonemap_1080: f64,
-    pub tonemap_2160: f64,
+    /// The GL tone-map segment, measured the same way. None =
+    /// unmeasured; no gauge is published for it.
+    pub tonemap_1080: Option<f64>,
+    pub tonemap_2160: Option<f64>,
 }
 
 pub struct EncoderSpeed {
     pub codec: String,
     pub element: String,
     pub hardware: bool,
-    pub s1080: f64,
-    pub s2160: f64,
+    /// None = unmeasured. A gauge is simply not published for it —
+    /// absence is how Prometheus says "no data", and a 0 would read as
+    /// "measured, and it produces nothing", which is a different and
+    /// much louder claim.
+    pub s1080: Option<f64>,
+    pub s2160: Option<f64>,
 }
 
 /// One scrape. Cheap by construction; see the module note.
@@ -93,14 +98,14 @@ pub async fn gather(
                                 codec: e["codec"].as_str().unwrap_or_default().to_string(),
                                 element: e["element"].as_str().unwrap_or_default().to_string(),
                                 hardware: e["hardware"].as_bool().unwrap_or(false),
-                                s1080: e["speed_1080"].as_f64().unwrap_or(0.0),
-                                s2160: e["speed_2160"].as_f64().unwrap_or(0.0),
+                                s1080: e["speed_1080"].as_f64(),
+                                s2160: e["speed_2160"].as_f64(),
                             })
                             .collect()
                     })
                     .unwrap_or_default(),
-                tonemap_1080: caps["tonemap_speed_1080"].as_f64().unwrap_or(0.0),
-                tonemap_2160: caps["tonemap_speed_2160"].as_f64().unwrap_or(0.0),
+                tonemap_1080: caps["tonemap_speed_1080"].as_f64(),
+                tonemap_2160: caps["tonemap_speed_2160"].as_f64(),
             }
         })
         .collect();
@@ -218,6 +223,7 @@ pub fn render(s: &Snapshot) -> String {
     for m in &s.modules {
         for e in &m.encoders {
             for (res, v) in [("1080", e.s1080), ("2160", e.s2160)] {
+                let Some(v) = v else { continue };
                 let _ = writeln!(
                     lines,
                     "kahawai_encoder_speed_realtime{{module=\"{}\",name=\"{}\",codec=\"{}\",element=\"{}\",hardware=\"{}\",height=\"{res}\"}} {v}",
@@ -233,16 +239,15 @@ pub fn render(s: &Snapshot) -> String {
     g(
         &mut out,
         "kahawai_encoder_speed_realtime",
-        "Measured encode speed as a realtime multiple (0 = unmeasured).",
+        "Measured reference-transcode speed as a realtime multiple; \
+         unmeasured boxes publish no sample.",
         lines,
     );
 
     let mut lines = String::new();
     for m in &s.modules {
-        if m.tonemap_1080 == 0.0 && m.tonemap_2160 == 0.0 {
-            continue;
-        }
         for (res, v) in [("1080", m.tonemap_1080), ("2160", m.tonemap_2160)] {
+            let Some(v) = v else { continue };
             let _ = writeln!(
                 lines,
                 "kahawai_tonemap_speed_realtime{{module=\"{}\",name=\"{}\",height=\"{res}\"}} {v}",
@@ -333,7 +338,8 @@ pub fn health(s: &Snapshot) -> serde_json::Value {
                     "codec": e.codec,
                     "element": e.element,
                     "hardware": e.hardware,
-                    // 0 = unmeasured, never "slow".
+                    // null = unmeasured; a small number means measured
+                    // and slow, which is the opposite conclusion.
                     "realtime_1080": e.s1080,
                     "realtime_2160": e.s2160,
                 })).collect::<Vec<_>>().into()

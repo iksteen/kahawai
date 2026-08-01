@@ -1572,8 +1572,9 @@ impl Registry {
         } else {
             "speed_1080"
         };
-        let v = e.get(key)?.as_f64()? as f32;
-        (v > 0.0).then_some(v)
+        // as_f64() on a JSON null returns None — absence stays absence,
+        // and a tiny measured value survives as the measurement it is.
+        Some(e.get(key)?.as_f64()? as f32)
     }
 
     /// Same for the GL tone-map segment (HUB-15a's boolean, measured).
@@ -1585,8 +1586,7 @@ impl Registry {
         } else {
             "tonemap_speed_1080"
         };
-        let v = c.get(key)?.as_f64()? as f32;
-        (v > 0.0).then_some(v)
+        Some(c.get(key)?.as_f64()? as f32)
     }
 
     /// HUB-15a: does this transcoder report the GL tone-map segment?

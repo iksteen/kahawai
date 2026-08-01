@@ -186,14 +186,14 @@ async fn dispatches_encode_session_to_transcoder() {
                 codec: "aac".into(),
                 element: "fdkaacenc".into(),
                 hardware: false,
-                speed_1080: 0.0,
-                speed_2160: 0.0,
+                speed_1080: None,
+                speed_2160: None,
             }],
             max_sessions: 2,
             decode_caps: vec![], // empty = assume capable (OPS-7)
             tonemap: false,
-            tonemap_speed_1080: 0.0,
-            tonemap_speed_2160: 0.0,
+            tonemap_speed_1080: None,
+            tonemap_speed_2160: None,
         };
         let _ = kahawai_transcoder::link_once(
             &hub_addr2,
@@ -390,14 +390,14 @@ async fn dispatches_encode_session_to_transcoder() {
                 codec: "aac".into(),
                 element: "fdkaacenc".into(),
                 hardware: false,
-                speed_1080: 0.0,
-                speed_2160: 0.0,
+                speed_1080: None,
+                speed_2160: None,
             }],
             max_sessions: 2,
             decode_caps: vec![],
             tonemap: false,
-            tonemap_speed_1080: 0.0,
-            tonemap_speed_2160: 0.0,
+            tonemap_speed_1080: None,
+            tonemap_speed_2160: None,
         };
         let _ = kahawai_transcoder::link_once(
             &hub_addr3,
