@@ -265,10 +265,14 @@ fn moved(a: Option<f32>, b: Option<f32>) -> bool {
 /// result gathered before it; now the two encoders measured first
 /// survive, and only the one that died is missing.
 pub fn measure_into(elements: &[&str], tonemap: bool, cache: &Path) -> BenchResults {
-    let mut out = BenchResults {
+    // MERGE into whatever is already there. Each piece of the benchmark
+    // runs in its own child process (see the `benchmark` subcommand), so
+    // a segfault costs exactly that piece — the results either side of
+    // it are already on disk and must survive.
+    let mut out = load(cache).unwrap_or(BenchResults {
         gst: gst_version(),
         ..Default::default()
-    };
+    });
     if crate::init().is_err() {
         return out;
     }

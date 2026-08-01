@@ -33,6 +33,13 @@ enum Cmd {
     Benchmark {
         #[arg(long)]
         cache: PathBuf,
+        /// Measure only this element (one per process: a crash costs
+        /// one measurement, not the rest of the run).
+        #[arg(long)]
+        only: Option<String>,
+        /// Measure the GL tone-map segment.
+        #[arg(long)]
+        tonemap: bool,
     },
 }
 
@@ -48,6 +55,10 @@ async fn main() -> Result<()> {
         }
         Some(Cmd::Doctor { json }) => kahawai::doctor(&cfg, json),
         Some(Cmd::RemuxWorker(w)) => kahawai::run_remux_worker(&cfg, w),
-        Some(Cmd::Benchmark { cache }) => kahawai::run_benchmark(&cfg, cache),
+        Some(Cmd::Benchmark {
+            cache,
+            only,
+            tonemap,
+        }) => kahawai::run_benchmark(&cfg, cache, only, tonemap),
     }
 }

@@ -97,25 +97,43 @@ pub struct WorkerArgs {
 /// it. A dead child is a missing measurement; a dead satellite is an
 /// outage.
 #[cfg(any(feature = "hub", feature = "transcoder"))]
-pub fn run_benchmark(cfg: &config::Config, cache: PathBuf) -> Result<()> {
+pub fn run_benchmark(
+    cfg: &config::Config,
+    cache: PathBuf,
+    only: Option<String>,
+    tonemap: bool,
+) -> Result<()> {
     kahawai_media::demote_elements(&cfg.transcoder.demote_decoders)?;
-    let elements: Vec<&str> = [
+    let elements: Vec<&str> = match &only {
+        // One element per process: a segfault costs that measurement,
+        // never the ones after it.
+        Some(el) => vec![el.as_str()],
+        None => [
+            kahawai_media::remux::h264_encoder(),
+            kahawai_media::remux::hevc_encoder(),
+            kahawai_media::remux::av1_encoder(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect(),
+    };
+    kahawai_media::bench::measure_into(&elements, tonemap, &cache);
+    Ok(())
+}
+
+/// The elements a benchmark run would measure, in order — the parent
+/// needs the list to spawn one child each.
+#[cfg(any(feature = "hub", feature = "transcoder"))]
+pub fn benchmark_elements() -> Vec<String> {
+    [
         kahawai_media::remux::h264_encoder(),
         kahawai_media::remux::hevc_encoder(),
         kahawai_media::remux::av1_encoder(),
     ]
     .into_iter()
     .flatten()
-    .collect();
-    // Writes after every element: this process may not survive the
-    // next one (svtav1enc segfaults on the J5005), and the results
-    // already gathered are worth keeping.
-    kahawai_media::bench::measure_into(
-        &elements,
-        kahawai_media::remux::tonemap_available(),
-        &cache,
-    );
-    Ok(())
+    .map(str::to_string)
+    .collect()
 }
 
 #[cfg(any(feature = "hub", feature = "transcoder"))]
@@ -387,17 +405,25 @@ fn spawn_local_benchmark(cache: PathBuf, registry: Arc<kahawai_hub::registry::Re
         let Ok(exe) = std::env::current_exe() else {
             return;
         };
-        let child = tokio::process::Command::new(exe)
-            .arg("benchmark")
-            .arg("--cache")
-            .arg(&cache)
-            .kill_on_drop(true)
-            .status();
-        match tokio::time::timeout(BENCH_BUDGET, child).await {
-            Ok(Ok(st)) if st.success() => {}
-            // A crash still leaves what it measured before dying; the
-            // child persists after every element for exactly this.
-            other => tracing::warn!(?other, "local benchmark child did not finish cleanly"),
+        // One child per piece: a crash costs that measurement alone.
+        let mut jobs: Vec<Vec<String>> = vec![vec!["--tonemap".into()]];
+        jobs.extend(
+            benchmark_elements()
+                .into_iter()
+                .map(|el| vec!["--only".into(), el]),
+        );
+        for args in jobs {
+            let child = tokio::process::Command::new(&exe)
+                .arg("benchmark")
+                .arg("--cache")
+                .arg(&cache)
+                .args(&args)
+                .kill_on_drop(true)
+                .status();
+            match tokio::time::timeout(BENCH_BUDGET, child).await {
+                Ok(Ok(st)) if st.success() => {}
+                other => tracing::warn!(?args, ?other, "benchmark child did not finish cleanly"),
+            }
         }
         match kahawai_media::bench::load(&cache) {
             Some(measured) => {

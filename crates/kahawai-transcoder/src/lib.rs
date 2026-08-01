@@ -218,34 +218,37 @@ fn spawn_benchmark(
         let Ok(exe) = std::env::current_exe() else {
             return;
         };
-        let child = tokio::process::Command::new(exe)
-            .arg("benchmark")
-            .arg("--cache")
-            .arg(&path)
-            .kill_on_drop(true)
-            .status();
-        match tokio::time::timeout(BENCH_BUDGET, child).await {
-            Ok(Ok(st)) if st.success() => {}
-            Ok(Ok(st)) => {
-                // A crash mid-run still leaves everything measured
-                // before it (the child writes after each element), and
-                // partial truth beats none: silence's vah264enc and
-                // vah265enc numbers survive svtav1enc segfaulting.
-                tracing::warn!(
+        // ONE CHILD PER PIECE. A segfault then costs exactly that
+        // measurement: silence's svtav1enc dies at 1080p (exit 139) and
+        // everything else on the box is still measured, in any order.
+        let mut jobs: Vec<Vec<String>> = vec![vec!["--tonemap".into()]];
+        jobs.extend(
+            kahawai_media::remux::encoder_capabilities()
+                .iter()
+                .filter(|(c, _, _)| ["h264", "hevc", "av1"].contains(c))
+                .map(|(_, el, _)| vec!["--only".into(), (*el).to_string()]),
+        );
+        for args in jobs {
+            let child = tokio::process::Command::new(&exe)
+                .arg("benchmark")
+                .arg("--cache")
+                .arg(&path)
+                .args(&args)
+                .kill_on_drop(true)
+                .status();
+            match tokio::time::timeout(BENCH_BUDGET, child).await {
+                Ok(Ok(st)) if st.success() => {}
+                Ok(Ok(st)) => tracing::warn!(
+                    ?args,
                     status = ?st,
-                    "benchmark child died; using whatever it managed to write"
-                );
-            }
-            Ok(Err(e)) => {
-                tracing::warn!(error = %e, "benchmark child failed to run");
-                return;
-            }
-            Err(_) => {
-                tracing::warn!(
+                    "benchmark child died; continuing with the rest"
+                ),
+                Ok(Err(e)) => tracing::warn!(?args, error = %e, "benchmark child failed to run"),
+                Err(_) => tracing::warn!(
+                    ?args,
                     budget_s = BENCH_BUDGET.as_secs(),
-                    "benchmark child exceeded its budget; keeping cached speeds"
-                );
-                return;
+                    "benchmark child exceeded its budget; continuing"
+                ),
             }
         }
         let Some(measured) = kahawai_media::bench::load(&path) else {
