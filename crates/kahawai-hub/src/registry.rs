@@ -69,10 +69,60 @@ pub struct PlacementNeed {
     pub video_codec: String,
     /// Same for audio ("aac"/"opus", empty = any).
     pub audio_codec: String,
+    /// HUB-36: the kind of work this is (`crate::pace::work_class`), or
+    /// None when there is no encode to predict. Placement looks up what
+    /// each box has been MEASURED to achieve on exactly this.
+    pub work_class: Option<String>,
+    /// Source bitrate, for the link term of the prediction: a box that
+    /// cannot pull the bytes fast enough cannot produce fast enough,
+    /// however quick its encoder.
+    pub source_kbps: Option<u32>,
+}
+
+/// Where a session should run, and how fast that is expected to go.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Placement {
+    /// `Some(module_id)` = dispatch to that satellite, `None` = run in
+    /// the hub's own supervised worker.
+    pub target: Option<String>,
+    /// Realtime multiple this placement is expected to sustain. None
+    /// when nothing about this box and this work has been measured —
+    /// which is NOT the same as slow, and is treated as capable.
+    pub predicted: Option<f32>,
+}
+
+/// Below this, a box is not keeping ahead of a viewer with any margin.
+/// Not 1.0: a box that exactly matches realtime stalls the moment
+/// anything else happens on it.
+pub const SUSTAINS: f32 = 1.2;
+
+/// Does this prediction clear the bar? An unmeasured box counts as
+/// sustaining — refusing work for lack of evidence would leave a fresh
+/// fleet unused, and the first session it runs is what produces the
+/// evidence.
+fn sustains(predicted: Option<f32>) -> bool {
+    predicted.is_none_or(|p| p >= SUSTAINS)
 }
 
 /// SEC-7: how long a renewed-but-unused fingerprint stays admitted.
 pub const RENEWAL_GRACE_SECS: i64 = 24 * 3600;
+
+/// Does this ELEMENT produce this codec? The local benchmark is keyed
+/// by element (a box that gains a hardware encoder must not inherit the
+/// software one's number), so the codec has to be read back off the
+/// name. Substrings rather than a table: every family spells the codec
+/// into the element (`nvh264enc`, `x265enc`, `vtenc_h265_hw`,
+/// `svtav1enc`), and an unknown element simply matches nothing and is
+/// left out of the estimate.
+fn element_encodes(element: &str, codec: &str) -> bool {
+    let e = element.to_ascii_lowercase();
+    match codec {
+        "h264" => e.contains("264"),
+        "hevc" => e.contains("265") || e.contains("hevc"),
+        "av1" => e.contains("av1"),
+        _ => false,
+    }
+}
 
 fn unix_now() -> i64 {
     SystemTime::now()
@@ -1739,7 +1789,7 @@ impl Registry {
         let links = self.tc_links.lock().unwrap();
         let load = self.tc_load.lock().unwrap();
         let disabled = self.disabled.lock().unwrap();
-        let mut candidates: Vec<(bool, bool, usize, String)> = caps
+        let mut candidates: Vec<(bool, bool, bool, Option<f32>, usize, String)> = caps
             .iter()
             .filter(|(id, _)| links.contains_key(*id) && !disabled.contains(*id))
             .filter_map(|(id, c)| {
@@ -1794,12 +1844,171 @@ impl Registry {
                 // job still runs (worker encodes as-is, verdict said so).
                 let tm = !need.needs_tonemap
                     || c.get("tonemap").and_then(|v| v.as_bool()).unwrap_or(false);
-                Some((tm, hw, current, id.clone()))
+                // HUB-36: what this box is expected to sustain on
+                // exactly this work. None = never measured, which ranks
+                // as neutral rather than last: a fresh box has to run
+                // something before it can be known, and refusing it for
+                // want of evidence is how a fleet stays unused.
+                let predicted = self.predict_fleet(id, need);
+                Some((sustains(predicted), tm, hw, predicted, current, id.clone()))
             })
             .collect();
-        // Tone-map fit, most hardware, least loaded.
-        candidates.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)).then(a.2.cmp(&b.2)));
-        candidates.first().map(|(_, _, _, id)| id.clone())
+        // Sustaining first — a box that keeps ahead of the viewer beats
+        // a faster-on-paper one that does not — then tone-map fit, then
+        // hardware, then the prediction itself, then least loaded.
+        candidates.sort_by(|a, b| {
+            let rank = |p: Option<f32>| p.unwrap_or(SUSTAINS);
+            b.0.cmp(&a.0)
+                .then(b.1.cmp(&a.1))
+                .then(b.2.cmp(&a.2))
+                .then(
+                    rank(b.3)
+                        .partial_cmp(&rank(a.3))
+                        .unwrap_or(std::cmp::Ordering::Equal),
+                )
+                .then(a.4.cmp(&b.4))
+        });
+        candidates.first().map(|c| c.5.clone())
+    }
+
+    /// HUB-36 phase 5: where this session should run, and how fast that
+    /// is expected to go.
+    ///
+    /// The hard filters are `pick_transcoder`'s, unchanged — a box that
+    /// cannot decode the source or encode the target is not a candidate
+    /// at any speed. What is new is the ORDER among boxes that can, and
+    /// the option of keeping the work here.
+    ///
+    /// Fleet still wins by default (§4.5: hub cores serve clients).
+    /// Work repatriates to the hub only in the one case worth changing:
+    /// no fleet box sustains and the hub does. That keeps today's
+    /// behaviour whenever a satellite is capable — including when
+    /// nothing has been measured yet, since unknown counts as capable.
+    pub fn place(&self, need: &PlacementNeed) -> Placement {
+        let fleet = self.pick_transcoder(need);
+        let local = self.predict_local(need);
+        match fleet {
+            None => Placement {
+                target: None,
+                predicted: local,
+            },
+            Some(id) => {
+                let fleet_pred = self.predict_fleet(&id, need);
+                if !sustains(fleet_pred) && sustains(local) && local.is_some() {
+                    tracing::info!(
+                        box_id = %id,
+                        class = need.work_class.as_deref().unwrap_or("-"),
+                        fleet = fleet_pred.unwrap_or(0.0),
+                        local = local.unwrap_or(0.0),
+                        "no fleet box sustains this work; keeping it local"
+                    );
+                    return Placement {
+                        target: None,
+                        predicted: local,
+                    };
+                }
+                Placement {
+                    target: Some(id),
+                    predicted: fleet_pred,
+                }
+            }
+        }
+    }
+
+    /// 2160-class work? Read off the class key rather than passed
+    /// separately, so the prediction and the thing being learned can
+    /// never disagree about which bucket they are in.
+    fn is_2160(need: &PlacementNeed) -> bool {
+        need.work_class
+            .as_deref()
+            .is_some_and(|c| c.starts_with("2160|"))
+    }
+
+    /// What a satellite is expected to sustain on this work.
+    ///
+    /// OBSERVED wins outright when present: a measured run already
+    /// contains the decode, the tone-map, the encode AND that box's link
+    /// stalls, so folding the component terms in on top would count the
+    /// same cost twice. Only when nothing has been observed do the parts
+    /// stand in, and then the SLOWEST of them governs — a chain is its
+    /// narrowest link.
+    fn predict_fleet(&self, id: &str, need: &PlacementNeed) -> Option<f32> {
+        if let Some(class) = need.work_class.as_deref()
+            && let Some(observed) = self.pace_of(id, class)
+        {
+            return Some(observed as f32);
+        }
+        let caps = self.transcoder_caps.lock().unwrap().get(id).cloned()?;
+        let big = Self::is_2160(need);
+        let key = if big { "speed_2160" } else { "speed_1080" };
+        let pos = |v: f32| (v > 0.0).then_some(v); // 0 on the wire = unmeasured
+
+        let mut terms: Vec<f32> = Vec::new();
+        if let Some(encoders) = caps.get("encoders").and_then(|e| e.as_array()) {
+            let best = encoders
+                .iter()
+                .filter(|e| match need.video_codec.as_str() {
+                    "" => true,
+                    c => e["codec"] == c,
+                })
+                .filter_map(|e| e.get(key).and_then(|v| v.as_f64()).map(|v| v as f32))
+                .filter_map(pos)
+                .fold(None::<f32>, |acc, v| Some(acc.map_or(v, |a| a.max(v))));
+            terms.extend(best);
+        }
+        if need.needs_tonemap {
+            let tm = caps
+                .get(if big {
+                    "tonemap_speed_2160"
+                } else {
+                    "tonemap_speed_1080"
+                })
+                .and_then(|v| v.as_f64())
+                .map(|v| v as f32)
+                .and_then(pos);
+            terms.extend(tm);
+        }
+        // The link term applies to DISPATCHED work only: the bytes have
+        // to cross the wire before they can be encoded.
+        if let (Some(kbps), Some(bps)) = (need.source_kbps, self.link_rate_of(id))
+            && kbps > 0
+        {
+            terms.push((bps as f32 * 8.0 / 1000.0) / kbps as f32);
+        }
+        terms
+            .into_iter()
+            .fold(None::<f32>, |acc, v| Some(acc.map_or(v, |a: f32| a.min(v))))
+    }
+
+    /// The same question for the hub's own box. No link term: the bytes
+    /// are already here, which is precisely why repatriating can beat a
+    /// faster satellite on a thin wire.
+    fn predict_local(&self, need: &PlacementNeed) -> Option<f32> {
+        if let Some(class) = need.work_class.as_deref()
+            && let Some(observed) = self.pace_of(crate::pace::LOCAL, class)
+        {
+            return Some(observed as f32);
+        }
+        let bench = self.local_bench.lock().unwrap().clone()?;
+        let big = Self::is_2160(need);
+        let pick = |s: &kahawai_media::bench::Speeds| if big { s.s2160 } else { s.s1080 };
+        let mut terms: Vec<f32> = Vec::new();
+        let best = bench
+            .encoders
+            .iter()
+            .filter(|(element, _)| match need.video_codec.as_str() {
+                "" => true,
+                c => element_encodes(element, c),
+            })
+            .filter_map(|(_, s)| pick(s))
+            .fold(None::<f32>, |acc, v| Some(acc.map_or(v, |a| a.max(v))));
+        terms.extend(best);
+        if need.needs_tonemap {
+            terms.extend(bench.tonemap.as_ref().and_then(pick));
+        }
+        terms
+            .into_iter()
+            .fold(None::<f32>, |acc, v| Some(acc.map_or(v, |a: f32| a.min(v))))
     }
 
     /// Enrolled satellites (DB) merged with live connection state.

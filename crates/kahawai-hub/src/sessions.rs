@@ -820,6 +820,12 @@ impl Sessions {
                     // pool (HUB-15b), same shape as the tone-map fact.
                     video_codec: String::new(),
                     audio_codec: String::new(),
+                    // HUB-36: the probe asks WHICH BOX, not how fast —
+                    // there is no plan yet to classify, so it carries no
+                    // prediction inputs and ranks exactly as it did
+                    // before phase 5.
+                    work_class: None,
+                    source_kbps: None,
                 };
                 let (tonemap, targets) = match registry.pick_transcoder(&need) {
                     Some(tc) => (
@@ -1028,6 +1034,15 @@ impl Sessions {
                     } else {
                         String::new()
                     },
+                    // Filled in just below, once the class is derived.
+                    work_class: None,
+                    // Average over the whole source: the link term only
+                    // needs the order of magnitude, and a per-scene peak
+                    // would condemn a box for one busy minute.
+                    source_kbps: info
+                        .duration_ms
+                        .filter(|d| *d > 0)
+                        .map(|d| ((parts.iter().map(|p| p.size).sum::<u64>() * 8) / d) as u32),
                 };
                 // Only an ENCODE has a pace worth learning: a copy runs
                 // at whatever the link allows and says nothing about
@@ -1040,15 +1055,44 @@ impl Sessions {
                         plan.video_codec.as_str(),
                         plan.tone_map,
                     );
+                    session_needs.work_class = Some(session_class.clone());
                 }
                 // Encode work goes to the fleet when one is available
                 // (§4.5); pure remux — and encode with no fleet — stays
                 // in the local supervised worker.
-                let placed = if session_needs.encode_video || session_needs.encode_audio {
-                    registry.pick_transcoder(&session_needs)
+                // HUB-36 phase 5: the placement now carries what it is
+                // expected to sustain, so a session that will crawl says
+                // so instead of letting the viewer discover it.
+                let placement = if session_needs.encode_video || session_needs.encode_audio {
+                    registry.place(&session_needs)
                 } else {
-                    None
+                    crate::registry::Placement {
+                        target: None,
+                        predicted: None,
+                    }
                 };
+                let placed = placement.target.clone();
+                if let Some(p) = placement.predicted
+                    && p < 1.0
+                {
+                    // AR-13: below realtime is placed anyway — refusing
+                    // would leave a slow fleet unusable — but it is
+                    // never placed SILENTLY.
+                    tracing::warn!(
+                        session = %id,
+                        box_id = placed.as_deref().unwrap_or("local"),
+                        class = session_needs.work_class.as_deref().unwrap_or("-"),
+                        predicted = p,
+                        "placed below realtime; playback may stall"
+                    );
+                    fold_facts(
+                        &mut verdict,
+                        &[kahawai_media::facts::Fact {
+                            kind: "video".into(),
+                            detail: format!("predicted {p:.1}x realtime — may stall"),
+                        }],
+                    );
+                }
                 // Read once: the same bytes serve both dispatch attempts.
                 let sets_bytes = match &burn_sets {
                     Some(p) => std::fs::read(p).unwrap_or_default(),
