@@ -158,6 +158,22 @@ pub struct MediahostConfig {
     /// detector is the filesystem watcher — which network mounts like
     /// sshfs can't serve, so the sweep catches what inotify can't see.
     pub rescan_minutes: u64,
+    /// Decoder elements to demote below software for DISCOVERY on this
+    /// box. Separate from the transcoder's list because the two modules
+    /// run on the same box with different jobs, and a decoder can be
+    /// right for one and wrong for the other.
+    ///
+    /// What discovery records is whatever decoder GStreamer autoplugs,
+    /// so a decoder that sees less of a stream than the playback one
+    /// writes that smaller view into the library: `dtsdec` (libdca)
+    /// decodes only the lossy DTS core and filed every DTS-HD MA 7.1
+    /// title as 5.1 (measured — 8 channels via avdec_dca, 6 via
+    /// dtsdec). Demoting it here makes the scan agree with playback.
+    ///
+    /// Ranks are process-global, so `all-in-one` effectively unions
+    /// this with `[transcoder] demote_decoders`; the lean satellite
+    /// binaries are separate processes and keep the lists independent.
+    pub demote_decoders: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -196,6 +212,7 @@ impl Default for MediahostConfig {
             name: "mediahost".into(),
             collections: Vec::new(),
             rescan_minutes: 60,
+            demote_decoders: Vec::new(),
         }
     }
 }

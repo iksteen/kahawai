@@ -442,8 +442,9 @@ fn dts_hd_check() -> Check {
             NAME,
             format!(
                 "{name} (libdca, core-only) outranks avdec_dca — DTS-HD tracks lose \
-                 their lossless extension and decode as lossy 5.1; add \"{name}\" to \
-                 [transcoder] demote_decoders"
+                 their lossless extension and decode as lossy 5.1, and a scan run \
+                 this way FILES them that way; add \"{name}\" to [transcoder] and \
+                 [mediahost] demote_decoders"
             ),
         ),
         None => Check::ok(NAME, "via avdec_dca (core + lossless XLL extension)"),

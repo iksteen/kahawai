@@ -563,6 +563,10 @@ async fn run_hub_inner(
             kahawai_mediahost::serve::resolve_rel(&cols, collection, path)
         });
         let state_dir = mh.state_dir.clone();
+        // Same reason as run_mediahost. Ranks are process-global, so in
+        // this binary the demotion is shared with the co-hosted
+        // transcoder — the lean satellite binaries keep them apart.
+        let _ = kahawai_media::demote_elements(&mh.demote_decoders);
         tokio::spawn(async move {
             if let Err(e) =
                 kahawai_mediahost::run_local(mh.collections, mh.rescan_minutes, &state_dir, tx, rx)
@@ -678,6 +682,10 @@ async fn run_hub_inner(
 
 #[cfg(feature = "mediahost")]
 pub async fn run_mediahost(cfg: config::MediahostConfig) -> Result<()> {
+    // Before any discovery runs: what the scan records is whatever
+    // decoder GStreamer autoplugs, so this list is what keeps the
+    // library's view of a stream from being narrower than playback's.
+    kahawai_media::demote_elements(&cfg.demote_decoders)?;
     kahawai_mediahost::run(
         &cfg.hub,
         &cfg.state_dir,
