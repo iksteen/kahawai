@@ -72,6 +72,20 @@ pub fn parse_movie(filename: &str) -> MovieGuess {
         }
         _ => filename,
     };
+    parse_movie_stem(stem)
+}
+
+/// Same parse as `parse_movie`, minus the trailing-`.xxx`-looks-like-an-
+/// extension strip — for directory names and other non-file strings,
+/// which never have a real extension to drop. Without this, a dot-glued
+/// two-word directory name ("30.Rock") loses its second word: "Rock" is
+/// 4 alphanumeric characters with a letter in it, indistinguishable from
+/// a plausible extension by the heuristic above.
+fn parse_movie_dir(name: &str) -> MovieGuess {
+    parse_movie_stem(&strip_release_tags(name))
+}
+
+fn parse_movie_stem(stem: &str) -> MovieGuess {
     let cleaned: String = stem
         .chars()
         .map(|c| if matches!(c, '.' | '_') { ' ' } else { c })
@@ -245,6 +259,7 @@ pub fn parse_episode(path_rel: &str) -> Option<EpisodeGuess> {
         .chars()
         .map(|c| if matches!(c, '.' | '_') { ' ' } else { c })
         .collect();
+    let cleaned = split_glued_marker(&cleaned);
     let tokens: Vec<&str> = cleaned.split_whitespace().collect();
     let (idx, season, episode, episode_end) = tokens.iter().enumerate().find_map(|(i, t)| {
         parse_sxxeyy(t)
@@ -261,8 +276,8 @@ pub fn parse_episode(path_rel: &str) -> Option<EpisodeGuess> {
         .find(|d| !is_season_dir(d))
         .copied();
     let show_guess = match show_dir {
-        Some(dir) => parse_movie(dir),
-        None => parse_movie(&tokens[..idx].join(" ")),
+        Some(dir) => parse_movie_dir(dir),
+        None => parse_movie_dir(&tokens[..idx].join(" ")),
     };
     let show_title = if show_guess.title.is_empty() {
         // e.g. bare "S01E01.mkv" at top level
@@ -309,7 +324,7 @@ pub fn parse_anime(path_rel: &str) -> Option<EpisodeGuess> {
         // Standard-named anime, but prefer the top-level dir identity
         // (release subdirs like "Title (720p) [Group]" mislead).
         if let Some(top) = top_dir(path_rel) {
-            let tg = parse_movie(top);
+            let tg = parse_movie_dir(top);
             g.show_title = tg.title;
             g.show_year = tg.year.or(g.show_year);
         }
@@ -451,8 +466,8 @@ pub fn parse_anime(path_rel: &str) -> Option<EpisodeGuess> {
                 tokens[..i].join(" ")
             };
             let show_guess = match top_dir(path_rel) {
-                Some(top) => parse_movie(top),
-                None => parse_movie(&title),
+                Some(top) => parse_movie_dir(top),
+                None => parse_movie_dir(&title),
             };
             return Some(EpisodeGuess {
                 show_title: if show_guess.title.is_empty() {
@@ -479,8 +494,8 @@ pub fn parse_anime(path_rel: &str) -> Option<EpisodeGuess> {
                 tokens[..i].join(" ")
             };
             let show_guess = match top_dir(path_rel) {
-                Some(top) => parse_movie(top),
-                None => parse_movie(&title),
+                Some(top) => parse_movie_dir(top),
+                None => parse_movie_dir(&title),
             };
             return Some(EpisodeGuess {
                 show_title: if show_guess.title.is_empty() {
@@ -505,8 +520,8 @@ pub fn parse_anime(path_rel: &str) -> Option<EpisodeGuess> {
         title = top_dir(path_rel).unwrap_or("Unknown Show").to_string();
     }
     let show_guess = match top_dir(path_rel) {
-        Some(top) => parse_movie(top),
-        None => parse_movie(&title),
+        Some(top) => parse_movie_dir(top),
+        None => parse_movie_dir(&title),
     };
     let ep_title = tokens[idx + 1..].join(" ");
     Some(EpisodeGuess {
@@ -562,6 +577,30 @@ fn top_dir(path_rel: &str) -> Option<&str> {
     let mut parts = path_rel.split('/');
     let first = parts.next()?;
     parts.next().map(|_| first) // only when there IS a directory
+}
+
+/// A hyphen gluing the show name straight to the episode marker with no
+/// surrounding space ("1883-S01E01", "30 Rock-S01E01") survives the
+/// '.'/'_' cleanup above as one token, so `parse_sxxeyy`/`parse_nnxnn` —
+/// which require the marker to lead its token — never see it. Insert the
+/// missing space wherever a '-' is immediately followed by a token they
+/// *would* accept. A '-' inside a marker itself ("S01E01-E02", "S02E05-
+/// 06") or one that already has a space on either side is left alone.
+fn split_glued_marker(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(s.len());
+    for (i, &c) in chars.iter().enumerate() {
+        if c == '-' && i > 0 {
+            let rest: String = chars[i + 1..].iter().collect();
+            let marker = &rest[..rest.find(' ').unwrap_or(rest.len())];
+            if parse_sxxeyy(marker).is_some() || parse_nnxnn(marker).is_some() {
+                out.push(' ');
+                continue;
+            }
+        }
+        out.push(c);
+    }
+    out
 }
 
 fn parse_sxxeyy(tok: &str) -> Option<(u32, u32, Option<u32>)> {
@@ -694,6 +733,25 @@ mod tests {
                 1,
                 1,
                 Some("Pilot"),
+            ),
+            // Show name glued straight to the marker by a bare hyphen,
+            // no surrounding space (the on-disk shape that shipped with
+            // zero series ever resolving into items).
+            (
+                "1883/Season01/1883-S01E01.mkv",
+                "1883",
+                None,
+                1,
+                1,
+                None,
+            ),
+            (
+                "30.Rock/Season01/30.Rock-S01E02.mkv",
+                "30 Rock",
+                None,
+                1,
+                2,
+                None,
             ),
         ];
         for (path, show, year, s, e, ep_title) in cases {
