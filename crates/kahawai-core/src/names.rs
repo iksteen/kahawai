@@ -155,6 +155,51 @@ fn parse_movie_stem(stem: &str) -> MovieGuess {
     MovieGuess { title, year, part }
 }
 
+/// Movie identity for a file that has NO episode shape at all — the
+/// last thing tried for an anime collection, where a film sits beside
+/// the series (HUB-30). Yearless is fine: "Akira.mkv" is as much a film
+/// as "Akira (1988).mkv", and requiring a year left 23 of them bare.
+///
+/// The filename names the film, with one exception that matters: a bare
+/// `partN` names a PIECE of one. `Nescaflowne (Eng,-Audio)/part1.mp4`
+/// through `part7.mp4` is a single film in seven parts, and taking the
+/// filename literally would mint seven — so identity falls to the
+/// directory and the number becomes the part, which is the same shape
+/// as the CD1/CD2 rips `parse_movie` already folds.
+///
+/// The directory is used ONLY then. A flat `Movies/Akira.mkv` would
+/// otherwise resolve to a film called "Movies".
+pub fn parse_movie_file(path_rel: &str) -> Option<MovieGuess> {
+    let filename = path_rel.rsplit('/').next()?;
+    let mg = parse_movie(filename);
+    if let Some(n) = bare_part(&mg.title) {
+        let dir = path_rel.rsplit('/').nth(1)?;
+        let d = parse_movie_dir(dir);
+        if d.title.is_empty() {
+            return None;
+        }
+        return Some(MovieGuess {
+            title: d.title,
+            year: d.year,
+            part: Some(n),
+        });
+    }
+    (!mg.title.is_empty()).then_some(mg)
+}
+
+/// `part3` / `Part 3` standing alone as the whole title — a piece, not
+/// a film. Deliberately only the bare form: "Part 2" as a title SUFFIX
+/// ("Deathly Hallows Part 2") is a real film and must survive, which is
+/// why `parse_movie` refuses to fold the part family in the first place.
+fn bare_part(title: &str) -> Option<u32> {
+    let t = title.trim().to_ascii_lowercase().replace(' ', "");
+    let n = t.strip_prefix("part")?;
+    if n.is_empty() || n.len() > 2 || !n.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    n.parse().ok()
+}
+
 fn parse_year_token(tok: &str) -> Option<u16> {
     let t = tok.trim_matches(|c| matches!(c, '(' | ')' | '[' | ']'));
     if t.len() != 4 {
@@ -850,6 +895,36 @@ pub fn release_revision(path_rel: &str) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    /// The anime last resort: no episode shape means a film. Yearless
+    /// counts, and a bare `partN` is a PIECE of a film, not one of its
+    /// own — seven such files in this library are one movie.
+    fn anime_films_resolve_without_a_year() {
+        let g = parse_movie_file("Akira.mkv").expect("bare film");
+        assert_eq!((g.title.as_str(), g.year, g.part), ("Akira", None, None));
+
+        let g = parse_movie_file("Neo Tokyo (Dual-Audio)/Neo Tokyo.mkv").expect("film in a dir");
+        assert_eq!((g.title.as_str(), g.part), ("Neo Tokyo", None));
+
+        // Seven parts, one film: identity from the directory, number
+        // from the filename, release tag stripped off the title.
+        for (n, file) in [(1u32, "part1.mp4"), (7, "part7.mp4")] {
+            let g = parse_movie_file(&format!("Nescaflowne (Eng,-Audio)/{file}"))
+                .expect("multi-part film");
+            assert_eq!((g.title.as_str(), g.part), ("Nescaflowne", Some(n)));
+        }
+
+        // A "Part N" SUFFIX is a real title and must not be mistaken
+        // for a piece.
+        let g = parse_movie_file("Harry Potter and the Deathly Hallows Part 2 (2011).mkv")
+            .expect("titled part");
+        assert_eq!(g.year, Some(2011));
+        assert!(g.title.contains("Part 2"), "lost a real title: {}", g.title);
+
+        // Nothing to name it by stays unresolved rather than guessed.
+        assert!(parse_movie_file("part3.mp4").is_none());
+    }
 
     #[test]
     /// Three bare digits are the most dangerous shape in this file, so

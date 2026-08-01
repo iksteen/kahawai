@@ -1091,16 +1091,16 @@ impl Registry {
                     names::parse_episode(&f.path_rel)
                 };
                 match guess {
-                    None if anime
-                        && let filename = f.path_rel.rsplit('/').next().unwrap_or(&f.path_rel)
-                        && let mg = names::parse_movie(filename)
-                        && mg.year.is_some() =>
-                    {
-                        // Anime movies (HUB-30): no episode shape, but a
-                        // credible "Title (Year)" resolves as a movie —
-                        // Ghibli films et al. Yearless non-parses (NCOP/
-                        // NCED extras) stay bare; ed2k matching will
-                        // identify those precisely later.
+                    None if anime && let Some(mg) = names::parse_movie_file(&f.path_rel) => {
+                        // Anime movies (HUB-30): no episode shape, so
+                        // the file is a film — Ghibli et al. The year
+                        // used to be required, which left 23 yearless
+                        // films bare ("Akira.mkv", "Robot Carnival.mkv")
+                        // for no benefit: the extras it was guarding
+                        // against (NCOP/NCED) parse as designations into
+                        // season 0 and never reach here. parse_movie_file
+                        // handles the one shape that would mint junk, a
+                        // bare "partN" naming a piece of a film.
                         source_part = mg.part;
                         let norm = names::normalize_title(&mg.title);
                         let existing: Option<String> = sqlx::query_scalar(
