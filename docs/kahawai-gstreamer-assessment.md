@@ -153,6 +153,45 @@ isolation stays), hardware acceleration becomes per-vendor
 hwdevice/hwframes plumbing instead of one registry, and codec
 licensing moves in-house.
 
+## The comparison arm, actually run (2026-08-01)
+
+The one cheap experiment the critique above allows was run:
+`scripts/kahawai-ffmpeg-compare.sh` samples files deterministically and
+executes both stacks' cheapest honest equivalent — our head sweep
+(`kahawai-sweep --one`) against a bounded ffmpeg copy-remux to HLS —
+and prints the four-way failure diff. 200 files across
+movies/series/anime/animore (seed 42), plus the captest torture file:
+
+- **183 both pass.**
+- **15 ffmpeg-only failures — all `.avi` → TS**, all the same
+  "first pts and dts value must be set" muxer refusal, and **all
+  cleared by adding `-fflags +genpts`** (verified on a sample). Not a
+  robustness gap: a live demonstration of the CLI's cost shape —
+  the default invocation fails, each container quirk needs its flag
+  discovered from stderr, and the fix is per-quirk option-string
+  knowledge. Our pipeline absorbs the same quirk implicitly because
+  the parser/timestamper chain regenerates timestamps by design.
+- **1 ours-only failure** — an mp4 whose produced segment had one
+  missing DTS, caught by the sweep's own segment validation. The
+  asymmetry warning made concrete: ffmpeg "passed" the same file
+  because its arm runs no equivalent check. Self-detected quality
+  bug on our side; unmeasured dimension on theirs.
+- **1 both-fail** — a file with PTS-less packets (genuinely broken).
+  Failure *manner* differs: ffmpeg exits with a clean muxer error;
+  ours dies on the known hlssink3 unwrap (contained to the child
+  process, but the crash class, not an error).
+
+Reading: on this corpus, raw demux/remux robustness is **near
+parity** — neither folklore ("ffmpeg swallows anything") nor scar
+tissue ("GStreamer chokes constantly") survives contact with the
+sample. What the experiment actually measured is the *shape* of each
+stack's failure handling: ffmpeg fails at spawn time with a flag as
+the fix; GStreamer fails in-pipeline with a probe or fallback as the
+fix; and our own validation layer is the only reason one real defect
+was visible at all. The unmeasured dimensions (integration depth,
+encode quality, silent wrongness) remain unmeasured; nothing here
+licenses a stronger claim.
+
 ## Verdict
 
 GStreamer was the right call for this architecture — not by a

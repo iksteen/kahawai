@@ -36,8 +36,11 @@ out=$(mktemp -d /tmp/kahawai-ffcmp.XXXXXX)
 echo "==> results under $out" >&2
 
 # Deterministic sample: same seed = same files on a re-run.
+# shuf -n instead of |head: head's early close SIGPIPEs the pipeline
+# under pipefail and set -e silently kills the whole run on any
+# directory big enough to overflow the pipe buffer (found live).
 find "$DIR" -type f \( -name '*.mkv' -o -name '*.mp4' -o -name '*.avi' -o -name '*.ts' -o -name '*.m2ts' -o -name '*.wmv' -o -name '*.ogm' \) \
-  | sort | shuf --random-source=<(yes "$SEED") | head -n "$LIMIT" > "$out/files.txt"
+  | sort | shuf --random-source=<(yes "$SEED") -n "$LIMIT" > "$out/files.txt"
 total=$(wc -l < "$out/files.txt")
 echo "==> $total files sampled from $DIR (seed $SEED)" >&2
 
