@@ -43,6 +43,44 @@ fn enroll(
     }
 }
 
+/// A TCP relay the test can cut, standing in for a transcoder box that
+/// dies. `JoinHandle::abort` is not that: it drops the future, but the
+/// connection stays open, so the hub sees a silent-but-live stream and
+/// waits out its 35 s liveness timeout — a PARTITION, which is a real
+/// failure mode but not the one this scenario claims. A process that
+/// dies closes its sockets and the hub notices at once. Cutting the
+/// relay closes them, which is both faithful and 33 s cheaper on every
+/// run of the suite.
+///
+/// The hub's cert is issued for `localhost`, so relaying through a
+/// second `localhost` port still validates.
+fn cuttable_relay(target: String) -> (String, tokio::sync::broadcast::Sender<()>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let addr = format!("localhost:{}", listener.local_addr().unwrap().port());
+    let (cut, _) = tokio::sync::broadcast::channel::<()>(1);
+    let cut2 = cut.clone();
+    tokio::spawn(async move {
+        let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+        while let Ok((mut inbound, _)) = listener.accept().await {
+            let target = target.clone();
+            let mut cut = cut2.subscribe();
+            tokio::spawn(async move {
+                let Ok(mut outbound) = tokio::net::TcpStream::connect(&target).await else {
+                    return;
+                };
+                tokio::select! {
+                    _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound) => {}
+                    // Both halves drop here: FIN on each, exactly as a
+                    // dying process would send.
+                    _ = cut.recv() => {}
+                }
+            });
+        }
+    });
+    (addr, cut)
+}
+
 #[tokio::test]
 async fn dispatches_encode_session_to_transcoder() {
     let _ = tracing_subscriber::fmt()
@@ -159,6 +197,27 @@ async fn dispatches_encode_session_to_transcoder() {
     ] {
         tx.send(pb::HostToHub { msg: Some(msg) }).await.unwrap();
     }
+    // Heartbeats, like a real mediahost: without them the hub's 35 s
+    // liveness timeout drops this link partway through the test.
+    {
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(5));
+            loop {
+                tick.tick().await;
+                if tx
+                    .send(pb::HostToHub {
+                        msg: Some(pb::host_to_hub::Msg::Heartbeat(pb::Heartbeat {})),
+                    })
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        });
+    }
+
     let serve_channel = channel.clone();
     tokio::spawn(async move {
         while let Ok(Some(m)) = inbound.message().await {
@@ -178,7 +237,11 @@ async fn dispatches_encode_session_to_transcoder() {
     let tc_id = enroll(&ca, &allowed, "transcoder", "01TC", "encoder-box");
     let tc_tls = kahawai_transport::mtls::mtls_client_config(&tc_id).unwrap();
     let tc_scratch = tempfile::tempdir().unwrap();
-    let hub_addr2 = hub_addr.clone();
+    // tc1 reaches the hub through a relay the test can cut, so its
+    // "death" later is a real one (see cuttable_relay).
+    let (tc1_addr, cut_tc1) =
+        cuttable_relay(hub_addr.replace("localhost:", "127.0.0.1:").to_string());
+    let hub_addr2 = tc1_addr;
     let scratch_path = tc_scratch.path().join("sessions");
     let tc1_task = tokio::spawn(async move {
         let caps = pb::CapabilityReport {
@@ -424,7 +487,10 @@ async fn dispatches_encode_session_to_transcoder() {
     .await
     .expect("backup transcoder never connected");
 
-    tc1_task.abort(); // the box running the session vanishes
+    // The box running the session vanishes: sockets close, and the hub
+    // learns from the stream ending rather than from a 35 s timeout.
+    let _ = cut_tc1.send(());
+    tc1_task.abort();
     let recovered = tokio::time::timeout(Duration::from_secs(70), async {
         loop {
             let resp = api.clone().oneshot(get(stream_url.clone())).await.unwrap();
