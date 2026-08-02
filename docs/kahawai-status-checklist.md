@@ -113,6 +113,13 @@ How something works and why it was built that way belong in
       by triggers from stored answers, chain order, refusals and pins —
       design in implementation §4.1/§4.2; per-media-type ordering is the
       2026-07-26 amendment recorded in the requirement.
+- [ ] HUB-5a Per-pass provider gating. `run_inner` bails at
+      `enrich.rs:782` when no TMDB key is set; the anime (874) and music
+      (964) passes are behind it. A music-only library enriches nothing
+      and is told a provider its chain lacks is missing
+      (`chain_for("music")` = musicbrainz). Anime keeps TMDB only as the
+      fallback behind AniDB/AniList, so a missing key should cost the
+      fallback, not the pass.
 - [x] HUB-6 Descriptive metadata: titles, plots, dates, ratings, posters,
       episode stills, season/episode and album/release structure, genres
       and cast; all stored, so everything reads back with providers
