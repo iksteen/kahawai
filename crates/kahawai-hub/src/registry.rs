@@ -1750,15 +1750,6 @@ impl Registry {
         self.tc_link_rate.lock().unwrap().get(module_id).copied()
     }
 
-    pub fn tc_session_started(&self, module_id: &str) {
-        *self
-            .tc_load
-            .lock()
-            .unwrap()
-            .entry(module_id.to_string())
-            .or_insert(0) += 1;
-    }
-
     pub fn tc_session_ended(&self, module_id: &str) {
         if let Some(n) = self.tc_load.lock().unwrap().get_mut(module_id) {
             *n = n.saturating_sub(1);
@@ -1784,10 +1775,36 @@ impl Registry {
 
     /// Placement (§4.5): capability fit (encoders AND source decoders)
     /// ≥ capacity ≥ hw-accel ≥ inverse load.
+    ///
+    /// A QUERY: who would take this work, without claiming them. Used
+    /// while planning, where the answer decides which encoders to offer
+    /// and nothing is dispatched — including for sessions that turn out
+    /// to be direct play. See [`Self::reserve_transcoder`] for the one
+    /// that takes the slot.
     pub fn pick_transcoder(&self, need: &PlacementNeed) -> Option<String> {
+        self.choose(need, false)
+    }
+
+    /// Pick AND take the slot, in the same critical section that read
+    /// the load, so a concurrent placement cannot see the box as free.
+    /// The caller owns the reservation and must return it with
+    /// [`Self::tc_session_ended`] on every path that does not end in a
+    /// running session.
+    ///
+    /// Counting only at dispatch-ready left a window up to 40 s wide in
+    /// which every concurrent placement read the same load. Measured on
+    /// a five-transcoder fleet: ten concurrent starts all chose one box
+    /// and its `max_sessions = 2` stopped none of them, because the
+    /// capacity filter and the least-loaded tie-break were both reading
+    /// a number nothing had incremented yet.
+    pub fn reserve_transcoder(&self, need: &PlacementNeed) -> Option<String> {
+        self.choose(need, true)
+    }
+
+    fn choose(&self, need: &PlacementNeed, reserve: bool) -> Option<String> {
         let caps = self.transcoder_caps.lock().unwrap().clone();
         let links = self.tc_links.lock().unwrap();
-        let load = self.tc_load.lock().unwrap();
+        let mut load = self.tc_load.lock().unwrap();
         let disabled = self.disabled.lock().unwrap();
         let mut candidates: Vec<(bool, bool, bool, Option<f32>, usize, String)> = caps
             .iter()
@@ -1868,7 +1885,13 @@ impl Registry {
                 )
                 .then(a.4.cmp(&b.4))
         });
-        candidates.first().map(|c| c.5.clone())
+        let winner = candidates.first().map(|c| c.5.clone())?;
+        if reserve {
+            // Still holding `load`: the slot is taken before any other
+            // placement can read the count.
+            *load.entry(winner.clone()).or_insert(0) += 1;
+        }
+        Some(winner)
     }
 
     /// HUB-36 phase 5: where this session should run, and how fast that
@@ -1885,7 +1908,7 @@ impl Registry {
     /// behaviour whenever a satellite is capable — including when
     /// nothing has been measured yet, since unknown counts as capable.
     pub fn place(&self, need: &PlacementNeed) -> Placement {
-        let fleet = self.pick_transcoder(need);
+        let fleet = self.reserve_transcoder(need);
         let local = self.predict_local(need);
         match fleet {
             None => Placement {
@@ -1895,6 +1918,9 @@ impl Registry {
             Some(id) => {
                 let fleet_pred = self.predict_fleet(&id, need);
                 if !sustains(fleet_pred) && sustains(local) && local.is_some() {
+                    // Reserved above and not used: hand it straight back
+                    // or the box stays counted busy for nothing.
+                    self.tc_session_ended(&id);
                     tracing::info!(
                         box_id = %id,
                         class = need.work_class.as_deref().unwrap_or("-"),

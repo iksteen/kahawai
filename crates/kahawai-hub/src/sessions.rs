@@ -1390,51 +1390,32 @@ impl Sessions {
                 };
                 match placed {
                     Some(tc) => {
-                        // TC-6: one retry on the fallback HLS sink — two
-                        // library files crash hlssink3 but mux fine on
-                        // hlssink2 (upstream fix pending).
-                        let facts = match self
-                            .start_transcode(
+                        // `place` reserved this box. Exactly one owner
+                        // of that reservation: this branch. It is held
+                        // across the sink-fallback retry — which reuses
+                        // the same box, so releasing between attempts
+                        // would leave a successful retry uncounted —
+                        // and returned on every failing path below.
+                        let dispatched = self
+                            .dispatch_to(
                                 registry,
                                 &tc,
                                 &id,
                                 plan,
-                                self.open_part_leases(registry, &parts, start_idx).await?,
+                                &parts,
                                 start_idx,
                                 local_ms,
-                                "",
-                                sets_bytes.clone(),
+                                &sets_bytes,
                             )
-                            .await
-                        {
-                            Ok(f) => f,
-                            Err(first)
-                                if plan.segment_format
-                                    != kahawai_media::remux::SegmentFormat::Ts =>
-                            {
-                                return Err(first); // fmp4 has no sink fallback
-                            }
-                            Err(first) => {
-                                tracing::warn!(session = %id, error = format!("{first:#}"),
-                                    "start failed; retrying with fallback sink");
-                                let f = self
-                                    .start_transcode(
-                                        registry,
-                                        &tc,
-                                        &id,
-                                        plan,
-                                        self.open_part_leases(registry, &parts, start_idx).await?,
-                                        start_idx,
-                                        local_ms,
-                                        "hlssink2",
-                                        sets_bytes.clone(),
-                                    )
-                                    .await
-                                    .with_context(|| format!("first attempt: {first:#}"))?;
-                                chosen_sink = "hlssink2".into();
-                                f
+                            .await;
+                        let (facts, sink) = match dispatched {
+                            Ok(v) => v,
+                            Err(e) => {
+                                registry.tc_session_ended(&tc);
+                                return Err(e);
                             }
                         };
+                        chosen_sink = sink;
                         fold_facts(&mut verdict, &facts);
                         Mode::Transcode {
                             transcoder: Mutex::new(tc),
@@ -1762,6 +1743,66 @@ impl Sessions {
         }
     }
 
+    /// One dispatch attempt plus TC-6's single sink fallback, as one
+    /// fallible unit — so the caller holding the box's reservation has
+    /// exactly one place to give it back. Returns the preroll facts and
+    /// the sink that actually worked.
+    #[allow(clippy::too_many_arguments)] // wire-shaped plumbing
+    async fn dispatch_to(
+        self: &Arc<Self>,
+        registry: &Registry,
+        tc: &str,
+        id: &str,
+        plan: kahawai_media::remux::RemuxPlan,
+        parts: &[PartSource],
+        start_idx: usize,
+        local_ms: u64,
+        sets_bytes: &[u8],
+    ) -> Result<(Vec<kahawai_media::facts::Fact>, String)> {
+        let leases = self.open_part_leases(registry, parts, start_idx).await?;
+        let first = match self
+            .start_transcode(
+                registry,
+                tc,
+                id,
+                plan,
+                leases,
+                start_idx,
+                local_ms,
+                "",
+                sets_bytes.to_vec(),
+            )
+            .await
+        {
+            Ok(f) => return Ok((f, String::new())),
+            // fmp4 has no sink fallback.
+            Err(e) if plan.segment_format != kahawai_media::remux::SegmentFormat::Ts => {
+                return Err(e);
+            }
+            Err(e) => e,
+        };
+        // TC-6: one retry on the fallback HLS sink — two library files
+        // crash hlssink3 but mux fine on hlssink2 (upstream fix pending).
+        tracing::warn!(session = %id, error = format!("{first:#}"),
+            "start failed; retrying with fallback sink");
+        let leases = self.open_part_leases(registry, parts, start_idx).await?;
+        let f = self
+            .start_transcode(
+                registry,
+                tc,
+                id,
+                plan,
+                leases,
+                start_idx,
+                local_ms,
+                "hlssink2",
+                sets_bytes.to_vec(),
+            )
+            .await
+            .with_context(|| format!("first attempt: {first:#}"))?;
+        Ok((f, "hlssink2".into()))
+    }
+
     /// Dispatch a session to a transcoder and wait for its playlist.
     #[allow(clippy::too_many_arguments)] // private plumbing, one call site per mode
     #[allow(clippy::too_many_arguments)] // wire-shaped plumbing
@@ -1827,7 +1868,8 @@ impl Sessions {
         }
         match tokio::time::timeout(Duration::from_secs(40), ready_rx).await {
             Ok(Ok(Ok(facts))) => {
-                registry.tc_session_started(transcoder);
+                // No increment here: the slot has been held since the
+                // pick. Counting again would double it.
                 tracing::info!(session = session_id, transcoder, "session dispatched");
                 Ok(facts)
             }
@@ -2464,7 +2506,31 @@ impl Sessions {
 
     /// Re-dispatch one session (its transcoder died or its worker
     /// crashed) at the viewer's last reported position.
+    /// The reservation `reserve_transcoder` takes below outlives
+    /// several fallible steps — leases, a watch-state read — so the
+    /// body is wrapped and the slot returned on any failure. A leaked
+    /// one is invisible: the box simply looks busier than it is until
+    /// the hub restarts, and two of them retire a `max_sessions = 2`
+    /// box from the fleet.
     pub async fn reschedule(self: &Arc<Self>, registry: &Registry, id: &str) -> Result<String> {
+        // Holds the reservation until the new box is actually running;
+        // cleared on success so only failures give it back.
+        let mut reserved: Option<String> = None;
+        let out = self.reschedule_inner(registry, id, &mut reserved).await;
+        if out.is_err()
+            && let Some(tc) = reserved
+        {
+            registry.tc_session_ended(&tc);
+        }
+        out
+    }
+
+    async fn reschedule_inner(
+        self: &Arc<Self>,
+        registry: &Registry,
+        id: &str,
+        reserved: &mut Option<String>,
+    ) -> Result<String> {
         let session = self.get(id).context("no such session")?;
         let plan = (*session.plan.lock().unwrap()).context("not a pipeline session")?;
         let Mode::Transcode { transcoder } = &session.mode else {
@@ -2473,8 +2539,9 @@ impl Sessions {
         let old_tc = transcoder.lock().unwrap().clone();
         registry.tc_session_ended(&old_tc);
         let new_tc = registry
-            .pick_transcoder(&session.needs)
+            .reserve_transcoder(&session.needs)
             .context("no capable transcoder left")?;
+        *reserved = Some(new_tc.clone());
         // Resume where the viewer was: the player posts progress every
         // 10 s, which is exactly the doc's start_offset for AR-6.
         let position_ms: i64 = sqlx::query_scalar(
@@ -2512,6 +2579,7 @@ impl Sessions {
         self.start_transcode(registry, &new_tc, id, plan, parts, idx, local_ms, "", sets)
             .await?;
         *transcoder.lock().unwrap() = new_tc.clone();
+        *reserved = None; // running now; the session owns the slot
         Ok(new_tc)
     }
 

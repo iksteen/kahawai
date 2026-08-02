@@ -221,12 +221,30 @@ async fn transcoder_registers_capabilities_and_clears_on_disconnect() {
         hub.registry.pick_transcoder(&need(&["video/x-daala"])),
         None
     );
-    // Capacity: max_sessions = 2 is a hard cap.
-    hub.registry.tc_session_started("01TC");
-    hub.registry.tc_session_started("01TC");
+    // Capacity: max_sessions = 2 is a hard cap, and it is the RESERVING
+    // pick that fills it — placement counts a box busy from the moment
+    // it is chosen, not from the moment the transcoder answers ready.
+    assert_eq!(
+        hub.registry.reserve_transcoder(&av1).as_deref(),
+        Some("01TC")
+    );
+    assert_eq!(
+        hub.registry.reserve_transcoder(&av1).as_deref(),
+        Some("01TC")
+    );
+    assert_eq!(hub.registry.reserve_transcoder(&av1), None, "at capacity");
     assert_eq!(hub.registry.pick_transcoder(&av1), None, "at capacity");
     hub.registry.tc_session_ended("01TC");
     assert_eq!(hub.registry.pick_transcoder(&av1).as_deref(), Some("01TC"));
+    // A query does not consume: asking twice more must still answer.
+    assert_eq!(hub.registry.pick_transcoder(&av1).as_deref(), Some("01TC"));
+    assert_eq!(
+        hub.registry.reserve_transcoder(&av1).as_deref(),
+        Some("01TC"),
+        "the freed slot is takeable"
+    );
+    hub.registry.tc_session_ended("01TC");
+    hub.registry.tc_session_ended("01TC");
 
     hub.registry.set_disabled("01TC", true).await.unwrap();
     assert_eq!(hub.registry.pick_transcoder(&av1), None);
@@ -291,4 +309,71 @@ async fn mediahost_cert_is_refused_on_transcoder_link() {
             assert_eq!(err.code(), tonic::Code::PermissionDenied);
         }
     }
+}
+
+/// TC-6 under concurrency, which is the only time a capacity cap does
+/// any work. Placement used to count a box busy only when the
+/// transcoder answered ready — up to 40 s after it was chosen — so
+/// every concurrent placement read the same load and the filter passed
+/// them all. Measured on a five-transcoder fleet before this fix: ten
+/// concurrent starts all landed on one box whose `max_sessions` was 2,
+/// while three idle boxes and the hub's own executor took nothing.
+#[tokio::test]
+async fn capacity_holds_when_placements_arrive_together() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    let registry = Arc::new(Registry::new(db, AllowedCerts::default()));
+
+    // Two boxes, three slots between them: whatever the sort prefers,
+    // the fourth caller must be refused.
+    for (id, max) in [("box-a", 2u32), ("box-b", 1)] {
+        registry.connected(id, "transcoder", id, "fp", "build");
+        registry.register_tc_link(id, tokio::sync::mpsc::channel(1).0);
+        registry.set_transcoder_caps(
+            id,
+            &CapabilityReport {
+                encoders: vec![EncoderCap {
+                    codec: "h264".into(),
+                    element: "x264enc".into(),
+                    hardware: false,
+                    speed_1080: None,
+                    speed_2160: None,
+                }],
+                max_sessions: max,
+                decode_caps: vec!["video/x-h264".into()],
+                tonemap: false,
+                tonemap_speed_1080: None,
+                tonemap_speed_2160: None,
+            },
+        );
+    }
+    let need = PlacementNeed {
+        encode_video: true,
+        encode_audio: false,
+        video_caps: vec!["video/x-h264".into()],
+        video_codec: "h264".into(),
+        ..Default::default()
+    };
+
+    let got = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let mut tasks = tokio::task::JoinSet::new();
+    for _ in 0..12 {
+        let (registry, need, got) = (registry.clone(), need.clone(), got.clone());
+        tasks.spawn(async move {
+            if let Some(tc) = registry.reserve_transcoder(&need) {
+                got.lock().unwrap().push(tc);
+            }
+        });
+    }
+    while tasks.join_next().await.is_some() {}
+
+    let got = got.lock().unwrap().clone();
+    assert_eq!(
+        got.len(),
+        3,
+        "placed more sessions than the fleet has slots"
+    );
+    let a = got.iter().filter(|t| *t == "box-a").count();
+    let b = got.iter().filter(|t| *t == "box-b").count();
+    assert_eq!((a, b), (2, 1), "each box took exactly its max_sessions");
 }
