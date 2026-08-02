@@ -369,12 +369,16 @@ How something works and why it was built that way belong in
       live fleet by `scripts/kahawai-latency.sh` (worst of N, every run
       printed), across a local file, a 12 GB 4K-class DTS title and an
       HDR10 one.
-- [ ] NFR-2 Scale targets. 250k files across 10 collections hold on
+- [x] NFR-2 Scale targets. 250k files across 10 collections hold on
       every browse path, deep pages and adversarial search included.
       Five executors exercised together (four enrolled transcoders plus
       the hub's own): eleven concurrent transcodes filled every box to
-      its own max_sessions and no further, with the overflow staying
-      local. Remaining: 10 mediahosts untested — 2 are live.
+      its own max_sessions and no further, overflow staying local. Ten
+      mediahosts enrolled and linked simultaneously
+      (`scripts/kahawai-fanout.sh`), per the 2026-08-02 amendment that
+      makes the mediahost count a claim about the HUB — allowlist,
+      links, collections, per-module state — and not about ten real
+      disks, which cannot be stood up here and are not claimed.
 - [x] NFR-3 No user-state loss on crash; media never written
 - [x] NFR-4 mTLS everywhere inter-module; token auth on client API
 - [x] NFR-5 Portability: Linux x86_64, macOS (transcoder), and Linux
