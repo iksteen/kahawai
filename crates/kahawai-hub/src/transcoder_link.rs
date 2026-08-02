@@ -186,6 +186,24 @@ impl TranscoderLink for TranscoderLinkService {
                                 }
                             }
                         }
+                        // OPS-10: a run's diagnostics, either pushed at
+                        // teardown or answering a CollectLogs. The hub
+                        // half is prepended here because only the hub
+                        // knows the plan, the verdict and where it placed
+                        // the work.
+                        tc_to_hub::Msg::SessionLogs(l) => {
+                            let Some(data_dir) = sessions.data_dir() else {
+                                continue;
+                            };
+                            let (item, header) = sessions.log_header(&l.session_id);
+                            crate::crashlog::store_bundle(
+                                data_dir,
+                                &item,
+                                &l.session_id,
+                                &format!("{header}{}", l.body),
+                            );
+                            sessions.deliver_logs(&l.session_id, format!("{header}{}", l.body));
+                        }
                         tc_to_hub::Msg::SessionReady(r) => {
                             let facts = r
                                 .facts

@@ -590,6 +590,19 @@ export function endSession(sessionId: string, keepalive = false) {
 
 // ---- admin ----
 
+/// OPS-10: URLs for the session/item diagnostic bundles. Plain hrefs on
+/// purpose — `storeTokens` mirrors the access token into the
+/// `kahawai_token` cookie, which is how <video>/<img>/EventSource
+/// already authenticate, so an <a download> needs no blob plumbing.
+export function sessionLogUrl(sessionId: string): string {
+  return `/admin/v1/sessions/${encodeURIComponent(sessionId)}/log`
+}
+
+export function itemLogUrl(itemId: string): string {
+  return `/admin/v1/items/${encodeURIComponent(itemId)}/log`
+}
+
+
 export type PendingEnrollment = {
   csr_fingerprint: string
   module_type: string

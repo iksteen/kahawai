@@ -163,6 +163,10 @@ pub fn router(
             "/admin/v1/sessions/{id}",
             axum::routing::delete(admin_end_session),
         )
+        // OPS-10: one session's diagnostics as a downloadable bundle,
+        // and the newest bundle for an item (whoever played it).
+        .route("/admin/v1/sessions/{id}/log", get(admin_session_log))
+        .route("/admin/v1/items/{id}/log", get(admin_item_log))
         .route_layer(axum::middleware::from_fn(require_admin))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -1107,6 +1111,58 @@ async fn admin_sessions(State(state): State<AppState>) -> Result<Json<Value>, Ap
         }));
     }
     Ok(Json(json!({ "sessions": out })))
+}
+
+/// OPS-10: a session's diagnostics, as an attachment. A live session is
+/// collected on the spot; an ended one is served from what teardown
+/// stored, which is the case that matters — nobody presses a button on
+/// a session they already closed.
+async fn admin_session_log(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Response, ApiError> {
+    let body = state
+        .sessions
+        .collect_logs(&state.registry, &id)
+        .await
+        .map_err(|e| (StatusCode::NOT_FOUND, format!("{e:#}")))?;
+    Ok(log_attachment(format!("kahawai-session-{id}.log"), body))
+}
+
+/// The newest bundle for an item, whoever played it.
+async fn admin_item_log(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Response, ApiError> {
+    let data_dir = state
+        .sessions
+        .data_dir()
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "no data dir".to_string()))?;
+    let path = crate::crashlog::newest_for_item(data_dir, &id).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            "no session logs for this item".to_string(),
+        )
+    })?;
+    let body = std::fs::read_to_string(&path).map_err(internal)?;
+    Ok(log_attachment(format!("kahawai-item-{id}.log"), body))
+}
+
+fn log_attachment(filename: String, body: String) -> Response {
+    (
+        [
+            (
+                axum::http::header::CONTENT_TYPE,
+                "text/plain; charset=utf-8".to_string(),
+            ),
+            (
+                axum::http::header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{filename}\""),
+            ),
+        ],
+        body,
+    )
+        .into_response()
 }
 
 async fn admin_end_session(

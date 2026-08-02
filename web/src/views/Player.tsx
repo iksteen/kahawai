@@ -20,6 +20,8 @@ import {
   type ItemDetail,
   type Session,
   type Subtitle,
+  isAdmin,
+  sessionLogUrl,
 } from '../api'
 import { buildProfile, loadMask, maskSummary } from '../capabilities'
 import CapabilityDebug from './CapabilityDebug'
@@ -870,6 +872,13 @@ export default function Player({
         ) : null}
         {showCaps && <CapabilityDebug onApply={restartWithCaps} applying={restarting} />}
         {capsError && <div className="dim">restart failed: {capsError}</div>}
+        {/* OPS-10: admins can take this session's diagnostics straight
+            from the screen where the problem is visible. */}
+        {isAdmin() && (
+          <a className="btn ghost small" href={sessionLogUrl(session.session_id)} download>
+            Download log
+          </a>
+        )}
       </div>
     </main>
   )

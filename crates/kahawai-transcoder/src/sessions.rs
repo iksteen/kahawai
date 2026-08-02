@@ -686,6 +686,22 @@ impl Runner {
                     .is_ok()
             }
         };
+        // OPS-10: gather BEFORE the dir goes. remove_dir_all below is
+        // synchronous and the hub's EndSession is fire-and-forget, so
+        // there is no later moment to ask — which is exactly why a hung
+        // session used to leave nothing behind.
+        let bundle = gather_bundle(session_id, &s.dir);
+        let _ = self
+            .link
+            .send(TcToHub {
+                msg: Some(tc_to_hub::Msg::SessionLogs(
+                    kahawai_proto::v1::SessionLogs {
+                        session_id: session_id.to_string(),
+                        body: bundle,
+                    },
+                )),
+            })
+            .await;
         if done {
             let _ = std::fs::remove_dir_all(&s.dir);
         } else {
@@ -696,6 +712,17 @@ impl Runner {
         tracing::info!(session = %session_id, "session run ended");
     }
 
+    /// OPS-10: this running session's diagnostics, on request. Returns
+    /// None when the session is not ours — an ended one is already
+    /// stored hub-side, so there is nothing useful to answer with.
+    pub fn collect_logs(&self, session_id: &str) -> Option<String> {
+        let dir = {
+            let sessions = self.sessions.lock().unwrap();
+            sessions.get(session_id)?.dir.clone()
+        };
+        Some(gather_bundle(session_id, &dir))
+    }
+
     /// Link died: every session dies with it (the hub reschedules, AR-6).
     pub async fn end_all(&self) {
         let ids: Vec<String> = self.sessions.lock().unwrap().keys().cloned().collect();
@@ -703,4 +730,96 @@ impl Runner {
             self.end(&id).await;
         }
     }
+}
+
+/// Everything the satellite knows about one run, as text a human can
+/// paste into a bug report (OPS-10).
+///
+/// Best-effort throughout: a missing file is a missing section, never a
+/// failure — this runs on the teardown path and must not be able to
+/// break it.
+fn gather_bundle(session_id: &str, dir: &std::path::Path) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(32 * 1024);
+    let _ = writeln!(out, "== satellite: session {session_id}");
+    let _ = writeln!(out, "run dir: {}", dir.display());
+
+    let segs: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+        .map(|rd| {
+            let mut v: Vec<_> = rd
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| {
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.starts_with("segment"))
+                })
+                .collect();
+            v.sort();
+            v
+        })
+        .unwrap_or_default();
+    let _ = writeln!(out, "segments: {}", segs.len());
+    if let Some(first) = segs.first() {
+        let _ = writeln!(out, "first segment: {}", first_segment_summary(first));
+    }
+
+    for name in [
+        "start.pos",
+        "viewer.pos",
+        "pace.json",
+        "pace.taken.json",
+        "facts.jsonl",
+    ] {
+        if let Ok(body) = std::fs::read_to_string(dir.join(name)) {
+            let _ = writeln!(out, "\n== {name}\n{}", body.trim_end());
+        }
+    }
+    if let Ok(pl) = std::fs::read_to_string(dir.join("master.m3u8")) {
+        let _ = writeln!(out, "\n== master.m3u8 (tail)\n{}", tail_lines(&pl, 40));
+    }
+    if let Ok(log) = std::fs::read_to_string(dir.join("worker.log")) {
+        let _ = writeln!(out, "\n== worker.log\n{log}");
+    }
+    out
+}
+
+/// Is the first segment independently decodable? One line, and the
+/// whole diagnosis of a wedged session: a player handed a segment with
+/// no parameter sets stalls there forever while the worker happily
+/// produces minutes more behind it.
+///
+/// H.264-in-TS only, which is what the start codes below assume. Other
+/// pipelines say so rather than being silently skipped.
+fn first_segment_summary(path: &std::path::Path) -> String {
+    let Ok(bytes) = std::fs::read(path) else {
+        return "unreadable".into();
+    };
+    if !path.extension().is_some_and(|e| e == "ts") {
+        return format!("{} bytes (not TS; no NAL summary)", bytes.len());
+    }
+    let (mut sps, mut pps, mut idr) = (false, false, false);
+    for w in bytes.windows(4) {
+        if w[0] == 0 && w[1] == 0 && w[2] == 1 {
+            match w[3] & 0x1f {
+                5 => idr = true,
+                7 => sps = true,
+                8 => pps = true,
+                _ => {}
+            }
+        }
+    }
+    format!(
+        "{} bytes, SPS={sps} PPS={pps} IDR={idr}{}",
+        bytes.len(),
+        if sps && pps && idr {
+            ""
+        } else {
+            "  <-- NOT independently decodable; a player wedges here"
+        }
+    )
+}
+
+fn tail_lines(body: &str, n: usize) -> String {
+    let lines: Vec<&str> = body.lines().collect();
+    lines[lines.len().saturating_sub(n)..].join("\n")
 }

@@ -412,6 +412,9 @@ pub struct Sessions {
     /// Sessions awaiting the transcoder's ready/error verdict; Ok
     /// carries the worker's session facts (AR-13).
     pending_ready: Mutex<HashMap<String, tokio::sync::oneshot::Sender<ReadyVerdict>>>,
+    /// OPS-10: callers awaiting a satellite's log bundle. Same shape as
+    /// `pending_ready` — one waiter per session, dropped on timeout.
+    pending_logs: Mutex<HashMap<String, tokio::sync::oneshot::Sender<String>>>,
     /// In-flight artifact fetches, keyed by (session, name).
     artifact_waiting: Mutex<
         HashMap<(String, String), tokio::sync::mpsc::Sender<kahawai_proto::v1::ArtifactData>>,
@@ -428,6 +431,125 @@ impl Sessions {
 
     /// Where diagnostics live: the scratch root is `<data_dir>/sessions`,
     /// so its parent is the data dir.
+    /// OPS-10: the hub half of a session bundle — what only the hub
+    /// knows. Structured state rather than log lines because the hub
+    /// cannot read its own log: it writes to stdout, redirected by
+    /// whatever launched it, and on macOS launchd discards it entirely.
+    ///
+    /// Returns `(item_id, header)`; the item id rides into the bundle
+    /// FILENAME so the item detail page can find it later.
+    pub fn log_header(&self, session_id: &str) -> (String, String) {
+        use std::fmt::Write as _;
+        let Some(s) = self.get(session_id) else {
+            // Already gone: still worth keeping the satellite's half.
+            return (
+                "unknown".into(),
+                format!("== hub: session {session_id}\n(session already ended; no hub state)\n\n"),
+            );
+        };
+        let mut h = String::new();
+        let _ = writeln!(h, "== hub: session {}", s.id);
+        let _ = writeln!(h, "item:       {}", s.item_id);
+        let _ = writeln!(h, "user:       {}", s.user_id);
+        let _ = writeln!(
+            h,
+            "mode:       {}",
+            match &s.mode {
+                Mode::Direct { .. } => "direct",
+                Mode::Remux { .. } => "remux (hub-local worker)",
+                Mode::Transcode { .. } => "transcode (dispatched)",
+            }
+        );
+        if let Mode::Transcode { transcoder } = &s.mode {
+            let _ = writeln!(h, "placed on:  {}", transcoder.lock().unwrap());
+        }
+        if !s.pace_class.is_empty() {
+            let _ = writeln!(h, "work class: {}", s.pace_class);
+        }
+        if let Some((video, audio)) = s.verdict.lock().unwrap().as_ref() {
+            let _ = writeln!(h, "verdict:    v: {video}");
+            let _ = writeln!(h, "            a: {audio}");
+        }
+        if let Some(plan) = *s.plan.lock().unwrap() {
+            let _ = writeln!(h, "plan:       {plan:?}");
+        }
+        let _ = writeln!(h, "sink:       {}", s.sink.lock().unwrap());
+        let _ = writeln!(h, "idle:       {}s", s.idle_for().as_secs());
+        let _ = writeln!(h);
+        (s.item_id.clone(), h)
+    }
+
+    /// OPS-10: this session's diagnostics, for the download button.
+    ///
+    /// A LIVE dispatched session is asked over the link; a live local one
+    /// is read straight off disk; an ENDED one comes from the bundle
+    /// stored at teardown, which is the case that matters — nobody
+    /// presses a button on a session they already closed.
+    pub async fn collect_logs(
+        &self,
+        registry: &crate::registry::Registry,
+        id: &str,
+    ) -> Result<String> {
+        let data_dir = self.data_dir().context("no data dir")?.to_path_buf();
+        let Some(session) = self.get(id) else {
+            // Ended: serve what teardown kept.
+            let path = crate::crashlog::bundle_for_session(&data_dir, id)
+                .context("no logs kept for that session")?;
+            return Ok(std::fs::read_to_string(path)?);
+        };
+        match &session.mode {
+            Mode::Remux { dir, .. } => {
+                let (_, header) = self.log_header(id);
+                Ok(format!("{header}{}", local_bundle(dir)))
+            }
+            Mode::Transcode { transcoder } => {
+                let tc = transcoder.lock().unwrap().clone();
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                self.pending_logs.lock().unwrap().insert(id.into(), tx);
+                let sent = registry
+                    .send_to_tc(
+                        &tc,
+                        kahawai_proto::v1::HubToTc {
+                            msg: Some(kahawai_proto::v1::hub_to_tc::Msg::CollectLogs(
+                                kahawai_proto::v1::CollectLogs {
+                                    session_id: id.to_string(),
+                                },
+                            )),
+                        },
+                    )
+                    .await;
+                if let Err(e) = sent {
+                    self.pending_logs.lock().unwrap().remove(id);
+                    // The box is gone; a stored bundle may still exist.
+                    return match crate::crashlog::bundle_for_session(&data_dir, id) {
+                        Some(p) => Ok(std::fs::read_to_string(p)?),
+                        None => Err(e),
+                    };
+                }
+                match tokio::time::timeout(Duration::from_secs(10), rx).await {
+                    Ok(Ok(body)) => Ok(body),
+                    _ => {
+                        self.pending_logs.lock().unwrap().remove(id);
+                        bail!("transcoder did not answer with logs in time")
+                    }
+                }
+            }
+            Mode::Direct { .. } => {
+                let (_, header) = self.log_header(id);
+                Ok(format!(
+                    "{header}(direct play: no pipeline, no worker log)\n"
+                ))
+            }
+        }
+    }
+
+    /// A bundle arrived for a caller waiting on it (the download button).
+    pub fn deliver_logs(&self, session_id: &str, body: String) {
+        if let Some(tx) = self.pending_logs.lock().unwrap().remove(session_id) {
+            let _ = tx.send(body);
+        }
+    }
+
     pub fn data_dir(&self) -> Option<&std::path::Path> {
         self.scratch_root.parent()
     }
@@ -445,6 +567,7 @@ impl Sessions {
             active: Mutex::new(HashMap::new()),
             tc_leases: Mutex::new(HashMap::new()),
             pending_ready: Mutex::new(HashMap::new()),
+            pending_logs: Mutex::new(HashMap::new()),
             artifact_waiting: Mutex::new(HashMap::new()),
             registry_for_teardown: Mutex::new(None),
         }
@@ -2264,6 +2387,16 @@ impl Sessions {
         }
         match &session.mode {
             Mode::Remux { dir, runner } => {
+                // OPS-10: the hub's OWN worker leaves the same evidence a
+                // satellite's does, and this wipe destroys it. Gather
+                // first, and store directly — a local session never
+                // touches the link. Teardown only: a seek-restart also
+                // wipes this dir, but a bundle per scrub is noise.
+                if let Some(data_dir) = self.scratch_root.parent() {
+                    let (item, header) = self.log_header(id);
+                    let body = format!("{header}{}", local_bundle(dir));
+                    crate::crashlog::store_bundle(data_dir, &item, id, &body);
+                }
                 runner.lock().unwrap().stop();
                 let _ = std::fs::remove_dir_all(dir);
             }
@@ -2406,4 +2539,32 @@ mod seek_merge_tests {
             Some(0)
         );
     }
+}
+
+/// The hub-local worker's half of a session bundle (OPS-10). The
+/// satellite's equivalent lives in kahawai-transcoder; this one is
+/// deliberately separate rather than shared, because the two read
+/// different directory layouts and sharing would mean a crate
+/// dependency purely for a string builder.
+fn local_bundle(dir: &std::path::Path) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let _ = writeln!(out, "== hub-local worker\nrun dir: {}", dir.display());
+    let segs = std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .filter(|e| e.file_name().to_string_lossy().starts_with("segment"))
+                .count()
+        })
+        .unwrap_or(0);
+    let _ = writeln!(out, "segments: {segs}");
+    for name in ["start.pos", "viewer.pos", "pace.json", "facts.jsonl"] {
+        if let Ok(body) = std::fs::read_to_string(dir.join(name)) {
+            let _ = writeln!(out, "\n== {name}\n{}", body.trim_end());
+        }
+    }
+    if let Ok(log) = std::fs::read_to_string(dir.join("worker.log")) {
+        let _ = writeln!(out, "\n== worker.log\n{log}");
+    }
+    out
 }

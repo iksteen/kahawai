@@ -195,6 +195,16 @@ Gaps identified in review that would block a real first release despite not appe
 
 *Why this is a requirement and not a runbook.* The DTS rank check already existed and already warned, in exactly the words that describe the bug; it warned on a box nobody was reading the output of, and the library silently accumulated 312 wrong channel counts. A check whose remedy is a hand-edited TOML on each satellite is a check that will be ignored.
 
+**OPS-10 Session diagnostics as one downloadable bundle.** A session's diagnostics shall be retrievable from the interface as a single text bundle, by an administrator, without shell access to any machine.
+
+*Why a requirement.* Diagnosing one hung session took four sources stitched together by hand — the hub log, the run directory over ssh, a segment pulled with scp and walked for NAL types, and `viewer.pos` against the segment count. A user reporting "it hangs" can supply none of that, and the evidence is deleted with the run directory the moment the session is torn down. A crash already leaves a log (`crashlog.rs`); a HANG, which is the harder failure, leaves nothing.
+
+*Capture.* A bundle shall be assembled when a session ENDS, not only when it fails, because a hang never fails — and it shall be assembled BEFORE the run directory is removed, which on the satellite happens synchronously during teardown. It shall additionally be obtainable on demand while a session is live. Retention is bounded like the crash store (newest N, byte-capped per bundle); a crash loop must not fill the disk it is reported on.
+
+*Content.* The bundle carries what the two sides each know and the other cannot: from the hub, structured session state — item, user, mode, plan, verdict, placed box, work class, sink — because the hub cannot read its own log (it writes to stdout, redirected by whatever launched it); from the executing box, the worker log, the session facts, playlist and position files, and a one-line verdict on whether the FIRST segment is independently decodable, which is the single fact that distinguishes "the pipeline is fine and the player is stuck" from everything else.
+
+*Reach.* An administrator shall be able to take the bundle from the admin session list, from the player while the problem is on screen, and from an item's detail page after the fact — the last returning the newest session for that item whoever played it, since the purpose is debugging somebody else's report.
+
 ## 10. Acceptance criteria (v1)
 
 1. All-in-one binary on a single machine: scan a mixed library (H.264/HEVC/AV1 video, FLAC/MP3/AAC audio, PGS+SRT subtitles), enrich from TheTVDB/TMDB/MusicBrainz, then browse, search, and play from the bundled web player, with library composition and match review done in the bundled admin UI. Additionally: an anime collection with fansub-convention filenames matches correctly via AniDB/AniList (hash-exact where ED2K hashes have been computed), presents a watch order, and plays with ASS subtitles rendered client-side in the web player with correct fonts.

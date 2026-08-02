@@ -21,6 +21,8 @@ import {
   type ItemDetail,
   type Session,
   type Source,
+  isAdmin,
+  itemLogUrl,
 } from '../api'
 import AlbumPlayer from './AlbumPlayer'
 import CapabilityDebug from './CapabilityDebug'
@@ -481,6 +483,14 @@ export default function Detail({
           {showCaps ? 'hide caps' : 'caps'}
         </button>
         {masked.length > 0 && <span className="caps-badge mono">masked: {masked.join(' ')}</span>}
+        {/* OPS-10: the LAST session for this item, whoever played it —
+            the point is debugging a report from someone else, after
+            they have closed the player. */}
+        {isAdmin() && (
+          <a className="btn ghost small" href={itemLogUrl(id)} download>
+            Last session log
+          </a>
+        )}
       </div>
       {showCaps && <CapabilityDebug onChange={() => setCapsRev((n) => n + 1)} />}
       {error && <div className="error">{error}</div>}

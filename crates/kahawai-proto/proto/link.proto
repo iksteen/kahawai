@@ -324,7 +324,22 @@ message TcToHub {
     // tick. A NEW kind rather than fields inside Heartbeat{}, which is
     // shared with the mediahost link.
     PaceReport pace_report = 8;
+    // OPS-10: this session's diagnostics, gathered from the run dir.
+    // Sent unsolicited at session end — the run dir is deleted
+    // synchronously right after, so there is no later window — and in
+    // answer to CollectLogs for a session still running.
+    SessionLogs session_logs = 9;
   }
+}
+
+// One session's satellite-side diagnostics, already assembled as text.
+// Assembled rather than shipped as fields because the reader is a human
+// pasting it into a bug report, and because what is worth including
+// differs per pipeline (a TS session has a first-segment summary, an
+// fMP4 one does not).
+message SessionLogs {
+  string session_id = 1;
+  string body = 2;
 }
 
 // One finished run's un-throttled production rate. The transcoder
@@ -458,6 +473,9 @@ message HubToTc {
     // own heartbeat ticker stalls) but socket reads always wake them, so
     // the hub pings and the transcoder answers with a Heartbeat.
     Ping ping = 7;
+    // OPS-10: hand me this running session's diagnostics. Only for a
+    // LIVE session; once it ends the bundle is already stored hub-side.
+    CollectLogs collect_logs = 8;
   }
 }
 
@@ -515,6 +533,10 @@ message StartSession {
 }
 
 message EndSession {
+  string session_id = 1;
+}
+
+message CollectLogs {
   string session_id = 1;
 }
 

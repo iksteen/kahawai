@@ -399,6 +399,27 @@ async fn link_loop(
                         Some(hub_to_tc::Msg::ViewerPosition(v)) => {
                             runner.viewer_position(&v.session_id, v.position_ms);
                         }
+                        // OPS-10: diagnostics for a session still running.
+                        // Answered inline — reading a run dir is a few
+                        // files and the reply is ~27 KB, so a spawn would
+                        // only risk racing the session's own teardown.
+                        Some(hub_to_tc::Msg::CollectLogs(c)) => {
+                            if let Some(body) = runner.collect_logs(&c.session_id)
+                                && tx
+                                    .send(TcToHub {
+                                        msg: Some(tc_to_hub::Msg::SessionLogs(
+                                            kahawai_proto::v1::SessionLogs {
+                                                session_id: c.session_id,
+                                                body,
+                                            },
+                                        )),
+                                    })
+                                    .await
+                                    .is_err()
+                            {
+                                bail!("link sender closed");
+                            }
+                        }
                         // Reactive liveness: our own ticker stalls under
                         // macOS App Nap, but inbound traffic wakes us.
                         Some(hub_to_tc::Msg::Ping(_)) => {

@@ -339,6 +339,10 @@ How something works and why it was built that way belong in
       scan filed 312 DTS files as 5.1, fixed 2026-08-01 by hand-editing
       TOML on the satellite. A check whose remedy is a hand-edited file
       per box is a check that gets ignored.
+- [ ] OPS-10 Session diagnostics as one downloadable bundle. Captured
+      at session end (a hang never fails, so crash capture never fired)
+      and on demand while live; admin download from the session list,
+      the player, and item detail. Design in implementation §4.6.
 
 ## Non-functional (NFR)
 

@@ -22,6 +22,7 @@ import {
   adminEnrollments,
   adminLibraries,
   adminSatellites,
+  sessionLogUrl,
   adminSessions,
   type AdminSession,
   type CollectionInfo,
@@ -545,12 +546,18 @@ export default function Admin() {
               <span className="dim">{s.username ?? '?'}</span>
               <span className="mono dim">idle {s.idle_secs}s</span>
             </span>
-            <button
-              className="btn ghost small"
-              onClick={() => adminEndSession(s.session_id).then(reload)}
-            >
-              End
-            </button>
+            <span>
+              {/* OPS-10: plain anchor — the media cookie authenticates it. */}
+              <a className="btn ghost small" href={sessionLogUrl(s.session_id)} download>
+                Log
+              </a>
+              <button
+                className="btn ghost small"
+                onClick={() => adminEndSession(s.session_id).then(reload)}
+              >
+                End
+              </button>
+            </span>
           </li>
         ))}
       </ul>
