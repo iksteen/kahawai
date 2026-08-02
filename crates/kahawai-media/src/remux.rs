@@ -5360,6 +5360,97 @@ mod tests {
         );
     }
 
+    /// A DEFECT, reproduced and left here — not a passing test.
+    /// Reported 2026-08-03: an offset start on an fMP4 COPY session
+    /// panics `fmp4mux` ("Timestamps going backwards") and takes the
+    /// worker with it, so the session produces no segments at all and
+    /// the player buffers forever. A seek is an offset start, which is
+    /// why seeking reproduces it.
+    ///
+    ///   cargo test -p kahawai-media an_offset_start -- --ignored
+    ///
+    /// What the measurements say, so the next person does not repeat
+    /// them:
+    ///
+    /// - It is `h264timestamper`, which reconstructs the DTS Matroska
+    ///   does not store. After a FLUSHING SEEK it emits DUPLICATE DTS —
+    ///   `1.920, 1.960, 1.960, 2.000, 2.000, …` on a 25 fps source that
+    ///   should step 40 ms a frame. Offset zero is clean; only the seek
+    ///   breaks it.
+    /// - `mpegtsmux` tolerates that (it rebases every stream onto its
+    ///   own epoch), which is why this never showed on the TS path.
+    /// - The element also rebases its whole branch onto a 1000-hour
+    ///   epoch, buffers AND segment together, so stream time stays
+    ///   correct. That is a red herring: normalising the base back
+    ///   (`segment.start - segment.time`) leaves the panic exactly
+    ///   where it was.
+    /// - Simply dropping the element for fMP4 does not work either:
+    ///   `isofmp4mux` then errors "Require DTS" and produces nothing.
+    ///   B-frames are what make the DTS necessary at all.
+    ///
+    /// So the fix is a trade-off rather than a repair, and belongs to
+    /// whoever owns the cost model: prefer TS for h264-with-B-frames
+    /// (costs an audio encode when the source's audio has no TS
+    /// mapping, which is what selects fMP4 for these files in the first
+    /// place), reconstruct DTS ourselves, or carry an upstream fix.
+    #[test]
+    #[ignore = "reproduces an unfixed upstream fmp4mux panic"]
+    fn an_offset_start_does_not_panic_the_fmp4_muxer() {
+        crate::init().unwrap();
+        if !crate::testutil::has_element("isofmp4mux") || !crate::testutil::has_element("flacenc") {
+            eprintln!("skipping: no isofmp4mux/flacenc");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let src_path = dir.path().join("flac.mkv");
+        // h264 WITH B-FRAMES + FLAC. Both matter: B-frames are what need
+        // reconstructed DTS at all, and FLAC has no TS mapping, so this
+        // is exactly the shape that negotiates to fMP4 in the field.
+        crate::testutil::render_h264_flac_mkv(&src_path);
+
+        let plan = RemuxPlan {
+            video: StreamMode::Copy,
+            audio: StreamMode::Copy,
+            segment_format: SegmentFormat::Fmp4,
+            ..Default::default()
+        };
+        let out = tempfile::tempdir().unwrap();
+        let job = start_at(
+            out.path(),
+            plan,
+            Box::new(FileSource::open(&src_path).unwrap()),
+            2_000,
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !job.finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(job.finished(), "offset start never finished");
+        assert!(job.failed().is_none(), "{:?}", job.failed());
+
+        // Whatever the fix turns out to be, it has to keep the property
+        // the timestamper was there for: a fragment is only readable
+        // behind its init segment, and its video DTS must be complete
+        // and monotonic or hls.js rejects the append.
+        let mut segs: Vec<_> = std::fs::read_dir(out.path())
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|x| x == "m4s"))
+            .collect();
+        segs.sort();
+        assert!(!segs.is_empty(), "offset start produced no fragments");
+        let mut bytes = std::fs::read(out.path().join("init.mp4")).unwrap();
+        for s in &segs {
+            bytes.extend(std::fs::read(s).unwrap());
+        }
+        let joined = dir.path().join("joined.mp4");
+        std::fs::write(&joined, bytes).unwrap();
+        let (missing, non_mono) = video_dts_defects(&joined);
+        assert_eq!(missing, 0, "{missing} video packets with no DTS");
+        assert_eq!(non_mono, 0, "{non_mono} non-monotonic video DTS");
+    }
+
     /// HUB-32b burn-in end to end: a PGS source encoded with
     /// `burn_subtitle` must carry the subtitle in the PICTURE, and it
     /// must be there when the session STARTS MID-SET — the case a
