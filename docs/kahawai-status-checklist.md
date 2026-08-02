@@ -167,8 +167,22 @@ How something works and why it was built that way belong in
       text codecs), mediahost extraction facility with index-driven sparse reads;
       image subtitles (PGS + VobSub) decoded server-side and rendered on a
       canvas overlay from the same tap — no video transcoding
-- [ ] HUB-32a ASS fallback policy *(flatten live and labeled; burn-in not built;
-      no per-library/user policy or playback-info reporting yet)*
+- [x] HUB-32a ASS fallback policy — server order client-native → flatten →
+      burn, with a per-user `ass_fallback` preference swapping the last two
+      and an explicit "burn in" pick in the subtitle list that beats even a
+      client that renders ASS itself. Burning runs `assrender` in the encode
+      chain: embedded tracks take the demuxer's own pad (the only path that
+      carries the release's attached fonts — verified live, a script asking
+      for Calibri on a box that has no Calibri), a user's sidecar `.ass` is
+      played in from an appsrc and ships to the worker like display sets do.
+      A burn forces the video encode that carries it and hard-filters
+      placement onto a box reporting `ass_burn`. Nothing ever flattens
+      silently: with no capable box the session refuses with a 422 the
+      client matches (`ass_burn_unavailable`) and offers flatten or stop.
+      *(Per-LIBRARY policy is not built — per-user only. The refusal was
+      verified structurally, not live: every box in this fleet has
+      assrender, including the hub's own, so the condition is unreachable
+      here.)*
 
 ## Hub — users, API, playback
 
