@@ -453,71 +453,12 @@ pub fn calibrate() -> Calibration {
     for codec in crate::bench::Codec::ALL {
         out.checks.push(decoder_speed_check(codec, &mut out.demote));
     }
-    out.checks.push(uncalibrated_check());
     // Class (b) is a fixed list, so `gstreamer_checks` already prints
     // this row on every startup and every doctor run. Take only its
     // demotion — printing it twice would say the calibration found
     // something the cheap checks did not.
     out.demote.extend(dts_hd_check().1);
     out
-}
-
-/// Codecs a decoder can be pathologically slow at that we hold no
-/// reference bitstream for, and the software decoder each would be
-/// measured against. Every one of these is a real risk on the same
-/// hardware that produced the h264/hevc finding — the J5005's
-/// hand-written demotion list names `vampeg2dec`, `vavp8dec`,
-/// `vavp9dec` and `vajpegdec` alongside the two this can measure.
-const UNCALIBRATED: &[(&str, &str, &str)] = &[
-    ("video/x-av1", "av1", "avdec_av1"),
-    ("video/x-vp9", "vp9", "avdec_vp9"),
-    ("video/x-vp8", "vp8", "avdec_vp8"),
-    ("video/mpeg", "mpeg2", "avdec_mpeg2video"),
-];
-
-/// AR-13 rule 4, applied to ourselves: a calibration that examines two
-/// codecs and reports only findings reads as "your decoders are fine".
-/// Name what was NOT measured, and only when this box actually has a
-/// decoder there that outranks software — otherwise it is noise.
-fn uncalibrated_check() -> Check {
-    const NAME: &str = "decode rank (unmeasured)";
-    let mut unexamined: Vec<String> = Vec::new();
-    for (caps_name, label, sw) in UNCALIBRATED {
-        let Some(sw_rank) = gst::ElementFactory::find(sw)
-            .filter(|f| f.rank() > gst::Rank::NONE)
-            .map(|f| f.rank())
-        else {
-            continue;
-        };
-        let caps = gst::Caps::new_empty_simple(*caps_name);
-        let mut found: Vec<String> = gst::ElementFactory::factories_with_type(
-            gst::ElementFactoryType::DECODER | gst::ElementFactoryType::MEDIA_VIDEO,
-            gst::Rank::MARGINAL,
-        )
-        .into_iter()
-        .filter(|f| {
-            f.name() != *sw
-                && f.rank() >= sw_rank
-                && is_hardware_decoder(&f.name())
-                && f.can_sink_any_caps(&caps)
-        })
-        .map(|f| format!("{} ({label})", f.name()))
-        .collect();
-        found.sort();
-        unexamined.extend(found);
-    }
-    if unexamined.is_empty() {
-        return Check::ok(NAME, "every decoder that outranks software was measured");
-    }
-    Check::warn(
-        NAME,
-        format!(
-            "{} outrank their software decoder and were NOT timed — no reference \
-             clip is checked in for those codecs, so this box could hold the same \
-             pathology unseen; compare by hand against the software decoder",
-            unexamined.join(", ")
-        ),
-    )
 }
 
 /// Is this element name a hardware decoder? A NAME heuristic, and

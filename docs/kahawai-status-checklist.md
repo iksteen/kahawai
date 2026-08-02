@@ -344,11 +344,13 @@ How something works and why it was built that way belong in
       additively and idempotently, preserving comments and never
       removing a human's entry. Opt-in because it is timed: the same
       checks run at every module startup, which must stay instant.
-      Covers h264 and hevc — the codecs with a checked-in reference
-      bitstream. A separate row names the hardware decoders it could
-      NOT time (av1/vp8/vp9/mpeg2), so "no findings" and "not examined"
-      do not read alike. The DTS half stays a fixed known-bad list:
-      libdca is fast and wrong, so no timing finds it.
+      Covers h264 and hevc (OPS-9a). The DTS half stays a fixed
+      known-bad list: libdca is fast and wrong, so no timing finds it.
+- [ ] OPS-9a Calibrate the remaining codecs. Only h264 and hevc have a
+      checked-in reference bitstream, so a hardware decoder for av1,
+      vp9, vp8 or mpeg2 is never timed. Not hypothetical: silence's
+      hand-written demotions include vavp9dec, vavp8dec and vampeg2dec,
+      none of which OPS-9 would have found.
 - [x] OPS-10 Session diagnostics as one downloadable bundle. Captured
       at session end (a hang never fails, so crash capture never fired)
       and on demand while live; admin download from the session list,

@@ -207,6 +207,8 @@ Gaps identified in review that would block a real first release despite not appe
 
 *Why this is a requirement and not a runbook.* The DTS rank check already existed and already warned, in exactly the words that describe the bug; it warned on a box nobody was reading the output of, and the library silently accumulated 312 wrong channel counts. A check whose remedy is a hand-edited TOML on each satellite is a check that will be ignored.
 
+**OPS-9a** The decoder timing of OPS-9 shall cover every codec for which this deployment can autoplug a hardware decoder, not only those with a checked-in reference bitstream.
+
 **OPS-10 Session diagnostics as one downloadable bundle.** A session's diagnostics shall be retrievable from the interface as a single text bundle, by an administrator, without shell access to any machine.
 
 *Why a requirement.* Diagnosing one hung session took four sources stitched together by hand — the hub log, the run directory over ssh, a segment pulled with scp and walked for NAL types, and `viewer.pos` against the segment count. A user reporting "it hangs" can supply none of that, and the evidence is deleted with the run directory the moment the session is torn down.
