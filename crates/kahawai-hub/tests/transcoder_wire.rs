@@ -164,6 +164,7 @@ async fn transcoder_registers_capabilities_and_clears_on_disconnect() {
             tonemap: false,
             tonemap_speed_1080: None,
             tonemap_speed_2160: None,
+            ass_burn: false,
         })),
     })
     .await
@@ -344,6 +345,7 @@ async fn capacity_holds_when_placements_arrive_together() {
                 tonemap: false,
                 tonemap_speed_1080: None,
                 tonemap_speed_2160: None,
+                ass_burn: false,
             },
         );
     }

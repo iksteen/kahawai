@@ -1278,6 +1278,99 @@ pub fn tonemap_available() -> bool {
         .any(tonemap_into)
 }
 
+/// Can this box burn ASS/SSA subtitles into the picture, feeding
+/// `encoder`? HUB-32a's burn arm needs `assrender` (libass), which is
+/// NOT universal — it is missing on the macOS satellite of this fleet
+/// while present on the Linux ones, so placement has to filter on it
+/// rather than assume it.
+///
+/// AR-13a: the probe ends in the real encoder. `assrender` sits where
+/// the image blender does, after the tone map, and takes 8-bit system
+/// memory, so an encoder that cannot follow it there is a box that
+/// cannot burn — regardless of the element being installed.
+///
+/// `text_sink` is deliberately left unconnected: this asks whether the
+/// VIDEO path holds together, which is what placement needs. Whether a
+/// particular script parses is a per-session question with a
+/// per-session answer.
+pub fn ass_burn_into(encoder: &str) -> bool {
+    static VERIFIED: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, bool>>,
+    > = std::sync::OnceLock::new();
+    let cache = VERIFIED.get_or_init(Default::default);
+    if let Some(known) = cache.lock().unwrap().get(encoder) {
+        return *known;
+    }
+    let ok = probe_ass_burn_into(encoder);
+    if !ok {
+        tracing::warn!(
+            encoder,
+            "ASS burn-in dry-run failed — tier unavailable for this target"
+        );
+    }
+    cache.lock().unwrap().insert(encoder.to_string(), ok);
+    ok
+}
+
+/// Any encode target this box can burn ASS into.
+pub fn ass_burn_available() -> bool {
+    [h264_encoder(), hevc_encoder(), av1_encoder()]
+        .into_iter()
+        .flatten()
+        .any(ass_burn_into)
+}
+
+fn probe_ass_burn_into(encoder: &str) -> bool {
+    if crate::init().is_err() || gst::ElementFactory::find("assrender").is_none() {
+        return false;
+    }
+    let pipe = gst::Pipeline::new();
+    let (Some(src), Some(pin), Some(render), Some(convert), Some(enc), Some(sink)) = (
+        gst::ElementFactory::make("videotestsrc")
+            .property("num-buffers", 5i32)
+            .build()
+            .ok(),
+        gst::ElementFactory::make("capsfilter")
+            .property(
+                "caps",
+                gst::Caps::builder("video/x-raw")
+                    .field("format", "I420")
+                    .field("width", 320i32)
+                    .field("height", 240i32)
+                    .field("framerate", gst::Fraction::new(24, 1))
+                    .build(),
+            )
+            .build()
+            .ok(),
+        gst::ElementFactory::make("assrender").build().ok(),
+        gst::ElementFactory::make("videoconvert").build().ok(),
+        gst::ElementFactory::make(encoder).build().ok(),
+        gst::ElementFactory::make("fakesink").build().ok(),
+    ) else {
+        return false;
+    };
+    if pipe
+        .add_many([&src, &pin, &render, &convert, &enc, &sink])
+        .is_err()
+        || gst::Element::link_many([&src, &pin, &render, &convert, &enc, &sink]).is_err()
+        || pipe.set_state(gst::State::Playing).is_err()
+    {
+        let _ = pipe.set_state(gst::State::Null);
+        return false;
+    }
+    let ok = pipe
+        .bus()
+        .and_then(|bus| {
+            bus.timed_pop_filtered(
+                gst::ClockTime::from_seconds(10),
+                &[gst::MessageType::Eos, gst::MessageType::Error],
+            )
+        })
+        .is_some_and(|msg| msg.type_() == gst::MessageType::Eos);
+    let _ = pipe.set_state(gst::State::Null);
+    ok
+}
+
 /// Can this box tone-map INTO `encoder`?
 ///
 /// AR-13a: a dry run has to reproduce the chain a session builds, or it

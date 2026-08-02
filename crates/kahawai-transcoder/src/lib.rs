@@ -172,6 +172,7 @@ fn probe_capabilities(max_sessions: u32, state_dir: &Path) -> Result<CapabilityR
     let decode_caps = kahawai_media::remux::decoder_caps_names();
     tracing::info!(decoders = decode_caps.len(), "decoder inventory");
     let tonemap = kahawai_media::remux::tonemap_available();
+    let ass_burn = kahawai_media::remux::ass_burn_available();
     let tm = bench.tonemap.unwrap_or_default();
     tracing::info!(
         tonemap,
@@ -179,6 +180,7 @@ fn probe_capabilities(max_sessions: u32, state_dir: &Path) -> Result<CapabilityR
         at_2160 = tm.s2160,
         "HDR tone-map segment (HUB-15a)"
     );
+    tracing::info!(ass_burn, "ASS burn-in (HUB-32a)");
     Ok(CapabilityReport {
         encoders,
         max_sessions,
@@ -186,6 +188,7 @@ fn probe_capabilities(max_sessions: u32, state_dir: &Path) -> Result<CapabilityR
         tonemap,
         tonemap_speed_1080: tm.s1080,
         tonemap_speed_2160: tm.s2160,
+        ass_burn,
     })
 }
 

@@ -1105,6 +1105,10 @@ impl Sessions {
                     video_caps: kahawai_media::remux::source_caps_names("video", info),
                     audio_caps: vec![],
                     needs_tonemap: true,
+                    // Not yet known here: the probe runs before the
+                    // plan picks a subtitle tier, and asking for the
+                    // burn would narrow the pool that DECIDES it.
+                    needs_ass_burn: false,
                     // Codec-agnostic probe: "which box would run an
                     // encode of this source at all" — its verified
                     // encoder set then becomes negotiation's target
@@ -1312,6 +1316,9 @@ impl Sessions {
                     video_caps: kahawai_media::remux::source_caps_names("video", &info),
                     audio_caps: kahawai_media::remux::source_caps_names("audio", &info),
                     needs_tonemap: plan.tone_map,
+                    // HUB-32a: set once the plan carries an ASS burn.
+                    // Hard filter — see PlacementNeed.
+                    needs_ass_burn: false,
                     // HUB-15b: the chosen TARGETS are hard placement
                     // filters (empty when the stream doesn't encode).
                     video_codec: if plan.video == StreamMode::Encode {

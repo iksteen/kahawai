@@ -246,8 +246,10 @@ const MATRIX: &[(&str, &[&str], bool, &str, bool)] = &[
         "text subtitle conversion unavailable",
         false,
     ),
+    // Presence only; the row below re-answers it by dry run (AR-13a),
+    // which is what placement actually reads.
     (
-        "ass burn-in",
+        "ass burn-in (element)",
         &["assrender"],
         false,
         "ASS burn-in unavailable (flatten only, HUB-32a)",
@@ -353,6 +355,22 @@ pub fn gstreamer_checks(bench_cache: Option<&std::path::Path>) -> Vec<Check> {
             _ => ", speed not yet measured".to_string(),
         }
     };
+    // HUB-32a/AR-13a: assrender being installed is not the question —
+    // whether it links to an encoder this box would actually use is.
+    out.push(if crate::remux::ass_burn_available() {
+        Check::ok("ass burn-in", "verified into this box's encoders")
+    } else if gst::ElementFactory::find("assrender").is_some() {
+        Check::warn(
+            "ass burn-in",
+            "assrender is installed but does not link to any encoder here — \
+             placement will not send ASS burns to this box",
+        )
+    } else {
+        Check::warn(
+            "ass burn-in",
+            "assrender missing — this box cannot burn ASS subtitles (HUB-32a)",
+        )
+    });
     out.push(if crate::remux::tonemap_available() {
         Check::ok(
             "hdr tone-map",

@@ -257,6 +257,7 @@ async fn dispatches_encode_session_to_transcoder() {
             tonemap: false,
             tonemap_speed_1080: None,
             tonemap_speed_2160: None,
+            ass_burn: false,
         };
         let _ = kahawai_transcoder::link_once(
             &hub_addr2,
@@ -461,6 +462,7 @@ async fn dispatches_encode_session_to_transcoder() {
             tonemap: false,
             tonemap_speed_1080: None,
             tonemap_speed_2160: None,
+            ass_burn: false,
         };
         let _ = kahawai_transcoder::link_once(
             &hub_addr3,

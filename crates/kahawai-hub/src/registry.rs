@@ -63,6 +63,12 @@ pub struct PlacementNeed {
     /// HUB-15a: the plan tone-maps — prefer a box reporting the GL
     /// segment (preference, not filter).
     pub needs_tonemap: bool,
+    /// HUB-32a: the plan burns ASS subtitles. A HARD filter, unlike
+    /// tone-map, because there is no honest degradation: dropping the
+    /// burn would silently hand back a video with no subtitles at all.
+    /// `assrender` is genuinely absent on some boxes (macOS here), so
+    /// this is a real constraint and not a formality.
+    pub needs_ass_burn: bool,
     /// HUB-15b: the encode TARGET codec ("h264"/"hevc"/"av1", empty =
     /// any video encoder qualifies). A HARD filter, unlike tone-map: a
     /// box without the target's encoder cannot degrade gracefully.
@@ -1565,6 +1571,7 @@ impl Registry {
             "max_sessions": caps.max_sessions,
             "decode_caps": caps.decode_caps,
             "tonemap": caps.tonemap,
+            "ass_burn": caps.ass_burn,
             "tonemap_speed_1080": caps.tonemap_speed_1080,
             "tonemap_speed_2160": caps.tonemap_speed_2160,
         });
@@ -1849,6 +1856,11 @@ impl Registry {
                 }
                 // Rank hardware on the codec the session will actually
                 // run (empty need: any hw video encoder counts).
+                if need.needs_ass_burn
+                    && !c.get("ass_burn").and_then(|v| v.as_bool()).unwrap_or(false)
+                {
+                    return None; // cannot burn ASS; not a candidate at all
+                }
                 let hw = encoders.iter().any(|e| {
                     e["hardware"] == true
                         && match need.video_codec.as_str() {

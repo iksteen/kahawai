@@ -21,6 +21,7 @@ fn caps(hardware: bool, s1080: f32, tonemap: f32) -> CapabilityReport {
         tonemap: tonemap > 0.0,
         tonemap_speed_1080: (tonemap > 0.0).then_some(tonemap),
         tonemap_speed_2160: (tonemap > 0.0).then_some(tonemap / 3.0),
+        ass_burn: false,
     }
 }
 
@@ -31,6 +32,7 @@ fn need(class: &str) -> PlacementNeed {
         video_caps: vec!["video/x-h265".into()],
         audio_caps: vec![],
         needs_tonemap: false,
+        needs_ass_burn: false,
         video_codec: "h264".into(),
         audio_codec: String::new(),
         work_class: Some(class.into()),

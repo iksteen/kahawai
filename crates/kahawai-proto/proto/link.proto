@@ -439,6 +439,12 @@ message CapabilityReport {
   // placement needed "can you keep up". Absent = unmeasured.
   optional float tonemap_speed_1080 = 5;
   optional float tonemap_speed_2160 = 6;
+  // HUB-32a: this box can burn ASS/SSA into the picture (libass via
+  // `assrender`), dry-run-verified into a real encoder per AR-13a.
+  // NOT universal — absent on macOS in this fleet — so placement
+  // FILTERS on it: an ASS burn has no honest degradation, the session
+  // says so instead (owner decision 2026-08-02).
+  bool ass_burn = 7;
 }
 
 message EncoderCap {
