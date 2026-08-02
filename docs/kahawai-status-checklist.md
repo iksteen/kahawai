@@ -36,7 +36,7 @@ How something works and why it was built that way belong in
 - [x] AR-9 Control plane client ↔ hub only
 - [x] AR-10 Direct play mediahost → hub → client with byte ranges; hub-side remux
 - [x] AR-11 Transcoder pulls source bytes via hub-brokered leases
-- [ ] AR-13 Capability as a cross-module contract. Client profiles
+- [x] AR-13 Capability as a cross-module contract. Client profiles
       (HUB-14) and transcoder inventories (TC-1) are declared and
       dry-run-verified, masks make client declarations falsifiable, and
       version markers are gated at the handshake instead (protocol 2).
@@ -47,7 +47,9 @@ How something works and why it was built that way belong in
       Transcoder declarations now carry a RATE (HUB-36), so a box
       running a filter at 0.65× is no longer indistinguishable from one
       running it at 5×.
-      Missing: mediahosts declare nothing (MH-12)
+      Mediahosts declare nothing, and shall not: MH-12 withdrawn as a
+      false premise (2026-08-02) — nothing they could declare decides
+      anything the hub should act on
 - [x] AR-12 Control/byte plane isolation: separate connections, no shared
       flow-control window (the frozen-heartbeat lesson, codified)
 
@@ -91,11 +93,13 @@ How something works and why it was built that way belong in
       on reconnect, in-sync = no manifest/no walk; FilesSeen reconciliation
 - [x] MH-11 Three-tier job runner: urgent extraction > ED2K > subtitle
       pre-warm, idle = no scan and no lease being served
-- [ ] MH-12 Mediahost capability declaration. Nothing is declared: the
-      hub infers extraction support from whether an answer arrives, and
-      infers locality not at all — a caller that assumes local access
-      gets ~4 KB/s through the byte plane and no session survives it
-      (worked around per feature, not declared)
+- [~] MH-12 WITHDRAWN 2026-08-02, false premise — see the amendment in
+      the requirement. Built and reverted the same night: probing one
+      host read 30 s for `movies` and 23 ms for `anime` on the same
+      disk, so the cost varies per FILE, not per host, and a per-host
+      declaration cannot describe it. Nothing gates on host access; a
+      host too slow to walk an index is too slow to serve video and
+      fails at playback, where the failure is
 
 ## Hub — registry, resolution, enrichment
 
