@@ -478,6 +478,15 @@ pub struct RemuxPlan {
     /// index) into the picture, for clients that cannot composite one
     /// themselves. Forces the video encode that carries it.
     pub burn_subtitle: Option<usize>,
+    /// HUB-32a: burn this EMBEDDED text subtitle track (the same `e{n}`
+    /// index space as `burn_subtitle`) into the picture with libass, for
+    /// clients that cannot render ASS themselves and whose user prefers
+    /// faithful typesetting over a flattened VTT. The demuxer's own
+    /// `application/x-ass` pad is used because it is the only source
+    /// that carries the file's attached fonts. Forces the video encode.
+    /// A user's SIDECAR .ass burns from a file instead (`burn_ass_file`
+    /// on `start_parts`) and has no fonts to attach.
+    pub burn_ass: Option<usize>,
     pub max_channels: Option<u32>,
     /// HUB-15b: what the encode arms produce and which segment
     /// container carries the session. Defaults = the historical
@@ -778,6 +787,9 @@ fn plumb_parsed_pad(
     subs_seen: &Arc<std::sync::atomic::AtomicUsize>,
     subs_dir: &std::path::Path,
     burn: &Option<std::sync::Arc<crate::burnin::Timeline>>,
+    // HUB-32a: Some when this session burns ASS — the chosen track's pad
+    // goes to assrender instead of a tap file.
+    ass_link: &Option<Arc<Mutex<AssBurnLink>>>,
     // False for the second and later parts of a multi-part source: the
     // tracks are the same ones continuing, so extracting them again would
     // overwrite the first part's files with a stream that starts at its
@@ -834,6 +846,16 @@ fn plumb_parsed_pad(
             return;
         }
         let idx = subs_seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        // HUB-32a: the burned track feeds assrender, not a tap. No tee —
+        // a burned track is in the picture, so nothing would fetch the
+        // sidecar, and switching away from a burn restarts the session.
+        if plan.burn_ass == Some(idx)
+            && let Some(link) = ass_link
+        {
+            tracing::info!(track = idx, caps = %name, "ASS burn: routing track to assrender");
+            AssBurnLink::offer_source(link, AssSource::Pad(qsrc));
+            return;
+        }
         if name.starts_with("subpicture/") {
             tap_image_track(pipe, &qsrc, &advertised, subs_dir, idx, &name);
         } else {
@@ -875,6 +897,7 @@ fn plumb_parsed_pad(
             plan,
             gate,
             burn,
+            ass_link,
             subs_dir,
         );
         return;
@@ -884,6 +907,7 @@ fn plumb_parsed_pad(
     let waiting = waiting.clone();
     let gate = gate.clone();
     let burn = burn.clone();
+    let ass_link = ass_link.clone();
     let facts_dir = subs_dir.to_path_buf();
     qsrc.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |qpad, info| {
         if let Some(gst::PadProbeData::Event(ev)) = &info.data
@@ -898,6 +922,7 @@ fn plumb_parsed_pad(
                 plan,
                 &gate,
                 &burn,
+                &ass_link,
                 &facts_dir,
             );
         }
@@ -1158,6 +1183,7 @@ fn route_stream(
     plan: RemuxPlan,
     gate: &Option<Arc<SeekGate>>,
     burn: &Option<std::sync::Arc<crate::burnin::Timeline>>,
+    ass_link: &Option<Arc<Mutex<AssBurnLink>>>,
     facts_dir: &std::path::Path,
 ) {
     let caps_name = caps
@@ -1185,6 +1211,7 @@ fn route_stream(
                     plan.max_height,
                     plan.tone_map,
                     burn.clone(),
+                    ass_link.clone(),
                 );
             } else {
                 build_audio_encode_chain(
@@ -1797,6 +1824,141 @@ pub(crate) fn tonemap_segment(encoder: &str) -> Vec<gst::Element> {
     ]
 }
 
+/// HUB-32a: the two halves of an ASS burn meet here.
+///
+/// `assrender` needs the picture on `video_sink` and the styled events
+/// on `text_sink`, and the two are decided in different callbacks with
+/// no ordering guarantee: the encode chain (which owns the renderer) is
+/// built from `pad-added`, and so is the demuxer's subtitle pad. Same
+/// shape as `WaitingPads`, which already rendezvouses muxer pads across
+/// the same callbacks — whichever half lands second does the linking.
+#[derive(Default)]
+pub(crate) struct AssBurnLink {
+    /// `assrender`'s `text_sink` and the pipeline it lives in, once the
+    /// encode chain exists.
+    text: Option<(gst::Pipeline, gst::Pad)>,
+    source: Option<AssSource>,
+}
+
+/// Where the events come from. The two cases are genuinely different
+/// mechanisms, not one with a flag (2026-08-02 experiments, recorded in
+/// `docs/kahawai-implementation.md`).
+pub(crate) enum AssSource {
+    /// An EMBEDDED track: the demuxer's own `application/x-ass` pad,
+    /// which is the only path that also carries the file's attached
+    /// fonts.
+    Pad(gst::Pad),
+    /// A user's SIDECAR script — header (the container's `codec_data`
+    /// equivalent) and one matroska-shaped payload per event. No fonts;
+    /// it renders with the system's.
+    File(String, Vec<(u64, u64, String)>),
+}
+
+impl AssBurnLink {
+    fn couple(&mut self) {
+        let (Some((pipe, sink)), Some(source)) = (&self.text, &self.source) else {
+            return; // the other half has not arrived yet
+        };
+        if sink.is_linked() {
+            return;
+        }
+        let result = match source {
+            AssSource::Pad(src) => src.link(sink).map(|_| ()),
+            AssSource::File(header, events) => play_ass_file(pipe, sink, header, events),
+        };
+        match result {
+            Ok(()) => tracing::info!("ASS burn: subtitles linked to assrender"),
+            // Loud: the encode carries on and produces a picture with no
+            // subtitles in it, which is the failure this tier exists to
+            // prevent and which nothing downstream can detect.
+            Err(e) => tracing::error!(error = %e, "ASS burn: subtitle → assrender link failed"),
+        }
+    }
+
+    pub(crate) fn offer_text_sink(link: &Mutex<Self>, pipe: &gst::Pipeline, pad: gst::Pad) {
+        let mut l = link.lock().unwrap();
+        l.text = Some((pipe.clone(), pad));
+        l.couple();
+    }
+
+    pub(crate) fn offer_source(link: &Mutex<Self>, source: AssSource) {
+        let mut l = link.lock().unwrap();
+        l.source = Some(source);
+        l.couple();
+    }
+}
+
+/// Play a sidecar script into `assrender` from an `appsrc`, because no
+/// GStreamer element turns a subtitle FILE into the
+/// `application/x-ass` stream a demuxer produces (`ssaparse` flattens
+/// to `text/x-raw`, which is the other tier entirely).
+///
+/// Built and linked in one go, deliberately: an `appsrc` that reaches
+/// PAUSED with its src pad unlinked pushes its caps into nothing and
+/// pauses its own streaming task, and every later `push_buffer` then
+/// queues into a task that will never run again. Measured — the events
+/// arrived, `push_buffer` returned Ok for all of them, and assrender
+/// logged "rendering disabled, doing buffer passthrough" for every
+/// frame because its text caps had never been set.
+fn play_ass_file(
+    pipe: &gst::Pipeline,
+    sink: &gst::Pad,
+    header: &str,
+    events: &[(u64, u64, String)],
+) -> Result<(), gst::PadLinkError> {
+    let src = gstreamer_app::AppSrc::builder()
+        .caps(
+            &gst::Caps::builder("application/x-ass")
+                .field(
+                    "codec_data",
+                    gst::Buffer::from_slice(header.to_string().into_bytes()),
+                )
+                .build(),
+        )
+        .format(gst::Format::Time)
+        .build();
+    pipe.add(&src).unwrap();
+    src.static_pad("src").unwrap().link(sink)?;
+    src.sync_state_with_parent().unwrap();
+    let events = events.to_vec();
+    // A thread, not a `need-data` handler: the whole script is already
+    // in memory (tens of kilobytes), so there is nothing to pull it
+    // lazily for, and appsrc's queue applies the backpressure.
+    std::thread::spawn(move || {
+        for (start, end, line) in events {
+            let mut buf = gst::Buffer::from_slice(line.into_bytes());
+            {
+                let b = buf.get_mut().unwrap();
+                b.set_pts(gst::ClockTime::from_mseconds(start));
+                b.set_duration(gst::ClockTime::from_mseconds(end.saturating_sub(start)));
+            }
+            if src.push_buffer(buf).is_err() {
+                return; // shutting down; assrender keeps what it got
+            }
+        }
+        let _ = src.end_of_stream();
+    });
+    Ok(())
+}
+
+/// Read a sidecar `.ass` into the form [`AssBurnLink`] plays from.
+fn load_ass_file(path: &Path) -> Option<AssSource> {
+    let text = match std::fs::read(path) {
+        Ok(b) => crate::subtitles::decode_text(&b),
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "ASS burn: sidecar unreadable");
+            return None;
+        }
+    };
+    let (header, events) = crate::subtitles::ass_file_events(&text);
+    if events.is_empty() {
+        tracing::warn!(path = %path.display(), "ASS burn: sidecar has no events");
+        return None;
+    }
+    tracing::info!(path = %path.display(), events = events.len(), "ASS burn: sidecar loaded");
+    Some(AssSource::File(header, events))
+}
+
 /// Link an encode branch and bring it up, reporting failure instead of
 /// panicking.
 ///
@@ -1844,6 +2006,9 @@ fn build_video_encode_chain(
     max_height: Option<u32>,
     tone_map: bool,
     burn: Option<std::sync::Arc<crate::burnin::Timeline>>,
+    // HUB-32a: Some when the plan burns an ASS track — the element is
+    // built here and its text pad published for the subtitle branch.
+    ass_burn: Option<Arc<Mutex<AssBurnLink>>>,
 ) {
     let (encoder, parser) = match target {
         VideoTarget::H264 => (h264_encoder(), "h264parse"),
@@ -1957,6 +2122,29 @@ fn build_video_encode_chain(
     // (subtitle white is already SDR — mapping it through the PQ curve
     // would crush it) and after the scaler (blit at output size, and
     // the rectangles scale to the frame the encoder actually sees).
+    // HUB-32a ASS burn: libass renders the styled events onto the same
+    // frames, in the same slot and for the same reasons. The text pad is
+    // published for whichever pad-added callback needs it — see
+    // `AssBurnLink`.
+    let ass_el: Vec<gst::Element> = ass_burn
+        .as_ref()
+        .and_then(|_| {
+            // wait-text: hold the picture until the subtitle stream is
+            // actually there. Off by default, and off means the encode
+            // wins the race every time — a 50-frame clip ran to EOS in
+            // 45 ms while assrender logged "rendering disabled, doing
+            // buffer passthrough" for every frame, because the text
+            // caps had not landed yet.
+            gst::ElementFactory::make("assrender")
+                .property("wait-text", true)
+                .build()
+                .ok()
+        })
+        .into_iter()
+        .collect();
+    if ass_burn.is_some() && ass_el.is_empty() {
+        tracing::error!("ASS burn requested but assrender is missing — encoding without subtitles");
+    }
     let burn_el: Vec<gst::Element> = burn
         .filter(|t| !t.is_empty())
         .and_then(crate::burnin::blend_element)
@@ -1971,6 +2159,9 @@ fn build_video_encode_chain(
     chain.extend(tonemap.iter());
     chain.extend(scaler.iter());
     chain.extend(burn_el.iter());
+    // link_many picks a compatible pad by caps, so the raw video lands
+    // on `video_sink` and never on `text_sink` (application/x-ass).
+    chain.extend(ass_el.iter());
     chain.extend(converters[scale_at..].iter());
     chain.push(&enc);
     chain.push(&parse);
@@ -1978,6 +2169,19 @@ fn build_video_encode_chain(
     pipe.add_many(chain.iter().copied()).unwrap();
     if !link_and_start(&chain, Some(&decode)) {
         return;
+    }
+    // AFTER link_and_start, and not a line earlier. Two ways this bites:
+    // the pads must share a pipeline or the link fails outright ("no
+    // common grandparent"), and `assrender`'s text pad is not ACTIVE
+    // until the element has its state — an appsrc linked to an inactive
+    // pad pushes once, fails, and pauses its own streaming task, which
+    // looks from the outside like a text stream that simply never
+    // arrived (measured: every frame logged "rendering disabled, doing
+    // buffer passthrough").
+    if let (Some(link), Some(el)) = (&ass_burn, ass_el.first())
+        && let Some(text) = el.static_pad("text_sink")
+    {
+        AssBurnLink::offer_text_sink(link, pipe, text);
     }
     let out = parse.static_pad("src").unwrap();
     guard_pts(&out);
@@ -2965,7 +3169,16 @@ pub fn start_paced(
     sink: Option<&str>,
     pace: Option<PaceConfig>,
 ) -> Result<RemuxJob> {
-    start_parts(out_dir, plan, vec![source], start_ms, sink, pace, None)
+    start_parts(
+        out_dir,
+        plan,
+        vec![source],
+        start_ms,
+        sink,
+        pace,
+        None,
+        None,
+    )
 }
 
 /// One pipeline spanning a multi-part source, in timeline order.
@@ -2995,6 +3208,11 @@ pub fn start_parts(
     // HUB-32b: display sets read for us (mediahost-side). None = walk
     // the source index ourselves, affordable only for local sources.
     burn_sets: Option<&Path>,
+    // HUB-32a: a user's own sidecar .ass to burn into the picture. An
+    // EMBEDDED ASS burn comes from `plan.burn_ass` instead and takes the
+    // demuxer's pad, because that is the only path carrying the file's
+    // attached fonts; a sidecar has none and renders with system fonts.
+    burn_ass_file: Option<&Path>,
 ) -> Result<RemuxJob> {
     crate::init()?;
     // Dolby Digital Plus reaches us as ONE container block holding an
@@ -3082,7 +3300,18 @@ pub fn start_parts(
         (None, None) => None,
     };
 
+    // Both halves of an ASS burn meet here — see `AssBurnLink`. Shared
+    // across parts on purpose, unlike the per-part track counters: the
+    // video chain is built once, from whichever part reaches it first.
+    let ass_link = (plan.burn_ass.is_some() || burn_ass_file.is_some())
+        .then(|| Arc::new(Mutex::new(AssBurnLink::default())));
+
     let pipeline = gst::Pipeline::new();
+    if let (Some(path), Some(link)) = (burn_ass_file, &ass_link)
+        && let Some(source) = load_ass_file(path)
+    {
+        AssBurnLink::offer_source(link, source);
+    }
     // The segment sink pair: TS = the hlssink family (TC-6 prefer
     // override intact); fMP4 = isofmp4mux + the fmp4sink writer. The
     // sink override is a TS-crash workaround and means nothing here.
@@ -3197,6 +3426,7 @@ pub fn start_parts(
         let subs_seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let subs_dir = subs_dir.clone();
         let burn_tl = burn_timeline.clone();
+        let ass_link = ass_link.clone();
         pb.connect_pad_added(move |_, pad| {
             plumb_parsed_pad(
                 &pipe,
@@ -3209,6 +3439,7 @@ pub fn start_parts(
                 &subs_seen,
                 &subs_dir,
                 &burn_tl,
+                &ass_link,
                 n == 0,
             );
         });
@@ -3377,7 +3608,7 @@ mod multipart {
             ..Default::default()
         };
         // 2 s into a 5 s first part.
-        let job = start_parts(&out, plan, sources, 2_000, None, None, None).unwrap();
+        let job = start_parts(&out, plan, sources, 2_000, None, None, None, None).unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
         while !job.finished() && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(100));
@@ -3432,7 +3663,7 @@ mod multipart {
             video_track: 0,
             ..Default::default()
         };
-        let job = start_parts(&out, plan, sources, 0, None, None, None).unwrap();
+        let job = start_parts(&out, plan, sources, 0, None, None, None, None).unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
         while !job.finished() && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(100));
@@ -4118,6 +4349,7 @@ mod tests {
         max_height: None,
         max_channels: None,
         tone_map: false,
+        burn_ass: None,
         burn_subtitle: None,
         video_codec: VideoTarget::H264,
         audio_codec: AudioTarget::Aac,
@@ -4844,6 +5076,226 @@ mod tests {
         std::fs::write(&joined, bytes).unwrap();
         let info = crate::discover(&joined, Duration::from_secs(30)).unwrap();
         assert_eq!(info.video[0].codec, "hevc", "{info:?}");
+    }
+
+    /// A script whose one event fills the LEFT HALF of a 320x240 frame
+    /// with a filled rectangle. Drawing commands (`\p1`), not text, on
+    /// purpose: libass needs no font for a rectangle, so what this
+    /// measures is the pipeline and not the box's fontconfig.
+    const ASS_SCRIPT: &str = "[Script Info]\n\
+         ScriptType: v4.00+\n\
+         PlayResX: 320\n\
+         PlayResY: 240\n\
+         \n\
+         [V4+ Styles]\n\
+         Format: Name, Fontname, Fontsize, PrimaryColour, Alignment, MarginL, MarginR, MarginV, Encoding\n\
+         Style: Default,Sans,20,&H00FFFFFF,7,0,0,0,1\n\
+         \n\
+         [Events]\n\
+         Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n\
+         Dialogue: 0,0:00:00.00,0:00:10.00,Default,,0,0,0,,{\\p1}m 0 0 l 160 0 l 160 240 l 0 240{\\p0}\n";
+
+    /// Mean luma of the first decoded frame. "In the picture" is a claim
+    /// about pixels, and a flat white box costs an encoder no more bits
+    /// than the flat black it covers — the burned and unburned runs came
+    /// out byte-for-byte the SAME SIZE while the burn worked, so a
+    /// size comparison would have been a test that cannot fail usefully.
+    fn mean_luma(seg: &Path) -> f64 {
+        let pipe = gst::parse::launch(&format!(
+            "filesrc location=\"{}\" ! decodebin ! videoconvert ! video/x-raw,format=GRAY8 ! appsink name=out",
+            seg.display()
+        ))
+        .unwrap()
+        .downcast::<gst::Pipeline>()
+        .unwrap();
+        let out = pipe
+            .by_name("out")
+            .unwrap()
+            .downcast::<gstreamer_app::AppSink>()
+            .unwrap();
+        pipe.set_state(gst::State::Playing).unwrap();
+        let sample = out.pull_sample().expect("no frame decoded");
+        let mean = {
+            let buf = sample.buffer().unwrap().map_readable().unwrap();
+            buf.iter().map(|b| *b as f64).sum::<f64>() / buf.len() as f64
+        };
+        pipe.set_state(gst::State::Null).unwrap();
+        mean
+    }
+
+    /// Encode `src` to a segment and return the segment's path, with or
+    /// without an ASS burn. `keep` names the copy that outlives the
+    /// run's own scratch dir.
+    fn encode_once(
+        src: &Path,
+        keep: &Path,
+        burn_ass: Option<usize>,
+        ass_file: Option<&Path>,
+        start_ms: u64,
+    ) -> std::path::PathBuf {
+        let plan = RemuxPlan {
+            video: StreamMode::Encode,
+            audio: StreamMode::Off,
+            video_kbps: Some(4000),
+            burn_ass,
+            ..Default::default()
+        };
+        let out = tempfile::tempdir().unwrap();
+        let job = start_parts(
+            out.path(),
+            plan,
+            vec![Box::new(FileSource::open(src).unwrap())],
+            start_ms,
+            None,
+            None,
+            None,
+            ass_file,
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !job.finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(job.finished(), "encode did not finish");
+        assert!(job.failed().is_none(), "encode failed: {:?}", job.failed());
+        let seg = std::fs::read_dir(out.path())
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|x| x == "ts"))
+            .min()
+            .expect("no segment produced");
+        std::fs::copy(&seg, keep).unwrap();
+        keep.to_path_buf()
+    }
+
+    fn ass_burn_testable() -> bool {
+        crate::init().unwrap();
+        if h264_encoder().is_none() || !crate::testutil::has_element("assrender") {
+            eprintln!("skipping: no H.264 encoder or no assrender");
+            return false;
+        }
+        true
+    }
+
+    /// HUB-32a end to end, sidecar arm: a user's own `.ass` reaches
+    /// `assrender` through the appsrc branch and the rendezvous, and
+    /// comes out IN THE PICTURE. A rendezvous that never coupled, an
+    /// appsrc linked to an inactive pad, or a `link_many` that stole
+    /// `text_sink` for the video all land here as "unchanged picture".
+    #[test]
+    fn a_sidecar_ass_burns_into_the_picture() {
+        if !ass_burn_testable() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let src_path = dir.path().join("black.mkv");
+        crate::testutil::render(&format!(
+            "videotestsrc num-buffers=50 pattern=black ! video/x-raw,format=I420,width=320,height=240,framerate=25/1 ! x264enc speed-preset=ultrafast key-int-max=25 bframes=0 ! h264parse ! matroskamux ! filesink location=\"{}\"",
+            src_path.display()
+        ));
+        let ass_path = dir.path().join("sub.ass");
+        std::fs::write(&ass_path, ASS_SCRIPT).unwrap();
+
+        let plain = mean_luma(&encode_once(
+            &src_path,
+            &dir.path().join("plain.ts"),
+            None,
+            None,
+            0,
+        ));
+        let burned = mean_luma(&encode_once(
+            &src_path,
+            &dir.path().join("burned.ts"),
+            None,
+            Some(&ass_path),
+            0,
+        ));
+        assert!(
+            plain < 20.0,
+            "black fixture is not black: mean luma {plain}"
+        );
+        // Half the frame turned white; anything near `plain` means the
+        // subtitle never reached the encoder.
+        assert!(
+            burned > 60.0,
+            "sidecar ASS did not reach the picture: mean luma {plain} plain vs {burned} burned"
+        );
+    }
+
+    /// HUB-32a end to end, EMBEDDED arm — the path that matters most,
+    /// because it is the only one that also carries a release's attached
+    /// fonts. Different plumbing from the sidecar: the demuxer's own
+    /// `application/x-ass` pad is intercepted in `plumb_parsed_pad`
+    /// instead of being tapped to a file, so it has its own way to fail.
+    #[test]
+    fn an_embedded_ass_track_burns_into_the_picture() {
+        if !ass_burn_testable() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let src_path = dir.path().join("black-ass.mkv");
+        // Round-trips through the sidecar splitter, which is also what
+        // feeds matroskamux the payload shape a demuxer emits.
+        let (header, events) = crate::subtitles::ass_file_events(ASS_SCRIPT);
+        crate::testutil::render_h264_ass_mkv(&src_path, &header, &events);
+        let info = crate::discover(&src_path, Duration::from_secs(30)).unwrap();
+        assert_eq!(
+            info.subtitles.len(),
+            1,
+            "fixture has no ASS track: {info:?}"
+        );
+
+        let plain = mean_luma(&encode_once(
+            &src_path,
+            &dir.path().join("plain.ts"),
+            None,
+            None,
+            0,
+        ));
+        let burned = mean_luma(&encode_once(
+            &src_path,
+            &dir.path().join("burned.ts"),
+            Some(0),
+            None,
+            0,
+        ));
+        assert!(
+            plain < 20.0,
+            "black fixture is not black: mean luma {plain}"
+        );
+        assert!(
+            burned > 60.0,
+            "embedded ASS did not reach the picture: mean luma {plain} plain vs {burned} burned"
+        );
+
+        // A SEEKED start still produces a picture: the seek gate counts
+        // video and audio branches only, and a subtitle pad feeding a
+        // real consumer instead of a fakesink is a third one — sparse,
+        // and it has held preroll hostage before. It does not, and the
+        // segment comes out.
+        //
+        // What it does NOT carry is the event that was already on
+        // screen. Measured 2026-08-02: after the flushing seek to 1 s
+        // matroskademux issues a segment starting at 1 s and then EOS on
+        // the subtitle pad, because the block at t=0 lives in an earlier
+        // cluster. So an embedded burn resumed mid-line shows nothing
+        // until the NEXT event — the same failure HUB-32b avoided by
+        // reading display sets from the container index up front, and
+        // the reason that tier does not follow the demuxer either.
+        // Asserted as-is rather than left silent; see the note in
+        // docs/kahawai-implementation.md.
+        let seeked = mean_luma(&encode_once(
+            &src_path,
+            &dir.path().join("seeked.ts"),
+            Some(0),
+            None,
+            1_000,
+        ));
+        assert!(
+            seeked < 20.0,
+            "the demuxer now carries the pre-seek event ({seeked}) — good news, \
+             drop this assertion and the limitation note with it"
+        );
     }
 
     /// HUB-32b burn-in end to end: a PGS source encoded with

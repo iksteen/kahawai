@@ -1682,6 +1682,10 @@ impl Sessions {
                         sink_owned.as_deref(),
                         None,
                         sets_owned.as_deref(),
+                        // HUB-32a: a sidecar .ass to burn arrives with
+                        // the tier that picks one; an embedded burn
+                        // needs no file (it rides plan.burn_ass).
+                        None,
                     )
                 })
                 .await
@@ -1859,6 +1863,9 @@ impl Sessions {
                     // 1-based on the wire: 0 means "burn nothing".
                     burn_subtitle: plan.burn_subtitle.map_or(0, |n| n as u32 + 1),
                     burn_sets: burn_sets.clone(),
+                    // 1-based on the wire, same as burn_subtitle.
+                    burn_ass: plan.burn_ass.map_or(0, |n| n as u32 + 1),
+                    burn_ass_file: Vec::new(),
                     video_codec: plan.video_codec.as_str().into(),
                     audio_codec: plan.audio_codec.as_str().into(),
                     container: plan.segment_format.as_str().into(),

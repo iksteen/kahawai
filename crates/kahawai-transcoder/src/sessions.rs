@@ -108,6 +108,8 @@ impl Runner {
         // HUB-15b (video_codec, audio_codec, container); empty = legacy.
         targets: (String, String, String),
         burn_sets: Vec<u8>,
+        // HUB-32a: (1 + the embedded e{n} to burn, or 0; a sidecar .ass)
+        ass_burn: (u32, Vec<u8>),
     ) {
         let result = self
             .start_inner(
@@ -123,6 +125,7 @@ impl Runner {
                 encode_params,
                 targets,
                 burn_sets,
+                ass_burn,
             )
             .await;
         let msg = match result {
@@ -180,6 +183,7 @@ impl Runner {
         (video_kbps, max_height, max_channels, tone_map, burn_subtitle): (u32, u32, u32, bool, u32),
         (video_codec, audio_codec, container): (String, String, String),
         burn_sets: Vec<u8>,
+        (burn_ass, burn_ass_file): (u32, Vec<u8>),
     ) -> Result<PathBuf> {
         // Replace any previous run first (seek-restart reuses the id).
         self.end(session_id).await;
@@ -256,6 +260,15 @@ impl Runner {
                         .with_context(|| format!("writing {}", p.display()))?;
                     cmd.args(["--burn-sets", &p.to_string_lossy()]);
                 }
+                if burn_ass > 0 {
+                    cmd.args(["--burn-ass", &(burn_ass - 1).to_string()]);
+                }
+                if !burn_ass_file.is_empty() {
+                    let p = dir.join("burn.ass");
+                    std::fs::write(&p, &burn_ass_file)
+                        .with_context(|| format!("writing {}", p.display()))?;
+                    cmd.args(["--burn-ass-file", &p.to_string_lossy()]);
+                }
                 if !video_codec.is_empty() {
                     cmd.args(["--video-codec", &video_codec]);
                 }
@@ -302,6 +315,7 @@ impl Runner {
                     max_channels: (max_channels > 0).then_some(max_channels),
                     tone_map,
                     burn_subtitle: (burn_subtitle > 0).then(|| (burn_subtitle - 1) as usize),
+                    burn_ass: (burn_ass > 0).then(|| (burn_ass - 1) as usize),
                     video_codec: kahawai_media::remux::VideoTarget::from_str(&video_codec),
                     audio_codec: kahawai_media::remux::AudioTarget::from_str(&audio_codec),
                     segment_format: kahawai_media::remux::SegmentFormat::from_str(&container),
@@ -315,6 +329,13 @@ impl Runner {
                     std::fs::write(&p, &burn_sets)?;
                     Some(p)
                 };
+                let ass_path = if burn_ass_file.is_empty() {
+                    None
+                } else {
+                    let p = dir.join("burn.ass");
+                    std::fs::write(&p, &burn_ass_file)?;
+                    Some(p)
+                };
                 let err = Arc::new(Mutex::new(None));
                 let err2 = err.clone();
                 let handle = tokio::task::spawn_blocking(move || {
@@ -325,6 +346,7 @@ impl Runner {
                         start_ms,
                         sink_owned.as_deref(),
                         sets_path.as_deref(),
+                        ass_path.as_deref(),
                     ) {
                         tracing::warn!(error = format!("{e:#}"), "in-process worker failed");
                         *err2.lock().unwrap() = Some(format!("{e:#}"));

@@ -536,6 +536,17 @@ message StartSession {
   string video_codec = 16; // h264 | hevc | av1
   string audio_codec = 17; // aac | opus
   string container = 18;   // ts | fmp4
+  // HUB-32a: burn this EMBEDDED text subtitle track into the picture
+  // with libass, as 1 + the e{n} index (0 = none), same encoding and
+  // same old-transcoder safety as burn_subtitle. Placement hard-filters
+  // on the reported `ass_burn` capability, so this only ever reaches a
+  // box that has assrender.
+  uint32 burn_ass = 19;
+  // A user's own sidecar .ass, sent whole for the same reason burn_sets
+  // is: the worker cannot read the source's neighbourhood. Empty = none.
+  // Embedded tracks do NOT come this way — they are burned from the
+  // demuxer's pad, the only path carrying the file's attached fonts.
+  bytes burn_ass_file = 20;
 }
 
 message EndSession {

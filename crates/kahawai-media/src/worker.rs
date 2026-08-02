@@ -79,6 +79,7 @@ pub fn run(
         start_ms,
         sink,
         None,
+        None,
     )
 }
 
@@ -93,6 +94,7 @@ pub fn run_parts(
     start_ms: u64,
     sink: Option<&str>,
     burn_sets: Option<&Path>,
+    burn_ass_file: Option<&Path>,
 ) -> Result<()> {
     anyhow::ensure!(!parts.is_empty(), "no parts given");
     let mut sources: Vec<Box<dyn RemuxSource>> = Vec::with_capacity(parts.len());
@@ -126,6 +128,7 @@ pub fn run_parts(
         sink,
         Some(pace),
         burn_sets,
+        burn_ass_file,
     )?;
     while !job.finished() {
         std::thread::sleep(std::time::Duration::from_millis(100));

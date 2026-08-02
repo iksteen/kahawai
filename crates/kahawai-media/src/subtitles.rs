@@ -240,22 +240,7 @@ fn parse_ass(content: &str) -> Vec<Cue> {
         else {
             continue;
         };
-        // ASS timestamps are H:MM:SS.cc (centiseconds).
-        let ts = |s: &str| -> Option<u64> {
-            let (hms, cc) = s.trim().rsplit_once('.')?;
-            let cc: u64 = cc.parse().ok()?;
-            let p: Vec<&str> = hms.split(':').collect();
-            let [h, m, sec] = p.as_slice() else {
-                return None;
-            };
-            Some(
-                ((h.parse::<u64>().ok()? * 60 + m.parse::<u64>().ok()?) * 60
-                    + sec.parse::<u64>().ok()?)
-                    * 1000
-                    + cc * 10,
-            )
-        };
-        let (Some(start), Some(end)) = (ts(start), ts(end)) else {
+        let (Some(start), Some(end)) = (ass_ts(start), ass_ts(end)) else {
             continue;
         };
         let text = clean_cue_text(text);
@@ -300,6 +285,95 @@ pub(crate) fn ass_dialogue(raw: &str, start_ms: u64, end_ms: u64) -> Option<Stri
         ts(start_ms),
         ts(end_ms)
     ))
+}
+
+/// Split a standalone `.ass`/`.ssa` script into the two things
+/// `assrender` consumes: the script header (which the container would
+/// have carried as `codec_data`) and one matroska-shaped payload per
+/// event, "ReadOrder,Layer,Style,Name,ML,MR,MV,Effect,Text", with the
+/// timing lifted out into the returned milliseconds because a buffer
+/// carries it there. The inverse of [`ass_dialogue`] — a user's sidecar
+/// file has no demuxer to do this for it (HUB-32a).
+///
+/// Everything before the first `Dialogue:` is the header verbatim,
+/// which keeps `[V4+ Styles]` and `[Script Info]` intact; a file whose
+/// `[Events]` section names its fields in any order still works,
+/// because the fields are read by name.
+pub fn ass_file_events(content: &str) -> (String, Vec<(u64, u64, String)>) {
+    let mut header = String::new();
+    let mut events = Vec::new();
+    let mut fields: Vec<String> = Vec::new();
+    let mut in_events = false;
+    for line in content.lines() {
+        let line = line.trim_end_matches('\r');
+        if line.trim().starts_with('[') {
+            in_events = line.trim().eq_ignore_ascii_case("[events]");
+        } else if in_events && let Some(fmt) = line.strip_prefix("Format:") {
+            fields = fmt.split(',').map(|f| f.trim().to_lowercase()).collect();
+        }
+        let Some(dialogue) = line.strip_prefix("Dialogue:").filter(|_| in_events) else {
+            if events.is_empty() {
+                header.push_str(line);
+                header.push('\n');
+            }
+            continue;
+        };
+        if fields.is_empty() {
+            continue;
+        }
+        let parts: Vec<&str> = dialogue.splitn(fields.len(), ',').collect();
+        let field = |name: &str| {
+            fields
+                .iter()
+                .position(|f| f == name)
+                .and_then(|i| parts.get(i))
+                .map(|v| v.trim())
+                .unwrap_or("")
+        };
+        let (Some(start), Some(end)) = (ass_ts(field("start")), ass_ts(field("end"))) else {
+            continue;
+        };
+        events.push((
+            start,
+            end,
+            format!(
+                "{},{},{},{},{},{},{},{},{}",
+                events.len(),
+                field("layer"),
+                field("style"),
+                field("name"),
+                field("marginl"),
+                field("marginr"),
+                field("marginv"),
+                field("effect"),
+                // Text is the last field and keeps its commas: splitn
+                // stopped there, so it is whatever remains, untrimmed
+                // (leading spaces are part of nothing but are harmless).
+                fields
+                    .iter()
+                    .position(|f| f == "text")
+                    .and_then(|i| parts.get(i))
+                    .copied()
+                    .unwrap_or("")
+            ),
+        ));
+    }
+    (header, events)
+}
+
+/// ASS timestamps are H:MM:SS.cc (centiseconds).
+fn ass_ts(s: &str) -> Option<u64> {
+    let (hms, cc) = s.trim().rsplit_once('.')?;
+    let cc: u64 = cc.parse().ok()?;
+    let p: Vec<&str> = hms.split(':').collect();
+    let [h, m, sec] = p.as_slice() else {
+        return None;
+    };
+    Some(
+        ((h.parse::<u64>().ok()? * 60 + m.parse::<u64>().ok()?) * 60 + sec.parse::<u64>().ok()?)
+            * 1000
+            + cc * 10,
+    )
 }
 
 /// One streamed extraction event (HUB-32 streaming: subtitles usable

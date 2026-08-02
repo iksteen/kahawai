@@ -37,6 +37,65 @@ pub fn render_h264_flac_mkv(path: &Path) {
     ));
 }
 
+/// Render a short black MKV carrying an EMBEDDED ASS subtitle track —
+/// the shape a real anime release has, and the only way to exercise the
+/// demuxer-pad burn path (HUB-32a), which is the one that also carries
+/// attached fonts. `events` are `(start_ms, end_ms, text)`.
+///
+/// The script is fed through an `appsrc` because no element turns a
+/// subtitle file into the `application/x-ass` stream matroskamux wants.
+/// It is pushed while the pipeline is still NULL on purpose: the buffers
+/// queue in the appsrc and go out once everything is active, so nothing
+/// races an inactive pad.
+pub fn render_h264_ass_mkv(path: &Path, header: &str, events: &[(u64, u64, String)]) {
+    crate::init().unwrap();
+    let pipe = gst::parse::launch(&format!(
+        "videotestsrc num-buffers=50 pattern=black ! video/x-raw,format=I420,width=320,height=240,framerate=25/1 \
+         ! x264enc speed-preset=ultrafast key-int-max=25 bframes=0 ! h264parse ! matroskamux name=m \
+         ! filesink location=\"{}\"",
+        path.display()
+    ))
+    .unwrap()
+    .downcast::<gst::Pipeline>()
+    .unwrap();
+    let mux = pipe.by_name("m").unwrap();
+    let src = gstreamer_app::AppSrc::builder()
+        .caps(
+            &gst::Caps::builder("application/x-ass")
+                .field(
+                    "codec_data",
+                    gst::Buffer::from_slice(header.to_string().into_bytes()),
+                )
+                .build(),
+        )
+        .format(gst::Format::Time)
+        .build();
+    pipe.add(&src).unwrap();
+    src.static_pad("src")
+        .unwrap()
+        .link(&mux.request_pad_simple("subtitle_%u").unwrap())
+        .unwrap();
+    for (start, end, line) in events {
+        let mut buf = gst::Buffer::from_slice(line.clone().into_bytes());
+        let b = buf.get_mut().unwrap();
+        b.set_pts(gst::ClockTime::from_mseconds(*start));
+        b.set_duration(gst::ClockTime::from_mseconds(end.saturating_sub(*start)));
+        src.push_buffer(buf).unwrap();
+    }
+    src.end_of_stream().unwrap();
+    pipe.set_state(gst::State::Playing).unwrap();
+    let bus = pipe.bus().unwrap();
+    let msg = bus.timed_pop_filtered(
+        gst::ClockTime::from_seconds(60),
+        &[gst::MessageType::Eos, gst::MessageType::Error],
+    );
+    pipe.set_state(gst::State::Null).unwrap();
+    assert!(
+        matches!(msg.map(|m| m.type_()), Some(gst::MessageType::Eos)),
+        "ASS fixture did not render"
+    );
+}
+
 pub fn has_element(name: &str) -> bool {
     crate::init().unwrap();
     gst::ElementFactory::find(name).is_some()

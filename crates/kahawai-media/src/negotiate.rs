@@ -426,6 +426,8 @@ pub fn negotiate(
         // back to the ceiling itself.
         // Only claim the burn when the encode that carries it exists.
         burn_subtitle: burn_subtitle.filter(|_| video == StreamMode::Encode),
+        // HUB-32a: set by the caller once the ASS tier is decided.
+        burn_ass: None,
         max_channels: (audio == StreamMode::Encode && profile.max_audio_channels > 0).then(|| {
             a.map(|s| s.channels)
                 .filter(|c| *c > 0)

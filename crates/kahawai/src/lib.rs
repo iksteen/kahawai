@@ -80,6 +80,14 @@ pub struct WorkerArgs {
     /// index itself (every read crosses the byte plane).
     #[arg(long)]
     pub burn_sets: Option<PathBuf>,
+    /// HUB-32a: burn this EMBEDDED text subtitle track (e{n}) into the
+    /// picture with libass. A user's SIDECAR .ass burns from
+    /// `--burn-ass-file` instead — the demuxer pad is used for embedded
+    /// tracks because it is what carries the file's attached fonts.
+    #[arg(long)]
+    pub burn_ass: Option<usize>,
+    #[arg(long)]
+    pub burn_ass_file: Option<PathBuf>,
     /// HUB-15b encode targets + segment container; unknown values fall
     /// back to the legacy h264/aac/ts.
     #[arg(long, default_value = "h264")]
@@ -168,6 +176,7 @@ pub fn run_remux_worker(cfg: &config::Config, w: WorkerArgs) -> Result<()> {
         max_channels: w.max_channels,
         tone_map: w.tone_map,
         burn_subtitle: w.burn_sub,
+        burn_ass: w.burn_ass,
         video_codec: kahawai_media::remux::VideoTarget::from_str(&w.video_codec),
         audio_codec: kahawai_media::remux::AudioTarget::from_str(&w.audio_codec),
         segment_format: kahawai_media::remux::SegmentFormat::from_str(&w.container),
@@ -179,6 +188,7 @@ pub fn run_remux_worker(cfg: &config::Config, w: WorkerArgs) -> Result<()> {
         w.start_ms,
         w.sink.as_deref(),
         w.burn_sets.as_deref(),
+        w.burn_ass_file.as_deref(),
     )
 }
 
