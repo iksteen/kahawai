@@ -1515,12 +1515,17 @@ async fn a_declined_chain_records_a_miss_only_where_nothing_stands() {
     assert_eq!(assigned(&db, "i1").await, None);
 }
 
-/// The selection must mirror the providers the pass actually builds: a
-/// searcher with no key never asks and never records its question, so
-/// counting it as owing work would re-select every matched item on
-/// every run — which is what kept feeding the restart wipe above.
+/// The selection must ask about exactly the providers the pass bound —
+/// no more, no less. json_each(?2) makes that a runtime fact rather
+/// than a hard-coded list: a provider outside the bound set never
+/// counts as owing work, whatever its name is. TVDB is one instance of
+/// this (an unconfigured searcher never asks and never records its
+/// question, so counting it as owed would re-select every matched item
+/// on every run — which is what kept feeding the restart wipe above),
+/// but the rule is general, which this test proves by naming a provider
+/// that isn't TVDB at all.
 #[tokio::test]
-async fn an_unconfigured_searcher_owes_no_work() {
+async fn a_provider_outside_the_bound_set_owes_no_work() {
     let dir = tempfile::tempdir().unwrap();
     let db = kahawai_hub::db::open(dir.path()).await.unwrap();
     item(&db, "i1").await;
@@ -1535,18 +1540,141 @@ async fn an_unconfigured_searcher_owes_no_work() {
     .await
     .unwrap();
 
-    let due = |tvdb: bool| {
+    let due = |providers: &'static str| {
         let db = db.clone();
         async move {
             sqlx::query(kahawai_hub::enrich::GENERIC_SELECTION_SQL)
                 .bind(kahawai_hub::providers::QUERY_REV)
-                .bind(tvdb)
+                .bind(providers)
                 .fetch_all(&db)
                 .await
                 .unwrap()
                 .len()
         }
     };
-    assert_eq!(due(false).await, 0, "tmdb answered, tvdb not configured");
-    assert_eq!(due(true).await, 1, "a configured tvdb still owes its look");
+    assert_eq!(
+        due(r#"["tmdb"]"#).await,
+        0,
+        "the only bound provider is already answered"
+    );
+    assert_eq!(
+        due(r#"["tmdb","tvdb"]"#).await,
+        1,
+        "tvdb is bound this time and still owes its look"
+    );
+    assert_eq!(
+        due(r#"["ghost"]"#).await,
+        1,
+        "a provider outside tmdb's answer still owes work once it's bound — \
+         nothing about the rule is tvdb-specific"
+    );
+}
+
+// ---------- the caller path: a restart must not erase a match ----------
+
+/// The regression itself, through the real entry point rather than
+/// `run_chain` directly. A fully-matched item can still get re-selected
+/// — here because an .nfo appeared that `local` hasn't read yet, which
+/// is independent of tmdb's already-answered state — and when it is,
+/// every provider it already holds a real answer for gets skipped
+/// rather than re-asked (`has_real_answer`). `run_chain` then returns
+/// `None`, not because anyone found a miss but because nothing needed
+/// doing. `enrich.rs`'s caller used to treat that `None` as "record a
+/// miss", overwriting the standing tmdb match on every such restart.
+/// This drives `Enricher::run_once` itself, so unlike the two tests
+/// above — which pin `run_chain`'s own (already-correct) guard — it
+/// fails if the regression creeps back in anywhere between `run_chain`
+/// and the database.
+#[tokio::test]
+async fn a_restart_that_re_selects_a_matched_item_does_not_erase_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    let registry = kahawai_hub::registry::Registry::new(db.clone(), Default::default());
+    // Never dialled: the item's tmdb answer already stands, so
+    // `has_real_answer` skips the provider before it would place a
+    // request with this key.
+    registry
+        .set_setting("tmdb_api_key", "unused-in-this-test")
+        .await
+        .unwrap();
+
+    item(&db, "i1").await;
+    store_answer(
+        &db,
+        "i1",
+        "tmdb",
+        "550",
+        "auto",
+        Fields {
+            title: Some("Fight Club".into()),
+            poster_path: Some("/p.jpg".into()),
+            // Filled so the details-backfill pass (a later, unrelated
+            // step of the same run) has nothing left to fetch either.
+            original_language: Some("en".into()),
+            genres: Some("[\"Drama\"]".into()),
+            cast_json: Some("[]".into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(assigned(&db, "i1").await.unwrap().0, "tmdb");
+
+    // An .nfo shows up that `local` has not read yet: on its own enough
+    // to re-select the item for the generic pass, per the SQL's local
+    // OR-branch.
+    sqlx::query(
+        "INSERT INTO files (module_id, collection_id, path_rel, size, mtime_unix,
+                            head_xxh3, tail_xxh3, oshash, streams_json)
+         VALUES ('m0', 'c0', 'Fight Club (1999).mkv', 1000, 1, 0, 0, 0,
+                 '{\"nfo\":\"Fight Club.nfo\"}')",
+    )
+    .execute(&db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO item_sources (module_id, collection_id, path_rel, item_id)
+         VALUES ('m0', 'c0', 'Fight Club (1999).mkv', 'i1')",
+    )
+    .execute(&db)
+    .await
+    .unwrap();
+
+    let rows = sqlx::query(kahawai_hub::enrich::GENERIC_SELECTION_SQL)
+        .bind(kahawai_hub::providers::QUERY_REV)
+        .bind(r#"["tmdb"]"#)
+        .fetch_all(&db)
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.len(),
+        1,
+        "the fresh .nfo owes a local answer, so the item is selected \
+         despite tmdb already matching"
+    );
+
+    let enricher = std::sync::Arc::new(kahawai_hub::enrich::Enricher::new(
+        dir.path().to_path_buf(),
+    ));
+    let registry = std::sync::Arc::new(registry);
+    enricher.run_once(&registry).await.unwrap();
+
+    let (pid, conf, poster): (String, String, Option<String>) = sqlx::query_as(
+        "SELECT provider_id, confidence, poster_path FROM provider_metadata
+          WHERE item_id = 'i1' AND provider = 'tmdb'",
+    )
+    .fetch_one(&db)
+    .await
+    .unwrap();
+    assert_eq!(
+        (pid.as_str(), conf.as_str()),
+        ("550", "auto"),
+        "the match survived a run that re-selected but could not re-answer it"
+    );
+    assert_eq!(poster.as_deref(), Some("/p.jpg"));
+    assert_eq!(
+        assigned(&db, "i1").await.unwrap().0,
+        "tmdb",
+        "and the assignment with it"
+    );
 }

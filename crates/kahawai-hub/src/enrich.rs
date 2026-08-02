@@ -228,10 +228,13 @@ pub fn pick_candidate<'c>(
 /// out to their own pass). Extracted so `scale_bench` can time the real
 /// statement: this runs at the top of every enrichment pass, so its
 /// quiescent cost at catalogue scale is a standing tax. Binds ?1 =
-/// [`crate::providers::QUERY_REV`], ?2 = whether a TVDB key is
-/// configured — an unconfigured searcher never asks and never records
-/// its question, so counting it as owing work would re-select every
-/// matched item on every run, forever.
+/// [`crate::providers::QUERY_REV`], ?2 = a JSON array of the network
+/// searcher names the pass actually built its `ProviderSet` from (e.g.
+/// `["tmdb"]`, or `["tmdb","tvdb"]` once a TVDB key is configured).
+/// Binding the real set rather than hard-coding it here means the SQL
+/// can never drift from the runtime chain: a searcher outside the bound
+/// set never counts as owing work, so an unconfigured one can't force a
+/// re-select of an item it will never be asked to look at.
 pub const GENERIC_SELECTION_SQL: &str =
             "SELECT i.id, i.kind, i.title, i.norm_title, i.year,
                     (SELECT s.path_rel FROM item_sources s
@@ -251,20 +254,20 @@ pub const GENERIC_SELECTION_SQL: &str =
                     -- title question has no provider_queries row and no
                     -- real answer stands. Never-matched, renamed and
                     -- QUERY_REV-bumped items all land here; misses never
-                    -- gate. tmdb/tvdb are the generic pass's network
-                    -- searchers, and the list must mirror the ProviderSet
-                    -- the pass actually builds: tvdb counts only when its
-                    -- key is configured (?2).
+                    -- gate. json_each(?2) walks exactly the searcher
+                    -- names the pass bound this run, so a conditional
+                    -- provider (TVDB today, whatever's next tomorrow)
+                    -- needs no SQL change: absent from ?2, it is never
+                    -- owed.
                     EXISTS (
-                      SELECT 1 FROM (SELECT 'tmdb' AS p
-                                     UNION ALL SELECT 'tvdb' WHERE ?2) sp
+                      SELECT 1 FROM json_each(?2) sp
                       WHERE NOT EXISTS (
                           SELECT 1 FROM provider_metadata pm
-                          WHERE pm.item_id = i.id AND pm.provider = sp.p
+                          WHERE pm.item_id = i.id AND pm.provider = sp.value
                             AND pm.provider_id <> '')
                         AND NOT EXISTS (
                           SELECT 1 FROM provider_queries q
-                          WHERE q.item_id = i.id AND q.provider = sp.p
+                          WHERE q.item_id = i.id AND q.provider = sp.value
                             AND q.query_type = 'title'
                             AND q.query = i.norm_title || '|' || COALESCE(i.year, '')
                             AND q.rev >= ?1))
@@ -885,9 +888,19 @@ impl Enricher {
         if let Err(e) = self.enrich_anime(registry, &providers, anime_items).await {
             tracing::warn!(error = format!("{e:#}"), "anime enrichment failed");
         }
+        // The names the selection SQL must ask about are exactly the
+        // ones `set` was just built from above — tmdb always, tvdb only
+        // when configured. Binding this instead of hard-coding it in
+        // SQL means a future conditional searcher is one line here, not
+        // a second list to keep in sync.
+        let generic_searchers: Vec<&str> = if tvdb_configured {
+            vec!["tmdb", "tvdb"]
+        } else {
+            vec!["tmdb"]
+        };
         let items = sqlx::query(GENERIC_SELECTION_SQL)
             .bind(crate::providers::QUERY_REV)
-            .bind(tvdb_configured)
+            .bind(serde_json::to_string(&generic_searchers)?)
             .fetch_all(registry.db())
             .await?;
         tracing::info!(items = items.len(), "enrichment run starting");

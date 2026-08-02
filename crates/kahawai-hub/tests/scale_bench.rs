@@ -373,7 +373,7 @@ async fn browse_latency_and_scale() {
             let rows = sqlx::query(kahawai_hub::enrich::GENERIC_SELECTION_SQL)
                 .bind(kahawai_hub::providers::QUERY_REV)
                 // both searchers configured: the bench times the worst case
-                .bind(true)
+                .bind(r#"["tmdb","tvdb"]"#)
                 .fetch_all(&b.db)
                 .await
                 .unwrap();
@@ -407,7 +407,7 @@ async fn browse_latency_and_scale() {
             let t = Instant::now();
             let rows = sqlx::query(kahawai_hub::enrich::GENERIC_SELECTION_SQL)
                 .bind(kahawai_hub::providers::QUERY_REV)
-                .bind(true)
+                .bind(r#"["tmdb","tvdb"]"#)
                 .fetch_all(&b.db)
                 .await
                 .unwrap();
