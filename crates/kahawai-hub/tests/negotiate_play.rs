@@ -60,6 +60,18 @@ async fn body_bytes(resp: axum::response::Response) -> Vec<u8> {
         .to_vec()
 }
 
+/// An API error is `(StatusCode, String)`, not JSON. Parsing it with
+/// `unwrap` reports "expected ident" and throws the server's actual
+/// message away — which is the whole diagnosis.
+fn json(bytes: Vec<u8>) -> serde_json::Value {
+    serde_json::from_slice(&bytes).unwrap_or_else(|_| {
+        panic!(
+            "server did not answer JSON: {}",
+            String::from_utf8_lossy(&bytes)
+        )
+    })
+}
+
 #[tokio::test]
 async fn negotiation_picks_cheapest_source_and_honors_caps() {
     // Two real files of the same movie: an MSE-friendly mp4 and an MKV.
@@ -191,6 +203,30 @@ async fn negotiation_picks_cheapest_source_and_honors_caps() {
     ] {
         tx.send(pb::HostToHub { msg: Some(msg) }).await.unwrap();
     }
+    // Heartbeats, like a real mediahost. Without them the hub's 35 s
+    // liveness timeout fires mid-test and every later play answers
+    // "no source is currently available (mediahost offline)" — a
+    // latent bug that only shows once the test runs longer than 35 s,
+    // which it now does (it performs a real AV1 encode first).
+    {
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(5));
+            loop {
+                tick.tick().await;
+                if tx
+                    .send(pb::HostToHub {
+                        msg: Some(pb::host_to_hub::Msg::Heartbeat(pb::Heartbeat {})),
+                    })
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        });
+    }
+
     let serve_channel = channel.clone();
     tokio::spawn(async move {
         while let Ok(Some(m)) = inbound.message().await {
@@ -231,7 +267,7 @@ async fn negotiation_picks_cheapest_source_and_honors_caps() {
                 )
                 .await
                 .unwrap();
-            let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+            let v: serde_json::Value = json(body_bytes(resp).await);
             if let Some(item) = v["items"].get(0)
                 && item["sources"] == 2
             {
@@ -258,7 +294,7 @@ async fn negotiation_picks_cheapest_source_and_honors_caps() {
                 .await
                 .unwrap();
             let status = resp.status();
-            let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+            let v: serde_json::Value = json(body_bytes(resp).await);
             (status, v)
         }
     };
