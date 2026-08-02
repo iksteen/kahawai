@@ -415,6 +415,13 @@ pub struct Sessions {
     /// OPS-10: callers awaiting a satellite's log bundle. Same shape as
     /// `pending_ready` — one waiter per session, dropped on timeout.
     pending_logs: Mutex<HashMap<String, tokio::sync::oneshot::Sender<String>>>,
+    /// OPS-10: the hub half of a bundle, kept for sessions that have
+    /// ALREADY been torn down. A dispatched session's bundle arrives
+    /// over the link well after `end()` removed it from `active`, and
+    /// without this every teardown bundle files itself under item
+    /// "unknown" — which breaks the item lookup for precisely the case
+    /// it exists for, somebody else's session, already closed.
+    ended_headers: Mutex<HashMap<String, (String, String)>>,
     /// In-flight artifact fetches, keyed by (session, name).
     artifact_waiting: Mutex<
         HashMap<(String, String), tokio::sync::mpsc::Sender<kahawai_proto::v1::ArtifactData>>,
@@ -441,7 +448,12 @@ impl Sessions {
     pub fn log_header(&self, session_id: &str) -> (String, String) {
         use std::fmt::Write as _;
         let Some(s) = self.get(session_id) else {
-            // Already gone: still worth keeping the satellite's half.
+            // Torn down already — which is the NORMAL case for a
+            // dispatched session's bundle, since it crosses the link
+            // after end() has forgotten the session.
+            if let Some(kept) = self.ended_headers.lock().unwrap().remove(session_id) {
+                return kept;
+            }
             return (
                 "unknown".into(),
                 format!("== hub: session {session_id}\n(session already ended; no hub state)\n\n"),
@@ -568,6 +580,7 @@ impl Sessions {
             tc_leases: Mutex::new(HashMap::new()),
             pending_ready: Mutex::new(HashMap::new()),
             pending_logs: Mutex::new(HashMap::new()),
+            ended_headers: Mutex::new(HashMap::new()),
             artifact_waiting: Mutex::new(HashMap::new()),
             registry_for_teardown: Mutex::new(None),
         }
@@ -2379,9 +2392,21 @@ impl Sessions {
     /// Remove a session: direct leases drop (closing the byte channel);
     /// remux pipelines stop and their scratch dir is deleted.
     pub fn end(&self, id: &str) -> bool {
+        // OPS-10: while the session still exists. Everything below this
+        // line has already forgotten it.
+        let header = self.log_header(id);
         let Some(session) = self.active.lock().unwrap().remove(id) else {
             return false;
         };
+        {
+            let mut kept = self.ended_headers.lock().unwrap();
+            // Bounded like the bundles themselves: a header is only
+            // useful until its bundle lands, moments later.
+            if kept.len() > 64 {
+                kept.clear();
+            }
+            kept.insert(id.to_string(), header);
+        }
         if let Some(registry) = self.registry_for_teardown.lock().unwrap().clone() {
             registry.emit(serde_json::json!({ "kind": "sessions" }));
         }
