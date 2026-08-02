@@ -262,6 +262,40 @@ export default function Settings() {
             caps playback bitrate (HUB-15) — copies refuse, encodes clamp
           </span>
         </div>
+        {/* HUB-32a: what happens to styled (ASS) subtitles on a client
+            that cannot render them itself. No server default — unset
+            reads as flatten, which is what everyone got before this
+            existed. Burning is never silent: if no box in the fleet can
+            do it, the session stops and asks. */}
+        <div className="row-form pref-row">
+          <span className="pref-label mono">styled subs</span>
+          <span className="chips">
+            {(['flatten', 'burn'] as const).map((v) => (
+              <button
+                key={v}
+                className={(values['ass_fallback'] ?? 'flatten') === v ? 'chip' : 'chip dim'}
+                title={
+                  v === 'flatten'
+                    ? 'convert to plain VTT — no video work, typesetting and karaoke lost'
+                    : 'burn into the picture — full fidelity, forces a video encode'
+                }
+                onClick={() =>
+                  putPref('', 'ass_fallback', v)
+                    .then(() => {
+                      setValues((cur) => ({ ...cur, ass_fallback: v }))
+                      flash()
+                    })
+                    .catch(() => {})
+                }
+              >
+                {v}
+              </button>
+            ))}
+          </span>
+          <span className="dim small-note">
+            for clients that cannot render ASS themselves (this browser can)
+          </span>
+        </div>
       </section>
       {MEDIA_TYPES.map((mt) => (
         <section key={mt}>

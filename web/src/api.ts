@@ -213,7 +213,19 @@ export type Subtitle = {
   derived_from: number | null
   delivery: SubtitleDelivery
   note: string
+  /// HUB-32a: the picker may offer "burn in" for this track even when
+  /// `delivery` says something cheaper. Not the same question: this
+  /// client declares ass_render unconditionally, so an ASS track always
+  /// reads as client-rendered and the burn could never be asked for.
+  burnable: boolean
 }
+
+/// HUB-32a: the hub refused to start because nothing in the fleet can
+/// burn ASS. The only correct response is to ask the user — flatten it
+/// or stop — so the sentinel is matched, never displayed.
+export const ASS_BURN_UNAVAILABLE = 'ass_burn_unavailable'
+export const isAssBurnRefusal = (e: unknown) =>
+  String(e).includes(ASS_BURN_UNAVAILABLE)
 
 export const isImageSub = (s: Subtitle) => ['pgs', 'vobsub', 'dvdsub'].includes(s.format)
 
@@ -296,6 +308,11 @@ export const subtitleLabel = (s: Subtitle) =>
         : '') +
   (s.delivery === 'burn' ? ' · burn-in' : s.delivery === 'none' ? ' · unavailable' : '')
 
+/// The extra picker row HUB-32a adds: burning a track that would
+/// otherwise be delivered some cheaper way. Encoded in the option's
+/// value so one <select> carries both readings of the same track.
+export const BURN_PREFIX = 'burn:' 
+
 export type LibrarySummary = { id: string; name: string; media_type: string }
 
 export const fetchLibraries = () =>
@@ -373,6 +390,7 @@ export function startSession(
   audioTrack = 0,
   videoTrack = 0,
   subtitleTrack?: number,
+  assFallback?: 'flatten',
 ): Promise<Session> {
   return json('/api/v1/playback/sessions', {
     method: 'POST',
@@ -385,6 +403,9 @@ export function startSession(
       // An IMAGE track id forces its burn-in from the first segment;
       // text tracks need no session involvement.
       subtitle_track: subtitleTrack ?? null,
+      // The user's answer to a previous ass_burn_unavailable refusal.
+      // Session-scoped: their standing preference is untouched.
+      ass_fallback: assFallback ?? null,
     }),
   })
 }
@@ -398,6 +419,7 @@ export async function startPlaybackSession(
   startMs = 0,
   audioTrack = 0,
   videoTrack = 0,
+  assFallback?: 'flatten',
 ): Promise<Session> {
   let cap: number | undefined
   try {
@@ -410,7 +432,15 @@ export async function startPlaybackSession(
   // Source-aware precision: probe the exact strings the announced
   // streams call for (profile/level from the hub's own probing).
   const announced = item.sources_detail.flatMap((s) => s.streams?.video ?? [])
-  return startSession(item.id, buildProfile(cap, announced), startMs, audioTrack, videoTrack)
+  return startSession(
+    item.id,
+    buildProfile(cap, announced),
+    startMs,
+    audioTrack,
+    videoTrack,
+    undefined,
+    assFallback,
+  )
 }
 
 /// Music plays direct by operator contract (browsers decode flac/mp3

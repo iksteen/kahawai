@@ -17,6 +17,7 @@ import {
   type Subtitle,
   type SubtitleCandidate,
   startPlaybackSession,
+  isAssBurnRefusal,
   type Item,
   type ItemDetail,
   type Session,
@@ -106,6 +107,10 @@ export default function Detail({
   const [subNote, setSubNote] = useState('')
   const [subQuota, setSubQuota] = useState<SubtitleQuota | null>(null)
   const [error, setError] = useState('')
+  /// Which play() call was refused for want of an ASS burn (its
+  /// `fromStart`), so answering "flatten" resumes the same way. null =
+  /// no question pending.
+  const [assRefusal, setAssRefusal] = useState<boolean | null>(null)
   const [busy, setBusy] = useState(false)
   const [showCaps, setShowCaps] = useState(false)
   // The badge reads the stored mask, which the panel edits underneath
@@ -360,9 +365,10 @@ export default function Detail({
     }
   }
 
-  async function play(fromStart = false) {
+  async function play(fromStart = false, assFallback?: 'flatten') {
     setBusy(true)
     setError('')
+    setAssRefusal(null)
     try {
       // Remux/transcode sessions start their pipeline at the resume
       // point (§6) — no waiting for a transcode to catch up. Direct
@@ -389,10 +395,14 @@ export default function Detail({
       // (built in one shared place, mask included). start_ms is ignored
       // by the direct path server-side, so resuming needs no mode
       // prediction here.
-      const session = await startPlaybackSession(item!, start, audioTrack)
+      const session = await startPlaybackSession(item!, start, audioTrack, 0, assFallback)
       onPlay(item!, session, start)
     } catch (e) {
-      setError(String(e))
+      // HUB-32a: nothing flattens silently. The one refusal that is a
+      // question keeps the answer in hand so "flatten this time" can
+      // retry from the same resume point.
+      if (isAssBurnRefusal(e)) setAssRefusal(fromStart)
+      else setError(String(e))
     } finally {
       setBusy(false)
     }
@@ -493,6 +503,18 @@ export default function Detail({
         )}
       </div>
       {showCaps && <CapabilityDebug onChange={() => setCapsRev((n) => n + 1)} />}
+      {assRefusal !== null && (
+        <div className="error">
+          No transcoder in the fleet can burn ASS subtitles, and your preference says
+          burn rather than flatten.{' '}
+          <button className="btn ghost small" onClick={() => void play(assRefusal, 'flatten')}>
+            Flatten this time
+          </button>{' '}
+          <button className="btn ghost small" onClick={() => setAssRefusal(null)}>
+            Stop
+          </button>
+        </div>
+      )}
       {error && <div className="error">{error}</div>}
 
       {related}

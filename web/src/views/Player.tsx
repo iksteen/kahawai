@@ -17,6 +17,8 @@ import {
   seekSession,
   startPlaybackSession,
   subtitleLabel,
+  BURN_PREFIX,
+  isAssBurnRefusal,
   type ItemDetail,
   type Session,
   type Subtitle,
@@ -162,15 +164,20 @@ export default function Player({
   // stores the effective profile per session and re-plans track
   // switches against it — so applying one restarts playback here.
   const [capsError, setCapsError] = useState('')
-  const restartWithCaps = async () => {
+  // HUB-32a: the one refusal that is a QUESTION, not an error. Nothing
+  // flattens silently, so the session stops until the user answers.
+  const [assRefusal, setAssRefusal] = useState(false)
+  const restartWithCaps = async (assFallback?: 'flatten') => {
     setRestarting(true)
     setCapsError('')
     try {
       const at = Math.round(posMs)
-      const fresh = await startPlaybackSession(item, at, audioTrack, videoTrack)
+      const fresh = await startPlaybackSession(item, at, audioTrack, videoTrack, assFallback)
+      setAssRefusal(false)
       onRestart(fresh, at) // remounts this component; the old session ends in cleanup
     } catch (e) {
-      setCapsError(String(e))
+      if (isAssBurnRefusal(e)) setAssRefusal(true)
+      else setCapsError(String(e))
       setRestarting(false)
     }
   }
@@ -821,29 +828,49 @@ export default function Player({
           <select
             value={subKey}
             onChange={(e) => {
-              const key = e.target.value
-              const prev = subs.find((x) => String(x.id) === subKey)
-              const s = subs.find((x) => String(x.id) === key)
+              const raw = e.target.value
+              // HUB-32a: one <select>, two readings of a track — the
+              // natural delivery, and "burn it in". The prefix is what
+              // distinguishes them; `subKey` keeps carrying it so the
+              // chosen row stays selected.
+              const key = raw
+              const asBurn = raw.startsWith(BURN_PREFIX)
+              const id = asBurn ? raw.slice(BURN_PREFIX.length) : raw
+              const prev = subs.find(
+                (x) => String(x.id) === subKey.replace(BURN_PREFIX, ''),
+              )
+              const prevBurned = subKey.startsWith(BURN_PREFIX) || prev?.delivery === 'burn'
+              const s = subs.find((x) => String(x.id) === id)
               setSubKey(key)
               // Two memory layers (HUB-33): the series remembers the
               // language; THIS item remembers the exact row — the only
               // spelling that can name a downloaded/OCR track.
               const value = key === '' ? 'off' : (s?.language ?? 'any').toLowerCase()
               void putPref(seriesRef.current, 'subs', value).catch(() => {})
-              void putPref(item.id, 'subs.track', key).catch(() => {})
+              void putPref(item.id, 'subs.track', id).catch(() => {})
               // Burn transitions live server-side: picking a burn
               // track restarts the pipeline with it; leaving one
               // withdraws it (0 = clear).
-              if (s?.delivery === 'burn') void switchBurn(s.id)
-              else if (prev?.delivery === 'burn') void switchBurn(0)
+              if (s && (asBurn || s.delivery === 'burn')) void switchBurn(s.id)
+              else if (prevBurned) void switchBurn(0)
             }}
           >
             <option value="">Off</option>
-            {subs.map((s) => (
+            {subs.flatMap((s) => [
               <option key={s.id} value={String(s.id)} disabled={s.delivery === 'none'}>
                 {subtitleLabel(s)}
-              </option>
-            ))}
+              </option>,
+              // The burn as an EXTRA row, not a replacement: a client
+              // that renders ASS itself still gets the natural reading
+              // first, and asking for the picture is an explicit act.
+              ...(s.burnable && s.delivery !== 'burn'
+                ? [
+                    <option key={`${s.id}-burn`} value={`${BURN_PREFIX}${s.id}`}>
+                      {subtitleLabel(s)} · burn in
+                    </option>,
+                  ]
+                : []),
+            ])}
           </select>
         </label>
       )}
@@ -870,7 +897,19 @@ export default function Player({
               .join(' · ')}
           </div>
         ) : null}
-        {showCaps && <CapabilityDebug onApply={restartWithCaps} applying={restarting} />}
+        {showCaps && <CapabilityDebug onApply={() => restartWithCaps()} applying={restarting} />}
+        {assRefusal && (
+          <div className="dim">
+            No transcoder in the fleet can burn ASS subtitles, and your
+            preference says burn rather than flatten.{' '}
+            <button className="btn ghost small" onClick={() => void restartWithCaps('flatten')}>
+              Flatten this time
+            </button>{' '}
+            <button className="btn ghost small" onClick={() => setAssRefusal(false)}>
+              Stop
+            </button>
+          </div>
+        )}
         {capsError && <div className="dim">restart failed: {capsError}</div>}
         {/* OPS-10: admins can take this session's diagnostics straight
             from the screen where the problem is visible. */}
