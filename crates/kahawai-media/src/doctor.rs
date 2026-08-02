@@ -490,14 +490,30 @@ fn is_hardware_decoder(name: &str) -> bool {
     PREFIXES.iter().any(|p| name.starts_with(p))
 }
 
-/// The software decoder a hardware one has to beat. gst-libav is the
-/// reference by construction: it is the portable path, present on every
-/// box we run, and the one a demotion falls back to.
-fn software_decoder(codec: crate::bench::Codec) -> &'static str {
+/// The software decoders a hardware one has to beat, best first.
+///
+/// A LIST because "the software decoder" is not one element: gst-libav
+/// covers most codecs, but AV1's is `dav1ddec` (libdav1d) and there is
+/// no `avdec_av1` on a normal install — naming only the libav one made
+/// the av1 row report "no software decoder to compare against" on a box
+/// that has two.
+fn software_decoders(codec: crate::bench::Codec) -> &'static [&'static str] {
     match codec {
-        crate::bench::Codec::H264 => "avdec_h264",
-        crate::bench::Codec::H265 => "avdec_h265",
+        crate::bench::Codec::H264 => &["avdec_h264"],
+        crate::bench::Codec::H265 => &["avdec_h265"],
+        crate::bench::Codec::Av1 => &["dav1ddec", "avdec_av1", "av1dec"],
+        crate::bench::Codec::Vp9 => &["avdec_vp9", "vp9dec"],
+        crate::bench::Codec::Vp8 => &["avdec_vp8", "vp8dec"],
+        crate::bench::Codec::Mpeg2 => &["avdec_mpeg2video", "mpeg2dec"],
     }
+}
+
+/// The one this box will actually be measured against.
+fn software_decoder(codec: crate::bench::Codec) -> Option<&'static str> {
+    software_decoders(codec)
+        .iter()
+        .copied()
+        .find(|n| gst::ElementFactory::find(n).is_some())
 }
 
 fn decoder_speed_check(codec: crate::bench::Codec, demote: &mut Vec<(String, String)>) -> Check {
@@ -507,17 +523,25 @@ fn decoder_speed_check(codec: crate::bench::Codec, demote: &mut Vec<(String, Str
             .filter(|f| f.rank() > gst::Rank::NONE)
             .map(|f| f.rank())
     };
-    let sw = software_decoder(codec);
+    let Some(sw) = software_decoder(codec) else {
+        return Check::warn(
+            name,
+            format!(
+                "none of {:?} present — no software decoder to compare against",
+                software_decoders(codec)
+            ),
+        );
+    };
     let Some(sw_rank) = rank(sw) else {
         return Check::warn(
             name,
-            format!("{sw} unavailable — no software decoder to compare against; install gst-libav"),
+            format!("{sw} is demoted out of autoplug; nothing to compare"),
         );
     };
     // Candidates: anything that decodes this codec, is in autoplug, and
     // GStreamer would reach for BEFORE the software decoder. A lower
     // rank is already losing, so timing it decides nothing.
-    let caps = gst::Caps::new_empty_simple(codec.caps_name());
+    let caps = codec.caps();
     let mut candidates: Vec<String> = gst::ElementFactory::factories_with_type(
         gst::ElementFactoryType::DECODER | gst::ElementFactoryType::MEDIA_VIDEO,
         gst::Rank::MARGINAL,

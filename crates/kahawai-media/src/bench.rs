@@ -107,6 +107,18 @@ const REF_2160: &[u8] = include_bytes!("../assets/ref-2160p.h264");
 /// content in two codecs. 1080p only: a 20x rank inversion is not
 /// subtler at 4K, and the asset would cost more than the finding.
 const REF_1080_H265: &[u8] = include_bytes!("../assets/ref-1080p.h265");
+/// OPS-9a: the codecs whose hardware decoders were never timed for want
+/// of a bitstream. Not hypothetical — silence's hand-written demotions
+/// name `vavp9dec`, `vavp8dec` and `vampeg2dec`, none of which OPS-9
+/// could have found. Kept small (2.6 MB for all seven clips): decode
+/// speed is compared BETWEEN decoders on one box, so the content only
+/// has to be identical across candidates, not incompressible.
+const REF_1080_AV1: &[u8] = include_bytes!("../assets/ref-1080p-av1.mkv");
+const REF_1080_VP9: &[u8] = include_bytes!("../assets/ref-1080p-vp9.webm");
+const REF_1080_VP8: &[u8] = include_bytes!("../assets/ref-1080p-vp8.webm");
+/// 720p, and 24 frames: MPEG-2 at 1080p costs megabytes for content
+/// this simple, and a rank inversion is not subtler at 720p.
+const REF_720_MPEG2: &[u8] = include_bytes!("../assets/ref-720p-mpeg2.m2v");
 
 /// Wall-clock ceiling for a DECODE measurement. Shorter than [`CAP`]
 /// because decoding is the cheap half: even the pathological case
@@ -490,23 +502,59 @@ pub fn decode_fps(element: &str, codec: Codec) -> Option<f32> {
     }
 
     let pipe = gst::Pipeline::new();
-    let src = gst::ElementFactory::make("multifilesrc")
-        .property("location", path.to_string_lossy().as_ref())
-        .property("loop", true)
-        .property("num-buffers", LOOPS)
-        .build()
-        .ok()?;
-    let parse = make(codec.parser())?;
+    let src = if codec.loops() {
+        gst::ElementFactory::make("multifilesrc")
+            .property("location", path.to_string_lossy().as_ref())
+            .property("loop", true)
+            .property("num-buffers", LOOPS)
+            .build()
+            .ok()?
+    } else {
+        gst::ElementFactory::make("filesrc")
+            .property("location", path.to_string_lossy().as_ref())
+            .build()
+            .ok()?
+    };
     let dec = make(element)?;
     let sink = gst::ElementFactory::make("fakesink")
         .property("sync", false)
         .build()
         .ok()?;
-    if pipe.add_many([&src, &parse, &dec, &sink]).is_err()
-        || gst::Element::link_many([&src, &parse, &dec, &sink]).is_err()
-    {
-        let _ = pipe.set_state(gst::State::Null);
+    if pipe.add_many([&src, &dec, &sink]).is_err() {
         return None;
+    }
+    match codec.parser() {
+        // Elementary stream: an explicit parser, linked straight
+        // through, so the looped source stays a plain byte feed.
+        Some(name) => {
+            let parse = make(name)?;
+            if pipe.add(&parse).is_err()
+                || gst::Element::link_many([&src, &parse, &dec, &sink]).is_err()
+            {
+                let _ = pipe.set_state(gst::State::Null);
+                return None;
+            }
+        }
+        // Container: parsebin demuxes and parses, and its pad appears
+        // once the caps are known.
+        None => {
+            let demux = make("parsebin")?;
+            if pipe.add(&demux).is_err()
+                || gst::Element::link(&src, &demux).is_err()
+                || gst::Element::link(&dec, &sink).is_err()
+            {
+                let _ = pipe.set_state(gst::State::Null);
+                return None;
+            }
+            let target = dec.clone();
+            demux.connect_pad_added(move |_, pad| {
+                if let Some(sink_pad) = target.static_pad("sink")
+                    && !sink_pad.is_linked()
+                {
+                    let _ = pad.link(&sink_pad);
+                }
+            });
+        }
     }
     count_through_capped(&pipe, &dec, DECODE_CAP, || {}).map(|m| m * REFERENCE_FPS)
 }
@@ -516,6 +564,10 @@ pub fn decode_fps(element: &str, codec: Codec) -> Option<f32> {
 pub enum Codec {
     H264,
     H265,
+    Av1,
+    Vp9,
+    Vp8,
+    Mpeg2,
 }
 
 impl Codec {
@@ -523,34 +575,82 @@ impl Codec {
         match self {
             Codec::H264 => REF_1080,
             Codec::H265 => REF_1080_H265,
+            Codec::Av1 => REF_1080_AV1,
+            Codec::Vp9 => REF_1080_VP9,
+            Codec::Vp8 => REF_1080_VP8,
+            Codec::Mpeg2 => REF_720_MPEG2,
         }
     }
     fn file(self) -> &'static str {
         match self {
             Codec::H264 => "ref-1080p.h264",
             Codec::H265 => "ref-1080p.h265",
+            Codec::Av1 => "ref-1080p-av1.mkv",
+            Codec::Vp9 => "ref-1080p-vp9.webm",
+            Codec::Vp8 => "ref-1080p-vp8.webm",
+            Codec::Mpeg2 => "ref-720p-mpeg2.m2v",
         }
     }
-    fn parser(self) -> &'static str {
+    /// Elementary streams concatenate, so `multifilesrc loop` can run a
+    /// short clip until the cap and a fast decoder still gets a real
+    /// sample. Container clips cannot be looped that way, so they are
+    /// long enough to stand alone and are demuxed by `parsebin`.
+    fn loops(self) -> bool {
+        !matches!(self, Codec::Av1 | Codec::Vp9 | Codec::Vp8)
+    }
+    fn parser(self) -> Option<&'static str> {
         match self {
-            Codec::H264 => "h264parse",
-            Codec::H265 => "h265parse",
+            Codec::H264 => Some("h264parse"),
+            Codec::H265 => Some("h265parse"),
+            Codec::Mpeg2 => Some("mpegvideoparse"),
+            // parsebin demuxes these; no explicit parser.
+            Codec::Av1 | Codec::Vp9 | Codec::Vp8 => None,
         }
     }
     /// The caps a decoder must accept to be a candidate for this codec.
-    pub fn caps_name(self) -> &'static str {
+    ///
+    /// MPEG carries its version in a FIELD, not the media type, so a
+    /// bare `video/mpeg` also matches the MPEG-1 and MPEG-4 decoders —
+    /// which then appear in the mpeg2 row as candidates that "would not
+    /// decode the clip", because of course they would not. Listing
+    /// elements nobody should compare is how a check teaches its reader
+    /// to skip it.
+    pub fn caps(self) -> gst::Caps {
+        let b = gst::Caps::builder(self.caps_name());
+        match self {
+            Codec::Mpeg2 => b.field("mpegversion", 2i32).build(),
+            _ => b.build(),
+        }
+    }
+
+    fn caps_name(self) -> &'static str {
         match self {
             Codec::H264 => "video/x-h264",
             Codec::H265 => "video/x-h265",
+            Codec::Av1 => "video/x-av1",
+            Codec::Vp9 => "video/x-vp9",
+            Codec::Vp8 => "video/x-vp8",
+            Codec::Mpeg2 => "video/mpeg",
         }
     }
     pub fn label(self) -> &'static str {
         match self {
             Codec::H264 => "h264",
             Codec::H265 => "hevc",
+            Codec::Av1 => "av1",
+            Codec::Vp9 => "vp9",
+            Codec::Vp8 => "vp8",
+            Codec::Mpeg2 => "mpeg2",
         }
     }
-    pub const ALL: [Codec; 2] = [Codec::H264, Codec::H265];
+    pub const ALL: [Codec; 6] = [
+        Codec::H264,
+        Codec::H265,
+        Codec::Av1,
+        Codec::Vp9,
+        Codec::Vp8,
+        Codec::Mpeg2,
+    ];
 }
 
 fn make(name: &str) -> Option<gst::Element> {

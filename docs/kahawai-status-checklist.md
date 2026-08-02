@@ -352,11 +352,18 @@ How something works and why it was built that way belong in
       checks run at every module startup, which must stay instant.
       Covers h264 and hevc (OPS-9a). The DTS half stays a fixed
       known-bad list: libdca is fast and wrong, so no timing finds it.
-- [ ] OPS-9a Calibrate the remaining codecs. Only h264 and hevc have a
-      checked-in reference bitstream, so a hardware decoder for av1,
-      vp9, vp8 or mpeg2 is never timed. Not hypothetical: silence's
-      hand-written demotions include vavp9dec, vavp8dec and vampeg2dec,
-      none of which OPS-9 would have found.
+- [x] OPS-9a Calibrate the remaining codecs. Reference bitstreams for
+      av1, vp9, vp8 and mpeg2 (2.6 MB for all seven; container clips
+      are demuxed rather than looped, elementary ones still loop). The
+      software reference is a preference list — AV1's is `dav1ddec`,
+      there is no `avdec_av1` on a normal install — and mpeg2 matches
+      on `mpegversion=2` so the MPEG-1 and MPEG-4 decoders stop
+      appearing as candidates. Found on the first run what OPS-9 was
+      blind to: `vavp8dec` at 9 fps against 386 on silence, one of the
+      three that box's operator had demoted by hand. A decoder that
+      cannot decode the reference at all is reported, never
+      auto-demoted: one clip cannot tell a broken element from an
+      unsupported profile.
 - [x] OPS-10 Session diagnostics as one downloadable bundle. Captured
       at session end (a hang never fails, so crash capture never fired)
       and on demand while live; admin download from the session list,
