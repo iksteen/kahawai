@@ -415,13 +415,18 @@ pub struct Sessions {
     /// OPS-10: callers awaiting a satellite's log bundle. Same shape as
     /// `pending_ready` — one waiter per session, dropped on timeout.
     pending_logs: Mutex<HashMap<String, tokio::sync::oneshot::Sender<String>>>,
-    /// OPS-10: the hub half of a bundle, kept for sessions that have
-    /// ALREADY been torn down. A dispatched session's bundle arrives
-    /// over the link well after `end()` removed it from `active`, and
-    /// without this every teardown bundle files itself under item
-    /// "unknown" — which breaks the item lookup for precisely the case
-    /// it exists for, somebody else's session, already closed.
-    ended_headers: Mutex<HashMap<String, (String, String)>>,
+    /// OPS-10: `(item_id, header)` for sessions `active` cannot answer
+    /// for. Two windows need it, and both are the interesting ones:
+    ///
+    /// * A session that FAILED TO START was never inserted into
+    ///   `active` — registration happens after the pipeline is up — so
+    ///   without this its diagnostics file under item "unknown".
+    /// * A dispatched session's bundle crosses the link well after
+    ///   `end()` removed it.
+    ///
+    /// Populated the moment the id is minted, replaced with the full
+    /// header at teardown.
+    known_sessions: Mutex<HashMap<String, (String, String)>>,
     /// In-flight artifact fetches, keyed by (session, name).
     artifact_waiting: Mutex<
         HashMap<(String, String), tokio::sync::mpsc::Sender<kahawai_proto::v1::ArtifactData>>,
@@ -451,8 +456,11 @@ impl Sessions {
             // Torn down already — which is the NORMAL case for a
             // dispatched session's bundle, since it crosses the link
             // after end() has forgotten the session.
-            if let Some(kept) = self.ended_headers.lock().unwrap().remove(session_id) {
-                return kept;
+            // NOT removed: a failed session emits a crash log AND a
+            // bundle, and a mid-session death emits both too — each
+            // needs the same header.
+            if let Some(kept) = self.known_sessions.lock().unwrap().get(session_id) {
+                return kept.clone();
             }
             return (
                 "unknown".into(),
@@ -487,6 +495,13 @@ impl Sessions {
         }
         let _ = writeln!(h, "sink:       {}", s.sink.lock().unwrap());
         let _ = writeln!(h, "idle:       {}s", s.idle_for().as_secs());
+        // An error recorded while the session was still live (a
+        // mid-session death that AR-6 rescheduled) belongs here too.
+        if let Some((_, kept)) = self.known_sessions.lock().unwrap().get(&s.id)
+            && let Some(line) = kept.lines().find(|l| l.starts_with("error:"))
+        {
+            let _ = writeln!(h, "{line}");
+        }
         let _ = writeln!(h);
         (s.item_id.clone(), h)
     }
@@ -555,6 +570,44 @@ impl Sessions {
         }
     }
 
+    /// OPS-10: remember which item a session id belongs to, from the
+    /// moment the id exists. Everything that can go wrong after this
+    /// point — a failed start, a mid-session death, a normal teardown —
+    /// produces diagnostics that must file under the right item.
+    fn note_session(&self, id: &str, item_id: &str) {
+        let mut kept = self.known_sessions.lock().unwrap();
+        // Bounded: these are small headers, and only the recent ones can
+        // still have diagnostics arriving for them.
+        if kept.len() > 64 {
+            kept.clear();
+        }
+        kept.insert(
+            id.to_string(),
+            (
+                item_id.to_string(),
+                format!("== hub: session {id}\nitem:       {item_id}\n(session did not reach a running state)\n\n"),
+            ),
+        );
+    }
+
+    /// OPS-10: record why a session failed, on the header every later
+    /// bundle carries.
+    ///
+    /// Both the error path and teardown write a bundle for the same
+    /// session, and they collide on the filename — so the teardown one,
+    /// which is richer but knows nothing about the failure, would erase
+    /// the error message. Putting the error on the HEADER means whichever
+    /// write lands last still carries it, and the worker log is not
+    /// duplicated into two files to achieve that.
+    pub fn note_error(&self, session_id: &str, error: &str) {
+        let mut kept = self.known_sessions.lock().unwrap();
+        if let Some((_, header)) = kept.get_mut(session_id)
+            && !header.contains("error:")
+        {
+            header.push_str(&format!("error:      {error}\n\n"));
+        }
+    }
+
     /// A bundle arrived for a caller waiting on it (the download button).
     pub fn deliver_logs(&self, session_id: &str, body: String) {
         if let Some(tx) = self.pending_logs.lock().unwrap().remove(session_id) {
@@ -580,7 +633,7 @@ impl Sessions {
             tc_leases: Mutex::new(HashMap::new()),
             pending_ready: Mutex::new(HashMap::new()),
             pending_logs: Mutex::new(HashMap::new()),
-            ended_headers: Mutex::new(HashMap::new()),
+            known_sessions: Mutex::new(HashMap::new()),
             artifact_waiting: Mutex::new(HashMap::new()),
             registry_for_teardown: Mutex::new(None),
         }
@@ -1123,6 +1176,10 @@ impl Sessions {
             .await?;
 
         let id = ulid::Ulid::generate().to_string();
+        // OPS-10: before anything can fail. Registration into `active`
+        // is a long way below and never happens for a session that
+        // fails to start — which is exactly the session worth a log.
+        self.note_session(&id, item_id);
         let mut chosen_sink = String::new();
         let mut verdict = None;
         let mut session_plan = None;
@@ -1581,6 +1638,15 @@ impl Sessions {
                             // the frames after it, which name nothing.
                             if let Some(data_dir) = self.scratch_root.parent() {
                                 crate::crashlog::store(data_dir, session_id, "local", &log);
+                                // OPS-10: and the full bundle, so a
+                                // failure is findable the same way an
+                                // ordinary session is. This session is
+                                // NOT in `active` — registration happens
+                                // after start succeeds — which is why
+                                // note_session ran when the id was minted.
+                                let (item, header) = self.log_header(session_id);
+                                let body = format!("{header}{}", local_bundle(&dir));
+                                crate::crashlog::store_bundle(data_dir, &item, session_id, &body);
                             }
                             bail!("pipeline worker exited at start ({status}): {tail}");
                         }
@@ -2399,7 +2465,7 @@ impl Sessions {
             return false;
         };
         {
-            let mut kept = self.ended_headers.lock().unwrap();
+            let mut kept = self.known_sessions.lock().unwrap();
             // Bounded like the bundles themselves: a header is only
             // useful until its bundle lands, moments later.
             if kept.len() > 64 {
@@ -2419,7 +2485,7 @@ impl Sessions {
                 // wipes this dir, but a bundle per scrub is noise.
                 if let Some(data_dir) = self.scratch_root.parent() {
                     let (item, header) = self.log_header(id);
-                    let body = format!("{header}{}", local_bundle(dir));
+                    let body = format!("{header}{}", local_bundle(&dir));
                     crate::crashlog::store_bundle(data_dir, &item, id, &body);
                 }
                 runner.lock().unwrap().stop();
