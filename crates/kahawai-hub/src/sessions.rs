@@ -2240,6 +2240,7 @@ impl Sessions {
             // a client-rendered track picked after a burn).
             if session.burn_pick.lock().unwrap().take().is_some() {
                 *session.burn_sets.lock().unwrap() = None;
+                *session.burn_ass_text.lock().unwrap() = None;
                 replan_subs = true;
             }
         } else if let Some(tid) = subtitle_track {
@@ -2252,7 +2253,15 @@ impl Sessions {
             );
             let part = session.parts.first().context("session has no parts")?;
             let is_image = crate::tracks::is_image_format(&track.format);
-            let new_pick = (is_image
+            // HUB-32a: ASS burns the same way image subtitles do — an
+            // explicit mid-session pick, honoured by a different tier.
+            // This used to test `is_image` alone, so an ASS pick fell
+            // through to `None`, matched the existing `None`, and the
+            // seek restarted with NOTHING changed: the picker offered
+            // "burn in", the player asked for it, and the hub quietly
+            // re-tapped the subtitle file instead (found live).
+            let is_ass = matches!(track.format.as_str(), "ass" | "ssa");
+            let new_pick = ((is_image || is_ass)
                 && track.module_id.as_deref() == Some(part.module_id.as_str())
                 && track.collection_id.as_deref() == Some(part.collection_id.as_str())
                 && track.path_rel.as_deref() == Some(part.path_rel.as_str()))
@@ -2265,20 +2274,50 @@ impl Sessions {
                 }
             })
             .flatten();
-            if is_image && new_pick.is_none() {
+            if (is_image || is_ass) && new_pick.is_none() {
                 bail!(
                     "track {tid} is not part of the playing source; restart the session to burn it"
                 );
+            }
+            // An ASS burn needs a box that can do it, and a seek cannot
+            // move boxes (HUB-15b). Refusing here beats restarting into
+            // a picture with no subtitles in it.
+            if is_ass {
+                let capable = match &session.mode {
+                    Mode::Transcode { transcoder } => {
+                        let tc = transcoder.lock().unwrap().clone();
+                        registry.transcoder_reports_ass_burn(&tc)
+                    }
+                    _ => kahawai_media::remux::ass_burn_available(),
+                };
+                anyhow::ensure!(capable, "{ASS_BURN_UNAVAILABLE}");
             }
             // Auto-burn already burning this very stream: adopt the
             // pick without touching the sets (no refetch needed).
             let already = matches!(new_pick,
                 Some(kahawai_media::negotiate::BurnPick::Embedded(i))
-                    if session.plan.lock().unwrap().is_some_and(|pl| pl.burn_subtitle == Some(i)));
+                    if session.plan.lock().unwrap().is_some_and(
+                        |pl| pl.burn_subtitle == Some(i) || pl.burn_ass == Some(i)));
             if already {
                 *session.burn_pick.lock().unwrap() = new_pick;
             } else if new_pick != *session.burn_pick.lock().unwrap() {
+                // A sidecar ASS burns from the FILE, so the script has
+                // to be in hand before the restart — the same shape as
+                // the display sets below, and for the same reason.
+                *session.burn_ass_text.lock().unwrap() = match new_pick {
+                    Some(kahawai_media::negotiate::BurnPick::Sidecar(_)) if is_ass => {
+                        let text = subtitles
+                            .ass_for_burn(registry, self, &session.item_id, &track.internal_key())
+                            .await;
+                        anyhow::ensure!(text.is_some(), "subtitle track {tid} has no ASS script");
+                        text
+                    }
+                    _ => None,
+                };
                 let sets = match new_pick {
+                    // An ASS pick has no display sets to walk; the
+                    // renderer takes the demuxer's pad or the script.
+                    Some(_) if is_ass => None,
                     Some(_) => {
                         let (module_id, collection_id, walk_rel, walk_idx, _) =
                             subtitles.extract_ref(registry, &track).await?;
