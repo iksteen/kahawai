@@ -228,7 +228,20 @@ pub fn pick_candidate<'c>(
 /// out to their own pass). Extracted so `scale_bench` can time the real
 /// statement: this runs at the top of every enrichment pass, so its
 /// quiescent cost at catalogue scale is a standing tax. Binds ?1 =
-/// [`crate::providers::QUERY_REV`].
+/// [`crate::providers::QUERY_REV`], ?2 = a JSON array of the searcher
+/// names read off the run's own `ProviderSet`
+/// ([`ProviderSet::searchers_in`]) — never a list written out beside
+/// it. A searcher outside the bound set is never owed, so one that
+/// cannot answer this run does not force a re-select of every item
+/// lacking its answer.
+///
+/// Read off, because "configured" and "able to answer" are different
+/// questions and diverge exactly when something is broken. A provider
+/// whose key is set but whose login failed is absent from the set: a
+/// list built from the key would still claim its work is owed, and
+/// nothing in the chain could ever clear that debt — a permanent
+/// full-catalogue re-select against the one statement whose cost this
+/// doc calls a standing tax.
 pub const GENERIC_SELECTION_SQL: &str =
             "SELECT i.id, i.kind, i.title, i.norm_title, i.year,
                     (SELECT s.path_rel FROM item_sources s
@@ -248,17 +261,20 @@ pub const GENERIC_SELECTION_SQL: &str =
                     -- title question has no provider_queries row and no
                     -- real answer stands. Never-matched, renamed and
                     -- QUERY_REV-bumped items all land here; misses never
-                    -- gate. tmdb/tvdb are the generic pass's network
-                    -- searchers (mirrors the ProviderSet the pass builds).
+                    -- gate. json_each(?2) walks exactly the searcher
+                    -- names the pass bound this run, so a conditional
+                    -- provider (TVDB today, whatever's next tomorrow)
+                    -- needs no SQL change: absent from ?2, it is never
+                    -- owed.
                     EXISTS (
-                      SELECT 1 FROM (SELECT 'tmdb' AS p UNION ALL SELECT 'tvdb') sp
+                      SELECT 1 FROM json_each(?2) sp
                       WHERE NOT EXISTS (
                           SELECT 1 FROM provider_metadata pm
-                          WHERE pm.item_id = i.id AND pm.provider = sp.p
+                          WHERE pm.item_id = i.id AND pm.provider = sp.value
                             AND pm.provider_id <> '')
                         AND NOT EXISTS (
                           SELECT 1 FROM provider_queries q
-                          WHERE q.item_id = i.id AND q.provider = sp.p
+                          WHERE q.item_id = i.id AND q.provider = sp.value
                             AND q.query_type = 'title'
                             AND q.query = i.norm_title || '|' || COALESCE(i.year, '')
                             AND q.rev >= ?1))
@@ -874,8 +890,18 @@ impl Enricher {
         if let Err(e) = self.enrich_anime(registry, &providers, anime_items).await {
             tracing::warn!(error = format!("{e:#}"), "anime enrichment failed");
         }
+        // Ask the SQL about the searchers this run ACTUALLY holds —
+        // read off the set, not restated beside it. A second list has
+        // to be kept in step by hand, and would answer a subtly
+        // different question: "is it configured" rather than "can it
+        // answer", which diverge exactly when a provider's login has
+        // failed. Then nothing in the chain can clear the debt the SQL
+        // reports, and every item lacking that provider's answer is
+        // re-selected on every run for as long as the fault lasts.
+        let generic_searchers = providers.searchers_in(crate::providers::chain_for("movies"));
         let items = sqlx::query(GENERIC_SELECTION_SQL)
             .bind(crate::providers::QUERY_REV)
+            .bind(serde_json::to_string(&generic_searchers)?)
             .fetch_all(registry.db())
             .await?;
         tracing::info!(items = items.len(), "enrichment run starting");
@@ -935,11 +961,15 @@ impl Enricher {
                         this.progress.1.fetch_add(1, Ordering::SeqCst);
                     }
                     Some(_) => {}
+                    // No miss row from here: the walker's Declined arm
+                    // records misses, guarded so a decline never
+                    // overwrites a standing answer. A chain declines in
+                    // full whenever every question is already on file —
+                    // routine on a restart — and an unconditional miss
+                    // upsert here erased the whole catalogue's matches
+                    // each time the hub came up.
                     None => {
                         this.progress.2.fetch_add(1, Ordering::SeqCst);
-                        if let Err(e) = this.store_generic(&db, &item.id, "tmdb", None).await {
-                            tracing::warn!(title = %item.title, error = %e, "miss upsert failed");
-                        }
                     }
                 }
             });
@@ -1049,20 +1079,11 @@ impl Enricher {
                 identified: false,
                 owner: None,
             };
+            // Same rule as the generic pass: the walker records misses,
+            // never the caller — a fully-declined chain is not a miss.
             match providers.run_chain("music", registry.db(), &item).await {
                 Some(_) => matched += 1,
-                None => {
-                    missed += 1;
-                    crate::providers::store_answer(
-                        registry.db(),
-                        &item.id,
-                        "musicbrainz",
-                        "",
-                        "miss",
-                        Default::default(),
-                    )
-                    .await?;
-                }
+                None => missed += 1,
             }
             if (n + 1) % 100 == 0 {
                 tracing::info!(
@@ -1461,16 +1482,12 @@ impl Enricher {
                     Err(e) => tracing::warn!(error = format!("{e:#}"), "episode binding failed"),
                 }
             }
+            // Same rule as the generic pass: the walker records misses,
+            // never the caller — a fully-declined chain is not a miss.
             match providers.run_chain("anime", registry.db(), item).await {
                 Some("settled") => {}
                 Some(_) => done += 1,
-                None => {
-                    tracing::debug!(title = %item.title, "no anime identity; recording miss");
-                    if !item.identified {
-                        self.store_generic(registry.db(), &item.id, "anime", None)
-                            .await?;
-                    }
-                }
+                None => tracing::debug!(title = %item.title, "no anime identity this run"),
             }
         }
         tracing::info!(matched = done, "anime enrichment complete");

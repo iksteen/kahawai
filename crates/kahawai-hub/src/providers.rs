@@ -1087,6 +1087,31 @@ impl ProviderSet {
         self.providers.push(p);
     }
 
+    /// The chain's searchers that this run ACTUALLY holds, in chain
+    /// order — what the selection SQL must ask about, derived from the
+    /// set rather than restated beside it.
+    ///
+    /// The distinction matters because "configured" and "usable" are
+    /// different questions. A provider whose key is set but whose login
+    /// failed is absent from the set: it cannot answer this run, so
+    /// counting it as owing work re-selects every item that lacks its
+    /// answer, on every run, with nothing able to clear the debt. A
+    /// second list written beside the set answers the first question
+    /// while the walker answers the second, and the two disagree
+    /// exactly when something is broken — which is when a full-
+    /// catalogue re-select is least affordable.
+    ///
+    /// `local` and other non-chain providers are excluded by
+    /// construction: this intersects with the declared chain (see
+    /// [`chain_for`]), and `local` is in none.
+    pub fn searchers_in(&self, chain: &[&'static str]) -> Vec<&'static str> {
+        chain
+            .iter()
+            .copied()
+            .filter(|name| self.providers.iter().any(|p| p.name() == *name))
+            .collect()
+    }
+
     pub fn get(&self, name: &str) -> Option<&dyn Provider> {
         self.providers
             .iter()
@@ -1101,8 +1126,11 @@ impl ProviderSet {
     }
 
     /// Walk the media type's chain for one item. Returns the outcome
-    /// confidence, or None when every provider declined (the caller
-    /// records the miss).
+    /// confidence, or None when every provider declined. Misses are
+    /// recorded HERE, in the Declined arm, and nowhere else: a caller
+    /// treating None as "record a miss" would overwrite standing
+    /// answers, because a chain declines in full whenever every
+    /// question is already on file — routine on a restart.
     ///
     /// HUB-5 first-claim-wins is per FIELD, so a match no longer ends
     /// the walk: the chain continues while anything is still missing,
