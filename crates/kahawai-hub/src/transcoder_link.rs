@@ -196,7 +196,7 @@ impl TranscoderLink for TranscoderLinkService {
                                 continue;
                             };
                             let (item, header) = sessions.log_header(&l.session_id);
-                            crate::crashlog::store_bundle(
+                            crate::sessionlog::store(
                                 data_dir,
                                 &item,
                                 &l.session_id,
@@ -220,33 +220,19 @@ impl TranscoderLink for TranscoderLinkService {
                             // own next attempt, so its worker stderr
                             // only survives if it lands here.
                             if let Some(data_dir) = sessions.data_dir() {
-                                crate::crashlog::store(
-                                    data_dir,
-                                    &e.session_id,
-                                    &module_id,
-                                    &e.worker_log,
-                                );
-                                // OPS-10: and as a bundle, so a failed
-                                // session is findable exactly like an
-                                // ordinary one — the item page is where
-                                // somebody looks after a report, and it
-                                // cannot know whether the session failed
-                                // or merely ended. The satellite pushes
-                                // a richer bundle too when it got far
-                                // enough to have a run dir; this is the
-                                // floor, and store_bundle keeps both.
+                                // ONE store, whatever went wrong: whoever
+                                // opens a log does not yet know whether
+                                // this session failed, hung or was fine.
+                                // The satellite pushes a richer bundle
+                                // too when it got far enough to have a
+                                // run dir; this is the floor.
                                 sessions.note_error(&e.session_id, &e.error);
                                 let (item, header) = sessions.log_header(&e.session_id);
                                 let body = format!(
                                     "{header}== session error\n{}\n\n== worker.log (as shipped                                      with the error)\n{}",
                                     e.error, e.worker_log
                                 );
-                                crate::crashlog::store_bundle(
-                                    data_dir,
-                                    &item,
-                                    &e.session_id,
-                                    &body,
-                                );
+                                crate::sessionlog::store(data_dir, &item, &e.session_id, &body);
                             }
                             // Pre-ready: fail the pending start. Post-ready
                             // (worker died mid-session): reschedule (AR-6).

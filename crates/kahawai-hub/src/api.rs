@@ -1138,7 +1138,7 @@ async fn admin_item_log(
         .sessions
         .data_dir()
         .ok_or_else(|| (StatusCode::NOT_FOUND, "no data dir".to_string()))?;
-    let path = crate::crashlog::newest_for_item(data_dir, &id).ok_or_else(|| {
+    let path = crate::sessionlog::newest_for_item(data_dir, &id).ok_or_else(|| {
         (
             StatusCode::NOT_FOUND,
             "no session logs for this item".to_string(),

@@ -520,7 +520,7 @@ impl Sessions {
         let data_dir = self.data_dir().context("no data dir")?.to_path_buf();
         let Some(session) = self.get(id) else {
             // Ended: serve what teardown kept.
-            let path = crate::crashlog::bundle_for_session(&data_dir, id)
+            let path = crate::sessionlog::for_session(&data_dir, id)
                 .context("no logs kept for that session")?;
             return Ok(std::fs::read_to_string(path)?);
         };
@@ -548,7 +548,7 @@ impl Sessions {
                 if let Err(e) = sent {
                     self.pending_logs.lock().unwrap().remove(id);
                     // The box is gone; a stored bundle may still exist.
-                    return match crate::crashlog::bundle_for_session(&data_dir, id) {
+                    return match crate::sessionlog::for_session(&data_dir, id) {
                         Some(p) => Ok(std::fs::read_to_string(p)?),
                         None => Err(e),
                     };
@@ -900,6 +900,15 @@ impl Sessions {
     /// (HUB-16: direct > copy > audio-encode > video-encode), rank
     /// breaking ties.
     #[allow(clippy::too_many_arguments)] // request-shaped plumbing
+    /// Mint the session id FIRST, then do the work.
+    ///
+    /// Everything below can fail — a source that is not currently
+    /// available, an unplayable plan, a worker that will not start — and
+    /// until an id exists a failure has nothing to attach a log to. That
+    /// is why the id is minted here rather than deeper in: "no source is
+    /// currently available (mediahost offline)" used to leave a 409 and
+    /// no record whatsoever (OPS-10).
+    #[allow(clippy::too_many_arguments)] // one call site, spelled out
     pub async fn start(
         self: &Arc<Self>,
         registry: &Registry,
@@ -913,6 +922,53 @@ impl Sessions {
         video_track: u32,
         subtitle_track: Option<i64>,
     ) -> Result<Arc<Session>> {
+        let id = ulid::Ulid::generate().to_string();
+        self.note_session(&id, item_id);
+        let started = self
+            .start_inner(
+                &id,
+                registry,
+                subtitles,
+                user_id,
+                item_id,
+                mode,
+                profile,
+                start_ms,
+                audio_track,
+                video_track,
+                subtitle_track,
+            )
+            .await;
+        if let Err(e) = &started
+            && let Some(data_dir) = self.scratch_root.parent()
+        {
+            // A session that never came up still gets a log, filed under
+            // the item like any other — the item page is where somebody
+            // looks after a report, and it cannot know how far the
+            // session got.
+            self.note_error(&id, &format!("{e:#}"));
+            let (item, header) = self.log_header(&id);
+            crate::sessionlog::store(data_dir, &item, &id, &header);
+        }
+        started
+    }
+
+    #[allow(clippy::too_many_arguments)] // wire-shaped plumbing
+    async fn start_inner(
+        self: &Arc<Self>,
+        id: &str,
+        registry: &Registry,
+        subtitles: &crate::subtitles::Subtitles,
+        user_id: &str,
+        item_id: &str,
+        mode: Option<&str>,
+        profile: Option<kahawai_core::media::CapabilityProfile>,
+        start_ms: u64,
+        audio_track: u32,
+        video_track: u32,
+        subtitle_track: Option<i64>,
+    ) -> Result<Arc<Session>> {
+        let id = id.to_string();
         let user_active = self
             .active
             .lock()
@@ -1175,11 +1231,6 @@ impl Sessions {
             )
             .await?;
 
-        let id = ulid::Ulid::generate().to_string();
-        // OPS-10: before anything can fail. Registration into `active`
-        // is a long way below and never happens for a session that
-        // fails to start — which is exactly the session worth a log.
-        self.note_session(&id, item_id);
         let mut chosen_sink = String::new();
         let mut verdict = None;
         let mut session_plan = None;
@@ -1637,16 +1688,16 @@ impl Sessions {
                             // line, and the four lines quoted below are
                             // the frames after it, which name nothing.
                             if let Some(data_dir) = self.scratch_root.parent() {
-                                crate::crashlog::store(data_dir, session_id, "local", &log);
-                                // OPS-10: and the full bundle, so a
-                                // failure is findable the same way an
-                                // ordinary session is. This session is
-                                // NOT in `active` — registration happens
-                                // after start succeeds — which is why
-                                // note_session ran when the id was minted.
+                                // OPS-10: this session is NOT in `active`
+                                // — registration happens after start
+                                // succeeds — which is why note_session
+                                // ran when the id was minted, and why
+                                // this bundle is the only trace it ever
+                                // existed.
+                                let _ = &log;
                                 let (item, header) = self.log_header(session_id);
                                 let body = format!("{header}{}", local_bundle(&dir));
-                                crate::crashlog::store_bundle(data_dir, &item, session_id, &body);
+                                crate::sessionlog::store(data_dir, &item, session_id, &body);
                             }
                             bail!("pipeline worker exited at start ({status}): {tail}");
                         }
@@ -2486,7 +2537,7 @@ impl Sessions {
                 if let Some(data_dir) = self.scratch_root.parent() {
                     let (item, header) = self.log_header(id);
                     let body = format!("{header}{}", local_bundle(&dir));
-                    crate::crashlog::store_bundle(data_dir, &item, id, &body);
+                    crate::sessionlog::store(data_dir, &item, id, &body);
                 }
                 runner.lock().unwrap().stop();
                 let _ = std::fs::remove_dir_all(dir);
