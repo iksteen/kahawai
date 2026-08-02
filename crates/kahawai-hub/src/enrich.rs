@@ -228,13 +228,20 @@ pub fn pick_candidate<'c>(
 /// out to their own pass). Extracted so `scale_bench` can time the real
 /// statement: this runs at the top of every enrichment pass, so its
 /// quiescent cost at catalogue scale is a standing tax. Binds ?1 =
-/// [`crate::providers::QUERY_REV`], ?2 = a JSON array of the network
-/// searcher names the pass actually built its `ProviderSet` from (e.g.
-/// `["tmdb"]`, or `["tmdb","tvdb"]` once a TVDB key is configured).
-/// Binding the real set rather than hard-coding it here means the SQL
-/// can never drift from the runtime chain: a searcher outside the bound
-/// set never counts as owing work, so an unconfigured one can't force a
-/// re-select of an item it will never be asked to look at.
+/// [`crate::providers::QUERY_REV`], ?2 = a JSON array of the searcher
+/// names read off the run's own `ProviderSet`
+/// ([`ProviderSet::searchers_in`]) — never a list written out beside
+/// it. A searcher outside the bound set is never owed, so one that
+/// cannot answer this run does not force a re-select of every item
+/// lacking its answer.
+///
+/// Read off, because "configured" and "able to answer" are different
+/// questions and diverge exactly when something is broken. A provider
+/// whose key is set but whose login failed is absent from the set: a
+/// list built from the key would still claim its work is owed, and
+/// nothing in the chain could ever clear that debt — a permanent
+/// full-catalogue re-select against the one statement whose cost this
+/// doc calls a standing tax.
 pub const GENERIC_SELECTION_SQL: &str =
             "SELECT i.id, i.kind, i.title, i.norm_title, i.year,
                     (SELECT s.path_rel FROM item_sources s
@@ -792,12 +799,7 @@ impl Enricher {
         };
         // TVDB is the backup resolver: only consulted when the TMDB
         // ladder comes up empty, same strict verifier.
-        let tvdb_key = registry.get_setting(TVDB_KEY_SETTING).await?;
-        // The selection counts tvdb as owing work while a key exists,
-        // even if this run's login fails: the work stays owed and a
-        // later run collects it. No key = no debt.
-        let tvdb_configured = tvdb_key.is_some();
-        let tvdb_token = match tvdb_key {
+        let tvdb_token = match registry.get_setting(TVDB_KEY_SETTING).await? {
             Some(tk) => {
                 let pin = registry.get_setting(TVDB_PIN_SETTING).await?;
                 match self.tvdb_login(&tk, pin.as_deref()).await {
@@ -888,16 +890,15 @@ impl Enricher {
         if let Err(e) = self.enrich_anime(registry, &providers, anime_items).await {
             tracing::warn!(error = format!("{e:#}"), "anime enrichment failed");
         }
-        // The names the selection SQL must ask about are exactly the
-        // ones `set` was just built from above — tmdb always, tvdb only
-        // when configured. Binding this instead of hard-coding it in
-        // SQL means a future conditional searcher is one line here, not
-        // a second list to keep in sync.
-        let generic_searchers: Vec<&str> = if tvdb_configured {
-            vec!["tmdb", "tvdb"]
-        } else {
-            vec!["tmdb"]
-        };
+        // Ask the SQL about the searchers this run ACTUALLY holds —
+        // read off the set, not restated beside it. A second list has
+        // to be kept in step by hand, and would answer a subtly
+        // different question: "is it configured" rather than "can it
+        // answer", which diverge exactly when a provider's login has
+        // failed. Then nothing in the chain can clear the debt the SQL
+        // reports, and every item lacking that provider's answer is
+        // re-selected on every run for as long as the fault lasts.
+        let generic_searchers = providers.searchers_in(crate::providers::chain_for("movies"));
         let items = sqlx::query(GENERIC_SELECTION_SQL)
             .bind(crate::providers::QUERY_REV)
             .bind(serde_json::to_string(&generic_searchers)?)

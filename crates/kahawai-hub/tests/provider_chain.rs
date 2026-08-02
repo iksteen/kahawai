@@ -1502,7 +1502,11 @@ async fn a_declined_chain_records_a_miss_only_where_nothing_stands() {
 
     let mut set = kahawai_hub::providers::ProviderSet::default();
     set.add(Box::new(DecliningProvider("tmdb")));
-    assert!(set.run_chain("movies", &db, &item_ref("i1")).await.is_none());
+    assert!(
+        set.run_chain("movies", &db, &item_ref("i1"))
+            .await
+            .is_none()
+    );
 
     let (pid, conf): (String, String) = sqlx::query_as(
         "SELECT provider_id, confidence FROM provider_metadata
@@ -1653,9 +1657,8 @@ async fn a_restart_that_re_selects_a_matched_item_does_not_erase_it() {
          despite tmdb already matching"
     );
 
-    let enricher = std::sync::Arc::new(kahawai_hub::enrich::Enricher::new(
-        dir.path().to_path_buf(),
-    ));
+    let enricher =
+        std::sync::Arc::new(kahawai_hub::enrich::Enricher::new(dir.path().to_path_buf()));
     let registry = std::sync::Arc::new(registry);
     enricher.run_once(&registry).await.unwrap();
 
@@ -1677,4 +1680,58 @@ async fn a_restart_that_re_selects_a_matched_item_does_not_erase_it() {
         "tmdb",
         "and the assignment with it"
     );
+}
+
+// ---------- the bound searchers are the run's own, not a copy ----------
+
+/// The selection asks about the searchers a run ACTUALLY holds, read
+/// off its `ProviderSet`. The alternative — a list written out beside
+/// the set — answers "is it configured" where the walker answers "can
+/// it answer", and those diverge precisely when something is broken.
+///
+/// The concrete case: a TVDB key is set but its login fails. The set
+/// has no TVDB provider, so no run can ever record a TVDB answer; a
+/// key-derived list would nonetheless report every item lacking one as
+/// owing work. On the maintainer's library that is 31,378 of 40,025
+/// items re-selected on every pass, permanently, against the one
+/// statement whose own doc calls its quiescent cost a standing tax.
+#[test]
+fn a_provider_that_cannot_answer_is_not_owed() {
+    use kahawai_hub::providers::{ProviderSet, chain_for};
+    let chain = chain_for("movies");
+
+    // Both usable: both owed.
+    let mut both = ProviderSet::default();
+    both.add(Box::new(DecliningProvider("tmdb")));
+    both.add(Box::new(DecliningProvider("tvdb")));
+    assert_eq!(both.searchers_in(chain), vec!["tmdb", "tvdb"]);
+
+    // TVDB configured but its login failed, so it never reached the
+    // set. It cannot answer, therefore it is not owed — this is the
+    // assertion a key-derived list fails.
+    let mut login_failed = ProviderSet::default();
+    login_failed.add(Box::new(DecliningProvider("tmdb")));
+    assert_eq!(
+        login_failed.searchers_in(chain),
+        vec!["tmdb"],
+        "a provider absent from the set must not be reported as owing work"
+    );
+
+    // Nothing configured at all: nothing is owed, rather than everything
+    // being owed forever with no way to clear it.
+    assert!(ProviderSet::default().searchers_in(chain).is_empty());
+
+    // `local` is asked before the chain and is in none of them (HUB-9),
+    // so it never becomes a searcher the selection waits on.
+    let mut with_local = ProviderSet::default();
+    with_local.add(Box::new(DecliningProvider("local")));
+    with_local.add(Box::new(DecliningProvider("tmdb")));
+    assert_eq!(with_local.searchers_in(chain), vec!["tmdb"]);
+
+    // Chain order, not insertion order: the bound array reads as the
+    // chain does.
+    let mut reversed = ProviderSet::default();
+    reversed.add(Box::new(DecliningProvider("tvdb")));
+    reversed.add(Box::new(DecliningProvider("tmdb")));
+    assert_eq!(reversed.searchers_in(chain), vec!["tmdb", "tvdb"]);
 }
