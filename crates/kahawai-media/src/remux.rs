@@ -778,7 +778,6 @@ fn plumb_parsed_pad(
     subs_seen: &Arc<std::sync::atomic::AtomicUsize>,
     subs_dir: &std::path::Path,
     burn: &Option<std::sync::Arc<crate::burnin::Timeline>>,
-    burn_start_ms: u64,
     // False for the second and later parts of a multi-part source: the
     // tracks are the same ones continuing, so extracting them again would
     // overwrite the first part's files with a stream that starts at its
@@ -876,7 +875,6 @@ fn plumb_parsed_pad(
             plan,
             gate,
             burn,
-            burn_start_ms,
             subs_dir,
         );
         return;
@@ -900,7 +898,6 @@ fn plumb_parsed_pad(
                 plan,
                 &gate,
                 &burn,
-                burn_start_ms,
                 &facts_dir,
             );
         }
@@ -1161,7 +1158,6 @@ fn route_stream(
     plan: RemuxPlan,
     gate: &Option<Arc<SeekGate>>,
     burn: &Option<std::sync::Arc<crate::burnin::Timeline>>,
-    burn_start_ms: u64,
     facts_dir: &std::path::Path,
 ) {
     let caps_name = caps
@@ -1189,7 +1185,6 @@ fn route_stream(
                     plan.max_height,
                     plan.tone_map,
                     burn.clone(),
-                    burn_start_ms,
                 );
             } else {
                 build_audio_encode_chain(
@@ -1649,10 +1644,6 @@ fn build_video_encode_chain(
     max_height: Option<u32>,
     tone_map: bool,
     burn: Option<std::sync::Arc<crate::burnin::Timeline>>,
-    // The session's start offset: the burn's time base is measured
-    // against it (frame timestamps are absolute on some boxes and
-    // rebased to the seek point on others).
-    burn_start_ms: u64,
 ) {
     let (encoder, parser) = match target {
         VideoTarget::H264 => (h264_encoder(), "h264parse"),
@@ -1762,7 +1753,7 @@ fn build_video_encode_chain(
     // the rectangles scale to the frame the encoder actually sees).
     let burn_el: Vec<gst::Element> = burn
         .filter(|t| !t.is_empty())
-        .and_then(|t| crate::burnin::blend_element(t, burn_start_ms))
+        .and_then(crate::burnin::blend_element)
         .into_iter()
         .collect();
     if burn_el.is_empty() {
@@ -3012,7 +3003,6 @@ pub fn start_parts(
                 &subs_seen,
                 &subs_dir,
                 &burn_tl,
-                start_ms,
                 n == 0,
             );
         });

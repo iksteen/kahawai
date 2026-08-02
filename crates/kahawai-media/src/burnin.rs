@@ -13,6 +13,11 @@
 //! 25.5s when played from zero, absent after a flushing seek to the
 //! same timestamp). A timeline knows what is on screen at any instant.
 //!
+//! Time is the file's, taken from each frame's segment rather than its
+//! timestamp: see [`blend_element`]. A burn is the one subtitle tier
+//! with no second chance — the pixels are in the picture — so being a
+//! GOP or a resume offset out is not a cosmetic error.
+//!
 //! Positions are canvas-relative: PGS authors against its own canvas
 //! (commonly 1920x1080) which need not match the coded frame (that
 //! same film is 3840x1600 scope), so every rectangle is scaled from
@@ -257,7 +262,7 @@ pub fn timeline_from_file(path: &std::path::Path) -> Result<Option<Timeline>> {
 /// correctly on another (NVENC, which makes no such claim) — a
 /// difference no amount of reading the pipeline reveals. Blending here
 /// is unconditional and needs nothing of the encoder.
-pub fn blend_element(timeline: std::sync::Arc<Timeline>, start_ms: u64) -> Option<gst::Element> {
+pub fn blend_element(timeline: std::sync::Arc<Timeline>) -> Option<gst::Element> {
     let el = gst::ElementFactory::make("identity").build().ok()?;
     let pad = el.static_pad("src")?;
     // A display set spans dozens of frames and its rectangles are
@@ -268,13 +273,6 @@ pub fn blend_element(timeline: std::sync::Arc<Timeline>, start_ms: u64) -> Optio
     // nothing is the failure mode this tier keeps finding (a negotiated
     // overlay dropped by one encoder, a timeline that never matches a
     // frame time), and a debug-level line hides exactly that.
-    // Whether frame timestamps are the file's own or rebased to the
-    // seek point is not ours to decide: a session started at 15.5s
-    // arrives as 15500ms on one box and as 0ms on another (measured,
-    // same code, different plugin sets). So measure it on the first
-    // frame instead of assuming — a wrong assumption puts every
-    // subtitle at the wrong time, which is worse than none.
-    let base = std::sync::atomic::AtomicU64::new(u64::MAX);
     let seen = std::sync::atomic::AtomicUsize::new(0);
     let first_span = (
         timeline.entries.first().map(|e| e.start_ms).unwrap_or(0),
@@ -304,26 +302,24 @@ pub fn blend_element(timeline: std::sync::Arc<Timeline>, start_ms: u64) -> Optio
             return gst::PadProbeReturn::Ok;
         };
         let (fw, fh) = (vinfo.width() as i32, vinfo.height() as i32);
-        let ms = pts.mseconds();
-        let mut b = base.load(std::sync::atomic::Ordering::Relaxed);
-        if b == u64::MAX {
-            // Rebased streams start near zero; absolute ones start at
-            // (or after) the offset the session asked for.
-            b = if start_ms > 1_000 && ms + 1_000 < start_ms {
-                start_ms
-            } else {
-                0
-            };
-            base.store(b, std::sync::atomic::Ordering::Relaxed);
-            tracing::info!(
-                first_pts_ms = ms,
-                start_ms,
-                offset_ms = b,
-                "burn-in: frame time base measured"
-            );
-        }
-        let Some(idx) = timeline.at(ms + b) else {
-            say(&format!("no set at {}ms", ms + b));
+        // Position in the FILE, which is what a display set is timed
+        // against — and which the buffer's own timestamp does not give
+        // us. A seeked session runs the whole chain to PAUSED with data
+        // from zero (the muxer gate needs every branch negotiated
+        // before the flushing seek can happen), so a probe here sees
+        // pre-seek frames stamped ~0 and post-seek frames stamped at
+        // the snapped keyframe, on the same pad. The segment is what
+        // separates them: it is re-sent by the flush and converts
+        // either one to the same truth. The seek gate reads `start.pos`
+        // exactly this way (remux::SeekGate::open_reporting).
+        let ms = pad
+            .sticky_event::<gst::event::Segment>(0)
+            .and_then(|e| e.segment().downcast_ref::<gst::ClockTime>().cloned())
+            .and_then(|seg| seg.to_stream_time(pts))
+            .unwrap_or(pts)
+            .mseconds();
+        let Some(idx) = timeline.at(ms) else {
+            say(&format!("no set at {ms}ms"));
             return gst::PadProbeReturn::Ok;
         };
 
@@ -447,6 +443,95 @@ mod tests {
         assert_eq!(codec, "S_HDMV/PGS");
         assert_eq!(private.as_deref(), Some(&b"size: 720x576"[..]));
         assert_eq!(out, blocks);
+    }
+
+    /// A seeked session's frames carry the file's position in their
+    /// SEGMENT, not in their timestamp — the buffer PTS after a
+    /// keyframe-snapped seek means nothing on its own, and a pre-seek
+    /// preroll frame (the gate makes every branch negotiate before the
+    /// flush) is stamped ~0 on the same pad. Reading the timestamp put
+    /// every subtitle a resume offset out of place: on a 1 h resume
+    /// into The Truman Show it looked up 2 h and burned nothing at all.
+    #[test]
+    fn a_seeked_frame_is_timed_by_its_segment() {
+        use super::{gst, gst_video};
+        use gstreamer::prelude::*;
+        gst::init().unwrap();
+        // One set, on screen 60.0–62.0 s: white over the whole frame,
+        // so "blended" is unmistakable in the output pixels.
+        let entries = vec![super::Entry {
+            start_ms: 60_000,
+            end_ms: 62_000,
+            canvas_w: 16,
+            objects: vec![crate::imagesubs::ImageObject {
+                x: 0,
+                y: 0,
+                w: 16,
+                h: 16,
+                rgba: vec![255u8; 16 * 16 * 4],
+            }],
+        }];
+        let timeline = std::sync::Arc::new(super::Timeline { entries });
+
+        let blend = super::blend_element(timeline.clone()).unwrap();
+        // Capture what the blend probe left behind. Added second, so it
+        // runs second; the src pad has no peer, so the push ends in
+        // not-linked AFTER both probes have seen the buffer.
+        let painted = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0));
+        let out = painted.clone();
+        blend
+            .static_pad("src")
+            .unwrap()
+            .add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+                if let Some(gst::PadProbeData::Buffer(b)) = &info.data {
+                    out.store(
+                        b.map_readable().unwrap()[0],
+                        std::sync::atomic::Ordering::SeqCst,
+                    );
+                }
+                gst::PadProbeReturn::Ok
+            });
+        blend.set_state(gst::State::Playing).unwrap();
+
+        // A bare pad rather than appsrc: the segment IS the subject of
+        // the test, and appsrc composes its own.
+        let src = gst::Pad::new(gst::PadDirection::Src);
+        src.set_active(true).unwrap();
+        src.link(&blend.static_pad("sink").unwrap()).unwrap();
+        src.push_event(gst::event::StreamStart::new("burn-test"));
+        src.push_event(gst::event::Caps::new(
+            &gst_video::VideoInfo::builder(gst_video::VideoFormat::Bgra, 16, 16)
+                .build()
+                .unwrap()
+                .to_caps()
+                .unwrap(),
+        ));
+        let push = |ms: u64| {
+            let mut buf = gst::Buffer::from_mut_slice(vec![0u8; 16 * 16 * 4]);
+            buf.get_mut()
+                .unwrap()
+                .set_pts(gst::ClockTime::from_mseconds(ms));
+            let _ = src.push(buf); // not-linked is expected; see above
+            painted.load(std::sync::atomic::Ordering::SeqCst)
+        };
+        let segment_at = |ms: u64| {
+            let mut s = gst::FormattedSegment::<gst::ClockTime>::new();
+            s.set_start(gst::ClockTime::from_mseconds(ms));
+            s.set_time(gst::ClockTime::from_mseconds(ms));
+            gst::event::Segment::new(s.as_ref())
+        };
+
+        // Pre-seek: the chain is rolling to PAUSED from the top of the
+        // file. Nothing is on screen at zero.
+        src.push_event(segment_at(0));
+        assert_eq!(push(0), 0, "blended a set that is not on screen");
+        // The flush lands at 60 s and re-sends the segment. Same
+        // element, same pad — the frame's own time is now 60 s, and the
+        // set belongs on it. Deciding this once, from the first frame,
+        // is what put every subtitle a resume offset out of place.
+        src.push_event(segment_at(60_000));
+        assert_eq!(push(60_000), 255, "seeked frame missed its set");
+        blend.set_state(gst::State::Null).unwrap();
     }
 
     /// Manual: BURN_SETS=/path/to.sets cargo test -p kahawai-media \

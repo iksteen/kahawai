@@ -236,7 +236,11 @@ How something works and why it was built that way belong in
       graphics-overlay capability gating both the offer and the client's
       own rendering; burn-in fallback for clients that cannot composite
       (mediahost-extracted display sets, seek-exact timeline, explicit
-      blend in the encode chain)
+      blend in the encode chain). A burned frame takes its time from
+      its SEGMENT, not its timestamp (2026-08-02): the seek gate rolls
+      pre-seek frames stamped ~0 past the blender before the flush, and
+      guessing a base from the first of them put every subtitle a
+      resume offset out — a 1 h resume looked up 2 h and burned nothing
 - [x] HUB-32c OCR text tier: Tesseract via leptess (MIT — subtile-ocr
       dropped, no copyleft), default-on `ocr` feature, idle sweep over
       the whole library (playback outranks it) + per-track button as the
@@ -339,10 +343,13 @@ How something works and why it was built that way belong in
       scan filed 312 DTS files as 5.1, fixed 2026-08-01 by hand-editing
       TOML on the satellite. A check whose remedy is a hand-edited file
       per box is a check that gets ignored.
-- [ ] OPS-10 Session diagnostics as one downloadable bundle. Captured
+- [x] OPS-10 Session diagnostics as one downloadable bundle. Captured
       at session end (a hang never fails, so crash capture never fired)
       and on demand while live; admin download from the session list,
       the player, and item detail. Design in implementation §4.6.
+      Earned its keep on 2026-08-02: the burn-in resume offset above was
+      diagnosed from one downloaded bundle — `start.pos` and the blend's
+      own first-frame line, side by side, named the bug.
 
 ## Non-functional (NFR)
 

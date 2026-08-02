@@ -2536,7 +2536,7 @@ impl Sessions {
                 // wipes this dir, but a bundle per scrub is noise.
                 if let Some(data_dir) = self.scratch_root.parent() {
                     let (item, header) = self.log_header(id);
-                    let body = format!("{header}{}", local_bundle(&dir));
+                    let body = format!("{header}{}", local_bundle(dir));
                     crate::sessionlog::store(data_dir, &item, id, &body);
                 }
                 runner.lock().unwrap().stop();
