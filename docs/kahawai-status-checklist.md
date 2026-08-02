@@ -50,6 +50,11 @@ How something works and why it was built that way belong in
       Mediahosts declare nothing, and shall not: MH-12 withdrawn as a
       false premise (2026-08-02) — nothing they could declare decides
       anything the hub should act on
+- [x] AR-13a Dry runs reproduce the session's chain. The tone-map probe
+      ends in the encoder it claims to feed, with that encoder's own
+      output pin, fed 10-bit — and `tonemap_available` means "some real
+      target verified", nothing more. The probe that ended in fakesink
+      passed on a box where every HDR session died at negotiation.
 - [x] AR-12 Control/byte plane isolation: separate connections, no shared
       flow-control window (the frozen-heartbeat lesson, codified)
 

@@ -1269,56 +1269,114 @@ const TONEMAP_FRAG: &str = include_str!("tonemap.frag");
 /// headless box can carry every GL plugin and still fail to open a GL
 /// display, and that must surface here, not mid-session.
 pub fn tonemap_available() -> bool {
-    static VERIFIED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *VERIFIED.get_or_init(|| {
-        if crate::init().is_err()
-            || [
-                "glupload",
-                "glcolorconvert",
-                "glshader",
-                "gldownload",
-                "capssetter",
-            ]
-            .iter()
-            .any(|n| gst::ElementFactory::find(n).is_none())
-        {
-            return false;
-        }
-        // Dry-run the REAL segment: GL context creation, RGBA
-        // negotiation and shader compilation all happen or fail here.
-        let pipe = gst::Pipeline::new();
-        let src = gst::ElementFactory::make("videotestsrc")
-            .property("num-buffers", 5i32)
-            .build()
-            .unwrap();
-        let sink = gst::ElementFactory::make("fakesink").build().unwrap();
-        let seg = tonemap_segment("");
-        pipe.add(&src).unwrap();
-        pipe.add_many(&seg).unwrap();
-        pipe.add(&sink).unwrap();
-        let mut all: Vec<&gst::Element> = vec![&src];
-        all.extend(seg.iter());
-        all.push(&sink);
-        if gst::Element::link_many(all).is_err() || pipe.set_state(gst::State::Playing).is_err() {
-            let _ = pipe.set_state(gst::State::Null);
-            tracing::warn!("GL tone-map segment failed dry-run — tier unavailable on this box");
-            return false;
-        }
-        let ok = pipe
-            .bus()
-            .and_then(|bus| {
-                bus.timed_pop_filtered(
-                    gst::ClockTime::from_seconds(5),
-                    &[gst::MessageType::Eos, gst::MessageType::Error],
-                )
-            })
-            .is_some_and(|msg| msg.type_() == gst::MessageType::Eos);
+    // Any target this box can actually encode into. Reporting the
+    // capability without naming a target is what let a box claim it
+    // could tone-map while every session died (see `tonemap_into`).
+    [h264_encoder(), hevc_encoder(), av1_encoder()]
+        .into_iter()
+        .flatten()
+        .any(tonemap_into)
+}
+
+/// Can this box tone-map INTO `encoder`?
+///
+/// AR-13a: a dry run has to reproduce the chain a session builds, or it
+/// measures something nobody runs. The old probe ended in `fakesink`
+/// and passed no encoder, so the segment's output pin fell back to the
+/// full format list and the sink accepted whatever came out. On the
+/// J5005 that reported `tonemap: true` at 1.30x while every HDR
+/// session died at negotiation — `vah264enc` takes NV12 and not I420,
+/// and the unpinned list resolved to I420. A day of HDR playback was
+/// lost to a capability the box had measured and did not have.
+///
+/// So the probe ends in the real encoder, with the pin that encoder
+/// forces, fed the 10-bit frames an HDR decode actually produces —
+/// 8-bit input would skip the upload/download conversion that costs
+/// the most and negotiates the narrowest.
+pub fn tonemap_into(encoder: &str) -> bool {
+    static VERIFIED: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, bool>>,
+    > = std::sync::OnceLock::new();
+    let cache = VERIFIED.get_or_init(Default::default);
+    if let Some(known) = cache.lock().unwrap().get(encoder) {
+        return *known;
+    }
+    let ok = probe_tonemap_into(encoder);
+    if !ok {
+        tracing::warn!(encoder, "GL tone-map into this encoder failed dry-run");
+    }
+    cache.lock().unwrap().insert(encoder.to_string(), ok);
+    ok
+}
+
+fn probe_tonemap_into(encoder: &str) -> bool {
+    if crate::init().is_err()
+        || [
+            "glupload",
+            "glcolorconvert",
+            "glshader",
+            "gldownload",
+            "capssetter",
+        ]
+        .iter()
+        .any(|n| gst::ElementFactory::find(n).is_none())
+    {
+        return false;
+    }
+    let pipe = gst::Pipeline::new();
+    let Ok(src) = gst::ElementFactory::make("videotestsrc")
+        .property("num-buffers", 5i32)
+        .build()
+    else {
+        return false;
+    };
+    // 10-bit in, like the HDR source this exists for.
+    let Ok(pin) = gst::ElementFactory::make("capsfilter")
+        .property(
+            "caps",
+            gst::Caps::builder("video/x-raw")
+                .field("format", "I420_10LE")
+                .field("width", 320i32)
+                .field("height", 240i32)
+                .build(),
+        )
+        .build()
+    else {
+        return false;
+    };
+    let (Some(convert), Some(enc), Some(sink)) = (
+        gst::ElementFactory::make("videoconvert").build().ok(),
+        gst::ElementFactory::make(encoder).build().ok(),
+        gst::ElementFactory::make("fakesink").build().ok(),
+    ) else {
+        return false;
+    };
+    let seg = tonemap_segment(encoder);
+    if pipe.add_many([&src, &pin, &convert]).is_err()
+        || pipe.add_many(&seg).is_err()
+        || pipe.add_many([&enc, &sink]).is_err()
+    {
+        return false;
+    }
+    let mut all: Vec<&gst::Element> = vec![&src, &pin, &convert];
+    all.extend(seg.iter());
+    all.push(&enc);
+    all.push(&sink);
+    if gst::Element::link_many(all).is_err() || pipe.set_state(gst::State::Playing).is_err() {
         let _ = pipe.set_state(gst::State::Null);
-        if !ok {
-            tracing::warn!("GL tone-map segment failed dry-run — tier unavailable on this box");
-        }
-        ok
-    })
+        return false;
+    }
+    let ok = pipe
+        .bus()
+        .and_then(|bus| {
+            bus.timed_pop_filtered(
+                gst::ClockTime::from_seconds(10),
+                &[gst::MessageType::Eos, gst::MessageType::Error],
+            )
+        })
+        .is_some_and(|msg| msg.type_() == gst::MessageType::Eos);
+    let _ = pipe.set_state(gst::State::Null);
+    ok
 }
 
 /// How long the burn-in index walk may take before the session gives
@@ -1779,11 +1837,17 @@ fn build_video_encode_chain(
     // scale (scaling PQ-coded pixels before linearizing would blur
     // across the transfer curve; and the shader is per-pixel GPU work,
     // its cost does not care).
-    let tonemap: Vec<gst::Element> = if tone_map && tonemap_available() {
+    // Ask about THIS target, not "can the box tone-map at all": the
+    // segment's output pin comes from this encoder, so that is the only
+    // question with an answer (AR-13a).
+    let tonemap: Vec<gst::Element> = if tone_map && encoder.is_some_and(tonemap_into) {
         tonemap_segment(encoder.unwrap_or_default())
     } else {
         if tone_map {
-            tracing::warn!("tone-map requested but GL segment unavailable — encoding as-is");
+            tracing::warn!(
+                encoder = encoder.unwrap_or("-"),
+                "tone-map requested but the GL segment cannot feed this encoder — encoding as-is"
+            );
         }
         vec![]
     };
@@ -3463,6 +3527,55 @@ mod concat_spike {
             checked += 1;
         }
         assert!(checked > 0, "no encoders on this box to check against");
+    }
+
+    /// AR-13a: the tone-map probe has to END IN THE ENCODER it claims
+    /// to feed. The old one ran `videotestsrc ! segment ! fakesink`
+    /// with no encoder named, so the output pin fell back to the whole
+    /// format list and a sink that accepts anything swallowed the
+    /// result. It reported healthy on a box where every HDR session
+    /// died at negotiation.
+    ///
+    /// This asserts the probe agrees with what the box can really do,
+    /// for each encoder the box actually has: a target the segment can
+    /// feed must verify, and `tonemap_available` must be exactly
+    /// "some target verified" rather than a claim of its own.
+    #[test]
+    fn tonemap_is_verified_against_a_real_encoder() {
+        crate::init().unwrap();
+        let targets: Vec<&str> = [h264_encoder(), hevc_encoder(), av1_encoder()]
+            .into_iter()
+            .flatten()
+            .collect();
+        if targets.is_empty() {
+            return; // no video encoder on this box; nothing to claim
+        }
+        let any = targets.iter().any(|e| tonemap_into(e));
+        assert_eq!(
+            tonemap_available(),
+            any,
+            "tonemap_available must mean 'some real target verified', nothing else"
+        );
+        // An element that is not an encoder at all cannot be a target,
+        // and must not be reported as one — the fakesink-shaped hole.
+        assert!(
+            !tonemap_into("fakesink"),
+            "a sink that accepts anything must not count as a verified target"
+        );
+        // Whatever the segment would pin for a verified target has to be
+        // a format that target accepts; that pairing is the thing the
+        // old probe could not see.
+        for enc in &targets {
+            if !tonemap_into(enc) {
+                continue;
+            }
+            let pinned = tonemap_out_caps(enc);
+            let list = pinned
+                .structure(0)
+                .and_then(|st| st.get::<gst::List>("format").ok())
+                .expect("pinned caps carry a format list");
+            assert!(!list.is_empty(), "{enc}: nothing pinned");
+        }
     }
 
     /// The FIRST segment must be independently decodable, which is the
