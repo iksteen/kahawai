@@ -794,9 +794,18 @@ impl Enricher {
         registry: &Arc<Registry>,
     ) -> Result<(usize, usize, usize)> {
         registry.emit(serde_json::json!({ "kind": "enrich", "running": true }));
-        let Some(key) = registry.get_setting(TMDB_KEY_SETTING).await? else {
-            anyhow::bail!("no TMDB API key configured");
-        };
+        // HUB-5a: OPTIONAL. Chains are declared per media type, so one
+        // type's credential must not decide whether another type runs —
+        // `chain_for("music")` is musicbrainz alone and needs no key at
+        // all, and anime holds TMDB only as the fallback behind the
+        // AniDB/AniList composite. Bailing here told a music-only
+        // library that a provider its chain does not contain was
+        // missing, and enriched nothing.
+        let tmdb_key = registry.get_setting(TMDB_KEY_SETTING).await?;
+        // The two passes below the chains are TMDB's own work (episode
+        // detail, detail backfill), so they keep their own copy and
+        // skip themselves when there is no key.
+        let tmdb_for_details = tmdb_key.clone();
         // TVDB is the backup resolver: only consulted when the TMDB
         // ladder comes up empty, same strict verifier.
         let tvdb_token = match registry.get_setting(TVDB_KEY_SETTING).await? {
@@ -825,10 +834,12 @@ impl Enricher {
                 registry: Arc::clone(registry),
             }));
         }
-        set.add(Box::new(TmdbProvider {
-            enricher: self.clone(),
-            key: key.clone(),
-        }));
+        if let Some(key) = tmdb_key {
+            set.add(Box::new(TmdbProvider {
+                enricher: self.clone(),
+                key,
+            }));
+        }
         if let Some(token) = tvdb_token.clone() {
             set.add(Box::new(TvdbProvider {
                 enricher: self.clone(),
@@ -885,6 +896,13 @@ impl Enricher {
         }));
         let providers = Arc::new(set);
 
+        // HUB-5a: every pass runs, and an absent provider is silent. Which
+        // providers exist is the operator's choice, not a fault: no
+        // TMDB key means no TMDB, the same way no TVDB key means no
+        // TVDB, and `run_chain` simply skips what the set does not
+        // hold. `local` is asked before every chain (HUB-9), so a pass
+        // with no network searcher still reads the owner's .nfo files.
+        //
         // Anime chain first (HUB-29): sequential — its providers pace
         // themselves against AniDB/AniList.
         if let Err(e) = self.enrich_anime(registry, &providers, anime_items).await {
@@ -982,14 +1000,19 @@ impl Enricher {
         );
         tracing::info!(matched = m, weak = w, missed = x, "enrichment run complete");
         registry.emit(serde_json::json!({ "kind": "enrich", "running": false }));
-        if let Err(e) = self
-            .enrich_episodes(registry, &key, tvdb_token.as_ref())
-            .await
-        {
-            tracing::warn!(error = format!("{e:#}"), "episode enrichment failed");
-        }
-        if let Err(e) = self.backfill_details(registry, &key).await {
-            tracing::warn!(error = format!("{e:#}"), "tmdb details backfill failed");
+        // Both are TMDB's own passes: no key, nothing for them to do.
+        // Skipped, not fatal — the chains above may have enriched
+        // plenty without one (HUB-5a).
+        if let Some(key) = tmdb_for_details.as_deref() {
+            if let Err(e) = self
+                .enrich_episodes(registry, key, tvdb_token.as_ref())
+                .await
+            {
+                tracing::warn!(error = format!("{e:#}"), "episode enrichment failed");
+            }
+            if let Err(e) = self.backfill_details(registry, key).await {
+                tracing::warn!(error = format!("{e:#}"), "tmdb details backfill failed");
+            }
         }
         if let Err(e) = self.enrich_music(registry, &providers).await {
             tracing::warn!(error = format!("{e:#}"), "music enrichment failed");

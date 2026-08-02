@@ -1735,3 +1735,70 @@ fn a_provider_that_cannot_answer_is_not_owed() {
     reversed.add(Box::new(DecliningProvider("tmdb")));
     assert_eq!(reversed.searchers_in(chain), vec!["tmdb", "tvdb"]);
 }
+
+// ---------- one type's credentials do not gate another's ----------
+
+/// HUB-5a. Providers are added only when configured, and the chains
+/// share nothing — so a set holding one type's provider must not look
+/// able to serve another's. The run used to bail on a missing TMDB key
+/// before any pass ran, which told a music-only library that a
+/// provider `chain_for("music")` does not contain was missing.
+#[test]
+fn the_chains_share_no_providers() {
+    use kahawai_hub::providers::{ProviderSet, chain_for};
+
+    let mut music_only = ProviderSet::default();
+    music_only.add(Box::new(DecliningProvider("musicbrainz")));
+    assert_eq!(
+        music_only.searchers_in(chain_for("music")),
+        vec!["musicbrainz"]
+    );
+    assert!(
+        music_only.searchers_in(chain_for("movies")).is_empty(),
+        "musicbrainz is in no other chain"
+    );
+
+    // The converse, or the fix has only moved which type is privileged.
+    let mut tmdb_only = ProviderSet::default();
+    tmdb_only.add(Box::new(DecliningProvider("tmdb")));
+    assert!(tmdb_only.searchers_in(chain_for("music")).is_empty());
+    assert_eq!(
+        tmdb_only.searchers_in(chain_for("anime")),
+        vec!["tmdb"],
+        "tmdb is the anime chain's fallback, not its lead"
+    );
+}
+
+/// HUB-5a end to end: a run with NO TMDB key configured must complete,
+/// not bail. `run_inner` used to refuse at the top, so a library whose
+/// chains need no TMDB — music is musicbrainz alone — enriched nothing
+/// and was told a provider it never asked for was missing.
+///
+/// Drives `run_once` rather than `serves` so it fails if the gate
+/// creeps back in anywhere between the two.
+#[tokio::test]
+async fn a_run_without_a_tmdb_key_still_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    let registry = std::sync::Arc::new(kahawai_hub::registry::Registry::new(
+        db.clone(),
+        Default::default(),
+    ));
+    // Deliberately no tmdb_api_key setting at all.
+    item(&db, "i1").await;
+
+    let enricher =
+        std::sync::Arc::new(kahawai_hub::enrich::Enricher::new(dir.path().to_path_buf()));
+    enricher
+        .run_once(&registry)
+        .await
+        .expect("a missing TMDB key must not fail the run");
+
+    // And it did not invent an answer for a provider it never had.
+    let tmdb_rows: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM provider_metadata WHERE provider = 'tmdb'")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    assert_eq!(tmdb_rows, 0, "no TMDB provider ran, so no TMDB rows");
+}
