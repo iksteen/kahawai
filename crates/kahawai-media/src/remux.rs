@@ -1824,6 +1824,12 @@ pub(crate) fn tonemap_segment(encoder: &str) -> Vec<gst::Element> {
     ]
 }
 
+/// How long the picture waits for its subtitles before giving up and
+/// encoding without them. Generous: the pads are usually milliseconds
+/// apart, and the only thing on the other side of this timeout is a
+/// session that never starts.
+const ASS_GATE_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// HUB-32a: the two halves of an ASS burn meet here.
 ///
 /// `assrender` needs the picture on `video_sink` and the styled events
@@ -1838,6 +1844,15 @@ pub(crate) struct AssBurnLink {
     /// encode chain exists.
     text: Option<(gst::Pipeline, gst::Pad)>,
     source: Option<AssSource>,
+    /// A block probe holding the PICTURE until the subtitles are
+    /// attached. Without it the encode simply outruns them: measured
+    /// live on a dispatched session, the video chain was built 88 ms
+    /// before the demuxer exposed its subtitle pad, and `assrender`
+    /// logged "rendering disabled, doing buffer passthrough" for every
+    /// frame in between — a clean picture with no subtitles in it,
+    /// which nothing downstream can detect. `wait-text` does not cover
+    /// this: it waits only once a text stream is LINKED.
+    gate: Option<(gst::Pad, gst::PadProbeId)>,
 }
 
 /// Where the events come from. The two cases are genuinely different
@@ -1873,15 +1888,52 @@ impl AssBurnLink {
             // prevent and which nothing downstream can detect.
             Err(e) => tracing::error!(error = %e, "ASS burn: subtitle → assrender link failed"),
         }
+        self.open_gate();
     }
 
-    pub(crate) fn offer_text_sink(link: &Mutex<Self>, pipe: &gst::Pipeline, pad: gst::Pad) {
+    /// Let the picture through. Called once the subtitles are attached
+    /// — or by the watchdog, which would rather ship a subtitle-less
+    /// encode (loudly) than a session that never starts.
+    fn open_gate(&mut self) {
+        if let Some((pad, id)) = self.gate.take() {
+            pad.remove_probe(id);
+        }
+    }
+
+    /// Hold the video branch closed until [`couple`] succeeds. Installed
+    /// on the encode chain's own sink pad, before decodebin is linked to
+    /// it, so no frame can reach `assrender` un-subtitled.
+    fn shut_gate(link: &Arc<Mutex<Self>>, pad: &gst::Pad) {
+        let Some(id) = pad.add_probe(gst::PadProbeType::BLOCK_DOWNSTREAM, |_, _| {
+            gst::PadProbeReturn::Ok
+        }) else {
+            return;
+        };
+        link.lock().unwrap().gate = Some((pad.clone(), id));
+        // Never deadlock on a subtitle pad that does not come: a source
+        // whose ASS track vanished between planning and demuxing would
+        // otherwise wedge the session at zero segments forever.
+        let link = link.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(ASS_GATE_WAIT);
+            let mut l = link.lock().unwrap();
+            if l.gate.is_some() {
+                tracing::error!(
+                    "ASS burn: no subtitle stream after {:?} — encoding WITHOUT subtitles",
+                    ASS_GATE_WAIT
+                );
+                l.open_gate();
+            }
+        });
+    }
+
+    pub(crate) fn offer_text_sink(link: &Arc<Mutex<Self>>, pipe: &gst::Pipeline, pad: gst::Pad) {
         let mut l = link.lock().unwrap();
         l.text = Some((pipe.clone(), pad));
         l.couple();
     }
 
-    pub(crate) fn offer_source(link: &Mutex<Self>, source: AssSource) {
+    pub(crate) fn offer_source(link: &Arc<Mutex<Self>>, source: AssSource) {
         let mut l = link.lock().unwrap();
         l.source = Some(source);
         l.couple();
@@ -2145,12 +2197,13 @@ fn build_video_encode_chain(
     if ass_burn.is_some() && ass_el.is_empty() {
         tracing::error!("ASS burn requested but assrender is missing — encoding without subtitles");
     }
+    let burn_wanted = burn.is_some();
     let burn_el: Vec<gst::Element> = burn
         .filter(|t| !t.is_empty())
         .and_then(crate::burnin::blend_element)
         .into_iter()
         .collect();
-    if burn_el.is_empty() {
+    if burn_wanted && burn_el.is_empty() {
         tracing::warn!("burn-in requested but no overlay/timeline — encoding without subtitles");
     }
 
@@ -2167,6 +2220,15 @@ fn build_video_encode_chain(
     chain.push(&parse);
     pipe.add(&decode).unwrap();
     pipe.add_many(chain.iter().copied()).unwrap();
+    // Shut the gate BEFORE anything can flow OR couple: an ASS burn
+    // that lets frames past un-subtitled produces exactly the silent,
+    // undetectable failure this tier exists to prevent, and the
+    // coupling further down is what opens it again.
+    if let Some(link) = &ass_burn
+        && !ass_el.is_empty()
+    {
+        AssBurnLink::shut_gate(link, &chain[0].static_pad("sink").unwrap());
+    }
     if !link_and_start(&chain, Some(&decode)) {
         return;
     }
