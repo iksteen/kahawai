@@ -1731,9 +1731,16 @@ struct SubtitleCaps {
 
 async fn item_subtitles(
     State(state): State<AppState>,
+    axum::Extension(claims): axum::Extension<crate::auth::Claims>,
     Path(id): Path<String>,
     Query(caps): Query<SubtitleCaps>,
 ) -> Result<Json<Value>, ApiError> {
+    let ass_burn = crate::tracks::AssBurn::for_user(
+        state.registry.db(),
+        &claims.sub,
+        state.registry.any_transcoder_ass_burn() || kahawai_media::remux::ass_burn_available(),
+    )
+    .await;
     let subs = state
         .subtitles
         .list(
@@ -1741,6 +1748,7 @@ async fn item_subtitles(
             &id,
             caps.ass_render.unwrap_or(true),
             caps.graphics_overlay.unwrap_or(true),
+            ass_burn,
         )
         .await
         .map_err(internal)?;

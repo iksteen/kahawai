@@ -40,6 +40,9 @@ pub struct TrackListing {
     pub track: crate::tracks::Track,
     pub delivery: crate::tracks::Delivery,
     pub note: &'static str,
+    /// HUB-32a: the picker may offer "burn in" for this track even when
+    /// `delivery` says something cheaper — see `tracks::burnable`.
+    pub burnable: bool,
 }
 
 /// A served ASS script: complete (cache/sidecar) or streamed while the
@@ -146,6 +149,7 @@ impl Subtitles {
         item_id: &str,
         ass_render: bool,
         graphics_overlay: bool,
+        ass_burn: crate::tracks::AssBurn,
     ) -> Result<Vec<TrackListing>> {
         let (module_id, collection_id, path_rel, _info) = source_row(registry, item_id).await?;
         let tracks = crate::tracks::for_item_source(
@@ -162,12 +166,19 @@ impl Subtitles {
         Ok(tracks
             .into_iter()
             .map(|t| {
-                let (delivery, note) =
-                    crate::tracks::delivery(&t, ass_render, graphics_overlay, burn_capable);
+                let (delivery, note) = crate::tracks::delivery(
+                    &t,
+                    ass_render,
+                    graphics_overlay,
+                    burn_capable,
+                    ass_burn,
+                );
+                let burnable = crate::tracks::burnable(&t, burn_capable, ass_burn.capable);
                 TrackListing {
                     track: t,
                     delivery,
                     note,
+                    burnable,
                 }
             })
             .collect())

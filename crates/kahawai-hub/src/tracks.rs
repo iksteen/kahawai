@@ -83,14 +83,60 @@ pub fn is_image_format(format: &str) -> bool {
     matches!(format, "pgs" | "vobsub" | "dvdsub")
 }
 
+/// What the server can do about ASS, and what the user asked it to do.
+/// See `negotiate::AssBurn` — the same pair, on the listing side.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AssBurn {
+    pub capable: bool,
+    pub preferred: bool,
+}
+
+impl AssBurn {
+    /// The pair, resolved for one user against one fleet. `capable` is
+    /// fleet-wide rather than about the box a probe happened to pick:
+    /// the tier is decided before placement, and placement then hard-
+    /// filters on it (or the session refuses — never a quiet flatten).
+    pub async fn for_user(db: &sqlx::SqlitePool, user_id: &str, capable: bool) -> Self {
+        // HUB-32a: no server default and no config key. Unset means
+        // flatten, which is what every client got before this existed.
+        let preferred = sqlx::query_scalar::<_, String>(
+            "SELECT value FROM user_prefs
+              WHERE user_id = ? AND scope = '' AND key = 'ass_fallback'",
+        )
+        .bind(user_id)
+        .fetch_optional(db)
+        .await
+        .ok()
+        .flatten()
+        .is_some_and(|v| v == "burn");
+        Self { capable, preferred }
+    }
+}
+
+/// Can this track be burned at all, whatever today's delivery is? The
+/// picker offers "burn in" as an override ALONGSIDE the natural
+/// delivery — the web client declares `ass_render: true`
+/// unconditionally, so without this an ASS track would only ever read
+/// as client-rendered and the burn could never be asked for.
+pub fn burnable(track: &Track, burn_capable: bool, ass_burn_capable: bool) -> bool {
+    if is_image_format(&track.format) {
+        // Overlay/burn both need the pipeline; a hub-stored image track
+        // has no stream to read.
+        return burn_capable && track.origin != "downloaded" && track.origin != "ocr";
+    }
+    matches!(track.format.as_str(), "ass" | "ssa") && ass_burn_capable
+}
+
 /// The delivery matrix. `burn_capable` is the hub-side fact from
 /// HUB-32b (the display-set timeline is readable where the encode
-/// runs); `ass_render`/`graphics_overlay` come from the client profile.
+/// runs); `ass_render`/`graphics_overlay` come from the client profile;
+/// `ass_burn` is HUB-32a's pair of a fleet fact and a user preference.
 pub fn delivery(
     track: &Track,
     ass_render: bool,
     graphics_overlay: bool,
     burn_capable: bool,
+    ass_burn: AssBurn,
 ) -> (Delivery, &'static str) {
     if is_image_format(&track.format) {
         // Overlay needs the session tap, which only embedded streams
@@ -107,7 +153,20 @@ pub fn delivery(
         );
     }
     match track.format.as_str() {
+        // Client-native always wins the DEFAULT. A user who wants the
+        // burn anyway picks it from the list — that is an override, not
+        // a preference, and `burnable` is what offers it.
         "ass" | "ssa" if ass_render => (Delivery::Ass, ""),
+        "ass" | "ssa" if ass_burn.preferred && ass_burn.capable => {
+            (Delivery::Burn, "burned in — restarts with a video encode")
+        }
+        // Never a silent flatten: the preference said burn and nothing
+        // can, so the reason travels with the track (HUB-32a). The
+        // session itself refuses rather than flattening quietly.
+        "ass" | "ssa" if ass_burn.preferred => (
+            Delivery::Text,
+            "flattened to VTT — no box in the fleet can burn ASS",
+        ),
         "ass" | "ssa" => (Delivery::Text, "flattened to VTT"),
         _ => (Delivery::Text, ""),
     }
@@ -321,4 +380,76 @@ pub async fn backfill_derived_from(db: &sqlx::SqlitePool) -> Result<()> {
         tracing::info!(fixed, "OCR track lineage backfilled from legacy labels");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn track(format: &str, origin: &str) -> Track {
+        Track {
+            id: 1,
+            item_id: "i".into(),
+            origin: origin.into(),
+            module_id: Some("m".into()),
+            collection_id: Some("c".into()),
+            path_rel: Some("f.mkv".into()),
+            stream_index: Some(0),
+            format: format.into(),
+            language: None,
+            label: None,
+            machine: false,
+            derived_from: None,
+        }
+    }
+
+    /// HUB-32a's ladder, as a table: client-native beats everything,
+    /// the preference decides flatten vs burn, and a preference nothing
+    /// can honour says so rather than flattening in silence.
+    #[test]
+    fn the_ass_ladder_reads_client_native_then_the_preference() {
+        let t = track("ass", "embedded");
+        let off = AssBurn::default();
+        let capable = AssBurn {
+            capable: true,
+            preferred: false,
+        };
+        let wants = AssBurn {
+            capable: true,
+            preferred: true,
+        };
+        let wants_but_cannot = AssBurn {
+            capable: false,
+            preferred: true,
+        };
+
+        assert_eq!(delivery(&t, true, true, true, wants).0, Delivery::Ass);
+        assert_eq!(delivery(&t, false, true, true, off).0, Delivery::Text);
+        assert_eq!(delivery(&t, false, true, true, capable).0, Delivery::Text);
+        assert_eq!(delivery(&t, false, true, true, wants).0, Delivery::Burn);
+
+        let (d, note) = delivery(&t, false, true, true, wants_but_cannot);
+        assert_eq!(d, Delivery::Text);
+        assert!(note.contains("no box"), "silent flatten: {note}");
+
+        // Burnable is independent of delivery: the picker offers the
+        // burn ALONGSIDE client-side rendering, which is the only way a
+        // web client (ass_render: true, always) can ever ask for it.
+        assert!(burnable(&t, true, true));
+        assert!(!burnable(&t, true, false), "no box, nothing to offer");
+        assert_eq!(
+            delivery(&t, true, true, true, wants).0,
+            Delivery::Ass,
+            "an offer is not a default"
+        );
+
+        // A downloaded .ass IS burnable: the hub holds the bytes and
+        // hands them over as a file, the same route a user's sidecar
+        // takes. An IMAGE track has no such route — burning one needs
+        // the display-set walk, which needs a stream.
+        assert!(burnable(&track("ass", "downloaded"), true, true));
+        assert!(!burnable(&track("pgs", "ocr"), true, true));
+        assert!(burnable(&track("pgs", "embedded"), true, false));
+        assert!(!burnable(&track("srt", "sidecar"), true, true));
+    }
 }

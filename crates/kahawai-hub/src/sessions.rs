@@ -118,6 +118,11 @@ pub struct Session {
     /// track-switch re-plans keep forcing the burn it asked for, and a
     /// new pick replaces it.
     burn_pick: Mutex<Option<kahawai_media::negotiate::BurnPick>>,
+    /// HUB-32a: this user's `ass_fallback` says burn rather than
+    /// flatten. Carried on the session because a seek re-negotiates,
+    /// and it must reach the same decision — against THIS executor's
+    /// capability, since a seek cannot move boxes.
+    ass_prefers_burn: bool,
     /// The HLS sink this session's content actually works on. Some
     /// files crash hlssink3 (TC-6); once the fallback saved a start or
     /// a seek, every later restart uses it directly instead of paying
@@ -1041,6 +1046,16 @@ impl Sessions {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
         };
+        // HUB-32a: burn ASS or flatten it? A fleet fact and this user's
+        // standing choice. Fleet-wide rather than per-box on purpose —
+        // the tier is decided before placement, which then hard-filters
+        // on it (registry::PlacementNeed::needs_ass_burn).
+        let ass_burn = crate::tracks::AssBurn::for_user(
+            registry.db(),
+            user_id,
+            registry.any_transcoder_ass_burn() || kahawai_media::remux::ass_burn_available(),
+        )
+        .await;
         // HUB-32c: which embedded image tracks already have an OCR text
         // track derived from them — those prefer text over burn in the
         // negotiation. Fetched once, keyed per source.
@@ -1064,8 +1079,15 @@ impl Sessions {
             }
             None => None,
         };
+        // Image tracks and ASS/SSA both burn (HUB-32b / HUB-32a) and
+        // both need a stream to burn FROM, so a hub-stored row (OCR,
+        // downloaded) is never a burn pick. Negotiation drops a pick
+        // whose tier cannot honour it.
         let burn_row = picked_row
-            .filter(|t| crate::tracks::is_image_format(&t.format))
+            .filter(|t| {
+                crate::tracks::is_image_format(&t.format)
+                    || matches!(t.format.as_str(), "ass" | "ssa")
+            })
             .filter(|t| t.module_id.is_some() && t.stream_index.is_some());
         let pick_for = |parts: &[PartSource]| -> Option<kahawai_media::negotiate::BurnPick> {
             let t = burn_row.as_ref()?;
@@ -1159,6 +1181,10 @@ impl Sessions {
                         })
                         .unwrap_or_default(),
                     pick_for(parts),
+                    kahawai_media::negotiate::AssBurn {
+                        capable: ass_burn.capable,
+                        preferred: ass_burn.preferred,
+                    },
                     &targets,
                 )
             };
@@ -1496,6 +1522,7 @@ impl Sessions {
             sub_verdicts: Mutex::new(sub_verdicts),
             burn_sets: Mutex::new(burn_sets.clone()),
             burn_pick: Mutex::new(burn_pick),
+            ass_prefers_burn: ass_burn.preferred,
             profile,
             sink: Mutex::new(chosen_sink),
             seek_lock: tokio::sync::Mutex::new(()),
@@ -2325,6 +2352,19 @@ impl Sessions {
                 // The session's explicit burn keeps forcing across
                 // track switches — its sets are already in hand.
                 *session.burn_pick.lock().unwrap(),
+                // A seek cannot move boxes (HUB-15b), so the question is
+                // whether THIS executor burns ASS — not whether the
+                // fleet does.
+                kahawai_media::negotiate::AssBurn {
+                    capable: match &session.mode {
+                        Mode::Transcode { transcoder } => {
+                            let tc = transcoder.lock().unwrap().clone();
+                            registry.transcoder_reports_ass_burn(&tc)
+                        }
+                        _ => kahawai_media::remux::ass_burn_available(),
+                    },
+                    preferred: session.ass_prefers_burn,
+                },
                 &targets,
             );
             plan = sp.plan;

@@ -1669,6 +1669,30 @@ impl Registry {
             .unwrap_or(false)
     }
 
+    pub fn transcoder_reports_ass_burn(&self, module_id: &str) -> bool {
+        self.transcoder_caps
+            .lock()
+            .unwrap()
+            .get(module_id)
+            .and_then(|c| c.get("ass_burn"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    }
+
+    /// HUB-32a: can ANY connected transcoder burn ASS? A fleet-wide
+    /// question, unlike `transcoder_reports_tonemap`, because the tier
+    /// is decided before placement and a burn is a HARD filter: knowing
+    /// some box can do it is what makes offering the tier honest, and
+    /// `place()` then has to land on one of those boxes or the session
+    /// refuses (there is no silent degradation for a burn).
+    pub fn any_transcoder_ass_burn(&self) -> bool {
+        self.transcoder_caps
+            .lock()
+            .unwrap()
+            .values()
+            .any(|c| c.get("ass_burn").and_then(|v| v.as_bool()).unwrap_or(false))
+    }
+
     pub fn clear_transcoder_caps(&self, module_id: &str) {
         self.transcoder_caps.lock().unwrap().remove(module_id);
     }

@@ -282,6 +282,13 @@ fn sweep_one(
         // the hub's caches.
         &[],
         None,
+        // Same reasoning as the burn-in walk: the sweep encodes where it
+        // reads, so it can burn ASS iff this box has assrender. No user
+        // to hold a preference, so it never burns passively.
+        kahawai_media::negotiate::AssBurn {
+            capable: kahawai_media::remux::ass_burn_available(),
+            preferred: false,
+        },
         // The sweep runs where it encodes: its own verified encoders
         // are the fleet.
         &kahawai_media::remux::encoder_capabilities()

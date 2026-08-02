@@ -39,6 +39,11 @@ pub struct SourcePlan {
     /// embedded index to walk — the caller fetches the sidecar's
     /// display sets and hands them to the pipeline.
     pub burn_sidecar: Option<usize>,
+    /// HUB-32a: a sidecar `.ass` to burn (index into
+    /// `external_subtitles`). Hub-internal for the same reason as
+    /// `burn_sidecar` — the worker is handed the FILE, not an index,
+    /// because it has no way to reach the media's neighbourhood.
+    pub burn_ass_sidecar: Option<usize>,
     pub cost: Cost,
     pub video_verdict: String,
     pub audio_verdict: String,
@@ -71,6 +76,21 @@ pub enum SubtitleTier {
     /// HUB-32b last resort: composited into the picture by the encoder.
     Burn,
     Unavailable,
+}
+
+/// HUB-32a: what the ASS fallback tier can and should do. The two only
+/// mean anything together — a preference no box can honour is a
+/// refusal, not a quiet flatten (owner decision), and a capable box
+/// with the preference unset still flattens.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct AssBurn {
+    /// The box that would run the encode reports `assrender` (TC-1).
+    /// `assrender` is absent on the mac mini and present on both Linux
+    /// boxes, so this is a real filter, not a formality.
+    pub capable: bool,
+    /// The user's `ass_fallback` preference says burn rather than
+    /// flatten. Per-user and global; there is no server default.
+    pub preferred: bool,
 }
 
 /// An explicit image track picked for burn-in (subtitle unification).
@@ -184,6 +204,20 @@ fn burn_wanted(
         })
 }
 
+/// Does this client need an ASS track burned in? (HUB-32a: it cannot
+/// render ASS, the user prefers burning to flattening, and a box can.)
+/// Like [`burn_wanted`] it is decided before the plan, because it
+/// vetoes direct play and copy alike.
+fn ass_burn_wanted(profile: &CapabilityProfile, info: &MediaInfo, ass_burn: AssBurn) -> bool {
+    ass_burn.capable
+        && ass_burn.preferred
+        && !profile.ass_render
+        && info
+            .subtitles
+            .iter()
+            .any(|s| matches!(s.format.as_str(), "ass" | "ssa"))
+}
+
 /// The whole decision, one source. `est_kbps` is the hub's aggregate
 /// size×8/duration estimate — the only bitrate available for
 /// pre-extension rows; used solely when a cap is set. `tonemap` is the
@@ -215,6 +249,11 @@ pub fn negotiate(
     // encode that carries them is forced. Still needs `burn_capable`;
     // picks that name a non-image track are ignored.
     burn_pick: Option<BurnPick>,
+    // HUB-32a: the ASS fallback tier's capability and preference. A
+    // `burn_pick` naming an ass/ssa track burns it regardless of
+    // `preferred` — an explicit pick is not a preference — but never
+    // without `capable`.
+    ass_burn: AssBurn,
     // HUB-15b: the verified encoder codec names of the box that would
     // run an encode ("h264"/"hevc"/"av1"/"aac"/"opus") — an executor
     // fact like `tonemap`, fetched from the speculatively placed
@@ -253,21 +292,30 @@ pub fn negotiate(
         .container
         .as_deref()
         .is_some_and(|c| profile.containers.iter().any(|p| p == c));
-    let forced_burn = burn_pick.filter(|p| {
-        burn_capable
-            && match p {
-                BurnPick::Embedded(i) => info
-                    .subtitles
-                    .get(*i)
-                    .is_some_and(|s| matches!(s.format.as_str(), "pgs" | "vobsub" | "dvdsub")),
-                BurnPick::Sidecar(i) => info
-                    .external_subtitles
-                    .get(*i)
-                    .is_some_and(|s| s.format == "vobsub"),
-            }
+    // A pick is honoured only by the tier that can actually carry it:
+    // image tracks need the display-set timeline (`burn_capable`), ASS
+    // needs a box with `assrender` (`ass_burn.capable`). The two live
+    // in different plan fields and different pipeline branches.
+    let picked = |p: &BurnPick| -> Option<&str> {
+        match p {
+            BurnPick::Embedded(i) => info.subtitles.get(*i).map(|s| s.format.as_str()),
+            BurnPick::Sidecar(i) => info.external_subtitles.get(*i).map(|s| s.format.as_str()),
+        }
+    };
+    let forced_burn = burn_pick.filter(|p| match picked(p) {
+        // A sidecar image burn only ever meant VobSub: a bare .sub has
+        // no index to walk.
+        Some("pgs" | "dvdsub") => burn_capable && matches!(p, BurnPick::Embedded(_)),
+        Some("vobsub") => burn_capable,
+        Some("ass" | "ssa") => ass_burn.capable,
+        _ => false,
     });
+    let forced_is_ass = forced_burn
+        .as_ref()
+        .and_then(picked)
+        .is_some_and(|f| matches!(f, "ass" | "ssa"));
     let forced_embedded = match forced_burn {
-        Some(BurnPick::Embedded(i)) => Some(i),
+        Some(BurnPick::Embedded(i)) if !forced_is_ass => Some(i),
         _ => None,
     };
     let direct = single_part
@@ -277,6 +325,7 @@ pub fn negotiate(
         && (v.is_some() || a.is_some())
         // Serving the file as-is cannot burn anything into it.
         && !burn_wanted(profile, info, burn_capable, ocr_text)
+        && !ass_burn_wanted(profile, info, ass_burn)
         && forced_burn.is_none();
 
     // HUB-32b last resort: an image subtitle a client cannot composite
@@ -299,6 +348,24 @@ pub fn negotiate(
             .flatten()
     });
 
+    // HUB-32a: the same last-resort shape one tier up. A client that
+    // cannot render ASS itself gets the flattened VTT by default and
+    // the burned picture when the user asked for it — never silently,
+    // and never without a box that can do it. An explicit pick wins
+    // over both, including over a client that CAN render ASS: the user
+    // asked for the typesetting in the picture.
+    let burn_ass_track = match forced_burn {
+        Some(BurnPick::Embedded(i)) if forced_is_ass => Some(i),
+        Some(BurnPick::Sidecar(_)) if forced_is_ass => None, // burns from the file
+        _ => ass_burn_wanted(profile, info, ass_burn)
+            .then(|| {
+                info.subtitles
+                    .iter()
+                    .position(|s| matches!(s.format.as_str(), "ass" | "ssa"))
+            })
+            .flatten(),
+    };
+
     // Remux/transcode arms, per CANDIDATE CONTAINER (HUB-15b).
     // An encode is only admissible when the client accepts its TARGET
     // (the capability-mask honesty rule, HUB-14) AND the executor
@@ -309,7 +376,7 @@ pub fn negotiate(
     // before is byte-identical, and fMP4 appears only where it is
     // strictly cheaper (av1/vp9 copies) or the only playable path
     // (no-h264 clients on hevc/av1-encoding fleets).
-    let burn_active = burn_subtitle.is_some() || forced_burn.is_some();
+    let burn_active = burn_subtitle.is_some() || forced_burn.is_some() || burn_ass_track.is_some();
     let candidate =
         |format: SegmentFormat| -> (StreamMode, VideoTarget, StreamMode, AudioTarget, (u8, Cost)) {
             let (v_ladder, a_ladder): (&[VideoTarget], &[AudioTarget]) = match format {
@@ -426,8 +493,9 @@ pub fn negotiate(
         // back to the ceiling itself.
         // Only claim the burn when the encode that carries it exists.
         burn_subtitle: burn_subtitle.filter(|_| video == StreamMode::Encode),
-        // HUB-32a: set by the caller once the ASS tier is decided.
-        burn_ass: None,
+        // Same honesty rule as burn_subtitle: only claim the burn when
+        // the encode that carries it exists.
+        burn_ass: burn_ass_track.filter(|_| video == StreamMode::Encode),
         max_channels: (audio == StreamMode::Encode && profile.max_audio_channels > 0).then(|| {
             a.map(|s| s.channels)
                 .filter(|c| *c > 0)
@@ -530,7 +598,17 @@ pub fn negotiate(
         .enumerate()
         .map(|(index, s)| {
             let (tier, note) = match s.format.as_str() {
+                "ass" | "ssa" if plan.burn_ass == Some(index) => {
+                    (SubtitleTier::Burn, "burned in (forces the video encode)")
+                }
                 "ass" | "ssa" if profile.ass_render => (SubtitleTier::Text, ""),
+                "ass" | "ssa" if burn_ass_track.is_some() => {
+                    (SubtitleTier::Unavailable, "only one track can be burned in")
+                }
+                "ass" | "ssa" if ass_burn.preferred && !ass_burn.capable => (
+                    SubtitleTier::Convert,
+                    "flattened to VTT — no box in the fleet can burn ASS",
+                ),
                 "ass" | "ssa" => (SubtitleTier::Convert, "flattened to VTT"),
                 // A planned burn outranks the passive readings: an
                 // explicit pick burns even for overlay-capable clients.
@@ -571,7 +649,11 @@ pub fn negotiate(
         direct,
         plan,
         burn_sidecar: match forced_burn {
-            Some(BurnPick::Sidecar(i)) if video == StreamMode::Encode => Some(i),
+            Some(BurnPick::Sidecar(i)) if !forced_is_ass && video == StreamMode::Encode => Some(i),
+            _ => None,
+        },
+        burn_ass_sidecar: match forced_burn {
+            Some(BurnPick::Sidecar(i)) if forced_is_ass && video == StreamMode::Encode => Some(i),
             _ => None,
         },
         cost,
@@ -612,6 +694,39 @@ mod tests {
         }
     }
     /// Full-fleet targets: what the dev box actually verifies.
+    /// Every pre-HUB-32a case reads the same with the ASS tier off, so
+    /// they keep their argument lists and this shadows the real one.
+    /// The ASS cases below call `super::negotiate` and pass it.
+    #[allow(clippy::too_many_arguments)]
+    fn negotiate(
+        profile: &CapabilityProfile,
+        info: &MediaInfo,
+        audio_track: usize,
+        video_track: usize,
+        single_part: bool,
+        est_kbps: Option<u32>,
+        tonemap: bool,
+        burn_capable: bool,
+        ocr_text: &[bool],
+        burn_pick: Option<BurnPick>,
+        targets: &[String],
+    ) -> SourcePlan {
+        super::negotiate(
+            profile,
+            info,
+            audio_track,
+            video_track,
+            single_part,
+            est_kbps,
+            tonemap,
+            burn_capable,
+            ocr_text,
+            burn_pick,
+            AssBurn::default(),
+            targets,
+        )
+    }
+
     fn fleet() -> Vec<String> {
         ["h264", "hevc", "av1", "aac", "opus"]
             .iter()
@@ -1112,6 +1227,151 @@ mod tests {
             &fleet(),
         );
         assert_eq!(sp.plan.max_channels, None);
+    }
+
+    /// HUB-32a: the ASS fallback ladder — client-native, then the
+    /// user's choice between flattening and burning, and never a silent
+    /// flatten when the choice was burn.
+    #[test]
+    fn ass_burns_only_when_wanted_and_possible() {
+        let mut p = chrome();
+        let mut info = media("matroska", Some(vs("h264")), Some(au("aac", 2)));
+        info.subtitles = vec![SubtitleStream {
+            format: "ass".into(),
+            language: Some("en".into()),
+        }];
+        let go = |p: &CapabilityProfile, ass: AssBurn, pick: Option<BurnPick>| {
+            super::negotiate(
+                p,
+                &info,
+                0,
+                0,
+                true,
+                None,
+                false,
+                true,
+                &[],
+                pick,
+                ass,
+                &fleet(),
+            )
+        };
+        let capable = AssBurn {
+            capable: true,
+            preferred: false,
+        };
+        let wants_burn = AssBurn {
+            capable: true,
+            preferred: true,
+        };
+
+        // A client that renders ASS itself always wins: nothing to do,
+        // no encode, whatever the preference says.
+        p.ass_render = true;
+        let sp = go(&p, wants_burn, None);
+        assert_eq!(sp.plan.burn_ass, None);
+        assert_eq!(sp.subtitles[0].tier, SubtitleTier::Text);
+        assert_eq!(sp.cost, Cost::Copy, "{}", sp.video_verdict);
+
+        // ...but an explicit pick beats even that. The user asked for
+        // the typesetting in the picture.
+        let sp = go(&p, capable, Some(BurnPick::Embedded(0)));
+        assert_eq!(sp.plan.burn_ass, Some(0));
+        assert_eq!(sp.subtitles[0].tier, SubtitleTier::Burn);
+
+        // No client-side ASS and no preference: flatten, no video work.
+        p.ass_render = false;
+        let sp = go(&p, capable, None);
+        assert_eq!(sp.plan.burn_ass, None);
+        assert_eq!(sp.subtitles[0].tier, SubtitleTier::Convert);
+        assert_eq!(sp.cost, Cost::Copy);
+
+        // Preference set and a box that can: burn, and that forces the
+        // encode carrying it — a copy cannot have anything burned in.
+        let sp = go(&p, wants_burn, None);
+        assert_eq!(sp.plan.burn_ass, Some(0));
+        assert_eq!(sp.cost, Cost::VideoEncode, "{}", sp.video_verdict);
+        assert_eq!(sp.subtitles[0].tier, SubtitleTier::Burn);
+        let mut mp4 = info.clone();
+        mp4.container = Some("mp4".into());
+        let with_mp4 = super::negotiate(
+            &p,
+            &mp4,
+            0,
+            0,
+            true,
+            None,
+            false,
+            true,
+            &[],
+            None,
+            wants_burn,
+            &fleet(),
+        );
+        assert!(!with_mp4.direct, "cannot burn into a file served as-is");
+
+        // Preference set and NO box that can. Flattening happens, but
+        // the verdict says why — the hub refuses this case outright
+        // before it gets here (the 422), and a silent flatten is the
+        // one thing the policy forbids.
+        let sp = go(
+            &p,
+            AssBurn {
+                capable: false,
+                preferred: true,
+            },
+            None,
+        );
+        assert_eq!(sp.plan.burn_ass, None);
+        assert_eq!(sp.cost, Cost::Copy);
+        assert!(
+            sp.subtitles[0].note.contains("no box"),
+            "silent flatten: {:?}",
+            sp.subtitles[0]
+        );
+
+        // A pick that names an ASS track is never mistaken for an image
+        // burn: different plan field, different pipeline branch.
+        let sp = go(&p, wants_burn, Some(BurnPick::Embedded(0)));
+        assert_eq!(sp.plan.burn_subtitle, None);
+        assert_eq!(sp.plan.burn_ass, Some(0));
+    }
+
+    /// A user's own `.ass` beside the media burns from the FILE, so the
+    /// plan carries no index — the hub hands the bytes over, exactly as
+    /// it does for a VobSub sidecar's display sets.
+    #[test]
+    fn a_sidecar_ass_pick_burns_from_the_file() {
+        let mut p = chrome();
+        p.ass_render = false;
+        let mut info = media("matroska", Some(vs("h264")), Some(au("aac", 2)));
+        info.external_subtitles = vec![kahawai_core::media::SidecarSubtitle {
+            format: "ass".into(),
+            language: Some("en".into()),
+            path_rel: "film.en.ass".into(),
+            track: None,
+        }];
+        let sp = super::negotiate(
+            &p,
+            &info,
+            0,
+            0,
+            true,
+            None,
+            false,
+            true,
+            &[],
+            Some(BurnPick::Sidecar(0)),
+            AssBurn {
+                capable: true,
+                preferred: false,
+            },
+            &fleet(),
+        );
+        assert_eq!(sp.burn_ass_sidecar, Some(0));
+        assert_eq!(sp.burn_sidecar, None, "not an image burn");
+        assert_eq!(sp.plan.burn_ass, None, "no embedded index to burn");
+        assert_eq!(sp.cost, Cost::VideoEncode, "{}", sp.video_verdict);
     }
 
     /// HUB-32b: a client that cannot composite gets image subtitles
