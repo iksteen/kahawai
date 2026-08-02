@@ -25,6 +25,15 @@ struct MbReleaseGroup {
     genres: Vec<String>,
 }
 
+/// TheTVDB credentials as configured. Carried where a token used to
+/// be: holding the token meant deciding at run start whether TVDB
+/// exists, which is a question only a request can answer.
+#[derive(Clone)]
+pub(crate) struct TvdbCreds {
+    key: String,
+    pin: Option<String>,
+}
+
 pub struct Enricher {
     /// Every provider call goes out through this: pacing and
     /// rate-limit backoff live in `gate.rs`, not at the call sites.
@@ -40,6 +49,14 @@ pub struct Enricher {
     /// in one evening; sessions are cheap to hold and expensive to
     /// re-establish.
     anidb: tokio::sync::Mutex<Option<crate::anidb::Anidb>>,
+    /// TheTVDB's bearer token, fetched on FIRST USE and kept for the
+    /// process (it is valid for weeks). Lazy so that a login failure
+    /// cannot remove TVDB from a whole run: TMDB is present whenever
+    /// its key is set and fails per request, and TVDB behaving
+    /// differently made a transient outage indistinguishable from "no
+    /// TVDB configured" — including to the selection, which then
+    /// stopped counting TVDB work as owed.
+    tvdb: tokio::sync::Mutex<Option<std::sync::Arc<String>>>,
     /// The byte plane, for HUB-9: reading a .nfo means leasing it from the
     /// mediahost that holds it. Attached at startup; absent in tests, where
     /// the local provider then simply is not in the chain.
@@ -397,6 +414,7 @@ impl Enricher {
             last_nudge: std::sync::atomic::AtomicU64::new(0),
             progress: Default::default(),
             anidb: Default::default(),
+            tvdb: Default::default(),
             sessions: Default::default(),
         }
     }
@@ -455,6 +473,26 @@ impl Enricher {
             .await
             .context("tmdb json")?
             .results)
+    }
+
+    /// The cached bearer token, logging in on first use. Concurrent
+    /// callers queue on the mutex, so a fleet of episode tasks starting
+    /// together still costs one login.
+    pub(crate) async fn tvdb_token(&self, creds: &TvdbCreds) -> Result<std::sync::Arc<String>> {
+        let mut slot = self.tvdb.lock().await;
+        if let Some(t) = slot.clone() {
+            return Ok(t);
+        }
+        let token = std::sync::Arc::new(self.tvdb_login(&creds.key, creds.pin.as_deref()).await?);
+        *slot = Some(token.clone());
+        Ok(token)
+    }
+
+    /// Drop the cached token so the next use logs in again. A token
+    /// lasts weeks, so the usual reason a request fails on auth is that
+    /// this one finally expired — and the process outlives that.
+    async fn tvdb_forget(&self) {
+        *self.tvdb.lock().await = None;
     }
 
     /// TheTVDB v4: login yields a bearer token (valid for weeks; we
@@ -807,18 +845,20 @@ impl Enricher {
         // skip themselves when there is no key.
         let tmdb_for_details = tmdb_key.clone();
         // TVDB is the backup resolver: only consulted when the TMDB
-        // ladder comes up empty, same strict verifier.
-        let tvdb_token = match registry.get_setting(TVDB_KEY_SETTING).await? {
-            Some(tk) => {
-                let pin = registry.get_setting(TVDB_PIN_SETTING).await?;
-                match self.tvdb_login(&tk, pin.as_deref()).await {
-                    Ok(tok) => Some(std::sync::Arc::new(tok)),
-                    Err(e) => {
-                        tracing::warn!(error = format!("{e:#}"), "TVDB login failed; skipping");
-                        None
-                    }
+        // ladder comes up empty, same strict verifier. Configured is
+        // all that is asked here — the login happens on first use, so a
+        // TVDB outage costs the requests it breaks, not the run.
+        let tvdb_creds = registry
+            .get_setting(TVDB_KEY_SETTING)
+            .await?
+            .map(|key| async move {
+                TvdbCreds {
+                    key,
+                    pin: registry.get_setting(TVDB_PIN_SETTING).await.ok().flatten(),
                 }
-            }
+            });
+        let tvdb_creds = match tvdb_creds {
+            Some(f) => Some(f.await),
             None => None,
         };
         for c in [&self.progress.0, &self.progress.1, &self.progress.2] {
@@ -840,10 +880,10 @@ impl Enricher {
                 key,
             }));
         }
-        if let Some(token) = tvdb_token.clone() {
+        if let Some(creds) = tvdb_creds.clone() {
             set.add(Box::new(TvdbProvider {
                 enricher: self.clone(),
-                token,
+                creds,
             }));
         }
         // Recover any bridge ids that went missing before deciding what
@@ -1005,7 +1045,7 @@ impl Enricher {
         // plenty without one (HUB-5a).
         if let Some(key) = tmdb_for_details.as_deref() {
             if let Err(e) = self
-                .enrich_episodes(registry, key, tvdb_token.as_ref())
+                .enrich_episodes(registry, key, tvdb_creds.as_ref())
                 .await
             {
                 tracing::warn!(error = format!("{e:#}"), "episode enrichment failed");
@@ -2434,7 +2474,7 @@ impl Enricher {
         self: &Arc<Self>,
         registry: &Registry,
         tmdb_key: &str,
-        tvdb_token: Option<&std::sync::Arc<String>>,
+        tvdb: Option<&TvdbCreds>,
     ) -> Result<()> {
         // Fetch for shows with metadata-less episodes, plus absolute-
         // numbered shows whose episodes lack the HUB-31 season
@@ -2513,22 +2553,14 @@ impl Enricher {
             for (provider, pid) in sources {
                 let this = self.clone();
                 let key = tmdb_key.to_string();
-                let token = tvdb_token.cloned();
+                let tvdb = tvdb.cloned();
                 let db = registry.db().clone();
                 let sem = sem.clone();
                 let show = show_id.clone();
                 tasks.spawn(async move {
                     let _permit = sem.acquire().await;
                     if let Err(e) = this
-                        .enrich_show_episodes(
-                            &db,
-                            &show,
-                            &provider,
-                            &pid,
-                            &key,
-                            token.as_deref(),
-                            aid,
-                        )
+                        .enrich_show_episodes(&db, &show, &provider, &pid, &key, tvdb.as_ref(), aid)
                         .await
                     {
                         tracing::warn!(show = %show, provider = %provider,
@@ -2550,7 +2582,7 @@ impl Enricher {
         provider: &str,
         pid: &str,
         tmdb_key: &str,
-        tvdb_token: Option<&String>,
+        tvdb: Option<&TvdbCreds>,
         anidb_id: Option<u32>,
     ) -> Result<()> {
         // Our episode items: (item_id, season, episode). season NULL =
@@ -2577,16 +2609,18 @@ impl Enricher {
         let (mut fetch_ok, mut fetch_failed) = (0u32, 0u32);
         match (provider, absolute) {
             ("tvdb", false) => {
-                let token = tvdb_token.context("tvdb-matched show but no tvdb token")?;
-                for e in self.tvdb_episodes_english(token, pid, "default").await? {
+                let creds = tvdb.context("tvdb-matched show but no tvdb key configured")?;
+                let token = self.tvdb_token(creds).await?;
+                for e in self.tvdb_episodes_english(&token, pid, "default").await? {
                     if let (Some(s), n) = (e.season, e.episode) {
                         by_key.insert((Some(s), n), e);
                     }
                 }
             }
             ("tvdb", true) => {
-                let token = tvdb_token.context("tvdb-matched show but no tvdb token")?;
-                let eps_abs = self.tvdb_episodes_english(token, pid, "absolute").await?;
+                let creds = tvdb.context("tvdb-matched show but no tvdb key configured")?;
+                let token = self.tvdb_token(creds).await?;
+                let eps_abs = self.tvdb_episodes_english(&token, pid, "absolute").await?;
                 for (i, e) in eps_abs.into_iter().enumerate() {
                     let n = e.absolute.unwrap_or(i as i64 + 1);
                     by_key.insert((None, n), e);
@@ -2595,7 +2629,7 @@ impl Enricher {
                 // curates it (usual for anime) — that join IS the
                 // season projection.
                 for e in self
-                    .tvdb_episodes(token, pid, "default", None)
+                    .tvdb_episodes(&token, pid, "default", None)
                     .await
                     .unwrap_or_default()
                 {
@@ -2835,9 +2869,14 @@ impl Enricher {
                 Err(e) => tracing::warn!(error = format!("{e:#}"), "review tmdb search failed"),
             }
         }
-        if let Some(tk) = registry.get_setting(TVDB_KEY_SETTING).await? {
-            let pin = registry.get_setting(TVDB_PIN_SETTING).await?;
-            if let Ok(token) = self.tvdb_login(&tk, pin.as_deref()).await {
+        if let Some(key) = registry.get_setting(TVDB_KEY_SETTING).await? {
+            let creds = TvdbCreds {
+                key,
+                pin: registry.get_setting(TVDB_PIN_SETTING).await?,
+            };
+            // Same cache as the enrichment run: a reviewer trying five
+            // titles in a row used to log in five times.
+            if let Ok(token) = self.tvdb_token(&creds).await {
                 match self.tvdb_search(&token, kind, query).await {
                     Ok(cands) => out.extend(cands.iter().map(|c| {
                         let mut v = serde_json::to_value(c).unwrap();
@@ -3347,7 +3386,18 @@ impl crate::providers::Provider for TmdbProvider {
 
 struct TvdbProvider {
     enricher: Arc<Enricher>,
-    token: std::sync::Arc<String>,
+    /// Credentials, not a token: see `Enricher::tvdb_token`. Present
+    /// whenever a key is configured, exactly like TMDB.
+    creds: TvdbCreds,
+}
+
+impl TvdbProvider {
+    /// The token for one request, dropping the cache when the request
+    /// that used it failed — a failure the chain then reschedules, so
+    /// the retry logs in fresh.
+    async fn token(&self) -> Result<std::sync::Arc<String>> {
+        self.enricher.tvdb_token(&self.creds).await
+    }
 }
 
 #[async_trait::async_trait]
@@ -3385,9 +3435,10 @@ impl crate::providers::Provider for TvdbProvider {
             if !crate::providers::question_pending(db, &item.id, "tvdb", "mapped_id", &q).await {
                 return Ok(crate::providers::Outcome::NotApplicable);
             }
+            let token = self.token().await?;
             let c = match self
                 .enricher
-                .tvdb_details(&self.token, &item.kind, tvdb_id)
+                .tvdb_details(&token, &item.kind, tvdb_id)
                 .await
             {
                 Ok(c) => c,
@@ -3395,7 +3446,12 @@ impl crate::providers::Provider for TvdbProvider {
                     crate::providers::record_question(db, &item.id, "tvdb", "mapped_id", &q).await;
                     return Ok(crate::providers::Outcome::Declined);
                 }
-                Err(e) => return Err(e),
+                // Not a 404, so the token is a suspect: drop it and let
+                // the chain reschedule. The retry logs in fresh.
+                Err(e) => {
+                    self.enricher.tvdb_forget().await;
+                    return Err(e);
+                }
             };
             crate::providers::record_question(db, &item.id, "tvdb", "mapped_id", &q).await;
             let pick = (c, "auto");
@@ -3408,10 +3464,18 @@ impl crate::providers::Provider for TvdbProvider {
         if !crate::providers::question_pending(db, &item.id, "tvdb", "title", &anchor).await {
             return Ok(crate::providers::Outcome::Declined);
         }
-        let cands = self
+        let token = self.token().await?;
+        let cands = match self
             .enricher
-            .tvdb_search(&self.token, &item.kind, &item.title)
-            .await?;
+            .tvdb_search(&token, &item.kind, &item.title)
+            .await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                self.enricher.tvdb_forget().await;
+                return Err(e);
+            }
+        };
         crate::providers::record_question(db, &item.id, "tvdb", "title", &anchor).await;
         match pick_candidate(&cands, &item.title, item.year) {
             Some((c, conf)) => {
