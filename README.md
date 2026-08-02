@@ -89,6 +89,8 @@ hostnames = ["localhost"]        # names/IPs baked into the hub's certificate SA
                                  # add the LAN address remote satellites will dial
 satellite_cert_days = 90
 enrollment_ttl_minutes = 15
+max_sessions_per_user = 4        # concurrent playback sessions ONE account may hold;
+                                 # raise for a shared or kiosk account (restart to apply)
 
 [mediahost]
 hub = "localhost:8421"

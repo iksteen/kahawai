@@ -45,6 +45,16 @@ pub struct Auth {
     setup_token: Mutex<Option<String>>,
     /// OPS-2 login throttle (in-memory; resets on restart).
     pub throttle: Throttle,
+    /// Users deleted while their access token was still valid, and when
+    /// that token can last have been issued.
+    ///
+    /// Access tokens are stateless JWTs and `require_auth` never reads
+    /// the database, so without this a deleted account keeps working
+    /// until its token expires. Entries are swept once past the TTL, so
+    /// the map is bounded by deletions-per-15-minutes. Per process by
+    /// design: a restart clears it, and any token it would have refused
+    /// has expired by then.
+    deleted: Mutex<std::collections::HashMap<String, std::time::Instant>>,
 }
 
 /// OPS-2: consecutive-failure lockout with exponential backoff, keyed
@@ -196,6 +206,7 @@ impl Auth {
             dec: DecodingKey::from_secret(&secret),
             setup_token: Mutex::new(setup_token),
             throttle: Throttle::default(),
+            deleted: Mutex::new(Default::default()),
         })
     }
 
@@ -240,6 +251,71 @@ impl Auth {
         *self.setup_token.lock().unwrap() = None;
         tracing::info!(username, "initial admin created; setup complete");
         self.issue_tokens(&id, username.trim(), true).await
+    }
+
+    /// True while `user_id` is a deleted account whose access token
+    /// could still verify. Sweeps expired entries as it goes.
+    pub fn is_deleted(&self, user_id: &str) -> bool {
+        let mut map = self.deleted.lock().unwrap();
+        let ttl = std::time::Duration::from_secs(ACCESS_TTL_SECS as u64);
+        map.retain(|_, at| at.elapsed() < ttl);
+        map.contains_key(user_id)
+    }
+
+    /// Remove a user and everything that is theirs alone.
+    ///
+    /// Refuses the last remaining admin: `setup_required` is decided
+    /// once, at `Auth::new`, so an emptied hub does not fall back into
+    /// setup mode until it restarts — deleting the last admin would
+    /// lock the operator out of their own hub with no way back in.
+    ///
+    /// Not removed: subtitles this user downloaded. Those belong to the
+    /// item and stay available to everyone, which is the same call
+    /// `created_by` records rather than owns.
+    pub async fn delete_user(&self, id: &str) -> Result<String> {
+        let (username, is_admin): (String, bool) =
+            sqlx::query_as("SELECT username, is_admin FROM users WHERE id = ?")
+                .bind(id)
+                .fetch_optional(&self.db)
+                .await?
+                .with_context(|| format!("no such user: {id}"))?;
+        if is_admin {
+            let admins: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE is_admin = 1")
+                .fetch_one(&self.db)
+                .await?;
+            anyhow::ensure!(admins > 1, "refusing to delete the last admin");
+        }
+
+        let mut tx = self.db.begin().await?;
+        // Order matters. refresh_tokens references users with no ON
+        // DELETE CASCADE and foreign keys are on, so it goes first or
+        // the user row cannot be removed at all.
+        sqlx::query("DELETE FROM refresh_tokens WHERE user_id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        // watch_state_archive has no foreign key, so these rows would
+        // outlive the user — and the HUB-20 restore path copies them
+        // back into watch_state, whose key WOULD then fail and roll
+        // back a whole scan. Purged rather than kept: the archive is
+        // keyed by a ULID that no recreated account will ever have.
+        sqlx::query("DELETE FROM watch_state_archive WHERE user_id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        // watch_state and user_prefs cascade from here.
+        sqlx::query("DELETE FROM users WHERE id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+
+        self.deleted
+            .lock()
+            .unwrap()
+            .insert(id.to_string(), std::time::Instant::now());
+        tracing::info!(username, %id, "user deleted");
+        Ok(username)
     }
 
     /// Admin user creation (HUB-26 first cut).

@@ -167,8 +167,9 @@ How something works and why it was built that way belong in
 
 ## Hub — users, API, playback
 
-- [ ] HUB-10 Multi-user *(accounts, admin flag, per-user watch state live;
-      per-library access grants and parental controls missing)*
+- [ ] HUB-10 Multi-user *(accounts with create AND delete, admin flag,
+      per-user watch state live; per-library access grants and parental
+      controls missing)*
 - [x] HUB-11 Versioned HTTP/JSON API + /api/v1/events SSE channel
       (invalidation hints: scan progress, satellite connectivity,
       sessions, enrichment; cookie-authenticated for EventSource)
@@ -361,11 +362,13 @@ How something works and why it was built that way belong in
 
 ## Non-functional (NFR)
 
-- [ ] NFR-1 Performance. Browse meets the 200 ms target at 50k items on
+- [x] NFR-1 Performance. Browse meets the 200 ms target at 50k items on
       every path — first page, last page, search and item detail — and
       holds it at 250k (`tests/scale_bench.rs`, worst run asserted).
-      Remaining: start-latency (direct <= 2 s, transcode <= 6 s) and 100
-      concurrent direct-play sessions are unmeasured.
+      Start latency and 100-session concurrency measured against the
+      live fleet by `scripts/kahawai-latency.sh` (worst of N, every run
+      printed), across a local file, a 12 GB 4K-class DTS title and an
+      HDR10 one.
 - [ ] NFR-2 Scale targets. 250k files across 10 collections hold on
       every browse path, deep pages and adversarial search included.
       Remaining: 5 concurrent transcoders untested — 3 are live.

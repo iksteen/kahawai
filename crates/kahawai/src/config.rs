@@ -90,6 +90,11 @@ pub struct HubConfig {
     pub hostnames: Vec<String>,
     pub satellite_cert_days: u32,
     pub enrollment_ttl_minutes: u64,
+    /// Concurrent playback sessions ONE account may hold. Four covers a
+    /// household's devices; raise it for a shared or kiosk account. The
+    /// hub's own capacity is far higher — this is an per-account guard,
+    /// not a capacity limit (NFR-1).
+    pub max_sessions_per_user: usize,
     /// OPS-8: peers allowed to speak for clients via X-Forwarded-For.
     /// Exact IPs ("192.168.0.5") or CIDR ranges ("172.16.0.0/12" for a
     /// docker/traefik bridge). Empty = headers ignored.
@@ -137,6 +142,7 @@ impl Default for HubConfig {
             hostnames: vec!["localhost".into()],
             satellite_cert_days: 90,
             enrollment_ttl_minutes: 15,
+            max_sessions_per_user: 4,
             trusted_proxies: Vec::new(),
             cors_origins: Vec::new(),
             // Off by default: scraping is opt-in.

@@ -683,3 +683,168 @@ async fn expired_refresh_tokens_prune_at_open() {
     .unwrap();
     assert_eq!(left, ["live"], "expired pruned, live kept");
 }
+
+/// HUB-10: deleting an account removes what is theirs, refuses the two
+/// deletions that would lock the operator out, and takes effect at once
+/// rather than whenever their access token happens to expire.
+#[tokio::test]
+async fn admin_deletes_users() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    let registry = Arc::new(Registry::new(db.clone(), Default::default()));
+    let auth = Arc::new(Auth::new(db.clone(), dir.path()).await.unwrap());
+    let setup_token = auth.setup_token().unwrap();
+    let api = test_router(
+        registry,
+        auth.clone(),
+        Arc::new(kahawai_hub::sessions::Sessions::new(
+            tempfile::tempdir().unwrap().keep(),
+        )),
+    );
+    let resp = api
+        .clone()
+        .oneshot(post(
+            "/api/v1/setup",
+            serde_json::json!({"token": setup_token, "username": "root", "password": "hunter22222"}),
+        ))
+        .await
+        .unwrap();
+    let setup = body_json(resp).await;
+    let admin_token = setup["access_token"].as_str().unwrap().to_string();
+    let admin_id: String = sqlx::query_scalar("SELECT id FROM users WHERE username = 'root'")
+        .fetch_one(&db)
+        .await
+        .unwrap();
+
+    let victim = auth.create_user("bob", "hunter22222", false).await.unwrap();
+    // Everything a user owns: a live token, watch state, a preference,
+    // and an archived row that has no foreign key to hold it down.
+    let bob = auth.login("bob", "hunter22222").await.unwrap().access_token;
+    sqlx::query("INSERT INTO items (id, kind, title, norm_title) VALUES ('i1','movie','M','m')")
+        .execute(&db)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO watch_state (user_id, item_id, position_ms) VALUES (?, 'i1', 5)")
+        .bind(&victim)
+        .execute(&db)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO user_prefs (user_id, scope, key, value) VALUES (?, 's', 'k', 'v')")
+        .bind(&victim)
+        .execute(&db)
+        .await
+        .unwrap();
+    // Keyed to content identity (MH-5), not to an item.
+    sqlx::query(
+        "INSERT INTO watch_state_archive
+           (user_id, size, head_xxh3, tail_xxh3, position_ms, played, play_count)
+         VALUES (?, 1, 2, 3, 5, 0, 0)",
+    )
+    .bind(&victim)
+    .execute(&db)
+    .await
+    .unwrap();
+
+    let del = |token: String, id: String| {
+        let api = api.clone();
+        async move {
+            api.oneshot(
+                Request::delete(format!("/admin/v1/users/{id}"))
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        }
+    };
+
+    // A user cannot delete anyone — the admin router refuses first.
+    assert_eq!(
+        del(bob.clone(), admin_id.clone()).await.status(),
+        StatusCode::FORBIDDEN
+    );
+    // Nor may an admin delete themselves: it would revoke the token
+    // mid-request, and for the only admin there is no way back.
+    assert_eq!(
+        del(admin_token.clone(), admin_id.clone()).await.status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        del(admin_token.clone(), "nobody".into()).await.status(),
+        StatusCode::NOT_FOUND
+    );
+
+    assert_eq!(
+        del(admin_token.clone(), victim.clone()).await.status(),
+        StatusCode::OK
+    );
+
+    // Everything of bob's is gone. refresh_tokens has no ON DELETE
+    // CASCADE and watch_state_archive has no foreign key at all, so
+    // both are deleted by hand — and the archive especially, since the
+    // satellite-restore path copies those rows back into watch_state
+    // and would fail on the key it no longer matches.
+    let count = |sql: &'static str| {
+        let db = db.clone();
+        let victim = victim.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>(sql)
+                .bind(&victim)
+                .fetch_one(&db)
+                .await
+                .unwrap()
+        }
+    };
+    assert_eq!(count("SELECT COUNT(*) FROM users WHERE id = ?").await, 0);
+    assert_eq!(
+        count("SELECT COUNT(*) FROM refresh_tokens WHERE user_id = ?").await,
+        0
+    );
+    assert_eq!(
+        count("SELECT COUNT(*) FROM watch_state WHERE user_id = ?").await,
+        0
+    );
+    assert_eq!(
+        count("SELECT COUNT(*) FROM user_prefs WHERE user_id = ?").await,
+        0
+    );
+    assert_eq!(
+        count("SELECT COUNT(*) FROM watch_state_archive WHERE user_id = ?").await,
+        0,
+        "archived rows outlived the user and would break a later restore"
+    );
+
+    // The token bob is holding verifies fine — right signature, not yet
+    // expired. It must stop working anyway.
+    let resp = api
+        .clone()
+        .oneshot(
+            Request::get("/api/v1/items")
+                .header("authorization", format!("Bearer {bob}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "a deleted user's live access token still worked"
+    );
+
+    // And the last admin is refused, so a hub cannot be orphaned: an
+    // emptied one does not fall back into setup mode until it restarts.
+    let second = auth
+        .create_user("root2", "hunter22222", true)
+        .await
+        .unwrap();
+    assert_eq!(
+        del(admin_token.clone(), second).await.status(),
+        StatusCode::OK
+    );
+    assert!(
+        auth.delete_user(&admin_id).await.is_err(),
+        "the last admin was deletable"
+    );
+}

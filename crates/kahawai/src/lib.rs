@@ -520,11 +520,15 @@ async fn run_hub_inner(
     spawn_local_benchmark(cfg.data_dir.join("benchmarks.json"), registry.clone());
     let auth = Arc::new(kahawai_hub::auth::Auth::new(db.clone(), &cfg.data_dir).await?);
     let sessions = Arc::new(
-        kahawai_hub::sessions::Sessions::new(cfg.data_dir.join("sessions"))
-            // Pipelines run in a supervised child of this same binary
-            // (hidden `remux-worker` subcommand): a GStreamer crash kills
-            // one session, never the hub (§1.1).
-            .with_worker_exe(std::env::current_exe().ok()),
+        kahawai_hub::sessions::Sessions::with_limits(
+            cfg.data_dir.join("sessions"),
+            cfg.max_sessions_per_user,
+            std::time::Duration::from_secs(90),
+        )
+        // Pipelines run in a supervised child of this same binary
+        // (hidden `remux-worker` subcommand): a GStreamer crash kills
+        // one session, never the hub (§1.1).
+        .with_worker_exe(std::env::current_exe().ok()),
     );
     sessions.spawn_janitor();
     sessions.attach_registry(registry.clone());

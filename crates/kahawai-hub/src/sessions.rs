@@ -399,6 +399,22 @@ pub struct Sessions {
     /// None → pipelines run in-process (tests only).
     worker_exe: Option<PathBuf>,
     active: Mutex<HashMap<String, Arc<Session>>>,
+    /// Session ids admitted but not yet in `active`, keyed to their
+    /// user. The per-user cap counts the UNION of this and `active`.
+    ///
+    /// Without it the cap was unenforceable: it counted `active`, let
+    /// the lock go, and the session only landed there ~500 lines and 16
+    /// awaits later, so concurrent starts all read the same stale count
+    /// (measured: 20 admitted against a cap of 4). A guard that holds
+    /// only for requests arriving one at a time is not a guard.
+    ///
+    /// A placeholder in `active` would not do: `Mode` has no variant
+    /// for "not started yet", and a fake one would inflate the metrics
+    /// gauge, show as a phantom row in the admin list, be reaped by the
+    /// janitor, and stall the subtitle drain loop. Same shape as
+    /// `known_sessions`, which already tracks ids `active` cannot
+    /// answer for.
+    reserved: Mutex<HashMap<String, String>>,
     /// Source leases for dispatched sessions (the transcoder pulls bytes
     /// over its link; lives from dispatch to session end).
     /// Hub-held source leases of dispatched sessions: (lease, size,
@@ -619,6 +635,40 @@ impl Sessions {
         self.scratch_root.parent()
     }
 
+    /// Take a slot for `user_id` under `id`, or refuse. The count is
+    /// the union of `reserved` and `active`, taken in ONE critical
+    /// section — which is the whole point: the previous check counted
+    /// `active` alone and released the lock long before the session
+    /// landed there.
+    ///
+    /// Lock order is `reserved` then `active`, and nothing else takes
+    /// both, so this cannot deadlock. Counting the union also makes the
+    /// window between the insert into `active` and [`Self::release`]
+    /// harmless: a session in both is still one session.
+    fn admit(&self, id: &str, user_id: &str) -> Result<()> {
+        let mut reserved = self.reserved.lock().unwrap();
+        let held = reserved.values().filter(|u| *u == user_id).count()
+            + self
+                .active
+                .lock()
+                .unwrap()
+                .values()
+                .filter(|s| s.user_id == user_id && !reserved.contains_key(&s.id))
+                .count();
+        if held >= self.max_per_user {
+            bail!("too many concurrent streams ({held}); close one first");
+        }
+        reserved.insert(id.to_string(), user_id.to_string());
+        Ok(())
+    }
+
+    /// Give the slot back. Called once `start` knows the outcome —
+    /// either the session is in `active` and counts itself, or it never
+    /// started and must not count at all.
+    fn release(&self, id: &str) {
+        self.reserved.lock().unwrap().remove(id);
+    }
+
     pub fn with_limits(scratch_root: PathBuf, max_per_user: usize, idle_timeout: Duration) -> Self {
         // Sessions never survive a restart; stale scratch is garbage.
         let _ = std::fs::remove_dir_all(&scratch_root);
@@ -630,6 +680,7 @@ impl Sessions {
             idle_timeout,
             worker_exe: None,
             active: Mutex::new(HashMap::new()),
+            reserved: Mutex::new(HashMap::new()),
             tc_leases: Mutex::new(HashMap::new()),
             pending_ready: Mutex::new(HashMap::new()),
             pending_logs: Mutex::new(HashMap::new()),
@@ -924,6 +975,10 @@ impl Sessions {
     ) -> Result<Arc<Session>> {
         let id = ulid::Ulid::generate().to_string();
         self.note_session(&id, item_id);
+        // The one admission point. Here rather than inside `start_inner`
+        // because that function has thirteen early returns, every one of
+        // which would otherwise have to remember to give the slot back.
+        self.admit(&id, user_id)?;
         let started = self
             .start_inner(
                 &id,
@@ -939,6 +994,7 @@ impl Sessions {
                 subtitle_track,
             )
             .await;
+        self.release(&id);
         if let Err(e) = &started
             && let Some(data_dir) = self.scratch_root.parent()
         {
@@ -969,16 +1025,6 @@ impl Sessions {
         subtitle_track: Option<i64>,
     ) -> Result<Arc<Session>> {
         let id = id.to_string();
-        let user_active = self
-            .active
-            .lock()
-            .unwrap()
-            .values()
-            .filter(|s| s.user_id == user_id)
-            .count();
-        if user_active >= self.max_per_user {
-            bail!("too many concurrent streams ({user_active}); close one first");
-        }
         // ONE path: every session negotiates. The user's standing
         // bandwidth cap tightens whatever the client asked for (HUB-15).
         let mut profile = profile.unwrap_or_default();
@@ -2477,6 +2523,25 @@ impl Sessions {
     }
 
     /// End every session backed by a given mediahost (satellite deletion).
+    /// End every session belonging to one user — what deleting an
+    /// account has to do before the account is gone, or the sessions
+    /// outlive it with no owner to stop them.
+    pub fn end_for_user(&self, user_id: &str) -> usize {
+        let ids: Vec<String> = self
+            .active
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|s| s.user_id == user_id)
+            .map(|s| s.id.clone())
+            .collect();
+        let n = ids.len();
+        for id in ids {
+            self.end(&id);
+        }
+        n
+    }
+
     pub fn end_for_module(&self, module_id: &str) -> usize {
         let ids: Vec<String> = self
             .active
@@ -2572,7 +2637,56 @@ impl Sessions {
 
 #[cfg(test)]
 mod tests {
-    use super::{PartSource, fold_facts, part_index};
+    use super::{PartSource, Sessions, fold_facts, part_index};
+
+    /// The per-user cap has to hold when starts ARRIVE TOGETHER, which
+    /// is the only time it matters. It used to count `active`, drop the
+    /// lock, and let the session land there some five hundred lines and
+    /// sixteen awaits later — so concurrent callers all read the same
+    /// stale count. Measured against the live hub before this fix: 20
+    /// concurrent starts admitted against a cap of 4.
+    ///
+    /// Admission is tested directly rather than through `start`, which
+    /// would need a registry, a mediahost and a real file to reach the
+    /// same decision.
+    #[test]
+    fn the_per_user_cap_holds_when_starts_arrive_together() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = std::sync::Arc::new(Sessions::with_limits(
+            dir.path().join("sessions"),
+            4,
+            std::time::Duration::from_secs(90),
+        ));
+
+        // Which ids won is a race; the test must not assume.
+        let admitted: std::sync::Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(20));
+        let mut threads = Vec::new();
+        for i in 0..20 {
+            let (sessions, admitted, barrier) =
+                (sessions.clone(), admitted.clone(), barrier.clone());
+            threads.push(std::thread::spawn(move || {
+                let id = format!("s{i}");
+                barrier.wait(); // all twenty push on the door at once
+                if sessions.admit(&id, "u1").is_ok() {
+                    admitted.lock().unwrap().push(id);
+                }
+            }));
+        }
+        for t in threads {
+            t.join().unwrap();
+        }
+        let admitted = admitted.lock().unwrap().clone();
+        assert_eq!(admitted.len(), 4, "the cap admitted more than it allows");
+
+        // Another user is unaffected: the cap is per user, not global.
+        assert!(sessions.admit("other", "u2").is_ok());
+
+        // Releasing frees exactly one slot, and no more.
+        sessions.release(&admitted[0]);
+        assert!(sessions.admit("again", "u1").is_ok());
+        assert!(sessions.admit("once-more", "u1").is_err());
+    }
 
     /// Facts amend the verdict by kind, exactly once — a seek-restart
     /// re-learns the same fold and must not stutter it — and unknown

@@ -138,6 +138,10 @@ pub fn router(
         )
         .route("/admin/v1/collections", get(admin_collections))
         .route("/admin/v1/users", post(admin_create_user))
+        .route(
+            "/admin/v1/users/{id}",
+            axum::routing::delete(admin_delete_user),
+        )
         .route("/admin/v1/providers", get(admin_providers))
         .route(
             "/admin/v1/providers/chains/{media_type}",
@@ -338,6 +342,13 @@ async fn require_auth(
             StatusCode::UNAUTHORIZED,
             "invalid or missing token".to_string(),
         ))?;
+    // A deleted account's token still VERIFIES — the signature is
+    // valid and the expiry has not passed. Refusing it here is what
+    // makes deletion take effect now rather than up to 15 minutes from
+    // now; the check is an in-memory lookup, not a query.
+    if state.auth.is_deleted(&claims.sub) {
+        return Err((StatusCode::UNAUTHORIZED, "account deleted".into()));
+    }
     req.extensions_mut().insert(claims);
     Ok(next.run(req).await)
 }
@@ -943,6 +954,40 @@ async fn admin_create_user(
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     Ok(Json(
         json!({ "id": id, "username": body.username, "admin": body.admin }),
+    ))
+}
+
+/// HUB-10: remove an account. Sessions first — a stream outliving its
+/// owner has nobody left to stop it — then the rows.
+///
+/// What survives on purpose: subtitles this user downloaded. They are
+/// attached to the item, not to the person who fetched them.
+async fn admin_delete_user(
+    State(state): State<AppState>,
+    axum::Extension(claims): axum::Extension<crate::auth::Claims>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    // Deleting yourself would revoke your own token mid-request and,
+    // for the only admin, leave nobody who can undo it.
+    if id == claims.sub {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "cannot delete the account you are signed in as".into(),
+        ));
+    }
+    let sessions_ended = state.sessions.end_for_user(&id);
+    let username = state.auth.delete_user(&id).await.map_err(|e| {
+        let msg = format!("{e:#}");
+        // "no such user" is a 404; refusing the last admin is a 403.
+        let code = if msg.contains("no such user") {
+            StatusCode::NOT_FOUND
+        } else {
+            StatusCode::FORBIDDEN
+        };
+        (code, msg)
+    })?;
+    Ok(Json(
+        json!({ "deleted": id, "username": username, "sessions_ended": sessions_ended }),
     ))
 }
 
