@@ -1292,7 +1292,7 @@ pub fn tonemap_available() -> bool {
             .build()
             .unwrap();
         let sink = gst::ElementFactory::make("fakesink").build().unwrap();
-        let seg = tonemap_segment();
+        let seg = tonemap_segment("");
         pipe.add(&src).unwrap();
         pipe.add_many(&seg).unwrap();
         pipe.add(&sink).unwrap();
@@ -1538,7 +1538,61 @@ fn open_on_keyframe(pad: &gst::Pad) {
 /// system memory, then capssetter rewrites the colorimetry tag to
 /// bt709 so the encoder's VUI tells the player the truth (the shader
 /// changed the pixels; nothing else knows to change the label).
-pub(crate) fn tonemap_segment() -> Vec<gst::Element> {
+/// The one output format to pin for `encoder`: the first of
+/// [`TONEMAP_OUT_FORMATS`] its sink pad actually accepts.
+///
+/// A LIST is not a preference order. Offering `{NV12, I420}` to
+/// `vah264enc` — which takes NV12 and not I420 — resolves to I420 and
+/// the pipeline dies with not-negotiated. Measured on the J5005:
+///
+/// ```text
+///   {NV12,I420}   not-negotiated
+///   NV12          OK
+///   I420          FAILED
+/// ```
+///
+/// So the pin has to name the format the DOWNSTREAM ENCODER takes,
+/// which means knowing which encoder that is. Falls back to the whole
+/// list when the element cannot be probed — no worse than before, and
+/// the only case where a list is honest.
+pub(crate) fn tonemap_out_caps(encoder: &str) -> gst::Caps {
+    let accepted: Vec<&str> = gst::ElementFactory::find(encoder)
+        .map(|f| {
+            let sinks: Vec<gst::Caps> = f
+                .static_pad_templates()
+                .into_iter()
+                .filter(|t| t.direction() == gst::PadDirection::Sink)
+                .map(|t| t.caps())
+                .collect();
+            TONEMAP_OUT_FORMATS
+                .iter()
+                .copied()
+                .filter(|fmt| {
+                    // Feature-agnostic: hardware templates publish under
+                    // memory:VAMemory/GLMemory/CUDAMemory, and it is the
+                    // FORMAT agreement being tested, not the memory space.
+                    let mut want = gst::Caps::builder("video/x-raw")
+                        .field("format", *fmt)
+                        .build();
+                    want.get_mut()
+                        .unwrap()
+                        .set_features(0, Some(gst::CapsFeatures::new_any()));
+                    sinks.iter().any(|c| !c.intersect(&want).is_empty())
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let formats = if accepted.is_empty() {
+        TONEMAP_OUT_FORMATS.to_vec()
+    } else {
+        accepted
+    };
+    gst::Caps::builder("video/x-raw")
+        .field("format", gst::List::new(formats))
+        .build()
+}
+
+pub(crate) fn tonemap_segment(encoder: &str) -> Vec<gst::Element> {
     let upload = gst::ElementFactory::make("glupload").build().unwrap();
     let to_rgba = gst::ElementFactory::make("glcolorconvert").build().unwrap();
     let rgba = gst::ElementFactory::make("capsfilter")
@@ -1574,12 +1628,7 @@ pub(crate) fn tonemap_segment() -> Vec<gst::Element> {
     // first so hardware still negotiates it; I420 is what makes the
     // software path exist at all.
     let nv12 = gst::ElementFactory::make("capsfilter")
-        .property(
-            "caps",
-            gst::Caps::builder("video/x-raw")
-                .field("format", gst::List::new(TONEMAP_OUT_FORMATS))
-                .build(),
-        )
+        .property("caps", tonemap_out_caps(encoder))
         .build()
         .unwrap();
     let relabel = gst::ElementFactory::make("capssetter")
@@ -1731,7 +1780,7 @@ fn build_video_encode_chain(
     // across the transfer curve; and the shader is per-pixel GPU work,
     // its cost does not care).
     let tonemap: Vec<gst::Element> = if tone_map && tonemap_available() {
-        tonemap_segment()
+        tonemap_segment(encoder.unwrap_or_default())
     } else {
         if tone_map {
             tracing::warn!("tone-map requested but GL segment unavailable — encoding as-is");
@@ -3349,16 +3398,6 @@ mod concat_spike {
     #[test]
     fn tonemap_output_suits_every_encoder_we_place() {
         crate::init().unwrap();
-        // Feature-agnostic: hardware sink templates are published under
-        // memory:CUDAMemory/GLMemory/VAMemory, and it is the FORMAT
-        // agreement being checked here, not the memory space.
-        let mut want = gst::Caps::builder("video/x-raw")
-            .field("format", gst::List::new(TONEMAP_OUT_FORMATS))
-            .build();
-        want.get_mut()
-            .unwrap()
-            .set_features(0, Some(gst::CapsFeatures::new_any()));
-
         let mut checked = 0;
         for name in [
             "openh264enc",
@@ -3384,11 +3423,43 @@ mod concat_spike {
             if sink.is_empty() {
                 continue;
             }
+            // What the segment WILL pin for this encoder — not merely
+            // whether the two sets overlap. A list is not a preference
+            // order: offering {NV12, I420} to an encoder that takes only
+            // NV12 resolved to I420 and died with not-negotiated on the
+            // J5005, which is how HDR transcoding broke there for a day
+            // while every "does it overlap" check stayed green.
+            let mut pinned = tonemap_out_caps(name);
+            pinned
+                .get_mut()
+                .unwrap()
+                .set_features(0, Some(gst::CapsFeatures::new_any()));
             assert!(
-                sink.iter().any(|c| !c.intersect(&want).is_empty()),
-                "{name} accepts none of {TONEMAP_OUT_FORMATS:?}; the tone-map \
-                 segment could not link to it. Its sink caps: {sink:?}"
+                sink.iter().any(|c| !c.intersect(&pinned).is_empty()),
+                "{name} accepts none of what the tone-map segment would pin \
+                 ({pinned:?}). Its sink caps: {sink:?}"
             );
+            // And every format in the pin must suit it, since the one
+            // negotiation picks is not ours to choose.
+            let Some(list) = pinned
+                .structure(0)
+                .and_then(|st| st.get::<gst::List>("format").ok())
+            else {
+                panic!("{name}: pinned caps carry no format list");
+            };
+            for fmt in list.iter() {
+                let fmt = fmt.get::<String>().unwrap();
+                let mut one = gst::Caps::builder("video/x-raw")
+                    .field("format", &fmt)
+                    .build();
+                one.get_mut()
+                    .unwrap()
+                    .set_features(0, Some(gst::CapsFeatures::new_any()));
+                assert!(
+                    sink.iter().any(|c| !c.intersect(&one).is_empty()),
+                    "{name} would be offered {fmt}, which it does not accept"
+                );
+            }
             checked += 1;
         }
         assert!(checked > 0, "no encoders on this box to check against");

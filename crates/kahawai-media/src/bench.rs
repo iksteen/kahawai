@@ -460,7 +460,7 @@ fn measure_tonemap(w: i32, h: i32) -> Option<f32> {
         return None;
     }
     let mut chain = vec![make("videoconvert")?];
-    chain.extend(crate::remux::tonemap_segment());
+    chain.extend(crate::remux::tonemap_segment(""));
     // The GL segment genuinely wants 10-bit in: that upload/download
     // round trip IS the cost being measured (HUB-15a).
     run_counting(&chain, w, h, "I420_10LE")
