@@ -207,6 +207,36 @@ impl Subtitles {
         Ok(to_vtt(&ex.cues, shift_ms))
     }
 
+    /// HUB-32a: the script for a SIDECAR ASS track that is about to be
+    /// burned. One small read through the same ladder every other
+    /// subtitle takes, returning the file's own text — which is what
+    /// `assrender` is fed through an appsrc. Embedded tracks never come
+    /// this way: they burn from the demuxer's pad, the only path
+    /// carrying the release's attached fonts.
+    ///
+    /// `None` rather than an error: a burn that cannot be materialised
+    /// is a tier that has to be withdrawn, not a session that dies.
+    pub async fn ass_for_burn(
+        &self,
+        registry: &Registry,
+        sessions: &Sessions,
+        item_id: &str,
+        key: &str,
+    ) -> Option<String> {
+        match self.load(registry, sessions, item_id, key).await {
+            Ok(ex) => ex.ass,
+            Err(e) => {
+                tracing::warn!(
+                    item = item_id,
+                    key,
+                    error = format!("{e:#}"),
+                    "ASS burn: sidecar script unreadable"
+                );
+                None
+            }
+        }
+    }
+
     /// The faithful ASS script for an ASS/SSA subtitle (HUB-32) — the
     /// original sidecar bytes, or the reconstructed embedded track.
     /// Times are absolute file times; ASS renderers offset via the

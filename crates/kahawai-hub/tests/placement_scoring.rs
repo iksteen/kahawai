@@ -180,3 +180,40 @@ async fn a_thin_link_caps_a_fast_encoder() {
     );
     assert!(got < SUSTAINS);
 }
+
+/// HUB-32a: an ASS burn is a HARD placement filter, not a preference.
+/// Unlike tone-map — where a box that cannot do it still runs the job
+/// and the verdict says so — dropping a burn would hand back a picture
+/// with no subtitles in it and nothing downstream could tell.
+/// `assrender` is genuinely absent on the mac mini, so this is a real
+/// constraint rather than a formality.
+#[tokio::test]
+async fn an_ass_burn_only_lands_on_a_box_that_can_burn() {
+    let (_d, reg) = registry().await;
+    let class = "1080|hevc|h264";
+    let mut burner = caps(false, 2.0, 0.0);
+    burner.ass_burn = true;
+    // The faster box cannot burn ASS. Without the filter it wins on
+    // every other axis and the subtitles vanish.
+    connect(&reg, "fast-no-ass", caps(true, 9.0, 0.0));
+    connect(&reg, "slow-with-ass", burner);
+
+    let mut n = need(class);
+    assert_eq!(
+        reg.place(&n).target.as_deref(),
+        Some("fast-no-ass"),
+        "without the need, speed wins"
+    );
+
+    n.needs_ass_burn = true;
+    assert_eq!(reg.place(&n).target.as_deref(), Some("slow-with-ass"));
+    assert!(reg.any_transcoder_ass_burn());
+
+    // With no capable box the placement fails outright rather than
+    // degrading — which is what makes the session's 422 reachable
+    // instead of a silent no-subtitle encode on the local worker.
+    let (_d2, empty) = registry().await;
+    connect(&empty, "fast-no-ass", caps(true, 9.0, 0.0));
+    assert_eq!(empty.place(&n).target, None);
+    assert!(!empty.any_transcoder_ass_burn());
+}

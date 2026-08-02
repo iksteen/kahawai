@@ -119,10 +119,17 @@ impl AssBurn {
 /// unconditionally, so without this an ASS track would only ever read
 /// as client-rendered and the burn could never be asked for.
 pub fn burnable(track: &Track, burn_capable: bool, ass_burn_capable: bool) -> bool {
+    // Both burns need a track the SOURCE carries: an image burn walks
+    // the container's index, and an ASS burn is expressed as an index
+    // into the source's streams or its sidecars (`negotiate::BurnPick`
+    // has no third shape). A hub-stored row — downloaded or OCR — has
+    // neither, so it cannot be picked for burn today even though the
+    // hub does hold its bytes.
+    if !matches!(track.origin.as_str(), "embedded" | "sidecar") {
+        return false;
+    }
     if is_image_format(&track.format) {
-        // Overlay/burn both need the pipeline; a hub-stored image track
-        // has no stream to read.
-        return burn_capable && track.origin != "downloaded" && track.origin != "ocr";
+        return burn_capable;
     }
     matches!(track.format.as_str(), "ass" | "ssa") && ass_burn_capable
 }
@@ -443,11 +450,9 @@ mod tests {
             "an offer is not a default"
         );
 
-        // A downloaded .ass IS burnable: the hub holds the bytes and
-        // hands them over as a file, the same route a user's sidecar
-        // takes. An IMAGE track has no such route — burning one needs
-        // the display-set walk, which needs a stream.
-        assert!(burnable(&track("ass", "downloaded"), true, true));
+        // A hub-stored row has no place in a BurnPick, whatever its
+        // format — the pick is an index into the source.
+        assert!(!burnable(&track("ass", "downloaded"), true, true));
         assert!(!burnable(&track("pgs", "ocr"), true, true));
         assert!(burnable(&track("pgs", "embedded"), true, false));
         assert!(!burnable(&track("srt", "sidecar"), true, true));

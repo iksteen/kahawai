@@ -1361,6 +1361,13 @@ struct StartSessionRequest {
     /// text picks are a no-op here (the client fetches them itself).
     #[serde(default)]
     subtitle_track: Option<i64>,
+    /// HUB-32a: the answer to the flatten-or-stop question a previous
+    /// attempt refused with `ass_burn_unavailable`. `"flatten"` retries
+    /// with the ASS burn tier off FOR THIS SESSION — the user's
+    /// standing preference is untouched, because answering a question
+    /// once is not changing your mind.
+    #[serde(default)]
+    ass_fallback: Option<String>,
 }
 
 /// HUB-11 event channel: server-sent invalidation hints ({kind, ...}).
@@ -1465,9 +1472,20 @@ async fn start_session(
             body.audio_track,
             body.video_track,
             body.subtitle_track,
+            body.ass_fallback.as_deref() == Some("flatten"),
         )
         .await
-        .map_err(|e| (StatusCode::CONFLICT, format!("{e:#}")))?;
+        // HUB-32a: the one start failure a client MATCHES rather than
+        // displays — it has to ask the user a question. Everything else
+        // stays a 409 with prose.
+        .map_err(|e| {
+            let text = format!("{e:#}");
+            if text.contains(crate::sessions::ASS_BURN_UNAVAILABLE) {
+                (StatusCode::UNPROCESSABLE_ENTITY, text)
+            } else {
+                (StatusCode::CONFLICT, text)
+            }
+        })?;
     let (mode, stream_url, ctype) = match &session.mode {
         crate::sessions::Mode::Direct { .. } => (
             "direct",

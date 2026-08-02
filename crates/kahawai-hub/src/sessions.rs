@@ -123,6 +123,10 @@ pub struct Session {
     /// and it must reach the same decision — against THIS executor's
     /// capability, since a seek cannot move boxes.
     ass_prefers_burn: bool,
+    /// HUB-32a: the sidecar script this session burns, if any. Held as
+    /// text for the same reason `start_remux` takes it that way — the
+    /// session dir is wiped on every restart.
+    burn_ass_text: Mutex<Option<String>>,
     /// The HLS sink this session's content actually works on. Some
     /// files crash hlssink3 (TC-6); once the fallback saved a start or
     /// a seek, every later restart uses it directly instead of paying
@@ -358,6 +362,13 @@ type LocalResolver = std::sync::Arc<dyn Fn(&str, &str) -> Result<std::path::Path
 /// index. Milliseconds on local disk; this is the sanity bound, well
 /// inside the client's own patience.
 const BURN_SETS_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// HUB-32a: the one start failure a client is expected to MATCH on
+/// rather than display. Everything else that fails a start is a 409
+/// with prose; this is a 422 with a stable sentinel, because the only
+/// correct response is to ask the user a question — flatten it or stop
+/// — and a client cannot ask that off a sentence that may be reworded.
+pub const ASS_BURN_UNAVAILABLE: &str = "ass_burn_unavailable";
 
 /// Fold a worker's session facts (AR-13) into the per-kind verdict, so
 /// "dts → aac (transcoded)" becomes "dts → aac (transcoded) · 7.1 → 5.1".
@@ -977,6 +988,10 @@ impl Sessions {
         audio_track: u32,
         video_track: u32,
         subtitle_track: Option<i64>,
+        // HUB-32a: the user answered "flatten" to a previous attempt's
+        // refusal. Session-scoped, never written back to the
+        // preference — answering once is not changing your mind.
+        force_flatten_ass: bool,
     ) -> Result<Arc<Session>> {
         let id = ulid::Ulid::generate().to_string();
         self.note_session(&id, item_id);
@@ -997,6 +1012,7 @@ impl Sessions {
                 audio_track,
                 video_track,
                 subtitle_track,
+                force_flatten_ass,
             )
             .await;
         self.release(&id);
@@ -1028,6 +1044,10 @@ impl Sessions {
         audio_track: u32,
         video_track: u32,
         subtitle_track: Option<i64>,
+        // HUB-32a: the user answered "flatten" to this session's
+        // refusal. Session-scoped, never written back to the
+        // preference — answering once is not changing your mind.
+        force_flatten_ass: bool,
     ) -> Result<Arc<Session>> {
         let id = id.to_string();
         // ONE path: every session negotiates. The user's standing
@@ -1050,12 +1070,12 @@ impl Sessions {
         // standing choice. Fleet-wide rather than per-box on purpose —
         // the tier is decided before placement, which then hard-filters
         // on it (registry::PlacementNeed::needs_ass_burn).
-        let ass_burn = crate::tracks::AssBurn::for_user(
-            registry.db(),
-            user_id,
-            registry.any_transcoder_ass_burn() || kahawai_media::remux::ass_burn_available(),
-        )
-        .await;
+        let ass_burn = crate::tracks::AssBurn {
+            capable: !force_flatten_ass
+                && (registry.any_transcoder_ass_burn()
+                    || kahawai_media::remux::ass_burn_available()),
+            ..crate::tracks::AssBurn::for_user(registry.db(), user_id, false).await
+        };
         // HUB-32c: which embedded image tracks already have an OCR text
         // track derived from them — those prefer text over burn in the
         // negotiation. Fetched once, keyed per source.
@@ -1242,6 +1262,11 @@ impl Sessions {
         // than an encode that burns nothing.
         let mut burn_sets: Option<std::path::PathBuf> = None;
         let mut sp = sp;
+        // Whatever the chosen source was judged with — a later re-plan
+        // must not resurrect a tier an earlier one withdrew.
+        let mut burn_capable = parts.first().is_some_and(|p| {
+            registry.is_connected(&p.module_id) || self.reads_locally(&p.module_id)
+        });
         // What to walk: the media file at the embedded index, or — for
         // a sidecar pick — the .idx at its in-idx track.
         let sets_ref = match (sp.plan.burn_subtitle, sp.burn_sidecar) {
@@ -1274,8 +1299,44 @@ impl Sessions {
                 );
                 // burn_capable=false also voids the pick: negotiate
                 // ignores a pick it cannot honor.
+                burn_capable = false;
                 sp = negotiate_with(&parts, &info, false);
             }
+        }
+        // HUB-32a: a sidecar ASS burn needs the script itself, the same
+        // way an image burn needs its display sets — the worker cannot
+        // read the media's neighbourhood. Embedded burns need nothing:
+        // they take the demuxer's own pad, which also carries the fonts.
+        let mut burn_ass_text: Option<String> = None;
+        if let Some(i) = sp.burn_ass_sidecar {
+            burn_ass_text = subtitles
+                .ass_for_burn(registry, self, item_id, &format!("s{i}"))
+                .await;
+            if burn_ass_text.is_none() {
+                // Same honesty rule as the display sets: re-plan with
+                // the tier withdrawn rather than encode video that burns
+                // nothing.
+                tracing::warn!(
+                    item = item_id,
+                    track = i,
+                    "ASS burn: sidecar script unavailable; re-planning without it"
+                );
+                sp = negotiate_with(&parts, &info, burn_capable);
+            }
+        }
+        // The refusal (HUB-32a, owner decision): when the fleet cannot
+        // burn what the user asked to burn, the session FAILS with a
+        // choice — flatten or stop — rather than flattening in silence.
+        // Raised here, before placement, because `place()` returning
+        // None falls back to the LOCAL worker, which has no assrender
+        // check of its own and would produce exactly the silent
+        // no-subtitle encode this tier exists to prevent.
+        let burns_ass = sp.plan.burn_ass.is_some() || sp.burn_ass_sidecar.is_some();
+        if burns_ass
+            && !registry.any_transcoder_ass_burn()
+            && !kahawai_media::remux::ass_burn_available()
+        {
+            bail!("{ASS_BURN_UNAVAILABLE}");
         }
         if sp.cost == kahawai_media::negotiate::Cost::Unplayable && mode != "direct" {
             // The verdict names the actual blocker — a client refusing
@@ -1342,9 +1403,10 @@ impl Sessions {
                     video_caps: kahawai_media::remux::source_caps_names("video", &info),
                     audio_caps: kahawai_media::remux::source_caps_names("audio", &info),
                     needs_tonemap: plan.tone_map,
-                    // HUB-32a: set once the plan carries an ASS burn.
-                    // Hard filter — see PlacementNeed.
-                    needs_ass_burn: false,
+                    // HUB-32a: a HARD filter — see PlacementNeed. Both
+                    // arms count: an embedded index in the plan, and a
+                    // sidecar script shipped with the session.
+                    needs_ass_burn: burns_ass,
                     // HUB-15b: the chosen TARGETS are hard placement
                     // filters (empty when the stream doesn't encode).
                     video_codec: if plan.video == StreamMode::Encode {
@@ -1421,6 +1483,7 @@ impl Sessions {
                     Some(p) => std::fs::read(p).unwrap_or_default(),
                     None => Vec::new(),
                 };
+                let ass_bytes = burn_ass_text.clone().unwrap_or_default().into_bytes();
                 match placed {
                     Some(tc) => {
                         // `place` reserved this box. Exactly one owner
@@ -1439,6 +1502,7 @@ impl Sessions {
                                 start_idx,
                                 local_ms,
                                 &sets_bytes,
+                                &ass_bytes,
                             )
                             .await;
                         let (facts, sink) = match dispatched {
@@ -1457,7 +1521,15 @@ impl Sessions {
                     None => {
                         let tail = self.open_part_leases(registry, &parts, start_idx).await?;
                         let (runner, facts) = match self
-                            .start_remux(&id, plan, tail, local_ms, "", burn_sets.as_deref())
+                            .start_remux(
+                                &id,
+                                plan,
+                                tail,
+                                local_ms,
+                                "",
+                                burn_sets.as_deref(),
+                                burn_ass_text.as_deref(),
+                            )
                             .await
                         {
                             Ok(r) => r,
@@ -1480,6 +1552,7 @@ impl Sessions {
                                         local_ms,
                                         "hlssink2",
                                         burn_sets.as_deref(),
+                                        burn_ass_text.as_deref(),
                                     )
                                     .await
                                     .with_context(|| format!("first attempt: {first:#}"))?;
@@ -1523,6 +1596,7 @@ impl Sessions {
             burn_sets: Mutex::new(burn_sets.clone()),
             burn_pick: Mutex::new(burn_pick),
             ass_prefers_burn: ass_burn.preferred,
+            burn_ass_text: Mutex::new(burn_ass_text),
             profile,
             sink: Mutex::new(chosen_sink),
             seek_lock: tokio::sync::Mutex::new(()),
@@ -1583,6 +1657,11 @@ impl Sessions {
         sink: &str,
         // HUB-32b: display sets the mediahost walked for us.
         sets: Option<&std::path::Path>,
+        // HUB-32a: a sidecar `.ass` script to burn, as TEXT rather than
+        // a path — this function wipes and recreates the session dir,
+        // so anything written beforehand would not survive. Embedded
+        // ASS needs nothing here: it burns from the demuxer's own pad.
+        ass: Option<&str>,
     ) -> Result<(RemuxRunner, Vec<kahawai_media::facts::Fact>)> {
         let dir = self.scratch_root.join(session_id);
         // ALWAYS from a clean dir: a crashed first attempt leaves its
@@ -1591,6 +1670,14 @@ impl Sessions {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
         anyhow::ensure!(!parts.is_empty(), "no source parts for the session");
+        let ass_path = match ass {
+            Some(text) => {
+                let p = dir.join("burn.ass");
+                std::fs::write(&p, text).with_context(|| format!("writing {}", p.display()))?;
+                Some(p)
+            }
+            None => None,
+        };
 
         let runner = match &self.worker_exe {
             Some(exe) => {
@@ -1653,6 +1740,12 @@ impl Sessions {
                 if let Some(p) = &sets {
                     cmd.args(["--burn-sets", &p.to_string_lossy()]);
                 }
+                if let Some(n) = plan.burn_ass {
+                    cmd.args(["--burn-ass", &n.to_string()]);
+                }
+                if let Some(p) = &ass_path {
+                    cmd.args(["--burn-ass-file", &p.to_string_lossy()]);
+                }
                 let child = cmd
                     .args(["--video", kahawai_media::worker::mode_arg(plan.video)])
                     .args(["--audio", kahawai_media::worker::mode_arg(plan.audio)])
@@ -1700,6 +1793,7 @@ impl Sessions {
                 let dir2 = dir.clone();
                 let sink_owned = (!sink.is_empty()).then(|| sink.to_string());
                 let sets_owned = sets.map(|p| p.to_path_buf());
+                let ass_owned = ass_path.clone();
                 let job = tokio::task::spawn_blocking(move || {
                     kahawai_media::remux::start_parts(
                         &dir2,
@@ -1709,10 +1803,7 @@ impl Sessions {
                         sink_owned.as_deref(),
                         None,
                         sets_owned.as_deref(),
-                        // HUB-32a: a sidecar .ass to burn arrives with
-                        // the tier that picks one; an embedded burn
-                        // needs no file (it rides plan.burn_ass).
-                        None,
+                        ass_owned.as_deref(),
                     )
                 })
                 .await
@@ -1796,6 +1887,7 @@ impl Sessions {
         start_idx: usize,
         local_ms: u64,
         sets_bytes: &[u8],
+        ass_bytes: &[u8],
     ) -> Result<(Vec<kahawai_media::facts::Fact>, String)> {
         let leases = self.open_part_leases(registry, parts, start_idx).await?;
         let first = match self
@@ -1809,6 +1901,7 @@ impl Sessions {
                 local_ms,
                 "",
                 sets_bytes.to_vec(),
+                ass_bytes.to_vec(),
             )
             .await
         {
@@ -1835,6 +1928,7 @@ impl Sessions {
                 local_ms,
                 "hlssink2",
                 sets_bytes.to_vec(),
+                ass_bytes.to_vec(),
             )
             .await
             .with_context(|| format!("first attempt: {first:#}"))?;
@@ -1857,6 +1951,10 @@ impl Sessions {
         // HUB-32b: a dispatched worker can no more walk the source
         // index than the hub can, so the display sets ride along.
         burn_sets: Vec<u8>,
+        // HUB-32a: and neither can it read the media's neighbourhood,
+        // so a sidecar `.ass` rides along the same way. Empty for an
+        // embedded burn, which comes off the demuxer's own pad.
+        burn_ass_file: Vec<u8>,
     ) -> Result<Vec<kahawai_media::facts::Fact>> {
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         anyhow::ensure!(!parts.is_empty(), "no source parts to dispatch");
@@ -1892,7 +1990,7 @@ impl Sessions {
                     burn_sets: burn_sets.clone(),
                     // 1-based on the wire, same as burn_subtitle.
                     burn_ass: plan.burn_ass.map_or(0, |n| n as u32 + 1),
-                    burn_ass_file: Vec::new(),
+                    burn_ass_file: burn_ass_file.clone(),
                     video_codec: plan.video_codec.as_str().into(),
                     audio_codec: plan.audio_codec.as_str().into(),
                     container: plan.segment_format.as_str().into(),
@@ -2402,6 +2500,7 @@ impl Sessions {
                 // now, never for a boundary.
                 let sink = session.sink.lock().unwrap().clone();
                 let burn_sets = session.burn_sets.lock().unwrap().clone();
+                let burn_ass = session.burn_ass_text.lock().unwrap().clone();
                 let tail = self.open_part_leases(registry, &session.parts, idx).await?;
                 let fresh = match self
                     .start_remux(
@@ -2411,6 +2510,7 @@ impl Sessions {
                         local_ms,
                         &sink,
                         burn_sets.as_deref(),
+                        burn_ass.as_deref(),
                     )
                     .await
                 {
@@ -2432,6 +2532,7 @@ impl Sessions {
                                 local_ms,
                                 "hlssink2",
                                 burn_sets.as_deref(),
+                                burn_ass.as_deref(),
                             )
                             .await
                             .with_context(|| format!("first attempt: {first:#}"))?;
@@ -2479,6 +2580,13 @@ impl Sessions {
                     .as_ref()
                     .map(|p| std::fs::read(p).unwrap_or_default())
                     .unwrap_or_default();
+                let ass_bytes = session
+                    .burn_ass_text
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .unwrap_or_default()
+                    .into_bytes();
                 if let Err(first) = self
                     .start_transcode(
                         registry,
@@ -2490,6 +2598,7 @@ impl Sessions {
                         local_ms,
                         &sink,
                         sets_bytes.clone(),
+                        ass_bytes.clone(),
                     )
                     .await
                 {
@@ -2511,6 +2620,7 @@ impl Sessions {
                         local_ms,
                         "hlssink2",
                         sets_bytes,
+                        ass_bytes,
                     )
                     .await
                     .with_context(|| format!("first attempt: {first:#}"))?;
@@ -2630,8 +2740,17 @@ impl Sessions {
             .as_ref()
             .map(|p| std::fs::read(p).unwrap_or_default())
             .unwrap_or_default();
-        self.start_transcode(registry, &new_tc, id, plan, parts, idx, local_ms, "", sets)
-            .await?;
+        let ass = session
+            .burn_ass_text
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_default()
+            .into_bytes();
+        self.start_transcode(
+            registry, &new_tc, id, plan, parts, idx, local_ms, "", sets, ass,
+        )
+        .await?;
         *transcoder.lock().unwrap() = new_tc.clone();
         *reserved = None; // running now; the session owns the slot
         Ok(new_tc)
