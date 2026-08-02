@@ -371,7 +371,10 @@ How something works and why it was built that way belong in
       HDR10 one.
 - [ ] NFR-2 Scale targets. 250k files across 10 collections hold on
       every browse path, deep pages and adversarial search included.
-      Remaining: 5 concurrent transcoders untested — 3 are live.
+      Five executors exercised together (four enrolled transcoders plus
+      the hub's own): eleven concurrent transcodes filled every box to
+      its own max_sessions and no further, with the overflow staying
+      local. Remaining: 10 mediahosts untested — 2 are live.
 - [x] NFR-3 No user-state loss on crash; media never written
 - [x] NFR-4 mTLS everywhere inter-module; token auth on client API
 - [x] NFR-5 Portability: Linux x86_64, macOS (transcoder), and Linux
