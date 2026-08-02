@@ -172,6 +172,11 @@ How something works and why it was built that way belong in
 
 ## Hub — users, API, playback
 
+- [ ] HUB-32d *(deferred)* Rasterise ASS server-side into a HUB-32b
+      bitmap track for overlay-capable clients — no encode, full
+      typesetting. Deferred: resolution-dependent unlike PGS, inverts
+      HUB-32c's bandwidth trade, and no client needs it yet (the web
+      player runs JASSUB).
 - [ ] HUB-10 Multi-user *(accounts with create AND delete, admin flag,
       per-user watch state live; per-library access grants and parental
       controls missing)*
