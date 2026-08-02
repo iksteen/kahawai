@@ -16,6 +16,7 @@ use std::time::Duration;
 use anyhow::Context;
 use anyhow::Result;
 
+pub mod calibrate;
 pub mod config;
 
 pub fn init_tracing() {
@@ -317,9 +318,26 @@ pub fn doctor_checks(cfg: &config::Config) -> Vec<kahawai_media::doctor::Check> 
     checks
 }
 
-pub fn doctor(cfg: &config::Config, json: bool) -> Result<()> {
+/// OPS-9: the calibration pass, which is TIMED and therefore belongs
+/// only here. `startup_checks` shares `doctor_checks` with this command
+/// and must stay instant — a boot that spends seconds decoding to warn
+/// nobody is reading is the thing the requirement complains about, not
+/// a fix for it.
+pub fn doctor(
+    cfg: &config::Config,
+    json: bool,
+    calibrate: bool,
+    fix: bool,
+    config_path: Option<&std::path::Path>,
+) -> Result<()> {
     use kahawai_media::doctor::Status;
-    let checks = doctor_checks(cfg);
+    let mut checks = doctor_checks(cfg);
+    // --fix implies the measurement: writing a demotion nobody measured
+    // is exactly the guesswork this replaces.
+    let calibration = (calibrate || fix).then(kahawai_media::doctor::calibrate);
+    if let Some(c) = &calibration {
+        checks.extend(c.checks.iter().cloned());
+    }
     if json {
         println!("{}", serde_json::to_string_pretty(&checks)?);
     } else {
@@ -330,6 +348,34 @@ pub fn doctor(cfg: &config::Config, json: bool) -> Result<()> {
                 Status::Fail => "FAIL",
             };
             println!("{tag} {:<28} {}", c.name, c.detail);
+        }
+    }
+    if let Some(calibration) = calibration.filter(|_| fix) {
+        let Some(path) = config_path else {
+            anyhow::bail!(
+                "--fix needs a config file to write; this box is running on defaults \
+                 (create one, or pass --config)"
+            );
+        };
+        if calibration.demote.is_empty() {
+            println!("\nnothing to fix: this box's decoder ranks are already right");
+        } else {
+            let written = calibrate::apply(path, &calibration.demote)?;
+            if written.is_empty() {
+                println!(
+                    "\n{} already says everything this box needs",
+                    path.display()
+                );
+            } else {
+                println!("\n{}:", path.display());
+                for w in &written {
+                    println!(
+                        "  [{}] demote_decoders += {}  ({})",
+                        w.section, w.element, w.why
+                    );
+                }
+                println!("restart this box's modules to apply.");
+            }
         }
     }
     if kahawai_media::doctor::has_essential_failure(&checks) {

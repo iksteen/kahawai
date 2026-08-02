@@ -1962,6 +1962,7 @@ dependencies = [
  "sqlx",
  "tempfile",
  "tokio",
+ "toml_edit",
  "tonic",
  "tracing",
  "tracing-subscriber",

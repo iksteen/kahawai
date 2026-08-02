@@ -45,6 +45,16 @@ enum Cmd {
         /// Machine-readable output.
         #[arg(long)]
         json: bool,
+        /// OPS-9: also TIME this box's decoders against the reference
+        /// clip, which the other checks are too cheap to do. Seconds,
+        /// not milliseconds — hence opt-in.
+        #[arg(long)]
+        calibrate: bool,
+        /// Write the demotions this box needs into its own config
+        /// (implies --calibrate). Additive and idempotent: it never
+        /// removes an entry a human put there.
+        #[arg(long)]
+        fix: bool,
     },
     /// Internal: per-session pipeline worker, spawned by the hub (§1.1
     /// crash isolation). Reads source bytes from the parent's socket.
@@ -128,7 +138,11 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Cmd::Mediahost => kahawai::run_mediahost(cfg.mediahost).await,
-        Cmd::Doctor { json } => kahawai::doctor(&cfg, json),
+        Cmd::Doctor {
+            json,
+            calibrate,
+            fix,
+        } => kahawai::doctor(&cfg, json, calibrate, fix, config_used.as_deref()),
         Cmd::RemuxWorker(w) => kahawai::run_remux_worker(&cfg, w),
         Cmd::Benchmark {
             cache,

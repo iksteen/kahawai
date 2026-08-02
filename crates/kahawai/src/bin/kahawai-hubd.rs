@@ -27,6 +27,14 @@ enum Cmd {
     Doctor {
         #[arg(long)]
         json: bool,
+        /// OPS-9: also TIME this box's decoders against the reference
+        /// clip. Seconds, not milliseconds — hence opt-in.
+        #[arg(long)]
+        calibrate: bool,
+        /// Write the demotions this box needs into its own config
+        /// (implies --calibrate). Additive and idempotent.
+        #[arg(long)]
+        fix: bool,
     },
     /// Overwrite a user's password (reads the new password from stdin).
     ResetPassword { username: String },
@@ -65,7 +73,11 @@ async fn main() -> Result<()> {
             kahawai::startup_checks(&cfg)?;
             kahawai::run_hub(cfg.hub, config_used).await
         }
-        Some(Cmd::Doctor { json }) => kahawai::doctor(&cfg, json),
+        Some(Cmd::Doctor {
+            json,
+            calibrate,
+            fix,
+        }) => kahawai::doctor(&cfg, json, calibrate, fix, config_used.as_deref()),
         Some(Cmd::ResetPassword { username }) => kahawai::reset_password(cfg.hub, &username).await,
         Some(Cmd::Backup { dest }) => {
             let m = kahawai_hub::backup::backup(&cfg.hub.data_dir, config_used.as_deref(), &dest)

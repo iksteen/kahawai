@@ -331,7 +331,7 @@ pub fn gstreamer_checks(bench_cache: Option<&std::path::Path>) -> Vec<Check> {
     // file came out 5.1-core on the box with libdca and 7.1 on the box
     // without. Ranks are read AFTER config demotions apply, so a box
     // fixed via [transcoder] demote_decoders reports ok here.
-    out.push(dts_hd_check());
+    out.push(dts_hd_check().0);
 
     // TC-1: encoders that will actually run sessions are dry-run-verified,
     // not just present — a broken element (or a hw element without its
@@ -422,7 +422,227 @@ pub fn gstreamer_checks(bench_cache: Option<&std::path::Path>) -> Vec<Check> {
     out
 }
 
-fn dts_hd_check() -> Check {
+/// OPS-9: one calibration pass over this box's decoder ranks — the
+/// checks a human reads, and the demotions `--fix` writes.
+#[derive(Debug, Default)]
+pub struct Calibration {
+    pub checks: Vec<Check>,
+    /// (element, why) for every demotion this box needs. Ordered and
+    /// deduplicated by the caller that writes them.
+    pub demote: Vec<(String, String)>,
+}
+
+/// OPS-9. TIMED, so only the `doctor` command calls this — the same
+/// checks run at every module startup via `gstreamer_checks`, and a
+/// boot must not pay seconds of decoding to say something a human is
+/// not there to read.
+///
+/// Two classes, and presence checks see neither:
+///
+/// (a) **Pathologically slow hardware decode.** On Gemini Lake
+/// `vah265dec` decodes at ~6 fps where `avdec_h265` does ~121 — the
+/// element is present, advertises the codec, and works. Only a
+/// measurement tells them apart, so each decoder outranking the
+/// software one is timed against the same reference clip.
+///
+/// (b) **Decoders that see less of the stream.** A fixed known-bad
+/// list, not a measurement: `dtsdec` decodes only the lossy DTS core,
+/// which no amount of timing reveals because it is fast and wrong.
+pub fn calibrate() -> Calibration {
+    let mut out = Calibration::default();
+    for codec in crate::bench::Codec::ALL {
+        out.checks.push(decoder_speed_check(codec, &mut out.demote));
+    }
+    out.checks.push(uncalibrated_check());
+    // Class (b) is a fixed list, so `gstreamer_checks` already prints
+    // this row on every startup and every doctor run. Take only its
+    // demotion — printing it twice would say the calibration found
+    // something the cheap checks did not.
+    out.demote.extend(dts_hd_check().1);
+    out
+}
+
+/// Codecs a decoder can be pathologically slow at that we hold no
+/// reference bitstream for, and the software decoder each would be
+/// measured against. Every one of these is a real risk on the same
+/// hardware that produced the h264/hevc finding — the J5005's
+/// hand-written demotion list names `vampeg2dec`, `vavp8dec`,
+/// `vavp9dec` and `vajpegdec` alongside the two this can measure.
+const UNCALIBRATED: &[(&str, &str, &str)] = &[
+    ("video/x-av1", "av1", "avdec_av1"),
+    ("video/x-vp9", "vp9", "avdec_vp9"),
+    ("video/x-vp8", "vp8", "avdec_vp8"),
+    ("video/mpeg", "mpeg2", "avdec_mpeg2video"),
+];
+
+/// AR-13 rule 4, applied to ourselves: a calibration that examines two
+/// codecs and reports only findings reads as "your decoders are fine".
+/// Name what was NOT measured, and only when this box actually has a
+/// decoder there that outranks software — otherwise it is noise.
+fn uncalibrated_check() -> Check {
+    const NAME: &str = "decode rank (unmeasured)";
+    let mut unexamined: Vec<String> = Vec::new();
+    for (caps_name, label, sw) in UNCALIBRATED {
+        let Some(sw_rank) = gst::ElementFactory::find(sw)
+            .filter(|f| f.rank() > gst::Rank::NONE)
+            .map(|f| f.rank())
+        else {
+            continue;
+        };
+        let caps = gst::Caps::new_empty_simple(*caps_name);
+        let mut found: Vec<String> = gst::ElementFactory::factories_with_type(
+            gst::ElementFactoryType::DECODER | gst::ElementFactoryType::MEDIA_VIDEO,
+            gst::Rank::MARGINAL,
+        )
+        .into_iter()
+        .filter(|f| {
+            f.name() != *sw
+                && f.rank() >= sw_rank
+                && is_hardware_decoder(&f.name())
+                && f.can_sink_any_caps(&caps)
+        })
+        .map(|f| format!("{} ({label})", f.name()))
+        .collect();
+        found.sort();
+        unexamined.extend(found);
+    }
+    if unexamined.is_empty() {
+        return Check::ok(NAME, "every decoder that outranks software was measured");
+    }
+    Check::warn(
+        NAME,
+        format!(
+            "{} outrank their software decoder and were NOT timed — no reference \
+             clip is checked in for those codecs, so this box could hold the same \
+             pathology unseen; compare by hand against the software decoder",
+            unexamined.join(", ")
+        ),
+    )
+}
+
+/// Is this element name a hardware decoder? A NAME heuristic, and
+/// deliberately so: GStreamer exposes no "this is fixed-function" bit,
+/// and every vendor's elements are named after their API. The ceiling
+/// is that a hardware decoder under an unlisted prefix is not
+/// examined — which the "unmeasured" row would then also miss, so the
+/// failure is silence rather than a wrong finding.
+///
+/// The filter matters in both directions. Without it the calibration
+/// times software siblings against each other (`vp9dec` versus
+/// `avdec_vp9`, both libvpx-class) and reports whichever lost as a
+/// pathology, which would demote a perfectly good decoder — and it
+/// floods the unmeasured row with elements nobody should compare,
+/// training the reader to skip the one row that matters.
+fn is_hardware_decoder(name: &str) -> bool {
+    const PREFIXES: &[&str] = &[
+        "va",    // vah264dec, vaapih265dec (VA-API)
+        "nv",    // nvh264dec, nvh265sldec (NVDEC)
+        "v4l2",  // v4l2h264dec (embedded)
+        "msdk",  // Intel Media SDK
+        "qsv",   // Intel Quick Sync
+        "d3d11", // Windows
+        "d3d12",
+        "amf", // AMD
+        "vt",  // vtdec, vtdec_hw (VideoToolbox)
+        "applemedia",
+    ];
+    PREFIXES.iter().any(|p| name.starts_with(p))
+}
+
+/// The software decoder a hardware one has to beat. gst-libav is the
+/// reference by construction: it is the portable path, present on every
+/// box we run, and the one a demotion falls back to.
+fn software_decoder(codec: crate::bench::Codec) -> &'static str {
+    match codec {
+        crate::bench::Codec::H264 => "avdec_h264",
+        crate::bench::Codec::H265 => "avdec_h265",
+    }
+}
+
+fn decoder_speed_check(codec: crate::bench::Codec, demote: &mut Vec<(String, String)>) -> Check {
+    let name = format!("{} decode rank", codec.label());
+    let rank = |n: &str| {
+        gst::ElementFactory::find(n)
+            .filter(|f| f.rank() > gst::Rank::NONE)
+            .map(|f| f.rank())
+    };
+    let sw = software_decoder(codec);
+    let Some(sw_rank) = rank(sw) else {
+        return Check::warn(
+            name,
+            format!("{sw} unavailable — no software decoder to compare against; install gst-libav"),
+        );
+    };
+    // Candidates: anything that decodes this codec, is in autoplug, and
+    // GStreamer would reach for BEFORE the software decoder. A lower
+    // rank is already losing, so timing it decides nothing.
+    let caps = gst::Caps::new_empty_simple(codec.caps_name());
+    let mut candidates: Vec<String> = gst::ElementFactory::factories_with_type(
+        gst::ElementFactoryType::DECODER | gst::ElementFactoryType::MEDIA_VIDEO,
+        gst::Rank::MARGINAL,
+    )
+    .into_iter()
+    .filter(|f| {
+        f.name() != sw
+            && f.rank() >= sw_rank
+            && is_hardware_decoder(&f.name())
+            && f.can_sink_any_caps(&caps)
+    })
+    .map(|f| f.name().to_string())
+    .collect();
+    candidates.sort();
+    if candidates.is_empty() {
+        return Check::ok(&name, format!("{sw} leads; nothing outranks it"));
+    }
+
+    let Some(sw_fps) = crate::bench::decode_fps(sw, codec) else {
+        return Check::warn(
+            name,
+            format!(
+                "{sw} would not decode the reference clip — cannot calibrate {}",
+                codec.label()
+            ),
+        );
+    };
+    let mut slower: Vec<String> = Vec::new();
+    let mut detail: Vec<String> = vec![format!("{sw} {sw_fps:.0} fps")];
+    for cand in &candidates {
+        match crate::bench::decode_fps(cand, codec) {
+            // Timed and slower: the finding. Name BOTH figures — "slow"
+            // is unactionable, "6 against 121" is not.
+            Some(fps) if fps < sw_fps => {
+                detail.push(format!("{cand} {fps:.0} fps"));
+                slower.push(cand.clone());
+                demote.push((
+                    cand.clone(),
+                    format!(
+                        "decodes {} at {fps:.0} fps where {sw} does {sw_fps:.0}",
+                        codec.label()
+                    ),
+                ));
+            }
+            Some(fps) => detail.push(format!("{cand} {fps:.0} fps")),
+            // Present, outranking, and it would not decode the clip at
+            // all. Not a speed finding, and not silently dropped either.
+            None => detail.push(format!("{cand} would not decode the clip")),
+        }
+    }
+    let detail = detail.join(" · ");
+    if slower.is_empty() {
+        Check::ok(name, detail)
+    } else {
+        Check::warn(
+            name,
+            format!(
+                "{detail} — {} outranks {sw} and is slower; \
+                 add it to [transcoder] demote_decoders (or run `doctor --fix`)",
+                slower.join(", ")
+            ),
+        )
+    }
+}
+
+fn dts_hd_check() -> (Check, Vec<(String, String)>) {
     const NAME: &str = "dts-hd full decode";
     let rank = |name: &str| {
         gst::ElementFactory::find(name)
@@ -430,24 +650,38 @@ fn dts_hd_check() -> Check {
             .map(|f| f.rank())
     };
     let Some(full) = rank("avdec_dca") else {
-        return Check::warn(
-            NAME,
-            "avdec_dca unavailable — DTS-HD sources decode only the lossy 5.1 core \
-             (or not at all); install gst-libav",
+        return (
+            Check::warn(
+                NAME,
+                "avdec_dca unavailable — DTS-HD sources decode only the lossy 5.1 core \
+                 (or not at all); install gst-libav",
+            ),
+            Vec::new(),
         );
     };
     let shadow = ["dtsdec", "dcadec"].iter().find(|n| rank(n) >= Some(full));
     match shadow {
-        Some(name) => Check::warn(
-            NAME,
-            format!(
-                "{name} (libdca, core-only) outranks avdec_dca — DTS-HD tracks lose \
-                 their lossless extension and decode as lossy 5.1, and a scan run \
-                 this way FILES them that way; add \"{name}\" to [transcoder] and \
-                 [mediahost] demote_decoders"
+        Some(name) => (
+            Check::warn(
+                NAME,
+                format!(
+                    "{name} (libdca, core-only) outranks avdec_dca — DTS-HD tracks lose \
+                     their lossless extension and decode as lossy 5.1, and a scan run \
+                     this way FILES them that way; add \"{name}\" to [transcoder] and \
+                     [mediahost] demote_decoders"
+                ),
             ),
+            vec![(
+                (*name).to_string(),
+                "libdca decodes only the lossy DTS core, so DTS-HD MA files \
+                 decode AND get filed as 5.1"
+                    .to_string(),
+            )],
         ),
-        None => Check::ok(NAME, "via avdec_dca (core + lossless XLL extension)"),
+        None => (
+            Check::ok(NAME, "via avdec_dca (core + lossless XLL extension)"),
+            Vec::new(),
+        ),
     }
 }
 
@@ -461,6 +695,46 @@ pub fn has_essential_failure(checks: &[Check]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// OPS-9. The calibration TIMES decoders, so this is the one test
+    /// that pays for it — and what it asserts are the two ways the
+    /// check could be actively harmful rather than merely wrong.
+    #[test]
+    fn calibration_never_demotes_the_thing_it_measures_against() {
+        crate::init().unwrap();
+        let cal = calibrate();
+        // A row per codec, so a box with no finding still says what was
+        // examined — "no warnings" and "nothing was checked" must not
+        // look alike.
+        for codec in crate::bench::Codec::ALL {
+            let name = format!("{} decode rank", codec.label());
+            let row = cal.checks.iter().find(|c| c.name == name);
+            assert!(
+                row.is_some(),
+                "no row for {}: {:?}",
+                codec.label(),
+                cal.checks
+            );
+        }
+        // Demoting the software reference would remove the fallback the
+        // demotion exists to fall back TO, leaving the box with no
+        // decoder for that codec at all.
+        for (element, _) in &cal.demote {
+            assert!(
+                !element.starts_with("avdec_"),
+                "would demote the software reference: {element}"
+            );
+        }
+        // Every demotion carries its measurement: `--fix` prints these
+        // into the operator's terminal, and "it was slow" is not a
+        // reason anyone can check later.
+        for (element, why) in &cal.demote {
+            assert!(
+                why.contains("fps") || why.contains("core"),
+                "demotion of {element} has no evidence: {why}"
+            );
+        }
+    }
 
     #[test]
     fn full_gst_install_passes_essentials() {

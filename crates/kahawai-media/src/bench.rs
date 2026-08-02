@@ -98,6 +98,21 @@ const CAP: Duration = Duration::from_secs(5);
 /// noise each, looped until the cap.
 const REF_1080: &[u8] = include_bytes!("../assets/ref-1080p.h264");
 const REF_2160: &[u8] = include_bytes!("../assets/ref-2160p.h264");
+/// OPS-9 needs a clip in a codec that HAS hardware decoders worth
+/// doubting. The encode benchmark only ever needed h264 (it is the
+/// input, decoded the same way by every candidate), but the decoder
+/// pathology this measures is `vah265dec`, so h265 has to exist as a
+/// bitstream. Same 24 frames, same pictures — re-encoded from
+/// `ref-1080p.h264`, so a decoder's two numbers describe the same
+/// content in two codecs. 1080p only: a 20x rank inversion is not
+/// subtler at 4K, and the asset would cost more than the finding.
+const REF_1080_H265: &[u8] = include_bytes!("../assets/ref-1080p.h265");
+
+/// Wall-clock ceiling for a DECODE measurement. Shorter than [`CAP`]
+/// because decoding is the cheap half: even the pathological case
+/// (~6 fps) produces enough frames in 2 s to be unmistakable against
+/// ~121, and `doctor` is a command a human waits on.
+const DECODE_CAP: Duration = Duration::from_secs(2);
 /// Loops requested; the wall cap usually ends the run first.
 const LOOPS: i32 = 60;
 /// Below this at 1080p, the 2160p figure is derived rather than
@@ -451,6 +466,93 @@ fn measure_tonemap(w: i32, h: i32) -> Option<f32> {
     run_counting(&chain, w, h, "I420_10LE")
 }
 
+/// OPS-9: frames per second one decoder element sustains on the
+/// reference clip. FPS, not realtime multiples — the question here is
+/// "is this element slower than that element", which is answered by
+/// comparing two numbers of the same kind, and the finding reads in
+/// the units the pathology was reported in (~6 fps versus ~121).
+///
+/// The element is named EXPLICITLY rather than autoplugged: the whole
+/// point is to time the candidate GStreamer would have chosen against
+/// the one it would not, and decodebin would just keep picking the
+/// former. `None` means it could not be timed at all — a decoder that
+/// refuses the clip is not thereby slow, and must not be reported as
+/// though it were.
+pub fn decode_fps(element: &str, codec: Codec) -> Option<f32> {
+    if crate::init().is_err() {
+        return None;
+    }
+    let tmp = std::env::temp_dir().join("kahawai-bench");
+    let _ = std::fs::create_dir_all(&tmp);
+    let path = tmp.join(codec.file());
+    if !path.exists() && std::fs::write(&path, codec.clip()).is_err() {
+        return None;
+    }
+
+    let pipe = gst::Pipeline::new();
+    let src = gst::ElementFactory::make("multifilesrc")
+        .property("location", path.to_string_lossy().as_ref())
+        .property("loop", true)
+        .property("num-buffers", LOOPS)
+        .build()
+        .ok()?;
+    let parse = make(codec.parser())?;
+    let dec = make(element)?;
+    let sink = gst::ElementFactory::make("fakesink")
+        .property("sync", false)
+        .build()
+        .ok()?;
+    if pipe.add_many([&src, &parse, &dec, &sink]).is_err()
+        || gst::Element::link_many([&src, &parse, &dec, &sink]).is_err()
+    {
+        let _ = pipe.set_state(gst::State::Null);
+        return None;
+    }
+    count_through_capped(&pipe, &dec, DECODE_CAP, || {}).map(|m| m * REFERENCE_FPS)
+}
+
+/// A codec OPS-9 can measure a decoder against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Codec {
+    H264,
+    H265,
+}
+
+impl Codec {
+    fn clip(self) -> &'static [u8] {
+        match self {
+            Codec::H264 => REF_1080,
+            Codec::H265 => REF_1080_H265,
+        }
+    }
+    fn file(self) -> &'static str {
+        match self {
+            Codec::H264 => "ref-1080p.h264",
+            Codec::H265 => "ref-1080p.h265",
+        }
+    }
+    fn parser(self) -> &'static str {
+        match self {
+            Codec::H264 => "h264parse",
+            Codec::H265 => "h265parse",
+        }
+    }
+    /// The caps a decoder must accept to be a candidate for this codec.
+    pub fn caps_name(self) -> &'static str {
+        match self {
+            Codec::H264 => "video/x-h264",
+            Codec::H265 => "video/x-h265",
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Codec::H264 => "h264",
+            Codec::H265 => "hevc",
+        }
+    }
+    pub const ALL: [Codec; 2] = [Codec::H264, Codec::H265];
+}
+
 fn make(name: &str) -> Option<gst::Element> {
     gst::ElementFactory::make(name).build().ok()
 }
@@ -479,6 +581,15 @@ fn count_through(
     at: &gst::Element,
     on_playing: impl FnOnce(),
 ) -> Option<f32> {
+    count_through_capped(pipe, at, CAP, on_playing)
+}
+
+fn count_through_capped(
+    pipe: &gst::Pipeline,
+    at: &gst::Element,
+    cap: Duration,
+    on_playing: impl FnOnce(),
+) -> Option<f32> {
     let frames = std::sync::Arc::new(AtomicU64::new(0));
     let started: std::sync::Arc<std::sync::Mutex<Option<Instant>>> = Default::default();
     let Some(out_pad) = at.static_pad("src") else {
@@ -504,7 +615,7 @@ fn count_through(
     // Probe attached, pipeline rolling: only now may a feeder start, so
     // the first buffer produced is the first buffer counted.
     on_playing();
-    let deadline = Instant::now() + CAP;
+    let deadline = Instant::now() + cap;
     // Wait for the run to finish or the cap to expire, whichever comes
     // first; a slow box simply reports the frames it managed.
     if let Some(bus) = pipe.bus() {
