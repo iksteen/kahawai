@@ -203,7 +203,8 @@ async fn query_returns_the_item_and_what_it_would_be_served() {
     let Fx { api, bearer, id, .. } = fixture().await;
     let profile = r#"{"profile":{"containers":["mp4"],
         "video":[{"codec":"h264"}],"audio":["aac"],
-        "hdr":false,"graphics_overlay":false,"ass_render":false}}"#;
+        "hdr":false,"graphics_overlay":false,"ass_render":false,
+        "target_duration":{"mode":"ignore"}}}"#;
     let resp = api
         .oneshot(query(
             &format!("/api/v1/items/{id}"),
@@ -347,7 +348,8 @@ async fn query_rasterises_nothing() {
             // would pass this test for the wrong reason.
             r#"{"profile":{"containers":["matroska","mp4"],"video":[{"codec":"h264"}],
                 "audio":["aac"],"hdr":false,
-                "graphics_overlay":true,"ass_render":false}}"#,
+                "graphics_overlay":true,"ass_render":false,
+                "target_duration":{"mode":"ignore"}}}"#,
         ))
         .await
         .unwrap();

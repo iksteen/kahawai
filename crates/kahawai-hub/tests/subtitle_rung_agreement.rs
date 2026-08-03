@@ -49,7 +49,8 @@ async fn query_and_a_real_session_agree_on_the_ass_rung() {
 
     const PROFILE: &str = r#"{"containers":["mp4"],"video":[{"codec":"h264"}],
         "audio":["aac"],"hdr":false,
-        "graphics_overlay":true,"ass_render":true}"#;
+        "graphics_overlay":true,"ass_render":true,
+        "target_duration":{"mode":"accurate"}}"#;
 
     // 1. QUERY: what would I be served?
     let resp = h

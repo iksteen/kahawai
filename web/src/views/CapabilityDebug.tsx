@@ -124,6 +124,59 @@ export default function CapabilityDebug({
         </span>
       </div>
 
+      {/* The one declaration that is not a boolean: correctness,
+          latency and encode cost, pick two. `short` is the only mode
+          that can force a video encode, so it carries the ceiling it
+          is buying. */}
+      <div className="caps-row">
+        <span className="caps-label dim">targetduration</span>
+        <span className="caps-opts">
+          {(['ignore', 'accurate', 'short'] as const).map((m) => {
+            const cur = mask.target_duration ?? probed.target_duration
+            const on = cur.mode === m
+            return (
+              <label key={m} className={on ? '' : 'caps-off'}>
+                <input
+                  type="radio"
+                  name="targetduration"
+                  checked={on}
+                  onChange={() =>
+                    update({
+                      ...mask,
+                      target_duration: m === 'short' ? { mode: m, max_secs: 6 } : { mode: m },
+                    })
+                  }
+                />
+                {m}
+              </label>
+            )
+          })}
+          {(mask.target_duration ?? probed.target_duration).mode === 'short' && (
+            <label>
+              max
+              <select
+                value={
+                  (mask.target_duration as { mode: 'short'; max_secs: number } | undefined)
+                    ?.max_secs ?? 6
+                }
+                onChange={(e) =>
+                  update({
+                    ...mask,
+                    target_duration: { mode: 'short', max_secs: Number(e.target.value) },
+                  })
+                }
+              >
+                {[2, 4, 6, 10].map((n) => (
+                  <option key={n} value={n}>
+                    {n}s
+                  </option>
+                ))}
+              </select>
+            </label>
+          )}
+        </span>
+      </div>
+
       <div className="caps-row">
         <span className="caps-label dim">ceilings</span>
         <span className="caps-opts">

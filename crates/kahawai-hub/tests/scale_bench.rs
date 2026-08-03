@@ -340,7 +340,8 @@ async fn browse_latency_and_scale() {
                 &format!("/api/v1/items/01BENCHITEM{:015}", items / 2),
                 r#"{"profile":{"containers":["mp4"],"video":[{"codec":"h264"}],
                     "audio":["aac"],"hdr":false,
-                    "graphics_overlay":true,"ass_render":true}}"#,
+                    "graphics_overlay":true,"ass_render":true,
+                    "target_duration":{"mode":"accurate"}}}"#,
                 5,
             )
             .await;

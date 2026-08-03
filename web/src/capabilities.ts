@@ -15,7 +15,16 @@ export type CapabilityProfile = {
   ass_render: boolean
   graphics_overlay: boolean
   vtt_render: boolean
+  target_duration: TargetDuration
 }
+
+/// What this client needs from EXT-X-TARGETDURATION. Required — the
+/// server has no default, because the right answer differs per client
+/// and guessing means either a spec violation or a startup delay.
+export type TargetDuration =
+  | { mode: 'ignore' }
+  | { mode: 'accurate' }
+  | { mode: 'short'; max_secs: number }
 
 // One representative codec string per family, at generous profile/level
 // — the hub's verifier judges the SOURCE's profile against what we
@@ -141,6 +150,7 @@ export type CapabilityMask = {
   ass_render?: boolean
   graphics_overlay?: boolean
   vtt_render?: boolean
+  target_duration?: TargetDuration
 }
 
 export function loadMask(): CapabilityMask {
@@ -177,6 +187,10 @@ export function maskSummary(m: CapabilityMask): string[] {
   for (const flag of ['hdr', 'ass_render', 'graphics_overlay', 'vtt_render'] as const) {
     if (m[flag] !== undefined) out.push(`${flag}=${m[flag]}`)
   }
+  if (m.target_duration) {
+    const t = m.target_duration
+    out.push(`target=${t.mode === 'short' ? `short:${t.max_secs}s` : t.mode}`)
+  }
   return out
 }
 
@@ -192,6 +206,7 @@ function applyMask(p: CapabilityProfile, m: CapabilityMask): CapabilityProfile {
   if (m.ass_render !== undefined) out.ass_render = m.ass_render
   if (m.graphics_overlay !== undefined) out.graphics_overlay = m.graphics_overlay
   if (m.vtt_render !== undefined) out.vtt_render = m.vtt_render
+  if (m.target_duration !== undefined) out.target_duration = m.target_duration
   return out
 }
 
@@ -224,6 +239,12 @@ export function probedProfile(): CapabilityProfile {
       // constant — its whole value is being maskable, which is the only
       // way to reach the burn-in fallback for SRT and OCR tracks.
       vtt_render: true,
+      // hls.js does not enforce the bound, and a browser reloading the
+      // playlist every 2 s is why startup is quick. Declaring
+      // `accurate` here would hand a 10 s-GOP file a 12 s target and
+      // triple the runway the hub must build before handover — for a
+      // player that never checks. The mask can force the other two.
+      target_duration: { mode: 'ignore' },
     }
     // A browser with no probeable video at all (should not happen)
     // must not send an empty list — that would transcode everything.

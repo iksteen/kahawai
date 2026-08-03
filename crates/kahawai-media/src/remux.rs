@@ -499,6 +499,18 @@ pub struct RemuxPlan {
     pub segment_format: SegmentFormat,
 }
 
+/// Fallback declaration when nothing better is known: the historical
+/// value, which is honest only for an encode (whose GOP we set) or a
+/// short-GOP source.
+pub const DEFAULT_TARGET_DURATION_SECS: u32 = 2;
+
+/// The fragment length the sink asks for. Segments are whole GOPs
+/// packed until this is passed, so the longest segment is bounded by
+/// `FRAGMENT_TARGET + max keyframe gap` — the formula the declaration
+/// is computed from, verified against real files (GOP 10.43 s produced
+/// segments of 10.22-10.58 s).
+pub const FRAGMENT_TARGET_SECS: u32 = 2;
+
 impl RemuxPlan {
     pub fn has_video(&self) -> bool {
         self.video != StreamMode::Off
@@ -2853,7 +2865,7 @@ fn make_hls_sink(out_dir: &Path, prefer: Option<&str>) -> Result<(gst::Element, 
     // The fragment interval the sink asks keyframes at, and therefore
     // the segment length: ~2 s keeps the session-start gate (three
     // segments) at ~6 s of content.
-    set_prop_if_present(&sink, "target-duration", 2u32);
+    set_prop_if_present(&sink, "target-duration", FRAGMENT_TARGET_SECS);
     // ON, and load-bearing: the request is what puts a keyframe at the
     // START of the first fragment. Turned off for one evening to stop
     // the sink racing a frame-based GOP pin, it made segment00000

@@ -19,6 +19,13 @@
 #                 "-" sends no profile at all: the conservative fallback
 #                 a session start would use.
 #   -m mode       force a mode (direct|remux|transcode) instead of cheapest
+#   -t target     what this client needs from EXT-X-TARGETDURATION —
+#                 REQUIRED by the API, so the script always sends one:
+#                   ignore     don't care (default; what a browser does)
+#                   accurate   must be correct, any value
+#                   short:N    must be correct AND <= N seconds, which
+#                              forces a video encode when the source's
+#                              keyframes are further apart than that
 #   -j            print the raw JSON response
 #   password "-"  prompt for it instead of passing on the command line
 #
@@ -30,15 +37,17 @@ set -euo pipefail
 API="${KAHAWAI_API:-localhost:8420}"
 CAPS="mp4,h264,aac,ass,overlay"
 MODE=""
+TARGET="ignore"
 RAW=0
 
-while getopts "a:c:m:jh" opt; do
+while getopts "a:c:m:t:jh" opt; do
     case $opt in
         a) API="$OPTARG" ;;
         c) CAPS="$OPTARG" ;;
         m) MODE="$OPTARG" ;;
+        t) TARGET="$OPTARG" ;;
         j) RAW=1 ;;
-        h|*) grep '^#' "$0" | sed 's/^# \{0,1\}//' | head -23; exit 0 ;;
+        h|*) grep '^#' "$0" | sed 's/^# \{0,1\}//' | head -31; exit 0 ;;
     esac
 done
 shift $((OPTIND - 1))
@@ -55,11 +64,20 @@ TOKEN=$(python3 -c 'import json,sys;print(json.dumps({"username":sys.argv[1],"pa
     | python3 -c 'import json,sys;print(json.load(sys.stdin)["access_token"])') \
     || { echo "login failed" >&2; exit 1; }
 
-BODY=$(python3 - "$CAPS" "$MODE" <<'PY'
+BODY=$(python3 - "$CAPS" "$MODE" "$TARGET" <<'PY'
 import json, sys
 
-caps, mode = sys.argv[1], sys.argv[2]
+caps, mode, target = sys.argv[1], sys.argv[2], sys.argv[3]
 body = {}
+# Required by the API: there is no server-side default, because the
+# right answer differs per client (see TargetDuration).
+if target.startswith("short"):
+    _, _, secs = target.partition(":")
+    td = {"mode": "short", "max_secs": int(secs or 6)}
+elif target in ("ignore", "accurate"):
+    td = {"mode": target}
+else:
+    sys.exit("unknown target duration mode: %s" % target)
 if mode:
     body["mode"] = mode
 
@@ -88,6 +106,7 @@ if caps != "-":
         "hdr": "hdr" in bits,
         "ass_render": "ass" in bits,
         "graphics_overlay": "overlay" in bits,
+        "target_duration": td,
     }
 print(json.dumps(body))
 PY
@@ -128,6 +147,7 @@ if not n:
     raise SystemExit(1)
 
 print("\nwould play: %s (%s) from %s" % (n["mode"], n["cost"], n["source"]["path_rel"]))
+print("  playlist: EXT-X-TARGETDURATION %s s" % n.get("target_duration_secs", "?"))
 print("  video: %s" % n["streams"]["video"])
 print("  audio: %s" % n["streams"]["audio"])
 for t in n["subtitles"]:

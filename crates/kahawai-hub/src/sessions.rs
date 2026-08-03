@@ -110,6 +110,14 @@ pub struct Session {
     /// The effective capability profile (client's or fallback, cap
     /// merged) — re-plans on track switches negotiate against IT.
     profile: kahawai_core::media::CapabilityProfile,
+    /// What this session's playlist declares as EXT-X-TARGETDURATION.
+    ///
+    /// Decided ONCE, at session start, and deliberately not a Mutex
+    /// like the verdicts beside it: RFC 8216 §6.2.1 forbids the value
+    /// changing once published, and a seek re-plan or a track switch
+    /// must not move it even if the re-plan would now compute
+    /// something else.
+    pub target_duration_secs: u32,
     /// HUB-32b: the display sets this session burns, if any. A seek
     /// restarts the pipeline, which must burn the same subtitles. LIVE:
     /// a mid-session subtitle pick swaps them.
@@ -688,9 +696,20 @@ async fn serve_reads(mut conn: tokio::net::UnixStream, lease: Lease, size: u64) 
 /// The gate is therefore CONTENT seconds, not a segment count — three
 /// segments can be as little as 4 s when scene-cut keyframes shorten
 /// them. ENDLIST (a finished short encode) is always ready.
-fn playlist_ready(path: &std::path::Path) -> bool {
+fn playlist_ready(path: &std::path::Path, target_secs: u32) -> bool {
+    // The 6.5 s above was derived against a declared target of 2: a
+    // client reloads the playlist about every target duration, so the
+    // runway it needs is production-gap PLUS one reload interval. Once
+    // the declaration follows the source — 12 s for a 10 s-GOP file —
+    // a fixed 6.5 s would hand over less content than the client's own
+    // refresh period and stall on the first gap.
+    //
+    // §6.3.3 pushes the same way from the other side: a client SHOULD
+    // NOT start within three target durations of the end, so a playlist
+    // shorter than that gives a conforming client nothing to play.
+    let need = (6.5f64).max(3.0 * target_secs as f64);
     match std::fs::read_to_string(path) {
-        Ok(p) => p.contains("#EXT-X-ENDLIST") || playlist_span_secs(&p) >= 6.5,
+        Ok(p) => p.contains("#EXT-X-ENDLIST") || playlist_span_secs(&p) >= need,
         Err(_) => false,
     }
 }
@@ -1678,6 +1697,7 @@ impl Sessions {
                             .start_remux(
                                 &id,
                                 plan,
+                                negotiated.target_duration_secs,
                                 tail,
                                 local_ms,
                                 "",
@@ -1702,6 +1722,7 @@ impl Sessions {
                                     .start_remux(
                                         &id,
                                         plan,
+                                        negotiated.target_duration_secs,
                                         tail,
                                         local_ms,
                                         "hlssink2",
@@ -1747,6 +1768,7 @@ impl Sessions {
             mode: session_mode,
             verdict: Mutex::new(verdict),
             sub_verdicts: Mutex::new(sub_verdicts),
+            target_duration_secs: negotiated.target_duration_secs,
             burn_sets: Mutex::new(burn_sets.clone()),
             burn_pick: Mutex::new(burn_pick),
             ass: neg.ass.clone(),
@@ -1802,10 +1824,15 @@ impl Sessions {
     /// Spin up the remux/transcode pipeline — in a supervised worker
     /// process when configured — feed it from the lease, and wait for the
     /// playlist to materialize so the returned URL is immediately playable.
+    #[allow(clippy::too_many_arguments)] // the session's shape, spelled out
     async fn start_remux(
         &self,
         session_id: &str,
         plan: kahawai_media::remux::RemuxPlan,
+        // What the playlist will DECLARE (not what the sink cuts on):
+        // the readiness gate hands over enough runway for a client
+        // reloading at that cadence, so it has to know the number.
+        target_secs: u32,
         parts: Vec<(Lease, u64)>,
         start_ms: u64,
         sink: &str,
@@ -1988,7 +2015,7 @@ impl Sessions {
                         // through to the ready-check below instead of
                         // declaring death. Only a non-zero exit, or a
                         // clean exit with nothing produced, is failure.
-                        if !(status.success() && playlist_ready(&playlist)) {
+                        if !(status.success() && playlist_ready(&playlist, target_secs)) {
                             let log =
                                 std::fs::read_to_string(dir.join("worker.log")).unwrap_or_default();
                             let tail: String =
@@ -2015,7 +2042,7 @@ impl Sessions {
                 }
                 RemuxRunner::Stopped => unreachable!("start_remux never yields Stopped"),
             }
-            if playlist_ready(&playlist) {
+            if playlist_ready(&playlist, target_secs) {
                 return Ok((runner, kahawai_media::facts::read(&dir)));
             }
             if std::time::Instant::now() > deadline {
@@ -2688,6 +2715,11 @@ impl Sessions {
                     .start_remux(
                         &session.id,
                         plan,
+                        // The session's own value, NOT a fresh
+                        // computation: a seek re-plans, but the client
+                        // keeps the playlist it already has and §6.2.1
+                        // forbids the declaration moving under it.
+                        session.target_duration_secs,
                         tail,
                         local_ms,
                         &sink,
@@ -2710,6 +2742,7 @@ impl Sessions {
                             .start_remux(
                                 &session.id,
                                 plan,
+                                session.target_duration_secs,
                                 tail,
                                 local_ms,
                                 "hlssink2",

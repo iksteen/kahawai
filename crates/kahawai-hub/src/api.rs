@@ -2547,6 +2547,11 @@ async fn item_query(
         // does not do because it would claim a box.
         "mode": mode,
         "cost": sp.cost.as_str(),
+        // What the playlist would declare. Part of "what would I be
+        // served": for a `short` client it is the guarantee it asked
+        // for, and for an `accurate` one it is how long its player will
+        // wait before it may start (RFC 8216 §6.3.3).
+        "target_duration_secs": sp.target_duration_secs,
         "streams": {
             "video": sp.video_verdict,
             "audio": sp.audio_verdict,
@@ -2636,6 +2641,11 @@ async fn transcode_file(
         .fetch_artifact(&state.registry, session, file)
         .await
         .map_err(|e| (StatusCode::NOT_FOUND, format!("{e:#}")))?;
+    let bytes = if file.ends_with(".m3u8") {
+        declare_target_duration(bytes, session.target_duration_secs)
+    } else {
+        bytes
+    };
     let ctype = if file.ends_with(".m3u8") {
         "application/vnd.apple.mpegurl"
     } else if file == "start.pos" {
@@ -2651,6 +2661,38 @@ async fn transcode_file(
         axum::body::Bytes::from(bytes),
     )
         .into_response())
+}
+
+
+/// Stamp the session's decided `EXT-X-TARGETDURATION` onto a playlist
+/// as it is served.
+///
+/// The sinks cannot do this themselves. hlssink3's `target-duration`
+/// property is the FRAGMENT interval it cuts on *and* the value it
+/// writes, so raising it to declare honestly would also make it pack
+/// longer fragments and overshoot again; the two numbers have to come
+/// apart, and this is where. It also covers playlists produced on a
+/// transcoder, which the hub only ever sees as bytes.
+///
+/// The value is fixed at session start, so every client sees one
+/// value for the session's life — §6.2.1 forbids it changing, and
+/// rewriting per-request would violate that even while looking like a
+/// fix.
+fn declare_target_duration(bytes: Vec<u8>, secs: u32) -> Vec<u8> {
+    let Ok(text) = String::from_utf8(bytes) else {
+        return Vec::new();
+    };
+    let out: String = text
+        .lines()
+        .map(|line| {
+            if line.starts_with("#EXT-X-TARGETDURATION:") {
+                format!("#EXT-X-TARGETDURATION:{secs}\n")
+            } else {
+                format!("{line}\n")
+            }
+        })
+        .collect();
+    out.into_bytes()
 }
 
 /// Serve session artifacts (playlist + segments): remux sessions from
@@ -2781,6 +2823,11 @@ async fn session_file(
     let bytes = tokio::fs::read(dir.join(&file))
         .await
         .map_err(|_| (StatusCode::NOT_FOUND, "no such file".to_string()))?;
+    let bytes = if file.ends_with(".m3u8") {
+        declare_target_duration(bytes, session.target_duration_secs)
+    } else {
+        bytes
+    };
     Ok(axum::response::Response::builder()
         .status(StatusCode::OK)
         .header("content-type", ctype)

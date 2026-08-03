@@ -332,7 +332,8 @@ async fn negotiation_picks_cheapest_source_and_honors_caps() {
         "profile": {
             "containers": ["mp4", "webm", "matroska"],
             "video": [{"codec": "h264"}],
-            "audio": ["aac", "mp3"]
+            "audio": ["aac", "mp3"],
+            "target_duration": {"mode": "ignore"}
         }
     }))
     .await;

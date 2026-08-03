@@ -257,7 +257,18 @@ How something works and why it was built that way belong in
       full video encode — a silent playback is a defect, an encode is a
       bill. Strictly a DROPPED stream; a source that never had video
       (music) or audio is not penalised for what it never had.
-- [x] HUB-17 HLS delivery for remux/transcode (EVENT playlists, mid-stream seek)
+- [x] HUB-17 HLS delivery for remux/transcode (EVENT playlists, mid-stream seek).
+      `EXT-X-TARGETDURATION` is declared from the source's measured
+      keyframe spacing, because a stream copy can only cut on a source
+      keyframe (measured here: median 10.0 s, worst 147 s, 87% of files
+      over the 2 s that used to be declared — RFC 8216 §4.3.3.1). The
+      client states which of three things it needs (`target_duration`,
+      required, no default): `ignore` keeps the old constant and the
+      old violation, `accurate` declares the truth, `short` guarantees
+      a ceiling and forces a video encode when the source cannot meet
+      it. The readiness gate scales with the declared value, since a
+      client reloads at roughly that cadence and §6.3.3 tells it not to
+      start within three of them.
 - [x] HUB-18 Sessions: per-user concurrency caps, progress checkpoints/resume,
       idle reaping, seek-anywhere with pipeline restart
 - [ ] HUB-19 Music: playback + queue live *(gapless delivery and ReplayGain

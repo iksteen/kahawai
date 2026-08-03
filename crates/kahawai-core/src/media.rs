@@ -102,36 +102,89 @@ pub struct AudioStream {
     pub layout: Option<String>,
 }
 
+/// What a client needs from `EXT-X-TARGETDURATION`, which is three
+/// different needs and not a boolean.
+///
+/// A stream copy can only cut on a source keyframe, so the declared
+/// value is bounded by the source's keyframe spacing — measured here to
+/// run past 147 s. RFC 8216 §4.3.3.1 makes under-declaring a violation,
+/// and §6.3.3 tells a client not to start playing within three target
+/// durations of the end, so an HONEST value on such a file is
+/// conforming and still unusable. The client is the only party that
+/// knows which of those two it can live with, so it says.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "mode")]
+pub enum TargetDuration {
+    /// Don't care: declare the cheap constant and accept that segments
+    /// may exceed it. What every browser has always got — hls.js does
+    /// not enforce the bound — and knowingly non-conforming.
+    Ignore,
+    /// Must be accurate; any value is fine. The declaration follows the
+    /// source, so a long-GOP file gets a long target and the client
+    /// waits longer before it may start. Costs nothing at playback.
+    Accurate,
+    /// Must be accurate AND no larger than `max_secs`. The only mode
+    /// that can force a video ENCODE — when the source's keyframes are
+    /// too far apart to cut inside the ceiling, the encoder's own GOP is
+    /// the only way to produce one, and the client asked for a
+    /// guarantee rather than a measurement.
+    Short { max_secs: u32 },
+}
+
+impl TargetDuration {
+    /// The ceiling this mode imposes, if any.
+    pub fn ceiling_secs(&self) -> Option<u32> {
+        match self {
+            Self::Short { max_secs } => Some((*max_secs).max(1)),
+            _ => None,
+        }
+    }
+}
+
 /// HUB-14: what the requesting client can play. Sent with each play
 /// request; per-request state, never persisted. `Default` is the
 /// conservative fallback for requests without one — it reproduces the
 /// pre-negotiation behavior exactly (mp4/webm direct, WEB_TARGET
 /// codecs, no ceilings), so old clients and scripts lose nothing.
+/// Every field defaults EXCEPT `target_duration`, which is required.
+/// The struct-level `#[serde(default)]` used to make the whole profile
+/// partial; a client must now state what it needs from the playlist,
+/// because there is no answer that is right for all three kinds of
+/// client and a silent default would pick one of them for it.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(default)]
 pub struct CapabilityProfile {
     /// Containers the client demuxes natively (normalized like
     /// `MediaInfo.container`: "mp4", "webm", "matroska", …).
+    #[serde(default = "default_containers")]
     pub containers: Vec<String>,
+    #[serde(default = "default_video")]
     pub video: Vec<VideoCap>,
     /// Audio codec names the client decodes ("aac", "mp3", "opus", …).
+    #[serde(default = "default_audio")]
     pub audio: Vec<String>,
     /// 0 = unlimited. The web client sends 0: browsers downmix 5.1 AAC
     /// natively, and forcing stereo would re-encode every 5.1 track.
+    #[serde(default)]
     pub max_audio_channels: u32,
+    #[serde(default)]
     pub max_height: Option<u32>,
+    #[serde(default)]
     pub max_fps: Option<u32>,
     /// Client will DISPLAY HDR bytes acceptably — either a real HDR
     /// pipeline, or compositor tone mapping (Chrome/Safari do this on
     /// SDR displays; Firefox does not and renders PQ washed-out).
     /// false + an hdr10 source vetoes copy/direct when the server can
     /// tone-map an encode instead (HUB-15a decision arm).
+    #[serde(default)]
     pub hdr: bool,
     /// min()-ed with the user's stored bandwidth pref by the hub.
+    #[serde(default)]
     pub max_bandwidth_kbps: Option<u32>,
     /// HUB-32a: client renders ASS/SSA faithfully (JASSUB).
+    #[serde(default)]
     pub ass_render: bool,
     /// HUB-32b: client composites bitmap display sets (canvas overlay).
+    #[serde(default)]
     pub graphics_overlay: bool,
     /// Client renders plain timed text. Every text rung — a converted
     /// SRT, a flattened ASS, an OCR-derived track — is delivered as
@@ -145,7 +198,28 @@ pub struct CapabilityProfile {
     /// what the conservative fallback has always delivered, and
     /// defaulting false would silently move every quiet client to
     /// burn-in.
+    #[serde(default = "default_true")]
     pub vtt_render: bool,
+    /// REQUIRED. See [`TargetDuration`] — the one field with no default,
+    /// because guessing it wrong is either a spec violation or an
+    /// unplayable startup delay depending on which client asked.
+    pub target_duration: TargetDuration,
+}
+
+fn default_containers() -> Vec<String> {
+    vec!["mp4".into(), "webm".into()]
+}
+fn default_video() -> Vec<VideoCap> {
+    vec![VideoCap {
+        codec: "h264".into(),
+        ..Default::default()
+    }]
+}
+fn default_audio() -> Vec<String> {
+    vec!["aac".into(), "mp3".into()]
+}
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -177,6 +251,10 @@ impl Default for CapabilityProfile {
             ass_render: false,
             graphics_overlay: false,
             vtt_render: true,
+            // The fallback for a request with NO profile at all, which
+            // is the pre-negotiation behaviour this Default exists to
+            // reproduce. A client that sends a profile must choose.
+            target_duration: TargetDuration::Ignore,
         }
     }
 }

@@ -59,6 +59,19 @@ pub struct SourcePlan {
     /// because it has no way to reach the media's neighbourhood.
     pub burn_ass_sidecar: Option<usize>,
     pub cost: Cost,
+    /// What to declare as `EXT-X-TARGETDURATION`, in seconds.
+    ///
+    /// Hub-side, not part of `RemuxPlan`: the sinks' own
+    /// `target-duration` is the FRAGMENT interval they cut on, and
+    /// hlssink3 conflates the two, so a sink asked to declare 12 would
+    /// also start packing 12-second fragments and overshoot again. The
+    /// hub therefore decides the declaration and applies it where the
+    /// playlist is served, which also covers playlists produced on a
+    /// transcoder.
+    ///
+    /// Fixed for the session's life. §6.2.1 forbids changing it once
+    /// published, and a seek re-plan must not move it.
+    pub target_duration_secs: u32,
     /// A stream the source HAS that this plan cannot deliver — today
     /// only audio, since dropped video is already `Cost::Unplayable`.
     /// Ranks ABOVE cost when choosing between sources: a complete plan
@@ -251,6 +264,61 @@ impl AssPolicy {
         out
     }
 }
+
+
+/// What `EXT-X-TARGETDURATION` must say, given how this plan will cut
+/// segments.
+///
+/// An ENCODE sets its own GOP (~2 s), so the historical constant is
+/// honest for it. A COPY can only cut on a source keyframe, and the
+/// sink packs whole GOPs until it passes the fragment target — so the
+/// longest segment is bounded by `FRAGMENT_TARGET + max keyframe gap`,
+/// which is the formula measured against real files (GOP 10.43 s →
+/// segments 10.22-10.58 s).
+///
+/// `None` for the gap means never measured, and a caller must assume it
+/// could be long: this library's worst known file is 147 s, so there is
+/// no safe small constant to fall back on.
+pub fn declared_target_secs(
+    mode: &kahawai_core::media::TargetDuration,
+    max_keyframe_gap_ms: Option<u32>,
+    video_is_encoded: bool,
+) -> u32 {
+    use kahawai_core::media::TargetDuration as T;
+    // We choose the GOP, so the segment length is ours either way.
+    if video_is_encoded {
+        return crate::remux::DEFAULT_TARGET_DURATION_SECS.max(match mode {
+            T::Short { max_secs } => (*max_secs).min(crate::remux::DEFAULT_TARGET_DURATION_SECS),
+            _ => 0,
+        });
+    }
+    match mode {
+        // Knowingly non-conforming, and the client said so.
+        T::Ignore => crate::remux::DEFAULT_TARGET_DURATION_SECS,
+        T::Accurate | T::Short { .. } => match max_keyframe_gap_ms {
+            Some(gap_ms) => {
+                let bound_ms = crate::remux::FRAGMENT_TARGET_SECS as u64 * 1000 + gap_ms as u64;
+                // §4.3.3.1 compares the NEAREST integer, and rounding
+                // is monotonic — every real segment is <= this bound,
+                // so `round(bound)` covers `round(actual)` without
+                // rounding up and inflating the client's reload
+                // interval for a file that never needed it.
+                (((bound_ms + 500) / 1000) as u32)
+                    .max(crate::remux::DEFAULT_TARGET_DURATION_SECS)
+            }
+            // Unmeasured: the honest answer is "could be long". A
+            // `short` client never reaches here — an unknown gap forces
+            // the encode above, which is exactly what it paid for.
+            None => UNKNOWN_GAP_TARGET_SECS,
+        },
+    }
+}
+
+/// Declared when a copy's keyframe spacing was never measured. Larger
+/// than every measured file in this library bar one, and still a guess:
+/// it exists so an `accurate` client is not handed a value we know to
+/// be wrong, not because it is provably right.
+pub const UNKNOWN_GAP_TARGET_SECS: u32 = 16;
 
 /// An explicit image track picked for burn-in (subtitle unification).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -643,11 +711,29 @@ pub fn negotiate(
     let f4 = candidate(SegmentFormat::Fmp4);
     // Fewest dropped streams, then cheapest, tie → TS: the proven path
     // wins unless fMP4 delivers more or strictly cheaper.
-    let (segment_format, (video, video_target, audio, audio_target, _key)) = if f4.4 < ts.4 {
+    let (segment_format, (mut video, video_target, audio, audio_target, _key)) = if f4.4 < ts.4 {
         (SegmentFormat::Fmp4, f4)
     } else {
         (SegmentFormat::Ts, ts)
     };
+
+    // A `short` client bought a GUARANTEE, and a copy cannot give one:
+    // segments land on the source's keyframes, which here run past
+    // 147 s. When they will not fit inside the ceiling — or were never
+    // measured, so nothing can promise they will — the encoder's own
+    // GOP is the only way to produce a segment that does, and that
+    // means encoding video that would otherwise have been copied.
+    //
+    // Only when there IS video to encode, and never against a source
+    // whose gap already fits: a 1 s-GOP file satisfies any sane ceiling
+    // for free, and re-encoding it would be pure waste.
+    let gap_ms = v.and_then(|s| s.max_keyframe_interval_ms);
+    if let Some(ceiling) = profile.target_duration.ceiling_secs()
+        && video == StreamMode::Copy
+        && declared_target_secs(&profile.target_duration, gap_ms, false) > ceiling
+    {
+        video = StreamMode::Encode;
+    }
 
     // HUB-15a: tone-map only when the pixels get rewritten anyway (an
     // encode) and only PQ — HLG is SDR-compatible by design, and a
@@ -886,6 +972,11 @@ pub fn negotiate(
         // carry it exists.
         burn_ass_sidecar: burn_ass_file.filter(|_| video == StreamMode::Encode),
         cost,
+        target_duration_secs: declared_target_secs(
+            &profile.target_duration,
+            gap_ms,
+            video == StreamMode::Encode,
+        ),
         incomplete,
         video_verdict,
         audio_verdict,
@@ -2321,5 +2412,94 @@ mod tests {
             (false, Cost::VideoEncode) < (true, Cost::Copy),
             "a bill must beat a defect"
         );
+    }
+    use kahawai_core::media::TargetDuration as T;
+
+
+    /// The declaration is `FRAGMENT_TARGET + max keyframe gap`, rounded
+    /// up — measured, not assumed: a 10.43 s GOP produced segments of
+    /// 10.22-10.58 s against a 2 s fragment target, so 12 covers it and
+    /// 11 would not.
+    #[test]
+    fn the_declared_value_bounds_the_longest_segment() {
+        assert_eq!(declared_target_secs(&T::Accurate, Some(10_430), false), 12);
+        assert_eq!(declared_target_secs(&T::Accurate, Some(1_000), false), 3);
+        // Never below the historical floor, however short the GOP.
+        assert_eq!(declared_target_secs(&T::Accurate, Some(10), false), 2);
+        // The worst file in this library: 147 s is not a number any
+        // constant would have covered.
+        assert_eq!(declared_target_secs(&T::Accurate, Some(147_100), false), 149);
+
+        // An ENCODE sets its own GOP, so the source's spacing is
+        // irrelevant — this is why `short` can promise anything at all.
+        assert_eq!(declared_target_secs(&T::Accurate, Some(147_100), true), 2);
+
+        // `ignore` keeps the old constant and stays knowingly wrong.
+        assert_eq!(declared_target_secs(&T::Ignore, Some(147_100), false), 2);
+
+        // Unmeasured: a bound we believe rather than one we measured,
+        // and deliberately not 2.
+        assert_eq!(
+            declared_target_secs(&T::Accurate, None, false),
+            UNKNOWN_GAP_TARGET_SECS
+        );
+    }
+
+    /// `short` buys a guarantee, and the only way to keep it on a
+    /// long-GOP source is to make the keyframes ourselves.
+    #[test]
+    fn short_forces_the_encode_only_when_the_source_cannot_fit() {
+        let profile = |mode| CapabilityProfile {
+            containers: vec!["mp4".into()],
+            video: vec![VideoCap {
+                codec: "h264".into(),
+                ..Default::default()
+            }],
+            audio: vec!["aac".into()],
+            target_duration: mode,
+            ..Default::default()
+        };
+        let source = |gap_ms| {
+            let mut info = media("matroska", Some(vs("h264")), Some(au("aac", 2)));
+            info.video[0].max_keyframe_interval_ms = gap_ms;
+            info
+        };
+        let plan = |mode, gap| {
+            negotiate(
+                &profile(mode),
+                &source(gap),
+                0,
+                0,
+                true,
+                None,
+                false,
+                true,
+                &[],
+                None,
+                &fleet(),
+            )
+        };
+
+        // 10 s keyframes cannot be cut inside a 6 s ceiling: encode.
+        let sp = plan(T::Short { max_secs: 6 }, Some(10_000));
+        assert_eq!(sp.plan.video, StreamMode::Encode, "{}", sp.video_verdict);
+        assert!(sp.target_duration_secs <= 6, "{}", sp.target_duration_secs);
+
+        // 1 s keyframes already fit — re-encoding would be pure waste.
+        let sp = plan(T::Short { max_secs: 6 }, Some(1_000));
+        assert_eq!(sp.plan.video, StreamMode::Copy, "{}", sp.video_verdict);
+        assert!(sp.target_duration_secs <= 6);
+
+        // Never measured: nothing can promise it fits, so the encode is
+        // what the client actually asked for.
+        let sp = plan(T::Short { max_secs: 6 }, None);
+        assert_eq!(sp.plan.video, StreamMode::Encode);
+
+        // The same long source under the other two modes stays a COPY —
+        // only `short` spends an encode on this.
+        for mode in [T::Accurate, T::Ignore] {
+            let sp = plan(mode.clone(), Some(10_000));
+            assert_eq!(sp.plan.video, StreamMode::Copy, "{mode:?}");
+        }
     }
 }
