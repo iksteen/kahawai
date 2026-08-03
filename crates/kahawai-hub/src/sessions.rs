@@ -118,11 +118,11 @@ pub struct Session {
     /// track-switch re-plans keep forcing the burn it asked for, and a
     /// new pick replaces it.
     burn_pick: Mutex<Option<kahawai_media::negotiate::BurnPick>>,
-    /// HUB-32a: this user's `ass_fallback` says burn rather than
-    /// flatten. Carried on the session because a seek re-negotiates,
-    /// and it must reach the same decision — against THIS executor's
-    /// capability, since a seek cannot move boxes.
-    ass_prefers_burn: bool,
+    /// HUB-32a/d: this user's ASS ladder. Carried on the session
+    /// because a seek re-negotiates and must reach the same decision —
+    /// against THIS executor's capability, since a seek cannot move
+    /// boxes.
+    ass: kahawai_media::negotiate::AssPolicy,
     /// HUB-32a: the sidecar script this session burns, if any. Held as
     /// text for the same reason `start_remux` takes it that way — the
     /// session dir is wiped on every restart.
@@ -1070,12 +1070,18 @@ impl Sessions {
         // standing choice. Fleet-wide rather than per-box on purpose —
         // the tier is decided before placement, which then hard-filters
         // on it (registry::PlacementNeed::needs_ass_burn).
-        let ass_burn = crate::tracks::AssBurn {
-            capable: !force_flatten_ass
-                && (registry.any_transcoder_ass_burn()
-                    || kahawai_media::remux::ass_burn_available()),
-            ..crate::tracks::AssBurn::for_user(registry.db(), user_id, false).await
-        };
+        let mut ass = crate::tracks::ass_policy_for_user(
+            registry.db(),
+            user_id,
+            registry.any_transcoder_ass_burn() || kahawai_media::remux::ass_burn_available(),
+        )
+        .await;
+        if force_flatten_ass {
+            // The user answered "flatten this time" to a refusal. Not
+            // written back to the preference: answering a question once
+            // is not reordering your ladder.
+            ass.order = vec![kahawai_media::negotiate::AssTier::Flatten];
+        }
         // HUB-32c: which embedded image tracks already have an OCR text
         // track derived from them — those prefer text over burn in the
         // negotiation. Fetched once, keyed per source.
@@ -1131,7 +1137,10 @@ impl Sessions {
             }
         };
         let negotiate_with =
-            |parts: &[PartSource], info: &kahawai_core::media::MediaInfo, burn_capable: bool| {
+            |parts: &[PartSource],
+             info: &kahawai_core::media::MediaInfo,
+             burn_capable: bool,
+             ass: &kahawai_media::negotiate::AssPolicy| {
                 let est_kbps = info
                     .duration_ms
                     .filter(|d| *d > 0)
@@ -1201,10 +1210,7 @@ impl Sessions {
                         })
                         .unwrap_or_default(),
                     pick_for(parts),
-                    kahawai_media::negotiate::AssBurn {
-                        capable: ass_burn.capable,
-                        preferred: ass_burn.preferred,
-                    },
+                    ass,
                     &targets,
                 )
             };
@@ -1216,7 +1222,7 @@ impl Sessions {
             let capable = parts.first().is_some_and(|p| {
                 registry.is_connected(&p.module_id) || self.reads_locally(&p.module_id)
             });
-            negotiate_with(parts, info, capable)
+            negotiate_with(parts, info, capable, &ass)
         };
         let (parts, info, sp, mode) = match mode {
             // Operator override (scripts, pipeline debugging): the mode
@@ -1300,8 +1306,31 @@ impl Sessions {
                 // burn_capable=false also voids the pick: negotiate
                 // ignores a pick it cannot honor.
                 burn_capable = false;
-                sp = negotiate_with(&parts, &info, false);
+                sp = negotiate_with(&parts, &info, false, &ass);
             }
+        }
+        // HUB-32d: the overlay rung only exists once a rasterised track
+        // does. Asked AFTER the source is chosen and only when the
+        // ladder would actually take it — rasterising for a client
+        // that would flatten anyway is pure waste — and the answer
+        // re-plans, exactly as failing display sets do one tier down.
+        let mut ass = ass;
+        if ass.overlay_reachable(&profile)
+            && let Some(part) = parts.first()
+            && subtitles
+                .overlay_ready(
+                    registry,
+                    self,
+                    item_id,
+                    &part.module_id,
+                    &part.collection_id,
+                    &part.path_rel,
+                    user_id,
+                )
+                .await
+        {
+            ass.overlay_ready = true;
+            sp = negotiate_with(&parts, &info, burn_capable, &ass);
         }
         // HUB-32a: a sidecar ASS burn needs the script itself, the same
         // way an image burn needs its display sets — the worker cannot
@@ -1321,7 +1350,7 @@ impl Sessions {
                     track = i,
                     "ASS burn: sidecar script unavailable; re-planning without it"
                 );
-                sp = negotiate_with(&parts, &info, burn_capable);
+                sp = negotiate_with(&parts, &info, burn_capable, &ass);
             }
         }
         // The refusal (HUB-32a, owner decision): when the fleet cannot
@@ -1595,7 +1624,7 @@ impl Sessions {
             sub_verdicts: Mutex::new(sub_verdicts),
             burn_sets: Mutex::new(burn_sets.clone()),
             burn_pick: Mutex::new(burn_pick),
-            ass_prefers_burn: ass_burn.preferred,
+            ass: ass.clone(),
             burn_ass_text: Mutex::new(burn_ass_text),
             profile,
             sink: Mutex::new(chosen_sink),
@@ -2282,7 +2311,8 @@ impl Sessions {
             // move boxes (HUB-15b). Only relevant when the preference
             // has actually selected the burn tier: otherwise this is an
             // ordinary track change and the client renders it itself.
-            if is_ass && session.ass_prefers_burn {
+            if is_ass && session.ass.order.first() == Some(&kahawai_media::negotiate::AssTier::Burn)
+            {
                 let capable = match &session.mode {
                     Mode::Transcode { transcoder } => {
                         let tc = transcoder.lock().unwrap().clone();
@@ -2492,15 +2522,15 @@ impl Sessions {
                 // A seek cannot move boxes (HUB-15b), so the question is
                 // whether THIS executor burns ASS — not whether the
                 // fleet does.
-                kahawai_media::negotiate::AssBurn {
-                    capable: match &session.mode {
+                &kahawai_media::negotiate::AssPolicy {
+                    burn_capable: match &session.mode {
                         Mode::Transcode { transcoder } => {
                             let tc = transcoder.lock().unwrap().clone();
                             registry.transcoder_reports_ass_burn(&tc)
                         }
                         _ => kahawai_media::remux::ass_burn_available(),
                     },
-                    preferred: session.ass_prefers_burn,
+                    ..session.ass.clone()
                 },
                 &targets,
             );

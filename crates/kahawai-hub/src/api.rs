@@ -1770,7 +1770,7 @@ async fn item_subtitles(
     Path(id): Path<String>,
     Query(caps): Query<SubtitleCaps>,
 ) -> Result<Json<Value>, ApiError> {
-    let ass_burn = crate::tracks::AssBurn::for_user(
+    let ass = crate::tracks::ass_policy_for_user(
         state.registry.db(),
         &claims.sub,
         state.registry.any_transcoder_ass_burn() || kahawai_media::remux::ass_burn_available(),
@@ -1783,7 +1783,7 @@ async fn item_subtitles(
             &id,
             caps.ass_render.unwrap_or(true),
             caps.graphics_overlay.unwrap_or(true),
-            ass_burn,
+            &ass,
         )
         .await
         .map_err(internal)?;

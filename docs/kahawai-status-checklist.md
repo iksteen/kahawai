@@ -167,10 +167,16 @@ How something works and why it was built that way belong in
       text codecs), mediahost extraction facility with index-driven sparse reads;
       image subtitles (PGS + VobSub) decoded server-side and rendered on a
       canvas overlay from the same tap — no video transcoding
-- [x] HUB-32a ASS fallback policy — server order client-native → flatten →
-      burn, with a per-user `ass_fallback` preference — the only way into
-      the burn tier, by decision: picking a track says WHICH subtitles,
-      never how they are delivered. Burning runs `assrender` in the encode
+- [x] HUB-32a ASS fallback policy — an ORDERED, capability-driven ladder.
+      `native` (the client's own renderer) always wins when declared and
+      is not orderable; the fallbacks — flatten, rasterised overlay
+      (HUB-32d), burn-in — are a per-user order (`ass_order`, default
+      flatten → overlay → burn) and the server takes the first rung this
+      client and this fleet can actually serve. Removing a rung is how
+      "never do that to my subtitles" is said, and an order that rules
+      out everything reachable refuses rather than downgrading quietly.
+      Picking a track says WHICH subtitles, never how they are
+      delivered. Burning runs `assrender` in the encode
       chain: embedded tracks take the demuxer's own pad (the only path that
       carries the release's attached fonts — verified live, a script asking
       for Calibri on a box that has no Calibri), a user's sidecar `.ass` is

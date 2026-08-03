@@ -56,8 +56,15 @@ pub enum AssBody {
 /// in the failed set until the next hub run.
 #[cfg(feature = "ocr")]
 const SETS_WAIT_URGENT: std::time::Duration = std::time::Duration::from_secs(20);
+
 #[cfg(feature = "ocr")]
 const SETS_WAIT_IDLE: std::time::Duration = std::time::Duration::from_secs(180);
+
+/// HUB-32d: how long a starting session waits for a rasterisation it
+/// needs. Generous next to the measured ~3.5 s an episode takes, and
+/// bounded for the same reason the burn path's wait is: a tier that is
+/// not ready is a tier to skip, not one to stall on.
+const RASTER_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Cache key for one subtitle track of one source file — shared by the
 /// lazy extractors and the mediahost ingestion path.
@@ -146,7 +153,7 @@ impl Subtitles {
         item_id: &str,
         ass_render: bool,
         graphics_overlay: bool,
-        ass_burn: crate::tracks::AssBurn,
+        ass: &kahawai_media::negotiate::AssPolicy,
     ) -> Result<Vec<TrackListing>> {
         let (module_id, collection_id, path_rel, _info) = source_row(registry, item_id).await?;
         let tracks = crate::tracks::for_item_source(
@@ -160,16 +167,23 @@ impl Subtitles {
         // Burn needs the display sets readable where the encode runs —
         // a connected mediahost extracts them (HUB-32b).
         let burn_capable = registry.is_connected(&module_id);
+        // HUB-32d: the overlay rung is only real once something has
+        // been rasterised. A listing never generates — it is a cheap,
+        // frequent call — so it reports what EXISTS. That makes it
+        // under-promise on first play, where the session start will
+        // generate one and then choose overlay; the alternative is
+        // over-promising burn, which is the expensive tier and the
+        // wrong answer.
+        let ass = kahawai_media::negotiate::AssPolicy {
+            overlay_ready: tracks.iter().any(|t| t.origin == "raster"),
+            ..ass.clone()
+        };
+        let ass = &ass;
         Ok(tracks
             .into_iter()
             .map(|t| {
-                let (delivery, note) = crate::tracks::delivery(
-                    &t,
-                    ass_render,
-                    graphics_overlay,
-                    burn_capable,
-                    ass_burn,
-                );
+                let (delivery, note) =
+                    crate::tracks::delivery(&t, ass_render, graphics_overlay, burn_capable, ass);
                 TrackListing {
                     track: t,
                     delivery,
@@ -648,7 +662,7 @@ impl Subtitles {
     /// there is no per-client cache to multiply — which was one of the
     /// two reasons this tier was deferred.
     pub async fn raster_generate(
-        self: &Arc<Self>,
+        &self,
         registry: &Registry,
         sessions: &crate::sessions::Sessions,
         parent_id: i64,
@@ -723,6 +737,82 @@ impl Subtitles {
             width, height, sets, bytes = ndjson.len(), ms = t0.elapsed().as_millis(),
             "ASS rasterised to a display-set track");
         Ok(id)
+    }
+
+    /// HUB-32d urgent path: make sure the overlay tier can actually be
+    /// served for this source, generating the raster if it is missing.
+    /// Returns whether a rasterised track is now in hand.
+    ///
+    /// Called only when the ladder would CHOOSE overlay
+    /// (`AssPolicy::overlay_reachable`) — rasterising for a client that
+    /// would take a cheaper tier anyway is pure waste. Bounded like the
+    /// burn path's display-set wait: a viewer is waiting, and a tier
+    /// that cannot be ready in time is a tier the ladder should skip
+    /// rather than one the session should stall for. Measured at ~3.5 s
+    /// for a 24-minute episode.
+    pub async fn overlay_ready(
+        &self,
+        registry: &Registry,
+        sessions: &crate::sessions::Sessions,
+        item_id: &str,
+        module_id: &str,
+        collection_id: &str,
+        path_rel: &str,
+        user_id: &str,
+    ) -> bool {
+        let tracks = match crate::tracks::for_item_source(
+            registry.db(),
+            item_id,
+            module_id,
+            collection_id,
+            path_rel,
+        )
+        .await
+        {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!(item = item_id, error = %e, "overlay tier: track list failed");
+                return false;
+            }
+        };
+        // Already rasterised: nothing to do, whatever it was derived
+        // from.
+        if tracks.iter().any(|t| t.origin == "raster") {
+            return true;
+        }
+        let Some(parent) = tracks
+            .iter()
+            .find(|t| matches!(t.format.as_str(), "ass" | "ssa"))
+        else {
+            return false; // no styled script here; the tier is moot
+        };
+        match tokio::time::timeout(
+            RASTER_WAIT,
+            self.raster_generate(registry, sessions, parent.id, user_id),
+        )
+        .await
+        {
+            Ok(Ok(_)) => true,
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    item = item_id,
+                    track = parent.id,
+                    error = format!("{e:#}"),
+                    "overlay tier: rasterising failed; falling to the next rung"
+                );
+                false
+            }
+            Err(_) => {
+                // The work continues and lands in the cache for next
+                // time; this session just takes the next rung.
+                tracing::warn!(
+                    item = item_id,
+                    track = parent.id,
+                    "overlay tier: rasterising did not finish in time"
+                );
+                false
+            }
+        }
     }
 
     /// The coded size and frame rate to render at — the source's own,

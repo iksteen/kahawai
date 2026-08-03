@@ -323,6 +323,9 @@ h2 { font-size: 14px; font-weight: 650; color: var(--dim); letter-spacing: 0.08e
   cursor: pointer;
   padding: 0 2px;
 }
+.chip-x:disabled { opacity: 0.3; cursor: default; }
+/* HUB-32a/d: the ordered ASS ladder wraps rather than overflowing. */
+.ass-ladder { flex-wrap: wrap; }
 
 .subpick {
   display: flex;

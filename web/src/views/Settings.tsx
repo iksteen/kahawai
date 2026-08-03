@@ -180,6 +180,89 @@ function OpenSubtitlesAccount({
   )
 }
 
+/// The HUB-32a/d fallback ladder: reorder with the arrows, drop a rung
+/// with its toggle. Removing `flatten` is how "never flatten this" is
+/// said — and then a client with no other rung available is refused
+/// rather than quietly downgraded.
+const ASS_RUNGS = {
+  flatten: 'plain VTT — no server work, typesetting and karaoke lost',
+  overlay: 'rasterised server-side, drawn on the client canvas — full typesetting, no encode',
+  burn: 'composited into the picture — full fidelity, forces a video encode',
+} as const
+type AssRung = keyof typeof ASS_RUNGS
+
+function AssLadder({
+  value,
+  onChange,
+  flash,
+}: {
+  value: string
+  onChange: (v: string) => void
+  flash: () => void
+}) {
+  const all = Object.keys(ASS_RUNGS) as AssRung[]
+  const parsed = value
+    .split(',')
+    .map((s) => s.trim())
+    .filter((s): s is AssRung => (all as string[]).includes(s))
+  const order = parsed.length > 0 ? parsed : all
+  const off = all.filter((r) => !order.includes(r))
+  const save = (next: AssRung[]) => {
+    const v = next.join(',')
+    onChange(v)
+    putPref('', 'ass_order', v)
+      .then(flash)
+      .catch(() => {})
+  }
+  const move = (i: number, d: -1 | 1) => {
+    const next = [...order]
+    const j = i + d
+    if (j < 0 || j >= next.length) return
+    ;[next[i], next[j]] = [next[j], next[i]]
+    save(next)
+  }
+  return (
+    <div className="row-form pref-row">
+      <span className="pref-label mono">styled subs</span>
+      <span className="chips ass-ladder">
+        {order.map((r, i) => (
+          <span key={r} className="chip" title={ASS_RUNGS[r]}>
+            {i + 1}. {r}
+            <button className="chip-x" disabled={i === 0} onClick={() => move(i, -1)}>
+              ↑
+            </button>
+            <button
+              className="chip-x"
+              disabled={i === order.length - 1}
+              onClick={() => move(i, 1)}
+            >
+              ↓
+            </button>
+            <button
+              className="chip-x"
+              title="remove this rung"
+              disabled={order.length === 1}
+              onClick={() => save(order.filter((x) => x !== r))}
+            >
+              ×
+            </button>
+          </span>
+        ))}
+        {off.map((r) => (
+          <button key={r} className="chip dim" title={ASS_RUNGS[r]} onClick={() => save([...order, r])}>
+            + {r}
+          </button>
+        ))}
+      </span>
+      <span className="dim small-note">
+        first one this client and fleet can serve wins; client-side rendering always
+        beats all of them (this browser can, so you will not see these unless you mask
+        it off in a player's caps panel)
+      </span>
+    </div>
+  )
+}
+
 export default function Settings() {
   const [values, setValues] = useState<Record<string, string>>({})
   const [loaded, setLoaded] = useState(false)
@@ -262,40 +345,17 @@ export default function Settings() {
             caps playback bitrate (HUB-15) — copies refuse, encodes clamp
           </span>
         </div>
-        {/* HUB-32a: what happens to styled (ASS) subtitles on a client
-            that cannot render them itself. No server default — unset
-            reads as flatten, which is what everyone got before this
-            existed. Burning is never silent: if no box in the fleet can
-            do it, the session stops and asks. */}
-        <div className="row-form pref-row">
-          <span className="pref-label mono">styled subs</span>
-          <span className="chips">
-            {(['flatten', 'burn'] as const).map((v) => (
-              <button
-                key={v}
-                className={(values['ass_fallback'] ?? 'flatten') === v ? 'chip' : 'chip dim'}
-                title={
-                  v === 'flatten'
-                    ? 'convert to plain VTT — no video work, typesetting and karaoke lost'
-                    : 'burn into the picture — full fidelity, forces a video encode'
-                }
-                onClick={() =>
-                  putPref('', 'ass_fallback', v)
-                    .then(() => {
-                      setValues((cur) => ({ ...cur, ass_fallback: v }))
-                      flash()
-                    })
-                    .catch(() => {})
-                }
-              >
-                {v}
-              </button>
-            ))}
-          </span>
-          <span className="dim small-note">
-            for clients that cannot render ASS themselves (this browser can)
-          </span>
-        </div>
+        {/* HUB-32a/d: how styled (ASS) subtitles reach a client that
+            cannot render them itself, as an ORDERED ladder. The server
+            tries each rung in turn and takes the first one this client
+            and this fleet can actually serve. `native` is not listed:
+            it is not a fallback, and it always wins when the client
+            declares it. */}
+        <AssLadder
+          value={values['ass_order'] ?? ''}
+          onChange={(v) => setValues((cur) => ({ ...cur, ass_order: v }))}
+          flash={flash}
+        />
       </section>
       {MEDIA_TYPES.map((mt) => (
         <section key={mt}>

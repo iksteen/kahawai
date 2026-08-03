@@ -78,19 +78,130 @@ pub enum SubtitleTier {
     Unavailable,
 }
 
-/// HUB-32a: what the ASS fallback tier can and should do. The two only
-/// mean anything together — a preference no box can honour is a
-/// refusal, not a quiet flatten (owner decision), and a capable box
-/// with the preference unset still flattens.
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
-pub struct AssBurn {
-    /// The box that would run the encode reports `assrender` (TC-1).
-    /// `assrender` is absent on the mac mini and present on both Linux
-    /// boxes, so this is a real filter, not a formality.
-    pub capable: bool,
-    /// The user's `ass_fallback` preference says burn rather than
-    /// flatten. Per-user and global; there is no server default.
-    pub preferred: bool,
+/// HUB-32a/d: how a styled script reaches THIS client, as an ordered
+/// ladder rather than a switch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AssTier {
+    /// The client renders the script itself (JASSUB). Always first
+    /// when the client declares it, and never user-orderable: nothing
+    /// a server does can beat the real thing.
+    Native,
+    /// Flatten to plain VTT. Typesetting, positioned signs and karaoke
+    /// are lost, but no server work happens at all — and it is the one
+    /// tier that is always possible.
+    Flatten,
+    /// HUB-32d: rasterised server-side into display sets the client
+    /// composites. Full typesetting, no video encode.
+    Overlay,
+    /// HUB-32a: composited into the picture by the encoder. Full
+    /// fidelity, and the only tier that forces a video encode.
+    Burn,
+}
+
+impl AssTier {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Native => "native",
+            Self::Flatten => "flatten",
+            Self::Overlay => "overlay",
+            Self::Burn => "burn",
+        }
+    }
+
+    /// Parse one fallback name. `native` is deliberately unparseable:
+    /// it is not a fallback and cannot be ordered.
+    pub fn parse_fallback(s: &str) -> Option<Self> {
+        match s.trim() {
+            "flatten" => Some(Self::Flatten),
+            "overlay" => Some(Self::Overlay),
+            "burn" => Some(Self::Burn),
+            _ => None,
+        }
+    }
+}
+
+/// The user's fallback order plus what the fleet and this source can
+/// actually honour. Order expresses intent; the capabilities decide
+/// which intent is reachable.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AssPolicy {
+    /// Fallback order, native excluded. Tiers the user removed are
+    /// absent, which is how "never flatten this" is expressed.
+    pub order: Vec<AssTier>,
+    /// Some box in the fleet reports `assrender` (TC-1). Genuinely
+    /// varies per box, so this is a real filter and not a formality.
+    pub burn_capable: bool,
+    /// A rasterised track for this source is in hand (HUB-32d).
+    pub overlay_ready: bool,
+}
+
+impl Default for AssPolicy {
+    /// The server's own order, and the one every user starts with:
+    /// cheapest acceptable first, most expensive last.
+    fn default() -> Self {
+        Self {
+            order: vec![AssTier::Flatten, AssTier::Overlay, AssTier::Burn],
+            burn_capable: false,
+            overlay_ready: false,
+        }
+    }
+}
+
+impl AssPolicy {
+    /// Can this client be served by this tier at all?
+    fn permits(&self, profile: &CapabilityProfile, tier: AssTier) -> bool {
+        match tier {
+            AssTier::Native => profile.ass_render,
+            AssTier::Flatten => true,
+            AssTier::Overlay => profile.graphics_overlay && self.overlay_ready,
+            AssTier::Burn => self.burn_capable,
+        }
+    }
+
+    /// Which tier serves this client. `None` means the user's order
+    /// ruled out everything that is actually available — the only case
+    /// left where a session refuses rather than degrading, because an
+    /// ordered list is already the answer to "and if you cannot".
+    pub fn choose(&self, profile: &CapabilityProfile) -> Option<AssTier> {
+        if profile.ass_render {
+            return Some(AssTier::Native);
+        }
+        self.order
+            .iter()
+            .copied()
+            .find(|t| self.permits(profile, *t))
+    }
+
+    /// Would the overlay tier be chosen if a rasterised track existed?
+    /// The hub asks before generating one: rasterising for a client
+    /// that would take a cheaper tier anyway is pure waste, and the
+    /// answer depends on the whole order, not just on overlay's place
+    /// in it (with `[burn, overlay, flatten]` and no burn-capable box,
+    /// overlay is next up).
+    pub fn overlay_reachable(&self, profile: &CapabilityProfile) -> bool {
+        if profile.ass_render || !profile.graphics_overlay {
+            return false;
+        }
+        let mut ready = self.clone();
+        ready.overlay_ready = true;
+        ready.choose(profile) == Some(AssTier::Overlay)
+    }
+
+    /// `flatten,overlay,burn` — the stored form. Unknown names are
+    /// dropped and duplicates collapse, so a hand-edited preference
+    /// degrades to a shorter order rather than to nothing.
+    pub fn parse_order(value: &str) -> Vec<AssTier> {
+        let mut out: Vec<AssTier> = Vec::new();
+        for part in value.split(',') {
+            if let Some(t) = AssTier::parse_fallback(part)
+                && !out.contains(&t)
+            {
+                out.push(t);
+            }
+        }
+        out
+    }
 }
 
 /// An explicit image track picked for burn-in (subtitle unification).
@@ -204,14 +315,12 @@ fn burn_wanted(
         })
 }
 
-/// Does this client need an ASS track burned in? (HUB-32a: it cannot
-/// render ASS, the user prefers burning to flattening, and a box can.)
-/// Like [`burn_wanted`] it is decided before the plan, because it
-/// vetoes direct play and copy alike.
-fn ass_burn_wanted(profile: &CapabilityProfile, info: &MediaInfo, ass_burn: AssBurn) -> bool {
-    ass_burn.capable
-        && ass_burn.preferred
-        && !profile.ass_render
+/// Does this client need an ASS track burned in? (HUB-32a: the user's
+/// ladder resolves to the burn tier for it, and the source has a
+/// styled script to burn.) Like [`burn_wanted`] it is decided before
+/// the plan, because it vetoes direct play and copy alike.
+fn ass_burn_wanted(profile: &CapabilityProfile, info: &MediaInfo, ass: &AssPolicy) -> bool {
+    ass.choose(profile) == Some(AssTier::Burn)
         && (info
             .subtitles
             .iter()
@@ -255,11 +364,10 @@ pub fn negotiate(
     // encode that carries them is forced. Still needs `burn_capable`;
     // picks that name a non-image track are ignored.
     burn_pick: Option<BurnPick>,
-    // HUB-32a: the ASS fallback tier's capability and preference. A
-    // `burn_pick` naming an ass/ssa track burns it regardless of
-    // `preferred` — an explicit pick is not a preference — but never
-    // without `capable`.
-    ass_burn: AssBurn,
+    // HUB-32a/d: the user's fallback ladder plus what the fleet and
+    // this source can honour. A `burn_pick` naming an ass/ssa track
+    // only chooses WHICH script; the ladder decides how it is served.
+    ass: &AssPolicy,
     // HUB-15b: the verified encoder codec names of the box that would
     // run an encode ("h264"/"hevc"/"av1"/"aac"/"opus") — an executor
     // fact like `tonemap`, fetched from the speculatively placed
@@ -334,7 +442,7 @@ pub fn negotiate(
         && (v.is_some() || a.is_some())
         // Serving the file as-is cannot burn anything into it.
         && !burn_wanted(profile, info, burn_capable, ocr_text)
-        && !ass_burn_wanted(profile, info, ass_burn)
+        && !ass_burn_wanted(profile, info, ass)
         && forced_burn.is_none();
 
     // HUB-32b last resort: an image subtitle a client cannot composite
@@ -363,7 +471,7 @@ pub fn negotiate(
     // silently, and never without a box that can do it. The pick only
     // chooses which track; a sidecar pick burns from the FILE, so it
     // carries no embedded index.
-    let ass_wanted = ass_burn_wanted(profile, info, ass_burn);
+    let ass_wanted = ass_burn_wanted(profile, info, ass);
     let is_ass = |f: &str| matches!(f, "ass" | "ssa");
     let first_embedded_ass = || info.subtitles.iter().position(|s| is_ass(&s.format));
     let first_sidecar_ass = || {
@@ -626,10 +734,20 @@ pub fn negotiate(
                     (SubtitleTier::Burn, "burned in (forces the video encode)")
                 }
                 "ass" | "ssa" if profile.ass_render => (SubtitleTier::Text, ""),
+                // HUB-32d: served as a rasterised overlay. No encode,
+                // no flattening — the playback-info line should not
+                // claim either.
+                "ass" | "ssa" if ass.choose(profile) == Some(AssTier::Overlay) => (
+                    SubtitleTier::Graphics,
+                    "rasterised overlay — full typesetting, no encode",
+                ),
                 "ass" | "ssa" if burn_ass_track.is_some() => {
                     (SubtitleTier::Unavailable, "only one track can be burned in")
                 }
-                "ass" | "ssa" if ass_burn.preferred && !ass_burn.capable => (
+                // Say which rung of the ladder answered, so a user who
+                // ordered burn first and got flattened text can see
+                // that the fleet, not the preference, decided.
+                "ass" | "ssa" if ass.order.first() == Some(&AssTier::Burn) => (
                     SubtitleTier::Convert,
                     "flattened to VTT — no box in the fleet can burn ASS",
                 ),
@@ -746,7 +864,7 @@ mod tests {
             burn_capable,
             ocr_text,
             burn_pick,
-            AssBurn::default(),
+            &AssPolicy::default(),
             targets,
         )
     }
@@ -1264,7 +1382,7 @@ mod tests {
             format: "ass".into(),
             language: Some("en".into()),
         }];
-        let go = |p: &CapabilityProfile, ass: AssBurn, pick: Option<BurnPick>| {
+        let go = |p: &CapabilityProfile, ass: &AssPolicy, pick: Option<BurnPick>| {
             super::negotiate(
                 p,
                 &info,
@@ -1280,19 +1398,23 @@ mod tests {
                 &fleet(),
             )
         };
-        let capable = AssBurn {
-            capable: true,
-            preferred: false,
+        // A burn-capable fleet with the DEFAULT order, which puts
+        // flatten first: capability alone never burns.
+        let capable = AssPolicy {
+            burn_capable: true,
+            ..Default::default()
         };
-        let wants_burn = AssBurn {
-            capable: true,
-            preferred: true,
+        // The same fleet, with the user's order naming burn first.
+        let wants_burn = AssPolicy {
+            order: vec![AssTier::Burn, AssTier::Flatten],
+            burn_capable: true,
+            overlay_ready: false,
         };
 
         // A client that renders ASS itself always wins: nothing to do,
         // no encode, whatever the preference says.
         p.ass_render = true;
-        let sp = go(&p, wants_burn, None);
+        let sp = go(&p, &wants_burn, None);
         assert_eq!(sp.plan.burn_ass, None);
         assert_eq!(sp.subtitles[0].tier, SubtitleTier::Text);
         assert_eq!(sp.cost, Cost::Copy, "{}", sp.video_verdict);
@@ -1302,21 +1424,21 @@ mod tests {
         // decision, 2026-08-03): the burn tier is reached by the
         // preference alone, so a client that renders ASS keeps doing
         // so and nothing is forced.
-        let sp = go(&p, capable, Some(BurnPick::Embedded(0)));
+        let sp = go(&p, &capable, Some(BurnPick::Embedded(0)));
         assert_eq!(sp.plan.burn_ass, None);
         assert_eq!(sp.subtitles[0].tier, SubtitleTier::Text);
         assert_eq!(sp.cost, Cost::Copy, "a pick must not force an encode");
 
         // No client-side ASS and no preference: flatten, no video work.
         p.ass_render = false;
-        let sp = go(&p, capable, None);
+        let sp = go(&p, &capable, None);
         assert_eq!(sp.plan.burn_ass, None);
         assert_eq!(sp.subtitles[0].tier, SubtitleTier::Convert);
         assert_eq!(sp.cost, Cost::Copy);
 
         // Preference set and a box that can: burn, and that forces the
         // encode carrying it — a copy cannot have anything burned in.
-        let sp = go(&p, wants_burn, None);
+        let sp = go(&p, &wants_burn, None);
         assert_eq!(sp.plan.burn_ass, Some(0));
         assert_eq!(sp.cost, Cost::VideoEncode, "{}", sp.video_verdict);
         assert_eq!(sp.subtitles[0].tier, SubtitleTier::Burn);
@@ -1333,7 +1455,7 @@ mod tests {
             true,
             &[],
             None,
-            wants_burn,
+            &wants_burn,
             &fleet(),
         );
         assert!(!with_mp4.direct, "cannot burn into a file served as-is");
@@ -1344,9 +1466,10 @@ mod tests {
         // one thing the policy forbids.
         let sp = go(
             &p,
-            AssBurn {
-                capable: false,
-                preferred: true,
+            &AssPolicy {
+                order: vec![AssTier::Burn, AssTier::Flatten],
+                burn_capable: false,
+                overlay_ready: false,
             },
             None,
         );
@@ -1360,7 +1483,7 @@ mod tests {
 
         // A pick that names an ASS track is never mistaken for an image
         // burn: different plan field, different pipeline branch.
-        let sp = go(&p, wants_burn, Some(BurnPick::Embedded(0)));
+        let sp = go(&p, &wants_burn, Some(BurnPick::Embedded(0)));
         assert_eq!(sp.plan.burn_subtitle, None);
         assert_eq!(sp.plan.burn_ass, Some(0));
 
@@ -1384,7 +1507,7 @@ mod tests {
                 true,
                 &[],
                 pick,
-                wants_burn,
+                &wants_burn,
                 &fleet(),
             )
         };
@@ -1417,11 +1540,12 @@ mod tests {
             true,
             &[],
             Some(BurnPick::Sidecar(0)),
-            // The preference is what selects the tier; the pick only
-            // names the file.
-            AssBurn {
-                capable: true,
-                preferred: true,
+            // The ladder is what selects the tier; the pick only names
+            // the file.
+            &AssPolicy {
+                order: vec![AssTier::Burn, AssTier::Flatten],
+                burn_capable: true,
+                overlay_ready: false,
             },
             &fleet(),
         );

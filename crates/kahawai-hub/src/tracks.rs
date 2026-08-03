@@ -87,59 +87,77 @@ pub fn is_image_format(format: &str) -> bool {
     matches!(format, "pgs" | "vobsub" | "dvdsub")
 }
 
-/// What the server can do about ASS, and what the user asked it to do.
-/// See `negotiate::AssBurn` — the same pair, on the listing side.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct AssBurn {
-    pub capable: bool,
-    pub preferred: bool,
-}
-
-impl AssBurn {
-    /// The pair, resolved for one user against one fleet. `capable` is
-    /// fleet-wide rather than about the box a probe happened to pick:
-    /// the tier is decided before placement, and placement then hard-
-    /// filters on it (or the session refuses — never a quiet flatten).
-    pub async fn for_user(db: &sqlx::SqlitePool, user_id: &str, capable: bool) -> Self {
-        // HUB-32a: no server default and no config key. Unset means
-        // flatten, which is what every client got before this existed.
-        let preferred = sqlx::query_scalar::<_, String>(
-            "SELECT value FROM user_prefs
-              WHERE user_id = ? AND scope = '' AND key = 'ass_fallback'",
-        )
-        .bind(user_id)
-        .fetch_optional(db)
-        .await
-        .ok()
-        .flatten()
-        .is_some_and(|v| v == "burn");
-        Self { capable, preferred }
+/// HUB-32a/d: the user's ASS ladder, resolved for one user against one
+/// fleet. `native` is not in the stored order — it is not a fallback,
+/// and nothing a server does beats the client rendering the real
+/// script itself.
+pub async fn ass_policy_for_user(
+    db: &sqlx::SqlitePool,
+    user_id: &str,
+    burn_capable: bool,
+) -> kahawai_media::negotiate::AssPolicy {
+    let stored = sqlx::query_scalar::<_, String>(
+        "SELECT value FROM user_prefs
+          WHERE user_id = ? AND scope = '' AND key = 'ass_order'",
+    )
+    .bind(user_id)
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten();
+    let mut policy = kahawai_media::negotiate::AssPolicy {
+        burn_capable,
+        ..Default::default()
+    };
+    if let Some(v) = stored {
+        let order = kahawai_media::negotiate::AssPolicy::parse_order(&v);
+        // An order that parsed to nothing is a corrupt preference, not
+        // a request for no subtitles at all: keep the default rather
+        // than refusing every styled script this user opens.
+        if !order.is_empty() {
+            policy.order = order;
+        }
     }
+    policy
 }
 
 /// The delivery matrix. `burn_capable` is the hub-side fact from
 /// HUB-32b (the display-set timeline is readable where the encode
-/// runs); `ass_render`/`graphics_overlay` come from the client profile;
-/// `ass_burn` is HUB-32a's pair of a fleet fact and a user preference.
+/// runs); `ass_render`/`graphics_overlay` come from the client
+/// profile; `ass` is HUB-32a/d's ordered ladder.
 pub fn delivery(
     track: &Track,
     ass_render: bool,
     graphics_overlay: bool,
     burn_capable: bool,
-    ass_burn: AssBurn,
+    ass: &kahawai_media::negotiate::AssPolicy,
 ) -> (Delivery, &'static str) {
     // HUB-32d: a rasterised script is display sets like any other, but
     // it is an ITEM-level artefact — no stream index, no session tap,
-    // so it needs neither `burn_capable` nor an embedded origin. It has
-    // no text form either: a client that cannot composite has nothing
-    // to do with it, and should pick the parent script instead.
+    // so it needs neither `burn_capable` nor an embedded origin.
+    //
+    // It offers itself only when the LADDER picked the overlay rung.
+    // That is what stops the parent script and its raster both
+    // claiming the same delivery — and they would send the client to
+    // different URLs. Whichever rung won is the only one that reads as
+    // playable, so the client's existing "best delivery wins" pick
+    // lands on it without having to know the user's order.
     if track.origin == "raster" {
-        return match graphics_overlay {
-            true => (
+        let profile = kahawai_core::media::CapabilityProfile {
+            ass_render,
+            graphics_overlay,
+            ..Default::default()
+        };
+        return match ass.choose(&profile) {
+            Some(kahawai_media::negotiate::AssTier::Overlay) => (
                 Delivery::Overlay,
                 "rasterised — full typesetting, no encode",
             ),
-            false => (Delivery::None, "needs an overlay-capable client"),
+            _ if !graphics_overlay => (Delivery::None, "needs an overlay-capable client"),
+            _ => (
+                Delivery::None,
+                "another tier in your subtitle order comes first",
+            ),
         };
     }
     if is_image_format(&track.format) {
@@ -157,21 +175,39 @@ pub fn delivery(
         );
     }
     match track.format.as_str() {
-        // Client-native always wins the DEFAULT. A user who wants the
-        // burn anyway picks it from the list — that is an override, not
-        // a preference, and `burnable` is what offers it.
-        "ass" | "ssa" if ass_render => (Delivery::Ass, ""),
-        "ass" | "ssa" if ass_burn.preferred && ass_burn.capable => {
-            (Delivery::Burn, "burned in — restarts with a video encode")
+        // The ladder decides, and it is the SAME decision negotiation
+        // makes — one `choose`, so a listing can never promise a tier
+        // the session would not pick.
+        "ass" | "ssa" => {
+            let profile = kahawai_core::media::CapabilityProfile {
+                ass_render,
+                graphics_overlay,
+                ..Default::default()
+            };
+            match ass.choose(&profile) {
+                Some(kahawai_media::negotiate::AssTier::Native) => (Delivery::Ass, ""),
+                Some(kahawai_media::negotiate::AssTier::Burn) => {
+                    (Delivery::Burn, "burned in — restarts with a video encode")
+                }
+                // The overlay rung is served by the RASTER row, not by
+                // this one — they are different URLs. The script's own
+                // remaining form is the flattened VTT, which is honest
+                // and still fetchable; the raster simply outranks it.
+                Some(kahawai_media::negotiate::AssTier::Overlay) => (
+                    Delivery::Text,
+                    "flattened to VTT — the rasterised overlay is preferred",
+                ),
+                Some(kahawai_media::negotiate::AssTier::Flatten) => {
+                    (Delivery::Text, "flattened to VTT")
+                }
+                // The order ruled out everything reachable. Said, not
+                // silently downgraded — the session refuses too.
+                None => (
+                    Delivery::None,
+                    "no tier in your subtitle order is available for this client",
+                ),
+            }
         }
-        // Never a silent flatten: the preference said burn and nothing
-        // can, so the reason travels with the track (HUB-32a). The
-        // session itself refuses rather than flattening quietly.
-        "ass" | "ssa" if ass_burn.preferred => (
-            Delivery::Text,
-            "flattened to VTT — no box in the fleet can burn ASS",
-        ),
-        "ass" | "ssa" => (Delivery::Text, "flattened to VTT"),
         _ => (Delivery::Text, ""),
     }
 }
@@ -407,39 +443,92 @@ mod tests {
         }
     }
 
-    /// HUB-32a's ladder, as a table: client-native beats everything,
-    /// the preference decides flatten vs burn, and a preference nothing
-    /// can honour says so rather than flattening in silence.
+    /// HUB-32a/d's ladder, as a table. Client-native always wins when
+    /// the client declares it; below that the USER's order decides, and
+    /// a rung the fleet or the client cannot serve is skipped rather
+    /// than stalling the ladder.
     #[test]
-    fn the_ass_ladder_reads_client_native_then_the_preference() {
+    fn the_ass_ladder_follows_the_users_order() {
+        use kahawai_media::negotiate::{AssPolicy, AssTier};
         let t = track("ass", "embedded");
-        let off = AssBurn::default();
-        let capable = AssBurn {
-            capable: true,
-            preferred: false,
+        let ladder = |order: &[AssTier], burn: bool, overlay: bool| AssPolicy {
+            order: order.to_vec(),
+            burn_capable: burn,
+            overlay_ready: overlay,
         };
-        let wants = AssBurn {
-            capable: true,
-            preferred: true,
-        };
-        let wants_but_cannot = AssBurn {
-            capable: false,
-            preferred: true,
-        };
+        let all = [AssTier::Flatten, AssTier::Overlay, AssTier::Burn];
 
-        assert_eq!(delivery(&t, true, true, true, wants).0, Delivery::Ass);
-        assert_eq!(delivery(&t, false, true, true, off).0, Delivery::Text);
-        assert_eq!(delivery(&t, false, true, true, capable).0, Delivery::Text);
-        assert_eq!(delivery(&t, false, true, true, wants).0, Delivery::Burn);
+        // Native outranks every order, including one that names burn
+        // first: nothing a server does beats the real renderer.
+        let d = delivery(&t, true, true, true, &ladder(&[AssTier::Burn], true, true));
+        assert_eq!(d.0, Delivery::Ass);
 
-        let (d, note) = delivery(&t, false, true, true, wants_but_cannot);
-        assert_eq!(d, Delivery::Text);
-        assert!(note.contains("no box"), "silent flatten: {note}");
+        // The default order, no client-side ASS: flatten is first and
+        // always possible, so it wins even with the others available.
+        let d = delivery(&t, false, true, true, &ladder(&all, true, true));
+        assert_eq!(d.0, Delivery::Text);
 
-        // A client that renders ASS is never overridden: the burn is
-        // reached by masking `ass_render` off, not by picking a track
-        // (owner decision, 2026-08-03 — the preference is the only way
-        // into the tier).
-        assert_eq!(delivery(&t, true, true, true, wants).0, Delivery::Ass);
+        // Reordered: overlay first, and it is ready. The SCRIPT's own
+        // delivery stays text — the overlay rung is served by the
+        // rasterised row, which is a different URL — but the note says
+        // which rung actually won.
+        let order = [AssTier::Overlay, AssTier::Burn, AssTier::Flatten];
+        let d = delivery(&t, false, true, true, &ladder(&order, true, true));
+        assert_eq!(d.0, Delivery::Text);
+        assert!(d.1.contains("overlay"), "unexplained: {}", d.1);
+        // ...and the raster row is the one that reads as playable, so
+        // "best delivery wins" on the client lands on it.
+        let r = track("raster", "raster");
+        let d = delivery(&r, false, true, true, &ladder(&order, true, true));
+        assert_eq!(d.0, Delivery::Overlay);
+        // With flatten first instead, the raster stops offering itself
+        // and the script's own text form wins.
+        let d = delivery(&r, false, true, true, &ladder(&all, true, true));
+        assert_eq!(d.0, Delivery::None);
+
+        // Same order, but nothing has been rasterised yet — skip to
+        // the next rung the fleet can serve.
+        let d = delivery(&t, false, true, true, &ladder(&order, true, false));
+        assert_eq!(d.0, Delivery::Burn);
+
+        // ...and with no burn-capable box either, down to flatten.
+        let d = delivery(&t, false, true, false, &ladder(&order, false, false));
+        assert_eq!(d.0, Delivery::Text);
+
+        // A client that cannot composite skips overlay however the
+        // user ordered it — capability outranks preference.
+        let d = delivery(&t, false, false, true, &ladder(&order, true, true));
+        assert_eq!(d.0, Delivery::Burn);
+
+        // An order with flatten REMOVED is how "never flatten this"
+        // is expressed, and when nothing else is reachable that is a
+        // refusal rather than a silent downgrade.
+        let d = delivery(
+            &t,
+            false,
+            false,
+            false,
+            &ladder(&[AssTier::Burn], false, false),
+        );
+        assert_eq!(d.0, Delivery::None);
+        assert!(d.1.contains("order"), "unexplained refusal: {}", d.1);
+    }
+
+    /// A hand-edited preference degrades to a shorter ladder, never to
+    /// a broken one: unknown names vanish, duplicates collapse, and
+    /// `native` is not orderable at all.
+    #[test]
+    fn a_stored_order_parses_forgivingly() {
+        use kahawai_media::negotiate::{AssPolicy, AssTier};
+        assert_eq!(
+            AssPolicy::parse_order("burn, flatten"),
+            vec![AssTier::Burn, AssTier::Flatten]
+        );
+        assert_eq!(
+            AssPolicy::parse_order("overlay,overlay,burn"),
+            vec![AssTier::Overlay, AssTier::Burn]
+        );
+        assert_eq!(AssPolicy::parse_order("native,burn"), vec![AssTier::Burn]);
+        assert!(AssPolicy::parse_order("nonsense").is_empty());
     }
 }
