@@ -24,6 +24,40 @@
 //! composition is flattened into a single RGBA rectangle over the union
 //! of its fragments' bounding boxes.
 //!
+//! ## What it costs (measured 2026-08-03, before anything was wired up)
+//!
+//! OPS-6 never evicts, so this tier was gated on a number. Cost is the
+//! product of two independent things — how often the composition
+//! CHANGES, and how big each changed rectangle is — and only the first
+//! varies much:
+//!
+//! | script                              | change rate | MB/min |
+//! |-------------------------------------|-------------|--------|
+//! | ordinary episode, no animation      |        2.5% |   0.64 |
+//! | signs-heavy (833 `\pos`)            |        2.4% |   0.49 |
+//! | real `\k` karaoke, song isolated    |        7.2% |   1.55 |
+//! | synthetic `\kf` sweep + `\t`        |        100% |  57.52 |
+//!
+//! So a 24-minute episode costs ~15 MB, and ~18 MB if it has a sung
+//! OP and ED. Real karaoke is 2.4x ordinary dialogue, not the 90x the
+//! last row suggests: `\k` steps once per SYLLABLE (~11 changes a
+//! line) while `\kf` sweeps and `\t` transforms change every frame.
+//! Only the latter saturate, and this library holds 10 `\kf` tags and
+//! ZERO `\t`/`\move` across 52,445 cached tracks — so sampling at the
+//! source frame rate costs essentially nothing here, which is why the
+//! cadence stayed as specified.
+//!
+//! Two things worth knowing before optimising:
+//!
+//! - PNG encoding dominates generation, not rendering (318 s against
+//!   15 s on the saturated case). Default zlib on RGBA.
+//! - The union-bbox flatten is pathological when one composition holds
+//!   widely separated elements: 26% of the frame per rect on the
+//!   synthetic case against 1-6% for dialogue. Cluster disjoint groups
+//!   before believing any figure from animated content.
+//!
+//! Re-derive any of this with `raster_cost_from_env` (ignored test).
+//!
 //! No bindgen and no binding crate: ten `extern "C"` declarations
 //! against the `libass.so` that `assrender` already forces onto every
 //! box that can burn (HUB-32a). Adding a build-time dependency to reach

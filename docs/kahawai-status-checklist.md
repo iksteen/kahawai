@@ -186,11 +186,14 @@ How something works and why it was built that way belong in
 
 ## Hub — users, API, playback
 
-- [ ] HUB-32d *(deferred)* Rasterise ASS server-side into a HUB-32b
-      bitmap track for overlay-capable clients — no encode, full
-      typesetting. Deferred: resolution-dependent unlike PGS, inverts
-      HUB-32c's bandwidth trade, and no client needs it yet (the web
-      player runs JASSUB).
+- [ ] HUB-32d Rasterise ASS server-side into a HUB-32b bitmap track for
+      overlay-capable clients — no encode, full typesetting. No longer
+      deferred on cost: measured 2026-08-03 at ~15 MB per 24-minute
+      episode (~18 MB with a sung OP/ED), because cost follows the
+      COMPOSITION CHANGE RATE and every real script sits at 2-7%. The
+      `assraster` module and the measurement harness are built; the
+      lifecycle and serving route are not. Numbers and method in the
+      module doc.
 - [ ] HUB-10 Multi-user *(accounts with create AND delete, admin flag,
       per-user watch state live; per-library access grants and parental
       controls missing)*
