@@ -84,6 +84,7 @@ pub fn router(
             axum::routing::delete(subtitle_delete),
         )
         .route("/api/v1/subtitles/{track_id}/ocr", post(subtitle_ocr))
+        .route("/api/v1/subtitles/{track_id}/raster", post(subtitle_raster))
         .route(
             "/api/v1/items/{id}/subtitles/{file}",
             get(item_subtitle_file),
@@ -547,8 +548,24 @@ async fn subtitle_ocr(
     }
 }
 
-/// Remove a hub-stored (downloaded/OCR) track. Scan-owned tracks
-/// refuse with 404-shaped `removed: false`.
+/// HUB-32d: rasterise a styled script into an overlay track. Same
+/// shape as the OCR button — idempotent, returns the existing row if
+/// one is already there.
+async fn subtitle_raster(
+    State(state): State<AppState>,
+    Path(track_id): Path<i64>,
+    axum::Extension(claims): axum::Extension<crate::auth::Claims>,
+) -> Result<Json<Value>, ApiError> {
+    let new_id = state
+        .subtitles
+        .raster_generate(&state.registry, &state.sessions, track_id, &claims.sub)
+        .await
+        .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, format!("{e:#}")))?;
+    Ok(Json(json!({ "track_id": new_id })))
+}
+
+/// Remove a hub-stored (downloaded/OCR/raster) track. Scan-owned
+/// tracks refuse with 404-shaped `removed: false`.
 async fn subtitle_delete(
     State(state): State<AppState>,
     Path(track_id): Path<i64>,
@@ -1808,6 +1825,33 @@ async fn item_subtitle_file(
         }
         Ok(())
     };
+    // HUB-32d: a rasterised track is display sets, served whole from
+    // the cache. Unlike the embedded overlay tap it is item-level and
+    // complete before the first byte goes out, so it needs no session
+    // and no tail-following — the client fetches it once, like a .vtt.
+    if let Some(raw) = file.strip_suffix(".jsonl") {
+        let track_id = resolve(raw)
+            .ok_or_else(|| ApiError::from((StatusCode::BAD_REQUEST, "bad track id".to_string())))?;
+        let track = crate::tracks::get(state.registry.db(), track_id)
+            .await
+            .map_err(internal)?
+            .filter(|t| t.item_id == id && t.origin == "raster")
+            .ok_or((
+                StatusCode::NOT_FOUND,
+                "no such rasterised track".to_string(),
+            ))?;
+        let bytes = tokio::fs::read(state.subtitles.raster_path(track.id))
+            .await
+            .map_err(|e| (StatusCode::NOT_FOUND, format!("raster body missing: {e}")))?;
+        return Ok((
+            [(
+                axum::http::header::CONTENT_TYPE,
+                "application/x-ndjson; charset=utf-8",
+            )],
+            bytes,
+        )
+            .into_response());
+    }
     if let Some(raw) = file.strip_suffix(".ass") {
         let track_id = resolve(raw)
             .ok_or_else(|| ApiError::from((StatusCode::BAD_REQUEST, "bad track id".to_string())))?;

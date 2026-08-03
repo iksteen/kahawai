@@ -18,6 +18,8 @@ import {
   startPlaybackSession,
   subtitleLabel,
   isAssBurnRefusal,
+  isRasterSub,
+  overlayUrl,
   type ItemDetail,
   type Session,
   type Subtitle,
@@ -344,14 +346,20 @@ export default function Player({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [liveText, subKey, trackEpoch, item.id])
 
-  // Image subtitles (PGS/VobSub): the session tap streams decoded
-  // display sets — {"s",cw,ch,"o":[{x,y,png}]} — and we draw the
-  // latest set at/before the playhead on a canvas overlay, scaled from
+  // Display-set overlays — {"s",cw,ch,"o":[{x,y,png}]} — drawn on a
+  // canvas at the latest set before the playhead, scaled from
   // composition space to the video's displayed content box.
+  //
+  // Two producers, one format (`overlayUrl` picks): PGS/VobSub decoded
+  // by the running pipeline and tail-followed off the session, and
+  // HUB-32d rasterised scripts, which are finished item-level
+  // artefacts. Only the first needs a transcoded session — hence the
+  // HLS requirement applying to it alone, not to the overlay tier.
   const imgCanvasRef = useRef<HTMLCanvasElement | null>(null)
   useEffect(() => {
     const video = videoRef.current
-    if (!video || !useImage || !selected || !isHls) return
+    if (!video || !useImage || !selected) return
+    if (!isHls && !isRasterSub(selected)) return
     let dead = false
     const ac = new AbortController()
     type ImgSet = { s: number; cw: number; ch: number; objects: { x: number; y: number; img: ImageBitmap }[] }
@@ -428,8 +436,8 @@ export default function Player({
     video.addEventListener('seeked', draw)
 
     ;(async () => {
-      const base = session.stream_url.replace(/[^/]*$/, '')
-      const resp = await fetch(`${base}subs-${selected.id}.jsonl`, { signal: ac.signal })
+      const url = overlayUrl(selected, item.id, session.stream_url)
+      const resp = await fetch(url, { signal: ac.signal })
       if (!resp.ok || !resp.body) return
       const reader = resp.body.getReader()
       const dec = new TextDecoder()

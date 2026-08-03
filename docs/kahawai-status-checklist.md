@@ -186,14 +186,21 @@ How something works and why it was built that way belong in
 
 ## Hub — users, API, playback
 
-- [ ] HUB-32d Rasterise ASS server-side into a HUB-32b bitmap track for
-      overlay-capable clients — no encode, full typesetting. No longer
-      deferred on cost: measured 2026-08-03 at ~15 MB per 24-minute
-      episode (~18 MB with a sung OP/ED), because cost follows the
-      COMPOSITION CHANGE RATE and every real script sits at 2-7%. The
-      `assraster` module and the measurement harness are built; the
-      lifecycle and serving route are not. Numbers and method in the
-      module doc.
+- [x] HUB-32d Rasterise ASS server-side into a HUB-32b bitmap track for
+      overlay-capable clients — no encode, full typesetting. Generated
+      on demand per script (`POST /api/v1/subtitles/{id}/raster`, a
+      button on the item page), deduped by `derived_from` like HUB-32c
+      OCR, stored as a first-class `raster` row plus the same NDJSON
+      the PGS tap writes, and served item-level rather than through the
+      session tap — so it needs no running pipeline and works on direct
+      play. Rendered once at the source's coded size; the client scales
+      it uniformly by width exactly as it does PGS and burn-in.
+      Auto-selection ranks client-native ASS → rasterised overlay →
+      flattened text. Cost was the reason this was deferred and is now
+      measured: ~15 MB per 24-minute episode (~18 MB with a sung
+      OP/ED), because cost follows the COMPOSITION CHANGE RATE and
+      every real script sits at 2-7% — numbers and method in the
+      `assraster` module doc.
 - [ ] HUB-10 Multi-user *(accounts with create AND delete, admin flag,
       per-user watch state live; per-library access grants and parental
       controls missing)*

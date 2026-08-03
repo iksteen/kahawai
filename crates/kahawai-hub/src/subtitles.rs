@@ -436,6 +436,14 @@ impl Subtitles {
         self.dir.join(format!("downloaded-{id}.json"))
     }
 
+    /// HUB-32d: the rasterised display sets for a `raster` row, in the
+    /// exact NDJSON the client already consumes for PGS — one line per
+    /// composition. Keyed by row id, so `delete_track` removes it with
+    /// the row and nothing has to reason about cache keys.
+    pub(crate) fn raster_path(&self, id: i64) -> PathBuf {
+        self.dir.join(format!("raster-{id}.jsonl"))
+    }
+
     /// Search results plus the entitlement state the UI must show.
     /// HUB-21/22/24: search external providers for one item. Hash first
     /// (exact file), title/year as the fallback the provider needs when
@@ -627,6 +635,133 @@ impl Subtitles {
         // A human pressed the button: bounded like the burn path's wait.
         self.ocr_generate_within(registry, parent_id, user_id, SETS_WAIT_URGENT)
             .await
+    }
+
+    /// HUB-32d: rasterise an ASS/SSA track into a display-set track an
+    /// overlay-capable client can composite — full typesetting, no
+    /// video encode anywhere. The result is a first-class `raster` row
+    /// whose `derived_from` points at the script it was rendered from,
+    /// the same linkage HUB-32c's OCR rows use and dedupe on.
+    ///
+    /// Rendered ONCE at the source's coded size. The player scales an
+    /// overlay uniformly by width (the same rule burn-in follows), so
+    /// there is no per-client cache to multiply — which was one of the
+    /// two reasons this tier was deferred.
+    pub async fn raster_generate(
+        self: &Arc<Self>,
+        registry: &Registry,
+        sessions: &crate::sessions::Sessions,
+        parent_id: i64,
+        user_id: &str,
+    ) -> Result<i64> {
+        // One generation per parent: losing the race means the work is
+        // already done, so return the winner's row.
+        let lock = {
+            let mut map = self.inflight.lock().unwrap();
+            map.entry(format!("raster:{parent_id}"))
+                .or_default()
+                .clone()
+        };
+        let _guard = lock.lock_owned().await;
+        if let Some(id) = sqlx::query_scalar::<_, i64>(
+            "SELECT id FROM subtitle_tracks WHERE derived_from = ? AND origin = 'raster'",
+        )
+        .bind(parent_id)
+        .fetch_optional(registry.db())
+        .await?
+        {
+            return Ok(id);
+        }
+        let parent = crate::tracks::get(registry.db(), parent_id)
+            .await?
+            .with_context(|| format!("no subtitle track {parent_id}"))?;
+        anyhow::ensure!(
+            matches!(parent.format.as_str(), "ass" | "ssa"),
+            "track {parent_id} is {}, not a styled script",
+            parent.format
+        );
+        let script = self
+            .ass_for_burn(registry, sessions, &parent.item_id, &parent.internal_key())
+            .await
+            .context("track has no ASS form to rasterise")?;
+        let (width, height, fps) = self.raster_geometry(registry, &parent).await?;
+
+        let t0 = std::time::Instant::now();
+        // Blocking and long: libass rendering plus a PNG per changed
+        // composition, measured at ~25 s for a feature (module doc in
+        // kahawai_media::assraster has the numbers).
+        let (ndjson, sets) = tokio::task::spawn_blocking(move || -> Result<(Vec<u8>, usize)> {
+            let mut r = kahawai_media::assraster::Raster::new(width, height)?;
+            let until = kahawai_media::assraster::script_end_ms(&script);
+            let sets = r.render(&script, fps, until)?;
+            Ok((kahawai_media::assraster::to_ndjson(&sets)?, sets.len()))
+        })
+        .await??;
+        anyhow::ensure!(sets > 0, "the script rendered nothing at all");
+
+        // machine = 0, unlike OCR. Both are generated, but `machine`
+        // means "imperfect by nature, and say so to the user"
+        // (HUB-32c): an OCR track guesses at glyphs, while this is the
+        // script rendered exactly as its author typeset it — MORE
+        // faithful than the flattened VTT, not less.
+        let id: i64 = sqlx::query_scalar(
+            "INSERT INTO subtitle_tracks
+               (item_id, origin, format, language, label, provider, machine,
+                created_by, derived_from)
+             VALUES (?, 'raster', 'raster', ?, ?, 'assraster', 0, ?, ?) RETURNING id",
+        )
+        .bind(&parent.item_id)
+        .bind(&parent.language)
+        .bind(format!("{width}x{height}"))
+        .bind(user_id)
+        .bind(parent_id)
+        .fetch_one(registry.db())
+        .await?;
+        std::fs::create_dir_all(&self.dir)?;
+        std::fs::write(self.raster_path(id), &ndjson)?;
+        tracing::info!(item = %parent.item_id, parent = parent_id, track = id,
+            width, height, sets, bytes = ndjson.len(), ms = t0.elapsed().as_millis(),
+            "ASS rasterised to a display-set track");
+        Ok(id)
+    }
+
+    /// The coded size and frame rate to render at — the source's own,
+    /// not the script's `PlayRes`. A script authored at 1280x720 for a
+    /// 1080p release must rasterise at 1080p or the overlay lands at
+    /// the wrong scale.
+    async fn raster_geometry(
+        &self,
+        registry: &Registry,
+        parent: &crate::tracks::Track,
+    ) -> Result<(u32, u32, (u32, u32))> {
+        let (m, c, p) = (
+            parent
+                .module_id
+                .clone()
+                .context("hub-stored track has no source")?,
+            parent.collection_id.clone().unwrap_or_default(),
+            parent.path_rel.clone().unwrap_or_default(),
+        );
+        let streams: String = sqlx::query_scalar(
+            "SELECT streams_json FROM files WHERE (module_id, collection_id, path_rel) = (?, ?, ?)",
+        )
+        .bind(&m)
+        .bind(&c)
+        .bind(&p)
+        .fetch_one(registry.db())
+        .await?;
+        let info: kahawai_core::media::MediaInfo = serde_json::from_str(&streams)?;
+        let v = info.video.first().context("source has no video track")?;
+        anyhow::ensure!(v.width > 0 && v.height > 0, "source video has no size");
+        // Unknown frame rate: 24000/1001 is the anime default and the
+        // rate only decides SAMPLING granularity, never the timestamps
+        // written — a wrong guess costs a little precision on animated
+        // effects, nothing else.
+        let fps = v
+            .fps
+            .filter(|(n, d)| *n > 0 && *d > 0)
+            .unwrap_or((24000, 1001));
+        Ok((v.width, v.height, fps))
     }
 
     /// Where the mediahost extraction addresses a track's display sets:
@@ -880,7 +1015,7 @@ impl Subtitles {
     pub async fn delete_track(&self, registry: &Registry, id: i64) -> Result<bool> {
         let n = sqlx::query(
             "DELETE FROM subtitle_tracks
-             WHERE id = ? AND origin IN ('downloaded', 'ocr')",
+             WHERE id = ? AND origin IN ('downloaded', 'ocr', 'raster')",
         )
         .bind(id)
         .execute(registry.db())
@@ -888,6 +1023,7 @@ impl Subtitles {
         .rows_affected();
         if n > 0 {
             let _ = std::fs::remove_file(self.downloaded_path(id));
+            let _ = std::fs::remove_file(self.raster_path(id));
         }
         Ok(n > 0)
     }

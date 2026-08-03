@@ -13,7 +13,9 @@
 //! - `origin` — `embedded` (a stream inside the media container),
 //!   `sidecar` (a file next to it: .srt/.ass/.vtt, or an .idx/.sub
 //!   VobSub pair), `downloaded` (HUB-24 provider fetch), `ocr`
-//!   (HUB-32c machine-read text).
+//!   (HUB-32c machine-read text), `raster` (HUB-32d: a styled script
+//!   rendered to display sets, served item-level rather than through
+//!   the session tap).
 //! - `module_id`/`collection_id`/`path_rel` — the MEDIA file the track
 //!   belongs to, for embedded/sidecar rows (NULL for hub-stored
 //!   origins, which bind to the item). List filtering and the load
@@ -25,8 +27,10 @@
 //!   speak stream indexes; this column is the translation.
 //! - `label` — provider release name, or the OCR row's legacy
 //!   `ocr:{key}:{model}` tag (superseded by `derived_from`).
-//! - `machine` — machine-generated (OCR): imperfect by nature and
-//!   user-visible as such (HUB-32c).
+//! - `machine` — machine-generated AND IMPERFECT, user-visible as such
+//!   (HUB-32c OCR). Not merely "derived": a HUB-32d `raster` row is
+//!   generated too, but it renders the author's own typesetting
+//!   exactly, so it is not flagged.
 //! - `derived_from` — OCR rows point at the exact image-track row they
 //!   were read from. Replaces string-parsing `label`, and is
 //!   per-source correct where the old item+index tie was not.
@@ -124,6 +128,20 @@ pub fn delivery(
     burn_capable: bool,
     ass_burn: AssBurn,
 ) -> (Delivery, &'static str) {
+    // HUB-32d: a rasterised script is display sets like any other, but
+    // it is an ITEM-level artefact — no stream index, no session tap,
+    // so it needs neither `burn_capable` nor an embedded origin. It has
+    // no text form either: a client that cannot composite has nothing
+    // to do with it, and should pick the parent script instead.
+    if track.origin == "raster" {
+        return match graphics_overlay {
+            true => (
+                Delivery::Overlay,
+                "rasterised — full typesetting, no encode",
+            ),
+            false => (Delivery::None, "needs an overlay-capable client"),
+        };
+    }
     if is_image_format(&track.format) {
         // Overlay needs the session tap, which only embedded streams
         // have (sidecar .idx/.sub is never in the pipeline).

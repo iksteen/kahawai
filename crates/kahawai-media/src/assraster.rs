@@ -317,18 +317,27 @@ pub struct RasterCost {
     pub ndjson_bytes: u64,
 }
 
-/// Measure without storing: HUB-32d is gated on this number, because
-/// OPS-6 never evicts and a tier that costs gigabytes an episode is a
-/// different proposition from one that costs megabytes.
-pub fn measure(sets: &[(u64, DisplaySet)]) -> Result<RasterCost> {
+/// When the script stops having anything to say: the last event end,
+/// plus a second so the final clear-the-screen set is emitted. Sampling
+/// past this only produces empty frames.
+pub fn script_end_ms(script: &str) -> u64 {
+    let (_, events) = crate::subtitles::ass_file_events(script);
+    events.iter().map(|(_, end, _)| *end).max().unwrap_or(0) + 1_000
+}
+
+/// Serialise to the NDJSON the client already consumes for PGS: one
+/// `{"s":ms,"cw":..,"ch":..,"o":[{"x","y","png"}…]}` per line, empty
+/// `o` clearing the screen. Deliberately the SAME bytes the live
+/// session tap writes (`remux::tap_image_track`) — this tier is a
+/// second producer for a format that exists, not a new one.
+pub fn to_ndjson(sets: &[(u64, DisplaySet)]) -> Result<Vec<u8>> {
     use base64::Engine;
-    let mut png_bytes = 0u64;
-    let mut ndjson_bytes = 0u64;
+    use std::io::Write;
+    let mut out = Vec::new();
     for (ms, set) in sets {
         let mut objs = Vec::new();
         for o in &set.objects {
             let png = crate::imagesubs::to_png(o).context("png encode")?;
-            png_bytes += png.len() as u64;
             objs.push(serde_json::json!({
                 "x": o.x, "y": o.y,
                 "png": base64::engine::general_purpose::STANDARD.encode(png),
@@ -337,12 +346,25 @@ pub fn measure(sets: &[(u64, DisplaySet)]) -> Result<RasterCost> {
         let line = serde_json::json!({
             "s": ms, "cw": set.canvas_w, "ch": set.canvas_h, "o": objs
         });
-        ndjson_bytes += line.to_string().len() as u64 + 1;
+        writeln!(out, "{line}")?;
+    }
+    Ok(out)
+}
+
+/// Measure without storing: HUB-32d was gated on this number, because
+/// OPS-6 never evicts and a tier that costs gigabytes an episode is a
+/// different proposition from one that costs megabytes.
+pub fn measure(sets: &[(u64, DisplaySet)]) -> Result<RasterCost> {
+    let mut png_bytes = 0u64;
+    for (_, set) in sets {
+        for o in &set.objects {
+            png_bytes += crate::imagesubs::to_png(o).context("png encode")?.len() as u64;
+        }
     }
     Ok(RasterCost {
         sets: sets.len(),
         png_bytes,
-        ndjson_bytes,
+        ndjson_bytes: to_ndjson(sets)?.len() as u64,
     })
 }
 

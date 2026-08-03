@@ -204,7 +204,7 @@ export const fetchChildren = (id: string) =>
 export type SubtitleDelivery = 'text' | 'ass' | 'overlay' | 'burn' | 'none'
 export type Subtitle = {
   id: number
-  origin: 'embedded' | 'sidecar' | 'downloaded' | 'ocr'
+  origin: 'embedded' | 'sidecar' | 'downloaded' | 'ocr' | 'raster'
   stream_index: number | null
   format: string
   language: string | null
@@ -223,6 +223,23 @@ export const isAssBurnRefusal = (e: unknown) =>
   String(e).includes(ASS_BURN_UNAVAILABLE)
 
 export const isImageSub = (s: Subtitle) => ['pgs', 'vobsub', 'dvdsub'].includes(s.format)
+
+/// HUB-32d: a styled script rendered server-side to display sets. It
+/// is delivered as an overlay like PGS, but sourced item-level rather
+/// than from the live session tap — see `overlayUrl`.
+export const isRasterSub = (s: Subtitle) => s.origin === 'raster'
+
+/// Where a track's display sets come from. An embedded image track is
+/// decoded by the running pipeline and tail-followed off the session;
+/// a rasterised one is a finished artefact on the item.
+export const overlayUrl = (s: Subtitle, itemId: string, streamUrl: string) =>
+  isRasterSub(s)
+    ? `/api/v1/items/${itemId}/subtitles/${s.id}.jsonl`
+    : `${streamUrl.replace(/[^/]*$/, '')}subs-${s.id}.jsonl`
+
+/// Rasterise a styled script into an overlay track (idempotent).
+export const generateRaster = (trackId: number) =>
+  json<{ track_id: number }>(`/api/v1/subtitles/${trackId}/raster`, { method: 'POST' })
 
 /// The capability bits feed each track's computed delivery; the list is
 /// always complete (a track this client cannot render says so via
@@ -300,7 +317,9 @@ export const subtitleLabel = (s: Subtitle) =>
       ? ' · downloaded'
       : s.origin === 'ocr'
         ? ' · ocr'
-        : '') +
+        : s.origin === 'raster'
+          ? ' · typeset'
+          : '') +
   (s.delivery === 'burn' ? ' · burn-in' : s.delivery === 'none' ? ' · unavailable' : '')
 
 export type LibrarySummary = { id: string; name: string; media_type: string }
@@ -535,12 +554,24 @@ export function pickSubtitle(
   // forcing a burn (a video encode restart) is never what a language
   // preference means — burns are explicit picks.
   const auto = (s: Subtitle) => s.delivery === 'text' || s.delivery === 'ass' || s.delivery === 'overlay'
+  // The server's fidelity order (HUB-32a/d): the client's own ASS
+  // renderer first, then a server-rasterised overlay, then flattened
+  // text. Within one language the BEST reading wins, not whichever row
+  // the listing happened to put first — otherwise a client with ASS
+  // masked off would take the flattened VTT and never notice the
+  // rasterised track sitting right behind it.
+  const rank = (s: Subtitle) => (s.delivery === 'ass' ? 0 : s.delivery === 'overlay' ? 1 : 2)
+  const best = (cs: Subtitle[]) =>
+    cs.length === 0 ? null : cs.reduce((a, b) => (rank(b) < rank(a) ? b : a))
   for (const want of wishlist) {
+    const eligible = subs.filter((s) => auto(s) && !isImageSub(s))
     const hit =
       want === 'any'
-        ? subs.find((s) => auto(s) && !isImageSub(s))
-        : subs.find(
-            (s) => auto(s) && !isImageSub(s) && (s.language ?? '').toLowerCase().slice(0, 2) === want.slice(0, 2),
+        ? best(eligible)
+        : best(
+            eligible.filter(
+              (s) => (s.language ?? '').toLowerCase().slice(0, 2) === want.slice(0, 2),
+            ),
           )
     if (hit) return hit
   }
