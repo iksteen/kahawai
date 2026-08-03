@@ -20,6 +20,50 @@ use std::sync::Arc;
 use kahawai_hub::registry::{FileUpsertRecord, Registry};
 use tower::ServiceExt;
 
+/// Built from the real structs, never hand-written JSON. A literal
+/// omitting one required field parses to an EMPTY `MediaInfo` —
+/// `parse_info` in the negotiator swallows the error — and every stream
+/// then negotiates to "none" while shape-only assertions stay green.
+/// That is exactly what the hand-written fixture here did until
+/// `the_fixture_declarations_actually_parse` caught it.
+fn info(subs: &[(&str, &str)]) -> kahawai_core::media::MediaInfo {
+    use kahawai_core::media::{AudioStream, MediaInfo, SubtitleStream, VideoStream};
+    MediaInfo {
+        container: Some("matroska".into()),
+        duration_ms: Some(60_000),
+        video: vec![VideoStream {
+            codec: "h264".into(),
+            width: 1920,
+            height: 1080,
+            ..Default::default()
+        }],
+        audio: vec![AudioStream {
+            codec: "aac".into(),
+            channels: 2,
+            sample_rate: 48_000,
+            ..Default::default()
+        }],
+        subtitles: subs
+            .iter()
+            .map(|(format, lang)| SubtitleStream {
+                format: (*format).into(),
+                language: Some((*lang).into()),
+            })
+            .collect(),
+        ..Default::default()
+    }
+}
+
+/// An item whose only subtitle is ASS, so the ladder has something to
+/// resolve. The declaration is what negotiation and the track sync both
+/// read, so no bytes are needed to pose the question.
+fn ass_rec(path: &str) -> FileUpsertRecord {
+    FileUpsertRecord {
+        streams_json: serde_json::to_string(&info(&[("ass", "en")])).unwrap(),
+        ..rec(path, 200)
+    }
+}
+
 fn rec(path: &str, size: u64) -> FileUpsertRecord {
     FileUpsertRecord {
         path_rel: path.into(),
@@ -28,10 +72,7 @@ fn rec(path: &str, size: u64) -> FileUpsertRecord {
         head_xxh3: 1,
         tail_xxh3: 2,
         oshash: 3,
-        streams_json: r#"{"container":"matroska","duration_ms":60000,
-            "video":[{"codec":"h264","width":1920,"height":1080}],
-            "audio":[{"codec":"aac","channels":2}]}"#
-            .into(),
+        streams_json: serde_json::to_string(&info(&[])).unwrap(),
     }
 }
 
@@ -39,6 +80,7 @@ fn test_router(
     registry: Arc<Registry>,
     auth: Arc<kahawai_hub::auth::Auth>,
     sessions: Arc<kahawai_hub::sessions::Sessions>,
+    subs_dir: std::path::PathBuf,
 ) -> axum::Router {
     let ca = Arc::new(
         kahawai_hub::pki::HubCa::load_or_create(tempfile::tempdir().unwrap().keep().as_path())
@@ -55,9 +97,7 @@ fn test_router(
         auth,
         sessions,
         enrollments,
-        Arc::new(kahawai_hub::subtitles::Subtitles::new(
-            tempfile::tempdir().unwrap().keep(),
-        )),
+        Arc::new(kahawai_hub::subtitles::Subtitles::new(subs_dir)),
         Arc::new(kahawai_hub::artwork::Artwork::new(
             tempfile::tempdir().unwrap().keep(),
             Arc::new(kahawai_hub::enrich::Enricher::new(
@@ -71,16 +111,29 @@ fn test_router(
     )
 }
 
-async fn fixture() -> (tempfile::TempDir, axum::Router, String, String) {
+/// `db` and `subs_dir` come back so a test can look for the artefacts
+/// QUERY must NOT have produced.
+struct Fx {
+    _dir: tempfile::TempDir,
+    api: axum::Router,
+    bearer: String,
+    id: String,
+    db: sqlx::SqlitePool,
+    subs_dir: std::path::PathBuf,
+}
+
+async fn fixture() -> Fx {
+    fixture_with(rec("Heat (1995).mkv", 100)).await
+}
+
+async fn fixture_with(file: FileUpsertRecord) -> Fx {
     let dir = tempfile::tempdir().unwrap();
     let db = kahawai_hub::db::open(dir.path()).await.unwrap();
     let reg = Arc::new(Registry::new(db.clone(), Default::default()));
     reg.announce_collection("01H", "movies", "movies", &[])
         .await
         .unwrap();
-    reg.upsert_files("01H", "movies", vec![rec("Heat (1995).mkv", 100)])
-        .await
-        .unwrap();
+    reg.upsert_files("01H", "movies", vec![file]).await.unwrap();
     // A source nobody can reach cannot be negotiated against, so the
     // mediahost has to be up for the question to have an answer.
     reg.connected("01H", "mediahost", "mh", "fp", "test");
@@ -101,14 +154,23 @@ async fn fixture() -> (tempfile::TempDir, axum::Router, String, String) {
         .fetch_one(&db)
         .await
         .unwrap();
+    let subs_dir = tempfile::tempdir().unwrap().keep();
     let api = test_router(
         reg,
         auth,
         Arc::new(kahawai_hub::sessions::Sessions::new(
             tempfile::tempdir().unwrap().keep(),
         )),
+        subs_dir.clone(),
     );
-    (dir, api, bearer, id)
+    Fx {
+        _dir: dir,
+        api,
+        bearer,
+        id,
+        db,
+        subs_dir,
+    }
 }
 
 fn query(
@@ -138,7 +200,7 @@ async fn json_of(resp: axum::response::Response) -> serde_json::Value {
 /// this client would actually be served.
 #[tokio::test]
 async fn query_returns_the_item_and_what_it_would_be_served() {
-    let (_d, api, bearer, id) = fixture().await;
+    let Fx { api, bearer, id, .. } = fixture().await;
     let profile = r#"{"profile":{"containers":["mp4"],
         "video":[{"codec":"h264"}],"audio":["aac"],
         "hdr":false,"graphics_overlay":false,"ass_render":false}}"#;
@@ -165,13 +227,12 @@ async fn query_returns_the_item_and_what_it_would_be_served() {
     // multi-source item cannot describe one file and play another.
     let n = &j["negotiated"];
     assert_eq!(n["source"]["path_rel"], "Heat (1995).mkv");
-    assert!(n["cost"].is_string(), "cost missing: {n}");
-    assert!(
-        n["streams"]["video"]
-            .as_str()
-            .is_some_and(|v| !v.is_empty()),
-        "no video verdict: {n}"
-    );
+    // A REAL verdict, not merely a present one: "none" and "unplayable"
+    // are non-empty strings, so the loose form of this assertion sat
+    // green for a whole fixture that never parsed.
+    assert_ne!(n["cost"], "unplayable", "{n}");
+    assert_ne!(n["streams"]["video"], "none", "{n}");
+    assert_ne!(n["streams"]["audio"], "none", "{n}");
     assert!(n["subtitles"].is_array());
 }
 
@@ -180,7 +241,7 @@ async fn query_returns_the_item_and_what_it_would_be_served() {
 /// would not. Getting the wrong one serves item data unauthenticated.
 #[tokio::test]
 async fn query_without_a_token_is_refused() {
-    let (_d, api, _bearer, id) = fixture().await;
+    let Fx { api, id, .. } = fixture().await;
     let resp = api
         .oneshot(query(
             &format!("/api/v1/items/{id}"),
@@ -197,7 +258,7 @@ async fn query_without_a_token_is_refused() {
 /// response — `Allow` header included — no longer happens for us.
 #[tokio::test]
 async fn an_unsupported_method_still_says_what_is_allowed() {
-    let (_d, api, bearer, id) = fixture().await;
+    let Fx { api, bearer, id, .. } = fixture().await;
     let resp = api
         .oneshot(
             axum::http::Request::builder()
@@ -218,7 +279,7 @@ async fn an_unsupported_method_still_says_what_is_allowed() {
 /// content."
 #[tokio::test]
 async fn a_query_without_a_json_content_type_is_refused() {
-    let (_d, api, bearer, id) = fixture().await;
+    let Fx { api, bearer, id, .. } = fixture().await;
     for ctype in [None, Some("text/plain")] {
         let resp = api
             .clone()
@@ -236,4 +297,109 @@ async fn a_query_without_a_json_content_type_is_refused() {
             "content-type {ctype:?} should have been refused"
         );
     }
+}
+
+/// **QUERY is safe.** The whole design rests on this: it reports the
+/// plan as it stands and never does the work. Point it at an ASS track
+/// with the ladder set overlay-FIRST — the arrangement that makes
+/// rasterising the preferred answer — and it must still come back
+/// without having rasterised anything.
+///
+/// The failure this catches is silent and plausible: `overlay_ready`
+/// (`subtitles.rs`) generates a `raster` row and its NDJSON, takes up
+/// to 30 s, and reaching for it here would make every item page pay a
+/// session's start-up cost. Nothing else in the suite would notice,
+/// because the ANSWER would be right — only its price would be wrong.
+#[tokio::test]
+async fn query_rasterises_nothing() {
+    let Fx {
+        api,
+        bearer,
+        id,
+        db,
+        subs_dir,
+        ..
+    } = fixture_with(ass_rec("Subbed (2011).mkv")).await;
+
+    let user: String = sqlx::query_scalar("SELECT id FROM users LIMIT 1")
+        .fetch_one(&db)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO user_prefs (user_id, scope, key, value)
+         VALUES (?, '', 'ass_order', 'overlay,flatten,burn')",
+    )
+    .bind(&user)
+    .execute(&db)
+    .await
+    .unwrap();
+
+    // A client that renders no ASS itself but does composite bitmaps:
+    // overlay is both reachable and first, so a QUERY willing to
+    // generate would generate here.
+    let resp = api
+        .oneshot(query(
+            &format!("/api/v1/items/{id}"),
+            Some(&bearer),
+            Some("application/json"),
+            // Direct-playable (matroska accepted), so the plan is a real
+            // one: an unplayable verdict carries no subtitles at all and
+            // would pass this test for the wrong reason.
+            r#"{"profile":{"containers":["matroska","mp4"],"video":[{"codec":"h264"}],
+                "audio":["aac"],"hdr":false,
+                "graphics_overlay":true,"ass_render":false}}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let j = json_of(resp).await;
+    let n = &j["negotiated"];
+    assert_ne!(n["cost"], "unplayable", "nothing to rasterise FOR: {n}");
+    let subs = n["subtitles"].as_array().unwrap();
+    assert_eq!(subs.len(), 1, "the ASS track must be listed: {j}");
+
+    // No raster row...
+    let rasters: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM subtitle_tracks WHERE origin = 'raster'")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    assert_eq!(rasters, 0, "QUERY created a raster track row");
+
+    // ...and no raster body on disk. Both, because either one alone
+    // could be the half that a partial implementation writes.
+    let stray: Vec<String> = std::fs::read_dir(&subs_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("raster-"))
+        .collect();
+    assert!(stray.is_empty(), "QUERY wrote raster artefacts: {stray:?}");
+
+    // And having generated nothing, it must not have PROMISED overlay
+    // either: the rung it reports is the one that is real right now.
+    assert_ne!(
+        subs[0]["delivery"], "overlay",
+        "overlay promised with no rasterised track in existence: {j}"
+    );
+}
+
+/// The fixtures declare their streams as JSON, and `parse_info`
+/// swallows a bad parse into an EMPTY `MediaInfo` — which negotiates to
+/// "none" for every stream and would make the tests above pass for
+/// reasons that have nothing to do with what they claim to test.
+#[test]
+fn the_fixture_declarations_actually_parse() {
+    for r in [rec("x.mkv", 1), ass_rec("y.mkv")] {
+        let info: kahawai_core::media::MediaInfo = serde_json::from_str(&r.streams_json)
+            .unwrap_or_else(|e| panic!("{}: {e}", r.path_rel));
+        assert_eq!(info.container.as_deref(), Some("matroska"));
+        assert_eq!(info.video.len(), 1, "{}: no video", r.path_rel);
+        assert_eq!(info.audio.len(), 1, "{}: no audio", r.path_rel);
+    }
+    let subs = serde_json::from_str::<kahawai_core::media::MediaInfo>(&ass_rec("y.mkv").streams_json)
+        .unwrap()
+        .subtitles;
+    assert_eq!(subs.len(), 1);
+    assert_eq!(subs[0].format, "ass");
 }

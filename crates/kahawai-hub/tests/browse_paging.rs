@@ -295,7 +295,8 @@ async fn search_finds_artists_and_episode_titles() {
 /// track; with no burn-capable host it reads `delivery: none`.
 #[tokio::test]
 async fn capability_changes_delivery_not_existence() {
-    let (api, token, db) = harness().await;
+    // No router needed: this one asks `Subtitles::list` directly.
+    let (_api, _token, db) = harness().await;
     let q = |sql: &'static str| {
         let db = db.clone();
         async move {

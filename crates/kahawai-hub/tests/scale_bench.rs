@@ -204,6 +204,50 @@ impl Bench {
     /// and best-of-N reported the good mode every time. A latency target
     /// is a promise about the slow case, so the slow case is what gets
     /// asserted.
+    /// The same timing for `QUERY`, which is a different question with a
+    /// different price: it parses every candidate source's `streams_json`
+    /// and asks the fleet once per candidate. GET is a few indexed reads;
+    /// this is negotiation. Measured beside it because QUERY became the
+    /// item page's load path, so a regression here is felt on every
+    /// detail view, not on a rare call.
+    async fn time_query(
+        &self,
+        uri: &str,
+        body: &str,
+        runs: usize,
+    ) -> (std::time::Duration, std::time::Duration) {
+        let mut worst = std::time::Duration::ZERO;
+        let mut best = std::time::Duration::MAX;
+        let mut all = Vec::new();
+        for _ in 0..runs {
+            let t = Instant::now();
+            let resp = self
+                .api
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("QUERY")
+                        .uri(uri)
+                        .header("authorization", format!("Bearer {}", self.token))
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert!(resp.status().is_success(), "{uri} -> {}", resp.status());
+            axum::body::to_bytes(resp.into_body(), 1 << 30)
+                .await
+                .unwrap();
+            let took = t.elapsed();
+            all.push(format!("{:.1}", took.as_secs_f64() * 1e3));
+            worst = worst.max(took);
+            best = best.min(took);
+        }
+        eprintln!("      QUERY {uri}  runs: {} ms", all.join(", "));
+        (worst, best)
+    }
+
     async fn time(&self, uri: &str, runs: usize) -> (std::time::Duration, usize) {
         let mut worst = std::time::Duration::ZERO;
         let mut all = Vec::new();
@@ -291,6 +335,15 @@ async fn browse_latency_and_scale() {
         let (detail, _) = b
             .time(&format!("/api/v1/items/01BENCHITEM{:015}", items / 2), 5)
             .await;
+        let (neg_worst, neg_best) = b
+            .time_query(
+                &format!("/api/v1/items/01BENCHITEM{:015}", items / 2),
+                r#"{"profile":{"containers":["mp4"],"video":[{"codec":"h264"}],
+                    "audio":["aac"],"hdr":false,
+                    "graphics_overlay":true,"ass_render":true}}"#,
+                5,
+            )
+            .await;
 
         eprintln!("  files             {files}");
         eprintln!(
@@ -312,6 +365,24 @@ async fn browse_latency_and_scale() {
         eprintln!(
             "  GET /items/{{id}}   {:>8.1} ms",
             detail.as_secs_f64() * 1e3
+        );
+        // Worst AND steady, because the spread is the whole finding: the
+        // FIRST query in a process dry-run-probes the encoders through
+        // GStreamer (`ass_burn_available`, ~1 s, memoized after), and
+        // every later one is a handful of indexed reads plus a pure
+        // `pick_transcoder`. Reporting either number alone lies — the
+        // same measurement reads as "285x GET" or "0.1x GET".
+        //
+        // No ratio against the GET line above: that one is a worst-of-5
+        // carrying its own warm-up, so dividing them compares a cold
+        // number by a warm one. And these seeded items have ONE source
+        // and no subtitle tracks, so this bounds the per-source work
+        // rather than exercising it — a multi-source item pays
+        // `candidate_sources` per candidate.
+        eprintln!(
+            "  QUERY /items/{{id}} {:>8.1} ms first / {:.1} ms steady",
+            neg_worst.as_secs_f64() * 1e3,
+            neg_best.as_secs_f64() * 1e3,
         );
 
         // The write side of the trigger-driven pick. A reorder recomputes
