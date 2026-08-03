@@ -49,6 +49,8 @@ message HostToHub {
     // HUB-32b: one image subtitle track's raw display-set blocks,
     // walked from the container index on the host's own disk.
     ImageSubtitles image_subtitles = 12;
+    // Longest keyframe gap of one file (HUB-17 backfill).
+    FileKeyframeInterval file_keyframe_interval = 13;
   }
 }
 
@@ -195,7 +197,16 @@ message HubToHost {
     // Index-driven and free on local disk; the hub cannot do this
     // itself because every read would cross the byte plane.
     ExtractImageSubs extract_image_subs = 9;
+    // Keyframe-interval backfill for files scanned before it was
+    // measured. Same cheapest tier as the attachment worklist: index
+    // reads only, no decoding.
+    KeyframeWorklist keyframe_worklist = 10;
   }
+}
+
+message KeyframeWorklist {
+  string collection_id = 1;
+  repeated string paths = 2;
 }
 
 message ExtractSubs {
@@ -250,6 +261,17 @@ message FileAttachments {
   // JSON array of {file_name, mime_type, offset, size} — exactly what
   // MediaInfo.attachments serializes to. "[]" = checked, none found.
   string attachments_json = 4;
+}
+
+message FileKeyframeInterval {
+  string collection_id = 1;
+  string path_rel = 2;
+  // Size at measurement time: the hub drops the result if the row moved on.
+  uint64 size = 3;
+  // Longest gap between keyframes. Absent = measured and UNKNOWN (a
+  // container with no index we can read), which is not the same as 0
+  // and must not be treated as "cuts possible anywhere".
+  optional uint32 max_keyframe_interval_ms = 4;
 }
 
 message Hashlist {

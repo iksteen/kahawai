@@ -464,6 +464,64 @@ impl Registry {
         Ok(paths)
     }
 
+    /// Files whose longest keyframe gap was never measured — rows
+    /// scanned before it existed. Any container: the mediahost decides
+    /// what it can read, and a file it cannot index reports UNKNOWN so
+    /// the row stops coming back (a `-1` sentinel, since JSON null and
+    /// "column absent" are the same query).
+    ///
+    /// Video only: the value bounds a video segment's length and means
+    /// nothing for a music file.
+    pub async fn keyframe_worklist(
+        &self,
+        module_id: &str,
+        collection_id: &str,
+    ) -> Result<Vec<String>> {
+        let paths = sqlx::query_scalar(
+            "SELECT path_rel FROM files
+             WHERE module_id = ? AND collection_id = ?
+               AND json_extract(streams_json, '$.video[0].codec') IS NOT NULL
+               AND json_extract(streams_json, '$.video[0].max_keyframe_interval_ms') IS NULL
+             ORDER BY path_rel",
+        )
+        .bind(module_id)
+        .bind(collection_id)
+        .fetch_all(&self.db)
+        .await?;
+        Ok(paths)
+    }
+
+    /// Store a measured keyframe interval, size-guarded like the others.
+    /// `None` means measured-and-unknown and is stored as -1: it has to
+    /// be distinguishable from "never measured", or every unreadable
+    /// file returns in the worklist forever. Readers treat any negative
+    /// value as unknown.
+    pub async fn record_file_keyframe_interval(
+        &self,
+        module_id: &str,
+        collection_id: &str,
+        path_rel: &str,
+        size: u64,
+        ms: Option<u32>,
+    ) -> Result<bool> {
+        let n = sqlx::query(
+            "UPDATE files
+                SET streams_json = json_set(streams_json,
+                    '$.video[0].max_keyframe_interval_ms', ?)
+              WHERE module_id = ? AND collection_id = ? AND path_rel = ? AND size = ?
+                AND json_extract(streams_json, '$.video[0].codec') IS NOT NULL",
+        )
+        .bind(ms.map(|v| v as i64).unwrap_or(-1))
+        .bind(module_id)
+        .bind(collection_id)
+        .bind(path_rel)
+        .bind(size as i64)
+        .execute(&self.db)
+        .await?
+        .rows_affected();
+        Ok(n > 0)
+    }
+
     /// Store a mediahost attachment declaration (size-guarded like ED2K:
     /// dropped when the row moved on). Writes into streams_json so the
     /// record looks exactly as if the scan had declared it.

@@ -9,7 +9,8 @@ use std::io::Read;
 use std::time::Duration;
 
 use kahawai_proto::v1::{
-    AttachmentsWorklist, ExtractSubs, FileAttachments, FileHash, FileHashes, FileSubtitles,
+    AttachmentsWorklist, ExtractSubs, FileAttachments, FileHash, FileHashes,
+    FileKeyframeInterval, FileSubtitles,
     Hashlist, HostToHub, SubTrack, SubsWorklist, host_to_hub,
 };
 
@@ -27,6 +28,7 @@ pub enum JobMsg {
     Hashlist(Hashlist),
     SubsWorklist(SubsWorklist),
     AttachmentsWorklist(AttachmentsWorklist),
+    KeyframeWorklist(kahawai_proto::v1::KeyframeWorklist),
     Urgent(ExtractSubs),
     UrgentImage(kahawai_proto::v1::ExtractImageSubs),
 }
@@ -57,6 +59,7 @@ fn intake(
     ed2k: &mut Tier,
     subs: &mut Tier,
     atts: &mut Tier,
+    keys: &mut Tier,
 ) -> bool {
     match msg {
         // Same urgency as a text extraction: a viewer is waiting on it
@@ -81,7 +84,20 @@ fn intake(
             atts.push(&w.collection_id, w.paths);
             false
         }
+        JobMsg::KeyframeWorklist(w) => {
+            keys.push(&w.collection_id, w.paths);
+            false
+        }
     }
+}
+
+/// Which background tier a drained job came from — three of them now,
+/// and a bool cannot say.
+#[derive(Clone, Copy)]
+enum Bg {
+    Atts,
+    Keyframe,
+    Subs,
 }
 
 pub async fn run(
@@ -95,6 +111,7 @@ pub async fn run(
     let mut ed2k = Tier::default();
     let mut subs = Tier::default();
     let mut atts = Tier::default();
+    let mut keys = Tier::default();
 
     loop {
         // Drain new work; block only when every queue is empty.
@@ -122,6 +139,7 @@ pub async fn run(
                 &mut ed2k,
                 &mut subs,
                 &mut atts,
+                &mut keys,
             );
         }
 
@@ -169,9 +187,16 @@ pub async fn run(
         // drains FIRST: it is ~10x cheaper per file (header reads only)
         // and unblocks font serving, while the subs pre-warm is a
         // long-tail warmup that can wait behind it.
-        let (from_subs, job) = match atts.q.pop_front() {
-            Some(j) => (false, Some(j)),
-            None => (true, subs.q.pop_front()),
+        // Attachments first (cheapest, unblocks font serving), then
+        // keyframe intervals — the same index-read cost, and every file
+        // still missing one forces a conservative TARGETDURATION until
+        // it lands. The subs pre-warm is the long tail and waits.
+        let (which, job) = match atts.q.pop_front() {
+            Some(j) => (Bg::Atts, Some(j)),
+            None => match keys.q.pop_front() {
+                Some(j) => (Bg::Keyframe, Some(j)),
+                None => (Bg::Subs, subs.q.pop_front()),
+            },
         };
         if let Some((collection_id, path_rel)) = job {
             // Idle gate before starting; the work itself is a bounded
@@ -187,6 +212,7 @@ pub async fn run(
                             &mut ed2k,
                             &mut subs,
                             &mut atts,
+                            &mut keys,
                         ) {
                             preempted = true;
                             break;
@@ -196,16 +222,22 @@ pub async fn run(
                     Err(_) => {} // still busy; keep waiting
                 }
             }
-            let tier = if from_subs { &mut subs } else { &mut atts };
+            let tier = match which {
+                Bg::Subs => &mut subs,
+                Bg::Atts => &mut atts,
+                Bg::Keyframe => &mut keys,
+            };
             if preempted || !urgent.is_empty() {
                 // Preempted: put the background job back and loop.
                 tier.q.push_front((collection_id, path_rel));
                 continue;
             }
-            if from_subs {
-                extract_and_send(&collections, &collection_id, &path_rel, &tx).await;
-            } else {
-                declare_and_send(&collections, &collection_id, &path_rel, &tx).await;
+            match which {
+                Bg::Subs => extract_and_send(&collections, &collection_id, &path_rel, &tx).await,
+                Bg::Atts => declare_and_send(&collections, &collection_id, &path_rel, &tx).await,
+                Bg::Keyframe => {
+                    measure_keyframes_and_send(&collections, &collection_id, &path_rel, &tx).await
+                }
             }
             tier.seen.remove(&(collection_id, path_rel));
         }
@@ -249,6 +281,50 @@ async fn declare_and_send(
             size,
             attachments_json,
         })),
+    };
+    let _ = tx.send(msg).await;
+}
+
+/// HUB-17 backfill: measure one file's longest keyframe gap from the
+/// container index and ship it. An UNKNOWN result is reported too —
+/// silence would leave the file in the worklist forever, and "we looked
+/// and this container has no index we can read" is a real answer.
+async fn measure_keyframes_and_send(
+    collections: &[CollectionConfig],
+    collection_id: &str,
+    path_rel: &str,
+    tx: &tokio::sync::mpsc::Sender<HostToHub>,
+) {
+    let result: anyhow::Result<(u64, Option<u32>)> = async {
+        let path = crate::serve::resolve_rel(collections, collection_id, path_rel)?;
+        let size = std::fs::metadata(&path)?.len();
+        let ms = tokio::task::spawn_blocking(move || {
+            kahawai_media::subindex::max_keyframe_interval_ms(&path)
+        })
+        .await?
+        .unwrap_or(None);
+        Ok((size, ms))
+    }
+    .await;
+    let (size, ms) = match result {
+        Ok(v) => v,
+        // Vanished or unreadable: say nothing and let the next scan
+        // reconcile, rather than recording a measurement we did not make.
+        Err(e) => {
+            tracing::debug!(collection = %collection_id, path = %path_rel,
+                error = format!("{e:#}"), "keyframe measurement failed");
+            return;
+        }
+    };
+    let msg = HostToHub {
+        msg: Some(host_to_hub::Msg::FileKeyframeInterval(
+            FileKeyframeInterval {
+                collection_id: collection_id.to_string(),
+                path_rel: path_rel.to_string(),
+                size,
+                max_keyframe_interval_ms: ms,
+            },
+        )),
     };
     let _ = tx.send(msg).await;
 }

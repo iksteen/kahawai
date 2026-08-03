@@ -274,6 +274,7 @@ fn kind_name(m: &host_to_hub::Msg) -> &'static str {
         host_to_hub::Msg::FileHashes(_) => "file_hashes",
         host_to_hub::Msg::FileSubtitles(_) => "file_subtitles",
         host_to_hub::Msg::FileAttachments(_) => "file_attachments",
+        host_to_hub::Msg::FileKeyframeInterval(_) => "file_keyframe_interval",
         host_to_hub::Msg::ImageSubtitles(_) => "image_subtitles",
     }
 }
@@ -376,6 +377,7 @@ async fn handle_host_msg(
                 push_ed2k_worklist(registry, module_id, &r.collection_id).await;
                 push_subs_worklist(registry, module_id, &r.collection_id).await;
                 push_attachments_worklist(registry, module_id, &r.collection_id).await;
+                push_keyframe_worklist(registry, module_id, &r.collection_id).await;
                 return Ok(());
             }
             // Incremental rescan (MH-5): what we already know, so the
@@ -459,6 +461,7 @@ async fn handle_host_msg(
             push_ed2k_worklist(registry, module_id, &p.collection_id).await;
             push_subs_worklist(registry, module_id, &p.collection_id).await;
             push_attachments_worklist(registry, module_id, &p.collection_id).await;
+            push_keyframe_worklist(registry, module_id, &p.collection_id).await;
         }
         host_to_hub::Msg::FileAttachments(fa) => {
             let stored = registry
@@ -474,6 +477,17 @@ async fn handle_host_msg(
                 tracing::info!(%module_id, collection = %fa.collection_id,
                     path = %fa.path_rel, stored, "attachments declared by mediahost");
             }
+        }
+        host_to_hub::Msg::FileKeyframeInterval(k) => {
+            registry
+                .record_file_keyframe_interval(
+                    module_id,
+                    &k.collection_id,
+                    &k.path_rel,
+                    k.size,
+                    k.max_keyframe_interval_ms,
+                )
+                .await?;
         }
         host_to_hub::Msg::FileSubtitles(fs) => {
             if !fs.error.is_empty() {
@@ -604,6 +618,44 @@ async fn push_attachments_worklist(
         };
         if let Err(e) = registry.send_to_host(module_id, msg).await {
             tracing::warn!(%module_id, error = format!("{e:#}"), "attachments worklist send failed");
+            return;
+        }
+    }
+}
+
+/// HUB-17 backfill: which files still have no measured keyframe gap.
+/// Same cheapest tier as attachments — index reads, no decoding — and
+/// the same chunking, because a large collection's list is long and
+/// the link is not a bulk channel.
+async fn push_keyframe_worklist(
+    registry: &crate::registry::Registry,
+    module_id: &str,
+    collection_id: &str,
+) {
+    let paths = match registry.keyframe_worklist(module_id, collection_id).await {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(%module_id, collection = %collection_id,
+                error = format!("{e:#}"), "keyframe worklist failed");
+            return;
+        }
+    };
+    if paths.is_empty() {
+        return;
+    }
+    tracing::info!(%module_id, collection = %collection_id, files = paths.len(),
+        "sending keyframe worklist");
+    for chunk in paths.chunks(5000) {
+        let msg = kahawai_proto::v1::HubToHost {
+            msg: Some(kahawai_proto::v1::hub_to_host::Msg::KeyframeWorklist(
+                kahawai_proto::v1::KeyframeWorklist {
+                    collection_id: collection_id.to_string(),
+                    paths: chunk.to_vec(),
+                },
+            )),
+        };
+        if let Err(e) = registry.send_to_host(module_id, msg).await {
+            tracing::warn!(%module_id, error = format!("{e:#}"), "keyframe worklist send failed");
             return;
         }
     }

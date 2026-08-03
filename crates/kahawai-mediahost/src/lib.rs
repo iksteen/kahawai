@@ -429,6 +429,10 @@ impl Engine {
                 let _ = self.hash_tx.try_send(hasher::JobMsg::Hashlist(h));
                 None
             }
+            hub_to_host::Msg::KeyframeWorklist(w) => {
+                let _ = self.hash_tx.try_send(hasher::JobMsg::KeyframeWorklist(w));
+                None
+            }
             hub_to_host::Msg::AttachmentsWorklist(w) => {
                 let _ = self
                     .hash_tx
