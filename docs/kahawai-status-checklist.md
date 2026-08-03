@@ -168,9 +168,9 @@ How something works and why it was built that way belong in
       image subtitles (PGS + VobSub) decoded server-side and rendered on a
       canvas overlay from the same tap — no video transcoding
 - [x] HUB-32a ASS fallback policy — server order client-native → flatten →
-      burn, with a per-user `ass_fallback` preference swapping the last two
-      and an explicit "burn in" pick in the subtitle list that beats even a
-      client that renders ASS itself. Burning runs `assrender` in the encode
+      burn, with a per-user `ass_fallback` preference — the only way into
+      the burn tier, by decision: picking a track says WHICH subtitles,
+      never how they are delivered. Burning runs `assrender` in the encode
       chain: embedded tracks take the demuxer's own pad (the only path that
       carries the release's attached fonts — verified live, a script asking
       for Calibri on a box that has no Calibri), a user's sidecar `.ass` is

@@ -213,11 +213,6 @@ export type Subtitle = {
   derived_from: number | null
   delivery: SubtitleDelivery
   note: string
-  /// HUB-32a: the picker may offer "burn in" for this track even when
-  /// `delivery` says something cheaper. Not the same question: this
-  /// client declares ass_render unconditionally, so an ASS track always
-  /// reads as client-rendered and the burn could never be asked for.
-  burnable: boolean
 }
 
 /// HUB-32a: the hub refused to start because nothing in the fleet can
@@ -307,11 +302,6 @@ export const subtitleLabel = (s: Subtitle) =>
         ? ' · ocr'
         : '') +
   (s.delivery === 'burn' ? ' · burn-in' : s.delivery === 'none' ? ' · unavailable' : '')
-
-/// The extra picker row HUB-32a adds: burning a track that would
-/// otherwise be delivered some cheaper way. Encoded in the option's
-/// value so one <select> carries both readings of the same track.
-export const BURN_PREFIX = 'burn:' 
 
 export type LibrarySummary = { id: string; name: string; media_type: string }
 

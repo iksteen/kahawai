@@ -40,9 +40,6 @@ pub struct TrackListing {
     pub track: crate::tracks::Track,
     pub delivery: crate::tracks::Delivery,
     pub note: &'static str,
-    /// HUB-32a: the picker may offer "burn in" for this track even when
-    /// `delivery` says something cheaper — see `tracks::burnable`.
-    pub burnable: bool,
 }
 
 /// A served ASS script: complete (cache/sidecar) or streamed while the
@@ -173,12 +170,10 @@ impl Subtitles {
                     burn_capable,
                     ass_burn,
                 );
-                let burnable = crate::tracks::burnable(&t, burn_capable, ass_burn.capable);
                 TrackListing {
                     track: t,
                     delivery,
                     note,
-                    burnable,
                 }
             })
             .collect())

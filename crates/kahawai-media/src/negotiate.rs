@@ -212,10 +212,16 @@ fn ass_burn_wanted(profile: &CapabilityProfile, info: &MediaInfo, ass_burn: AssB
     ass_burn.capable
         && ass_burn.preferred
         && !profile.ass_render
-        && info
+        && (info
             .subtitles
             .iter()
             .any(|s| matches!(s.format.as_str(), "ass" | "ssa"))
+            // A user's own .ass counts: some releases carry no embedded
+            // subtitles at all and the sidecar IS the subtitle track.
+            || info
+                .external_subtitles
+                .iter()
+                .any(|s| matches!(s.format.as_str(), "ass" | "ssa")))
 }
 
 /// The whole decision, one source. `est_kbps` is the hub's aggregate
@@ -302,22 +308,25 @@ pub fn negotiate(
             BurnPick::Sidecar(i) => info.external_subtitles.get(*i).map(|s| s.format.as_str()),
         }
     };
+    // Only IMAGE picks force a burn. An ASS pick does not: the ASS
+    // tier is chosen by the user's standing `ass_fallback` preference
+    // and nothing else (owner decision, 2026-08-03) — picking a track
+    // says WHICH subtitles, never HOW they are delivered.
     let forced_burn = burn_pick.filter(|p| match picked(p) {
         // A sidecar image burn only ever meant VobSub: a bare .sub has
         // no index to walk.
         Some("pgs" | "dvdsub") => burn_capable && matches!(p, BurnPick::Embedded(_)),
         Some("vobsub") => burn_capable,
-        Some("ass" | "ssa") => ass_burn.capable,
         _ => false,
     });
-    let forced_is_ass = forced_burn
-        .as_ref()
-        .and_then(picked)
-        .is_some_and(|f| matches!(f, "ass" | "ssa"));
     let forced_embedded = match forced_burn {
-        Some(BurnPick::Embedded(i)) if !forced_is_ass => Some(i),
+        Some(BurnPick::Embedded(i)) => Some(i),
         _ => None,
     };
+    // ...but it does say which ASS track the tier applies to. Without
+    // this the burn would always take the first ASS stream, and a
+    // release with five languages would burn whichever came first.
+    let picked_ass = burn_pick.filter(|p| matches!(picked(p), Some("ass" | "ssa")));
     let direct = single_part
         && container_ok
         && (v.is_none() || v_client_ok)
@@ -350,20 +359,32 @@ pub fn negotiate(
 
     // HUB-32a: the same last-resort shape one tier up. A client that
     // cannot render ASS itself gets the flattened VTT by default and
-    // the burned picture when the user asked for it — never silently,
-    // and never without a box that can do it. An explicit pick wins
-    // over both, including over a client that CAN render ASS: the user
-    // asked for the typesetting in the picture.
-    let burn_ass_track = match forced_burn {
-        Some(BurnPick::Embedded(i)) if forced_is_ass => Some(i),
-        Some(BurnPick::Sidecar(_)) if forced_is_ass => None, // burns from the file
-        _ => ass_burn_wanted(profile, info, ass_burn)
-            .then(|| {
-                info.subtitles
-                    .iter()
-                    .position(|s| matches!(s.format.as_str(), "ass" | "ssa"))
-            })
-            .flatten(),
+    // the burned picture when the user's preference says so — never
+    // silently, and never without a box that can do it. The pick only
+    // chooses which track; a sidecar pick burns from the FILE, so it
+    // carries no embedded index.
+    let ass_wanted = ass_burn_wanted(profile, info, ass_burn);
+    let is_ass = |f: &str| matches!(f, "ass" | "ssa");
+    let first_embedded_ass = || info.subtitles.iter().position(|s| is_ass(&s.format));
+    let first_sidecar_ass = || {
+        info.external_subtitles
+            .iter()
+            .position(|s| is_ass(&s.format))
+    };
+    // Embedded index (burns from the demuxer pad) and sidecar index
+    // (burns from the file) are mutually exclusive; embedded wins when
+    // nothing was picked, because it is the one that carries fonts.
+    let (burn_ass_track, burn_ass_file) = if !ass_wanted {
+        (None, None)
+    } else {
+        match picked_ass {
+            Some(BurnPick::Embedded(i)) => (Some(i), None),
+            Some(BurnPick::Sidecar(i)) => (None, Some(i)),
+            None => match first_embedded_ass() {
+                Some(i) => (Some(i), None),
+                None => (None, first_sidecar_ass()),
+            },
+        }
     };
 
     // Remux/transcode arms, per CANDIDATE CONTAINER (HUB-15b).
@@ -376,7 +397,10 @@ pub fn negotiate(
     // before is byte-identical, and fMP4 appears only where it is
     // strictly cheaper (av1/vp9 copies) or the only playable path
     // (no-h264 clients on hevc/av1-encoding fleets).
-    let burn_active = burn_subtitle.is_some() || forced_burn.is_some() || burn_ass_track.is_some();
+    let burn_active = burn_subtitle.is_some()
+        || forced_burn.is_some()
+        || burn_ass_track.is_some()
+        || burn_ass_file.is_some();
     let candidate =
         |format: SegmentFormat| -> (StreamMode, VideoTarget, StreamMode, AudioTarget, (u8, Cost)) {
             let (v_ladder, a_ladder): (&[VideoTarget], &[AudioTarget]) = match format {
@@ -649,13 +673,13 @@ pub fn negotiate(
         direct,
         plan,
         burn_sidecar: match forced_burn {
-            Some(BurnPick::Sidecar(i)) if !forced_is_ass && video == StreamMode::Encode => Some(i),
+            Some(BurnPick::Sidecar(i)) if video == StreamMode::Encode => Some(i),
             _ => None,
         },
-        burn_ass_sidecar: match forced_burn {
-            Some(BurnPick::Sidecar(i)) if forced_is_ass && video == StreamMode::Encode => Some(i),
-            _ => None,
-        },
+        // A user's own `.ass` burns only when the tier calls for it,
+        // same as an embedded one, and only once the encode that would
+        // carry it exists.
+        burn_ass_sidecar: burn_ass_file.filter(|_| video == StreamMode::Encode),
         cost,
         video_verdict,
         audio_verdict,
@@ -1273,11 +1297,15 @@ mod tests {
         assert_eq!(sp.subtitles[0].tier, SubtitleTier::Text);
         assert_eq!(sp.cost, Cost::Copy, "{}", sp.video_verdict);
 
-        // ...but an explicit pick beats even that. The user asked for
-        // the typesetting in the picture.
+        // ...and a pick does NOT override it. Picking a track says
+        // which subtitles, never how they are delivered (owner
+        // decision, 2026-08-03): the burn tier is reached by the
+        // preference alone, so a client that renders ASS keeps doing
+        // so and nothing is forced.
         let sp = go(&p, capable, Some(BurnPick::Embedded(0)));
-        assert_eq!(sp.plan.burn_ass, Some(0));
-        assert_eq!(sp.subtitles[0].tier, SubtitleTier::Burn);
+        assert_eq!(sp.plan.burn_ass, None);
+        assert_eq!(sp.subtitles[0].tier, SubtitleTier::Text);
+        assert_eq!(sp.cost, Cost::Copy, "a pick must not force an encode");
 
         // No client-side ASS and no preference: flatten, no video work.
         p.ass_render = false;
@@ -1335,6 +1363,33 @@ mod tests {
         let sp = go(&p, wants_burn, Some(BurnPick::Embedded(0)));
         assert_eq!(sp.plan.burn_subtitle, None);
         assert_eq!(sp.plan.burn_ass, Some(0));
+
+        // With the tier active, the pick chooses WHICH track burns —
+        // otherwise a release with five languages would always burn
+        // whichever stream happened to come first.
+        let mut multi = info.clone();
+        multi.subtitles.push(SubtitleStream {
+            format: "ass".into(),
+            language: Some("de".into()),
+        });
+        let two = |pick| {
+            super::negotiate(
+                &p,
+                &multi,
+                0,
+                0,
+                true,
+                None,
+                false,
+                true,
+                &[],
+                pick,
+                wants_burn,
+                &fleet(),
+            )
+        };
+        assert_eq!(two(None).plan.burn_ass, Some(0), "no pick: the first");
+        assert_eq!(two(Some(BurnPick::Embedded(1))).plan.burn_ass, Some(1));
     }
 
     /// A user's own `.ass` beside the media burns from the FILE, so the
@@ -1362,9 +1417,11 @@ mod tests {
             true,
             &[],
             Some(BurnPick::Sidecar(0)),
+            // The preference is what selects the tier; the pick only
+            // names the file.
             AssBurn {
                 capable: true,
-                preferred: false,
+                preferred: true,
             },
             &fleet(),
         );

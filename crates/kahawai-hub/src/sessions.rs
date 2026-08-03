@@ -2253,13 +2253,12 @@ impl Sessions {
             );
             let part = session.parts.first().context("session has no parts")?;
             let is_image = crate::tracks::is_image_format(&track.format);
-            // HUB-32a: ASS burns the same way image subtitles do — an
-            // explicit mid-session pick, honoured by a different tier.
-            // This used to test `is_image` alone, so an ASS pick fell
-            // through to `None`, matched the existing `None`, and the
-            // seek restarted with NOTHING changed: the picker offered
-            // "burn in", the player asked for it, and the hub quietly
-            // re-tapped the subtitle file instead (found live).
+            // HUB-32a: an ASS pick has to reach negotiation too, but
+            // for a different reason than an image one. It never forces
+            // a burn — the `ass_fallback` preference is the only way
+            // into that tier — it says WHICH track the tier applies to,
+            // so switching language mid-film re-burns the new one
+            // instead of silently keeping the first.
             let is_ass = matches!(track.format.as_str(), "ass" | "ssa");
             let new_pick = ((is_image || is_ass)
                 && track.module_id.as_deref() == Some(part.module_id.as_str())
@@ -2280,9 +2279,10 @@ impl Sessions {
                 );
             }
             // An ASS burn needs a box that can do it, and a seek cannot
-            // move boxes (HUB-15b). Refusing here beats restarting into
-            // a picture with no subtitles in it.
-            if is_ass {
+            // move boxes (HUB-15b). Only relevant when the preference
+            // has actually selected the burn tier: otherwise this is an
+            // ordinary track change and the client renders it itself.
+            if is_ass && session.ass_prefers_burn {
                 let capable = match &session.mode {
                     Mode::Transcode { transcoder } => {
                         let tc = transcoder.lock().unwrap().clone();

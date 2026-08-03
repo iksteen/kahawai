@@ -113,27 +113,6 @@ impl AssBurn {
     }
 }
 
-/// Can this track be burned at all, whatever today's delivery is? The
-/// picker offers "burn in" as an override ALONGSIDE the natural
-/// delivery — the web client declares `ass_render: true`
-/// unconditionally, so without this an ASS track would only ever read
-/// as client-rendered and the burn could never be asked for.
-pub fn burnable(track: &Track, burn_capable: bool, ass_burn_capable: bool) -> bool {
-    // Both burns need a track the SOURCE carries: an image burn walks
-    // the container's index, and an ASS burn is expressed as an index
-    // into the source's streams or its sidecars (`negotiate::BurnPick`
-    // has no third shape). A hub-stored row — downloaded or OCR — has
-    // neither, so it cannot be picked for burn today even though the
-    // hub does hold its bytes.
-    if !matches!(track.origin.as_str(), "embedded" | "sidecar") {
-        return false;
-    }
-    if is_image_format(&track.format) {
-        return burn_capable;
-    }
-    matches!(track.format.as_str(), "ass" | "ssa") && ass_burn_capable
-}
-
 /// The delivery matrix. `burn_capable` is the hub-side fact from
 /// HUB-32b (the display-set timeline is readable where the encode
 /// runs); `ass_render`/`graphics_overlay` come from the client profile;
@@ -439,22 +418,10 @@ mod tests {
         assert_eq!(d, Delivery::Text);
         assert!(note.contains("no box"), "silent flatten: {note}");
 
-        // Burnable is independent of delivery: the picker offers the
-        // burn ALONGSIDE client-side rendering, which is the only way a
-        // web client (ass_render: true, always) can ever ask for it.
-        assert!(burnable(&t, true, true));
-        assert!(!burnable(&t, true, false), "no box, nothing to offer");
-        assert_eq!(
-            delivery(&t, true, true, true, wants).0,
-            Delivery::Ass,
-            "an offer is not a default"
-        );
-
-        // A hub-stored row has no place in a BurnPick, whatever its
-        // format — the pick is an index into the source.
-        assert!(!burnable(&track("ass", "downloaded"), true, true));
-        assert!(!burnable(&track("pgs", "ocr"), true, true));
-        assert!(burnable(&track("pgs", "embedded"), true, false));
-        assert!(!burnable(&track("srt", "sidecar"), true, true));
+        // A client that renders ASS is never overridden: the burn is
+        // reached by masking `ass_render` off, not by picking a track
+        // (owner decision, 2026-08-03 — the preference is the only way
+        // into the tier).
+        assert_eq!(delivery(&t, true, true, true, wants).0, Delivery::Ass);
     }
 }
