@@ -30,10 +30,27 @@ pub fn is_text_format(format: &str) -> bool {
 /// to Latin-1 — the overwhelmingly common non-UTF-8 sidecar encoding.
 pub fn decode_text(bytes: &[u8]) -> String {
     let bytes = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(bytes);
-    match std::str::from_utf8(bytes) {
+    let text = match std::str::from_utf8(bytes) {
         Ok(s) => s.to_string(),
         Err(_) => bytes.iter().map(|&b| b as char).collect(),
+    };
+    // Matroska ASS block payloads are routinely NUL-padded, and those
+    // NULs used to travel all the way into the `.ass` we serve. Found
+    // 2026-08-03 while rasterising: libass parsed such a script as 517
+    // events and rendered NOTHING, and the same bytes go to JASSUB in
+    // the browser and to external players (HUB-34). Nothing in a
+    // subtitle ever means NUL, so drop the whole C0 range except the
+    // line structure.
+    if text
+        .bytes()
+        .any(|b| b < 0x20 && !matches!(b, b'\n' | b'\r' | b'\t'))
+    {
+        return text
+            .chars()
+            .filter(|c| !c.is_control() || matches!(c, '\n' | '\r' | '\t'))
+            .collect();
     }
+    text
 }
 
 /// Parse sidecar content by format name (see `is_text_format`).
@@ -828,5 +845,17 @@ mod tests {
             line,
             "Dialogue: 0,0:01:01.50,0:01:03.75,Default,,0,0,0,,{\\an8}Sign"
         );
+    }
+    /// Matroska pads ASS block payloads with NUL, and those used to
+    /// reach the served script: libass then parsed the events and drew
+    /// nothing at all. JASSUB and external players get the same bytes.
+    #[test]
+    fn nul_padding_never_reaches_the_script() {
+        let raw = b"0,0,Default,,0,0,0,,Hello\x00";
+        let text = decode_text(raw);
+        assert!(!text.contains('\0'), "NUL survived: {text:?}");
+        assert!(text.ends_with("Hello"));
+        // Ordinary text is untouched, newlines and tabs included.
+        assert_eq!(decode_text(b"a\nb\tc"), "a\nb\tc");
     }
 }

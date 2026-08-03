@@ -1,6 +1,7 @@
 //! GStreamer wrappers (MH-3): file discovery mapped into the normalized
 //! stream model. Blocking — call from `spawn_blocking` in async contexts.
 
+pub mod assraster;
 pub mod bench;
 pub mod burnin;
 pub mod doctor;
