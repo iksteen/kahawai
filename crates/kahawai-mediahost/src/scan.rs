@@ -287,6 +287,20 @@ fn inspect(root: &Path, path: &Path) -> Result<Inspected> {
     info.external_subtitles = find_sidecars(root, path);
     info.artwork = find_artwork(root, path);
     info.nfo = find_nfo(root, path);
+    // The longest keyframe gap, from the container index — kilobytes of
+    // reads, and the only honest bound on a copy session's segment
+    // length (and so on EXT-X-TARGETDURATION). Failure is not fatal:
+    // the field stays None and callers treat that as "could be long".
+    if let Some(v) = info.video.first_mut() {
+        match kahawai_media::subindex::max_keyframe_interval_ms(path) {
+            Ok(ms) => v.max_keyframe_interval_ms = ms,
+            Err(e) => tracing::debug!(
+                path = %path.display(),
+                error = format!("{e:#}"),
+                "keyframe interval probe failed"
+            ),
+        }
+    }
     // MH-4: declare embedded attachments (fonts) — name/mime/byte range
     // only, payloads are never read at scan time.
     if matches!(info.container.as_deref(), Some("matroska" | "webm")) {

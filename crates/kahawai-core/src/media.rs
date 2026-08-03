@@ -74,6 +74,17 @@ pub struct VideoStream {
     /// Stream bitrate where the container states one; 0 is never stored.
     #[serde(default)]
     pub bitrate_kbps: Option<u32>,
+    /// Longest gap between keyframes, from the container index at scan
+    /// (MH-3). `None` = not measured: an unsupported container, an
+    /// absent index, or a row scanned before this existed. Unknown is
+    /// NOT zero — a caller that needs a bound must assume it could be
+    /// long.
+    ///
+    /// A stream copy can only cut on a source keyframe, so this is what
+    /// bounds the longest HLS segment and therefore the only honest
+    /// `EXT-X-TARGETDURATION` (RFC 8216 §4.3.3.1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_keyframe_interval_ms: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]

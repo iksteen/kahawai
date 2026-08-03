@@ -133,6 +133,10 @@ fn map_info(info: &DiscovererInfo) -> MediaInfo {
             profile: st_get("profile"),
             level: st_get("level"),
             bitrate_kbps: (s.bitrate() > 0).then(|| s.bitrate() / 1000),
+            // GStreamer discovery does not expose keyframe spacing; the
+            // mediahost fills this from the container index after the
+            // probe (scan.rs).
+            max_keyframe_interval_ms: None,
         });
     }
 

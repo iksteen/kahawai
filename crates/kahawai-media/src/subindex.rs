@@ -1642,3 +1642,357 @@ mod tests {
         assert!(extract_sparse(f.path()).unwrap().is_none());
     }
 }
+
+/// The longest gap between keyframes, in milliseconds — read from the
+/// container's own index, never by decoding.
+///
+/// This is what makes an honest `EXT-X-TARGETDURATION` possible. A
+/// stream-copy session cannot cut anywhere but a source keyframe, so
+/// the longest keyframe gap bounds the longest segment; without it the
+/// playlist can only guess, and guessing low is a spec violation
+/// (RFC 8216 §4.3.3.1) that strict clients act on.
+///
+/// `None` means "unknown, assume nothing": an unsupported container
+/// (AVI), an index that isn't there, or a file whose every frame is a
+/// keyframe (no `stss` box — MP4 says so by omission). Callers must
+/// treat unknown as "could be long" rather than as zero.
+///
+/// Sources are conservative on purpose. Matroska Cues are a hint, not a
+/// contract — a muxer may index only some keyframes — so a missed one
+/// makes the measured gap LONGER than the truth, which errs toward a
+/// larger declared duration. That is the safe direction.
+pub fn max_keyframe_interval_ms(path: &Path) -> Result<Option<u32>> {
+    let mut src = crate::remux::FileSource::open(path)?;
+    let mut magic = [0u8; 12];
+    {
+        let mut f = std::fs::File::open(path)?;
+        use std::io::Read;
+        if f.read(&mut magic)? < 12 {
+            return Ok(None);
+        }
+    }
+    if magic[..4] == [0x1A, 0x45, 0xDF, 0xA3] {
+        mkv_max_keyframe_gap(&mut src)
+    } else if &magic[4..8] == b"ftyp" {
+        mp4_max_keyframe_gap(&mut src)
+    } else {
+        Ok(None)
+    }
+}
+
+/// Matroska: the Cues element indexes keyframes by timestamp. Reached
+/// through the SeekHead exactly as `declare_attachments` does, so a
+/// file whose SeekHead promises no Cues costs only the header hops.
+fn mkv_max_keyframe_gap(src: &mut dyn RemuxSource) -> Result<Option<u32>> {
+    let mut r = Reader::new(src);
+    let head = r.read_at(0, 32.min(r.len as usize))?;
+    let Ok((id, il)) = ebml_id(&head) else {
+        return Ok(None);
+    };
+    if id != EBML_HEADER {
+        return Ok(None);
+    }
+    let (hsize, hsl) = ebml_size(&head[il..])?;
+    let pos = il as u64 + hsl as u64 + hsize.context("unknown EBML header size")?;
+    let seg = r.read_at(pos, 16)?;
+    let (id, il) = ebml_id(&seg)?;
+    if id != SEGMENT {
+        return Ok(None);
+    }
+    let (seg_size, sl) = ebml_size(&seg[il..])?;
+    let segment_start = pos + il as u64 + sl as u64;
+    let segment_end = seg_size.map(|s| segment_start + s).unwrap_or(r.len);
+
+    let mut scale = 1_000_000u64; // ns per tick; matroska's default
+    let mut video_track: Option<u64> = None;
+    let mut cues: Option<(u64, u64)> = None; // (body, size)
+    let mut pending: Vec<u64> = Vec::new();
+    let mut saw_seekhead = false;
+    let mut visited = std::collections::HashSet::new();
+    let mut pos = segment_start;
+    while pos < segment_end.min(r.len) {
+        if !visited.insert(pos) {
+            break;
+        }
+        let Ok(head) = r.read_at(pos, 16) else { break };
+        let Ok((id, il)) = ebml_id(&head) else { break };
+        let Ok((size, sl)) = ebml_size(&head[il..]) else {
+            break;
+        };
+        let body = pos + il as u64 + sl as u64;
+        let Some(size) = size else { break };
+        match id {
+            SEEK_HEAD => {
+                saw_seekhead = true;
+                let data = r.read_at(body, size as usize)?;
+                walk_children(&data, |id, seek| {
+                    if id == SEEK {
+                        let (mut target, mut position) = (0u32, None);
+                        walk_children(seek, |id, v| {
+                            match id {
+                                SEEK_ID => target = uint(v) as u32,
+                                SEEK_POSITION => position = Some(uint(v)),
+                                _ => {}
+                            }
+                            Ok(true)
+                        })?;
+                        if let Some(p) = position
+                            && matches!(target, CUES | TRACKS | INFO)
+                        {
+                            pending.push(segment_start + p);
+                        }
+                    }
+                    Ok(true)
+                })?;
+            }
+            INFO => {
+                let data = r.read_at(body, size as usize)?;
+                walk_children(&data, |id, v| {
+                    if id == TIMESTAMP_SCALE {
+                        scale = uint(v).max(1);
+                    }
+                    Ok(true)
+                })?;
+            }
+            TRACKS => {
+                let data = r.read_at(body, size as usize)?;
+                walk_children(&data, |id, entry| {
+                    if id == TRACK_ENTRY {
+                        let (mut num, mut kind) = (None, 0u64);
+                        walk_children(entry, |id, v| {
+                            match id {
+                                TRACK_NUMBER => num = Some(uint(v)),
+                                TRACK_TYPE => kind = uint(v),
+                                _ => {}
+                            }
+                            Ok(true)
+                        })?;
+                        // 1 = video, and the FIRST one: the same track
+                        // negotiation plans around.
+                        if kind == 1 && video_track.is_none() {
+                            video_track = num;
+                        }
+                    }
+                    Ok(true)
+                })?;
+            }
+            CUES => cues = Some((body, size)),
+            // Clusters mean the index is behind us; with a SeekHead
+            // that promised nothing more, stop rather than hop the
+            // whole file.
+            CLUSTER if saw_seekhead && pending.is_empty() => break,
+            _ => {}
+        }
+        if cues.is_some() && video_track.is_some() {
+            break;
+        }
+        pos = body + size;
+        if let Some(next) = pending.iter().find(|p| !visited.contains(*p)) {
+            pos = *next;
+        }
+    }
+
+    let Some((body, size)) = cues else {
+        return Ok(None);
+    };
+    let data = r.read_at(body, size as usize)?;
+    let mut times: Vec<u64> = Vec::new();
+    walk_children(&data, |id, point| {
+        if id == CUE_POINT {
+            let (mut time, mut track) = (None, None);
+            walk_children(point, |id, v| {
+                match id {
+                    CUE_TIME => time = Some(uint(v)),
+                    CUE_TRACK_POSITIONS => {
+                        walk_children(v, |id, w| {
+                            if id == CUE_TRACK {
+                                track = Some(uint(w));
+                            }
+                            Ok(true)
+                        })?;
+                    }
+                    _ => {}
+                }
+                Ok(true)
+            })?;
+            // Cues for a subtitle or audio track say nothing about
+            // where the video can be cut.
+            let ours = match (track, video_track) {
+                (Some(t), Some(v)) => t == v,
+                _ => true,
+            };
+            if let Some(t) = time
+                && ours
+            {
+                times.push(t);
+            }
+        }
+        Ok(true)
+    })?;
+    Ok(gap_ms(&mut times, |ticks| ticks * scale / 1_000_000))
+}
+
+/// MP4: `stss` lists the sync samples and `stts` gives every sample's
+/// duration, so the keyframe timeline is exact. No `stss` at all means
+/// every sample is a sync sample (an all-intra file) — a zero-length
+/// gap, not an unknown one.
+fn mp4_max_keyframe_gap(src: &mut dyn RemuxSource) -> Result<Option<u32>> {
+    let mut r = Reader::new(src);
+    let mut pos = 0u64;
+    let mut moov: Option<Vec<u8>> = None;
+    while pos + 8 <= r.len {
+        let head = r.read_at(pos, 16)?;
+        let size32 = u32::from_be_bytes(head[0..4].try_into().unwrap()) as u64;
+        let kind = &head[4..8];
+        let (size, hdr) = if size32 == 1 {
+            (u64::from_be_bytes(head[8..16].try_into().unwrap()), 16u64)
+        } else if size32 == 0 {
+            (r.len - pos, 8u64)
+        } else {
+            (size32, 8u64)
+        };
+        if size < hdr {
+            return Ok(None);
+        }
+        if kind == b"moov" {
+            moov = Some(r.read_at(pos + hdr, (size - hdr) as usize)?);
+            break;
+        }
+        pos += size;
+    }
+    let Some(moov) = moov else { return Ok(None) };
+
+    let mut out: Option<Option<u32>> = None;
+    walk_boxes(&moov, |kind, body| {
+        if kind != *b"trak" || out.is_some() {
+            return Ok(());
+        }
+        let Some(mdia) = find_box(body, b"mdia") else {
+            return Ok(());
+        };
+        let Some(hdlr) = find_box(mdia, b"hdlr") else {
+            return Ok(());
+        };
+        if hdlr.len() < 12 || &hdlr[8..12] != b"vide" {
+            return Ok(());
+        }
+        let Some(mdhd) = find_box(mdia, b"mdhd") else {
+            return Ok(());
+        };
+        let timescale = if mdhd[0] == 1 {
+            u32::from_be_bytes(mdhd[20..24].try_into().unwrap())
+        } else {
+            u32::from_be_bytes(mdhd[12..16].try_into().unwrap())
+        } as u64;
+        let Some(stbl) = find_box(mdia, b"minf").and_then(|m| find_box(m, b"stbl")) else {
+            return Ok(());
+        };
+        let Some(stts) = find_box(stbl, b"stts") else {
+            return Ok(());
+        };
+        // No stss: every sample is a keyframe, so a cut is possible
+        // anywhere. Known and zero, not unknown.
+        let Some(stss) = find_box(stbl, b"stss") else {
+            out = Some(Some(0));
+            return Ok(());
+        };
+        let ts = timescale.max(1);
+        let n = u32::from_be_bytes(stss[4..8].try_into().unwrap()) as usize;
+        let syncs: std::collections::HashSet<u32> = (0..n)
+            .filter_map(|i| stss.get(8 + i * 4..12 + i * 4))
+            .map(|b| u32::from_be_bytes(b.try_into().unwrap()))
+            .collect();
+        let entries = u32::from_be_bytes(stts[4..8].try_into().unwrap()) as usize;
+        let mut times: Vec<u64> = Vec::new();
+        let (mut t, mut sample) = (0u64, 1u32);
+        for e in 0..entries {
+            let base = 8 + e * 8;
+            let (Some(cnt), Some(delta)) = (stts.get(base..base + 4), stts.get(base + 4..base + 8))
+            else {
+                break;
+            };
+            let cnt = u32::from_be_bytes(cnt.try_into().unwrap());
+            let delta = u32::from_be_bytes(delta.try_into().unwrap()) as u64;
+            for _ in 0..cnt {
+                if syncs.contains(&sample) {
+                    times.push(t);
+                }
+                t += delta;
+                sample += 1;
+            }
+        }
+        out = Some(gap_ms(&mut times, |t| t * 1000 / ts));
+        Ok(())
+    })?;
+    Ok(out.flatten())
+}
+
+/// Largest adjacent gap in a keyframe timeline, via `to_ms`. Fewer than
+/// two keyframes is not a measurement — one keyframe says nothing about
+/// spacing — so it reads as unknown.
+fn gap_ms(times: &mut Vec<u64>, to_ms: impl Fn(u64) -> u64) -> Option<u32> {
+    if times.len() < 2 {
+        return None;
+    }
+    times.sort_unstable();
+    let max = times
+        .windows(2)
+        .map(|w| to_ms(w[1]) - to_ms(w[0]))
+        .max()
+        .unwrap_or(0);
+    Some(max.min(u32::MAX as u64) as u32)
+}
+
+#[cfg(test)]
+mod keyframe_tests {
+    use super::*;
+
+    /// Both index formats, against a keyframe interval we CHOSE. A
+    /// parser that silently returns something plausible is the failure
+    /// mode here — the number decides a spec-bound value, so the test
+    /// pins it to a GOP the encoder was told to produce.
+    #[test]
+    fn keyframe_interval_read_from_mkv_and_mp4_indexes() {
+        if !crate::testutil::has_element("x264enc") {
+            eprintln!("skipped: no x264enc");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        // 25 fps, a keyframe every 50 frames = 2.0 s, 6 s long.
+        for (name, mux) in [
+            ("gop.mkv", "matroskamux"),
+            ("gop.mp4", "mp4mux faststart=true"),
+        ] {
+            let path = dir.path().join(name);
+            crate::testutil::render(&format!(
+                "videotestsrc num-buffers=150 ! video/x-raw,framerate=25/1,width=320,height=240 \
+                 ! x264enc key-int-max=50 speed-preset=ultrafast ! h264parse \
+                 ! {mux} ! filesink location={}",
+                path.display()
+            ));
+            let got = max_keyframe_interval_ms(&path)
+                .unwrap()
+                .unwrap_or_else(|| panic!("{name}: no interval read"));
+            assert!(
+                (1900..=2100).contains(&got),
+                "{name}: expected ~2000 ms, got {got}"
+            );
+        }
+    }
+
+    /// Unknown must stay unknown. A container we cannot index reads as
+    /// `None` so the caller falls back to a conservative bound — the one
+    /// thing it must never do is read as 0, which would declare that
+    /// cuts are possible anywhere.
+    #[test]
+    fn an_unindexable_file_is_unknown_not_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let junk = dir.path().join("not-media.bin");
+        std::fs::write(&junk, vec![0u8; 4096]).unwrap();
+        assert_eq!(max_keyframe_interval_ms(&junk).unwrap(), None);
+
+        let empty = dir.path().join("empty.mkv");
+        std::fs::write(&empty, b"").unwrap();
+        assert!(matches!(max_keyframe_interval_ms(&empty), Ok(None) | Err(_)));
+    }
+}
