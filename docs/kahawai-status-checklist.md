@@ -386,6 +386,11 @@ How something works and why it was built that way belong in
 - [x] OPS-7 Cross-version satellite compatibility: protocol gated on major
       version (Hello/HelloAck) — per decision 2026-07-25, major-gating IS the
       compatibility contract; no previous-minor guarantee
+      *(TODO before 1.0.0, per the 2026-08-03 amendment: flatten the
+      protocol into one clean major and force a full rescan, deleting
+      the accumulated backfill messages and the "scanned before this
+      existed" branches they exist to serve. Currently carried: MH-4
+      attachments, the keyframe interval.)*
 - [x] OPS-8 Reverse-proxy support: trusted_proxies (exact IPs and CIDR
       ranges — docker/traefik bridges) gate X-Forwarded-For for OPS-2
       throttling (rightmost-untrusted, spoof-safe), configurable CORS

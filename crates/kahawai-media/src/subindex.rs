@@ -1890,8 +1890,17 @@ fn mp4_max_keyframe_gap(src: &mut dyn RemuxSource) -> Result<Option<u32>> {
         let Some(stts) = find_box(stbl, b"stts") else {
             return Ok(());
         };
-        // No stss: every sample is a keyframe, so a cut is possible
-        // anywhere. Known and zero, not unknown.
+        let entries = u32::from_be_bytes(stts[4..8].try_into().unwrap()) as usize;
+        // FRAGMENTED mp4: the moov describes no samples at all (the
+        // fragments carry their own tables), so an absent `stss` here
+        // means "not written down", not "no keyframes to write down".
+        // Reading it as all-intra would declare that a cut is possible
+        // anywhere and put us straight back to under-declaring.
+        if entries == 0 || find_box(&moov, b"mvex").is_some() {
+            return Ok(());
+        }
+        // No stss in a non-fragmented file: every sample IS a sync
+        // sample, so a cut is possible anywhere. Known and zero.
         let Some(stss) = find_box(stbl, b"stss") else {
             out = Some(Some(0));
             return Ok(());
@@ -1902,7 +1911,6 @@ fn mp4_max_keyframe_gap(src: &mut dyn RemuxSource) -> Result<Option<u32>> {
             .filter_map(|i| stss.get(8 + i * 4..12 + i * 4))
             .map(|b| u32::from_be_bytes(b.try_into().unwrap()))
             .collect();
-        let entries = u32::from_be_bytes(stts[4..8].try_into().unwrap()) as usize;
         let mut times: Vec<u64> = Vec::new();
         let (mut t, mut sample) = (0u64, 1u32);
         for e in 0..entries {
@@ -1978,6 +1986,32 @@ mod keyframe_tests {
                 "{name}: expected ~2000 ms, got {got}"
             );
         }
+    }
+
+    /// A FRAGMENTED mp4 must read as unknown. Its moov describes no
+    /// samples — the fragments carry their own tables — so the absent
+    /// `stss` means "not written here", and taking it for all-intra
+    /// would declare cuts possible anywhere: the exact under-declaration
+    /// this whole measurement exists to stop.
+    #[test]
+    fn a_fragmented_mp4_is_unknown_not_all_intra() {
+        if !crate::testutil::has_element("isofmp4mux") || !crate::testutil::has_element("x264enc") {
+            eprintln!("skipped: no isofmp4mux/x264enc");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("frag.mp4");
+        crate::testutil::render(&format!(
+            "videotestsrc num-buffers=150 ! video/x-raw,framerate=25/1,width=320,height=240 \
+             ! x264enc key-int-max=50 speed-preset=ultrafast ! h264parse \
+             ! isofmp4mux ! filesink location={}",
+            path.display()
+        ));
+        assert_eq!(
+            max_keyframe_interval_ms(&path).unwrap(),
+            None,
+            "a fragmented mp4 has no sample table to read"
+        );
     }
 
     /// Unknown must stay unknown. A container we cannot index reads as
