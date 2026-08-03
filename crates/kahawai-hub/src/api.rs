@@ -70,7 +70,7 @@ pub fn router(
         .route("/api/v1/collections", get(list_collections))
         .route("/api/v1/libraries", get(list_libraries))
         .route("/api/v1/items", get(list_items))
-        .route("/api/v1/items/{id}", get(item_detail))
+        .route("/api/v1/items/{id}", get(item_detail).fallback(item_query))
         .route("/api/v1/items/{id}/children", get(item_children))
         .route("/api/v1/items/{id}/artwork", get(item_artwork))
         .route("/api/v1/items/{id}/subtitles", get(item_subtitles))
@@ -1727,6 +1727,10 @@ async fn item_subtitles(
             &ass,
             &claims.sub,
             claims.admin,
+            // The legacy listing keeps its own source resolution; the
+            // QUERY path passes the negotiated one. This endpoint goes
+            // away with the split.
+            None,
         )
         .await
         .map_err(internal)?;
@@ -2287,6 +2291,22 @@ async fn item_detail(
     Path(id): Path<String>,
     axum::Extension(claims): axum::Extension<crate::auth::Claims>,
 ) -> Result<Json<Value>, ApiError> {
+    Ok(Json(item_body(&state, &id, &claims.sub, true).await?))
+}
+
+/// The item as discovered: one row, its sources, its metadata and its
+/// relations. Shared by `GET` and by `QUERY`, which adds the negotiated
+/// half on top — one builder, so the two can never drift apart.
+///
+/// `with_streams` is what separates them: the scan's `MediaInfo` per
+/// source is an answer to "what is in the file", and belongs to the
+/// request that asked a question about playing it.
+async fn item_body(
+    state: &AppState,
+    id: &str,
+    user_id: &str,
+    with_streams: bool,
+) -> Result<Value, ApiError> {
     let item = sqlx::query(
         "SELECT i.id, i.kind, i.season, i.episode, i.artist,
                 COALESCE(md.title, i.title) AS title,
@@ -2303,8 +2323,8 @@ async fn item_detail(
          LEFT JOIN resolved_metadata pmd ON pmd.item_id = p.id
          WHERE i.id = ?",
     )
-    .bind(&claims.sub)
-    .bind(&id)
+    .bind(user_id)
+    .bind(id)
     .fetch_optional(state.registry.db())
     .await
     .map_err(internal)?
@@ -2323,7 +2343,7 @@ async fn item_detail(
                   COALESCE(f.revision, 1) DESC,
                   f.size DESC",
     )
-    .bind(&id)
+    .bind(id)
     .fetch_all(state.registry.db())
     .await
     .map_err(internal)?;
@@ -2334,15 +2354,18 @@ async fn item_detail(
             let module_id: String = r.get("module_id");
             let streams: Value = serde_json::from_str(r.get::<String, _>("streams_json").as_str())
                 .unwrap_or(Value::Null);
-            json!({
+            let mut src = json!({
                 "module_id": module_id,
                 "collection_id": r.get::<String, _>("collection_id"),
                 "path_rel": r.get::<String, _>("path_rel"),
                 "size": r.get::<i64, _>("size"),
                 "available": state.registry.is_connected(&module_id),
                 "revision": r.get::<i64, _>("revision"),
-                "streams": streams,
-            })
+            });
+            if with_streams {
+                src["streams"] = streams;
+            }
+            src
         })
         .collect();
 
@@ -2366,7 +2389,7 @@ async fn item_detail(
          WHERE i.id = ? AND m.provider_id != ''
          ORDER BY m.item_id = i.id DESC LIMIT 1",
     )
-    .bind(&id)
+    .bind(id)
     .fetch_optional(state.registry.db())
     .await
     .map_err(internal)?;
@@ -2403,7 +2426,7 @@ async fn item_detail(
              WHEN 'side_story' THEN 3 WHEN 'spin_off' THEN 4 ELSE 5 END,
              r.target_title",
     )
-    .bind(&id)
+    .bind(id)
     .fetch_all(state.registry.db())
     .await
     .map_err(internal)?;
@@ -2421,7 +2444,153 @@ async fn item_detail(
                 .collect(),
         );
     }
-    Ok(Json(out))
+    Ok(out)
+}
+
+/// The question `QUERY /api/v1/items/{id}` answers. Same inputs a
+/// session start takes, minus everything that only matters once you
+/// are actually playing.
+#[derive(Deserialize, Default)]
+struct ItemQuery {
+    /// Absent = the conservative fallback, exactly as `start_session`
+    /// treats a missing profile.
+    #[serde(default)]
+    profile: Option<kahawai_core::media::CapabilityProfile>,
+    #[serde(default)]
+    audio_track: u32,
+    #[serde(default)]
+    video_track: u32,
+    #[serde(default)]
+    subtitle_track: Option<i64>,
+    /// Operator override (scripts, pipeline debugging).
+    #[serde(default)]
+    mode: Option<String>,
+}
+
+/// `QUERY /api/v1/items/{id}` (RFC 10008) — the item, its discovered
+/// streams, and what this client would actually be served.
+///
+/// **It answers only what is knowable now.** QUERY is safe and
+/// idempotent, so it starts nothing and waits for nothing: no
+/// display-set extraction dispatched to a mediahost, no rasterisation,
+/// no lease, no transcoder reserved. It runs the same negotiation a
+/// session runs, stopping before the fetches that would make a burn or
+/// an overlay *real* — so those tiers are reported only when their
+/// artefacts already exist, and a first play may still land elsewhere
+/// after the session materialises one.
+///
+/// Reached through `MethodRouter::fallback`, because axum's
+/// `MethodFilter` has no extension methods. That fallback swallows
+/// EVERY unmatched method, so the method is checked here and the
+/// `Allow` header written by hand — axum's own 405 machinery no longer
+/// runs for this route.
+async fn item_query(
+    State(state): State<AppState>,
+    axum::Extension(claims): axum::Extension<crate::auth::Claims>,
+    Path(id): Path<String>,
+    method: axum::http::Method,
+    body: Option<Json<ItemQuery>>,
+) -> Result<Response, ApiError> {
+    if method.as_str() != "QUERY" {
+        return Ok((
+            StatusCode::METHOD_NOT_ALLOWED,
+            [
+                (axum::http::header::ALLOW, "GET, QUERY"),
+                (
+                    axum::http::HeaderName::from_static("accept-query"),
+                    "application/json",
+                ),
+            ],
+            "",
+        )
+            .into_response());
+    }
+    // RFC 10008: "Servers MUST fail the request if the Content-Type
+    // request field is missing or is inconsistent with the request
+    // content." `Json`'s own extractor rejection is that check — it
+    // 415s on a missing or wrong type — so a body that failed to
+    // extract is a refusal, not an empty query.
+    let Json(q) = body.ok_or((
+        StatusCode::UNSUPPORTED_MEDIA_TYPE,
+        "QUERY needs a body with Content-Type: application/json".to_string(),
+    ))?;
+
+    let mut out = item_body(&state, &id, &claims.sub, true).await?;
+    let neg = crate::sessions::Negotiation::new(
+        &state.sessions,
+        &state.registry,
+        &claims.sub,
+        &id,
+        q.profile,
+        q.audio_track,
+        q.video_track,
+        q.subtitle_track,
+    )
+    .await
+    .map_err(|e| (StatusCode::CONFLICT, format!("{e:#}")))?;
+    let (parts, _info, sp, mode) = neg
+        .best_source(&id, q.mode.as_deref())
+        .await
+        .map_err(|e| (StatusCode::CONFLICT, format!("{e:#}")))?;
+
+    let mut verdicts = sp.subtitles.clone();
+    crate::sessions::fill_verdict_track_ids(&state.registry, &parts, &mut verdicts).await;
+    // The unified track list for the source the negotiation ACTUALLY
+    // chose. Asking `source_row` instead — as the old listing endpoint
+    // did — can name a different file on a multi-source item, and then
+    // every delivery describes something that will not be played.
+    let subtitles = match parts.first() {
+        Some(p) => state
+            .subtitles
+            .list(
+                &state.registry,
+                &id,
+                q_ass_render(&neg),
+                q_graphics_overlay(&neg),
+                &neg.ass,
+                &claims.sub,
+                claims.admin,
+                Some((&p.module_id, &p.collection_id, &p.path_rel)),
+            )
+            .await
+            .map_err(internal)?,
+        None => Vec::new(),
+    };
+
+    out["negotiated"] = json!({
+        "source": parts.first().map(|p| json!({
+            "module_id": p.module_id,
+            "collection_id": p.collection_id,
+            "path_rel": p.path_rel,
+        })),
+        // What negotiation decided. A `remux` may still be dispatched to
+        // a transcoder at session start — that is placement, which QUERY
+        // does not do because it would claim a box.
+        "mode": mode,
+        "cost": sp.cost.as_str(),
+        "streams": {
+            "video": sp.video_verdict,
+            "audio": sp.audio_verdict,
+            "subtitles": verdicts,
+        },
+        "subtitles": subtitles,
+    });
+    Ok((
+        [(
+            axum::http::HeaderName::from_static("accept-query"),
+            "application/json",
+        )],
+        Json(out),
+    )
+        .into_response())
+}
+
+fn q_ass_render(neg: &crate::sessions::Negotiation<'_>) -> bool {
+    neg.profile().ass_render
+}
+
+fn q_graphics_overlay(neg: &crate::sessions::Negotiation<'_>) -> bool {
+    neg.profile().graphics_overlay
 }
 
 #[derive(Deserialize)]

@@ -159,6 +159,7 @@ impl Subtitles {
     /// same source `open_source` would pick, plus the hub-stored rows.
     /// Capability adjusts each track's DELIVERY, never its existence
     /// (the UI disables `none`; the API always lists).
+    #[allow(clippy::too_many_arguments)] // the caller's identity and caps, spelled out
     pub async fn list(
         &self,
         registry: &Registry,
@@ -169,8 +170,20 @@ impl Subtitles {
         // Who is asking, for `TrackListing::deletable`.
         user_id: &str,
         is_admin: bool,
+        // WHICH source to list tracks for. `None` falls back to
+        // `source_row`, which orders by size — a different rule from
+        // the one playback uses, so a multi-source item can list tracks
+        // from a file the session will not play. A caller that has
+        // already negotiated passes the source it chose.
+        source: Option<(&str, &str, &str)>,
     ) -> Result<Vec<TrackListing>> {
-        let (module_id, collection_id, path_rel, _info) = source_row(registry, item_id).await?;
+        let (module_id, collection_id, path_rel) = match source {
+            Some((m, c, p)) => (m.to_string(), c.to_string(), p.to_string()),
+            None => {
+                let (m, c, p, _info) = source_row(registry, item_id).await?;
+                (m, c, p)
+            }
+        };
         let tracks = crate::tracks::for_item_source(
             registry.db(),
             item_id,

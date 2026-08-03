@@ -546,7 +546,7 @@ fn local_encoder_names() -> Vec<String> {
 /// rows. Stamp each verdict with the id of the embedded row bound to
 /// the session's source (missing rows read as None — a source scanned
 /// before the unification migration ran).
-async fn fill_verdict_track_ids(
+pub(crate) async fn fill_verdict_track_ids(
     registry: &Registry,
     parts: &[PartSource],
     verdicts: &mut [kahawai_media::negotiate::SubtitleVerdict],

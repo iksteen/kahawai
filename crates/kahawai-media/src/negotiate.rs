@@ -29,6 +29,20 @@ pub enum Cost {
     Unplayable,
 }
 
+impl Cost {
+    /// The wire name. Spelled out rather than derived, so renaming a
+    /// variant cannot silently change the API.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::Copy => "copy",
+            Self::AudioEncode => "audio_encode",
+            Self::VideoEncode => "video_encode",
+            Self::Unplayable => "unplayable",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SourcePlan {
     /// Serve bytes as-is; `plan` is still filled for verdict text.
