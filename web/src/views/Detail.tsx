@@ -10,9 +10,7 @@ import {
   searchSubtitles,
   downloadSubtitle,
   deleteSubtitle,
-  ocrSubtitle,
   quotaLabel,
-  isImageSub,
   type SubtitleQuota,
   type Subtitle,
   type SubtitleCandidate,
@@ -101,8 +99,6 @@ export default function Detail({
   // empty = no preference, search every language.
   const [subLangs, setSubLangs] = useState<string[]>([])
   const [subBusy, setSubBusy] = useState(false)
-  // HUB-32c: which image track is being OCRed (~30 s for a film).
-  const [ocrBusy, setOcrBusy] = useState<string | null>(null)
   const [subNote, setSubNote] = useState('')
   const [subQuota, setSubQuota] = useState<SubtitleQuota | null>(null)
   const [error, setError] = useState('')
@@ -536,47 +532,22 @@ export default function Detail({
                   {s.delivery === 'none' ? 'unused' : s.delivery}
                 </span>
               </span>
-              <button
-                className="btn ghost small"
-                onClick={() =>
-                  deleteSubtitle(s.id)
-                    .then(reloadSubs)
-                    .catch((e) => setError(String(e)))
-                }
-              >
-                Remove
-              </button>
-            </li>
-          ))}
-        {/* HUB-32c: image tracks with no OCR text derived from them
-            yet can grow one — per stream, keyed by lineage, so two
-            same-language image tracks each get their own button. */}
-        {subs
-          .filter(
-            (s) =>
-              isImageSub(s) &&
-              (s.origin === 'embedded' || s.origin === 'sidecar') &&
-              !subs.some((t) => t.origin === 'ocr' && t.derived_from === s.id),
-          )
-          .map((s) => (
-            <li key={`ocr-${s.id}`}>
-              <span className="chips">
-                <span className="chip dim">{s.format}</span>
-                <span>{s.language ?? '?'} · image only</span>
-              </span>
-              <button
-                className="btn ghost small"
-                disabled={ocrBusy !== null}
-                onClick={() => {
-                  setOcrBusy(String(s.id))
-                  ocrSubtitle(s.id)
-                    .then(reloadSubs)
-                    .catch((e) => setError(String(e)))
-                    .finally(() => setOcrBusy(null))
-                }}
-              >
-                {ocrBusy === String(s.id) ? 'Reading…' : '→ text (OCR)'}
-              </button>
+              {/* Only a DOWNLOADED track, and only for whoever spent
+                  the provider quota on it (or an admin). The caches
+                  rebuild themselves, so removing one would be a button
+                  that undoes nothing. */}
+              {s.deletable && (
+                <button
+                  className="btn ghost small"
+                  onClick={() =>
+                    deleteSubtitle(s.id)
+                      .then(reloadSubs)
+                      .catch((e) => setError(String(e)))
+                  }
+                >
+                  Remove
+                </button>
+              )}
             </li>
           ))}
       </ul>

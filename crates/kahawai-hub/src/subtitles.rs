@@ -40,6 +40,18 @@ pub struct TrackListing {
     pub track: crate::tracks::Track,
     pub delivery: crate::tracks::Delivery,
     pub note: &'static str,
+    /// May the REQUESTING user remove this track? Computed per request
+    /// like `delivery`, and never stored: it is a fact about who is
+    /// asking, not about the track.
+    ///
+    /// Only `downloaded` rows qualify at all. The other hub-stored
+    /// origins are caches — a raster is rebuilt by the next session
+    /// that needs it, an OCR row by the idle sweep — so deleting one
+    /// destroys nothing and offering it is noise. A download is
+    /// different: it spent a shared, rate-limited provider quota that
+    /// re-fetching spends again, which is why it is also restricted to
+    /// whoever spent it, or an admin.
+    pub deletable: bool,
 }
 
 /// A served ASS script: complete (cache/sidecar) or streamed while the
@@ -154,6 +166,9 @@ impl Subtitles {
         ass_render: bool,
         graphics_overlay: bool,
         ass: &kahawai_media::negotiate::AssPolicy,
+        // Who is asking, for `TrackListing::deletable`.
+        user_id: &str,
+        is_admin: bool,
     ) -> Result<Vec<TrackListing>> {
         let (module_id, collection_id, path_rel, _info) = source_row(registry, item_id).await?;
         let tracks = crate::tracks::for_item_source(
@@ -184,10 +199,13 @@ impl Subtitles {
             .map(|t| {
                 let (delivery, note) =
                     crate::tracks::delivery(&t, ass_render, graphics_overlay, burn_capable, ass);
+                let deletable = t.origin == "downloaded"
+                    && (is_admin || t.created_by.as_deref() == Some(user_id));
                 TrackListing {
                     track: t,
                     delivery,
                     note,
+                    deletable,
                 }
             })
             .collect())
@@ -632,23 +650,6 @@ impl Subtitles {
         std::fs::write(self.downloaded_path(id), serde_json::to_vec(&ex)?)?;
         tracing::info!(item = item_id, id, format = %dl.format, "external subtitle downloaded");
         Ok((id, provider.quota()))
-    }
-
-    /// HUB-32c: OCR an image subtitle track (embedded or VobSub
-    /// sidecar) into a new text track. The result is a first-class
-    /// `ocr` row whose `derived_from` points at the image track — that
-    /// linkage is what regeneration replaces by and what the sweep and
-    /// negotiation dedupe on. Returns the new track id.
-    #[cfg(feature = "ocr")]
-    pub async fn ocr_generate(
-        &self,
-        registry: &Registry,
-        parent_id: i64,
-        user_id: &str,
-    ) -> Result<i64> {
-        // A human pressed the button: bounded like the burn path's wait.
-        self.ocr_generate_within(registry, parent_id, user_id, SETS_WAIT_URGENT)
-            .await
     }
 
     /// HUB-32d: rasterise an ASS/SSA track into a display-set track an
@@ -1105,21 +1106,36 @@ impl Subtitles {
         .unwrap_or_default()
     }
 
-    /// Remove a hub-stored track (downloaded/OCR: row + cached body).
-    /// Scan-owned rows refuse — deleting one would only last until the
-    /// next rescan re-materializes it.
-    pub async fn delete_track(&self, registry: &Registry, id: i64) -> Result<bool> {
+    /// Remove a DOWNLOADED track — the only hub-stored origin anyone
+    /// deletes, and only its creator or an admin.
+    ///
+    /// The others are caches and deleting them destroys nothing: a
+    /// raster is rebuilt by the next session that needs it, an OCR row
+    /// by the idle sweep. A download is not a cache. It spent a shared,
+    /// rate-limited provider quota, re-fetching spends another, and
+    /// there is no way to un-spend one — so it belongs to whoever paid
+    /// for it. Scan-owned rows refuse too: deleting one would last only
+    /// until the next rescan re-materialises it.
+    pub async fn delete_track(
+        &self,
+        registry: &Registry,
+        id: i64,
+        user_id: &str,
+        is_admin: bool,
+    ) -> Result<bool> {
         let n = sqlx::query(
             "DELETE FROM subtitle_tracks
-             WHERE id = ? AND origin IN ('downloaded', 'ocr', 'raster')",
+             WHERE id = ? AND origin = 'downloaded'
+               AND (? OR created_by = ?)",
         )
         .bind(id)
+        .bind(is_admin)
+        .bind(user_id)
         .execute(registry.db())
         .await?
         .rows_affected();
         if n > 0 {
             let _ = std::fs::remove_file(self.downloaded_path(id));
-            let _ = std::fs::remove_file(self.raster_path(id));
         }
         Ok(n > 0)
     }

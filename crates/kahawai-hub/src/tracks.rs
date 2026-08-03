@@ -63,6 +63,11 @@ pub struct Track {
     pub label: Option<String>,
     pub machine: bool,
     pub derived_from: Option<i64>,
+    /// Who created a hub-stored row. Never serialised — it decides
+    /// `TrackListing::deletable` server-side rather than telling every
+    /// client which user fetched which subtitle.
+    #[serde(skip)]
+    pub created_by: Option<String>,
 }
 
 /// How a track can be served to a given client — the tier ladder
@@ -204,7 +209,8 @@ pub fn delivery(
 pub async fn get(db: &sqlx::SqlitePool, id: i64) -> Result<Option<Track>> {
     Ok(sqlx::query(
         "SELECT id, item_id, origin, module_id, collection_id, path_rel,
-                stream_index, format, language, label, machine, derived_from
+                stream_index, format, language, label, machine, derived_from,
+                created_by
          FROM subtitle_tracks WHERE id = ?",
     )
     .bind(id)
@@ -225,7 +231,8 @@ pub async fn for_item_source(
 ) -> Result<Vec<Track>> {
     Ok(sqlx::query(
         "SELECT id, item_id, origin, module_id, collection_id, path_rel,
-                stream_index, format, language, label, machine, derived_from
+                stream_index, format, language, label, machine, derived_from,
+                created_by
          FROM subtitle_tracks
          WHERE item_id = ?
            AND (module_id IS NULL
@@ -269,6 +276,7 @@ fn row_to_track(r: sqlx::sqlite::SqliteRow) -> Track {
         label: r.get("label"),
         machine: r.get::<i64, _>("machine") != 0,
         derived_from: r.get("derived_from"),
+        created_by: r.get("created_by"),
     }
 }
 
@@ -429,6 +437,7 @@ mod tests {
             label: None,
             machine: false,
             derived_from: None,
+            created_by: None,
         }
     }
 

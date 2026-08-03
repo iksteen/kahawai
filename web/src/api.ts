@@ -213,6 +213,10 @@ export type Subtitle = {
   derived_from: number | null
   delivery: SubtitleDelivery
   note: string
+  /// HUB-32c/d: may THIS user remove it? Only downloaded tracks, and
+  /// only their creator or an admin — the other hub-stored origins are
+  /// caches that rebuild themselves.
+  deletable: boolean
 }
 
 
@@ -291,9 +295,6 @@ export const deleteSubtitle = (id: number) =>
 
 /// HUB-32c: OCR an image track (embedded or VobSub sidecar) into a new
 /// text track. Synchronous — a feature film takes ~30 s; cached, and
-/// the new row's `derived_from` points at the image track.
-export const ocrSubtitle = (trackId: number) =>
-  json<{ track_id: number }>(`/api/v1/subtitles/${trackId}/ocr`, { method: 'POST' })
 
 export const fetchFonts = (itemId: string) =>
   json<{ fonts: string[] }>(`/api/v1/items/${itemId}/fonts`)

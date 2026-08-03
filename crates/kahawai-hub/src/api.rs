@@ -83,7 +83,6 @@ pub fn router(
             "/api/v1/subtitles/{track_id}",
             axum::routing::delete(subtitle_delete),
         )
-        .route("/api/v1/subtitles/{track_id}/ocr", post(subtitle_ocr))
         .route(
             "/api/v1/items/{id}/subtitles/{file}",
             get(item_subtitle_file),
@@ -522,40 +521,17 @@ async fn subtitle_download(
 /// the caller is a human who pressed a button; the result is cached,
 /// so it runs once per track. Feature-gated: without `ocr` the route
 /// answers with what is missing rather than 404.
-async fn subtitle_ocr(
-    State(state): State<AppState>,
-    Path(track_id): Path<i64>,
-    axum::Extension(claims): axum::Extension<crate::auth::Claims>,
-) -> Result<Json<Value>, ApiError> {
-    #[cfg(feature = "ocr")]
-    {
-        let new_id = state
-            .subtitles
-            .ocr_generate(&state.registry, track_id, &claims.sub)
-            .await
-            .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, format!("{e:#}")))?;
-        Ok(Json(json!({ "track_id": new_id })))
-    }
-    #[cfg(not(feature = "ocr"))]
-    {
-        let _ = (claims, track_id, state);
-        Err((
-            StatusCode::NOT_IMPLEMENTED,
-            "this build has no OCR support (compiled with --no-default-features)".into(),
-        )
-            .into())
-    }
-}
-
-/// Remove a hub-stored (downloaded/OCR/raster) track. Scan-owned
-/// tracks refuse with 404-shaped `removed: false`.
+/// Remove a DOWNLOADED track, as its creator or an admin. Anything
+/// else — a cache, a scan-owned row, someone else's download — refuses
+/// with 404-shaped `removed: false`.
 async fn subtitle_delete(
     State(state): State<AppState>,
+    axum::Extension(claims): axum::Extension<crate::auth::Claims>,
     Path(track_id): Path<i64>,
 ) -> Result<Json<Value>, ApiError> {
     let removed = state
         .subtitles
-        .delete_track(&state.registry, track_id)
+        .delete_track(&state.registry, track_id, &claims.sub, claims.admin)
         .await
         .map_err(internal)?;
     Ok(Json(json!({ "removed": removed })))
@@ -1749,6 +1725,8 @@ async fn item_subtitles(
             caps.ass_render.unwrap_or(true),
             caps.graphics_overlay.unwrap_or(true),
             &ass,
+            &claims.sub,
+            claims.admin,
         )
         .await
         .map_err(internal)?;
