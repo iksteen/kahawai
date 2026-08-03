@@ -192,6 +192,349 @@ impl PendingSeek {
 /// The local process's verified encoder codec names — negotiation's
 /// target pool when no fleet box would run the encode (HUB-15b),
 /// mirroring the tonemap_available() fallback.
+/// What the box that would run an encode can do. A PARAMETER rather
+/// than part of [`Negotiation`], because the two callers learn it from
+/// different places and the difference is load-bearing: a session start
+/// probes the whole fleet, while a seek reads it off the executor it is
+/// already bound to (a seek cannot move boxes, HUB-15b). Folding these
+/// in would quietly make a seek re-plan against a fleet it cannot use.
+pub(crate) struct ExecutorFacts {
+    /// HUB-15a: that box reports the GL tone-map segment.
+    pub tonemap: bool,
+    /// HUB-15b: its verified encoder codec names — negotiation's target
+    /// pool, intersected with what the client accepts.
+    pub targets: Vec<String>,
+    /// HUB-32b: this source's display-set timeline is readable where
+    /// the encode would run.
+    pub burn_capable: bool,
+}
+
+/// Everything a negotiation needs that does not change between
+/// candidates: the caller's identity-derived facts and their picks.
+///
+/// Extracted from `start_inner`, where it was five closures over the
+/// same captures, called at five points — twice to choose a source and
+/// three more times to re-plan after a fetch withdrew a tier. Holding
+/// it in one place is what lets a read-only caller ask the same
+/// question without starting a session.
+pub(crate) struct Negotiation<'a> {
+    registry: &'a Registry,
+    sessions: &'a Sessions,
+    /// The client's profile, already tightened by the user's standing
+    /// bandwidth cap (HUB-15).
+    profile: kahawai_core::media::CapabilityProfile,
+    /// HUB-32a/d: the user's ASS ladder. `pub` because the overlay rung
+    /// only becomes real once something has been rasterised, and the
+    /// caller flips `overlay_ready` before re-planning.
+    pub ass: kahawai_media::negotiate::AssPolicy,
+    /// HUB-32c: image tracks that already have OCR text derived from
+    /// them, keyed per source.
+    ocr_set: std::collections::HashSet<(String, String, String, i64)>,
+    /// An explicit burn pick, if the caller named one and it is a track
+    /// some tier could actually burn.
+    burn_row: Option<crate::tracks::Track>,
+    audio_track: u32,
+    video_track: u32,
+}
+
+impl<'a> Negotiation<'a> {
+    /// Resolve the caller's inputs once. The subtitle pick is validated
+    /// here so a bad track id fails before any source work.
+    #[allow(clippy::too_many_arguments)] // the caller's request, spelled out
+    pub(crate) async fn new(
+        sessions: &'a Sessions,
+        registry: &'a Registry,
+        user_id: &str,
+        item_id: &str,
+        profile: Option<kahawai_core::media::CapabilityProfile>,
+        audio_track: u32,
+        video_track: u32,
+        subtitle_track: Option<i64>,
+    ) -> Result<Self> {
+        // ONE path: every session negotiates. The user's standing
+        // bandwidth cap tightens whatever the client asked for (HUB-15).
+        let mut profile = profile.unwrap_or_default();
+        let pref_cap: Option<u32> = sqlx::query_scalar::<_, String>(
+            "SELECT value FROM user_prefs
+              WHERE user_id = ? AND scope = '' AND key = 'bandwidth_kbps'",
+        )
+        .bind(user_id)
+        .fetch_optional(registry.db())
+        .await?
+        .and_then(|v| v.parse().ok())
+        .filter(|v| *v > 0);
+        profile.max_bandwidth_kbps = match (profile.max_bandwidth_kbps, pref_cap) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        // HUB-32a: burn ASS or flatten it? A fleet fact and this user's
+        // standing choice. Fleet-wide rather than per-box on purpose —
+        // the tier is decided before placement, which then hard-filters
+        // on it (registry::PlacementNeed::needs_ass_burn).
+        let ass = crate::tracks::ass_policy_for_user(
+            registry.db(),
+            user_id,
+            registry.any_transcoder_ass_burn() || kahawai_media::remux::ass_burn_available(),
+        )
+        .await;
+        // HUB-32c: which embedded image tracks already have an OCR text
+        // track derived from them — those prefer text over burn in the
+        // negotiation. Fetched once, keyed per source.
+        let ocr_set = crate::subtitles::ocr_stream_set(registry.db(), item_id).await;
+        // Subtitle unification: an explicit IMAGE track pick forces its
+        // burn — overriding both the overlay preference and the
+        // OCR-spares-burn rule. Text/ass/downloaded picks have no plan
+        // impact (the client fetches them itself). The row binds to a
+        // source, so the pick also pins source selection to it: judging
+        // other sources would silently drop the burn the user asked for.
+        let picked_row = match subtitle_track {
+            Some(tid) => {
+                let t = crate::tracks::get(registry.db(), tid)
+                    .await?
+                    .with_context(|| format!("no subtitle track {tid}"))?;
+                anyhow::ensure!(
+                    t.item_id == item_id,
+                    "subtitle track {tid} belongs to another item"
+                );
+                Some(t)
+            }
+            None => None,
+        };
+        // Image tracks and ASS/SSA both burn (HUB-32b / HUB-32a) and
+        // both need a stream to burn FROM, so a hub-stored row (OCR,
+        // downloaded) is never a burn pick. Negotiation drops a pick
+        // whose tier cannot honour it.
+        let burn_row = picked_row
+            .filter(|t| {
+                crate::tracks::is_image_format(&t.format)
+                    || matches!(t.format.as_str(), "ass" | "ssa")
+            })
+            .filter(|t| t.module_id.is_some() && t.stream_index.is_some());
+        Ok(Self {
+            registry,
+            sessions,
+            profile,
+            ass,
+            ocr_set,
+            burn_row,
+            audio_track,
+            video_track,
+        })
+    }
+
+    pub(crate) fn profile(&self) -> &kahawai_core::media::CapabilityProfile {
+        &self.profile
+    }
+
+    /// The burn pick, but only when it belongs to THESE parts — a pick
+    /// naming another source is not a pick for this one.
+    pub(crate) fn pick_for(
+        &self,
+        parts: &[PartSource],
+    ) -> Option<kahawai_media::negotiate::BurnPick> {
+        let t = self.burn_row.as_ref()?;
+        let p = parts.first()?;
+        if (
+            t.module_id.as_deref(),
+            t.collection_id.as_deref(),
+            t.path_rel.as_deref(),
+        ) != (
+            Some(p.module_id.as_str()),
+            Some(p.collection_id.as_str()),
+            Some(p.path_rel.as_str()),
+        ) {
+            return None;
+        }
+        let i = t.stream_index? as usize;
+        match t.origin.as_str() {
+            "embedded" => Some(kahawai_media::negotiate::BurnPick::Embedded(i)),
+            "sidecar" => Some(kahawai_media::negotiate::BurnPick::Sidecar(i)),
+            _ => None,
+        }
+    }
+
+    /// Ask the fleet which box would run an encode of this source, and
+    /// what it can do. A pure query — `pick_transcoder` is
+    /// `choose(need, false)` and reserves nothing.
+    pub(crate) fn probe(
+        &self,
+        info: &kahawai_core::media::MediaInfo,
+        burn_capable: bool,
+    ) -> ExecutorFacts {
+        // HUB-15a: would the box that runs a video encode of THIS
+        // source tone-map? Same placement question the real dispatch
+        // asks (ponytail: probed with encode_audio=false — a fleet
+        // where that changes the pick diverges cosmetically; the
+        // worker-side guard keeps the failure soft).
+        let need = crate::registry::PlacementNeed {
+            encode_video: true,
+            encode_audio: false,
+            video_caps: kahawai_media::remux::source_caps_names("video", info),
+            audio_caps: vec![],
+            needs_tonemap: true,
+            // Not yet known here: the probe runs before the plan picks
+            // a subtitle tier, and asking for the burn would narrow the
+            // pool that DECIDES it.
+            needs_ass_burn: false,
+            // Codec-agnostic probe: "which box would run an encode of
+            // this source at all" — its verified encoder set then
+            // becomes negotiation's target pool (HUB-15b), same shape
+            // as the tone-map fact.
+            video_codec: String::new(),
+            audio_codec: String::new(),
+            // HUB-36: the probe asks WHICH BOX, not how fast — there is
+            // no plan yet to classify, so it carries no prediction
+            // inputs and ranks exactly as it did before phase 5.
+            work_class: None,
+            source_kbps: None,
+        };
+        let (tonemap, targets) = match self.registry.pick_transcoder(&need) {
+            Some(tc) => (
+                self.registry.transcoder_reports_tonemap(&tc),
+                self.registry.transcoder_encoders(&tc),
+            ),
+            None => (
+                kahawai_media::remux::tonemap_available(),
+                local_encoder_names(),
+            ),
+        };
+        ExecutorFacts {
+            tonemap,
+            targets,
+            burn_capable,
+        }
+    }
+
+    /// The plan for one source against one executor's capabilities.
+    pub(crate) fn plan(
+        &self,
+        parts: &[PartSource],
+        info: &kahawai_core::media::MediaInfo,
+        facts: &ExecutorFacts,
+    ) -> kahawai_media::negotiate::SourcePlan {
+        let est_kbps = info
+            .duration_ms
+            .filter(|d| *d > 0)
+            .map(|d| ((parts.iter().map(|p| p.size).sum::<u64>() * 8) / d) as u32);
+        kahawai_media::negotiate::negotiate(
+            &self.profile,
+            info,
+            self.audio_track as usize,
+            self.video_track as usize,
+            parts.len() == 1,
+            est_kbps,
+            facts.tonemap,
+            facts.burn_capable,
+            &parts
+                .first()
+                .map(|p| {
+                    crate::subtitles::ocr_flags_for(
+                        &self.ocr_set,
+                        &p.module_id,
+                        &p.collection_id,
+                        &p.path_rel,
+                        info.subtitles.len(),
+                    )
+                })
+                .unwrap_or_default(),
+            self.pick_for(parts),
+            &self.ass,
+            &facts.targets,
+        )
+    }
+
+    /// Probe the fleet, then plan. The session-start form.
+    pub(crate) fn plan_probed(
+        &self,
+        parts: &[PartSource],
+        info: &kahawai_core::media::MediaInfo,
+        burn_capable: bool,
+    ) -> kahawai_media::negotiate::SourcePlan {
+        self.plan(parts, info, &self.probe(info, burn_capable))
+    }
+
+    /// HUB-32b: the display-set timeline comes from the mediahost,
+    /// which walks its own disk in milliseconds — the hub cannot, every
+    /// read would cross the byte plane at ~4 KB/s. Offer the tier while
+    /// that host is reachable; the sets themselves decide later, and a
+    /// failure there re-plans.
+    fn reads_sets_for(&self, parts: &[PartSource]) -> bool {
+        parts.first().is_some_and(|p| {
+            self.registry.is_connected(&p.module_id) || self.sessions.reads_locally(&p.module_id)
+        })
+    }
+
+    /// Plan against the source's own reachability — the form used while
+    /// choosing between candidates.
+    pub(crate) fn plan_auto(
+        &self,
+        parts: &[PartSource],
+        info: &kahawai_core::media::MediaInfo,
+    ) -> kahawai_media::negotiate::SourcePlan {
+        self.plan_probed(parts, info, self.reads_sets_for(parts))
+    }
+
+    /// Which source to play and how, judged across every candidate.
+    ///
+    /// Returns `Cost::Unplayable` rather than failing when nothing the
+    /// client accepts can be produced — a caller asking "what would I
+    /// get" deserves that answer, and only a session turns it into an
+    /// error. The two failures here are different: they mean there is
+    /// no source to negotiate against at all.
+    pub(crate) async fn best_source(
+        &self,
+        item_id: &str,
+        mode: Option<&str>,
+    ) -> Result<(
+        Vec<PartSource>,
+        kahawai_core::media::MediaInfo,
+        kahawai_media::negotiate::SourcePlan,
+        String,
+    )> {
+        match mode {
+            // Operator override (scripts, pipeline debugging): the mode
+            // is forced on the rank-best source; the PLAN still comes
+            // from negotiation.
+            Some(m) => {
+                let (parts, info) = self.sessions.source_parts(self.registry, item_id).await?;
+                let sp = self.plan_auto(&parts, &info);
+                Ok((parts, info, sp, m.to_string()))
+            }
+            // HUB-14/16: judge every candidate, cheapest sufficient
+            // path wins, rank breaks ties.
+            None => {
+                let mut candidates = self
+                    .sessions
+                    .candidate_sources(self.registry, item_id)
+                    .await?;
+                // A burn pick pins the source it binds to: judging the
+                // others would let a cheaper copy win and silently drop
+                // the burn the user explicitly selected.
+                if self.burn_row.is_some() {
+                    candidates.retain(|(parts, _)| self.pick_for(parts).is_some());
+                    if candidates.is_empty() {
+                        bail!("the picked subtitle track's source is not available");
+                    }
+                }
+                if candidates.is_empty() {
+                    bail!("no source is currently available (mediahost offline)");
+                }
+                let mut best: Option<(kahawai_media::negotiate::SourcePlan, usize)> = None;
+                for (idx, (parts, info)) in candidates.iter().enumerate() {
+                    let sp = self.plan_auto(parts, info);
+                    if best.as_ref().is_none_or(|(cur, _)| sp.cost < cur.cost) {
+                        best = Some((sp, idx));
+                    }
+                }
+                let (sp, idx) = best.unwrap();
+                let mode = if sp.direct { "direct" } else { "remux" };
+                let (parts, info) = candidates.into_iter().nth(idx).unwrap();
+                Ok((parts, info, sp, mode.to_string()))
+            }
+        }
+    }
+}
+
 fn local_encoder_names() -> Vec<String> {
     kahawai_media::remux::encoder_capabilities()
         .iter()
@@ -1034,212 +1377,18 @@ impl Sessions {
         subtitle_track: Option<i64>,
     ) -> Result<Arc<Session>> {
         let id = id.to_string();
-        // ONE path: every session negotiates. The user's standing
-        // bandwidth cap tightens whatever the client asked for (HUB-15).
-        let mut profile = profile.unwrap_or_default();
-        let pref_cap: Option<u32> = sqlx::query_scalar::<_, String>(
-            "SELECT value FROM user_prefs
-              WHERE user_id = ? AND scope = '' AND key = 'bandwidth_kbps'",
-        )
-        .bind(user_id)
-        .fetch_optional(registry.db())
-        .await?
-        .and_then(|v| v.parse().ok())
-        .filter(|v| *v > 0);
-        profile.max_bandwidth_kbps = match (profile.max_bandwidth_kbps, pref_cap) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        };
-        // HUB-32a: burn ASS or flatten it? A fleet fact and this user's
-        // standing choice. Fleet-wide rather than per-box on purpose —
-        // the tier is decided before placement, which then hard-filters
-        // on it (registry::PlacementNeed::needs_ass_burn).
-        let ass = crate::tracks::ass_policy_for_user(
-            registry.db(),
+        let mut neg = Negotiation::new(
+            self,
+            registry,
             user_id,
-            registry.any_transcoder_ass_burn() || kahawai_media::remux::ass_burn_available(),
+            item_id,
+            profile,
+            audio_track,
+            video_track,
+            subtitle_track,
         )
-        .await;
-        // HUB-32c: which embedded image tracks already have an OCR text
-        // track derived from them — those prefer text over burn in the
-        // negotiation. Fetched once, keyed per source.
-        let ocr_set = crate::subtitles::ocr_stream_set(registry.db(), item_id).await;
-        // Subtitle unification: an explicit IMAGE track pick forces its
-        // burn — overriding both the overlay preference and the
-        // OCR-spares-burn rule. Text/ass/downloaded picks have no plan
-        // impact (the client fetches them itself). The row binds to a
-        // source, so the pick also pins source selection to it: judging
-        // other sources would silently drop the burn the user asked for.
-        let picked_row = match subtitle_track {
-            Some(tid) => {
-                let t = crate::tracks::get(registry.db(), tid)
-                    .await?
-                    .with_context(|| format!("no subtitle track {tid}"))?;
-                anyhow::ensure!(
-                    t.item_id == item_id,
-                    "subtitle track {tid} belongs to another item"
-                );
-                Some(t)
-            }
-            None => None,
-        };
-        // Image tracks and ASS/SSA both burn (HUB-32b / HUB-32a) and
-        // both need a stream to burn FROM, so a hub-stored row (OCR,
-        // downloaded) is never a burn pick. Negotiation drops a pick
-        // whose tier cannot honour it.
-        let burn_row = picked_row
-            .filter(|t| {
-                crate::tracks::is_image_format(&t.format)
-                    || matches!(t.format.as_str(), "ass" | "ssa")
-            })
-            .filter(|t| t.module_id.is_some() && t.stream_index.is_some());
-        let pick_for = |parts: &[PartSource]| -> Option<kahawai_media::negotiate::BurnPick> {
-            let t = burn_row.as_ref()?;
-            let p = parts.first()?;
-            if (
-                t.module_id.as_deref(),
-                t.collection_id.as_deref(),
-                t.path_rel.as_deref(),
-            ) != (
-                Some(p.module_id.as_str()),
-                Some(p.collection_id.as_str()),
-                Some(p.path_rel.as_str()),
-            ) {
-                return None;
-            }
-            let i = t.stream_index? as usize;
-            match t.origin.as_str() {
-                "embedded" => Some(kahawai_media::negotiate::BurnPick::Embedded(i)),
-                "sidecar" => Some(kahawai_media::negotiate::BurnPick::Sidecar(i)),
-                _ => None,
-            }
-        };
-        let negotiate_with =
-            |parts: &[PartSource],
-             info: &kahawai_core::media::MediaInfo,
-             burn_capable: bool,
-             ass: &kahawai_media::negotiate::AssPolicy| {
-                let est_kbps = info
-                    .duration_ms
-                    .filter(|d| *d > 0)
-                    .map(|d| ((parts.iter().map(|p| p.size).sum::<u64>() * 8) / d) as u32);
-                // HUB-15a: would the box that runs a video encode of THIS
-                // source tone-map? Same placement question the real dispatch
-                // asks (ponytail: probed with encode_audio=false — a fleet
-                // where that changes the pick diverges cosmetically; the
-                // worker-side guard keeps the failure soft).
-                let need = crate::registry::PlacementNeed {
-                    encode_video: true,
-                    encode_audio: false,
-                    video_caps: kahawai_media::remux::source_caps_names("video", info),
-                    audio_caps: vec![],
-                    needs_tonemap: true,
-                    // Not yet known here: the probe runs before the
-                    // plan picks a subtitle tier, and asking for the
-                    // burn would narrow the pool that DECIDES it.
-                    needs_ass_burn: false,
-                    // Codec-agnostic probe: "which box would run an
-                    // encode of this source at all" — its verified
-                    // encoder set then becomes negotiation's target
-                    // pool (HUB-15b), same shape as the tone-map fact.
-                    video_codec: String::new(),
-                    audio_codec: String::new(),
-                    // HUB-36: the probe asks WHICH BOX, not how fast —
-                    // there is no plan yet to classify, so it carries no
-                    // prediction inputs and ranks exactly as it did
-                    // before phase 5.
-                    work_class: None,
-                    source_kbps: None,
-                };
-                let (tonemap, targets) = match registry.pick_transcoder(&need) {
-                    Some(tc) => (
-                        registry.transcoder_reports_tonemap(&tc),
-                        registry.transcoder_encoders(&tc),
-                    ),
-                    None => (
-                        kahawai_media::remux::tonemap_available(),
-                        local_encoder_names(),
-                    ),
-                };
-                // HUB-32b: the timeline comes from the mediahost, which
-                // walks its own disk in milliseconds (the hub cannot: every
-                // read would cross the byte plane at ~4 KB/s). Offer the
-                // tier while that host is reachable; `burn_sets` below is
-                // what actually decides, and a failure there re-plans.
-                kahawai_media::negotiate::negotiate(
-                    &profile,
-                    info,
-                    audio_track as usize,
-                    video_track as usize,
-                    parts.len() == 1,
-                    est_kbps,
-                    tonemap,
-                    burn_capable,
-                    &parts
-                        .first()
-                        .map(|p| {
-                            crate::subtitles::ocr_flags_for(
-                                &ocr_set,
-                                &p.module_id,
-                                &p.collection_id,
-                                &p.path_rel,
-                                info.subtitles.len(),
-                            )
-                        })
-                        .unwrap_or_default(),
-                    pick_for(parts),
-                    ass,
-                    &targets,
-                )
-            };
-        // HUB-32b: the timeline comes from the mediahost, which walks
-        // its own disk in milliseconds — the hub cannot, every read
-        // would cross the byte plane at ~4 KB/s. Offer the tier while
-        // that host is reachable; the sets themselves decide below.
-        let negotiate_one = |parts: &[PartSource], info: &kahawai_core::media::MediaInfo| {
-            let capable = parts.first().is_some_and(|p| {
-                registry.is_connected(&p.module_id) || self.reads_locally(&p.module_id)
-            });
-            negotiate_with(parts, info, capable, &ass)
-        };
-        let (parts, info, sp, mode) = match mode {
-            // Operator override (scripts, pipeline debugging): the mode
-            // is forced on the rank-best source; the PLAN still comes
-            // from negotiation.
-            Some(m) => {
-                let (parts, info) = self.source_parts(registry, item_id).await?;
-                let sp = negotiate_one(&parts, &info);
-                (parts, info, sp, m.to_string())
-            }
-            // HUB-14/16: judge every candidate, cheapest sufficient
-            // path wins, rank breaks ties.
-            None => {
-                let mut candidates = self.candidate_sources(registry, item_id).await?;
-                // A burn pick pins the source it binds to: judging the
-                // others would let a cheaper copy win and silently drop
-                // the burn the user explicitly selected.
-                if burn_row.is_some() {
-                    candidates.retain(|(parts, _)| pick_for(parts).is_some());
-                    if candidates.is_empty() {
-                        bail!("the picked subtitle track's source is not available");
-                    }
-                }
-                if candidates.is_empty() {
-                    bail!("no source is currently available (mediahost offline)");
-                }
-                let mut best: Option<(kahawai_media::negotiate::SourcePlan, usize)> = None;
-                for (idx, (parts, info)) in candidates.iter().enumerate() {
-                    let sp = negotiate_one(parts, info);
-                    if best.as_ref().is_none_or(|(cur, _)| sp.cost < cur.cost) {
-                        best = Some((sp, idx));
-                    }
-                }
-                let (sp, idx) = best.unwrap();
-                let mode = if sp.direct { "direct" } else { "remux" };
-                let (parts, info) = candidates.into_iter().nth(idx).unwrap();
-                (parts, info, sp, mode.to_string())
-            }
-        };
+        .await?;
+        let (parts, info, sp, mode) = neg.best_source(item_id, mode).await?;
         // HUB-32b: a burn is only real once the display sets exist. Ask
         // the mediahost, and if they do not arrive, negotiate again
         // with the tier withdrawn — better an honest "unavailable"
@@ -1284,7 +1433,7 @@ impl Sessions {
                 // burn_capable=false also voids the pick: negotiate
                 // ignores a pick it cannot honor.
                 burn_capable = false;
-                sp = negotiate_with(&parts, &info, false, &ass);
+                sp = neg.plan_probed(&parts, &info, false);
             }
         }
         // HUB-32d: the overlay rung only exists once a rasterised track
@@ -1292,8 +1441,7 @@ impl Sessions {
         // ladder would actually take it — rasterising for a client
         // that would flatten anyway is pure waste — and the answer
         // re-plans, exactly as failing display sets do one tier down.
-        let mut ass = ass;
-        if ass.overlay_reachable(&profile)
+        if neg.ass.overlay_reachable(neg.profile())
             && let Some(part) = parts.first()
             && subtitles
                 .overlay_ready(
@@ -1307,8 +1455,8 @@ impl Sessions {
                 )
                 .await
         {
-            ass.overlay_ready = true;
-            sp = negotiate_with(&parts, &info, burn_capable, &ass);
+            neg.ass.overlay_ready = true;
+            sp = neg.plan_probed(&parts, &info, burn_capable);
         }
         // HUB-32a: a sidecar ASS burn needs the script itself, the same
         // way an image burn needs its display sets — the worker cannot
@@ -1328,7 +1476,7 @@ impl Sessions {
                     track = i,
                     "ASS burn: sidecar script unavailable; re-planning without it"
                 );
-                sp = negotiate_with(&parts, &info, burn_capable, &ass);
+                sp = neg.plan_probed(&parts, &info, burn_capable);
             }
         }
         // No refusal to raise: the ladder is a permutation and flatten
@@ -1572,7 +1720,7 @@ impl Sessions {
         // speaks stream indexes, the API speaks track rows.
         let mut sub_verdicts = negotiated.subtitles;
         fill_verdict_track_ids(registry, &parts, &mut sub_verdicts).await;
-        let burn_pick = burn_sets.as_ref().and_then(|_| pick_for(&parts));
+        let burn_pick = burn_sets.as_ref().and_then(|_| neg.pick_for(&parts));
         let session = Arc::new(Session {
             id,
             user_id: user_id.to_string(),
@@ -1592,9 +1740,9 @@ impl Sessions {
             sub_verdicts: Mutex::new(sub_verdicts),
             burn_sets: Mutex::new(burn_sets.clone()),
             burn_pick: Mutex::new(burn_pick),
-            ass: ass.clone(),
+            ass: neg.ass.clone(),
             burn_ass_text: Mutex::new(burn_ass_text),
-            profile,
+            profile: neg.profile().clone(),
             sink: Mutex::new(chosen_sink),
             seek_lock: tokio::sync::Mutex::new(()),
             pending_seek: Mutex::new(None),
