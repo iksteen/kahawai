@@ -51,6 +51,15 @@ location / {
 ```
 
 Notes:
+- **`QUERY` needs no configuration.** The item resource answers it
+  (RFC 10008, see §4.4 of the implementation doc) and nginx forwards an
+  extension method unchanged — verified on 1.30.4 with exactly the
+  `proxy_pass` above: the method reaches the hub, the request BODY
+  arrives (a dropped body would silently degrade every client to the
+  conservative capability fallback, and the answer would still look
+  plausible), and `Accept-Query` plus `405`/`Allow` come back intact.
+  A proxy that whitelists methods must add `QUERY`, or item pages load
+  without their negotiated half.
 - `/api/v1/events` is SSE. The hub sends `X-Accel-Buffering: no`,
   which nginx honors — no extra config needed. Other proxies must not
   buffer `text/event-stream` responses (traefik and caddy don't).
