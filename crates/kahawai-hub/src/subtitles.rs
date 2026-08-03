@@ -661,7 +661,13 @@ impl Subtitles {
     /// overlay uniformly by width (the same rule burn-in follows), so
     /// there is no per-client cache to multiply — which was one of the
     /// two reasons this tier was deferred.
-    pub async fn raster_generate(
+    ///
+    /// Called by [`overlay_ready`] and nothing else: rasterising is not
+    /// a user decision, it is how the overlay rung gets served, so it
+    /// happens when the ladder needs it and never on request. (OCR has
+    /// a button because THAT is a decision — machine-read text is
+    /// imperfect and a user may not want it at all.)
+    pub(crate) async fn raster_generate(
         &self,
         registry: &Registry,
         sessions: &crate::sessions::Sessions,

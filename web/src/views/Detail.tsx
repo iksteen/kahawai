@@ -11,7 +11,6 @@ import {
   downloadSubtitle,
   deleteSubtitle,
   ocrSubtitle,
-  generateRaster,
   quotaLabel,
   isImageSub,
   type SubtitleQuota,
@@ -104,8 +103,6 @@ export default function Detail({
   const [subBusy, setSubBusy] = useState(false)
   // HUB-32c: which image track is being OCRed (~30 s for a film).
   const [ocrBusy, setOcrBusy] = useState<string | null>(null)
-  // HUB-32d: which script is being rasterised (~4 s for an episode).
-  const [rasterBusy, setRasterBusy] = useState<string | null>(null)
   const [subNote, setSubNote] = useState('')
   const [subQuota, setSubQuota] = useState<SubtitleQuota | null>(null)
   const [error, setError] = useState('')
@@ -579,41 +576,6 @@ export default function Detail({
                 }}
               >
                 {ocrBusy === String(s.id) ? 'Reading…' : '→ text (OCR)'}
-              </button>
-            </li>
-          ))}
-        {/* HUB-32d: styled scripts with no rasterised overlay derived
-            from them yet. Same shape as the OCR button and the same
-            lineage rule, but the opposite direction — OCR turns
-            pictures into text, this turns text into pictures so a
-            client that cannot render ASS still sees the typesetting
-            without anyone encoding video. */}
-        {subs
-          .filter(
-            (s) =>
-              ['ass', 'ssa'].includes(s.format) &&
-              (s.origin === 'embedded' || s.origin === 'sidecar') &&
-              !subs.some((t) => t.origin === 'raster' && t.derived_from === s.id),
-          )
-          .map((s) => (
-            <li key={`raster-${s.id}`}>
-              <span className="chips">
-                <span className="chip dim">{s.format}</span>
-                <span>{s.language ?? '?'} · styled</span>
-              </span>
-              <button
-                className="btn ghost small"
-                disabled={rasterBusy !== null}
-                title="render to an overlay track for clients without an ASS renderer"
-                onClick={() => {
-                  setRasterBusy(String(s.id))
-                  generateRaster(s.id)
-                    .then(reloadSubs)
-                    .catch((e) => setError(String(e)))
-                    .finally(() => setRasterBusy(null))
-                }}
-              >
-                {rasterBusy === String(s.id) ? 'Rendering…' : '→ overlay (typeset)'}
               </button>
             </li>
           ))}

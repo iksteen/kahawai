@@ -231,9 +231,6 @@ export const overlayUrl = (s: Subtitle, itemId: string, streamUrl: string) =>
     ? `/api/v1/items/${itemId}/subtitles/${s.id}.jsonl`
     : `${streamUrl.replace(/[^/]*$/, '')}subs-${s.id}.jsonl`
 
-/// Rasterise a styled script into an overlay track (idempotent).
-export const generateRaster = (trackId: number) =>
-  json<{ track_id: number }>(`/api/v1/subtitles/${trackId}/raster`, { method: 'POST' })
 
 /// The capability bits feed each track's computed delivery; the list is
 /// always complete (a track this client cannot render says so via

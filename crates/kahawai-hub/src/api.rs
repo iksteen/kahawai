@@ -84,7 +84,6 @@ pub fn router(
             axum::routing::delete(subtitle_delete),
         )
         .route("/api/v1/subtitles/{track_id}/ocr", post(subtitle_ocr))
-        .route("/api/v1/subtitles/{track_id}/raster", post(subtitle_raster))
         .route(
             "/api/v1/items/{id}/subtitles/{file}",
             get(item_subtitle_file),
@@ -546,22 +545,6 @@ async fn subtitle_ocr(
         )
             .into())
     }
-}
-
-/// HUB-32d: rasterise a styled script into an overlay track. Same
-/// shape as the OCR button — idempotent, returns the existing row if
-/// one is already there.
-async fn subtitle_raster(
-    State(state): State<AppState>,
-    Path(track_id): Path<i64>,
-    axum::Extension(claims): axum::Extension<crate::auth::Claims>,
-) -> Result<Json<Value>, ApiError> {
-    let new_id = state
-        .subtitles
-        .raster_generate(&state.registry, &state.sessions, track_id, &claims.sub)
-        .await
-        .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, format!("{e:#}")))?;
-    Ok(Json(json!({ "track_id": new_id })))
 }
 
 /// Remove a hub-stored (downloaded/OCR/raster) track. Scan-owned
