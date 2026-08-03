@@ -14,6 +14,7 @@ export type CapabilityProfile = {
   max_bandwidth_kbps?: number
   ass_render: boolean
   graphics_overlay: boolean
+  vtt_render: boolean
 }
 
 // One representative codec string per family, at generous profile/level
@@ -139,6 +140,7 @@ export type CapabilityMask = {
   hdr?: boolean
   ass_render?: boolean
   graphics_overlay?: boolean
+  vtt_render?: boolean
 }
 
 export function loadMask(): CapabilityMask {
@@ -172,7 +174,7 @@ export function maskSummary(m: CapabilityMask): string[] {
   }
   if (m.max_height) out.push(`≤${m.max_height}p`)
   if (m.max_audio_channels) out.push(`${m.max_audio_channels}ch`)
-  for (const flag of ['hdr', 'ass_render', 'graphics_overlay'] as const) {
+  for (const flag of ['hdr', 'ass_render', 'graphics_overlay', 'vtt_render'] as const) {
     if (m[flag] !== undefined) out.push(`${flag}=${m[flag]}`)
   }
   return out
@@ -189,6 +191,7 @@ function applyMask(p: CapabilityProfile, m: CapabilityMask): CapabilityProfile {
   if (m.hdr !== undefined) out.hdr = m.hdr
   if (m.ass_render !== undefined) out.ass_render = m.ass_render
   if (m.graphics_overlay !== undefined) out.graphics_overlay = m.graphics_overlay
+  if (m.vtt_render !== undefined) out.vtt_render = m.vtt_render
   return out
 }
 
@@ -215,6 +218,12 @@ export function probedProfile(): CapabilityProfile {
       hdr: !navigator.userAgent.includes('Firefox'),
       ass_render: true, // JASSUB is bundled
       graphics_overlay: true, // canvas display-set renderer is bundled
+      // Every browser renders WebVTT, and the player has no other text
+      // path: a <track> takes VTT and nothing else, and the live cue
+      // tap feeds the same TextTrack renderer. So this probes to a
+      // constant — its whole value is being maskable, which is the only
+      // way to reach the burn-in fallback for SRT and OCR tracks.
+      vtt_render: true,
     }
     // A browser with no probeable video at all (should not happen)
     // must not send an empty list — that would transcode everything.

@@ -2525,8 +2525,7 @@ async fn item_query(
             .list(
                 &state.registry,
                 &id,
-                q_ass_render(&neg),
-                q_graphics_overlay(&neg),
+                neg.profile(),
                 &neg.ass,
                 &claims.sub,
                 claims.admin,
@@ -2563,14 +2562,6 @@ async fn item_query(
         Json(out),
     )
         .into_response())
-}
-
-fn q_ass_render(neg: &crate::sessions::Negotiation<'_>) -> bool {
-    neg.profile().ass_render
-}
-
-fn q_graphics_overlay(neg: &crate::sessions::Negotiation<'_>) -> bool {
-    neg.profile().graphics_overlay
 }
 
 #[derive(Deserialize)]

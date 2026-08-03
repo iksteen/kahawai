@@ -160,8 +160,9 @@ impl Subtitles {
         &self,
         registry: &Registry,
         item_id: &str,
-        ass_render: bool,
-        graphics_overlay: bool,
+        // Whole, not as loose bools: the delivery matrix reads three
+        // of its flags and the caller always has one.
+        profile: &kahawai_core::media::CapabilityProfile,
         ass: &kahawai_media::negotiate::AssPolicy,
         // Who is asking, for `TrackListing::deletable`.
         user_id: &str,
@@ -195,7 +196,7 @@ impl Subtitles {
             .into_iter()
             .map(|t| {
                 let (delivery, note) =
-                    crate::tracks::delivery(&t, ass_render, graphics_overlay, burn_capable, ass);
+                    crate::tracks::delivery(&t, profile, burn_capable, ass);
                 let deletable = t.origin == "downloaded"
                     && (is_admin || t.created_by.as_deref() == Some(user_id));
                 TrackListing {

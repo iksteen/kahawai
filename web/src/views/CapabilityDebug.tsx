@@ -54,7 +54,7 @@ export default function CapabilityDebug({
     update(next)
   }
 
-  const setFlag = (flag: 'hdr' | 'ass_render' | 'graphics_overlay', value: boolean) => {
+  const setFlag = (flag: 'hdr' | 'ass_render' | 'graphics_overlay' | 'vtt_render', value: boolean) => {
     const next = { ...mask }
     // Back at the probe's own answer = no override at all, so the
     // summary never reports a mask that changes nothing.
@@ -70,7 +70,7 @@ export default function CapabilityDebug({
     update(next)
   }
 
-  const flag = (k: 'hdr' | 'ass_render' | 'graphics_overlay') => mask[k] ?? probed[k]
+  const flag = (k: 'hdr' | 'ass_render' | 'graphics_overlay' | 'vtt_render') => mask[k] ?? probed[k]
   const summary = maskSummary(mask)
 
   const codecRow = (kind: DropKind, label: string, names: string[]) => (
@@ -115,7 +115,7 @@ export default function CapabilityDebug({
       <div className="caps-row">
         <span className="caps-label dim">declares</span>
         <span className="caps-opts">
-          {(['hdr', 'ass_render', 'graphics_overlay'] as const).map((k) => (
+          {(['hdr', 'ass_render', 'graphics_overlay', 'vtt_render'] as const).map((k) => (
             <label key={k} className={flag(k) ? '' : 'caps-off'}>
               <input type="checkbox" checked={flag(k)} onChange={(e) => setFlag(k, e.target.checked)} />
               {k}

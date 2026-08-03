@@ -129,11 +129,16 @@ pub async fn ass_policy_for_user(
 /// profile; `ass` is HUB-32a/d's ordered ladder.
 pub fn delivery(
     track: &Track,
-    ass_render: bool,
-    graphics_overlay: bool,
+    profile: &kahawai_core::media::CapabilityProfile,
     burn_capable: bool,
     ass: &kahawai_media::negotiate::AssPolicy,
 ) -> (Delivery, &'static str) {
+    // The profile arrives whole rather than as loose bools. Four
+    // parallel booleans at a call site is three chances to swap two of
+    // them, and this function used to REBUILD a profile internally from
+    // them just to ask the ladder — which is the same object the caller
+    // already had.
+    let (graphics_overlay, vtt_render) = (profile.graphics_overlay, profile.vtt_render);
     // HUB-32d: a rasterised script is display sets like any other, but
     // it is an ITEM-level artefact — no stream index, no session tap,
     // so it needs neither `burn_capable` nor an embedded origin.
@@ -145,13 +150,8 @@ pub fn delivery(
     // playable, so the client's existing "best delivery wins" pick
     // lands on it without having to know the user's order.
     if track.origin == "raster" {
-        let profile = kahawai_core::media::CapabilityProfile {
-            ass_render,
-            graphics_overlay,
-            ..Default::default()
-        };
-        return match ass.choose(&profile) {
-            kahawai_media::negotiate::AssTier::Overlay => (
+        return match ass.choose(profile) {
+            Some(kahawai_media::negotiate::AssTier::Overlay) => (
                 Delivery::Overlay,
                 "rasterised — full typesetting, no encode",
             ),
@@ -181,28 +181,46 @@ pub fn delivery(
         // makes — one `choose`, so a listing can never promise a tier
         // the session would not pick.
         "ass" | "ssa" => {
-            let profile = kahawai_core::media::CapabilityProfile {
-                ass_render,
-                graphics_overlay,
-                ..Default::default()
-            };
-            match ass.choose(&profile) {
-                kahawai_media::negotiate::AssTier::Native => (Delivery::Ass, ""),
-                kahawai_media::negotiate::AssTier::Burn => {
+            match ass.choose(profile) {
+                Some(kahawai_media::negotiate::AssTier::Native) => (Delivery::Ass, ""),
+                Some(kahawai_media::negotiate::AssTier::Burn) => {
                     (Delivery::Burn, "burned in — restarts with a video encode")
                 }
                 // The overlay rung is served by the RASTER row, not by
                 // this one — they are different URLs. The script's own
                 // remaining form is the flattened VTT, which is honest
                 // and still fetchable; the raster simply outranks it.
-                kahawai_media::negotiate::AssTier::Overlay => (
+                //
+                // Unless text is off: then the script has no readable
+                // form of its own at all and the raster is the whole
+                // answer.
+                Some(kahawai_media::negotiate::AssTier::Overlay) if vtt_render => (
                     Delivery::Text,
                     "flattened to VTT — the rasterised overlay is preferred",
                 ),
-                kahawai_media::negotiate::AssTier::Flatten => (Delivery::Text, "flattened to VTT"),
+                Some(kahawai_media::negotiate::AssTier::Overlay) => (
+                    Delivery::None,
+                    "the rasterised overlay carries this script",
+                ),
+                Some(kahawai_media::negotiate::AssTier::Flatten) => {
+                    (Delivery::Text, "flattened to VTT")
+                }
+                None => (
+                    Delivery::None,
+                    "client renders neither ASS nor text, and no box can burn it in",
+                ),
             }
         }
-        _ => (Delivery::Text, ""),
+        // Everything else is timed text — SRT, an OCR-derived track, a
+        // downloaded .srt — and reaches the client as WebVTT or not at
+        // all. A client that renders none falls to burn, the same last
+        // resort an image track takes when it cannot composite.
+        _ if vtt_render => (Delivery::Text, ""),
+        _ if burn_capable => (Delivery::Burn, "burned in — the client renders no text"),
+        _ => (
+            Delivery::None,
+            "client renders no text and no box can burn it in",
+        ),
     }
 }
 
@@ -455,15 +473,26 @@ mod tests {
             overlay_ready: overlay,
         };
         let all = [AssTier::Flatten, AssTier::Overlay, AssTier::Burn];
+        // Named, because `delivery(&t, false, true, true, ..)` is three
+        // booleans nobody can read at a glance — the reason the function
+        // takes a profile now.
+        let caps = |ass_render: bool, graphics_overlay: bool, vtt_render: bool| {
+            kahawai_core::media::CapabilityProfile {
+                ass_render,
+                graphics_overlay,
+                vtt_render,
+                ..Default::default()
+            }
+        };
 
         // Native outranks every order, including one that names burn
         // first: nothing a server does beats the real renderer.
-        let d = delivery(&t, true, true, true, &ladder(&[AssTier::Burn], true, true));
+        let d = delivery(&t, &caps(true, true, true), true, &ladder(&[AssTier::Burn], true, true));
         assert_eq!(d.0, Delivery::Ass);
 
         // The default order, no client-side ASS: flatten is first and
         // always possible, so it wins even with the others available.
-        let d = delivery(&t, false, true, true, &ladder(&all, true, true));
+        let d = delivery(&t, &caps(false, true, true), true, &ladder(&all, true, true));
         assert_eq!(d.0, Delivery::Text);
 
         // Reordered: overlay first, and it is ready. The SCRIPT's own
@@ -471,45 +500,75 @@ mod tests {
         // rasterised row, which is a different URL — but the note says
         // which rung actually won.
         let order = [AssTier::Overlay, AssTier::Burn, AssTier::Flatten];
-        let d = delivery(&t, false, true, true, &ladder(&order, true, true));
+        let d = delivery(&t, &caps(false, true, true), true, &ladder(&order, true, true));
         assert_eq!(d.0, Delivery::Text);
         assert!(d.1.contains("overlay"), "unexplained: {}", d.1);
         // ...and the raster row is the one that reads as playable, so
         // "best delivery wins" on the client lands on it.
         let r = track("raster", "raster");
-        let d = delivery(&r, false, true, true, &ladder(&order, true, true));
+        let d = delivery(&r, &caps(false, true, true), true, &ladder(&order, true, true));
         assert_eq!(d.0, Delivery::Overlay);
         // With flatten first instead, the raster stops offering itself
         // and the script's own text form wins.
-        let d = delivery(&r, false, true, true, &ladder(&all, true, true));
+        let d = delivery(&r, &caps(false, true, true), true, &ladder(&all, true, true));
         assert_eq!(d.0, Delivery::None);
 
         // Same order, but nothing has been rasterised yet — skip to
         // the next rung the fleet can serve.
-        let d = delivery(&t, false, true, true, &ladder(&order, true, false));
+        let d = delivery(&t, &caps(false, true, true), true, &ladder(&order, true, false));
         assert_eq!(d.0, Delivery::Burn);
 
         // ...and with no burn-capable box either, down to flatten.
-        let d = delivery(&t, false, true, false, &ladder(&order, false, false));
+        let d = delivery(&t, &caps(false, true, true), false, &ladder(&order, false, false));
         assert_eq!(d.0, Delivery::Text);
 
         // A client that cannot composite skips overlay however the
         // user ordered it — capability outranks preference.
-        let d = delivery(&t, false, false, true, &ladder(&order, true, true));
+        let d = delivery(&t, &caps(false, false, true), true, &ladder(&order, true, true));
         assert_eq!(d.0, Delivery::Burn);
 
-        // The ladder can never strand a client: `choose` is total,
-        // because flatten is always possible and the stored order is
-        // always a permutation. Even a policy built by hand with a
-        // single unreachable rung falls back rather than refusing.
+        // A client that renders text is never stranded: flatten is
+        // always possible for it and the stored order is always a
+        // permutation, so even a hand-built policy with a single
+        // unreachable rung falls back rather than refusing.
         let d = delivery(
             &t,
-            false,
-            false,
+            &caps(false, false, true),
             false,
             &ladder(&[AssTier::Burn], false, false),
         );
         assert_eq!(d.0, Delivery::Text);
+
+        // Turn text off and that guarantee ends — which is the whole
+        // point of the bit. Flatten needs a text renderer, so an
+        // ASS-less, text-less, overlay-less client on a fleet that
+        // cannot burn has no rung at all, and the honest answer is to
+        // say so rather than name a tier that would deliver nothing.
+        let d = delivery(
+            &t,
+            &caps(false, false, false),
+            false,
+            &ladder(&all, false, false),
+        );
+        assert_eq!(d.0, Delivery::None, "{}", d.1);
+        assert!(d.1.contains("neither ASS nor text"), "unexplained: {}", d.1);
+
+        // Give that same client a burn-capable box and the ladder
+        // resolves again, one rung lower.
+        let d = delivery(&t, &caps(false, false, false), true, &ladder(&all, true, false));
+        assert_eq!(d.0, Delivery::Burn, "{}", d.1);
+
+        // And the case this was built for: a plain SRT for a client
+        // that renders no text burns in, exactly as an image track does
+        // when it cannot composite.
+        let srt = track("embedded", "srt");
+        let d = delivery(&srt, &caps(false, false, false), true, &ladder(&all, true, false));
+        assert_eq!(d.0, Delivery::Burn, "{}", d.1);
+        let d = delivery(&srt, &caps(false, false, false), false, &ladder(&all, false, false));
+        assert_eq!(d.0, Delivery::None, "{}", d.1);
+        // ...while a text-capable client still just gets it as text.
+        let d = delivery(&srt, &caps(false, false, true), true, &ladder(&all, true, false));
+        assert_eq!(d.0, Delivery::Text, "{}", d.1);
     }
 
     /// A stored order is priority, never removal: whatever it leaves

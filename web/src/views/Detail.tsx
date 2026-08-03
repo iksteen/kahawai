@@ -494,7 +494,19 @@ export default function Detail({
           </a>
         )}
       </div>
-      {showCaps && <CapabilityDebug onChange={() => setCapsRev((n) => n + 1)} />}
+      {/* Re-ASK, don't just re-badge. The negotiated half of this page
+          is an answer to the capability profile, so editing the mask
+          invalidates it — the deliveries, the ASS rung and the reasons
+          all move. (The effect that used to do this hung off the old
+          separate subtitle fetch and went away with it.) */}
+      {showCaps && (
+        <CapabilityDebug
+          onChange={() => {
+            setCapsRev((n) => n + 1)
+            void reloadSubs()
+          }}
+        />
+      )}
       {error && <div className="error">{error}</div>}
 
       {related}

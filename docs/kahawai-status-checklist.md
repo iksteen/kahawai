@@ -185,6 +185,13 @@ How something works and why it was built that way belong in
       placement onto a box reporting `ass_burn`. Nothing ever flattens
       silently: with no capable box the session refuses with a 422 the
       client matches (`ass_burn_unavailable`) and offers flatten or stop.
+      A client may also declare it renders no timed text at all
+      (`vtt_render`, maskable like the others): the flatten rung
+      disappears from the ASS ladder and plain text — SRT, sidecars,
+      HUB-32c OCR output — falls to burn-in, the same last resort an
+      image track takes when the client cannot composite. Every browser
+      renders WebVTT, so this exists to make that fallback reachable
+      from the capability mask rather than only in theory.
       *(Per-LIBRARY policy is not built — per-user only. The refusal was
       verified structurally, not live: every box in this fleet has
       assrender, including the hub's own, so the condition is unreachable

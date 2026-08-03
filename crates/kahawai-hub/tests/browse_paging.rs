@@ -357,8 +357,11 @@ async fn capability_changes_delivery_not_existence() {
             subs.list(
                 &reg,
                 "subs-item",
-                ass_render,
-                overlay,
+                &kahawai_core::media::CapabilityProfile {
+                    ass_render,
+                    graphics_overlay: overlay,
+                    ..Default::default()
+                },
                 &ass,
                 "u",
                 false,

@@ -176,24 +176,41 @@ impl AssPolicy {
     fn permits(&self, profile: &CapabilityProfile, tier: AssTier) -> bool {
         match tier {
             AssTier::Native => profile.ass_render,
-            AssTier::Flatten => true,
+            // Flattening produces WebVTT and nothing else, so a client
+            // that does not render text has no use for this rung. It is
+            // true for every real browser, which is exactly why the
+            // capability mask must be able to say otherwise: a rung
+            // nobody can turn off is a rung nobody tests.
+            AssTier::Flatten => profile.vtt_render,
             AssTier::Overlay => profile.graphics_overlay && self.overlay_ready,
             AssTier::Burn => self.burn_capable,
         }
     }
 
-    /// Which tier serves this client. Total, not partial: `Flatten` is
-    /// always possible and always in the order, so there is always an
-    /// answer and no session can be refused for want of one.
-    pub fn choose(&self, profile: &CapabilityProfile) -> AssTier {
+    /// Which tier serves this client, or `None` when this fleet can
+    /// serve the script no way at all.
+    ///
+    /// It used to be total, on the grounds that `Flatten` is always
+    /// possible and always in the order. That stopped being true when
+    /// `vtt_render` became declarable: a client rendering neither ASS
+    /// nor text, on a fleet with no burn-capable box, has no rung left.
+    /// The `None` is not a new failure mode — it is the same refusal
+    /// `ass_burn_unavailable` already produces — but it is now
+    /// reachable from the capability mask, which is the point.
+    pub fn choose(&self, profile: &CapabilityProfile) -> Option<AssTier> {
         if profile.ass_render {
-            return AssTier::Native;
+            return Some(AssTier::Native);
         }
         self.order
             .iter()
             .copied()
             .find(|t| self.permits(profile, *t))
-            .unwrap_or(AssTier::Flatten)
+            // The old belt-and-braces, kept for every client that can
+            // read text: a hand-built order missing `Flatten` still
+            // resolves, because flattening needs nothing from the fleet.
+            // `parse_order` guarantees a full permutation, so this only
+            // ever catches a policy someone constructed by hand.
+            .or_else(|| profile.vtt_render.then_some(AssTier::Flatten))
     }
 
     /// Would the overlay tier be chosen if a rasterised track existed?
@@ -208,7 +225,7 @@ impl AssPolicy {
         }
         let mut ready = self.clone();
         ready.overlay_ready = true;
-        ready.choose(profile) == AssTier::Overlay
+        ready.choose(profile) == Some(AssTier::Overlay)
     }
 
     /// `flatten,overlay,burn` — the stored form, parsed into a full
@@ -351,7 +368,7 @@ fn burn_wanted(
 /// styled script to burn.) Like [`burn_wanted`] it is decided before
 /// the plan, because it vetoes direct play and copy alike.
 fn ass_burn_wanted(profile: &CapabilityProfile, info: &MediaInfo, ass: &AssPolicy) -> bool {
-    ass.choose(profile) == AssTier::Burn
+    ass.choose(profile) == Some(AssTier::Burn)
         && (info
             .subtitles
             .iter()
@@ -786,7 +803,7 @@ pub fn negotiate(
                 // HUB-32d: served as a rasterised overlay. No encode,
                 // no flattening — the playback-info line should not
                 // claim either.
-                "ass" | "ssa" if ass.choose(profile) == AssTier::Overlay => (
+                "ass" | "ssa" if ass.choose(profile) == Some(AssTier::Overlay) => (
                     SubtitleTier::Graphics,
                     "rasterised overlay — full typesetting, no encode",
                 ),
@@ -796,6 +813,13 @@ pub fn negotiate(
                 // Say which rung of the ladder answered, so a user who
                 // ordered burn first and got flattened text can see
                 // that the fleet, not the preference, decided.
+                // No rung left: neither ASS nor text renders here and
+                // nothing can burn it. Reachable only from a capability
+                // mask today, and honest rather than silent.
+                "ass" | "ssa" if ass.choose(profile).is_none() => (
+                    SubtitleTier::Unavailable,
+                    "no rung left: client renders neither ASS nor text, and no box can burn it",
+                ),
                 "ass" | "ssa" if ass.order.first() == Some(&AssTier::Burn) => (
                     SubtitleTier::Convert,
                     "flattened to VTT — no box in the fleet can burn ASS",
@@ -823,6 +847,20 @@ pub fn negotiate(
                     SubtitleTier::Unavailable,
                     "no OCR text yet and no burn path",
                 ),
+                // Plain timed text for a client that renders none. It
+                // falls to burn exactly as an image track does when the
+                // client cannot composite — the same last resort, and
+                // the only rung a text format has below itself.
+                _ if !profile.vtt_render => {
+                    if ass.burn_capable {
+                        (SubtitleTier::Burn, "burned in — the client renders no text")
+                    } else {
+                        (
+                            SubtitleTier::Unavailable,
+                            "client renders no text and no box can burn it in",
+                        )
+                    }
+                }
                 _ => (SubtitleTier::Text, ""),
             };
             SubtitleVerdict {

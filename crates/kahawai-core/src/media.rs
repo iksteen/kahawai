@@ -122,6 +122,19 @@ pub struct CapabilityProfile {
     pub ass_render: bool,
     /// HUB-32b: client composites bitmap display sets (canvas overlay).
     pub graphics_overlay: bool,
+    /// Client renders plain timed text. Every text rung — a converted
+    /// SRT, a flattened ASS, an OCR-derived track — is delivered as
+    /// WebVTT and nothing else, so this one bit covers all of them: no
+    /// browser's `<track>` accepts SRT, and the cue-tap path feeds the
+    /// same TextTrack renderer.
+    ///
+    /// Defaults TRUE, unlike its neighbours. `ass_render` and
+    /// `graphics_overlay` default false because a client that says
+    /// nothing probably cannot do them; text is the opposite — it is
+    /// what the conservative fallback has always delivered, and
+    /// defaulting false would silently move every quiet client to
+    /// burn-in.
+    pub vtt_render: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -152,6 +165,7 @@ impl Default for CapabilityProfile {
             max_bandwidth_kbps: None,
             ass_render: false,
             graphics_overlay: false,
+            vtt_render: true,
         }
     }
 }
