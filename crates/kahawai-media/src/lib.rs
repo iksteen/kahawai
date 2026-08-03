@@ -119,8 +119,13 @@ fn map_info(info: &DiscovererInfo) -> MediaInfo {
             .and_then(|c| c.structure(0).map(|st| st.name().to_string()))
             .unwrap_or_default();
         let hdr = classify_hdr(st_get("colorimetry").as_deref());
+        // `video/mpeg` is three different codecs wearing one caps name;
+        // the version is a FIELD, exactly as it is for audio.
+        let mpeg_version = caps
+            .as_ref()
+            .and_then(|c| c.structure(0).and_then(|st| st.get::<i32>("mpegversion").ok()));
         out.video.push(VideoStream {
-            codec: normalize_video_codec(&name),
+            codec: normalize_video_codec(&name, mpeg_version),
             width: s.width(),
             height: s.height(),
             fps: {
@@ -288,14 +293,32 @@ fn normalize_container(caps_name: &str) -> String {
     .to_string()
 }
 
-fn normalize_video_codec(caps_name: &str) -> String {
+/// `mpeg_version` splits the `video/mpeg` caps name the way the audio
+/// normalizer below already splits `audio/mpeg` into mp3 and aac.
+///
+/// It matters because the three are not interchangeable to a client:
+/// Android lists MPEG-4 Part 2 as a MANDATORY decoder on every version
+/// and does not list MPEG-2 at all. Collapsing them meant a client
+/// declaring "mpeg" — meaning the one its platform guarantees — could
+/// be handed a copy of the one it does not, which is a wrong-codec bug
+/// that has nothing to do with why this function was revisited.
+///
+/// Unknown version keeps the old flat name rather than guessing: it is
+/// what pre-existing rows say, and it degrades toward a transcode.
+fn normalize_video_codec(caps_name: &str, mpeg_version: Option<i32>) -> String {
     match caps_name {
         "video/x-h264" => "h264",
         "video/x-h265" => "hevc",
         "video/x-vp8" => "vp8",
         "video/x-vp9" => "vp9",
         "video/x-av1" => "av1",
-        "video/mpeg" => "mpeg",
+        "video/mpeg" => match mpeg_version {
+            Some(1) => "mpeg1",
+            Some(2) => "mpeg2",
+            // Part 2 — DivX/Xvid. NOT Part 10, which is h264 above.
+            Some(4) => "mpeg4part2",
+            _ => "mpeg",
+        },
         "video/x-theora" => "theora",
         other => other,
     }

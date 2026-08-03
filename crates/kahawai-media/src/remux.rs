@@ -105,7 +105,10 @@ pub(crate) fn codec_to_caps_name<'a>(kind: &str, codec: &'a str) -> Option<&'a s
         ("video", "hevc") => "video/x-h265",
         ("video", "av1") => "video/x-av1",
         ("video", "vp9") => "video/x-vp9",
-        ("video", "mpeg") => "video/mpeg",
+        // All three share one caps NAME; the version is a field, so a
+        // caps-level check cannot tell them apart. The precision lives
+        // in the codec label a client matches against.
+        ("video", "mpeg" | "mpeg1" | "mpeg2" | "mpeg4part2") => "video/mpeg",
         ("audio", "aac" | "mp3" | "mpeg-audio") => "audio/mpeg",
         ("audio", "ac3") => "audio/x-ac3",
         ("audio", "eac3") => "audio/x-eac3",

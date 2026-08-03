@@ -1675,9 +1675,96 @@ pub fn max_keyframe_interval_ms(path: &Path) -> Result<Option<u32>> {
         mkv_max_keyframe_gap(&mut src)
     } else if &magic[4..8] == b"ftyp" {
         mp4_max_keyframe_gap(&mut src)
+    } else if &magic[..4] == b"RIFF" && &magic[8..12] == b"AVI " {
+        avi_max_keyframe_gap(&mut src)
     } else {
         Ok(None)
     }
+}
+
+/// AVI: `idx1` is a flat table of 16-byte entries, one per chunk, with
+/// `AVIIF_KEYFRAME` in the flags — the same fact as Cues and `stss`,
+/// differently spelled.
+///
+/// Worth having despite the container's age: these files are MPEG-4
+/// Part 2, which Android lists as a mandatory decoder on every version,
+/// so a phone can be handed the video stream COPIED rather than
+/// re-encoded — and then the source's keyframe spacing decides segment
+/// length exactly as it does for a modern container. Browsers cannot
+/// decode Part 2 and never take that path, which is why this looked
+/// skippable until the reporting client turned out to be ExoPlayer.
+///
+/// Costs megabytes rather than kilobytes: a feature-length `idx1` runs
+/// to ~3 MB because it indexes every chunk, not every keyframe. Still
+/// an index read, still no decoding, and read in windows rather than
+/// whole.
+fn avi_max_keyframe_gap(src: &mut dyn RemuxSource) -> Result<Option<u32>> {
+    const AVIIF_KEYFRAME: u32 = 0x10;
+    let mut r = Reader::new(src);
+    // Top-level RIFF walk: find the video stream's number and its frame
+    // duration in `hdrl`, then the `idx1` table.
+    let (mut pos, mut idx1) = (12u64, None);
+    let (mut video_stream, mut secs_per_frame) = (None::<usize>, None::<f64>);
+    let mut stream_no = 0usize;
+    while pos + 8 <= r.len {
+        let head = r.read_at(pos, 8)?;
+        let id = &head[0..4];
+        let size = u32::from_be_bytes([head[7], head[6], head[5], head[4]]) as u64;
+        if id == b"LIST" {
+            let kind = r.read_at(pos + 8, 4)?;
+            if &kind[..] == b"hdrl" || &kind[..] == b"strl" {
+                pos += 12; // descend
+                continue;
+            }
+            pos += 8 + size + (size & 1); // movi and friends: skip whole
+            continue;
+        }
+        if id == b"strh" {
+            let b = r.read_at(pos + 8, 32.min(size as usize))?;
+            if b.len() >= 32 {
+                let is_video = &b[0..4] == b"vids";
+                let scale = u32::from_le_bytes(b[20..24].try_into().unwrap()) as f64;
+                let rate = u32::from_le_bytes(b[24..28].try_into().unwrap()) as f64;
+                if is_video && video_stream.is_none() {
+                    video_stream = Some(stream_no);
+                    if rate > 0.0 {
+                        secs_per_frame = Some(scale / rate);
+                    }
+                }
+            }
+            stream_no += 1;
+        }
+        if id == b"idx1" {
+            idx1 = Some((pos + 8, size));
+            break;
+        }
+        pos += 8 + size + (size & 1);
+    }
+    let (Some((body, size)), Some(stream), Some(spf)) = (idx1, video_stream, secs_per_frame) else {
+        return Ok(None);
+    };
+    // The chunk id of this stream's video data: "00dc"/"00db" for
+    // stream 0, "01dc" for stream 1, and so on.
+    let tag = format!("{:02}", stream);
+    let (mut frames, mut keyframes) = (0u64, Vec::new());
+    let mut off = 0u64;
+    while off + 16 <= size {
+        let n = (16 * 4096).min((size - off) as usize) / 16 * 16;
+        let buf = r.read_at(body + off, n)?;
+        for e in buf.chunks_exact(16) {
+            let ck = &e[0..4];
+            if ck[0..2] != tag.as_bytes()[0..2] || !matches!(&ck[2..4], b"dc" | b"db") {
+                continue;
+            }
+            let flags = u32::from_le_bytes(e[4..8].try_into().unwrap());
+            if flags & AVIIF_KEYFRAME != 0 {
+                keyframes.push(frames);
+            }
+            frames += 1;
+        }
+        off += n as u64;
+    }
+    Ok(gap_ms(&mut keyframes, move |f| (f as f64 * spf * 1000.0) as u64))
 }
 
 /// Matroska: the Cues element indexes keyframes by timestamp. Reached
@@ -2011,6 +2098,37 @@ mod keyframe_tests {
             max_keyframe_interval_ms(&path).unwrap(),
             None,
             "a fragmented mp4 has no sample table to read"
+        );
+    }
+
+    /// AVI carries the same fact in `idx1`, and it is not a museum
+    /// piece here: these files are MPEG-4 Part 2, which Android
+    /// decodes on every version, so a phone gets the stream COPIED and
+    /// the source's keyframe spacing decides its segment length.
+    ///
+    /// Ground-truthed against ffprobe on a real file rather than only
+    /// against itself: `Last Resort - S01E04` reads 10010 ms here and
+    /// ffprobe walks 893 keyframes to the same 10.010 s.
+    #[test]
+    fn keyframe_interval_read_from_an_avi_index() {
+        if !crate::testutil::has_element("avimux") || !crate::testutil::has_element("x264enc") {
+            eprintln!("skipped: no avimux/x264enc");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gop.avi");
+        crate::testutil::render(&format!(
+            "videotestsrc num-buffers=150 ! video/x-raw,framerate=25/1,width=320,height=240 \
+             ! x264enc key-int-max=50 speed-preset=ultrafast ! h264parse \
+             ! avimux ! filesink location={}",
+            path.display()
+        ));
+        let got = max_keyframe_interval_ms(&path)
+            .unwrap()
+            .expect("no interval read from idx1");
+        assert!(
+            (1900..=2100).contains(&got),
+            "expected ~2000 ms from idx1, got {got}"
         );
     }
 
