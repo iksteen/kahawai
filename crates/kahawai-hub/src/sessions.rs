@@ -519,10 +519,19 @@ impl<'a> Negotiation<'a> {
                 if candidates.is_empty() {
                     bail!("no source is currently available (mediahost offline)");
                 }
+                // Completeness first, then cost — the same rule
+                // `negotiate` already uses to choose between TS and
+                // fMP4, applied across sources. A source whose audio
+                // this client cannot take plans "cheaper" than one that
+                // must encode, and picking it plays the film silently.
+                // A bill beats a defect.
                 let mut best: Option<(kahawai_media::negotiate::SourcePlan, usize)> = None;
                 for (idx, (parts, info)) in candidates.iter().enumerate() {
                     let sp = self.plan_auto(parts, info);
-                    if best.as_ref().is_none_or(|(cur, _)| sp.cost < cur.cost) {
+                    let better = best
+                        .as_ref()
+                        .is_none_or(|(cur, _)| (sp.incomplete, sp.cost) < (cur.incomplete, cur.cost));
+                    if better {
                         best = Some((sp, idx));
                     }
                 }

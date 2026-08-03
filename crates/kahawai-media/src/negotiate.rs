@@ -59,6 +59,13 @@ pub struct SourcePlan {
     /// because it has no way to reach the media's neighbourhood.
     pub burn_ass_sidecar: Option<usize>,
     pub cost: Cost,
+    /// A stream the source HAS that this plan cannot deliver — today
+    /// only audio, since dropped video is already `Cost::Unplayable`.
+    /// Ranks ABOVE cost when choosing between sources: a complete plan
+    /// wins even if it costs a full video encode, because a silent
+    /// playback is a defect and an encode is only a bill. Absence of a
+    /// stream is not a drop; see where this is computed.
+    pub incomplete: bool,
     pub video_verdict: String,
     pub audio_verdict: String,
     pub subtitles: Vec<SubtitleVerdict>,
@@ -682,6 +689,24 @@ pub fn negotiate(
         Cost::Copy
     };
 
+    // The same rule the TS-vs-fMP4 choice above already applies, hoisted
+    // to where the CALLER can see it: delivering beats saving an encode.
+    // `Cost` alone cannot express it — a plan that drops the audio is
+    // genuinely cheaper than one that encodes it — so a source that
+    // silently loses a stream would out-rank a source that keeps it
+    // (`Negotiation::best_source` ranks by this pair, not by cost).
+    //
+    // Strictly "the source HAS it and we cannot deliver it". Absence is
+    // not incompleteness: a music file has no video row to lose and a
+    // video-only rip is not silent, and penalising either would rank a
+    // perfectly good source below a worse one.
+    //
+    // Direct needs no special case: it is chosen only when every stream
+    // the file HAS is one the client takes (`a.is_none() || a_client_ok`
+    // above), so serving the bytes as-is cannot drop anything.
+    let incomplete =
+        (v.is_some() && video == StreamMode::Off) || (a.is_some() && audio == StreamMode::Off);
+
     // Verdicts: the established plan_summary strings, plus negotiation
     // notes nothing else can know.
     let (mut video_verdict, mut audio_verdict) = plan_summary(info, &plan);
@@ -823,6 +848,7 @@ pub fn negotiate(
         // carry it exists.
         burn_ass_sidecar: burn_ass_file.filter(|_| video == StreamMode::Encode),
         cost,
+        incomplete,
         video_verdict,
         audio_verdict,
         subtitles,
@@ -2163,5 +2189,99 @@ mod tests {
             assert_eq!(new.plan.video, old.video, "video parity for {info:?}");
             assert_eq!(new.plan.audio, old.audio, "audio parity for {info:?}");
         }
+    }
+
+    /// Completeness outranks cost when choosing a SOURCE. The trap is
+    /// the other half: a source that never HAD the stream must not be
+    /// treated as having lost it, or a music file (no video) and a
+    /// silent-film rip (no audio) both rank below a worse source.
+    #[test]
+    fn a_dropped_stream_is_incomplete_but_an_absent_one_is_not() {
+        // A client that decodes video but no audio codec at all, and a
+        // fleet with no audio encoder to bridge to: the ac3 has nowhere
+        // to go.
+        let deaf = CapabilityProfile {
+            containers: vec!["mp4".into()],
+            video: vec![VideoCap {
+                codec: "h264".into(),
+                ..Default::default()
+            }],
+            audio: vec![],
+            ..Default::default()
+        };
+        let video_only_fleet: Vec<String> = vec!["h264".into()];
+
+        let dropped = negotiate(
+            &deaf,
+            &media("matroska", Some(vs("h264")), Some(au("ac3", 6))),
+            0,
+            0,
+            true,
+            None,
+            false,
+            true,
+            &[],
+            None,
+            &video_only_fleet,
+        );
+        assert!(
+            dropped.incomplete,
+            "audio exists and cannot be delivered: {}",
+            dropped.audio_verdict
+        );
+        assert_eq!(
+            dropped.cost,
+            Cost::Copy,
+            "and it is genuinely CHEAP — which is exactly why cost alone \
+             would pick it over a source that keeps the audio"
+        );
+
+        // The trap: the same client, a source with no audio track at
+        // all. Nothing was lost, so nothing is incomplete.
+        let silent_source = negotiate(
+            &deaf,
+            &media("matroska", Some(vs("h264")), None),
+            0,
+            0,
+            true,
+            None,
+            false,
+            true,
+            &[],
+            None,
+            &video_only_fleet,
+        );
+        assert!(
+            !silent_source.incomplete,
+            "a source with no audio row lost nothing: {}",
+            silent_source.audio_verdict
+        );
+
+        // And the mirror: audio-only (music) for a client that takes it.
+        let music = negotiate(
+            &chrome(),
+            &media("mp4", None, Some(au("aac", 2))),
+            0,
+            0,
+            true,
+            None,
+            false,
+            true,
+            &[],
+            None,
+            &fleet(),
+        );
+        assert!(
+            !music.incomplete,
+            "no video row to lose: {}",
+            music.video_verdict
+        );
+
+        // The ordering the source choice relies on: complete-but-costly
+        // sorts before cheap-but-silent.
+        assert!(
+            (false, Cost::VideoEncode) < (true, Cost::Copy),
+            "a bill must beat a defect"
+        );
     }
 }

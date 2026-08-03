@@ -244,7 +244,12 @@ How something works and why it was built that way belong in
       construction (they never report the new codecs). TC-6 sink
       fallback is TS-only; fmp4 failures fail loudly
 - [x] HUB-16 Cheapest-path preference incl. SOURCE choice: every
-      candidate judged, direct > copy > audio-enc > video-enc, rank ties
+      candidate judged, direct > copy > audio-enc > video-enc, rank ties.
+      Completeness outranks cost: a source with a stream this client
+      cannot be given loses to one that delivers everything, even at a
+      full video encode — a silent playback is a defect, an encode is a
+      bill. Strictly a DROPPED stream; a source that never had video
+      (music) or audio is not penalised for what it never had.
 - [x] HUB-17 HLS delivery for remux/transcode (EVENT playlists, mid-stream seek)
 - [x] HUB-18 Sessions: per-user concurrency caps, progress checkpoints/resume,
       idle reaping, seek-anywhere with pipeline restart
