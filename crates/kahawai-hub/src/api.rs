@@ -2494,7 +2494,14 @@ async fn item_query(
         Ok(v) => v,
         Err(e) => {
             out["negotiated"] = Value::Null;
-            out["unavailable"] = json!(format!("{e:#}"));
+            // Negotiation cannot tell those two apart — it sees an empty
+            // candidate set either way and blames the fleet. The source
+            // list is already in hand here, so say which it is.
+            out["unavailable"] = if out["sources"].as_array().is_some_and(|s| s.is_empty()) {
+                json!("this item has no media of its own")
+            } else {
+                json!(format!("{e:#}"))
+            };
             return Ok((
                 [(
                     axum::http::HeaderName::from_static("accept-query"),
