@@ -6,10 +6,13 @@
 #   kahawai-query.sh [-a host:port] [-c caps] [-m mode] [-j] <username> <password> <item-id>
 #
 #   -a host:port  API address (default: $KAHAWAI_API or localhost:8420)
-#   -c caps       comma-separated capability bits, default "hls,h264,aac,ass,overlay":
-#                   mp4 hls mkv          container support
+#   -c caps       comma-separated capability bits, default "mp4,h264,aac,ass,overlay":
+#                   mp4 webm matroska    containers the client DEMUXES
+#                     (mkv = matroska; a browser sends mp4/webm only.
+#                      This is not the delivery format — HLS is decided
+#                      by negotiation, never declared here)
 #                   h264 hevc av1 vp9    decodable video
-#                   aac ac3 eac3 flac opus  decodable audio
+#                   aac ac3 eac3 flac opus mp3 vorbis   decodable audio
 #                   hdr                  will display HDR acceptably
 #                   ass                  renders ASS itself (JASSUB)
 #                   overlay              composites bitmap subtitles
@@ -25,7 +28,7 @@
 set -euo pipefail
 
 API="${KAHAWAI_API:-localhost:8420}"
-CAPS="hls,h264,aac,ass,overlay"
+CAPS="mp4,h264,aac,ass,overlay"
 MODE=""
 RAW=0
 
@@ -64,7 +67,13 @@ if caps != "-":
     bits = [b.strip() for b in caps.split(",") if b.strip()]
     known_v = {"h264", "hevc", "av1", "vp9"}
     known_a = {"aac", "ac3", "eac3", "flac", "opus", "mp3", "vorbis"}
-    known_c = {"mp4", "hls", "mkv", "webm"}
+    # The hub compares these literally against `MediaInfo.container`,
+    # which the probe normalizes — so "mkv" would silently match
+    # nothing. Accept it as the name people type, send what the hub
+    # actually holds.
+    aliases = {"mkv": "matroska"}
+    bits = [aliases.get(b, b) for b in bits]
+    known_c = {"mp4", "webm", "matroska"}
     unknown = [b for b in bits
                if b not in known_v | known_a | known_c | {"hdr", "ass", "overlay"}]
     if unknown:
