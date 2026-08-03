@@ -363,13 +363,6 @@ type LocalResolver = std::sync::Arc<dyn Fn(&str, &str) -> Result<std::path::Path
 /// inside the client's own patience.
 const BURN_SETS_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
 
-/// HUB-32a: the one start failure a client is expected to MATCH on
-/// rather than display. Everything else that fails a start is a 409
-/// with prose; this is a 422 with a stable sentinel, because the only
-/// correct response is to ask the user a question — flatten it or stop
-/// — and a client cannot ask that off a sentence that may be reworded.
-pub const ASS_BURN_UNAVAILABLE: &str = "ass_burn_unavailable";
-
 /// Fold a worker's session facts (AR-13) into the per-kind verdict, so
 /// "dts → aac (transcoded)" becomes "dts → aac (transcoded) · 7.1 → 5.1".
 /// Idempotent — a seek-restart re-learns the same facts and must not
@@ -988,10 +981,6 @@ impl Sessions {
         audio_track: u32,
         video_track: u32,
         subtitle_track: Option<i64>,
-        // HUB-32a: the user answered "flatten" to a previous attempt's
-        // refusal. Session-scoped, never written back to the
-        // preference — answering once is not changing your mind.
-        force_flatten_ass: bool,
     ) -> Result<Arc<Session>> {
         let id = ulid::Ulid::generate().to_string();
         self.note_session(&id, item_id);
@@ -1012,7 +1001,6 @@ impl Sessions {
                 audio_track,
                 video_track,
                 subtitle_track,
-                force_flatten_ass,
             )
             .await;
         self.release(&id);
@@ -1044,10 +1032,6 @@ impl Sessions {
         audio_track: u32,
         video_track: u32,
         subtitle_track: Option<i64>,
-        // HUB-32a: the user answered "flatten" to this session's
-        // refusal. Session-scoped, never written back to the
-        // preference — answering once is not changing your mind.
-        force_flatten_ass: bool,
     ) -> Result<Arc<Session>> {
         let id = id.to_string();
         // ONE path: every session negotiates. The user's standing
@@ -1070,18 +1054,12 @@ impl Sessions {
         // standing choice. Fleet-wide rather than per-box on purpose —
         // the tier is decided before placement, which then hard-filters
         // on it (registry::PlacementNeed::needs_ass_burn).
-        let mut ass = crate::tracks::ass_policy_for_user(
+        let ass = crate::tracks::ass_policy_for_user(
             registry.db(),
             user_id,
             registry.any_transcoder_ass_burn() || kahawai_media::remux::ass_burn_available(),
         )
         .await;
-        if force_flatten_ass {
-            // The user answered "flatten this time" to a refusal. Not
-            // written back to the preference: answering a question once
-            // is not reordering your ladder.
-            ass.order = vec![kahawai_media::negotiate::AssTier::Flatten];
-        }
         // HUB-32c: which embedded image tracks already have an OCR text
         // track derived from them — those prefer text over burn in the
         // negotiation. Fetched once, keyed per source.
@@ -1353,20 +1331,10 @@ impl Sessions {
                 sp = negotiate_with(&parts, &info, burn_capable, &ass);
             }
         }
-        // The refusal (HUB-32a, owner decision): when the fleet cannot
-        // burn what the user asked to burn, the session FAILS with a
-        // choice — flatten or stop — rather than flattening in silence.
-        // Raised here, before placement, because `place()` returning
-        // None falls back to the LOCAL worker, which has no assrender
-        // check of its own and would produce exactly the silent
-        // no-subtitle encode this tier exists to prevent.
+        // No refusal to raise: the ladder is a permutation and flatten
+        // is always possible, so `AssPolicy::choose` is total and a burn
+        // is only ever planned when some box can perform it.
         let burns_ass = sp.plan.burn_ass.is_some() || sp.burn_ass_sidecar.is_some();
-        if burns_ass
-            && !registry.any_transcoder_ass_burn()
-            && !kahawai_media::remux::ass_burn_available()
-        {
-            bail!("{ASS_BURN_UNAVAILABLE}");
-        }
         if sp.cost == kahawai_media::negotiate::Cost::Unplayable && mode != "direct" {
             // The verdict names the actual blocker — a client refusing
             // the encode target reads very differently from a fleet
@@ -2307,21 +2275,9 @@ impl Sessions {
                     "track {tid} is not part of the playing source; restart the session to burn it"
                 );
             }
-            // An ASS burn needs a box that can do it, and a seek cannot
-            // move boxes (HUB-15b). Only relevant when the preference
-            // has actually selected the burn tier: otherwise this is an
-            // ordinary track change and the client renders it itself.
-            if is_ass && session.ass.order.first() == Some(&kahawai_media::negotiate::AssTier::Burn)
-            {
-                let capable = match &session.mode {
-                    Mode::Transcode { transcoder } => {
-                        let tc = transcoder.lock().unwrap().clone();
-                        registry.transcoder_reports_ass_burn(&tc)
-                    }
-                    _ => kahawai_media::remux::ass_burn_available(),
-                };
-                anyhow::ensure!(capable, "{ASS_BURN_UNAVAILABLE}");
-            }
+            // No capability check here either: a seek cannot move boxes
+            // (HUB-15b), so the re-negotiation below simply walks THIS
+            // executor's ladder and lands on the next rung it can serve.
             // Auto-burn already burning this very stream: adopt the
             // pick without touching the sets (no refetch needed).
             let already = matches!(new_pick,

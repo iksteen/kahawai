@@ -17,7 +17,6 @@ import {
   seekSession,
   startPlaybackSession,
   subtitleLabel,
-  isAssBurnRefusal,
   isRasterSub,
   overlayUrl,
   type ItemDetail,
@@ -165,20 +164,15 @@ export default function Player({
   // stores the effective profile per session and re-plans track
   // switches against it — so applying one restarts playback here.
   const [capsError, setCapsError] = useState('')
-  // HUB-32a: the one refusal that is a QUESTION, not an error. Nothing
-  // flattens silently, so the session stops until the user answers.
-  const [assRefusal, setAssRefusal] = useState(false)
-  const restartWithCaps = async (assFallback?: 'flatten') => {
+  const restartWithCaps = async () => {
     setRestarting(true)
     setCapsError('')
     try {
       const at = Math.round(posMs)
-      const fresh = await startPlaybackSession(item, at, audioTrack, videoTrack, assFallback)
-      setAssRefusal(false)
+      const fresh = await startPlaybackSession(item, at, audioTrack, videoTrack)
       onRestart(fresh, at) // remounts this component; the old session ends in cleanup
     } catch (e) {
-      if (isAssBurnRefusal(e)) setAssRefusal(true)
-      else setCapsError(String(e))
+      setCapsError(String(e))
       setRestarting(false)
     }
   }
@@ -887,18 +881,6 @@ export default function Player({
           </div>
         ) : null}
         {showCaps && <CapabilityDebug onApply={() => restartWithCaps()} applying={restarting} />}
-        {assRefusal && (
-          <div className="dim">
-            No transcoder in the fleet can burn ASS subtitles, and your
-            preference says burn rather than flatten.{' '}
-            <button className="btn ghost small" onClick={() => void restartWithCaps('flatten')}>
-              Flatten this time
-            </button>{' '}
-            <button className="btn ghost small" onClick={() => setAssRefusal(false)}>
-              Stop
-            </button>
-          </div>
-        )}
         {capsError && <div className="dim">restart failed: {capsError}</div>}
         {/* OPS-10: admins can take this session's diagnostics straight
             from the screen where the problem is visible. */}

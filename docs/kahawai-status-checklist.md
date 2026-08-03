@@ -170,13 +170,13 @@ How something works and why it was built that way belong in
 - [x] HUB-32a ASS fallback policy — an ORDERED, capability-driven ladder.
       `native` (the client's own renderer) always wins when declared and
       is not orderable; the fallbacks — flatten, rasterised overlay
-      (HUB-32d), burn-in — are a per-user order (`ass_order`, default
+      (HUB-32d), burn-in — are a per-user ORDER (`ass_order`, default
       flatten → overlay → burn) and the server takes the first rung this
-      client and this fleet can actually serve. Removing a rung is how
-      "never do that to my subtitles" is said, and an order that rules
-      out everything reachable refuses rather than downgrading quietly.
-      Picking a track says WHICH subtitles, never how they are
-      delivered. Burning runs `assrender` in the encode
+      client and this fleet can actually serve. The order is a
+      permutation, never a subset: reordering only, so the ladder always
+      resolves and no session can be refused for want of a tier. Picking
+      a track says WHICH subtitles, never how they are delivered.
+      Burning runs `assrender` in the encode
       chain: embedded tracks take the demuxer's own pad (the only path that
       carries the release's attached fonts — verified live, a script asking
       for Calibri on a box that has no Calibri), a user's sidecar `.ass` is

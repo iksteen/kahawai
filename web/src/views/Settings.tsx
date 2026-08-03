@@ -180,10 +180,10 @@ function OpenSubtitlesAccount({
   )
 }
 
-/// The HUB-32a/d fallback ladder: reorder with the arrows, drop a rung
-/// with its toggle. Removing `flatten` is how "never flatten this" is
-/// said — and then a client with no other rung available is refused
-/// rather than quietly downgraded.
+/// The HUB-32a/d fallback ladder: reorder with the arrows. Every rung
+/// is always present — the order expresses priority, never removal, so
+/// there is always something a client can be served (owner decision,
+/// 2026-08-03).
 const ASS_RUNGS = {
   flatten: 'plain VTT — no server work, typesetting and karaoke lost',
   overlay: 'rasterised server-side, drawn on the client canvas — full typesetting, no encode',
@@ -201,12 +201,13 @@ function AssLadder({
   flash: () => void
 }) {
   const all = Object.keys(ASS_RUNGS) as AssRung[]
+  // A permutation, always: whatever the stored value leaves out is
+  // appended, mirroring the server's own parse.
   const parsed = value
     .split(',')
     .map((s) => s.trim())
     .filter((s): s is AssRung => (all as string[]).includes(s))
-  const order = parsed.length > 0 ? parsed : all
-  const off = all.filter((r) => !order.includes(r))
+  const order = [...new Set([...parsed, ...all])]
   const save = (next: AssRung[]) => {
     const v = next.join(',')
     onChange(v)
@@ -238,20 +239,7 @@ function AssLadder({
             >
               ↓
             </button>
-            <button
-              className="chip-x"
-              title="remove this rung"
-              disabled={order.length === 1}
-              onClick={() => save(order.filter((x) => x !== r))}
-            >
-              ×
-            </button>
           </span>
-        ))}
-        {off.map((r) => (
-          <button key={r} className="chip dim" title={ASS_RUNGS[r]} onClick={() => save([...order, r])}>
-            + {r}
-          </button>
         ))}
       </span>
       <span className="dim small-note">

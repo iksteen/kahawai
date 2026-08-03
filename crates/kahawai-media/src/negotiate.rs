@@ -126,8 +126,10 @@ impl AssTier {
 /// which intent is reachable.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AssPolicy {
-    /// Fallback order, native excluded. Tiers the user removed are
-    /// absent, which is how "never flatten this" is expressed.
+    /// Fallback order, native excluded. A PERMUTATION, never a subset:
+    /// every rung is always present, so the ladder always resolves and
+    /// no ordering can leave a client with nothing (owner decision,
+    /// 2026-08-03 — reorder, do not remove).
     pub order: Vec<AssTier>,
     /// Some box in the fleet reports `assrender` (TC-1). Genuinely
     /// varies per box, so this is a real filter and not a formality.
@@ -159,18 +161,18 @@ impl AssPolicy {
         }
     }
 
-    /// Which tier serves this client. `None` means the user's order
-    /// ruled out everything that is actually available — the only case
-    /// left where a session refuses rather than degrading, because an
-    /// ordered list is already the answer to "and if you cannot".
-    pub fn choose(&self, profile: &CapabilityProfile) -> Option<AssTier> {
+    /// Which tier serves this client. Total, not partial: `Flatten` is
+    /// always possible and always in the order, so there is always an
+    /// answer and no session can be refused for want of one.
+    pub fn choose(&self, profile: &CapabilityProfile) -> AssTier {
         if profile.ass_render {
-            return Some(AssTier::Native);
+            return AssTier::Native;
         }
         self.order
             .iter()
             .copied()
             .find(|t| self.permits(profile, *t))
+            .unwrap_or(AssTier::Flatten)
     }
 
     /// Would the overlay tier be chosen if a rasterised track existed?
@@ -185,18 +187,26 @@ impl AssPolicy {
         }
         let mut ready = self.clone();
         ready.overlay_ready = true;
-        ready.choose(profile) == Some(AssTier::Overlay)
+        ready.choose(profile) == AssTier::Overlay
     }
 
-    /// `flatten,overlay,burn` — the stored form. Unknown names are
-    /// dropped and duplicates collapse, so a hand-edited preference
-    /// degrades to a shorter order rather than to nothing.
+    /// `flatten,overlay,burn` — the stored form, parsed into a full
+    /// permutation. Unknown names are dropped, duplicates collapse, and
+    /// anything the stored value LEFT OUT is appended in default order:
+    /// the preference expresses priority, never removal, so a truncated
+    /// or hand-edited value degrades to a different order rather than
+    /// to a client with no way to read subtitles at all.
     pub fn parse_order(value: &str) -> Vec<AssTier> {
         let mut out: Vec<AssTier> = Vec::new();
         for part in value.split(',') {
             if let Some(t) = AssTier::parse_fallback(part)
                 && !out.contains(&t)
             {
+                out.push(t);
+            }
+        }
+        for t in [AssTier::Flatten, AssTier::Overlay, AssTier::Burn] {
+            if !out.contains(&t) {
                 out.push(t);
             }
         }
@@ -320,7 +330,7 @@ fn burn_wanted(
 /// styled script to burn.) Like [`burn_wanted`] it is decided before
 /// the plan, because it vetoes direct play and copy alike.
 fn ass_burn_wanted(profile: &CapabilityProfile, info: &MediaInfo, ass: &AssPolicy) -> bool {
-    ass.choose(profile) == Some(AssTier::Burn)
+    ass.choose(profile) == AssTier::Burn
         && (info
             .subtitles
             .iter()
@@ -737,7 +747,7 @@ pub fn negotiate(
                 // HUB-32d: served as a rasterised overlay. No encode,
                 // no flattening — the playback-info line should not
                 // claim either.
-                "ass" | "ssa" if ass.choose(profile) == Some(AssTier::Overlay) => (
+                "ass" | "ssa" if ass.choose(profile) == AssTier::Overlay => (
                     SubtitleTier::Graphics,
                     "rasterised overlay — full typesetting, no encode",
                 ),

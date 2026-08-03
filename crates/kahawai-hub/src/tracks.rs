@@ -110,13 +110,10 @@ pub async fn ass_policy_for_user(
         ..Default::default()
     };
     if let Some(v) = stored {
-        let order = kahawai_media::negotiate::AssPolicy::parse_order(&v);
-        // An order that parsed to nothing is a corrupt preference, not
-        // a request for no subtitles at all: keep the default rather
-        // than refusing every styled script this user opens.
-        if !order.is_empty() {
-            policy.order = order;
-        }
+        // Always a full permutation — `parse_order` appends whatever
+        // the stored value left out, so a corrupt or truncated
+        // preference reorders rather than removes.
+        policy.order = kahawai_media::negotiate::AssPolicy::parse_order(&v);
     }
     policy
 }
@@ -149,7 +146,7 @@ pub fn delivery(
             ..Default::default()
         };
         return match ass.choose(&profile) {
-            Some(kahawai_media::negotiate::AssTier::Overlay) => (
+            kahawai_media::negotiate::AssTier::Overlay => (
                 Delivery::Overlay,
                 "rasterised — full typesetting, no encode",
             ),
@@ -185,27 +182,19 @@ pub fn delivery(
                 ..Default::default()
             };
             match ass.choose(&profile) {
-                Some(kahawai_media::negotiate::AssTier::Native) => (Delivery::Ass, ""),
-                Some(kahawai_media::negotiate::AssTier::Burn) => {
+                kahawai_media::negotiate::AssTier::Native => (Delivery::Ass, ""),
+                kahawai_media::negotiate::AssTier::Burn => {
                     (Delivery::Burn, "burned in — restarts with a video encode")
                 }
                 // The overlay rung is served by the RASTER row, not by
                 // this one — they are different URLs. The script's own
                 // remaining form is the flattened VTT, which is honest
                 // and still fetchable; the raster simply outranks it.
-                Some(kahawai_media::negotiate::AssTier::Overlay) => (
+                kahawai_media::negotiate::AssTier::Overlay => (
                     Delivery::Text,
                     "flattened to VTT — the rasterised overlay is preferred",
                 ),
-                Some(kahawai_media::negotiate::AssTier::Flatten) => {
-                    (Delivery::Text, "flattened to VTT")
-                }
-                // The order ruled out everything reachable. Said, not
-                // silently downgraded — the session refuses too.
-                None => (
-                    Delivery::None,
-                    "no tier in your subtitle order is available for this client",
-                ),
+                kahawai_media::negotiate::AssTier::Flatten => (Delivery::Text, "flattened to VTT"),
             }
         }
         _ => (Delivery::Text, ""),
@@ -500,9 +489,10 @@ mod tests {
         let d = delivery(&t, false, false, true, &ladder(&order, true, true));
         assert_eq!(d.0, Delivery::Burn);
 
-        // An order with flatten REMOVED is how "never flatten this"
-        // is expressed, and when nothing else is reachable that is a
-        // refusal rather than a silent downgrade.
+        // The ladder can never strand a client: `choose` is total,
+        // because flatten is always possible and the stored order is
+        // always a permutation. Even a policy built by hand with a
+        // single unreachable rung falls back rather than refusing.
         let d = delivery(
             &t,
             false,
@@ -510,25 +500,36 @@ mod tests {
             false,
             &ladder(&[AssTier::Burn], false, false),
         );
-        assert_eq!(d.0, Delivery::None);
-        assert!(d.1.contains("order"), "unexplained refusal: {}", d.1);
+        assert_eq!(d.0, Delivery::Text);
     }
 
-    /// A hand-edited preference degrades to a shorter ladder, never to
-    /// a broken one: unknown names vanish, duplicates collapse, and
-    /// `native` is not orderable at all.
+    /// A stored order is priority, never removal: whatever it leaves
+    /// out is appended in default order, so a truncated or hand-edited
+    /// value reorders the ladder instead of shortening it. Unknown
+    /// names vanish, duplicates collapse, and `native` is not orderable
+    /// at all.
     #[test]
-    fn a_stored_order_parses_forgivingly() {
+    fn a_stored_order_always_parses_to_a_full_permutation() {
         use kahawai_media::negotiate::{AssPolicy, AssTier};
+        let all = [AssTier::Flatten, AssTier::Overlay, AssTier::Burn];
+        for stored in [
+            "burn, flatten",
+            "overlay,overlay,burn",
+            "native,burn",
+            "nonsense",
+            "",
+        ] {
+            let got = AssPolicy::parse_order(stored);
+            assert_eq!(got.len(), all.len(), "{stored:?} -> {got:?}");
+            for t in all {
+                assert!(got.contains(&t), "{stored:?} lost {t:?}");
+            }
+        }
+        // The stated part keeps its order; the rest follow.
         assert_eq!(
-            AssPolicy::parse_order("burn, flatten"),
-            vec![AssTier::Burn, AssTier::Flatten]
+            AssPolicy::parse_order("burn"),
+            vec![AssTier::Burn, AssTier::Flatten, AssTier::Overlay]
         );
-        assert_eq!(
-            AssPolicy::parse_order("overlay,overlay,burn"),
-            vec![AssTier::Overlay, AssTier::Burn]
-        );
-        assert_eq!(AssPolicy::parse_order("native,burn"), vec![AssTier::Burn]);
-        assert!(AssPolicy::parse_order("nonsense").is_empty());
+        assert_eq!(AssPolicy::parse_order("native,burn")[0], AssTier::Burn);
     }
 }
