@@ -169,6 +169,7 @@ export type ItemMetadata = {
 }
 
 export type ItemDetail = Item & {
+  negotiated?: Negotiated
   sources_detail: Source[]
   show_title?: string | null
   parent_id?: string | null
@@ -352,8 +353,40 @@ export type Bootstrap = { setup_required: boolean; authenticated: boolean }
 
 export const fetchBootstrap = () => json<Bootstrap>('/api/v1/bootstrap')
 
+/// What this client would actually be served, for the profile it asked
+/// with — the converged half of the item resource.
+export type Negotiated = {
+  source: { module_id: string; collection_id: string; path_rel: string } | null
+  /// What negotiation decided. A `remux` may still be dispatched to a
+  /// transcoder when the session starts; that is placement, which a
+  /// safe method does not do.
+  mode: string
+  cost: string
+  streams: { video: string; audio: string; subtitles: SubtitleVerdict[] }
+  /// The unified track list for the source negotiation chose, each with
+  /// the delivery it would get.
+  subtitles: Subtitle[]
+}
+
+/// Ask what we would be served, not merely what was discovered
+/// (RFC 10008 QUERY). One round trip: the answer carries the announced
+/// streams AND the negotiated verdict.
+///
+/// The profile sent here is the UNREFINED probe. `refineForSources`
+/// needs the announced streams this call returns, and it can only ever
+/// ADD precise caps beside the family floor — which `cap_admits`
+/// already treats as unknown-permissive — so the only thing lost is a
+/// slightly pessimistic preview on a device whose generic high-end
+/// probe fails but whose per-stream one passes. `startPlaybackSession`
+/// still refines, and by then the streams are in hand.
 export async function fetchItem(id: string): Promise<ItemDetail> {
-  const raw = await json<Item & { sources: Source[] | number }>(`/api/v1/items/${id}`)
+  const raw = await json<
+    Item & { sources: Source[] | number; negotiated?: Negotiated }
+  >(`/api/v1/items/${id}`, {
+    method: 'QUERY',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ profile: buildProfile() }),
+  })
   const sources = Array.isArray(raw.sources) ? raw.sources : []
   return { ...(raw as Item), sources: sources.length, sources_detail: sources }
 }

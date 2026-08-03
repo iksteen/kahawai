@@ -9,7 +9,6 @@ import {
   fetchItem,
   fetchLibraries,
   fetchPrefs,
-  fetchSubtitles,
   pickSubtitle,
   postProgress,
   putPref,
@@ -25,7 +24,7 @@ import {
   isAdmin,
   sessionLogUrl,
 } from '../api'
-import { buildProfile, loadMask, maskSummary } from '../capabilities'
+import { loadMask, maskSummary } from '../capabilities'
 import CapabilityDebug from './CapabilityDebug'
 
 function fmt(ms: number) {
@@ -56,10 +55,10 @@ export default function Player({
   onRestart: (session: Session, at: number) => void
 }) {
   const videoRef = useRef<HTMLVideoElement>(null)
-  // The capabilities THIS session was negotiated with: frozen at mount
-  // so the player's own rendering can never disagree with what the hub
-  // was told (a mask edited mid-session applies on the next restart).
-  const capsRef = useRef(buildProfile())
+  // No capsRef any more: the subtitle list used to be a second call
+  // that had to be told this client's bits, and could therefore
+  // disagree with the session. It now arrives with the item, computed
+  // server-side from the same profile the QUERY asked with.
   const [showCaps, setShowCaps] = useState(false)
   const [restarting, setRestarting] = useState(false)
   const maskedRef = useRef(maskSummary(loadMask()))
@@ -126,9 +125,10 @@ export default function Player({
         setAudioTrack(r.audioTrack)
         subsPrefRef.current = r.subs
         subTrackPrefRef.current = r.subTrack
-        // The full list, with delivery computed from THIS client's
-        // capability bits (nothing is filtered any more).
-        return fetchSubtitles(item.id, capsRef.current.graphics_overlay, capsRef.current.ass_render)
+        // The full list arrived with the item: QUERY answered "what
+        // would I be served", and delivery is already computed against
+        // this client's capability bits. Nothing is filtered out.
+        return { subtitles: d.negotiated?.subtitles ?? [] }
       })
       .then((r) => {
         setSubs(r.subtitles)

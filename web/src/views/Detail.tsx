@@ -5,7 +5,6 @@ import {
   fetchItem,
   fetchLibraries,
   fetchPrefs,
-  fetchSubtitles,
   resolveTracks,
   searchSubtitles,
   downloadSubtitle,
@@ -116,16 +115,23 @@ export default function Detail({
     setSubs([])
     setSubCands(null)
     setSubNote('')
-    fetchItem(id).then(setItem).catch((e) => setError(String(e)))
+    fetchItem(id)
+      .then((d) => {
+        setItem(d)
+        setSubs(d.negotiated?.subtitles ?? [])
+      })
+      .catch((e) => setError(String(e)))
   }, [id])
+  // The subtitle list rides on the item now — one question, one
+  // answer. After a download or a delete that means re-asking the
+  // item, which is heavier than the old list refetch but pure.
   const reloadSubs = () =>
-    fetchSubtitles(id)
-      .then((r) => setSubs(r.subtitles))
+    fetchItem(id)
+      .then((d) => {
+        setItem(d)
+        setSubs(d.negotiated?.subtitles ?? [])
+      })
       .catch(() => setSubs([]))
-  useEffect(() => {
-    if (item && item.kind !== 'show' && item.kind !== 'album') void reloadSubs()
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [item?.id, item?.kind])
   useEffect(() => {
     if (item?.kind === 'show' || item?.kind === 'album') {
       fetchChildren(item.id)

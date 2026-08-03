@@ -2528,10 +2528,26 @@ async fn item_query(
     )
     .await
     .map_err(|e| (StatusCode::CONFLICT, format!("{e:#}")))?;
-    let (parts, _info, sp, mode) = neg
-        .best_source(&id, q.mode.as_deref())
-        .await
-        .map_err(|e| (StatusCode::CONFLICT, format!("{e:#}")))?;
+    // Nothing to negotiate is an ANSWER, not a failure: a show or an
+    // album has no sources of its own, and a movie whose mediahost is
+    // offline has none right now. Both are ordinary items whose detail
+    // page must still load, so the converged half comes back null with
+    // the reason beside it.
+    let (parts, _info, sp, mode) = match neg.best_source(&id, q.mode.as_deref()).await {
+        Ok(v) => v,
+        Err(e) => {
+            out["negotiated"] = Value::Null;
+            out["unavailable"] = json!(format!("{e:#}"));
+            return Ok((
+                [(
+                    axum::http::HeaderName::from_static("accept-query"),
+                    "application/json",
+                )],
+                Json(out),
+            )
+                .into_response());
+        }
+    };
 
     let mut verdicts = sp.subtitles.clone();
     crate::sessions::fill_verdict_track_ids(&state.registry, &parts, &mut verdicts).await;
