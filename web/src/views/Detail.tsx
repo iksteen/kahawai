@@ -524,7 +524,20 @@ export default function Detail({
                 {/* "ocr" stays visible: machine-read text is imperfect
                     by nature and must say so (HUB-32c). */}
                 <span className="chip">{s.origin}</span>
-                <span>{s.language ?? '?'} · {s.format}</span>
+                <span>
+                  {s.language ?? '?'} · {s.format}
+                </span>
+                {/* What this track is DOING for the caps this browser
+                    declares. A stored artefact the ladder currently
+                    skips otherwise reads as the only subtitle on the
+                    item — the file's own tracks are one line of prose
+                    above, so an idle row looks like the whole story. */}
+                <span
+                  className={s.delivery === 'none' ? 'chip dim' : 'chip'}
+                  title={s.note || undefined}
+                >
+                  {s.delivery === 'none' ? 'unused' : s.delivery}
+                </span>
               </span>
               <button
                 className="btn ghost small"
