@@ -85,6 +85,11 @@ fn intake(
             false
         }
         JobMsg::KeyframeWorklist(w) => {
+            // Logged on receipt, mirroring the hub's "sending" line:
+            // between them, a worklist that never arrives is one grep
+            // rather than a guess.
+            tracing::info!(collection = %w.collection_id, files = w.paths.len(),
+                "keyframe worklist received");
             keys.push(&w.collection_id, w.paths);
             false
         }
@@ -115,12 +120,18 @@ pub async fn run(
 
     loop {
         // Drain new work; block only when every queue is empty.
+        //
+        // EVERY queue, and the background ones are listed once so they
+        // cannot drift apart: a tier missing from this check is work
+        // that sits in its queue while the loop blocks on `recv()`
+        // waiting for a message that never comes — which is exactly
+        // what a fourth tier did on the day it was added.
         loop {
+            let background = [&atts, &keys, &subs];
             let empty = urgent.is_empty()
                 && urgent_image.is_empty()
                 && ed2k.q.is_empty()
-                && subs.q.is_empty()
-                && atts.q.is_empty();
+                && background.iter().all(|t| t.q.is_empty());
             let msg = if empty {
                 match rx.recv().await {
                     Some(m) => m,
@@ -316,6 +327,8 @@ async fn measure_keyframes_and_send(
             return;
         }
     };
+    tracing::debug!(collection = %collection_id, path = %path_rel, ms = ?ms,
+        "keyframe interval measured");
     let msg = HostToHub {
         msg: Some(host_to_hub::Msg::FileKeyframeInterval(
             FileKeyframeInterval {
