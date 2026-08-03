@@ -1257,8 +1257,30 @@ fn route_stream(
                 tail = el.static_pad("src").unwrap();
             }
             guard_pts(&tail);
+            // GATE UPSTREAM OF THE PARSER CHAIN, not at the muxer feed.
+            //
+            // The gate exists so the muxer is still virgin when the
+            // offset seek flushes (splitmuxsink aborts on a mid-GOP
+            // flush). Blocking at `from` keeps that property — nothing
+            // gets past — and adds the one this path also needs: the
+            // parser and `h264timestamper` never see pre-seek data
+            // either, so the flush finds them with no state to corrupt.
+            //
+            // With the gate at the muxer feed instead, the timestamper
+            // HAS built state by the time the seek flushes it, and
+            // afterwards emits duplicate DTS (measured
+            // `1.920, 1.960, 1.960, 2.000, 2.000` on a 25 fps source).
+            // mpegtsmux rebases everything onto its own epoch and never
+            // noticed; `isofmp4mux` PANICKED — "Timestamps going
+            // backwards" — killing the worker, so the session produced
+            // no segments and the player buffered forever. Reported
+            // 2026-08-03 against an h264+FLAC episode, where every seek
+            // and every resume rolled the dice.
+            //
+            // Blocking earlier is strictly stronger for the original
+            // reason too: less reaches the sink, not more.
             if let Some(g) = gate {
-                g.install(&tail);
+                g.install(from);
             }
             if let Err(e) = tail.link(&sinkpad) {
                 tracing::warn!(caps = %caps_name, error = %e, "remux: pad link failed");
@@ -5360,17 +5382,13 @@ mod tests {
         );
     }
 
-    /// A DEFECT, reproduced and left here — not a passing test.
-    /// Reported 2026-08-03: an offset start on an fMP4 COPY session
-    /// panics `fmp4mux` ("Timestamps going backwards") and takes the
-    /// worker with it, so the session produces no segments at all and
-    /// the player buffers forever. A seek is an offset start, which is
-    /// why seeking reproduces it.
+    /// Regression, reported 2026-08-03: an offset start on an fMP4
+    /// COPY session panicked `fmp4mux` ("Timestamps going backwards")
+    /// and took the worker with it, so the session produced no segments
+    /// at all and the player buffered forever. A seek is an offset
+    /// start, which is why seeking reproduced it.
     ///
-    ///   cargo test -p kahawai-media an_offset_start -- --ignored
-    ///
-    /// What the measurements say, so the next person does not repeat
-    /// them:
+    /// What the measurements said, so nobody repeats them:
     ///
     /// - It is `h264timestamper`, which reconstructs the DTS Matroska
     ///   does not store. After a FLUSHING SEEK it emits DUPLICATE DTS —
@@ -5388,13 +5406,13 @@ mod tests {
     ///   `isofmp4mux` then errors "Require DTS" and produces nothing.
     ///   B-frames are what make the DTS necessary at all.
     ///
-    /// So the fix is a trade-off rather than a repair, and belongs to
-    /// whoever owns the cost model: prefer TS for h264-with-B-frames
-    /// (costs an audio encode when the source's audio has no TS
-    /// mapping, which is what selects fMP4 for these files in the first
-    /// place), reconstruct DTS ourselves, or carry an upstream fix.
+    /// The fix is none of those: the seek gate moved UPSTREAM of the
+    /// parser chain, so the timestamper never sees pre-seek data and
+    /// the flush finds it with no state to corrupt. It still runs, and
+    /// still supplies the DTS fMP4 requires — which is why this test
+    /// checks the muxed output for missing and non-monotonic DTS rather
+    /// than only for the absence of a panic.
     #[test]
-    #[ignore = "reproduces an unfixed upstream fmp4mux panic"]
     fn an_offset_start_does_not_panic_the_fmp4_muxer() {
         crate::init().unwrap();
         if !crate::testutil::has_element("isofmp4mux") || !crate::testutil::has_element("flacenc") {
