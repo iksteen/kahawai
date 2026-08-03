@@ -272,10 +272,12 @@ Feature gating: cargo feature `ocr` on `kahawai-hub` (forwarded by the `kahawai`
 POST /api/v1/auth/token                     # login → access+refresh
 GET  /api/v1/libraries
 GET  /api/v1/items?library=&q=&sort=&limit=&offset=   # browse AND search; returns total
-GET  /api/v1/items/{id}                     # incl. sources[] with full StreamInfo
+GET  /api/v1/items/{id}                     # as DISCOVERED: sources[] without StreamInfo
+QUERY /api/v1/items/{id}                    # as NEGOTIATED: the above + streams + verdict
+                                            # body: { profile?, audio_track?, video_track?,
+                                            #         subtitle_track?, mode? }
 GET  /api/v1/items/{id}/children            # seasons/episodes, album/tracks
 GET  /api/v1/items/{id}/artwork?size=       # named size, resized + cached
-GET  /api/v1/items/{id}/subtitles           # available streams: embedded/sidecar/downloaded
 GET  /api/v1/items/{id}/subtitles/search?lang=   # provider candidates (quota state included)
 POST /api/v1/items/{id}/subtitles           # body: { provider, provider_file_id }
 DELETE /api/v1/items/{id}/subtitles/{sub_id}
@@ -296,6 +298,12 @@ DELETE /admin/v1/satellites/{id}            # delete = allowlist removal + casca
 ```
 
 `/playback/decisions` is side-effect-free and returns the full negotiation verdict (per-stream direct/remux/transcode + reasons) so clients can display "why is this transcoding".
+
+**The method carries the question** (RFC 10008). `GET /items/{id}` answers *what did we find* — the item, its sources, its metadata. `QUERY /items/{id}` answers *what would you get*, taking a whole `CapabilityProfile` in the request body and returning the same body plus per-source `StreamInfo` and a `negotiated` block: the source it judged, the mode, the cost, the per-stream verdicts, and the subtitle track list with each track's delivery. The library browser uses GET; the item viewer uses QUERY. The split exists because the old shape asked the same question two ways and got two answers: a separate `GET /items/{id}/subtitles` computed each track's delivery from two booleans in a query string, resolved *its own* source by size while negotiation resolved one by cost, and so could promise `burn` to a client that would refuse the video encode carrying it. One negotiation now answers both halves, over the source it actually chose, so they cannot disagree. That endpoint is deleted, and `sources[].streams` is gone from GET — "what is in the file" is only ever an answer to a question about playing it.
+
+QUERY is **safe and idempotent, and returns only what is knowable now**: it starts no extraction, generates no raster, opens no lease and claims no transcoder, so no session is ever slower because someone asked a question about it. Tiers gated on an artefact report the artefact that already exists — the overlay rung only where a raster row is already there — which under-promises on first play rather than over-promising the expensive tier. `Accept-Query: application/json` advertises it, a missing or inconsistent `Content-Type` is refused per the RFC, and an unsupported method answers 405 with `Allow: GET, QUERY`.
+
+*This breaks v1 in place, against NFR-7* ("breaking changes only in a new major API version"). Deliberate, with the maintainer's sanction: there are no external clients yet, and carrying a `/api/v2` for a pre-release keyspace costs more than it protects. NFR-7 governs from the first outside consumer.
 
 **Every browse page is a deferred join.** An inner query chooses WHICH ≤200 ids make the page using only indexed scalar columns — the membership covering index for a library browse, the sort index for search and unscoped — and the resolved-metadata view, watch state and source counts join onto those ids afterwards. Joining first and paging second resolves the view for every candidate the sort visits, which is the recurring 900 ms failure mode whenever an ORDER BY stops matching an index. A search page streams the sort index and stops early; when it underfills, the scan saw everything, so the total is known without a counting pass — only a full page pays one.
 

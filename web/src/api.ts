@@ -237,14 +237,6 @@ export const overlayUrl = (s: Subtitle, itemId: string, streamUrl: string) =>
     : `${streamUrl.replace(/[^/]*$/, '')}subs-${s.id}.jsonl`
 
 
-/// The capability bits feed each track's computed delivery; the list is
-/// always complete (a track this client cannot render says so via
-/// `delivery: 'none'` and the UI disables it).
-export const fetchSubtitles = (itemId: string, graphicsOverlay = true, assRender = true) =>
-  json<{ subtitles: Subtitle[] }>(
-    `/api/v1/items/${itemId}/subtitles?graphics_overlay=${graphicsOverlay}&ass_render=${assRender}`,
-  )
-
 /// HUB-21/22/24: external subtitle search + download.
 export type SubtitleCandidate = {
   provider: string

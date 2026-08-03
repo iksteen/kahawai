@@ -73,7 +73,6 @@ pub fn router(
         .route("/api/v1/items/{id}", get(item_detail).fallback(item_query))
         .route("/api/v1/items/{id}/children", get(item_children))
         .route("/api/v1/items/{id}/artwork", get(item_artwork))
-        .route("/api/v1/items/{id}/subtitles", get(item_subtitles))
         .route("/api/v1/items/{id}/subtitles/search", post(subtitle_search))
         .route(
             "/api/v1/items/{id}/subtitles/download",
@@ -1696,48 +1695,6 @@ async fn item_artwork(
 }
 
 #[derive(Deserialize)]
-struct SubtitleCaps {
-    /// Capability bits feed each track's computed DELIVERY; absent =
-    /// true, so a declaration-less client sees the richest reading.
-    /// Nothing is filtered out any more — a track a client cannot
-    /// render lists as `delivery: none` and the UI disables it.
-    graphics_overlay: Option<bool>,
-    ass_render: Option<bool>,
-}
-
-async fn item_subtitles(
-    State(state): State<AppState>,
-    axum::Extension(claims): axum::Extension<crate::auth::Claims>,
-    Path(id): Path<String>,
-    Query(caps): Query<SubtitleCaps>,
-) -> Result<Json<Value>, ApiError> {
-    let ass = crate::tracks::ass_policy_for_user(
-        state.registry.db(),
-        &claims.sub,
-        state.registry.any_transcoder_ass_burn() || kahawai_media::remux::ass_burn_available(),
-    )
-    .await;
-    let subs = state
-        .subtitles
-        .list(
-            &state.registry,
-            &id,
-            caps.ass_render.unwrap_or(true),
-            caps.graphics_overlay.unwrap_or(true),
-            &ass,
-            &claims.sub,
-            claims.admin,
-            // The legacy listing keeps its own source resolution; the
-            // QUERY path passes the negotiated one. This endpoint goes
-            // away with the split.
-            None,
-        )
-        .await
-        .map_err(internal)?;
-    Ok(Json(json!({ "subtitles": subs })))
-}
-
-#[derive(Deserialize)]
 struct VttQuery {
     /// f64 so a client that computed a fractional shift still works.
     #[serde(default)]
@@ -2291,7 +2248,7 @@ async fn item_detail(
     Path(id): Path<String>,
     axum::Extension(claims): axum::Extension<crate::auth::Claims>,
 ) -> Result<Json<Value>, ApiError> {
-    Ok(Json(item_body(&state, &id, &claims.sub, true).await?))
+    Ok(Json(item_body(&state, &id, &claims.sub, false).await?))
 }
 
 /// The item as discovered: one row, its sources, its metadata and its
@@ -2566,7 +2523,7 @@ async fn item_query(
                 &neg.ass,
                 &claims.sub,
                 claims.admin,
-                Some((&p.module_id, &p.collection_id, &p.path_rel)),
+                (&p.module_id, &p.collection_id, &p.path_rel),
             )
             .await
             .map_err(internal)?,

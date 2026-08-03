@@ -339,37 +339,53 @@ async fn capability_changes_delivery_not_existence() {
     )
     .await;
 
-    let delivery_of = |v: &serde_json::Value, format: &str| -> String {
-        v["subtitles"]
-            .as_array()
+    // Straight at `Subtitles::list`, not over HTTP: the listing endpoint
+    // is gone, and QUERY — which replaced it — cannot pose this
+    // question. It negotiates a source first, so "the file is known but
+    // its host is not connected", which is exactly the state that makes
+    // burn unreachable below, never reaches the listing there.
+    let reg = std::sync::Arc::new(kahawai_hub::registry::Registry::new(
+        db.clone(),
+        Default::default(),
+    ));
+    let subs = kahawai_hub::subtitles::Subtitles::new(tempfile::tempdir().unwrap().keep());
+    let list = |ass_render: bool, overlay: bool| {
+        let (reg, subs, db) = (reg.clone(), &subs, db.clone());
+        async move {
+            let ass = kahawai_hub::tracks::ass_policy_for_user(&db, "u", false).await;
+            subs.list(
+                &reg,
+                "subs-item",
+                ass_render,
+                overlay,
+                &ass,
+                "u",
+                false,
+                ("m2", "c2", "subbed.mkv"),
+            )
+            .await
             .unwrap()
-            .iter()
-            .find(|s| s["format"] == format)
-            .unwrap_or_else(|| panic!("{format} must be listed: {v}"))["delivery"]
-            .as_str()
-            .unwrap()
-            .to_string()
+        }
     };
-    let all = page(&api, &token, "/api/v1/items/subs-item/subtitles").await;
-    assert_eq!(all["subtitles"].as_array().unwrap().len(), 3);
-    assert_eq!(delivery_of(&all, "pgs"), "overlay");
-    assert_eq!(delivery_of(&all, "ass"), "ass");
-    assert_eq!(delivery_of(&all, "srt"), "text");
+    use kahawai_hub::tracks::Delivery;
+    let delivery_of = |v: &[kahawai_hub::subtitles::TrackListing], format: &str| -> Delivery {
+        v.iter()
+            .find(|s| s.track.format == format)
+            .unwrap_or_else(|| panic!("{format} must be listed"))
+            .delivery
+    };
 
-    let gated = page(
-        &api,
-        &token,
-        "/api/v1/items/subs-item/subtitles?graphics_overlay=false&ass_render=false",
-    )
-    .await;
-    assert_eq!(
-        gated["subtitles"].as_array().unwrap().len(),
-        3,
-        "capability must not filter: {gated}"
-    );
+    let all = list(true, true).await;
+    assert_eq!(all.len(), 3);
+    assert_eq!(delivery_of(&all, "pgs"), Delivery::Overlay);
+    assert_eq!(delivery_of(&all, "ass"), Delivery::Ass);
+    assert_eq!(delivery_of(&all, "srt"), Delivery::Text);
+
+    let gated = list(false, false).await;
+    assert_eq!(gated.len(), 3, "capability must not filter");
     // m2 is enrolled but not CONNECTED, so no burn either: none.
-    assert_eq!(delivery_of(&gated, "pgs"), "none");
-    assert_eq!(delivery_of(&gated, "ass"), "text");
+    assert_eq!(delivery_of(&gated, "pgs"), Delivery::None);
+    assert_eq!(delivery_of(&gated, "ass"), Delivery::Text);
 }
 
 /// Unification materialization: a rescan preserves row ids while a

@@ -194,8 +194,9 @@ How something works and why it was built that way belong in
 
 - [x] HUB-32d Rasterise ASS server-side into a HUB-32b bitmap track for
       overlay-capable clients — no encode, full typesetting. Generated
-      on demand per script (`POST /api/v1/subtitles/{id}/raster`, a
-      button on the item page), deduped by `derived_from` like HUB-32c
+      when the ladder reaches that rung at session start — never by a
+      button, because rasterising is how a tier gets served and not a
+      decision a user makes — deduped by `derived_from` like HUB-32c
       OCR, stored as a first-class `raster` row plus the same NDJSON
       the PGS tap writes, and served item-level rather than through the
       session tap — so it needs no running pipeline and works on direct
@@ -439,6 +440,13 @@ How something works and why it was built that way belong in
       served at all), SIGHUP reload for what can change under a running
       process.
 - [x] NFR-7 Versioned client API (`/api/v1`)
+      *(One sanctioned exception, taken in place rather than as `/api/v2`:
+      the item resource was split by method — `GET` for what was
+      discovered, `QUERY` (RFC 10008) for what this client would be
+      served — and `GET /items/{id}/subtitles` plus `sources[].streams`
+      on `GET` were deleted with it. There are no external clients yet;
+      NFR-7 governs from the first one. See §4.4 of the implementation
+      doc for the shape and the reasoning.)*
 - [x] NFR-8 Codec support delegated to system GStreamer; MIT throughout —
       the OCR tier links leptess/Tesseract (MIT/Apache-2.0), not
       subtile-ocr, so no GPL combined-work consequence exists;

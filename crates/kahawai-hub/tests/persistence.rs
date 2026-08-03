@@ -120,7 +120,9 @@ async fn files_and_items_survive_restart() {
     assert_eq!(items[0]["title"], "Heat");
     assert_eq!(items[0]["sources"], 2);
 
-    // Detail includes sources with parsed stream info and availability.
+    // Detail lists the sources and their availability. Stream info is
+    // deliberately NOT here: "what is in the file" is only an answer to
+    // a question about playing it, and that question is QUERY's.
     let id = items[0]["id"].as_str().unwrap();
     let resp = api
         .clone()
@@ -135,7 +137,11 @@ async fn files_and_items_survive_restart() {
     let sources = json["sources"].as_array().unwrap();
     assert_eq!(sources.len(), 2);
     assert_eq!(sources[0]["size"], 100, "sources ranked by size");
-    assert_eq!(sources[0]["streams"]["container"], "matroska");
+    assert!(
+        sources[0]["streams"].is_null(),
+        "GET must not carry stream info: {}",
+        sources[0]
+    );
     assert_eq!(sources[0]["available"], false);
 
     // Unknown item → 404.

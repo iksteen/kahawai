@@ -62,13 +62,9 @@ pub enum AssBody {
 }
 
 /// How long OCR generation waits for the mediahost's display-set walk.
-/// Urgent (a human pressed the button): bounded like the burn path.
-/// Idle (the sweep): nobody is waiting, and giving up early only wastes
-/// the walk — the sets still arrive and get cached, but the track sits
-/// in the failed set until the next hub run.
-#[cfg(feature = "ocr")]
-const SETS_WAIT_URGENT: std::time::Duration = std::time::Duration::from_secs(20);
-
+/// Only the sweep generates now — nobody is waiting, and giving up
+/// early only wastes the walk: the sets still arrive and get cached,
+/// but the track sits in the failed set until the next hub run.
 #[cfg(feature = "ocr")]
 const SETS_WAIT_IDLE: std::time::Duration = std::time::Duration::from_secs(180);
 
@@ -170,31 +166,19 @@ impl Subtitles {
         // Who is asking, for `TrackListing::deletable`.
         user_id: &str,
         is_admin: bool,
-        // WHICH source to list tracks for. `None` falls back to
-        // `source_row`, which orders by size — a different rule from
-        // the one playback uses, so a multi-source item can list tracks
-        // from a file the session will not play. A caller that has
-        // already negotiated passes the source it chose.
-        source: Option<(&str, &str, &str)>,
+        // WHICH source to list tracks for — always the one the caller
+        // negotiated. There is no fallback on purpose: `source_row`
+        // orders by size, a different rule from the one playback uses,
+        // so on a multi-source item it can list the tracks of a file
+        // the session will not play.
+        (module_id, collection_id, path_rel): (&str, &str, &str),
     ) -> Result<Vec<TrackListing>> {
-        let (module_id, collection_id, path_rel) = match source {
-            Some((m, c, p)) => (m.to_string(), c.to_string(), p.to_string()),
-            None => {
-                let (m, c, p, _info) = source_row(registry, item_id).await?;
-                (m, c, p)
-            }
-        };
-        let tracks = crate::tracks::for_item_source(
-            registry.db(),
-            item_id,
-            &module_id,
-            &collection_id,
-            &path_rel,
-        )
-        .await?;
+        let tracks =
+            crate::tracks::for_item_source(registry.db(), item_id, module_id, collection_id, path_rel)
+                .await?;
         // Burn needs the display sets readable where the encode runs —
         // a connected mediahost extracts them (HUB-32b).
-        let burn_capable = registry.is_connected(&module_id);
+        let burn_capable = registry.is_connected(module_id);
         // HUB-32d: the overlay rung is only real once something has
         // been rasterised. A listing never generates — it is a cheap,
         // frequent call — so it reports what EXISTS. That makes it
