@@ -697,17 +697,30 @@ async fn serve_reads(mut conn: tokio::net::UnixStream, lease: Lease, size: u64) 
 /// segments can be as little as 4 s when scene-cut keyframes shorten
 /// them. ENDLIST (a finished short encode) is always ready.
 fn playlist_ready(path: &std::path::Path, target_secs: u32) -> bool {
-    // The 6.5 s above was derived against a declared target of 2: a
-    // client reloads the playlist about every target duration, so the
-    // runway it needs is production-gap PLUS one reload interval. Once
-    // the declaration follows the source — 12 s for a 10 s-GOP file —
-    // a fixed 6.5 s would hand over less content than the client's own
-    // refresh period and stall on the first gap.
+    // The 6.5 s floor was derived against a declared target of 2: a
+    // client reloads about every target duration, so the runway it
+    // needs is production-gap PLUS one reload interval. Once the
+    // declaration follows the source — 12 s for a 10 s-GOP file — a
+    // fixed 6.5 s hands over less than the client's own refresh period
+    // and stalls on the first gap. §6.3.3 pushes the same way: a client
+    // SHOULD NOT start within three target durations of the end.
     //
-    // §6.3.3 pushes the same way from the other side: a client SHOULD
-    // NOT start within three target durations of the end, so a playlist
-    // shorter than that gives a conforming client nothing to play.
-    let need = (6.5f64).max(3.0 * target_secs as f64);
+    // CAPPED so this gate can never be what times a start out. A 66 s
+    // GOP would ask for 204 s of content, which is more than the 30 s
+    // start deadline can produce however fast the source reads.
+    //
+    // Past the cap the server can do nothing useful anyway: a client
+    // that honours §6.3.3 waits on its own account whatever we hand
+    // it, and one that does not is ready now — so waiting longer here
+    // only converts the client's wait into our timeout.
+    //
+    // Not the cure for extreme sources, and it should not be mistaken
+    // for one: a file whose keyframes are 66 s apart cannot close a
+    // single segment inside the deadline no matter what this returns,
+    // because one segment IS one GOP. Those need `short`, which
+    // re-encodes and gives them keyframes of our own choosing.
+    const MAX_RUNWAY_SECS: f64 = 30.0;
+    let need = (6.5f64).max((3.0 * target_secs as f64).min(MAX_RUNWAY_SECS));
     match std::fs::read_to_string(path) {
         Ok(p) => p.contains("#EXT-X-ENDLIST") || playlist_span_secs(&p) >= need,
         Err(_) => false,
