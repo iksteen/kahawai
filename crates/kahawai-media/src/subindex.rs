@@ -1646,11 +1646,18 @@ mod tests {
 /// The longest gap between keyframes, in milliseconds — read from the
 /// container's own index, never by decoding.
 ///
-/// This is what makes an honest `EXT-X-TARGETDURATION` possible. A
-/// stream-copy session cannot cut anywhere but a source keyframe, so
-/// the longest keyframe gap bounds the longest segment; without it the
-/// playlist can only guess, and guessing low is a spec violation
-/// (RFC 8216 §4.3.3.1) that strict clients act on.
+/// What it is FOR: our segmenters (`splitmuxsink`, `isofmp4mux`) close
+/// a fragment at the first keyframe past the fragment target, and a
+/// stream copy has no encoder to request one from — so on a copy the
+/// longest keyframe gap bounds the longest segment, and declaring
+/// below it violates RFC 8216 §4.3.3.1, which strict clients act on.
+///
+/// Worth being exact, because the wrong version of this sentence sent
+/// a whole night sideways: HLS does not require segments to start at
+/// keyframes (§6.2.1 "SHOULD", and §3 allows leading frames to be
+/// "downloaded but possibly discarded"). A segmenter cutting on a time
+/// grid would make the declared duration a constant of our choosing
+/// and this measurement unnecessary.
 ///
 /// `None` means "unknown, assume nothing": an unsupported container
 /// (AVI), an index that isn't there, or a file whose every frame is a

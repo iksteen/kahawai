@@ -80,9 +80,19 @@ pub struct VideoStream {
     /// NOT zero — a caller that needs a bound must assume it could be
     /// long.
     ///
-    /// A stream copy can only cut on a source keyframe, so this is what
-    /// bounds the longest HLS segment and therefore the only honest
-    /// `EXT-X-TARGETDURATION` (RFC 8216 §4.3.3.1).
+    /// Bounds the longest HLS segment OUR SEGMENTERS produce, and so
+    /// the honest `EXT-X-TARGETDURATION` (RFC 8216 §4.3.3.1, "the
+    /// maximum Media Segment duration").
+    ///
+    /// The coupling is our tooling, not the format: `splitmuxsink` and
+    /// `isofmp4mux` both close a fragment at the first keyframe past
+    /// the fragment target, and a copy has no encoder to ask for one,
+    /// so the source's spacing leaks into segment length. The spec
+    /// itself only RECOMMENDS keyframe-aligned segments (§6.2.1
+    /// "SHOULD attempt to divide… on packet and key frame
+    /// boundaries"), and §3 explicitly allows a segment whose leading
+    /// frames are "downloaded but possibly discarded". A segmenter
+    /// that cut on a time grid would make this field irrelevant.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_keyframe_interval_ms: Option<u32>,
 }
@@ -105,13 +115,15 @@ pub struct AudioStream {
 /// What a client needs from `EXT-X-TARGETDURATION`, which is three
 /// different needs and not a boolean.
 ///
-/// A stream copy can only cut on a source keyframe, so the declared
-/// value is bounded by the source's keyframe spacing — measured here to
-/// run past 147 s. RFC 8216 §4.3.3.1 makes under-declaring a violation,
-/// and §6.3.3 tells a client not to start playing within three target
-/// durations of the end, so an HONEST value on such a file is
-/// conforming and still unusable. The client is the only party that
-/// knows which of those two it can live with, so it says.
+/// Our segmenters close fragments at keyframes, so on a COPY the
+/// declared value is bounded by the source's keyframe spacing —
+/// measured here to run past 147 s. (That bound is a property of
+/// `splitmuxsink`/`isofmp4mux`, not of HLS; see
+/// `VideoStream::max_keyframe_interval_ms`.) RFC 8216 §4.3.3.1 makes
+/// under-declaring a violation, and §6.3.3 tells a client not to start
+/// within three target durations of the end, so an HONEST value on
+/// such a file is conforming and still awkward. The client is the only
+/// party that knows which it can live with, so it says.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "mode")]
 pub enum TargetDuration {

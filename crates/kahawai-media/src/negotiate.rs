@@ -270,11 +270,12 @@ impl AssPolicy {
 /// segments.
 ///
 /// An ENCODE sets its own GOP (~2 s), so the historical constant is
-/// honest for it. A COPY can only cut on a source keyframe, and the
-/// sink packs whole GOPs until it passes the fragment target — so the
-/// longest segment is bounded by `FRAGMENT_TARGET + max keyframe gap`,
-/// which is the formula measured against real files (GOP 10.43 s →
-/// segments 10.22-10.58 s).
+/// honest for it. On a COPY our sinks cut at source keyframes and pack
+/// whole GOPs until they pass the fragment target — so the longest
+/// segment is bounded by `FRAGMENT_TARGET + max keyframe gap`, the
+/// formula measured against real files (GOP 10.43 s → segments
+/// 10.22-10.58 s). That is our segmenters' behaviour, not a rule of
+/// HLS: the format would accept a fixed time grid with mid-GOP starts.
 ///
 /// `None` for the gap means never measured, and a caller must assume it
 /// could be long: this library's worst known file is 147 s, so there is

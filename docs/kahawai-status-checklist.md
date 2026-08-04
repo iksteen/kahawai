@@ -259,16 +259,26 @@ How something works and why it was built that way belong in
       (music) or audio is not penalised for what it never had.
 - [x] HUB-17 HLS delivery for remux/transcode (EVENT playlists, mid-stream seek).
       `EXT-X-TARGETDURATION` is declared from the source's measured
-      keyframe spacing, because a stream copy can only cut on a source
-      keyframe (measured here: median 10.0 s, worst 147 s, 87% of files
-      over the 2 s that used to be declared — RFC 8216 §4.3.3.1). The
-      client states which of three things it needs (`target_duration`,
-      required, no default): `ignore` keeps the old constant and the
-      old violation, `accurate` declares the truth, `short` guarantees
-      a ceiling and forces a video encode when the source cannot meet
-      it. The readiness gate scales with the declared value, since a
-      client reloads at roughly that cadence and §6.3.3 tells it not to
-      start within three of them.
+      keyframe spacing on copies (median 10.0 s here, worst 147 s; the
+      2 s previously declared was wrong for 87% of files, RFC 8216
+      §4.3.3.1). The client states which of three things it needs
+      (`target_duration`, required, no default): `ignore` keeps the old
+      constant and the old violation, `accurate` declares the truth,
+      `short` guarantees a ceiling and forces a video encode when the
+      source cannot meet it.
+      *Why keyframes enter at all: `splitmuxsink` and `isofmp4mux` both
+      close a fragment at the first keyframe past the fragment target,
+      and a copy has no encoder to request one from. HLS does not
+      require it (§6.2.1 SHOULD; §3 permits discarded leading frames),
+      so a segmenter cutting on a time grid would make the declared
+      value a constant of our choosing and delete this whole
+      mechanism. Not built: no shipped GStreamer segmenter does it.*
+      *This does NOT fix the ExoPlayer hang it was prompted by. That is
+      a liveness failure — the pacer holds production at viewer+120 s,
+      the playlist stops changing for 40+ s (measured, copy AND
+      transcode), and ExoPlayer errors after 3.5x the declared value of
+      no change. A larger declaration only widens that margin. See
+      HUB-18.*
 - [x] HUB-18 Sessions: per-user concurrency caps, progress checkpoints/resume,
       idle reaping, seek-anywhere with pipeline restart
 - [ ] HUB-19 Music: playback + queue live *(gapless delivery and ReplayGain
