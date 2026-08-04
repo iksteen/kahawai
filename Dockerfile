@@ -10,8 +10,15 @@
 #   docker run --rm --gpus all kahawai doctor
 
 ARG RUST_VERSION=1.97.1
-ARG GST_PLUGINS_RS_VERSION=0.14.4
-ARG GST_PLUGINS_RS_REV=95a7172f82d0ec816e4e89111a762c24d5c47b22
+# gst-plugins-rs now follows GStreamer's own version numbers.
+ARG GST_PLUGINS_RS_VERSION=gstreamer-1.28.5
+ARG GST_PLUGINS_RS_REV=cee45224cb2d10e1523af4f256d0dd64c8b29491
+# Ubuntu 26.04 ships GStreamer 1.28.2; the patched demuxers are built
+# from the current stable release instead. gst-plugins-good declares
+# ">= major.minor.0" for a stable series, so 1.28.5 plugins against the
+# distro's 1.28.2 core and base is a supported combination.
+ARG GSTREAMER_VERSION=1.28.5
+ARG GSTREAMER_REV=727ceb91886862d200f423baf36cde2bb7ce5b4d
 
 FROM rust:${RUST_VERSION}-bookworm AS rust-toolchain
 
@@ -38,25 +45,68 @@ RUN apt-get update \
         libass-dev \
         libleptonica-dev \
         libtesseract-dev \
+        meson \
+        ninja-build \
         pkg-config \
         protobuf-compiler \
     && rm -rf /var/lib/apt/lists/*
 
+# The upstream fixes this image carries, with their reports and
+# reproducers: patches/*/. Copied before the plugin builds so a change
+# to a patch rebuilds only what depends on it.
+COPY patches /usr/src/patches
+
+# gst-plugins-good: avi and matroska only. Everything else stays on the
+# distro's 1.28.2 — these are the two the patches touch, and the two
+# whose failures are fatal rather than cosmetic. They land in
+# /usr/local, which GST_PLUGIN_PATH searches ahead of the system path,
+# so they shadow the packaged copies.
+ARG GSTREAMER_VERSION
+ARG GSTREAMER_REV
+RUN git clone --depth 1 --branch "$GSTREAMER_VERSION" \
+        https://gitlab.freedesktop.org/gstreamer/gstreamer.git /tmp/gstreamer \
+    && test "$(git -C /tmp/gstreamer rev-parse HEAD)" = "$GSTREAMER_REV" \
+    && for p in /usr/src/patches/gstreamer/*.patch; do \
+           echo "applying $(basename "$p")"; \
+           git -C /tmp/gstreamer apply "$p"; \
+       done \
+    && meson setup /tmp/gst-good-build /tmp/gstreamer/subprojects/gst-plugins-good \
+        --buildtype=release \
+        -Dauto_features=disabled -Davi=enabled -Dmatroska=enabled \
+        -Dexamples=disabled -Dtests=disabled -Dnls=disabled -Ddoc=disabled \
+    && meson compile -C /tmp/gst-good-build \
+    && install -D -m 0755 -s /tmp/gst-good-build/gst/avi/libgstavi.so \
+        /out/gstreamer-1.0/libgstavi.so \
+    && install -D -m 0755 -s /tmp/gst-good-build/gst/matroska/libgstmatroska.so \
+        /out/gstreamer-1.0/libgstmatroska.so
+
+# gst-plugin-fmp4 became gst-plugin-isobmff (libgstfmp4.so ->
+# libgstisobmff.so) between 0.14 and 1.28. The element kahawai asks for,
+# isofmp4mux, is unchanged and still lives in that plugin.
+# 0000 is an upstream commit, not ours — the leading zero says so, and
+# says it goes first: 0001 fixes its abort by storing no running time,
+# which is only safe once 0000 stops the emission unwrapping it. Both
+# landed after the 1.28.5 tag, so a release build has to carry them.
+# Applied in filename order, which is why the numbering carries it.
 ARG GST_PLUGINS_RS_VERSION
 ARG GST_PLUGINS_RS_REV
 RUN git clone --depth 1 --branch "$GST_PLUGINS_RS_VERSION" \
         https://gitlab.freedesktop.org/gstreamer/gst-plugins-rs.git \
         /tmp/gst-plugins-rs \
-    && test "$(git -C /tmp/gst-plugins-rs rev-parse HEAD)" = "$GST_PLUGINS_RS_REV"
+    && test "$(git -C /tmp/gst-plugins-rs rev-parse HEAD)" = "$GST_PLUGINS_RS_REV" \
+    && for p in /usr/src/patches/gst-plugins-rs/*.patch; do \
+           echo "applying $(basename "$p")"; \
+           git -C /tmp/gst-plugins-rs apply "$p"; \
+       done
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,id=gst-plugins-rs-target-ubuntu2604,target=/tmp/gst-plugins-rs/target \
     cargo build --locked --release \
         --manifest-path /tmp/gst-plugins-rs/Cargo.toml \
-        -p gst-plugin-fmp4 \
+        -p gst-plugin-isobmff \
         -p gst-plugin-hlssink3 \
-    && install -D -m 0755 -s /tmp/gst-plugins-rs/target/release/libgstfmp4.so \
-        /out/gstreamer-1.0/libgstfmp4.so \
+    && install -D -m 0755 -s /tmp/gst-plugins-rs/target/release/libgstisobmff.so \
+        /out/gstreamer-1.0/libgstisobmff.so \
     && install -D -m 0755 -s /tmp/gst-plugins-rs/target/release/libgsthlssink3.so \
         /out/gstreamer-1.0/libgsthlssink3.so
 

@@ -18,7 +18,7 @@ frames without PTS. hlssink2 muxes the same input without complaint.
 The fix treats a missing PTS like the existing `buffer == None` branch:
 warn, and store no running time.
 
-## Sibling issue, same family — no patch of ours
+## Sibling issue — carried here as 0000, and applied first
 
     thread '<unnamed>' panicked at net/hlssink3/src/hlsbasesink.rs:660:53:
     called `Option::unwrap()` on a `None` value
@@ -28,8 +28,12 @@ buffer, and `segment.to_running_time(pts)` can also return None (PTS
 before segment start); the `hls-segment-added` emission then unwraps it.
 Fixed upstream by `86d7e33cc` "hlsbasesink: Don't unwrap() running_time
 when a segment is added" (Piotr Brzezinski, 2026-07-14), which is what
-makes the branch above safe to take. `…-repro-2.py` covers it — it
-shifts running time negative with `gst_pad_set_offset()`.
+makes the branch above safe to take — so this patch is only correct on
+top of it. No release carries it yet, so it is vendored beside this one
+as `0000-hlsbasesink-…`: not ours, and applied first.
+
+`…-repro-2.py` covers it, shifting running time negative with
+`gst_pad_set_offset()`.
 
 ## State on this box
 
