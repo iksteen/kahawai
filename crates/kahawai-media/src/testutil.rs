@@ -131,10 +131,12 @@ fn render_av(path: &Path, muxer: &str) {
 /// on most buffers (only a DTS), because AVI carries no per-frame
 /// presentation times. Needs lamemp3enc; callers should skip when
 /// [`has_element`] says it is missing.
-pub fn render_h264_mp3_avi(path: &Path) {
+pub fn render_h264_mp3_avi(path: &Path, frames: u32) {
     render(&format!(
-        "videotestsrc num-buffers=1000 ! video/x-raw,format=I420,width=320,height=240,framerate=25/1 ! x264enc bframes=3 b-adapt=false key-int-max=25 ! h264parse ! avimux name=m audiotestsrc num-buffers=1720 ! audioconvert ! lamemp3enc ! m. m. ! filesink location=\"{}\"",
-        path.display()
+        "videotestsrc num-buffers={frames} ! video/x-raw,format=I420,width=320,height=240,framerate=25/1 ! x264enc bframes=3 b-adapt=false key-int-max=25 ! h264parse ! avimux name=m audiotestsrc num-buffers={audio} ! audioconvert ! lamemp3enc ! m. m. ! filesink location=\"{}\"",
+        path.display(),
+        frames = frames,
+        audio = frames * 43 / 25,
     ));
 }
 

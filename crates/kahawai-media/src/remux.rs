@@ -3344,11 +3344,42 @@ pub(crate) fn seekable_appsrc(mut source: Box<dyn RemuxSource>) -> AppSrc {
                     let _ = feeder_src.end_of_stream();
                 }
                 Some(Ok((offset, bytes))) => {
-                    let mut b = gst::Buffer::from_mut_slice(bytes);
-                    b.get_mut().unwrap().set_offset(offset);
-                    // Err = Flushing (seek in progress) or shutdown;
-                    // either a new Need follows or recv fails.
-                    let _ = feeder_src.push_buffer(b);
+                    // Push in slices, never one buffer per read.
+                    //
+                    // gst_avi_demux_chain() advances exactly ONE state
+                    // per buffer — START parses the RIFF header and
+                    // returns, HEADER needs the next buffer — so a file
+                    // that arrives whole in a single buffer never gets
+                    // past the header and dies at EOS with "got eos and
+                    // didn't receive a complete header object".
+                    // Measured on a 1.5 MiB AVI, same bytes: pushed as
+                    // one buffer it fails, as two it demuxes. Only
+                    // sources smaller than READ_BLOCK could hit it,
+                    // which is why it took a test fixture to find.
+                    //
+                    // The slices share the read's memory (copy_region
+                    // takes a reference, not a copy), so this costs
+                    // buffer headers and nothing else.
+                    const MAX_PUSH: usize = 256 * 1024;
+                    let len = bytes.len();
+                    let whole = gst::Buffer::from_mut_slice(bytes);
+                    let chunk = MAX_PUSH.min(len.div_ceil(4)).max(1);
+                    let mut at = 0usize;
+                    while at < len {
+                        let n = chunk.min(len - at);
+                        let Ok(mut b) =
+                            whole.copy_region(gst::BufferCopyFlags::MEMORY, at..at + n)
+                        else {
+                            break;
+                        };
+                        b.get_mut().unwrap().set_offset(offset + at as u64);
+                        // Err = Flushing (seek in progress) or shutdown;
+                        // either a new Need follows or recv fails.
+                        if feeder_src.push_buffer(b).is_err() {
+                            break;
+                        }
+                        at += n;
+                    }
                 }
             }
         }
@@ -4779,6 +4810,48 @@ mod tests {
         assert!(playlist.contains("#EXTINF"), "no segments: {playlist}");
     }
 
+    /// A source smaller than one read block must still demux.
+    ///
+    /// gst_avi_demux_chain() advances one state per BUFFER: START
+    /// parses the RIFF header and returns, HEADER waits for the next
+    /// buffer. Hand it the whole file at once — which the ring did for
+    /// anything under READ_BLOCK — and it never leaves the header, then
+    /// errors at EOS with "didn't receive a complete header object".
+    /// Proven independent of kahawai: the same bytes through a bare
+    /// appsrc fail as one buffer and succeed as two.
+    #[test]
+    fn a_source_smaller_than_one_read_block_still_demuxes() {
+        crate::init().unwrap();
+        if !crate::testutil::has_element("lamemp3enc") || !crate::testutil::has_element("x264enc") {
+            eprintln!("SKIP: no lamemp3enc/x264enc");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let src_path = dir.path().join("tiny.avi");
+        crate::testutil::render_h264_mp3_avi(&src_path, 250);
+        let size = std::fs::metadata(&src_path).unwrap().len();
+        assert!(
+            size < 2 * 1024 * 1024,
+            "fixture grew past a read block ({size} bytes); it no longer covers the case"
+        );
+
+        let out = tempfile::tempdir().unwrap();
+        let job = start(
+            out.path(),
+            COPY_AV,
+            Box::new(FileSource::open(&src_path).unwrap()),
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !job.finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(job.finished(), "remux of a sub-block source never finished");
+        assert!(job.failed().is_none(), "remux failed: {:?}", job.failed());
+        let playlist = std::fs::read_to_string(out.path().join("master.m3u8")).unwrap();
+        assert!(playlist.contains("#EXTINF"), "no segments: {playlist}");
+    }
+
     /// A DTS-only video stream must still reach the muxer.
     ///
     /// AVI has no per-frame presentation times, so avidemux emits h264
@@ -4796,7 +4869,7 @@ mod tests {
         }
         let dir = tempfile::tempdir().unwrap();
         let src_path = dir.path().join("dtsonly.avi");
-        crate::testutil::render_h264_mp3_avi(&src_path);
+        crate::testutil::render_h264_mp3_avi(&src_path, 1000);
 
         let out = tempfile::tempdir().unwrap();
         let job = start(
