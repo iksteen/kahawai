@@ -1327,6 +1327,22 @@ fn route_stream(
         .flatten();
     match target {
         Some(sinkpad) => {
+            // Stamp BEFORE the parser as well as after it.
+            //
+            // AVI carries no per-frame presentation times, so avidemux
+            // hands out h264 with a DTS and no PTS on all but the
+            // keyframes — 114,154 of 124,532 buffers on the file that
+            // found this. h264parse then holds every one of them: an
+            // hour of video went in and nothing came out, splitmuxsink
+            // sat on `Sleeping for running time 99:99:99.999999999`
+            // (that is CLOCK_TIME_NONE) waiting for a video pad that
+            // never produced anything, and the session yielded audio
+            // and no segments at all. Fixing the timestamps at the
+            // chain's exit was too late to help the parser inside it.
+            //
+            // A no-op for anything that already carries a PTS, which is
+            // every container that stores one.
+            guard_pts(from);
             let mut tail = from.clone();
             // parser → timestamper, each present only when it applies;
             // every hop is pure repackaging, no decode.
@@ -4761,6 +4777,45 @@ mod tests {
         assert!(job.failed().is_none(), "remux failed: {:?}", job.failed());
         let playlist = std::fs::read_to_string(out.path().join("master.m3u8")).unwrap();
         assert!(playlist.contains("#EXTINF"), "no segments: {playlist}");
+    }
+
+    /// A DTS-only video stream must still reach the muxer.
+    ///
+    /// AVI has no per-frame presentation times, so avidemux emits h264
+    /// with a DTS and no PTS. h264parse holds such buffers instead of
+    /// passing them on, so the video pad stays silent forever and
+    /// splitmuxsink waits on it — audio flows, no segment is ever
+    /// written. The guard has to run on the way INTO the parser chain,
+    /// not just on the way out.
+    #[test]
+    fn a_dts_only_video_stream_still_reaches_the_muxer() {
+        crate::init().unwrap();
+        if !crate::testutil::has_element("lamemp3enc") || !crate::testutil::has_element("x264enc") {
+            eprintln!("SKIP: no lamemp3enc/x264enc");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let src_path = dir.path().join("dtsonly.avi");
+        crate::testutil::render_h264_mp3_avi(&src_path);
+
+        let out = tempfile::tempdir().unwrap();
+        let job = start(
+            out.path(),
+            COPY_AV,
+            Box::new(FileSource::open(&src_path).unwrap()),
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !job.finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(job.finished(), "remux of a DTS-only stream never finished");
+        assert!(job.failed().is_none(), "remux failed: {:?}", job.failed());
+        let playlist = std::fs::read_to_string(out.path().join("master.m3u8")).unwrap();
+        assert!(
+            playlist.contains("#EXTINF"),
+            "no segments written — the video pad never produced a buffer: {playlist}"
+        );
     }
 
     /// parsebin keeps its parser for everything except AV1.
