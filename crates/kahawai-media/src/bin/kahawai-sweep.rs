@@ -202,7 +202,13 @@ fn sweep_in_child(exe: &Path, path: &Path, full: bool) -> (Verdict, String) {
 
 /// The tail kept alongside the head, so a container whose index lives at
 /// the end (Matroska Cues, an mp4 moov, an AVI idx1) can still be read.
+/// Scaled, because an index grows with the recording: a 13-hour 32 GB
+/// capture carries a 23 MB moov, which a flat 16 MiB window cut in
+/// half — qtdemux then reported a perfectly good file as "contains no
+/// playable streams". The window only permits reads, it does not force
+/// them, so a larger one costs nothing on files that never seek there.
 const TAIL_BYTES: u64 = 16 * 1024 * 1024;
+const TAIL_FRACTION: u64 = 256;
 
 /// Serves the file's first `head` bytes and its last `tail` bytes, and
 /// reports EOF in between: a truncated file that kept its index.
@@ -353,7 +359,10 @@ fn sweep_one(
         Ok(s) => s,
         Err(e) => return (Verdict::Fail, format!("[open] {e}")),
     };
-    let budget = BudgetSource::new(src, if full { u64::MAX } else { HEAD_BYTES }, TAIL_BYTES);
+    let tail = TAIL_BYTES.max(
+        kahawai_media::remux::RemuxSource::size(&src) / TAIL_FRACTION,
+    );
+    let budget = BudgetSource::new(src, if full { u64::MAX } else { HEAD_BYTES }, tail);
     let truncated = budget.exhausted.clone();
     let job = match kahawai_media::remux::start(out.path(), plan, Box::new(budget)) {
         Ok(j) => j,
