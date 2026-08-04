@@ -1,0 +1,84 @@
+From 684fa5da3233f950130f2151b82fd7be365730cf Mon Sep 17 00:00:00 2001
+From: Ingmar Steen <iksteen@gmail.com>
+Date: Tue, 4 Aug 2026 21:24:50 +0200
+Subject: [PATCH 3/3] matroskademux: accept a large element the file vouches
+ for
+
+MAX_BLOCK_SIZE refuses any element over 32 MiB, and in streaming mode
+that refusal is fatal:
+
+  reading large block of size 35821506 not supported; file might be corrupt
+
+The size is not evidence of corruption on its own. Fansubbed releases
+attach their subtitle fonts, and a CJK font pack passes 32 MiB without
+being remarkable - 12 of 1108 Matroska files in one ordinary library
+carry Attachments over the limit, and another 28 sit between 8 and 32
+MiB, so the boundary is one releases approach routinely rather than a
+frontier only broken files reach. Every one of those 12 is undemuxable
+in streaming mode while pull mode plays it, because pull can skip what
+it cannot hold and streaming cannot.
+
+What does distinguish a corrupt size is whether the element could be
+there at all. Upstream usually knows the length, and the demuxer
+already consults it for SeekHead validation, so when the element ends
+inside the file the size is corroborated by the file itself. Accept
+that case, bounded by MAX_SANE_ELEMENT_SIZE so the adapter still has a
+ceiling, and leave everything else - unknown length, or an element
+running past the end - refused exactly as before.
+
+Measured on 1.28.5 with the same change, through a push-only appsrc so
+pull cannot be reached: the file demuxes, and the demuxer publishes all
+45 attachments instead of dying. A file in the same library claiming a
+128041197 byte element inside 88.8 MB still fails, which is the case
+this guard was written for and which ffmpeg independently reports as
+"exceeds containing master element".
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_011KQFNXanCWf4EjotC8Ah4z
+---
+ .../gst/matroska/matroska-demux.c             | 24 +++++++++++++++++++
+ 1 file changed, 24 insertions(+)
+
+diff --git a/subprojects/gst-plugins-good/gst/matroska/matroska-demux.c b/subprojects/gst-plugins-good/gst/matroska/matroska-demux.c
+index 14188913..de3b6057 100644
+--- a/subprojects/gst-plugins-good/gst/matroska/matroska-demux.c
++++ b/subprojects/gst-plugins-good/gst/matroska/matroska-demux.c
+@@ -6089,11 +6089,35 @@ gst_matroska_demux_parse_contents (GstMatroskaDemux * demux, GstEbmlRead * ebml)
+ #define GST_FLOW_OVERFLOW   GST_FLOW_CUSTOM_ERROR
+ 
+ #define MAX_BLOCK_SIZE (32 * 1024 * 1024)
++/* Ceiling for an element we accept on the strength of it fitting inside
++ * the file. Generous enough for the font packs fansubbed releases
++ * attach (tens of MB is routine), small enough to bound what streaming
++ * has to hold in the adapter. */
++#define MAX_SANE_ELEMENT_SIZE (256 * 1024 * 1024)
+ 
+ static inline GstFlowReturn
+ gst_matroska_demux_check_read_size (GstMatroskaDemux * demux, guint64 bytes)
+ {
+   if (G_UNLIKELY (bytes > MAX_BLOCK_SIZE)) {
++    /* A large element is only suspicious if it could not possibly be
++     * there. When upstream knows the length and the element fits inside
++     * it, the size is corroborated by the file itself and the element is
++     * real data - Attachments carrying subtitle fonts run well past
++     * MAX_BLOCK_SIZE in ordinary releases, and refusing them makes such
++     * a file undemuxable in streaming mode while pull mode plays it. A
++     * declared size that runs past the end of the file is the corrupt
++     * case this guard is for, and stays refused. */
++    if (bytes <= MAX_SANE_ELEMENT_SIZE) {
++      gint64 length = gst_matroska_read_common_get_length (&demux->common);
++
++      if (length > 0 && demux->common.offset + bytes <= (guint64) length) {
++        GST_DEBUG_OBJECT (demux,
++            "accepting large element of size %" G_GUINT64_FORMAT
++            "; it fits within the %" G_GINT64_FORMAT " byte file", bytes,
++            length);
++        return GST_FLOW_OK;
++      }
++    }
+     /* only a few blocks are expected/allowed to be large,
+      * and will be recursed into, whereas others will be read and must fit */
+     if (demux->streaming) {
+-- 
+2.55.0
+

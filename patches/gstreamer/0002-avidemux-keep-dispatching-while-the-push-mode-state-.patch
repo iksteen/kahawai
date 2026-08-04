@@ -1,0 +1,70 @@
+From 3099c5e6b62100a29e98b9b6a74c897297e77395 Mon Sep 17 00:00:00 2001
+From: Ingmar Steen <iksteen@gmail.com>
+Date: Tue, 4 Aug 2026 19:14:57 +0200
+Subject: [PATCH 2/3] avidemux: keep dispatching while the push-mode state
+ advances
+
+gst_avi_demux_chain() handles exactly one state per buffer: START
+parses the RIFF header and returns, HEADER waits for the next buffer.
+A source that delivers the whole file in a single buffer therefore
+never leaves the header, and the file is rejected at EOS with
+
+  got eos and didn't receive a complete header object
+
+although every byte of it arrived. Buffer segmentation is not
+something a source has to get right for a demuxer, and nothing else
+about avidemux depends on it.
+
+Reproduces with a bare appsrc pushing a 1.5 MB AVI, no other element
+involved: as one buffer it fails, as two it demuxes. filesrc hides it
+by operating in pull mode; any pushing source with a read block larger
+than the file will hit it.
+
+Loop while the state changes, so a buffer that carries several states'
+worth of data is parsed in one go.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_011KQFNXanCWf4EjotC8Ah4z
+---
+ subprojects/gst-plugins-good/gst/avi/gstavidemux.c | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/subprojects/gst-plugins-good/gst/avi/gstavidemux.c b/subprojects/gst-plugins-good/gst/avi/gstavidemux.c
+index d64980b5..0eb70a30 100644
+--- a/subprojects/gst-plugins-good/gst/avi/gstavidemux.c
++++ b/subprojects/gst-plugins-good/gst/avi/gstavidemux.c
+@@ -5845,6 +5845,7 @@ gst_avi_demux_chain (GstPad * pad, GstObject * parent, GstBuffer * buf)
+ {
+   GstFlowReturn res;
+   GstAviDemux *avi = GST_AVI_DEMUX (parent);
++  GstAviDemuxState last_state;
+   gint i;
+ 
+   if (GST_BUFFER_IS_DISCONT (buf)) {
+@@ -5859,6 +5860,9 @@ gst_avi_demux_chain (GstPad * pad, GstObject * parent, GstBuffer * buf)
+       gst_buffer_get_size (buf));
+   gst_adapter_push (avi->adapter, buf);
+ 
++dispatch:
++  last_state = avi->state;
++
+   switch (avi->state) {
+     case GST_AVI_DEMUX_START:
+       if ((res = gst_avi_demux_stream_init_push (avi)) != GST_FLOW_OK) {
+@@ -5927,6 +5931,13 @@ gst_avi_demux_chain (GstPad * pad, GstObject * parent, GstBuffer * buf)
+       break;
+   }
+ 
++  /* One buffer can hold more than one state's worth of data - a whole
++   * small file, when the source reads in large blocks - and handling a
++   * single state per buffer leaves such a file stuck in the header:
++   * EOS then reports it as truncated although every byte arrived. */
++  if (res == GST_FLOW_OK && avi->state != last_state)
++    goto dispatch;
++
+   GST_DEBUG_OBJECT (avi, "state: %d res:%s", avi->state,
+       gst_flow_get_name (res));
+ 
+-- 
+2.55.0
+
