@@ -258,10 +258,12 @@ How something works and why it was built that way belong in
       bill. Strictly a DROPPED stream; a source that never had video
       (music) or audio is not penalised for what it never had.
 - [x] HUB-17 HLS delivery for remux/transcode (EVENT playlists, mid-stream seek).
-      AV1 copies work only because `av1parse` is demoted at init: left
-      auto-pluggable, `parsebin` uses it, parses to `alignment=frame`
-      and loses the buffer timestamps, and every AV1 copy session dies
-      producing no playlist (fixed 2026-08-04; see `kahawai-media/lib.rs`).
+      `parsebin` is stopped from parsing any stream we parse ourselves
+      (`autoplug-continue` answers with `parser_for`), so each stream
+      has exactly ONE parser. Double-parsing was a no-op for h264/ac3
+      and fatal for AV1 — parsebin parses it to `alignment=frame`,
+      losing the buffer timestamps, and every AV1 copy session then
+      died producing no playlist (fixed 2026-08-04).
       `EXT-X-TARGETDURATION` is declared from the source's measured
       keyframe spacing on copies (median 10.0 s here, worst 147 s; the
       2 s previously declared was wrong for 87% of files, RFC 8216

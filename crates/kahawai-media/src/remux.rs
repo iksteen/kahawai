@@ -3433,6 +3433,29 @@ pub fn start_parts(
     for source in sources {
         let appsrc = seekable_appsrc(source);
         let parsebin = gst::ElementFactory::make("parsebin").build()?;
+        // Do not let parsebin parse a stream WE are going to parse.
+        //
+        // `autoplug-continue` is asked before each element is plugged;
+        // returning false exposes the stream as the demuxer produced it.
+        // Answering with `parser_for` — the same function that decides
+        // what the branch attaches later — makes the two decisions one
+        // decision, taken at plug time instead of after the fact.
+        //
+        // Container caps (`video/quicktime`, `video/x-matroska`) are not
+        // in `parser_for`, so demuxing always continues; only elementary
+        // streams we have a parser for are exposed raw.
+        //
+        // Why it matters beyond tidiness: parsebin fixes its output caps
+        // when it exposes the pad and never renegotiates them, so a
+        // second parser downstream has to CONVERT whatever parsebin
+        // happened to pick. For AV1 that conversion (frame → tu) drops
+        // every buffer timestamp and the session freezes; for h264 it is
+        // a measured no-op. One parser, fed the demuxer's own buffers,
+        // has neither problem.
+        parsebin.connect("autoplug-continue", false, |args| {
+            let caps = args[2].get::<gst::Caps>().ok()?;
+            Some((parser_for(&caps).is_none()).to_value())
+        });
         pipeline.add_many([appsrc.upcast_ref::<gst::Element>(), &parsebin])?;
         gst::Element::link_many([appsrc.upcast_ref::<gst::Element>(), &parsebin])?;
         parsebins.push(parsebin);
@@ -4565,6 +4588,62 @@ mod tests {
                 .unwrap()
                 .contains("#EXT-X-ENDLIST")
         );
+    }
+
+    /// Streams `parser_for` does NOT cover must still be parsed BY
+    /// PARSEBIN, or stopping its autoplug breaks them.
+    ///
+    /// `autoplug-continue` answers with `parser_for`, so every codec it
+    /// returns `None` for — flac, vorbis, vp8, theora, divx — keeps the
+    /// old behaviour and gets parsebin's parser. Getting that backwards
+    /// is silent: the muxer simply never negotiates and the session
+    /// produces no playlist at all, with no error anywhere (which is
+    /// exactly how the AV1 freeze presented).
+    ///
+    /// FLAC is the case in this library — it is what the anime rips use.
+    #[test]
+    fn a_codec_we_have_no_parser_for_still_remuxes() {
+        crate::init().unwrap();
+        // The premise: if this ever gains a parser, the test below stops
+        // covering what it claims to.
+        for name in ["audio/x-flac", "audio/x-vorbis", "video/x-vp8"] {
+            let caps = gst::Caps::builder(name).build();
+            assert!(
+                parser_for(&caps).is_none(),
+                "{name} now has a parser — pick another uncovered codec"
+            );
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let src_path = dir.path().join("flac.mkv");
+        crate::testutil::render_h264_flac_mkv(&src_path);
+
+        // fMP4, because MPEG-TS cannot carry FLAC at all — a TS copy of
+        // it is a plan negotiation would never make, and asserting on one
+        // tests the muxer's limits rather than the autoplug decision.
+        let plan = RemuxPlan {
+            segment_format: SegmentFormat::Fmp4,
+            ..COPY_AV
+        };
+        let out = tempfile::tempdir().unwrap();
+        let job = start(
+            out.path(),
+            plan,
+            Box::new(FileSource::open(&src_path).unwrap()),
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !job.finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            job.finished(),
+            "remux of an unparsed-by-us codec never finished — parsebin \
+             was stopped from parsing something we do not parse either"
+        );
+        assert!(job.failed().is_none(), "remux failed: {:?}", job.failed());
+        let playlist = std::fs::read_to_string(out.path().join("master.m3u8")).unwrap();
+        assert!(playlist.contains("#EXTINF"), "no segments: {playlist}");
     }
 
     /// The corpus sweep's first catch: MP4 with the moov atom at the end
