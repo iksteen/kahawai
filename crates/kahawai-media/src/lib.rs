@@ -43,6 +43,32 @@ pub fn init() -> Result<()> {
                 f.set_rank(gst::Rank::NONE);
             }
         }
+        // `av1parse` must never be AUTO-PLUGGED, or AV1 cannot be
+        // copied at all.
+        //
+        // `parsebin` plugs it and parses AV1 to `alignment=frame`,
+        // losing the buffer timestamps in the process: only the first
+        // buffer keeps a PTS. `isofmp4mux` accepts `alignment=tu` and
+        // nothing else, so the parser downstream has to regroup frames
+        // into temporal units with nothing to stamp them from —
+        // `guard_pts` then drops every one (16796 in 30 s), the muxer's
+        // video pad starves, the audio queue fills behind it, and the
+        // session dies with "remux produced no playlist in time". Every
+        // AV1 file, at any GOP length.
+        //
+        // Demoting it leaves the demuxer's own temporal units intact all
+        // the way to the muxer, which is exactly what
+        // `matroskademux ! av1parse ! isofmp4mux` does outside our
+        // pipeline — the control that works. Nothing loses a parser it
+        // needed: `route_stream` still builds `av1parse` EXPLICITLY by
+        // name for the branches that want one, and rank only governs
+        // auto-plugging. Verified both ways on a real AV1 source: copy
+        // produces segments (it produced none before), and the transcode
+        // path still decodes.
+        if let Some(f) = gst::ElementFactory::find("av1parse") {
+            use gst::prelude::PluginFeatureExt;
+            f.set_rank(gst::Rank::NONE);
+        }
         Ok(())
     })
     .clone()
