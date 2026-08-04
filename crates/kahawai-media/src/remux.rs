@@ -15,77 +15,97 @@ use gstreamer::prelude::*;
 use gstreamer_app::AppSrc;
 use gstreamer_video as gst_video;
 
-/// Caps structure names mpegtsmux can actually carry, read from its own
-/// sink pad templates. Never hand-list what the element can tell us: a
-/// hardcoded list shipped eac3 (which mpegtsmux rejects at runtime →
-/// opaque not-negotiated) and omitted dts/opus (which it happily muxes).
-pub(crate) fn ts_muxable_names() -> &'static std::collections::HashSet<String> {
-    static NAMES: std::sync::OnceLock<std::collections::HashSet<String>> =
-        std::sync::OnceLock::new();
-    NAMES.get_or_init(|| {
-        let mut names = std::collections::HashSet::new();
+/// What a container's muxer can carry, read from its own sink pad
+/// templates. Never hand-list what the element can tell us: a hardcoded
+/// list shipped eac3 (which mpegtsmux rejects at runtime → opaque
+/// not-negotiated) and omitted dts/opus (which it happily muxes).
+///
+/// Kept as CAPS, not names, because names alone cannot separate mp3
+/// from AAC — both are `audio/mpeg`, and isofmp4mux's template takes
+/// only `mpegversion=4` while mpegtsmux takes 1 as well. Answering that
+/// from the template is what keeps the two muxers' differences in one
+/// place instead of in a special case per call site.
+pub(crate) fn muxable_caps(format: SegmentFormat) -> &'static gst::Caps {
+    static TS: std::sync::OnceLock<gst::Caps> = std::sync::OnceLock::new();
+    static FMP4: std::sync::OnceLock<gst::Caps> = std::sync::OnceLock::new();
+    let sink_caps = |element: &str| {
+        // Before the first Caps::new_empty(): building caps at all
+        // asserts an initialized GStreamer.
         let _ = crate::init();
-        let Some(factory) = gst::ElementFactory::find("mpegtsmux") else {
-            return names; // doctor already warns; remux will bail cleanly
+        let mut caps = gst::Caps::new_empty();
+        let Some(factory) = gst::ElementFactory::find(element) else {
+            return caps; // doctor already warns; remux will bail cleanly
         };
         for tmpl in factory.static_pad_templates() {
             if tmpl.direction() == gst::PadDirection::Sink {
-                for s in tmpl.caps().iter() {
-                    names.insert(s.name().to_string());
-                }
+                caps.merge(tmpl.caps().copy());
             }
         }
-        // The templates advertise these, but at runtime the muxer refuses
-        // them unless enable-custom-mappings=true — and no browser plays
-        // AV1/VP9-in-TS anyway. Treat as needs-transcoder, not muxable.
-        names.remove("video/x-av1");
-        names.remove("video/x-vp9");
-        names
-    })
-}
-
-/// Same oracle for the fMP4 path, off isofmp4mux's own templates
-/// (h264/h265/vp9/av1 + aac/opus/flac/eac3). The template's
-/// `audio/mpeg` is mpegversion-4-only, but `codec_to_caps_name` maps
-/// mp3 onto the same name — excluded by codec name in negotiate's
-/// muxable closure, which is the only place that starts from codecs.
-pub(crate) fn fmp4_muxable_names() -> &'static std::collections::HashSet<String> {
-    static NAMES: std::sync::OnceLock<std::collections::HashSet<String>> =
-        std::sync::OnceLock::new();
-    NAMES.get_or_init(|| {
-        let mut names = std::collections::HashSet::new();
-        let _ = crate::init();
-        let Some(factory) = gst::ElementFactory::find("isofmp4mux") else {
-            return names;
-        };
-        for tmpl in factory.static_pad_templates() {
-            if tmpl.direction() == gst::PadDirection::Sink {
-                for s in tmpl.caps().iter() {
-                    names.insert(s.name().to_string());
-                }
-            }
-        }
-        names
-    })
-}
-
-/// The chosen container's muxable-names set.
-pub(crate) fn muxable_names(format: SegmentFormat) -> &'static std::collections::HashSet<String> {
+        caps
+    };
     match format {
-        SegmentFormat::Ts => ts_muxable_names(),
-        SegmentFormat::Fmp4 => fmp4_muxable_names(),
+        SegmentFormat::Ts => TS.get_or_init(|| {
+            let caps = sink_caps("mpegtsmux");
+            // The templates advertise these, but at runtime the muxer
+            // refuses them unless enable-custom-mappings=true — and no
+            // browser plays AV1/VP9-in-TS anyway. Treat as
+            // needs-transcoder, not muxable.
+            let mut kept = gst::Caps::new_empty();
+            for s in caps.iter() {
+                if !matches!(s.name().as_str(), "video/x-av1" | "video/x-vp9") {
+                    kept.get_mut().unwrap().append_structure(s.to_owned());
+                }
+            }
+            kept
+        }),
+        SegmentFormat::Fmp4 => FMP4.get_or_init(|| sink_caps("isofmp4mux")),
     }
+}
+
+/// The chosen container's muxable caps-structure names.
+pub(crate) fn muxable_names(format: SegmentFormat) -> std::collections::HashSet<String> {
+    muxable_caps(format)
+        .iter()
+        .map(|s| s.name().to_string())
+        .collect()
+}
+
+/// Can this container carry a stream of these caps?
+///
+/// Compares the structure NAME and `mpegversion`, and deliberately
+/// nothing else: every other template field (`stream-format`,
+/// `alignment`, `parsed`, `framed`, …) is one the parser inserted in
+/// [`route_stream`] converts, so demanding it here would drop streams
+/// that mux perfectly well — h264 arrives byte-stream/nal from AVI and
+/// leaves h264parse as avc/au. `mpegversion` is the one field no parser
+/// can change, and the one that tells mp3 apart from AAC.
+pub(crate) fn caps_muxable(caps: &gst::Caps, format: SegmentFormat) -> bool {
+    let _ = crate::init();
+    let Some(s) = caps.structure(0) else {
+        return false;
+    };
+    let mut probe = s.to_owned();
+    let extra: Vec<String> = probe
+        .fields()
+        .filter(|f| f.as_str() != "mpegversion")
+        .map(|f| f.to_string())
+        .collect();
+    for f in extra {
+        probe.remove_field(&f);
+    }
+    gst::Caps::from(probe).can_intersect(muxable_caps(format))
 }
 
 /// Which muxer pad kind a parsed stream belongs on, if the session's
 /// segment container can carry it.
-fn sink_compatible(caps_name: &str, format: SegmentFormat) -> Option<&'static str> {
-    if !muxable_names(format).contains(caps_name) {
+fn sink_compatible(caps: &gst::Caps, format: SegmentFormat) -> Option<&'static str> {
+    if !caps_muxable(caps, format) {
         return None;
     }
-    if caps_name.starts_with("video/") {
+    let name = caps.structure(0)?.name();
+    if name.starts_with("video/") {
         Some("video")
-    } else if caps_name.starts_with("audio/") {
+    } else if name.starts_with("audio/") {
         Some("audio")
     } else {
         None
@@ -118,6 +138,29 @@ pub(crate) fn codec_to_caps_name<'a>(kind: &str, codec: &'a str) -> Option<&'a s
         ("audio", "truehd") => "audio/x-true-hd",
         ("audio", "vorbis") => "audio/x-vorbis",
         _ => return None,
+    })
+}
+
+/// A codec LABEL as caps, for asking [`caps_muxable`] whether a
+/// container could carry the stream before a pipeline exists.
+///
+/// Carries `mpegversion` for the `audio/mpeg` family, where the label
+/// is the only thing separating mp3 and MPEG-1 layer 1/2 audio (both
+/// version 1, TS-only) from AAC (version 2/4, muxable everywhere).
+/// Nothing else is constrained: see [`caps_muxable`] for why fields a
+/// parser can fix up must not appear here.
+pub(crate) fn codec_to_caps(kind: &str, codec: &str) -> Option<gst::Caps> {
+    // Building caps asserts an initialized GStreamer, and negotiation
+    // reaches here before anything else touches it.
+    let _ = crate::init();
+    let name = codec_to_caps_name(kind, codec)?;
+    let b = gst::Caps::builder(name);
+    Some(match (kind, codec) {
+        ("audio", "mp3" | "mpeg-audio") => b.field("mpegversion", 1i32).build(),
+        ("audio", "aac") => b
+            .field("mpegversion", gst::List::new([2i32, 4i32]))
+            .build(),
+        _ => b.build(),
     })
 }
 
@@ -345,6 +388,11 @@ pub fn decoder_caps_names() -> Vec<String> {
 /// Can any installed decoder take this stream? Derived from the element
 /// registry (never hand-list what it can tell us).
 pub(crate) fn can_decode(caps_name: &str) -> bool {
+    // Anything that builds caps or reads the registry needs GStreamer
+    // up. This used to ride on a caller having touched the muxable-caps
+    // cache first, which is not a contract — it is an ordering accident,
+    // and it panicked the moment negotiation short-circuited past it.
+    let _ = crate::init();
     let caps = gst::Caps::new_empty_simple(caps_name);
     gst::ElementFactory::factories_with_type(gst::ElementFactoryType::DECODER, gst::Rank::MARGINAL)
         .iter()
@@ -533,7 +581,7 @@ pub fn plan_streams(
     // Clamp stale indexes (rescan shrank the track list) to the last track.
     let audio_track = audio_track.min(info.audio.len().saturating_sub(1));
     let video_track = video_track.min(info.video.len().saturating_sub(1));
-    let names = ts_muxable_names();
+    let names = muxable_names(SegmentFormat::Ts);
     let copyable = |kind: &str, codec: &str, accepted: &[&str]| {
         accepted.contains(&codec)
             && codec_to_caps_name(kind, codec).is_some_and(|n| names.contains(n))
@@ -573,7 +621,7 @@ pub fn plan_streams(
 /// (§4.3b spirit: the player reports which path was taken and why —
 /// nothing converts silently).
 pub fn plan_summary(info: &kahawai_core::media::MediaInfo, plan: &RemuxPlan) -> (String, String) {
-    let names = ts_muxable_names();
+    let names = muxable_names(SegmentFormat::Ts);
     let kind_summary =
         |kind: &str, codecs: Vec<&str>, mode: StreamMode, target_codec: &str| match mode {
             StreamMode::Copy => codecs
@@ -782,9 +830,12 @@ fn mode_for(caps_name: &str, plan: &RemuxPlan) -> StreamMode {
 }
 
 /// Would route_stream do something useful with a stream of these caps?
-fn routable(caps_name: &str, plan: &RemuxPlan) -> bool {
+fn routable(caps: &gst::Caps, plan: &RemuxPlan) -> bool {
+    let Some(caps_name) = caps.structure(0).map(|s| s.name()) else {
+        return false;
+    };
     match mode_for(caps_name, plan) {
-        StreamMode::Copy => sink_compatible(caps_name, plan.segment_format).is_some(),
+        StreamMode::Copy => sink_compatible(caps, plan.segment_format).is_some(),
         StreamMode::Encode => can_decode(caps_name),
         StreamMode::Off => false,
     }
@@ -903,7 +954,7 @@ fn plumb_parsed_pad(
             return;
         }
     }
-    if routable(&name, &plan) {
+    if routable(&advertised, &plan) {
         route_stream(
             pipe,
             waiting,
@@ -1245,7 +1296,7 @@ fn route_stream(
     }
     let target = (mode == StreamMode::Copy)
         .then(|| {
-            sink_compatible(&caps_name, plan.segment_format)
+            sink_compatible(caps, plan.segment_format)
                 .and_then(|kind| waiting.lock().unwrap().remove(kind))
         })
         .flatten();
@@ -1302,7 +1353,11 @@ fn route_stream(
             }
         }
         None => {
-            tracing::info!(caps = %caps_name, "remux: dropping stream (not TS-compatible or duplicate)");
+            tracing::info!(
+                caps = %caps_name,
+                container = plan.segment_format.as_str(),
+                "remux: dropping stream (container cannot carry it, or duplicate)"
+            );
             // sync=false: don't pace the dropped stream at realtime speed;
             // async=false: don't hold pipeline preroll hostage to a sparse
             // track (subtitles) that may not produce a buffer for minutes
@@ -4504,27 +4559,77 @@ mod tests {
         );
     }
 
+    /// mp3 and AAC share the caps NAME `audio/mpeg`, so a name-level
+    /// muxability check called mp3 fMP4-muxable; the copy it planned
+    /// then failed to link against isofmp4mux (mpegversion 4 only) and
+    /// took the pipeline down with `not-linked`. Both the codec-label
+    /// side (negotiation) and the live-caps side (the worker) must say
+    /// no, and both must still say yes for TS.
+    #[test]
+    fn mpeg_audio_muxability_is_decided_by_version_not_name() {
+        crate::init().unwrap();
+        for label in ["mp3", "mpeg-audio"] {
+            let c = codec_to_caps("audio", label).unwrap();
+            assert!(
+                caps_muxable(&c, SegmentFormat::Ts),
+                "{label} is MPEG-1 audio, which mpegtsmux carries"
+            );
+            assert!(
+                !caps_muxable(&c, SegmentFormat::Fmp4),
+                "{label} must not plan as an fMP4 copy"
+            );
+        }
+        // AAC is the same caps name and must stay muxable in both.
+        let aac = codec_to_caps("audio", "aac").unwrap();
+        assert!(caps_muxable(&aac, SegmentFormat::Ts));
+        assert!(caps_muxable(&aac, SegmentFormat::Fmp4));
+
+        // The worker sees full caps off the demuxer, not a label.
+        let live_mp3 = gst::Caps::builder("audio/mpeg")
+            .field("mpegversion", 1i32)
+            .field("layer", 3i32)
+            .field("rate", 48000i32)
+            .field("channels", 2i32)
+            .build();
+        assert_eq!(sink_compatible(&live_mp3, SegmentFormat::Ts), Some("audio"));
+        assert_eq!(sink_compatible(&live_mp3, SegmentFormat::Fmp4), None);
+
+        // The check must NOT tighten on fields a parser converts:
+        // h264 arrives byte-stream/nal from AVI and leaves h264parse as
+        // avc/au, which is what isofmp4mux's template demands.
+        let live_h264 = gst::Caps::builder("video/x-h264")
+            .field("stream-format", "byte-stream")
+            .field("alignment", "nal")
+            .build();
+        assert_eq!(
+            sink_compatible(&live_h264, SegmentFormat::Fmp4),
+            Some("video")
+        );
+        assert_eq!(sink_compatible(&live_h264, SegmentFormat::Ts), Some("video"));
+    }
+
     #[test]
     fn ts_compat_follows_muxer_templates() {
         crate::init().unwrap();
+        let caps = |n: &str| gst::Caps::builder(n).build();
         // Basics that any mpegtsmux supports.
         assert_eq!(
-            sink_compatible("video/x-h264", SegmentFormat::Ts),
+            sink_compatible(&caps("video/x-h264"), SegmentFormat::Ts),
             Some("video")
         );
         assert_eq!(
-            sink_compatible("audio/mpeg", SegmentFormat::Ts),
+            sink_compatible(&caps("audio/mpeg"), SegmentFormat::Ts),
             Some("audio")
         );
-        assert_eq!(sink_compatible("text/x-raw", SegmentFormat::Ts), None);
+        assert_eq!(sink_compatible(&caps("text/x-raw"), SegmentFormat::Ts), None);
         // Every answer must agree with the muxer's own template.
-        let names = ts_muxable_names();
+        let names = muxable_names(SegmentFormat::Ts);
         assert_eq!(
-            sink_compatible("audio/x-eac3", SegmentFormat::Ts).is_some(),
+            sink_compatible(&caps("audio/x-eac3"), SegmentFormat::Ts).is_some(),
             names.contains("audio/x-eac3")
         );
         assert_eq!(
-            sink_compatible("audio/x-dts", SegmentFormat::Ts).is_some(),
+            sink_compatible(&caps("audio/x-dts"), SegmentFormat::Ts).is_some(),
             names.contains("audio/x-dts")
         );
 
@@ -4686,7 +4791,7 @@ mod tests {
             eprintln!("skipping: no avenc_eac3 to build the fixture");
             return;
         }
-        if ts_muxable_names().contains("audio/x-eac3") {
+        if muxable_names(SegmentFormat::Ts).contains("audio/x-eac3") {
             eprintln!("skipping: this mpegtsmux muxes eac3 natively");
             return;
         }

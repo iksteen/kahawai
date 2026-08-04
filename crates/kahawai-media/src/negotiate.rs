@@ -635,14 +635,14 @@ pub fn negotiate(
                     &[AudioTarget::Aac, AudioTarget::Opus],
                 ),
             };
-            let names = crate::remux::muxable_names(format);
+            // Asked of the muxer's own template, fields and all: mp3 and
+            // AAC share the caps name `audio/mpeg`, and isofmp4mux takes
+            // only mpegversion 4. A name-level check answered "muxable"
+            // for both, and the mp3 copy it planned then failed to link
+            // in the worker.
             let muxable = |kind: &str, codec: &str| {
-                // isofmp4mux's `audio/mpeg` template is mpegversion 4 only,
-                // and codec_to_caps_name collides mp3 onto the same name.
-                if format == SegmentFormat::Fmp4 && codec == "mp3" {
-                    return false;
-                }
-                codec_to_caps_name(kind, codec).is_some_and(|n| names.contains(n))
+                crate::remux::codec_to_caps(kind, codec)
+                    .is_some_and(|c| crate::remux::caps_muxable(&c, format))
             };
             let vt = v_ladder
                 .iter()
@@ -1159,6 +1159,66 @@ mod tests {
         assert_eq!(sp.cost, Cost::AudioEncode, "{}", sp.audio_verdict);
         assert_eq!(sp.plan.audio_codec, AudioTarget::Opus);
         assert_eq!(sp.plan.segment_format, SegmentFormat::Fmp4);
+    }
+
+    /// An MPEG-1 audio copy must never ride fMP4. isofmp4mux's
+    /// `audio/mpeg` template is mpegversion 4 (AAC) only, so the plan
+    /// would fail to link in the worker and take the session down.
+    /// `mp3` was guarded by name; `mpeg-audio` — what discovery labels
+    /// layer 1/2, and what it falls back to when version and layer
+    /// cannot be read — was not, and two files in the library carry it.
+    #[test]
+    fn mpeg1_audio_never_copies_into_fmp4() {
+        crate::init().unwrap();
+        for label in ["mp3", "mpeg-audio"] {
+            // A client that accepts the source audio AND av1, so the
+            // fMP4 candidate is the one that would otherwise win.
+            let mut p = chrome();
+            p.audio.push(label.into());
+            p.video.push(VideoCap {
+                codec: "av1".into(),
+                ..Default::default()
+            });
+            let info = media("matroska", Some(vs("av1")), Some(au(label, 2)));
+            let sp = negotiate(
+                &p,
+                &info,
+                0,
+                0,
+                true,
+                None,
+                false,
+                true,
+                &[],
+                None,
+                &fleet(),
+            );
+            assert!(
+                sp.plan.segment_format != SegmentFormat::Fmp4
+                    || sp.plan.audio != StreamMode::Copy,
+                "{label}: planned an fMP4 copy isofmp4mux cannot link ({})",
+                sp.audio_verdict
+            );
+            // TS still copies it — the fix must not cost the cheap path.
+            let mut p = chrome();
+            p.audio.push(label.into());
+            let info = media("matroska", Some(vs("h264")), Some(au(label, 2)));
+            let sp = negotiate(
+                &p,
+                &info,
+                0,
+                0,
+                true,
+                None,
+                false,
+                true,
+                &[],
+                None,
+                &fleet(),
+            );
+            assert_eq!(sp.plan.segment_format, SegmentFormat::Ts);
+            assert_eq!(sp.plan.audio, StreamMode::Copy, "{}", sp.audio_verdict);
+        }
     }
 
     /// AV1/VP9 sources with capable clients flip from today's forced
