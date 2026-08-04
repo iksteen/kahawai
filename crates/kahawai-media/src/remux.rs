@@ -669,6 +669,31 @@ pub fn plan_summary(info: &kahawai_core::media::MediaInfo, plan: &RemuxPlan) -> 
     )
 }
 
+/// Streams parsebin must be stopped from parsing, so the parser we
+/// attach gets the demuxer's own buffers instead of parsebin's output.
+///
+/// AV1, and deliberately nothing else. parsebin fixes a pad's caps when
+/// it exposes it and never renegotiates, so it settles AV1 on
+/// `alignment=frame`; isofmp4mux demands `alignment=tu`, and the
+/// frame→tu conversion a second av1parse performs drops every buffer
+/// timestamp — 16,796 dropped by `guard_pts`, muxer starved, session
+/// frozen. Fed raw OBUs, our av1parse produces `tu` directly.
+///
+/// This is NOT the general rule "one parser per stream", which was
+/// tried and measurably costs more than it buys. Applied to h264 it
+/// makes mpegtsmux emit one timestamp-less PES per keyframe — a bare
+/// 9-byte PPS, which ffmpeg reports as an access unit with no picture
+/// and the sweep flags as a missing DTS (6 of 60 files). The bytes
+/// h264parse produces are byte-identical either way; what the second
+/// parser contributes is re-segmenting them, and that is what keeps the
+/// muxer's PES boundaries honest. Measured with plain gst-launch, no
+/// kahawai involved: `qtdemux ! h264parse ! mpegtsmux` gives 106
+/// timestamp-less packets, `qtdemux ! h264parse ! h264parse !
+/// mpegtsmux` gives none.
+fn parsebin_must_not_parse(caps: &gst::CapsRef) -> bool {
+    caps.structure(0).is_some_and(|s| s.name() == "video/x-av1")
+}
+
 /// TS muxing needs specific stream-formats (h26x as Annex-B byte-stream,
 /// AAC as ADTS) while containers store avc/hvc1/raw. A per-stream parser
 /// between demux and muxer converts during caps negotiation — pure
@@ -3488,28 +3513,15 @@ pub fn start_parts(
     for source in sources {
         let appsrc = seekable_appsrc(source);
         let parsebin = gst::ElementFactory::make("parsebin").build()?;
-        // Do not let parsebin parse a stream WE are going to parse.
+        // Keep parsebin's own parser away from AV1, and only AV1.
         //
         // `autoplug-continue` is asked before each element is plugged;
         // returning false exposes the stream as the demuxer produced it.
-        // Answering with `parser_for` — the same function that decides
-        // what the branch attaches later — makes the two decisions one
-        // decision, taken at plug time instead of after the fact.
-        //
-        // Container caps (`video/quicktime`, `video/x-matroska`) are not
-        // in `parser_for`, so demuxing always continues; only elementary
-        // streams we have a parser for are exposed raw.
-        //
-        // Why it matters beyond tidiness: parsebin fixes its output caps
-        // when it exposes the pad and never renegotiates them, so a
-        // second parser downstream has to CONVERT whatever parsebin
-        // happened to pick. For AV1 that conversion (frame → tu) drops
-        // every buffer timestamp and the session freezes; for h264 it is
-        // a measured no-op. One parser, fed the demuxer's own buffers,
-        // has neither problem.
+        // Container caps are never in `parsebin_must_not_parse`, so
+        // demuxing always continues.
         parsebin.connect("autoplug-continue", false, |args| {
             let caps = args[2].get::<gst::Caps>().ok()?;
-            Some((parser_for(&caps).is_none()).to_value())
+            Some((!parsebin_must_not_parse(&caps)).to_value())
         });
         pipeline.add_many([appsrc.upcast_ref::<gst::Element>(), &parsebin])?;
         gst::Element::link_many([appsrc.upcast_ref::<gst::Element>(), &parsebin])?;
@@ -4749,6 +4761,45 @@ mod tests {
         assert!(job.failed().is_none(), "remux failed: {:?}", job.failed());
         let playlist = std::fs::read_to_string(out.path().join("master.m3u8")).unwrap();
         assert!(playlist.contains("#EXTINF"), "no segments: {playlist}");
+    }
+
+    /// parsebin keeps its parser for everything except AV1.
+    ///
+    /// The general form of this rule — block wherever `parser_for` has
+    /// an answer, one parser per stream — was tried and reverted: for
+    /// h264 out of MP4 it makes mpegtsmux emit a bare 9-byte PPS as its
+    /// own timestamp-less PES once per keyframe, which the sweep flags
+    /// as `[bad dts] 1 missing` (6 of 60 files). The parser's output
+    /// bytes are identical either way; the second parse re-segments
+    /// them, and that is what keeps the muxer's PES boundaries honest.
+    ///
+    /// This guards the DECISION, not the defect. A synthetic fixture
+    /// does not reproduce it — measured: `qtdemux ! h264parse !
+    /// mpegtsmux` over a rendered mp4 gives 0 timestamp-less packets,
+    /// over a real one 106 — so the end-to-end property belongs to the
+    /// corpus sweep, which is what caught it.
+    #[test]
+    fn only_av1_is_kept_from_parsebins_parser() {
+        crate::init().unwrap();
+        let caps = |n: &str| gst::Caps::builder(n).build();
+        assert!(parsebin_must_not_parse(&caps("video/x-av1")));
+        for name in [
+            "video/x-h264",
+            "video/x-h265",
+            "video/x-vp9",
+            "audio/mpeg",
+            "audio/x-ac3",
+            // Containers: parsebin must always be free to demux.
+            "video/quicktime",
+            "video/x-matroska",
+        ] {
+            assert!(
+                !parsebin_must_not_parse(&caps(name)),
+                "{name} would lose parsebin's parser; only AV1 may"
+            );
+            // The codecs above still get a parser from us afterwards —
+            // that is the double parse the h264 path depends on.
+        }
     }
 
     /// The corpus sweep's first catch: MP4 with the moov atom at the end
