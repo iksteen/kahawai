@@ -279,6 +279,18 @@ How something works and why it was built that way belong in
       transcode), and ExoPlayer errors after 3.5x the declared value of
       no change. A larger declaration only widens that margin. See
       HUB-18.*
+      *KNOWN DEFECT (2026-08-04): an AV1 stream COPY produces no
+      segments — the session dies on "remux produced no playlist in
+      time" and any client that decodes AV1 natively cannot play those
+      54 files. It transcodes fine, so it only bites the copy path.
+      Ruled out by measurement: not the GOP (a 6.7 s-GOP file fails
+      like a 66 s one), not demux speed (30 min of media walked in
+      40 s), not segment-format choice (fMP4 correctly selected), not
+      muxer capability (`av1parse ! isofmp4mux` with an eac3 pad writes
+      418 MB standalone), and not the pacer (unchanged with the window
+      set to ~forever). Remaining suspects: our `fmp4sink` appsink
+      wrapper, the appsrc/lease source, or `parsebin` vs an explicit
+      `av1parse`.*
 - [x] HUB-18 Sessions: per-user concurrency caps, progress checkpoints/resume,
       idle reaping, seek-anywhere with pipeline restart
 - [ ] HUB-19 Music: playback + queue live *(gapless delivery and ReplayGain
