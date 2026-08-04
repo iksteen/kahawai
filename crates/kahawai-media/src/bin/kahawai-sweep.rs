@@ -200,20 +200,36 @@ fn sweep_in_child(exe: &Path, path: &Path, full: bool) -> (Verdict, String) {
     }
 }
 
-/// Serves from an inner source until `budget` bytes have been read in
-/// total (seeks are free — the moov probe at the tail must succeed), then
-/// reports EOF. Head-sweeps whole libraries in seconds per file.
+/// The tail kept alongside the head, so a container whose index lives at
+/// the end (Matroska Cues, an mp4 moov, an AVI idx1) can still be read.
+const TAIL_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Serves the file's first `head` bytes and its last `tail` bytes, and
+/// reports EOF in between: a truncated file that kept its index.
+/// Head-sweeps whole libraries in seconds per file.
+///
+/// The window is a function of the OFFSET, never of how much has been
+/// read already. A cumulative budget looks equivalent and is not: the
+/// tail reads this doc has always promised are free were spending the
+/// head's allowance, so by the time anything re-read offset 0 — which
+/// parsebin's typefind does, after the demuxer has been to the end —
+/// it got EOF, and the file failed as "Can't typefind stream" having
+/// produced nothing. Five good files failed that way, and WHICH five
+/// moved between runs, because a cumulative counter makes the verdict
+/// depend on read order.
 struct BudgetSource {
     inner: kahawai_media::remux::FileSource,
-    remaining: u64,
+    head: u64,
+    tail: u64,
     exhausted: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl BudgetSource {
-    fn new(inner: kahawai_media::remux::FileSource, budget: u64) -> Self {
+    fn new(inner: kahawai_media::remux::FileSource, head: u64, tail: u64) -> Self {
         Self {
             inner,
-            remaining: budget,
+            head,
+            tail,
             exhausted: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
@@ -225,14 +241,23 @@ impl kahawai_media::remux::RemuxSource for BudgetSource {
     }
 
     fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> std::io::Result<usize> {
-        if self.remaining == 0 {
+        let size = self.inner.size();
+        // `--full` passes u64::MAX, which makes the head the whole file.
+        let head_end = self.head.min(size);
+        let end = if offset < head_end {
+            head_end
+        } else if offset >= size.saturating_sub(self.tail) {
+            size
+        } else {
+            self.exhausted.store(true, Ordering::Relaxed);
+            return Ok(0);
+        };
+        let cap = ((end - offset) as usize).min(buf.len());
+        if cap == 0 {
             self.exhausted.store(true, Ordering::Relaxed);
             return Ok(0);
         }
-        let cap = (self.remaining as usize).min(buf.len());
-        let n = self.inner.read_at(offset, &mut buf[..cap])?;
-        self.remaining -= n as u64;
-        Ok(n)
+        self.inner.read_at(offset, &mut buf[..cap])
     }
 }
 
@@ -328,7 +353,7 @@ fn sweep_one(
         Ok(s) => s,
         Err(e) => return (Verdict::Fail, format!("[open] {e}")),
     };
-    let budget = BudgetSource::new(src, if full { u64::MAX } else { HEAD_BYTES });
+    let budget = BudgetSource::new(src, if full { u64::MAX } else { HEAD_BYTES }, TAIL_BYTES);
     let truncated = budget.exhausted.clone();
     let job = match kahawai_media::remux::start(out.path(), plan, Box::new(budget)) {
         Ok(j) => j,
@@ -494,4 +519,46 @@ fn video_dts_defects(seg: &Path) -> (usize, usize) {
         }
     }
     (missing, ooo)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kahawai_media::remux::RemuxSource;
+
+    /// The head must stay readable no matter what was read before it.
+    ///
+    /// This is the whole point of the window being a function of the
+    /// offset: the previous cumulative budget let a tail read (the
+    /// Matroska Cues, an mp4 moov) spend the head's allowance, so
+    /// parsebin's typefind — which reads offset 0 again after the
+    /// demuxer has been to the end — got EOF and the file failed as
+    /// "Can't typefind stream" with no output at all.
+    #[test]
+    fn the_head_survives_a_tail_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.bin");
+        std::fs::write(&path, vec![7u8; 4096]).unwrap();
+        let open = || kahawai_media::remux::FileSource::open(&path).unwrap();
+        let mut src = BudgetSource::new(open(), 1024, 1024);
+        let mut buf = [0u8; 512];
+
+        // Read the index at the tail first, as a demuxer does.
+        assert_eq!(src.read_at(3800, &mut buf).unwrap(), 296);
+        // ... and the head is still there.
+        assert_eq!(src.read_at(0, &mut buf).unwrap(), 512);
+        assert_eq!(src.read_at(512, &mut buf).unwrap(), 512);
+        assert!(!src.exhausted.load(Ordering::Relaxed));
+
+        // A read that straddles the head boundary stops at it, and the
+        // gap between head and tail reads as EOF.
+        assert_eq!(src.read_at(768, &mut buf).unwrap(), 256);
+        assert_eq!(src.read_at(2048, &mut buf).unwrap(), 0);
+        assert!(src.exhausted.load(Ordering::Relaxed));
+
+        // --full: the head is the whole file, so nothing is withheld.
+        let mut all = BudgetSource::new(open(), u64::MAX, 1024);
+        assert_eq!(all.read_at(2048, &mut buf).unwrap(), 512);
+        assert!(!all.exhausted.load(Ordering::Relaxed));
+    }
 }
