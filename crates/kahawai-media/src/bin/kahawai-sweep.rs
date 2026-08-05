@@ -406,12 +406,12 @@ fn sweep_one(
     }
     if has_ffprobe && plan.has_video() {
         for seg in &segments {
-            let (missing, ooo) = video_dts_defects(seg);
+            let (packets, untimed, ooo) = video_dts_defects(seg);
             // A packet without a DTS is not by itself a defect, so the
             // cheap scan only nominates: confirm with the decoder before
-            // failing a file. See `frames_missing_timestamps`.
-            let missing = if missing > 0 {
-                frames_missing_timestamps(seg)
+            // failing a file. See `untimed_picture_packets`.
+            let missing = if untimed > 0 {
+                untimed_picture_packets(seg, packets, untimed)
             } else {
                 0
             };
@@ -419,7 +419,7 @@ fn sweep_one(
                 return (
                     Verdict::Fail,
                     format!(
-                        "[bad dts] {}: {missing} frames without a timestamp, \
+                        "[bad dts] {}: {missing} pictures without a timestamp, \
                          {ooo} out-of-order — {codecs}",
                         seg.file_name().unwrap_or_default().to_string_lossy()
                     ),
@@ -531,19 +531,37 @@ fn segment_stream_kinds(seg: &Path) -> (bool, bool) {
 /// gets it absorbed — which is why the test below pins what it can
 /// rather than the case itself.
 ///
-/// Frames are the honest unit: this decodes and asks for
-/// `best_effort_timestamp`, which is `N/A` only when a picture really
-/// has no time. Decoding is expensive, so it runs only on segments the
-/// scan nominates.
-fn frames_missing_timestamps(seg: &Path) -> usize {
+/// So the question is not "is a timestamp missing" but "is one missing
+/// from a packet that carries a picture", and that is answerable by
+/// counting: every packet the decoder does not turn into a frame is an
+/// access unit with no picture, and is entitled to have no timestamp.
+///
+/// `best_effort_timestamp` looked like the answer and is not — ffprobe
+/// interpolates it. Measured: stripping the timestamps out of a real
+/// picture's PES header still reports every frame as timed, so a check
+/// built on it fires on nothing and only looks like a check.
+///
+/// Decoding is expensive, so this runs only on nominated segments.
+fn untimed_picture_packets(seg: &Path, packets: usize, untimed: usize) -> usize {
+    let pictureless = packets.saturating_sub(decoded_frames(seg));
+    untimed.saturating_sub(pictureless)
+}
+
+/// Video packets in `seg` that the decoder turns into a picture.
+///
+/// The difference between this and the packet count is the number of
+/// access units carrying no picture, which is what makes a timestamp
+/// legitimately absent.
+fn decoded_frames(seg: &Path) -> usize {
     let out = std::process::Command::new("ffprobe")
         .args([
             "-v",
             "error",
             "-select_streams",
             "v",
+            "-count_frames",
             "-show_entries",
-            "frame=best_effort_timestamp",
+            "stream=nb_read_frames",
             "-of",
             "csv=p=0",
         ])
@@ -552,13 +570,12 @@ fn frames_missing_timestamps(seg: &Path) -> usize {
     let Ok(out) = out else { return 0 };
     String::from_utf8_lossy(&out.stdout)
         .lines()
-        .map(|l| l.trim().trim_end_matches(','))
-        .filter(|f| !f.is_empty())
-        .filter(|f| f.parse::<i64>().is_err())
-        .count()
+        .find_map(|l| l.trim().trim_end_matches(',').parse::<usize>().ok())
+        .unwrap_or(0)
 }
 
-fn video_dts_defects(seg: &Path) -> (usize, usize) {
+/// `(packets, without a DTS, out of order)` for the video stream.
+fn video_dts_defects(seg: &Path) -> (usize, usize, usize) {
     let out = std::process::Command::new("ffprobe")
         .args([
             "-v",
@@ -572,14 +589,15 @@ fn video_dts_defects(seg: &Path) -> (usize, usize) {
         ])
         .arg(seg)
         .output();
-    let Ok(out) = out else { return (0, 0) };
-    let (mut missing, mut ooo) = (0, 0);
+    let Ok(out) = out else { return (0, 0, 0) };
+    let (mut packets, mut missing, mut ooo) = (0, 0, 0);
     let mut prev: Option<i64> = None;
     for line in String::from_utf8_lossy(&out.stdout).lines() {
         let field = line.trim().trim_end_matches(',');
         if field.is_empty() {
             continue;
         }
+        packets += 1;
         match field.parse::<i64>() {
             Ok(dts) => {
                 if prev.is_some_and(|p| dts < p) {
@@ -590,7 +608,7 @@ fn video_dts_defects(seg: &Path) -> (usize, usize) {
             Err(_) => missing += 1,
         }
     }
-    (missing, ooo)
+    (packets, missing, ooo)
 }
 
 #[cfg(test)]
@@ -685,27 +703,71 @@ mod tests {
             .expect("muxing timed out");
         pipeline.set_state(gstreamer::State::Null).unwrap();
 
-        let (missing, ooo) = video_dts_defects(&ts);
+        let (packets, untimed, ooo) = video_dts_defects(&ts);
         assert_eq!(ooo, 0, "nothing here is out of order");
         assert_eq!(
-            frames_missing_timestamps(&ts),
+            untimed_picture_packets(&ts, packets, untimed),
             0,
             "every picture in a freshly muxed clip has a timestamp"
         );
-        // The muxer only adds parameter sets when the stream does not
-        // already carry them, and x264enc keeps them in band — so this
-        // clip does not always exhibit the packet the confirmation step
-        // exists for. When it does, the two must disagree, because that
-        // disagreement IS the fix. Reproducing it on demand needs a
-        // stream whose config lives out of band, which no synthetic
-        // pipeline here produced; the library files that show it are in
-        // the commit message.
-        if missing > 0 {
-            assert_eq!(
-                frames_missing_timestamps(&ts),
-                0,
-                "a packet without a DTS must not by itself condemn a segment"
-            );
+
+        // Now damage it, because a check that cannot fail is not a
+        // check. Strip the timestamps out of one picture's PES header:
+        // the packet loses its DTS while still carrying a picture,
+        // which is the defect the sweep is meant to catch — and is
+        // exactly what a parameter-set packet is NOT.
+        let damaged = dir.path().join("damaged.ts");
+        std::fs::write(&damaged, strip_one_picture_timestamp(&std::fs::read(&ts).unwrap()))
+            .unwrap();
+        let (packets, untimed, _) = video_dts_defects(&damaged);
+        assert_eq!(untimed, 1, "the damage did not land");
+        assert_eq!(
+            untimed_picture_packets(&damaged, packets, untimed),
+            1,
+            "a picture without a timestamp must still be caught"
+        );
+    }
+
+    /// Blank the PTS/DTS flags of one video PES header, in place.
+    ///
+    /// Transport stream, so: 188-byte packets, the video PID is the one
+    /// whose payload starts a video PES, and the timestamp flags live
+    /// in the third byte of the PES header extension. The declared
+    /// header length stays as it is and its bytes become stuffing,
+    /// which is what a real muxer would leave behind.
+    fn strip_one_picture_timestamp(ts: &[u8]) -> Vec<u8> {
+        const PKT: usize = 188;
+        let mut out = ts.to_vec();
+        let payload_offset = |p: &[u8]| -> Option<usize> {
+            match (p[3] >> 4) & 3 {
+                1 => Some(4),
+                3 => Some(5 + p[4] as usize),
+                _ => None,
+            }
+        };
+        // Skip the first few pictures: the very first one anchors the
+        // stream, and damaging it changes what the decoder can do at all.
+        let mut seen = 0;
+        for off in (0..out.len().saturating_sub(PKT)).step_by(PKT) {
+            let p = &out[off..off + PKT];
+            if p[0] != 0x47 || p[1] & 0x40 == 0 {
+                continue;
+            }
+            let Some(o) = payload_offset(p) else { continue };
+            if p.get(o..o + 4) != Some(&[0x00, 0x00, 0x01, 0xE0]) || p[o + 7] & 0xC0 == 0 {
+                continue;
+            }
+            seen += 1;
+            if seen < 8 {
+                continue;
+            }
+            let hdr_len = p[o + 8] as usize;
+            out[off + o + 7] = 0x00; // PTS_DTS_flags = none
+            for k in 0..hdr_len {
+                out[off + o + 9 + k] = 0xFF;
+            }
+            break;
         }
+        out
     }
 }
