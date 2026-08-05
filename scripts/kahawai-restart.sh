@@ -72,6 +72,21 @@ fi
 [ -z "$(pids)" ] || { echo "FAILED to stop $svc" >&2; exit 1; }
 echo "==> stopped" >&2
 
+# A locally staged codec stack, if one is present: patches/gstreamer/
+# 0004 changes the size of a public H.264 struct, so the plugins holding
+# one must come from the same build as the library. Kahawai-only on
+# purpose — a plugin here is invisible to every other GStreamer program
+# on the box, so nothing else can end up mixing the two ABIs. The
+# plugins carry an RPATH to the matching library, and this exports the
+# path anyway so a hand-run gst-launch against the same directory
+# behaves like the service does.
+gst_local="$HOME/.local/lib/kahawai-gst"
+if [ -d "$gst_local/plugins" ]; then
+  export GST_PLUGIN_PATH="$gst_local/plugins${GST_PLUGIN_PATH:+:$GST_PLUGIN_PATH}"
+  export LD_LIBRARY_PATH="$gst_local/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+  echo "==> staged plugins: $gst_local/plugins" >&2
+fi
+
 log="${KAHAWAI_LOG_DIR:-$HOME/.local/share/kahawai}/${svc}.log"
 mkdir -p "$(dirname "$log")"
 # Relative exec path so the anchored/bracketed pattern keeps matching.
