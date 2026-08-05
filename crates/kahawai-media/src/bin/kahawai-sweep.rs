@@ -407,11 +407,20 @@ fn sweep_one(
     if has_ffprobe && plan.has_video() {
         for seg in &segments {
             let (missing, ooo) = video_dts_defects(seg);
+            // A packet without a DTS is not by itself a defect, so the
+            // cheap scan only nominates: confirm with the decoder before
+            // failing a file. See `frames_missing_timestamps`.
+            let missing = if missing > 0 {
+                frames_missing_timestamps(seg)
+            } else {
+                0
+            };
             if missing + ooo > 0 {
                 return (
                     Verdict::Fail,
                     format!(
-                        "[bad dts] {}: {missing} missing, {ooo} out-of-order — {codecs}",
+                        "[bad dts] {}: {missing} frames without a timestamp, \
+                         {ooo} out-of-order — {codecs}",
                         seg.file_name().unwrap_or_default().to_string_lossy()
                     ),
                 );
@@ -495,6 +504,48 @@ fn segment_stream_kinds(seg: &Path) -> (bool, bool) {
 }
 
 /// (missing_dts, non_monotonic) video packets per segment, via ffprobe.
+/// Pictures in `seg` that reach the decoder without a timestamp.
+///
+/// The cheap packet scan cannot answer this, and read literally it is
+/// wrong: `mpegtsmux` writes the parameter sets once per keyframe as a
+/// picture-less access unit — 10 bytes of SPS/PPS, so a receiver can
+/// join mid-stream — and an access unit with no picture has nothing to
+/// present, so it carries no DTS. `ffprobe` reports that as a packet
+/// with `dts=N/A`, which the scan counted as a missing timestamp.
+///
+/// Whether it appears as its own packet or is packed into the
+/// neighbouring picture's PES depends on where the segment was cut, so
+/// the scan fired on 19 files of ~6500 and passed their near-identical
+/// neighbours — every one of them playable, and every frame in them
+/// correctly timed (2026-08-05).
+///
+/// Frames are the honest unit: this decodes and asks for
+/// `best_effort_timestamp`, which is `N/A` only when a picture really
+/// has no time. Decoding is expensive, so it runs only on segments the
+/// scan nominates.
+fn frames_missing_timestamps(seg: &Path) -> usize {
+    let out = std::process::Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "v",
+            "-show_entries",
+            "frame=best_effort_timestamp",
+            "-of",
+            "csv=p=0",
+        ])
+        .arg(seg)
+        .output();
+    let Ok(out) = out else { return 0 };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|l| l.trim().trim_end_matches(','))
+        .filter(|f| !f.is_empty())
+        .filter(|f| f.parse::<i64>().is_err())
+        .count()
+}
+
 fn video_dts_defects(seg: &Path) -> (usize, usize) {
     let out = std::process::Command::new("ffprobe")
         .args([
@@ -569,5 +620,80 @@ mod tests {
         let mut all = BudgetSource::new(open(), u64::MAX, 1024);
         assert_eq!(all.read_at(2048, &mut buf).unwrap(), 512);
         assert!(!all.exhausted.load(Ordering::Relaxed));
+    }
+
+    /// The packet scan nominates; the decoder decides.
+    ///
+    /// mpegtsmux writes the parameter sets once per keyframe as a
+    /// picture-less access unit, which has nothing to present and so
+    /// carries no DTS. Reading that as a missing timestamp failed 19
+    /// perfectly playable files and — worse — taught us to skim past
+    /// `[bad dts]`, which is how a real one would have been missed.
+    ///
+    /// Everything here comes out of a muxer, so it needs no fixture and
+    /// no library.
+    #[test]
+    fn a_parameter_set_only_packet_is_not_a_missing_timestamp() {
+        if std::process::Command::new("ffprobe")
+            .arg("-version")
+            .output()
+            .is_err()
+        {
+            eprintln!("no ffprobe; skipped");
+            return;
+        }
+        use gstreamer::prelude::*;
+
+        kahawai_media::init().unwrap();
+        for el in ["x264enc", "mpegtsmux"] {
+            if gstreamer::ElementFactory::find(el).is_none() {
+                eprintln!("no {el}; skipped");
+                return;
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let ts = dir.path().join("clip.ts");
+        // key-int-max=12 at 24 fps: a keyframe every half second, so the
+        // muxer repeats the parameter sets several times in a 2 s clip.
+        let pipeline = gstreamer::parse::launch(&format!(
+            "videotestsrc num-buffers=48 ! video/x-raw,framerate=24/1,width=320,height=180 ! \
+             x264enc key-int-max=12 ! h264parse ! mpegtsmux ! filesink location={}",
+            ts.display()
+        ))
+        .expect("pipeline");
+        pipeline.set_state(gstreamer::State::Playing).unwrap();
+        pipeline
+            .bus()
+            .unwrap()
+            .timed_pop_filtered(
+                gstreamer::ClockTime::from_seconds(30),
+                &[gstreamer::MessageType::Eos, gstreamer::MessageType::Error],
+            )
+            .expect("muxing timed out");
+        pipeline.set_state(gstreamer::State::Null).unwrap();
+
+        let (missing, ooo) = video_dts_defects(&ts);
+        assert_eq!(ooo, 0, "nothing here is out of order");
+        assert_eq!(
+            frames_missing_timestamps(&ts),
+            0,
+            "every picture in a freshly muxed clip has a timestamp"
+        );
+        // The muxer only adds parameter sets when the stream does not
+        // already carry them, and x264enc keeps them in band — so this
+        // clip does not always exhibit the packet the confirmation step
+        // exists for. When it does, the two must disagree, because that
+        // disagreement IS the fix. Reproducing it on demand needs a
+        // stream whose config lives out of band, which no synthetic
+        // pipeline here produced; the library files that show it are in
+        // the commit message.
+        if missing > 0 {
+            assert_eq!(
+                frames_missing_timestamps(&ts),
+                0,
+                "a packet without a DTS must not by itself condemn a segment"
+            );
+        }
     }
 }
