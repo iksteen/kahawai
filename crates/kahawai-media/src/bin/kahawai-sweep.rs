@@ -519,6 +519,18 @@ fn segment_stream_kinds(seg: &Path) -> (bool, bool) {
 /// neighbours — every one of them playable, and every frame in them
 /// correctly timed (2026-08-05).
 ///
+/// The streams that provoke it share a signature, measured on their own
+/// samples rather than inferred: a lone in-band PPS before every
+/// keyframe, no SPS in band at all (it lives in `avcC`), and no access
+/// unit delimiters, so the muxer inserts its own. House of Cards S04E05
+/// carries 622 PPS against 623 IDRs and zero SPS; its output then holds
+/// 15 PPS against 2 SPS for 14 keyframes, and the surplus PPS are the
+/// picture-less access units. Not reproducible from any pipeline built
+/// here — x264enc, openh264enc and nvh264enc all keep SPS and PPS
+/// paired, and hand-feeding the muxer an untimed parameter-set buffer
+/// gets it absorbed — which is why the test below pins what it can
+/// rather than the case itself.
+///
 /// Frames are the honest unit: this decodes and asks for
 /// `best_effort_timestamp`, which is `N/A` only when a picture really
 /// has no time. Decoding is expensive, so it runs only on segments the
