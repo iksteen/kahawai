@@ -279,12 +279,19 @@ How something works and why it was built that way belong in
       so a segmenter cutting on a time grid would make the declared
       value a constant of our choosing and delete this whole
       mechanism. Not built: no shipped GStreamer segmenter does it.*
-      *This does NOT fix the ExoPlayer hang it was prompted by. That is
-      a liveness failure — the pacer holds production at viewer+120 s,
-      the playlist stops changing for 40+ s (measured, copy AND
+      *This does NOT fix the ExoPlayer hang it was prompted by; the
+      pacer does. That was a liveness failure — production held at
+      viewer+120 s, the playlist unchanged for 40+ s (measured, copy AND
       transcode), and ExoPlayer errors after 3.5x the declared value of
-      no change. A larger declaration only widens that margin. See
-      HUB-18.*
+      no change — and a larger declaration only widened the margin. The
+      pacer now releases on playlist age as well as viewer position, so
+      a client that never reports a position keeps being served at
+      about real time instead of freezing: measured on a live session,
+      20 segments then frozen for 65 s before, 20 → 33 segments (1.03x)
+      after. A paused player never tripped it in the first place — that
+      claim was wrong, see `kahawai-implementation.md` §4.6 — and a VOD
+      playlist would remove the contradiction rather than bound it, but
+      nothing observed now requires one: `kahawai-vod-plan.md`.*
 - [x] HUB-18 Sessions: per-user concurrency caps, progress checkpoints/resume,
       idle reaping, seek-anywhere with pipeline restart
 - [ ] HUB-19 Music: playback + queue live *(gapless delivery and ReplayGain

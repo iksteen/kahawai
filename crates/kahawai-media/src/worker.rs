@@ -119,6 +119,12 @@ pub fn run_parts(
         floor_ms: start_ms,
         viewer_file: out_dir.join("viewer.pos"),
         out_dir: out_dir.to_path_buf(),
+        // Unset: take the allowance from the playlist's own target
+        // duration, which is the number the client's stuck check is
+        // derived from. Set it (0 = off) only to pin the behaviour.
+        stale_ms: std::env::var("KAHAWAI_PACE_STALE_MS")
+            .ok()
+            .and_then(|v| v.parse().ok()),
     };
     let job = remux::start_parts(
         out_dir,

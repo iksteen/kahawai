@@ -3013,6 +3013,14 @@ pub fn start_at(
 /// `viewer_file`, absolute ms; absent = `floor_ms`). In-band and
 /// deterministic — polling pause/resume loses to pipelines that finish
 /// a file between two polls.
+///
+/// The window alone is not safe on its own, because a client that never
+/// reports a position leaves `viewer_file` at the floor: production
+/// then stops for good at floor+window and the playlist stops changing
+/// with it. A LIVE playlist that stops changing is a client-side error
+/// — ExoPlayer's `PlaylistStuckException` fires after 3.5 target
+/// durations of no change — so the pacer also releases on playlist AGE
+/// (`stale_ms`), which is what keeps a non-reporting viewer playing.
 pub struct PaceConfig {
     pub window_ms: u64,
     pub floor_ms: u64,
@@ -3020,6 +3028,106 @@ pub struct PaceConfig {
     /// HUB-36: where to drop `pace.json` — the run dir, alongside
     /// `start.pos` and `viewer.pos`.
     pub out_dir: std::path::PathBuf,
+    /// Let production through once `master.m3u8` has been untouched for
+    /// this long, whatever the viewer says. `None` reads the allowance
+    /// from the playlist's own target duration; `Some(0)` turns the
+    /// release off and leaves the window alone.
+    ///
+    /// Self-limiting rather than a widened window: the escape holds only
+    /// until the sink closes the next segment and rewrites the playlist,
+    /// at which point the file is fresh and the window blocks again. A
+    /// stalled session therefore produces about one segment per
+    /// allowance — roughly real time, since a segment is about one
+    /// target duration of media — instead of freezing or running away.
+    pub stale_ms: Option<u64>,
+}
+
+/// Staleness allowance before any playlist says otherwise.
+pub const PACE_STALE_FALLBACK_MS: u64 = 6_000;
+
+/// A LIVE client's own bound: ExoPlayer's `DefaultHlsPlaylistTracker`
+/// errors after this many declared target durations of no change.
+const CLIENT_STUCK_TARGETS: f64 = 3.5;
+
+/// How much of that bound we are willing to spend. The rest pays for
+/// the segment's own production, which is not instant — a heavy GOP has
+/// been measured at 3.5 s against a ~2 s cadence.
+const STALE_SAFETY: f64 = 0.7;
+
+/// How long the playlist may sit unchanged before the pacer lets a
+/// segment through, read from the playlist the sink is writing.
+///
+/// Two numbers, and the smaller wins:
+///
+/// - **the longest segment** the playlist lists. Each release produces
+///   about one segment, so this is what sets the leak rate: allowing one
+///   segment's worth of wall time per segment of media paces a
+///   non-reporting viewer at about real time, which is the most it can
+///   consume anyway. Measured before this was in: a session declaring 2
+///   while cutting 5.18 s GOPs released every 2 s and ran at 2.6x,
+///   which is most of the pacing window given away.
+/// - **the client's tolerance**, `3.5 x EXT-X-TARGETDURATION`, spent at
+///   70%. A declaration that undersells the real segment length (the
+///   `ignore` profile keeps a constant 2) makes the client the binding
+///   constraint, and being right with the client beats pacing.
+///
+/// Read fresh each time rather than cached: a sink's first playlist can
+/// precede both its final target duration and its typical segment.
+fn playlist_stale_allowance_ms(playlist: &std::path::Path, configured: Option<u64>) -> u64 {
+    if let Some(ms) = configured {
+        return ms;
+    }
+    let Ok(text) = std::fs::read_to_string(playlist) else {
+        return PACE_STALE_FALLBACK_MS;
+    };
+    let declared = text.lines().find_map(|l| {
+        l.strip_prefix("#EXT-X-TARGETDURATION:")?
+            .trim()
+            .parse::<f64>()
+            .ok()
+    });
+    let longest = text
+        .lines()
+        .filter_map(|l| l.strip_prefix("#EXTINF:")?.trim_end_matches(',').parse::<f64>().ok())
+        .fold(f64::NAN, f64::max);
+
+    let client_cap = declared
+        .filter(|d| *d > 0.0)
+        .map(|d| d * CLIENT_STUCK_TARGETS * STALE_SAFETY);
+    let paced = if longest.is_finite() && longest > 0.0 {
+        Some(longest)
+    } else {
+        None
+    };
+    // Rounded, not truncated: 3.5 x 0.7 lands a millisecond short of
+    // the number the comment claims, which reads as a bug forever after.
+    match (paced, client_cap) {
+        (Some(p), Some(c)) => (p.min(c) * 1000.0).round() as u64,
+        (Some(v), None) | (None, Some(v)) => (v * 1000.0).round() as u64,
+        (None, None) => PACE_STALE_FALLBACK_MS,
+    }
+}
+
+/// Whether the playlist has gone unwritten long enough to release the
+/// pacer. `allow_ms` of 0 never releases.
+///
+/// A missing playlist counts as stale. Nothing has been produced yet,
+/// so there is no viewer to pace against and no segment for a client to
+/// be sitting on — holding production there would stall a start rather
+/// than protect anything. In a real session the window is minutes wide
+/// and the first segment lands long before it shuts, so this arm is
+/// reached only by a restart's empty directory or a degenerate window.
+fn playlist_stale(playlist: &std::path::Path, allow_ms: u64) -> bool {
+    if allow_ms == 0 {
+        return false;
+    }
+    match std::fs::metadata(playlist).and_then(|m| m.modified()) {
+        Ok(modified) => modified
+            .elapsed()
+            .map(|age| age.as_millis() as u64 >= allow_ms)
+            .unwrap_or(false),
+        Err(_) => true,
+    }
 }
 
 /// HUB-36: how fast this box ACTUALLY produced content, measured only
@@ -3142,6 +3250,19 @@ fn install_pace_probe(
                     if !m.done {
                         m.finish(produced_ms, &cfg.out_dir);
                     }
+                }
+                // Release on playlist age as well as viewer position. A
+                // viewer that never reports leaves the window shut for
+                // good, and a LIVE playlist that never changes is a
+                // client error, not a quiet server. Measured after the
+                // meter so the throttle still marks the end of the
+                // honest measurement.
+                let playlist = cfg.out_dir.join("master.m3u8");
+                if playlist_stale(
+                    &playlist,
+                    playlist_stale_allowance_ms(&playlist, cfg.stale_ms),
+                ) {
+                    break;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(200));
             }
@@ -4293,6 +4414,151 @@ mod concat_spike {
         assert!(
             longest - shortest < 0.2,
             "segments are not one GOP each (min {shortest:.3}, max {longest:.3}): {body:?}"
+        );
+    }
+
+    /// A viewer that never reports must not freeze the session.
+    ///
+    /// `viewer.pos` absent and a zero-width window is the shape of the
+    /// stall measured at 42 s (copy) and 47 s (transcode): the pacer
+    /// shuts after the first buffer, nothing reopens it, the playlist
+    /// stops changing, and a LIVE client calls that an error. The age
+    /// release is what reopens it — with the release off, the same
+    /// pipeline does not finish at all, which is the control that says
+    /// the release is what did it and not the fixture being too small
+    /// to pace.
+    #[test]
+    fn a_stale_playlist_releases_a_shut_pacing_window() {
+        crate::init().unwrap();
+        for el in ["hlssink3", "x264enc"] {
+            if gst::ElementFactory::find(el).is_none() {
+                eprintln!("no {el}; skipped");
+                return;
+            }
+        }
+
+        // Returns (reached EOS, segments listed).
+        let run = |stale_ms: Option<u64>, secs: u64| -> (bool, usize) {
+            let dir = tempfile::tempdir().unwrap();
+            let out = dir.path().join("hls");
+            std::fs::create_dir_all(&out).unwrap();
+            let (sink, _) = make_hls_sink(&out, Some("hlssink3")).unwrap();
+
+            let pipeline = gst::Pipeline::new();
+            let src = gst::ElementFactory::make("videotestsrc")
+                .property("num-buffers", 120i32) // 5 s at 24
+                .build()
+                .unwrap();
+            let caps = gst::ElementFactory::make("capsfilter")
+                .property(
+                    "caps",
+                    gst::Caps::builder("video/x-raw")
+                        .field("framerate", gst::Fraction::new(24, 1))
+                        .field("width", 320i32)
+                        .field("height", 180i32)
+                        .build(),
+                )
+                .build()
+                .unwrap();
+            // Second-long GOPs: several segments inside a short run.
+            let enc = gst::ElementFactory::make("x264enc")
+                .property("key-int-max", 24u32)
+                .build()
+                .unwrap();
+            let parse = gst::ElementFactory::make("h264parse").build().unwrap();
+            pipeline
+                .add_many([&src, &caps, &enc, &parse, &sink])
+                .unwrap();
+            gst::Element::link_many([&src, &caps, &enc, &parse]).unwrap();
+
+            let stopping = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            install_pace_probe(
+                &parse.static_pad("src").unwrap(),
+                Arc::new(PaceConfig {
+                    // Zero window: every buffer past the floor is held,
+                    // so only the age release can let anything through.
+                    window_ms: 0,
+                    floor_ms: 0,
+                    // Never written — the non-reporting client.
+                    viewer_file: out.join("viewer.pos"),
+                    out_dir: out.clone(),
+                    stale_ms,
+                }),
+                stopping.clone(),
+                None,
+            );
+            let pad = sink.request_pad_simple("video").unwrap();
+            parse.static_pad("src").unwrap().link(&pad).unwrap();
+
+            // Not run_to_eos: the probe holds a streaming thread, and
+            // NULL waits for that thread, so the stop flag has to be
+            // set BEFORE the transition or teardown deadlocks — the
+            // control case blocks forever by construction.
+            pipeline.set_state(gst::State::Playing).unwrap();
+            let msg = pipeline.bus().unwrap().timed_pop_filtered(
+                gst::ClockTime::from_seconds(secs),
+                &[gst::MessageType::Eos, gst::MessageType::Error],
+            );
+            stopping.store(true, std::sync::atomic::Ordering::SeqCst);
+            let _ = pipeline.set_state(gst::State::Null);
+
+            let segments = std::fs::read_to_string(out.join("master.m3u8"))
+                .map(|p| p.matches("#EXTINF:").count())
+                .unwrap_or(0);
+            (
+                matches!(msg.map(|m| m.type_()), Some(gst::MessageType::Eos)),
+                segments,
+            )
+        };
+
+        let (eos, segments) = run(Some(100), 60);
+        assert!(eos, "a stale playlist did not release the pacer");
+        assert!(
+            segments >= 3,
+            "released, but produced {segments} segments — the playlist would still look frozen"
+        );
+
+        let (control_eos, _) = run(Some(0), 5);
+        assert!(
+            !control_eos,
+            "the control finished with the release off, so the window was never shut \
+             and this test proves nothing"
+        );
+    }
+
+    /// The allowance decides how much of the pacing window a
+    /// non-reporting viewer gets back, so both of its inputs matter.
+    #[test]
+    fn the_stale_allowance_paces_by_segment_and_defers_to_the_client() {
+        let dir = tempfile::tempdir().unwrap();
+        let pl = dir.path().join("master.m3u8");
+        let write = |body: &str| std::fs::write(&pl, body).unwrap();
+
+        // An explicit setting wins outright, including "never".
+        write("#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6.0,\na.ts\n");
+        assert_eq!(playlist_stale_allowance_ms(&pl, Some(1234)), 1234);
+        assert_eq!(playlist_stale_allowance_ms(&pl, Some(0)), 0);
+
+        // Honest declaration: the segment sets the pace (6 s of media
+        // per 6 s of wall ≈ real time), well inside the client's 21 s.
+        assert_eq!(playlist_stale_allowance_ms(&pl, None), 6_000);
+
+        // The `ignore` profile's constant 2 against 5.18 s GOPs — the
+        // case measured at 2.6x. The client's 3.5 x 2 x 0.7 = 4.9 s now
+        // binds instead of the declared 2 s.
+        write("#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXTINF:5.18,\na.ts\n#EXTINF:4.0,\nb.ts\n");
+        assert_eq!(playlist_stale_allowance_ms(&pl, None), 4_900);
+
+        // Nothing to go on yet: the fallback, not zero — zero would
+        // mean "never release" and re-freeze the session.
+        write("#EXTM3U\n");
+        assert_eq!(
+            playlist_stale_allowance_ms(&pl, None),
+            PACE_STALE_FALLBACK_MS
+        );
+        assert_eq!(
+            playlist_stale_allowance_ms(&dir.path().join("nope.m3u8"), None),
+            PACE_STALE_FALLBACK_MS
         );
     }
 
