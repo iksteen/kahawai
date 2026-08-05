@@ -1,4 +1,4 @@
-From 77713eaba4e57a37c2da2f23ca3373ee98e27ced Mon Sep 17 00:00:00 2001
+From 31d5a6a4d70ce92311a71e569867792dffda0df4 Mon Sep 17 00:00:00 2001
 From: Ingmar Steen <iksteen@gmail.com>
 Date: Wed, 5 Aug 2026 07:23:08 +0200
 Subject: [PATCH] codecparsers: h264: allow a full dec_ref_pic_marking()
@@ -10,27 +10,31 @@ asked for, so the decoder keeps pictures the encoder evicted and every
 following P/B frame predicts from the wrong references. Nothing resets
 it: decoding stays wrong until the next IDR, and an open GOP has none.
 
-The standard sets no explicit bound (7.3.3.3). What bounds the loop in
-practice is the reference set the operations can address - up to 16
-short-term and 16 long-term pictures - plus the operations that set the
-long-term maximum and mark the current picture. Ten is below what a
-conforming stream may legally send, and encoders do send more: an
-ordinary fansubbed release evicts fifteen short-term references in one
-non-IDR slice header when it opens a new GOP, with num_ref_frames=16.
+The standard sets no explicit bound (7.3.3.3). What bounds the loop is
+the reference set the operations can address: A.3 bounds MaxDpbFrames
+at 16 and each reference frame has two fields, so 32 references, each
+of which may in the worst case be moved to the long-term list (type 3)
+and then discarded from it (type 2), plus three operations to set the
+long-term maximum (type 4), mark the current picture as long-term
+(type 6) and end the process (type 0). That is the bound libavcodec
+has used for years as H264_MAX_MMCO_COUNT.
 
-Measured on such a file, 750 slices:
+Ten is below what a conforming stream may legally send, and encoders do
+send more: an ordinary fansubbed release with num_ref_frames=16 evicts
+fifteen short-term references in one non-IDR slice header when it opens
+a new GOP. Measured on such a file, its first 750 slices:
 
-  ref_pic_marking[10]:  7 parse failures, first at slice 250
-  ref_pic_marking[34]:  0 parse failures, 15 operations parsed
+  ref_pic_marking[10]:  7 parse failures, first at the 251st slice
+  ref_pic_marking[67]:  0 parse failures, largest marking 15
 
 and through nvh264dec, against libavcodec frame by frame:
 
-  before:  692 frames, 442 differing, wrong from frame 250 onward
-  after:   699 frames,   0 differing, bit-exact
+  before:  700 frames, 450 differing, wrong from frame 250 onward
+  after:   700 frames,   0 differing, bit-exact
 
 The seven frames the decoder had been dropping are the seven headers it
 could not parse. ffmpeg decodes the same file correctly on the same
-hardware, including via NVDEC, because its own limit is 66.
+hardware, including via NVDEC, because of the larger limit above.
 
 This affects every decoder built on the parser - vah264dec,
 d3d11h264dec, v4l2slh264dec and nvh264dec alike - and it is silent:
@@ -40,14 +44,14 @@ Growing the array changes the size of the public GstH264DecRefPicMarking
 and of GstH264SliceHdr, which embeds it by value, so this is an ABI
 break and cannot be backported to a stable branch as it stands.
 ---
- .../gst-libs/gst/codecparsers/gsth264parser.h    | 16 +++++++++++++++-
- 1 file changed, 15 insertions(+), 1 deletion(-)
+ .../gst-libs/gst/codecparsers/gsth264parser.h | 20 ++++++++++++++++++-
+ 1 file changed, 19 insertions(+), 1 deletion(-)
 
 diff --git a/subprojects/gst-plugins-bad/gst-libs/gst/codecparsers/gsth264parser.h b/subprojects/gst-plugins-bad/gst-libs/gst/codecparsers/gsth264parser.h
-index 4485b916942..478f932b051 100644
+index 4485b916942..d372ca65353 100644
 --- a/subprojects/gst-plugins-bad/gst-libs/gst/codecparsers/gsth264parser.h
 +++ b/subprojects/gst-plugins-bad/gst-libs/gst/codecparsers/gsth264parser.h
-@@ -971,6 +971,20 @@ struct _GstH264PredWeightTable
+@@ -971,6 +971,24 @@ struct _GstH264PredWeightTable
    gint8 chroma_offset_l1[32][2];
  };
  
@@ -56,19 +60,23 @@ index 4485b916942..478f932b051 100644
 + *
 + * Maximum number of memory management control operations one
 + * dec_ref_pic_marking() can carry. The standard sets no explicit bound
-+ * (7.3.3.3); what bounds it in practice is the reference set those
-+ * operations can address - up to 16 short-term and 16 long-term
-+ * pictures, plus the operations that set the long-term maximum and mark
-+ * the current picture.
++ * (7.3.3.3); what bounds it is the reference set those operations can
++ * address. A.3 bounds MaxDpbFrames at 16, and each reference frame has
++ * two fields, so 32 references - each of which may, in the worst case,
++ * be moved to the long-term list (type 3) and then discarded from it
++ * (type 2). Three more set the long-term maximum (type 4), mark the
++ * current picture as long-term (type 6) and end the process (type 0).
++ *
++ * The same bound libavcodec has used for years, as H264_MAX_MMCO_COUNT.
 + *
 + * Since: 1.30
 + */
-+#define GST_H264_MAX_REF_PIC_MARKINGS 34
++#define GST_H264_MAX_REF_PIC_MARKINGS 67
 +
  struct _GstH264RefPicMarking
  {
    guint8 memory_management_control_operation;
-@@ -988,7 +1002,7 @@ struct _GstH264DecRefPicMarking
+@@ -988,7 +1006,7 @@ struct _GstH264DecRefPicMarking
    guint8 long_term_reference_flag;
  
    guint8 adaptive_ref_pic_marking_mode_flag;
