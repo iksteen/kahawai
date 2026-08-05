@@ -1,0 +1,8 @@
+.git
+.gitignore
+target
+**/target
+web/node_modules
+web/dist-ssr
+*.log
+kahawai.toml

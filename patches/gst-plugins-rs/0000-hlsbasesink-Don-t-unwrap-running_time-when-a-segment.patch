@@ -1,0 +1,29 @@
+From 86d7e33cc4a0ea97dd2bcbbf9baf8b32bcadc181 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Piotr=20Brzezin=CC=81ski?= <piotr@centricular.com>
+Date: Tue, 14 Jul 2026 16:38:37 +0200
+Subject: [PATCH] hlsbasesink: Don't unwrap() running_time when a segment is
+ added
+
+It's an option for a reason...
+
+Part-of: <https://gitlab.freedesktop.org/gstreamer/gst-plugins-rs/-/merge_requests/3173>
+---
+ net/hlssink3/src/hlsbasesink.rs | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/net/hlssink3/src/hlsbasesink.rs b/net/hlssink3/src/hlsbasesink.rs
+index 521e60c7c..f3521ac63 100644
+--- a/net/hlssink3/src/hlsbasesink.rs
++++ b/net/hlssink3/src/hlsbasesink.rs
+@@ -657,7 +657,7 @@ impl HlsBaseSink {
+         self.write_playlist(context).inspect(|_res| {
+             let mut s = gst::Structure::builder("hls-segment-added")
+                 .field("location", location)
+-                .field("running-time", running_time.unwrap())
++                .field("running-time", running_time)
+                 .field("duration", duration);
+             if let Some(ts) = timestamp {
+                 s = s.field("timestamp", ts.timestamp());
+-- 
+2.55.0
+
