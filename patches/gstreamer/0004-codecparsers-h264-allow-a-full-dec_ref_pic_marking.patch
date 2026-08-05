@@ -1,0 +1,82 @@
+From 77713eaba4e57a37c2da2f23ca3373ee98e27ced Mon Sep 17 00:00:00 2001
+From: Ingmar Steen <iksteen@gmail.com>
+Date: Wed, 5 Aug 2026 07:23:08 +0200
+Subject: [PATCH] codecparsers: h264: allow a full dec_ref_pic_marking()
+
+ref_pic_marking[] holds ten entries, and a slice header carrying more
+makes gst_h264_parser_parse_slice_hdr() take the error path. The whole
+header is then lost, including the reference marking the stream just
+asked for, so the decoder keeps pictures the encoder evicted and every
+following P/B frame predicts from the wrong references. Nothing resets
+it: decoding stays wrong until the next IDR, and an open GOP has none.
+
+The standard sets no explicit bound (7.3.3.3). What bounds the loop in
+practice is the reference set the operations can address - up to 16
+short-term and 16 long-term pictures - plus the operations that set the
+long-term maximum and mark the current picture. Ten is below what a
+conforming stream may legally send, and encoders do send more: an
+ordinary fansubbed release evicts fifteen short-term references in one
+non-IDR slice header when it opens a new GOP, with num_ref_frames=16.
+
+Measured on such a file, 750 slices:
+
+  ref_pic_marking[10]:  7 parse failures, first at slice 250
+  ref_pic_marking[34]:  0 parse failures, 15 operations parsed
+
+and through nvh264dec, against libavcodec frame by frame:
+
+  before:  692 frames, 442 differing, wrong from frame 250 onward
+  after:   699 frames,   0 differing, bit-exact
+
+The seven frames the decoder had been dropping are the seven headers it
+could not parse. ffmpeg decodes the same file correctly on the same
+hardware, including via NVDEC, because its own limit is 66.
+
+This affects every decoder built on the parser - vah264dec,
+d3d11h264dec, v4l2slh264dec and nvh264dec alike - and it is silent:
+the failure returns no error to the pipeline, only wrong pixels.
+
+Growing the array changes the size of the public GstH264DecRefPicMarking
+and of GstH264SliceHdr, which embeds it by value, so this is an ABI
+break and cannot be backported to a stable branch as it stands.
+---
+ .../gst-libs/gst/codecparsers/gsth264parser.h    | 16 +++++++++++++++-
+ 1 file changed, 15 insertions(+), 1 deletion(-)
+
+diff --git a/subprojects/gst-plugins-bad/gst-libs/gst/codecparsers/gsth264parser.h b/subprojects/gst-plugins-bad/gst-libs/gst/codecparsers/gsth264parser.h
+index 4485b916942..478f932b051 100644
+--- a/subprojects/gst-plugins-bad/gst-libs/gst/codecparsers/gsth264parser.h
++++ b/subprojects/gst-plugins-bad/gst-libs/gst/codecparsers/gsth264parser.h
+@@ -971,6 +971,20 @@ struct _GstH264PredWeightTable
+   gint8 chroma_offset_l1[32][2];
+ };
+ 
++/**
++ * GST_H264_MAX_REF_PIC_MARKINGS:
++ *
++ * Maximum number of memory management control operations one
++ * dec_ref_pic_marking() can carry. The standard sets no explicit bound
++ * (7.3.3.3); what bounds it in practice is the reference set those
++ * operations can address - up to 16 short-term and 16 long-term
++ * pictures, plus the operations that set the long-term maximum and mark
++ * the current picture.
++ *
++ * Since: 1.30
++ */
++#define GST_H264_MAX_REF_PIC_MARKINGS 34
++
+ struct _GstH264RefPicMarking
+ {
+   guint8 memory_management_control_operation;
+@@ -988,7 +1002,7 @@ struct _GstH264DecRefPicMarking
+   guint8 long_term_reference_flag;
+ 
+   guint8 adaptive_ref_pic_marking_mode_flag;
+-  GstH264RefPicMarking ref_pic_marking[10];
++  GstH264RefPicMarking ref_pic_marking[GST_H264_MAX_REF_PIC_MARKINGS];
+   guint8 n_ref_pic_marking;
+ 
+   /* Size of the dec_ref_pic_marking() syntax element in bits (Since: 1.18) */
+-- 
+2.55.0
+
