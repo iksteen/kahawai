@@ -13,10 +13,11 @@ ARG RUST_VERSION=1.97.1
 # gst-plugins-rs now follows GStreamer's own version numbers.
 ARG GST_PLUGINS_RS_VERSION=gstreamer-1.28.5
 ARG GST_PLUGINS_RS_REV=cee45224cb2d10e1523af4f256d0dd64c8b29491
-# Ubuntu 26.04 ships GStreamer 1.28.2; the patched demuxers are built
-# from the current stable release instead. gst-plugins-good declares
-# ">= major.minor.0" for a stable series, so 1.28.5 plugins against the
-# distro's 1.28.2 core and base is a supported combination.
+# Ubuntu 26.04 ships GStreamer 1.28.2; the patched demuxers and the
+# patched H.264 codec stack are built from the current stable release
+# instead. gst-plugins-good declares ">= major.minor.0" for a stable
+# series, so 1.28.5 plugins against the distro's 1.28.2 core and base is
+# a supported combination.
 ARG GSTREAMER_VERSION=1.28.5
 ARG GSTREAMER_REV=727ceb91886862d200f423baf36cde2bb7ce5b4d
 
@@ -43,8 +44,10 @@ RUN apt-get update \
         libgstreamer-plugins-base1.0-dev \
         libgstreamer1.0-dev \
         libass-dev \
+        libgudev-1.0-dev \
         libleptonica-dev \
         libtesseract-dev \
+        libva-dev \
         meson \
         ninja-build \
         pkg-config \
@@ -56,11 +59,6 @@ RUN apt-get update \
 # to a patch rebuilds only what depends on it.
 COPY patches /usr/src/patches
 
-# gst-plugins-good: avi and matroska only. Everything else stays on the
-# distro's 1.28.2 — these are the two the patches touch, and the two
-# whose failures are fatal rather than cosmetic. They land in
-# /usr/local, which GST_PLUGIN_PATH searches ahead of the system path,
-# so they shadow the packaged copies.
 ARG GSTREAMER_VERSION
 ARG GSTREAMER_REV
 RUN git clone --depth 1 --branch "$GSTREAMER_VERSION" \
@@ -69,8 +67,14 @@ RUN git clone --depth 1 --branch "$GSTREAMER_VERSION" \
     && for p in /usr/src/patches/gstreamer/*.patch; do \
            echo "applying $(basename "$p")"; \
            git -C /tmp/gstreamer apply "$p"; \
-       done \
-    && meson setup /tmp/gst-good-build /tmp/gstreamer/subprojects/gst-plugins-good \
+       done
+
+# gst-plugins-good: avi and matroska only. Everything else stays on the
+# distro's 1.28.2 — these are the two the patches touch, and the two
+# whose failures are fatal rather than cosmetic. They land in
+# /usr/local, which GST_PLUGIN_PATH searches ahead of the system path,
+# so they shadow the packaged copies.
+RUN meson setup /tmp/gst-good-build /tmp/gstreamer/subprojects/gst-plugins-good \
         --buildtype=release \
         -Dauto_features=disabled -Davi=enabled -Dmatroska=enabled \
         -Dexamples=disabled -Dtests=disabled -Dnls=disabled -Ddoc=disabled \
@@ -79,6 +83,46 @@ RUN git clone --depth 1 --branch "$GSTREAMER_VERSION" \
         /out/gstreamer-1.0/libgstavi.so \
     && install -D -m 0755 -s /tmp/gst-good-build/gst/matroska/libgstmatroska.so \
         /out/gstreamer-1.0/libgstmatroska.so
+
+# gst-plugins-bad: patch 0004 grows an array inside the public
+# GstH264DecRefPicMarking, so libgstcodecparsers changes size and
+# everything holding one has to be rebuilt against the new header. That
+# is not optional and not per-plugin: a process loads exactly one
+# libgstcodecparsers-1.0.so.0 — the soname is the same, so a decoder
+# built against the old layout would read a patched struct at the wrong
+# offsets, which is worse than the bug being fixed.
+#
+# So this builds the two libraries that carry the struct
+# (codecparsers, codecs) and every plugin kahawai reaches that holds
+# one: h264parse/h265parse (videoparsers), the timestampers, tsdemux,
+# and the four hardware codec plugins. The runtime stage deletes the
+# distro's remaining consumers rather than trusting them.
+#
+# The other bad libraries these link — libgstva-1.0, libgstcuda-1.0,
+# libgstmpegts-1.0 — do not hold the struct, so the distro's 1.28.2
+# copies stay, on the same in-series-ABI reasoning as the demuxers
+# above.
+RUN meson setup /tmp/gst-bad-build /tmp/gstreamer/subprojects/gst-plugins-bad \
+        --buildtype=release --prefix=/usr/local --libdir=lib \
+        -Dauto_features=disabled \
+        -Dcodectimestamper=enabled -Dmpegtsdemux=enabled -Dnvcodec=enabled \
+        -Dqsv=enabled -Dv4l2codecs=enabled -Dva=enabled \
+        -Dvideoparsers=enabled \
+        -Dexamples=disabled -Dtests=disabled -Dnls=disabled -Ddoc=disabled \
+        -Dintrospection=disabled \
+    && meson compile -C /tmp/gst-bad-build \
+    && mkdir -p /out/lib \
+    && for l in codecparsers codecs; do \
+           cp -a "/tmp/gst-bad-build/gst-libs/gst/$l/libgst$l-1.0.so"* /out/lib/; \
+       done \
+    && for p in gst/codectimestamper/libgstcodectimestamper \
+                gst/mpegtsdemux/libgstmpegtsdemux \
+                gst/videoparsers/libgstvideoparsersbad \
+                sys/nvcodec/libgstnvcodec sys/qsv/libgstqsv \
+                sys/v4l2codecs/libgstv4l2codecs sys/va/libgstva; do \
+           install -D -m 0755 "/tmp/gst-bad-build/$p.so" \
+               "/out/gstreamer-1.0/$(basename "$p").so"; \
+       done
 
 # gst-plugin-fmp4 became gst-plugin-isobmff (libgstfmp4.so ->
 # libgstisobmff.so) between 0.14 and 1.28. The element kahawai asks for,
@@ -143,7 +187,6 @@ RUN set -eux; \
         gstreamer1.0-plugins-good \
         gstreamer1.0-plugins-ugly \
         gstreamer1.0-tools \
-        gstreamer1.0-vaapi \
         gstreamer1.0-x \
         mesa-va-drivers \
         tesseract-ocr \
@@ -154,6 +197,36 @@ RUN set -eux; \
 
 COPY --from=builder /out/kahawai /usr/local/bin/kahawai
 COPY --from=builder /out/gstreamer-1.0/ /usr/local/lib/gstreamer-1.0/
+COPY --from=builder /out/lib/ /usr/local/lib/
+
+# gstreamer1.0-vaapi is deliberately not installed: Ubuntu still ships
+# it at 1.26.8, it holds an H.264 slice header too, and it cannot be
+# rebuilt — gstreamer-vaapi was dropped from the monorepo before 1.28.
+# The va plugin built above covers the same hardware, which is why
+# upstream retired it.
+#
+# Everything else that holds one of the patched structs and was not
+# rebuilt goes now. Reading DT_NEEDED with grep rather than objdump
+# keeps binutils out of the runtime image; the strings are in .dynstr
+# either way, and a false positive would only demand a replacement that
+# is already there. Verified against ubuntu:26.04: seven consumers are
+# ours, six are removed here.
+RUN set -eux; \
+    ldconfig; \
+    for so in /usr/lib/*/gstreamer-1.0/*.so; do \
+        grep -aq 'libgstcodecparsers-1.0.so.0\|libgstcodecs-1.0.so.0' "$so" \
+            || continue; \
+        if [ -e "/usr/local/lib/gstreamer-1.0/$(basename "$so")" ]; then \
+            echo "patched: $(basename "$so")"; \
+        else \
+            echo "removing stale ABI consumer: $(basename "$so")"; \
+            rm "$so"; \
+        fi; \
+    done; \
+    # The whole scheme rests on /usr/local/lib winning in the cache, so
+    # let the loader say so rather than assuming Ubuntu's search order.
+    ldd /usr/local/lib/gstreamer-1.0/libgstnvcodec.so \
+        | grep -q '/usr/local/lib/libgstcodecparsers-1.0.so.0'
 
 # The NVIDIA runtime injects its driver libraries. "video" is NVENC/NVDEC;
 # "graphics" also permits the headless OpenGL tone-mapping path.
