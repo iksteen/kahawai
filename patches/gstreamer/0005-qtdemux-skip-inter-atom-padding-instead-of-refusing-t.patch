@@ -1,0 +1,67 @@
+From deca4ea098a550cc36db942afaa810fdbd4f8ec3 Mon Sep 17 00:00:00 2001
+From: Ingmar Steen <iksteen@gmail.com>
+Date: Thu, 6 Aug 2026 10:12:13 +0200
+Subject: [PATCH] qtdemux: skip inter-atom padding instead of refusing the file
+
+    This file is invalid and cannot be played.
+    atom .... has bogus size 18446744073709551615
+
+Some muxers align the atom that follows by leaving eight zero bytes that
+no atom covers. The format cannot describe a gap belonging to nobody, so
+the walk reads a size field of 0 - which extract_initial_length_and_fourcc
+turns into G_MAXUINT64, meaning "to the end of the file" - together with
+a fourcc of 0, and the size check then rejects the file outright.
+
+Only the streaming path meets it. Pull mode stops walking once it has
+the moov and reads by the sample tables, so the padding is never
+visited; push mode walks every byte. The same file therefore plays from
+a file:// URI and fails from a pipe, which is what makes it look like
+corruption rather than a parser limit.
+
+No atom has a zero type, so eight zero bytes cannot be confused with
+content: step over them.
+
+Found by sweeping a library through a push-only source. 25 of about
+37 000 files failed this way, all from one release group, all playable
+with ffmpeg and all playable through qtdemux in pull mode.
+
+The reproducer needs no media: mux an mp4 with faststart, insert eight
+zero bytes before mdat and add 8 to every chunk offset in stco, so the
+file is correct in every respect except the orphan padding. It then
+demuxes in pull mode and fails in push mode; with this patch, both.
+---
+ .../gst-plugins-good/gst/isomp4/qtdemux.c      | 18 ++++++++++++++++++
+ 1 file changed, 18 insertions(+)
+
+diff --git a/subprojects/gst-plugins-good/gst/isomp4/qtdemux.c b/subprojects/gst-plugins-good/gst/isomp4/qtdemux.c
+index 677f7832d3f..e380e1d36d9 100644
+--- a/subprojects/gst-plugins-good/gst/isomp4/qtdemux.c
++++ b/subprojects/gst-plugins-good/gst/isomp4/qtdemux.c
+@@ -8451,6 +8451,24 @@ gst_qtdemux_process_adapter (GstQTDemux * demux, gboolean force)
+           ret = GST_FLOW_ERROR;
+           break;
+         }
++        /* Eight zero bytes are padding, not an atom. Muxers leave them
++         * to align the atom that follows, and the format has no way to
++         * describe a gap that belongs to nobody. No atom has a zero
++         * type, so this cannot swallow real content; step over it and
++         * carry on rather than refusing the file.
++         *
++         * Pull mode never meets this: it stops walking once it has the
++         * moov and reads by the sample tables, so the padding is never
++         * visited. Streaming walks every byte, which is why such a file
++         * plays from a file:// URI and fails from a pipe. */
++        if (fourcc == 0 && size == G_MAXUINT64) {
++          GST_DEBUG_OBJECT (demux, "skipping 8 bytes of padding at offset %"
++              G_GUINT64_FORMAT, demux->offset);
++          gst_adapter_flush (demux->adapter, 8);
++          demux->offset += 8;
++          demux->neededbytes = 16;
++          break;
++        }
+         if (fourcc == FOURCC_mdat) {
+           guint64 next_entry = next_entry_size (demux);
+           if (QTDEMUX_N_STREAMS (demux) > 0 && (next_entry != -1
+-- 
+2.55.0
+
