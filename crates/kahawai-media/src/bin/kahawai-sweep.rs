@@ -27,9 +27,21 @@ const MEDIA_EXTS: &[&str] = &[
     "opus", "m4a", "aac", "wav",
 ];
 const HEAD_BYTES: u64 = 48 * 1024 * 1024;
-/// In-child pipeline deadline; the parent's watchdog is the backstop.
-const PIPELINE_DEADLINE: Duration = Duration::from_secs(120);
-const CHILD_WATCHDOG: Duration = Duration::from_secs(180);
+/// How long a pipeline may produce nothing before it counts as stuck.
+/// Progress, not elapsed time, is what separates a slow disk from a
+/// hang — see the wait loop in `sweep_one`.
+const PIPELINE_STALL: Duration = Duration::from_secs(120);
+/// Backstop for a pipeline that produces forever without finishing.
+/// --full feeds whole files, so it earns a longer one.
+const fn pipeline_cap(full: bool) -> Duration {
+    Duration::from_secs(if full { 1800 } else { 600 })
+}
+/// The parent's backstop for a child that never answers at all. It has
+/// to sit above the child's own cap, or it fails the slow files the
+/// child was about to pass.
+fn child_watchdog(full: bool) -> Duration {
+    pipeline_cap(full) + Duration::from_secs(120)
+}
 
 #[derive(PartialEq, Clone, Copy)]
 enum Verdict {
@@ -60,6 +72,7 @@ fn main() {
     let mut jobs = 4usize;
     let mut one = None;
     let mut profile_path: Option<PathBuf> = None;
+    let mut keep: Option<PathBuf> = None;
     while let Some(a) = args.next() {
         match a.as_str() {
             "--full" => full = true,
@@ -69,6 +82,10 @@ fn main() {
             // A CapabilityProfile as JSON (dump the browser's
             // buildProfile() from the console to sweep a real client).
             "--profile" => profile_path = args.next().map(PathBuf::from),
+            // Write the segments here instead of a temp dir that is
+            // deleted on the way out. --one only: the point is to read
+            // the output of a single verdict afterwards.
+            "--keep" => keep = args.next().map(PathBuf::from),
             other => dir = Some(PathBuf::from(other)),
         }
     }
@@ -85,13 +102,15 @@ fn main() {
             .arg("-version")
             .output()
             .is_ok();
-        let (verdict, detail) = sweep_one(&path, full, has_ffprobe, &profile);
+        let (verdict, detail) = sweep_one(&path, full, has_ffprobe, &profile, keep.as_deref());
         println!("{}\t{}", verdict.tag().trim_end(), detail);
         return;
     }
 
     let Some(dir) = dir else {
-        eprintln!("usage: kahawai-sweep <dir> [--full] [--limit N] [--jobs N]");
+        eprintln!(
+            "usage: kahawai-sweep <dir> [--full] [--limit N] [--jobs N]\n       kahawai-sweep --one <file> [--full] [--keep <dir>]"
+        );
         std::process::exit(2);
     };
 
@@ -100,7 +119,7 @@ fn main() {
         .output()
         .is_err()
     {
-        eprintln!("note: ffprobe not found — segment DTS checks skipped");
+        eprintln!("note: ffprobe not found — the segment stream-kind check is skipped");
     }
 
     let mut files = Vec::new();
@@ -162,14 +181,17 @@ fn sweep_in_child(exe: &Path, path: &Path, full: bool) -> (Verdict, String) {
         Ok(c) => c,
         Err(e) => return (Verdict::Fail, format!("[spawn] {e}")),
     };
-    let deadline = Instant::now() + CHILD_WATCHDOG;
+    let deadline = Instant::now() + child_watchdog(full);
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) if Instant::now() > deadline => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return (Verdict::Fail, "[watchdog] killed after 180s".into());
+                return (
+                    Verdict::Fail,
+                    format!("[watchdog] killed after {:?}", child_watchdog(full)),
+                );
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(100)),
             Err(e) => return (Verdict::Fail, format!("[wait] {e}")),
@@ -290,6 +312,7 @@ fn sweep_one(
     full: bool,
     has_ffprobe: bool,
     profile: &kahawai_core::media::CapabilityProfile,
+    keep: Option<&Path>,
 ) -> (Verdict, String) {
     // 1. Discovery, as the mediahost scanner would do it.
     let info = match kahawai_media::discover(path, Duration::from_secs(30)) {
@@ -351,9 +374,21 @@ fn sweep_one(
     }
 
     // 3. Remux through the real pipeline.
-    let out = match tempfile::tempdir() {
-        Ok(d) => d,
-        Err(e) => return (Verdict::Fail, format!("[tempdir] {e}")),
+    // The TempDir binding must outlive the pipeline: dropping it wipes
+    // the segments the checks below read.
+    let tmp;
+    let out_dir = match keep {
+        Some(d) => match std::fs::create_dir_all(d) {
+            Ok(()) => d.to_path_buf(),
+            Err(e) => return (Verdict::Fail, format!("[tempdir] {e}")),
+        },
+        None => match tempfile::tempdir() {
+            Ok(d) => {
+                tmp = d;
+                tmp.path().to_path_buf()
+            }
+            Err(e) => return (Verdict::Fail, format!("[tempdir] {e}")),
+        },
     };
     let src = match kahawai_media::remux::FileSource::open(path) {
         Ok(s) => s,
@@ -362,31 +397,55 @@ fn sweep_one(
     let tail = TAIL_BYTES.max(kahawai_media::remux::RemuxSource::size(&src) / TAIL_FRACTION);
     let budget = BudgetSource::new(src, if full { u64::MAX } else { HEAD_BYTES }, tail);
     let truncated = budget.exhausted.clone();
-    let job = match kahawai_media::remux::start(out.path(), plan, Box::new(budget)) {
+    let job = match kahawai_media::remux::start(&out_dir, plan, Box::new(budget)) {
         Ok(j) => j,
         Err(e) => return (Verdict::Fail, format!("[start] {e:#}")),
     };
-    let deadline = Instant::now() + PIPELINE_DEADLINE;
-    while !job.finished() && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    if !job.finished() {
+    // A deadline counted from the start measures the disk, not the file.
+    // Four American Horror Story episodes that swept OK on an idle NAS
+    // reported [hang] at four jobs on a busy one — each still writing
+    // segments when the clock ran out, and each passing alone in 89 s of
+    // a 120 s allowance. So the pipeline may take as long as it keeps
+    // producing, and fails when it stops producing; the cap is only
+    // there so a livelock still terminates.
+    let mut produced = 0;
+    let mut progressed = Instant::now();
+    let cap = Instant::now() + pipeline_cap(full);
+    let stalled = loop {
+        if job.finished() {
+            break false;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        let bytes = output_bytes(&out_dir);
+        if bytes > produced {
+            produced = bytes;
+            progressed = Instant::now();
+        }
+        if progressed.elapsed() > PIPELINE_STALL {
+            break true;
+        }
+        if Instant::now() > cap {
+            break true;
+        }
+    };
+    if stalled {
         job.stop();
+        let waited = progressed.elapsed().as_secs();
         return (
             Verdict::Fail,
-            format!("[hang] pipeline never finished; {codecs}"),
+            format!("[hang] no output for {waited}s; {codecs}"),
         );
     }
 
     // 4. Validate what came out.
-    let segments: Vec<PathBuf> = std::fs::read_dir(out.path())
+    let segments: Vec<PathBuf> = std::fs::read_dir(&out_dir)
         .map(|rd| {
             rd.filter_map(|e| e.ok().map(|e| e.path()))
                 .filter(|p| p.extension().is_some_and(|e| e == "ts"))
                 .collect()
         })
         .unwrap_or_default();
-    let playlist_ok = out.path().join("master.m3u8").exists();
+    let playlist_ok = out_dir.join("master.m3u8").exists();
 
     let truncated = truncated.load(Ordering::Relaxed);
     if let Some(err) = job.failed() {
@@ -402,22 +461,14 @@ fn sweep_one(
     if !playlist_ok || segments.is_empty() {
         return (Verdict::Fail, format!("[no output] {codecs}"));
     }
-    if has_ffprobe && plan.has_video() {
+    if plan.has_video() {
         for seg in &segments {
-            let (packets, untimed, ooo) = video_dts_defects(seg);
-            // A packet without a DTS is not by itself a defect, so the
-            // cheap scan only nominates: confirm with the decoder before
-            // failing a file. See `untimed_picture_packets`.
-            let missing = if untimed > 0 {
-                untimed_picture_packets(seg, packets, untimed)
-            } else {
-                0
-            };
-            if missing + ooo > 0 {
+            let (_, untimed, ooo) = video_pes_defects(&std::fs::read(seg).unwrap_or_default());
+            if untimed + ooo > 0 {
                 return (
                     Verdict::Fail,
                     format!(
-                        "[bad dts] {}: {missing} pictures without a timestamp, \
+                        "[bad dts] {}: {untimed} PES packets without a timestamp, \
                          {ooo} out-of-order — {codecs}",
                         seg.file_name().unwrap_or_default().to_string_lossy()
                     ),
@@ -502,111 +553,93 @@ fn segment_stream_kinds(seg: &Path) -> (bool, bool) {
 }
 
 /// (missing_dts, non_monotonic) video packets per segment, via ffprobe.
-/// Pictures in `seg` that reach the decoder without a timestamp.
-///
-/// The cheap packet scan cannot answer this, and read literally it is
-/// wrong: `mpegtsmux` writes the parameter sets once per keyframe as a
-/// picture-less access unit — 10 bytes of SPS/PPS, so a receiver can
-/// join mid-stream — and an access unit with no picture has nothing to
-/// present, so it carries no DTS. `ffprobe` reports that as a packet
-/// with `dts=N/A`, which the scan counted as a missing timestamp.
-///
-/// Whether it appears as its own packet or is packed into the
-/// neighbouring picture's PES depends on where the segment was cut, so
-/// the scan fired on 19 files of ~6500 and passed their near-identical
-/// neighbours — every one of them playable, and every frame in them
-/// correctly timed (2026-08-05).
-///
-/// The streams that provoke it share a signature, measured on their own
-/// samples rather than inferred: a lone in-band PPS before every
-/// keyframe, no SPS in band at all (it lives in `avcC`), and no access
-/// unit delimiters, so the muxer inserts its own. House of Cards S04E05
-/// carries 622 PPS against 623 IDRs and zero SPS; its output then holds
-/// 15 PPS against 2 SPS for 14 keyframes, and the surplus PPS are the
-/// picture-less access units. Not reproducible from any pipeline built
-/// here — x264enc, openh264enc and nvh264enc all keep SPS and PPS
-/// paired, and hand-feeding the muxer an untimed parameter-set buffer
-/// gets it absorbed — which is why the test below pins what it can
-/// rather than the case itself.
-///
-/// So the question is not "is a timestamp missing" but "is one missing
-/// from a packet that carries a picture", and that is answerable by
-/// counting: every packet the decoder does not turn into a frame is an
-/// access unit with no picture, and is entitled to have no timestamp.
-///
-/// `best_effort_timestamp` looked like the answer and is not — ffprobe
-/// interpolates it. Measured: stripping the timestamps out of a real
-/// picture's PES header still reports every frame as timed, so a check
-/// built on it fires on nothing and only looks like a check.
-///
-/// Decoding is expensive, so this runs only on nominated segments.
-fn untimed_picture_packets(seg: &Path, packets: usize, untimed: usize) -> usize {
-    let pictureless = packets.saturating_sub(decoded_frames(seg));
-    untimed.saturating_sub(pictureless)
-}
-
-/// Video packets in `seg` that the decoder turns into a picture.
-///
-/// The difference between this and the packet count is the number of
-/// access units carrying no picture, which is what makes a timestamp
-/// legitimately absent.
-fn decoded_frames(seg: &Path) -> usize {
-    let out = std::process::Command::new("ffprobe")
-        .args([
-            "-v",
-            "error",
-            "-select_streams",
-            "v",
-            "-count_frames",
-            "-show_entries",
-            "stream=nb_read_frames",
-            "-of",
-            "csv=p=0",
-        ])
-        .arg(seg)
-        .output();
-    let Ok(out) = out else { return 0 };
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .find_map(|l| l.trim().trim_end_matches(',').parse::<usize>().ok())
+/// Bytes written into the output directory so far.
+fn output_bytes(dir: &Path) -> u64 {
+    std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .filter_map(|e| e.metadata().ok())
+                .map(|m| m.len())
+                .sum()
+        })
         .unwrap_or(0)
 }
 
-/// `(packets, without a DTS, out of order)` for the video stream.
-fn video_dts_defects(seg: &Path) -> (usize, usize, usize) {
-    let out = std::process::Command::new("ffprobe")
-        .args([
-            "-v",
-            "error",
-            "-select_streams",
-            "v",
-            "-show_entries",
-            "packet=dts",
-            "-of",
-            "csv=p=0",
-        ])
-        .arg(seg)
-        .output();
-    let Ok(out) = out else { return (0, 0, 0) };
-    let (mut packets, mut missing, mut ooo) = (0, 0, 0);
+/// `(video PES packets, without a PTS, out of decode order)` for `ts`.
+///
+/// Read at the transport-stream level rather than through ffprobe,
+/// because the two answer different questions. ffprobe re-splits the
+/// elementary stream into access units and then attributes the PES
+/// timestamps to them, so a stream whose access-unit boundary does not
+/// coincide with the PES boundary loses a timestamp *in the reader*
+/// while the file itself carries one on every PES.
+///
+/// That is not hypothetical: sources exist whose keyframe block ends
+/// with the next picture's SEI (The Ark S02E08, and four more found by
+/// this sweep). Copied faithfully, the SEI rides at the tail of the
+/// keyframe's PES; ffprobe splits the access unit at that SEI, ends up
+/// one boundary out, and reports the next picture as untimed. Every PES
+/// in those segments has a PTS. Counting frames against packets to
+/// cancel the difference — what this did before — cancels the wrong
+/// ones: it hid the finding in 24 segments and fired on the 25th, which
+/// was merely the truncated one.
+///
+/// What kahawai controls is the muxer's output, so that is what is
+/// measured: every video PES carries a PTS, and decode order never goes
+/// backwards.
+fn video_pes_defects(ts: &[u8]) -> (usize, usize, usize) {
+    const PKT: usize = 188;
+    // PTS and DTS are 33-bit and wrap; a decrease of more than half the
+    // range is that wrap, not a stream out of order.
+    const HALF: i64 = 1 << 32;
+    let (mut pes, mut untimed, mut ooo) = (0, 0, 0);
+    let mut vpid: Option<u16> = None;
     let mut prev: Option<i64> = None;
-    for line in String::from_utf8_lossy(&out.stdout).lines() {
-        let field = line.trim().trim_end_matches(',');
-        if field.is_empty() {
+    for chunk in ts.chunks_exact(PKT) {
+        if chunk[0] != 0x47 || chunk[1] & 0x40 == 0 {
             continue;
         }
-        packets += 1;
-        match field.parse::<i64>() {
-            Ok(dts) => {
-                if prev.is_some_and(|p| dts < p) {
-                    ooo += 1;
-                }
-                prev = Some(dts);
-            }
-            Err(_) => missing += 1,
+        let pid = (u16::from(chunk[1] & 0x1f) << 8) | u16::from(chunk[2]);
+        let off = match (chunk[3] >> 4) & 3 {
+            1 => 4,
+            3 => 5 + chunk[4] as usize,
+            _ => continue,
+        };
+        let Some(p) = chunk.get(off..) else { continue };
+        // Video stream ids are 0xE0-0xEF; the first one seen names the
+        // PID, and anything else on the segment is somebody else's.
+        if p.len() < 14 || p[..3] != [0x00, 0x00, 0x01] || !(0xE0..=0xEF).contains(&p[3]) {
+            continue;
         }
+        if *vpid.get_or_insert(pid) != pid {
+            continue;
+        }
+        pes += 1;
+        let flags = p[7] >> 6;
+        if flags & 0b10 == 0 {
+            untimed += 1;
+            continue;
+        }
+        // With both, the DTS follows the PTS; with only a PTS, decode
+        // order and presentation order are the same.
+        let stamp = |b: &[u8]| -> i64 {
+            (i64::from(b[0] & 0x0e) << 29)
+                | (i64::from(b[1]) << 22)
+                | (i64::from(b[2] & 0xfe) << 14)
+                | (i64::from(b[3]) << 7)
+                | (i64::from(b[4]) >> 1)
+        };
+        let dts = if flags == 0b11 && p.len() >= 19 {
+            stamp(&p[14..19])
+        } else {
+            stamp(&p[9..14])
+        };
+        if prev.is_some_and(|q| dts < q && q - dts < HALF) {
+            ooo += 1;
+        }
+        prev = Some(dts);
     }
-    (packets, missing, ooo)
+    (pes, untimed, ooo)
 }
 
 #[cfg(test)]
@@ -650,26 +683,20 @@ mod tests {
         assert!(!all.exhausted.load(Ordering::Relaxed));
     }
 
-    /// The packet scan nominates; the decoder decides.
+    /// Every video PES the muxer writes carries a timestamp.
     ///
-    /// mpegtsmux writes the parameter sets once per keyframe as a
-    /// picture-less access unit, which has nothing to present and so
-    /// carries no DTS. Reading that as a missing timestamp failed 19
-    /// perfectly playable files and — worse — taught us to skim past
-    /// `[bad dts]`, which is how a real one would have been missed.
+    /// The earlier form of this check counted ffprobe's access units and
+    /// subtracted decoded frames to cancel the parameter-set packets
+    /// that legitimately have none. It cancelled the wrong ones: on a
+    /// source whose keyframe block ends with the next picture's SEI it
+    /// reported one untimed picture per file, in whichever segment
+    /// happened to have no picture-less access unit to spend. Reading
+    /// the PES headers answers the question directly, and needs neither
+    /// ffprobe nor a decoder.
     ///
-    /// Everything here comes out of a muxer, so it needs no fixture and
-    /// no library.
+    /// Everything here comes out of a muxer, so it needs no fixture.
     #[test]
-    fn a_parameter_set_only_packet_is_not_a_missing_timestamp() {
-        if std::process::Command::new("ffprobe")
-            .arg("-version")
-            .output()
-            .is_err()
-        {
-            eprintln!("no ffprobe; skipped");
-            return;
-        }
+    fn every_video_pes_carries_a_timestamp() {
         use gstreamer::prelude::*;
 
         kahawai_media::init().unwrap();
@@ -679,7 +706,6 @@ mod tests {
                 return;
             }
         }
-
         let dir = tempfile::tempdir().unwrap();
         let ts = dir.path().join("clip.ts");
         // key-int-max=12 at 24 fps: a keyframe every half second, so the
@@ -701,32 +727,15 @@ mod tests {
             .expect("muxing timed out");
         pipeline.set_state(gstreamer::State::Null).unwrap();
 
-        let (packets, untimed, ooo) = video_dts_defects(&ts);
+        let muxed = std::fs::read(&ts).unwrap();
+        let (pes, untimed, ooo) = video_pes_defects(&muxed);
+        assert!(pes > 40, "expected a PES per picture, got {pes}");
+        assert_eq!(untimed, 0, "a freshly muxed clip stamps every PES");
         assert_eq!(ooo, 0, "nothing here is out of order");
-        assert_eq!(
-            untimed_picture_packets(&ts, packets, untimed),
-            0,
-            "every picture in a freshly muxed clip has a timestamp"
-        );
 
-        // Now damage it, because a check that cannot fail is not a
-        // check. Strip the timestamps out of one picture's PES header:
-        // the packet loses its DTS while still carrying a picture,
-        // which is the defect the sweep is meant to catch — and is
-        // exactly what a parameter-set packet is NOT.
-        let damaged = dir.path().join("damaged.ts");
-        std::fs::write(
-            &damaged,
-            strip_one_picture_timestamp(&std::fs::read(&ts).unwrap()),
-        )
-        .unwrap();
-        let (packets, untimed, _) = video_dts_defects(&damaged);
-        assert_eq!(untimed, 1, "the damage did not land");
-        assert_eq!(
-            untimed_picture_packets(&damaged, packets, untimed),
-            1,
-            "a picture without a timestamp must still be caught"
-        );
+        // Now damage it, because a check that cannot fail is not a check.
+        let (_, untimed, _) = video_pes_defects(&strip_one_picture_timestamp(&muxed));
+        assert_eq!(untimed, 1, "a PES without a timestamp must be caught");
     }
 
     /// Blank the PTS/DTS flags of one video PES header, in place.
