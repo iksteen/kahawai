@@ -72,25 +72,107 @@ pub fn discover(path: &Path, timeout: Duration) -> Result<MediaInfo> {
     let uri = gst::glib::filename_to_uri(path, None)
         .with_context(|| format!("building uri for {}", path.display()))?;
     let discoverer = Discoverer::new(gst::ClockTime::from_mseconds(timeout.as_millis() as u64))?;
-    let info = discoverer
-        .discover_uri(&uri)
-        .with_context(|| format!("discovering {}", path.display()))?;
+    let info = match discoverer.discover_uri(&uri) {
+        Ok(info) => info,
+        // The synchronous binding returns the GError and drops the
+        // GstDiscovererInfo, and the info is the whole question: a
+        // decode chain that failed on one track still describes the
+        // rest of the file. The signal hands over both.
+        Err(sync_err) => discover_uri_partial(&uri, timeout).with_context(|| {
+            format!("discovering {}: {}", path.display(), sync_err.message())
+        })?,
+    };
     // discover_uri returns Ok even on timeout/missing-plugin results —
     // don't let those masquerade as valid-but-empty media (a slow NAS
     // would scan whole libraries as streamless files).
     let result = info.result();
-    let missing_plugins = result == gstreamer_pbutils::DiscovererResult::MissingPlugins;
-    if result != gstreamer_pbutils::DiscovererResult::Ok && !missing_plugins {
+    // Two results are worth a second look rather than a refusal, because
+    // both can arrive with the streams already described:
+    //
+    //   MissingPlugins — one unmappable track (S_DVBSUB →
+    //   application/x-subtitle-unknown), not a broken file.
+    //
+    //   Error — the discoverer DECODES, and a decode chain can fail on a
+    //   track we would never decode. Measured: an MKV whose Atmos E-AC-3
+    //   fails to negotiate (`transform could not transform
+    //   audio/x-eac3, channels=6 in anything`) errors the whole
+    //   discovery, while parsebin — what the remux path actually
+    //   builds — walks the same file without complaint.
+    //
+    // Timeout is NOT in this list. Partial information from a slow read
+    // is indistinguishable from a complete answer once mapped, and a
+    // stalling NAS would quietly scan a library as short files.
+    let partial = result_is_partial(result);
+    if result != gstreamer_pbutils::DiscovererResult::Ok && !partial {
         anyhow::bail!("discovering {}: {result:?}", path.display());
     }
     let mapped = map_info(&info);
-    // MissingPlugins with a usable A/V core is one unmappable track
-    // (e.g. S_DVBSUB → application/x-subtitle-unknown), not a broken
-    // file — record what we found instead of failing the whole file.
-    if missing_plugins && (mapped.video.is_empty() || mapped.audio.is_empty()) {
+    // The core is the evidence: audio and video both mapped means the
+    // discoverer got far enough to describe the file, whatever it
+    // tripped over on the way.
+    if partial && (mapped.video.is_empty() || mapped.audio.is_empty()) {
         anyhow::bail!("discovering {}: {result:?}", path.display());
     }
+    if partial {
+        tracing::warn!(
+            path = %path.display(),
+            ?result,
+            video = mapped.video.len(),
+            audio = mapped.audio.len(),
+            subtitles = mapped.subtitles.len(),
+            "discovery reported a problem but described a usable file; using what it found"
+        );
+    }
     Ok(mapped)
+}
+
+/// Whether a non-Ok discovery may still be believed if it described a
+/// usable audio/video core.
+fn result_is_partial(result: gstreamer_pbutils::DiscovererResult) -> bool {
+    matches!(
+        result,
+        gstreamer_pbutils::DiscovererResult::MissingPlugins
+            | gstreamer_pbutils::DiscovererResult::Error
+    )
+}
+
+/// Run the discoverer through its signal so the info survives an error.
+///
+/// `gst_discoverer_discover_uri` returns the info AND sets a GError; the
+/// Rust binding keeps only the error. The async form emits both to
+/// `discovered`, so this is the same discovery, read differently — not a
+/// second, weaker attempt.
+fn discover_uri_partial(uri: &str, timeout: Duration) -> Result<DiscovererInfo> {
+    use gstreamer::glib;
+
+    let ctx = glib::MainContext::new();
+    let run = || -> Result<DiscovererInfo> {
+        let discoverer =
+            Discoverer::new(gst::ClockTime::from_mseconds(timeout.as_millis() as u64))?;
+        let main_loop = glib::MainLoop::new(Some(&ctx), false);
+        let found: std::sync::Arc<std::sync::Mutex<Option<DiscovererInfo>>> = Default::default();
+        {
+            let (found, ml) = (found.clone(), main_loop.clone());
+            discoverer.connect_discovered(move |_, info, _err| {
+                *found.lock().unwrap() = Some(info.clone());
+                ml.quit();
+            });
+        }
+        // Backstop only: the discoverer's own timeout fires first, and
+        // this exists so a signal that never arrives cannot hang a scan.
+        {
+            let ml = main_loop.clone();
+            glib::timeout_add_local_once(timeout + Duration::from_secs(5), move || ml.quit());
+        }
+        discoverer.start();
+        discoverer.discover_uri_async(uri)?;
+        main_loop.run();
+        discoverer.stop();
+        let info = found.lock().unwrap().take();
+        info.context("the discoverer returned neither information nor an error")
+    };
+    ctx.with_thread_default(run)
+        .context("acquiring a main context for discovery")?
 }
 
 fn map_info(info: &DiscovererInfo) -> MediaInfo {
@@ -383,6 +465,27 @@ mod tests {
         assert_eq!(classify_hdr(Some("0:6:16:7")), None, "16 = BT601, not PQ");
         assert_eq!(classify_hdr(Some("bt709")), None);
         assert_eq!(classify_hdr(None), None);
+    }
+
+    /// Which discovery verdicts may be believed on their evidence.
+    ///
+    /// `Error` joined this list because the discoverer DECODES: an MKV
+    /// whose Atmos E-AC-3 would not negotiate errored the whole file
+    /// while parsebin — what the remux path builds — read it happily,
+    /// so a playable episode was invisible to the library.
+    ///
+    /// `Timeout` must stay out. A slow read returns a partial answer
+    /// that looks exactly like a complete one once mapped, so trusting
+    /// it would let a stalling NAS rewrite a library as short files —
+    /// and unlike the others, the evidence for that cannot be checked.
+    #[test]
+    fn only_a_described_file_survives_a_bad_discovery() {
+        use gstreamer_pbutils::DiscovererResult as R;
+        assert!(result_is_partial(R::MissingPlugins));
+        assert!(result_is_partial(R::Error));
+        assert!(!result_is_partial(R::Timeout));
+        assert!(!result_is_partial(R::Busy));
+        assert!(!result_is_partial(R::UriInvalid));
     }
 
     /// Build a tiny fixture by running a gst-launch-style pipeline to EOS.
