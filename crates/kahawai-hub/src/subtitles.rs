@@ -759,6 +759,7 @@ impl Subtitles {
     /// that cannot be ready in time is a tier the ladder should skip
     /// rather than one the session should stall for. Measured at ~3.5 s
     /// for a 24-minute episode.
+    #[allow(clippy::too_many_arguments)] // one over, and each one is a distinct input
     pub async fn overlay_ready(
         &self,
         registry: &Registry,

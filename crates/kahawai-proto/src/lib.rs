@@ -1,4 +1,8 @@
 pub mod v1 {
+    // prost decides the shape of these enums, so the size-difference
+    // lint has nobody to talk to here.
+    #![allow(clippy::large_enum_variant)]
+
     tonic::include_proto!("kahawai.v1");
 }
 

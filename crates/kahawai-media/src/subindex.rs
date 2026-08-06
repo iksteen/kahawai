@@ -2034,7 +2034,7 @@ fn mp4_max_keyframe_gap(src: &mut dyn RemuxSource) -> Result<Option<u32>> {
 /// Largest adjacent gap in a keyframe timeline, via `to_ms`. Fewer than
 /// two keyframes is not a measurement — one keyframe says nothing about
 /// spacing — so it reads as unknown.
-fn gap_ms(times: &mut Vec<u64>, to_ms: impl Fn(u64) -> u64) -> Option<u32> {
+fn gap_ms(times: &mut [u64], to_ms: impl Fn(u64) -> u64) -> Option<u32> {
     if times.len() < 2 {
         return None;
     }
