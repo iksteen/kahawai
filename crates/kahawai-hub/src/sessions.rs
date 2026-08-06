@@ -1913,6 +1913,9 @@ impl Sessions {
                     .arg(&socks[0].0)
                     .arg(&dir)
                     .arg(socks[0].1.to_string());
+                // Who to die with. The worker compares this against its
+                // own getppid(); see the guard in run_remux_worker.
+                cmd.args(["--supervisor-pid", &std::process::id().to_string()]);
                 for (sock, size) in &socks[1..] {
                     cmd.args(["--part", &format!("{}:{size}", sock.display())]);
                 }

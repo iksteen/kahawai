@@ -94,6 +94,11 @@ pub struct WorkerArgs {
     /// The source is interlaced: deinterlace before the encoder.
     #[arg(long)]
     pub deinterlace: bool,
+    /// The pid this worker belongs to. See the PDEATHSIG guard in
+    /// [`run_remux_worker`]; absent means the guard cannot check and
+    /// leaves the kernel's signal as the only tie.
+    #[arg(long)]
+    pub supervisor_pid: Option<u32>,
     /// HUB-32b: burn this image subtitle track (e{n}) into the picture.
     #[arg(long)]
     pub burn_sub: Option<usize>,
@@ -171,10 +176,21 @@ pub fn run_remux_worker(cfg: &config::Config, w: WorkerArgs) -> Result<()> {
     // pipeline workers indefinitely (one survived three days).
     // PDEATHSIG is the kernel's guarantee; the getppid check
     // closes the race where the parent died before prctl ran.
+    //
+    // Against the supervisor's OWN pid, not against 1. Reparenting to
+    // init is what a dead parent looks like on a normal box, but in a
+    // container the hub is pid 1 itself — it is the ENTRYPOINT — so
+    // every worker it spawned had getppid() == 1 legitimately and this
+    // guard refused all of them. The image could not play anything
+    // (reported 2026-08-06, reproduced with `docker run --entrypoint sh
+    // … kahawai remux-worker …`, where the shell is pid 1 and stands in
+    // for the hub).
     #[cfg(target_os = "linux")]
     unsafe {
         libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
-        if libc::getppid() == 1 {
+        if let Some(expected) = w.supervisor_pid
+            && libc::getppid() != expected as libc::pid_t
+        {
             anyhow::bail!("supervisor already gone; not starting");
         }
     }

@@ -138,3 +138,52 @@ fn worker_remuxes_over_socket() {
     );
     assert!(out.join("segment00000.ts").exists());
 }
+
+/// The supervisor guard checks the pid it was given, not the number 1.
+///
+/// "My parent is init" is what a dead supervisor looks like on a normal
+/// box, and it is what a HEALTHY one looks like in a container: the hub
+/// is the ENTRYPOINT, so it is pid 1 and every worker it spawns has
+/// getppid() == 1. Read literally, the guard refused all of them and the
+/// image could not play anything (reported 2026-08-06).
+///
+/// Both halves matter, so both are here: a worker told its real
+/// supervisor starts, and one told a pid that is not its parent does not.
+#[test]
+fn the_supervisor_guard_compares_pids_not_init() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("out");
+    std::fs::create_dir(&out).unwrap();
+    // No socket is ever served: whatever happens, this worker cannot get
+    // past the source. The guard fires before that, so the two runs are
+    // told apart by their message, not by their exit status.
+    let sock = dir.path().join("worker.sock");
+
+    let run = |pid: u32| {
+        let child = std::process::Command::new(env!("CARGO_BIN_EXE_kahawai"))
+            .arg("remux-worker")
+            .arg(&sock)
+            .arg(&out)
+            .arg("1024")
+            .args(["--video", "copy"])
+            .args(["--supervisor-pid", &pid.to_string()])
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&child.stderr).to_string()
+    };
+
+    // This test process IS the worker's parent, whatever pid it has.
+    let ours = run(std::process::id());
+    assert!(
+        !ours.contains("supervisor already gone"),
+        "a worker spawned by its own supervisor must start: {ours}"
+    );
+
+    // A pid that is not its parent: the race the guard exists for.
+    let stranger = run(u32::from(u16::MAX) + 1);
+    assert!(
+        stranger.contains("supervisor already gone"),
+        "a worker whose supervisor is gone must not start: {stranger}"
+    );
+}

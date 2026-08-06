@@ -240,6 +240,9 @@ impl Runner {
                     .arg(&sock)
                     .arg(&dir)
                     .arg(size.to_string());
+                // Who to die with. The worker compares this against its
+                // own getppid(); see the guard in run_remux_worker.
+                cmd.args(["--supervisor-pid", &std::process::id().to_string()]);
                 for (s, n) in &socks[1..] {
                     cmd.args(["--part", &format!("{}:{n}", s.display())]);
                 }
