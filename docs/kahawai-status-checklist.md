@@ -317,7 +317,12 @@ How something works and why it was built that way belong in
       bands, per-episode hash identity + re-binding (`ed2k_aid`,
       `tests/hash_binding.rs`), generic release revisions (0043),
       bare-file identification + movie minting, batch-marker spans
-      (0045). Missing: cross-aid re-binding (per-season splits)
+      (0045). Cross-aid re-binding DECLINED 2026-08-06 (measured: 213 of
+      217 aid disagreements are AniDB's per-season splitting of Pokemon,
+      already correctly placed — moving them would break correct slots).
+      Missing: collision breaking — several files on one slot whose
+      hashes name different eids are different episodes (Megazone 23
+      pt.03-a/b share S00E023; eids 39483/39484)
 - [x] HUB-30a Hashes are canonical identity: late ED2K re-verifies name
       matches, overrides on disagreement (manual included); manual matches
       otherwise adopt anime ids only via reverse mapping (proven live)

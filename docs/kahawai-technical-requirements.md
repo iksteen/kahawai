@@ -156,6 +156,31 @@ Anime is a differentiating pillar, not a skin over `series`: its metadata ecosys
 
 **HUB-29** Anime libraries shall use anime-native metadata providers behind the same provider trait: AniDB and AniList as first implementations (MyAnimeList/Kitsu as candidates), with cross-service ID mapping (including to TheTVDB/TMDB via the community anime-lists mapping) so artwork or descriptions can fall back to western providers where the anime services are sparse.
 **HUB-30** Anime filename parsing shall understand fansub/release conventions: `[ReleaseGroup]`-prefixed names, absolute episode numbering as the norm, version tags (`v2`), CRC32 suffixes, batch markers, and specials/OVA/ONA/movie designations. Where ED2K hashes are available (MH-9), the hub shall use AniDB exact-file identification — hash → precise episode, release group, and version — as the highest-confidence match, above all name-based heuristics.
+
+*Amended 2026-08-06: cross-aid re-binding is declined, and what remains
+of it is narrowed to breaking collisions.* The original reading — a file
+whose hash names a different AniDB entry than its show should move to
+that entry's numbering — was measured against the library before being
+built, and it is wrong for the common case. Of 873 hashed anime files,
+217 disagree with their show's aid and **213 of those are Pokémon**,
+where AniDB splits one televised series into an entry per season (aids
+230, 1041, 11585) while the files are laid out, numbered and titled by
+season on disk. Those files are already in the right place: moving
+`Pokemon 06x01` to episode 1 of another entry would break a correct
+slot to satisfy a keyspace kahawai does not present (HUB-31 makes the
+numbering a per-user projection, not AniDB's to decide). A differing aid
+is therefore not evidence of a misplacement.
+
+What the hash is still owed is narrower and demonstrably real: when
+SEVERAL files are bound to ONE episode slot and their hashes name
+DIFFERENT AniDB episode ids, they are different episodes and shall be
+split apart, taking their numbering from the hash. Several sources on
+one slot is otherwise legitimate — two copies of the same episode share
+an eid — so the eid, not the count, is the test. Megazone 23 is the
+worked case: `pt.03-a` and `pt.03-b` both landed on S00E023, an episode
+number lifted out of the *title*, while their hashes name eids 39483 and
+39484 (episodes 1 and 2 of aid 3545). A number taken from a title shall
+never outrank a hash that names the episode.
 **HUB-30a** Hashes are canonical identity. When an ED2K hash arrives after an item has already been matched by name, the hub shall re-verify the existing match against the hash-derived identity and, on disagreement, the hash wins — overriding even a manual match, because the hash states what the file *is*. Absent such disagreement, an existing manual match is never re-decided: anime-service IDs attach to a manually matched item only through reverse ID mapping (anime-lists), never by re-running identification.
 **HUB-31** The hub shall model anime structure natively — AniDB-style per-series entries with absolute numbering, plus the relations graph (sequel, prequel, side story, alternative version) — and offer per-library presentation as either native structure or TVDB-style seasons via the ID mapping. The relations graph shall be exposed to clients as a suggested watch order on the item detail.
 **HUB-32** ASS/SSA subtitles shall be first-class: styling and typesetting preserved (never silently flattened to SRT), font attachments — declared at scan (MH-4), extracted on demand by the hub and cached — served alongside the subtitle stream, client-side ASS rendering supported where the client declares the capability (the bundled web player shall, per HUB-27), and burn-in via the transcoder — with the correct fonts supplied to it — as the fidelity fallback for clients that cannot.
