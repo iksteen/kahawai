@@ -199,11 +199,24 @@ RUN set -eux; \
         intel_packages="intel-media-va-driver-non-free i965-va-driver-shaders libvpl2 onevpl-tools"; \
     fi; \
     apt-get update; \
+    # Every Tesseract LANGUAGE, and no Tesseract SCRIPT. The hub maps a
+    # track's language tag to a model name and, for any tag it does not
+    # map, passes the three-letter tag through as the model name
+    # (hub/ocr.rs) — so the set it can ask for is exactly the languages,
+    # and shipping only English silently drops the OCR tier for every
+    # other one. Derived rather than listed: a hand-list is a second
+    # place to forget a language. 124 packages, ~338 MiB.
+    #
+    # The script packs are the other ~329 MiB and are unreachable here:
+    # they hold Latin.traineddata, HanS.traineddata and friends, and no
+    # language tag turns into those names.
+    tesseract_langs="$(apt-cache pkgnames tesseract-ocr- \
+        | grep -vE '^tesseract-ocr-(all|script-)' | sort | tr '\n' ' ')"; \
     apt-get install -y --no-install-recommends \
         $(tr '\n' ' ' < /tmp/runtime-packages.txt) \
         ca-certificates fontconfig \
         mesa-va-drivers vainfo \
-        tesseract-ocr tesseract-ocr-eng \
+        tesseract-ocr $tesseract_langs \
         $intel_packages; \
     rm -rf /var/lib/apt/lists/* /tmp/runtime-packages.txt
 
