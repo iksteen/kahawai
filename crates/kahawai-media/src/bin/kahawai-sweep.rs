@@ -438,10 +438,13 @@ fn sweep_one(
     }
 
     // 4. Validate what came out.
+    // Both containers: an fMP4 session writes init.mp4 + segment*.m4s,
+    // and counting only .ts scored every one of them [no output] — which
+    // is how a plan that had just been fixed still read as broken.
     let segments: Vec<PathBuf> = std::fs::read_dir(&out_dir)
         .map(|rd| {
             rd.filter_map(|e| e.ok().map(|e| e.path()))
-                .filter(|p| p.extension().is_some_and(|e| e == "ts"))
+                .filter(|p| p.extension().is_some_and(|e| e == "ts" || e == "m4s"))
                 .collect()
         })
         .unwrap_or_default();
@@ -461,8 +464,13 @@ fn sweep_one(
     if !playlist_ok || segments.is_empty() {
         return (Verdict::Fail, format!("[no output] {codecs}"));
     }
+    // PES headers are a transport-stream thing; fMP4 carries its
+    // timestamps in the moof, and nothing here reads those yet.
     if plan.has_video() {
-        for seg in &segments {
+        for seg in segments
+            .iter()
+            .filter(|p| p.extension().is_some_and(|e| e == "ts"))
+        {
             let (_, untimed, ooo) = video_pes_defects(&std::fs::read(seg).unwrap_or_default());
             if untimed + ooo > 0 {
                 return (
@@ -482,7 +490,15 @@ fn sweep_one(
         let mut sorted = segments.clone();
         sorted.sort();
         if let Some(first) = sorted.first() {
-            let (has_v, has_a) = segment_stream_kinds(first);
+            // An .m4s has no headers of its own — the tracks are declared
+            // once, in the init segment, and ffprobe reads no streams at
+            // all from the fragment alone.
+            let init = out_dir.join("init.mp4");
+            let probe = match first.extension().is_some_and(|e| e == "m4s") && init.exists() {
+                true => init,
+                false => first.clone(),
+            };
+            let (has_v, has_a) = segment_stream_kinds(&probe);
             if plan.has_video() && !has_v {
                 return (
                     Verdict::Fail,

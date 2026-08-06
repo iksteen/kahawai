@@ -708,13 +708,38 @@ pub fn negotiate(
         };
     let ts = candidate(SegmentFormat::Ts);
     let f4 = candidate(SegmentFormat::Fmp4);
-    // Fewest dropped streams, then cheapest, tie → TS: the proven path
-    // wins unless fMP4 delivers more or strictly cheaper.
-    let (segment_format, (mut video, video_target, audio, audio_target, _key)) = if f4.4 < ts.4 {
-        (SegmentFormat::Fmp4, f4)
-    } else {
-        (SegmentFormat::Ts, ts)
+    // MPEG-TS carries H.264, and nothing newer.
+    //
+    // `caps_muxable` says otherwise because it answers a different
+    // question: mpegtsmux really does mux HEVC, hls.js really does parse
+    // it (stream type 0x24, its advanced-codec TS parser), and the
+    // segments really do decode. What they do not do is play. Measured
+    // on Mr. Inbetween S01E01 (HEVC Main 10, 10 s GOP) in Firefox 153:
+    // as TS, the media element buffers in fragments with holes between
+    // them and hls.js nudges the playhead over each one until it gives
+    // up with `bufferStalledError`. The same source through the same
+    // pipeline into fMP4 buffers 0.00-45.50 in one range and plays.
+    //
+    // Apple's authoring rules land in the same place — HEVC has to be
+    // packaged as fMP4 fragments, and only H.264 may use transport
+    // streams ("HLS Authoring Update", WWDC17 session 515).
+    //
+    // So the TS candidate is only a candidate when what it would deliver
+    // is H.264. Audio-only sessions keep it: the restriction is about
+    // the video codec, and TS carries AAC perfectly well.
+    let ts_delivers_h264 = match ts.0 {
+        StreamMode::Off => true,
+        StreamMode::Copy => v.is_some_and(|s| s.codec == "h264"),
+        StreamMode::Encode => ts.1 == VideoTarget::H264,
     };
+    // Then: fewest dropped streams, then cheapest, tie → TS, the proven
+    // path — it wins unless fMP4 delivers more or strictly cheaper.
+    let (segment_format, (mut video, video_target, audio, audio_target, _key)) =
+        if !ts_delivers_h264 || f4.4 < ts.4 {
+            (SegmentFormat::Fmp4, f4)
+        } else {
+            (SegmentFormat::Ts, ts)
+        };
 
     // A `short` client bought a GUARANTEE, and a copy cannot give one:
     // segments land on the source's keyframes, which here run past
@@ -2480,6 +2505,60 @@ mod tests {
     /// up — measured, not assumed: a 10.43 s GOP produced segments of
     /// 10.22-10.58 s against a 2 s fragment target, so 12 covers it and
     /// 11 would not.
+    /// A copied HEVC stream is delivered as fMP4, never as TS.
+    ///
+    /// mpegtsmux muxes HEVC and hls.js parses it, so nothing upstream
+    /// objects — but Firefox 153 buffers the result in fragments with
+    /// holes between them and stalls within a second, while the same
+    /// source in fMP4 buffers one continuous range and plays (measured
+    /// on Mr. Inbetween S01E01). Apple's authoring rules say the same:
+    /// HEVC goes in fMP4 fragments, TS is for H.264.
+    #[test]
+    fn an_hevc_copy_is_delivered_as_fmp4() {
+        crate::init().unwrap();
+        // AC-3 audio no browser decodes, so the cheapest plan copies the
+        // video and encodes the audio — the shape that chose TS before.
+        let info = media("matroska", Some(vs("hevc")), Some(au("ac3", 6)));
+        let sp = negotiate(
+            &chrome(),
+            &info,
+            0,
+            0,
+            true,
+            None,
+            false,
+            true,
+            &[],
+            None,
+            &fleet(),
+        );
+        assert_eq!(sp.plan.video, StreamMode::Copy, "{}", sp.video_verdict);
+        assert_eq!(sp.plan.audio, StreamMode::Encode, "{}", sp.audio_verdict);
+        assert_eq!(
+            sp.plan.segment_format,
+            SegmentFormat::Fmp4,
+            "hevc must not be delivered in a transport stream"
+        );
+
+        // The control: H.264 in the same shape keeps the proven TS path.
+        let h264 = media("matroska", Some(vs("h264")), Some(au("ac3", 6)));
+        let sp = negotiate(
+            &chrome(),
+            &h264,
+            0,
+            0,
+            true,
+            None,
+            false,
+            true,
+            &[],
+            None,
+            &fleet(),
+        );
+        assert_eq!(sp.plan.video, StreamMode::Copy, "{}", sp.video_verdict);
+        assert_eq!(sp.plan.segment_format, SegmentFormat::Ts);
+    }
+
     /// Fields are the encoder's problem, and only the encoder's.
     ///
     /// nvh264enc fails at the first frame with `Failed to lock bitstream,
