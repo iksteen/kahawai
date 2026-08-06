@@ -182,7 +182,7 @@ cd ~/kahawai-src
 # no Tesseract (which Homebrew would otherwise have to provide for a
 # tier that executes hub-side).
 export KAHAWAI_BUILD
-cargo build --release --no-default-features --features transcoder \
+cargo build --release -p kahawai-transcoderd \
     --bin kahawai-transcoder 2>&1 | tail -1
 BIN=target/release/kahawai-transcoder
 # The transcoder runs as a launchd DAEMON (system domain): daemons are

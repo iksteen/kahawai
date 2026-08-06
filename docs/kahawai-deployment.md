@@ -204,10 +204,13 @@ else.
 # deliberately not scriptable, which is why setup is separate.
 scripts/kahawai-mac.sh setup
 
-# Per-module binaries: deployments run the lean flavor —
-#   cargo build --release --no-default-features --features mediahost --bin kahawai-mediahost
-#   cargo build --release --no-default-features --features transcoder --bin kahawai-transcoder
-#   cargo build --release --no-default-features --features hub,ocr --bin kahawai-hub
+# Per-module binaries: each satellite is its own package, so the lean
+# build is the only build —
+#   cargo build --release -p kahawai-mediahostd    # kahawai-mediahost
+#   cargo build --release -p kahawai-transcoderd   # kahawai-transcoder
+#   cargo build --release -p kahawai --bin kahawai-hub
+# No feature flags: kahawai-hub is not in a satellite's dependency graph,
+# so no build can give one SQLite, axum or Tesseract.
 # (the `kahawai` binary keeps everything, incl. all-in-one, for the dev
 # box). silence: scripts/kahawai-silence.sh builds both satellite
 # binaries here (same arch) and ships + restarts them.

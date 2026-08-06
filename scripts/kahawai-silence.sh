@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
-# Deploy the lean satellite binaries to silence (the NAS): build
+# Deploy the satellite binaries to silence (the NAS): build
 # kahawai-mediahost and kahawai-transcoder on THIS box (both are Arch
 # x86_64 — no cross toolchain, no build load on a J5005), ship them,
 # restart the orphaned processes, and wait for both links.
+#
+# No feature flags: each satellite is its own package and has no hub in
+# its dependency graph, so it cannot pick up SQLite, axum or Tesseract
+# however it is built.
 #
 # Usage: kahawai-silence.sh [user@host]
 set -euo pipefail
@@ -11,10 +15,8 @@ HOST="${1:-ingmar@192.168.0.109}"
 repo=$(cd "$(dirname "$0")/.." && pwd)
 
 echo "==> building lean satellite binaries" >&2
-(cd "$repo" && cargo build --release --no-default-features \
-    --features mediahost --bin kahawai-mediahost)
-(cd "$repo" && cargo build --release --no-default-features \
-    --features transcoder --bin kahawai-transcoder)
+(cd "$repo" && cargo build --release -p kahawai-mediahostd)
+(cd "$repo" && cargo build --release -p kahawai-transcoderd)
 
 # Stop FIRST: scp into a running executable fails with ETXTBSY.
 echo "==> stopping satellites on $HOST" >&2

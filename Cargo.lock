@@ -2034,6 +2034,7 @@ dependencies = [
  "gstreamer-pbutils",
  "gstreamer-video",
  "kahawai-core",
+ "pkg-config",
  "png",
  "serde",
  "serde_json",
