@@ -4,7 +4,13 @@
 first. Upstream commit `86d7e33cc` by Piotr Brzeziński, 2026-07-14,
 carried here only because releases do not have it yet: the newest
 gst-plugins-rs release, `gstreamer-1.28.5` (tagged 2026-07-02),
-predates it. Drop this file as soon as a release contains it.
+predates it.
+
+**Released in `gstreamer-1.28.6`** (2026-08-05), verified in the tagged
+file rather than the changelog: `hlsbasesink.rs:660` reads
+`.field("running-time", running_time)`, no unwrap. Nothing applies it
+any more — the image pins 1.28.6 — and it is kept only as the record of
+why 0001 needed it first.
 
 It lives on this branch alone, not in `patches/` on master. That tree is
 what we wrote and are submitting upstream; this is neither. It exists

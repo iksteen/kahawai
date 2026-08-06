@@ -1,6 +1,11 @@
 # hlssink3: process abort when a fragment's first buffer has no PTS
 
-**Upstream:** merged as `80bfd7064` via gst-plugins-rs MR 3189.
+**Upstream:** merged as `80bfd7064` via gst-plugins-rs MR 3189, and
+**released in `gstreamer-1.28.6`** (2026-08-05) — verified in the tagged
+`net/hlssink3/src/hlssink3/imp.rs`, which carries the warning this patch
+adds. Nothing applies it any more; the image pins 1.28.6 and the file is
+kept as the record, with a reproducer that still answers "is your build
+affected?".
 **Observed on:** 0.15.3 (Arch `gst-plugin-hlssink3 0.15.3-1`), GStreamer
 1.28.5. **Reproducer:** `…-repro-1.py` (videotestsrc only).
 

@@ -36,13 +36,41 @@ ladders, and the hardening pass. Design documents:
 
 ## Running it
 
+> **The container image is the recommended way to run kahawai.** It builds
+> GStreamer with the fixes in [`patches/`](./patches), which are not in a
+> release yet. On a stock install, files that those patches address will fail
+> to play — usually looking like corrupt media rather than a missing fix.
+>
+> ```sh
+> docker build -t kahawai .
+> docker run --rm --gpus all kahawai doctor                   # NVIDIA
+> docker run --rm --device=/dev/dri:/dev/dri kahawai doctor   # Intel/AMD
+> ```
+>
+> Building from source works and is what development uses — the notes below
+> cover it. Each patch carries a report and a reproducer that needs no media,
+> so you can check whether your own GStreamer is affected.
+
 ### Prerequisites
 
 - **Rust** (edition 2024 toolchain) and **protoc** (protobuf compiler) to build.
 - **GStreamer 1.24+** with the plugin sets: base, good, bad, ugly, libav, and
   [gst-plugins-rs](https://gitlab.freedesktop.org/gstreamer/gst-plugins-rs)
-  (for `hlssink3`). Hardware encoders come from your platform: `gst-plugin-va`
-  (VA-API/Quick Sync), the NVIDIA plugin set (NVENC), or macOS VideoToolbox.
+  **1.28.6 or newer** (for `hlssink3`). Hardware encoders come from your
+  platform: `gst-plugin-va` (VA-API/Quick Sync), the NVIDIA plugin set
+  (NVENC), or macOS VideoToolbox.
+
+  1.28.6 is the first release carrying two hlssink3 fixes that matter here:
+  a fragment whose first buffer has no PTS, and a running time unwrapped when
+  a segment is added. Both panic inside an FFI callback, so they abort the
+  whole process instead of failing one session — an older gst-plugins-rs
+  takes the server down on ordinary files.
+
+  Note that these plugins report their *crate* version, not the release, so
+  `gst-inspect-1.0 hlssink3` shows the same number either way; only the git
+  hash it appends distinguishes them. To settle it, run the reproducer in
+  [`patches/gst-plugins-rs/`](./patches/gst-plugins-rs) — it aborts the
+  process on an affected build and exits cleanly on a fixed one.
 - Node is **not** required to run — the web app ships prebuilt in the binary
   (`cd web && npm run build` only if you hack on it).
 

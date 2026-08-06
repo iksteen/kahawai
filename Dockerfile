@@ -10,16 +10,19 @@
 #   docker run --rm --gpus all kahawai doctor
 
 ARG RUST_VERSION=1.97.1
-# gst-plugins-rs now follows GStreamer's own version numbers.
-ARG GST_PLUGINS_RS_VERSION=gstreamer-1.28.5
-ARG GST_PLUGINS_RS_REV=cee45224cb2d10e1523af4f256d0dd64c8b29491
-# Ubuntu 26.04 ships GStreamer 1.28.2; the patched demuxers and the
-# patched H.264 codec stack are built from the current stable release
-# instead. gst-plugins-good declares ">= major.minor.0" for a stable
-# series, so 1.28.5 plugins against the distro's 1.28.2 core and base is
-# a supported combination.
-ARG GSTREAMER_VERSION=1.28.5
-ARG GSTREAMER_REV=727ceb91886862d200f423baf36cde2bb7ce5b4d
+# gst-plugins-rs follows GStreamer's version numbers. 1.28.6 is the
+# minimum: below it, hlssink3 aborts the process — not the session —
+# on a fragment whose first buffer has no PTS, and on an unwrapped
+# running time when a segment is added. Both panic inside an FFI
+# callback, which cannot unwind.
+ARG GST_PLUGINS_RS_VERSION=gstreamer-1.28.6
+ARG GST_PLUGINS_RS_REV=75e46c3a1b868e9a08fd688d091476b76a498df1
+# The whole GStreamer stack — core, base, good, bad, ugly, libav —
+# comes from this tag, patched with patches/gstreamer. None of Ubuntu's
+# gstreamer packages are installed: one tree means one version, one ABI,
+# and the fixes in patches/ apply to everything that could load them.
+ARG GSTREAMER_VERSION=1.28.6
+ARG GSTREAMER_REV=2d3e05cbdad68e47d645f548899b432dc9fb4473
 
 FROM rust:${RUST_VERSION}-bookworm AS rust-toolchain
 
@@ -33,25 +36,26 @@ ENV CARGO_HOME=/usr/local/cargo \
     RUSTUP_HOME=/usr/local/rustup \
     PATH=/usr/local/cargo/bin:$PATH
 
+# Dependencies come from Ubuntu's build-dep sets for the gstreamer
+# source packages, not from a list maintained here. That set is what
+# builds the plugins the distro ships, so the source build can reach
+# every one of them — including plugins nothing in kahawai names, which
+# decodebin can still autoplug and a library can still need.
+#
+# libgstreamer*-dev is deliberately absent: GStreamer is built below,
+# and the distro's headers would be what everything later links
+# against.
 ARG DEBIAN_FRONTEND=noninteractive
-RUN apt-get update \
+RUN sed -i 's/^Types: deb$/Types: deb deb-src/' /etc/apt/sources.list.d/ubuntu.sources \
+    && apt-get update \
+    && apt-get build-dep -y --no-install-recommends \
+        gstreamer1.0 gst-plugins-base1.0 gst-plugins-good1.0 \
+        gst-plugins-bad1.0 gst-plugins-ugly1.0 gst-libav1.0 \
     && apt-get install -y --no-install-recommends \
-        build-essential \
-        ca-certificates \
-        clang \
-        cmake \
-        git \
-        libgstreamer-plugins-base1.0-dev \
-        libgstreamer1.0-dev \
-        libass-dev \
-        libgudev-1.0-dev \
-        libleptonica-dev \
-        libtesseract-dev \
-        libva-dev \
-        meson \
-        ninja-build \
-        pkg-config \
-        protobuf-compiler \
+        bison build-essential ca-certificates clang cmake flex git meson \
+        nasm ninja-build pkg-config protobuf-compiler \
+        libvpl-dev libsvtav1enc-dev libaom-dev libdav1d-dev \
+        libleptonica-dev libtesseract-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # The upstream fixes this image carries, with their reports and
@@ -69,79 +73,87 @@ RUN git clone --depth 1 --branch "$GSTREAMER_VERSION" \
            git -C /tmp/gstreamer apply "$p"; \
        done
 
-# gst-plugins-good: avi and matroska only. Everything else stays on the
-# distro's 1.28.2 — these are the two the patches touch, and the two
-# whose failures are fatal rather than cosmetic. They land in
-# /usr/local, which GST_PLUGIN_PATH searches ahead of the system path,
-# so they shadow the packaged copies.
-RUN meson setup /tmp/gst-good-build /tmp/gstreamer/subprojects/gst-plugins-good \
-        --buildtype=release \
-        -Dauto_features=disabled -Davi=enabled -Dmatroska=enabled \
-        -Dexamples=disabled -Dtests=disabled -Dnls=disabled -Ddoc=disabled \
-    && meson compile -C /tmp/gst-good-build \
-    && install -D -m 0755 -s /tmp/gst-good-build/gst/avi/libgstavi.so \
-        /out/gstreamer-1.0/libgstavi.so \
-    && install -D -m 0755 -s /tmp/gst-good-build/gst/matroska/libgstmatroska.so \
-        /out/gstreamer-1.0/libgstmatroska.so
-
-# gst-plugins-bad: patch 0004 grows an array inside the public
-# GstH264DecRefPicMarking, so libgstcodecparsers changes size and
-# everything holding one has to be rebuilt against the new header. That
-# is not optional and not per-plugin: a process loads exactly one
-# libgstcodecparsers-1.0.so.0 — the soname is the same, so a decoder
-# built against the old layout would read a patched struct at the wrong
-# offsets, which is worse than the bug being fixed.
+# auto_features stays at its default, so every plugin whose dependency
+# is present is built — DVD, chiptunes, Bluetooth codecs and all. What
+# this image will be asked to play is not knowable from here, and a
+# plugin that costs seconds of compile is a cheaper bet than finding it
+# missing against a real file.
 #
-# So this builds the two libraries that carry the struct
-# (codecparsers, codecs) and every plugin kahawai reaches that holds
-# one: h264parse/h265parse (videoparsers), the timestampers, tsdemux,
-# and the four hardware codec plugins. The runtime stage deletes the
-# distro's remaining consumers rather than trusting them.
+# Off: Qt, GTK, devtools — hundreds of megabytes to draw pictures on a
+# screen this container does not have.
 #
-# The other bad libraries these link — libgstva-1.0, libgstcuda-1.0,
-# libgstmpegts-1.0 — do not hold the struct, so the distro's 1.28.2
-# copies stay, on the same in-series-ABI reasoning as the demuxers
-# above.
-RUN meson setup /tmp/gst-bad-build /tmp/gstreamer/subprojects/gst-plugins-bad \
+# The plugins kahawai cannot work without are named explicitly, so a
+# missing dependency fails this build instead of becoming a missing
+# element at runtime.
+RUN meson setup /tmp/gst-build /tmp/gstreamer \
         --buildtype=release --prefix=/usr/local --libdir=lib \
-        -Dauto_features=disabled \
-        -Dcodectimestamper=enabled -Dmpegtsdemux=enabled -Dnvcodec=enabled \
-        -Dqsv=enabled -Dv4l2codecs=enabled -Dva=enabled \
-        -Dvideoparsers=enabled \
-        -Dexamples=disabled -Dtests=disabled -Dnls=disabled -Ddoc=disabled \
-        -Dintrospection=disabled \
-    && meson compile -C /tmp/gst-bad-build \
-    && mkdir -p /out/lib \
-    && for l in codecparsers codecs; do \
-           cp -a "/tmp/gst-bad-build/gst-libs/gst/$l/libgst$l-1.0.so"* /out/lib/; \
-       done \
-    && for p in gst/codectimestamper/libgstcodectimestamper \
-                gst/mpegtsdemux/libgstmpegtsdemux \
-                gst/videoparsers/libgstvideoparsersbad \
-                sys/nvcodec/libgstnvcodec sys/qsv/libgstqsv \
-                sys/v4l2codecs/libgstv4l2codecs sys/va/libgstva; do \
-           install -D -m 0755 "/tmp/gst-bad-build/$p.so" \
-               "/out/gstreamer-1.0/$(basename "$p").so"; \
-       done
+        --wrap-mode=nodownload \
+        -Dgpl=enabled \
+        -Dexamples=disabled -Dtests=disabled -Ddoc=disabled -Dnls=disabled \
+        -Dintrospection=disabled -Ddevtools=disabled -Dges=disabled \
+        -Drtsp_server=disabled -Dsharp=disabled -Dpython=disabled \
+        -Drs=disabled -Dgst-examples=disabled -Dqt5=disabled -Dqt6=disabled \
+        -Dgst-plugins-good:avi=enabled -Dgst-plugins-good:matroska=enabled \
+        -Dgst-plugins-good:isomp4=enabled -Dgst-plugins-good:flac=enabled \
+        -Dgst-plugins-good:audioparsers=enabled \
+        -Dgst-plugins-bad:hls=enabled \
+        -Dgst-plugins-bad:videoparsers=enabled -Dgst-plugins-bad:codectimestamper=enabled \
+        -Dgst-plugins-bad:mpegtsdemux=enabled -Dgst-plugins-bad:mpegtsmux=enabled \
+        -Dgst-plugins-bad:assrender=enabled -Dgst-plugins-bad:nvcodec=enabled \
+        -Dgst-plugins-bad:va=enabled -Dgst-plugins-bad:qsv=enabled \
+        -Dgst-plugins-bad:v4l2codecs=enabled \
+        -Dgst-plugins-ugly:x264=enabled -Dgst-plugins-ugly:a52dec=enabled \
+        -Dgst-plugins-ugly:mpeg2dec=enabled -Dgst-plugins-ugly:dvdread=enabled \
+        -Dlibav=enabled \
+    && meson compile -C /tmp/gst-build \
+    && meson install -C /tmp/gst-build \
+    && meson install -C /tmp/gst-build --destdir /staging \
+    && ldconfig
 
-# gst-plugin-fmp4 became gst-plugin-isobmff (libgstfmp4.so ->
-# libgstisobmff.so) between 0.14 and 1.28. The element kahawai asks for,
-# isofmp4mux, is unchanged and still lives in that plugin.
-# 0000 is an upstream commit, not ours — the leading zero says so, and
-# says it goes first: 0001 fixes its abort by storing no running time,
-# which is only safe once 0000 stops the emission unwrapping it. Both
-# landed after the 1.28.5 tag, so a release build has to carry them.
-# Applied in filename order, which is why the numbering carries it.
+# What the runtime must install, derived from what was built: every
+# shared object the plugins and libraries load, mapped back to its
+# owning package. A plugin gained or lost upstream updates this by
+# itself.
+RUN mkdir -p /out \
+    && ldd /usr/local/lib/gstreamer-1.0/*.so /usr/local/lib/libgst*.so.* 2>/dev/null \
+        | awk '/=> \//{print $3}' | sort -u \
+        | grep -v '^/usr/local/' \
+        | xargs -r dpkg -S 2>/dev/null \
+        | cut -d: -f1 | tr -d ' ' | sort -u > /out/runtime-packages.txt \
+    && wc -l < /out/runtime-packages.txt
+
+# Everything built after this — gst-plugins-rs, and kahawai itself —
+# must link the GStreamer just installed, not a distro one.
+ENV PKG_CONFIG_PATH=/usr/local/lib/pkgconfig \
+    LD_LIBRARY_PATH=/usr/local/lib
+
+# Three plugins out of the forty-odd in gst-plugins-rs, because this is
+# the slowest step here and the rest — webrtc, ndi, spotify, gtk4,
+# threadshare — brings its own dependency trees for elements nothing
+# would reach.
+#
+#   isobmff    isofmp4mux, which kahawai muxes CMAF with. The plugin
+#              was gst-plugin-fmp4 before 1.28; the element is unchanged.
+#   hlssink3   the HLS sink kahawai prefers.
+#   dav1d      AV1 decoding. Nothing names it, and it is still needed:
+#              decodebin picks decoders out of the registry, so a codec
+#              with no decoder is a file that will not play. libaom
+#              gives av1dec as well; dav1ddec is first in kahawai's
+#              ladder and several times faster.
+#
+# rav1enc also lives here and is not built: it sits below svtav1enc,
+# which gst-plugins-bad provides. Add -p gst-plugin-rav1e for a second
+# software AV1 encoder.
+#
+# patches/gst-plugins-rs is NOT applied: 1.28.6 carries both fixes, and
+# git apply refuses a patch already in the tree. The files stay as the
+# record; each says where it landed.
 ARG GST_PLUGINS_RS_VERSION
 ARG GST_PLUGINS_RS_REV
 RUN git clone --depth 1 --branch "$GST_PLUGINS_RS_VERSION" \
         https://gitlab.freedesktop.org/gstreamer/gst-plugins-rs.git \
         /tmp/gst-plugins-rs \
-    && test "$(git -C /tmp/gst-plugins-rs rev-parse HEAD)" = "$GST_PLUGINS_RS_REV" \
-    && for p in /usr/src/patches/gst-plugins-rs/*.patch; do \
-           echo "applying $(basename "$p")"; \
-           git -C /tmp/gst-plugins-rs apply "$p"; \
-       done
+    && test "$(git -C /tmp/gst-plugins-rs rev-parse HEAD)" = "$GST_PLUGINS_RS_REV"
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,id=gst-plugins-rs-target-ubuntu2604,target=/tmp/gst-plugins-rs/target \
@@ -149,10 +161,19 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
         --manifest-path /tmp/gst-plugins-rs/Cargo.toml \
         -p gst-plugin-isobmff \
         -p gst-plugin-hlssink3 \
+        -p gst-plugin-dav1d \
     && install -D -m 0755 -s /tmp/gst-plugins-rs/target/release/libgstisobmff.so \
-        /out/gstreamer-1.0/libgstisobmff.so \
+        /staging/usr/local/lib/gstreamer-1.0/libgstisobmff.so \
     && install -D -m 0755 -s /tmp/gst-plugins-rs/target/release/libgsthlssink3.so \
-        /out/gstreamer-1.0/libgsthlssink3.so
+        /staging/usr/local/lib/gstreamer-1.0/libgsthlssink3.so \
+    && install -D -m 0755 -s /tmp/gst-plugins-rs/target/release/libgstdav1d.so \
+        /staging/usr/local/lib/gstreamer-1.0/libgstdav1d.so \
+    && install -D -m 0755 -s /tmp/gst-plugins-rs/target/release/libgstdav1d.so \
+        /usr/local/lib/gstreamer-1.0/libgstdav1d.so \
+    && install -D -m 0755 -s /tmp/gst-plugins-rs/target/release/libgstisobmff.so \
+        /usr/local/lib/gstreamer-1.0/libgstisobmff.so \
+    && install -D -m 0755 -s /tmp/gst-plugins-rs/target/release/libgsthlssink3.so \
+        /usr/local/lib/gstreamer-1.0/libgsthlssink3.so
 
 WORKDIR /usr/src/kahawai
 COPY . .
@@ -163,12 +184,13 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     KAHAWAI_BUILD="${KAHAWAI_BUILD}" cargo build --locked --release --bin kahawai \
     && install -D -m 0755 -s target/release/kahawai /out/kahawai
 
-# GStreamer 1.24 from Ubuntu 24.04 recognizes Blackwell GPUs but its NVENC
-# preset negotiation fails against current drivers. 1.28 supports the same
-# older devices while also making H.264/HEVC/AV1 NVENC usable on Blackwell.
 FROM ubuntu:26.04 AS runtime
 
+# The runtime libraries are the list the builder derived, plus the
+# drivers and data files nothing links against but everything needs. No
+# gstreamer1.0-* packages: the stack comes from the builder.
 ARG DEBIAN_FRONTEND=noninteractive
+COPY --from=builder /out/runtime-packages.txt /tmp/runtime-packages.txt
 RUN set -eux; \
     arch="$(dpkg --print-architecture)"; \
     intel_packages=""; \
@@ -178,55 +200,17 @@ RUN set -eux; \
     fi; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
-        ca-certificates \
-        fontconfig \
-        gstreamer1.0-gl \
-        gstreamer1.0-libav \
-        gstreamer1.0-plugins-bad \
-        gstreamer1.0-plugins-base \
-        gstreamer1.0-plugins-good \
-        gstreamer1.0-plugins-ugly \
-        gstreamer1.0-tools \
-        gstreamer1.0-x \
-        mesa-va-drivers \
-        tesseract-ocr \
-        tesseract-ocr-eng \
-        vainfo \
+        $(tr '\n' ' ' < /tmp/runtime-packages.txt) \
+        ca-certificates fontconfig \
+        mesa-va-drivers vainfo \
+        tesseract-ocr tesseract-ocr-eng \
         $intel_packages; \
-    rm -rf /var/lib/apt/lists/*
+    rm -rf /var/lib/apt/lists/* /tmp/runtime-packages.txt
 
 COPY --from=builder /out/kahawai /usr/local/bin/kahawai
-COPY --from=builder /out/gstreamer-1.0/ /usr/local/lib/gstreamer-1.0/
-COPY --from=builder /out/lib/ /usr/local/lib/
+COPY --from=builder /staging/usr/local/ /usr/local/
 
-# gstreamer1.0-vaapi is deliberately not installed: Ubuntu still ships
-# it at 1.26.8, it holds an H.264 slice header too, and it cannot be
-# rebuilt — gstreamer-vaapi was dropped from the monorepo before 1.28.
-# The va plugin built above covers the same hardware, which is why
-# upstream retired it.
-#
-# Everything else that holds one of the patched structs and was not
-# rebuilt goes now. Reading DT_NEEDED with grep rather than objdump
-# keeps binutils out of the runtime image; the strings are in .dynstr
-# either way, and a false positive would only demand a replacement that
-# is already there. Verified against ubuntu:26.04: seven consumers are
-# ours, six are removed here.
-RUN set -eux; \
-    ldconfig; \
-    for so in /usr/lib/*/gstreamer-1.0/*.so; do \
-        grep -aq 'libgstcodecparsers-1.0.so.0\|libgstcodecs-1.0.so.0' "$so" \
-            || continue; \
-        if [ -e "/usr/local/lib/gstreamer-1.0/$(basename "$so")" ]; then \
-            echo "patched: $(basename "$so")"; \
-        else \
-            echo "removing stale ABI consumer: $(basename "$so")"; \
-            rm "$so"; \
-        fi; \
-    done; \
-    # The whole scheme rests on /usr/local/lib winning in the cache, so
-    # let the loader say so rather than assuming Ubuntu's search order.
-    ldd /usr/local/lib/gstreamer-1.0/libgstnvcodec.so \
-        | grep -q '/usr/local/lib/libgstcodecparsers-1.0.so.0'
+RUN ldconfig
 
 # The NVIDIA runtime injects its driver libraries. "video" is NVENC/NVDEC;
 # "graphics" also permits the headless OpenGL tone-mapping path.
