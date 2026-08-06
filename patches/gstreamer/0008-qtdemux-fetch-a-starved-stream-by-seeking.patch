@@ -1,0 +1,270 @@
+From 4cf737d9c1516497cdeca82cd9d4092cf7eb410a Mon Sep 17 00:00:00 2001
+From: Ingmar Steen <iksteen@gmail.com>
+Date: Thu, 6 Aug 2026 22:20:42 +0200
+Subject: [PATCH] qtdemux: fetch a starved stream by seeking instead of reading
+ up to it
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Pushed, samples are served in byte order. That is right for a file whose
+streams are interleaved and wrong for one whose streams are not: an MP4
+written as all video and then all audio delivers nothing from its second
+stream until the first is exhausted, because the first sample of that
+stream sits at the far end of the file. Anything downstream that muxes
+waits that entire time. On a 1.8 GB title that is the difference between
+starting and appearing to hang; pulled, the same file starts at once,
+because each stream is read where it lives.
+
+When upstream can seek, pushed can do the same. Track how far each
+stream has fallen behind in decode time, and when one falls further
+behind than any sane interleave — and its data is far enough away that
+the jump pays for itself — seek to it rather than read everything in
+between.
+
+Three parts:
+
+  - qtdemux_push_starved_stream() finds the stream that is furthest
+    behind and says where its data is, or says no, which is the answer
+    for every interleaved file.
+
+  - next_entry_size() passes over a stream whose next sample lies behind
+    the read position rather than selecting it and finding no entry at
+    the current offset, which ended the file early. Only when a seek can
+    fetch it back, so a non-seekable upstream is unaffected.
+
+  - The segment that answers such a seek must not be read as "start
+    again from here": that path repositions every stream to the new byte
+    offset and marks as EOS any stream with no samples there, which is
+    precisely the stream just seeked away from. The seqnum of the seek
+    identifies its own segment.
+
+Measured on a 27.5 MB file whose audio starts at 97.9% (videotestsrc +
+audiotestsrc through mp4mux with interleaving disabled): starting both
+streams read 100% of the file before, 27% after, against 0.06% pulled.
+The remainder is the lag threshold, so the cost no longer grows with the
+file: the 1.8 GB title that prompted this went from producing nothing in
+120 s to 3057 segments carrying both streams.
+---
+ .../gst-plugins-good/gst/isomp4/qtdemux.c     | 140 ++++++++++++++++++
+ .../gst-plugins-good/gst/isomp4/qtdemux.h     |   6 +
+ 2 files changed, 146 insertions(+)
+
+diff --git a/subprojects/gst-plugins-good/gst/isomp4/qtdemux.c b/subprojects/gst-plugins-good/gst/isomp4/qtdemux.c
+index 4ad4745e3d9..3536c7621e3 100644
+--- a/subprojects/gst-plugins-good/gst/isomp4/qtdemux.c
++++ b/subprojects/gst-plugins-good/gst/isomp4/qtdemux.c
+@@ -374,6 +374,7 @@ static GstCaps *qtdemux_generic_caps (GstQTDemux * qtdemux,
+     QtDemuxStream * stream, QtDemuxStreamStsdEntry * entry, guint32 fourcc,
+     GNode * stsd_entry, gchar ** codec_name);
+ 
++static guint64 next_entry_size (GstQTDemux * demux);
+ static gboolean qtdemux_parse_samples (GstQTDemux * qtdemux,
+     QtDemuxStream * stream, guint32 n);
+ static GstFlowReturn qtdemux_expose_streams (GstQTDemux * qtdemux);
+@@ -2037,6 +2038,8 @@ gst_qtdemux_reset (GstQTDemux * qtdemux, gboolean hard)
+     qtdemux->first_mdat = -1;
+     qtdemux->header_size = 0;
+     qtdemux->mdatoffset = -1;
++    qtdemux->interleave_seek_pending = FALSE;
++    qtdemux->interleave_seek_seqnum = GST_SEQNUM_INVALID;
+     qtdemux->restoredata_offset = -1;
+     if (qtdemux->mdatbuffer)
+       gst_buffer_unref (qtdemux->mdatbuffer);
+@@ -2283,6 +2286,24 @@ gst_qtdemux_handle_sink_event (GstPad * sinkpad, GstObject * parent,
+         GST_OBJECT_UNLOCK (demux);
+       }
+ 
++      /* Our own seek, sent to fetch a stream the byte-order schedule was
++       * starving. Everything below reads a segment as "start again from
++       * here" and repositions every stream to this byte offset — which
++       * marks as EOS exactly the stream we seeked away from, whose
++       * samples are elsewhere in the file. Move the read position and
++       * leave the streams where they are. */
++      if (demux->interleave_seek_seqnum != GST_SEQNUM_INVALID
++          && gst_event_get_seqnum (event) == demux->interleave_seek_seqnum) {
++        GST_DEBUG_OBJECT (demux, "segment answers our own interleave seek; "
++            "keeping stream positions");
++        demux->interleave_seek_seqnum = GST_SEQNUM_INVALID;
++        demux->interleave_seek_pending = FALSE;
++        gst_adapter_clear (demux->adapter);
++        demux->todrop = 0;
++        demux->neededbytes = next_entry_size (demux);
++        goto exit;
++      }
++
+       /* we only expect a BYTE segment, e.g. following a seek */
+       if (segment.format == GST_FORMAT_BYTES) {
+         if (GST_CLOCK_TIME_IS_VALID (segment.start)) {
+@@ -7791,6 +7812,84 @@ has_next_entry (GstQTDemux * demux)
+   return FALSE;
+ }
+ 
++/* How far a stream may fall behind before it is worth a seek to fetch it,
++ * and how far away its data must be for the seek to pay for itself.
++ *
++ * The lag is deliberately larger than any sane interleave (mp4mux
++ * defaults to 250 ms), so a well-muxed file never reaches it. The
++ * distance mirrors the guard on the header-hunting seek below: a jump
++ * shorter than this costs more in flushes than it saves in reads. */
++#define QTDEMUX_PUSH_SEEK_LAG (2 * GST_SECOND)
++#define QTDEMUX_PUSH_SEEK_DISTANCE (4 * 1024 * 1024)
++
++/*
++ * qtdemux_push_starved_stream
++ *
++ * Pushed, samples are served in byte order, which is right for a file
++ * whose streams are interleaved and wrong for one whose streams are
++ * not: an MP4 written as all video then all audio delivers nothing from
++ * its second stream until the first is exhausted. Anything downstream
++ * that muxes waits that whole time, which on a 1.8 GB file is the
++ * difference between starting and appearing to hang.
++ *
++ * Pulled this never arises, because each stream is read where it lives.
++ * When upstream can seek, pushed can do the same: notice the stream
++ * that has fallen behind in decode time, and say where its data is.
++ *
++ * Returns TRUE and sets @offset when such a stream exists.
++ */
++static gboolean
++qtdemux_push_starved_stream (GstQTDemux * demux, guint64 * offset)
++{
++  GstClockTime lag_time = GST_CLOCK_TIME_NONE, lead_time = 0;
++  guint64 lag_offset = 0;
++  gint i;
++
++  for (i = 0; i < QTDEMUX_N_STREAMS (demux); i++) {
++    QtDemuxStream *stream = QTDEMUX_NTH_STREAM (demux, i);
++    QtDemuxSample *sample;
++    GstClockTime dts;
++
++    /* Nothing left to serve, or nothing served yet: sample_index is
++     * unsigned and "not started" is -1, which this catches too. */
++    if (stream->sample_index >= stream->n_samples)
++      continue;
++    if (!qtdemux_parse_samples (demux, stream, stream->sample_index))
++      continue;
++
++    sample = &stream->samples[stream->sample_index];
++    dts = QTSAMPLE_DTS (stream, sample);
++    if (!GST_CLOCK_TIME_IS_VALID (dts))
++      continue;
++
++    if (dts > lead_time)
++      lead_time = dts;
++    if (!GST_CLOCK_TIME_IS_VALID (lag_time) || dts < lag_time) {
++      lag_time = dts;
++      lag_offset = sample->offset;
++    }
++  }
++
++  if (!GST_CLOCK_TIME_IS_VALID (lag_time)
++      || lead_time - lag_time < QTDEMUX_PUSH_SEEK_LAG)
++    return FALSE;
++
++  /* Behind us it can only be reached by seeking; ahead of us it arrives
++   * on its own, unless it is a long way off. */
++  if (lag_offset >= demux->offset
++      && lag_offset - demux->offset < QTDEMUX_PUSH_SEEK_DISTANCE)
++    return FALSE;
++
++  GST_DEBUG_OBJECT (demux,
++      "stream lags by %" GST_TIME_FORMAT ", its data is at %" G_GUINT64_FORMAT
++      " (%s read position %" G_GUINT64_FORMAT "); seeking to it",
++      GST_TIME_ARGS (lead_time - lag_time), lag_offset,
++      lag_offset < demux->offset ? "behind" : "ahead of", demux->offset);
++
++  *offset = lag_offset;
++  return TRUE;
++}
++
+ /*
+  * next_entry_size
+  *
+@@ -7821,6 +7920,21 @@ next_entry_size (GstQTDemux * demux)
+       continue;
+     }
+ 
++    /* Pushed with a seekable upstream, a stream whose next sample lies
++     * BEHIND the read position is not the end of anything: it is a
++     * stream the byte-order schedule has run past, and
++     * qtdemux_push_starved_stream seeks back for it once it has fallen
++     * far enough behind. Passing over it here keeps the reachable
++     * streams flowing meanwhile; without this it is chosen below, no
++     * entry is found at the current offset, and the file ends early. */
++    if (!demux->pullbased && demux->upstream_seekable && !demux->fragmented
++        && qtdemux_parse_samples (demux, stream, stream->sample_index)
++        && stream->samples[stream->sample_index].offset < demux->offset) {
++      GST_LOG_OBJECT (demux, "track-id %u is behind the read position",
++          stream->track_id);
++      continue;
++    }
++
+     if (!qtdemux_parse_samples (demux, stream, stream->sample_index)) {
+       GST_LOG_OBJECT (demux, "Parsing of index %u from stbl atom failed!",
+           stream->sample_index);
+@@ -7886,6 +8000,11 @@ qtdemux_seek_offset (GstQTDemux * demux, guint64 offset)
+ 
+   /* store seqnum to drop flush events, they don't need to reach downstream */
+   demux->offset_seek_seqnum = gst_event_get_seqnum (event);
++  /* ... and, for a seek that fetches a starved stream, remember it: the
++   * segment that comes back must NOT be read as a reposition of every
++   * stream (see the sink event handler). */
++  if (demux->interleave_seek_pending)
++    demux->interleave_seek_seqnum = gst_event_get_seqnum (event);
+   res = gst_pad_push_event (demux->sinkpad, event);
+   demux->offset_seek_seqnum = GST_SEQNUM_INVALID;
+ 
+@@ -8674,11 +8793,32 @@ gst_qtdemux_process_adapter (GstQTDemux * demux, gboolean force)
+         guint64 dts, pts, duration;
+         gboolean round_up_duration = FALSE;
+         gboolean keyframe;
++        guint64 starved_offset;
+         gint i;
+ 
+         GST_DEBUG_OBJECT (demux,
+             "BEGIN // in MOVIE for offset %" G_GUINT64_FORMAT, demux->offset);
+ 
++        /* Fetch a stream the byte-order schedule is starving, instead of
++         * reading everything between here and its data. The conditions
++         * live in qtdemux_push_starved_stream, which says no for every
++         * interleaved file — which is nearly all of them. */
++        if (!demux->pullbased && demux->upstream_seekable
++            && !demux->fragmented
++            && qtdemux_push_starved_stream (demux, &starved_offset)) {
++          demux->interleave_seek_pending = TRUE;
++          if (qtdemux_seek_offset (demux, starved_offset)) {
++            demux->offset = starved_offset;
++            demux->neededbytes = next_entry_size (demux);
++            /* The seek flushed the adapter; nothing to process until the
++             * data from the new position arrives. */
++            break;
++          }
++          demux->interleave_seek_pending = FALSE;
++          GST_DEBUG_OBJECT (demux,
++              "seek to the starved stream failed; reading through instead");
++        }
++
+         if (demux->fragmented) {
+           GST_DEBUG_OBJECT (demux, "mdat remaining %" G_GUINT64_FORMAT,
+               demux->mdatleft);
+diff --git a/subprojects/gst-plugins-good/gst/isomp4/qtdemux.h b/subprojects/gst-plugins-good/gst/isomp4/qtdemux.h
+index 51a2a875805..56a44bc36fb 100644
+--- a/subprojects/gst-plugins-good/gst/isomp4/qtdemux.h
++++ b/subprojects/gst-plugins-good/gst/isomp4/qtdemux.h
+@@ -287,6 +287,12 @@ struct _GstQTDemux {
+ 
+   /* Whether upstream is seekable in BYTES */
+   gboolean upstream_seekable;
++
++  /* A seek this element made to fetch a stream the byte-order schedule
++   * was starving (push mode only), and the seqnum of the segment that
++   * answers it. */
++  gboolean interleave_seek_pending;
++  guint32 interleave_seek_seqnum;
+   /* UPSTREAM BYTE: Size of upstream content.
+    * Note : This is only computed once ! If upstream grows in the meantime
+    * it will not be updated */
+-- 
+2.55.0
+
