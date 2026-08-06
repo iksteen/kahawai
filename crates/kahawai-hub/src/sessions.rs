@@ -1925,6 +1925,9 @@ impl Sessions {
                         cmd.args([flag, &v.to_string()]);
                     }
                 }
+                if plan.deinterlace {
+                    cmd.arg("--deinterlace");
+                }
                 if plan.tone_map {
                     cmd.arg("--tone-map");
                 }
@@ -2179,6 +2182,7 @@ impl Sessions {
                     max_height: plan.max_height.unwrap_or(0),
                     max_channels: plan.max_channels.unwrap_or(0),
                     tone_map: plan.tone_map,
+                    deinterlace: plan.deinterlace,
                     // 1-based on the wire: 0 means "burn nothing".
                     burn_subtitle: plan.burn_subtitle.map_or(0, |n| n as u32 + 1),
                     burn_sets: burn_sets.clone(),

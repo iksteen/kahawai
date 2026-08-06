@@ -91,6 +91,9 @@ pub struct WorkerArgs {
     /// HUB-15a: tone-map HDR to SDR in the video encode chain.
     #[arg(long)]
     pub tone_map: bool,
+    /// The source is interlaced: deinterlace before the encoder.
+    #[arg(long)]
+    pub deinterlace: bool,
     /// HUB-32b: burn this image subtitle track (e{n}) into the picture.
     #[arg(long)]
     pub burn_sub: Option<usize>,
@@ -191,6 +194,7 @@ pub fn run_remux_worker(cfg: &config::Config, w: WorkerArgs) -> Result<()> {
         max_height: w.max_height,
         max_channels: w.max_channels,
         tone_map: w.tone_map,
+        deinterlace: w.deinterlace,
         burn_subtitle: w.burn_sub,
         burn_ass: w.burn_ass,
         video_codec: kahawai_media::remux::VideoTarget::from_str(&w.video_codec),

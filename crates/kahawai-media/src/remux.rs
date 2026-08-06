@@ -523,6 +523,22 @@ pub struct RemuxPlan {
     /// HUB-15a: run the GL PQ→SDR tone-map segment in the video encode
     /// chain. Only set when the executing box reported the capability.
     pub tone_map: bool,
+    /// Deinterlace before the encoder, because the source carries fields.
+    ///
+    /// Only meaningful with an encode: a copy hands the client whatever
+    /// the file holds. Set from the source's own `interlaced` flag, and
+    /// not unconditionally, because the element works in system memory
+    /// and cannot take the 10-bit device memory a hardware decoder hands
+    /// an NVENC encode — inserting it always would cost every HDR encode
+    /// a download and a conversion to buy nothing.
+    ///
+    /// It is also what makes those sources encode at all here: nvh264enc
+    /// fails at the first frame with `Failed to lock bitstream,
+    /// NV_ENC_ERR_INVALID_PARAM` when handed field-flagged buffers (an
+    /// RTX 5070 Ti, driver 610.43.03; measured, and relabelling the caps
+    /// progressive with capssetter is enough to make it pass, so it is
+    /// the field flags and not the pixels).
+    pub deinterlace: bool,
     /// HUB-32b last resort: burn this image subtitle track (the `e{n}`
     /// index) into the picture, for clients that cannot composite one
     /// themselves. Forces the video encode that carries it.
@@ -1299,6 +1315,7 @@ fn route_stream(
                     plan.video_kbps,
                     plan.max_height,
                     plan.tone_map,
+                    plan.deinterlace,
                     burn.clone(),
                     ass_link.clone(),
                 );
@@ -2188,6 +2205,7 @@ fn build_video_encode_chain(
     video_kbps: Option<u32>,
     max_height: Option<u32>,
     tone_map: bool,
+    deinterlace: bool,
     burn: Option<std::sync::Arc<crate::burnin::Timeline>>,
     // HUB-32a: Some when the plan burns an ASS track — the element is
     // built here and its text pad published for the subtitle branch.
@@ -2273,6 +2291,30 @@ fn build_video_encode_chain(
         _ => vec![],
     };
 
+    // Fields go before everything that reads the picture: the tone map,
+    // the scaler and any burn-in all blend rows, and blending rows that
+    // belong to different instants is how interlaced content turns into
+    // combing that no later stage can undo.
+    let deinterlacer: Vec<gst::Element> = match deinterlace {
+        // mode=interlaced, not the default auto. Auto believes the caps,
+        // and a 1080i BluRay remux arrives with progressive-looking caps
+        // and field flags on the buffers: auto passes it through and the
+        // encoder then fails on the flags. The element is only in the
+        // chain because discovery already said this source has fields,
+        // so there is nothing left for auto to decide.
+        true => match gst::ElementFactory::make("deinterlace")
+            .property_from_str("mode", "interlaced")
+            .build()
+        {
+            Ok(el) => vec![el],
+            Err(_) => {
+                tracing::warn!("interlaced source and no deinterlace element — encoding fields");
+                vec![]
+            }
+        },
+        false => vec![],
+    };
+
     // HUB-15a: the GL segment sits in the same system-memory zone as
     // the scaler, before it — tone-map at source resolution, then
     // scale (scaling PQ-coded pixels before linearizing would blur
@@ -2340,6 +2382,7 @@ fn build_video_encode_chain(
 
     let mut chain: Vec<&gst::Element> = Vec::new();
     chain.extend(converters[..scale_at].iter());
+    chain.extend(deinterlacer.iter());
     chain.extend(tonemap.iter());
     chain.extend(scaler.iter());
     chain.extend(burn_el.iter());
@@ -4853,6 +4896,7 @@ mod tests {
         max_height: None,
         max_channels: None,
         tone_map: false,
+        deinterlace: false,
         burn_ass: None,
         burn_subtitle: None,
         video_codec: VideoTarget::H264,

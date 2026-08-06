@@ -105,6 +105,8 @@ impl Runner {
         sink: &str,
         tail_sizes: Vec<u64>,
         encode_params: (u32, u32, u32, bool, u32),
+        // The source is interlaced; the encode chain deinterlaces.
+        deinterlace: bool,
         // HUB-15b (video_codec, audio_codec, container); empty = legacy.
         targets: (String, String, String),
         burn_sets: Vec<u8>,
@@ -123,6 +125,7 @@ impl Runner {
                 sink,
                 &tail_sizes,
                 encode_params,
+                deinterlace,
                 targets,
                 burn_sets,
                 ass_burn,
@@ -181,6 +184,7 @@ impl Runner {
         sink: &str,
         tail_sizes: &[u64],
         (video_kbps, max_height, max_channels, tone_map, burn_subtitle): (u32, u32, u32, bool, u32),
+        deinterlace: bool,
         (video_codec, audio_codec, container): (String, String, String),
         burn_sets: Vec<u8>,
         (burn_ass, burn_ass_file): (u32, Vec<u8>),
@@ -248,6 +252,9 @@ impl Runner {
                         cmd.args([flag, &v.to_string()]);
                     }
                 }
+                if deinterlace {
+                    cmd.arg("--deinterlace");
+                }
                 if tone_map {
                     cmd.arg("--tone-map");
                 }
@@ -314,6 +321,7 @@ impl Runner {
                     max_height: (max_height > 0).then_some(max_height),
                     max_channels: (max_channels > 0).then_some(max_channels),
                     tone_map,
+                    deinterlace,
                     burn_subtitle: (burn_subtitle > 0).then(|| (burn_subtitle - 1) as usize),
                     burn_ass: (burn_ass > 0).then(|| (burn_ass - 1) as usize),
                     video_codec: kahawai_media::remux::VideoTarget::from_str(&video_codec),

@@ -769,6 +769,9 @@ pub fn negotiate(
                 })
         }),
         tone_map,
+        // Fields only matter where the pixels get rewritten; a copy
+        // carries them out as they came in.
+        deinterlace: video == StreamMode::Encode && v.is_some_and(|s| s.interlaced),
         video_codec: video_target,
         audio_codec: audio_target,
         segment_format,
@@ -2477,6 +2480,74 @@ mod tests {
     /// up — measured, not assumed: a 10.43 s GOP produced segments of
     /// 10.22-10.58 s against a 2 s fragment target, so 12 covers it and
     /// 11 would not.
+    /// Fields are the encoder's problem, and only the encoder's.
+    ///
+    /// nvh264enc fails at the first frame with `Failed to lock bitstream,
+    /// NV_ENC_ERR_INVALID_PARAM` when handed field-flagged buffers, so an
+    /// interlaced source that reaches an encode must be deinterlaced on
+    /// the way in. A copy carries the fields out untouched, which is both
+    /// cheaper and what the client asked for.
+    #[test]
+    fn an_interlaced_source_is_deinterlaced_only_when_it_is_encoded() {
+        crate::init().unwrap();
+        let mut interlaced = media("matroska", Some(vs("h264")), Some(au("aac", 2)));
+        interlaced.video[0].interlaced = true;
+
+        // Copy: an h264 source a chrome client takes as-is.
+        let sp = negotiate(
+            &chrome(),
+            &interlaced,
+            0,
+            0,
+            true,
+            None,
+            false,
+            true,
+            &[],
+            None,
+            &fleet(),
+        );
+        assert!(sp.plan.video != StreamMode::Encode, "{}", sp.video_verdict);
+        assert!(!sp.plan.deinterlace, "a copy keeps the source's fields");
+
+        // Encode: the same source for a client that cannot take h264.
+        let mut p = chrome();
+        p.video.retain(|c| c.codec != "h264");
+        let sp = negotiate(
+            &p,
+            &interlaced,
+            0,
+            0,
+            true,
+            None,
+            false,
+            true,
+            &[],
+            None,
+            &fleet(),
+        );
+        assert_eq!(sp.plan.video, StreamMode::Encode, "{}", sp.video_verdict);
+        assert!(sp.plan.deinterlace, "an encode of fields must deinterlace");
+
+        // And a progressive source pays nothing for the feature.
+        let progressive = media("matroska", Some(vs("h264")), Some(au("aac", 2)));
+        let sp = negotiate(
+            &p,
+            &progressive,
+            0,
+            0,
+            true,
+            None,
+            false,
+            true,
+            &[],
+            None,
+            &fleet(),
+        );
+        assert_eq!(sp.plan.video, StreamMode::Encode, "{}", sp.video_verdict);
+        assert!(!sp.plan.deinterlace, "nothing to deinterlace");
+    }
+
     #[test]
     fn the_declared_value_bounds_the_longest_segment() {
         assert_eq!(declared_target_secs(&T::Accurate, Some(10_430), false), 12);

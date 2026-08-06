@@ -569,6 +569,11 @@ message StartSession {
   // Embedded tracks do NOT come this way — they are burned from the
   // demuxer's pad, the only path carrying the file's attached fonts.
   bytes burn_ass_file = 20;
+  // The source carries fields, so the encode chain deinterlaces before
+  // anything reads the picture. Sent rather than re-derived because the
+  // worker never sees the file, only the bytes it is fed. An old
+  // transcoder ignoring this encodes fields, which is what it did before.
+  bool deinterlace = 21;
 }
 
 message EndSession {
