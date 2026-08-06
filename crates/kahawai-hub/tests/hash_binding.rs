@@ -551,3 +551,153 @@ async fn selection_follows_the_question_not_the_miss() {
         "bridge question spent"
     );
 }
+
+/// Adds a second file to an EXISTING episode item, with its own hash
+/// answer: the shape of two rips sharing one slot.
+async fn extra_source(
+    db: &SqlitePool,
+    item_id: &str,
+    name: &str,
+    file_aid: u32,
+    eid: i64,
+    epno: &str,
+) {
+    sqlx::query(
+        "INSERT INTO files (module_id, collection_id, path_rel, size, mtime_unix,
+                            head_xxh3, tail_xxh3, oshash, streams_json, subs_extracted, ed2k)
+         VALUES ('m','c', ? || '.mkv', 700, 1, 0, 0, 0, '{}', 0, 'hash-' || ?)",
+    )
+    .bind(name)
+    .bind(name)
+    .execute(db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO item_sources (item_id, module_id, collection_id, path_rel)
+         VALUES (?, 'm', 'c', ? || '.mkv')",
+    )
+    .bind(item_id)
+    .bind(name)
+    .execute(db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT OR REPLACE INTO ed2k_aid (ed2k, aid, eid, epno, gid, group_name, updated_at)
+         VALUES ('hash-' || ?, ?, ?, ?, 7, 'Grp', unixepoch())",
+    )
+    .bind(name)
+    .bind(file_aid)
+    .bind(eid)
+    .bind(epno)
+    .execute(db)
+    .await
+    .unwrap();
+}
+
+/// Two files on one slot, from another AniDB entry, naming different
+/// episodes: they are different episodes and must come apart.
+///
+/// Megazone 23 is the case (HUB-30, amended 2026-08-06): `pt.03-a` and
+/// `pt.03-b` both landed on S00E023 — an episode number lifted out of
+/// the TITLE "Megazone 23" — while their hashes name eids 39483 and
+/// 39484, episodes 1 and 2 of a different aid. The numbering cannot come
+/// from the hash, because that entry's episode 1 is not this show's, so
+/// the first keeps the slot and the second is parked on a free season-0
+/// number.
+#[tokio::test]
+async fn a_slot_shared_by_different_episodes_comes_apart() {
+    let (enricher, db, _dir) = harness().await;
+    const OTHER_AID: u32 = 3545;
+    // The contested slot, and a real episode 1 that must not be disturbed.
+    episode(&db, "own1", Some(0), 1, AID, "S1").await;
+    episode(&db, "pt3a", Some(0), 23, OTHER_AID, "1").await;
+    sqlx::query("UPDATE ed2k_aid SET eid = 39483 WHERE ed2k = 'hash-pt3a'")
+        .execute(&db)
+        .await
+        .unwrap();
+    extra_source(&db, "pt3a", "pt3b", OTHER_AID, 39484, "2").await;
+
+    let moves = enricher
+        .bind_hashed_episodes(&db, "show", AID)
+        .await
+        .unwrap();
+
+    assert_eq!(moves.len(), 1, "exactly the second file moves: {moves:?}");
+    let (a_season, a_ep, a_id) = slot_of(&db, "pt3a.mkv").await;
+    let (b_season, b_ep, b_id) = slot_of(&db, "pt3b.mkv").await;
+    assert_ne!(a_id, b_id, "different episodes must not share an item");
+    assert_eq!(
+        (a_season, a_ep),
+        (Some(0), 23),
+        "the lower eid keeps the slot"
+    );
+    assert_eq!(b_season, Some(0), "the other stays in the season it was in");
+    assert!(
+        b_ep > 23,
+        "on a free number, not on top of an existing one: {b_ep}"
+    );
+    // The show's own episode is untouched — this pass moves nothing else.
+    assert_eq!(slot_of(&db, "own1.mkv").await.1, 1);
+}
+
+/// Two rips of the SAME episode share an eid, and sharing an item is
+/// what they are supposed to do. The count of sources is not the test.
+#[tokio::test]
+async fn two_copies_of_one_episode_stay_together() {
+    let (enricher, db, _dir) = harness().await;
+    const OTHER_AID: u32 = 3545;
+    episode(&db, "dup", Some(0), 23, OTHER_AID, "1").await;
+    sqlx::query("UPDATE ed2k_aid SET eid = 39483 WHERE ed2k = 'hash-dup'")
+        .execute(&db)
+        .await
+        .unwrap();
+    extra_source(&db, "dup", "dup720", OTHER_AID, 39483, "1").await;
+
+    let moves = enricher
+        .bind_hashed_episodes(&db, "show", AID)
+        .await
+        .unwrap();
+
+    assert!(moves.is_empty(), "same eid, nothing to split: {moves:?}");
+    assert_eq!(
+        slot_of(&db, "dup.mkv").await.2,
+        slot_of(&db, "dup720.mkv").await.2
+    );
+}
+
+/// The same split on an ABSOLUTE-numbered show, which is the anime norm:
+/// its episodes carry a NULL season (HUB-31), so the freed number has to
+/// come from that same numbering — not from season 0, where "the first
+/// free number" is 1 and a real episode 1 already sits.
+///
+/// The live database taught this one. The first cut parked the file at
+/// season 0 episode 1, beside a real absolute episode 1, because the
+/// fixture only ever used season 0.
+#[tokio::test]
+async fn a_split_on_an_absolute_numbered_show_stays_absolute() {
+    let (enricher, db, _dir) = harness().await;
+    const OTHER_AID: u32 = 3545;
+    episode(&db, "abs1", None, 1, AID, "1").await;
+    episode(&db, "abs23", None, 23, OTHER_AID, "1").await;
+    sqlx::query("UPDATE ed2k_aid SET eid = 39483 WHERE ed2k = 'hash-abs23'")
+        .execute(&db)
+        .await
+        .unwrap();
+    extra_source(&db, "abs23", "abs23b", OTHER_AID, 39484, "2").await;
+
+    let moves = enricher
+        .bind_hashed_episodes(&db, "show", AID)
+        .await
+        .unwrap();
+
+    assert_eq!(moves.len(), 1, "{moves:?}");
+    let (season, ep, id) = slot_of(&db, "abs23b.mkv").await;
+    assert_eq!(season, None, "an absolute show has no season to park in");
+    assert_eq!(ep, 24, "the next free absolute number, past the 23 in use");
+    assert_ne!(id, slot_of(&db, "abs23.mkv").await.2);
+    // The show's real episode 1 is untouched.
+    assert_eq!(
+        slot_of(&db, "abs1.mkv").await,
+        (None, 1, "abs1".to_string())
+    );
+}

@@ -65,6 +65,20 @@ pub struct Enricher {
 
 /// One file moved to the episode its hash says it is (HUB-30).
 #[derive(Debug)]
+/// A file left where the name put it, kept for the collision pass:
+/// what AniDB says it is, and which slot it currently shares.
+struct SlotOccupant {
+    item_id: String,
+    module_id: String,
+    collection_id: String,
+    path: String,
+    season: Option<i64>,
+    episode: i64,
+    eid: Option<i64>,
+    epno: String,
+}
+
+#[derive(Debug)]
 pub struct EpisodeRebind {
     pub path: String,
     pub from: (Option<i64>, i64),
@@ -1922,7 +1936,7 @@ impl Enricher {
         let rows = sqlx::query(
             "SELECT s.module_id, s.collection_id, s.path_rel,
                     ep.id AS item_id, ep.title, ep.norm_title, ep.season, ep.episode,
-                    c.aid, c.epno
+                    c.aid, c.epno, c.eid
              FROM item_sources s
              JOIN items ep ON ep.id = s.item_id
              JOIN files f ON (f.module_id, f.collection_id, f.path_rel)
@@ -1939,12 +1953,30 @@ impl Enricher {
         .await?;
 
         let mut moves = Vec::new();
+        let mut elsewhere: Vec<SlotOccupant> = Vec::new();
         for r in rows {
             let (aid, epno) = (r.get::<i64, _>("aid") as u32, r.get::<String, _>("epno"));
             let path: String = r.get("path_rel");
             if aid != show_aid {
+                // Declined by measurement, not by omission: AniDB splits a
+                // televised series into an entry per season, so most files
+                // whose aid differs are already in the right slot and
+                // moving them would break it (HUB-30, amended 2026-08-06).
+                // One question about them is still open — whether this file
+                // SHARES its slot with a different episode — so hand it to
+                // the collision pass below.
                 tracing::debug!(path = %path, file_aid = aid, show_aid,
                     "file belongs to a different anidb entry; not rebinding");
+                elsewhere.push(SlotOccupant {
+                    item_id: r.get("item_id"),
+                    module_id: r.get("module_id"),
+                    collection_id: r.get("collection_id"),
+                    season: r.get::<Option<i64>, _>("season"),
+                    episode: r.get::<i64, _>("episode"),
+                    eid: r.get::<Option<i64>, _>("eid"),
+                    path,
+                    epno,
+                });
                 continue;
             }
             let (cur_season, cur_ep) = (
@@ -2048,6 +2080,120 @@ impl Enricher {
                 from: (cur_season, cur_ep),
                 to: (target.0, target.1),
             });
+        }
+        moves.extend(self.break_slot_collisions(db, show_id, elsewhere).await?);
+        Ok(moves)
+    }
+
+    /// Files sharing one episode slot whose hashes name DIFFERENT AniDB
+    /// episodes are different episodes, and each gets its own item.
+    ///
+    /// Several sources on a slot is otherwise the ordinary two-copies
+    /// case — a 1080p and a 720p rip of one episode share an eid — so the
+    /// eid is the test, and the count is not.
+    ///
+    /// The numbering cannot come from the hash here, which is why this is
+    /// a separate pass rather than part of the loop above: these files
+    /// belong to another AniDB entry, whose episode 1 is not this show's
+    /// episode 1. Megazone 23 is the case it was written for — `pt.03-a`
+    /// is episode 1 of aid 3545 while `pt.01` is episode 1 of aid 1729 —
+    /// so claiming that number would land on a correct slot. Instead the
+    /// file AniDB numbers first keeps the contested slot and the rest go
+    /// to free numbers in the SAME season, in eid order: distinct and
+    /// stable, claiming nothing about a keyspace this show does not use.
+    async fn break_slot_collisions(
+        &self,
+        db: &sqlx::SqlitePool,
+        show_id: &str,
+        occupants: Vec<SlotOccupant>,
+    ) -> Result<Vec<EpisodeRebind>> {
+        use std::collections::{HashMap, HashSet};
+        let mut by_slot: HashMap<String, Vec<SlotOccupant>> = HashMap::new();
+        for o in occupants {
+            by_slot.entry(o.item_id.clone()).or_default().push(o);
+        }
+
+        let mut moves = Vec::new();
+        for (_slot, mut group) in by_slot {
+            let eids: HashSet<Option<i64>> = group.iter().map(|o| o.eid).collect();
+            // One episode in several copies, or an answer that cannot tell
+            // them apart: nothing to break.
+            if group.len() < 2 || eids.len() < 2 || eids.contains(&None) {
+                continue;
+            }
+            // AniDB's own order decides who keeps the slot; the path breaks
+            // ties so a rescan cannot shuffle them.
+            group.sort_by(|a, b| (a.eid, a.path.as_str()).cmp(&(b.eid, b.path.as_str())));
+            for o in group.into_iter().skip(1) {
+                // The slot's OWN season, not season 0: an anime show is
+                // normally absolute-numbered, so its episodes carry a NULL
+                // season (HUB-31), and parking in 0 both invents a season
+                // the show does not use and starts numbering at 1 — on top
+                // of a real episode 1. Measured on the live database, which
+                // the fixture had not reproduced.
+                let episode: i64 = sqlx::query_scalar(
+                    "SELECT COALESCE(MAX(episode), 0) + 1 FROM items
+                      WHERE parent_id = ?1 AND season IS ?2",
+                )
+                .bind(show_id)
+                .bind(o.season)
+                .fetch_one(db)
+                .await?;
+                // Its own name, because the slot's title described the
+                // episode it is being separated from.
+                let title = std::path::Path::new(&o.path)
+                    .file_stem()
+                    .map(|st| st.to_string_lossy().to_string())
+                    .unwrap_or_else(|| o.path.clone());
+
+                let mut tx = db.begin().await?;
+                let id = ulid::Ulid::generate().to_string();
+                sqlx::query(
+                    "INSERT INTO items (id, kind, title, norm_title, parent_id, season, episode)
+                     VALUES (?, 'episode', ?, ?, ?, ?, ?)",
+                )
+                .bind(&id)
+                .bind(&title)
+                .bind(kahawai_core::names::normalize_title(&title))
+                .bind(show_id)
+                .bind(o.season)
+                .bind(episode)
+                .execute(&mut *tx)
+                .await?;
+                sqlx::query(
+                    "UPDATE item_sources SET item_id = ?1
+                      WHERE module_id = ?2 AND collection_id = ?3 AND path_rel = ?4",
+                )
+                .bind(&id)
+                .bind(&o.module_id)
+                .bind(&o.collection_id)
+                .bind(&o.path)
+                .execute(&mut *tx)
+                .await?;
+                // Watch state follows the FILE, as everywhere else here:
+                // the user watched this content under the shared number.
+                sqlx::query(
+                    "UPDATE watch_state SET item_id = ?1
+                      WHERE item_id = ?2
+                        AND NOT EXISTS (SELECT 1 FROM watch_state w2
+                                         WHERE w2.item_id = ?1
+                                           AND w2.user_id = watch_state.user_id)",
+                )
+                .bind(&id)
+                .bind(&o.item_id)
+                .execute(&mut *tx)
+                .await?;
+                tx.commit().await?;
+
+                tracing::info!(path = %o.path, eid = ?o.eid, epno = %o.epno,
+                    from = %fmt_slot(o.season, o.episode), to = %fmt_slot(o.season, episode),
+                    "split a slot shared by different anidb episodes");
+                moves.push(EpisodeRebind {
+                    path: o.path,
+                    from: (o.season, o.episode),
+                    to: (o.season, episode),
+                });
+            }
         }
         Ok(moves)
     }
