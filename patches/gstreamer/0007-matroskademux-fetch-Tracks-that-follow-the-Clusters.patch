@@ -1,0 +1,139 @@
+From d6548fba2bad6e4cde17e3976aeb35acbdb597d5 Mon Sep 17 00:00:00 2001
+From: Ingmar Steen <iksteen@gmail.com>
+Date: Thu, 6 Aug 2026 11:44:52 +0200
+Subject: [PATCH] matroskademux: fetch Tracks that follow the Clusters when
+ streaming
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+    Could not demultiplex stream.
+    File layout does not permit streaming
+
+Matroska does not require Tracks before the Clusters, and a file that
+puts it last says so in the SeekHead at the front. Pull mode acts on
+that — gst_matroska_demux_find_tracks() goes and reads it. Streaming
+refused, so the same file plays from a file:// URI and fails from a
+pipe, which is how it presents: not as an unusual layout but as a
+corrupt file.
+
+Remember where the SeekHead said Tracks is, the way the Cues location
+is already remembered, and on meeting a Cluster with no tracks to put
+it in, seek there and come back. Only when upstream is seekable, and
+only once — if the seek lands somewhere without Tracks, the file really
+cannot be read this way and the old error stands.
+
+Found by sweeping a library through a push-only source: 6 files of
+about 37 000, all playable with ffmpeg and through this element in pull
+mode.
+
+The reproducer builds its own fixture: mux an ordinary file, move the
+Tracks element to the end, correct the SeekHead, and feed it through an
+appsrc that answers seeks — which is what a server reading its own
+storage looks like.
+---
+ .../gst/matroska/matroska-demux.c             | 46 ++++++++++++++++++-
+ .../gst/matroska/matroska-demux.h             |  7 +++
+ 2 files changed, 52 insertions(+), 1 deletion(-)
+
+diff --git a/subprojects/gst-plugins-good/gst/matroska/matroska-demux.c b/subprojects/gst-plugins-good/gst/matroska/matroska-demux.c
+index 65d8e25468a..7bb069ee315 100644
+--- a/subprojects/gst-plugins-good/gst/matroska/matroska-demux.c
++++ b/subprojects/gst-plugins-good/gst/matroska/matroska-demux.c
+@@ -373,6 +373,9 @@ gst_matroska_demux_reset (GstElement * element)
+   demux->stream_last_time = GST_CLOCK_TIME_NONE;
+   demux->last_cluster_offset = 0;
+   demux->index_offset = 0;
++  demux->tracks_offset = 0;
++  demux->tracks_resume_offset = 0;
++  demux->fetching_tracks = FALSE;
+   demux->seekable = FALSE;
+   demux->need_segment = FALSE;
+   demux->upstream_format_is_time = FALSE;
+@@ -5987,12 +5990,19 @@ gst_matroska_demux_parse_contents_seekentry (GstMatroskaDemux * demux,
+         break;
+       }
+ 
+-      /* only pick up index location when streaming */
++      /* only pick up locations when streaming */
+       if (demux->streaming) {
+         if (seek_id == GST_MATROSKA_ID_CUES) {
+           demux->index_offset = seek_pos + demux->common.ebml_segment_start;
+           GST_DEBUG_OBJECT (demux, "Cues located at offset %" G_GUINT64_FORMAT,
+               demux->index_offset);
++        } else if (seek_id == GST_MATROSKA_ID_TRACKS) {
++          /* A file may put its Tracks after the Clusters. Pull mode goes
++           * and reads it; streaming needs to know where before it walks
++           * into the first Cluster with no tracks to put it in. */
++          demux->tracks_offset = seek_pos + demux->common.ebml_segment_start;
++          GST_DEBUG_OBJECT (demux, "Tracks located at offset %"
++              G_GUINT64_FORMAT, demux->tracks_offset);
+         }
+         break;
+       }
+@@ -6407,10 +6417,44 @@ gst_matroska_demux_parse_id (GstMatroskaDemux * demux, guint32 id,
+              * playback */
+             ret = gst_matroska_demux_update_tracks (demux, &ebml);
+           }
++          /* Fetched from behind the Clusters: go back to the one that
++           * sent us here, now that there are tracks to put it in. */
++          if (ret == GST_FLOW_OK && demux->fetching_tracks) {
++            guint64 resume = demux->tracks_resume_offset;
++
++            demux->fetching_tracks = FALSE;
++            GST_INFO_OBJECT (demux, "have Tracks, resuming at %"
++                G_GUINT64_FORMAT, resume);
++            if (!perform_seek_to_offset (demux, 1.0, resume,
++                    gst_util_seqnum_next (), GST_SEEK_FLAG_NONE))
++              goto seek_failed;
++            goto exit;
++          }
+           break;
+         case GST_MATROSKA_ID_CLUSTER:
+           if (G_UNLIKELY (demux->tracks_ebml_offset == G_MAXUINT64)) {
+             if (demux->streaming) {
++              /* The Tracks may simply be elsewhere: the SeekHead at the
++               * front of the file says where, and upstream can seek.
++               * Fetch it and come back — the same detour this element
++               * already makes for a Cues element it needs and has not
++               * reached. Attempted once: if the seek lands somewhere
++               * without Tracks, the file really is unusable this way. */
++              if (demux->seekable && demux->tracks_offset
++                  && !demux->fetching_tracks) {
++                GST_INFO_OBJECT (demux, "Cluster before Tracks; fetching "
++                    "Tracks from %" G_GUINT64_FORMAT " and resuming at %"
++                    G_GUINT64_FORMAT, demux->tracks_offset,
++                    demux->common.offset);
++                demux->fetching_tracks = TRUE;
++                demux->tracks_resume_offset = demux->common.offset;
++                if (perform_seek_to_offset (demux, 1.0, demux->tracks_offset,
++                        gst_util_seqnum_next (), GST_SEEK_FLAG_NONE)) {
++                  ret = GST_FLOW_OK;
++                  goto exit;
++                }
++                demux->fetching_tracks = FALSE;
++              }
+               GST_DEBUG_OBJECT (demux, "Cluster before Track");
+               goto not_streamable;
+             } else {
+diff --git a/subprojects/gst-plugins-good/gst/matroska/matroska-demux.h b/subprojects/gst-plugins-good/gst/matroska/matroska-demux.h
+index 82cf60066c8..7038419d5c1 100644
+--- a/subprojects/gst-plugins-good/gst/matroska/matroska-demux.h
++++ b/subprojects/gst-plugins-good/gst/matroska/matroska-demux.h
+@@ -112,6 +112,13 @@ typedef struct _GstMatroskaDemux {
+   gboolean                 seekable;
+   gboolean                 building_index;
+   guint64                  index_offset;
++
++  /* Tracks after the first Cluster: where the SeekHead says it is, and
++   * where to resume once it has been fetched. Streaming only — pull
++   * mode simply goes and reads it. */
++  guint64                  tracks_offset;
++  guint64                  tracks_resume_offset;
++  gboolean                 fetching_tracks;
+   GstEvent                *seek_event;
+   GstEvent                *deferred_seek_event;
+   GstPad                  *deferred_seek_pad;
+-- 
+2.55.0
+
