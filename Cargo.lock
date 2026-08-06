@@ -1949,23 +1949,20 @@ dependencies = [
  "anyhow",
  "axum",
  "clap",
- "figment",
  "kahawai-core",
  "kahawai-hub",
  "kahawai-media",
  "kahawai-mediahost",
- "kahawai-transcoder",
+ "kahawai-mediahostd",
+ "kahawai-runtime",
+ "kahawai-transcoderd",
  "kahawai-transport",
- "libc",
- "serde",
  "serde_json",
  "sqlx",
  "tempfile",
  "tokio",
- "toml_edit",
  "tonic",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -2070,6 +2067,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "kahawai-mediahostd"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "kahawai-media",
+ "kahawai-mediahost",
+ "kahawai-runtime",
+ "tokio",
+]
+
+[[package]]
 name = "kahawai-proto"
 version = "0.1.0"
 dependencies = [
@@ -2077,6 +2086,25 @@ dependencies = [
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
+]
+
+[[package]]
+name = "kahawai-runtime"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "figment",
+ "kahawai-core",
+ "kahawai-media",
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "toml_edit",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -2093,6 +2121,17 @@ dependencies = [
  "tokio-stream",
  "tonic",
  "tracing",
+]
+
+[[package]]
+name = "kahawai-transcoderd"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "kahawai-runtime",
+ "kahawai-transcoder",
+ "tokio",
 ]
 
 [[package]]

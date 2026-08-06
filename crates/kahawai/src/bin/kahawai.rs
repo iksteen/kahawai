@@ -6,8 +6,24 @@
 use std::path::PathBuf;
 
 use anyhow::Result;
+
+/// What this binary can run, and the doctor rows only it can produce:
+/// the OCR tier lives behind the hub crate, so a build without the hub
+/// has no way to ask whether Tesseract is usable.
+const ROLES: Roles = Roles::all();
+
+fn ocr_rows() -> Vec<kahawai_media::doctor::Check> {
+    #[cfg(feature = "ocr")]
+    {
+        vec![kahawai_hub::ocr::doctor_check()]
+    }
+    #[cfg(not(feature = "ocr"))]
+    {
+        Vec::new()
+    }
+}
 use clap::{Parser, Subcommand};
-use kahawai::WorkerArgs;
+use kahawai_runtime::{Roles, WorkerArgs};
 
 #[derive(Parser)]
 #[command(
@@ -94,13 +110,13 @@ enum HubCmd {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    kahawai::init_tracing();
+    kahawai_runtime::init_tracing();
     let cli = Cli::parse();
-    let (cfg, config_used) = kahawai::load_config(cli.config.as_deref())?;
+    let (cfg, config_used) = kahawai_runtime::load_config(cli.config.as_deref())?;
 
     match &cli.command {
         Cmd::Hub { cmd: None } | Cmd::Mediahost | Cmd::Transcoder | Cmd::AllInOne => {
-            kahawai::startup_checks(&cfg)?
+            kahawai_runtime::startup_checks(&cfg, ROLES, ocr_rows())?
         }
         _ => {}
     }
@@ -137,19 +153,27 @@ async fn main() -> Result<()> {
             );
             Ok(())
         }
-        Cmd::Mediahost => kahawai::run_mediahost(cfg.mediahost).await,
+        Cmd::Mediahost => kahawai_mediahostd::run_mediahost(cfg.mediahost).await,
         Cmd::Doctor {
             json,
             calibrate,
             fix,
-        } => kahawai::doctor(&cfg, json, calibrate, fix, config_used.as_deref()),
-        Cmd::RemuxWorker(w) => kahawai::run_remux_worker(&cfg, w),
+        } => kahawai_runtime::doctor(
+            &cfg,
+            ROLES,
+            ocr_rows(),
+            json,
+            calibrate,
+            fix,
+            config_used.as_deref(),
+        ),
+        Cmd::RemuxWorker(w) => kahawai_runtime::run_remux_worker(&cfg, w),
         Cmd::Benchmark {
             cache,
             only,
             tonemap,
-        } => kahawai::run_benchmark(&cfg, cache, only, tonemap),
-        Cmd::Transcoder => kahawai::run_transcoder(&cfg).await,
+        } => kahawai_runtime::run_benchmark(&cfg, cache, only, tonemap),
+        Cmd::Transcoder => kahawai_transcoderd::run_transcoder(&cfg).await,
         Cmd::AllInOne => kahawai::run_all_in_one(cfg, config_used).await,
     }
 }

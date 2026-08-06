@@ -1,0 +1,28 @@
+[package]
+name = "kahawai-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Deliberately depends on no role crate. Cargo unifies features across a
+# build, so anything shared by all the binaries links what the fattest of
+# them asks for; keeping hub, mediahost and transcoder out of this
+# manifest is what stops a satellite from carrying SQLite, axum or an OCR
+# engine it never calls.
+[dependencies]
+kahawai-core = { workspace = true }
+kahawai-media = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+figment = { workspace = true }
+libc = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+toml_edit = "0.22"
+
+[dev-dependencies]
+figment = { workspace = true, features = ["test"] }
+tempfile = { workspace = true }

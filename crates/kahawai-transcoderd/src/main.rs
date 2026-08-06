@@ -4,8 +4,15 @@
 use std::path::PathBuf;
 
 use anyhow::Result;
+
+/// This binary runs one module, so it is judged on one module's rows.
+const ROLES: Roles = Roles {
+    hub: false,
+    mediahost: false,
+    transcoder: true,
+};
 use clap::{Parser, Subcommand};
-use kahawai::WorkerArgs;
+use kahawai_runtime::{Roles, WorkerArgs};
 
 #[derive(Parser)]
 #[command(name = "kahawai-transcoder", version, about = "Kahawai transcoder")]
@@ -53,24 +60,32 @@ enum Cmd {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    kahawai::init_tracing();
+    kahawai_runtime::init_tracing();
     let cli = Cli::parse();
-    let (cfg, config_used) = kahawai::load_config(cli.config.as_deref())?;
+    let (cfg, config_used) = kahawai_runtime::load_config(cli.config.as_deref())?;
     match cli.command {
         None => {
-            kahawai::startup_checks(&cfg)?;
-            kahawai::run_transcoder(&cfg).await
+            kahawai_runtime::startup_checks(&cfg, ROLES, Vec::new())?;
+            kahawai_transcoderd::run_transcoder(&cfg).await
         }
         Some(Cmd::Doctor {
             json,
             calibrate,
             fix,
-        }) => kahawai::doctor(&cfg, json, calibrate, fix, config_used.as_deref()),
-        Some(Cmd::RemuxWorker(w)) => kahawai::run_remux_worker(&cfg, w),
+        }) => kahawai_runtime::doctor(
+            &cfg,
+            ROLES,
+            Vec::new(),
+            json,
+            calibrate,
+            fix,
+            config_used.as_deref(),
+        ),
+        Some(Cmd::RemuxWorker(w)) => kahawai_runtime::run_remux_worker(&cfg, w),
         Some(Cmd::Benchmark {
             cache,
             only,
             tonemap,
-        }) => kahawai::run_benchmark(&cfg, cache, only, tonemap),
+        }) => kahawai_runtime::run_benchmark(&cfg, cache, only, tonemap),
     }
 }

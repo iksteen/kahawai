@@ -4,67 +4,41 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
-# One package, four binaries — each built with only the features (and
-# therefore dependencies) its module needs. `cargo build` (default
-# features) produces all four, full-fat, for the dev box; deployments
-# build one lean flavor:
-#
-#   cargo build --release --no-default-features --features transcoder \
-#       --bin kahawai-transcoder
-#
-# `required-features` keeps a lean build from even attempting the bins
-# whose modules are compiled out.
+# The everything binary, plus the hub daemon. This is the package that
+# pulls SQLite, axum and Tesseract, which is why the satellites live in
+# packages of their own rather than beside these bins.
 [features]
-default = ["hub", "mediahost", "transcoder", "ocr"]
-hub = ["dep:kahawai-hub", "dep:sqlx", "dep:axum"]
-mediahost = ["dep:kahawai-mediahost"]
-transcoder = ["dep:kahawai-transcoder"]
-# HUB-32c Tesseract linkage for hub builds. Historically the GPL escape
-# hatch for subtile-ocr; that crate was never linked (leptess is MIT),
-# so today this only drops the Tesseract system dependency.
-ocr = ["hub", "kahawai-hub/ocr"]
+default = ["ocr"]
+# HUB-32c Tesseract linkage. Historically the GPL escape hatch for
+# subtile-ocr; that crate was never linked (leptess is MIT), so today
+# this only drops the Tesseract system dependency.
+ocr = ["kahawai-hub/ocr"]
 
 [[bin]]
 name = "kahawai"
 path = "src/bin/kahawai.rs"
-required-features = ["hub", "mediahost", "transcoder"]
 
 [[bin]]
 name = "kahawai-hub"
 path = "src/bin/kahawai-hubd.rs"
-required-features = ["hub"]
-
-[[bin]]
-name = "kahawai-mediahost"
-path = "src/bin/kahawai-mediahostd.rs"
-required-features = ["mediahost"]
-
-[[bin]]
-name = "kahawai-transcoder"
-path = "src/bin/kahawai-transcoderd.rs"
-required-features = ["transcoder"]
 
 [dependencies]
 kahawai-core = { workspace = true }
-kahawai-hub = { workspace = true, optional = true }
+kahawai-hub = { workspace = true }
 kahawai-media = { workspace = true }
-kahawai-mediahost = { workspace = true, optional = true }
-kahawai-transcoder = { workspace = true, optional = true }
+kahawai-mediahost = { workspace = true }
+kahawai-mediahostd = { workspace = true }
+kahawai-runtime = { workspace = true }
+kahawai-transcoderd = { workspace = true }
 kahawai-transport = { workspace = true }
 anyhow = { workspace = true }
+axum = { workspace = true }
+clap = { workspace = true }
+serde_json = { workspace = true }
+sqlx = { workspace = true }
 tokio = { workspace = true }
 tonic = { workspace = true }
-sqlx = { workspace = true, optional = true }
-axum = { workspace = true, optional = true }
-serde_json = { workspace = true }
-clap = { workspace = true }
-libc = { workspace = true }
-figment = { workspace = true }
-serde = { workspace = true }
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
-toml_edit = "0.22"
 
 [dev-dependencies]
-figment = { workspace = true, features = ["test"] }
 tempfile = { workspace = true }

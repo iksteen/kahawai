@@ -6,8 +6,28 @@
 use std::path::PathBuf;
 
 use anyhow::Result;
+
+/// What this binary can run, and the doctor rows only it can produce:
+/// the OCR tier lives behind the hub crate, so a build without the hub
+/// has no way to ask whether Tesseract is usable.
+const ROLES: Roles = Roles {
+    hub: true,
+    mediahost: false,
+    transcoder: false,
+};
+
+fn ocr_rows() -> Vec<kahawai_media::doctor::Check> {
+    #[cfg(feature = "ocr")]
+    {
+        vec![kahawai_hub::ocr::doctor_check()]
+    }
+    #[cfg(not(feature = "ocr"))]
+    {
+        Vec::new()
+    }
+}
 use clap::{Parser, Subcommand};
-use kahawai::WorkerArgs;
+use kahawai_runtime::{Roles, WorkerArgs};
 
 #[derive(Parser)]
 #[command(name = "kahawai-hub", version, about = "Kahawai hub")]
@@ -65,19 +85,27 @@ enum Cmd {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    kahawai::init_tracing();
+    kahawai_runtime::init_tracing();
     let cli = Cli::parse();
-    let (cfg, config_used) = kahawai::load_config(cli.config.as_deref())?;
+    let (cfg, config_used) = kahawai_runtime::load_config(cli.config.as_deref())?;
     match cli.command {
         None => {
-            kahawai::startup_checks(&cfg)?;
+            kahawai_runtime::startup_checks(&cfg, ROLES, ocr_rows())?;
             kahawai::run_hub(cfg.hub, config_used).await
         }
         Some(Cmd::Doctor {
             json,
             calibrate,
             fix,
-        }) => kahawai::doctor(&cfg, json, calibrate, fix, config_used.as_deref()),
+        }) => kahawai_runtime::doctor(
+            &cfg,
+            ROLES,
+            ocr_rows(),
+            json,
+            calibrate,
+            fix,
+            config_used.as_deref(),
+        ),
         Some(Cmd::ResetPassword { username }) => kahawai::reset_password(cfg.hub, &username).await,
         Some(Cmd::Backup { dest }) => {
             let m = kahawai_hub::backup::backup(&cfg.hub.data_dir, config_used.as_deref(), &dest)
@@ -98,11 +126,11 @@ async fn main() -> Result<()> {
             );
             Ok(())
         }
-        Some(Cmd::RemuxWorker(w)) => kahawai::run_remux_worker(&cfg, w),
+        Some(Cmd::RemuxWorker(w)) => kahawai_runtime::run_remux_worker(&cfg, w),
         Some(Cmd::Benchmark {
             cache,
             only,
             tonemap,
-        }) => kahawai::run_benchmark(&cfg, cache, only, tonemap),
+        }) => kahawai_runtime::run_benchmark(&cfg, cache, only, tonemap),
     }
 }

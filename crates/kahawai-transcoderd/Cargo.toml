@@ -1,0 +1,18 @@
+[package]
+name = "kahawai-transcoderd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# As with the mediahost: its own package, so the hub cannot arrive
+# through feature unification.
+[[bin]]
+name = "kahawai-transcoder"
+path = "src/main.rs"
+
+[dependencies]
+kahawai-runtime = { workspace = true }
+kahawai-transcoder = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }

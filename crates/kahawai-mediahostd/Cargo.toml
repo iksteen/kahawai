@@ -1,0 +1,19 @@
+[package]
+name = "kahawai-mediahostd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# The satellite's own package, so no build can widen it: the hub is not a
+# dependency here, and feature unification cannot add one.
+[[bin]]
+name = "kahawai-mediahost"
+path = "src/main.rs"
+
+[dependencies]
+kahawai-media = { workspace = true }
+kahawai-mediahost = { workspace = true }
+kahawai-runtime = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }
