@@ -536,9 +536,9 @@ impl<'a> Negotiation<'a> {
                 let mut best: Option<(kahawai_media::negotiate::SourcePlan, usize)> = None;
                 for (idx, (parts, info)) in candidates.iter().enumerate() {
                     let sp = self.plan_auto(parts, info);
-                    let better = best
-                        .as_ref()
-                        .is_none_or(|(cur, _)| (sp.incomplete, sp.cost) < (cur.incomplete, cur.cost));
+                    let better = best.as_ref().is_none_or(|(cur, _)| {
+                        (sp.incomplete, sp.cost) < (cur.incomplete, cur.cost)
+                    });
                     if better {
                         best = Some((sp, idx));
                     }

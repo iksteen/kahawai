@@ -1771,7 +1771,9 @@ fn avi_max_keyframe_gap(src: &mut dyn RemuxSource) -> Result<Option<u32>> {
         }
         off += n as u64;
     }
-    Ok(gap_ms(&mut keyframes, move |f| (f as f64 * spf * 1000.0) as u64))
+    Ok(gap_ms(&mut keyframes, move |f| {
+        (f as f64 * spf * 1000.0) as u64
+    }))
 }
 
 /// Matroska: the Cues element indexes keyframes by timestamp. Reached
@@ -2152,6 +2154,9 @@ mod keyframe_tests {
 
         let empty = dir.path().join("empty.mkv");
         std::fs::write(&empty, b"").unwrap();
-        assert!(matches!(max_keyframe_interval_ms(&empty), Ok(None) | Err(_)));
+        assert!(matches!(
+            max_keyframe_interval_ms(&empty),
+            Ok(None) | Err(_)
+        ));
     }
 }

@@ -2663,7 +2663,6 @@ async fn transcode_file(
         .into_response())
 }
 
-
 /// Stamp the session's decided `EXT-X-TARGETDURATION` onto a playlist
 /// as it is served.
 ///

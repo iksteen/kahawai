@@ -265,7 +265,6 @@ impl AssPolicy {
     }
 }
 
-
 /// What `EXT-X-TARGETDURATION` must say, given how this plan will cut
 /// segments.
 ///
@@ -304,8 +303,7 @@ pub fn declared_target_secs(
                 // so `round(bound)` covers `round(actual)` without
                 // rounding up and inflating the client's reload
                 // interval for a file that never needed it.
-                (((bound_ms + 500) / 1000) as u32)
-                    .max(crate::remux::DEFAULT_TARGET_DURATION_SECS)
+                (((bound_ms + 500) / 1000) as u32).max(crate::remux::DEFAULT_TARGET_DURATION_SECS)
             }
             // Unmeasured: the honest answer is "could be long". A
             // `short` client never reaches here — an unknown gap forces
@@ -1194,8 +1192,7 @@ mod tests {
                 &fleet(),
             );
             assert!(
-                sp.plan.segment_format != SegmentFormat::Fmp4
-                    || sp.plan.audio != StreamMode::Copy,
+                sp.plan.segment_format != SegmentFormat::Fmp4 || sp.plan.audio != StreamMode::Copy,
                 "{label}: planned an fMP4 copy isofmp4mux cannot link ({})",
                 sp.audio_verdict
             );
@@ -2476,7 +2473,6 @@ mod tests {
     }
     use kahawai_core::media::TargetDuration as T;
 
-
     /// The declaration is `FRAGMENT_TARGET + max keyframe gap`, rounded
     /// up — measured, not assumed: a 10.43 s GOP produced segments of
     /// 10.22-10.58 s against a 2 s fragment target, so 12 covers it and
@@ -2489,7 +2485,10 @@ mod tests {
         assert_eq!(declared_target_secs(&T::Accurate, Some(10), false), 2);
         // The worst file in this library: 147 s is not a number any
         // constant would have covered.
-        assert_eq!(declared_target_secs(&T::Accurate, Some(147_100), false), 149);
+        assert_eq!(
+            declared_target_secs(&T::Accurate, Some(147_100), false),
+            149
+        );
 
         // An ENCODE sets its own GOP, so the source's spacing is
         // irrelevant — this is why `short` can promise anything at all.

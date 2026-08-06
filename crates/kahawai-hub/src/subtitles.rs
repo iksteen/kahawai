@@ -174,9 +174,14 @@ impl Subtitles {
         // the session will not play.
         (module_id, collection_id, path_rel): (&str, &str, &str),
     ) -> Result<Vec<TrackListing>> {
-        let tracks =
-            crate::tracks::for_item_source(registry.db(), item_id, module_id, collection_id, path_rel)
-                .await?;
+        let tracks = crate::tracks::for_item_source(
+            registry.db(),
+            item_id,
+            module_id,
+            collection_id,
+            path_rel,
+        )
+        .await?;
         // Burn needs the display sets readable where the encode runs —
         // a connected mediahost extracts them (HUB-32b).
         let burn_capable = registry.is_connected(module_id);
@@ -195,8 +200,7 @@ impl Subtitles {
         Ok(tracks
             .into_iter()
             .map(|t| {
-                let (delivery, note) =
-                    crate::tracks::delivery(&t, profile, burn_capable, ass);
+                let (delivery, note) = crate::tracks::delivery(&t, profile, burn_capable, ass);
                 let deletable = t.origin == "downloaded"
                     && (is_admin || t.created_by.as_deref() == Some(user_id));
                 TrackListing {

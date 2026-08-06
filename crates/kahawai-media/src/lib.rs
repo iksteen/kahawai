@@ -78,9 +78,8 @@ pub fn discover(path: &Path, timeout: Duration) -> Result<MediaInfo> {
         // GstDiscovererInfo, and the info is the whole question: a
         // decode chain that failed on one track still describes the
         // rest of the file. The signal hands over both.
-        Err(sync_err) => discover_uri_partial(&uri, timeout).with_context(|| {
-            format!("discovering {}: {}", path.display(), sync_err.message())
-        })?,
+        Err(sync_err) => discover_uri_partial(&uri, timeout)
+            .with_context(|| format!("discovering {}: {}", path.display(), sync_err.message()))?,
     };
     // discover_uri returns Ok even on timeout/missing-plugin results —
     // don't let those masquerade as valid-but-empty media (a slow NAS
@@ -203,9 +202,10 @@ fn map_info(info: &DiscovererInfo) -> MediaInfo {
         let hdr = classify_hdr(st_get("colorimetry").as_deref());
         // `video/mpeg` is three different codecs wearing one caps name;
         // the version is a FIELD, exactly as it is for audio.
-        let mpeg_version = caps
-            .as_ref()
-            .and_then(|c| c.structure(0).and_then(|st| st.get::<i32>("mpegversion").ok()));
+        let mpeg_version = caps.as_ref().and_then(|c| {
+            c.structure(0)
+                .and_then(|st| st.get::<i32>("mpegversion").ok())
+        });
         out.video.push(VideoStream {
             codec: normalize_video_codec(&name, mpeg_version),
             width: s.width(),

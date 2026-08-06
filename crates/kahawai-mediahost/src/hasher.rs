@@ -9,9 +9,8 @@ use std::io::Read;
 use std::time::Duration;
 
 use kahawai_proto::v1::{
-    AttachmentsWorklist, ExtractSubs, FileAttachments, FileHash, FileHashes,
-    FileKeyframeInterval, FileSubtitles,
-    Hashlist, HostToHub, SubTrack, SubsWorklist, host_to_hub,
+    AttachmentsWorklist, ExtractSubs, FileAttachments, FileHash, FileHashes, FileKeyframeInterval,
+    FileSubtitles, Hashlist, HostToHub, SubTrack, SubsWorklist, host_to_hub,
 };
 
 use crate::Activity;

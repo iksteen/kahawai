@@ -200,7 +200,9 @@ async fn json_of(resp: axum::response::Response) -> serde_json::Value {
 /// this client would actually be served.
 #[tokio::test]
 async fn query_returns_the_item_and_what_it_would_be_served() {
-    let Fx { api, bearer, id, .. } = fixture().await;
+    let Fx {
+        api, bearer, id, ..
+    } = fixture().await;
     let profile = r#"{"profile":{"containers":["mp4"],
         "video":[{"codec":"h264"}],"audio":["aac"],
         "hdr":false,"graphics_overlay":false,"ass_render":false,
@@ -259,7 +261,9 @@ async fn query_without_a_token_is_refused() {
 /// response — `Allow` header included — no longer happens for us.
 #[tokio::test]
 async fn an_unsupported_method_still_says_what_is_allowed() {
-    let Fx { api, bearer, id, .. } = fixture().await;
+    let Fx {
+        api, bearer, id, ..
+    } = fixture().await;
     let resp = api
         .oneshot(
             axum::http::Request::builder()
@@ -280,7 +284,9 @@ async fn an_unsupported_method_still_says_what_is_allowed() {
 /// content."
 #[tokio::test]
 async fn a_query_without_a_json_content_type_is_refused() {
-    let Fx { api, bearer, id, .. } = fixture().await;
+    let Fx {
+        api, bearer, id, ..
+    } = fixture().await;
     for ctype in [None, Some("text/plain")] {
         let resp = api
             .clone()
@@ -393,15 +399,16 @@ async fn query_rasterises_nothing() {
 #[test]
 fn the_fixture_declarations_actually_parse() {
     for r in [rec("x.mkv", 1), ass_rec("y.mkv")] {
-        let info: kahawai_core::media::MediaInfo = serde_json::from_str(&r.streams_json)
-            .unwrap_or_else(|e| panic!("{}: {e}", r.path_rel));
+        let info: kahawai_core::media::MediaInfo =
+            serde_json::from_str(&r.streams_json).unwrap_or_else(|e| panic!("{}: {e}", r.path_rel));
         assert_eq!(info.container.as_deref(), Some("matroska"));
         assert_eq!(info.video.len(), 1, "{}: no video", r.path_rel);
         assert_eq!(info.audio.len(), 1, "{}: no audio", r.path_rel);
     }
-    let subs = serde_json::from_str::<kahawai_core::media::MediaInfo>(&ass_rec("y.mkv").streams_json)
-        .unwrap()
-        .subtitles;
+    let subs =
+        serde_json::from_str::<kahawai_core::media::MediaInfo>(&ass_rec("y.mkv").streams_json)
+            .unwrap()
+            .subtitles;
     assert_eq!(subs.len(), 1);
     assert_eq!(subs[0].format, "ass");
 }

@@ -198,10 +198,9 @@ pub fn delivery(
                     Delivery::Text,
                     "flattened to VTT — the rasterised overlay is preferred",
                 ),
-                Some(kahawai_media::negotiate::AssTier::Overlay) => (
-                    Delivery::None,
-                    "the rasterised overlay carries this script",
-                ),
+                Some(kahawai_media::negotiate::AssTier::Overlay) => {
+                    (Delivery::None, "the rasterised overlay carries this script")
+                }
                 Some(kahawai_media::negotiate::AssTier::Flatten) => {
                     (Delivery::Text, "flattened to VTT")
                 }
@@ -487,12 +486,22 @@ mod tests {
 
         // Native outranks every order, including one that names burn
         // first: nothing a server does beats the real renderer.
-        let d = delivery(&t, &caps(true, true, true), true, &ladder(&[AssTier::Burn], true, true));
+        let d = delivery(
+            &t,
+            &caps(true, true, true),
+            true,
+            &ladder(&[AssTier::Burn], true, true),
+        );
         assert_eq!(d.0, Delivery::Ass);
 
         // The default order, no client-side ASS: flatten is first and
         // always possible, so it wins even with the others available.
-        let d = delivery(&t, &caps(false, true, true), true, &ladder(&all, true, true));
+        let d = delivery(
+            &t,
+            &caps(false, true, true),
+            true,
+            &ladder(&all, true, true),
+        );
         assert_eq!(d.0, Delivery::Text);
 
         // Reordered: overlay first, and it is ready. The SCRIPT's own
@@ -500,31 +509,61 @@ mod tests {
         // rasterised row, which is a different URL — but the note says
         // which rung actually won.
         let order = [AssTier::Overlay, AssTier::Burn, AssTier::Flatten];
-        let d = delivery(&t, &caps(false, true, true), true, &ladder(&order, true, true));
+        let d = delivery(
+            &t,
+            &caps(false, true, true),
+            true,
+            &ladder(&order, true, true),
+        );
         assert_eq!(d.0, Delivery::Text);
         assert!(d.1.contains("overlay"), "unexplained: {}", d.1);
         // ...and the raster row is the one that reads as playable, so
         // "best delivery wins" on the client lands on it.
         let r = track("raster", "raster");
-        let d = delivery(&r, &caps(false, true, true), true, &ladder(&order, true, true));
+        let d = delivery(
+            &r,
+            &caps(false, true, true),
+            true,
+            &ladder(&order, true, true),
+        );
         assert_eq!(d.0, Delivery::Overlay);
         // With flatten first instead, the raster stops offering itself
         // and the script's own text form wins.
-        let d = delivery(&r, &caps(false, true, true), true, &ladder(&all, true, true));
+        let d = delivery(
+            &r,
+            &caps(false, true, true),
+            true,
+            &ladder(&all, true, true),
+        );
         assert_eq!(d.0, Delivery::None);
 
         // Same order, but nothing has been rasterised yet — skip to
         // the next rung the fleet can serve.
-        let d = delivery(&t, &caps(false, true, true), true, &ladder(&order, true, false));
+        let d = delivery(
+            &t,
+            &caps(false, true, true),
+            true,
+            &ladder(&order, true, false),
+        );
         assert_eq!(d.0, Delivery::Burn);
 
         // ...and with no burn-capable box either, down to flatten.
-        let d = delivery(&t, &caps(false, true, true), false, &ladder(&order, false, false));
+        let d = delivery(
+            &t,
+            &caps(false, true, true),
+            false,
+            &ladder(&order, false, false),
+        );
         assert_eq!(d.0, Delivery::Text);
 
         // A client that cannot composite skips overlay however the
         // user ordered it — capability outranks preference.
-        let d = delivery(&t, &caps(false, false, true), true, &ladder(&order, true, true));
+        let d = delivery(
+            &t,
+            &caps(false, false, true),
+            true,
+            &ladder(&order, true, true),
+        );
         assert_eq!(d.0, Delivery::Burn);
 
         // A client that renders text is never stranded: flatten is
@@ -555,19 +594,39 @@ mod tests {
 
         // Give that same client a burn-capable box and the ladder
         // resolves again, one rung lower.
-        let d = delivery(&t, &caps(false, false, false), true, &ladder(&all, true, false));
+        let d = delivery(
+            &t,
+            &caps(false, false, false),
+            true,
+            &ladder(&all, true, false),
+        );
         assert_eq!(d.0, Delivery::Burn, "{}", d.1);
 
         // And the case this was built for: a plain SRT for a client
         // that renders no text burns in, exactly as an image track does
         // when it cannot composite.
         let srt = track("embedded", "srt");
-        let d = delivery(&srt, &caps(false, false, false), true, &ladder(&all, true, false));
+        let d = delivery(
+            &srt,
+            &caps(false, false, false),
+            true,
+            &ladder(&all, true, false),
+        );
         assert_eq!(d.0, Delivery::Burn, "{}", d.1);
-        let d = delivery(&srt, &caps(false, false, false), false, &ladder(&all, false, false));
+        let d = delivery(
+            &srt,
+            &caps(false, false, false),
+            false,
+            &ladder(&all, false, false),
+        );
         assert_eq!(d.0, Delivery::None, "{}", d.1);
         // ...while a text-capable client still just gets it as text.
-        let d = delivery(&srt, &caps(false, false, true), true, &ladder(&all, true, false));
+        let d = delivery(
+            &srt,
+            &caps(false, false, true),
+            true,
+            &ladder(&all, true, false),
+        );
         assert_eq!(d.0, Delivery::Text, "{}", d.1);
     }
 

@@ -157,9 +157,7 @@ pub(crate) fn codec_to_caps(kind: &str, codec: &str) -> Option<gst::Caps> {
     let b = gst::Caps::builder(name);
     Some(match (kind, codec) {
         ("audio", "mp3" | "mpeg-audio") => b.field("mpegversion", 1i32).build(),
-        ("audio", "aac") => b
-            .field("mpegversion", gst::List::new([2i32, 4i32]))
-            .build(),
+        ("audio", "aac") => b.field("mpegversion", gst::List::new([2i32, 4i32])).build(),
         _ => b.build(),
     })
 }
@@ -3088,7 +3086,12 @@ fn playlist_stale_allowance_ms(playlist: &std::path::Path, configured: Option<u6
     });
     let longest = text
         .lines()
-        .filter_map(|l| l.strip_prefix("#EXTINF:")?.trim_end_matches(',').parse::<f64>().ok())
+        .filter_map(|l| {
+            l.strip_prefix("#EXTINF:")?
+                .trim_end_matches(',')
+                .parse::<f64>()
+                .ok()
+        })
         .fold(f64::NAN, f64::max);
 
     let client_cap = declared
@@ -3488,8 +3491,7 @@ pub(crate) fn seekable_appsrc(mut source: Box<dyn RemuxSource>) -> AppSrc {
                     let mut at = 0usize;
                     while at < len {
                         let n = chunk.min(len - at);
-                        let Ok(mut b) =
-                            whole.copy_region(gst::BufferCopyFlags::MEMORY, at..at + n)
+                        let Ok(mut b) = whole.copy_region(gst::BufferCopyFlags::MEMORY, at..at + n)
                         else {
                             break;
                         };
@@ -4930,7 +4932,10 @@ mod tests {
             sink_compatible(&live_h264, SegmentFormat::Fmp4),
             Some("video")
         );
-        assert_eq!(sink_compatible(&live_h264, SegmentFormat::Ts), Some("video"));
+        assert_eq!(
+            sink_compatible(&live_h264, SegmentFormat::Ts),
+            Some("video")
+        );
     }
 
     #[test]
@@ -4946,7 +4951,10 @@ mod tests {
             sink_compatible(&caps("audio/mpeg"), SegmentFormat::Ts),
             Some("audio")
         );
-        assert_eq!(sink_compatible(&caps("text/x-raw"), SegmentFormat::Ts), None);
+        assert_eq!(
+            sink_compatible(&caps("text/x-raw"), SegmentFormat::Ts),
+            None
+        );
         // Every answer must agree with the muxer's own template.
         let names = muxable_names(SegmentFormat::Ts);
         assert_eq!(

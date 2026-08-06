@@ -359,9 +359,7 @@ fn sweep_one(
         Ok(s) => s,
         Err(e) => return (Verdict::Fail, format!("[open] {e}")),
     };
-    let tail = TAIL_BYTES.max(
-        kahawai_media::remux::RemuxSource::size(&src) / TAIL_FRACTION,
-    );
+    let tail = TAIL_BYTES.max(kahawai_media::remux::RemuxSource::size(&src) / TAIL_FRACTION);
     let budget = BudgetSource::new(src, if full { u64::MAX } else { HEAD_BYTES }, tail);
     let truncated = budget.exhausted.clone();
     let job = match kahawai_media::remux::start(out.path(), plan, Box::new(budget)) {
@@ -717,8 +715,11 @@ mod tests {
         // which is the defect the sweep is meant to catch — and is
         // exactly what a parameter-set packet is NOT.
         let damaged = dir.path().join("damaged.ts");
-        std::fs::write(&damaged, strip_one_picture_timestamp(&std::fs::read(&ts).unwrap()))
-            .unwrap();
+        std::fs::write(
+            &damaged,
+            strip_one_picture_timestamp(&std::fs::read(&ts).unwrap()),
+        )
+        .unwrap();
         let (packets, untimed, _) = video_dts_defects(&damaged);
         assert_eq!(untimed, 1, "the damage did not land");
         assert_eq!(
