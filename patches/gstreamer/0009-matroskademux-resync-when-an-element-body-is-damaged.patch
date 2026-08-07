@@ -1,0 +1,85 @@
+From e6762dc8cf915656681db5ff6e7bc2c0e6b7792a Mon Sep 17 00:00:00 2001
+From: Ingmar Steen <iksteen@gmail.com>
+Date: Fri, 7 Aug 2026 18:39:52 +0200
+Subject: [PATCH] matroskademux: resync when an element's contents are damaged,
+ not just its header
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Streaming already recovers from corruption: when an element's ID or
+length will not read, gst_matroska_demux_chain() scans on for the next
+Cluster and carries on, bounded by INVALID_DATA_THRESHOLD. That path is
+never reached when the header reads perfectly well and the contents do
+not, which is what a hole in the payload actually looks like — a
+corrupt region presents a plausible id and a plausible length, and the
+parse fails one level further in. gst_matroska_demux_parse_id() then
+posts a fatal error and the file is over.
+
+The same demuxer walks through such a file in pull mode, because there
+search_cluster() is reachable. So the recovery policy is not in
+question, only its availability: push mode gives up where pull mode
+does not, on the same bytes.
+
+Route the streaming case into the resync the header path already uses.
+Pull mode keeps its own recovery and is untouched. The bound is the
+existing threshold rather than a second one, so a file that is damage
+all the way down still fails, after the same 2 MB of looking.
+
+Found on a 2.8 GB Matroska missing the last 127 KiB of every 1 MiB
+block — a download that wrote 897 KiB per chunk. ffmpeg plays it with
+artefacts at each gap; matroskademux died at the first. With this it
+demuxes to the end, resyncing 21 times over the head of the file, and
+in less time than a healthy file of the same size takes.
+---
+ .../gst/matroska/matroska-demux.c             | 34 +++++++++++++++++++
+ 1 file changed, 34 insertions(+)
+
+diff --git a/subprojects/gst-plugins-good/gst/matroska/matroska-demux.c b/subprojects/gst-plugins-good/gst/matroska/matroska-demux.c
+index 71d3adcd1e4..526890147ca 100644
+--- a/subprojects/gst-plugins-good/gst/matroska/matroska-demux.c
++++ b/subprojects/gst-plugins-good/gst/matroska/matroska-demux.c
+@@ -6285,6 +6285,40 @@ read_error:
+   }
+ parse_failed:
+   {
++    /* Streaming: damage inside an element is the same accident as damage
++     * in front of one, so recover the same way — scan on for the next
++     * cluster. gst_matroska_demux_chain() already does this when the
++     * ID/length header will not read at all; it never gets the chance
++     * here, because a corrupt region can present a header that parses (a
++     * plausible id, a plausible length) and fail only on the contents.
++     * A hole in the payload therefore killed a file that this same
++     * demuxer walks through in pull mode, where search_cluster() is
++     * reachable.
++     *
++     * Bounded by INVALID_DATA_THRESHOLD exactly as the header path is,
++     * so a file that is damage all the way down still fails, after the
++     * same amount of looking. */
++    if (demux->streaming) {
++      if (demux->common.start_resync_offset == -1) {
++        demux->common.start_resync_offset = demux->common.offset;
++        demux->common.state_to_restore = demux->common.state;
++      }
++      if (demux->common.offset - demux->common.start_resync_offset <=
++          INVALID_DATA_THRESHOLD) {
++        GST_WARNING_OBJECT (demux,
++            "Failed to parse Element 0x%x, looking for next cluster, "
++            "actual offset %" G_GUINT64_FORMAT ", start resync offset %"
++            G_GUINT64_FORMAT, id, demux->common.offset,
++            demux->common.start_resync_offset);
++        demux->common.state = GST_MATROSKA_READ_STATE_SCANNING;
++        ret = GST_FLOW_OK;
++        goto exit;
++      }
++      GST_WARNING_OBJECT (demux,
++          "unrecoverable parse error, next cluster not found and threshold "
++          "exceeded, bytes scanned %" G_GINT64_FORMAT,
++          demux->common.offset - demux->common.start_resync_offset);
++    }
+     GST_ELEMENT_ERROR (demux, STREAM, DEMUX, (NULL),
+         ("Failed to parse Element 0x%x", id));
+     ret = GST_FLOW_ERROR;
+-- 
+2.55.0
+
