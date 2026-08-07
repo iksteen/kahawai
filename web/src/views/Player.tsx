@@ -25,6 +25,7 @@ import {
   sessionLogUrl,
 } from '../api'
 import { loadMask, maskSummary } from '../capabilities'
+import { keepSessionAlive } from '../keepalive'
 import CapabilityDebug from './CapabilityDebug'
 
 function fmt(ms: number) {
@@ -687,9 +688,10 @@ export default function Player({
 
     const report = (keepalive = false) =>
       postProgress(session.session_id, absMs(), keepalive)
-    const tick = setInterval(() => {
-      if (!video.paused) report()
-    }, 10_000)
+    // Pings while paused too, bounded — see keepalive.ts. Guarding
+    // this on `!video.paused` is what let the reaper delete a paused
+    // viewer's segment directory out from under them.
+    const stopPinging = keepSessionAlive(absMs, (ms) => void postProgress(session.session_id, ms))
     const onPause = () => report()
     const onEnded = () => {
       report()
@@ -709,7 +711,7 @@ export default function Player({
     window.addEventListener('beforeunload', onUnload)
 
     return () => {
-      clearInterval(tick)
+      stopPinging()
       video.removeEventListener('loadedmetadata', seekToResume)
       video.removeEventListener('timeupdate', onTime)
       video.removeEventListener('pause', onPause)

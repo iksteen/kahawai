@@ -119,7 +119,10 @@ export default function AlbumPlayer({
   const idleSession = slots.current[1 - active].session
   useEffect(() => {
     if (!activeSession) return
-    return keepSessionAlive(activeSession.session_id, () => (els[active].current?.currentTime ?? 0) * 1000)
+    return keepSessionAlive(
+      () => (els[active].current?.currentTime ?? 0) * 1000,
+      (ms) => void postProgress(activeSession.session_id, ms)
+    )
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeSession, active])
   // The preloaded session has finished fetching and reads nothing more,
@@ -128,7 +131,10 @@ export default function AlbumPlayer({
   // never moves is exactly what keepSessionAlive already handles.
   useEffect(() => {
     if (!idleSession) return
-    return keepSessionAlive(idleSession.session_id, () => 0)
+    return keepSessionAlive(
+      () => 0,
+      (ms) => void postProgress(idleSession.session_id, ms)
+    )
   }, [idleSession])
 
   const factor = replayGainFactor(tracks[index], 'album')
