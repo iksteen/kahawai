@@ -277,18 +277,26 @@ async fn admin_flow_enrollments_satellites_archive_restore() {
         )
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::CONFLICT, "in-process is not deletable");
-    let survived: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM satellites WHERE module_id = 'local'")
-        .fetch_one(&db)
-        .await
-        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::CONFLICT,
+        "in-process is not deletable"
+    );
+    let survived: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM satellites WHERE module_id = 'local'")
+            .fetch_one(&db)
+            .await
+            .unwrap();
     assert_eq!(survived, 1, "the refusal must not have deleted it anyway");
     let cols: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM collections WHERE module_id = 'local'")
             .fetch_one(&db)
             .await
             .unwrap();
-    assert_eq!(cols, 1, "its collections stay — the composer still lists them");
+    assert_eq!(
+        cols, 1,
+        "its collections stay — the composer still lists them"
+    );
 
     // The same bytes return on a DIFFERENT host: watch state restored.
     registry

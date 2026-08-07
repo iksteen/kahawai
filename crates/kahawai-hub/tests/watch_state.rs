@@ -266,7 +266,9 @@ async fn progress_resume_played_caps_and_idle() {
     // track" must never wear the same status as "no such session".
     let resp = api
         .clone()
-        .oneshot(get(format!("/api/v1/playback/sessions/{s1}/subs-999999.ass")))
+        .oneshot(get(format!(
+            "/api/v1/playback/sessions/{s1}/subs-999999.ass"
+        )))
         .await
         .unwrap();
     assert_eq!(

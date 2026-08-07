@@ -59,6 +59,7 @@ OPS-n …), `kahawai-implementation.md` (how it works and why),
 cargo build                     # default-members = the kahawai binary
 cargo test --workspace          # 31 test binaries; gate on the exit code
 cargo clippy --workspace --all-targets
+cargo fmt --all                 # before every commit, not before a release
 ```
 
 Requirement-status changes update `docs/kahawai-status-checklist.md` in

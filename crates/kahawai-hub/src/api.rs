@@ -1641,10 +1641,7 @@ async fn stream_session(
     Path(id): Path<String>,
     headers: axum::http::HeaderMap,
 ) -> Result<Response, ApiError> {
-    let session = state
-        .sessions
-        .get(&id)
-        .ok_or_else(session_gone)?;
+    let session = state.sessions.get(&id).ok_or_else(session_gone)?;
     session.touch();
     let crate::sessions::Mode::Direct { lease } = &session.mode else {
         return Err((StatusCode::CONFLICT, "not a direct-play session".into()));
@@ -2630,10 +2627,7 @@ async fn post_progress(
     axum::Extension(claims): axum::Extension<crate::auth::Claims>,
     Json(body): Json<ProgressRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    let session = state
-        .sessions
-        .get(&id)
-        .ok_or_else(session_gone)?;
+    let session = state.sessions.get(&id).ok_or_else(session_gone)?;
     if session.user_id != claims.sub {
         return Err((StatusCode::FORBIDDEN, "not your session".into()));
     }
@@ -2750,10 +2744,7 @@ async fn session_file(
     State(state): State<AppState>,
     Path((id, file)): Path<(String, String)>,
 ) -> Result<Response, ApiError> {
-    let session = state
-        .sessions
-        .get(&id)
-        .ok_or_else(session_gone)?;
+    let session = state.sessions.get(&id).ok_or_else(session_gone)?;
     session.touch();
     // Live subtitle tap (HUB-32): the remux pipeline — local or on a
     // transcoder — appends ASS events to subs-e{n}.ass from the session
