@@ -294,8 +294,9 @@ How something works and why it was built that way belong in
       nothing observed now requires one: `kahawai-vod-plan.md`.*
 - [x] HUB-18 Sessions: per-user concurrency caps, progress checkpoints/resume,
       idle reaping, seek-anywhere with pipeline restart
-- [ ] HUB-19 Music: playback + queue live *(gapless delivery and ReplayGain
-      pass-through not implemented)*
+- [ ] HUB-19 Music: playback + queue live, gapless delivery (two elements,
+      the idle one warmed 30 s ahead) and ReplayGain pass-through *(no
+      music transcoding to mobile-suitable formats and bitrates)*
 
 ## Hub — web interface
 
