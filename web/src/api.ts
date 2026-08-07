@@ -119,6 +119,16 @@ export type Item = {
   parent_id?: string | null
   parent_title?: string | null
   sources: number
+  /// HUB-19 ReplayGain, as the file states it. Gains are dB to apply;
+  /// peaks are linear sample values where 1.0 is full scale. Absent for
+  /// anything untagged.
+  replay_gain?: {
+    track_gain_db?: number | null
+    track_peak?: number | null
+    album_gain_db?: number | null
+    album_peak?: number | null
+    reference_level_db?: number | null
+  } | null
   /// Enrichment state (movie/show): null = never enriched,
   /// miss/rejected = unmatched, weak = uncertain, auto/manual = good.
   match_confidence?: string | null

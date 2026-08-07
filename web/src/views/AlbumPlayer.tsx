@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { endSession, postProgress, startSessionDirect, type Item, type Session } from '../api'
+import { replayGainFactor } from '../replaygain'
 
 /// Queue playback for an album (HUB-27): one direct-play session per
 /// track, auto-advance on ended, prev/next. The <audio> element streams
@@ -20,6 +21,11 @@ export default function AlbumPlayer({
   const [error, setError] = useState('')
   const audioRef = useRef<HTMLAudioElement>(null)
   const sessionRef = useRef<Session | null>(null)
+  // ReplayGain rides in a Web Audio gain node rather than the element's
+  // volume, because volume is the USER's: setting it here would fight
+  // the slider on every track change, and it cannot go above 1.0 for
+  // the 126 tracks in this library whose gain is positive.
+  const gainRef = useRef<{ ctx: AudioContext; gain: GainNode } | null>(null)
 
   // jump when the user clicks another track row
   useEffect(() => setIndex(startAt), [startAt])
@@ -57,6 +63,29 @@ export default function AlbumPlayer({
     },
     []
   )
+
+  // This queue is an album, so album gain (HUB-19). A single track
+  // played from somewhere else would ask for 'track'.
+  const factor = replayGainFactor(tracks[index], 'album')
+  useEffect(() => {
+    const el = audioRef.current
+    if (!el) return
+    if (!gainRef.current) {
+      const Ctor = window.AudioContext ?? (window as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext
+      if (!Ctor) return // no Web Audio: play unlevelled rather than not at all
+      const ctx = new Ctor()
+      const gain = ctx.createGain()
+      // A source node can only ever be created ONCE per element, so it
+      // is built with the graph and kept for the component's life.
+      ctx.createMediaElementSource(el).connect(gain).connect(ctx.destination)
+      gainRef.current = { ctx, gain }
+    }
+    const { ctx, gain } = gainRef.current
+    // Autoplay policy suspends a context created before a gesture.
+    if (ctx.state === 'suspended') void ctx.resume()
+    gain.gain.value = factor
+  }, [factor, session])
+  useEffect(() => () => void gainRef.current?.ctx.close(), [])
 
   const advance = (dir: number) => {
     const next = index + dir
