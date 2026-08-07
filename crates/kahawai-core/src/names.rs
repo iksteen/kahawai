@@ -464,6 +464,46 @@ pub fn parse_anime(path_rel: &str) -> Option<EpisodeGuess> {
             .map(|&(i, band, index, consumed, span, _)| (i, band, index, consumed, span))
     };
 
+    // Tokens the SHOW's own name occupies, which are not episode
+    // numbers however much they look like one.
+    //
+    // "MegaZone 23 pt.03-a" read the 23 out of the title and called it
+    // episode 23; "Black Magic M 66" became episode 66. The existing
+    // guards catch this only when a designator carries an explicit index
+    // ("Cyber City Oedo 808 Ova 02"), so a name with no designator had
+    // nothing between it and the title's number.
+    //
+    // Matched on alphanumerics alone, because the directory and the file
+    // punctuate differently: dir "Black Magic M-66" against file "Black
+    // Magic M 66" is one token there and two here.
+    let title_tokens = {
+        let squash = |s: &str| -> String {
+            s.chars()
+                .filter(|c| c.is_alphanumeric())
+                .flat_map(|c| c.to_lowercase())
+                .collect()
+        };
+        let wanted = top_dir(path_rel).map(|d| squash(&parse_movie_dir(d).title));
+        match wanted {
+            Some(w) if !w.is_empty() => {
+                let mut seen = String::new();
+                let mut covered = 0;
+                for (i, t) in tokens.iter().enumerate() {
+                    seen.push_str(&squash(t));
+                    if !w.starts_with(&seen) {
+                        break;
+                    }
+                    if seen == w {
+                        covered = i + 1;
+                        break;
+                    }
+                }
+                covered
+            }
+            _ => 0,
+        }
+    };
+
     // Absolute episode: an explicit E01/EP01 token wins; otherwise the
     // LAST standalone number (optional vN) that isn't a plausible year.
     let e_token = tokens.iter().enumerate().find_map(|(i, t)| {
@@ -484,6 +524,10 @@ pub fn parse_anime(path_rel: &str) -> Option<EpisodeGuess> {
             {
                 return None;
             }
+            // Nor is one the show's own name owns.
+            if i < title_tokens {
+                return None;
+            }
             // A trailing batch marker ("Show - 01-02") spans a range.
             // FINAL token only: mid-name dashed numbers are usually
             // title ("Ranma 1-2 Special" must not become a span).
@@ -492,7 +536,16 @@ pub fn parse_anime(path_rel: &str) -> Option<EpisodeGuess> {
             {
                 return Some((i, a, Some(b)));
             }
-            let num = t.split(['v', 'V']).next()?;
+            // A lettered part of one numbered thing — "pt.03-a", "03b" —
+            // is that number. The disc-style suffix says which half of a
+            // release you are holding, not which episode: both halves
+            // land on the same number, and what pulls them apart is
+            // their hash (`break_slot_collisions`), which knows whether
+            // they are one episode in two files or two episodes.
+            let num = match lettered_part(t) {
+                Some(n) => n,
+                None => t.split(['v', 'V']).next()?,
+            };
             if num.is_empty() || num.len() > 4 || !num.chars().all(|c| c.is_ascii_digit()) {
                 return None;
             }
@@ -593,6 +646,21 @@ pub fn parse_anime(path_rel: &str) -> Option<EpisodeGuess> {
         episode_end,
         episode_title: (!ep_title.is_empty()).then_some(ep_title),
     })
+}
+
+/// The digits of a SEPARATED lettered part: "03-a" → "03".
+///
+/// Separated only. A glued digit+letter is how the world writes
+/// resolutions and stream tags — this library holds 18 `720p`, 13
+/// `1080p` and 4 `707r`, and not one glued part — so reading those as
+/// numbers turned "Pokemon XYZ Episode 01 … 720p" into episode 720.
+/// "03-04" is a range and "01v2" a version; both are read before this.
+fn lettered_part(t: &str) -> Option<&str> {
+    let (num, tail) = t.split_once('-')?;
+    let mut tail = tail.chars();
+    let one_letter = tail.next().is_some_and(|c| c.is_ascii_alphabetic()) && tail.next().is_none();
+    (one_letter && !num.is_empty() && num.len() <= 4 && num.chars().all(|c| c.is_ascii_digit()))
+        .then_some(num)
 }
 
 /// A batch-marker token: `1-2`, `01-02`, `1-26` — two 1-3 digit numbers,
@@ -1402,5 +1470,58 @@ mod tests {
             super::parse_movie("Armitage Dual Matrix [2002] (Dual-Audio)").year,
             Some(2002)
         );
+    }
+
+    /// A number the SHOW's name owns is not an episode number.
+    ///
+    /// Found in the live library: "MegaZone 23 pt.03-a" became episode
+    /// 23 and "Black Magic M 66" episode 66, because the reverse scan
+    /// for "the last standalone number" walked back into the title. The
+    /// existing guard only covers a designator with an explicit index
+    /// ("Cyber City Oedo 808 Ova 02"), so a name without one had nothing
+    /// protecting it.
+    #[test]
+    fn a_number_in_the_show_title_is_not_an_episode() {
+        // The title is punctuated differently in the directory than in
+        // the file, which is why the match is on alphanumerics.
+        let g = parse_anime("Black Magic M-66 (Dual-Audio)/Black Magic M 66.mkv");
+        assert!(g.is_none(), "no episode number here at all: {g:?}");
+
+        let g = parse_anime("Patlabor 2/Patlabor 2 the Movie.mkv");
+        assert!(g.is_none(), "a movie, not episode 2: {g:?}");
+
+        // Numbers AFTER the title are still episodes.
+        let g = parse_anime("Gundam 0080/Gundam 0080 - 03.mkv").unwrap();
+        assert_eq!((g.show_title.as_str(), g.episode), ("Gundam 0080", 3));
+        let g = parse_anime("Ranma 1-2/Ranma 1-2 - 05.mkv").unwrap();
+        assert_eq!(g.episode, 5, "a hyphenated title number is title too");
+        // And a show whose title number REPEATS as the episode still works.
+        let g = parse_anime("Area 88/Area 88 - 88.mkv").unwrap();
+        assert_eq!(g.episode, 88);
+    }
+
+    /// A lettered part — "pt.03-a", "03b" — is that number. Both halves
+    /// land on the same slot deliberately: whether they are one episode
+    /// in two files or two episodes is a question only the hash can
+    /// answer, and the binder answers it (`break_slot_collisions`).
+    #[test]
+    fn a_lettered_part_reads_as_its_number() {
+        let a = parse_anime("Megazone 23 (Dual-Audio)/MegaZone 23 pt.03-a.mkv").unwrap();
+        let b = parse_anime("Megazone 23 (Dual-Audio)/MegaZone 23 pt.03-b.mkv").unwrap();
+        assert_eq!((a.episode, b.episode), (3, 3), "same part, two files");
+        assert_eq!(a.show_title, "Megazone 23");
+
+        // The readings it must not steal:
+        let r = parse_anime("Show/Show - 01-02.mkv").unwrap();
+        assert_eq!(
+            (r.episode, r.episode_end),
+            (1, Some(2)),
+            "a range stays a range"
+        );
+        let v = parse_anime("Show/Show - 05v2.mkv").unwrap();
+        assert_eq!(v.episode, 5, "a version tag stays a version tag");
+        // The tag that broke this the first time round.
+        let q = parse_anime("Pokemon/Pokemon XYZ Episode 01 [English Dubbed] 720p.mkv").unwrap();
+        assert_eq!(q.episode, 1, "a resolution is not an episode number");
     }
 }
