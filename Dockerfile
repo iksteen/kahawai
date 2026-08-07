@@ -65,12 +65,18 @@ COPY patches /usr/src/patches
 
 ARG GSTREAMER_VERSION
 ARG GSTREAMER_REV
+# A patch that stops applying must FAIL the build. A for loop exits with
+# the status of its last iteration, so without the explicit exit a patch
+# that no longer applies after a version bump is skipped, the later ones
+# succeed, and the image ships silently missing a fix — indistinguishable
+# from a working one until someone plays the file it was written for.
 RUN git clone --depth 1 --branch "$GSTREAMER_VERSION" \
         https://gitlab.freedesktop.org/gstreamer/gstreamer.git /tmp/gstreamer \
     && test "$(git -C /tmp/gstreamer rev-parse HEAD)" = "$GSTREAMER_REV" \
     && for p in /usr/src/patches/gstreamer/*.patch; do \
            echo "applying $(basename "$p")"; \
-           git -C /tmp/gstreamer apply "$p"; \
+           git -C /tmp/gstreamer apply "$p" \
+               || { echo "FAILED to apply $(basename "$p")" >&2; exit 1; }; \
        done
 
 # auto_features stays at its default, so every plugin whose dependency
