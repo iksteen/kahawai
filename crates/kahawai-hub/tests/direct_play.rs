@@ -257,7 +257,9 @@ async fn direct_play_ranges_end_to_end() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
     let resp = get(None).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    // Ended is ended, however it ended: a client streaming this session
+    // gets GONE and knows to start a new one rather than to give up.
+    assert_eq!(resp.status(), StatusCode::GONE);
 
     // Kill the link: new sessions must fail with "no source available".
     drop(tx);

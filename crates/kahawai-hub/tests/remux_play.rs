@@ -318,7 +318,9 @@ async fn remux_to_hls_end_to_end() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
     let resp = api.clone().oneshot(get(stream_url)).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    // The playlist of an ended session is GONE, not missing: hls.js
+    // reads the status off the failed load and the player restarts.
+    assert_eq!(resp.status(), StatusCode::GONE);
 }
 
 /// Router with default admin plumbing for tests that don't exercise it.

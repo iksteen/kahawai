@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { endSession, postProgress, startSessionDirect, type Item, type Session } from '../api'
 import { keepSessionAlive } from '../keepalive'
+import { isSessionGone, mayRecover } from '../recovery'
 import { replayGainFactor } from '../replaygain'
 
 /// Queue playback for an album (HUB-27): one direct-play session per
@@ -55,6 +56,8 @@ export default function AlbumPlayer({
   // whole record.
   const gainRef = useRef<{ ctx: AudioContext; gain: GainNode } | null>(null)
   const wiredRef = useRef(new WeakSet<HTMLAudioElement>())
+  // Where to put the playhead once a recovered session's element loads.
+  const resumeAt = useRef(0)
 
   const release = useCallback((slot: Slot, keepalive = false) => {
     if (slot.session) void endSession(slot.session.session_id, keepalive)
@@ -117,25 +120,55 @@ export default function AlbumPlayer({
   // being audible. Policy and bound live in keepalive.ts.
   const activeSession = slots.current[active].session
   const idleSession = slots.current[1 - active].session
+
+  /// The hub answered 410: this session is gone and no ping will bring
+  /// it back. A direct-play music session is cheap to rebuild — a lease,
+  /// not a pipeline — so take a fresh one and put the playhead back where
+  /// it was. Nothing here knows how long a session may idle; the 410 is
+  /// the entire trigger (see recovery.ts).
+  const recoverSlot = useCallback(
+    async (which: 0 | 1, want: number, resumeSeconds: number) => {
+      if (!mayRecover(tracks[want]?.id ?? 'album', resumeSeconds * 1000, performance.now())) {
+        setError('playback session ended and could not be restarted')
+        return
+      }
+      resumeAt.current = resumeSeconds
+      // prepare() no-ops when the slot already claims this index, and it
+      // does — with a session the hub has forgotten. Drop the claim.
+      slots.current[which].index = null
+      await prepare(which, want)
+    },
+    [tracks, prepare]
+  )
+
   useEffect(() => {
     if (!activeSession) return
     return keepSessionAlive(
       () => (els[active].current?.currentTime ?? 0) * 1000,
-      (ms) => void postProgress(activeSession.session_id, ms)
+      (ms) =>
+        void postProgress(activeSession.session_id, ms).then((r) => {
+          if (isSessionGone(r))
+            void recoverSlot(active as 0 | 1, index, els[active].current?.currentTime ?? 0)
+        })
     )
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeSession, active])
+  }, [activeSession, active, index])
   // The preloaded session has finished fetching and reads nothing more,
   // so a pause while it is hot would let the reaper take it before it is
   // ever heard and the swap would land on a dead URL. A position that
-  // never moves is exactly what keepSessionAlive already handles.
+  // never moves is exactly what keepSessionAlive already handles — and if
+  // it is taken anyway, warming it again costs one lease and no audio.
   useEffect(() => {
     if (!idleSession) return
     return keepSessionAlive(
       () => 0,
-      (ms) => void postProgress(idleSession.session_id, ms)
+      (ms) =>
+        void postProgress(idleSession.session_id, ms).then((r) => {
+          if (isSessionGone(r)) void recoverSlot((1 - active) as 0 | 1, index + 1, 0)
+        })
     )
-  }, [idleSession])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [idleSession, active, index])
 
   const factor = replayGainFactor(tracks[index], 'album')
   useEffect(() => {
@@ -235,6 +268,26 @@ export default function AlbumPlayer({
               hidden={which !== active}
               onTimeUpdate={() => onTime(which)}
               onEnded={() => onEnded(which)}
+              // A recovered session streams the same file from the top;
+              // put the playhead back where the dead one left off.
+              onLoadedMetadata={() => {
+                if (which !== active || resumeAt.current <= 0) return
+                const el = els[which].current
+                if (el) el.currentTime = resumeAt.current
+                resumeAt.current = 0
+              }}
+              // The element reports a failure with no status of its own,
+              // so ask the hub what kind it was — 410 means the session
+              // went away, anything else is a real media fault.
+              onError={() => {
+                const s = slots.current[which].session
+                if (!s) return
+                void postProgress(s.session_id, 0).then((r) => {
+                  if (!isSessionGone(r)) return
+                  const at = which === active ? (els[which].current?.currentTime ?? 0) : 0
+                  void recoverSlot(which, which === active ? index : index + 1, at)
+                })
+              }}
             />
           )
         )

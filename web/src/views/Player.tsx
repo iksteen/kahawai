@@ -26,6 +26,7 @@ import {
 } from '../api'
 import { loadMask, maskSummary } from '../capabilities'
 import { keepSessionAlive } from '../keepalive'
+import { SESSION_GONE, isSessionGone, mayRecover } from '../recovery'
 import CapabilityDebug from './CapabilityDebug'
 
 function fmt(ms: number) {
@@ -175,6 +176,30 @@ export default function Player({
     } catch (e) {
       setCapsError(String(e))
       setRestarting(false)
+    }
+  }
+
+  /// The hub no longer has this session — reaped for idleness, lost to a
+  /// restart, ended elsewhere. Start a fresh one where we are and hand it
+  /// up: onRestart remounts this component (keyed on session id) and the
+  /// cleanup ends the old session, so this is the capability-restart path
+  /// with a different trigger.
+  ///
+  /// Driven only by a 410 from the hub. Nothing here knows or guesses how
+  /// long a session is allowed to idle — see recovery.ts.
+  const [gone, setGone] = useState('')
+  const recover = async () => {
+    const at = Math.round(offsetRef.current + (videoRef.current?.currentTime ?? 0) * 1000)
+    // Two restarts at the same position mean the first never played.
+    if (!mayRecover(item.id, at, performance.now())) {
+      setGone('playback session ended and could not be restarted')
+      return
+    }
+    try {
+      const fresh = await startPlaybackSession(item, at, audioTrack, videoTrack)
+      onRestart(fresh, at)
+    } catch (e) {
+      setGone(String(e))
     }
   }
 
@@ -628,6 +653,12 @@ export default function Player({
         liveMaxLatencyDurationCount: Infinity,
         maxBufferLength: 60,
       })
+      // A dead session 410s every segment and playlist refresh. hls.js
+      // hands us the status; without this it retries internally and then
+      // stalls with nothing to explain it.
+      hls.on(Hls.Events.ERROR, (_e, data) => {
+        if (data.response?.code === SESSION_GONE) void recover()
+      })
       hls.loadSource(session.stream_url)
       hls.attachMedia(video)
       hlsRef.current = hls
@@ -691,8 +722,25 @@ export default function Player({
     // Pings while paused too, bounded — see keepalive.ts. Guarding
     // this on `!video.paused` is what let the reaper delete a paused
     // viewer's segment directory out from under them.
-    const stopPinging = keepSessionAlive(absMs, (ms) => void postProgress(session.session_id, ms))
+    //
+    // The ping doubles as the earliest death detector: it runs every
+    // 10 s, so a session lost to ANY cause answers 410 here, usually
+    // before the picture stalls.
+    const stopPinging = keepSessionAlive(absMs, (ms) => {
+      void postProgress(session.session_id, ms).then((r) => {
+        if (isSessionGone(r)) void recover()
+      })
+    })
     const onPause = () => report()
+    // Direct play has no hls.js to report a status: the element just
+    // fails. Ask the hub which kind of failure it was — a 410 is a dead
+    // session, anything else is a real media fault and stays one.
+    const onError = () => {
+      void postProgress(session.session_id, absMs()).then((r) => {
+        if (isSessionGone(r)) void recover()
+      })
+    }
+    video.addEventListener('error', onError)
     const onEnded = () => {
       report()
       // Multi-part sources (CD1/CD2): this part's playlist ended but
@@ -715,6 +763,7 @@ export default function Player({
       video.removeEventListener('loadedmetadata', seekToResume)
       video.removeEventListener('timeupdate', onTime)
       video.removeEventListener('pause', onPause)
+      video.removeEventListener('error', onError)
       video.removeEventListener('ended', onEnded)
       window.removeEventListener('beforeunload', onUnload)
       report(true)
@@ -884,6 +933,9 @@ export default function Player({
         ) : null}
         {showCaps && <CapabilityDebug onApply={() => restartWithCaps()} applying={restarting} />}
         {capsError && <div className="dim">restart failed: {capsError}</div>}
+        {/* Recovery is silent when it works; this is only the case where
+            it could not, so the picture never just stops without a word. */}
+        {gone && <div className="error">{gone}</div>}
         {/* OPS-10: admins can take this session's diagnostics straight
             from the screen where the problem is visible. */}
         {isAdmin() && (

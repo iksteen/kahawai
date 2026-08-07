@@ -227,6 +227,24 @@ fn internal(e: impl std::fmt::Display) -> ApiError {
     (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
 }
 
+/// A session that existed and no longer does — reaped for idleness
+/// (HUB-18), ended by the user, or lost with its module or the hub.
+///
+/// **410, never 404.** This is the whole client contract for recovery:
+/// a client that sees GONE on any `/api/v1/playback/sessions/{id}/…`
+/// endpoint knows the session is unrecoverable and that starting a new
+/// one at its current position is the correct response. 404 stays what
+/// it should mean, a missing sub-resource — `session_file` answers it
+/// for "no such embedded track" on a perfectly live session, and that
+/// ambiguity is exactly why the two must not share a status.
+///
+/// The status carries the whole signal deliberately: a third-party
+/// client (HUB-28) must not have to parse a body, match English prose,
+/// or know how long our idle timeout happens to be this month.
+fn session_gone() -> ApiError {
+    (StatusCode::GONE, "no such session".into())
+}
+
 /// The token as a client presents it: Authorization header first, the
 /// kahawai_token cookie as the fallback for <video>/HLS requests, which
 /// cannot set headers (HUB-27). Shared with `bootstrap`, so what counts
@@ -1192,7 +1210,7 @@ async fn admin_end_session(
     if state.sessions.end(&id) {
         Ok(StatusCode::NO_CONTENT)
     } else {
-        Err((StatusCode::NOT_FOUND, "no such session".into()))
+        Err(session_gone())
     }
 }
 
@@ -1502,6 +1520,13 @@ async fn seek_session(
     Path(id): Path<String>,
     Json(body): Json<SeekRequest>,
 ) -> Result<Json<Value>, ApiError> {
+    // Before the seek, not inside it: `Sessions::seek` reports a missing
+    // session as an ordinary error, which lands as the same 409 a real
+    // seek failure does. A client cannot recover from an ambiguous
+    // status, so the one case it CAN act on gets answered first.
+    if state.sessions.get(&id).is_none() {
+        return Err(session_gone());
+    }
     let part_base_ms = state
         .sessions
         .seek(
@@ -1543,7 +1568,7 @@ async fn end_session(
     if state.sessions.end(&id) {
         Ok(StatusCode::NO_CONTENT)
     } else {
-        Err((StatusCode::NOT_FOUND, "no such session".into()))
+        Err(session_gone())
     }
 }
 
@@ -1610,7 +1635,7 @@ async fn stream_session(
     let session = state
         .sessions
         .get(&id)
-        .ok_or((StatusCode::NOT_FOUND, "no such session".to_string()))?;
+        .ok_or_else(session_gone)?;
     session.touch();
     let crate::sessions::Mode::Direct { lease } = &session.mode else {
         return Err((StatusCode::CONFLICT, "not a direct-play session".into()));
@@ -2599,7 +2624,7 @@ async fn post_progress(
     let session = state
         .sessions
         .get(&id)
-        .ok_or((StatusCode::NOT_FOUND, "no such session".to_string()))?;
+        .ok_or_else(session_gone)?;
     if session.user_id != claims.sub {
         return Err((StatusCode::FORBIDDEN, "not your session".into()));
     }
@@ -2719,7 +2744,7 @@ async fn session_file(
     let session = state
         .sessions
         .get(&id)
-        .ok_or((StatusCode::NOT_FOUND, "no such session".to_string()))?;
+        .ok_or_else(session_gone)?;
     session.touch();
     // Live subtitle tap (HUB-32): the remux pipeline — local or on a
     // transcoder — appends ASS events to subs-e{n}.ass from the session

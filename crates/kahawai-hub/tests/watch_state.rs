@@ -260,7 +260,24 @@ async fn progress_resume_played_caps_and_idle() {
         "cap of 2 sessions per user"
     );
 
+    // A LIVE session still answers 404 for a sub-resource that does not
+    // exist. This is the discrimination the recovery contract rests on:
+    // a client may only restart a session on GONE, so "no such embedded
+    // track" must never wear the same status as "no such session".
+    let resp = api
+        .clone()
+        .oneshot(get(format!("/api/v1/playback/sessions/{s1}/subs-999999.ass")))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "a missing sub-resource on a live session is 404, not GONE"
+    );
+
     // Idle reaping: stop touching; the janitor ends both within ~2 s.
+    // The reaped session answers GONE — the one signal a client needs to
+    // know it should start a new session at its current position.
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let resp = api
@@ -268,9 +285,14 @@ async fn progress_resume_played_caps_and_idle() {
                 .oneshot(get(format!("/api/v1/playback/sessions/{s1}/stream")))
                 .await
                 .unwrap();
-            if resp.status() == StatusCode::NOT_FOUND {
+            if resp.status() == StatusCode::GONE {
                 return;
             }
+            assert_ne!(
+                resp.status(),
+                StatusCode::NOT_FOUND,
+                "a reaped session must be GONE, never 404"
+            );
             // NB: polling the stream endpoint touches the session, so
             // back off beyond the idle timeout between checks.
             tokio::time::sleep(Duration::from_millis(900)).await;
