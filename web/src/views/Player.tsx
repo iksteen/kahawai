@@ -11,6 +11,7 @@ import {
   fetchPrefs,
   pickSubtitle,
   postProgress,
+  refreshTokens,
   putPref,
   resolveTracks,
   seekSession,
@@ -657,7 +658,16 @@ export default function Player({
       // hands us the status; without this it retries internally and then
       // stalls with nothing to explain it.
       hls.on(Hls.Events.ERROR, (_e, data) => {
-        if (data.response?.code === SESSION_GONE) void recover()
+        const code = data.response?.code
+        if (code === SESSION_GONE) {
+          void recover()
+          return
+        }
+        // hls.js fetches with its own XHR, so it never gets api()'s
+        // refresh-and-retry. Without this an expired token stops
+        // playback dead — and worse, hides a 410 behind a 401, because
+        // auth runs before the handler that would have said GONE.
+        if (code === 401) void refreshTokens().then((ok) => ok && hls.startLoad())
       })
       hls.loadSource(session.stream_url)
       hls.attachMedia(video)

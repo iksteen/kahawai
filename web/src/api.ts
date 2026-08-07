@@ -4,6 +4,8 @@
 
 import { buildProfile } from './capabilities'
 
+import { REFRESH_RETRY_MS, refreshDelayMs } from './token'
+
 const LS_ACCESS = 'kahawai.access'
 const LS_REFRESH = 'kahawai.refresh'
 
@@ -20,10 +22,14 @@ export function storeTokens(t: Tokens | null) {
     localStorage.setItem(LS_ACCESS, t.access_token)
     localStorage.setItem(LS_REFRESH, t.refresh_token)
     syncCookie(t.access_token)
+    // Every path that lands a token — login, refresh — re-arms the
+    // timer from the new expiry, so the schedule is never stale.
+    keepTokenFresh()
   } else {
     localStorage.removeItem(LS_ACCESS)
     localStorage.removeItem(LS_REFRESH)
     syncCookie(null)
+    clearTimeout(refreshTimer)
   }
 }
 
@@ -31,7 +37,7 @@ export function accessToken(): string | null {
   return localStorage.getItem(LS_ACCESS)
 }
 
-function claims(): { username?: string; admin?: boolean } {
+function claims(): { username?: string; admin?: boolean; exp?: number } {
   const t = accessToken()
   if (!t) return {}
   try {
@@ -39,6 +45,33 @@ function claims(): { username?: string; admin?: boolean } {
   } catch {
     return {}
   }
+}
+
+let refreshTimer: ReturnType<typeof setTimeout> | undefined
+
+/// Keep the access token valid ahead of time, rather than repairing it
+/// after something fails.
+///
+/// `api()` refreshes on a 401 and retries, but it is not the only thing
+/// carrying this token: the SAME token rides the kahawai_token cookie
+/// for <video>, <img> and EventSource, and hls.js puts it in a Bearer
+/// header from its own XHR. None of those pass through api(), so none
+/// of them can repair themselves — an expired token simply fails the
+/// media request, hls.js stops loading, and the session it was reading
+/// goes idle and is reaped. Observed 2026-08-07: a paused film died
+/// this way, and because the expired token makes the hub answer 401
+/// where it would have answered 410, session recovery could not see
+/// its own trigger either.
+export function keepTokenFresh() {
+  clearTimeout(refreshTimer)
+  const exp = claims().exp
+  if (!exp) return
+  refreshTimer = setTimeout(() => {
+    void refreshTokens().then((ok) => {
+      // On success storeTokens() reschedules from the NEW expiry.
+      if (!ok && accessToken()) refreshTimer = setTimeout(keepTokenFresh, REFRESH_RETRY_MS)
+    })
+  }, refreshDelayMs(exp * 1000, Date.now()))
 }
 
 export function username(): string {

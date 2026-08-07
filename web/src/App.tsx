@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react'
 import {
   fetchBootstrap,
   isAdmin,
-  refreshTokens,
+  keepTokenFresh,
   storeTokens,
   username,
   type ItemDetail,
@@ -127,10 +127,19 @@ export default function App() {
 
   // Keep the media cookie fresh: <video> and hls.js requests authenticate
   // with it, and access tokens expire after 15 minutes.
+  //
+  // Scheduled from the token's OWN expiry, not on a fixed interval. A
+  // 10-minute interval looks like enough margin against a 15-minute
+  // token until it restarts: every mount began the count again without
+  // refreshing, so a reload landing partway through left a gap longer
+  // than the token lived. Measured 2026-08-07 — token issued 14:38:07,
+  // dead 14:53:07, refreshed 14:56:48. In those three minutes hls.js
+  // got 401s, stopped loading, and the session it was reading was
+  // reaped for idleness; the 401 also masked the 410 that would have
+  // told the player to recover.
   useEffect(() => {
     if (phase !== 'app') return
-    const t = setInterval(refreshTokens, 10 * 60 * 1000)
-    return () => clearInterval(t)
+    keepTokenFresh()
   }, [phase])
 
   if (phase === 'boot') return null
