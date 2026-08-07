@@ -188,12 +188,33 @@ export default function Player({
   ///
   /// Driven only by a 410 from the hub. Nothing here knows or guesses how
   /// long a session is allowed to idle — see recovery.ts.
+  /// A session that died while PAUSED is not recovered until the viewer
+  /// presses play. Restarting it there would spend a pipeline — or a
+  /// transcoder slot — on something nobody is watching, and would undo
+  /// exactly what the reaper freed; worse, the new session goes idle and
+  /// is reaped in turn, so a player left paused overnight would respawn
+  /// a worker every half hour. The loop guard cannot see that: those
+  /// events are thirty minutes apart and its window is sixty seconds.
+  const deadRef = useRef(false)
+  /// Detectors overlap by design — the ping and hls.js can both notice
+  /// the same death. Without this the second one reaches mayRecover at
+  /// the position the first just took, is refused as a loop, and reports
+  /// a failure over a recovery that worked.
+  const recovering = useRef(false)
+
   const [gone, setGone] = useState('')
   const recover = async () => {
+    if (videoRef.current?.paused) {
+      deadRef.current = true
+      return
+    }
+    if (recovering.current) return
+    recovering.current = true
     const at = Math.round(offsetRef.current + (videoRef.current?.currentTime ?? 0) * 1000)
     // Two restarts at the same position mean the first never played.
     if (!mayRecover(item.id, at, performance.now())) {
       setGone('playback session ended and could not be restarted')
+      recovering.current = false
       return
     }
     try {
@@ -201,6 +222,7 @@ export default function Player({
       onRestart(fresh, at)
     } catch (e) {
       setGone(String(e))
+      recovering.current = false
     }
   }
 
@@ -742,6 +764,14 @@ export default function Player({
       })
     })
     const onPause = () => report()
+    // The gesture that makes recovery worth doing. Proactive rather than
+    // waiting for the load to fail, so there is no error flash first.
+    const onPlay = () => {
+      if (!deadRef.current) return
+      deadRef.current = false
+      void recover()
+    }
+    video.addEventListener('play', onPlay)
     // Direct play has no hls.js to report a status: the element just
     // fails. Ask the hub which kind of failure it was — a 410 is a dead
     // session, anything else is a real media fault and stays one.
@@ -773,6 +803,7 @@ export default function Player({
       video.removeEventListener('loadedmetadata', seekToResume)
       video.removeEventListener('timeupdate', onTime)
       video.removeEventListener('pause', onPause)
+      video.removeEventListener('play', onPlay)
       video.removeEventListener('error', onError)
       video.removeEventListener('ended', onEnded)
       window.removeEventListener('beforeunload', onUnload)

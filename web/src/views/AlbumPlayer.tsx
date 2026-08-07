@@ -126,8 +126,17 @@ export default function AlbumPlayer({
   /// not a pipeline — so take a fresh one and put the playhead back where
   /// it was. Nothing here knows how long a session may idle; the 410 is
   /// the entire trigger (see recovery.ts).
+  /// Not while the queue is paused: a restart there spends a lease on
+  /// audio nobody is listening to, and the fresh session goes idle and
+  /// is reaped in turn — a paused queue would respawn one forever. The
+  /// death is remembered instead and acted on when play is pressed.
+  const deadRef = useRef(false)
   const recoverSlot = useCallback(
-    async (which: 0 | 1, want: number, resumeSeconds: number) => {
+    async (which: 0 | 1, want: number, resumeSeconds: number, paused: boolean) => {
+      if (paused) {
+        deadRef.current = true
+        return
+      }
       if (!mayRecover(tracks[want]?.id ?? 'album', resumeSeconds * 1000, performance.now())) {
         setError('playback session ended and could not be restarted')
         return
@@ -148,7 +157,12 @@ export default function AlbumPlayer({
       (ms) =>
         void postProgress(activeSession.session_id, ms).then((r) => {
           if (isSessionGone(r))
-            void recoverSlot(active as 0 | 1, index, els[active].current?.currentTime ?? 0)
+            void recoverSlot(
+              active as 0 | 1,
+              index,
+              els[active].current?.currentTime ?? 0,
+              els[active].current?.paused ?? false
+            )
         })
     )
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -164,7 +178,15 @@ export default function AlbumPlayer({
       () => 0,
       (ms) =>
         void postProgress(idleSession.session_id, ms).then((r) => {
-          if (isSessionGone(r)) void recoverSlot((1 - active) as 0 | 1, index + 1, 0)
+          // The preload is judged by the AUDIBLE element: warming the
+          // next track while the queue sits paused is the same waste.
+          if (isSessionGone(r))
+            void recoverSlot(
+              (1 - active) as 0 | 1,
+              index + 1,
+              0,
+              els[active].current?.paused ?? false
+            )
         })
     )
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -266,6 +288,11 @@ export default function AlbumPlayer({
               preload="auto"
               controls={which === active}
               hidden={which !== active}
+              onPlay={() => {
+                if (which !== active || !deadRef.current) return
+                deadRef.current = false
+                void recoverSlot(which, index, els[which].current?.currentTime ?? 0, false)
+              }}
               onTimeUpdate={() => onTime(which)}
               onEnded={() => onEnded(which)}
               // A recovered session streams the same file from the top;
@@ -285,7 +312,12 @@ export default function AlbumPlayer({
                 void postProgress(s.session_id, 0).then((r) => {
                   if (!isSessionGone(r)) return
                   const at = which === active ? (els[which].current?.currentTime ?? 0) : 0
-                  void recoverSlot(which, which === active ? index : index + 1, at)
+                  void recoverSlot(
+                    which,
+                    which === active ? index : index + 1,
+                    at,
+                    els[active].current?.paused ?? false
+                  )
                 })
               }}
             />
