@@ -194,6 +194,37 @@ pub fn run_remux_worker(cfg: &config::Config, w: WorkerArgs) -> Result<()> {
             anyhow::bail!("supervisor already gone; not starting");
         }
     }
+    // TC-6 CPU shares. Applied by the worker to ITSELF rather than by
+    // the spawner, so the hub and the transcoder share one
+    // implementation and neither needs `pre_exec` — and read out of the
+    // config this process loads, the same route `demote_decoders`
+    // takes, so there is nothing to plumb through two spawn sites.
+    //
+    // Raising niceness never needs privileges; lowering it does, and a
+    // refusal is logged rather than failing a session over a knob.
+    if cfg.transcoder.worker_nice != 0 {
+        // SAFETY: setpriority on our own process, with a value clamped
+        // to the range the kernel accepts.
+        let rc = unsafe {
+            libc::setpriority(
+                libc::PRIO_PROCESS,
+                0,
+                cfg.transcoder.worker_nice.clamp(-20, 19),
+            )
+        };
+        if rc == 0 {
+            tracing::info!(nice = cfg.transcoder.worker_nice, "worker niceness applied");
+        } else {
+            tracing::warn!(
+                nice = cfg.transcoder.worker_nice,
+                error = %std::io::Error::last_os_error(),
+                "setpriority refused; worker runs at the default priority"
+            );
+        }
+    }
+    if cfg.transcoder.worker_threads > 0 {
+        kahawai_media::remux::set_encoder_threads(cfg.transcoder.worker_threads);
+    }
     // Blocking by design: this process exists only for the pipeline.
     kahawai_media::demote_elements(&cfg.transcoder.demote_decoders)?;
     let mut all = vec![(w.socket, w.size)];

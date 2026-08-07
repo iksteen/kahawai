@@ -235,6 +235,20 @@ pub const AV1_ENCODERS: &[&str] = &[
     "av1enc",
 ];
 
+/// The software entries of the three lists above — everything else in
+/// them is hardware. One list, because two places ask the same question
+/// and would drift: TC-1's `hardware` flag, which placement filters on,
+/// and the per-session `video encoder selected` log that says whether
+/// this session degraded (TC-6).
+pub const SW_VIDEO_ENCODERS: &[&str] = &[
+    "x264enc",
+    "openh264enc",
+    "x265enc",
+    "svtav1enc",
+    "rav1enc",
+    "av1enc",
+];
+
 /// Best available H.264 encoder, dry-run-verified once. None → this box
 /// cannot transcode video.
 pub fn h264_encoder() -> Option<&'static str> {
@@ -250,6 +264,47 @@ pub fn hevc_encoder() -> Option<&'static str> {
 pub fn av1_encoder() -> Option<&'static str> {
     static VERIFIED: std::sync::OnceLock<Option<&'static str>> = std::sync::OnceLock::new();
     *VERIFIED.get_or_init(|| verified_encoder(AV1_ENCODERS, dry_run_video_encoder))
+}
+
+/// TC-6 CPU share: the thread ceiling a worker was configured with, or
+/// None for the encoder's own default.
+///
+/// Process-global and set once at worker startup, exactly like
+/// `demote_elements` and for the same reason: it is a fact about this
+/// box, not a decision about this session, and a worker process runs one
+/// session anyway. Threading it through the plan would have it cross
+/// four call sites to say the same thing.
+static ENCODER_THREADS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+
+pub fn set_encoder_threads(n: u32) {
+    let _ = ENCODER_THREADS.set(n);
+}
+
+/// Apply that ceiling to a SOFTWARE encoder. Hardware encoders are left
+/// alone — their concurrency is the driver's, and none of them carries a
+/// thread property to set anyway.
+///
+/// One property name per encoder, each read off `gst-inspect` on a box
+/// that has the element rather than from memory. x265enc is the odd one:
+/// it exposes no thread property at all, only libx265's `option-string`,
+/// where `pools` is the total-thread knob. x264enc has an
+/// `option-string` too and must NOT be set through it — it has a real
+/// `threads` property, and writing the string would discard whatever
+/// else a future caller put there.
+fn set_encoder_threads_on(enc: &gst::Element, name: &str, n: u32) {
+    match name {
+        "x264enc" | "av1enc" | "rav1enc" => set_prop_str_if_present(enc, "threads", &n.to_string()),
+        "openh264enc" => set_prop_str_if_present(enc, "multi-thread", &n.to_string()),
+        "svtav1enc" => set_prop_str_if_present(enc, "level-of-parallelism", &n.to_string()),
+        "x265enc" => set_prop_str_if_present(enc, "option-string", &format!("pools={n}")),
+        // Hardware, or an encoder we have never measured a knob on.
+        _ => return,
+    }
+    tracing::info!(
+        encoder = name,
+        threads = n,
+        "software encoder thread ceiling applied"
+    );
 }
 
 /// The converter chain that feeds an encoder, by encoder family. The
@@ -282,14 +337,6 @@ pub(crate) fn encode_converter_names(enc_name: &str) -> Vec<&'static str> {
 /// `opus:` entry appearing here is what makes the box eligible for
 /// that encode target (HUB-15b) — placement hard-filters on it.
 pub fn encoder_capabilities() -> Vec<(&'static str, &'static str, bool)> {
-    const SW_VIDEO: &[&str] = &[
-        "x264enc",
-        "openh264enc",
-        "x265enc",
-        "svtav1enc",
-        "rav1enc",
-        "av1enc",
-    ];
     let mut caps = Vec::new();
     for (codec, el) in [
         ("h264", h264_encoder()),
@@ -297,7 +344,7 @@ pub fn encoder_capabilities() -> Vec<(&'static str, &'static str, bool)> {
         ("av1", av1_encoder()),
     ] {
         if let Some(el) = el {
-            caps.push((codec, el, !SW_VIDEO.contains(&el)));
+            caps.push((codec, el, !SW_VIDEO_ENCODERS.contains(&el)));
         }
     }
     for (codec, el) in [("aac", aac_encoder()), ("opus", opus_encoder())] {
@@ -2262,6 +2309,24 @@ fn build_video_encode_chain(
     // and the sink cuts at both, which is how segments came out 1.96 s
     // and 1.04 s alternating. Ten seconds never fires first in practice.
     // One name per encoder family, each guarded:
+    // TC-6: which encoder this session actually got. The requirement is
+    // to degrade to software PREDICTABLY, and a degradation nobody can
+    // see afterwards is not predictable — the preference list resolves
+    // per worker process, so the answer differs between two sessions on
+    // one box and only the session's own log can say which it was.
+    // `HLS sink selected` has been logged the same way for the same
+    // reason; the encoder was the louder omission of the two.
+    tracing::info!(
+        encoder = enc_name,
+        target = target.as_str(),
+        hardware = !SW_VIDEO_ENCODERS.contains(&enc_name),
+        "video encoder selected"
+    );
+    // Before the GOP pins, so a log reading the element's properties back
+    // shows the ceiling next to the bitrate it competes with.
+    if let Some(&n) = ENCODER_THREADS.get().filter(|n| **n > 0) {
+        set_encoder_threads_on(&enc, enc_name, n);
+    }
     set_prop_str_if_present(&enc, "gop-size", "240"); // nvenc, qsv
     set_prop_str_if_present(&enc, "key-int-max", "240"); // x264, x265, va
     set_prop_str_if_present(&enc, "max-keyframe-interval", "240"); // vtenc
@@ -4781,6 +4846,68 @@ mod concat_spike {
 
 #[cfg(test)]
 mod tests {
+    /// TC-6: the thread ceiling has to LAND, on every software encoder
+    /// this box actually has.
+    ///
+    /// The failure mode it exists for is silence: `set_prop_str_if_present`
+    /// skips a property that is not there, so one wrong name in the match
+    /// means the ceiling quietly does nothing and the transcode still
+    /// completes, looking identical. Reading the value back is the only
+    /// thing that distinguishes "applied" from "ignored".
+    ///
+    /// Elements absent from this box are skipped rather than failed — the
+    /// same shape the sink tests use — and the count is asserted so a
+    /// build with no software encoders at all cannot pass vacuously.
+    #[test]
+    fn the_thread_ceiling_lands_on_every_software_encoder_present() {
+        use gst::glib::prelude::ObjectExt;
+        crate::init().unwrap();
+        // Property names are from `gst-inspect` per element, not memory.
+        // x265enc carries no thread property at all — libx265's
+        // `option-string` is the only way in, and `pools` is its
+        // total-thread knob.
+        let cases: &[(&str, &str, &str)] = &[
+            ("x264enc", "threads", "3"),
+            ("openh264enc", "multi-thread", "3"),
+            ("av1enc", "threads", "3"),
+            ("rav1enc", "threads", "3"),
+            ("svtav1enc", "level-of-parallelism", "3"),
+            ("x265enc", "option-string", "pools=3"),
+        ];
+        let mut checked = 0;
+        for (name, prop, want) in cases {
+            let Ok(enc) = gst::ElementFactory::make(name).build() else {
+                eprintln!("no {name}; skipped");
+                continue;
+            };
+            super::set_encoder_threads_on(&enc, name, 3);
+            let v = enc.property_value(prop);
+            // The numeric properties are variously uint and int across
+            // these elements, so compare what the value SAYS rather than
+            // guessing a Rust type per element.
+            let got = v
+                .get::<u32>()
+                .map(|n| n.to_string())
+                .or_else(|_| v.get::<i32>().map(|n| n.to_string()))
+                .or_else(|_| v.get::<String>())
+                .unwrap_or_else(|_| format!("{v:?}"));
+            assert_eq!(
+                &got, want,
+                "{name}.{prop} was not set — wrong property name in the match?"
+            );
+            checked += 1;
+        }
+        assert!(
+            checked > 0,
+            "no software encoder present at all; the ceiling was never exercised"
+        );
+        // A hardware encoder has no such knob and must be left alone
+        // rather than panicked over.
+        if let Ok(enc) = gst::ElementFactory::make("vah264enc").build() {
+            super::set_encoder_threads_on(&enc, "vah264enc", 3);
+        }
+    }
+
     #[test]
     fn selects_requested_video_track() {
         crate::init().unwrap();

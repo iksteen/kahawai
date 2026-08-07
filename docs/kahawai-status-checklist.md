@@ -415,8 +415,21 @@ How something works and why it was built that way belong in
       (HUB-36 — the un-throttled phase, once per run), but there is
       still no continuous progress percentage per session
 - [x] TC-5 Cancellable sessions; transcode-ahead pacing window
-- [ ] TC-6 Resource ceilings *(max_sessions enforced; CPU/GPU shares and
-      scratch-disk quota/eviction not enforced)*
+- [x] TC-6 Resource ceilings, as amended 2026-08-08: `max_sessions` at
+      placement, and CPU shares as `[transcoder] worker_nice` +
+      `worker_threads`, which each pipeline worker applies to itself
+      (both default to 0 = today's behaviour; on all-in-one they govern
+      the hub's own remux workers too). Runtime degradation to software
+      comes free from the per-session worker process dry-running its
+      preference list, and the session log now names the encoder it got.
+      Struck by the amendment, with reasons and measurements there:
+      scratch eviction (unreachable without giving up the EVENT playlist
+      players seek in; a run costs 3.0–5.4 GB per content-hour and is
+      deleted whole at teardown) and GPU session count (not discoverable
+      on VA-API or VideoToolbox). Still open: a hardware failure
+      MID-RUN ends the session — the one retry in `dispatch_to` covers
+      the sink at start only. cgroup CPU weight is documented, not
+      enforced.
 - [ ] TC-7 *(optional v1.x)* Offline pre-transcode
 
 ## Operations (OPS)

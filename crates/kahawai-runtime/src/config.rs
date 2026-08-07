@@ -196,6 +196,33 @@ pub struct TranscoderConfig {
     /// pathologically slow (e.g. Gemini Lake VA-API: vah265dec 6 fps
     /// where avdec_h265 does 121). Encode preference is unaffected.
     pub demote_decoders: Vec<String>,
+    /// TC-6 CPU share: niceness applied by each pipeline worker to
+    /// itself at startup. 0 = leave it alone, which is what every
+    /// deployment did before this existed.
+    ///
+    /// Positive only in practice — lowering niceness needs privileges we
+    /// do not have and the worker logs the refusal rather than failing
+    /// the session. The case this is for is `all-in-one`, where a
+    /// software encode competes with the hub that has to serve the very
+    /// stream it is producing; on a dedicated transcoder, transcoding is
+    /// the job and there is nothing to yield to.
+    ///
+    /// Read by the WORKER out of this section whoever spawned it, the
+    /// same way `demote_decoders` is: the worker is the thing that
+    /// encodes, whether a transcoder daemon or the hub's own remux
+    /// started it, so on all-in-one this governs the hub's workers too.
+    pub worker_nice: i32,
+    /// TC-6 CPU share: thread ceiling for SOFTWARE video encoders
+    /// (x264enc, x265enc, svtav1enc, av1enc, rav1enc, openh264enc).
+    /// 0 = the encoder's own default, which is "as many as this box
+    /// has". Hardware encoders are untouched: their concurrency lives
+    /// in the driver and is not ours to set.
+    ///
+    /// A ceiling on threads is not the same thing as a share of a CPU —
+    /// it is the part of one a process can grant itself. The other part
+    /// is a cgroup, which belongs to whatever supervises this process;
+    /// `docs/kahawai-deployment.md` has the systemd form.
+    pub worker_threads: u32,
 }
 
 impl Default for TranscoderConfig {
@@ -206,6 +233,8 @@ impl Default for TranscoderConfig {
             name: "transcoder".into(),
             max_sessions: 2,
             demote_decoders: Vec::new(),
+            worker_nice: 0,
+            worker_threads: 0,
         }
     }
 }

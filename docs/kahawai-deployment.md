@@ -132,6 +132,46 @@ It honours the usual env override
    `login throttled` log lines.
 
 
+## Capping what a transcode costs the box (TC-6)
+
+Each session's pipeline is a separate `remux-worker` process, and two
+knobs bound what one costs. Both live in `[transcoder]`, both default to
+0 = off, and both are read by the worker itself — so on `all-in-one` they
+also govern the workers the *hub* spawns for its own remuxes, which is
+the deployment where this matters at all. On a dedicated transcoder box,
+transcoding is the job and there is nothing to yield to.
+
+```toml
+[transcoder]
+# Yield to the hub that has to serve the stream being produced.
+worker_nice = 10
+# Thread ceiling for SOFTWARE encoders (x264enc, x265enc, svtav1enc,
+# av1enc, rav1enc, openh264enc). Hardware encoders are untouched: their
+# concurrency lives in the driver.
+worker_threads = 4
+```
+
+Which encoder a session got — and therefore whether `worker_threads`
+applied — is in that session's `worker.log` as `video encoder selected`,
+with a `hardware` flag. The preference list resolves per worker process,
+so two sessions on one box can legitimately differ.
+
+A **share** of a CPU is not something a process can grant itself; that is
+a cgroup, and it belongs to whatever supervises the process. Under
+systemd:
+
+```ini
+# /etc/systemd/system/kahawai-transcoder.service.d/cpu.conf
+[Service]
+CPUWeight=50           # relative to other services (default 100)
+CPUQuota=600%          # never more than six cores' worth
+IOWeight=50
+```
+
+Under Docker/Podman the equivalents are `--cpu-shares` and `--cpus`.
+Neither replaces `worker_nice`: the cgroup bounds the whole service, the
+niceness orders the worker *against the hub inside it*.
+
 ## Scraping metrics (NFR-6)
 
 `/metrics` is off until `hub.metrics_token` is set, and it takes that

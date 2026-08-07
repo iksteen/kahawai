@@ -1960,6 +1960,17 @@ impl Sessions {
                     } else {
                         vec!["--sink".into(), sink.to_string()]
                     })
+                    // BOTH streams. The dispatched path (transcoder
+                    // sessions.rs) learned this the hard way and this
+                    // copy never got the fix: `tracing_subscriber` writes
+                    // to STDOUT, so capturing stderr alone kept the
+                    // GStreamer C-side output and Rust panics — which is
+                    // why crash capture looked fine — while every
+                    // `tracing::info!` the worker emitted went to the
+                    // detached parent's stdout and was discarded. A
+                    // locally-remuxed session's worker.log was 0 bytes
+                    // for its whole life, and OPS-10 bundled that.
+                    .stdout(std::process::Stdio::from(log.try_clone()?))
                     .stderr(std::process::Stdio::from(log))
                     .kill_on_drop(true)
                     .spawn()
