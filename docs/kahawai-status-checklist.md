@@ -215,9 +215,15 @@ How something works and why it was built that way belong in
       OP/ED), because cost follows the COMPOSITION CHANGE RATE and
       every real script sits at 2-7% — numbers and method in the
       `assraster` module doc.
-- [ ] HUB-10 Multi-user *(accounts with create AND delete, admin flag,
-      per-user watch state live; per-library access grants and parental
-      controls missing)*
+- [x] HUB-10 Multi-user: accounts with create and delete, admin flag,
+      per-user watch state, and per-library access grants — a
+      `users.all_libraries` flag plus a `user_libraries` list
+      (`hub/grants.rs`), enforced on browse, cross-library search, item
+      detail, children, artwork, fonts, subtitles, collections and
+      playback. Admins are not bound by grants; denials answer 404.
+      Managed from the admin UI's users panel and `kahawai-users.sh`.
+      Parental control needs no separate mechanism: it is a library the
+      admin composes and grants.
 - [x] HUB-11 Versioned HTTP/JSON API + /api/v1/events SSE channel
       (invalidation hints: scan progress, satellite connectivity,
       sessions, enrichment; cookie-authenticated for EventSource)

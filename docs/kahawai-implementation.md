@@ -122,7 +122,7 @@ Fast-path change detection uses `(path, size, mtime)`; `ContentId` resolves rena
 
 ### 4.1 Data model (SQLite)
 
-Core tables: `mediahosts`, `collections`, `files` (technical metadata as JSON column + indexed scalar columns), `libraries`, `library_collections`, `items` (logical entities; `kind` = movie|show|season|episode|artist|album|track), `item_sources` (item ↔ file, quality rank), `subtitles` (downloaded/registered external subtitle streams, §4.3a), `users`, `grants`, `watch_state (user, item, position_ms, play_count, updated_at)`, `watch_state_archive` and `binding_archive` (content-identity-keyed survivors of mediahost deletion, §7.4), `sessions`, `satellites (module_id, type, name, cert_fingerprint(s), enrolled_at)` — this table *is* the mTLS allowlist — plus append-only `satellite_audit`.
+Core tables: `mediahosts`, `collections`, `files` (technical metadata as JSON column + indexed scalar columns), `libraries`, `library_collections`, `items` (logical entities; `kind` = movie|show|season|episode|artist|album|track), `item_sources` (item ↔ file, quality rank), `subtitles` (downloaded/registered external subtitle streams, §4.3a), `users` (with the `all_libraries` access flag), `user_libraries` (HUB-10 per-library grants; the `hub/grants.rs` module doc is the reference for what the flag and the list mean together), `watch_state (user, item, position_ms, play_count, updated_at)`, `watch_state_archive` and `binding_archive` (content-identity-keyed survivors of mediahost deletion, §7.4), `sessions`, `satellites (module_id, type, name, cert_fingerprint(s), enrolled_at)` — this table *is* the mTLS allowlist — plus append-only `satellite_audit`.
 
 Watch-state writes are batched but flushed on session teardown and every 10 s (NFR-3).
 
@@ -480,7 +480,7 @@ In all-in-one mode `LocalTransport` bypasses TLS and enrollment entirely — the
 
 ### 7.5 Client API
 
-Unchanged by the PKI: Argon2id password hashes, 15-min JWT access tokens, rotating refresh tokens with a server-side revocation table, per-route authorization middleware mapping user grants → library visibility. The client-facing listener may use the hub CA's leaf cert, an ACME cert, or sit behind a reverse proxy; client apps are *not* enrolled in the internal CA.
+Unchanged by the PKI: Argon2id password hashes, 15-min JWT access tokens, rotating refresh tokens with a server-side revocation table, per-route authorization middleware mapping user grants → library visibility (one `require_item_access` layer over the whole `/api/v1/items/{id}…` group, plus the browse and playback checks). The client-facing listener may use the hub CA's leaf cert, an ACME cert, or sit behind a reverse proxy; client apps are *not* enrolled in the internal CA.
 
 ## 8. Configuration example
 

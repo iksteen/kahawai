@@ -303,7 +303,7 @@ impl Auth {
             .bind(id)
             .execute(&mut *tx)
             .await?;
-        // watch_state and user_prefs cascade from here.
+        // watch_state, user_prefs and user_libraries cascade from here.
         sqlx::query("DELETE FROM users WHERE id = ?")
             .bind(id)
             .execute(&mut *tx)

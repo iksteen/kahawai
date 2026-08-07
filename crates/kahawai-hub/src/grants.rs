@@ -1,0 +1,223 @@
+//! Per-library access grants (HUB-10): which libraries an account may
+//! see, and so which items it may browse, search, open, fetch artwork
+//! for, download subtitles for, and play.
+//!
+//! ## What is stored
+//!
+//! `users.all_libraries`, a flag defaulting to 1, and `user_libraries`, a
+//! plain (user, library) list:
+//!
+//! | `all_libraries` | rows in `user_libraries` | the account sees |
+//! |-----------------|--------------------------|------------------|
+//! | 1               | ignored                  | every library, including ones created later |
+//! | 0               | some                     | exactly those |
+//! | 0               | none                     | nothing |
+//!
+//! The flag is there so that "nothing" is expressible. A list on its own
+//! cannot say it: with no rows meaning "everything" you can never revoke
+//! the last library, and with no rows meaning "nothing" every library
+//! created later is invisible until someone remembers to hand it out.
+//! The flag also makes the upgrade honest — an existing hub migrates with
+//! every account unrestricted, which is what it had a moment earlier.
+//!
+//! Grants attach to libraries, never to collections (0008): a collection
+//! is where files happen to live, a library is the thing a person is
+//! given. An item reaches a library through `item_libraries`, which holds
+//! TOP-LEVEL items only — the 0036/0039 triggers project
+//! `COALESCE(parent_id, id)`, so an episode is visible exactly when its
+//! show is, and a track exactly when its album is. Every predicate here
+//! projects the same way rather than joining a second level.
+//!
+//! An item in no library at all is invisible to a restricted account.
+//! There is nothing to grant that would reach it; attach its collection
+//! to a library first.
+//!
+//! ## Who bypasses
+//!
+//! Admins, always — which is why every entry point here takes [`Claims`]
+//! rather than a user id, so a caller cannot forget. The admin role is
+//! the configuration role: it can grant itself any library through the
+//! same endpoint that would restrict it, so enforcing one against it is
+//! theatre with a per-request cost. An admin's grant rows are stored and
+//! simply not consulted until `is_admin` comes off.
+//!
+//! ## Why 404 and never 403
+//!
+//! Denials answer 404, for library ids as much as item ids. 403 says
+//! "this exists and is not yours", which turns every endpoint taking an
+//! id into an oracle for the rest of the catalogue. 404 tells a
+//! restricted account the one thing it is entitled to know: its own
+//! grants did not cover that. Callers own the status; what this module
+//! returns is a bool.
+//!
+//! ## Cost
+//!
+//! An unrestricted account — every account on a single-user hub, and
+//! every admin — never reaches the predicates below. Callers resolve
+//! [`restricted`] once and otherwise run the SQL they always ran, so the
+//! measured NFR-1 browse plans are untouched. A restricted account pays
+//! one indexed read per item-scoped request, and one probe per candidate
+//! row on the two scan-shaped browses: the cost class of the in-library
+//! search predicate that has always been there.
+
+use anyhow::Result;
+use serde_json::{Value, json};
+use sqlx::{Row, SqlitePool};
+
+use crate::auth::Claims;
+
+/// Whether the grant predicates apply to this request at all.
+///
+/// An unknown user id reads as restricted-with-no-grants. It cannot
+/// happen behind `require_auth` — the token was signed for an account —
+/// but the direction a missing row falls is not something to leave to
+/// `unwrap_or_default`.
+pub async fn restricted(db: &SqlitePool, claims: &Claims) -> Result<bool> {
+    if claims.admin {
+        return Ok(false);
+    }
+    let all: Option<i64> = sqlx::query_scalar("SELECT all_libraries FROM users WHERE id = ?")
+        .bind(&claims.sub)
+        .fetch_optional(db)
+        .await?;
+    Ok(all.unwrap_or(0) == 0)
+}
+
+/// May this account see this item — or the show/album it belongs to?
+///
+/// One statement: the flag and the membership probe share a round trip,
+/// because the caller that asks this is usually about to do one thing
+/// with the answer and two queries would be two waits.
+pub async fn can_see(db: &SqlitePool, claims: &Claims, item_id: &str) -> Result<bool> {
+    if claims.admin {
+        return Ok(true);
+    }
+    let ok: i64 = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM users WHERE id = ?1 AND all_libraries = 1)
+             OR EXISTS (SELECT 1 FROM item_libraries il
+                          JOIN user_libraries ul
+                            ON ul.library_id = il.library_id AND ul.user_id = ?1
+                         WHERE il.item_id
+                               = COALESCE((SELECT parent_id FROM items WHERE id = ?2), ?2))",
+    )
+    .bind(&claims.sub)
+    .bind(item_id)
+    .fetch_one(db)
+    .await?;
+    Ok(ok != 0)
+}
+
+/// May this account see this library? True for a library that does not
+/// exist when the account is unrestricted — "no such library" is the
+/// caller's own 404 to give, not a grant decision.
+pub async fn can_see_library(db: &SqlitePool, claims: &Claims, library_id: &str) -> Result<bool> {
+    if claims.admin {
+        return Ok(true);
+    }
+    let ok: i64 = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM users WHERE id = ?1 AND all_libraries = 1)
+             OR EXISTS (SELECT 1 FROM user_libraries WHERE user_id = ?1 AND library_id = ?2)",
+    )
+    .bind(&claims.sub)
+    .bind(library_id)
+    .fetch_one(db)
+    .await?;
+    Ok(ok != 0)
+}
+
+/// The membership predicate for a browse scan, correlated on the
+/// candidate alias `c` — the same shape and the same alias as the
+/// in-library search fragment it sits beside.
+///
+/// `?1` is the user id in every browse query already (it is what
+/// `watch_state` joins on), so this binds nothing new. Only ever
+/// interpolated when [`restricted`] said so: it carries no
+/// `all_libraries` check of its own, which is what keeps it a single
+/// indexed probe instead of a per-row lookup in `users`.
+pub const VISIBLE_C: &str = "\
+AND EXISTS (SELECT 1 FROM item_libraries il
+              JOIN user_libraries ul
+                ON ul.library_id = il.library_id AND ul.user_id = ?1
+             WHERE il.item_id = COALESCE(c.parent_id, c.id))";
+
+/// Every account with its access, for the admin panel. Sorted by name,
+/// which is how the panel lists them and how a diff between two hubs
+/// stays readable.
+pub async fn users_with_access(db: &SqlitePool) -> Result<Vec<Value>> {
+    let rows = sqlx::query(
+        "SELECT u.id, u.username, u.is_admin, u.all_libraries, u.created_at,
+                (SELECT json_group_array(ul.library_id)
+                   FROM user_libraries ul WHERE ul.user_id = u.id) AS libraries
+           FROM users u ORDER BY u.username",
+    )
+    .fetch_all(db)
+    .await?;
+    Ok(rows
+        .iter()
+        .map(|r| {
+            json!({
+                "id": r.get::<String, _>("id"),
+                "username": r.get::<String, _>("username"),
+                "is_admin": r.get::<i64, _>("is_admin") != 0,
+                "all_libraries": r.get::<i64, _>("all_libraries") != 0,
+                "created_at": r.get::<i64, _>("created_at"),
+                "libraries": serde_json::from_str::<Value>(&r.get::<String, _>("libraries"))
+                    .unwrap_or_else(|_| json!([])),
+            })
+        })
+        .collect())
+}
+
+/// Replace an account's access wholesale, in one transaction.
+///
+/// Wholesale rather than add/remove because that is what a panel of
+/// checkboxes has in hand, and because two clients toggling different
+/// boxes should not be able to interleave into a set neither asked for.
+///
+/// `Ok(false)` means there is no such account — the one failure a caller
+/// can do anything about, so it is a return value rather than an error.
+/// An `Err` here is the database being unavailable, and no caller should
+/// have to read prose to tell those apart.
+///
+/// Library ids that do not exist are dropped rather than refused — the
+/// insert selects from `libraries`, so a stale id from a client holding
+/// an old list cannot fail the whole call. The caller reads the stored
+/// set back and can see what landed.
+pub async fn set_access(
+    db: &SqlitePool,
+    user_id: &str,
+    all_libraries: bool,
+    libraries: &[String],
+) -> Result<bool> {
+    let mut tx = db.begin().await?;
+    let res = sqlx::query("UPDATE users SET all_libraries = ? WHERE id = ?")
+        .bind(all_libraries)
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+    if res.rows_affected() == 0 {
+        return Ok(false);
+    }
+    sqlx::query("DELETE FROM user_libraries WHERE user_id = ?")
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+    for library_id in libraries {
+        sqlx::query(
+            "INSERT OR IGNORE INTO user_libraries (user_id, library_id)
+             SELECT ?1, id FROM libraries WHERE id = ?2",
+        )
+        .bind(user_id)
+        .bind(library_id)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    tracing::info!(
+        user_id,
+        all_libraries,
+        granted = libraries.len(),
+        "library access set"
+    );
+    Ok(true)
+}

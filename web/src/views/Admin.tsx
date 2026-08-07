@@ -23,9 +23,15 @@ import {
   adminEnrollments,
   adminLibraries,
   adminSatellites,
+  adminUsers,
+  adminCreateUser,
+  adminDeleteUser,
+  adminSetUserLibraries,
+  username,
   sessionLogUrl,
   adminSessions,
   type AdminSession,
+  type AdminUser,
   type CollectionInfo,
   type Library,
   type PendingEnrollment,
@@ -35,6 +41,166 @@ import {
 // HUB-11: the events channel pushes invalidation hints; polling remains
 // only as a slow fallback for anything a hint doesn't cover.
 const POLL_MS = 15000
+
+/// HUB-10/26: accounts and what each may see.
+///
+/// A checkbox writes the account's WHOLE access, not a delta — that is
+/// what the endpoint takes, and it is why two admins with the panel open
+/// cannot interleave into a set neither picked.
+function UsersSection({
+  libraries,
+  onNotice,
+  onError,
+  tick,
+}: {
+  libraries: Library[]
+  onNotice: (s: string) => void
+  onError: (s: string) => void
+  tick: number
+}) {
+  const [users, setUsers] = useState<AdminUser[]>([])
+  const [name, setName] = useState('')
+  const [pass, setPass] = useState('')
+  const [admin, setAdmin] = useState(false)
+  const [confirming, setConfirming] = useState<string | null>(null)
+
+  const refresh = () =>
+    adminUsers()
+      .then((r) => setUsers(r.users))
+      .catch((e) => onError(String(e)))
+  useEffect(() => {
+    void refresh()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tick])
+
+  const setAccess = (u: AdminUser, all: boolean, libs: string[]) =>
+    adminSetUserLibraries(u.id, all, libs)
+      .then(() => refresh())
+      .catch((e) => onError(String(e)))
+
+  const me = username()
+  return (
+    <>
+      <h2>Users</h2>
+      <form
+        className="row-form"
+        onSubmit={(e) => {
+          e.preventDefault()
+          adminCreateUser(name.trim(), pass, admin)
+            .then(() => {
+              onNotice(
+                `Created ${name.trim()} — it can see every library until you say otherwise.`,
+              )
+              setName('')
+              setPass('')
+              setAdmin(false)
+              return refresh()
+            })
+            .catch((e) => onError(String(e)))
+        }}
+      >
+        <input
+          placeholder="new username"
+          value={name}
+          onChange={(e) => setName(e.target.value)}
+        />
+        <input
+          type="password"
+          placeholder="password (8+ characters)"
+          value={pass}
+          onChange={(e) => setPass(e.target.value)}
+        />
+        <label className="chip">
+          <input
+            type="checkbox"
+            checked={admin}
+            onChange={(e) => setAdmin(e.target.checked)}
+          />{' '}
+          admin
+        </label>
+        <button className="btn small" disabled={!name.trim() || pass.length < 8}>
+          Create
+        </button>
+      </form>
+      <ul className="rows">
+        {users.map((u) => (
+          <li key={u.id}>
+            <span className="chips">
+              <span>{u.username}</span>
+              {u.is_admin ? (
+                <>
+                  <span className="chip">admin</span>
+                  <span className="dim">
+                    every library — an admin configures the grants, so it is not
+                    bound by them
+                  </span>
+                </>
+              ) : (
+                <>
+                  <label className="chip">
+                    <input
+                      type="checkbox"
+                      checked={u.all_libraries}
+                      onChange={(e) => void setAccess(u, e.target.checked, u.libraries)}
+                    />{' '}
+                    all libraries
+                  </label>
+                  {!u.all_libraries &&
+                    libraries.map((l) => (
+                      <label className="chip" key={l.id}>
+                        <input
+                          type="checkbox"
+                          checked={u.libraries.includes(l.id)}
+                          onChange={(e) =>
+                            void setAccess(
+                              u,
+                              false,
+                              e.target.checked
+                                ? [...u.libraries, l.id]
+                                : u.libraries.filter((x) => x !== l.id),
+                            )
+                          }
+                        />{' '}
+                        {l.name}
+                      </label>
+                    ))}
+                  {!u.all_libraries && u.libraries.length === 0 && (
+                    <span className="chip warn">no access</span>
+                  )}
+                </>
+              )}
+            </span>
+            <span>
+              <button
+                className="btn ghost small"
+                // The API refuses this too; saying so before the click is
+                // kinder than an error afterwards.
+                disabled={u.username === me}
+                title={
+                  u.username === me
+                    ? 'You are signed in as this account'
+                    : 'Removes the account, its watch state and its sessions'
+                }
+                onClick={() => {
+                  if (confirming !== u.id) {
+                    setConfirming(u.id)
+                    return
+                  }
+                  setConfirming(null)
+                  adminDeleteUser(u.id)
+                    .then(() => refresh())
+                    .catch((e) => onError(String(e)))
+                }}
+              >
+                {confirming === u.id ? 'Really delete?' : 'Delete'}
+              </button>
+            </span>
+          </li>
+        ))}
+      </ul>
+    </>
+  )
+}
 
 function TmdbSection({ onNotice, tick }: { onNotice: (s: string) => void; tick: number }) {
   const [configured, setConfigured] = useState(false)
@@ -537,6 +703,13 @@ export default function Admin() {
           )
         })}
       </ul>
+
+      <UsersSection
+        libraries={libraries}
+        onNotice={setNotice}
+        onError={setError}
+        tick={tick}
+      />
 
       <h2>Active sessions</h2>
       {sessions.length === 0 && <p className="dim">Nobody is streaming.</p>}

@@ -66,10 +66,10 @@ pub fn router(
         proxy_trust: net.proxy_trust,
         metrics_token: Arc::new(net.metrics_token),
     };
-    let protected = Router::new()
-        .route("/api/v1/collections", get(list_collections))
-        .route("/api/v1/libraries", get(list_libraries))
-        .route("/api/v1/items", get(list_items))
+    // HUB-10: everything keyed by an item id, behind ONE grant check.
+    // Their own group so `require_item_access` is stated once — a check
+    // per handler is a check nobody adds to the ninth.
+    let items = Router::new()
         .route("/api/v1/items/{id}", get(item_detail).fallback(item_query))
         .route("/api/v1/items/{id}/children", get(item_children))
         .route("/api/v1/items/{id}/artwork", get(item_artwork))
@@ -79,15 +79,25 @@ pub fn router(
             post(subtitle_download),
         )
         .route(
-            "/api/v1/subtitles/{track_id}",
-            axum::routing::delete(subtitle_delete),
-        )
-        .route(
             "/api/v1/items/{id}/subtitles/{file}",
             get(item_subtitle_file),
         )
         .route("/api/v1/items/{id}/fonts", get(item_fonts))
         .route("/api/v1/items/{id}/fonts/{n}", get(item_font))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            require_item_access,
+        ));
+    let protected = Router::new()
+        .route("/api/v1/collections", get(list_collections))
+        .route("/api/v1/libraries", get(list_libraries))
+        .route("/api/v1/items", get(list_items))
+        // Not in the `items` group: keyed by a TRACK id, and already
+        // gated on being that track's downloader or an admin.
+        .route(
+            "/api/v1/subtitles/{track_id}",
+            axum::routing::delete(subtitle_delete),
+        )
         .route("/api/v1/prefs", get(get_prefs).put(put_pref))
         .route("/api/v1/events", get(events))
         .route("/api/v1/playback/sessions", post(start_session))
@@ -102,6 +112,10 @@ pub fn router(
         )
         .route("/api/v1/playback/sessions/{id}/seek", post(seek_session))
         .route("/api/v1/playback/sessions/{id}/{file}", get(session_file))
+        // Merged BEFORE this layer, so `require_auth` wraps the item
+        // group from outside and its Claims extension is present by the
+        // time `require_item_access` looks for it.
+        .merge(items)
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             require_auth,
@@ -135,10 +149,14 @@ pub fn router(
             axum::routing::delete(admin_detach_collection),
         )
         .route("/admin/v1/collections", get(admin_collections))
-        .route("/admin/v1/users", post(admin_create_user))
+        .route("/admin/v1/users", get(admin_users).post(admin_create_user))
         .route(
             "/admin/v1/users/{id}",
             axum::routing::delete(admin_delete_user),
+        )
+        .route(
+            "/admin/v1/users/{id}/libraries",
+            axum::routing::put(admin_set_user_libraries),
         )
         .route("/admin/v1/providers", get(admin_providers))
         .route(
@@ -374,6 +392,36 @@ async fn require_auth(
 /// a time. Length is not hidden and does not need to be.
 fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// HUB-10: a denial the caller cannot tell from absence. See the
+/// `grants` module doc for why this is never 403.
+fn hidden(what: &str) -> ApiError {
+    (StatusCode::NOT_FOUND, format!("no such {what}"))
+}
+
+/// HUB-10: the grant gate for every route keyed by an item id.
+///
+/// Layered inside `require_auth`, so Claims is present. The id is read
+/// through `Path` rather than by counting URI segments: the group holds
+/// routes of three different depths, and `/items/{id}/fonts/{n}` would
+/// otherwise be one refactor away from checking the font number.
+async fn require_item_access(
+    State(state): State<AppState>,
+    axum::extract::Path(params): axum::extract::Path<std::collections::HashMap<String, String>>,
+    axum::Extension(claims): axum::Extension<crate::auth::Claims>,
+    req: Request,
+    next: Next,
+) -> Result<Response, ApiError> {
+    let id = params.get("id").map(String::as_str).unwrap_or_default();
+    if !crate::grants::can_see(state.registry.db(), &claims, id)
+        .await
+        .map_err(internal)?
+    {
+        tracing::debug!(user = %claims.username, item = %id, "item hidden by grants");
+        return Err(hidden("item"));
+    }
+    Ok(next.run(req).await)
 }
 
 /// Layered after require_auth: the Claims extension is already present.
@@ -928,6 +976,57 @@ async fn admin_apply_match(
     Ok(Json(json!({ "ok": true })))
 }
 
+/// HUB-10: the accounts and what each may see (HUB-26 users panel).
+async fn admin_users(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+    let users = crate::grants::users_with_access(state.registry.db())
+        .await
+        .map_err(internal)?;
+    Ok(Json(json!({ "users": users })))
+}
+
+#[derive(Deserialize)]
+struct SetAccess {
+    /// Everything, including libraries made later. When true the list is
+    /// stored but not consulted — see the `grants` module doc.
+    all_libraries: bool,
+    #[serde(default)]
+    libraries: Vec<String>,
+}
+
+/// HUB-10: replace an account's library access.
+///
+/// Wholesale, and idempotent: a panel of checkboxes holds the whole
+/// answer, and PUTting it means two admins toggling different boxes
+/// cannot interleave into a set neither chose. Answers with what was
+/// stored, so a stale library id that got dropped is visible rather than
+/// assumed.
+///
+/// Running sessions are left alone. Revoking a library does not reach
+/// into a stream already playing; the next request the client makes is
+/// where it finds out.
+async fn admin_set_user_libraries(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<SetAccess>,
+) -> Result<Json<Value>, ApiError> {
+    let db = state.registry.db();
+    let existed = crate::grants::set_access(db, &id, body.all_libraries, &body.libraries)
+        .await
+        .map_err(internal)?;
+    if !existed {
+        return Err(hidden("user"));
+    }
+    let stored: Vec<String> =
+        sqlx::query_scalar("SELECT library_id FROM user_libraries WHERE user_id = ?")
+            .bind(&id)
+            .fetch_all(db)
+            .await
+            .map_err(internal)?;
+    Ok(Json(
+        json!({ "id": id, "all_libraries": body.all_libraries, "libraries": stored }),
+    ))
+}
+
 #[derive(Deserialize)]
 struct CreateUser {
     username: String,
@@ -1454,6 +1553,15 @@ async fn start_session(
     axum::Extension(claims): axum::Extension<crate::auth::Claims>,
     Json(body): Json<StartSessionRequest>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
+    // HUB-10. Here rather than inside `Sessions::start`: authorization is
+    // the API edge's job, and the session-scoped routes that follow are
+    // reachable only with the ULID this call hands back.
+    if !crate::grants::can_see(state.registry.db(), &claims, &body.item_id)
+        .await
+        .map_err(internal)?
+    {
+        return Err(hidden("item"));
+    }
     let session = state
         .sessions
         .start(
@@ -1685,8 +1793,37 @@ async fn stream_session(
     Ok(resp.body(body).unwrap())
 }
 
-async fn list_collections(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+async fn list_collections(
+    State(state): State<AppState>,
+    axum::Extension(claims): axum::Extension<crate::auth::Claims>,
+) -> Result<Json<Value>, ApiError> {
+    let db = state.registry.db();
     let cols = state.registry.collections().await.map_err(internal)?;
+    // HUB-10: a restricted account is told about the collections behind
+    // the libraries it holds and no others. Otherwise this route
+    // enumerates the shape of the rest of the disk — names, hosts and
+    // file counts — to somebody who was granted one shelf of it.
+    if !crate::grants::restricted(db, &claims)
+        .await
+        .map_err(internal)?
+    {
+        return Ok(Json(json!({ "collections": cols })));
+    }
+    let mine: Vec<(String, String)> = sqlx::query_as(
+        "SELECT lc.module_id, lc.collection_id FROM library_collections lc
+           JOIN user_libraries ul ON ul.library_id = lc.library_id AND ul.user_id = ?",
+    )
+    .bind(&claims.sub)
+    .fetch_all(db)
+    .await
+    .map_err(internal)?;
+    let cols: Vec<_> = cols
+        .into_iter()
+        .filter(|c| {
+            mine.iter()
+                .any(|(m, i)| *m == c.module_id && *i == c.collection_id)
+        })
+        .collect();
     Ok(Json(json!({ "collections": cols })))
 }
 
@@ -1886,11 +2023,30 @@ async fn item_font(
         .into_response())
 }
 
-async fn list_libraries(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
-    let rows = sqlx::query("SELECT id, name, media_type FROM libraries ORDER BY name")
-        .fetch_all(state.registry.db())
+/// HUB-10: the libraries THIS account holds. Everything the client shows
+/// hangs off this list, so filtering it here is what makes a restricted
+/// account's whole UI right rather than nine views right one at a time.
+async fn list_libraries(
+    State(state): State<AppState>,
+    axum::Extension(claims): axum::Extension<crate::auth::Claims>,
+) -> Result<Json<Value>, ApiError> {
+    let db = state.registry.db();
+    let restricted = crate::grants::restricted(db, &claims)
         .await
         .map_err(internal)?;
+    let mut query = if restricted {
+        sqlx::query(
+            "SELECT l.id, l.name, l.media_type FROM libraries l
+               JOIN user_libraries ul ON ul.library_id = l.id AND ul.user_id = ?
+              ORDER BY l.name",
+        )
+    } else {
+        sqlx::query("SELECT id, name, media_type FROM libraries ORDER BY name")
+    };
+    if restricted {
+        query = query.bind(&claims.sub);
+    }
+    let rows = query.fetch_all(db).await.map_err(internal)?;
     let libraries: Vec<Value> = rows
         .iter()
         .map(|r| {
@@ -2063,6 +2219,35 @@ async fn list_items(
             .filter(|s| !s.is_empty());
     let db = state.registry.db();
 
+    // HUB-10. Resolved once, not folded into the predicates: for an
+    // unrestricted account — every account on a single-user hub, and
+    // every admin — the queries below must stay the ones the NFR-1
+    // numbers were measured on, byte for byte. A grant term they carried
+    // unconditionally would be a `users` lookup per candidate row.
+    let restricted = crate::grants::restricted(db, &claims)
+        .await
+        .map_err(internal)?;
+    // A library the account does not hold is answered before any of it
+    // is read. Once the grant is in hand, membership IS the answer: the
+    // rows of a granted library are visible by definition, so the page
+    // and count below stay untouched.
+    if restricted
+        && let Some(library) = &q.library
+        && !crate::grants::can_see_library(db, &claims, library)
+            .await
+            .map_err(internal)?
+    {
+        return Err(hidden("library"));
+    }
+    // Only the two scan-shaped browses need the predicate: a library
+    // page is already scoped by the grant checked above, and an
+    // in-library search by its own membership term.
+    let visible = if restricted {
+        crate::grants::VISIBLE_C
+    } else {
+        ""
+    };
+
     // Three explicit shapes rather than one query with
     // `(?N IS NULL OR ...)` guards: a guard is opaque at plan time, which
     // is the pattern that has cost us an index twice now.
@@ -2117,7 +2302,9 @@ async fn list_items(
                                   WHERE il.library_id = ?2
                                     AND il.item_id = COALESCE(c.parent_id, c.id))"
                 }
-                None => "",
+                // Cross-library search by a restricted account: the same
+                // shape, over every library it holds instead of one.
+                None => visible,
             };
             let order_c = items_order_c(q.sort.as_deref());
             let sql = item_page_sql(
@@ -2163,7 +2350,10 @@ async fn list_items(
                              OR (c.kind = 'album' AND c.norm_artist LIKE '%' || ?3 || '%'))"
                 );
                 sqlx::query_scalar(sqlx::AssertSqlSafe(count))
-                    .bind("") // ?1 unused here; keeps the numbering shared
+                    // ?1 is the user id as everywhere else — unused here
+                    // unless `member` is the grant predicate, and bound
+                    // either way so the numbering stays shared.
+                    .bind(&claims.sub)
                     .bind(library.as_deref().unwrap_or(""))
                     .bind(needle)
                     .fetch_one(db)
@@ -2178,7 +2368,7 @@ async fn list_items(
             let sql = item_page_sql(
                 &format!(
                     "SELECT c.id AS item_id FROM items c
-                      WHERE c.kind NOT IN ('episode', 'track')
+                      WHERE c.kind NOT IN ('episode', 'track') {visible}
                       ORDER BY {order_c} LIMIT ?2 OFFSET ?3"
                 ),
                 items_order(q.sort.as_deref()),
@@ -2190,12 +2380,21 @@ async fn list_items(
                 .fetch_all(db)
                 .await
                 .map_err(internal)?;
-            let total: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM items WHERE kind NOT IN ('episode', 'track')",
-            )
-            .fetch_one(db)
-            .await
-            .map_err(internal)?;
+            // The same predicate as the page, not the cheaper
+            // `COUNT(*) FROM item_libraries` a granted set would allow:
+            // a total that disagrees with the rows it counts is a paging
+            // bug that only shows up on the last page.
+            // ponytail: an unrestricted account keeps the bare count, so
+            // the extra probe is paid only where it decides something.
+            let count = format!(
+                "SELECT COUNT(*) FROM items c
+                  WHERE c.kind NOT IN ('episode', 'track') {visible}"
+            );
+            let mut counter = sqlx::query_scalar(sqlx::AssertSqlSafe(count));
+            if restricted {
+                counter = counter.bind(&claims.sub);
+            }
+            let total: i64 = counter.fetch_one(db).await.map_err(internal)?;
             (rows, total)
         }
     };

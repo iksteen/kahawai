@@ -920,3 +920,41 @@ export const adminSessions = () =>
   json<{ sessions: AdminSession[] }>('/admin/v1/sessions')
 export const adminEndSession = (id: string) =>
   api(`/admin/v1/sessions/${id}`, { method: 'DELETE' })
+
+/// HUB-10. `all_libraries` wins over `libraries`: with it set the list is
+/// stored but not consulted, and libraries created later are included.
+export type AdminUser = {
+  id: string
+  username: string
+  is_admin: boolean
+  all_libraries: boolean
+  libraries: string[]
+  created_at: number
+}
+
+export const adminUsers = () => json<{ users: AdminUser[] }>('/admin/v1/users')
+
+export const adminCreateUser = (username: string, password: string, admin: boolean) =>
+  json<{ id: string }>('/admin/v1/users', {
+    method: 'POST',
+    body: JSON.stringify({ username, password, admin }),
+  })
+
+export const adminDeleteUser = (id: string) =>
+  api(`/admin/v1/users/${id}`, { method: 'DELETE' })
+
+/// Whole state, not a toggle: the panel holds every box, and sending all
+/// of them is what keeps two admins from interleaving into a set neither
+/// picked.
+export const adminSetUserLibraries = (
+  id: string,
+  allLibraries: boolean,
+  libraries: string[],
+) =>
+  json<{ all_libraries: boolean; libraries: string[] }>(
+    `/admin/v1/users/${id}/libraries`,
+    {
+      method: 'PUT',
+      body: JSON.stringify({ all_libraries: allLibraries, libraries }),
+    },
+  )
