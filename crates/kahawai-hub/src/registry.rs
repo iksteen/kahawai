@@ -278,14 +278,21 @@ impl Registry {
     /// AR-5: a satellites row for the in-process mediahost so admin
     /// views and cascades treat it like any satellite. No certificate —
     /// the marker fingerprint never matches a TLS peer.
+    /// The in-process mediahost's stand-in for a certificate fingerprint.
+    /// It has none: AR-5 replaces the link's transport with channels, so
+    /// there is no TLS identity to pin, admit or revoke. Anything that
+    /// means "enrolled satellite" must test for this first.
+    pub const IN_PROCESS: &str = "in-process";
+
     pub async fn ensure_local_satellite(&self, module_id: &str, name: &str) -> Result<()> {
         sqlx::query(
             "INSERT INTO satellites (module_id, module_type, name, cert_fingerprint)
-             VALUES (?, 'mediahost', ?, 'in-process')
+             VALUES (?, 'mediahost', ?, ?)
              ON CONFLICT (module_id) DO UPDATE SET name = excluded.name",
         )
         .bind(module_id)
         .bind(name)
+        .bind(Self::IN_PROCESS)
         .execute(&self.db)
         .await?;
         Ok(())
@@ -2132,6 +2139,17 @@ impl Registry {
     }
 
     /// Enrolled satellites (DB) merged with live connection state.
+    /// Is this the hub's own in-process mediahost (AR-5)? Callers that
+    /// mean "an enrolled satellite" ask this before acting.
+    pub async fn is_in_process(&self, module_id: &str) -> Result<bool> {
+        let fp: Option<String> =
+            sqlx::query_scalar("SELECT cert_fingerprint FROM satellites WHERE module_id = ?")
+                .bind(module_id)
+                .fetch_optional(&self.db)
+                .await?;
+        Ok(fp.as_deref() == Some(Self::IN_PROCESS))
+    }
+
     pub async fn satellites_overview(&self) -> Result<Vec<serde_json::Value>> {
         let rows = sqlx::query(
             "SELECT module_id, module_type, name, cert_fingerprint, enrolled_at
@@ -2190,6 +2208,17 @@ impl Registry {
                 .fetch_optional(&self.db)
                 .await?
                 .with_context(|| format!("no such satellite: {module_id}"))?;
+        // The hub's own mediahost is not a satellite in any sense this
+        // operation means. It cannot be enrolled, so there is no
+        // certificate to revoke and no reconnection to refuse — deleting
+        // it only wipes the index of everything it serves, which for an
+        // all-in-one deployment is the entire library. It would come back
+        // on the next hub start (ensure_local_satellite) and re-probe from
+        // nothing, so the button was pure cost.
+        anyhow::ensure!(
+            fingerprint != Self::IN_PROCESS,
+            "the in-process mediahost cannot be deleted: it is the hub itself"
+        );
 
         let mut tx = self.db.begin().await?;
         sqlx::query(

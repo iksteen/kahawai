@@ -254,6 +254,42 @@ async fn admin_flow_enrollments_satellites_archive_restore() {
         "audit trail"
     );
 
+    // The hub's own mediahost (AR-5) is refused, and refused BEFORE
+    // anything is torn down. It has no certificate to revoke and no
+    // reconnection to refuse, so deleting it would only wipe the index of
+    // everything it serves — on an all-in-one deployment, the whole
+    // library — and it would reappear on the next hub start anyway.
+    registry
+        .ensure_local_satellite("local", "dev-local")
+        .await
+        .unwrap();
+    registry
+        .announce_collection("local", "movies", "movies", &[])
+        .await
+        .unwrap();
+    let resp = api
+        .clone()
+        .oneshot(
+            Request::delete("/admin/v1/satellites/local")
+                .header("authorization", admin_bearer.clone())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT, "in-process is not deletable");
+    let survived: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM satellites WHERE module_id = 'local'")
+        .fetch_one(&db)
+        .await
+        .unwrap();
+    assert_eq!(survived, 1, "the refusal must not have deleted it anyway");
+    let cols: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM collections WHERE module_id = 'local'")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    assert_eq!(cols, 1, "its collections stay — the composer still lists them");
+
     // The same bytes return on a DIFFERENT host: watch state restored.
     registry
         .announce_collection("01NEW", "movies", "movies", &[])

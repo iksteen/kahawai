@@ -18,6 +18,7 @@ import {
   adminDetachCollection,
   adminSetSatelliteDisabled,
   adminDeleteSatellite,
+  IN_PROCESS,
   adminEndSession,
   adminEnrollments,
   adminLibraries,
@@ -263,7 +264,14 @@ export default function Admin() {
         adminCollections(),
       ])
       setPending(e.pending)
-      setSatellites(s.satellites)
+      // The hub's own in-process mediahost (AR-5) is not an enrolled
+      // satellite: it has no certificate to show, nothing to enable or
+      // disable, and nothing to revoke. Listing it only offered a Delete
+      // that would wipe the index of everything it serves — the whole
+      // library, on an all-in-one deployment. Its COLLECTIONS still
+      // appear in the composer below, which reads the collections table
+      // and never this list.
+      setSatellites(s.satellites.filter((x) => x.cert_fingerprint !== IN_PROCESS))
       setSessions(x.sessions)
       setLibraries(l.libraries)
       setCollections(c.collections)

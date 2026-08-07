@@ -731,6 +731,12 @@ export type SatelliteCaps = {
 /// benchmark claims. `class` is `{res}|{src}|{dst}[|tm]`.
 export type PaceRow = { class: string; multiple: number }
 
+/// The in-process mediahost's stand-in for a certificate fingerprint —
+/// AR-5 replaces the link's transport with channels, so there is no TLS
+/// identity to pin or revoke. Mirrors Registry::IN_PROCESS; it is part
+/// of the admin API's shape, not a private detail.
+export const IN_PROCESS = 'in-process'
+
 export type Satellite = {
   module_id: string
   module_type: string

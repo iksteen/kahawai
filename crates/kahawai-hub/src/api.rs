@@ -999,6 +999,15 @@ async fn admin_delete_satellite(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
+    // Before ending anything: the hub's own mediahost is not a satellite
+    // this operation can act on, and refusing after tearing its sessions
+    // down would be the destructive half of an operation that then fails.
+    if state.registry.is_in_process(&id).await.map_err(internal)? {
+        return Err((
+            StatusCode::CONFLICT,
+            "the in-process mediahost cannot be deleted: it is the hub itself".into(),
+        ));
+    }
     let ended = state.sessions.end_for_module(&id);
     let fingerprint = state
         .registry
