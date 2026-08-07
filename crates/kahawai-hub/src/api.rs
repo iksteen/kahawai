@@ -2205,6 +2205,12 @@ fn item_row_json(r: &sqlx::sqlite::SqliteRow) -> Value {
         "proj_season": r.try_get::<Option<i64>, _>("proj_season").ok().flatten(),
         "proj_episode": r.try_get::<Option<i64>, _>("proj_episode").ok().flatten(),
         "sources": r.get::<i64, _>("sources"),
+        // HUB-19 ReplayGain, as stored: absent for anything untagged.
+        "replay_gain": r
+            .try_get::<Option<String>, _>("replay_gain")
+            .ok()
+            .flatten()
+            .and_then(|j| serde_json::from_str::<Value>(&j).ok()),
         "resume_position_ms": r.get::<Option<i64>, _>("position_ms"),
         "resume_duration_ms": r.try_get::<Option<i64>, _>("duration_ms").ok().flatten(),
         "played": r.get::<Option<i64>, _>("played").unwrap_or(0) != 0,
@@ -2226,9 +2232,17 @@ async fn item_children(
                 md.updated_at AS art_version,
                 md.proj_season, md.proj_episode,
                 COUNT(s.item_id) AS sources,
+                -- HUB-19: the file's own loudness statement, passed
+                -- through for the player to apply. MIN() picks one
+                -- deterministically when an item has several sources;
+                -- copies of one track carry the same measurement, and
+                -- where they disagree the difference is under a dB.
+                MIN(json_extract(f.streams_json, '$.replay_gain')) AS replay_gain,
                 w.position_ms, w.duration_ms, w.played, w.play_count
          FROM items i
          LEFT JOIN item_sources s ON s.item_id = i.id
+         LEFT JOIN files f ON (f.module_id, f.collection_id, f.path_rel)
+                            = (s.module_id, s.collection_id, s.path_rel)
          LEFT JOIN watch_state w ON w.item_id = i.id AND w.user_id = ?
          LEFT JOIN resolved_metadata md ON md.item_id = i.id
          WHERE i.parent_id = ?

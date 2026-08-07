@@ -6,6 +6,45 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+/// A file's own loudness statement (HUB-19).
+///
+/// Gains are dB to apply; peaks are linear sample values where 1.0 is
+/// full scale, so a player can turn a track down without clipping it —
+/// the peak is what says whether a positive gain is safe.
+///
+/// Album values exist so a record plays with its own dynamics intact:
+/// applying per-track gain across an album flattens the quiet tracks
+/// the artist meant to be quiet. A client that has both should prefer
+/// album when playing an album and track when shuffling.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReplayGain {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub track_gain_db: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub track_peak: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub album_gain_db: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub album_peak: Option<f64>,
+    /// The loudness the gains aim at, when the file says. ReplayGain 1.0
+    /// files usually mean 89 dB SPL; absent is the common case.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference_level_db: Option<f64>,
+}
+
+impl ReplayGain {
+    /// None when the file carried no usable number — which is how an
+    /// untagged file stays absent from the payload instead of arriving
+    /// as an object full of nulls.
+    pub fn some(self) -> Option<Self> {
+        let empty = self.track_gain_db.is_none()
+            && self.track_peak.is_none()
+            && self.album_gain_db.is_none()
+            && self.album_peak.is_none();
+        (!empty).then_some(self)
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct MediaInfo {
     /// Container format, normalized ("matroska", "mp4", "webm", …).
@@ -20,6 +59,11 @@ pub struct MediaInfo {
     /// Sidecar subtitle files next to the media file (MH-4).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub external_subtitles: Vec<SidecarSubtitle>,
+    /// ReplayGain (HUB-19), as the file states it: a loudness
+    /// measurement someone made once, carried to the client rather than
+    /// re-measured or applied here. Absent for anything untagged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replay_gain: Option<ReplayGain>,
     /// Local artwork in the media file's directory (MH-4):
     /// cover/folder/poster image, path relative to the collection root.
     #[serde(default, skip_serializing_if = "Option::is_none")]

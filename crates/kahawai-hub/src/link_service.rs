@@ -74,14 +74,24 @@ pub fn local_link(
     tokio::spawn(async move {
         let mut seen: std::collections::HashMap<String, std::collections::HashSet<String>> =
             Default::default();
+        let mut partial: std::collections::HashMap<(String, String, u32), PartialSets> =
+            Default::default();
         while let Some(HostToHub { msg }) = host_rx.recv().await {
             let Some(msg) = msg else { continue };
             if matches!(msg, host_to_hub::Msg::Heartbeat(_)) {
                 registry.seen(&module_id);
                 continue;
             }
-            if let Err(e) =
-                handle_host_msg(&registry, &subtitles, &enricher, &module_id, msg, &mut seen).await
+            if let Err(e) = handle_host_msg(
+                &registry,
+                &subtitles,
+                &enricher,
+                &module_id,
+                msg,
+                &mut seen,
+                &mut partial,
+            )
+            .await
             {
                 tracing::error!(%module_id, error = format!("{e:#}"), "handling local link message");
             }
@@ -166,9 +176,17 @@ impl MediahostLink for MediahostLinkService {
                         String,
                         std::collections::HashSet<String>,
                     > = std::collections::HashMap::new();
+                    let mut partial: std::collections::HashMap<(String, String, u32), PartialSets> =
+                        std::collections::HashMap::new();
                     while let Some(msg) = work_rx.recv().await {
                         if let Err(e) = handle_host_msg(
-                            &registry, &subtitles, &enricher, &module_id, msg, &mut seen,
+                            &registry,
+                            &subtitles,
+                            &enricher,
+                            &module_id,
+                            msg,
+                            &mut seen,
+                            &mut partial,
                         )
                         .await
                         {
@@ -261,6 +279,62 @@ impl MediahostLink for MediahostLinkService {
     }
 }
 
+/// Blocks of one track's display sets, gathered from the messages that
+/// carry them. Per connection: a dropped link drops the partial with it,
+/// and the next request starts the transfer again.
+struct PartialSets {
+    bytes: usize,
+    blocks: Vec<kahawai_proto::v1::ImageSubBlock>,
+}
+
+/// Ceiling on one track's transfer. Not the wire limit — that is per
+/// message and now unreachable — but a guard against a sender that
+/// never marks the end.
+const MAX_SETS_BYTES: usize = 512 * 1024 * 1024;
+
+/// What a chunk of display sets means for the transfer it belongs to.
+enum Chunk {
+    /// Held; the sender has not said done yet.
+    More,
+    /// The last chunk: `m.blocks` now holds the whole track, and the
+    /// value is what it weighed.
+    Complete(usize),
+    /// The sender never said done and went past the cap.
+    TooBig(usize),
+}
+
+/// Gather one message into its transfer, and say whether that completes
+/// it. On completion the message's own `blocks` are replaced by every
+/// block of the track, so the caller stores one thing.
+///
+/// A message with no `done` marker at all is an older mediahost sending
+/// the whole track at once — complete by definition, which is why the
+/// field has presence rather than defaulting to false.
+fn accept_chunk(
+    partial: &mut std::collections::HashMap<(String, String, u32), PartialSets>,
+    m: &mut kahawai_proto::v1::ImageSubtitles,
+) -> Chunk {
+    let key = (m.collection_id.clone(), m.path_rel.clone(), m.sub_index);
+    let last = m.done.unwrap_or(true);
+    let held = partial.entry(key.clone()).or_insert_with(|| PartialSets {
+        bytes: 0,
+        blocks: Vec::new(),
+    });
+    held.bytes += m.blocks.iter().map(|b| b.payload.len()).sum::<usize>();
+    held.blocks.append(&mut m.blocks);
+    if held.bytes > MAX_SETS_BYTES {
+        let bytes = held.bytes;
+        partial.remove(&key);
+        return Chunk::TooBig(bytes);
+    }
+    if !last {
+        return Chunk::More;
+    }
+    let held = partial.remove(&key).expect("just inserted");
+    m.blocks = held.blocks;
+    Chunk::Complete(held.bytes)
+}
+
 fn kind_name(m: &host_to_hub::Msg) -> &'static str {
     match m {
         host_to_hub::Msg::Hello(_) => "hello",
@@ -289,6 +363,7 @@ async fn handle_host_msg(
     module_id: &str,
     msg: host_to_hub::Msg,
     seen: &mut std::collections::HashMap<String, std::collections::HashSet<String>>,
+    partial: &mut std::collections::HashMap<(String, String, u32), PartialSets>,
 ) -> anyhow::Result<()> {
     use crate::registry::FileUpsertRecord;
     match msg {
@@ -411,15 +486,46 @@ async fn handle_host_msg(
         }
         // HUB-32b: display sets the host walked for us; cached for the
         // burn-in session that asked (and for any later one).
-        host_to_hub::Msg::ImageSubtitles(m) => {
+        host_to_hub::Msg::ImageSubtitles(mut m) => {
             if !m.error.is_empty() {
+                partial.remove(&(m.collection_id.clone(), m.path_rel.clone(), m.sub_index));
                 tracing::warn!(%module_id, collection = %m.collection_id, path = %m.path_rel,
                     track = m.sub_index, error = %m.error, "image display-set extraction failed");
-            } else if let Err(e) = subtitles.store_image_sets(module_id, &m).await {
+                // Remember it, or the idle sweep asks again forever: one
+                // .mp4 with no image track was re-requested on every run
+                // for days.
+                if let Err(e) = subtitles
+                    .remember_extraction_failure(
+                        registry,
+                        module_id,
+                        &m.collection_id,
+                        &m.path_rel,
+                        m.sub_index,
+                        &m.error,
+                    )
+                    .await
+                {
+                    tracing::warn!(%module_id, error = format!("{e:#}"),
+                        "recording an extraction failure");
+                }
+                return Ok(());
+            }
+            let bytes = match accept_chunk(partial, &mut m) {
+                Chunk::More => return Ok(()),
+                Chunk::TooBig(bytes) => {
+                    tracing::warn!(%module_id, collection = %m.collection_id, path = %m.path_rel,
+                        track = m.sub_index, bytes,
+                        "display-set transfer exceeded the cap; abandoned");
+                    return Ok(());
+                }
+                Chunk::Complete(bytes) => bytes,
+            };
+            if let Err(e) = subtitles.store_image_sets(module_id, &m).await {
                 tracing::warn!(%module_id, error = format!("{e:#}"), "storing image display sets");
             } else {
                 tracing::info!(%module_id, collection = %m.collection_id, path = %m.path_rel,
-                    track = m.sub_index, blocks = m.blocks.len(), "image display sets cached");
+                    track = m.sub_index, blocks = m.blocks.len(), bytes,
+                    "image display sets cached");
             }
         }
         host_to_hub::Msg::FilesSeen(s) => {
@@ -692,5 +798,103 @@ async fn push_subs_worklist(
             tracing::warn!(%module_id, error = format!("{e:#}"), "subs worklist send failed");
             return;
         }
+    }
+}
+
+#[cfg(test)]
+mod chunk_tests {
+    use super::*;
+
+    fn msg(blocks: &[usize], done: Option<bool>) -> kahawai_proto::v1::ImageSubtitles {
+        kahawai_proto::v1::ImageSubtitles {
+            collection_id: "c".into(),
+            path_rel: "film.mkv".into(),
+            sub_index: 0,
+            blocks: blocks
+                .iter()
+                .map(|n| kahawai_proto::v1::ImageSubBlock {
+                    start_ms: 0,
+                    duration_ms: 0,
+                    payload: vec![7u8; *n],
+                })
+                .collect(),
+            done,
+            ..Default::default()
+        }
+    }
+
+    /// A track split across messages arrives as one track.
+    ///
+    /// This is why the split exists: one message per track put a whole
+    /// PGS stream on the wire, the largest that survived was 63.8 MiB
+    /// against a 64 MiB limit, and going over reset the SHARED link
+    /// stream — so a single subtitle track took scans and leases down
+    /// with it (3663 sent, 24 arrived, 2026-08-07).
+    #[test]
+    fn chunks_reassemble_into_one_track() {
+        let mut partial = std::collections::HashMap::new();
+        let mut a = msg(&[10, 20], Some(false));
+        assert!(matches!(accept_chunk(&mut partial, &mut a), Chunk::More));
+        let mut b = msg(&[30], Some(false));
+        assert!(matches!(accept_chunk(&mut partial, &mut b), Chunk::More));
+        let mut c = msg(&[40], Some(true));
+        let Chunk::Complete(bytes) = accept_chunk(&mut partial, &mut c) else {
+            panic!("the last chunk completes the transfer");
+        };
+        assert_eq!(bytes, 100);
+        assert_eq!(c.blocks.len(), 4, "every block, in order of arrival");
+        assert!(partial.is_empty(), "nothing held after completion");
+    }
+
+    /// An older mediahost sends the whole track in one message and no
+    /// marker at all. Absent must read as complete — read as "false,
+    /// more coming" the hub would hold it forever.
+    #[test]
+    fn a_message_without_the_marker_is_a_whole_track() {
+        let mut partial = std::collections::HashMap::new();
+        let mut m = msg(&[5, 5], None);
+        let Chunk::Complete(bytes) = accept_chunk(&mut partial, &mut m) else {
+            panic!("no marker means one message, complete");
+        };
+        assert_eq!((bytes, m.blocks.len()), (10, 2));
+        assert!(partial.is_empty());
+    }
+
+    /// Two tracks in flight at once do not pour into each other.
+    #[test]
+    fn transfers_are_kept_apart() {
+        let mut partial = std::collections::HashMap::new();
+        let mut first = msg(&[10], Some(false));
+        let mut other = kahawai_proto::v1::ImageSubtitles {
+            sub_index: 1,
+            ..msg(&[20], Some(true))
+        };
+        assert!(matches!(
+            accept_chunk(&mut partial, &mut first),
+            Chunk::More
+        ));
+        let Chunk::Complete(bytes) = accept_chunk(&mut partial, &mut other) else {
+            panic!("the other track completes on its own");
+        };
+        assert_eq!((bytes, other.blocks.len()), (20, 1));
+        // The first is still held, untouched.
+        let mut rest = msg(&[1], Some(true));
+        let Chunk::Complete(bytes) = accept_chunk(&mut partial, &mut rest) else {
+            panic!("the first completes when its own last chunk lands");
+        };
+        assert_eq!(bytes, 11);
+    }
+
+    /// A sender that never says done is cut off rather than allowed to
+    /// grow the hub's memory without end.
+    #[test]
+    fn a_transfer_that_never_ends_is_abandoned() {
+        let mut partial = std::collections::HashMap::new();
+        let mut over = msg(&[MAX_SETS_BYTES + 1], Some(false));
+        assert!(matches!(
+            accept_chunk(&mut partial, &mut over),
+            Chunk::TooBig(_)
+        ));
+        assert!(partial.is_empty(), "the partial is dropped, not kept");
     }
 }

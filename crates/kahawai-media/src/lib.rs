@@ -294,6 +294,19 @@ fn map_info(info: &DiscovererInfo) -> MediaInfo {
                 out.tags.insert(name.into(), v.to_string());
             }
         }
+        // ReplayGain (HUB-19). GStreamer has already turned whatever the
+        // container spells it — Vorbis comments in FLAC, TXXX frames in
+        // MP3, APE items — into these five, so this reads one shape for
+        // every format kahawai serves.
+        let gain = |tag_name: &str| tags.generic(tag_name).and_then(|v| v.get::<f64>().ok());
+        out.replay_gain = kahawai_core::media::ReplayGain {
+            track_gain_db: gain(gst::tags::TrackGain::TAG_NAME),
+            track_peak: gain(gst::tags::TrackPeak::TAG_NAME),
+            album_gain_db: gain(gst::tags::AlbumGain::TAG_NAME),
+            album_peak: gain(gst::tags::AlbumPeak::TAG_NAME),
+            reference_level_db: gain(gst::tags::ReferenceLevel::TAG_NAME),
+        }
+        .some();
     }
 
     out
@@ -574,5 +587,73 @@ mod tests {
         let path = dir.path().join("garbage.mkv");
         std::fs::write(&path, b"this is not media").unwrap();
         assert!(discover(&path, Duration::from_secs(5)).is_err());
+    }
+
+    /// ReplayGain (HUB-19) is read as the file states it, and absent
+    /// when the file says nothing.
+    ///
+    /// The point of reading GStreamer's normalised tags rather than the
+    /// container's own is that FLAC's Vorbis comments, MP3's TXXX frames
+    /// and APE items all arrive here in one shape. The fixture is a
+    /// FLAC because that is what this library is made of.
+    #[test]
+    fn replay_gain_is_read_when_the_file_states_it() {
+        init().unwrap();
+        for el in ["audiotestsrc", "taginject", "flacenc"] {
+            if gstreamer::ElementFactory::find(el).is_none() {
+                eprintln!("no {el}; skipped");
+                return;
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mux = |name: &str, tags: &str| {
+            let path = dir.path().join(name);
+            let inject = if tags.is_empty() {
+                String::new()
+            } else {
+                format!("taginject tags=\"{tags}\" ! ")
+            };
+            let pipeline = gstreamer::parse::launch(&format!(
+                "audiotestsrc num-buffers=20 ! audioconvert ! {inject}flacenc ! \
+                 filesink location={}",
+                path.display()
+            ))
+            .expect("pipeline");
+            pipeline.set_state(gstreamer::State::Playing).unwrap();
+            pipeline
+                .bus()
+                .unwrap()
+                .timed_pop_filtered(
+                    gstreamer::ClockTime::from_seconds(30),
+                    &[gstreamer::MessageType::Eos, gstreamer::MessageType::Error],
+                )
+                .expect("muxing timed out");
+            pipeline.set_state(gstreamer::State::Null).unwrap();
+            path
+        };
+
+        let tagged = mux(
+            "tagged.flac",
+            "replaygain-track-gain=(double)-11.28,replaygain-track-peak=(double)0.9,\
+             replaygain-album-gain=(double)-10.5,replaygain-album-peak=(double)1.0",
+        );
+        let rg = discover(&tagged, std::time::Duration::from_secs(30))
+            .expect("discover")
+            .replay_gain
+            .expect("the file states ReplayGain");
+        assert_eq!(rg.track_gain_db, Some(-11.28));
+        assert_eq!(rg.track_peak, Some(0.9));
+        assert_eq!(rg.album_gain_db, Some(-10.5));
+        assert_eq!(rg.album_peak, Some(1.0));
+
+        // Untagged is None, not a shell of nulls: a client asking "does
+        // this file state its loudness" gets one answer, not five.
+        let bare = mux("bare.flac", "");
+        assert_eq!(
+            discover(&bare, std::time::Duration::from_secs(30))
+                .expect("discover")
+                .replay_gain,
+            None
+        );
     }
 }

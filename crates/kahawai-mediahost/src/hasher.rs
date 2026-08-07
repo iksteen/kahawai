@@ -398,25 +398,33 @@ async fn extract_image_and_send(
                 ms = started.elapsed().as_millis(),
                 "image display sets extracted"
             );
-            kahawai_proto::v1::ImageSubtitles {
-                collection_id: collection_id.into(),
-                path_rel: path_rel.into(),
+            // Chunked, because a track is not a message: a PGS stream
+            // of a whole film runs to tens of MiB and the largest that
+            // ever crossed intact was 63.8 MiB against a 64 MiB limit.
+            // Over it the shared link stream resets, taking scans and
+            // leases with it.
+            let blocks: Vec<kahawai_proto::v1::ImageSubBlock> = track
+                .blocks
+                .into_iter()
+                .map(
+                    |(start_ms, dur, payload)| kahawai_proto::v1::ImageSubBlock {
+                        start_ms,
+                        duration_ms: dur.unwrap_or(0),
+                        payload,
+                    },
+                )
+                .collect();
+            send_chunked(
+                tx,
+                collection_id,
+                path_rel,
                 sub_index,
-                codec: track.codec,
-                codec_private: track.codec_private.unwrap_or_default(),
-                blocks: track
-                    .blocks
-                    .into_iter()
-                    .map(
-                        |(start_ms, dur, payload)| kahawai_proto::v1::ImageSubBlock {
-                            start_ms,
-                            duration_ms: dur.unwrap_or(0),
-                            payload,
-                        },
-                    )
-                    .collect(),
-                error: String::new(),
-            }
+                track.codec,
+                track.codec_private.unwrap_or_default(),
+                blocks,
+            )
+            .await;
+            return;
         }
         other => {
             let error = match other {
@@ -432,6 +440,8 @@ async fn extract_image_and_send(
                 path_rel: path_rel.into(),
                 sub_index,
                 error,
+                // One message, and it is the last one.
+                done: Some(true),
                 ..Default::default()
             }
         }
@@ -563,4 +573,87 @@ async fn hash_one(
         crc_checked: claimed_crc.is_some(),
         crc_ok: crc_ok.unwrap_or(false),
     })
+}
+
+/// How much block payload rides in one message.
+///
+/// Far below the 64 MiB the link allows, because the limit is a cliff
+/// rather than a budget: crossing it resets the shared stream, not just
+/// this transfer. 4 MiB also keeps the receiver's buffer small and fits
+/// inside the 4 MiB default that any less generous peer would impose.
+const SETS_CHUNK_BYTES: usize = 4 * 1024 * 1024;
+
+/// Send one track's display sets as a run of messages, the last marked
+/// done. The header fields ride on every chunk so the receiver can key
+/// them without remembering an opening message.
+async fn send_chunked(
+    tx: &tokio::sync::mpsc::Sender<HostToHub>,
+    collection_id: &str,
+    path_rel: &str,
+    sub_index: u32,
+    codec: String,
+    codec_private: Vec<u8>,
+    blocks: Vec<kahawai_proto::v1::ImageSubBlock>,
+) {
+    let mut chunk: Vec<kahawai_proto::v1::ImageSubBlock> = Vec::new();
+    let mut bytes = 0usize;
+    let mut sent = 0usize;
+    let total = blocks.len();
+    let mut iter = blocks.into_iter().peekable();
+    while let Some(b) = iter.next() {
+        bytes += b.payload.len();
+        chunk.push(b);
+        let last = iter.peek().is_none();
+        if bytes < SETS_CHUNK_BYTES && !last {
+            continue;
+        }
+        sent += chunk.len();
+        let msg = kahawai_proto::v1::ImageSubtitles {
+            collection_id: collection_id.into(),
+            path_rel: path_rel.into(),
+            sub_index,
+            codec: codec.clone(),
+            codec_private: codec_private.clone(),
+            blocks: std::mem::take(&mut chunk),
+            error: String::new(),
+            done: Some(last),
+        };
+        bytes = 0;
+        if tx
+            .send(HostToHub {
+                msg: Some(host_to_hub::Msg::ImageSubtitles(msg)),
+            })
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                collection = collection_id,
+                path = path_rel,
+                track = sub_index,
+                sent,
+                total,
+                "link closed mid-transfer; display sets abandoned"
+            );
+            return;
+        }
+    }
+    // A track with no blocks at all still needs its one message, or the
+    // hub waits for a transfer that never starts.
+    if total == 0 {
+        let _ = tx
+            .send(HostToHub {
+                msg: Some(host_to_hub::Msg::ImageSubtitles(
+                    kahawai_proto::v1::ImageSubtitles {
+                        collection_id: collection_id.into(),
+                        path_rel: path_rel.into(),
+                        sub_index,
+                        codec,
+                        codec_private,
+                        done: Some(true),
+                        ..Default::default()
+                    },
+                )),
+            })
+            .await;
+    }
 }

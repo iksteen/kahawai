@@ -234,6 +234,19 @@ message ImageSubtitles {
   bytes codec_private = 5;
   repeated ImageSubBlock blocks = 6;
   string error = 7;
+  // A track's blocks arrive in SEVERAL of these messages, the last one
+  // saying done — the same shape Manifest uses, and for the same reason:
+  // one message per track put a whole PGS stream on the wire at once,
+  // and the largest that ever survived was 63.8 MiB against a 64 MiB
+  // limit. Over it, the stream resets — and since this rides the shared
+  // link stream, one oversized subtitle track took down scans, leases
+  // and playback with it (measured 2026-08-07: 3663 extractions sent,
+  // 24 arrived).
+  //
+  // OPTIONAL for presence, not for taste: an older mediahost sends no
+  // field at all, and that must read as "one message, complete" rather
+  // than as "false, more coming" — which would wait forever.
+  optional bool done = 8;
 }
 
 message ImageSubBlock {

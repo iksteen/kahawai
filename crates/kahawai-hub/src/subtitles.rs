@@ -2,6 +2,18 @@
 //! sidecar text subtitles, extract/convert them to WebVTT lazily, and
 //! cache extracted cues on the hub (embedded extraction demuxes the whole
 //! source once — never twice).
+//!
+//! `image_set_failures` (0048) is the memory of a question already
+//! answered no: a mediahost that could not extract a track's display
+//! sets — an .mp4 with no image track, a container with no usable index
+//! — records it here, keyed by (module, collection, path, sub_index)
+//! AND the file's mtime. The mtime is what makes it a statement about
+//! bytes rather than about a name: replace or re-encode the file and the
+//! row stops matching, so the question is asked again. Nothing expires
+//! it otherwise; a refusal does not go stale on its own.
+//!
+//! Without it the idle sweep re-asked on every hub run — one file was
+//! re-requested for days — and each ask costs a walk on the mediahost.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -1170,6 +1182,76 @@ impl Subtitles {
     /// and cached like any other extraction. `None` when the host is
     /// gone or the track has no usable index — the caller then plans
     /// without a burn instead of promising one.
+    /// Remember that a mediahost could not extract this track.
+    ///
+    /// Keyed to the file's mtime as well as its path: a re-encoded or
+    /// replaced file is a different question, and re-asking it is right.
+    /// A file the hub has no row for records NULL, which never matches
+    /// and so never suppresses.
+    pub async fn remember_extraction_failure(
+        &self,
+        registry: &Registry,
+        module_id: &str,
+        collection_id: &str,
+        path_rel: &str,
+        sub_index: u32,
+        error: &str,
+    ) -> Result<()> {
+        let mtime: Option<i64> = sqlx::query_scalar(
+            "SELECT mtime_unix FROM files
+              WHERE module_id = ?1 AND collection_id = ?2 AND path_rel = ?3",
+        )
+        .bind(module_id)
+        .bind(collection_id)
+        .bind(path_rel)
+        .fetch_optional(registry.db())
+        .await?
+        .flatten();
+        sqlx::query(
+            "INSERT INTO image_set_failures
+                 (module_id, collection_id, path_rel, sub_index, mtime_unix, error, at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, unixepoch())
+             ON CONFLICT (module_id, collection_id, path_rel, sub_index) DO UPDATE
+             SET mtime_unix = excluded.mtime_unix, error = excluded.error, at = excluded.at",
+        )
+        .bind(module_id)
+        .bind(collection_id)
+        .bind(path_rel)
+        .bind(sub_index)
+        .bind(mtime)
+        .bind(error)
+        .execute(registry.db())
+        .await?;
+        Ok(())
+    }
+
+    /// Was this exact track — same file, same mtime — refused before?
+    async fn extraction_failed_before(
+        &self,
+        registry: &Registry,
+        module_id: &str,
+        collection_id: &str,
+        path_rel: &str,
+        sub_index: usize,
+    ) -> bool {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT 1 FROM image_set_failures f
+               JOIN files fi ON (fi.module_id, fi.collection_id, fi.path_rel)
+                              = (f.module_id, f.collection_id, f.path_rel)
+              WHERE f.module_id = ?1 AND f.collection_id = ?2 AND f.path_rel = ?3
+                AND f.sub_index = ?4 AND f.mtime_unix IS fi.mtime_unix",
+        )
+        .bind(module_id)
+        .bind(collection_id)
+        .bind(path_rel)
+        .bind(sub_index as i64)
+        .fetch_optional(registry.db())
+        .await
+        .ok()
+        .flatten()
+        .is_some()
+    }
+
     pub async fn image_sets(
         &self,
         registry: &Registry,
@@ -1188,6 +1270,16 @@ impl Subtitles {
             return Some(cache_path);
         }
         if !registry.is_connected(module_id) {
+            return None;
+        }
+        // Already asked about these exact bytes and told no. Without
+        // this the idle sweep re-asks every run — one .mp4 with no image
+        // track was requested again on every hub start for days, and
+        // each request cost a mediahost walk.
+        if self
+            .extraction_failed_before(registry, module_id, collection_id, path_rel, sub_index)
+            .await
+        {
             return None;
         }
         let msg = kahawai_proto::v1::HubToHost {
