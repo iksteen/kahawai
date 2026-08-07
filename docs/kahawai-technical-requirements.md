@@ -141,7 +141,7 @@ What survives, in AR-13 and unchanged by this: the byte plane's ~4 KB/s figure i
 **HUB-16** The hub shall always prefer the cheapest sufficient path: direct play > remux > audio-only transcode > video transcode, and among sources prefer one that avoids transcoding entirely.
 **HUB-17** Transcoded delivery shall use an adaptive segmented protocol (HLS as baseline; LL-HLS and DASH as extensions), support seeking into not-yet-transcoded regions (session restart at seek point), and support mid-stream quality switching.
 **HUB-18** The hub shall track play sessions: concurrent stream limits per user, progress checkpoints (resume state written at a fixed interval and on teardown), idle timeout and orphan cleanup, and administrator visibility into active sessions (who, what, direct/transcoded, which transcoder, throughput).
-**HUB-19** Music playback shall support gapless-capable delivery, ReplayGain/loudness metadata pass-through, and transcoding to formats and bitrates suitable for mobile clients.
+**HUB-19** Music playback shall support gapless-capable delivery and ReplayGain/loudness metadata pass-through.
 
 ### 6.5 Bundled web interface
 

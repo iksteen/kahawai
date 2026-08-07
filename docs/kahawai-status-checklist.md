@@ -296,9 +296,10 @@ How something works and why it was built that way belong in
       idle reaping, seek-anywhere with pipeline restart. A reaped session
       answers 410 Gone on every session endpoint (404 stays "sub-resource
       missing"), and both players recover from it automatically
-- [ ] HUB-19 Music: playback + queue live, gapless delivery (two elements,
-      the idle one warmed 30 s ahead) and ReplayGain pass-through *(no
-      music transcoding to mobile-suitable formats and bitrates)*
+- [x] HUB-19 Music: playback + queue live, gapless delivery (two elements,
+      the idle one warmed 30 s ahead) and ReplayGain pass-through. Every
+      track plays direct — the browser gets a byte-range URL and no
+      pipeline is built
 
 ## Hub — web interface
 
