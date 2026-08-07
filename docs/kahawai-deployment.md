@@ -224,6 +224,50 @@ Deploy without an identity still works; it says plainly that the
 binary stays ad-hoc signed and the Local Network grant will need
 re-approving, rather than leaving a silent reconnect loop to diagnose.
 
+### GStreamer on the mac: `provision`, and two traps
+
+Homebrew ships GStreamer as one formula, and says on upgrade what to do
+with anything of ours: *"Do not install plugins into GStreamer's prefix.
+They will be deleted by `brew upgrade`."* So the patched plugins live in
+`~/.local/lib/kahawai-gst`, and the daemon is pointed at them —
+**`GST_PLUGIN_PATH` in the plist's `EnvironmentVariables`**, because a
+launchd daemon inherits nothing from a login shell. Without that key the
+transcoder loads Homebrew's stock plugins and every patch in
+`patches/gstreamer` is inert: installed, and doing nothing.
+
+`scripts/kahawai-mac.sh provision` (ON the mac) does the lot — installs
+or upgrades GStreamer and the build tools, clones the tag matching the
+installed version, applies every patch or stops, builds and stages the
+plugins, then writes the plist and bootstraps the daemon. It is
+idempotent, and it is the whole of what used to be done by hand.
+
+Two failures are worth knowing because neither says what is wrong.
+
+**Upgrading GStreamer requires `cargo clean`.** Cargo caches build-script
+output containing the *version-stamped* Cellar path
+(`Cellar/gstreamer/1.28.5/lib`), which the upgrade deletes. The next
+build fails in the linker pointing at a directory that is not there, with
+nothing to connect it to the upgrade. `provision` does the clean itself
+when the version moved. Note the side effect: the clean removes the
+transcoder binary for half a minute, and `KeepAlive` will spend that
+time failing to spawn a program that does not exist —
+`last exit code = 78: EX_CONFIG` and a wedged job needing
+`sudo launchctl bootout` and `bootstrap`. Provision before deploy, not
+during.
+
+**Staged plugins need `install_name_tool`, not a copy.** A plugin
+resolves `@rpath/libgstcodecparsers-1.0.0.dylib` through rpaths recorded
+at build time: first the build tree, then Homebrew's Cellar. Once the
+build tree is gone the second one answers — so a copied plugin loads
+**Homebrew's unpatched library** while looking perfectly installed.
+Patch 0004 in particular is then silently absent. `provision` repoints
+the dependency to an absolute path in `~/.local/lib/kahawai-gst/lib` and
+re-signs, since `install_name_tool` voids the signature.
+
+Two of the nine reproducers cannot run on macOS and this is not a
+missing patch: `0004`'s wants an NVIDIA decoder, and `0008` reads
+`/proc/self/io`. The other seven verify normally.
+
 Two macOS-only behaviours are already handled in code and worth knowing
 about: `vtdec`/`vtdec_hw` are demoted at startup (they build a GL
 texture cache and SIGSEGV without an AppKit main loop, which a headless

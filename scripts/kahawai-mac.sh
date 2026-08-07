@@ -33,13 +33,140 @@ AGENT=org.thegraveyard.kahawai.transcoder
 # start at boot without a login session. VideoToolbox hw encode and the
 # GL tone-map segment both verified under the daemon (2026-07-31).
 # Sudo happens here, once; deploys just pkill and KeepAlive respawns.
+# Where the patched plugins live. Homebrew says it plainly on upgrade:
+# "Do not install plugins into GStreamer's prefix. They will be deleted
+# by `brew upgrade`." So they go somewhere brew will never touch, and the
+# daemon is pointed at it explicitly.
+KAHAWAI_GST="$HOME/.local/lib/kahawai-gst"
+
+# GStreamer and the patched plugins, from nothing. Run ON the mac.
+gst() {
+    [ "$(uname)" = Darwin ] || { echo "run gst ON the mac" >&2; exit 2; }
+    local brew_bin
+    for brew_bin in /opt/homebrew/bin /usr/local/bin; do
+        [ -x "$brew_bin/brew" ] && break
+    done
+    [ -x "$brew_bin/brew" ] || { echo "Homebrew not found" >&2; exit 1; }
+    export PATH="$brew_bin:$PATH"
+    export HOMEBREW_NO_AUTO_UPDATE=1
+
+    local before after
+    before="$(gst-inspect-1.0 --version 2>/dev/null | awk '/^gst-inspect-1.0 version/ {print $3}')"
+    echo "==> gstreamer + build tools" >&2
+    brew install gstreamer meson ninja pkg-config >/dev/null 2>&1 || true
+    brew upgrade gstreamer >/dev/null 2>&1 || true
+    after="$(gst-inspect-1.0 --version 2>/dev/null | awk '/^gst-inspect-1.0 version/ {print $3}')"
+    [ -n "$after" ] || { echo "no gstreamer after install" >&2; exit 1; }
+    echo "    gstreamer ${before:-none} -> $after" >&2
+
+    # A GStreamer upgrade moves the version-stamped Cellar path that
+    # cargo baked into its cached build-script output, and the next build
+    # then links against a directory that no longer exists — an error
+    # that names the missing path and never mentions the upgrade. So the
+    # cache goes whenever the version moved.
+    if [ -n "$before" ] && [ "$before" != "$after" ] && [ -d "$HOME/kahawai-src" ]; then
+        echo "==> gstreamer moved: cargo clean (stale Cellar paths)" >&2
+        ( cd "$HOME/kahawai-src" && cargo clean >/dev/null 2>&1 ) || true
+    fi
+
+    local patches="$HOME/kahawai-src/patches/gstreamer"
+    [ -d "$patches" ] || { echo "no $patches — run 'deploy' first" >&2; exit 1; }
+
+    local src; src=$(mktemp -d -t kahawai-gst-src)
+    echo "==> source: gstreamer $after" >&2
+    git clone --depth 1 --branch "$after" \
+        https://gitlab.freedesktop.org/gstreamer/gstreamer.git "$src" >/dev/null 2>&1 \
+        || { echo "clone of tag $after failed" >&2; exit 1; }
+    local p
+    for p in "$patches"/*.patch; do
+        echo "    applying $(basename "$p")" >&2
+        git -C "$src" apply "$p" || {
+            echo "FAILED to apply $(basename "$p") to $after" >&2; exit 1; }
+    done
+
+    # Which plugins, read from the patches. gst-plugins-bad is different:
+    # 0004 edits gst-libs/codecparsers, and what needs rebuilding is
+    # every plugin that LINKS it — which no patch names because none
+    # edits them. nvcodec/va/v4l2codecs are Linux-only and absent here.
+    local good bad_plugins="videoparsers codectimestamper mpegtsdemux"
+    good=$(grep -hoE 'subprojects/gst-plugins-good/gst/[a-z0-9]+/' "$patches"/*.patch \
+           | awk -F/ '{print $4}' | sort -u)
+    echo "==> building: $(echo "$good" | tr '\n' ' ')| $bad_plugins" >&2
+
+    export PKG_CONFIG_PATH="$brew_bin/../lib/pkgconfig:$brew_bin/../share/pkgconfig"
+    local gb bb args=()
+    gb=$(mktemp -d); bb=$(mktemp -d)
+    args=(--buildtype=release -Dauto_features=disabled)
+    for p in $good; do args+=("-D$p=enabled"); done
+    meson setup "$gb" "$src/subprojects/gst-plugins-good" "${args[@]}" >/dev/null \
+        || { echo "gst-plugins-good: setup failed" >&2; exit 1; }
+    ninja -C "$gb" >/dev/null || { echo "gst-plugins-good: build failed" >&2; exit 1; }
+    args=(--buildtype=release -Dauto_features=disabled)
+    for p in $bad_plugins; do args+=("-D$p=enabled"); done
+    meson setup "$bb" "$src/subprojects/gst-plugins-bad" "${args[@]}" >/dev/null \
+        || { echo "gst-plugins-bad: setup failed" >&2; exit 1; }
+    ninja -C "$bb" >/dev/null || { echo "gst-plugins-bad: build failed" >&2; exit 1; }
+
+    # Wipe: this directory is a build product. A survivor from before a
+    # system upgrade loads, looks right, and is linked against an ABI
+    # that is gone.
+    rm -rf "$KAHAWAI_GST"
+    mkdir -p "$KAHAWAI_GST/plugins" "$KAHAWAI_GST/lib"
+
+    # The patched codecparsers, real file only — a looser glob also
+    # matches meson's .symbols artifacts.
+    local lib
+    lib=$(find "$bb/gst-libs" -type f -name 'libgstcodecparsers-1.0.0.dylib' ! -name '*.symbols' | head -1)
+    [ -n "$lib" ] || { echo "codecparsers not built" >&2; exit 1; }
+    install -m644 "$lib" "$KAHAWAI_GST/lib/"
+    ln -sf libgstcodecparsers-1.0.0.dylib "$KAHAWAI_GST/lib/libgstcodecparsers-1.0.dylib"
+    install_name_tool -id "$KAHAWAI_GST/lib/libgstcodecparsers-1.0.0.dylib" \
+        "$KAHAWAI_GST/lib/libgstcodecparsers-1.0.0.dylib"
+    codesign -f -s - "$KAHAWAI_GST/lib/libgstcodecparsers-1.0.0.dylib" 2>/dev/null
+
+    local so b
+    for so in "$gb"/gst/*/libgst*.dylib "$bb"/gst/*/libgst*.dylib; do
+        [ -f "$so" ] || continue
+        b=$(basename "$so")
+        install -m644 "$so" "$KAHAWAI_GST/plugins/$b"
+        # macOS resolves @rpath, and the recorded rpaths run
+        # build-tree-then-Homebrew. Once the build tree is gone the
+        # plugin silently loads HOMEBREW's unpatched codecparsers — the
+        # file is installed and the patch does nothing. Pin it absolutely
+        # and re-sign, because install_name_tool voids the signature.
+        if otool -L "$KAHAWAI_GST/plugins/$b" | grep -q '@rpath/libgstcodecparsers'; then
+            install_name_tool -change @rpath/libgstcodecparsers-1.0.0.dylib \
+                "$KAHAWAI_GST/lib/libgstcodecparsers-1.0.0.dylib" "$KAHAWAI_GST/plugins/$b"
+            codesign -f -s - "$KAHAWAI_GST/plugins/$b" 2>/dev/null
+        fi
+        echo "    installed $b" >&2
+    done
+    rm -rf "$src" "$gb" "$bb"
+
+    # Prove the daemon's own setting resolves to what we just built,
+    # rather than to Homebrew's copy of the same plugin.
+    echo "==> loading from:" >&2
+    local name
+    for name in $good videoparsersbad; do
+        printf '    %-16s %s\n' "$name" \
+            "$(GST_PLUGIN_PATH="$KAHAWAI_GST/plugins" gst-inspect-1.0 "$name" 2>/dev/null \
+               | awk '/Filename/{print $2}')" >&2
+    done
+}
+
 install_daemon() {
     local plist="/Library/LaunchDaemons/$AGENT.plist"
-    [ -f "$plist" ] && { echo "daemon already installed" >&2; return 0; }
     # Retire a pre-daemon user agent so two supervisors never race.
     launchctl bootout "gui/$(id -u)/$AGENT" 2>/dev/null || true
     rm -f "$HOME/Library/LaunchAgents/$AGENT.plist"
     tmpd=$(mktemp)
+    # GST_PLUGIN_PATH is the whole reason this is regenerated rather than
+    # left alone once present. A daemon inherits nothing from a login
+    # shell, so without it the transcoder loads Homebrew's stock plugins
+    # and every patch in patches/gstreamer is inert — installed, and
+    # doing nothing. An earlier version returned early when the file
+    # existed, which meant a satellite could never acquire a setting it
+    # did not have on the day it was first provisioned.
     cat > "$tmpd" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -54,11 +181,23 @@ install_daemon() {
     <key>KeepAlive</key><true/>
     <key>StandardOutPath</key><string>$HOME/kahawai-transcoder.log</string>
     <key>StandardErrorPath</key><string>$HOME/kahawai-transcoder.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>GST_PLUGIN_PATH</key><string>$KAHAWAI_GST/plugins</string>
+    </dict>
 </dict>
 </plist>
 PLIST
+    if [ -f "$plist" ] && diff -q "$tmpd" "$plist" >/dev/null 2>&1; then
+        echo "daemon plist already current" >&2
+        rm -f "$tmpd"
+        return 0
+    fi
     echo "installing the launchd daemon (sudo)" >&2
     sudo install -o root -g wheel -m 644 "$tmpd" "$plist"
+    # bootout before bootstrap: bootstrap alone refuses a label already
+    # loaded, and a plist edit does not reach a running job.
+    sudo launchctl bootout "system/$AGENT" 2>/dev/null || true
     sudo launchctl bootstrap system "$plist"
     rm -f "$tmpd"
     echo "daemon installed and started" >&2
@@ -246,8 +385,28 @@ REMOTE
     return 1
 }
 
+# Everything a fresh satellite needs, in the order the parts depend on
+# each other: GStreamer and the patched plugins first, because the plist
+# points at them; then the daemon, which needs the binary that `deploy`
+# builds. Idempotent — running it on a working satellite re-verifies and
+# changes only what has drifted.
+provision() {
+    [ "$(uname)" = Darwin ] || { echo "run provision ON the mac" >&2; exit 2; }
+    gst
+    install_daemon
+    echo >&2
+    echo "provisioned. From the dev box: scripts/kahawai-mac.sh deploy" >&2
+}
+
 case "${1:-}" in
     setup) setup ;;
+    gst) gst ;;
+    provision) provision ;;
     deploy) shift; deploy "${1:-}" ;;
-    *) echo "usage: $0 {setup|deploy [host]}" >&2; exit 2 ;;
+    *) echo "usage: $0 {setup|gst|provision|deploy [host]}" >&2
+       echo "  setup      ON the mac, once: signing identity, then provision" >&2
+       echo "  gst        ON the mac: GStreamer + the patches/ plugins" >&2
+       echo "  provision  ON the mac: gst, then the launchd daemon (sudo)" >&2
+       echo "  deploy     FROM the dev box: sync, build, sign, restart" >&2
+       exit 2 ;;
 esac
