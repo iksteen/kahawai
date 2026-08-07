@@ -19,7 +19,7 @@
 #   python3 0005-…-repro-1.py
 #   GST_PLUGIN_PATH=/path/to/patched python3 0005-…-repro-1.py
 #
-# Exits 0 when the bug reproduces, 1 when the plugin is fixed. Builds
+# Exits 0 when the plugin is fixed, 1 when the bug reproduces. Builds
 # its own fixture — no media needed.
 import os
 import struct
@@ -150,6 +150,6 @@ for label, path in (("clean", plain), ("padded", padded)):
 pads, error = verdict
 if error or pads == 0:
     print("REPRODUCED: the same file demuxes in pull mode and is refused in push mode")
-    sys.exit(0)
+    sys.exit(1)
 print("not reproduced — the padding is skipped and the file demuxes (patched)")
-sys.exit(1)
+sys.exit(0)

@@ -20,7 +20,7 @@
 #   python3 0009-…-repro-1.py
 #   GST_PLUGIN_PATH=/path/to/patched python3 0009-…-repro-1.py
 #
-# Exits 0 when the bug reproduces, 1 when the plugin is fixed. Builds its
+# Exits 0 when the plugin is fixed, 1 when the bug reproduces. Builds its
 # own fixture — no media needed.
 import os
 import struct
@@ -184,10 +184,10 @@ def main():
         sys.exit("harness broken: no pads appeared, the file was never demuxed")
     if err is None:
         print(f"OK       pushed to EOS on {pads} pads — resynced past the damage")
-        return 1
+        return 0
     print(f"AFFECTED pushed run failed on {pads} pads: {err}")
     print("         (pull mode reaches search_cluster() and survives the same file)")
-    return 0
+    return 1
 
 
 if __name__ == "__main__":

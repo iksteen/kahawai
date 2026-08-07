@@ -85,8 +85,8 @@ previously passed changed.
 It muxes its own file, overwrites one Cluster Timestamp's length with a
 value no unsigned integer may have — leaving the id and length field
 readable, which is the case the header-level resync cannot see — and
-pushes the result through `appsrc`. Exits 0 when the bug reproduces, 1
-when the plugin is fixed.
+pushes the result through `appsrc`. Exits 0 when the plugin is fixed, 1
+when the bug reproduces.
 
 It fails loudly if no pads appear. An earlier draft linked the demuxer's
 sometimes-pads by name in a `parse_launch` string, which links nothing:

@@ -20,7 +20,7 @@
 #
 #   python3 0004-…-repro-1.py [decoder, default nvh264dec]
 #
-# Exits 0 when the bug reproduces, 1 when the plugin is fixed.
+# Exits 0 when the plugin is fixed, 1 when the bug reproduces.
 import os
 import subprocess
 import sys
@@ -82,6 +82,6 @@ print("  %-20s : %d frames, %d differing%s"
 
 if bad or len(got) != len(ref):
     print("REPRODUCED: H.264 decoding is bit-exact by spec, so any difference is wrong output")
-    sys.exit(0)
+    sys.exit(1)
 print("not reproduced — the parser accepts a full dec_ref_pic_marking (patched)")
-sys.exit(1)
+sys.exit(0)

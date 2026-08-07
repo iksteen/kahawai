@@ -9,7 +9,7 @@
 #
 #   python3 avidemux-leading-junk.py
 #
-# Exits 0 when the bug reproduces, 1 when the plugin is fixed.
+# Exits 0 when the plugin is fixed, 1 when the bug reproduces.
 import os
 import struct
 import subprocess
@@ -98,6 +98,6 @@ result = demux_push(avi)
 print("pads exposed: %d, error: %s" % (result["pads"], result["error"] or "none"))
 if result["error"]:
     print("REPRODUCED: a zero-sized JUNK before the header kills push-mode demux")
-    sys.exit(0)
+    sys.exit(1)
 print("not reproduced — avidemux skips the padding (patched)")
-sys.exit(1)
+sys.exit(0)

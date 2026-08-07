@@ -69,7 +69,7 @@ discards the fonts, so it was not kept.
 
 ## Running the reproducer
 
-Exits 0 when the bug reproduces, 1 when the plugin is fixed:
+Exits 0 when the plugin is fixed, 1 when the bug reproduces:
 
     python3 0003-…-repro-1.py [attachment MiB, default 33]
     GST_PLUGIN_PATH=/path/to/patched python3 0003-…-repro-1.py

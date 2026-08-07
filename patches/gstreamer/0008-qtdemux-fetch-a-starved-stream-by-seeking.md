@@ -100,8 +100,13 @@ bytes) that failed before.
     python3 0008-…-repro-1.py [outdir]
 
 It mixes its own file, prints what starting both streams costs pulled
-and pushed, and exits non-zero when the pushed read runs to the far end
-of the file. That is the check to re-run on each GStreamer release.
+and pushed, and exits non-zero when the pushed read runs to the far end of the
+file. That is the check to re-run on each GStreamer release.
+
+Exits 0 when the plugin is fixed, 1 when the bug reproduces — the same
+way as every other reproducer here. It used to be the other way round,
+alone among the nine, which made a checker that ran them all report this
+patch as missing precisely when it was working.
 
 ## Also seen, not diagnosed
 

@@ -40,7 +40,7 @@ matters for everyone else.
 
 ## Running the reproducer
 
-Exits 0 when the bug reproduces, 1 when the plugin is fixed:
+Exits 0 when the plugin is fixed, 1 when the bug reproduces:
 
     python3 0002-…-repro-1.py
     GST_PLUGIN_PATH=/path/to/patched python3 0002-…-repro-1.py

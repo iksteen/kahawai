@@ -10,7 +10,7 @@
 #
 #   python3 matroskademux-large-attachment.py [attachment MiB, default 33]
 #
-# Exits 0 when the bug reproduces, 1 when the plugin is fixed.
+# Exits 0 when the plugin is fixed, 1 when the bug reproduces.
 import os
 import subprocess
 import sys
@@ -139,6 +139,6 @@ print("  pads=%d attachments published=%d error=%s"
 
 if result["error"]:
     print("REPRODUCED: an element the file plainly contains is refused in push mode")
-    sys.exit(0)
+    sys.exit(1)
 print("not reproduced — the element is accepted (patched)")
-sys.exit(1)
+sys.exit(0)

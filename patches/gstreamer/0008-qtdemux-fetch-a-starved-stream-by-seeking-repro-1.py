@@ -146,3 +146,4 @@ if share >= 50:
           "file. Downstream that needs both streams — any muxer — waits it out.")
     sys.exit(1)
 print("OK: the read is bounded by the lag threshold, not by the file size.")
+sys.exit(0)

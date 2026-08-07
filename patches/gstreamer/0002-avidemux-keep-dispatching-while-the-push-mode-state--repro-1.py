@@ -11,7 +11,7 @@
 #
 #   python3 avidemux-single-buffer-header.py
 #
-# Exits 0 when the bug reproduces, 1 when the plugin is fixed.
+# Exits 0 when the plugin is fixed, 1 when the bug reproduces.
 import os
 import subprocess
 import sys
@@ -93,6 +93,6 @@ print("  as 2 buffers: pads=%d error=%s" % (two["pads"], two["error"] or "none")
 
 if one["error"] and not two["error"]:
     print("REPRODUCED: identical bytes, and only the buffer COUNT decides it")
-    sys.exit(0)
+    sys.exit(1)
 print("not reproduced — chain() keeps dispatching while the state advances (patched)")
-sys.exit(1)
+sys.exit(0)

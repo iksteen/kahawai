@@ -35,7 +35,7 @@ pushes, so the patch (or an updated package) is the only fix.
 
 ## Running the reproducer
 
-Exits 0 when the bug reproduces, 1 when the plugin is fixed, so it works
+Exits 0 when the plugin is fixed, 1 when the bug reproduces, so it works
 as a before/after check:
 
     python3 0001-…-repro-1.py
