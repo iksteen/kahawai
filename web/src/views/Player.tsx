@@ -102,6 +102,10 @@ export default function Player({
   const [streams, setStreams] = useState(session.streams)
   const streamsRef = useRef(session.streams)
   streamsRef.current = streams
+  // Track initialisation finishes asynchronously. Keep its burn switch
+  // pointed at the current render without making the fetch effect restart
+  // whenever the seek machinery is recreated.
+  const switchBurnRef = useRef<(trackId: number) => Promise<void>>(async () => {})
 
   useEffect(() => {
     // One resolution (HUB-33), same helper Detail used to start the
@@ -152,7 +156,7 @@ export default function Player({
               (v) => v.track_id === pick.id && v.tier === 'burn',
             )
           ) {
-            void switchBurn(pick.id)
+            void switchBurnRef.current(pick.id)
           }
         }
       })
@@ -287,6 +291,7 @@ export default function Player({
       setSeeking(false)
     }
   }
+  switchBurnRef.current = switchBurn
 
   // <track> is lazy about mode; force the selected one to display.
   useEffect(() => {

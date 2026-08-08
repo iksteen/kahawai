@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useState } from 'react'
 import {
   artworkUrl,
   fetchChildren,
@@ -106,8 +106,8 @@ export default function Detail({
   // The badge reads the stored mask, which the panel edits underneath
   // it; the counter repaints it on an edit instead of leaving the
   // previous mask on screen.
-  const [capsRev, setCapsRev] = useState(0)
-  const masked = useMemo(() => maskSummary(loadMask()), [capsRev])
+  const [, setCapsRev] = useState(0)
+  const masked = maskSummary(loadMask())
 
   useEffect(() => {
     setItem(null)
