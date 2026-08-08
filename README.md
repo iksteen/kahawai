@@ -33,6 +33,7 @@ ladders, and the hardening pass. Design documents:
 
 - [Technical requirements](./docs/kahawai-technical-requirements.md)
 - [Implementation design](./docs/kahawai-implementation.md)
+- [Release process](./docs/kahawai-releasing.md)
 
 ## Running it
 

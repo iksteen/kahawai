@@ -52,10 +52,10 @@ RUN sed -i 's/^Types: deb$/Types: deb deb-src/' /etc/apt/sources.list.d/ubuntu.s
         gstreamer1.0 gst-plugins-base1.0 gst-plugins-good1.0 \
         gst-plugins-bad1.0 gst-plugins-ugly1.0 gst-libav1.0 \
     && apt-get install -y --no-install-recommends \
-        bison build-essential ca-certificates clang cmake flex git meson \
-        nasm ninja-build pkg-config protobuf-compiler \
-        libvpl-dev libsvtav1enc-dev libaom-dev libdav1d-dev \
-        libleptonica-dev libtesseract-dev \
+        bison build-essential ca-certificates clang cmake ffmpeg flex git meson \
+        nasm ninja-build pkg-config protobuf-compiler python3 python3-gi \
+        libvpl-dev libsvtav1enc-dev libaom-dev libdav1d-dev libfdk-aac-dev \
+        libleptonica-dev libtesseract-dev tesseract-ocr-eng \
     && rm -rf /var/lib/apt/lists/*
 
 # The upstream fixes this image carries, with their reports and
@@ -190,13 +190,38 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     KAHAWAI_BUILD="${KAHAWAI_BUILD}" cargo build --locked --release --bin kahawai \
     && install -D -m 0755 -s target/release/kahawai /out/kahawai
 
+# This is the release boundary, not an optional sibling stage. Both outputs
+# below copy from it, so BuildKit cannot produce an image or binary artifact
+# without running the patch reproducers and the non-skippable media suite.
+FROM builder AS media-tested
+
+# GL tone-map tests need the same headless window selection as the runtime and
+# a real, private runtime directory. Without these, the element factories are
+# present but their dry-run fails before negotiation, which is not evidence that
+# the shipped path works.
+ENV GST_GL_WINDOW=surfaceless \
+    XDG_RUNTIME_DIR=/tmp/kahawai-runtime
+RUN mkdir -p "$XDG_RUNTIME_DIR" && chmod 0700 "$XDG_RUNTIME_DIR"
+
+RUN scripts/kahawai-gst-plugins.sh verify \
+        --library-dir /usr/local/lib \
+        --plugin-dir /usr/local/lib/gstreamer-1.0 \
+        --exclusive
+
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=kahawai-target-ubuntu2604,target=/usr/src/kahawai/target \
+    KAHAWAI_MEDIA_TEST_STRICT=1 cargo test --locked --release --workspace
+
+FROM scratch AS binary-artifact
+COPY --from=media-tested /out/kahawai /kahawai
+
 FROM ubuntu:26.04 AS runtime
 
 # The runtime libraries are the list the builder derived, plus the
 # drivers and data files nothing links against but everything needs. No
 # gstreamer1.0-* packages: the stack comes from the builder.
 ARG DEBIAN_FRONTEND=noninteractive
-COPY --from=builder /out/runtime-packages.txt /tmp/runtime-packages.txt
+COPY --from=media-tested /out/runtime-packages.txt /tmp/runtime-packages.txt
 RUN set -eux; \
     arch="$(dpkg --print-architecture)"; \
     intel_packages=""; \
@@ -226,8 +251,8 @@ RUN set -eux; \
         $intel_packages; \
     rm -rf /var/lib/apt/lists/* /tmp/runtime-packages.txt
 
-COPY --from=builder /out/kahawai /usr/local/bin/kahawai
-COPY --from=builder /staging/usr/local/ /usr/local/
+COPY --from=media-tested /out/kahawai /usr/local/bin/kahawai
+COPY --from=media-tested /staging/usr/local/ /usr/local/
 
 RUN ldconfig
 
