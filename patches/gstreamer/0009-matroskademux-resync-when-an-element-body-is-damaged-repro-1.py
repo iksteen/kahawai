@@ -27,6 +27,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
 
 import gi
 
@@ -123,20 +124,27 @@ def demux_pushed(path):
     """
     pipeline = Gst.Pipeline.new(None)
     handle = open(path, "rb")
+    handle_lock = threading.Lock()
     src = Gst.ElementFactory.make("appsrc")
     src.set_property("stream-type", 1)          # seekable, but pushing
     src.set_property("format", Gst.Format.BYTES)
     src.set_property("size", os.path.getsize(path))
 
     def need_data(element, length):
-        chunk = handle.read(max(length, 4096))
+        # appsrc may request a seek from a different streaming thread.
+        # Keep the shared file position atomic across seek and read, or a
+        # scheduling-dependent interleave can feed bytes from the old offset
+        # and falsely report that the patched demuxer failed to resynchronise.
+        with handle_lock:
+            chunk = handle.read(max(length, 4096))
         if chunk:
             element.emit("push-buffer", Gst.Buffer.new_wrapped(chunk))
         else:
             element.emit("end-of-stream")
 
     def seek_data(_element, offset):
-        handle.seek(offset)
+        with handle_lock:
+            handle.seek(offset)
         return True
 
     src.connect("need-data", need_data)
