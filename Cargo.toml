@@ -6,7 +6,7 @@ members = ["crates/*"]
 default-members = ["crates/kahawai"]
 
 [workspace.package]
-version = "0.0.0-dev"
+version = "0.0.1-rc.5"
 edition = "2024"
 license = "MIT"
 
