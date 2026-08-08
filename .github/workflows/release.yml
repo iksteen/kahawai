@@ -141,6 +141,7 @@ jobs:
   image:
     name: image (${{ matrix.platform }})
     needs: [prepare, draft-release]
+    environment: release
     permissions:
       contents: read
       id-token: write
@@ -232,6 +233,7 @@ jobs:
   publish:
     name: publish tested release
     needs: [prepare, image]
+    environment: release
     runs-on: ubuntu-26.04
     permissions:
       contents: write
