@@ -5080,21 +5080,26 @@ mod tests {
     #[test]
     fn mpeg_audio_muxability_is_decided_by_version_not_name() {
         crate::init().unwrap();
+        let has_fmp4 = crate::testutil::require_elements(&["isofmp4mux"]);
         for label in ["mp3", "mpeg-audio"] {
             let c = codec_to_caps("audio", label).unwrap();
             assert!(
                 caps_muxable(&c, SegmentFormat::Ts),
                 "{label} is MPEG-1 audio, which mpegtsmux carries"
             );
-            assert!(
-                !caps_muxable(&c, SegmentFormat::Fmp4),
-                "{label} must not plan as an fMP4 copy"
-            );
+            if has_fmp4 {
+                assert!(
+                    !caps_muxable(&c, SegmentFormat::Fmp4),
+                    "{label} must not plan as an fMP4 copy"
+                );
+            }
         }
         // AAC is the same caps name and must stay muxable in both.
         let aac = codec_to_caps("audio", "aac").unwrap();
         assert!(caps_muxable(&aac, SegmentFormat::Ts));
-        assert!(caps_muxable(&aac, SegmentFormat::Fmp4));
+        if has_fmp4 {
+            assert!(caps_muxable(&aac, SegmentFormat::Fmp4));
+        }
 
         // The worker sees full caps off the demuxer, not a label.
         let live_mp3 = gst::Caps::builder("audio/mpeg")
@@ -5104,7 +5109,9 @@ mod tests {
             .field("channels", 2i32)
             .build();
         assert_eq!(sink_compatible(&live_mp3, SegmentFormat::Ts), Some("audio"));
-        assert_eq!(sink_compatible(&live_mp3, SegmentFormat::Fmp4), None);
+        if has_fmp4 {
+            assert_eq!(sink_compatible(&live_mp3, SegmentFormat::Fmp4), None);
+        }
 
         // The check must NOT tighten on fields a parser converts:
         // h264 arrives byte-stream/nal from AVI and leaves h264parse as
@@ -5113,10 +5120,12 @@ mod tests {
             .field("stream-format", "byte-stream")
             .field("alignment", "nal")
             .build();
-        assert_eq!(
-            sink_compatible(&live_h264, SegmentFormat::Fmp4),
-            Some("video")
-        );
+        if has_fmp4 {
+            assert_eq!(
+                sink_compatible(&live_h264, SegmentFormat::Fmp4),
+                Some("video")
+            );
+        }
         assert_eq!(
             sink_compatible(&live_h264, SegmentFormat::Ts),
             Some("video")
@@ -5176,10 +5185,17 @@ mod tests {
     #[test]
     fn remuxes_uneven_track_ends() {
         crate::init().unwrap();
+        if !crate::testutil::require_elements(&["x264enc"]) {
+            return;
+        }
+        let Some(aac) = aac_encoder() else {
+            crate::testutil::require(false, "verified AAC encoder");
+            return;
+        };
         let dir = tempfile::tempdir().unwrap();
         let src_path = dir.path().join("uneven.mkv");
         let p = gst::parse::launch(&format!(
-            "videotestsrc num-buffers=100 ! video/x-raw,format=I420,width=320,height=240 ! x264enc speed-preset=ultrafast ! h264parse ! matroskamux name=m audiotestsrc num-buffers=200 ! audioconvert ! fdkaacenc ! m. m. ! filesink location=\"{}\"",
+            "videotestsrc num-buffers=100 ! video/x-raw,format=I420,width=320,height=240 ! x264enc speed-preset=ultrafast ! h264parse ! matroskamux name=m audiotestsrc num-buffers=200 ! audioconvert ! {aac} ! m. m. ! filesink location=\"{}\"",
             src_path.display()
         ))
         .unwrap();
@@ -5227,6 +5243,9 @@ mod tests {
     #[test]
     fn a_codec_we_have_no_parser_for_still_remuxes() {
         crate::init().unwrap();
+        if !crate::testutil::require_elements(&["isofmp4mux", "x264enc", "flacenc"]) {
+            return;
+        }
         // The premise: if this ever gains a parser, the test below stops
         // covering what it claims to.
         for name in ["audio/x-flac", "audio/x-vorbis", "video/x-vp8"] {
@@ -5503,10 +5522,14 @@ mod tests {
         if !crate::testutil::require(h264_encoder().is_some(), "verified H.264 encoder") {
             return;
         }
+        let Some(aac) = aac_encoder() else {
+            crate::testutil::require(false, "verified AAC encoder");
+            return;
+        };
         let dir = tempfile::tempdir().unwrap();
         let src_path = dir.path().join("divx.mkv");
         crate::testutil::render(&format!(
-            "videotestsrc num-buffers=125 ! video/x-raw,format=I420,width=320,height=240,framerate=25/1 ! avenc_mpeg4 ! matroskamux name=m audiotestsrc num-buffers=215 ! audioconvert ! fdkaacenc ! m. m. ! filesink location=\"{}\"",
+            "videotestsrc num-buffers=125 ! video/x-raw,format=I420,width=320,height=240,framerate=25/1 ! avenc_mpeg4 ! matroskamux name=m audiotestsrc num-buffers=215 ! audioconvert ! {aac} ! m. m. ! filesink location=\"{}\"",
             src_path.display()
         ));
 

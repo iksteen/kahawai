@@ -18,22 +18,16 @@ env:
 jobs:
   fmt:
     name: rustfmt
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v7
-      - run: rustup component add rustfmt
       - run: cargo fmt --all --check
 
   clippy:
     name: clippy
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v7
-
-      # Enough to COMPILE against: the bindings need gstreamer-1.0 >= 1.14
-      # and Ubuntu ships far newer. The plugin set the container image
-      # builds from source matters at runtime, not here — clippy never
-      # starts a pipeline.
       - name: Install build dependencies
         run: |
           sudo apt-get update
@@ -42,9 +36,6 @@ jobs:
             libass-dev libva-dev libgudev-1.0-dev \
             libleptonica-dev libtesseract-dev \
             protobuf-compiler clang cmake
-
-      - run: rustup component add clippy
-
       - name: Cache cargo registry and target
         uses: actions/cache@v6
         with:
@@ -53,10 +44,131 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
-
-      # --all-targets so tests and benches are linted too: they are where
-      # the checks live, and an unlinted test is how a check that cannot
-      # fail gets written.
+          key: ubuntu-26.04-clippy-rust-1.97.1-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ubuntu-26.04-clippy-rust-1.97.1-
+      - name: Record toolchain
+        run: |
+          {
+            echo '### Clippy environment'
+            echo '```text'
+            sed -n '1,6p' /etc/os-release
+            rustc --version
+            cargo --version
+            pkg-config --modversion gstreamer-1.0
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      # --all-targets includes the checks themselves: an unlinted test is
+      # how a check that cannot fail gets written.
       - run: cargo clippy --locked --workspace --all-targets
+
+  test:
+    name: workspace tests
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install build and media dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+            gstreamer1.0-tools gstreamer1.0-plugins-base \
+            gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
+            gstreamer1.0-plugins-ugly gstreamer1.0-libav \
+            ca-certificates ffmpeg \
+            libass-dev libva-dev libgudev-1.0-dev \
+            libleptonica-dev libtesseract-dev tesseract-ocr-eng \
+            protobuf-compiler clang cmake
+      - name: Cache cargo registry and target
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ubuntu-26.04-test-rust-1.97.1-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ubuntu-26.04-test-rust-1.97.1-
+      - name: Record media stack
+        run: |
+          {
+            echo '### Workspace-test environment'
+            echo '```text'
+            sed -n '1,6p' /etc/os-release
+            rustc --version
+            gst-inspect-1.0 --version
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - run: cargo test --locked --workspace
+        env:
+          KAHAWAI_MEDIA_SKIP_FILE: ${{ runner.temp }}/kahawai-media-skips.txt
+      - name: Report media paths not exercised
+        if: always()
+        env:
+          KAHAWAI_MEDIA_SKIP_FILE: ${{ runner.temp }}/kahawai-media-skips.txt
+        run: |
+          if test -s "$KAHAWAI_MEDIA_SKIP_FILE"; then
+            {
+              echo '### Media prerequisites unavailable'
+              echo 'The distro-stack job did not exercise these paths:'
+              echo '```text'
+              sort -u "$KAHAWAI_MEDIA_SKIP_FILE"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo '### Media prerequisites unavailable: none' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  no-default-features:
+    name: no default features
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+            libass-dev libva-dev libgudev-1.0-dev \
+            protobuf-compiler clang cmake
+      - name: Cache cargo registry and target
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ubuntu-26.04-no-default-rust-1.97.1-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ubuntu-26.04-no-default-rust-1.97.1-
+      - run: cargo check --locked --workspace --no-default-features
+
+  web:
+    name: web
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version-file: .node-version
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Record toolchain
+        run: |
+          {
+            echo '### Web environment'
+            echo '```text'
+            sed -n '1,6p' /etc/os-release
+            node --version
+            npm --version
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - run: npm ci
+        working-directory: web
+      - run: npm run lint
+        working-directory: web
+      - run: npm test
+        working-directory: web
+      - run: npm run build
+        working-directory: web
+      - name: Embedded assets match their source
+        run: git diff --exit-code -- web/dist

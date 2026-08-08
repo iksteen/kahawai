@@ -1,0 +1,6 @@
+[env]
+# Leptonica 1.86.0's public header selects `atomic_int` in C11 mode, but the
+# Ubuntu 26.04 hosted runner's Clang 21/libclang combination cannot resolve
+# that typedef through bindgen. Select Leptonica's own `int` fallback; it has
+# the same ABI and the OCR crates are this workspace's only bindgen consumers.
+BINDGEN_EXTRA_CLANG_ARGS = { value = "-D__STDC_NO_ATOMICS__=1", force = false }

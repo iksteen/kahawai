@@ -1108,6 +1108,9 @@ mod tests {
     #[test]
     fn encode_targets_follow_client_and_fleet() {
         crate::init().unwrap();
+        if !crate::testutil::require_elements(&["isofmp4mux"]) {
+            return;
+        }
         // An hevc-only client (the {"video":["h264"]} mask off state),
         // hevc source that needs an encode (tone-map forces it).
         let mut p = chrome();
@@ -1252,6 +1255,9 @@ mod tests {
     #[test]
     fn av1_copy_rides_fmp4() {
         crate::init().unwrap();
+        if !crate::testutil::require_elements(&["isofmp4mux"]) {
+            return;
+        }
         let mut p = chrome();
         p.video.push(VideoCap {
             codec: "av1".into(),
@@ -1346,38 +1352,44 @@ mod tests {
         );
         assert_eq!(sp.cost, Cost::AudioEncode);
         assert_eq!(sp.plan.max_channels, None);
-        // HEVC with hevc in profile: copy; without: video encode.
-        let sp = negotiate(
-            &p,
-            &media("matroska", Some(vs("hevc")), Some(au("aac", 2))),
-            0,
-            0,
-            true,
-            None,
-            false,
-            true,
-            &[],
-            None,
-            &fleet(),
-        );
-        assert_eq!(sp.plan.video, StreamMode::Copy);
-        let mut no_hevc = chrome();
-        no_hevc.video.retain(|c| c.codec != "hevc");
-        let sp = negotiate(
-            &no_hevc,
-            &media("matroska", Some(vs("hevc")), Some(au("aac", 2))),
-            0,
-            0,
-            true,
-            None,
-            false,
-            true,
-            &[],
-            None,
-            &fleet(),
-        );
-        assert_eq!(sp.cost, Cost::VideoEncode);
-        assert_eq!(sp.plan.video_kbps, Some(6000));
+        // HEVC uses fMP4, whose isofmp4mux comes from gst-plugins-rs and
+        // is not packaged by every distro. Keep the rest of the decision
+        // table exercised on those systems; strict release tests still
+        // make an absent muxer fatal through require_elements.
+        if crate::testutil::require_elements(&["isofmp4mux"]) {
+            // HEVC with hevc in profile: copy; without: video encode.
+            let sp = negotiate(
+                &p,
+                &media("matroska", Some(vs("hevc")), Some(au("aac", 2))),
+                0,
+                0,
+                true,
+                None,
+                false,
+                true,
+                &[],
+                None,
+                &fleet(),
+            );
+            assert_eq!(sp.plan.video, StreamMode::Copy);
+            let mut no_hevc = chrome();
+            no_hevc.video.retain(|c| c.codec != "hevc");
+            let sp = negotiate(
+                &no_hevc,
+                &media("matroska", Some(vs("hevc")), Some(au("aac", 2))),
+                0,
+                0,
+                true,
+                None,
+                false,
+                true,
+                &[],
+                None,
+                &fleet(),
+            );
+            assert_eq!(sp.cost, Cost::VideoEncode);
+            assert_eq!(sp.plan.video_kbps, Some(6000));
+        }
         // Multi-part never direct, even when everything fits.
         let sp = negotiate(
             &p,
@@ -2184,6 +2196,9 @@ mod tests {
     /// (Chrome/Safari — they tone-map themselves) keeps the copy.
     #[test]
     fn hdr10_copy_vetoed_when_client_cannot_display_it() {
+        if !crate::testutil::require_elements(&["isofmp4mux"]) {
+            return;
+        }
         let mut p = chrome(); // hdr: false, decodes hevc
         assert!(
             p.video.iter().any(|c| c.codec == "hevc"),
@@ -2516,6 +2531,9 @@ mod tests {
     #[test]
     fn an_hevc_copy_is_delivered_as_fmp4() {
         crate::init().unwrap();
+        if !crate::testutil::require_elements(&["isofmp4mux"]) {
+            return;
+        }
         // AC-3 audio no browser decodes, so the cheapest plan copies the
         // video and encodes the audio — the shape that chose TS before.
         let info = media("matroska", Some(vs("hevc")), Some(au("ac3", 6)));

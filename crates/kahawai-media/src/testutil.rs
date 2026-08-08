@@ -165,6 +165,11 @@ fn missing_prerequisite(description: &str, strict: bool, report_path: Option<&Pa
 fn report(kind: &str, description: &str, report_path: Option<&Path>) {
     eprintln!("{kind}: {description}");
     if let Some(path) = report_path {
+        // Tests report from several libtest worker threads. A single
+        // formatted writeln can become several writes, so O_APPEND alone
+        // does not keep records intact.
+        static REPORT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = REPORT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -252,5 +257,35 @@ mod tests {
             std::fs::read_to_string(report).unwrap(),
             "SKIP: deliberately absent\n"
         );
+    }
+
+    #[test]
+    fn concurrent_prerequisites_leave_whole_report_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let report = dir.path().join("skips.txt");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(16));
+        let threads: Vec<_> = (0..16)
+            .map(|i| {
+                let report = report.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    missing_prerequisite(&format!("prerequisite {i}"), false, Some(&report));
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+
+        let mut actual: Vec<_> = std::fs::read_to_string(report)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        actual.sort();
+        let mut expected: Vec<_> = (0..16).map(|i| format!("SKIP: prerequisite {i}")).collect();
+        expected.sort();
+        assert_eq!(actual, expected);
     }
 }
