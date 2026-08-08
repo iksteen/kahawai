@@ -113,7 +113,8 @@ Deployment topology, cross-compilation and the NAS/macOS satellites:
 
 ## House rules
 
-- **Never `git push`.** Commit locally; the maintainer pushes.
+- **Never `git push` autonomously.** Commit locally by default; push only when
+  the maintainer explicitly asks you to.
 - Bundle IDs, launchd labels and service names: `org.thegraveyard.*`.
 - Every CLI-testable feature gets a companion script in `scripts/`
   (see `kahawai-play.sh`, `kahawai-list.sh`).

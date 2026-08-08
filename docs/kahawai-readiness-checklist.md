@@ -33,9 +33,11 @@ The audit found a strong functional candidate: the locked Rust workspace tests,
 formatting and clippy pass, and the web application builds and passes its small
 test suite. It is not yet ready for public deployment. In particular, deleted
 administrator access can survive a quick restart, session endpoints are not all
-owner-scoped, refresh rotation races, restore does not restore configuration,
-multi-root collections can alias files, `--no-default-features` does not build,
-and mandatory CI does not currently run the test suites.
+owner-scoped, refresh rotation races, restore does not restore configuration and
+multi-root collections can alias files. The CI implementation added after the
+audit now includes the complete locked workspace, no-default and web gates, but
+the hosted jobs and first release run remain evidence that must be observed
+before those outcomes can be checked.
 
 A follow-up audit of the media core reached a different conclusion from the
 functional evidence. The GStreamer paths contain unusually valuable corpus and
@@ -332,12 +334,16 @@ matrix rather than being dismissed as post-MVP cleanup.
 - [ ] GST-26 Keep one bounded diagnostic ring per worker and include GStreamer
       warnings/errors, state transitions and the pipeline actualisation in the
       session bundle without allowing GST_DEBUG output to exhaust scratch space
-- [~] GST-27 The Dockerfile already builds a pinned GStreamer, gst-plugins-rs,
-      libass and codec stack. Turn that stack into a mandatory media-test stage
-      and CI job in which a required missing plugin fails the job; tests must not
-      silently `return` and be reported as passing when a path was never
-      exercised. Derive supported versions and image contents from the platform
-      decision and current primary project sources
+- [~] GST-27 The Dockerfile builds pinned GStreamer 1.28.6, gst-plugins-rs,
+      libass and codec dependencies and now makes patch verification plus
+      `KAHAWAI_MEDIA_TEST_STRICT=1 cargo test --locked --release --workspace` a
+      mandatory ancestor of every release image. Required prerequisites panic
+      in strict mode; distro CI retains best-effort execution but records every
+      unavailable path. On 2026-08-08 the complete debug-profile strict suite
+      against the host's Kahawai-only GStreamer 1.28.5 prefix exited 0. The same
+      day the amd64 pinned-GStreamer 1.28.6 container gate passed all 11 patch
+      reproducers and the complete strict release-profile workspace suite. Both
+      hosted release architectures still need successful recorded runs
 - [ ] GST-28 Add worker-process regression fixtures for every supported
       container and copy/encode/seek/subtitle route, including long/irregular
       GOPs, multiple same-kind tracks, multipart sources, missing PTS/DTS,
@@ -351,13 +357,17 @@ matrix rather than being dismissed as post-MVP cleanup.
 - [ ] GST-30 Add fuzz targets for the pure EBML/MP4 subtitle indexes, PGS,
       VobSub, KBS1/zstd and ASS parsing boundaries. Seed them with the corpus and
       run bounded PR smoke fuzzing plus longer sanitizer-enabled nightly jobs
-- [~] GST-31 The active GStreamer patch loop already fails the image build when
-      a patch stops applying, and `scripts/kahawai-gst-plugins.sh` already runs
-      available reproducers. Add reproducers or explicit executable substitutes
-      for GStreamer patch `0006` and gst-plugins-rs record `0000`, run the build
-      and verification in required CI, and exercise a minimum-supported system-
-      stack matrix in addition to the pinned container. Record upstream issue,
-      release and ABI claims from current primary GStreamer sources
+- [~] GST-31 The active GStreamer patch loop fails when a patch stops applying,
+      and every patch record now has an executable reproducer or wrapper. The
+      verifier accepts explicit library/plugin prefixes, isolates the pinned
+      container registry, distinguishes a crashed reproducer from a missing
+      fix, and has a device-independent direct-parser proof for the ABI-changing
+      H.264 patch. On 2026-08-08 all 11 records were LIVE against the host's
+      Kahawai-only GStreamer 1.28.5 prefix, both with the exposed NVIDIA decoder
+      and with the headless parser substitute (exit 0); all 11 also passed in
+      the pinned GStreamer 1.28.6 amd64 container without NVIDIA hardware.
+      Required hosted arm64 verification and recording current upstream issue,
+      release and ABI claims remain
 
 ## Backup and filesystem safety (BKP)
 
@@ -389,20 +399,25 @@ matrix rather than being dismissed as post-MVP cleanup.
 
 ## Continuous integration and test coverage (CI)
 
-- [~] CI-1 Pull-request CI already runs `cargo fmt --all --check` and locked
-      workspace clippy with warnings denied. Add the complete locked workspace
-      tests and `cargo check --locked --workspace --no-default-features` as
-      equally mandatory jobs
-- [ ] CI-2 Mandatory web CI runs installation from the lockfile, source lint
-      with warnings denied, unit tests and the production build; generated
-      `web/dist` is then compared with Git so stale embedded assets fail CI
-- [ ] CI-3 Scope web linting to source and test files, excluding generated
-      output and dependencies; fix both current source findings—the unnecessary
-      `capsRev` dependency in `Detail` and missing `switchBurn` dependency in
-      `Player`—rather than hiding them in generated-file noise
-- [ ] CI-4 Make integration tests hermetic. Every spawned Kahawai process uses
-      an explicit temporary configuration, data directory and isolated XDG
-      environment; no test reads an operator's real configuration
+- [~] CI-1 Pull-request CI defines separate mandatory Ubuntu 26.04 jobs for
+      `cargo fmt --all --check`, locked workspace clippy with warnings denied,
+      the complete locked workspace tests and the locked no-default build. The
+      same commands exited 0 locally on 2026-08-08; the first clean hosted run
+      and required-branch configuration remain to be inspected
+- [~] CI-2 Mandatory Ubuntu 26.04 web CI installs from the lockfile, lints with
+      warnings denied, runs unit tests and the production build, then compares
+      generated `web/dist` with Git. All four operations completed locally on
+      2026-08-08 and the rebuilt bundle is staged in this change; the first clean
+      hosted run and required-branch configuration remain to be inspected
+- [~] CI-3 Web lint is scoped to `src` and `test`, excluding generated output
+      and dependencies. The stale `capsRev` calculation and `switchBurn`
+      callback capture were corrected rather than suppressed, and lint exited 0
+      locally on 2026-08-08. The first clean hosted lint job remains
+- [~] CI-4 Worker integration tests now remove inherited `KAHAWAI_*` settings
+      and give every spawned process an explicit temporary configuration, state
+      directories and isolated XDG environment. The logs from both ordinary and
+      strict full-workspace runs on 2026-08-08 show only temporary configuration
+      paths and all three worker tests passed; the hosted run remains
 - [ ] CI-5 Test account deletion, demotion and password reset across immediate
       restart; atomic concurrent refresh, token-family replay, browser/API
       logout, cookie attributes, Origin checks and absence of browser-stored
@@ -461,9 +476,14 @@ matrix rather than being dismissed as post-MVP cleanup.
       read-only media mount guidance and explicit writable state mounts. Every
       target uses the same Kahawai binary; the all-in-one target retains one
       parent process containing all three modules, with supervised job children
-- [ ] OPS-RDY-8 Produce and smoke-test Linux amd64 and arm64 images; pin base
-      images and CI actions, attach OCI metadata, SBOM and provenance, and sign
-      release artifacts
+- [~] OPS-RDY-8 The tag-driven release workflow defines native Ubuntu 26.04
+      amd64 and arm64 image builds, strict media gates, exact-digest smoke tests,
+      OCI metadata, SBOM/provenance, a gated multi-architecture manifest and
+      checksummed stamped source plus explicitly unsupported bare binaries. On
+      2026-08-08 the local amd64 production image built from the gated stage and
+      its smoke test scanned a generated clip and played five HLS segments. The
+      first hosted two-architecture release must still be inspected; base
+      image/action digest pinning and artifact signing remain
 - [ ] OPS-RDY-9 Publish a modular Compose example and a release runbook covering
       reverse proxy TLS, trusted proxies, persistent paths, ownership, upgrade,
       rollback and backup/restore drills
