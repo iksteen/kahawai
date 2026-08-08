@@ -11,11 +11,12 @@
 # can present a plausible id and a plausible length, and the failure then
 # lands on a fatal path instead of the recovering one.
 #
-# This fixture writes a valid file and then overwrites one Cluster
+# This fixture writes a valid file and then overwrites the penultimate Cluster
 # Timestamp's body with a length that no unsigned integer may have (EBML
 # allows at most 8 bytes), leaving the id and the length field readable.
-# That is what a hole in a download looks like from the parser's side,
-# and it is what the affected library file does at every 1 MiB boundary.
+# The final Cluster is left intact as the guaranteed resync target. That
+# is what a hole in a download looks like from the parser's side, and it
+# is what the affected library file does at every 1 MiB boundary.
 #
 #   python3 0009-…-repro-1.py
 #   GST_PLUGIN_PATH=/path/to/patched python3 0009-…-repro-1.py
@@ -37,7 +38,7 @@ from gi.repository import Gst  # noqa: E402
 Gst.init(None)
 
 SEGMENT, CLUSTER, TIMESTAMP = 0x18538067, 0x1F43B675, 0xE7
-SECONDS = 4
+SECONDS = 8
 
 
 def read_id(buf, off):
@@ -84,20 +85,23 @@ def mux(path):
 
 
 def damage(path):
-    """Give the SECOND cluster's Timestamp a body no uint may have.
+    """Give the penultimate cluster's Timestamp a body no uint may have.
 
     The id and the length field stay readable on purpose: this is the
     case the header-level resync cannot see, because nothing about the
-    header is wrong.
+    header is wrong. Requiring three clusters avoids first-cluster setup
+    semantics, and damaging the penultimate leaves exactly one guaranteed
+    later Cluster for the patched demuxer to find.
     """
     buf = bytearray(open(path, "rb").read())
     seg = next(k for k in children(buf, 0, len(buf)) if k[1] == SEGMENT)
     kids = list(children(buf, seg[0] + seg[2], seg[0] + seg[2] + seg[3]))
     clusters = [k for k in kids if k[1] == CLUSTER]
-    if len(clusters) < 2:
+    if len(clusters) < 3:
         sys.exit("fixture has too few clusters; raise SECONDS")
 
-    c_off, _, c_hdr, c_size = clusters[1]
+    cluster_index = len(clusters) - 2
+    c_off, _, c_hdr, c_size = clusters[cluster_index]
     ts = next(k for k in children(buf, c_off + c_hdr, c_off + c_hdr + c_size)
               if k[1] == TIMESTAMP)
     ts_off = ts[0]
@@ -112,7 +116,7 @@ def damage(path):
         sys.exit("fixture too small to damage; raise SECONDS")
     buf[ts_off:ts_off + 2] = bytes([TIMESTAMP, 0x80 | body])
     open(path, "wb").write(buf)
-    return body
+    return body, len(clusters), cluster_index + 1
 
 
 def demux_pushed(path):
@@ -182,9 +186,10 @@ def main():
     path = os.path.join(out, "damaged.mkv")
 
     mux(path)
-    body = damage(path)
+    body, cluster_count, damaged_cluster = damage(path)
     print(f"fixture: {path} ({os.path.getsize(path)} bytes), "
-          f"cluster 2 Timestamp body forced to {body} bytes")
+          f"{cluster_count} clusters, cluster {damaged_cluster} Timestamp "
+          f"body forced to {body} bytes")
 
     pads, err = demux_pushed(path)
     # No pads means nothing was demuxed, so neither verdict is evidence.
