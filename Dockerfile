@@ -46,7 +46,15 @@ ENV CARGO_HOME=/usr/local/cargo \
 # and the distro's headers would be what everything later links
 # against.
 ARG DEBIAN_FRONTEND=noninteractive
-RUN sed -i 's/^Types: deb$/Types: deb deb-src/' /etc/apt/sources.list.d/ubuntu.sources \
+# Ubuntu Resolute publishes libvpl-dev only for amd64:
+# https://packages.ubuntu.com/libvpl-dev
+RUN set -eux; \
+    arch="$(dpkg --print-architecture)"; \
+    intel_build_packages=""; \
+    if [ "$arch" = amd64 ]; then \
+        intel_build_packages="libvpl-dev"; \
+    fi; \
+    sed -i 's/^Types: deb$/Types: deb deb-src/' /etc/apt/sources.list.d/ubuntu.sources \
     && apt-get update \
     && apt-get build-dep -y --no-install-recommends \
         gstreamer1.0 gst-plugins-base1.0 gst-plugins-good1.0 \
@@ -54,8 +62,9 @@ RUN sed -i 's/^Types: deb$/Types: deb deb-src/' /etc/apt/sources.list.d/ubuntu.s
     && apt-get install -y --no-install-recommends \
         bison build-essential ca-certificates clang cmake ffmpeg flex git meson \
         nasm ninja-build pkg-config protobuf-compiler python3 python3-gi \
-        libvpl-dev libsvtav1enc-dev libaom-dev libdav1d-dev libfdk-aac-dev \
+        libsvtav1enc-dev libaom-dev libdav1d-dev libfdk-aac-dev \
         libleptonica-dev libtesseract-dev tesseract-ocr-eng \
+        $intel_build_packages \
     && rm -rf /var/lib/apt/lists/*
 
 # The upstream fixes this image carries, with their reports and
@@ -91,7 +100,12 @@ RUN git clone --depth 1 --branch "$GSTREAMER_VERSION" \
 # The plugins kahawai cannot work without are named explicitly, so a
 # missing dependency fails this build instead of becoming a missing
 # element at runtime.
-RUN meson setup /tmp/gst-build /tmp/gstreamer \
+RUN set -eux; \
+    arch="$(dpkg --print-architecture)"; \
+    # The qsv plugin embeds oneVPL, so it must follow the package selection above.
+    qsv=disabled; \
+    if [ "$arch" = amd64 ]; then qsv=enabled; fi; \
+    meson setup /tmp/gst-build /tmp/gstreamer \
         --buildtype=release --prefix=/usr/local --libdir=lib \
         --wrap-mode=nodownload \
         -Dgpl=enabled \
@@ -106,7 +120,7 @@ RUN meson setup /tmp/gst-build /tmp/gstreamer \
         -Dgst-plugins-bad:videoparsers=enabled -Dgst-plugins-bad:codectimestamper=enabled \
         -Dgst-plugins-bad:mpegtsdemux=enabled -Dgst-plugins-bad:mpegtsmux=enabled \
         -Dgst-plugins-bad:assrender=enabled -Dgst-plugins-bad:nvcodec=enabled \
-        -Dgst-plugins-bad:va=enabled -Dgst-plugins-bad:qsv=enabled \
+        -Dgst-plugins-bad:va=enabled -Dgst-plugins-bad:qsv="$qsv" \
         -Dgst-plugins-bad:v4l2codecs=enabled \
         -Dgst-plugins-ugly:x264=enabled -Dgst-plugins-ugly:a52dec=enabled \
         -Dgst-plugins-ugly:mpeg2dec=enabled -Dgst-plugins-ugly:dvdread=enabled \
