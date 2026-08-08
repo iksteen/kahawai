@@ -399,25 +399,27 @@ matrix rather than being dismissed as post-MVP cleanup.
 
 ## Continuous integration and test coverage (CI)
 
-- [~] CI-1 Pull-request CI defines separate mandatory Ubuntu 26.04 jobs for
+- [x] CI-1 CI runs on direct pushes to `master` and on pull requests for
+      third-party contributions, with separate Ubuntu 26.04 jobs for
       `cargo fmt --all --check`, locked workspace clippy with warnings denied,
       the complete locked workspace tests and the locked no-default build. The
-      same commands exited 0 locally on 2026-08-08; the first clean hosted run
-      and required-branch configuration remain to be inspected
-- [~] CI-2 Mandatory Ubuntu 26.04 web CI installs from the lockfile, lints with
-      warnings denied, runs unit tests and the production build, then compares
-      generated `web/dist` with Git. All four operations completed locally on
-      2026-08-08 and the rebuilt bundle is staged in this change; the first clean
-      hosted run and required-branch configuration remain to be inspected
-- [~] CI-3 Web lint is scoped to `src` and `test`, excluding generated output
+      commands exited 0 locally and in the hosted run for `ad8e764` on
+      2026-08-08
+- [x] CI-2 Ubuntu 26.04 web CI runs on direct pushes to `master` and pull
+      requests, installs from the lockfile, lints with warnings denied, runs
+      unit tests and the production build, then compares generated `web/dist`
+      with Git. All operations completed locally and in the hosted run for
+      `ad8e764` on 2026-08-08
+- [x] CI-3 Web lint is scoped to `src` and `test`, excluding generated output
       and dependencies. The stale `capsRev` calculation and `switchBurn`
       callback capture were corrected rather than suppressed, and lint exited 0
-      locally on 2026-08-08. The first clean hosted lint job remains
-- [~] CI-4 Worker integration tests now remove inherited `KAHAWAI_*` settings
+      locally and in the hosted run for `ad8e764` on 2026-08-08
+- [x] CI-4 Worker integration tests remove inherited `KAHAWAI_*` settings
       and give every spawned process an explicit temporary configuration, state
       directories and isolated XDG environment. The logs from both ordinary and
       strict full-workspace runs on 2026-08-08 show only temporary configuration
-      paths and all three worker tests passed; the hosted run remains
+      paths, and all three worker tests also passed in the hosted run for
+      `ad8e764`
 - [ ] CI-5 Test account deletion, demotion and password reset across immediate
       restart; atomic concurrent refresh, token-family replay, browser/API
       logout, cookie attributes, Origin checks and absence of browser-stored
