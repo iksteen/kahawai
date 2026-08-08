@@ -22,6 +22,7 @@
 #
 # Exits 0 when the plugin is fixed, 1 when the bug reproduces.
 import os
+import ctypes
 import subprocess
 import sys
 import tempfile
@@ -65,10 +66,111 @@ def framemd5_gst(path, decoder):
     return [l.split()[-1] for l in ff.stdout.splitlines() if l and not l.startswith("#")]
 
 
+def parser_result(path):
+    """Exercise the parser directly when no device decoder is exposed.
+
+    The patched structure is larger than the distro's introspection metadata,
+    so using PyGObject here would allocate the old, too-small SliceHdr. Keep the
+    NAL ABI explicit and give SliceHdr a deliberately oversized opaque buffer.
+    This also makes the reproducer useful on headless CI runners.
+    """
+
+    class Nalu(ctypes.Structure):
+        _fields_ = [
+            ("ref_idc", ctypes.c_uint16),
+            ("type", ctypes.c_uint16),
+            ("idr_pic_flag", ctypes.c_uint8),
+            ("size", ctypes.c_uint32),
+            ("offset", ctypes.c_uint32),
+            ("sc_offset", ctypes.c_uint32),
+            ("valid", ctypes.c_int),
+            ("data", ctypes.c_void_p),
+            ("header_bytes", ctypes.c_uint8),
+            ("extension_type", ctypes.c_uint8),
+            ("extension", ctypes.c_uint8 * 6),
+        ]
+
+    if ctypes.sizeof(Nalu) != 40:
+        raise RuntimeError("unsupported GstH264NalUnit ABI")
+
+    lib = ctypes.CDLL("libgstcodecparsers-1.0.so.0")
+    lib.gst_h264_nal_parser_new.restype = ctypes.c_void_p
+    lib.gst_h264_parser_identify_nalu.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_uint8),
+        ctypes.c_uint,
+        ctypes.c_size_t,
+        ctypes.POINTER(Nalu),
+    ]
+    lib.gst_h264_parser_parse_nal.argtypes = [ctypes.c_void_p, ctypes.POINTER(Nalu)]
+    lib.gst_h264_parser_parse_slice_hdr.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(Nalu),
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_int,
+    ]
+    lib.gst_h264_nal_parser_free.argtypes = [ctypes.c_void_p]
+
+    raw = open(path, "rb").read()
+    data = (ctypes.c_uint8 * len(raw)).from_buffer_copy(raw)
+    parser = lib.gst_h264_nal_parser_new()
+    if not parser:
+        raise RuntimeError("gst_h264_nal_parser_new() failed")
+
+    offset = 0
+    slices = 0
+    failures = 0
+    try:
+        while offset < len(raw):
+            nalu = Nalu()
+            result = lib.gst_h264_parser_identify_nalu(
+                parser, data, offset, len(raw), ctypes.byref(nalu)
+            )
+            # NO_NAL_END is valid for the final Annex-B NAL in this complete file.
+            if result not in (0, 5):
+                raise RuntimeError(f"identify_nalu failed at {offset}: {result}")
+            if nalu.type in (7, 8):
+                result = lib.gst_h264_parser_parse_nal(parser, ctypes.byref(nalu))
+                if result != 0:
+                    raise RuntimeError(f"parameter-set parse failed: {result}")
+            elif nalu.type in (1, 5):
+                # Patched GstH264SliceHdr is ~2 KiB on 64-bit platforms. The
+                # extra room avoids importing stale struct sizes from the
+                # system typelib while retaining canary-safe storage.
+                slice_header = (ctypes.c_uint8 * 4096)()
+                result = lib.gst_h264_parser_parse_slice_hdr(
+                    parser, ctypes.byref(nalu), slice_header, 0, 1
+                )
+                slices += 1
+                failures += result != 0
+
+            next_offset = nalu.offset + nalu.size
+            if next_offset <= offset:
+                raise RuntimeError("identify_nalu made no progress")
+            offset = next_offset
+    finally:
+        lib.gst_h264_nal_parser_free(parser)
+
+    return slices, failures
+
+
 tmp = tempfile.mkdtemp()
 stream = os.path.join(tmp, "mmco.h264")
 make_stream(stream)
 print("fixture: %d bytes, %s" % (os.path.getsize(stream), DECODER))
+
+decoder_available = subprocess.run(
+    ["gst-inspect-1.0", DECODER], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+).returncode == 0
+if not decoder_available:
+    slices, failures = parser_result(stream)
+    print("  direct parser       : %d slices, %d parse failures" % (slices, failures))
+    if slices != FRAMES or failures:
+        print("REPRODUCED: the parser rejected a full dec_ref_pic_marking")
+        sys.exit(1)
+    print("not reproduced — the parser accepts a full dec_ref_pic_marking (patched)")
+    sys.exit(0)
 
 ref = framemd5_reference(stream)
 got = framemd5_gst(stream, DECODER)

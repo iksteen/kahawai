@@ -3,6 +3,8 @@
 # they are the ones loading.
 #
 #   kahawai-gst-plugins.sh verify    # are the patches live? (default)
+#   kahawai-gst-plugins.sh verify --library-dir /usr/local/lib \
+#       --plugin-dir /usr/local/lib/gstreamer-1.0 --exclusive
 #   kahawai-gst-plugins.sh build     # rebuild everything and reinstall
 #
 # Why this exists: the plugins on a dev box drift. They were last built
@@ -35,6 +37,9 @@ RS_PATCHES="$REPO/patches/gst-plugins-rs"
 # The one directory this script owns. Kahawai-only on purpose: invisible
 # to every other GStreamer program on the box.
 KAHAWAI_GST="$HOME/.local/lib/kahawai-gst"
+VERIFY_LIBRARY_DIR="$KAHAWAI_GST/lib"
+VERIFY_PLUGIN_DIR="$KAHAWAI_GST/plugins"
+VERIFY_EXCLUSIVE=""
 # GStreamer's own per-user directory. READ ONLY, and only to warn: it is
 # the user's, nothing here writes to it or removes from it. It is worth
 # looking at because it takes PRECEDENCE over GST_PLUGIN_PATH, so a copy
@@ -83,6 +88,14 @@ require_version() {
 
 verify() {
     local version live=0 missing=0 skipped=0
+    export GST_PLUGIN_PATH="$VERIFY_PLUGIN_DIR${GST_PLUGIN_PATH:+:$GST_PLUGIN_PATH}"
+    export LD_LIBRARY_PATH="$VERIFY_LIBRARY_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    if [ -n "$VERIFY_EXCLUSIVE" ]; then
+        export GST_PLUGIN_SYSTEM_PATH_1_0="$VERIFY_PLUGIN_DIR"
+        local registry_dir
+        registry_dir="$(mktemp -d -t kahawai-gst-registry-XXXXXX)"
+        export GST_REGISTRY="$registry_dir/registry.bin"
+    fi
     version="$(gst_version)"; require_version "$version"
     echo "system GStreamer: $version"
 
@@ -91,7 +104,7 @@ verify() {
     # verdicts below would describe it rather than our build. Said, not
     # touched: removing it is the owner's call.
     local clash=0 so
-    for so in "$KAHAWAI_GST"/plugins/*.so; do
+    for so in "$VERIFY_PLUGIN_DIR"/*.so; do
         [ -e "$so" ] || continue
         if [ -e "$USER_PLUGINS/$(basename "$so")" ]; then
             [ "$clash" = 0 ] && echo && echo "WARNING: $USER_PLUGINS also has, and it wins —"
@@ -102,51 +115,62 @@ verify() {
     [ "$clash" = 1 ] && echo "         the verdicts below may describe those, not this build"
     echo
 
-    export GST_PLUGIN_PATH="$KAHAWAI_GST/plugins${GST_PLUGIN_PATH:+:$GST_PLUGIN_PATH}"
-    export LD_LIBRARY_PATH="$KAHAWAI_GST/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-
     local patch
     for patch in "$PATCHES"/*.patch "$RS_PATCHES"/*.patch; do
         [ -e "$patch" ] || continue
-        local n name repro out rc dir
+        local n name dir patch_failed=0 ran=0 repro out rc
         dir="$(dirname "$patch")"
         n="$(basename "$patch" | cut -c1-4)"
         name="$(basename "$patch" .patch | cut -c6-)"
-        repro="$(ls "$dir/$n"-*-repro-1.py 2>/dev/null | head -1)"
-        if [ -z "$repro" ]; then
+        for repro in "$dir/$n"-*-repro-*.py; do
+            [ -e "$repro" ] || continue
+            ran=$((ran + 1))
+            out="$(mktemp -d)"
+            local log="$out/run.log"
+            # No arguments: the reproducers do not share one. Most take an
+            # output directory, 0003 takes a size in MiB, and handing a path
+            # to that one crashes it — which then reads as a missing patch.
+            ( cd "$out" && python3 "$repro" ) >"$log" 2>&1
+            rc=$?
+            # A reproducer that dies on its own fixture also exits non-zero,
+            # which would read as "patch missing". Keep that verdict distinct.
+            local crashed=0
+            grep -q 'Traceback (most recent call last)' "$log" && crashed=1
+            if [ "$crashed" = 1 ]; then
+                printf '  %s  %-43s %-8s INCONCLUSIVE (reproducer crashed)\n' \
+                    "$n" "${name:0:43}" "$(basename "$repro" | sed -n 's/.*-repro-\([0-9]*\)\.py/repro-\1/p')"
+                patch_failed=1
+            elif [ "$rc" = 0 ]; then
+                printf '  %s  %-43s %-8s LIVE\n' \
+                    "$n" "${name:0:43}" "$(basename "$repro" | sed -n 's/.*-repro-\([0-9]*\)\.py/repro-\1/p')"
+            else
+                printf '  %s  %-43s %-8s MISSING\n' \
+                    "$n" "${name:0:43}" "$(basename "$repro" | sed -n 's/.*-repro-\([0-9]*\)\.py/repro-\1/p')"
+                patch_failed=1
+            fi
+            rm -rf "$out"
+        done
+        if [ "$ran" -eq 0 ]; then
             printf '  %s  %-52s no reproducer\n' "$n" "${name:0:52}"
             skipped=$((skipped + 1))
             continue
         fi
-        out="$(mktemp -d)"
-        local log="$out/run.log"
-        # No arguments: the reproducers do not share one. Most take an
-        # output directory, 0003 takes a size in MiB, and handing a path
-        # to that one crashes it — which then reads as a missing patch.
-        ( cd "$out" && python3 "$repro" ) >"$log" 2>&1
-        rc=$?
-        # A reproducer that dies on its own fixture also exits non-zero,
-        # which would read as "patch missing" and send someone rebuilding
-        # plugins that were fine. Call that out instead of counting it.
-        local crashed=0
-        grep -q 'Traceback (most recent call last)' "$log" && crashed=1
-        rm -rf "$out"
-        if [ "$crashed" = 1 ]; then
-            printf '  %s  %-52s INCONCLUSIVE (reproducer crashed)\n' "$n" "${name:0:52}"
+        if [ "$patch_failed" = 1 ]; then
             missing=$((missing + 1))
-        elif [ "$rc" = 0 ]; then
-            printf '  %s  %-52s LIVE\n' "$n" "${name:0:52}"; live=$((live + 1))
         else
-            printf '  %s  %-52s MISSING\n' "$n" "${name:0:52}"; missing=$((missing + 1))
+            live=$((live + 1))
         fi
     done
 
     echo
     echo "live=$live missing=$missing no-reproducer=$skipped"
-    [ "$missing" -eq 0 ] || {
+    if [ "$missing" -ne 0 ] || [ "$skipped" -ne 0 ]; then
         echo "run '$(basename "$0") build' to rebuild the plugins from patches/" >&2
         return 1
-    }
+    fi
+    if [ -n "${registry_dir:-}" ]; then
+        rm -rf "$registry_dir"
+    fi
 }
 
 # ----------------------------------------------------------------- build
@@ -318,8 +342,19 @@ build_hlssink3() {
     rm -rf "$rs"
 }
 
-case "${1:-verify}" in
+action="${1:-verify}"
+[ "$#" -gt 0 ] && shift
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --library-dir) [ "$#" -ge 2 ] || die "--library-dir needs a path"; VERIFY_LIBRARY_DIR="$2"; shift 2 ;;
+        --plugin-dir) [ "$#" -ge 2 ] || die "--plugin-dir needs a path"; VERIFY_PLUGIN_DIR="$2"; shift 2 ;;
+        --exclusive) VERIFY_EXCLUSIVE=1; shift ;;
+        *) die "unknown argument: $1" ;;
+    esac
+done
+
+case "$action" in
     verify) verify ;;
-    build)  build ;;
-    *) echo "usage: $(basename "$0") [verify|build]" >&2; exit 2 ;;
+    build)  [ -z "$VERIFY_EXCLUSIVE" ] || die "--exclusive is verify-only"; build ;;
+    *) echo "usage: $(basename "$0") [verify|build] [--library-dir DIR --plugin-dir DIR --exclusive]" >&2; exit 2 ;;
 esac
