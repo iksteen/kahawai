@@ -114,6 +114,8 @@ fn test_router(
 /// `db` and `subs_dir` come back so a test can look for the artefacts
 /// QUERY must NOT have produced.
 struct Fx {
+    // Keep this bound for the whole test. Dropping it unlinks hub.db while
+    // the router's lazy SQLite pool is still using the directory.
     _dir: tempfile::TempDir,
     api: axum::Router,
     bearer: String,
@@ -201,7 +203,11 @@ async fn json_of(resp: axum::response::Response) -> serde_json::Value {
 #[tokio::test]
 async fn query_returns_the_item_and_what_it_would_be_served() {
     let Fx {
-        api, bearer, id, ..
+        _dir,
+        api,
+        bearer,
+        id,
+        ..
     } = fixture().await;
     let profile = r#"{"profile":{"containers":["mp4"],
         "video":[{"codec":"h264"}],"audio":["aac"],
@@ -244,7 +250,7 @@ async fn query_returns_the_item_and_what_it_would_be_served() {
 /// would not. Getting the wrong one serves item data unauthenticated.
 #[tokio::test]
 async fn query_without_a_token_is_refused() {
-    let Fx { api, id, .. } = fixture().await;
+    let Fx { _dir, api, id, .. } = fixture().await;
     let resp = api
         .oneshot(query(
             &format!("/api/v1/items/{id}"),
@@ -262,7 +268,11 @@ async fn query_without_a_token_is_refused() {
 #[tokio::test]
 async fn an_unsupported_method_still_says_what_is_allowed() {
     let Fx {
-        api, bearer, id, ..
+        _dir,
+        api,
+        bearer,
+        id,
+        ..
     } = fixture().await;
     let resp = api
         .oneshot(
@@ -285,7 +295,11 @@ async fn an_unsupported_method_still_says_what_is_allowed() {
 #[tokio::test]
 async fn a_query_without_a_json_content_type_is_refused() {
     let Fx {
-        api, bearer, id, ..
+        _dir,
+        api,
+        bearer,
+        id,
+        ..
     } = fixture().await;
     for ctype in [None, Some("text/plain")] {
         let resp = api
@@ -320,6 +334,7 @@ async fn a_query_without_a_json_content_type_is_refused() {
 #[tokio::test]
 async fn query_rasterises_nothing() {
     let Fx {
+        _dir,
         api,
         bearer,
         id,
@@ -362,6 +377,11 @@ async fn query_rasterises_nothing() {
     assert_eq!(resp.status(), 200);
     let j = json_of(resp).await;
     let n = &j["negotiated"];
+    assert!(
+        n.is_object(),
+        "the connected fixture must have a negotiation: {}",
+        j["unavailable"]
+    );
     assert_ne!(n["cost"], "unplayable", "nothing to rasterise FOR: {n}");
     let subs = n["subtitles"].as_array().unwrap();
     assert_eq!(subs.len(), 1, "the ASS track must be listed: {j}");
