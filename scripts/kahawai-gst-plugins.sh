@@ -139,6 +139,7 @@ verify() {
             if [ "$crashed" = 1 ]; then
                 printf '  %s  %-43s %-8s INCONCLUSIVE (reproducer crashed)\n' \
                     "$n" "${name:0:43}" "$(basename "$repro" | sed -n 's/.*-repro-\([0-9]*\)\.py/repro-\1/p')"
+                sed 's/^/      /' "$log" >&2
                 patch_failed=1
             elif [ "$rc" = 0 ]; then
                 printf '  %s  %-43s %-8s LIVE\n' \
@@ -146,6 +147,7 @@ verify() {
             else
                 printf '  %s  %-43s %-8s MISSING\n' \
                     "$n" "${name:0:43}" "$(basename "$repro" | sed -n 's/.*-repro-\([0-9]*\)\.py/repro-\1/p')"
+                sed 's/^/      /' "$log" >&2
                 patch_failed=1
             fi
             rm -rf "$out"
