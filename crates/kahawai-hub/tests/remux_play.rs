@@ -24,6 +24,9 @@ async fn body_bytes(resp: axum::response::Response) -> Vec<u8> {
 
 #[tokio::test]
 async fn remux_to_hls_end_to_end() {
+    if !kahawai_media::testutil::require_h264_aac_fixture() {
+        return;
+    }
     // A real MKV (h264 + AAC) in a collection root.
     let root = tempfile::tempdir().unwrap();
     let mkv = root.path().join("Heat (1995).mkv");

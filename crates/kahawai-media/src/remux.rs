@@ -295,7 +295,15 @@ fn set_encoder_threads_on(enc: &gst::Element, name: &str, n: u32) {
     match name {
         "x264enc" | "av1enc" | "rav1enc" => set_prop_str_if_present(enc, "threads", &n.to_string()),
         "openh264enc" => set_prop_str_if_present(enc, "multi-thread", &n.to_string()),
-        "svtav1enc" => set_prop_str_if_present(enc, "level-of-parallelism", &n.to_string()),
+        // SVT-AV1 renamed this when its 3.0 API landed. GStreamer 1.28
+        // exposes `logical-processors`; newer releases expose
+        // `level-of-parallelism`. Prefer the new spelling, but support
+        // the pinned release image as well.
+        "svtav1enc" => {
+            if let Some(prop) = svtav1_thread_property(enc) {
+                set_prop_str_if_present(enc, prop, &n.to_string());
+            }
+        }
         "x265enc" => set_prop_str_if_present(enc, "option-string", &format!("pools={n}")),
         // Hardware, or an encoder we have never measured a knob on.
         _ => return,
@@ -305,6 +313,12 @@ fn set_encoder_threads_on(enc: &gst::Element, name: &str, n: u32) {
         threads = n,
         "software encoder thread ceiling applied"
     );
+}
+
+fn svtav1_thread_property(enc: &gst::Element) -> Option<&'static str> {
+    ["level-of-parallelism", "logical-processors"]
+        .into_iter()
+        .find(|name| enc.find_property(name).is_some())
 }
 
 /// The converter chain that feeds an encoder, by encoder family. The
@@ -4052,8 +4066,7 @@ mod multipart {
     #[test]
     fn resuming_inside_the_first_part_reports_its_own_start() {
         crate::init().unwrap();
-        if !crate::testutil::has_element("fdkaacenc") {
-            eprintln!("no fdkaacenc; skipped");
+        if !crate::testutil::require_elements(&["fdkaacenc"]) {
             return;
         }
         let dir = tempfile::tempdir().unwrap();
@@ -4107,8 +4120,7 @@ mod multipart {
     #[test]
     fn two_parts_render_as_one_continuous_playlist() {
         crate::init().unwrap();
-        if !crate::testutil::has_element("fdkaacenc") {
-            eprintln!("no fdkaacenc; skipped");
+        if !crate::testutil::require_elements(&["fdkaacenc"]) {
             return;
         }
         let dir = tempfile::tempdir().unwrap();
@@ -4339,6 +4351,7 @@ mod concat_spike {
             .flatten()
             .collect();
         if targets.is_empty() {
+            crate::testutil::not_applicable("no verified video encoder to test tone mapping");
             return; // no video encoder on this box; nothing to claim
         }
         let any = targets.iter().any(|e| tonemap_into(e));
@@ -4385,11 +4398,8 @@ mod concat_spike {
     #[test]
     fn the_first_segment_is_independently_decodable() {
         crate::init().unwrap();
-        for el in ["hlssink3", "x264enc"] {
-            if gst::ElementFactory::find(el).is_none() {
-                eprintln!("no {el}; skipped");
-                return;
-            }
+        if !crate::testutil::require_elements(&["hlssink3", "x264enc"]) {
+            return;
         }
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("hls");
@@ -4457,11 +4467,8 @@ mod concat_spike {
     #[test]
     fn segments_run_one_gop_each() {
         crate::init().unwrap();
-        for el in ["hlssink3", "x264enc"] {
-            if gst::ElementFactory::find(el).is_none() {
-                eprintln!("no {el}; skipped");
-                return;
-            }
+        if !crate::testutil::require_elements(&["hlssink3", "x264enc"]) {
+            return;
         }
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("hls");
@@ -4540,11 +4547,8 @@ mod concat_spike {
     #[test]
     fn a_stale_playlist_releases_a_shut_pacing_window() {
         crate::init().unwrap();
-        for el in ["hlssink3", "x264enc"] {
-            if gst::ElementFactory::find(el).is_none() {
-                eprintln!("no {el}; skipped");
-                return;
-            }
+        if !crate::testutil::require_elements(&["hlssink3", "x264enc"]) {
+            return;
         }
 
         // Returns (reached EOS, segments listed).
@@ -4677,8 +4681,7 @@ mod concat_spike {
     #[test]
     fn concat_over_appsrc_yields_one_continuous_playlist() {
         crate::init().unwrap();
-        if gst::ElementFactory::find("hlssink3").is_none() {
-            eprintln!("no hlssink3; skipped");
+        if !crate::testutil::require_elements(&["hlssink3"]) {
             return;
         }
         let dir = tempfile::tempdir().unwrap();
@@ -4871,14 +4874,25 @@ mod tests {
             ("openh264enc", "multi-thread", "3"),
             ("av1enc", "threads", "3"),
             ("rav1enc", "threads", "3"),
-            ("svtav1enc", "level-of-parallelism", "3"),
+            // Resolved below: GStreamer 1.28 uses `logical-processors`,
+            // while releases built against SVT-AV1 3 use
+            // `level-of-parallelism`.
+            ("svtav1enc", "", "3"),
             ("x265enc", "option-string", "pools=3"),
         ];
         let mut checked = 0;
-        for (name, prop, want) in cases {
+        for (name, configured_prop, want) in cases {
             let Ok(enc) = gst::ElementFactory::make(name).build() else {
-                eprintln!("no {name}; skipped");
+                crate::testutil::not_applicable(&format!(
+                    "optional software encoder {name} is not installed"
+                ));
                 continue;
+            };
+            let prop = if *name == "svtav1enc" {
+                super::svtav1_thread_property(&enc)
+                    .expect("svtav1enc has no recognized thread-control property")
+            } else {
+                *configured_prop
             };
             super::set_encoder_threads_on(&enc, name, 3);
             let v = enc.property_value(prop);
@@ -4961,7 +4975,7 @@ mod tests {
     fn selects_requested_audio_track() {
         crate::init().unwrap();
         let Some(aac) = aac_encoder() else {
-            eprintln!("skipping: no AAC encoder installed");
+            crate::testutil::require(false, "verified AAC encoder");
             return;
         };
         // Two AAC tracks distinguishable by channel count: 0 = stereo,
@@ -5267,8 +5281,7 @@ mod tests {
     #[test]
     fn a_source_smaller_than_one_read_block_still_demuxes() {
         crate::init().unwrap();
-        if !crate::testutil::has_element("lamemp3enc") || !crate::testutil::has_element("x264enc") {
-            eprintln!("SKIP: no lamemp3enc/x264enc");
+        if !crate::testutil::require_elements(&["lamemp3enc", "x264enc"]) {
             return;
         }
         let dir = tempfile::tempdir().unwrap();
@@ -5308,8 +5321,7 @@ mod tests {
     #[test]
     fn a_dts_only_video_stream_still_reaches_the_muxer() {
         crate::init().unwrap();
-        if !crate::testutil::has_element("lamemp3enc") || !crate::testutil::has_element("x264enc") {
-            eprintln!("SKIP: no lamemp3enc/x264enc");
+        if !crate::testutil::require_elements(&["lamemp3enc", "x264enc"]) {
             return;
         }
         let dir = tempfile::tempdir().unwrap();
@@ -5381,6 +5393,9 @@ mod tests {
     #[test]
     fn remuxes_nonfaststart_mp4() {
         crate::init().unwrap();
+        if !crate::testutil::require_h264_aac_fixture() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let src_path = dir.path().join("in.mp4");
         crate::testutil::render_h264_aac_mp4(&src_path);
@@ -5411,16 +5426,14 @@ mod tests {
     #[test]
     fn transcodes_eac3_audio_to_aac() {
         crate::init().unwrap();
-        if !crate::testutil::has_element("avenc_eac3") {
-            eprintln!("skipping: no avenc_eac3 to build the fixture");
+        if !crate::testutil::require_elements(&["avenc_eac3"]) {
             return;
         }
         if muxable_names(SegmentFormat::Ts).contains("audio/x-eac3") {
-            eprintln!("skipping: this mpegtsmux muxes eac3 natively");
+            crate::testutil::not_applicable("mpegtsmux accepts E-AC-3 natively");
             return;
         }
-        if aac_encoder().is_none() {
-            eprintln!("skipping: no verified AAC encoder");
+        if !crate::testutil::require(aac_encoder().is_some(), "verified AAC encoder") {
             return;
         }
         let dir = tempfile::tempdir().unwrap();
@@ -5484,12 +5497,10 @@ mod tests {
     #[test]
     fn transcodes_mpeg4_video_to_h264() {
         crate::init().unwrap();
-        if !crate::testutil::has_element("avenc_mpeg4") {
-            eprintln!("skipping: no avenc_mpeg4 to build the fixture");
+        if !crate::testutil::require_elements(&["avenc_mpeg4"]) {
             return;
         }
-        if h264_encoder().is_none() {
-            eprintln!("skipping: no verified H.264 encoder");
+        if !crate::testutil::require(h264_encoder().is_some(), "verified H.264 encoder") {
             return;
         }
         let dir = tempfile::tempdir().unwrap();
@@ -5543,6 +5554,9 @@ mod tests {
     #[test]
     fn starts_at_offset() {
         crate::init().unwrap();
+        if !crate::testutil::require_h264_aac_fixture() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let src_path = dir.path().join("in.mkv");
         crate::testutil::render_h264_aac_mkv(&src_path); // 10 s fixture
@@ -5586,8 +5600,7 @@ mod tests {
     #[test]
     fn starts_at_offset_with_encode_branch() {
         crate::init().unwrap();
-        if aac_encoder().is_none() {
-            eprintln!("skipping: no verified AAC encoder");
+        if !crate::testutil::require(aac_encoder().is_some(), "verified AAC encoder") {
             return;
         }
         let dir = tempfile::tempdir().unwrap();
@@ -5638,8 +5651,10 @@ mod tests {
     #[test]
     fn encode_honors_scale_and_downmix() {
         crate::init().unwrap();
-        if h264_encoder().is_none() || aac_encoder().is_none() {
-            eprintln!("skipping: encoders unavailable");
+        if !crate::testutil::require(
+            h264_encoder().is_some() && aac_encoder().is_some(),
+            "verified H.264 and AAC encoders",
+        ) {
             return;
         }
         let dir = tempfile::tempdir().unwrap();
@@ -5808,8 +5823,11 @@ mod tests {
     #[test]
     fn fmp4_sink_produces_init_segments_and_playlist() {
         crate::init().unwrap();
-        if !crate::testutil::has_element("isofmp4mux") || h264_encoder().is_none() {
-            return; // doctor territory, not this test's
+        if !crate::testutil::require(
+            crate::testutil::elements_available(&["isofmp4mux"]) && h264_encoder().is_some(),
+            "isofmp4mux and a verified H.264 encoder",
+        ) {
+            return;
         }
         let dir = tempfile::tempdir().unwrap();
         let src_path = dir.path().join("in.mkv");
@@ -5884,7 +5902,10 @@ mod tests {
     #[test]
     fn fmp4_sink_offset_start() {
         crate::init().unwrap();
-        if !crate::testutil::has_element("isofmp4mux") || h264_encoder().is_none() {
+        if !crate::testutil::require(
+            crate::testutil::elements_available(&["isofmp4mux"]) && h264_encoder().is_some(),
+            "isofmp4mux and a verified H.264 encoder",
+        ) {
             return;
         }
         let dir = tempfile::tempdir().unwrap();
@@ -5940,7 +5961,7 @@ mod tests {
     #[test]
     fn fmp4_sink_carries_hevc_copy() {
         crate::init().unwrap();
-        if !crate::testutil::has_element("isofmp4mux") || !crate::testutil::has_element("x265enc") {
+        if !crate::testutil::require_elements(&["isofmp4mux", "x265enc"]) {
             return;
         }
         let dir = tempfile::tempdir().unwrap();
@@ -6077,8 +6098,10 @@ mod tests {
 
     fn ass_burn_testable() -> bool {
         crate::init().unwrap();
-        if h264_encoder().is_none() || !crate::testutil::has_element("assrender") {
-            eprintln!("skipping: no H.264 encoder or no assrender");
+        if !crate::testutil::require(
+            h264_encoder().is_some() && crate::testutil::elements_available(&["assrender"]),
+            "verified H.264 encoder and assrender",
+        ) {
             return false;
         }
         true
@@ -6238,8 +6261,7 @@ mod tests {
     #[test]
     fn an_offset_start_does_not_panic_the_fmp4_muxer() {
         crate::init().unwrap();
-        if !crate::testutil::has_element("isofmp4mux") || !crate::testutil::has_element("flacenc") {
-            eprintln!("skipping: no isofmp4mux/flacenc");
+        if !crate::testutil::require_elements(&["isofmp4mux", "flacenc"]) {
             return;
         }
         let dir = tempfile::tempdir().unwrap();
@@ -6361,11 +6383,12 @@ mod tests {
     #[test]
     fn channel_ceiling_downmixes_to_the_ceiling_not_mono() {
         crate::init().unwrap();
-        if h264_encoder().is_none()
-            || aac_encoder().is_none()
-            || !crate::testutil::has_element("fdkaacenc")
-        {
-            eprintln!("skipping: encoders unavailable");
+        if !crate::testutil::require(
+            h264_encoder().is_some()
+                && aac_encoder().is_some()
+                && crate::testutil::elements_available(&["fdkaacenc"]),
+            "verified H.264/AAC encoders and fdkaacenc",
+        ) {
             return;
         }
         let dir = tempfile::tempdir().unwrap();
@@ -6437,7 +6460,7 @@ mod tests {
     fn aac_layout_search_answers_with_something_the_encoder_takes() {
         crate::init().unwrap();
         let Some(enc) = aac_encoder() else {
-            eprintln!("skipping: no AAC encoder");
+            crate::testutil::require(false, "verified AAC encoder");
             return;
         };
         let (n, m) = aac_input_layout(enc, 8, 0xc3f, None).expect("no layout accepted for 7.1");
@@ -6466,8 +6489,10 @@ mod tests {
     #[test]
     fn unbounded_encode_keeps_the_source_layout_and_decodes() {
         crate::init().unwrap();
-        if aac_encoder().is_none() || !crate::testutil::has_element("fdkaacenc") {
-            eprintln!("skipping: encoders unavailable");
+        if !crate::testutil::require(
+            aac_encoder().is_some() && crate::testutil::elements_available(&["fdkaacenc"]),
+            "verified AAC encoder and fdkaacenc",
+        ) {
             return;
         }
         let dir = tempfile::tempdir().unwrap();
@@ -6536,11 +6561,12 @@ mod tests {
     #[test]
     fn tonemap_encode_outputs_sdr_tagged_video() {
         crate::init().unwrap();
-        if h264_encoder().is_none()
-            || !tonemap_available()
-            || !crate::testutil::has_element("x265enc")
-        {
-            eprintln!("skipping: encoder, GL tone-map segment, or x265enc unavailable");
+        if !crate::testutil::require(
+            h264_encoder().is_some()
+                && tonemap_available()
+                && crate::testutil::elements_available(&["x265enc"]),
+            "verified H.264 encoder, GL tone-map segment, and x265enc",
+        ) {
             return;
         }
         let dir = tempfile::tempdir().unwrap();
@@ -6617,6 +6643,9 @@ mod tests {
     #[test]
     fn remuxes_mkv_to_hls_without_reencoding() {
         crate::init().unwrap();
+        if !crate::testutil::require_h264_aac_fixture() {
+            return;
+        }
         // Fixture: h264 + AAC in MKV (both TS-compatible).
         let dir = tempfile::tempdir().unwrap();
         let src_path = dir.path().join("in.mkv");

@@ -20,6 +20,14 @@ fn home() -> Option<PathBuf> {
 }
 
 fn is_system_user() -> bool {
+    #[cfg(test)]
+    let root = std::env::var("KAHAWAI_TEST_EUID")
+        .map(|euid| euid == "0")
+        .unwrap_or_else(|_| {
+            // SAFETY: geteuid has no preconditions and cannot fail.
+            unsafe { libc::geteuid() == 0 }
+        });
+    #[cfg(not(test))]
     // SAFETY: geteuid has no preconditions and cannot fail.
     let root = unsafe { libc::geteuid() } == 0;
     root || home().is_none()
@@ -296,6 +304,9 @@ mod tests {
     fn defaults_without_file() {
         figment::Jail::expect_with(|jail| {
             // No kahawai.toml in the jail cwd; XDG resolution applies.
+            // Explicitly model an ordinary user so this remains hermetic
+            // when the test suite itself runs as root in the release image.
+            jail.set_env("KAHAWAI_TEST_EUID", "1000");
             jail.set_env("HOME", "/home/test");
             jail.set_env("XDG_DATA_HOME", "");
             jail.set_env("XDG_CONFIG_HOME", "");
@@ -319,6 +330,7 @@ mod tests {
     #[test]
     fn xdg_env_overrides_data_home() {
         figment::Jail::expect_with(|jail| {
+            jail.set_env("KAHAWAI_TEST_EUID", "1000");
             jail.set_env("HOME", "/home/test");
             jail.set_env("XDG_DATA_HOME", "/custom/data");
             let (cfg, _) = load(None).unwrap();

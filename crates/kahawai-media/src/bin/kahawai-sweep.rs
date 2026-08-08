@@ -716,11 +716,8 @@ mod tests {
         use gstreamer::prelude::*;
 
         kahawai_media::init().unwrap();
-        for el in ["x264enc", "mpegtsmux"] {
-            if gstreamer::ElementFactory::find(el).is_none() {
-                eprintln!("no {el}; skipped");
-                return;
-            }
+        if !kahawai_media::testutil::require_elements(&["x264enc", "mpegtsmux"]) {
+            return;
         }
         let dir = tempfile::tempdir().unwrap();
         let ts = dir.path().join("clip.ts");

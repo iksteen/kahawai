@@ -74,6 +74,9 @@ fn json(bytes: Vec<u8>) -> serde_json::Value {
 
 #[tokio::test]
 async fn negotiation_picks_cheapest_source_and_honors_caps() {
+    if !kahawai_media::testutil::require_h264_aac_fixture() {
+        return;
+    }
     // Two real files of the same movie: an MSE-friendly mp4 and an MKV.
     let root = tempfile::tempdir().unwrap();
     let mp4 = root.path().join("Heat (1995).mp4");

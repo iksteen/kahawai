@@ -2057,8 +2057,7 @@ mod keyframe_tests {
     /// pins it to a GOP the encoder was told to produce.
     #[test]
     fn keyframe_interval_read_from_mkv_and_mp4_indexes() {
-        if !crate::testutil::has_element("x264enc") {
-            eprintln!("skipped: no x264enc");
+        if !crate::testutil::require_elements(&["x264enc"]) {
             return;
         }
         let dir = tempfile::tempdir().unwrap();
@@ -2091,8 +2090,7 @@ mod keyframe_tests {
     /// this whole measurement exists to stop.
     #[test]
     fn a_fragmented_mp4_is_unknown_not_all_intra() {
-        if !crate::testutil::has_element("isofmp4mux") || !crate::testutil::has_element("x264enc") {
-            eprintln!("skipped: no isofmp4mux/x264enc");
+        if !crate::testutil::require_elements(&["isofmp4mux", "x264enc"]) {
             return;
         }
         let dir = tempfile::tempdir().unwrap();
@@ -2120,8 +2118,7 @@ mod keyframe_tests {
     /// ffprobe walks 893 keyframes to the same 10.010 s.
     #[test]
     fn keyframe_interval_read_from_an_avi_index() {
-        if !crate::testutil::has_element("avimux") || !crate::testutil::has_element("x264enc") {
-            eprintln!("skipped: no avimux/x264enc");
+        if !crate::testutil::require_elements(&["avimux", "x264enc"]) {
             return;
         }
         let dir = tempfile::tempdir().unwrap();

@@ -1,6 +1,7 @@
 //! Test-only fixture generation (used by kahawai-media and kahawai-hub
 //! integration tests). Not part of the public API.
 
+use std::io::Write;
 use std::path::Path;
 
 use gstreamer as gst;
@@ -97,8 +98,80 @@ pub fn render_h264_ass_mkv(path: &Path, header: &str, events: &[(u64, u64, Strin
 }
 
 pub fn has_element(name: &str) -> bool {
+    require_elements(&[name])
+}
+
+/// Gate a media test on a runtime prerequisite. The normal distro-stack
+/// suite reports and skips unavailable paths; the pinned release suite sets
+/// `KAHAWAI_MEDIA_TEST_STRICT=1`, turning that same absence into a failure.
+pub fn require(available: bool, description: &str) -> bool {
+    if available {
+        return true;
+    }
+    missing_prerequisite(description, strict_mode(), skip_report().as_deref());
+    false
+}
+
+pub fn require_elements(names: &[&str]) -> bool {
     crate::init().unwrap();
-    gst::ElementFactory::find(name).is_some()
+    let missing: Vec<_> = names
+        .iter()
+        .copied()
+        .filter(|name| gst::ElementFactory::find(name).is_none())
+        .collect();
+    require(
+        missing.is_empty(),
+        &format!("GStreamer element(s): {}", missing.join(", ")),
+    )
+}
+
+/// Raw availability query for compound prerequisites that should produce one
+/// combined strict-mode error rather than one message per operand.
+pub fn elements_available(names: &[&str]) -> bool {
+    crate::init().unwrap();
+    names
+        .iter()
+        .all(|name| gst::ElementFactory::find(name).is_some())
+}
+
+pub fn require_h264_aac_fixture() -> bool {
+    require(
+        elements_available(&["x264enc"]) && crate::remux::aac_encoder().is_some(),
+        "x264enc and a verified AAC encoder for generated fixtures",
+    )
+}
+
+/// Record a passing-but-inapplicable regression without treating it as a
+/// missing runtime prerequisite. This remains allowed in strict mode.
+pub fn not_applicable(description: &str) {
+    report("NOT APPLICABLE", description, skip_report().as_deref());
+}
+
+fn strict_mode() -> bool {
+    std::env::var_os("KAHAWAI_MEDIA_TEST_STRICT").is_some_and(|v| v == "1")
+}
+
+fn skip_report() -> Option<std::path::PathBuf> {
+    std::env::var_os("KAHAWAI_MEDIA_SKIP_FILE").map(Into::into)
+}
+
+fn missing_prerequisite(description: &str, strict: bool, report_path: Option<&Path>) {
+    if strict {
+        panic!("required media prerequisite unavailable: {description}");
+    }
+    report("SKIP", description, report_path);
+}
+
+fn report(kind: &str, description: &str, report_path: Option<&Path>) {
+    eprintln!("{kind}: {description}");
+    if let Some(path) = report_path {
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .unwrap_or_else(|e| panic!("opening media skip report {}: {e}", path.display()));
+        writeln!(file, "{kind}: {description}").unwrap();
+    }
 }
 
 /// 5.1 fixture: h264 + 6-channel AAC, for the HUB-15 channel ceiling
@@ -120,8 +193,9 @@ pub fn render_pq_hevc_mkv(path: &Path) {
 }
 
 fn render_av(path: &Path, muxer: &str) {
+    let aac = crate::remux::aac_encoder().expect("fixture requires a verified AAC encoder");
     render(&format!(
-        "videotestsrc num-buffers=250 ! video/x-raw,format=I420,width=320,height=240,framerate=25/1 ! x264enc bframes=3 b-adapt=false key-int-max=25 ! h264parse ! {muxer} name=m audiotestsrc num-buffers=430 ! audioconvert ! fdkaacenc ! m. m. ! filesink location=\"{}\"",
+        "videotestsrc num-buffers=250 ! video/x-raw,format=I420,width=320,height=240,framerate=25/1 ! x264enc bframes=3 b-adapt=false key-int-max=25 ! h264parse ! {muxer} name=m audiotestsrc num-buffers=430 ! audioconvert ! {aac} ! m. m. ! filesink location=\"{}\"",
         path.display()
     ));
 }
@@ -157,4 +231,26 @@ pub fn render(launch: &str) {
         "fixture pipeline failed"
     );
     p.set_state(gst::State::Null).unwrap();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[should_panic(expected = "required media prerequisite unavailable")]
+    fn strict_prerequisites_fail_instead_of_skipping() {
+        missing_prerequisite("deliberately absent", true, None);
+    }
+
+    #[test]
+    fn best_effort_prerequisites_leave_a_machine_readable_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let report = dir.path().join("skips.txt");
+        missing_prerequisite("deliberately absent", false, Some(&report));
+        assert_eq!(
+            std::fs::read_to_string(report).unwrap(),
+            "SKIP: deliberately absent\n"
+        );
+    }
 }

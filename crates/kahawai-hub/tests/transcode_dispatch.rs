@@ -86,8 +86,10 @@ async fn dispatches_encode_session_to_transcoder() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter("info,kahawai_hub=debug")
         .try_init();
-    if kahawai_media::remux::aac_encoder().is_none() {
-        eprintln!("skipping: no verified AAC encoder");
+    if !kahawai_media::testutil::require(
+        kahawai_media::remux::aac_encoder().is_some(),
+        "verified AAC encoder",
+    ) {
         return;
     }
 

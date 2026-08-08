@@ -248,8 +248,7 @@ mod tests {
 
     #[test]
     fn lang_mapping_resolves_and_gates_on_installed_models() {
-        if !model_installed("eng") {
-            eprintln!("skipping: tesseract/eng not installed");
+        if !kahawai_media::testutil::require(model_installed("eng"), "Tesseract eng model") {
             return;
         }
         assert_eq!(model_for(Some("en")).as_deref(), Some("eng"));
@@ -273,8 +272,7 @@ mod tests {
     /// re-verified live whenever a track is generated.
     #[test]
     fn hand_rolled_bmp_is_readable_by_tesseract() {
-        if !model_installed("eng") {
-            eprintln!("skipping: tesseract/eng not installed");
+        if !kahawai_media::testutil::require(model_installed("eng"), "Tesseract eng model") {
             return;
         }
         let (w, h) = (61u32, 50u32); // odd width: row padding exercised

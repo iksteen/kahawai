@@ -599,11 +599,8 @@ mod tests {
     #[test]
     fn replay_gain_is_read_when_the_file_states_it() {
         init().unwrap();
-        for el in ["audiotestsrc", "taginject", "flacenc"] {
-            if gstreamer::ElementFactory::find(el).is_none() {
-                eprintln!("no {el}; skipped");
-                return;
-            }
+        if !crate::testutil::require_elements(&["audiotestsrc", "taginject", "flacenc"]) {
+            return;
         }
         let dir = tempfile::tempdir().unwrap();
         let mux = |name: &str, tags: &str| {
