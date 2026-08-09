@@ -8,6 +8,8 @@ use kahawai_hub::auth::Auth;
 use kahawai_hub::registry::Registry;
 use tower::ServiceExt;
 
+static AUTH_MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!();
+
 async fn body_json(resp: axum::response::Response) -> serde_json::Value {
     let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
         .await
@@ -26,6 +28,14 @@ fn get_authed(uri: &str, token: &str) -> Request<Body> {
     Request::get(uri)
         .header("authorization", format!("Bearer {token}"))
         .body(Body::empty())
+        .unwrap()
+}
+
+fn post_authed(uri: &str, token: &str, body: serde_json::Value) -> Request<Body> {
+    Request::post(uri)
+        .header("authorization", format!("Bearer {token}"))
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
         .unwrap()
 }
 
@@ -145,6 +155,7 @@ async fn setup_then_auth_flow() {
     assert_eq!(resp.status(), StatusCode::OK);
     let rotated = body_json(resp).await;
     assert!(rotated["access_token"].as_str().is_some());
+    let rotated_refresh = rotated["refresh_token"].as_str().unwrap().to_string();
     let resp = api
         .clone()
         .oneshot(post(
@@ -157,6 +168,19 @@ async fn setup_then_auth_flow() {
         resp.status(),
         StatusCode::UNAUTHORIZED,
         "refresh tokens are single-use"
+    );
+    let resp = api
+        .clone()
+        .oneshot(post(
+            "/api/v1/auth/refresh",
+            serde_json::json!({"refresh_token": rotated_refresh}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "replay must revoke the rotated token's whole family"
     );
 
     // CLI reset-password: old password dies, new one works.
@@ -259,6 +283,31 @@ fn test_router(
         )),
         kahawai_hub::api::NetOptions::default(),
     )
+}
+
+async fn auth_harness() -> (
+    tempfile::TempDir,
+    sqlx::SqlitePool,
+    Arc<Auth>,
+    axum::Router,
+    kahawai_hub::auth::TokenPair,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    let registry = Arc::new(Registry::new(db.clone(), Default::default()));
+    let auth = Arc::new(Auth::new(db.clone(), dir.path()).await.unwrap());
+    let setup = auth
+        .complete_setup(&auth.setup_token().unwrap(), "root", "hunter22222hunter")
+        .await
+        .unwrap();
+    let api = test_router(
+        registry,
+        auth.clone(),
+        Arc::new(kahawai_hub::sessions::Sessions::new(
+            tempfile::tempdir().unwrap().keep(),
+        )),
+    );
+    (dir, db, auth, api, setup)
 }
 
 #[tokio::test]
@@ -650,9 +699,9 @@ async fn bootstrap_states_setup_and_auth_without_a_token() {
     assert_eq!(body_json(resp).await["authenticated"], true);
 }
 
-/// Expired refresh tokens are pruned when Auth opens; live ones stay.
+/// Expired refresh families are pruned when Auth opens; live ones stay.
 #[tokio::test]
-async fn expired_refresh_tokens_prune_at_open() {
+async fn expired_refresh_families_prune_at_open() {
     let dir = tempfile::tempdir().unwrap();
     let db = kahawai_hub::db::open(dir.path()).await.unwrap();
     let auth = Auth::new(db.clone(), dir.path()).await.unwrap();
@@ -660,28 +709,219 @@ async fn expired_refresh_tokens_prune_at_open() {
         .await
         .unwrap();
     sqlx::query(
-        "INSERT INTO refresh_tokens (token_hash, user_id, expires_at)
-         SELECT 'dead', id, unixepoch() - 1 FROM users LIMIT 1",
+        "INSERT INTO refresh_families (id, user_id, current_token_hash, expires_at)
+         SELECT 'dead', id, 'dead-hash', unixepoch() - 1 FROM users LIMIT 1",
     )
     .execute(&db)
     .await
     .unwrap();
     sqlx::query(
-        "INSERT INTO refresh_tokens (token_hash, user_id, expires_at)
-         SELECT 'live', id, unixepoch() + 3600 FROM users LIMIT 1",
+        "INSERT INTO refresh_families (id, user_id, current_token_hash, expires_at)
+         SELECT 'live', id, 'live-hash', unixepoch() + 3600 FROM users LIMIT 1",
     )
     .execute(&db)
     .await
     .unwrap();
 
     let _ = Auth::new(db.clone(), dir.path()).await.unwrap();
-    let left: Vec<String> = sqlx::query_scalar(
-        "SELECT token_hash FROM refresh_tokens WHERE token_hash IN ('dead','live')",
+    let left: Vec<String> =
+        sqlx::query_scalar("SELECT id FROM refresh_families WHERE id IN ('dead','live')")
+            .fetch_all(&db)
+            .await
+            .unwrap();
+    assert_eq!(left, ["live"], "expired pruned, live kept");
+}
+
+/// 0050 deliberately cannot preserve an opaque legacy token: it lacks the
+/// family selector that makes replay identifiable after rotation.
+#[tokio::test]
+async fn refresh_family_migration_invalidates_legacy_tokens() {
+    use sha2::{Digest, Sha256};
+    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("hub.db");
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            SqliteConnectOptions::new()
+                .filename(&db_path)
+                .create_if_missing(true)
+                .foreign_keys(true),
+        )
+        .await
+        .unwrap();
+    AUTH_MIGRATOR.run_to(49, &pool).await.unwrap();
+
+    sqlx::query(
+        "INSERT INTO users (id, username, password_hash, is_admin)
+         VALUES ('legacy-user', 'legacy', 'unused', 0)",
     )
-    .fetch_all(&db)
+    .execute(&pool)
     .await
     .unwrap();
-    assert_eq!(left, ["live"], "expired pruned, live kept");
+    let legacy = "a-legacy-refresh-token";
+    let hash = Sha256::digest(legacy.as_bytes());
+    let hash = hash.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    sqlx::query(
+        "INSERT INTO refresh_tokens (token_hash, user_id, expires_at)
+         VALUES (?, 'legacy-user', unixepoch() + 3600)",
+    )
+    .bind(hash)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    AUTH_MIGRATOR.run(&pool).await.unwrap();
+    let auth = Auth::new(pool.clone(), dir.path()).await.unwrap();
+    assert!(matches!(
+        auth.refresh(legacy).await,
+        Err(kahawai_hub::auth::RefreshError::Invalid)
+    ));
+    let old_table: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_schema
+          WHERE type = 'table' AND name = 'refresh_tokens'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(old_table, 0, "legacy token storage survived migration");
+}
+
+/// AUTH-4/5: one concurrent rotation wins. The loser is a presentation of
+/// the now-consumed token, so it also revokes the winner's family.
+#[tokio::test]
+async fn concurrent_refresh_has_one_winner_and_revokes_replay_family() {
+    let (_dir, db, auth, _api, _setup) = auth_harness().await;
+    let contested = auth
+        .login("root", "hunter22222hunter")
+        .await
+        .unwrap()
+        .refresh_token;
+    let separate = auth
+        .login("root", "hunter22222hunter")
+        .await
+        .unwrap()
+        .refresh_token;
+    let barrier = Arc::new(tokio::sync::Barrier::new(3));
+    let run = |auth: Arc<Auth>, barrier: Arc<tokio::sync::Barrier>, token: String| {
+        tokio::spawn(async move {
+            barrier.wait().await;
+            auth.refresh(&token).await
+        })
+    };
+    let first = run(auth.clone(), barrier.clone(), contested.clone());
+    let second = run(auth.clone(), barrier.clone(), contested);
+    barrier.wait().await;
+    let first = first.await.unwrap();
+    let second = second.await.unwrap();
+    assert_eq!(
+        usize::from(first.is_ok()) + usize::from(second.is_ok()),
+        1,
+        "concurrent refresh did not have exactly one winner"
+    );
+    let winner = first.or(second).unwrap();
+    assert!(matches!(
+        auth.refresh(&winner.refresh_token).await,
+        Err(kahawai_hub::auth::RefreshError::Invalid)
+    ));
+    assert!(
+        auth.refresh(&separate).await.is_ok(),
+        "replay revoked a separate login family"
+    );
+    let revoked: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM refresh_families WHERE revoked_at IS NOT NULL")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    assert_eq!(revoked, 1);
+}
+
+/// API logout is authenticated, family-scoped, idempotent and deliberately
+/// does not reveal whether a supplied refresh token was current or foreign.
+#[tokio::test]
+async fn api_logout_revokes_only_the_callers_current_family() {
+    let (_dir, _db, auth, api, root) = auth_harness().await;
+    auth.create_user("bob", "hunter22222hunter", false)
+        .await
+        .unwrap();
+    let bob = auth.login("bob", "hunter22222hunter").await.unwrap();
+
+    let resp = api
+        .clone()
+        .oneshot(post(
+            "/api/v1/auth/logout",
+            serde_json::json!({"refresh_token": root.refresh_token}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    let resp = api
+        .clone()
+        .oneshot(post_authed(
+            "/api/v1/auth/logout",
+            &root.access_token,
+            serde_json::json!({"refresh_token": bob.refresh_token}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    let bob = auth.refresh(&bob.refresh_token).await.unwrap();
+
+    for _ in 0..2 {
+        let resp = api
+            .clone()
+            .oneshot(post_authed(
+                "/api/v1/auth/logout",
+                &bob.access_token,
+                serde_json::json!({"refresh_token": bob.refresh_token}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    }
+    assert!(matches!(
+        auth.refresh(&bob.refresh_token).await,
+        Err(kahawai_hub::auth::RefreshError::Invalid)
+    ));
+    assert!(
+        auth.refresh(&root.refresh_token).await.is_ok(),
+        "logging out bob revoked root's family"
+    );
+}
+
+/// The CLI path and the running hub share the transactionally persisted
+/// family state: every existing login remains revoked after Auth reopens.
+#[tokio::test]
+async fn password_reset_revokes_all_families_across_restart() {
+    let (dir, db, auth, _api, setup) = auth_harness().await;
+    let second = auth.login("root", "hunter22222hunter").await.unwrap();
+    kahawai_hub::auth::reset_password(&db, "root", "new-password-22")
+        .await
+        .unwrap();
+
+    let restarted = Auth::new(db.clone(), dir.path()).await.unwrap();
+    for token in [&setup.refresh_token, &second.refresh_token] {
+        assert!(matches!(
+            restarted.refresh(token).await,
+            Err(kahawai_hub::auth::RefreshError::Invalid)
+        ));
+    }
+    assert!(
+        restarted
+            .login("root", "new-password-22")
+            .await
+            .unwrap()
+            .refresh_token
+            .starts_with("v1.")
+    );
+    let revoked: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM refresh_families WHERE revoked_at IS NOT NULL")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    assert_eq!(revoked, 2);
 }
 
 /// HUB-10: deleting an account removes what is theirs, refuses the two
@@ -780,11 +1020,9 @@ async fn admin_deletes_users() {
         StatusCode::OK
     );
 
-    // Everything of bob's is gone. refresh_tokens has no ON DELETE
-    // CASCADE and watch_state_archive has no foreign key at all, so
-    // both are deleted by hand — and the archive especially, since the
-    // satellite-restore path copies those rows back into watch_state
-    // and would fail on the key it no longer matches.
+    // Everything of bob's is gone. Refresh families cascade from users;
+    // watch_state_archive has no foreign key and is deleted by hand, since
+    // the satellite-restore path would otherwise copy its orphan back.
     let count = |sql: &'static str| {
         let db = db.clone();
         let victim = victim.clone();
@@ -798,7 +1036,7 @@ async fn admin_deletes_users() {
     };
     assert_eq!(count("SELECT COUNT(*) FROM users WHERE id = ?").await, 0);
     assert_eq!(
-        count("SELECT COUNT(*) FROM refresh_tokens WHERE user_id = ?").await,
+        count("SELECT COUNT(*) FROM refresh_families WHERE user_id = ?").await,
         0
     );
     assert_eq!(

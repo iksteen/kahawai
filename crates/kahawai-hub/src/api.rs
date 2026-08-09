@@ -92,6 +92,7 @@ pub fn router(
         .route("/api/v1/collections", get(list_collections))
         .route("/api/v1/libraries", get(list_libraries))
         .route("/api/v1/items", get(list_items))
+        .route("/api/v1/auth/logout", post(logout))
         // Not in the `items` group: keyed by a TRACK id, and already
         // gated on being that track's downloader or an admin.
         .route(
@@ -1428,13 +1429,31 @@ async fn refresh(
     State(state): State<AppState>,
     Json(body): Json<RefreshRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    let tokens = state.auth.refresh(&body.refresh_token).await.map_err(|_| {
-        (
-            StatusCode::UNAUTHORIZED,
-            "invalid refresh token".to_string(),
-        )
-    })?;
+    let tokens = state
+        .auth
+        .refresh(&body.refresh_token)
+        .await
+        .map_err(|e| match e {
+            crate::auth::RefreshError::Invalid => (
+                StatusCode::UNAUTHORIZED,
+                "invalid refresh token".to_string(),
+            ),
+            crate::auth::RefreshError::Internal(e) => internal(e),
+        })?;
     Ok(Json(json!(tokens)))
+}
+
+async fn logout(
+    State(state): State<AppState>,
+    axum::Extension(claims): axum::Extension<crate::auth::Claims>,
+    Json(body): Json<RefreshRequest>,
+) -> Result<StatusCode, ApiError> {
+    state
+        .auth
+        .logout(&claims.sub, &body.refresh_token)
+        .await
+        .map_err(internal)?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[derive(Deserialize)]

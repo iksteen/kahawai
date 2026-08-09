@@ -277,6 +277,8 @@ Feature gating: cargo feature `ocr` on `kahawai-hub` (forwarded by the `kahawai`
 
 ```
 POST /api/v1/auth/token                     # login → access+refresh
+POST /api/v1/auth/refresh                   # rotate one refresh family
+POST /api/v1/auth/logout                    # bearer + refresh → revoke that family
 GET  /api/v1/libraries
 GET  /api/v1/items?library=&q=&sort=&limit=&offset=   # browse AND search; returns total
 GET  /api/v1/items/{id}                     # as DISCOVERED: sources[] without StreamInfo
@@ -487,7 +489,7 @@ In all-in-one mode the bounded local queues bypass TLS and enrollment entirely �
 
 ### 7.5 Client API
 
-Unchanged by the PKI: Argon2id password hashes, 15-min JWT access tokens, rotating refresh tokens with a server-side revocation table, per-route authorization middleware mapping user grants → library visibility (one `require_item_access` layer over the whole `/api/v1/items/{id}…` group, plus the browse and playback checks). The client-facing listener may use the hub CA's leaf cert, an ACME cert, or sit behind a reverse proxy; client apps are *not* enrolled in the internal CA.
+Unchanged by the PKI: Argon2id password hashes, 15-min JWT access tokens, and rotating refresh-token families. Each login has one database row containing only its current token hash: rotation conditionally replaces that hash in an immediate transaction, concurrent use has one winner, and presentation of a consumed token revokes that family. The token's random family selector makes old-token replay identifiable without retaining one row per rotation. API logout requires the access bearer plus the current refresh token and revokes that login only; password reset revokes every family for the account. Per-route authorization middleware maps user grants → library visibility (one `require_item_access` layer over the whole `/api/v1/items/{id}…` group, plus the browse and playback checks). The client-facing listener may use the hub CA's leaf cert, an ACME cert, or sit behind a reverse proxy; client apps are *not* enrolled in the internal CA.
 
 ## 8. Configuration example
 
@@ -558,7 +560,7 @@ Negotiation engine: exhaustive table-driven unit tests (capability × source mat
 
 ## 10. Operational readiness (OPS-1..8)
 
-**Bootstrap.** Empty DB → hub serves only `/app/setup` and prints `Setup token: XXXX-XXXX` to console/logs; the flow (token → admin credentials → done) flips a `setup_complete` flag. `kahawai hub reset-password <user>` writes a new Argon2id hash directly. Login throttling via an in-memory failure counter keyed on `(account)` and `(source_ip)` with exponential backoff and `tracing` audit events; source IP taken from the socket or from `X-Forwarded-For` only when the peer is in the configured `trusted_proxies` list.
+**Bootstrap.** Empty DB → hub serves only `/app/setup` and prints `Setup token: XXXX-XXXX` to console/logs; the flow (token → admin credentials → done) flips a `setup_complete` flag. `kahawai hub reset-password <user>` writes a new Argon2id hash and revokes every refresh family for that user in one transaction. Login throttling via an in-memory failure counter keyed on `(account)` and `(source_ip)` with exponential backoff and `tracing` audit events; source IP taken from the socket or from `X-Forwarded-For` only when the peer is in the configured `trusted_proxies` list.
 
 **`doctor`.** Shared implementation in `kahawai-media` + per-module checks. GStreamer probe reuses the transcoder's startup enumeration (§6) and maps it against a static feature matrix table (`capability → required elements`), printing a report like `HEVC decode: OK (vah265dec) / DoVi: missing (dlbvision) → will tone-map`. When the `ocr` feature is compiled in, the hub's doctor also probes Tesseract and enumerates trained models: `OCR: OK (tesseract 5.x; models: eng, deu) / jpn: missing → OCR tier off for Japanese`. Also checks: registry/DB writability, scratch-dir space, `/dev/dri` access when VA-API configured, and `|system_clock - build_time|` sanity. Exit code non-zero on essential failures; `--json` for scripting. The same checks run at startup with warnings-vs-fatal per the same matrix.
 

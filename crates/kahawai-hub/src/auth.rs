@@ -4,6 +4,27 @@
 //! per-hub secret in `data_dir/jwt.secret`; rotating refresh tokens stored
 //! hashed with server-side revocation.
 //!
+//! ## Refresh families
+//!
+//! Every setup or login creates one independent refresh family. Its bearer
+//! token is `v1.<family selector>.<secret>`: the 128-bit random selector finds
+//! the family, while only the SHA-256 hash of the complete token is stored.
+//! The 256-bit secret never enters the database or logs. A family has exactly
+//! one current hash, so storage is one row per login rather than one row per
+//! rotation.
+//!
+//! Rotation takes a SQLite immediate transaction and conditionally replaces
+//! that current hash only while the family is active, unexpired and still
+//! names the presented hash. One concurrent request therefore wins. A later
+//! presentation of any consumed token still carries the family selector but
+//! has the wrong hash; that is replay and revokes the whole family. Separate
+//! logins remain separate families. Logout revokes one, password reset revokes
+//! all of a user's families, and deleting the user cascades to them.
+//!
+//! The rolling expiry is extended on successful rotation, preserving the
+//! existing 30-day idle lifetime. Revoked families stop rotating, so retaining
+//! them until that expiry identifies repeated replay without unbounded growth.
+//!
 //! ponytail: login throttling (OPS-2) lands with the hardening pass.
 
 use std::path::Path;
@@ -35,6 +56,14 @@ pub struct TokenPair {
     pub access_token: String,
     pub refresh_token: String,
     pub expires_in: i64,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum RefreshError {
+    #[error("invalid refresh token")]
+    Invalid,
+    #[error(transparent)]
+    Internal(#[from] anyhow::Error),
 }
 
 pub struct Auth {
@@ -137,6 +166,31 @@ fn hash_token(token: &str) -> String {
     d.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+fn make_refresh_token(family_id: &str) -> (String, String) {
+    let token = format!("v1.{family_id}.{}", random_token(32));
+    let hash = hash_token(&token);
+    (token, hash)
+}
+
+fn parse_refresh_token(token: &str) -> Option<(&str, String)> {
+    let mut parts = token.split('.');
+    let (Some("v1"), Some(family_id), Some(secret), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return None;
+    };
+    let is_lower_hex = |s: &str, len: usize| {
+        s.len() == len
+            && s.as_bytes()
+                .iter()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b))
+    };
+    if !is_lower_hex(family_id, 32) || !is_lower_hex(secret, 64) {
+        return None;
+    }
+    Some((family_id, hash_token(token)))
+}
+
 pub fn hash_password(password: &str) -> Result<String> {
     let salt = SaltString::generate(&mut OsRng);
     Ok(Argon2::default()
@@ -173,16 +227,15 @@ impl Auth {
             s
         };
 
-        // Dead tokens have no audit value beyond their revoked flag's
-        // lifetime: an expired row can never authenticate again, so it
-        // is pure growth (1,569 rows for 2 users when this landed,
-        // mostly scripted test-account logins). Pruned at open.
-        let pruned = sqlx::query("DELETE FROM refresh_tokens WHERE expires_at < unixepoch()")
+        // An expired family cannot authenticate or be made active by replay.
+        // Active families have a rolling expiry; revoked ones do not, so this
+        // also bounds the tombstones retained to identify replay.
+        let pruned = sqlx::query("DELETE FROM refresh_families WHERE expires_at < unixepoch()")
             .execute(&db)
             .await?
             .rows_affected();
         if pruned > 0 {
-            tracing::info!(pruned, "expired refresh tokens removed");
+            tracing::info!(pruned, "expired refresh families removed");
         }
 
         let users: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
@@ -287,13 +340,6 @@ impl Auth {
         }
 
         let mut tx = self.db.begin().await?;
-        // Order matters. refresh_tokens references users with no ON
-        // DELETE CASCADE and foreign keys are on, so it goes first or
-        // the user row cannot be removed at all.
-        sqlx::query("DELETE FROM refresh_tokens WHERE user_id = ?")
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
         // watch_state_archive has no foreign key, so these rows would
         // outlive the user — and the HUB-20 restore path copies them
         // back into watch_state, whose key WOULD then fail and roll
@@ -303,7 +349,8 @@ impl Auth {
             .bind(id)
             .execute(&mut *tx)
             .await?;
-        // watch_state, user_prefs and user_libraries cascade from here.
+        // watch_state, user_prefs, user_libraries and refresh families
+        // cascade from here.
         sqlx::query("DELETE FROM users WHERE id = ?")
             .bind(id)
             .execute(&mut *tx)
@@ -371,47 +418,100 @@ impl Auth {
         .await
     }
 
-    /// Rotate a refresh token: single use, server-side revocation.
-    pub async fn refresh(&self, refresh_token: &str) -> Result<TokenPair> {
-        let hash = hash_token(refresh_token);
-        let row = sqlx::query(
-            "SELECT rt.user_id, rt.expires_at, rt.revoked, u.username, u.is_admin
-             FROM refresh_tokens rt JOIN users u ON u.id = rt.user_id
-             WHERE rt.token_hash = ?",
+    /// Rotate exactly once. Replaying a consumed token revokes its family.
+    pub async fn refresh(
+        &self,
+        refresh_token: &str,
+    ) -> std::result::Result<TokenPair, RefreshError> {
+        let Some((family_id, presented_hash)) = parse_refresh_token(refresh_token) else {
+            return Err(RefreshError::Invalid);
+        };
+        let now = now_unix();
+        let (next_token, next_hash) = make_refresh_token(family_id);
+        let mut tx = self
+            .db
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .context("beginning refresh rotation")?;
+        let changed = sqlx::query(
+            "UPDATE refresh_families
+                SET current_token_hash = ?, expires_at = ?, rotated_at = ?
+              WHERE id = ? AND current_token_hash = ?
+                AND revoked_at IS NULL AND expires_at >= ?",
         )
-        .bind(&hash)
-        .fetch_optional(&self.db)
-        .await?
-        .context("unknown refresh token")?;
-        if row.get::<i64, _>("revoked") != 0 || row.get::<i64, _>("expires_at") < now_unix() {
-            bail!("refresh token expired or revoked");
-        }
-        sqlx::query("UPDATE refresh_tokens SET revoked = 1 WHERE token_hash = ?")
-            .bind(&hash)
-            .execute(&self.db)
-            .await?;
-        self.issue_tokens(
-            &row.get::<String, _>("user_id"),
-            &row.get::<String, _>("username"),
-            row.get::<i64, _>("is_admin") != 0,
-        )
+        .bind(&next_hash)
+        .bind(now + REFRESH_TTL_SECS)
+        .bind(now)
+        .bind(family_id)
+        .bind(&presented_hash)
+        .bind(now)
+        .execute(&mut *tx)
         .await
+        .context("rotating refresh family")?
+        .rows_affected();
+
+        if changed == 0 {
+            let family = sqlx::query(
+                "SELECT current_token_hash, expires_at, revoked_at
+                   FROM refresh_families WHERE id = ?",
+            )
+            .bind(family_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .context("checking rejected refresh family")?;
+            if let Some(family) = family
+                && family.get::<Option<i64>, _>("revoked_at").is_none()
+                && family.get::<i64, _>("expires_at") >= now
+                && family.get::<String, _>("current_token_hash") != presented_hash
+            {
+                sqlx::query(
+                    "UPDATE refresh_families SET revoked_at = ?
+                      WHERE id = ? AND revoked_at IS NULL",
+                )
+                .bind(now)
+                .bind(family_id)
+                .execute(&mut *tx)
+                .await
+                .context("revoking replayed refresh family")?;
+                tx.commit().await.context("committing replay revocation")?;
+            }
+            return Err(RefreshError::Invalid);
+        }
+
+        let user = sqlx::query(
+            "SELECT u.id, u.username, u.is_admin
+               FROM users u JOIN refresh_families rf ON rf.user_id = u.id
+              WHERE rf.id = ?",
+        )
+        .bind(family_id)
+        .fetch_one(&mut *tx)
+        .await
+        .context("loading refresh-family user")?;
+        let access_token = self.issue_access_token(
+            &user.get::<String, _>("id"),
+            &user.get::<String, _>("username"),
+            user.get::<i64, _>("is_admin") != 0,
+        )?;
+        tx.commit().await.context("committing refresh rotation")?;
+        Ok(TokenPair {
+            access_token,
+            refresh_token: next_token,
+            expires_in: ACCESS_TTL_SECS,
+        })
     }
 
     async fn issue_tokens(&self, user_id: &str, username: &str, admin: bool) -> Result<TokenPair> {
-        let claims = Claims {
-            sub: user_id.to_string(),
-            username: username.to_string(),
-            admin,
-            exp: now_unix() + ACCESS_TTL_SECS,
-        };
-        let access_token = jsonwebtoken::encode(&Header::default(), &claims, &self.enc)?;
-        let refresh_token = random_token(32);
+        let access_token = self.issue_access_token(user_id, username, admin)?;
+        let family_id = random_token(16);
+        let (refresh_token, token_hash) = make_refresh_token(&family_id);
         sqlx::query(
-            "INSERT INTO refresh_tokens (token_hash, user_id, expires_at) VALUES (?, ?, ?)",
+            "INSERT INTO refresh_families
+                (id, user_id, current_token_hash, expires_at)
+             VALUES (?, ?, ?, ?)",
         )
-        .bind(hash_token(&refresh_token))
+        .bind(&family_id)
         .bind(user_id)
+        .bind(token_hash)
         .bind(now_unix() + REFRESH_TTL_SECS)
         .execute(&self.db)
         .await?;
@@ -422,6 +522,41 @@ impl Auth {
         })
     }
 
+    fn issue_access_token(&self, user_id: &str, username: &str, admin: bool) -> Result<String> {
+        let claims = Claims {
+            sub: user_id.to_string(),
+            username: username.to_string(),
+            admin,
+            exp: now_unix() + ACCESS_TTL_SECS,
+        };
+        Ok(jsonwebtoken::encode(
+            &Header::default(),
+            &claims,
+            &self.enc,
+        )?)
+    }
+
+    /// Revoke the named current family if it belongs to `user_id`.
+    ///
+    /// Deliberately idempotent and non-oracular: malformed, unknown, stale,
+    /// foreign and already-revoked tokens all do nothing successfully.
+    pub async fn logout(&self, user_id: &str, token: &str) -> Result<()> {
+        let Some((family_id, token_hash)) = parse_refresh_token(token) else {
+            return Ok(());
+        };
+        sqlx::query(
+            "UPDATE refresh_families SET revoked_at = unixepoch()
+              WHERE id = ? AND user_id = ? AND current_token_hash = ?
+                AND revoked_at IS NULL",
+        )
+        .bind(family_id)
+        .bind(user_id)
+        .bind(token_hash)
+        .execute(&self.db)
+        .await?;
+        Ok(())
+    }
+
     pub fn verify(&self, bearer: &str) -> Result<Claims> {
         let data = jsonwebtoken::decode::<Claims>(bearer, &self.dec, &Validation::default())?;
         Ok(data.claims)
@@ -429,23 +564,25 @@ impl Auth {
 }
 
 /// CLI escape hatch (OPS-1): overwrite a user's password hash and revoke
-/// their refresh tokens.
+/// every refresh family in the same committed transaction.
 pub async fn reset_password(db: &SqlitePool, username: &str, new_password: &str) -> Result<()> {
     let hash = hash_password(new_password)?;
+    let mut tx = db.begin_with("BEGIN IMMEDIATE").await?;
     let res = sqlx::query("UPDATE users SET password_hash = ? WHERE username = ?")
         .bind(&hash)
         .bind(username)
-        .execute(db)
+        .execute(&mut *tx)
         .await?;
     if res.rows_affected() == 0 {
         bail!("no such user: {username}");
     }
     sqlx::query(
-        "UPDATE refresh_tokens SET revoked = 1
+        "UPDATE refresh_families SET revoked_at = unixepoch()
          WHERE user_id = (SELECT id FROM users WHERE username = ?)",
     )
     .bind(username)
-    .execute(db)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(())
 }

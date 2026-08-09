@@ -90,14 +90,23 @@ matrix rather than being dismissed as post-MVP cleanup.
 - [ ] AUTH-3 Make deletion, administrator-role changes and password resets
       invalidate access immediately, including across hub restart and when the
       reset is performed by a separate CLI process
-- [ ] AUTH-4 Consume refresh tokens atomically with a conditional database
-      update; concurrent use has exactly one winner
-- [ ] AUTH-5 Group rotating refresh tokens into families. Reuse of a consumed
-      token revokes its family, logout revokes the active family, and password
-      reset revokes every family for that user
-- [ ] AUTH-6 Add `POST /api/v1/auth/logout` and support explicit
-      `client: "browser" | "api"` modes on setup and login, defaulting to API
-      mode for command-line and third-party clients
+- [x] AUTH-4 Refresh-family rotation uses `BEGIN IMMEDIATE` plus a conditional
+      update over the family id, current hash, revocation state and expiry.
+      `auth_api::concurrent_refresh_has_one_winner_and_revokes_replay_family`
+      releases two callers together and proves exactly one winner
+- [x] AUTH-5 Each login has a bounded one-row refresh family. Consumed-token
+      replay revokes that family, authenticated API logout revokes its current
+      family, and password reset revokes every family in the password-update
+      transaction. The auth integration suite proves family isolation and
+      persistence across `Auth` restart; `kahawai-auth-cycle.sh` exercises the
+      same rotation, replay, concurrency and logout behavior against a hub.
+      The rebuilt binary passed that cycle before and after a real restart on
+      2026-08-09; the live database reported migration 50, seven bounded
+      families, one active setup family and no legacy token table
+- [~] AUTH-6 `POST /api/v1/auth/logout` exists for API bearer clients and is
+      authenticated, family-scoped and idempotent. Explicit
+      `client: "browser" | "api"` modes on setup/login and browser-cookie
+      logout remain
 - [ ] AUTH-7 API auth mode returns access and refresh bearer tokens and sets no
       cookie. Browser mode returns only the access token and sets host-only,
       `HttpOnly`, `SameSite=Strict` refresh and media cookies
@@ -420,11 +429,14 @@ matrix rather than being dismissed as post-MVP cleanup.
       strict full-workspace runs on 2026-08-08 show only temporary configuration
       paths, and all three worker tests also passed in the hosted run for
       `ad8e764`
-- [ ] CI-5 Test account deletion, demotion and password reset across immediate
-      restart; atomic concurrent refresh, token-family replay, browser/API
-      logout, cookie attributes, Origin checks and absence of browser-stored
-      secrets. Prove setup-token entropy, per-IP/global throttling and permanent
-      setup closure after the first administrator is committed
+- [~] CI-5 `auth_api` covers atomic concurrent refresh, family replay,
+      family-isolated API logout, password-reset revocation of all refresh
+      families across `Auth` restart, deletion cascade and migration-time
+      invalidation of legacy refresh tokens. Access-token invalidation after
+      deletion/demotion/reset, browser logout, cookie attributes, Origin
+      checks, browser secret storage, setup entropy/throttling and durable
+      setup closure remain. `cargo test --workspace`, formatting and clippy
+      all exited 0 locally on 2026-08-09
 - [ ] CI-6 With two users, exercise every session-scoped endpoint using a
       foreign session ID and prove all denials are indistinguishable 404s
 - [ ] CI-7 Test identical paths in separate roots, root reordering, overlapping
