@@ -110,6 +110,10 @@ environment variable shaped `KAHAWAI_<SECTION>__<KEY>`, e.g.
 `KAHAWAI_HUB__DATA_DIR=/srv/kahawai`.
 
 ```toml
+[all_in_one]
+transcoder = true               # set false (then restart) to keep encoding off this machine;
+                                # external transcoders can still enroll and remux stays local
+
 [hub]
 bind = "127.0.0.1:8420"          # client API + web app; put a reverse proxy in front for TLS
 satellite_bind = "0.0.0.0:8421"  # enrollment + mTLS link for satellites

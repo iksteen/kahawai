@@ -11,6 +11,7 @@ const ROLES: Roles = Roles {
     hub: false,
     mediahost: true,
     transcoder: false,
+    local_encode: false,
 };
 use clap::{Parser, Subcommand};
 

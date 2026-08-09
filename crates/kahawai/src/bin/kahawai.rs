@@ -115,7 +115,19 @@ async fn main() -> Result<()> {
     let (cfg, config_used) = kahawai_runtime::load_config(cli.config.as_deref())?;
 
     match &cli.command {
-        Cmd::Hub { cmd: None } | Cmd::Mediahost | Cmd::Transcoder | Cmd::AllInOne => {
+        Cmd::AllInOne => {
+            let transcoder = cfg.all_in_one.transcoder;
+            kahawai_runtime::startup_checks(
+                &cfg,
+                Roles {
+                    transcoder,
+                    local_encode: transcoder,
+                    ..ROLES
+                },
+                ocr_rows(),
+            )?
+        }
+        Cmd::Hub { cmd: None } | Cmd::Mediahost | Cmd::Transcoder => {
             kahawai_runtime::startup_checks(&cfg, ROLES, ocr_rows())?
         }
         _ => {}

@@ -279,10 +279,12 @@ impl<'a> Negotiation<'a> {
         // standing choice. Fleet-wide rather than per-box on purpose —
         // the tier is decided before placement, which then hard-filters
         // on it (registry::PlacementNeed::needs_ass_burn).
+        let local_ass_burn =
+            registry.local_executor_enabled() && kahawai_media::remux::ass_burn_available();
         let ass = crate::tracks::ass_policy_for_user(
             registry.db(),
             user_id,
-            registry.any_transcoder_ass_burn() || kahawai_media::remux::ass_burn_available(),
+            registry.any_transcoder_ass_burn() || local_ass_burn,
         )
         .await;
         // HUB-32c: which embedded image tracks already have an OCR text
@@ -401,10 +403,11 @@ impl<'a> Negotiation<'a> {
                 self.registry.transcoder_reports_tonemap(&tc),
                 self.registry.transcoder_encoders(&tc),
             ),
-            None => (
+            None if self.registry.local_executor_enabled() => (
                 kahawai_media::remux::tonemap_available(),
                 local_encoder_names(),
             ),
+            None => (false, Vec::new()),
         };
         ExecutorFacts {
             tonemap,
@@ -1639,9 +1642,14 @@ impl Sessions {
                 } else {
                     crate::registry::Placement {
                         target: None,
+                        available: true,
                         predicted: None,
                     }
                 };
+                anyhow::ensure!(
+                    placement.available,
+                    "transcoding unavailable: the local transcoder is disabled and no capable external transcoder is connected"
+                );
                 let placed = placement.target.clone();
                 if let Some(p) = placement.predicted
                     && p < 1.0

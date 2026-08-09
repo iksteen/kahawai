@@ -78,11 +78,27 @@ fn default_config_path() -> PathBuf {
 #[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default)]
+    pub all_in_one: AllInOneConfig,
+    #[serde(default)]
     pub hub: HubConfig,
     #[serde(default)]
     pub mediahost: MediahostConfig,
     #[serde(default)]
     pub transcoder: TranscoderConfig,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct AllInOneConfig {
+    /// Let the hub's supervised worker encode when no suitable external
+    /// transcoder is available. Remuxing remains available when this is off.
+    pub transcoder: bool,
+}
+
+impl Default for AllInOneConfig {
+    fn default() -> Self {
+        Self { transcoder: true }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -323,6 +339,17 @@ mod tests {
                 PathBuf::from("/home/test/.local/share/kahawai-mediahost")
             );
             assert_eq!(cfg.mediahost.hub, "localhost:8421");
+            assert!(cfg.all_in_one.transcoder);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn all_in_one_transcoder_can_be_disabled() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file("kahawai.toml", "[all_in_one]\ntranscoder = false\n")?;
+            let (cfg, _) = load(Some(Path::new("kahawai.toml"))).unwrap();
+            assert!(!cfg.all_in_one.transcoder);
             Ok(())
         });
     }

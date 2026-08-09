@@ -12,7 +12,7 @@ Kahawai — Hawaiian for *stream*; also the Māori name of a New Zealand fish, f
 
 The system ships in two deployment shapes built from the same codebase:
 
-1. **All-in-one binary** — a single executable that embeds the hub, one mediahost, and one transcoder, suitable for a NAS or a single home server.
+1. **All-in-one binary** — a single executable that embeds the hub, one mediahost, and, by default, one transcoder, suitable for a NAS or a single home server. The local transcoder may be disabled when encode work belongs on external satellites.
 2. **Modular deployment** — the hub, one or more mediahosts, and zero or more transcoders run as separate processes, potentially on separate machines, connected over the network.
 
 The functional behavior visible to clients must be identical in both shapes.
@@ -40,7 +40,7 @@ The functional behavior visible to clients must be identical in both shapes.
 **AR-2** The hub shall be the only module clients communicate with. Mediahosts and transcoders shall never be directly addressable by clients; all media bytes reaching a client are proxied or brokered by the hub (see AR-8 for the delegated-delivery exception).
 **AR-3** Mediahosts and transcoders shall initiate connections *to* the hub (outbound registration), so they can live behind NAT or firewalls without inbound port forwarding.
 **AR-4** A hub shall support multiple simultaneously connected mediahosts and transcoders. A mediahost shall be able to announce multiple collections.
-**AR-5** The all-in-one binary shall run all three modules in one process, replacing the network transport between them with an in-process transport, with no change in module logic.
+**AR-5** The all-in-one binary shall run the hub, mediahost and transcoder in one process by default, replacing the network transport between them with an in-process transport, with no change in module logic. A deployment may structurally disable the in-process transcoder while retaining hub-local remuxing and accepting external transcoder satellites; this choice shall be durable configuration applied before encoder dry-runs, background benchmarking or playback placement, not an admin drain toggle.
 **AR-6** Modules shall tolerate disconnects: a mediahost dropping shall mark its collections unavailable (not deleted); a transcoder dropping shall fail over active sessions to another transcoder where possible, otherwise terminate those sessions with a client-visible error.
 **AR-7** All inter-module protocol messages shall be versioned; a hub shall reject or degrade gracefully when a module speaks an incompatible protocol version.
 **AR-8** *(Optional, v1.x)* The hub may issue signed, expiring delegation tokens allowing a client to fetch stream bytes directly from a mediahost or transcoder when network topology permits, to take the hub out of the data path. This must be opt-in per deployment.

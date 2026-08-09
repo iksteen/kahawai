@@ -213,8 +213,8 @@ matrix rather than being dismissed as post-MVP cleanup.
       discovery, embedded subtitle/font extraction and ASS rasterisation as
       well as remux/transcode; a malformed library file must cost one job, not
       the hub or mediahost daemon. Job children remain an implementation detail:
-      all-in-one still embeds the hub, mediahost and transcoder modules in one
-      parent process and uses the single Kahawai binary
+      all-in-one still uses one parent process and the single Kahawai binary;
+      its transcoder module is embedded when `[all_in_one] transcoder` is enabled
 - [ ] GST-2 Run scan/extraction work through a bounded reusable worker pool,
       replace a worker after a crash or job budget, and attribute a crash or
       timeout to the exact file. Playback remains one worker process per
@@ -291,7 +291,7 @@ matrix rather than being dismissed as post-MVP cleanup.
 - [ ] GST-18 Remove the in-process playback worker fallback from integration
       tests and normal runtime. Tests spawn the same supervised worker binary as
       production; unit tests exercise only pure planners, parsers and adapters.
-      This isolates jobs and does not split the three all-in-one modules into
+      This isolates jobs and does not split the enabled all-in-one modules into
       separate module processes
 - [ ] GST-19 Have TS and fMP4 paths share one playlist contract and one decided
       target duration. The on-disk playlist, readiness/pacing logic and bytes

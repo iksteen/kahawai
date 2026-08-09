@@ -262,7 +262,10 @@ const MATRIX: &[(&str, &[&str], bool, &str, bool)] = &[
 /// `bench_cache`: where this box keeps its HUB-36 measurements, so the
 /// encoder rows can state speed. The doctor never benchmarks itself —
 /// that is a ~40 s job owned by the hub/satellite background task.
-pub fn gstreamer_checks(bench_cache: Option<&std::path::Path>) -> Vec<Check> {
+pub fn gstreamer_checks(
+    bench_cache: Option<&std::path::Path>,
+    verify_encoders: bool,
+) -> Vec<Check> {
     let mut out = Vec::new();
     if let Err(e) = crate::init() {
         out.push(Check::fail("gstreamer", format!("{e:#}"), true));
@@ -294,6 +297,9 @@ pub fn gstreamer_checks(bench_cache: Option<&std::path::Path>) -> Vec<Check> {
                 format!("missing {} — {cost}", elements.join("/")),
             )),
         }
+    }
+    if !verify_encoders {
+        out.retain(|c| c.name != "ass burn-in (element)" && !c.name.starts_with("encode "));
     }
 
     // hlssink3 has a known panic class (see remux.rs) that the session
@@ -335,6 +341,10 @@ pub fn gstreamer_checks(bench_cache: Option<&std::path::Path>) -> Vec<Check> {
     // fixed via [transcoder] demote_decoders reports ok here.
     out.push(dts_hd_check().0);
 
+    if !verify_encoders {
+        return out;
+    }
+
     // TC-1: encoders that will actually run sessions are dry-run-verified,
     // not just present — a broken element (or a hw element without its
     // driver) surfaces here, not mid-session.
@@ -363,7 +373,7 @@ pub fn gstreamer_checks(bench_cache: Option<&std::path::Path>) -> Vec<Check> {
         Check::warn(
             "ass burn-in",
             "assrender is installed but does not link to any encoder here — \
-             placement will not send ASS burns to this box",
+                 placement will not send ASS burns to this box",
         )
     } else {
         Check::warn(
@@ -383,8 +393,8 @@ pub fn gstreamer_checks(bench_cache: Option<&std::path::Path>) -> Vec<Check> {
         Check::warn(
             "hdr tone-map",
             "GL segment incomplete — HDR sources transcode without tone-mapping \
-             (washed-out colors); check gst-plugins-base GL and capssetter \
-             (gst-plugins-bad)",
+                 (washed-out colors); check gst-plugins-base GL and capssetter \
+                 (gst-plugins-bad)",
         )
     });
 
@@ -721,7 +731,7 @@ mod tests {
 
     #[test]
     fn full_gst_install_passes_essentials() {
-        let checks = gstreamer_checks(None);
+        let checks = gstreamer_checks(None, true);
         assert!(checks.len() > 10);
         assert!(
             !has_essential_failure(&checks),
@@ -763,5 +773,13 @@ mod tests {
                 "fallback should recommend the preferred element: {hls:?}"
             );
         }
+    }
+
+    #[test]
+    fn disabled_transcoding_skips_encoder_dry_runs() {
+        let checks = gstreamer_checks(None, false);
+        assert!(checks.iter().all(|c| c.name != "hdr tone-map"));
+        assert!(checks.iter().all(|c| c.name != "ass burn-in"));
+        assert!(checks.iter().all(|c| !c.name.starts_with("encode ")));
     }
 }

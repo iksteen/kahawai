@@ -26,6 +26,9 @@ pub struct Roles {
     pub hub: bool,
     pub mediahost: bool,
     pub transcoder: bool,
+    /// The hub may encode in its own supervised worker even when it does not
+    /// contain the networked transcoder module.
+    pub local_encode: bool,
 }
 
 impl Roles {
@@ -35,6 +38,7 @@ impl Roles {
             hub: true,
             mediahost: true,
             transcoder: true,
+            local_encode: true,
         }
     }
 }
@@ -270,16 +274,24 @@ pub fn doctor_checks(
     // The workers apply these before building pipelines, so the doctor
     // must too — otherwise it reports the ranks of a registry no session
     // actually uses (and flags a shadow the config already demoted).
-    let _ = kahawai_media::demote_elements(&cfg.transcoder.demote_decoders);
+    let verify_encoders = roles.transcoder || roles.local_encode;
+    if verify_encoders {
+        let _ = kahawai_media::demote_elements(&cfg.transcoder.demote_decoders);
+    }
     // HUB-36: whichever role this box plays, its benchmark cache lives
     // beside that role's state; show measured speeds when they exist.
-    let bench_cache = [
-        cfg.hub.data_dir.join("benchmarks.json"),
-        cfg.transcoder.state_dir.join("benchmarks.json"),
-    ]
-    .into_iter()
-    .find(|p| p.exists());
-    let mut checks = kahawai_media::doctor::gstreamer_checks(bench_cache.as_deref());
+    let bench_cache = verify_encoders
+        .then(|| {
+            [
+                cfg.hub.data_dir.join("benchmarks.json"),
+                cfg.transcoder.state_dir.join("benchmarks.json"),
+            ]
+            .into_iter()
+            .find(|p| p.exists())
+        })
+        .flatten();
+    let mut checks =
+        kahawai_media::doctor::gstreamer_checks(bench_cache.as_deref(), verify_encoders);
 
     // Clock sanity: satellites on RTC-less boxes boot in the past (OPS-4).
     let year_2025 = 1735689600;

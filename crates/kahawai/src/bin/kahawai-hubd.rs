@@ -14,6 +14,7 @@ const ROLES: Roles = Roles {
     hub: true,
     mediahost: false,
     transcoder: false,
+    local_encode: true,
 };
 
 fn ocr_rows() -> Vec<kahawai_media::doctor::Check> {

@@ -24,7 +24,7 @@ pub async fn reset_password(cfg: config::HubConfig, username: &str) -> Result<()
 }
 
 pub async fn run_hub(cfg: config::HubConfig, config_path: Option<PathBuf>) -> Result<()> {
-    run_hub_inner(cfg, None, config_path).await
+    run_hub_inner(cfg, None, true, config_path).await
 }
 
 /// AR-5 all-in-one: the hub plus an IN-PROCESS mediahost — module logic
@@ -33,9 +33,15 @@ pub async fn run_hub(cfg: config::HubConfig, config_path: Option<PathBuf>) -> Re
 /// mediahosts/transcoders enroll and dial in exactly as in modular mode.
 pub async fn run_all_in_one(cfg: config::Config, config_path: Option<PathBuf>) -> Result<()> {
     // An empty in-process mediahost is useful when this process supplies
-    // the hub and local transcoding while collections live on external
-    // mediahosts. In that setup the in-process engine stays connected and idle.
-    run_hub_inner(cfg.hub, Some(cfg.mediahost), config_path).await
+    // the hub (and optionally local transcoding) while collections live on
+    // external mediahosts. The empty engine stays connected and idle.
+    run_hub_inner(
+        cfg.hub,
+        Some(cfg.mediahost),
+        cfg.all_in_one.transcoder,
+        config_path,
+    )
+    .await
 }
 
 /// HUB-36: measure this box's encoders in the background and hand the
@@ -92,6 +98,7 @@ fn spawn_local_benchmark(cache: PathBuf, registry: Arc<kahawai_hub::registry::Re
 async fn run_hub_inner(
     cfg: config::HubConfig,
     local_mediahost: Option<config::MediahostConfig>,
+    local_transcoder: bool,
     // The file SIGHUP re-reads (NFR-6). None when defaults were used.
     config_path: Option<PathBuf>,
 ) -> Result<()> {
@@ -105,10 +112,10 @@ async fn run_hub_inner(
     // The satellites table IS the mTLS allowlist (SEC-5): load it, then
     // the registry keeps it in sync on approve/delete.
     let allowed = kahawai_transport::mtls::AllowedCerts::default();
-    let registry = Arc::new(kahawai_hub::registry::Registry::new(
-        db.clone(),
-        allowed.clone(),
-    ));
+    let registry = Arc::new(
+        kahawai_hub::registry::Registry::new(db.clone(), allowed.clone())
+            .with_local_executor(local_transcoder),
+    );
     let admitted = registry.load_allowlist().await?;
     tracing::info!(admitted, "mTLS allowlist loaded");
     // HUB-36 phase 4: what the fleet has been measured to achieve, so a
@@ -118,10 +125,14 @@ async fn run_hub_inner(
         Ok(n) => tracing::info!(classes = n, "measured pace loaded"),
         Err(e) => tracing::warn!(error = format!("{e:#}"), "pace table unreadable"),
     }
-    // HUB-36: the hub is an executor too (an encode with no fleet stays
-    // local), so it measures itself on the same cache-but-verify terms
-    // as a satellite — off the startup path, published when it lands.
-    spawn_local_benchmark(cfg.data_dir.join("benchmarks.json"), registry.clone());
+    if local_transcoder {
+        // HUB-36: the hub is an executor too (an encode with no fleet stays
+        // local), so it measures itself on the same cache-but-verify terms
+        // as a satellite — off the startup path, published when it lands.
+        spawn_local_benchmark(cfg.data_dir.join("benchmarks.json"), registry.clone());
+    } else {
+        tracing::info!("in-process transcoder disabled by [all_in_one].transcoder");
+    }
     let auth = Arc::new(kahawai_hub::auth::Auth::new(db.clone(), &cfg.data_dir).await?);
     let sessions = Arc::new(
         kahawai_hub::sessions::Sessions::with_limits(
@@ -347,13 +358,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn all_in_one_starts_without_mediahost_collections() {
+    async fn all_in_one_starts_without_local_collections_or_transcoding() {
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = config::Config::default();
         cfg.hub.bind = unused_loopback_addr();
         cfg.hub.satellite_bind = unused_loopback_addr();
         cfg.hub.data_dir = dir.path().join("hub");
         cfg.mediahost.state_dir = dir.path().join("mediahost");
+        cfg.all_in_one.transcoder = false;
         assert!(cfg.mediahost.collections.is_empty());
 
         let api_addr = cfg.hub.bind;

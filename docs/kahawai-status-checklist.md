@@ -407,7 +407,11 @@ How something works and why it was built that way belong in
 ## Transcoder (TC)
 
 - [x] TC-1 Capability probe reported on registration
-- [x] TC-2 Capability + inverse-load placement; admin enable/disable
+- [x] TC-2 Capability + inverse-load placement; admin enable/disable for
+      enrolled transcoders. The AIO local executor is instead a structural
+      `[all_in_one] transcoder` setting (default true): false suppresses its
+      encoder dry-runs, capability benchmark and local placement while external
+      transcoders remain schedulable
 - [x] TC-3 Sessions fully specified by the hub
 - [x] TC-4 Dynamic GStreamer pipelines, HLS segments, supervised worker
       process. Progress reporting is PARTIAL, and the requirement was

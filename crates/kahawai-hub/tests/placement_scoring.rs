@@ -41,10 +41,19 @@ fn need(class: &str) -> PlacementNeed {
 }
 
 async fn registry() -> (tempfile::TempDir, std::sync::Arc<Registry>) {
+    registry_with_local_executor(true).await
+}
+
+async fn registry_with_local_executor(
+    enabled: bool,
+) -> (tempfile::TempDir, std::sync::Arc<Registry>) {
     let dir = tempfile::tempdir().unwrap();
     let db = kahawai_hub::db::open(dir.path()).await.unwrap();
     let allowed = kahawai_transport::mtls::AllowedCerts::default();
-    (dir, std::sync::Arc::new(Registry::new(db, allowed)))
+    (
+        dir,
+        std::sync::Arc::new(Registry::new(db, allowed).with_local_executor(enabled)),
+    )
 }
 
 /// Connect a transcoder well enough to be a placement candidate.
@@ -161,6 +170,25 @@ async fn work_repatriates_only_when_no_fleet_box_sustains_and_the_hub_does() {
     reg.set_pace("capable", class, 2.0);
     let p = reg.place(&need(class));
     assert_eq!(p.target.as_deref(), Some("capable"));
+}
+
+#[tokio::test]
+async fn disabling_the_local_executor_requires_and_keeps_work_on_the_fleet() {
+    let (_d, reg) = registry_with_local_executor(false).await;
+    let class = "1080|hevc|h264";
+
+    let unavailable = reg.place(&need(class));
+    assert!(!unavailable.available);
+    assert_eq!(unavailable.target, None);
+
+    connect(&reg, "external", caps(true, 0.4, 0.0));
+    reg.set_pace("external", class, 0.4);
+    // Even evidence that the hub would be faster must not override the
+    // structural choice to keep encoding off this machine.
+    reg.set_pace(pace::LOCAL, class, 5.0);
+    let placed = reg.place(&need(class));
+    assert!(placed.available);
+    assert_eq!(placed.target.as_deref(), Some("external"));
 }
 
 #[tokio::test]

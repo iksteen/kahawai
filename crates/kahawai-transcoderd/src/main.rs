@@ -10,6 +10,7 @@ const ROLES: Roles = Roles {
     hub: false,
     mediahost: false,
     transcoder: true,
+    local_encode: false,
 };
 use clap::{Parser, Subcommand};
 use kahawai_runtime::{Roles, WorkerArgs};

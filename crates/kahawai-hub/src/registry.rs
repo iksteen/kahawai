@@ -91,6 +91,10 @@ pub struct Placement {
     /// `Some(module_id)` = dispatch to that satellite, `None` = run in
     /// the hub's own supervised worker.
     pub target: Option<String>,
+    /// False when neither a suitable satellite nor the local executor is
+    /// available. `target = None` alone means local, so absence needs to be
+    /// represented separately.
+    pub available: bool,
     /// Realtime multiple this placement is expected to sustain. None
     /// when nothing about this box and this work has been measured —
     /// which is NOT the same as slow, and is treated as capable.
@@ -149,6 +153,10 @@ pub struct Registry {
     /// an executor too (encode with no fleet stays local), so it needs
     /// the same numbers to compete for placement.
     local_bench: Mutex<Option<kahawai_media::bench::BenchResults>>,
+    /// Structural startup choice. Unlike a satellite drain this is not a
+    /// live scheduling toggle: an AIO whose hardware is unsuitable must not
+    /// probe or select the local encode path at all.
+    local_executor_enabled: bool,
     tc_links: Mutex<
         HashMap<
             String,
@@ -212,6 +220,7 @@ impl Registry {
             links: Mutex::new(HashMap::new()),
             transcoder_caps: Mutex::new(HashMap::new()),
             local_bench: Mutex::new(None),
+            local_executor_enabled: true,
             tc_links: Mutex::new(HashMap::new()),
             tc_load: Mutex::new(HashMap::new()),
             tc_pace: Mutex::new(HashMap::new()),
@@ -221,6 +230,17 @@ impl Registry {
             deep_rescan: Mutex::new(std::collections::HashSet::new()),
             events: tokio::sync::broadcast::channel(256).0,
         }
+    }
+
+    /// Set whether this hub may perform encode work in its own worker.
+    /// Applied while constructing the registry, before it is shared.
+    pub fn with_local_executor(mut self, enabled: bool) -> Self {
+        self.local_executor_enabled = enabled;
+        self
+    }
+
+    pub fn local_executor_enabled(&self) -> bool {
+        self.local_executor_enabled
     }
 
     /// Push an event hint to /api/v1/events subscribers (HUB-11).
@@ -2010,15 +2030,23 @@ impl Registry {
     /// nothing has been measured yet, since unknown counts as capable.
     pub fn place(&self, need: &PlacementNeed) -> Placement {
         let fleet = self.reserve_transcoder(need);
-        let local = self.predict_local(need);
+        let local = self
+            .local_executor_enabled
+            .then(|| self.predict_local(need))
+            .flatten();
         match fleet {
             None => Placement {
                 target: None,
+                available: self.local_executor_enabled,
                 predicted: local,
             },
             Some(id) => {
                 let fleet_pred = self.predict_fleet(&id, need);
-                if !sustains(fleet_pred) && sustains(local) && local.is_some() {
+                if self.local_executor_enabled
+                    && !sustains(fleet_pred)
+                    && sustains(local)
+                    && local.is_some()
+                {
                     // Reserved above and not used: hand it straight back
                     // or the box stays counted busy for nothing.
                     self.tc_session_ended(&id);
@@ -2031,11 +2059,13 @@ impl Registry {
                     );
                     return Placement {
                         target: None,
+                        available: true,
                         predicted: local,
                     };
                 }
                 Placement {
                     target: Some(id),
+                    available: true,
                     predicted: fleet_pred,
                 }
             }

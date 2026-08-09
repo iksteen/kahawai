@@ -76,6 +76,14 @@ kahawai/
 
 The single `kahawai` binary exposes subcommands: `kahawai all-in-one`, `kahawai hub`, `kahawai mediahost`, `kahawai transcoder` (AR-5). Each module crate exports `async fn run(cfg, transport) -> Result<()>`; the binary merely wires the chosen transport:
 
+`[all_in_one] transcoder = false` makes the local encode executor structurally
+unavailable before startup encoder dry-runs, capability benchmarking and
+placement. It deliberately does
+not create a synthetic satellite: the admin satellite toggle is a live drain
+for an enrolled remote worker, whereas this setting describes what the AIO
+machine may run across restarts. Hub-local remux workers remain available
+(AR-10), and external transcoders continue to enroll and receive encode work.
+
 ```rust
 match cli.command {
     Cmd::AllInOne => {
@@ -476,7 +484,7 @@ Allowlist removal only happens through satellite deletion. `DELETE /admin/v1/sat
 
 A transient disconnect touches none of this — it only flips availability flags. On any later import, resolution step 2 (§4.2) checks the archives by `ContentId` first, restoring identity, manual matches, and watch state before consulting providers. Re-admitting a deleted machine is a fresh §7.2 enrollment with a new key.
 
-In all-in-one mode `LocalTransport` bypasses TLS and enrollment entirely — the three modules share a process and trust is intrinsic; the PKI machinery activates only for network transports.
+In all-in-one mode `LocalTransport` bypasses TLS and enrollment entirely — the enabled co-resident modules share a process and trust is intrinsic; the PKI machinery activates only for network transports.
 
 ### 7.5 Client API
 
@@ -538,7 +546,12 @@ max_sessions = 3
 scratch_dir = "/var/tmp/kahawai"
 ```
 
-All-in-one reads the same file with all three sections present and `hub`-address fields ignored.
+All-in-one reads the same file; satellite `hub`-address fields are ignored for its co-resident modules.
+
+```toml
+[all_in_one]
+transcoder = false       # external transcoders only; remux still runs in the hub
+```
 
 ## 9. Testing strategy
 
