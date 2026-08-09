@@ -32,10 +32,9 @@ pub async fn run_hub(cfg: config::HubConfig, config_path: Option<PathBuf>) -> Re
 /// direct file reads. The satellite listener stays up: external
 /// mediahosts/transcoders enroll and dial in exactly as in modular mode.
 pub async fn run_all_in_one(cfg: config::Config, config_path: Option<PathBuf>) -> Result<()> {
-    anyhow::ensure!(
-        !cfg.mediahost.collections.is_empty(),
-        "all-in-one needs at least one [[mediahost.collections]] entry"
-    );
+    // An empty in-process mediahost is useful when this process supplies
+    // the hub and local transcoding while collections live on external
+    // mediahosts. In that setup the in-process engine stays connected and idle.
     run_hub_inner(cfg.hub, Some(cfg.mediahost), config_path).await
 }
 
@@ -334,4 +333,48 @@ async fn run_hub_inner(
         .serve_with_incoming(kahawai_transport::tls::tls_incoming(listener, tls))
         .await
         .context("satellite listener failed")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn unused_loopback_addr() -> std::net::SocketAddr {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn all_in_one_starts_without_mediahost_collections() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = config::Config::default();
+        cfg.hub.bind = unused_loopback_addr();
+        cfg.hub.satellite_bind = unused_loopback_addr();
+        cfg.hub.data_dir = dir.path().join("hub");
+        cfg.mediahost.state_dir = dir.path().join("mediahost");
+        assert!(cfg.mediahost.collections.is_empty());
+
+        let api_addr = cfg.hub.bind;
+        let server = tokio::spawn(run_all_in_one(cfg, None));
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if server.is_finished() {
+                let result = server.await.unwrap();
+                panic!("all-in-one exited before serving: {result:?}");
+            }
+            if tokio::net::TcpStream::connect(api_addr).await.is_ok() {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "all-in-one did not start its client API"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        server.abort();
+        let _ = server.await;
+    }
 }
