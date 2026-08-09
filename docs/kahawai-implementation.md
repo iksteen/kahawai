@@ -55,18 +55,17 @@ kahawai/
 │   ├── kahawai-core/           # shared types: capability model, stream model,
 │   │                           # content identity, negotiation engine (pure logic)
 │   ├── kahawai-proto/          # .proto files + tonic/prost codegen
-│   ├── kahawai-transport/      # Transport trait: TcpTransport (tonic) and
-│   │                           # LocalTransport (in-process duplex channels)
+│   ├── kahawai-transport/      # mTLS, enrollment identity and certificate
+│   │                           # renewal shared by networked satellites
 │   ├── kahawai-media/          # gstreamer wrappers: discovery, pipeline builder,
 │   │                           # encoder capability probing
 │   ├── kahawai-hub/            # hub library (registry, libraries, enrichment,
 │   │                           # sessions, in-hub remuxer, client API)
 │   ├── kahawai-mediahost/      # mediahost library (scanner, watcher, file server)
 │   ├── kahawai-transcoder/     # transcoder library (session runner)
-│   ├── kahawai-providers/     # enrichment providers: thetvdb, tmdb, musicbrainz,
-│   │                           # anidb, anilist, anime-lists mapping, local-nfo
-│   │                           # (MetadataProvider trait); subtitle providers:
-│   │                           # opensubtitles (SubtitleProvider trait)
+│   ├── kahawai-runtime/        # config, startup checks and worker plumbing
+│   ├── kahawai-mediahostd/     # lean mediahost binary
+│   ├── kahawai-transcoderd/    # lean transcoder binary
 │   └── kahawai/                # the binary crate
 ├── web/                        # TS + Vite + React SPA (admin UI + MVP player);
 │                               # `vite build` output embedded into kahawai-hub
@@ -74,32 +73,32 @@ kahawai/
 └── migrations/
 ```
 
-The single `kahawai` binary exposes subcommands: `kahawai all-in-one`, `kahawai hub`, `kahawai mediahost`, `kahawai transcoder` (AR-5). Each module crate exports `async fn run(cfg, transport) -> Result<()>`; the binary merely wires the chosen transport:
+The single `kahawai` binary exposes subcommands: `kahawai all-in-one`,
+`kahawai hub`, `kahawai mediahost`, `kahawai transcoder` (AR-5). Networked
+mediahosts and transcoders use tonic over mTLS. All-in-one does not send that
+traffic over loopback and does not run tonic against an in-memory socket: it
+starts the mediahost engine with a pair of bounded Tokio queues carrying the
+same generated `HostToHub` / `HubToHost` Rust values used by the wire adapter.
+They are moved as ordinary Rust values — no protobuf encoding, HTTP/2 or TLS.
+The hub drains the local host queue through the same `handle_host_msg` function
+as the network link, keeping reconciliation, manifests, extraction worklists,
+ordering and backpressure identical between deployment modes.
 
 `[all_in_one] transcoder = false` makes the local encode executor structurally
 unavailable before startup encoder dry-runs, capability benchmarking and
-placement. It deliberately does
-not create a synthetic satellite: the admin satellite toggle is a live drain
+placement. It deliberately does not create a synthetic satellite: the admin
+satellite toggle is a live drain
 for an enrolled remote worker, whereas this setting describes what the AIO
 machine may run across restarts. Hub-local remux workers remain available
 (AR-10), and external transcoders continue to enroll and receive encode work.
 
-```rust
-match cli.command {
-    Cmd::AllInOne => {
-        let (hub_side, host_side, tc_side) = kahawai_transport::local_mesh();
-        try_join!(
-            kahawai_hub::run(cfg.hub, hub_side),
-            kahawai_mediahost::run(cfg.mediahost, host_side),
-            kahawai_transcoder::run(cfg.transcoder, tc_side),
-        )?;
-    }
-    Cmd::Hub => kahawai_hub::run(cfg.hub, TcpTransport::listen(cfg.bind).await?).await?,
-    ...
-}
-```
-
-`LocalTransport` implements `tower::Service` over in-memory duplex streams so tonic clients/servers run unchanged in-process; the media byte channel maps to direct `tokio::fs` reads in all-in-one mode (AR-11 short-circuit).
+The AIO byte path is short-circuited separately. `Sessions::set_local_source`
+registers the in-process collection resolver; opening a lease for that module
+resolves the path directly and serves it from a local Tokio file. The lease
+retains the same request/chunk shape for its consumers, but no bytes cross gRPC
+or a loopback interface. Local encode work is the hub's supervised worker path,
+not an in-process `TranscoderLink`; external transcoders still use that gRPC
+service normally. The satellite listener remains active in every case.
 
 ## 3. Inter-module protocol (`kahawai-proto`)
 
@@ -114,7 +113,7 @@ Three gRPC services, all initiated module→hub (AR-3) over mTLS (the satellite'
 - hub→tc: `StartSession{ spec: TranscodeSpec }`, `Seek{ session, offset }`, `SetQuality{ session, ladder_step }`, `Cancel{ session }`
 - tc→hub: `SegmentReady{ session, seq, uri|inline }`, `PlaylistUpdate`, `Progress{ realtime_x, position }`, `SessionError`, `Load{ cpu, gpu_sessions }`
 
-**Byte plane.** Bulk media bytes ride gRPC too — tonic byte-chunk streams, mTLS under the hub CA, with the one-time token minted on the control stream binding each stream to a specific read lease or transcode session. The hard-won invariant (AR-12): **the byte plane MUST be a separate HTTP/2 connection from the control link** — a distinct tonic channel, never a stream multiplexed onto the control connection. HTTP/2 flow control is per-connection as well as per-stream: in early implementation, a single stalled lease stream (client paused, pipeline backpressured) exhausted the shared connection-level window and froze heartbeats for 40 s at a time, producing false disconnects and spurious failovers. Separate connections give each plane its own window; a stalled lease now stalls only itself. In all-in-one mode the byte plane is a function call. This keeps bulk media bytes off the gRPC streams. In all-in-one mode the byte plane is a function call.
+**Byte plane.** For a networked mediahost, bulk media bytes ride a separate gRPC connection: tonic byte-chunk streams over mTLS, with a one-time token minted on the control stream binding the channel to a specific read lease. The hard-won invariant (AR-12): **the byte plane MUST be a separate HTTP/2 connection from the control link**. HTTP/2 flow control is per-connection as well as per-stream: in early implementation, a single stalled lease stream (client paused, pipeline backpressured) exhausted the shared connection-level window and froze heartbeats for 40 s at a time, producing false disconnects and spurious failovers. Separate connections make a stalled lease stall only itself. The in-process mediahost takes neither connection: path resolution and file reads stay local as described in §2.
 
 Content identity (MH-5):
 
@@ -484,7 +483,7 @@ Allowlist removal only happens through satellite deletion. `DELETE /admin/v1/sat
 
 A transient disconnect touches none of this — it only flips availability flags. On any later import, resolution step 2 (§4.2) checks the archives by `ContentId` first, restoring identity, manual matches, and watch state before consulting providers. Re-admitting a deleted machine is a fresh §7.2 enrollment with a new key.
 
-In all-in-one mode `LocalTransport` bypasses TLS and enrollment entirely — the enabled co-resident modules share a process and trust is intrinsic; the PKI machinery activates only for network transports.
+In all-in-one mode the bounded local queues bypass TLS and enrollment entirely — the in-process mediahost shares the hub's fate and trust is intrinsic. The PKI machinery applies only to external satellites, including external mediahosts and transcoders attached to an AIO hub.
 
 ### 7.5 Client API
 
@@ -555,7 +554,7 @@ transcoder = false       # external transcoders only; remux still runs in the hu
 
 ## 9. Testing strategy
 
-Negotiation engine: exhaustive table-driven unit tests (capability × source matrix). Media layer: fixture corpus generated by `gst-launch` scripts (each codec/container/subtitle permutation, tiny durations) committed via Git LFS; discovery snapshots asserted. Integration: `LocalTransport` lets the full three-module flow run in one test process; a second suite runs the same client-visible tests against a docker-compose modular topology (acceptance criterion 3). Chaos tests: kill/reconnect mediahost and transcoder mid-session (criterion 4). PKI tests: full enrollment happy path, wrong/expired code, CSR substitution (fingerprint mismatch), a CA-signed certificate *not* on the allowlist refused at handshake (fail-closed), renewal near expiry including the old/new fingerprint overlap window and grace lapse (unused new fingerprint retired, active one untouched), satellite refusing a hub presenting a foreign CA, and the deletion path — delete a mediahost, assert connection drop + collection removal + TLS-level reconnection refusal, then re-enroll, rescan, and assert manual matches and watch state are restored from the archives (criterion 5). Web UI: Playwright end-to-end suite driven against the all-in-one binary (login, enrollment approval, library composition, direct/remux/transcode playback with the real capability probe, subtitle search+download), run in Chromium and WebKit to cover both the MSE and native-HLS player paths. Performance: `criterion` micro-benches for negotiation and scan throughput; k6 scripts for API latency targets (NFR-1).
+Negotiation engine: exhaustive table-driven unit tests (capability × source matrix). Media layer: fixture corpus generated by `gst-launch` scripts (each codec/container/subtitle permutation, tiny durations) committed via Git LFS; discovery snapshots asserted. Integration: the bounded local link runs the mediahost engine and the hub's real message handler in one process without network transport; a second suite runs the same client-visible tests against a docker-compose modular topology (acceptance criterion 3). Chaos tests: kill/reconnect mediahost and transcoder mid-session (criterion 4). PKI tests: full enrollment happy path, wrong/expired code, CSR substitution (fingerprint mismatch), a CA-signed certificate *not* on the allowlist refused at handshake (fail-closed), renewal near expiry including the old/new fingerprint overlap window and grace lapse (unused new fingerprint retired, active one untouched), satellite refusing a hub presenting a foreign CA, and the deletion path — delete a mediahost, assert connection drop + collection removal + TLS-level reconnection refusal, then re-enroll, rescan, and assert manual matches and watch state are restored from the archives (criterion 5). Web UI: Playwright end-to-end suite driven against the all-in-one binary (login, enrollment approval, library composition, direct/remux/transcode playback with the real capability probe, subtitle search+download), run in Chromium and WebKit to cover both the MSE and native-HLS player paths. Performance: `criterion` micro-benches for negotiation and scan throughput; k6 scripts for API latency targets (NFR-1).
 
 ## 10. Operational readiness (OPS-1..8)
 
