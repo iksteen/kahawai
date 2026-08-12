@@ -43,8 +43,9 @@ function useOptimistic(value: string, onChange: (v: string) => void, flash: () =
   const seq = useRef(0)
   const inflight = useRef(0)
   const saved = useRef(value)
-  /// Which write `saved` came from, so a success that lands out of order
-  /// cannot overwrite a newer one that already landed.
+  /// Which write `saved` came from. `putPref` guarantees replies land in this
+  /// order too; the sequence still decides whether a failure is current enough
+  /// to put anything back on screen.
   const savedSeq = useRef(0)
   // Nothing outstanding means the prop is what the server has.
   if (inflight.current === 0) saved.current = value
@@ -52,6 +53,8 @@ function useOptimistic(value: string, onChange: (v: string) => void, flash: () =
     const mine = ++seq.current
     inflight.current++
     onChange(v)
+    // `putPref` serialises whole-state commits per preference key. The
+    // optimistic control still moves now; only its network writes wait.
     put()
       .then(() => {
         // Any success moves the revert target, not just the newest one. Only

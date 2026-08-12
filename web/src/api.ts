@@ -5,6 +5,7 @@
 import { buildProfile } from './capabilities.ts'
 
 import { notify } from './toast.ts'
+import { SerialQueue } from './serial.ts'
 import { REFRESH_RETRY_MS, refreshDelayMs } from './token.ts'
 
 const LS_ACCESS = 'kahawai.access'
@@ -1010,11 +1011,22 @@ export function openEvents(onEvent: (e: { kind: string } & Record<string, unknow
   return es
 }
 
-export const putPref = (scope: string, key: string, value: string) =>
-  json<{ ok: boolean }>('/api/v1/prefs', {
-    method: 'PUT',
-    body: JSON.stringify({ scope, key, value }),
-  })
+// Preferences are whole-value writes. One queue per key preserves the order
+// the viewer changed that value while unrelated controls still save in
+// parallel. Filtering stale responses in a component cannot provide this: an
+// older request can commit last and only reveal the rollback after a reload.
+const prefWrites = new Map<string, SerialQueue>()
+export const putPref = (scope: string, key: string, value: string) => {
+  const target = `${scope}\0${key}`
+  const queue = prefWrites.get(target) ?? new SerialQueue()
+  prefWrites.set(target, queue)
+  return queue.run(() =>
+    json<{ ok: boolean }>('/api/v1/prefs', {
+      method: 'PUT',
+      body: JSON.stringify({ scope, key, value }),
+    }),
+  )
+}
 
 /// Seek-restart: the pipeline restarts at the offset; re-attach the
 /// player. An audio_track switches tracks during the restart (HUB-27).

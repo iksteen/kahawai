@@ -83,6 +83,10 @@ export default function SearchOverlay({
   onClose: () => void
 }) {
   const [hits, setHits] = useState<LibraryHits[] | null>(null)
+  /// The query that produced the rows still on screen. Rows remain visible and
+  /// actionable while their replacements load; this keeps their label honest.
+  const [shownQuery, setShownQuery] = useState('')
+  const [searching, setSearching] = useState(false)
   /// The libraries that could not be asked, by name. Only reporting the
   /// all-failed case still stated a fact it did not have: two libraries
   /// erroring beside one with no matches printed "nothing matches" over a count
@@ -97,10 +101,16 @@ export default function SearchOverlay({
   useEffect(() => {
     if (libs.length === 0 || !query) {
       setHits(null)
+      setShownQuery('')
+      setSearching(false)
       setHighlight(-1)
       setFailed([])
       return
     }
+    // Keep the old rows in place while asking. They are visible, so pressing
+    // Enter on their highlight remains predictable; blanking the panel here
+    // makes every debounced keystroke flash the whole surface away instead.
+    setSearching(true)
     // Cleared before asking, so a failure does not paint over the next
     // keystroke's results for a round trip.
     setFailed([])
@@ -125,6 +135,8 @@ export default function SearchOverlay({
       // may paint.
       if (stale) return
       setHits(all.filter((h) => h.items.length > 0))
+      setShownQuery(query)
+      setSearching(false)
       // Beside the rows it belongs to rather than at the top of this effect:
       // the old results stay on screen until these land, and a Down pressed
       // while the new query was in flight is a Down against what was showing.
@@ -277,6 +289,11 @@ export default function SearchOverlay({
           on whatever it was over. */}
       <div className="menu-sheet" onClick={onClose} />
       <div className="search-panel">
+        {searching && hits !== null && (
+          <span className="search-update mono" role="status">
+            updating
+          </span>
+        )}
         {/* Outside the listbox below, because a listbox may contain nothing but
             options: a paragraph and a button inside one can be dropped from the
             accessibility tree altogether, which would have silently hidden the
@@ -313,7 +330,7 @@ export default function SearchOverlay({
             nothing else. Focus stays in the box and the lit row is named by
             `aria-activedescendant`, which is the whole reason the rows carry
             ids — and why they are not tab stops. */}
-        <div id={SEARCH_LIST_ID} role="listbox" aria-label={`Results for ${query}`}>
+        <div id={SEARCH_LIST_ID} role="listbox" aria-label={`Results for ${shownQuery || query}`}>
           {rows.map((row, i) =>
             row.kind === 'library' ? (
               <button

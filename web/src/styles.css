@@ -781,6 +781,19 @@ h2 {
   animation: rise 160ms ease-out;
   text-align: left;
 }
+.search-update {
+  position: sticky;
+  z-index: 1;
+  top: 0;
+  float: right;
+  margin: 3px 5px -20px 0;
+  padding: 2px 5px;
+  border-radius: 3px;
+  background: var(--surface);
+  color: var(--teal);
+  font-size: 10px;
+  pointer-events: none;
+}
 .search-empty,
 .search-failed {
   margin: 0;
@@ -1763,7 +1776,7 @@ h2 {
    what shows — and it is opaque, so it covers the tilde on the box behind it.
    Half-strength slate, the same blank as a card that has not arrived at all,
    because it says the same thing.
-   
+
    The browser distinguishes the first two for us — an image paints this
    background until its content arrives. The third needs help: an `onError`
    on each <img> adds `.art-failed`, and a picture that FAILS is then hidden

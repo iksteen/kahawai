@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { notify } from '../toast'
 import { moved, useDragOrder } from '../reorder'
+import { SerialQueue } from '../serial'
 import Icon from '../icons'
 import {
   adminApprove,
@@ -124,6 +125,7 @@ function UsersSection({
         inflight: number
         savedSeq: number
         saved: { all_libraries: boolean; libraries: string[] } | null
+        queue: SerialQueue
       }
     >(),
   )
@@ -181,7 +183,13 @@ function UsersSection({
   const setAccess = (u: AdminUser, all: boolean, libs: string[]) => {
     // Per user, because two users' grants are two independent writes and a
     // shared counter would have them cancel each other.
-    const w = writes.current.get(u.id) ?? { seq: 0, inflight: 0, savedSeq: 0, saved: null }
+    const w = writes.current.get(u.id) ?? {
+      seq: 0,
+      inflight: 0,
+      savedSeq: 0,
+      saved: null,
+      queue: new SerialQueue(),
+    }
     writes.current.set(u.id, w)
     // Nothing outstanding means the chips on screen are what the hub has.
     if (w.inflight === 0) w.saved = { all_libraries: u.all_libraries, libraries: u.libraries }
@@ -190,7 +198,11 @@ function UsersSection({
     const apply = (v: { all_libraries: boolean; libraries: string[] }) =>
       setUsers((us) => us.map((x) => (x.id === u.id ? { ...x, ...v } : x)))
     apply({ all_libraries: all, libraries: libs })
-    return adminSetUserLibraries(u.id, all, libs)
+    // The optimistic chips move at once; only the commits wait. Filtering stale
+    // replies did not order SQLite writes, so request A could commit after B
+    // and leave the hub holding A while the panel continued to show B.
+    return w.queue
+      .run(() => adminSetUserLibraries(u.id, all, libs))
       .then((r) => {
         // The revert target moves on ANY success, newest-first: an older write
         // succeeding while a newer one is out still tells us something the hub
