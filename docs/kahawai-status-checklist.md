@@ -264,10 +264,13 @@ How something works and why it was built that way belong in
 - [x] HUB-11 Versioned HTTP/JSON API + /api/v1/events SSE channel
       (invalidation hints: scan progress, satellite connectivity,
       sessions, enrichment; cookie-authenticated for EventSource).
-      API authentication has 15-minute access JWTs and hashed, rotating
-      refresh families: conditional single-winner rotation, family revocation
-      on replay, family-scoped logout, and all-family revocation on password
-      reset
+      API authentication has 15-minute access JWTs with an explicit HS256-only
+      allowlist, signature/expiry validation, and required fixed issuer, API
+      audience and signed `access` credential type. Mutable account state and
+      the durable access generation come from the database on every request.
+      Refresh credentials use hashed, rotating families: conditional
+      single-winner rotation, family revocation on replay, family-scoped logout,
+      and all-family revocation on password reset
 - [x] HUB-12 Browse/search/filter/sort. Hierarchical browse, one
       endpoint for browse and cross-library search with server-side sort
       and paging, item detail with stream info, artwork at named sizes,

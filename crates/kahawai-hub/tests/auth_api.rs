@@ -827,6 +827,126 @@ async fn refresh_family_migration_invalidates_legacy_tokens() {
     assert_eq!(old_table, 0, "legacy token storage survived migration");
 }
 
+/// AUTH-2: only signed, unexpired HS256 access credentials minted by the
+/// Kahawai hub for its client API cross the authentication boundary.
+#[tokio::test]
+async fn access_tokens_require_algorithm_signature_expiry_issuer_audience_and_type() {
+    use jsonwebtoken::{Algorithm, EncodingKey, Header};
+    use serde::Serialize;
+
+    #[derive(Clone, Serialize)]
+    struct TestClaims<'a> {
+        sub: &'a str,
+        username: &'a str,
+        admin: bool,
+        auth_version: i64,
+        exp: i64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        iss: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        aud: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        token_type: Option<&'a str>,
+    }
+
+    let (dir, db, auth, _api, issued) = auth_harness().await;
+    assert!(
+        auth.authenticate(&issued.access_token).await.is_ok(),
+        "Auth did not accept its own hardened access token"
+    );
+
+    let (user_id, auth_version): (String, i64) =
+        sqlx::query_as("SELECT id, auth_version FROM users WHERE username = 'root'")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    let secret = std::fs::read(dir.path().join("jwt.secret")).unwrap();
+    let sign = |claims: &TestClaims<'_>, algorithm: Algorithm, key: &[u8]| {
+        jsonwebtoken::encode(
+            &Header::new(algorithm),
+            claims,
+            &EncodingKey::from_secret(key),
+        )
+        .unwrap()
+    };
+    let valid = TestClaims {
+        sub: &user_id,
+        username: "untrusted-token-copy",
+        admin: false,
+        auth_version,
+        exp: i64::MAX,
+        iss: Some(kahawai_hub::auth::ACCESS_TOKEN_ISSUER),
+        aud: Some(kahawai_hub::auth::ACCESS_TOKEN_AUDIENCE),
+        token_type: Some(kahawai_hub::auth::ACCESS_TOKEN_TYPE),
+    };
+
+    for (name, claims) in [
+        (
+            "missing issuer",
+            TestClaims {
+                iss: None,
+                ..valid.clone()
+            },
+        ),
+        (
+            "wrong issuer",
+            TestClaims {
+                iss: Some("urn:not-kahawai:hub"),
+                ..valid.clone()
+            },
+        ),
+        (
+            "missing audience",
+            TestClaims {
+                aud: None,
+                ..valid.clone()
+            },
+        ),
+        (
+            "wrong audience",
+            TestClaims {
+                aud: Some("urn:kahawai:not-the-api"),
+                ..valid.clone()
+            },
+        ),
+        (
+            "missing token type",
+            TestClaims {
+                token_type: None,
+                ..valid.clone()
+            },
+        ),
+        (
+            "wrong token type",
+            TestClaims {
+                token_type: Some("password-reset"),
+                ..valid.clone()
+            },
+        ),
+        (
+            "expired",
+            TestClaims {
+                exp: 1,
+                ..valid.clone()
+            },
+        ),
+    ] {
+        let token = sign(&claims, Algorithm::HS256, &secret);
+        assert!(
+            auth.authenticate(&token).await.is_err(),
+            "accepted token with {name}"
+        );
+    }
+
+    let wrong_signature = sign(&valid, Algorithm::HS256, b"a different signing secret");
+    assert!(auth.authenticate(&wrong_signature).await.is_err());
+    let wrong_algorithm = sign(&valid, Algorithm::HS384, &secret);
+    assert!(
+        auth.authenticate(&wrong_algorithm).await.is_err(),
+        "algorithm outside the HS256 allowlist was accepted"
+    );
+}
+
 /// AUTH-1: migration 52 deliberately creates a fresh credential generation.
 /// Access tokens from the old shape do not decode, and existing refresh
 /// families cannot mint replacements.

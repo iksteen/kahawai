@@ -26,6 +26,7 @@ if [ "$PASSWORD" = "-" ]; then
 fi
 
 KAHAWAI_AUTH_PASSWORD="$PASSWORD" python3 - "$API" "$USERNAME" <<'PY'
+import base64
 import concurrent.futures
 import json
 import os
@@ -65,16 +66,39 @@ def expect(want, result, what):
     return body
 
 
+def assert_access_shape(token):
+    try:
+        header64, payload64, _signature = token.split(".")
+        decode = lambda part: json.loads(base64.urlsafe_b64decode(part + "=" * (-len(part) % 4)))
+        header, payload = decode(header64), decode(payload64)
+    except (ValueError, KeyError, json.JSONDecodeError) as error:
+        raise SystemExit("access token is not a JWT: %s" % error)
+    expected = {
+        "alg": (header.get("alg"), "HS256"),
+        "iss": (payload.get("iss"), "urn:kahawai:hub"),
+        "aud": (payload.get("aud"), "urn:kahawai:api"),
+        "token_type": (payload.get("token_type"), "access"),
+    }
+    wrong = ["%s=%r" % (name, actual) for name, (actual, want) in expected.items() if actual != want]
+    if wrong:
+        raise SystemExit("access token has wrong authentication boundary: " + ", ".join(wrong))
+
+
 def login():
-    return expect(
+    pair = expect(
         200,
         call("POST", "/api/v1/auth/token", {"username": username, "password": password}),
         "login",
     )
+    assert_access_shape(pair["access_token"])
+    return pair
 
 
 def refresh(token):
-    return call("POST", "/api/v1/auth/refresh", {"refresh_token": token})
+    result = call("POST", "/api/v1/auth/refresh", {"refresh_token": token})
+    if result[0] == 200:
+        assert_access_shape(result[1]["access_token"])
+    return result
 
 
 # Consumed-token replay revokes the rotated token but not another login.

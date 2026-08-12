@@ -92,11 +92,14 @@ marked in that document.
       refresh family, and makes old access tokens undecodable because they lack
       the required generation claim. The field's durable-generation meaning is
       documented in `hub/auth.rs`, beside the code that enforces it
-- [~] AUTH-2 Retain the existing HS256 allowlist, signature and expiry
-      validation. Every authenticated HTTP request now loads the user by primary
-      key and constructs username and administrator status from the database;
-      adding and requiring the intended issuer, audience and token-type claims
-      remains
+- [x] AUTH-2 Access tokens retain an explicit HS256-only algorithm allowlist,
+      signature and expiry validation, and require the fixed issuer
+      `urn:kahawai:hub`, API audience `urn:kahawai:api`, and signed credential
+      type `access`. Every authenticated HTTP request then loads the user by
+      primary key and constructs username and administrator status from the
+      database. `auth_api::access_tokens_require_algorithm_signature_expiry_issuer_audience_and_type`
+      exercises the complete acceptance boundary; `kahawai-auth-cycle.sh`
+      inspects the same claims on tokens issued by a running hub
 - [x] AUTH-3 Deletion removes the authoritative user row; role changes and
       password resets increment `auth_version` in the same committed write.
       `auth_api::password_reset_revokes_all_families_across_restart` uses a

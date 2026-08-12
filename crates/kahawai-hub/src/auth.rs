@@ -45,7 +45,7 @@ use std::sync::Mutex;
 use anyhow::{Context, Result, bail};
 use argon2::Argon2;
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
-use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation};
+use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -53,6 +53,18 @@ use sqlx::{Row, SqlitePool};
 
 const ACCESS_TTL_SECS: i64 = 15 * 60;
 const REFRESH_TTL_SECS: i64 = 30 * 24 * 3600;
+
+/// JWT issuer: the authority that minted the credential. The per-hub signing
+/// secret distinguishes installations; this stable value names the authority
+/// class without coupling credentials to a bind address or reverse-proxy URL.
+pub const ACCESS_TOKEN_ISSUER: &str = "urn:kahawai:hub";
+/// JWT audience: the only resource server allowed to consume an access token.
+/// It names the client HTTP API, not a deployment hostname or client device.
+pub const ACCESS_TOKEN_AUDIENCE: &str = "urn:kahawai:api";
+/// Credential class. This application claim is enforced rather than relying
+/// on the informational JWT `typ` header, so another JWT class cannot be
+/// accepted as API access.
+pub const ACCESS_TOKEN_TYPE: &str = "access";
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Claims {
@@ -63,6 +75,9 @@ pub struct Claims {
     /// Durable access generation; must equal `users.auth_version`.
     pub auth_version: i64,
     pub exp: i64,
+    pub iss: String,
+    pub aud: String,
+    pub token_type: String,
 }
 
 /// What `set_admin` did, or why it declined to.
@@ -626,9 +641,12 @@ impl Auth {
             admin,
             auth_version,
             exp: now_unix() + ACCESS_TTL_SECS,
+            iss: ACCESS_TOKEN_ISSUER.to_string(),
+            aud: ACCESS_TOKEN_AUDIENCE.to_string(),
+            token_type: ACCESS_TOKEN_TYPE.to_string(),
         };
         Ok(jsonwebtoken::encode(
-            &Header::default(),
+            &Header::new(Algorithm::HS256),
             &claims,
             &self.enc,
         )?)
@@ -662,8 +680,19 @@ impl Auth {
     /// exists, that its generation is current, and what username/admin rights
     /// it has now. No process-local cache participates in invalidation.
     pub async fn authenticate(&self, bearer: &str) -> Result<Claims> {
-        let token =
-            jsonwebtoken::decode::<Claims>(bearer, &self.dec, &Validation::default())?.claims;
+        // AUTH-2: an explicit one-entry algorithm allowlist retains signature
+        // and expiry checks while issuer/audience bind this JWT to Kahawai's
+        // client API. Custom token_type is checked immediately after decode
+        // rather than relying on the informational JWT `typ` header.
+        let mut validation = Validation::new(Algorithm::HS256);
+        validation.set_required_spec_claims(&["exp", "iss", "aud"]);
+        validation.set_issuer(&[ACCESS_TOKEN_ISSUER]);
+        validation.set_audience(&[ACCESS_TOKEN_AUDIENCE]);
+        let token = jsonwebtoken::decode::<Claims>(bearer, &self.dec, &validation)?.claims;
+        anyhow::ensure!(
+            token.token_type == ACCESS_TOKEN_TYPE,
+            "wrong access token type"
+        );
         let row = sqlx::query("SELECT username, is_admin, auth_version FROM users WHERE id = ?")
             .bind(&token.sub)
             .fetch_optional(&self.db)
@@ -680,6 +709,9 @@ impl Auth {
             admin: row.get::<i64, _>("is_admin") != 0,
             auth_version: current_version,
             exp: token.exp,
+            iss: token.iss,
+            aud: token.aud,
+            token_type: token.token_type,
         })
     }
 }
