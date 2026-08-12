@@ -227,11 +227,15 @@ impl PendingSeek {
 /// already bound to (a seek cannot move boxes, HUB-15b). Folding these
 /// in would quietly make a seek re-plan against a fleet it cannot use.
 pub(crate) struct ExecutorFacts {
-    /// HUB-15a: that box reports the GL tone-map segment.
+    /// HUB-15a: the selected full video executor reports tone-map.
     pub tonemap: bool,
-    /// HUB-15b: its verified encoder codec names — negotiation's target
-    /// pool, intersected with what the client accepts.
-    pub targets: Vec<String>,
+    /// HUB-15b: verified video targets of that full executor.
+    pub video_targets: Vec<String>,
+    /// Its audio targets, used when the whole video-encode pipeline is
+    /// dispatched there.
+    pub full_audio_targets: Vec<String>,
+    /// Audio targets of the hub's lightweight local worker.
+    pub local_audio_targets: Vec<String>,
     /// HUB-32b: this source's display-set timeline is readable where
     /// the encode would run.
     pub burn_capable: bool,
@@ -300,7 +304,7 @@ impl<'a> Negotiation<'a> {
         // the tier is decided before placement, which then hard-filters
         // on it (registry::PlacementNeed::needs_ass_burn).
         let local_ass_burn =
-            registry.local_executor_enabled() && kahawai_media::remux::ass_burn_available();
+            registry.local_video_executor_enabled() && kahawai_media::remux::ass_burn_available();
         let ass = crate::tracks::ass_policy_for_user(
             registry.db(),
             user_id,
@@ -418,12 +422,12 @@ impl<'a> Negotiation<'a> {
             work_class: None,
             source_kbps: None,
         };
-        let (tonemap, targets) = match self.registry.pick_transcoder(&need) {
+        let (tonemap, full_targets) = match self.registry.pick_transcoder(&need) {
             Some(tc) => (
                 self.registry.transcoder_reports_tonemap(&tc),
                 self.registry.transcoder_encoders(&tc),
             ),
-            None if self.registry.local_executor_enabled() => (
+            None if self.registry.local_video_executor_enabled() => (
                 kahawai_media::remux::tonemap_available(),
                 local_encoder_names(),
             ),
@@ -431,7 +435,9 @@ impl<'a> Negotiation<'a> {
         };
         ExecutorFacts {
             tonemap,
-            targets,
+            video_targets: video_encoder_names(&full_targets),
+            full_audio_targets: audio_encoder_names(&full_targets),
+            local_audio_targets: local_audio_encoder_names(),
             burn_capable,
         }
     }
@@ -447,7 +453,7 @@ impl<'a> Negotiation<'a> {
             .duration_ms
             .filter(|d| *d > 0)
             .map(|d| ((parts.iter().map(|p| p.size).sum::<u64>() * 8) / d) as u32);
-        kahawai_media::negotiate::negotiate(
+        kahawai_media::negotiate::negotiate_for_executors(
             &self.profile,
             info,
             self.audio_track as usize,
@@ -470,7 +476,9 @@ impl<'a> Negotiation<'a> {
                 .unwrap_or_default(),
             self.pick_for(parts),
             &self.ass,
-            &facts.targets,
+            &facts.video_targets,
+            &facts.full_audio_targets,
+            &facts.local_audio_targets,
         )
     }
 
@@ -595,6 +603,32 @@ fn local_encoder_names() -> Vec<String> {
     kahawai_media::remux::encoder_capabilities()
         .iter()
         .map(|(c, _, _)| c.to_string())
+        .collect()
+}
+
+fn local_audio_encoder_names() -> Vec<String> {
+    [
+        ("aac", kahawai_media::remux::aac_encoder()),
+        ("opus", kahawai_media::remux::opus_encoder()),
+    ]
+    .into_iter()
+    .filter_map(|(codec, element)| element.map(|_| codec.to_string()))
+    .collect()
+}
+
+fn video_encoder_names(targets: &[String]) -> Vec<String> {
+    targets
+        .iter()
+        .filter(|t| matches!(t.as_str(), "h264" | "hevc" | "av1"))
+        .cloned()
+        .collect()
+}
+
+fn audio_encoder_names(targets: &[String]) -> Vec<String> {
+    targets
+        .iter()
+        .filter(|t| matches!(t.as_str(), "aac" | "opus"))
+        .cloned()
         .collect()
 }
 
@@ -1825,7 +1859,7 @@ impl Sessions {
                 };
                 anyhow::ensure!(
                     placement.available,
-                    "transcoding unavailable: the local transcoder is disabled and no capable external transcoder is connected"
+                    "video transcoding unavailable: no capable external transcoder or enabled all-in-one transcoder"
                 );
                 let placed = placement.target.clone();
                 if let Some(p) = placement.predicted
@@ -2823,12 +2857,16 @@ impl Sessions {
             // change re-plans even with the same tracks.
             let (_, _, _, info) = crate::subtitles::source_row(registry, &session.item_id).await?;
             // HUB-15a: the executor is already chosen here — ask IT.
+            // Plain hub-local audio work is not a video executor.
             let tonemap = match &session.mode {
                 Mode::Transcode { transcoder } => {
                     let tc = transcoder.lock().unwrap().clone();
                     registry.transcoder_reports_tonemap(&tc)
                 }
-                _ => kahawai_media::remux::tonemap_available(),
+                _ if registry.local_video_executor_enabled() => {
+                    kahawai_media::remux::tonemap_available()
+                }
+                _ => false,
             };
             // Mirrors the start path (connected counts: the mediahost
             // walks its own index); sets already fetched into scratch
@@ -2840,13 +2878,25 @@ impl Sessions {
                 });
             // HUB-15b: re-plans may only pick targets the ALREADY
             // CHOSEN executor encodes — the session does not move boxes
-            // on a track switch.
-            let targets = match &session.mode {
+            // on a track switch. A remote video session therefore uses
+            // that same box even if the new plan becomes audio-only.
+            let (video_targets, full_audio_targets, local_audio_targets) = match &session.mode {
                 Mode::Transcode { transcoder } => {
                     let tc = transcoder.lock().unwrap().clone();
-                    registry.transcoder_encoders(&tc)
+                    let all = registry.transcoder_encoders(&tc);
+                    let video = video_encoder_names(&all);
+                    let audio = audio_encoder_names(&all);
+                    (video, audio.clone(), audio)
                 }
-                _ => local_encoder_names(),
+                _ => {
+                    let video = if registry.local_video_executor_enabled() {
+                        video_encoder_names(&local_encoder_names())
+                    } else {
+                        Vec::new()
+                    };
+                    let audio = local_audio_encoder_names();
+                    (video, audio.clone(), audio)
+                }
             };
             let ocr_set = crate::subtitles::ocr_stream_set(registry.db(), &session.item_id).await;
             let ocr_flags = session
@@ -2862,7 +2912,7 @@ impl Sessions {
                     )
                 })
                 .unwrap_or_default();
-            let sp = kahawai_media::negotiate::negotiate(
+            let sp = kahawai_media::negotiate::negotiate_for_executors(
                 &session.profile,
                 &info,
                 want_audio,
@@ -2884,11 +2934,16 @@ impl Sessions {
                             let tc = transcoder.lock().unwrap().clone();
                             registry.transcoder_reports_ass_burn(&tc)
                         }
-                        _ => kahawai_media::remux::ass_burn_available(),
+                        _ if registry.local_video_executor_enabled() => {
+                            kahawai_media::remux::ass_burn_available()
+                        }
+                        _ => false,
                     },
                     ..session.ass.clone()
                 },
-                &targets,
+                &video_targets,
+                &full_audio_targets,
+                &local_audio_targets,
             );
             plan = sp.plan;
             anyhow::ensure!(plan.playable(), "selected track is not playable");

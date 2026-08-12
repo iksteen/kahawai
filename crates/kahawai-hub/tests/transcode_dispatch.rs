@@ -1,8 +1,6 @@
-//! End-to-end session dispatch (M3, §4.5): a source whose audio needs
-//! encoding is placed on a connected transcoder (real kahawai-transcoder
-//! link code, in-process worker), source bytes flow hub→transcoder over
-//! the control link, and the playlist + AAC segments come back through
-//! the hub's artifact proxy.
+//! End-to-end execution boundary (AR-10/HUB-16): audio-only encode stays
+//! in the hub even with a transcoder connected; forcing video encode dispatches
+//! the same source to a real kahawai-transcoder link, including seek/failover.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -82,13 +80,14 @@ fn cuttable_relay(target: String) -> (String, tokio::sync::broadcast::Sender<()>
 }
 
 #[tokio::test]
-async fn dispatches_encode_session_to_transcoder() {
+async fn keeps_audio_encode_local_and_dispatches_video_encode() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter("info,kahawai_hub=debug")
         .try_init();
     if !kahawai_media::testutil::require(
-        kahawai_media::remux::aac_encoder().is_some(),
-        "verified AAC encoder",
+        kahawai_media::remux::aac_encoder().is_some()
+            && kahawai_media::remux::h264_encoder().is_some(),
+        "verified AAC and H.264 encoders",
     ) {
         return;
     }
@@ -235,7 +234,8 @@ async fn dispatches_encode_session_to_transcoder() {
         }
     });
 
-    // Real transcoder link (in-process worker), aac-only capability.
+    // Real transcoder link (in-process worker), with the locally verified
+    // H.264 and AAC elements advertised as a full executor.
     let tc_id = enroll(&ca, &allowed, "transcoder", "01TC", "encoder-box");
     let tc_tls = kahawai_transport::mtls::mtls_client_config(&tc_id).unwrap();
     let tc_scratch = tempfile::tempdir().unwrap();
@@ -247,13 +247,22 @@ async fn dispatches_encode_session_to_transcoder() {
     let scratch_path = tc_scratch.path().join("sessions");
     let tc1_task = tokio::spawn(async move {
         let caps = pb::CapabilityReport {
-            encoders: vec![pb::EncoderCap {
-                codec: "aac".into(),
-                element: "fdkaacenc".into(),
-                hardware: false,
-                speed_1080: None,
-                speed_2160: None,
-            }],
+            encoders: vec![
+                pb::EncoderCap {
+                    codec: "h264".into(),
+                    element: kahawai_media::remux::h264_encoder().unwrap().into(),
+                    hardware: false,
+                    speed_1080: None,
+                    speed_2160: None,
+                },
+                pb::EncoderCap {
+                    codec: "aac".into(),
+                    element: kahawai_media::remux::aac_encoder().unwrap().into(),
+                    hardware: false,
+                    speed_1080: None,
+                    speed_2160: None,
+                },
+            ],
             max_sessions: 2,
             decode_caps: vec![], // empty = assume capable (OPS-7)
             tonemap: false,
@@ -323,24 +332,54 @@ async fn dispatches_encode_session_to_transcoder() {
     .await
     .expect("transcoder never registered");
 
-    // Start a remux session: audio Encode → dispatched.
+    let start = || {
+        Request::post("/api/v1/playback/sessions")
+            .header("authorization", bearer.clone())
+            .header("content-type", "application/json")
+            .body(Body::from(format!(
+                "{{\"item_id\":\"{item_id}\",\"mode\":\"remux\"}}"
+            )))
+            .unwrap()
+    };
+
+    // H.264 copies and only FLAC→AAC encodes: this is lightweight hub work,
+    // even though a capable external transcoder is already connected.
+    let resp = api.clone().oneshot(start()).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let local: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+    assert_eq!(
+        local["mode"], "remux",
+        "audio-only must stay local: {local}"
+    );
+    assert_eq!(local["streams"]["cost"], "audio_encode");
+    assert_eq!(local["streams"]["audio"], "flac → aac (transcoded)");
+    let local_id = local["session_id"].as_str().unwrap();
     let resp = api
         .clone()
         .oneshot(
-            Request::post("/api/v1/playback/sessions")
+            Request::delete(format!("/api/v1/playback/sessions/{local_id}"))
                 .header("authorization", bearer.clone())
-                .header("content-type", "application/json")
-                .body(Body::from(format!(
-                    "{{\"item_id\":\"{item_id}\",\"mode\":\"remux\"}}"
-                )))
+                .body(Body::empty())
                 .unwrap(),
         )
         .await
         .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    // Force video encode for the same source. Now the full transcoder owns
+    // the pipeline, preserving the dispatch, seek and failover coverage.
+    sqlx::query(
+        "INSERT INTO user_prefs (user_id, scope, key, value)
+         SELECT id, '', 'bandwidth_kbps', '1' FROM users",
+    )
+    .execute(&db)
+    .await
+    .unwrap();
+    let resp = api.clone().oneshot(start()).await.unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);
     let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
-    assert_eq!(v["mode"], "transcode", "session should dispatch: {v}");
-    assert_eq!(v["streams"]["cost"], "audio_encode");
+    assert_eq!(v["mode"], "transcode", "video encode should dispatch: {v}");
+    assert_eq!(v["streams"]["cost"], "video_encode");
     assert_eq!(v["streams"]["audio"], "flac → aac (transcoded)");
     let stream_url = v["stream_url"].as_str().unwrap().to_string();
     let session_id = v["session_id"].as_str().unwrap().to_string();
@@ -453,13 +492,22 @@ async fn dispatches_encode_session_to_transcoder() {
     let tc2_path = tc2_scratch.path().join("sessions");
     tokio::spawn(async move {
         let caps = pb::CapabilityReport {
-            encoders: vec![pb::EncoderCap {
-                codec: "aac".into(),
-                element: "fdkaacenc".into(),
-                hardware: false,
-                speed_1080: None,
-                speed_2160: None,
-            }],
+            encoders: vec![
+                pb::EncoderCap {
+                    codec: "h264".into(),
+                    element: kahawai_media::remux::h264_encoder().unwrap().into(),
+                    hardware: false,
+                    speed_1080: None,
+                    speed_2160: None,
+                },
+                pb::EncoderCap {
+                    codec: "aac".into(),
+                    element: kahawai_media::remux::aac_encoder().unwrap().into(),
+                    hardware: false,
+                    speed_1080: None,
+                    speed_2160: None,
+                },
+            ],
             max_sessions: 2,
             decode_caps: vec![],
             tonemap: false,

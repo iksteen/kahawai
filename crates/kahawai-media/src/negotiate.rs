@@ -470,6 +470,45 @@ pub fn negotiate(
     est_kbps: Option<u32>,
     tonemap: bool,
     burn_capable: bool,
+    ocr_text: &[bool],
+    burn_pick: Option<BurnPick>,
+    ass: &AssPolicy,
+    targets: &[String],
+) -> SourcePlan {
+    negotiate_for_executors(
+        profile,
+        info,
+        audio_track,
+        video_track,
+        single_part,
+        est_kbps,
+        tonemap,
+        burn_capable,
+        ocr_text,
+        burn_pick,
+        ass,
+        targets,
+        targets,
+        targets,
+    )
+}
+
+/// Negotiate against the two execution classes in the topology.
+///
+/// A copied-video/audio-encode plan runs in the hub, while a video encode
+/// (and any audio encode accompanying it) runs on one full transcoder. Keeping
+/// the target pools separate prevents either executor's codecs from being
+/// promised on work that will run on the other.
+#[allow(clippy::too_many_arguments)]
+pub fn negotiate_for_executors(
+    profile: &CapabilityProfile,
+    info: &MediaInfo,
+    audio_track: usize,
+    video_track: usize,
+    single_part: bool,
+    est_kbps: Option<u32>,
+    tonemap: bool,
+    burn_capable: bool,
     // Per-subtitle-stream: a cached OCR text track exists (HUB-32c).
     // Indexes align with `info.subtitles`; short slices read as false.
     ocr_text: &[bool],
@@ -483,12 +522,14 @@ pub fn negotiate(
     // this source can honour. A `burn_pick` naming an ass/ssa track
     // only chooses WHICH script; the ladder decides how it is served.
     ass: &AssPolicy,
-    // HUB-15b: the verified encoder codec names of the box that would
-    // run an encode ("h264"/"hevc"/"av1"/"aac"/"opus") — an executor
-    // fact like `tonemap`, fetched from the speculatively placed
-    // transcoder or the local probes. Encode targets are picked from
-    // this set ∩ the client profile, in ubiquity order.
-    targets: &[String],
+    // HUB-15b: verified video targets of the selected full transcoder.
+    video_targets: &[String],
+    // Audio targets on that same full transcoder, used when video also
+    // encodes and the complete pipeline is dispatched there.
+    full_audio_targets: &[String],
+    // Audio targets of the hub's lightweight worker, used when video is
+    // copied and only audio needs encoding (AR-10/HUB-16).
+    local_audio_targets: &[String],
 ) -> SourcePlan {
     let audio_track = audio_track.min(info.audio.len().saturating_sub(1));
     let video_track = video_track.min(info.video.len().saturating_sub(1));
@@ -647,24 +688,12 @@ pub fn negotiate(
                 .copied()
                 .find(|t| {
                     profile.video.iter().any(|c| c.codec == t.as_str())
-                        && targets.iter().any(|e| e == t.as_str())
+                        && video_targets.iter().any(|e| e == t.as_str())
                 })
                 .unwrap_or_default();
             let client_takes_video_target = v_ladder.iter().any(|t| {
                 profile.video.iter().any(|c| c.codec == t.as_str())
-                    && targets.iter().any(|e| e == t.as_str())
-            });
-            let at = a_ladder
-                .iter()
-                .copied()
-                .find(|t| {
-                    profile.audio.iter().any(|c| c == t.as_str())
-                        && targets.iter().any(|e| e == t.as_str())
-                })
-                .unwrap_or_default();
-            let client_takes_audio_target = a_ladder.iter().any(|t| {
-                profile.audio.iter().any(|c| c == t.as_str())
-                    && targets.iter().any(|e| e == t.as_str())
+                    && video_targets.iter().any(|e| e == t.as_str())
             });
             let video = if v
                 .is_some_and(|s| v_client_ok && muxable("video", &s.codec) && !burn_active)
@@ -677,6 +706,23 @@ pub fn negotiate(
             } else {
                 StreamMode::Off
             };
+            let audio_targets = if video == StreamMode::Encode {
+                full_audio_targets
+            } else {
+                local_audio_targets
+            };
+            let at = a_ladder
+                .iter()
+                .copied()
+                .find(|t| {
+                    profile.audio.iter().any(|c| c == t.as_str())
+                        && audio_targets.iter().any(|e| e == t.as_str())
+                })
+                .unwrap_or_default();
+            let client_takes_audio_target = a_ladder.iter().any(|t| {
+                profile.audio.iter().any(|c| c == t.as_str())
+                    && audio_targets.iter().any(|e| e == t.as_str())
+            });
             let audio = if a.is_some_and(|s| a_client_ok && muxable("audio", &s.codec)) {
                 StreamMode::Copy
             } else if client_takes_audio_target
@@ -855,15 +901,27 @@ pub fn negotiate(
         } else {
             &["aac", "opus"]
         };
+        let offered_targets = if kind == "video" {
+            video_targets
+        } else if video == StreamMode::Encode {
+            full_audio_targets
+        } else {
+            local_audio_targets
+        };
         let have: Vec<&str> = ladder
             .iter()
             .copied()
-            .filter(|t| targets.iter().any(|e| e == t))
+            .filter(|t| offered_targets.iter().any(|e| e == t))
             .collect();
-        if have.is_empty() {
-            format!("no {kind} encoder on the fleet")
+        let executor = if kind == "video" || video == StreamMode::Encode {
+            "full transcoder"
         } else {
-            format!("fleet encodes {}", have.join(", "))
+            "hub"
+        };
+        if have.is_empty() {
+            format!("no {kind} encoder on the {executor}")
+        } else {
+            format!("{executor} encodes {}", have.join(", "))
         }
     };
     if video == StreamMode::Off && v.is_some() && !v_client_ok {
@@ -1145,8 +1203,8 @@ mod tests {
         );
         assert_eq!(sp.cost, Cost::Unplayable);
         assert!(
-            sp.video_verdict.contains("fleet encodes h264"),
-            "refusal names the fleet: {}",
+            sp.video_verdict.contains("full transcoder encodes h264"),
+            "refusal names the executor: {}",
             sp.video_verdict
         );
 

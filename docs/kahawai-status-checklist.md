@@ -28,8 +28,9 @@ How something works and why it was built that way belong in
       module logic unchanged, the link transport replaced by channels
       (no gRPC/TLS/enrollment for the local module) and the byte plane
       replaced by direct file reads (AR-11 short-circuit); the satellite
-      listener stays up so external mediahosts/transcoders dial in;
-      encode work runs in the hub's supervised local workers
+      listener stays up so external mediahosts/transcoders dial in. Plain
+      hub workers stop at remux/audio-only encode; AIO may additionally
+      enable full local video transcoding
 - [x] AR-6 Disconnect tolerance: collections go unavailable, never deleted.
       A transcoder that drops has its sessions moved to another box
       (`reschedule_for_transcoder`), and only the ones that cannot be moved
@@ -41,7 +42,9 @@ How something works and why it was built that way belong in
 - [x] AR-7 Versioned protocol; Hello/HelloAck major-version gate
 - [ ] AR-8 *(optional v1.x)* Delegated direct-fetch tokens
 - [x] AR-9 Control plane client ↔ hub only
-- [x] AR-10 Direct play mediahost → hub → client with byte ranges; hub-side remux
+- [x] AR-10 Direct play mediahost → hub → client with byte ranges; hub-side
+      remux and audio-only transcode with video copied. Any video encode,
+      filter or subtitle burn requires a full external or AIO transcoder
 - [x] AR-11 Transcoder pulls source bytes via hub-brokered leases
 - [x] AR-13 Capability as a cross-module contract. Client profiles
       (HUB-14) and transcoder inventories (TC-1) are declared and
@@ -53,7 +56,8 @@ How something works and why it was built that way belong in
       the hub log answers which build each satellite runs (protocol 2.2).
       Transcoder declarations now carry a RATE (HUB-36), so a box
       running a filter at 0.65× is no longer indistinguishable from one
-      running it at 5×.
+      running it at 5×. Plain hub declares no video capability and runs
+      no video benchmark; its lightweight audio execution is structural.
       Mediahosts declare nothing, and shall not: MH-12 withdrawn as a
       false premise (2026-08-02) — nothing they could declare decides
       anything the hub should act on
@@ -299,7 +303,7 @@ How something works and why it was built that way belong in
       `tests/negotiate_play.rs`); explicit mode = operator force. Session
       responses carry aggregate plan cost separately from pipeline mode, so
       player/admin labels say TRANSCODE when either elementary stream is
-      encoded even if the local HLS pipeline is structurally a remux
+      encoded even if an audio-only encode runs in the hub-local HLS pipeline
 - [x] HUB-15 Negotiation matrix: codec/profile/level, resolution/fps
       ceilings, bandwidth cap (pref + profile), channel downmix,
       subtitle tiers with graphics_overlay/ass_render gating, HDR
@@ -322,6 +326,8 @@ How something works and why it was built that way belong in
       fallback is TS-only; fmp4 failures fail loudly
 - [x] HUB-16 Cheapest-path preference incl. SOURCE choice: every
       candidate judged, direct > copy > audio-enc > video-enc, rank ties.
+      The same line is the execution boundary: audio-only encode remains
+      hub-local; video encode requires a full external/AIO transcoder.
       Completeness outranks cost: a source with a stream this client
       cannot be given loses to one that delivers everything, even at a
       full video encode — a silent playback is a defect, an encode is a
@@ -458,8 +464,9 @@ How something works and why it was built that way belong in
 - [x] HUB-35 Granular refresh: library-refresh endpoint fanning out
       per-collection scan requests, per-collection live progress in the
       admin overview, global rescan removed (endpoint + button)
-- [x] HUB-36 Pace-aware placement, on measured capability. Boxes
-      benchmark encoders and the GL tone-map; workers meter the
+- [x] HUB-36 Pace-aware video placement, on measured capability. Full
+      external/AIO transcoders benchmark video encoders and GL tone-map;
+      plain hub does neither. Workers meter the
       un-throttled phase of real sessions into a persisted per-(box,
       work class) EWMA; placement ranks on it and states a
       below-realtime prediction in the verdict rather than letting a
@@ -472,10 +479,11 @@ How something works and why it was built that way belong in
 
 - [x] TC-1 Capability probe reported on registration
 - [x] TC-2 Capability + inverse-load placement; admin enable/disable for
-      enrolled transcoders. The AIO local executor is instead a structural
-      `[all_in_one] transcoder` setting (default true): false suppresses its
-      encoder dry-runs, capability benchmark and local placement while external
-      transcoders remain schedulable
+      enrolled transcoders. The AIO full local video executor is instead a
+      structural `[all_in_one] transcoder` setting (default true): false
+      suppresses its video-encoder dry-runs, benchmark and video placement
+      while external transcoders remain schedulable. Plain hub still performs
+      remux and audio-only transcode and never enters video placement
 - [x] TC-3 Sessions fully specified by the hub
 - [x] TC-4 Dynamic GStreamer pipelines, HLS segments, supervised worker
       process. Progress reporting is PARTIAL, and the requirement was
@@ -572,9 +580,10 @@ How something works and why it was built that way belong in
       HDR10 one.
 - [x] NFR-2 Scale targets. 250k files across 10 collections hold on
       every browse path, deep pages and adversarial search included.
-      Five executors exercised together (four enrolled transcoders plus
-      the hub's own): eleven concurrent transcodes filled every box to
-      its own max_sessions and no further, overflow staying local. Ten
+      Five full video executors exercised together (four enrolled
+      transcoders plus AIO's enabled local transcoder): eleven concurrent
+      video transcodes filled every box to its own max_sessions and no
+      further, overflow staying in AIO's local executor. Ten
       mediahosts enrolled and linked simultaneously
       (`scripts/kahawai-fanout.sh`), per the 2026-08-02 amendment that
       makes the mediahost count a claim about the HUB — allowlist,

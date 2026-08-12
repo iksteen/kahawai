@@ -24,7 +24,7 @@ pub async fn reset_password(cfg: config::HubConfig, username: &str) -> Result<()
 }
 
 pub async fn run_hub(cfg: config::HubConfig, config_path: Option<PathBuf>) -> Result<()> {
-    run_hub_inner(cfg, None, true, config_path).await
+    run_hub_inner(cfg, None, false, config_path).await
 }
 
 /// AR-5 all-in-one: the hub plus an IN-PROCESS mediahost — module logic
@@ -114,7 +114,7 @@ async fn run_hub_inner(
     let allowed = kahawai_transport::mtls::AllowedCerts::default();
     let registry = Arc::new(
         kahawai_hub::registry::Registry::new(db.clone(), allowed.clone())
-            .with_local_executor(local_transcoder),
+            .with_local_video_executor(local_transcoder),
     );
     let admitted = registry.load_allowlist().await?;
     tracing::info!(admitted, "mTLS allowlist loaded");
@@ -126,12 +126,12 @@ async fn run_hub_inner(
         Err(e) => tracing::warn!(error = format!("{e:#}"), "pace table unreadable"),
     }
     if local_transcoder {
-        // HUB-36: the hub is an executor too (an encode with no fleet stays
-        // local), so it measures itself on the same cache-but-verify terms
-        // as a satellite — off the startup path, published when it lands.
+        // HUB-36: AIO's full local transcoder competes on the same measured
+        // footing as satellites. Plain hub never enters this branch: its
+        // local worker stops at remux and audio-only transcode.
         spawn_local_benchmark(cfg.data_dir.join("benchmarks.json"), registry.clone());
     } else {
-        tracing::info!("in-process transcoder disabled by [all_in_one].transcoder");
+        tracing::info!("local video transcoder disabled; hub retains remux and audio transcode");
     }
     let auth = Arc::new(kahawai_hub::auth::Auth::new(db.clone(), &cfg.data_dir).await?);
     let sessions = Arc::new(

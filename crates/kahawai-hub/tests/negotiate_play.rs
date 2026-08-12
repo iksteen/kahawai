@@ -120,7 +120,8 @@ async fn negotiation_picks_cheapest_source_and_honors_caps() {
     )
     .unwrap();
     let db = kahawai_hub::db::open_in_memory().await.unwrap();
-    let registry = Arc::new(Registry::new(db.clone(), allowed.clone()));
+    let registry =
+        Arc::new(Registry::new(db.clone(), allowed.clone()).with_local_video_executor(true));
     let sessions = Arc::new(kahawai_hub::sessions::Sessions::new(
         tempfile::tempdir().unwrap().keep(),
     ));

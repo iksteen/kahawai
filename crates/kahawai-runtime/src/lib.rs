@@ -26,8 +26,8 @@ pub struct Roles {
     pub hub: bool,
     pub mediahost: bool,
     pub transcoder: bool,
-    /// The hub may encode in its own supervised worker even when it does not
-    /// contain the networked transcoder module.
+    /// AIO may run full local video encode in the hub-supervised worker.
+    /// Plain hub's remux/audio-only worker does not require video probing.
     pub local_encode: bool,
 }
 

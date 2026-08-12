@@ -91,9 +91,9 @@ pub struct Placement {
     /// `Some(module_id)` = dispatch to that satellite, `None` = run in
     /// the hub's own supervised worker.
     pub target: Option<String>,
-    /// False when neither a suitable satellite nor the local executor is
-    /// available. `target = None` alone means local, so absence needs to be
-    /// represented separately.
+    /// False when video work has neither a suitable satellite nor AIO's
+    /// full local executor. `target = None` alone means local (including
+    /// ordinary hub audio work), so absence needs separate representation.
     pub available: bool,
     /// Realtime multiple this placement is expected to sustain. None
     /// when nothing about this box and this work has been measured —
@@ -149,14 +149,14 @@ pub struct Registry {
     /// Live capability reports from connected transcoders (TC-1); cleared
     /// on disconnect — a report is only valid while the link is up.
     transcoder_caps: Mutex<HashMap<String, serde_json::Value>>,
-    /// HUB-36: what the HUB's own box measured about itself. The hub is
-    /// an executor too (encode with no fleet stays local), so it needs
-    /// the same numbers to compete for placement.
+    /// HUB-36: what AIO's optional full local transcoder measured about
+    /// itself. Plain hub never fills this: its local worker is limited to
+    /// remux and audio-only transcode, neither of which needs video pace.
     local_bench: Mutex<Option<kahawai_media::bench::BenchResults>>,
-    /// Structural startup choice. Unlike a satellite drain this is not a
-    /// live scheduling toggle: an AIO whose hardware is unsuitable must not
-    /// probe or select the local encode path at all.
-    local_executor_enabled: bool,
+    /// Structural startup choice for FULL local video execution. The hub's
+    /// lightweight remux/audio worker is always available; only AIO may add
+    /// video encode, tone-map and subtitle burn-in here.
+    local_video_executor_enabled: bool,
     tc_links: Mutex<
         HashMap<
             String,
@@ -223,7 +223,7 @@ impl Registry {
             links: Mutex::new(HashMap::new()),
             transcoder_caps: Mutex::new(HashMap::new()),
             local_bench: Mutex::new(None),
-            local_executor_enabled: true,
+            local_video_executor_enabled: false,
             tc_links: Mutex::new(HashMap::new()),
             tc_load: Mutex::new(HashMap::new()),
             tc_pace: Mutex::new(HashMap::new()),
@@ -235,15 +235,15 @@ impl Registry {
         }
     }
 
-    /// Set whether this hub may perform encode work in its own worker.
+    /// Set whether AIO may perform VIDEO encode work in its own worker.
     /// Applied while constructing the registry, before it is shared.
-    pub fn with_local_executor(mut self, enabled: bool) -> Self {
-        self.local_executor_enabled = enabled;
+    pub fn with_local_video_executor(mut self, enabled: bool) -> Self {
+        self.local_video_executor_enabled = enabled;
         self
     }
 
-    pub fn local_executor_enabled(&self) -> bool {
-        self.local_executor_enabled
+    pub fn local_video_executor_enabled(&self) -> bool {
+        self.local_video_executor_enabled
     }
 
     /// Push an event hint to /api/v1/events subscribers (HUB-11).
@@ -1757,13 +1757,12 @@ impl Registry {
             .unwrap_or_default()
     }
 
-    /// HUB-36: publish what the hub's own box measured (background
-    /// benchmark at startup).
+    /// HUB-36: publish what AIO's full local transcoder measured.
     pub fn set_local_bench(&self, b: kahawai_media::bench::BenchResults) {
         *self.local_bench.lock().unwrap() = Some(b);
     }
 
-    /// The hub box's own measured speeds, if the benchmark has landed.
+    /// AIO's local video speeds, if its benchmark has landed.
     pub fn local_bench(&self) -> Option<kahawai_media::bench::BenchResults> {
         self.local_bench.lock().unwrap().clone()
     }
@@ -2094,31 +2093,32 @@ impl Registry {
     /// HUB-36 phase 5: where this session should run, and how fast that
     /// is expected to go.
     ///
-    /// The hard filters are `pick_transcoder`'s, unchanged — a box that
-    /// cannot decode the source or encode the target is not a candidate
-    /// at any speed. What is new is the ORDER among boxes that can, and
-    /// the option of keeping the work here.
-    ///
-    /// Fleet still wins by default (§4.5: hub cores serve clients).
-    /// Work repatriates to the hub only in the one case worth changing:
-    /// no fleet box sustains and the hub does. That keeps today's
-    /// behaviour whenever a satellite is capable — including when
-    /// nothing has been measured yet, since unknown counts as capable.
+    /// Audio-only encode is lightweight hub work (AR-10/HUB-16), so it
+    /// never consumes a fleet slot. Video encode is full-transcoder work:
+    /// external fleet first, with AIO's enabled local video executor as
+    /// the measured fallback/repatriation candidate.
     pub fn place(&self, need: &PlacementNeed) -> Placement {
+        if !need.encode_video {
+            return Placement {
+                target: None,
+                available: true,
+                predicted: None,
+            };
+        }
         let fleet = self.reserve_transcoder(need);
         let local = self
-            .local_executor_enabled
+            .local_video_executor_enabled
             .then(|| self.predict_local(need))
             .flatten();
         match fleet {
             None => Placement {
                 target: None,
-                available: self.local_executor_enabled,
+                available: self.local_video_executor_enabled,
                 predicted: local,
             },
             Some(id) => {
                 let fleet_pred = self.predict_fleet(&id, need);
-                if self.local_executor_enabled
+                if self.local_video_executor_enabled
                     && !sustains(fleet_pred)
                     && sustains(local)
                     && local.is_some()
@@ -2213,9 +2213,9 @@ impl Registry {
             .fold(None::<f32>, |acc, v| Some(acc.map_or(v, |a: f32| a.min(v))))
     }
 
-    /// The same question for the hub's own box. No link term: the bytes
-    /// are already here, which is precisely why repatriating can beat a
-    /// faster satellite on a thin wire.
+    /// The same question for AIO's full local transcoder. No link term:
+    /// the bytes are already here, which is precisely why repatriating can
+    /// beat a faster satellite on a thin wire.
     fn predict_local(&self, need: &PlacementNeed) -> Option<f32> {
         if let Some(class) = need.work_class.as_deref()
             && let Some(observed) = self.pace_of(crate::pace::LOCAL, class)

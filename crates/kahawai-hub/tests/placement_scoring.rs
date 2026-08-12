@@ -41,10 +41,10 @@ fn need(class: &str) -> PlacementNeed {
 }
 
 async fn registry() -> (tempfile::TempDir, std::sync::Arc<Registry>) {
-    registry_with_local_executor(true).await
+    registry_with_local_video_executor(true).await
 }
 
-async fn registry_with_local_executor(
+async fn registry_with_local_video_executor(
     enabled: bool,
 ) -> (tempfile::TempDir, std::sync::Arc<Registry>) {
     let dir = tempfile::tempdir().unwrap();
@@ -52,7 +52,7 @@ async fn registry_with_local_executor(
     let allowed = kahawai_transport::mtls::AllowedCerts::default();
     (
         dir,
-        std::sync::Arc::new(Registry::new(db, allowed).with_local_executor(enabled)),
+        std::sync::Arc::new(Registry::new(db, allowed).with_local_video_executor(enabled)),
     )
 }
 
@@ -173,8 +173,8 @@ async fn work_repatriates_only_when_no_fleet_box_sustains_and_the_hub_does() {
 }
 
 #[tokio::test]
-async fn disabling_the_local_executor_requires_and_keeps_work_on_the_fleet() {
-    let (_d, reg) = registry_with_local_executor(false).await;
+async fn disabling_the_local_video_executor_requires_and_keeps_video_on_the_fleet() {
+    let (_d, reg) = registry_with_local_video_executor(false).await;
     let class = "1080|hevc|h264";
 
     let unavailable = reg.place(&need(class));
@@ -189,6 +189,29 @@ async fn disabling_the_local_executor_requires_and_keeps_work_on_the_fleet() {
     let placed = reg.place(&need(class));
     assert!(placed.available);
     assert_eq!(placed.target.as_deref(), Some("external"));
+}
+
+#[tokio::test]
+async fn audio_only_encode_is_always_lightweight_local_hub_work() {
+    let (_d, reg) = registry_with_local_video_executor(false).await;
+    let audio = PlacementNeed {
+        encode_video: false,
+        encode_audio: true,
+        audio_caps: vec!["audio/x-ac3".into()],
+        audio_codec: "aac".into(),
+        ..PlacementNeed::default()
+    };
+
+    let p = reg.place(&audio);
+    assert!(p.available);
+    assert_eq!(p.target, None);
+    assert_eq!(p.predicted, None);
+
+    // Even a connected full transcoder does not consume lightweight work.
+    connect(&reg, "external", caps(true, 9.0, 0.0));
+    let p = reg.place(&audio);
+    assert!(p.available);
+    assert_eq!(p.target, None);
 }
 
 #[tokio::test]

@@ -84,21 +84,23 @@ The hub drains the local host queue through the same `handle_host_msg` function
 as the network link, keeping reconciliation, manifests, extraction worklists,
 ordering and backpressure identical between deployment modes.
 
-`[all_in_one] transcoder = false` makes the local encode executor structurally
-unavailable before startup encoder dry-runs, capability benchmarking and
-placement. It deliberately does not create a synthetic satellite: the admin
-satellite toggle is a live drain
-for an enrolled remote worker, whereas this setting describes what the AIO
-machine may run across restarts. Hub-local remux workers remain available
-(AR-10), and external transcoders continue to enroll and receive encode work.
+`[all_in_one] transcoder = false` makes the full local video executor
+structurally unavailable before startup video-encoder dry-runs, capability
+benchmarking and placement. It deliberately does not create a synthetic
+satellite: the admin satellite toggle is a live drain for an enrolled remote
+worker, whereas this setting describes what the AIO machine may run across
+restarts. Hub-local remux and audio-only transcode workers remain available
+(AR-10), and external transcoders continue to enroll and receive video encode
+work. Plain `hub` has this same lightweight worker boundary unconditionally:
+it never probes video encoders or competes for video placement.
 
 The AIO byte path is short-circuited separately. `Sessions::set_local_source`
 registers the in-process collection resolver; opening a lease for that module
 resolves the path directly and serves it from a local Tokio file. The lease
 retains the same request/chunk shape for its consumers, but no bytes cross gRPC
-or a loopback interface. Local encode work is the hub's supervised worker path,
-not an in-process `TranscoderLink`; external transcoders still use that gRPC
-service normally. The satellite listener remains active in every case.
+or a loopback interface. Local lightweight work and AIO's optional full encode work use the hub's
+supervised worker path, not an in-process `TranscoderLink`; external
+transcoders still use that gRPC service normally. The satellite listener remains active in every case.
 
 ## 3. Inter-module protocol (`kahawai-proto`)
 
@@ -326,7 +328,7 @@ QUERY is **safe and idempotent, and returns only what is knowable now**: it star
 
 ### 4.5 Capability negotiation (`kahawai-core::negotiate`)
 
-**Capability is the architecture's spine, not a transcoder detail (AR-13).** Four participants declare what they can do and the hub decides from those declarations: the client's probed profile (HUB-14), the transcoder's dry-run-verified inventory (TC-1), what a mediahost's access to a file permits (MH-12), and the hub's own in-process worker on the same terms as any transcoder. Everything below was learned by getting one of them wrong.
+**Capability is the architecture's spine, not a transcoder detail (AR-13).** The client declares its probed profile (HUB-14), every full transcoder declares its dry-run-verified inventory (TC-1), and topology determines the hub worker's deliberately narrower role. Plain hub capability is structural: remux and audio-only transcode while copying video. It is not treated as a full transcoder and declares no video encoder, tone-map or burn capability. AIO's enabled in-process transcoder is measured on the same terms as an external one. Everything below was learned by getting one of them wrong.
 
 *What a declaration must be.* **Measured, never assumed** — encoders are dry-run-verified because a box can own `vah264enc` and a broken driver, and the GL tone-map segment is dry-run as a whole pipeline because element presence does not prove a headless box can open a GL context. **Decision-bearing, or it is a protocol version** — a `burnin: bool` reported by every build that has the code is not a capability but a version marker, and version belongs in the AR-7 handshake where an incompatible peer is refused once and loudly; that flag was deleted and `PROTOCOL_MAJOR` bumped to 2 instead. **Expressed in the terms of the decision** — the tone-map boolean says "yes" for a box that sustains 1.7× realtime at 1080p and 0.65× at 2160p (measured: the GL segment alone on a J5005, with the upload/download round trip costing more than the shader), so it answers "can you" when placement needed "can you keep up"; that is HUB-36's gap. **Honest in absence** — a missing capability re-plans *before* the work starts and the verdict says what was actually done, because the alternative is what burn-in shipped for one afternoon: a plan that claimed a burn, forced a video encode for it, and produced no subtitles.
 
@@ -356,7 +358,7 @@ Decision order per HUB-16: try full direct play; else keep every stream that fit
 
 *Link rate* answers "can the bytes even arrive". Reads ≥1 MiB through the lease bridge fold into an EWMA (α=0.2); smaller reads measure round-trip latency, not bandwidth. It is deliberately in-memory and cleared on disconnect — a rate describes one connection over one network, and a persisted stale one lies confidently.
 
-*The scorer* (`Registry::place`) keeps every hard filter — a box that cannot decode the source or encode the target is not a candidate at any speed — and changes only the order among those that can. Observed pace wins outright when present and is never blended with the benchmark, because a real run already contains the decode, the tone-map, the encode AND that box's link stalls; blending would count the same cost twice. Unobserved work falls back to the components, and the SLOWEST governs (encoder, tone-map when planned, link bytes against source bitrate). Nothing measured at all yields `None`, which ranks as CAPABLE: refusing work for want of evidence is how a fleet never earns any. Rank is `sustains(≥1.2×)` → tone-map fit → hardware → prediction → load, where 1.2 rather than 1.0 because a box that exactly matches realtime stalls the moment anything else happens on it. Fleet still wins by default (§4.5 policy: hub cores serve clients); work repatriates to the hub only when no fleet box sustains and the hub does. A placement predicting below realtime is placed anyway — refusing would strand a slow fleet — but never silently: the verdict gains `predicted 0.7× realtime — may stall` through the same facts channel as the 7.1→5.1 fold.
+*The scorer* (`Registry::place`) keeps every hard filter — a box that cannot decode the source or encode the target is not a candidate at any speed — and changes only the order among those that can. Observed pace wins outright when present and is never blended with the benchmark, because a real run already contains the decode, the tone-map, the encode AND that box's link stalls; blending would count the same cost twice. Unobserved work falls back to the components, and the SLOWEST governs (encoder, tone-map when planned, link bytes against source bitrate). Nothing measured at all yields `None`, which ranks as CAPABLE: refusing work for want of evidence is how a fleet never earns any. Rank is `sustains(≥1.2×)` → tone-map fit → hardware → prediction → load, where 1.2 rather than 1.0 because a box that exactly matches realtime stalls the moment anything else happens on it. Audio-only encode stays in the hub because it is lightweight AR-10 work. For video encode, the fleet still wins by default (§4.5 policy: hub cores serve clients); only an enabled AIO full transcoder may compete locally, and work repatriates to it only when no fleet box sustains and it does. A placement predicting below realtime is placed anyway — refusing would strand a slow fleet — but never silently: the verdict gains `predicted 0.7× realtime — may stall` through the same facts channel as the 7.1→5.1 fold.
 
 **Session diagnostics (OPS-10).** A bundle is assembled per session and stored under `<data_dir>/session-logs/{unix}-{item}-{session}.log`, newest 40 kept. The item id rides in the FILENAME because sessions are ephemeral and leave no row behind — that is what makes "the last session for this item" a directory glob rather than a schema change.
 
@@ -374,7 +376,7 @@ Decision order per HUB-16: try full direct play; else keep every stream that fit
 
 State machine per session: `Negotiated → Provisioning → Streaming → (Seeking|SwitchingQuality)* → Ended`. Direct play sessions hold an `OpenRead` lease against the mediahost and proxy ranges with `Accept-Ranges`/`206`.
 
-**Remux sessions run entirely inside the hub** — this is why `kahawai-hub` depends on `kahawai-media`. When the plan is `container: Remux` with every stream `Copy`, the hub feeds the mediahost byte stream through a local demux-only pipeline (`appsrc ! parsebin ! <selected streams, no decode> ! cmafmux → hlssink3`-style segmenting) and serves the result like any HLS session. Parsing and repackaging elementary streams is cheap (no codec work, a few % CPU), so it needs no scheduling, works with zero transcoders attached (AR-10), and keeps transcoders free for real encoding jobs. Seek = pipeline restart at the target keyframe, same as §6 but without the decode path.
+**Lightweight sessions run entirely inside the hub** — this is why `kahawai-hub` depends on `kahawai-media`. For pure remux, the hub feeds the mediahost byte stream through a local demux-only pipeline (`appsrc ! parsebin ! <selected streams, no decode> ! cmafmux → hlssink3`-style segmenting). The same supervised pipeline may copy video while decoding and encoding audio for codec conversion or downmix. Both are cheap relative to video decode/filter/encode, need no placement, work with zero transcoders attached (AR-10), and keep full transcoders free for video work. Seek = pipeline restart at the target keyframe, same as §6.
 
 **`EXT-X-TARGETDURATION` and what it is really about.** The spec defines it as one thing — "the maximum Media Segment duration", and every segment's EXTINF rounded to nearest must be ≤ it (RFC 8216 §4.3.3.1). It says nothing about keyframes: §6.2.1 only says a server *SHOULD* divide "on packet and key frame boundaries", and §3 explicitly allows a segment whose leading frames are "downloaded but possibly discarded". Segment length is the server's choice.
 
@@ -384,7 +386,7 @@ Because the right value differs per client, the client states which of three thi
 
 **What this does NOT fix, and the mistake worth recording.** It was prompted by an ExoPlayer hang, and it does not address it. That hang is a LIVENESS failure: the pacer holds production at `viewer + 120 s` (`worker.rs`), so once the pipeline runs ahead the playlist stops changing — measured at 42 s for a copy and 47 s for a transcode with no progress pings — and ExoPlayer raises `PlaylistStuckException` after `3.5 × targetDuration` of *no change* (`DefaultHlsPlaylistTracker`, current androidx/media). Declaring 12 instead of 2 lifts that threshold from 7 s to 42 s, which clears a normal 10 s ping cadence — a wider margin, not a fix. (An earlier draft claimed a paused player trips it unconditionally. It does not: the exception surfaces through the loading path, so a player sitting on a full buffer never asks. Source-validated, 2026-08-05. The exposure is a *playing* client whose pacer-stalled playlist stops changing for longer than the threshold — bounded by how fast the viewer drains the window, and measured at 42 s and 47 s, i.e. right at it.) The live model requires continuous appends and the pacer exists to stop appending; the resolution taken is to make the pacer release on playlist age as well as viewer position, so a stalled playlist is refreshed at about one segment per target duration whatever the viewer reports. A VOD playlist (complete segment list + `EXT-X-ENDLIST`, so idleness is legal) would remove the contradiction outright rather than bound it, but with the paused case withdrawn nothing observed requires it: `kahawai-vod-plan.md` records what it would take, buy and cost, and why it is not scheduled.
 
-Transcode sessions (any stream marked `Encode`) are placed on a transcoder by a scorer (capability fit ≥ hw-accel ≥ inverse load), monitored via `Progress`; on transcoder loss the spec is re-issued to the next candidate with `start_offset = last served segment` (AR-6). If no transcoder is connected, plans requiring `Encode` fail fast at `/playback/decisions` with a distinct reason so clients can fall back (e.g., pick a lower-quality source or disable the offending subtitle) rather than time out. Idle timeout 90 s without segment fetch or progress ping → teardown. Concurrency limits enforced per user (HUB-18).
+Sessions with video marked `Encode` are placed on a full transcoder by a scorer (capability fit ≥ hw-accel ≥ inverse load); audio-only encode with video copied remains in the hub. Dispatched sessions are monitored via `Progress`; on transcoder loss the spec is re-issued to the next candidate with `start_offset = last served segment` (AR-6). If no full transcoder is connected, plans requiring video `Encode` fail fast at `/playback/decisions` with a distinct reason so clients can fall back (e.g., pick a lower-quality source or disable the offending subtitle) rather than time out. Idle timeout 90 s without segment fetch or progress ping → teardown. Concurrency limits enforced per user (HUB-18).
 
 ### 4.7 Embedded web UI (HUB-25..28)
 

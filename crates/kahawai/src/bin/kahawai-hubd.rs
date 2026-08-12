@@ -14,7 +14,7 @@ const ROLES: Roles = Roles {
     hub: true,
     mediahost: false,
     transcoder: false,
-    local_encode: true,
+    local_encode: false,
 };
 
 fn ocr_rows() -> Vec<kahawai_media::doctor::Check> {
@@ -69,7 +69,7 @@ enum Cmd {
     },
     #[command(hide = true)]
     RemuxWorker(WorkerArgs),
-    /// HUB-36: measure encoders into a cache file, then exit.
+    /// Internal benchmark command retained for AIO child compatibility.
     #[command(hide = true)]
     Benchmark {
         #[arg(long)]

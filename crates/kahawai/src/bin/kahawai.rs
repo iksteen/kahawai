@@ -11,6 +11,24 @@ use anyhow::Result;
 /// the OCR tier lives behind the hub crate, so a build without the hub
 /// has no way to ask whether Tesseract is usable.
 const ROLES: Roles = Roles::all();
+const HUB_ROLES: Roles = Roles {
+    hub: true,
+    mediahost: false,
+    transcoder: false,
+    local_encode: false,
+};
+const MEDIAHOST_ROLES: Roles = Roles {
+    hub: false,
+    mediahost: true,
+    transcoder: false,
+    local_encode: false,
+};
+const TRANSCODER_ROLES: Roles = Roles {
+    hub: false,
+    mediahost: false,
+    transcoder: true,
+    local_encode: false,
+};
 
 fn ocr_rows() -> Vec<kahawai_media::doctor::Check> {
     #[cfg(feature = "ocr")]
@@ -127,9 +145,9 @@ async fn main() -> Result<()> {
                 ocr_rows(),
             )?
         }
-        Cmd::Hub { cmd: None } | Cmd::Mediahost | Cmd::Transcoder => {
-            kahawai_runtime::startup_checks(&cfg, ROLES, ocr_rows())?
-        }
+        Cmd::Hub { cmd: None } => kahawai_runtime::startup_checks(&cfg, HUB_ROLES, ocr_rows())?,
+        Cmd::Mediahost => kahawai_runtime::startup_checks(&cfg, MEDIAHOST_ROLES, Vec::new())?,
+        Cmd::Transcoder => kahawai_runtime::startup_checks(&cfg, TRANSCODER_ROLES, Vec::new())?,
         _ => {}
     }
     match cli.command {
