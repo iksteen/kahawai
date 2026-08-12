@@ -92,9 +92,11 @@ followed, and those cases are listed too.
 ## Built past the prototype
 
 - [x] UI-8 **Admin rights are settable.** The prototype draws the admin flag
-      as a clickable toggle with no endpoint behind it. Built, with the two
-      refusals the prototype could not have known it needed: you may not strip
-      your own rights, and the last admin may not be demoted. See HUB-10.
+      as a clickable toggle with no endpoint behind it. Built with a durable
+      access generation: promotion/demotion invalidates old access immediately,
+      so self-demotion is safe when another admin remains; the client refreshes
+      into its ordinary role and returns home. The last admin may not be
+      demoted. See HUB-10 and AUTH-3.
 
 - [x] UI-9 **Marking a season is one request.** The prototype marks episodes
       one at a time. `PUT /api/v1/items/{id}/watched` takes a list, so a

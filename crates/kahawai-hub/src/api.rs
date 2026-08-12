@@ -362,10 +362,16 @@ async fn health(State(state): State<AppState>) -> Result<Json<Value>, ApiError> 
 
 async fn bootstrap(State(state): State<AppState>, req: Request) -> Json<Value> {
     let setup_required = state.auth.setup_required();
+    let authenticated = if setup_required {
+        false
+    } else if let Some(token) = presented_token(&req) {
+        state.auth.authenticate(&token).await.is_ok()
+    } else {
+        false
+    };
     Json(json!({
         "setup_required": setup_required,
-        "authenticated": !setup_required
-            && presented_token(&req).and_then(|t| state.auth.verify(&t).ok()).is_some(),
+        "authenticated": authenticated,
     }))
 }
 
@@ -379,19 +385,20 @@ async fn require_auth(
         tracing::warn!(path = %req.uri(), "503: setup_required returned true");
         return Err((StatusCode::SERVICE_UNAVAILABLE, "setup required".into()));
     }
-    let claims = presented_token(&req)
-        .and_then(|t| state.auth.verify(&t).ok())
-        .ok_or((
+    let token = presented_token(&req).ok_or((
+        StatusCode::UNAUTHORIZED,
+        "invalid or missing token".to_string(),
+    ))?;
+    // Signature and expiry are necessary, but mutable account state comes from
+    // the indexed users row on every request. Its durable generation makes a
+    // deletion, role change or CLI password reset effective across processes
+    // and restarts rather than only in this Auth instance.
+    let claims = state.auth.authenticate(&token).await.map_err(|_| {
+        (
             StatusCode::UNAUTHORIZED,
             "invalid or missing token".to_string(),
-        ))?;
-    // A deleted account's token still VERIFIES — the signature is
-    // valid and the expiry has not passed. Refusing it here is what
-    // makes deletion take effect now rather than up to 15 minutes from
-    // now; the check is an in-memory lookup, not a query.
-    if state.auth.is_deleted(&claims.sub) {
-        return Err((StatusCode::UNAUTHORIZED, "account deleted".into()));
-    }
+        )
+    })?;
     req.extensions_mut().insert(claims);
     Ok(next.run(req).await)
 }
@@ -1043,42 +1050,16 @@ struct SetAdminBody {
 
 /// HUB-10: promote or demote an account.
 ///
-/// **Nobody changes their own admin flag, in either direction.** Not a
-/// question of what is sensible — it is what keeps the endpoint from being an
-/// escalation. `require_admin` reads `claims.admin` out of a 15-minute JWT and
-/// never asks the database (AUTH-2 is the fix for that, and is not landed), so
-/// an account demoted a moment ago still presents a token that says otherwise.
-/// Allowing self-promotion would let it set `is_admin` back to 1 for good, and
-/// `refresh` would then mint genuine admin tokens for ever: a bounded stale
-/// claim turned into a permanent one, by this endpoint.
-///
-/// Refusing the demotion direction alone is not enough, and refusing both
-/// costs nothing — the first admin comes from `complete_setup`, so there is no
-/// legitimate way to reach this asking about yourself.
-///
-/// **Removable once AUTH-1/2/3 land.** They are what make a stale claim
-/// impossible: `auth_version` invalidates the old token, and administrator
-/// status starts coming from the database on every request. After that this
-/// guard protects nothing that is not already protected, and the demotion
-/// half can go back to being the ordinary courtesy it looks like.
-///
-/// Note what does NOT go with it: the last-admin check in `Auth::set_admin`
-/// is a database race, not a token one, and survives all three.
-///
 /// Grants are untouched. A demoted admin falls back to whatever its
 /// `user_libraries` rows already said, which is what the panel then shows.
+/// AUTH-3 increments the account's durable access generation in the same write,
+/// so even a self-demotion takes effect on the next request; the last-admin
+/// predicate remains the independent database backstop against reaching zero.
 async fn admin_set_user_admin(
     State(state): State<AppState>,
-    axum::Extension(claims): axum::Extension<crate::auth::Claims>,
     Path(id): Path<String>,
     Json(body): Json<SetAdminBody>,
 ) -> Result<Json<Value>, ApiError> {
-    if id == claims.sub {
-        return Err((
-            StatusCode::CONFLICT,
-            "cannot change your own admin rights".into(),
-        ));
-    }
     match state
         .auth
         .set_admin(&id, body.admin)
@@ -1143,35 +1124,19 @@ async fn admin_delete_user(
             "cannot delete the account you are signed in as".into(),
         ));
     }
-    let username = state.auth.delete_user(&id).await.map_err(|e| {
-        let msg = format!("{e:#}");
-        // "no such user" is a 404; refusing the last admin is a 409, the same
-        // as the admin-flag route — the request is well formed and the state
-        // says no, which is not what FORBIDDEN means here.
-        //
-        // Still branching on the message text, which the project's own rule
-        // forbids, and the `else` is a catch-all: a SQLITE_BUSY or a disk error
-        // now reports 409, which this project defines as "will refuse for
-        // ever", when the honest answer is 500 and retry. Both wants the same
-        // thing — a typed result from `Auth::delete_user` — and that belongs
-        // with making its last-admin check atomic, so both are recorded for
-        // whoever owns `auth.rs` rather than edited around their live AUTH
-        // work.
-        let code = if msg.contains("no such user") {
-            StatusCode::NOT_FOUND
-        } else {
-            StatusCode::CONFLICT
-        };
-        (code, msg)
-    })?;
-    // After the delete, not before. Sessions still go first in the sense that
-    // matters — nothing outlives its owner — but ending them ahead of the
-    // refusal meant a REFUSED delete had already killed the target's playback.
-    // Reachable on purpose: a demoted admin holding a token that still says
-    // `admin: true` can aim this at the remaining admin and get 409 every time,
-    // killing their streams on each attempt. It also fires on the transient
-    // failure recorded in kahawai-hub-review-findings.md, so an innocent
-    // viewer's stream dies for a race nobody asked about.
+    let username = match state.auth.delete_user(&id).await.map_err(internal)? {
+        crate::auth::DeleteUser::Deleted(username) => username,
+        crate::auth::DeleteUser::NoSuchUser => return Err(hidden("user")),
+        crate::auth::DeleteUser::LastAdmin => {
+            return Err((
+                StatusCode::CONFLICT,
+                "refusing to delete the last admin".into(),
+            ));
+        }
+    };
+    // After the committed delete, not before: a refused operation must not end
+    // somebody's sessions. Authentication now rejects the missing user row on
+    // every request, so no process-local tombstone is needed.
     let sessions_ended = state.sessions.end_for_user(&id);
     Ok(Json(
         json!({ "deleted": id, "username": username, "sessions_ended": sessions_ended }),

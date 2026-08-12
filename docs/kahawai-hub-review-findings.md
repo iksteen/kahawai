@@ -23,53 +23,18 @@ line 1640, cited as the session-start refusal, had become the middle of
 
 ---
 
-## 1. `delete_user` can still take the last admin away
+## 1. `delete_user` can still take the last admin away — FIXED
 
 `crates/kahawai-hub/src/auth.rs`, `Auth::delete_user`
 
-`set_admin` was made atomic — the count and the write are one statement, so
-two admins demoting each other concurrently cannot both see two admins and
-both proceed. `delete_user` still does it in two steps:
-
-```rust
-let admins: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE is_admin = 1")
-    .fetch_one(&self.db).await?;
-anyhow::ensure!(admins > 1, "refusing to delete the last admin");
-```
-
-With exactly two admins, a delete of one racing a demote of the other leaves
-zero. The count is read before the transaction below it even begins, so the
-window is the whole of that read-to-commit gap.
-
-This is not theoretical: the same shape in `set_admin` was reproduced by
-running 30 rounds of concurrent mutual demotion — it reached zero admins on
-round 17.
-
-The fix that worked for `set_admin` transfers directly: fold the guard into
-the statement, so SQLite's write lock does the arbitration.
-
-```sql
-DELETE FROM users
- WHERE id = ?1
-   AND (is_admin = 0 OR (SELECT COUNT(*) FROM users WHERE is_admin = 1) > 1)
-```
-
-…and treat `rows_affected() == 0` as either "no such user" or "last admin",
-distinguished by a follow-up read. `set_admin` now returns an enum for exactly
-this.
-
-### 1b. Two comments disagree about whether a restart saves you
-
-The doc comment on `Auth::set_admin` is right:
-
-> `setup_required` is decided once at `Auth::new` from `users == 0`, NOT from
-> `admins == 0`, so a hub with no admin and any ordinary account left does not
-> fall back into setup mode on a restart either.
-
-The comment directly above `delete_user` implies the opposite — that an emptied hub
-falls back into setup mode once it restarts. If anyone reasons about severity
-from that comment they will under-rate it. A hub in this state is
-unadministrable until someone edits SQLite by hand.
+Deletion now uses `BEGIN IMMEDIATE` and the same guarded-statement shape as
+`set_admin`: the admin count and delete are one SQLite write-lock decision.
+`DeleteUser` reports deleted, absent and last-admin outcomes without parsing an
+error string. `auth_api::delete_racing_demotion_keeps_an_admin` releases a
+delete and demotion together for thirty rounds and proves exactly one
+admin-removing operation wins each round. The stale restart comment was replaced
+with the correct invariant: ordinary users do not make a zero-admin hub enter
+setup mode, before or after restart.
 
 ---
 
@@ -332,41 +297,14 @@ not the branch. Not investigated — a flake in a spike test is worth knowing
 about before someone spends an afternoon on a red workspace run that is not
 their fault.
 
-## 12. A demoted admin can re-promote itself for as long as its token lives
+## 12. A demoted admin can re-promote itself for as long as its token lives — FIXED
 
-`admin_set_user_admin` refuses to change your OWN flag, and its doc comment
-explains why: `require_admin` reads `admin` out of the access token and never
-asks the database, so self-promotion would turn a bounded stale claim into a
-permanent one.
-
-The bounded claim is enough on its own. Admin A demotes admin B; B's token still
-says `admin: true` for up to its remaining life, and within that window
-
-```
-POST /admin/v1/users  {"username":"b2","password":"…","admin":true}
-```
-
-is unguarded. It writes `is_admin = 1` for a fresh account, and B signs in as
-`b2` with permanent admin. The self-guard blocks the one spelling of this that
-has an alternative one route down the same router group — and B can equally aim
-the guarded route at any OTHER account whose password it knows, since that is
-not self.
-
-So "demote" is not a security control until the token stops being the source of
-truth, and the comment asserting otherwise is worse than no comment, because it
-will be relied on. The guard also costs a real operation: a sole operator handing
-over cannot demote themselves, and the new admin has to do it.
-
-The fix deletes the whole rationale: have `require_admin` read `is_admin` from
-the database, which is an indexed single-row read on a path that already does an
-in-memory `is_deleted` lookup for exactly this reason — or keep a `demoted` set
-beside `deleted`. Either way the self-guard, and its paragraph, can go.
-
-Not touched here: it is `auth.rs` and the admin router, where there is live AUTH
-work, and a non-admin cannot reach any spelling of it — `library_grants`'
-`admin_rights_are_grantable_but_not_removable_from_yourself` covers that. It is
-defence in depth rather than an open door, which is why it is written down rather
-than patched from a frontend branch.
+Every authenticated request now resolves administrator status from the current
+user row and compares the token's durable `auth_version`. A role change bumps
+that generation in the same statement, so the token that authorized a demotion
+is rejected on its next request and cannot create or promote another admin. The
+self-change guard and its stale-claim rationale are gone; self-demotion is safe
+when the independent last-admin predicate permits it.
 
 ## Checked and NOT a defect: the cacheable artwork 404
 

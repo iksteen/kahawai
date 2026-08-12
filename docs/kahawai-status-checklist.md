@@ -231,18 +231,16 @@ How something works and why it was built that way belong in
       playback. Admins are not bound by grants; denials answer 404.
       Managed from the admin UI's users panel and `kahawai-users.sh`.
       `PUT /admin/v1/users/{id}/admin` promotes and demotes
-      (`kahawai-users.sh promote|demote`). It refuses 409 on any change to the
-      requester's OWN flag, in either direction, and refuses to demote the last
-      admin, also with 409. `DELETE /admin/v1/users/{id}` answers the same way
-      for the same reasons — 409 for deleting the account you are signed in as
-      and 409 for the last admin, 404 for a stranger — so a client can tell a
-      refusal of the request from `require_admin`'s 403, which means the token
-      is not an admin at all. A refused delete ends no sessions.
-      Both directions matter: `require_admin` trusts `claims.admin` from
-      a 15-minute JWT (AUTH-2 is the fix and has not landed), so a just-demoted
-      account still holds a token saying otherwise — allowing self-promotion
-      would let it restore `is_admin` permanently, turning a bounded stale
-      claim into a durable one.
+      (`kahawai-users.sh promote|demote`), including self-demotion when another
+      admin remains; it refuses to demote the last admin with 409. The role and
+      durable access generation change in one statement, so the token that
+      authorized a demotion is rejected on its next request and mutable admin
+      state always comes from the user row. `DELETE /admin/v1/users/{id}` still
+      refuses deleting the account currently making the request, refuses the
+      last admin with 409, and answers 404 for a stranger. Its last-admin guard
+      and delete are one guarded statement under an immediate transaction, so a
+      concurrent demotion/delete cannot take the total to zero; a refused delete
+      ends no sessions.
       Grants are untouched by a demotion — the account falls back to the
       `user_libraries` rows it already had.
       Parental control needs no separate mechanism: it is a library the

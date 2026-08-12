@@ -131,9 +131,9 @@ elif cmd in ("promote", "demote"):
     if not args:
         sys.exit("usage: %s <user>" % cmd)
     u = find(args[0])
-    # The hub refuses to strip the rights of the account you are signed in
-    # as, and refuses to demote the last admin. Both come back as 409 with
-    # the reason, so there is nothing to re-check here.
+    # Self-demotion is allowed when another admin remains; the token used for
+    # this command is invalid immediately afterwards. The last admin is still
+    # refused with 409.
     call("PUT", "/admin/v1/users/%s/admin" % u["id"], {"admin": cmd == "promote"})
     print("%s is now %s" % (args[0], "an admin" if cmd == "promote" else "an ordinary account"))
 

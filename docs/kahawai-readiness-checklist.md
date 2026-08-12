@@ -88,18 +88,22 @@ marked in that document.
 
 ## Authentication and tenant isolation (AUTH)
 
-- [ ] AUTH-1 Add an immutable auth migration with `users.auth_version`; old
-      access and refresh tokens are intentionally invalid after this migration.
-      Document the field's meaning in the Rust auth module, not as mutable
-      commentary in the migration log
+- [x] AUTH-1 Migration 52 adds `users.auth_version`, revokes every existing
+      refresh family, and makes old access tokens undecodable because they lack
+      the required generation claim. The field's durable-generation meaning is
+      documented in `hub/auth.rs`, beside the code that enforces it
 - [~] AUTH-2 Retain the existing HS256 allowlist, signature and expiry
-      validation. Add and require the intended issuer, audience and token-type
-      claims, then load the user by primary key for every authenticated HTTP
-      request; construct username and administrator status from the database
-      rather than trusting mutable claims in the token
-- [ ] AUTH-3 Make deletion, administrator-role changes and password resets
-      invalidate access immediately, including across hub restart and when the
-      reset is performed by a separate CLI process
+      validation. Every authenticated HTTP request now loads the user by primary
+      key and constructs username and administrator status from the database;
+      adding and requiring the intended issuer, audience and token-type claims
+      remains
+- [x] AUTH-3 Deletion removes the authoritative user row; role changes and
+      password resets increment `auth_version` in the same committed write.
+      `auth_api::password_reset_revokes_all_families_across_restart` uses a
+      separate database pool and then a fresh `Auth` to prove immediate access
+      invalidation across the CLI-process and restart boundaries;
+      `admin_role_changes_invalidate_access_and_keep_one_admin` and
+      `admin_deletes_users` cover the other two mutations
 - [x] AUTH-4 Refresh-family rotation uses `BEGIN IMMEDIATE` plus a conditional
       update over the family id, current hash, revocation state and expiry.
       `auth_api::concurrent_refresh_has_one_winner_and_revokes_replay_family`

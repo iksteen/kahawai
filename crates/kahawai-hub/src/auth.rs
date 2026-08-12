@@ -21,6 +21,18 @@
 //! logins remain separate families. Logout revokes one, password reset revokes
 //! all of a user's families, and deleting the user cascades to them.
 //!
+//! ## Access invalidation generation
+//!
+//! `users.auth_version` is the durable generation of every access credential
+//! for an account. Access tokens carry the generation at issue time; every
+//! authenticated HTTP request loads the user by primary key and accepts the
+//! token only when its generation still matches. Role changes and password
+//! resets increment it in the same committed write as the change, and deletion
+//! removes the row, so all three invalidate access immediately across hub
+//! restart and across processes. The database row is also authoritative for
+//! mutable username and administrator state; those token claims are never
+//! trusted after signature and expiry validation.
+//!
 //! The rolling expiry is extended on successful rotation, preserving the
 //! existing 30-day idle lifetime. Revoked families stop rotating, so retaining
 //! them until that expiry identifies repeated replay without unbounded growth.
@@ -48,6 +60,8 @@ pub struct Claims {
     pub sub: String,
     pub username: String,
     pub admin: bool,
+    /// Durable access generation; must equal `users.auth_version`.
+    pub auth_version: i64,
     pub exp: i64,
 }
 
@@ -59,6 +73,15 @@ pub enum SetAdmin {
     Unchanged,
     NoSuchUser,
     /// Demoting this account would leave the hub with no admin at all.
+    LastAdmin,
+}
+
+/// What `delete_user` did, or why it declined to.
+#[derive(Debug, PartialEq, Eq)]
+pub enum DeleteUser {
+    Deleted(String),
+    NoSuchUser,
+    /// Deleting this account would leave the hub with no admin at all.
     LastAdmin,
 }
 
@@ -85,16 +108,6 @@ pub struct Auth {
     setup_token: Mutex<Option<String>>,
     /// OPS-2 login throttle (in-memory; resets on restart).
     pub throttle: Throttle,
-    /// Users deleted while their access token was still valid, and when
-    /// that token can last have been issued.
-    ///
-    /// Access tokens are stateless JWTs and `require_auth` never reads
-    /// the database, so without this a deleted account keeps working
-    /// until its token expires. Entries are swept once past the TTL, so
-    /// the map is bounded by deletions-per-15-minutes. Per process by
-    /// design: a restart clears it, and any token it would have refused
-    /// has expired by then.
-    deleted: Mutex<std::collections::HashMap<String, std::time::Instant>>,
 }
 
 /// OPS-2: consecutive-failure lockout with exponential backoff, keyed
@@ -270,7 +283,6 @@ impl Auth {
             dec: DecodingKey::from_secret(&secret),
             setup_token: Mutex::new(setup_token),
             throttle: Throttle::default(),
-            deleted: Mutex::new(Default::default()),
         })
     }
 
@@ -314,16 +326,7 @@ impl Auth {
         .await?;
         *self.setup_token.lock().unwrap() = None;
         tracing::info!(username, "initial admin created; setup complete");
-        self.issue_tokens(&id, username.trim(), true).await
-    }
-
-    /// True while `user_id` is a deleted account whose access token
-    /// could still verify. Sweeps expired entries as it goes.
-    pub fn is_deleted(&self, user_id: &str) -> bool {
-        let mut map = self.deleted.lock().unwrap();
-        let ttl = std::time::Duration::from_secs(ACCESS_TTL_SECS as u64);
-        map.retain(|_, at| at.elapsed() < ttl);
-        map.contains_key(user_id)
+        self.issue_tokens(&id, username.trim(), true, 1).await
     }
 
     /// Promote or demote an account.
@@ -353,11 +356,13 @@ impl Auth {
     /// for a refusal and 404 for a missing account, and neither is something
     /// to recover by reading prose off an error.
     pub async fn set_admin(&self, id: &str, admin: bool) -> Result<SetAdmin> {
+        let mut tx = self.db.begin_with("BEGIN IMMEDIATE").await?;
         let Some(was): Option<bool> = sqlx::query_scalar("SELECT is_admin FROM users WHERE id = ?")
             .bind(id)
-            .fetch_optional(&self.db)
+            .fetch_optional(&mut *tx)
             .await?
         else {
+            tx.rollback().await?;
             return Ok(SetAdmin::NoSuchUser);
         };
         // Idempotent on purpose: a panel that shows the state and sets it
@@ -365,80 +370,82 @@ impl Auth {
         // before the write also keeps a no-op demotion from being refused as
         // the last admin, which it is not — nothing would have changed.
         if was == admin {
+            tx.rollback().await?;
             return Ok(SetAdmin::Unchanged);
         }
         let changed = sqlx::query(
-            "UPDATE users SET is_admin = ?1
+            "UPDATE users
+                SET is_admin = ?1, auth_version = auth_version + 1
               WHERE id = ?2
                 AND (?1 OR (SELECT COUNT(*) FROM users WHERE is_admin = 1) > 1)",
         )
         .bind(admin)
         .bind(id)
-        .execute(&self.db)
+        .execute(&mut *tx)
         .await?
         .rows_affected();
         if changed == 1 {
+            tx.commit().await?;
             return Ok(SetAdmin::Changed);
         }
-        // Nothing written. On a promotion the guard is `?1 OR …` = true, so
-        // the only way to match no rows is that the id stopped existing;
-        // on a demotion it is the last-admin guard, since the row was there
-        // a moment ago.
-        Ok(if admin {
-            SetAdmin::NoSuchUser
-        } else {
-            SetAdmin::LastAdmin
-        })
+        // The immediate transaction keeps the row present and unchanged from
+        // the read above through this outcome. A promotion cannot be refused;
+        // therefore only a last-admin demotion reaches here.
+        Ok(SetAdmin::LastAdmin)
     }
 
     /// Remove a user and everything that is theirs alone.
     ///
-    /// Refuses the last remaining admin: `setup_required` is decided
-    /// once, at `Auth::new`, so an emptied hub does not fall back into
-    /// setup mode until it restarts — deleting the last admin would
-    /// lock the operator out of their own hub with no way back in.
+    /// Refuses the last remaining admin. `setup_required` is decided once at
+    /// `Auth::new` from whether any users exist, so a hub with ordinary users
+    /// and no administrator remains unadministrable across restart.
     ///
-    /// Not removed: subtitles this user downloaded. Those belong to the
-    /// item and stay available to everyone, which is the same call
-    /// `created_by` records rather than owns.
-    pub async fn delete_user(&self, id: &str) -> Result<String> {
-        let (username, is_admin): (String, bool) =
+    /// The guard and deletion run under one immediate write transaction. A
+    /// concurrent demotion or deletion therefore observes this operation
+    /// either wholly before or wholly after its own last-admin check; neither
+    /// can pass a stale count and take the total to zero.
+    ///
+    /// Not removed: subtitles this user downloaded. Those belong to the item
+    /// and stay available to everyone, which is the same call `created_by`
+    /// records rather than owns.
+    pub async fn delete_user(&self, id: &str) -> Result<DeleteUser> {
+        let mut tx = self.db.begin_with("BEGIN IMMEDIATE").await?;
+        let Some((username, _is_admin)): Option<(String, bool)> =
             sqlx::query_as("SELECT username, is_admin FROM users WHERE id = ?")
                 .bind(id)
-                .fetch_optional(&self.db)
+                .fetch_optional(&mut *tx)
                 .await?
-                .with_context(|| format!("no such user: {id}"))?;
-        if is_admin {
-            let admins: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE is_admin = 1")
-                .fetch_one(&self.db)
-                .await?;
-            anyhow::ensure!(admins > 1, "refusing to delete the last admin");
-        }
+        else {
+            tx.rollback().await?;
+            return Ok(DeleteUser::NoSuchUser);
+        };
 
-        let mut tx = self.db.begin().await?;
-        // watch_state_archive has no foreign key, so these rows would
-        // outlive the user — and the HUB-20 restore path copies them
-        // back into watch_state, whose key WOULD then fail and roll
-        // back a whole scan. Purged rather than kept: the archive is
-        // keyed by a ULID that no recreated account will ever have.
+        // watch_state_archive has no foreign key, so these rows would outlive
+        // the user. This write is rolled back too if the guarded delete below
+        // refuses the last administrator.
         sqlx::query("DELETE FROM watch_state_archive WHERE user_id = ?")
             .bind(id)
             .execute(&mut *tx)
             .await?;
-        // watch_state, user_prefs, user_libraries and refresh families
-        // cascade from here.
-        sqlx::query("DELETE FROM users WHERE id = ?")
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
+        // The count and delete are one statement under SQLite's write lock.
+        // Other user-owned rows and refresh families cascade from users.
+        let changed = sqlx::query(
+            "DELETE FROM users
+              WHERE id = ?1
+                AND (is_admin = 0 OR (SELECT COUNT(*) FROM users WHERE is_admin = 1) > 1)",
+        )
+        .bind(id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if changed == 0 {
+            tx.rollback().await?;
+            return Ok(DeleteUser::LastAdmin);
+        }
         tx.commit().await?;
 
-        self.deleted
-            .lock()
-            .unwrap()
-            .insert(id.to_string(), std::time::Instant::now());
         tracing::info!(username, %id, "user deleted");
-        Ok(username)
+        Ok(DeleteUser::Deleted(username))
     }
 
     /// Admin user creation (HUB-26 first cut).
@@ -469,7 +476,7 @@ impl Auth {
 
     pub async fn login(&self, username: &str, password: &str) -> Result<TokenPair> {
         let row = sqlx::query(
-            "SELECT id, username, password_hash, is_admin FROM users WHERE username = ?",
+            "SELECT id, username, password_hash, is_admin, auth_version FROM users WHERE username = ?",
         )
         .bind(username.trim())
         .fetch_optional(&self.db)
@@ -490,6 +497,7 @@ impl Auth {
             &row.get::<String, _>("id"),
             &row.get::<String, _>("username"),
             row.get::<i64, _>("is_admin") != 0,
+            row.get("auth_version"),
         )
         .await
     }
@@ -555,7 +563,7 @@ impl Auth {
         }
 
         let user = sqlx::query(
-            "SELECT u.id, u.username, u.is_admin
+            "SELECT u.id, u.username, u.is_admin, u.auth_version
                FROM users u JOIN refresh_families rf ON rf.user_id = u.id
               WHERE rf.id = ?",
         )
@@ -567,6 +575,7 @@ impl Auth {
             &user.get::<String, _>("id"),
             &user.get::<String, _>("username"),
             user.get::<i64, _>("is_admin") != 0,
+            user.get("auth_version"),
         )?;
         tx.commit().await.context("committing refresh rotation")?;
         Ok(TokenPair {
@@ -576,8 +585,14 @@ impl Auth {
         })
     }
 
-    async fn issue_tokens(&self, user_id: &str, username: &str, admin: bool) -> Result<TokenPair> {
-        let access_token = self.issue_access_token(user_id, username, admin)?;
+    async fn issue_tokens(
+        &self,
+        user_id: &str,
+        username: &str,
+        admin: bool,
+        auth_version: i64,
+    ) -> Result<TokenPair> {
+        let access_token = self.issue_access_token(user_id, username, admin, auth_version)?;
         let family_id = random_token(16);
         let (refresh_token, token_hash) = make_refresh_token(&family_id);
         sqlx::query(
@@ -598,11 +613,18 @@ impl Auth {
         })
     }
 
-    fn issue_access_token(&self, user_id: &str, username: &str, admin: bool) -> Result<String> {
+    fn issue_access_token(
+        &self,
+        user_id: &str,
+        username: &str,
+        admin: bool,
+        auth_version: i64,
+    ) -> Result<String> {
         let claims = Claims {
             sub: user_id.to_string(),
             username: username.to_string(),
             admin,
+            auth_version,
             exp: now_unix() + ACCESS_TTL_SECS,
         };
         Ok(jsonwebtoken::encode(
@@ -633,9 +655,32 @@ impl Auth {
         Ok(())
     }
 
-    pub fn verify(&self, bearer: &str) -> Result<Claims> {
-        let data = jsonwebtoken::decode::<Claims>(bearer, &self.dec, &Validation::default())?;
-        Ok(data.claims)
+    /// Verify the token and resolve its mutable account state from storage.
+    ///
+    /// Signature and expiry establish who minted the token and its bounded
+    /// lifetime. The indexed user lookup establishes that the account still
+    /// exists, that its generation is current, and what username/admin rights
+    /// it has now. No process-local cache participates in invalidation.
+    pub async fn authenticate(&self, bearer: &str) -> Result<Claims> {
+        let token =
+            jsonwebtoken::decode::<Claims>(bearer, &self.dec, &Validation::default())?.claims;
+        let row = sqlx::query("SELECT username, is_admin, auth_version FROM users WHERE id = ?")
+            .bind(&token.sub)
+            .fetch_optional(&self.db)
+            .await?
+            .context("account no longer exists")?;
+        let current_version: i64 = row.get("auth_version");
+        anyhow::ensure!(
+            token.auth_version == current_version,
+            "access token has been invalidated"
+        );
+        Ok(Claims {
+            sub: token.sub,
+            username: row.get("username"),
+            admin: row.get::<i64, _>("is_admin") != 0,
+            auth_version: current_version,
+            exp: token.exp,
+        })
     }
 }
 
@@ -644,11 +689,15 @@ impl Auth {
 pub async fn reset_password(db: &SqlitePool, username: &str, new_password: &str) -> Result<()> {
     let hash = hash_password(new_password)?;
     let mut tx = db.begin_with("BEGIN IMMEDIATE").await?;
-    let res = sqlx::query("UPDATE users SET password_hash = ? WHERE username = ?")
-        .bind(&hash)
-        .bind(username)
-        .execute(&mut *tx)
-        .await?;
+    let res = sqlx::query(
+        "UPDATE users
+            SET password_hash = ?, auth_version = auth_version + 1
+          WHERE username = ?",
+    )
+    .bind(&hash)
+    .bind(username)
+    .execute(&mut *tx)
+    .await?;
     if res.rows_affected() == 0 {
         bail!("no such user: {username}");
     }

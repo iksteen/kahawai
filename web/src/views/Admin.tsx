@@ -32,6 +32,7 @@ import {
   adminDeleteUser,
   adminSetUserLibraries,
   adminSetUserAdmin,
+  refreshTokens,
   username,
   sessionLogUrl,
   adminSessions,
@@ -247,8 +248,20 @@ function UsersSection({
       //
       // The error is cleared by hand, because a success used to do that
       // through the notice it no longer sends.
-      .then(() => {
+      .then(async () => {
         onError('')
+        if (u.username === username() && !admin) {
+          // The role write invalidated the token that authorized it. Rotate to
+          // a current non-admin access token before leaving this screen; a bare
+          // reload would make bootstrap see only the invalid old one and show
+          // sign-in despite the refresh family still being live.
+          if (!(await refreshTokens()))
+            throw new Error(
+              'Your role changed, but the session could not be refreshed. Sign in again.',
+            )
+          window.location.assign('/app/')
+          return
+        }
         return refresh()
       })
       .catch((e) => onError(String(e)))
@@ -315,13 +328,12 @@ function UsersSection({
               <span className="user-name">{u.username}</span>
               <button
                 className={`chip toggle${u.is_admin ? ' on' : ''}`}
-                disabled={u.username === me}
                 title={
-                  u.username === me
-                    ? 'You are signed in as this account — nobody changes their own admin rights, either way'
-                    : u.is_admin
-                      ? 'Demote to an ordinary account, bound by its grants'
-                      : 'Make an administrator: every library, and this panel'
+                  u.is_admin
+                    ? u.username === me
+                      ? 'Demote this account and return to the home screen'
+                      : 'Demote to an ordinary account, bound by its grants'
+                    : 'Make an administrator: every library, and this panel'
                 }
                 onClick={() => void setRole(u, !u.is_admin)}
               >

@@ -188,7 +188,11 @@ async fn setup_then_auth_flow() {
         .await
         .unwrap();
     assert!(auth.login("ingmar", "hunter22222").await.is_err());
-    assert!(auth.login("ingmar", "new-password-9").await.is_ok());
+    let after_reset = auth.login("ingmar", "new-password-9").await.unwrap();
+    assert!(
+        auth.authenticate(&access).await.is_err(),
+        "password reset left the old access token usable"
+    );
     assert!(
         kahawai_hub::auth::reset_password(&db, "ghost", "whatever-pass")
             .await
@@ -199,20 +203,32 @@ async fn setup_then_auth_flow() {
     // Restarted hub with existing users skips setup mode.
     let auth2 = Auth::new(db.clone(), dir.path()).await.unwrap();
     assert!(!auth2.setup_required());
+    assert!(
+        auth2.authenticate(&access).await.is_err(),
+        "password-reset invalidation did not survive Auth restart"
+    );
 
-    // Cookie auth: media elements can't set headers, so the kahawai_token
-    // cookie must satisfy the middleware too.
-    let resp = api
-        .clone()
-        .oneshot(
-            Request::get("/api/v1/items")
-                .header("cookie", format!("other=1; kahawai_token={access}"))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
+    // Cookie auth: media elements can't set headers, so a current access token
+    // in the kahawai_token cookie satisfies the middleware. The pre-reset one
+    // does not.
+    let cookie_get = |token: String| {
+        let api = api.clone();
+        async move {
+            api.oneshot(
+                Request::get("/api/v1/items")
+                    .header("cookie", format!("other=1; kahawai_token={token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        }
+    };
+    assert_eq!(cookie_get(access).await.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        cookie_get(after_reset.access_token).await.status(),
+        StatusCode::OK
+    );
     let resp = api
         .clone()
         .oneshot(
@@ -811,6 +827,90 @@ async fn refresh_family_migration_invalidates_legacy_tokens() {
     assert_eq!(old_table, 0, "legacy token storage survived migration");
 }
 
+/// AUTH-1: migration 52 deliberately creates a fresh credential generation.
+/// Access tokens from the old shape do not decode, and existing refresh
+/// families cannot mint replacements.
+#[tokio::test]
+async fn auth_version_migration_invalidates_existing_access_and_refresh() {
+    use serde::Serialize;
+    use sha2::{Digest, Sha256};
+    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+
+    #[derive(Serialize)]
+    struct LegacyClaims<'a> {
+        sub: &'a str,
+        username: &'a str,
+        admin: bool,
+        exp: i64,
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("hub.db");
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            SqliteConnectOptions::new()
+                .filename(&path)
+                .create_if_missing(true)
+                .foreign_keys(true),
+        )
+        .await
+        .unwrap();
+    AUTH_MIGRATOR.run_to(51, &pool).await.unwrap();
+    sqlx::query(
+        "INSERT INTO users (id, username, password_hash, is_admin)
+         VALUES ('old-user', 'old', 'unused', 1)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let secret = [7_u8; 32];
+    std::fs::write(dir.path().join("jwt.secret"), secret).unwrap();
+    let access = jsonwebtoken::encode(
+        &jsonwebtoken::Header::default(),
+        &LegacyClaims {
+            sub: "old-user",
+            username: "old",
+            admin: true,
+            exp: i64::MAX,
+        },
+        &jsonwebtoken::EncodingKey::from_secret(&secret),
+    )
+    .unwrap();
+    let refresh = "v1.0123456789abcdef0123456789abcdef.0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let refresh_hash = Sha256::digest(refresh.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    sqlx::query(
+        "INSERT INTO refresh_families
+            (id, user_id, current_token_hash, expires_at)
+         VALUES ('0123456789abcdef0123456789abcdef', 'old-user', ?, unixepoch() + 3600)",
+    )
+    .bind(refresh_hash)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    AUTH_MIGRATOR.run(&pool).await.unwrap();
+    let auth = Auth::new(pool.clone(), dir.path()).await.unwrap();
+    assert!(auth.authenticate(&access).await.is_err());
+    assert!(matches!(
+        auth.refresh(refresh).await,
+        Err(kahawai_hub::auth::RefreshError::Invalid)
+    ));
+    let row: (i64, bool) = sqlx::query_as(
+        "SELECT auth_version, revoked_at IS NOT NULL FROM users
+           JOIN refresh_families ON user_id = users.id
+          WHERE users.id = 'old-user'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(row, (1, true));
+}
+
 /// AUTH-4/5: one concurrent rotation wins. The loser is a presentation of
 /// the now-consumed token, so it also revokes the winner's family.
 #[tokio::test]
@@ -920,11 +1020,27 @@ async fn api_logout_revokes_only_the_callers_current_family() {
 async fn password_reset_revokes_all_families_across_restart() {
     let (dir, db, auth, _api, setup) = auth_harness().await;
     let second = auth.login("root", "hunter22222hunter").await.unwrap();
-    kahawai_hub::auth::reset_password(&db, "root", "new-password-22")
+    // A distinct pool is the separate CLI process: no Auth state is shared with
+    // the running hub, only the durable database transaction.
+    let cli_db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    kahawai_hub::auth::reset_password(&cli_db, "root", "new-password-22")
         .await
         .unwrap();
+    cli_db.close().await;
 
+    for access in [&setup.access_token, &second.access_token] {
+        assert!(
+            auth.authenticate(access).await.is_err(),
+            "separate-process reset left running-hub access valid"
+        );
+    }
     let restarted = Auth::new(db.clone(), dir.path()).await.unwrap();
+    for access in [&setup.access_token, &second.access_token] {
+        assert!(
+            restarted.authenticate(access).await.is_err(),
+            "access invalidation did not survive restart"
+        );
+    }
     for token in [&setup.refresh_token, &second.refresh_token] {
         assert!(matches!(
             restarted.refresh(token).await,
@@ -950,6 +1066,62 @@ async fn password_reset_revokes_all_families_across_restart() {
 /// HUB-10: deleting an account removes what is theirs, refuses the two
 /// deletions that would lock the operator out, and takes effect at once
 /// rather than whenever their access token happens to expire.
+#[tokio::test]
+async fn delete_racing_demotion_keeps_an_admin() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    let auth = Arc::new(Auth::new(db.clone(), dir.path()).await.unwrap());
+
+    // Re-run the actual race, not merely its two statements in a chosen order.
+    // Before the guarded delete this could let each operation observe two
+    // administrators and then independently remove one.
+    for round in 0..30 {
+        sqlx::query("DELETE FROM users").execute(&db).await.unwrap();
+        for id in [format!("a-{round}"), format!("b-{round}")] {
+            sqlx::query(
+                "INSERT INTO users (id, username, password_hash, is_admin)
+                 VALUES (?, ?, 'unused', 1)",
+            )
+            .bind(&id)
+            .bind(&id)
+            .execute(&db)
+            .await
+            .unwrap();
+        }
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+        let delete = {
+            let auth = auth.clone();
+            let barrier = barrier.clone();
+            tokio::spawn(async move {
+                barrier.wait().await;
+                auth.delete_user(&format!("a-{round}")).await.unwrap()
+            })
+        };
+        let demote = {
+            let auth = auth.clone();
+            let barrier = barrier.clone();
+            tokio::spawn(async move {
+                barrier.wait().await;
+                auth.set_admin(&format!("b-{round}"), false).await.unwrap()
+            })
+        };
+        barrier.wait().await;
+        let deleted = delete.await.unwrap();
+        let demoted = demote.await.unwrap();
+        assert!(
+            matches!(deleted, kahawai_hub::auth::DeleteUser::Deleted(_))
+                ^ matches!(demoted, kahawai_hub::auth::SetAdmin::Changed),
+            "round {round}: exactly one admin-removing operation must win: {deleted:?}, {demoted:?}"
+        );
+        let admins: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE is_admin = 1")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(admins, 1, "round {round} orphaned the hub");
+    }
+}
+
 #[tokio::test]
 async fn admin_deletes_users() {
     let dir = tempfile::tempdir().unwrap();
@@ -1039,38 +1211,16 @@ async fn admin_deletes_users() {
         del(admin_token.clone(), admin_id.clone()).await.status(),
         StatusCode::CONFLICT
     );
-    // And the last-admin refusal over HTTP, which was only ever asserted against
-    // `Auth` directly — the same gap that left the admin-flag route's status
-    // unpinned. Reachable by the stale-claim route: promote bob, take a token
-    // while it says `admin: true`, demote bob again. Aiming a delete at the
-    // remaining admin then passes `require_admin` on the stale claim and passes
-    // the self-guard, so it lands on this refusal.
+    // A token minted while bob was an admin dies with the demotion's durable
+    // generation bump. It cannot use a stale role to reach any admin action.
     auth.set_admin(&victim, true).await.unwrap();
     let bob_admin_token = auth.login("bob", "hunter22222").await.unwrap().access_token;
     auth.set_admin(&victim, false).await.unwrap();
-    let resp = del(bob_admin_token.clone(), admin_id.clone()).await;
     assert_eq!(
-        resp.status(),
-        StatusCode::CONFLICT,
-        "refusing the last admin is a conflict, not the 403 that means \
-         'your token is not an admin'"
+        del(bob_admin_token, admin_id.clone()).await.status(),
+        StatusCode::UNAUTHORIZED,
+        "a demoted account retained admin access"
     );
-    let body = String::from_utf8(
-        axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap()
-            .to_vec(),
-    )
-    .unwrap();
-    assert!(
-        body.contains("last admin"),
-        "and it says which conflict, since the self-guard shares the status: {body}"
-    );
-    let still: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE is_admin = 1")
-        .fetch_one(&db)
-        .await
-        .unwrap();
-    assert_eq!(still, 1, "nothing was deleted");
 
     assert_eq!(
         del(admin_token.clone(), "nobody".into()).await.status(),
@@ -1132,6 +1282,11 @@ async fn admin_deletes_users() {
         StatusCode::UNAUTHORIZED,
         "a deleted user's live access token still worked"
     );
+    let restarted = Auth::new(db.clone(), dir.path()).await.unwrap();
+    assert!(
+        restarted.authenticate(&bob).await.is_err(),
+        "deleted-user invalidation did not survive Auth restart"
+    );
 
     // And the last admin is refused, so a hub cannot be orphaned: an
     // emptied one does not fall back into setup mode until it restarts.
@@ -1143,8 +1298,9 @@ async fn admin_deletes_users() {
         del(admin_token.clone(), second).await.status(),
         StatusCode::OK
     );
-    assert!(
-        auth.delete_user(&admin_id).await.is_err(),
+    assert_eq!(
+        auth.delete_user(&admin_id).await.unwrap(),
+        kahawai_hub::auth::DeleteUser::LastAdmin,
         "the last admin was deletable"
     );
 }

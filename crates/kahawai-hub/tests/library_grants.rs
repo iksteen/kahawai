@@ -498,7 +498,7 @@ async fn deleting_an_account_takes_its_grants() {
 /// two ways it must refuse, because both of them are how a hub ends up with
 /// nobody who can administer it.
 #[tokio::test]
-async fn admin_rights_are_grantable_but_not_removable_from_yourself() {
+async fn admin_role_changes_invalidate_access_and_keep_one_admin() {
     let h = harness().await;
     let boss_id: String = sqlx::query_scalar("SELECT id FROM users WHERE username = 'boss'")
         .fetch_one(&h.db)
@@ -552,109 +552,72 @@ async fn admin_rights_are_grantable_but_not_removable_from_yourself() {
     );
     assert!(is_admin(h.kid_id.clone()).await);
 
-    // Nobody touches their own flag, in either direction.
-    //
-    // The demotion half is the one a viewer meets: one click, in a list where
-    // every other row is somebody else. The promotion half is the one that
-    // matters, and it is not obvious — `require_admin` trusts a 15-minute JWT,
-    // so a just-demoted account still holds a token saying it is an admin.
-    // Were self-promotion allowed it could write `is_admin` back and keep it,
-    // which is a permanent escalation out of a stale claim.
+    // Mint a token for the newly promoted account. Role changes bump the
+    // durable access generation, so its original non-admin token remains
+    // invalid rather than gaining rights from the database lookup.
+    let login = |username: &'static str| {
+        let api = h.api.clone();
+        async move {
+            let (status, body) = call(
+                &api,
+                "",
+                "POST",
+                "/api/v1/auth/token",
+                Some(json!({ "username": username, "password": "hunter22222hunter" })),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            serde_json::from_str::<Value>(&body).unwrap()["access_token"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        }
+    };
+    let kid_admin_token = login("kid").await;
+
+    // Self-demotion is now safe: the role and generation move in one write.
+    // The token that authorized it is rejected on the very next request.
     assert_eq!(
         promote(h.boss.clone(), boss_id.clone(), false).await,
-        StatusCode::CONFLICT,
-        "an admin must not be able to remove its own rights"
+        StatusCode::OK
     );
-    assert!(
-        is_admin(boss_id.clone()).await,
-        "a refused demotion must not have written anything"
-    );
+    assert!(!is_admin(boss_id.clone()).await);
     assert_eq!(
         promote(h.boss.clone(), boss_id.clone(), true).await,
-        StatusCode::CONFLICT,
-        "nobody sets their own admin flag, not even to the value it already has"
+        StatusCode::UNAUTHORIZED,
+        "a role-changing token remained usable"
     );
 
-    // A token minted while the kid IS an admin: this is the stale claim the
-    // whole guard exists for. The kid's original token says `admin: false`
-    // and would be turned away by `require_admin` before reaching the
-    // endpoint, which would prove nothing.
-    let kid_admin_token = {
-        let (status, body) = call(
-            &h.api,
-            "",
-            "POST",
-            "/api/v1/auth/token",
-            Some(json!({ "username": "kid", "password": "hunter22222hunter" })),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK, "kid must be able to log in");
-        serde_json::from_str::<Value>(&body).unwrap()["access_token"]
-            .as_str()
-            .unwrap()
-            .to_string()
-    };
-
-    // The escalation itself, spelled out: demote the kid, then let the kid use
-    // the token it still holds — the one that says `admin: true` — to put its
-    // own flag back. `require_admin` lets it through the door; this endpoint
-    // must not let it through the second one.
+    // Hand administration back, then prove the same invalidation for the
+    // other account without relying on a special self-change guard.
     assert_eq!(
-        promote(h.boss.clone(), h.kid_id.clone(), false).await,
+        promote(kid_admin_token.clone(), boss_id.clone(), true).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        promote(kid_admin_token.clone(), h.kid_id.clone(), false).await,
         StatusCode::OK
     );
     assert!(!is_admin(h.kid_id.clone()).await);
     assert_eq!(
-        promote(kid_admin_token.clone(), h.kid_id.clone(), true).await,
-        StatusCode::CONFLICT,
-        "a demoted account must not re-promote itself with its stale token"
-    );
-    assert!(
-        !is_admin(h.kid_id.clone()).await,
-        "the refused self-promotion must not have written anything"
-    );
-    // Put it back so the rest of the test reads as before.
-    assert_eq!(
-        promote(h.boss.clone(), h.kid_id.clone(), true).await,
-        StatusCode::OK
+        promote(kid_admin_token, h.kid_id.clone(), true).await,
+        StatusCode::UNAUTHORIZED,
+        "a demoted account could still use its old admin token"
     );
 
-    // Demoting somebody else is allowed, and there is still an admin left.
-    assert_eq!(
-        promote(h.boss.clone(), h.kid_id.clone(), false).await,
-        StatusCode::OK
-    );
-    assert!(!is_admin(h.kid_id.clone()).await);
-    let admins: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE is_admin = 1")
-        .fetch_one(&h.db)
-        .await
-        .unwrap();
-    assert_eq!(admins, 1);
-
-    // The last-admin backstop IS reachable over HTTP, by the same stale-token
-    // route as the escalation above: the kid was an admin, still holds the token
-    // that says so, and the boss is now the only admin left. Demoting the boss
-    // is not a self-change, so it passes that guard and lands on this one. An
-    // earlier comment here said it could not be reached and asserted the enum
-    // directly instead, which left the handler's own status unpinned.
+    // A freshly authenticated sole admin reaches the database backstop when
+    // attempting self-demotion. This is a state conflict, not stale auth.
+    let boss = login("boss").await;
     let (status, body) = call(
         &h.api,
-        &kid_admin_token,
+        &boss,
         "PUT",
         &format!("/admin/v1/users/{boss_id}/admin"),
         Some(json!({ "admin": false })),
     )
     .await;
-    assert_eq!(
-        status,
-        StatusCode::CONFLICT,
-        "refusing the last admin is a conflict, not a 403 — that is what
-         `require_admin` says when the token is not an admin at all"
-    );
-    assert!(
-        body.contains("last admin"),
-        "and it says which conflict, since the self-guard shares the status: {body}"
-    );
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(body.contains("last admin"));
     assert!(is_admin(boss_id.clone()).await, "nothing was written");
 
     // Still asserted at the layer below, so it stays true for any caller that
@@ -671,7 +634,7 @@ async fn admin_rights_are_grantable_but_not_removable_from_yourself() {
 
     // And a stranger is a 404, not a silent success.
     assert_eq!(
-        promote(h.boss.clone(), "nope".to_string(), true).await,
+        promote(boss, "nope".to_string(), true).await,
         StatusCode::NOT_FOUND
     );
 }
