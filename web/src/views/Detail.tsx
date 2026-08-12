@@ -38,6 +38,7 @@ import {
   watchedPct,
 } from '../label'
 import { notify } from '../toast'
+import { deliveryPlan as plan } from '../delivery'
 import tmdbLogo from '../assets/tmdb.svg'
 
 const GB = 1024 * 1024 * 1024
@@ -116,29 +117,6 @@ function Chips({ s }: { s: Source }) {
 ///
 /// UNPLAYABLE keeps its note: it is the one verdict that describes no work at
 /// all but a refusal, and there is no stream row to read it off.
-const PLAN = {
-  direct: { chip: 'DIRECT', tone: 'teal', note: '' },
-  copy: { chip: 'REMUX', tone: 'teal', note: '' },
-  audio_encode: {
-    chip: 'TRANSCODE',
-    tone: 'sand',
-    note: 'the audio is re-encoded; the picture is copied',
-  },
-  video_encode: { chip: 'TRANSCODE', tone: 'sand', note: '' },
-  unplayable: {
-    chip: 'UNPLAYABLE',
-    tone: 'warn',
-    note: 'nothing here can be delivered to this browser',
-  },
-} as const
-
-const plan = (cost: string) =>
-  PLAN[cost as keyof typeof PLAN] ?? {
-    chip: cost.toUpperCase(),
-    tone: 'warn' as const,
-    note: '',
-  }
-
 /// Deliveries that mean something is being done TO the subtitles rather
 /// than them being handed over as they are. Worth a colour, because each
 /// one costs something: a burn restarts the video encode.

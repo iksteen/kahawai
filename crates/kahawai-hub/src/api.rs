@@ -1311,6 +1311,7 @@ async fn admin_sessions(State(state): State<AppState>) -> Result<Json<Value>, Ap
             "module_id": s.module_id,
             "idle_secs": s.idle_for().as_secs(),
             "streams": s.verdict.lock().unwrap().as_ref().map(|(video, audio)| json!({
+                "cost": s.delivery_cost(),
                 "video": video,
                 "audio": audio,
             })),
@@ -1698,6 +1699,10 @@ async fn start_session(
             "content_type": ctype,
             "stream_url": stream_url,
             "streams": session.verdict.lock().unwrap().as_ref().map(|(video, audio)| json!({
+                // Aggregate semantic work, separate from `mode`, which says
+                // where/how the pipeline runs. A remux pipeline can encode
+                // audio; a dispatched pipeline can copy video.
+                "cost": session.delivery_cost(),
                 "video": video,
                 "audio": audio,
                 // Additive (HUB-32a/b): per-subtitle tier verdicts on
@@ -1760,7 +1765,7 @@ async fn seek_session(
     let session = state.sessions.get(&id);
     let streams = session.as_ref().and_then(|s| {
         s.verdict.lock().unwrap().as_ref().map(|(video, audio)| {
-            json!({ "video": video, "audio": audio,
+            json!({ "cost": s.delivery_cost(), "video": video, "audio": audio,
                         "subtitles": *s.sub_verdicts.lock().unwrap() })
         })
     });

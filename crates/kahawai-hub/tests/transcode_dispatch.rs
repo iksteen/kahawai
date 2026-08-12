@@ -340,6 +340,7 @@ async fn dispatches_encode_session_to_transcoder() {
     assert_eq!(resp.status(), StatusCode::CREATED);
     let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
     assert_eq!(v["mode"], "transcode", "session should dispatch: {v}");
+    assert_eq!(v["streams"]["cost"], "audio_encode");
     assert_eq!(v["streams"]["audio"], "flac → aac (transcoded)");
     let stream_url = v["stream_url"].as_str().unwrap().to_string();
     let session_id = v["session_id"].as_str().unwrap().to_string();

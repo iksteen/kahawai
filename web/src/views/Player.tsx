@@ -45,6 +45,7 @@ import { initialHealth, isFrozen, sessionHealth, type SessionEvent } from '../pl
 import { subtitleRoute } from '../subtitle-route'
 import { useSubtitleRenderers } from '../use-subtitles'
 import { seLabel } from '../label'
+import { deliveryPlan } from '../delivery'
 
 function fmt(ms: number) {
   const s = Math.max(0, Math.floor(ms / 1000))
@@ -249,6 +250,9 @@ export default function Player({
   const [trk, sendTrack] = useReducer(tracks, session.streams, initialTracks)
   const { subs, subKey, audioList: audioTracks, audio: audioTrack } = trk
   const { videoList: videoTracks, video: videoTrack, epoch: trackEpoch, streams, vttFallback } = trk
+  // `session.mode` describes pipeline ownership/container shape. The plan cost
+  // says what happened to the elementary streams and changes with track picks.
+  const delivery = deliveryPlan(streams?.cost ?? session.mode)
   // HUB-33: memory scope for manual track choices (series id, or the
   // item itself for movies).
   const seriesRef = useRef<string>(item.id)
@@ -1499,7 +1503,8 @@ export default function Player({
           <div className="info-overlay mono">
             <span>
               <span className="dim">session </span>
-              {item.title} · <span className="teal">{session.mode}</span> · {session.content_type}
+              {item.title} · <span className={delivery.tone}>{delivery.chip}</span> ·{' '}
+              {session.content_type}
             </span>
             {streams && (
               <>

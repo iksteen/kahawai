@@ -356,6 +356,10 @@ async fn negotiation_picks_cheapest_source_and_honors_caps() {
     let (status, v) = start(serde_json::json!({ "item_id": item_id })).await;
     assert_eq!(status, StatusCode::CREATED, "{v}");
     assert_eq!(v["mode"], "remux", "cap must forbid direct: {v}");
+    assert_eq!(
+        v["streams"]["cost"], "video_encode",
+        "aggregate work must not be confused with the local pipeline mode: {v}"
+    );
     let video_verdict = v["streams"]["video"].as_str().unwrap();
     assert!(
         video_verdict.contains("bandwidth cap"),

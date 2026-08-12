@@ -640,6 +640,26 @@ impl Session {
             .unwrap_or(0)
     }
 
+    /// Aggregate delivery cost of what is playing now. This is derived from
+    /// the elementary-stream plan, not [`Mode`]: `Mode::Remux` means the hub
+    /// owns an HLS pipeline and `Mode::Transcode` means a satellite owns it;
+    /// either pipeline may copy one stream and encode the other.
+    pub fn delivery_cost(&self) -> Option<&'static str> {
+        if matches!(&self.mode, Mode::Direct { .. }) {
+            return Some(kahawai_media::negotiate::Cost::Direct.as_str());
+        }
+        self.plan.lock().unwrap().map(|plan| {
+            use kahawai_media::remux::StreamMode;
+            if plan.video == StreamMode::Encode {
+                kahawai_media::negotiate::Cost::VideoEncode.as_str()
+            } else if plan.audio == StreamMode::Encode {
+                kahawai_media::negotiate::Cost::AudioEncode.as_str()
+            } else {
+                kahawai_media::negotiate::Cost::Copy.as_str()
+            }
+        })
+    }
+
     /// Any client activity (stream chunks, playlist/segment fetches,
     /// progress pings) keeps the session alive (HUB-18).
     pub fn touch(&self) {

@@ -291,7 +291,10 @@ How something works and why it was built that way belong in
 - [x] HUB-13 All hub state in embedded storage; survives restart without rescan
 - [x] HUB-14 Capability-profile negotiation: browser-probed profile with
       every play request, hub decides per stream (`negotiate.rs`,
-      `tests/negotiate_play.rs`); explicit mode = operator force
+      `tests/negotiate_play.rs`); explicit mode = operator force. Session
+      responses carry aggregate plan cost separately from pipeline mode, so
+      player/admin labels say TRANSCODE when either elementary stream is
+      encoded even if the local HLS pipeline is structurally a remux
 - [x] HUB-15 Negotiation matrix: codec/profile/level, resolution/fps
       ceilings, bandwidth cap (pref + profile), channel downmix,
       subtitle tiers with graphics_overlay/ass_render gating, HDR

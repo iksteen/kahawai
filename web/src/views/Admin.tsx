@@ -43,6 +43,7 @@ import {
   type PendingEnrollment,
   type Satellite,
 } from '../api'
+import { deliveryPlan } from '../delivery'
 
 // HUB-11: the events channel pushes invalidation hints; polling remains
 // only as a slow fallback for anything a hint doesn't cover.
@@ -1202,7 +1203,7 @@ export default function Admin() {
               {sessions.map((s) => (
                 <li key={s.session_id}>
                   <span className="chips">
-                    <span className="chip">{s.mode}</span>
+                    <span className="chip">{deliveryPlan(s.streams?.cost ?? s.mode).chip}</span>
                     <span>{s.title ?? s.session_id}</span>
                     {s.streams && (
                       <span className="mono dim">

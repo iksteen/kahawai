@@ -744,7 +744,14 @@ export type SubtitleVerdict = {
   tier: 'text' | 'convert' | 'graphics' | 'ocr' | 'burn' | 'unavailable'
   note: string
 }
-export type StreamVerdict = { video: string; audio: string; subtitles?: SubtitleVerdict[] }
+export type StreamVerdict = {
+  /// Aggregate semantic work. Unlike session `mode`, this says whether an
+  /// elementary stream is encoded and follows track-switch re-plans.
+  cost: 'direct' | 'copy' | 'audio_encode' | 'video_encode'
+  video: string
+  audio: string
+  subtitles?: SubtitleVerdict[]
+}
 
 export type Session = {
   session_id: string
