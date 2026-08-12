@@ -72,8 +72,10 @@ ladders, and the hardening pass. Design documents:
   hash it appends distinguishes them. To settle it, run the reproducer in
   [`patches/gst-plugins-rs/`](./patches/gst-plugins-rs) — it aborts the
   process on an affected build and exits cleanly on a fixed one.
-- Node is **not** required to run — the web app ships prebuilt in the binary
-  (`cd web && npm run build` only if you hack on it).
+- Node is **not** required to run — the web app ships prebuilt in the binary,
+  and a build without npm embeds that checked-in bundle. With npm installed,
+  `cargo build` rebuilds it from `web/` whenever the sources change, so the
+  binary cannot ship an app older than the tree it was built from.
 
 ```sh
 cargo build --release

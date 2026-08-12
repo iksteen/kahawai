@@ -81,10 +81,16 @@ jobs:
           if wrong:
               raise SystemExit("workspace version mismatch: " + ", ".join(wrong))
           PY
+      # Before the cargo steps, deliberately. The hub's build script builds the
+      # web bundle when web/node_modules exists, so this ordering is what puts
+      # that path — the one every local build takes — under CI at all. Reversed,
+      # cargo ran without node_modules and only ever exercised the fallback.
+      - run: npm ci
+        working-directory: web
       - run: cargo fmt --all --check
       - run: cargo clippy --locked --workspace --all-targets
       - run: cargo check --locked --workspace --no-default-features
-      - run: npm ci
+      - run: npm run fmt:check
         working-directory: web
       - run: npm run lint
         working-directory: web
@@ -92,7 +98,12 @@ jobs:
         working-directory: web
       - run: npm run build
         working-directory: web
-      - run: git diff --exit-code -- web/dist
+      - name: Embedded assets match their source
+        # See ci.yml: staged, so a new chunk the build emitted cannot slip
+        # through as merely untracked.
+        run: |
+          git add -A web/dist
+          git diff --cached --exit-code -- web/dist
 
   draft-release:
     name: create draft release

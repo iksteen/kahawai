@@ -94,7 +94,15 @@ rel="./${exe#"$repo"/}"
 # setsid + </dev/null: the hub READS STDIN (enrollment codes), so an
 # inherited descriptor keeps this script — and anything piping its
 # output — alive forever. Fully detach.
-( cd "$repo" && setsid "$rel" "$svc" >>"$log" 2>&1 </dev/null & ) || true
+#
+# --fork, or the detaching is a coin toss. Without it setsid EXECS in place
+# when it can, and bash had already optimised away the subshell's own fork —
+# so the service stayed this script's child and bash sat in do_wait on it.
+# The restart still worked and still reported "started", then hung until the
+# service exited: ten minutes of a finished deploy looking like a slow build,
+# repeatedly, before anyone thought to look at the process tree. Forcing the
+# fork means the service is init's child by the time we check for it.
+( cd "$repo" && setsid --fork "$rel" "$svc" >>"$log" 2>&1 </dev/null & ) || true
 
 for _ in $(seq 1 20); do
   now=$(pids | tr '\n' ' ')

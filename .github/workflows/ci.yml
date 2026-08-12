@@ -164,6 +164,8 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
       - run: npm ci
         working-directory: web
+      - run: npm run fmt:check
+        working-directory: web
       - run: npm run lint
         working-directory: web
       - run: npm test
@@ -171,4 +173,8 @@ jobs:
       - run: npm run build
         working-directory: web
       - name: Embedded assets match their source
-        run: git diff --exit-code -- web/dist
+        # Staged, because `git diff` alone cannot see a file the build emitted
+        # that was never committed — a new chunk would pass unnoticed.
+        run: |
+          git add -A web/dist
+          git diff --cached --exit-code -- web/dist
