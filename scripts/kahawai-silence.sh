@@ -22,12 +22,32 @@ echo "==> building lean satellite binaries" >&2
 echo "==> stopping satellites on $HOST" >&2
 ssh "$HOST" 'bash -s' <<'REMOTE'
 set -euo pipefail
-# Old single-binary layout: retire it so nothing relaunches it by habit.
-pkill -f '^/home/ingmar/kahawai mediahost' 2>/dev/null || true
-pkill -f '^/home/ingmar/kahawai transcoder' 2>/dev/null || true
-pkill -f '^/home/ingmar/kahawai-mediahost' 2>/dev/null || true
-pkill -f '^/home/ingmar/kahawai-transcoder' 2>/dev/null || true
+# Match the resolved executable, not argv[0]: a process started as
+# ./kahawai-mediahost keeps that relative spelling in cmdline and, after a
+# replacement, /proc/PID/exe reads "... (deleted)". Both defeated anchored
+# command-line matching and left the old protocol binary connected.
+for proc in /proc/[0-9]*; do
+    exe=$(readlink "$proc/exe" 2>/dev/null || true)
+    exe=${exe% (deleted)}
+    case "$exe" in
+        /home/ingmar/kahawai|/home/ingmar/kahawai-mediahost|/home/ingmar/kahawai-transcoder)
+            kill "${proc##*/}" 2>/dev/null || true ;;
+    esac
+done
 sleep 2
+left=""
+for proc in /proc/[0-9]*; do
+    exe=$(readlink "$proc/exe" 2>/dev/null || true)
+    exe=${exe% (deleted)}
+    case "$exe" in
+        /home/ingmar/kahawai|/home/ingmar/kahawai-mediahost|/home/ingmar/kahawai-transcoder)
+            left="$left ${proc##*/}:$exe" ;;
+    esac
+done
+if [[ -n "$left" ]]; then
+    echo "satellite executable still running:$left" >&2
+    exit 1
+fi
 REMOTE
 
 echo "==> shipping to $HOST" >&2
