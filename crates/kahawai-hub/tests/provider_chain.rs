@@ -345,6 +345,53 @@ async fn an_unreachable_provider_is_rescheduled_not_dropped() {
     assert_eq!(left, 0);
 }
 
+/// A provider response may return after another task deleted its item.
+/// Every asynchronous completion path must then discard the stale result.
+#[tokio::test]
+async fn provider_completion_for_a_retired_item_is_a_no_op() {
+    use kahawai_hub::providers::{record_question, reschedule};
+    let db = kahawai_hub::db::open_in_memory().await.unwrap();
+    item(&db, "gone").await;
+    sqlx::query("DELETE FROM items WHERE id = 'gone'")
+        .execute(&db)
+        .await
+        .unwrap();
+
+    reschedule(&db, "gone", "tmdb", "late transport failure").await;
+    record_question(&db, "gone", "tmdb", "title", "gone|").await;
+    store_answer(&db, "gone", "tmdb", "1", "auto", Fields::default())
+        .await
+        .unwrap();
+
+    let counts: (i64, i64, i64) = sqlx::query_as(
+        "SELECT (SELECT COUNT(*) FROM enrichment_queue),
+                (SELECT COUNT(*) FROM provider_queries),
+                (SELECT COUNT(*) FROM provider_metadata)",
+    )
+    .fetch_one(&db)
+    .await
+    .unwrap();
+    assert_eq!(counts, (0, 0, 0), "stale provider completion wrote state");
+}
+
+/// A successful empty answer closes that exact question. Repeated scheduling
+/// must not turn an unfindable title into a standing provider call until its
+/// identity or the query revision changes.
+#[tokio::test]
+async fn a_recorded_miss_is_not_owed_ad_infinitum() {
+    use kahawai_hub::providers::{question_pending, record_question};
+    let db = kahawai_hub::db::open_in_memory().await.unwrap();
+    item(&db, "i1").await;
+    let anchor = "unfindable title|1999";
+    assert!(question_pending(&db, "i1", "anime", "title", anchor).await);
+    record_question(&db, "i1", "anime", "title", anchor).await;
+    assert!(!question_pending(&db, "i1", "anime", "title", anchor).await);
+    assert!(
+        question_pending(&db, "i1", "anime", "title", "renamed title|1999").await,
+        "changing the identity re-opens the question"
+    );
+}
+
 /// Work that is due shows up for the next run to pick up.
 #[tokio::test]
 async fn due_work_is_offered_to_the_next_run() {

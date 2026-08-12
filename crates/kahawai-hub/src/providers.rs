@@ -652,7 +652,8 @@ pub async fn reschedule(db: &SqlitePool, item_id: &str, provider: &str, reason: 
     let due = retry_delay(attempts);
     let _ = sqlx::query(
         "INSERT INTO enrichment_queue (item_id, provider, due_at, attempts, reason)
-         VALUES (?, ?, unixepoch() + ?, 1, ?)
+         SELECT ?, ?, unixepoch() + ?, 1, ?
+          WHERE EXISTS (SELECT 1 FROM items WHERE id = ?)
          ON CONFLICT (item_id, provider) DO UPDATE SET
            due_at = unixepoch() + ?,
            attempts = enrichment_queue.attempts + 1,
@@ -662,6 +663,7 @@ pub async fn reschedule(db: &SqlitePool, item_id: &str, provider: &str, reason: 
     .bind(provider)
     .bind(due)
     .bind(reason)
+    .bind(item_id)
     .bind(due)
     .execute(db)
     .await;
@@ -814,7 +816,8 @@ pub async fn record_question(
 ) {
     let _ = sqlx::query(
         "INSERT INTO provider_queries (item_id, provider, query_type, query, rev, asked_at)
-         VALUES (?, ?, ?, ?, ?, unixepoch())
+         SELECT ?, ?, ?, ?, ?, unixepoch()
+          WHERE EXISTS (SELECT 1 FROM items WHERE id = ?)
          ON CONFLICT (item_id, provider, query_type, query)
          DO UPDATE SET rev = excluded.rev, asked_at = excluded.asked_at",
     )
@@ -823,6 +826,7 @@ pub async fn record_question(
     .bind(query_type)
     .bind(query)
     .bind(QUERY_REV)
+    .bind(item_id)
     .execute(db)
     .await;
 }
@@ -894,7 +898,8 @@ const STORE_ANSWER: &str = "\
 INSERT INTO provider_metadata
            (item_id, provider, provider_id, title, overview, poster_path, rating,
             premiered, original_language, genres, cast_json, confidence, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch())
+         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch()
+          WHERE EXISTS (SELECT 1 FROM items WHERE id = ?)
          ON CONFLICT (item_id, provider) DO UPDATE SET
            provider_id = excluded.provider_id,
            title = excluded.title,
@@ -937,6 +942,7 @@ fn bind_answer<'a>(
         .bind(&fields.genres)
         .bind(&fields.cast_json)
         .bind(confidence)
+        .bind(item_id)
 }
 
 /// The user's choice: THIS provider's record is what the item is.

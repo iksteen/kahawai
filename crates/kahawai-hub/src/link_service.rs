@@ -651,6 +651,7 @@ async fn handle_host_msg(
             push_subs_worklist(registry, module_id, &p.collection_id).await;
             push_attachments_worklist(registry, module_id, &p.collection_id).await;
             push_keyframe_worklist(registry, module_id, &p.collection_id).await;
+            enricher.scan_complete(registry.clone());
         }
         host_to_hub::Msg::FileAttachments(fa) => {
             let stored = registry

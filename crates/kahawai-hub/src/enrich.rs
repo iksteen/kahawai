@@ -42,6 +42,8 @@ pub struct Enricher {
     anilist: crate::anime::Anilist,
     last_nudge: std::sync::atomic::AtomicU64,
     running: AtomicBool,
+    scheduled: AtomicBool,
+    rerun_requested: AtomicBool,
     /// (matched, weak, missed) of the current/last run.
     progress: (AtomicUsize, AtomicUsize, AtomicUsize),
     /// The UDP session, kept for the PROCESS lifetime — not per run.
@@ -425,6 +427,8 @@ impl Enricher {
             data_dir,
             http,
             running: AtomicBool::new(false),
+            scheduled: AtomicBool::new(false),
+            rerun_requested: AtomicBool::new(false),
             last_nudge: std::sync::atomic::AtomicU64::new(0),
             progress: Default::default(),
             anidb: Default::default(),
@@ -813,10 +817,53 @@ impl Enricher {
         {
             return;
         }
+        self.schedule(registry, std::time::Duration::ZERO);
+    }
+
+    /// A completed scan is authoritative owed-work input even when every file
+    /// was already hashed. Completions settle briefly and coalesce; a request
+    /// arriving during a run causes one follow-up pass.
+    pub fn scan_complete(self: &Arc<Self>, registry: Arc<Registry>) {
+        self.schedule(registry, std::time::Duration::from_secs(2));
+    }
+
+    fn schedule(self: &Arc<Self>, registry: Arc<Registry>, settle: std::time::Duration) {
+        self.rerun_requested.store(true, Ordering::SeqCst);
+        if self
+            .scheduled
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
         let this = self.clone();
         tokio::spawn(async move {
-            if let Err(e) = this.run_once(&registry).await {
-                tracing::debug!(error = format!("{e:#}"), "nudged enrichment skipped");
+            tokio::time::sleep(settle).await;
+            loop {
+                // A manual run may own the runner. Keep the request pending.
+                if this.running.load(Ordering::SeqCst) {
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    continue;
+                }
+                this.rerun_requested.store(false, Ordering::SeqCst);
+                if let Err(e) = this.run_once(&registry).await {
+                    tracing::warn!(error = format!("{e:#}"), "scheduled enrichment failed");
+                }
+                if this.rerun_requested.load(Ordering::SeqCst) {
+                    continue;
+                }
+
+                this.scheduled.store(false, Ordering::SeqCst);
+                // Close the request-vs-exit race: a requester either spawned
+                // its own worker or left the flag set for this one to reacquire.
+                if !this.rerun_requested.load(Ordering::SeqCst)
+                    || this
+                        .scheduled
+                        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                        .is_err()
+                {
+                    break;
+                }
             }
         });
     }
