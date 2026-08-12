@@ -200,15 +200,13 @@ followed, and those cases are listed too.
       `"ignorePatterns": ["dist"]`. Scoping the command was an exemption the
       tool could not see, so a bare `oxlint` — or an editor, which does not run
       npm scripts and puts lint diagnostics in the gutter — still walked twelve
-      committed minified bundles. `dist` is committed on
-      purpose, because rust-embed compiles it into the hub binary, so it is in
-      the tree and is nobody's source; the config is where that belongs.
-      A bare `oxlint` is silent now (0 warnings, verified 2026-08-10).
-      Left alone deliberately: a bare `oxfmt` still reads `dist`, because it
-      takes its exclusions from `.gitignore`/`.prettierignore` rather than its
-      own config and `dist` cannot go in `.gitignore`. Nothing runs it bare,
-      and a `.prettierignore` in a repo with no prettier is a worse artifact
-      than the papercut. `npm run fmt:check` is scoped and clean.
+      committed minified bundles. `dist` is now generated and ignored rather
+      than committed: native Rolldown output differed between developer Linux
+      and Ubuntu 26.04 despite the pinned Node/package lock, making a generated-
+      diff gate demand a container merely to edit TypeScript. Release and image
+      builds generate it before Cargo and fail if it is absent. The explicit
+      source/test scope remains useful for a developer who already has a local
+      bundle. `npm run fmt:check` and bare `oxlint` are clean.
 
 - [x] UI-16 **Home-screen artwork was sized for a display nobody here has.**
       A first load fetched 59 artwork requests totalling 2.05 MB, against

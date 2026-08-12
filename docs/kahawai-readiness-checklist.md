@@ -433,9 +433,12 @@ marked in that document.
       2026-08-08
 - [x] CI-2 Ubuntu 26.04 web CI runs on direct pushes to `master` and pull
       requests, installs from the lockfile, lints with warnings denied, runs
-      unit tests and the production build, then compares generated `web/dist`
-      with Git. All operations completed locally and in the hosted run for
-      `ad8e764` on 2026-08-08
+      unit tests and builds the ignored production `web/dist` from a clean
+      checkout. Release source gates and the container build generate it before
+      Cargo with `KAHAWAI_REQUIRE_WEB=1`; native bundler output is not committed
+      or compared across developer platforms. The original gates completed in
+      the hosted run for `ad8e764` on 2026-08-08; the generated-asset ownership
+      change awaits its first hosted run
 - [x] CI-3 Web lint is scoped to `src` and `test`, excluding generated output
       and dependencies, and `.oxlintrc.json` carries `"ignorePatterns":
       ["dist"]` so the exclusion holds for anything that does not go through

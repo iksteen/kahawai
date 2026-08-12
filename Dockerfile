@@ -10,6 +10,7 @@
 #   docker run --rm --gpus all kahawai doctor
 
 ARG RUST_VERSION=1.97.1
+ARG NODE_VERSION=24.19.0
 # gst-plugins-rs follows GStreamer's version numbers. 1.28.6 is the
 # minimum: below it, hlssink3 aborts the process — not the session —
 # on a fragment whose first buffer has no PTS, and on an unwrapped
@@ -25,11 +26,14 @@ ARG GSTREAMER_VERSION=1.28.6
 ARG GSTREAMER_REV=2d3e05cbdad68e47d645f548899b432dc9fb4473
 
 FROM rust:${RUST_VERSION}-bookworm AS rust-toolchain
+FROM node:${NODE_VERSION}-bookworm-slim AS node-toolchain
 
-# Build against the same userspace ABI as the runtime while retaining a pinned,
-# current Rust toolchain. Rust's glibc binaries are forward-compatible here.
+# Build against the same userspace ABI as the runtime while retaining pinned,
+# current Rust and Node toolchains. Their glibc binaries are forward-compatible
+# here.
 FROM ubuntu:26.04 AS builder
 
+COPY --from=node-toolchain /usr/local/ /usr/local/
 COPY --from=rust-toolchain /usr/local/cargo /usr/local/cargo
 COPY --from=rust-toolchain /usr/local/rustup /usr/local/rustup
 ENV CARGO_HOME=/usr/local/cargo \
@@ -198,10 +202,17 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 WORKDIR /usr/src/kahawai
 COPY . .
 
+# Generated web assets are never committed. Every artifact-producing build
+# creates them from the lockfile before rust-embed compiles them into Kahawai.
+RUN --mount=type=cache,target=/root/.npm \
+    npm ci --prefix web \
+    && npm run --prefix web build
+
 ARG KAHAWAI_BUILD=container
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,id=kahawai-target-ubuntu2604,target=/usr/src/kahawai/target \
-    KAHAWAI_BUILD="${KAHAWAI_BUILD}" cargo build --locked --release --bin kahawai \
+    KAHAWAI_BUILD="${KAHAWAI_BUILD}" KAHAWAI_REQUIRE_WEB=1 \
+        cargo build --locked --release --bin kahawai \
     && install -D -m 0755 -s target/release/kahawai /out/kahawai
 
 # This is the release boundary, not an optional sibling stage. Both outputs

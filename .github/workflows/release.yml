@@ -41,6 +41,10 @@ jobs:
     name: stamped source gates
     needs: prepare
     runs-on: ubuntu-26.04
+    env:
+      # A release source gate must exercise the same complete binary boundary
+      # as the container build, never an accidentally UI-less Rust build.
+      KAHAWAI_REQUIRE_WEB: 1
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -81,11 +85,11 @@ jobs:
           if wrong:
               raise SystemExit("workspace version mismatch: " + ", ".join(wrong))
           PY
-      # Before the cargo steps, deliberately. The hub's build script builds the
-      # web bundle when web/node_modules exists, so this ordering is what puts
-      # that path — the one every local build takes — under CI at all. Reversed,
-      # cargo ran without node_modules and only ever exercised the fallback.
+      # Generated assets are absent from Git. Build them before any Cargo step
+      # that compiles kahawai-hub so rust-embed sees the release bundle.
       - run: npm ci
+        working-directory: web
+      - run: npm run build
         working-directory: web
       - run: cargo fmt --all --check
       - run: cargo clippy --locked --workspace --all-targets
@@ -96,14 +100,6 @@ jobs:
         working-directory: web
       - run: npm test
         working-directory: web
-      - run: npm run build
-        working-directory: web
-      - name: Embedded assets match their source
-        # See ci.yml: staged, so a new chunk the build emitted cannot slip
-        # through as merely untracked.
-        run: |
-          git add -A web/dist
-          git diff --cached --exit-code -- web/dist
 
   draft-release:
     name: create draft release

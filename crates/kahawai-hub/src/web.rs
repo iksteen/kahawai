@@ -10,7 +10,13 @@ use tower_http::compression::CompressionLayer;
 
 #[derive(rust_embed::Embed)]
 #[folder = "../../web/dist"]
+#[allow_missing = true]
 struct Assets;
+
+/// Rust-only checks and satellite builds intentionally do not generate Vite's
+/// bundle. Keep `/app/` honest and diagnosable in such a binary without
+/// pretending that this page is the application.
+const NO_WEB_UI: &str = "<!doctype html><html><head><title>kahawai</title></head><body><h1>kahawai</h1><p>The web UI was not embedded in this build.</p></body></html>";
 
 pub fn router() -> Router {
     Router::new()
@@ -55,8 +61,11 @@ fn spa_response(path: &str) -> Response {
             Some(a) => (a, "index.html"),
             None => {
                 return (
-                    StatusCode::NOT_FOUND,
-                    "web UI not embedded in this build (web/dist missing at compile time)",
+                    [
+                        (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+                        (header::CACHE_CONTROL, "no-cache"),
+                    ],
+                    NO_WEB_UI,
                 )
                     .into_response();
             }

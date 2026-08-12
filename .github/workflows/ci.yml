@@ -170,11 +170,8 @@ jobs:
         working-directory: web
       - run: npm test
         working-directory: web
+      # This is both the production-bundle gate and proof that a clean checkout
+      # can generate the ignored rust-embed input. Generated hashes are native-
+      # toolchain details and are deliberately not compared with Git.
       - run: npm run build
         working-directory: web
-      - name: Embedded assets match their source
-        # Staged, because `git diff` alone cannot see a file the build emitted
-        # that was never committed — a new chunk would pass unnoticed.
-        run: |
-          git add -A web/dist
-          git diff --cached --exit-code -- web/dist

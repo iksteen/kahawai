@@ -292,8 +292,6 @@ deploy() {
     local repo; repo=$(cd "$(dirname "$0")/.." && pwd)
     echo "==> syncing source to $host" >&2
     (cd "$repo" && git ls-files | rsync -a --files-from=- . "$host:kahawai-src/")
-    # web/dist is gitignored but rust-embed needs it at compile time.
-    [ -d "$repo/web/dist" ] && rsync -a "$repo/web/dist/" "$host:kahawai-src/web/dist/"
 
     # Where the log ends BEFORE the restart: "link established" is a
     # line the previous run also wrote, and grepping the tail would

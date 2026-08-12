@@ -255,8 +255,9 @@ scripts/kahawai-mac.sh setup
 # box). silence: scripts/kahawai-silence.sh builds both satellite
 # binaries here (same arch) and ships + restarts them.
 #
-# from the dev box, per deploy: sync tracked files + web/dist, build,
-# sign, restart the launchd agent, wait for the link.
+# from the dev box, per deploy: sync tracked files, build, sign,
+# restart the launchd agent, wait for the link. Satellites do not contain
+# the hub's web UI, so generated web/dist is neither synced nor needed.
 scripts/kahawai-mac.sh deploy [user@host]
 ```
 
