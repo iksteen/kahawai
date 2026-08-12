@@ -11,266 +11,1457 @@
   --sand: #dcb877;
   --warn: #d98d7a;
   --mono: ui-monospace, 'JetBrains Mono', Menlo, Consolas, monospace;
+
+  /* Four more steps the design uses often enough to name. --hairline is a
+     separator INSIDE a card, one notch softer than the card's own --line.
+     --prose is body copy: a shade under --text, so an overview does not
+     compete with the heading above it. --dimmer is tertiary only —
+     placeholder numerals and disabled marks — never a label: labels were
+     deliberately raised off it for contrast. */
+  --hairline: #1a2c30;
+  --hover: #16262a;
+  --prose: #cdd8da;
+  --dimmer: #3d5559;
+
+  /* No poster: the kahawai swell, behind every artwork box. It shows
+     while a poster loads and stays if none arrives — one cached asset
+     rather than a per-card swap, and no stripes: the prototype's diagonal
+     hatch is scaffolding meaning "a poster goes here", not a thing to
+     ship. */
+  --art-none: url('./assets/placeholder.svg') center / cover no-repeat;
+
+  /* Native controls are dark too. Without this a <select>'s own dropdown,
+     every checkbox and the scrollbars all render light on a page that is
+     not, and the sort control looks like something from another
+     application. Cheaper and more consistent than restyling each one, and
+     it is the only way to reach the popup list at all. */
+  color-scheme: dark;
 }
 
-* { box-sizing: border-box; }
+* {
+  box-sizing: border-box;
+}
 
-html, body { margin: 0; padding: 0; }
+html,
+body {
+  margin: 0;
+  padding: 0;
+}
 
 body {
   background: radial-gradient(120% 90% at 75% -10%, #12262b 0%, var(--bg) 55%) fixed;
   color: var(--text);
-  font: 15px/1.55 system-ui, -apple-system, 'Segoe UI', sans-serif;
+  font:
+    15px/1.55 system-ui,
+    -apple-system,
+    'Segoe UI',
+    sans-serif;
 }
 
-button { font: inherit; color: inherit; }
+button {
+  font: inherit;
+  color: inherit;
+}
 
-.shell { max-width: 1100px; margin: 0 auto; padding: 0 24px 64px; }
+/* The bottom padding is room for the music queue bar, which floats over
+   the page rather than pushing it: without it the last row of a library
+   sits under the bar and cannot be reached. */
+.shell {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 0 clamp(14px, 4vw, 32px) 88px;
+}
 
-main { animation: rise 240ms ease-out; }
-@keyframes rise { from { opacity: 0; transform: translateY(4px); } }
+main {
+  animation: rise 240ms ease-out;
+}
+@keyframes rise {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+}
 @media (prefers-reduced-motion: reduce) {
-  * { animation: none !important; transition: none !important; }
+  * {
+    animation: none !important;
+    transition: none !important;
+  }
 }
 
 /* -------- topbar -------- */
+/* Three things, spread: the wordmark (which is also the jump menu), the
+   search box, and you. It wraps rather than crushes — on a narrow screen
+   the search box drops to its own line at full width instead of becoming
+   too small to type a title into. */
 .topbar {
-  display: flex; align-items: center; justify-content: space-between;
-  padding: 20px 0 28px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 20px 0 26px;
 }
 .wordmark {
-  background: none; border: 0; cursor: pointer; padding: 0;
-  font-size: 20px; font-weight: 650; letter-spacing: 0.04em;
+  background: none;
+  border: 0;
+  cursor: pointer;
+  padding: 0;
+  font-size: 20px;
+  font-weight: 650;
+  letter-spacing: 0.04em;
+  display: flex;
+  align-items: center;
 }
-.wordmark.big { font-size: 28px; cursor: default; }
-.tilde { color: var(--teal); }
-.topbar-right { display: flex; gap: 12px; align-items: center; }
-.whoami { color: var(--dim); font-size: 13px; }
-/* One search box for the whole app, so it is in the same place whichever
-   screen you are on. `justify-content: space-between` puts it in the
-   middle by itself; the margins keep it off both neighbours. */
-.topbar-search { width: 320px; margin: 0 24px; }
+/* The login screen's wordmark is a heading, not a button. */
+.wordmark.big {
+  font-size: 28px;
+  cursor: default;
+}
+.tilde {
+  color: var(--teal);
+}
+.wordmark-caret {
+  display: inline-flex;
+  line-height: 0;
+  color: var(--dim);
+  margin-left: 7px;
+}
+
+/* -------- popovers --------
+   A menu is positioned against its trigger, so the pair share an anchor. */
+.menu-anchor {
+  position: relative;
+}
+/* The click-catcher. Covers the page under the menu so a dismissing click
+   lands here and NOT on whatever it was over — closing a menu by pressing
+   a card behind it would both close it and open the card. */
+.menu-sheet {
+  position: fixed;
+  inset: 0;
+  z-index: 14;
+}
+.menu {
+  position: absolute;
+  top: calc(100% + 8px);
+  z-index: 15;
+  min-width: 190px;
+  display: flex;
+  flex-direction: column;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 4px;
+  box-shadow: 0 12px 34px rgba(0, 0, 0, 0.55);
+  animation: rise 160ms ease-out;
+}
+.menu-left {
+  left: 0;
+}
+.menu-right {
+  right: 0;
+}
+.menu-item {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  text-align: left;
+  background: none;
+  color: var(--dim);
+  border: 0;
+  border-radius: 4px;
+  padding: 7px 10px;
+  font-size: 13.5px;
+  cursor: pointer;
+}
+.menu-item:hover {
+  background: var(--hover);
+  color: var(--text);
+}
+/* Where you already are: filled, lit, and the glyph lit with it. */
+.menu-item.here {
+  background: var(--hover);
+  color: var(--text);
+}
+.menu-glyph {
+  display: inline-flex;
+  line-height: 0;
+  color: var(--dimmer);
+}
+.menu-item.here .menu-glyph,
+.menu-item:hover .menu-glyph {
+  color: var(--teal);
+}
+/* Leaving is not destructive, but it is not ordinary either. */
+.menu-item.leaving:hover {
+  color: var(--warn);
+}
+.menu-item.leaving:hover .menu-glyph {
+  color: var(--warn);
+}
+.menu-sep {
+  display: block;
+  height: 1px;
+  background: var(--line);
+  margin: 4px 6px;
+}
+
+/* -------- header search --------
+   One search box for the whole app, so it is in the same place whichever
+   screen you are on. It grows into the space between its neighbours and
+   stops before it becomes a banner. */
+.search {
+  position: relative;
+  flex: 1 1 200px;
+  max-width: 420px;
+  min-width: 150px;
+}
+/* Above the panel's click-catcher, which is a full-screen fixed layer at 14.
+   Without this the field is behind it while its own results are showing:
+   clicking into the query to fix a typo landed on the catcher instead, dropping
+   focus and dismissing the results, and the ✕ took two clicks — one to close the
+   panel and one to actually clear. Clicking your own search box should not be a
+   way of losing what you typed. */
+.search-input {
+  position: relative;
+  z-index: 16;
+  border-radius: 20px;
+  padding: 7px 30px;
+  font-size: 13.5px;
+}
+.search-icon {
+  position: absolute;
+  left: 10px;
+  top: 50%;
+  transform: translateY(-50%);
+  display: inline-flex;
+  line-height: 0;
+  color: var(--dimmer);
+  pointer-events: none;
+}
+.search-clear {
+  position: absolute;
+  z-index: 16;
+  right: 8px;
+  top: 50%;
+  transform: translateY(-50%);
+  background: none;
+  border: 0;
+  color: var(--dim);
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 2px;
+}
+.search-clear:hover {
+  color: var(--text);
+}
+
+/* -------- who you are -------- */
+.profile-btn {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: none;
+  border: 1px solid var(--line);
+  border-radius: 20px;
+  padding: 3px 10px 3px 4px;
+  cursor: pointer;
+  color: var(--text);
+}
+.profile-btn:hover {
+  border-color: var(--dim);
+}
+.profile-name {
+  font-size: 13px;
+}
+.avatar {
+  width: 24px;
+  height: 24px;
+  flex: none;
+  border-radius: 50%;
+  background: var(--hover);
+  border: 1px solid var(--teal-dim);
+  display: grid;
+  place-items: center;
+  color: var(--teal);
+  line-height: 0;
+}
+
+/* -------- notice (UX-1) --------
+   Bottom right, over everything, and not clickable: it reports, it does
+   not ask. Five seconds and gone; see toast.ts. */
+.toast {
+  position: fixed;
+  bottom: 20px;
+  right: 20px;
+  z-index: 30;
+  pointer-events: none;
+  max-width: 420px;
+  background: var(--surface);
+  border: 1px solid var(--teal-dim);
+  border-radius: 6px;
+  padding: 10px 16px;
+  color: var(--teal);
+  font-size: 13px;
+  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.5);
+  animation: rise 200ms ease-out;
+}
 
 /* -------- buttons, inputs -------- */
 .btn {
-  background: var(--teal); color: #062a25; border: 1px solid var(--teal);
-  border-radius: 4px; padding: 8px 18px; font-weight: 650; cursor: pointer;
+  background: var(--teal);
+  color: #062a25;
+  border: 1px solid var(--teal);
+  border-radius: 4px;
+  padding: 8px 18px;
+  font-weight: 650;
+  cursor: pointer;
 }
-.btn:hover { filter: brightness(1.08); }
-.btn:disabled { opacity: 0.45; cursor: default; filter: none; }
-.btn.ghost { background: none; color: var(--text); border-color: var(--line); font-weight: 500; }
-.btn.ghost:hover { border-color: var(--dim); filter: none; }
-.btn.small { padding: 4px 12px; font-size: 13px; }
+.btn:hover {
+  filter: brightness(1.08);
+}
+.btn:disabled {
+  opacity: 0.45;
+  cursor: default;
+  filter: none;
+}
+.btn.ghost {
+  background: none;
+  color: var(--text);
+  border-color: var(--line);
+  font-weight: 500;
+}
+.btn.ghost:hover {
+  border-color: var(--dim);
+  filter: none;
+}
+.btn.small {
+  padding: 4px 12px;
+  font-size: 13px;
+}
+/* Every screen below the top level opens with one of these. */
+.back {
+  margin-bottom: 18px;
+}
 
 input {
-  background: var(--surface); color: var(--text);
-  border: 1px solid var(--line); border-radius: 4px;
-  padding: 9px 12px; font: inherit; width: 100%;
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 9px 12px;
+  font: inherit;
+  width: 100%;
 }
-input::placeholder { color: var(--dim); }
-input:focus-visible, button:focus-visible {
-  outline: 2px solid var(--teal); outline-offset: 1px;
+input::placeholder {
+  color: var(--dim);
+}
+/* Matched to the inputs beside them rather than left native, so a row of
+   a label, a field and a picker reads as one row. */
+select {
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 8px 10px;
+  font: inherit;
+}
+select:hover {
+  border-color: var(--dim);
+}
+input:focus-visible,
+button:focus-visible,
+select:focus-visible {
+  outline: 2px solid var(--teal);
+  outline-offset: 1px;
 }
 
-.mono { font-family: var(--mono); font-size: 12px; }
-.dim { color: var(--dim); }
-.error {
-  color: var(--warn); font-size: 13.5px; margin: 10px 0;
-  white-space: pre-wrap; overflow-wrap: anywhere;
+.mono {
+  font-family: var(--mono);
+  font-size: 12px;
 }
-.page-pad { padding: 24px; }
+.dim {
+  color: var(--dim);
+}
+.error {
+  color: var(--warn);
+  font-size: 13.5px;
+  margin: 10px 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.page-pad {
+  padding: 24px;
+}
 
 /* -------- auth -------- */
-.auth-wrap { min-height: 100vh; display: grid; place-items: center; padding: 24px; }
-.auth-card {
-  width: 340px; display: flex; flex-direction: column; gap: 12px;
-  background: var(--surface); border: 1px solid var(--line); border-radius: 8px;
-  padding: 32px 28px 28px;
+.auth-wrap {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 24px;
 }
-.auth-hint { color: var(--dim); font-size: 13.5px; margin: 0 0 6px; }
+.auth-card {
+  /* Not a flat 340px: on a narrow phone that overflows the padding it is
+     centred in, and the one screen everybody meets first is the wrong one
+     to have a horizontal scrollbar. */
+  width: min(340px, 100%);
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 32px 28px 28px;
+  animation: rise 240ms ease-out;
+}
+.auth-hint {
+  color: var(--dim);
+  font-size: 13.5px;
+  margin: 0 0 6px;
+}
+
+/* An input is filled a step AWAY from whatever it sits on, so the field
+   reads as a well rather than as a rectangle drawn on the panel. On the
+   page that means --surface (the global rule below); on a panel that is
+   already --surface it means --bg. */
+.auth-card input,
+.dialog input {
+  background: var(--bg);
+}
 
 /* -------- library -------- */
-.library-head { display: flex; align-items: baseline; gap: 16px; margin-bottom: 20px; }
-h1 { font-size: 22px; font-weight: 650; letter-spacing: 0.01em; margin: 0; }
-h2 { font-size: 14px; font-weight: 650; color: var(--dim); letter-spacing: 0.08em;
-     text-transform: uppercase; margin: 36px 0 12px; }
-.filter { width: 220px; margin-left: auto; }
+.library-head {
+  display: flex;
+  align-items: baseline;
+  gap: 16px;
+  margin-bottom: 20px;
+}
+h1 {
+  font-size: 22px;
+  font-weight: 650;
+  letter-spacing: 0.01em;
+  margin: 0;
+}
+h2 {
+  font-size: 14px;
+  font-weight: 650;
+  color: var(--dim);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  margin: 36px 0 12px;
+}
+.filter {
+  width: 220px;
+  margin-left: auto;
+}
 /* Sized to its longest option, not to the search box beside it. */
-.sort { width: auto; }
-.count { color: var(--dim); }
+.sort {
+  width: auto;
+}
+.count {
+  color: var(--dim);
+}
 
 /* The library's full height is reserved from the first response, and the
    grid inside it is translated to the rows currently on screen. Only the
    visible rows exist in the DOM; the scrollbar still describes all of
    them, so it never jumps the way an infinite-scroll one does. */
-.grid-scroll { position: relative; }
+.grid-scroll {
+  position: relative;
+}
 .grid-scroll > .grid {
-  position: absolute; top: 0; left: 0; right: 0;
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
   will-change: transform;
 }
-/* A cell whose row has not arrived yet: same box, no content. */
-.card-pending { pointer-events: none; }
-.card-pending .card-art { background: var(--line); opacity: 0.35; }
+/* A cell whose row has not arrived yet: same box, no content.
+   Held at half strength, on the whole ghost rather than just its picture, so
+   a shelf part-way through loading reads as unfinished at a glance instead of
+   as a row of oddly blank cards. */
+.card-pending {
+  pointer-events: none;
+  opacity: 0.5;
+}
+.card-pending .card-art {
+  background: var(--line);
+}
+/* Not the missing-artwork mark. `.card-artbox` carries the kahawai tilde so a
+   poster that will not load has something behind it, but "there is no poster
+   for this" and "this has not arrived yet" are different things and must not
+   look alike. */
+.card-pending .card-artbox {
+  background-image: none;
+}
+/* The shelf's own ghosts. The real card's art is an <img> and gets its shape
+   from `.shelf-card .card-art`; the ghost's is a <span>, so it needs to be a
+   block for that same rule to apply to it. Both then read `--card-ratio` off
+   the shelf, which is how a ghost in the music row comes out square and 194px
+   like the album cards beside it, while one in a film row is 2:3 and 258. */
+.shelf-card.card-pending {
+  cursor: default;
+}
+.shelf-card.card-pending .card-art {
+  display: block;
+  background: var(--line);
+  opacity: 0.35;
+  border-radius: 4px;
+}
+/* Where a shelf would be, when it would not load. Kept to roughly the
+   height of a card row so the page below it does not jump when it recovers. */
+.shelf-failed {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 22px 2px;
+  font-size: 13px;
+}
 
-/* -------- cross-library results -------- */
-.result-lib { margin-bottom: 26px; }
-/* The heading IS the way into the library, so it has to look pressable
-   across its whole width rather than like a label with a link in it. */
-.result-lib-head {
-  display: flex; align-items: baseline; gap: 10px; width: 100%;
-  background: none; border: 0; border-bottom: 1px solid var(--line);
-  padding: 0 2px 6px; margin-bottom: 10px; cursor: pointer; text-align: left;
+/* -------- home --------
+   Continue watching, then one shelf per library. */
+.home-head {
+  font-size: 13px;
+  font-weight: 650;
+  color: var(--dim);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  margin: 6px 0 12px;
 }
-.result-lib-head:hover { border-bottom-color: var(--teal-dim); }
-.result-lib-head:hover .result-lib-name { color: var(--teal); }
-.result-lib-name { font-weight: 650; font-size: 15px; }
-.result-lib-head .count { margin-left: auto; font-size: 12px; }
-.result-list { list-style: none; margin: 0; padding: 0; }
-.result-row {
-  display: flex; align-items: center; gap: 12px; width: 100%;
-  background: none; border: 0; border-radius: 5px;
-  padding: 6px 8px; cursor: pointer; text-align: left;
+
+/* Wide cards, because these are landscape stills and a half-watched
+   episode is identified by its title far more than by its picture. */
+.continuing {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 12px;
+  margin-bottom: 36px;
 }
-.result-row:hover { background: var(--surface); }
+.continue-card {
+  display: flex;
+  gap: 14px;
+  align-items: stretch;
+  text-align: left;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 0;
+  cursor: pointer;
+  overflow: hidden;
+}
+.continue-card:hover {
+  border-color: var(--teal-dim);
+}
+/* A fixed strip rather than the image's own shape: these cards sit in a row
+   and a poster beside a still would make the row ragged. 76px was the
+   prototype's number and it is too mean on a real screen — at that width a
+   landscape still is a sliver, and half the point of this row is recognising
+   the episode by its picture. */
+/* A poster, the same shape as everything else on the page. A landscape strip
+   here was the odd one out — and for an episode it meant its own still, which
+   is a different picture as well as a different shape, so the row read as two
+   kinds of thing. The show's poster instead: same shape, same crop, scannable.
+
+   The aspect ratio gives the box a definite height, which is also what the
+   absolutely-positioned picture inside it resolves against. Without it the
+   image fell back to its own intrinsic height and drove the card. */
+.continue-card .card-artbox {
+  width: 92px;
+  flex: none;
+  align-self: flex-start;
+  aspect-ratio: 2 / 3;
+  border-radius: 0;
+  position: relative;
+  overflow: hidden;
+}
+.continue-art {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+.continue-text {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  justify-content: center;
+  padding: 12px 14px 12px 0;
+  flex: 1;
+  min-width: 0;
+}
+.continue-title {
+  font-weight: 600;
+  font-size: 14.5px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.continue-meta {
+  color: var(--dim);
+  font-size: 12.5px;
+}
+/* The progress bar sits on the bottom of the text column, so it lines up
+   across cards whatever their title does. */
+.continue-text .waterline {
+  margin-top: auto;
+  max-width: none;
+}
+
+/* -------- shelves -------- */
+.shelf-head {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  margin: 34px 0 12px;
+}
+.shelf-name {
+  background: none;
+  border: 0;
+  padding: 0;
+  cursor: pointer;
+  font-size: 16px;
+  font-weight: 650;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+.shelf-name:hover {
+  color: var(--teal);
+}
+.shelf-arrow {
+  color: var(--dimmer);
+  font-size: 12px;
+}
+.shelf-note {
+  color: var(--dim);
+  font-size: 11.5px;
+}
+.shelf-lane-wrap {
+  position: relative;
+}
+/* The scrollbar is hidden because the arrows and the cut-off card at the
+   edge already say it scrolls, and a always-visible bar under every shelf
+   is four horizontal rules across the page. */
+.shelf-lane {
+  display: flex;
+  gap: 12px;
+  overflow-x: auto;
+  padding: 2px 2px 12px;
+  scrollbar-width: none;
+}
+.shelf-lane::-webkit-scrollbar {
+  display: none;
+}
+.shelf-card {
+  flex: none;
+  width: 150px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  text-align: left;
+  cursor: pointer;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 10px;
+}
+.shelf-card:hover {
+  border-color: var(--teal-dim);
+}
+.shelf-card .card-art {
+  aspect-ratio: var(--card-ratio, 2 / 3);
+  border-radius: 4px;
+}
+/* One line each. A shelf is scanned along, not read down, so a card that
+   grows a second line of title makes the whole rail taller. */
+.shelf-title {
+  font-weight: 600;
+  font-size: 13px;
+  line-height: 1.3;
+  margin-top: 2px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.shelf-meta {
+  color: var(--dim);
+  font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* Only while the pointer is over the lane. Both are always rendered: the
+   one that cannot move anything is dimmed and disabled, because an arrow
+   that disappears under the cursor hands your click to the card beneath
+   it. A disabled button still occupies the hit area and absorbs it. */
+.lane-nudge {
+  position: absolute;
+  top: 2px;
+  bottom: 14px;
+  z-index: 3;
+  width: 40px;
+  border: 0;
+  cursor: pointer;
+  line-height: 0;
+  color: var(--text);
+  display: inline-flex;
+  align-items: center;
+  opacity: 0;
+  transition: opacity 0.12s;
+}
+.shelf-lane-wrap:hover .lane-nudge,
+.lane-nudge:focus-visible {
+  opacity: 1;
+}
+/* The reasoning above depends on a pointer that can hover. On a finger there
+   is no hover, so the arrows never become visible at all and are still 40px of
+   live hit area over each end of the lane: a tap on the card underneath
+   scrolled the strip instead of opening anything. A touch screen scrolls a lane
+   by dragging it, which is what these exist to substitute for.
+
+   Both halves of the query, because `(hover: none)` alone is also true of
+   anything with no pointing device at all — measured: headless Firefox reports
+   `hover: none` with `pointer: none`, so the arrows vanished from every
+   automated run of this page while a real desktop kept them. A finger is the
+   case that wants them gone, and a finger is a coarse pointer. */
+@media (hover: none) and (pointer: coarse) {
+  .lane-nudge {
+    display: none;
+  }
+}
+.lane-nudge:enabled:hover {
+  color: var(--teal);
+}
+.lane-nudge:disabled {
+  color: var(--dimmer);
+  cursor: default;
+}
+.lane-nudge.left {
+  left: 0;
+  justify-content: flex-start;
+  padding-left: 4px;
+  background: linear-gradient(to right, rgba(10, 16, 18, 0.92), rgba(10, 16, 18, 0));
+}
+.lane-nudge.right {
+  right: 0;
+  justify-content: flex-end;
+  padding-right: 4px;
+  background: linear-gradient(to left, rgba(10, 16, 18, 0.92), rgba(10, 16, 18, 0));
+}
+
+/* -------- the search results panel -------- */
+/* Anchored to `.search`, which is `position: relative` above. Nothing between
+   that box and the viewport sets `overflow`, so the panel cannot be clipped —
+   which matters on a narrow screen. z-15 is the same rung as `.menu`: above the
+   click-catcher at 14 and the music dock at 13, below dialogs at 20 and toasts
+   at 30.
+
+   `min(280px, 100%)` and not a flat 280px: between roughly 370 and 430px the
+   topbar wraps only the profile button, leaving the box 212–267px wide, and a
+   floor wider than that box wins against `left`/`right` — LTR keeps `right`, so
+   the panel grew off the right edge, taking every count and arrow with it and
+   giving the document a horizontal scrollbar nothing else here produces.
+   Measured at 375px: 54px past the edge. */
+.search-panel {
+  position: absolute;
+  top: calc(100% + 8px);
+  left: 0;
+  right: 0;
+  z-index: 15;
+  min-width: min(280px, 100%);
+  max-height: 70vh;
+  overflow-y: auto;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 6px;
+  box-shadow: 0 12px 34px rgba(0, 0, 0, 0.55);
+  animation: rise 160ms ease-out;
+  text-align: left;
+}
+.search-empty,
+.search-failed {
+  margin: 0;
+  padding: 10px;
+  font-size: 13px;
+}
+/* The heading IS the way into the library, so it looks pressable across its
+   whole width rather than like a label with a link in it. */
+.search-lib {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  background: none;
+  border: none;
+  border-radius: 4px;
+  padding: 8px 10px 5px;
+  cursor: pointer;
+  font-family: inherit;
+  text-align: left;
+}
+.search-lib:hover {
+  background: var(--hover);
+}
+.search-lib-name {
+  color: var(--dim);
+  font-size: 11px;
+  font-weight: 650;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.search-lib-go {
+  margin-left: auto;
+  display: inline-flex;
+  line-height: 0;
+  color: var(--teal);
+}
+.search-hit {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  background: none;
+  border: none;
+  border-radius: 4px;
+  padding: 6px 10px;
+  cursor: pointer;
+  color: var(--text);
+  font-family: inherit;
+  text-align: left;
+}
+.search-hit:hover {
+  background: var(--hover);
+}
+/* The keyboard's highlight, on either kind of row. Stronger than the hover it
+   sits beside, and with a marker down the left edge, because the two can be on
+   different rows at once — the mouse rests where it last was while the arrows
+   move somewhere else, and the row that Enter opens has to be the obvious one.
+   `inset` so it does not change the row's size as it moves. */
+.search-row-on {
+  background: var(--hover);
+  box-shadow: inset 2px 0 0 var(--teal);
+}
+
+/* The two lines stack, and both have to be able to ellipsise: a long title
+   must not push the year out of the panel. */
+.search-hit-text {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+
+/* -------- what a result looks like -------- */
+/* The page these were written for is gone — the results are a panel under the
+   search box now, and its own rules are up with `.search-panel`. What is left
+   here is the three pieces of a single result, which that panel still uses: the
+   thumbnail, the title and the line under it. The grouping and row rules that
+   went with the page were deleted rather than left to rot; the one that was
+   left behind by mistake, `margin-left: auto` below, spent a day putting every
+   year at the wrong end of its row. */
 .result-art {
-  width: 34px; height: 34px; object-fit: cover; border-radius: 3px;
-  flex: none; display: block;
+  width: 34px;
+  height: 34px;
+  object-fit: cover;
+  border-radius: 3px;
+  flex: none;
+  display: block;
+  /* Same swell, at thumbnail size — a result row with no poster should
+     not be a hole in the list. */
+  background: var(--art-none);
 }
-.result-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.result-meta { color: var(--dim); margin-left: auto; font-size: 12px; flex: none; }
+.result-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* No `margin-left: auto` here: that belonged to the full-page result row, which
+   laid the title and the year out side by side. The panel stacks them, so the
+   auto margin pushed every year 196px right to the far edge of the text block
+   instead of leaving it under its title — and `flex: none` stopped it
+   ellipsising, so a long line wrapped instead. */
+.result-meta {
+  color: var(--dim);
+  font-size: 12px;
+  /* Clipped like the title above it, which the note beside `.search-hit-text`
+     already claimed of both lines: an artist and album long enough to wrap
+     pushed the row taller than its 34px thumbnail and broke the rhythm of the
+     list. */
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 
+/* The column floor and the art's shape come from the view, which knows
+   the library's media type: 140px columns of 2:3 posters, or 150px of
+   square sleeves. GAP in Library.tsx must equal this gap. */
 .grid {
-  list-style: none; margin: 0; padding: 0;
-  display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 12px;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(var(--card-min, 140px), 1fr));
+  gap: 14px;
 }
 .card {
-  display: flex; flex-direction: column; gap: 4px; width: 100%;
-  text-align: left; cursor: pointer;
-  background: var(--surface); border: 1px solid var(--line); border-radius: 6px;
-  padding: 14px 16px; min-height: 92px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  width: 100%;
+  text-align: left;
+  cursor: pointer;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 10px;
 }
-.card:hover { border-color: var(--teal-dim); }
+.card:hover {
+  border-color: var(--teal-dim);
+}
 /* Always exactly two lines tall — clipped when longer, padded out when
    shorter. Every cell being the same height is what lets the library
    reserve its full scroll height up front and be RIGHT about it; when
    titles were free to wrap to one, two or three lines, cards measured
-   307/331/355px and the reserved height drifted as you scrolled. */
+   307/331/355px and the reserved height drifted as you scrolled.
+   The prototype lets a title wrap freely, which it can afford with eight
+   sample items and no reserved height; a 3525-item library cannot. */
 .card-title {
-  font-weight: 600; font-size: 15.5px; line-height: 1.3;
-  height: 2.6em;
-  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+  font-weight: 600;
+  font-size: 14px;
+  line-height: 1.35;
+  height: 2.7em;
+  margin-top: 4px;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
   overflow: hidden;
 }
-.card-meta { color: var(--dim); }
+.card-meta {
+  color: var(--dim);
+  font-size: 12px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
 
-/* -------- detail -------- */
-.detail-head { margin: 22px 0 6px; }
-.year { color: var(--dim); font-weight: 400; }
-.detail-sub { color: var(--dim); margin-top: 4px; }
+/* -------- detail --------
+   Artwork beside everything that identifies the item. It wraps rather
+   than shrinking the poster, so on a phone the poster keeps its shape and
+   the text goes underneath. */
+.detail-top {
+  display: flex;
+  gap: 26px;
+  margin: 22px 0 8px;
+  align-items: flex-start;
+  flex-wrap: wrap;
+}
+.detail-artbox {
+  /* Never wider than half the viewport: a 190px poster is most of a
+     narrow screen, and the title has to fit beside it. */
+  width: min(var(--art-w, 190px), 46vw);
+  flex: none;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+.detail-art {
+  width: 100%;
+  aspect-ratio: var(--card-ratio, 2 / 3);
+  object-fit: cover;
+  display: block;
+  border-radius: 6px;
+}
+.detail-meta {
+  flex: 1;
+  min-width: 280px;
+}
+.detail-meta h1 {
+  font-size: 24px;
+}
+.detail-meta .overview {
+  max-width: 640px;
+  margin: 14px 0 0;
+  text-wrap: pretty;
+}
+/* Premiered, rating, match confidence, times seen — set apart from the
+   title, and each other, without punctuation to maintain. */
+.detail-facts {
+  color: var(--dim);
+  font-size: 12px;
+  margin-top: 8px;
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.sand {
+  color: var(--sand);
+}
+.teal {
+  color: var(--teal);
+}
+/* A tick that is already ticked reads as state, not as an offer. */
+.btn.mark {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+.btn.mark.on {
+  color: var(--teal);
+  border-color: var(--teal-dim);
+}
+
+.detail-head {
+  margin: 22px 0 6px;
+}
+.year {
+  color: var(--dim);
+  font-weight: 400;
+}
+.detail-sub {
+  color: var(--dim);
+  margin-top: 4px;
+}
+/* Both `display: block`, and that is load-bearing rather than tidiness:
+   these are spans, and an inline box ignores height AND width, so the
+   fill measured 0x0 and the sand never appeared anywhere it was used.
+   The track only ever showed because a flex parent blockified it. */
 .waterline {
-  height: 2px; background: var(--line); border-radius: 1px;
-  margin-top: 14px; max-width: 420px;
+  display: block;
+  height: 2px;
+  background: var(--line);
+  border-radius: 1px;
+  margin-top: 14px;
+  max-width: 420px;
 }
-.waterline-fill { height: 100%; background: var(--sand); border-radius: 1px; }
+.waterline-fill {
+  display: block;
+  height: 100%;
+  background: var(--sand);
+  border-radius: 1px;
+}
 
-.play-row { display: flex; align-items: center; gap: 12px; margin: 22px 0 4px; }
-.small-note { font-size: 12.5px; }
+.play-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 20px 0 4px;
+  flex-wrap: wrap;
+}
 
-.sources { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 10px; }
+/* -------- playback plan (HUB-14) --------
+   Why this is or is not transcoding, per elementary stream. */
+.plan {
+  max-width: 760px;
+  padding: 14px 16px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.plan-head {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.chip.strong {
+  font-weight: 600;
+}
+.chip.sand {
+  border-color: var(--sand);
+  color: var(--sand);
+}
+.chip.teal {
+  border-color: var(--teal-dim);
+  color: var(--teal);
+}
+/* A fixed label column, so the reasons line up and read down the panel
+   instead of as three unrelated sentences. Separated by the inner
+   hairline, which is a step softer than the panel's own border. */
+.plan-row {
+  display: grid;
+  grid-template-columns: 88px 1fr;
+  gap: 12px;
+  font-size: 12.5px;
+  border-top: 1px solid var(--hairline);
+  padding-top: 8px;
+}
+/* The capabilities toggle and its mask badge on the left, the session log on
+   the right. The log wrapped onto a line of its own before, but that was the
+   explainer that used to sit between them plus `flex-wrap`, not the alignment. */
+.plan-foot {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  border-top: 1px solid var(--hairline);
+  padding-top: 9px;
+}
+.plan-foot .log-link {
+  margin-left: auto;
+}
+.dimmer {
+  color: var(--dimmer);
+}
+/* A button is as wide as its label. Inside the metadata column these are
+   flex items, and flex items shrink by default — which broke "Play from
+   start" across two lines rather than wrapping the row. */
+.play-row .btn {
+  flex: none;
+  white-space: nowrap;
+}
+.small-note {
+  font-size: 12.5px;
+}
+
+.sources {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
 .sources li {
-  display: flex; flex-direction: column; gap: 6px;
-  border: 1px solid var(--line); border-radius: 6px; padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 12px 14px;
 }
-.path { color: var(--dim); overflow-wrap: anywhere; }
+.path {
+  color: var(--dim);
+  overflow-wrap: anywhere;
+}
 
-.chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
 .chip {
-  font-family: var(--mono); font-size: 11px; letter-spacing: 0.02em;
-  border: 1px solid var(--teal-dim); color: var(--teal);
-  border-radius: 3px; padding: 1px 7px;
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.02em;
+  border: 1px solid var(--teal-dim);
+  color: var(--teal);
+  border-radius: 3px;
+  padding: 3px 8px;
 }
-.chip.dim { border-color: var(--line); color: var(--dim); }
-.chip.warn { border-color: var(--warn); color: var(--warn); }
+.chip.dim {
+  border-color: var(--line);
+  color: var(--dim);
+}
+.chip.warn {
+  border-color: var(--warn);
+  color: var(--warn);
+}
 
-/* -------- player -------- */
-.videobox { position: relative; }
+/* -------- player --------
+   A black stage with everything drawn over it. The stage is the element
+   that goes fullscreen, because the subtitle canvases are its children
+   and taking only the <video> would strand them. */
+/* A dead stream leaves the <video> with no intrinsic size, so it falls back to
+   the 150px default and the player becomes a strip. That was survivable while
+   the dialogs lived outside this box; now they are inside it, and a 190px
+   dialog in a 150px `overflow: hidden` box turns its only button into a scroll
+   region. Room only when a dialog needs it — normal playback layout is
+   untouched. */
+.videobox:has(.standby),
+/* Starting: the veil is `position: absolute`, so with no <video> yet the box
+   has no height at all and `overflow: hidden` clips the spinner to nothing.
+   16:9 because that is what most of a library is, so the box that appears at
+   265ms is usually the shape the picture will be — the alternative was an
+   arbitrary height and a visible jump when the video arrived. */
+.videobox:not(:has(video)) {
+  aspect-ratio: 16 / 9;
+  /* A dialog's body is a hub error string of unbounded length, so the shape is
+     a floor rather than a cage: it may grow past 16:9 to fit one. */
+  min-height: min(20rem, 60vh);
+}
+.videobox {
+  position: relative;
+  /* A stacking context, so the overlays inside stay inside. `.standby` is
+     z-40 and this box only had `position: relative`, which does not make
+     one — in theater the transform did, so the veil was contained there and
+     escaped in window mode, painting over the profile menu (z-15) and any
+     dialog (z-20) it happened to overlap. The number is arbitrary; having
+     one at all is the point. */
+  isolation: isolate;
+  background: #000;
+  border-radius: 6px;
+  margin-top: 14px;
+  overflow: hidden;
+}
+/* Centred by `inset: 0` plus `margin: auto` against the box's own bounds,
+   so it stays put through a resize without measuring anything. Above the
+   subtitle canvases (2) and below the transport bar (6), which must stay
+   clickable through it. */
+.play-veil {
+  position: absolute;
+  inset: 0;
+  margin: auto;
+  z-index: 4;
+  width: 74px;
+  height: 74px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  background: rgba(10, 16, 18, 0.6);
+  border: 1px solid var(--line);
+  color: var(--text);
+  cursor: pointer;
+  transition:
+    background 140ms,
+    border-color 140ms,
+    color 140ms;
+}
+.play-veil:hover {
+  background: rgba(10, 16, 18, 0.82);
+  border-color: var(--teal);
+  color: var(--teal);
+}
+/* A right-pointing triangle carries its mass to the left: the glyph's
+   centroid sits at x=9.67 of a 24-unit box whose centre is 12, which is 2.9px
+   at this size. Centring the BOX therefore looks left-of-centre, which is
+   what it did. Nudged right by that difference — measured, not guessed. */
+.play-veil svg {
+  transform: translateX(3px);
+}
 .videobox video {
-  width: 100%; max-height: 78vh; background: #000;
-  border-radius: 6px; margin-top: 14px;
+  width: 100%;
+  /* `auto` first: the intrinsic ratio wins the moment metadata lands, and this
+     only decides the shape before it. Without it the element uses the HTML
+     default of 300x150, which at full width is a 7.5:1 letterbox slot — the
+     second of the two jumps a cold start used to make. */
+  aspect-ratio: auto 16 / 9;
+  max-height: 78vh;
+  display: block;
+  background: #000;
+  cursor: pointer;
 }
-.videobox:fullscreen { background: #000; }
-/* controlsList=nofullscreen is Chromium-only; this covers Safari.
-   ponytail: Firefox has no hook to hide it — custom controls if it matters. */
-.videobox video::-webkit-media-controls-fullscreen-button { display: none; }
+/* Theater: out of the column and across the window. The negative margin
+   is how a centred, max-width page yields the full viewport width. */
+.mode-theater .videobox {
+  width: 100vw;
+  margin-left: 50%;
+  transform: translateX(-50%);
+  border-radius: 0;
+}
+/* Theater only. Bare, this was a second `.videobox video` at equal
+   specificity that won on order and raised the cap in EVERY mode — at 1080p
+   the transport bar started below the fold. */
+.mode-theater .videobox video {
+  max-height: 88vh;
+}
+.videobox:fullscreen {
+  border-radius: 0;
+  margin: 0;
+}
 .videobox:fullscreen video {
-  width: 100%; height: 100%; max-height: none; margin: 0; border-radius: 0;
-}
-.fs-btn {
-  position: absolute; top: 22px; right: 8px; z-index: 2;
-  opacity: 0; transition: opacity 0.15s;
-}
-.videobox:hover .fs-btn, .videobox:fullscreen .fs-btn { opacity: 1; }
-.videobox:fullscreen .fs-btn { top: 8px; }
-.playback-info { color: var(--dim); margin-top: 10px; }
-
-/* Capability debug mask (HUB-14/32 branch testing). */
-.caps-badge {
-  margin-left: 8px; padding: 1px 8px; border-radius: 999px;
-  border: 1px solid var(--warn, #b8860b); color: var(--warn, #b8860b);
-}
-.caps-panel {
-  margin-top: 10px; padding: 10px 12px;
-  border: 1px solid var(--line); border-radius: 8px;
-  display: flex; flex-direction: column; gap: 8px;
-}
-.caps-intro { line-height: 1.5; max-width: 70ch; }
-.caps-row { display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; }
-.caps-label { min-width: 5.5em; }
-.caps-opts { display: flex; gap: 12px; flex-wrap: wrap; align-items: baseline; }
-.caps-opts label { display: inline-flex; gap: 4px; align-items: baseline; cursor: pointer; }
-.caps-opts select { margin-left: 4px; }
-.caps-off { color: var(--dim); text-decoration: line-through; }
-.caps-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-
-@media (max-width: 560px) {
-  .shell { padding: 0 14px 40px; }
-  .library-head { flex-wrap: wrap; }
-  .filter { width: 100%; margin-left: 0; }
+  width: 100%;
+  height: 100%;
+  max-height: none;
 }
 
-.related { list-style: none; margin: 8px 0 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
-.linklike {
-  background: none; border: none; padding: 0; cursor: pointer;
-  color: var(--teal); font: inherit;
-}
-.linklike:hover { text-decoration: underline; }
+/* Paused, in the middle, unmissable — and not clickable, so the click
+   that resumes goes to the video underneath it. */
 
-/* -------- admin -------- */
-.rows { list-style: none; margin: 0 0 8px; padding: 0; display: flex; flex-direction: column; gap: 8px; }
-.rows li {
-  display: flex; align-items: center; justify-content: space-between; gap: 12px;
-  border: 1px solid var(--line); border-radius: 6px; padding: 10px 14px;
+/* What the hub decided, over the picture it decided it for. */
+.info-overlay {
+  position: absolute;
+  top: 14px;
+  left: 16px;
+  z-index: 5;
+  max-width: min(480px, 70%);
+  background: rgba(10, 16, 18, 0.82);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 11px 14px;
+  font-size: 12px;
+  line-height: 1.75;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  /* It reports; it does not intercept. Anything inside it that IS meant
+     to be pressed opts back in. */
+  pointer-events: none;
 }
-.rows .chips { align-items: center; }
-.approve-row { display: flex; gap: 10px; max-width: 420px; margin-top: 10px; }
-.notice { color: var(--teal); font-size: 13.5px; }
-.btn.danger { background: var(--warn); border-color: var(--warn); color: #2a120b; }
+.info-log {
+  pointer-events: auto;
+  align-self: flex-start;
+  margin-top: 4px;
+  color: var(--dim);
+  text-decoration: none;
+  border-bottom: 1px dotted var(--teal-dim);
+}
+.info-log:hover {
+  color: var(--teal);
+  border-bottom-color: var(--teal);
+}
+
+/* The bar fades with the pointer, and the gradient is what keeps white
+   controls legible over an arbitrary frame. */
+.player-bar {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 6;
+  padding: 44px 16px 12px;
+  background: linear-gradient(
+    to top,
+    rgba(0, 0, 0, 0.88) 0%,
+    rgba(0, 0, 0, 0.45) 55%,
+    transparent 100%
+  );
+  transition: opacity 160ms;
+}
+.player-bar.away {
+  opacity: 0;
+  pointer-events: none;
+}
+
+/* Lift the subtitle canvases clear of the bar while it is up. JASSUB and
+   the image-subtitle renderer both insert their canvas next to the
+   <video> and set its box on every resize — but never its transform, so
+   this survives them. See the note in Player.tsx for why native cues need
+   a different lever. */
+.videobox canvas {
+  transition: transform 160ms ease-out;
+}
+.videobox.bar-up canvas {
+  transform: translateY(-46px);
+}
+
+.transport {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 10px;
+  flex-wrap: wrap;
+  row-gap: 8px;
+}
+.transport-right {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.tbtn {
+  background: none;
+  border: 0;
+  color: #fff;
+  cursor: pointer;
+  padding: 3px;
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  line-height: 0;
+  font-size: 12.5px;
+}
+.tbtn:hover,
+.tbtn.on {
+  color: var(--teal);
+}
+.tpill {
+  background: none;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  color: var(--dim);
+  padding: 3px 10px;
+  font-size: 11.5px;
+  cursor: pointer;
+}
+.tpill:hover {
+  border-color: var(--teal-dim);
+  color: var(--teal);
+}
+.tpill.on {
+  border-color: var(--teal);
+  color: var(--teal);
+}
+.tsel {
+  background: rgba(17, 29, 32, 0.92);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 3px 8px;
+  font-size: 12px;
+}
+.clock {
+  color: var(--prose);
+  font-size: 12px;
+}
+.restarting {
+  color: var(--sand);
+  font-size: 11.5px;
+  animation: pulse 1s ease-in-out infinite;
+}
+@keyframes pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+.vol {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: 8px;
+}
+.vol input[type='range'] {
+  width: 84px;
+  accent-color: var(--teal);
+  background: transparent;
+}
+.caps-under {
+  margin-top: 10px;
+}
 
 /* Full-timeline seek bar (remux/transcode): click anywhere; beyond the
    produced range the hub restarts the pipeline at the target. */
 .seekbar {
   position: relative;
-  height: 22px;
-  margin-top: 6px;
-  background: color-mix(in srgb, var(--teal) 12%, transparent);
-  border: 1px solid color-mix(in srgb, var(--teal) 30%, transparent);
-  border-radius: 4px;
+  height: 6px;
+  background: rgba(255, 255, 255, 0.16);
+  border-radius: 3px;
   cursor: pointer;
   overflow: hidden;
+  transition: height 120ms;
 }
+.seekbar:hover {
+  height: 10px;
+}
+/* No `pointer-events: none`: that would stop this being a hit-test target, so
+   the `cursor` below and the bar's tooltip would never fire. `seekTo` refuses
+   while frozen, which makes the click a no-op with the affordance intact. */
 .seekbar.busy {
   opacity: 0.5;
   cursor: progress;
+}
+/* The produced range, with a dashed edge at the frontier: a seek inside
+   it is instant, past it the pipeline restarts. */
+.seekbar-made {
+  position: absolute;
+  inset: 0;
+  background: rgba(95, 200, 183, 0.22);
+  border-right: 1px dashed rgba(95, 200, 183, 0.55);
+}
+.seekbar-fill {
+  position: relative;
+  height: 100%;
+  background: var(--teal);
+  border-radius: 3px;
 }
 /* Deep seek / track switch: the hub is restarting the pipeline. The
    picture freezes (deliberately); this says why. */
@@ -282,6 +1473,10 @@ h2 { font-size: 14px; font-weight: 650; color: var(--dim); letter-spacing: 0.08e
   justify-content: center;
   background: rgba(0, 0, 0, 0.45);
   pointer-events: none;
+  /* Above `.play-veil`, which has one. A positioned element with a z-index
+     paints over a later sibling that has none, so being further down the DOM
+     was not enough — the play button covered this spinner. */
+  z-index: 5;
 }
 .seek-veil-spin {
   font-size: 42px;
@@ -289,20 +1484,127 @@ h2 { font-size: 14px; font-weight: 650; color: var(--dim); letter-spacing: 0.08e
   animation: seek-veil-rotate 1.1s linear infinite;
 }
 @keyframes seek-veil-rotate {
-  to { transform: rotate(360deg); }
+  to {
+    transform: rotate(360deg);
+  }
 }
-.seekbar-fill {
-  height: 100%;
-  background: color-mix(in srgb, var(--teal) 45%, transparent);
+
+/* Capability debug mask (HUB-14/32 branch testing). */
+.caps-badge {
+  /* No margin of its own: both rows that hold it are flex with a `gap`, so
+     one added 8px on top of the gap and left this chip further from the
+     button than everything else on the row. */
+  padding: 1px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--warn, #b8860b);
+  color: var(--warn, #b8860b);
 }
-.seekbar-time {
-  position: absolute;
-  inset: 0;
+.caps-panel {
+  margin-top: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.caps-intro {
+  line-height: 1.5;
+  max-width: 70ch;
+}
+.caps-row {
+  display: flex;
+  gap: 10px;
+  align-items: baseline;
+  flex-wrap: wrap;
+}
+.caps-label {
+  min-width: 5.5em;
+}
+.caps-opts {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+  align-items: baseline;
+}
+.caps-opts label {
+  display: inline-flex;
+  gap: 4px;
+  align-items: baseline;
+  cursor: pointer;
+}
+.caps-opts select {
+  margin-left: 4px;
+}
+.caps-off {
+  color: var(--dim);
+  text-decoration: line-through;
+}
+.caps-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.related {
+  list-style: none;
+  margin: 8px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.linklike {
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  color: var(--teal);
+  font: inherit;
+}
+.linklike:hover {
+  text-decoration: underline;
+}
+
+/* -------- admin -------- */
+.rows {
+  list-style: none;
+  margin: 0 0 8px;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.rows li {
   display: flex;
   align-items: center;
-  justify-content: center;
-  font-size: 12px;
-  pointer-events: none;
+  justify-content: space-between;
+  gap: 12px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 10px 14px;
+}
+/* These rows are a sentence, not a shelf of boxes: a badge, a title, and runs
+   of mono detail beside them. Centring aligned the BOXES, and a 15px run in a
+   23.25px line box centres 2px lower than a 12px mono run in an 18.6px one — so
+   a session read "claude" sitting two pixels below "idle 0s", measured off the
+   rendered pixels, neither word having a descender to explain it. Baseline is
+   what a line of text wants; pills on the same line hang off it correctly
+   because their own text does. */
+.rows .chips {
+  align-items: baseline;
+}
+.approve-row {
+  display: flex;
+  gap: 10px;
+  max-width: 420px;
+  margin-top: 10px;
+}
+.btn.danger {
+  background: var(--warn);
+  border-color: var(--warn);
+  color: #2a120b;
 }
 
 .card.episode {
@@ -311,10 +1613,106 @@ h2 { font-size: 14px; font-weight: 650; color: var(--dim); letter-spacing: 0.08e
   padding: 8px 12px;
 }
 
+/* -------- episode rows --------
+   The row opens the episode; the tick beside it changes its watched
+   state. Two buttons, because one cannot do both. */
+.season-head {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  margin: 32px 0 10px;
+  flex-wrap: wrap;
+}
+.season-head h2 {
+  margin: 0;
+}
+.season-mark {
+  margin-left: auto;
+  font-size: 12px;
+}
+/* No `overflow: hidden`: the global focus indicator is an outline with a
+   1px offset, drawn outside the border box, and the tallest child defines
+   that box on three sides — so keyboard focus on an episode showed as a
+   sliver beside the tick button and nothing else. Nothing needs clipping
+   here: the children carry no background and no radius of their own. */
+.rows li.ep-row {
+  padding: 0;
+  gap: 0;
+}
+.ep-open {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex: 1;
+  min-width: 0;
+  text-align: left;
+  background: none;
+  border: 0;
+  padding: 9px 14px;
+  cursor: pointer;
+}
+.rows li.ep-row:hover {
+  border-color: var(--teal-dim);
+}
+/* Wide enough for S01E01-02, so titles start on the same column whether
+   or not an episode spans a range. */
+.ep-no {
+  width: 76px;
+  flex: none;
+}
+.ep-title {
+  font-size: 14px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ep-state {
+  margin-left: auto;
+  color: var(--sand);
+  font-size: 11.5px;
+  flex: none;
+}
+.ep-seen {
+  background: none;
+  border: 0;
+  padding: 2px 12px 2px 8px;
+  color: var(--dimmer);
+  cursor: pointer;
+  line-height: 0;
+  flex: none;
+}
+.ep-seen:hover {
+  color: var(--teal);
+}
+.ep-seen.on {
+  color: var(--teal);
+}
+.ep-seen:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
 .row-form {
   display: flex;
+  align-items: center;
+  flex-wrap: wrap;
   gap: 8px;
   margin-bottom: 10px;
+}
+/* Four controls on one line: the two fields share whatever is left after the
+   admin toggle and Create, which take only what they need. The row already
+   wraps; what forced a break was the global `input { width: 100% }` — right for
+   a login card, and here it made each field demand a line of its own.
+   `flex-basis` rather than a width, so the two stay equal as the column
+   narrows, and `min-width: 0` so they can shrink below their placeholder text
+   instead of pushing the buttons off the end. The basis is small enough that
+   the four still share a line with the admin sidebar beside them at 760, where
+   170px each put Create on a row of its own; the fields grow to fill whatever
+   is actually there. Under about 400px it wraps, which is why the row is still
+   allowed to. */
+.user-new input {
+  flex: 1 1 120px;
+  min-width: 0;
 }
 .chip-x {
   background: none;
@@ -323,9 +1721,10 @@ h2 { font-size: 14px; font-weight: 650; color: var(--dim); letter-spacing: 0.08e
   cursor: pointer;
   padding: 0 2px;
 }
-.chip-x:disabled { opacity: 0.3; cursor: default; }
-/* HUB-32a/d: the ordered ASS ladder wraps rather than overflowing. */
-.ass-ladder { flex-wrap: wrap; }
+.chip-x:disabled {
+  opacity: 0.3;
+  cursor: default;
+}
 
 .subpick {
   display: flex;
@@ -342,80 +1741,103 @@ h2 { font-size: 14px; font-weight: 650; color: var(--dim); letter-spacing: 0.08e
   padding: 0.15rem 0.4rem;
 }
 
-.card-artbox { position: relative; display: block; margin-bottom: 0.4rem; }
+/* The swell lives on the BOX, not on the image: an image that fails can
+   then be hidden outright, and a hidden image cannot paint the browser's
+   own broken-artwork mark over it. */
+.card-artbox {
+  position: relative;
+  display: block;
+  background: var(--art-none);
+  border-radius: 4px;
+  overflow: hidden;
+}
 .card-art {
   width: 100%;
-  aspect-ratio: 1;
+  /* A poster unless the view says otherwise — see `shapeOf`. */
+  aspect-ratio: var(--card-ratio, 2 / 3);
   object-fit: cover;
-  border-radius: 6px;
+  border-radius: 4px;
   display: block;
 }
+/* While a picture is in flight it paints nothing, so its own background is
+   what shows — and it is opaque, so it covers the tilde on the box behind it.
+   Half-strength slate, the same blank as a card that has not arrived at all,
+   because it says the same thing.
+   
+   The browser distinguishes the first two for us — an image paints this
+   background until its content arrives. The third needs help: an `onError`
+   on each <img> adds `.art-failed`, and a picture that FAILS is then hidden
+   by the rule below, background and all, which
+   reveals the full-strength tilde behind it — and that one means something
+   different: there is no poster for this, and none is coming. */
+.card-artbox img {
+  background: color-mix(in srgb, var(--line), var(--surface));
+}
+
+/* Still occupies its cell — `visibility`, not `display` — so the row
+   height the virtualiser measured stays true. Hides the background above
+   with it, which is the point. */
+.art-failed {
+  visibility: hidden;
+}
 .seen-badge {
-  position: absolute; right: 6px; bottom: 6px;
-  display: inline-flex; padding: 4px; border-radius: 4px;
-  background: rgba(10, 16, 18, 0.78); color: var(--teal);
+  position: absolute;
+  right: 6px;
+  bottom: 6px;
+  display: inline-flex;
+  padding: 4px;
+  border-radius: 4px;
+  background: rgba(10, 16, 18, 0.78);
+  color: var(--teal);
   line-height: 0;
 }
 .card-progress {
-  position: absolute; left: 0; right: 0; bottom: 0; height: 3px;
-  display: block; background: rgba(10, 16, 18, 0.6);
-  border-radius: 0 0 6px 6px; overflow: hidden;
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 3px;
+  display: block;
+  background: rgba(10, 16, 18, 0.6);
+  border-radius: 0 0 4px 4px;
+  overflow: hidden;
 }
-.card-progress-fill { display: block; height: 100%; background: var(--sand); }
+.card-progress-fill {
+  display: block;
+  height: 100%;
+  background: var(--sand);
+}
 .kind-badge {
-  position: absolute; left: 6px; top: 6px;
-  display: inline-flex; padding: 4px; border-radius: 4px;
-  background: rgba(10, 16, 18, 0.78); color: var(--teal);
+  position: absolute;
+  left: 6px;
+  top: 6px;
+  display: inline-flex;
+  padding: 4px;
+  border-radius: 4px;
+  background: rgba(10, 16, 18, 0.78);
+  color: var(--teal);
   line-height: 0;
 }
-.queue-bar {
-  position: sticky;
-  bottom: 0;
-  display: flex;
-  align-items: center;
-  gap: 0.75rem;
-  padding: 0.6rem 0.9rem;
-  background: rgba(20, 28, 30, 0.97);
-  border: 1px solid #2a3438;
-  border-radius: 8px;
-  margin-top: 1rem;
+/* -------- album tracks --------
+   The same row primitive as episodes; only the leading column differs. */
+.rows.tracks {
+  max-width: 640px;
 }
-.queue-bar audio {
-  flex: 1;
-  min-width: 0;
-  height: 32px;
-}
-.queue-bar .now {
-  max-width: 18rem;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-size: 0.85rem;
-}
-.track-row {
-  display: flex;
-  align-items: center;
-  gap: 0.6rem;
-  width: 100%;
-  text-align: left;
-}
-.track-row .tno {
-  width: 2rem;
+.tracks .tno {
+  width: 28px;
   text-align: right;
-  color: var(--dim, #8aa);
+  flex: none;
 }
-.track-row.playing .tno::before {
-  content: '▶ ';
+.tracks .ep-row.playing {
+  border-color: var(--teal-dim);
 }
-
-.album-head {
-  display: flex;
-  gap: 1rem;
-  align-items: flex-start;
+.tracks .ep-row.playing .tno {
+  color: var(--teal);
 }
-.album-art {
-  width: 160px;
-  aspect-ratio: 1;
+.track-played {
+  display: inline-flex;
+  line-height: 0;
+  color: var(--teal);
   flex: none;
 }
 
@@ -425,7 +1847,7 @@ h2 { font-size: 14px; font-weight: 650; color: var(--dim); letter-spacing: 0.08e
 }
 .overview {
   line-height: 1.55;
-  color: #cdd8da;
+  color: var(--prose);
 }
 .cast {
   display: grid;
@@ -450,13 +1872,6 @@ h2 { font-size: 14px; font-weight: 650; color: var(--dim); letter-spacing: 0.08e
   height: 0.8rem;
   opacity: 0.7;
 }
-.row-form {
-  display: flex;
-  gap: 0.5rem;
-  align-items: center;
-  flex-wrap: wrap;
-}
-
 .review-row {
   display: flex;
   align-items: center;
@@ -464,10 +1879,6 @@ h2 { font-size: 14px; font-weight: 650; color: var(--dim); letter-spacing: 0.08e
 }
 .review-row .card.episode {
   flex: 1;
-}
-.chip.warn {
-  color: var(--warn);
-  border-color: var(--warn);
 }
 .review-search {
   margin: 0.4rem 0 0.8rem 1rem;
@@ -481,11 +1892,13 @@ h2 { font-size: 14px; font-weight: 650; color: var(--dim); letter-spacing: 0.08e
   position: relative;
 }
 .match-btn {
-  /* Anchored like the kind/seen badges: on the art, upper right
-     (card padding 14/16 + the badges' 6px inset). */
+  /* Anchored like the kind/seen badges: on the art, upper right. Those
+     sit 6px inside the art, which starts at the card's 1px border plus
+     its 10px padding — so 17, not the prototype's 16. At 16 it misses its
+     two siblings on the same corner by a pixel. */
   position: absolute;
-  top: 21px;
-  right: 23px;
+  top: 17px;
+  right: 17px;
   z-index: 2;
   width: 22px;
   height: 22px;
@@ -544,20 +1957,1222 @@ h2 { font-size: 14px; font-weight: 650; color: var(--dim); letter-spacing: 0.08e
   margin-bottom: 0.6rem;
 }
 
-.episode-still {
-  width: 220px;
-  aspect-ratio: 16 / 9;
-  object-fit: cover;
-  flex: none;
+/* Settings (HUB-33 track defaults) */
+.pref-label {
+  width: 3.5rem;
+  color: var(--dim, #7a8a8f);
+}
+input.invalid {
+  border-color: #b3564f;
+}
+.pref-row {
+  align-items: center;
+}
+.pref-row .chips {
+  min-height: 1.6rem;
+}
+.pref-row .chip {
+  cursor: pointer;
+}
+.lang-add {
+  width: 6rem;
+  flex: 0 0 auto;
+}
+.saved-flash {
+  font-size: 0.55em;
+  vertical-align: middle;
+  opacity: 0.8;
 }
 
-/* Settings (HUB-33 track defaults) */
-.pref-label { width: 3.5rem; color: var(--dim, #7a8a8f); }
-input.invalid { border-color: #b3564f; }
-.pref-row { align-items: center; }
-.pref-row .chips { min-height: 1.6rem; }
-.pref-row .chip { cursor: pointer; }
-.lang-add { width: 6rem; flex: 0 0 auto; }
-.saved-flash { font-size: 0.55em; vertical-align: middle; opacity: 0.8; }
+.library-head h1.clickable {
+  cursor: pointer;
+}
 
-.library-head h1.clickable { cursor: pointer; }
+/* -------- narrow screens --------
+   Kept last, so every rule above is what it overrides. */
+@media (max-width: 560px) {
+  .shell {
+    padding: 0 14px 40px;
+  }
+  .library-head {
+    flex-wrap: wrap;
+  }
+  .filter {
+    width: 100%;
+    margin-left: 0;
+  }
+  /* Between roughly 370 and 430 the header wraps the profile button onto a
+     line of its own, where `space-between` leaves it at the LEFT. Its menu
+     hangs off that button's right edge and cannot be narrower than 190px, so
+     the menu's left edge computed to x = -60 and every item lost its first
+     55px: "…ttings", "…dmin", "…gn out", with no page scrollbar to recover
+     them. Pushing the button to the end of its own line gives the menu the
+     whole width to open into. The same wrap band is why `.search-panel`
+     carries a `min(280px, 100%)`; this is the other half of it. */
+  .topbar > .menu-anchor:last-child {
+    margin-left: auto;
+  }
+  /* The control bar is absolutely positioned inside the picture, and the
+     picture's height is the viewport width over the film's aspect — so a
+     2.39:1 film at 375 gets a box 145px tall while the transport wraps to
+     three rows and the bar becomes 208. The box clips, and everything above
+     its top edge is gone: measured, the seek bar sat at y121-127 with zero
+     pixels inside the box and hit-testing to the page behind it. No scrubbing
+     at all on a phone, for exactly the films people scrub most.
+
+     One row that scrolls sideways instead of three that stack: the bar comes
+     back to ~112px, every control stays where it was and stays reachable, and
+     the picture is not letterboxed to make room for chrome that is only on
+     screen while you are touching it. */
+  .transport {
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+  .transport::-webkit-scrollbar {
+    display: none;
+  }
+}
+
+/* A standing per-title subtitle choice, and the way out of it. */
+.title-sub {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 1px 4px 1px 8px;
+}
+.title-sub .chip-x {
+  color: var(--dimmer);
+}
+.title-sub .chip-x:hover {
+  color: var(--warn);
+}
+/* Candidate names are long and the columns after them matter more. */
+.cand-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sub-candidates li {
+  gap: 10px;
+}
+
+/* -------- callouts --------
+   Something that needs a decision, not just reading. Tinted rather than
+   merely bordered, so it separates from the panel it sits in. */
+.callout {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  flex-wrap: wrap;
+  border-radius: 6px;
+  padding: 10px 12px;
+  margin-bottom: 12px;
+  font-size: 13px;
+}
+.callout-acts {
+  margin-left: auto;
+  display: flex;
+  gap: 8px;
+}
+.sand-callout {
+  border: 1px solid #3d3626;
+  background: rgba(220, 184, 119, 0.06);
+  color: var(--sand);
+}
+/* Sand, not teal: confirming a guess is not the same act as choosing. */
+.sand-btn {
+  background: var(--sand);
+  border-color: var(--sand);
+  color: #2a1f0b;
+}
+
+.dialog-note {
+  color: var(--dimmer);
+  font-size: 12px;
+  margin: 4px 0 12px;
+}
+/* Candidate cards sit a step below the dialog they are in, the same way
+   an input does. */
+.candidates .card {
+  background: var(--bg);
+  padding: 8px;
+}
+.candidates .card-title {
+  font-size: 12.5px;
+  height: 2.6em;
+}
+.candidates .card-meta {
+  font-size: 11px;
+}
+
+/* -------- season screen --------
+   The episodes as pictures, and the one you land on opened underneath. */
+.season-top {
+  display: flex;
+  align-items: baseline;
+  gap: 14px;
+  margin: 20px 0 12px;
+  flex-wrap: wrap;
+}
+.season-top h1 {
+  font-size: 22px;
+}
+/* A still is 16:9 and wider than a poster, so these cards are wider. */
+.ep-strip {
+  padding-bottom: 14px;
+  /* Room for the nudge arrows when the page scrolls the picked episode into
+     view: `nearest` stops the moment the card is inside, which parked it flush
+     against the right edge and 15px under the 40px arrow sitting there. */
+  scroll-padding-inline: 48px;
+}
+.ep-card {
+  flex: none;
+  width: 220px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  text-align: left;
+  cursor: pointer;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 8px;
+}
+.ep-card:hover {
+  border-color: var(--teal-dim);
+}
+/* The one being shown below is lit, or the panel looks unrelated to the
+   strip above it. */
+.ep-card.picked {
+  border-color: var(--teal);
+  background: var(--hover);
+}
+.ep-still {
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  object-fit: cover;
+  display: block;
+  border-radius: 4px;
+}
+.ep-badge {
+  position: absolute;
+  left: 6px;
+  top: 6px;
+  background: rgba(10, 16, 18, 0.78);
+  color: var(--teal);
+  border-radius: 3px;
+  padding: 1px 7px;
+  font-size: 11px;
+}
+/* The selected episode, under a hairline: a different question from the
+   strip, so it is separated rather than merely spaced. */
+.ep-detail {
+  display: flex;
+  gap: 26px;
+  align-items: flex-start;
+  flex-wrap: wrap;
+  margin-top: 10px;
+  padding-top: 22px;
+  border-top: 1px solid var(--hairline);
+}
+.ep-detail-art {
+  width: min(300px, 100%);
+  flex: none;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+.ep-detail-title {
+  font-size: 20px;
+  font-weight: 650;
+  margin: 4px 0 0;
+  color: var(--text);
+  text-transform: none;
+  letter-spacing: 0;
+}
+.ep-path {
+  font-size: 11.5px;
+  margin-top: 10px;
+  overflow-wrap: anywhere;
+}
+/* A season heading that leads somewhere says so. */
+.season-open {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  background: none;
+  border: 0;
+  padding: 0;
+  cursor: pointer;
+}
+.season-open:hover h2,
+.season-open:hover .shelf-arrow {
+  color: var(--teal);
+}
+
+/* -------- up next --------
+   Offered near the end, over the corner of the picture. It rides above
+   the bar when the bar is up, for the same reason the subtitles do. */
+.up-next {
+  position: absolute;
+  right: 20px;
+  bottom: 20px;
+  z-index: 7;
+  width: 296px;
+  max-width: calc(100% - 40px);
+  background: rgba(10, 16, 18, 0.94);
+  border: 1px solid var(--teal-dim);
+  border-radius: 8px;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  box-shadow: 0 12px 34px rgba(0, 0, 0, 0.6);
+  transition: bottom 160ms ease-out;
+  animation: rise 240ms ease-out;
+}
+.up-next.lifted {
+  bottom: 92px;
+}
+.up-next-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.up-next-label {
+  color: var(--dim);
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+/* The number sits in the middle of the ring, so the ring needs no label
+   and the number needs no unit. */
+.up-next-ring {
+  margin-left: auto;
+  position: relative;
+  width: 26px;
+  height: 26px;
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.up-next-ring svg {
+  position: absolute;
+  transform: rotate(-90deg);
+}
+.up-next-ring span {
+  font-size: 11px;
+  color: var(--teal);
+}
+.up-next-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  text-align: left;
+  background: none;
+  border: 0;
+  padding: 0;
+  cursor: pointer;
+}
+.up-next-item:hover .up-next-title {
+  color: var(--teal);
+}
+.up-next-thumb {
+  width: 76px;
+  height: 44px;
+  flex: none;
+  border-radius: 4px;
+}
+.up-next-thumb img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+.up-next-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.up-next-title {
+  font-size: 13.5px;
+  line-height: 1.3;
+  overflow-wrap: anywhere;
+}
+.up-next-acts {
+  display: flex;
+  gap: 8px;
+}
+.up-next-acts .leaving:hover {
+  border-color: var(--warn);
+  color: var(--warn);
+}
+
+/* -------- music queue --------
+   Fixed, centred, above every screen: the queue outlives the album page
+   that started it, so it cannot live in the page's flow. `.shell` keeps
+   88px of bottom padding so the last row of a library is never under it. */
+/* Below `.menu-sheet` (14) on purpose: that sheet exists so a click that
+   dismisses a menu lands on IT and not on whatever was underneath. At 15 the
+   dock sat above the catcher, so dismissing a menu over the music bar also
+   pressed the bar's transport. */
+/* Where the music bar was. A caught throw in the queue is `position: fixed`
+   like the dock it replaces, so the offer to retry is where the thing that
+   failed used to be rather than at the end of the page. */
+.queue-fail {
+  position: fixed;
+  bottom: 16px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: min(760px, calc(100vw - 24px));
+  z-index: 13;
+}
+.queue-fail .failed {
+  margin: 0;
+}
+.queue-dock {
+  position: fixed;
+  bottom: 16px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: min(760px, calc(100vw - 24px));
+  z-index: 13;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+/* The dock is fixed to the bottom of the VIEWPORT, so on a short screen it
+   parks on top of whatever the page ends with — measured on an album at
+   375x720, scrolled fully down: the last two tracks sat under it and their
+   play and add buttons hit-tested to the dock, four controls with no way to
+   reach them. Nothing else reserves the space, because nothing else knows the
+   dock is there; `:has` is how the page finds out. Generous rather than exact:
+   the bar grows a row when the title wraps. */
+body:has(.queue-dock) .shell {
+  padding-bottom: 140px;
+}
+.queue-bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 16px;
+  background: rgba(17, 29, 32, 0.97);
+  /* Teal, not --line: this is the one piece of chrome that is playing. */
+  border: 1px solid var(--teal-dim);
+  border-radius: 8px;
+  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.5);
+}
+/* Both elements are present for the gapless handover; neither is seen. */
+.queue-bar audio {
+  display: none;
+}
+.queue-play {
+  background: var(--teal);
+  color: #062a25;
+  border: 0;
+  border-radius: 50%;
+  width: 30px;
+  height: 30px;
+  flex: none;
+  cursor: pointer;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 0;
+}
+.queue-play:hover {
+  filter: brightness(1.08);
+}
+.queue-now {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  flex: none;
+  max-width: 230px;
+}
+.queue-now-title {
+  font-size: 12.5px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.queue-now-sub {
+  font-size: 10.5px;
+  color: var(--dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.queue-progress {
+  flex: 1;
+  height: 3px;
+  background: var(--line);
+  border-radius: 2px;
+}
+.queue-progress-fill {
+  display: block;
+  height: 100%;
+  background: var(--teal);
+  border-radius: 2px;
+}
+.queue-how {
+  color: var(--dim);
+  font-size: 11px;
+  flex: none;
+}
+.queue-x {
+  color: var(--dim);
+  font-size: 14px;
+  flex: none;
+}
+.queue-x:hover {
+  color: var(--text);
+}
+.queue-error {
+  margin: 0;
+  padding: 8px 14px;
+  background: rgba(17, 29, 32, 0.97);
+  border: 1px solid var(--warn);
+  border-radius: 8px;
+  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.5);
+  font-size: 12.5px;
+}
+
+.queue-list {
+  background: rgba(17, 29, 32, 0.98);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.5);
+  max-height: 300px;
+  overflow-y: auto;
+  padding: 8px;
+}
+.queue-list-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 2px 6px 8px;
+}
+.queue-list-head .mono {
+  font-size: 10.5px;
+  color: var(--dimmer);
+  letter-spacing: 0.12em;
+}
+.queue-clear {
+  margin-left: auto;
+  font-size: 11.5px;
+  color: var(--dim);
+}
+.queue-clear:hover {
+  color: var(--warn);
+}
+.queue-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.queue-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  text-align: left;
+  background: none;
+  border: 0;
+  border-radius: 4px;
+  padding: 6px 10px;
+  cursor: pointer;
+  color: var(--dim);
+}
+.queue-row:hover {
+  background: var(--hover);
+  color: var(--text);
+}
+.queue-row.now {
+  background: rgba(95, 200, 183, 0.08);
+  color: var(--text);
+}
+.queue-mark {
+  width: 18px;
+  text-align: right;
+  flex: none;
+  font-size: 11px;
+  color: var(--dimmer);
+}
+.queue-row.now .queue-mark {
+  color: var(--teal);
+}
+.queue-row-title {
+  font-size: 13px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.queue-row-sub {
+  margin-left: auto;
+  font-size: 11px;
+  color: #5e7a7d;
+  flex: none;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Adding one track is a different wish from playing the record from it,
+   so it is a different button — outside the row's own. */
+.track-add {
+  background: none;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  color: var(--dim);
+  width: 24px;
+  height: 22px;
+  flex: none;
+  margin-right: 10px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 0;
+  cursor: pointer;
+  padding: 0;
+}
+.track-add:hover {
+  border-color: var(--teal);
+  color: var(--teal);
+}
+
+/* -------- settings --------
+   A column of cards, each one subject with a glyph and a title. Bounded
+   width because these are forms, and a form the width of a monitor is
+   harder to read than one you can take in. */
+.settings-head {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  margin: 0 0 4px;
+}
+.settings-intro {
+  font-size: 13px;
+  margin: 0 0 24px;
+  max-width: 640px;
+  text-wrap: pretty;
+}
+.settings-cards {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  max-width: 660px;
+}
+/* The flash keeps its space so saving never nudges the heading. */
+.saved-flash {
+  opacity: 0;
+  transition: opacity 300ms;
+  font-size: 11px;
+}
+.saved-flash.on {
+  opacity: 1;
+}
+
+.card-plain {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface);
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin: 0;
+}
+.card-head {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+.card-glyph {
+  display: inline-flex;
+  line-height: 0;
+  color: var(--teal);
+}
+/* Deliberately NOT .card-title: that one is the library cell's, clamped to
+   a fixed two lines so every cell measures the same. Inheriting it put a
+   two-line box next to a centred icon, which read as a misaligned icon. */
+.card-name {
+  font-weight: 600;
+  font-size: 14px;
+  text-transform: capitalize;
+  line-height: 1;
+}
+.card-badge {
+  margin-left: auto;
+  font-size: 10.5px;
+}
+.card-prose {
+  font-size: 12.5px;
+  margin: 0;
+  max-width: 560px;
+  text-wrap: pretty;
+}
+
+/* One label column, one gap, and therefore one place every control and
+   every explanation starts. Both are derived from these two numbers so a
+   change to the label width cannot leave the notes behind. */
+.card-plain {
+  --pref-label-w: 76px;
+  --pref-gap: 10px;
+}
+.pref-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px var(--pref-gap);
+}
+/* Inputs in a settings row share the line rather than each taking one:
+   the global `input { width: 100% }` is right for a login card and wrong
+   for a row of fields, so it is overridden where the row is the layout. */
+.pref-row input:not(.lang-add) {
+  width: auto;
+  flex: 1 1 170px;
+  min-width: 150px;
+}
+.pref-row .btn {
+  flex: none;
+}
+.pref-label {
+  width: var(--pref-label-w);
+  flex: none;
+  color: var(--dim);
+  font-size: 12px;
+}
+/* An explanation belongs under the control it explains, lined up with it —
+   squeezed onto the end of the row it either wraps or crushes the input. */
+.pref-note {
+  font-size: 12px;
+  max-width: 480px;
+  text-wrap: pretty;
+  margin: -2px 0 0 calc(var(--pref-label-w) + var(--pref-gap));
+}
+
+/* A choice that needs a paragraph to make sense gets its own block rather
+   than a label in a 76px column. */
+.pref-block {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+.pref-block-head {
+  font-size: 12.5px;
+  font-weight: 600;
+}
+/* Grip, name, explanation — as one grid across all three rows, so every
+   explanation starts at the same place. As independent flex rows the notes
+   began wherever each name happened to end, and "burnt into the picture"
+   is a lot wider than "plain text". */
+.ladder {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  grid-template-columns: auto auto 1fr;
+  row-gap: 4px;
+  column-gap: 9px;
+}
+.ladder li {
+  display: grid;
+  grid-template-columns: subgrid;
+  grid-column: 1 / -1;
+  align-items: center;
+  padding: 5px 8px;
+  border: 1px solid var(--hairline);
+  border-radius: 4px;
+  cursor: grab;
+}
+.ladder li:focus-visible {
+  outline: 1px solid var(--teal);
+  outline-offset: 1px;
+}
+.ladder li.lifting {
+  opacity: 0.4;
+}
+.ladder li.over {
+  border-color: var(--teal);
+  background: rgba(95, 200, 183, 0.08);
+}
+.ladder-grip {
+  display: inline-flex;
+  line-height: 0;
+  color: var(--dimmer);
+}
+/* The order IS the setting, so the top rung is the one that reads loudest. */
+.ladder li:first-child {
+  border-color: var(--teal-dim);
+}
+.ladder li:first-child .ladder-name {
+  color: var(--teal);
+}
+.ladder-name {
+  font-size: 12.5px;
+  font-weight: 500;
+}
+.ladder-note {
+  font-size: 11.5px;
+  text-wrap: pretty;
+}
+
+/* Group heading for the three per-type cards, so the rule they share is
+   stated once instead of once per card. */
+.settings-group {
+  margin: 14px 0 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.settings-group h2 {
+  font-size: 13px;
+  margin: 0;
+}
+.pref-row .chips {
+  flex: 1 1 240px;
+  align-items: center;
+}
+
+/* A language, draggable. The grip says so; the name promotes on click so
+   the same reordering is reachable without a pointer. */
+.lang-pill {
+  border: 1px solid var(--teal-dim);
+  cursor: grab;
+}
+.lang-pill.lifting {
+  opacity: 0.4;
+}
+.lang-pill.over {
+  border-color: var(--teal);
+  background: rgba(95, 200, 183, 0.08);
+}
+.lang-grip {
+  display: inline-flex;
+  line-height: 0;
+  color: var(--dimmer);
+  padding-right: 1px;
+}
+.lang-name {
+  background: none;
+  border: 0;
+  padding: 0;
+  cursor: pointer;
+  color: var(--teal);
+  font-size: 12px;
+  font-family: inherit;
+}
+.lang-pill:first-child .lang-name {
+  color: var(--teal);
+}
+/* The lock and the × share one box: an icon has no line box and a glyph
+   has a tall one, so without this a pinned pill stood taller than the rest. */
+.lang-end {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 15px;
+  height: 15px;
+  flex: none;
+  line-height: 1;
+  font-size: 12px;
+}
+.lang-lock {
+  color: var(--dimmer);
+}
+/* Dashed, because it is an opening rather than a value. */
+.lang-add {
+  width: 70px;
+  flex: none;
+  border-style: dashed;
+  padding: 4px 8px;
+  font-size: 12px;
+  background: var(--bg);
+}
+.card-plain input {
+  background: var(--bg);
+}
+.pref-input {
+  flex: 0 1 190px;
+  min-width: 150px;
+}
+/* A two-state choice reads as one control, not two chips. The unpicked side
+   keeps full-strength text: dimming it is how a disabled control looks, and
+   it is not disabled — it is the other half of the choice. */
+.chip.toggle {
+  cursor: pointer;
+  border-color: var(--dim);
+  color: var(--text);
+  background: var(--surface);
+}
+/* A chip that DOES something is a control, and a control is as tall as the
+   buttons beside it. At badge height these stood two thirds the height of
+   the Save and Delete they shared a row with, which reads as cramped
+   rather than compact. `.btn.small` is 30px; these land on 28. */
+.chip.toggle,
+.chain-pill,
+.lang-pill {
+  display: inline-flex;
+  align-items: center;
+  min-height: 28px;
+  border-radius: 4px;
+  font-size: 12px;
+}
+.chip.toggle,
+.chain-pill {
+  padding: 4px 11px;
+}
+/* Tighter, because it holds a grip and a × of its own. */
+.lang-pill {
+  padding: 3px 4px 3px 6px;
+  gap: 3px;
+}
+.chip.toggle:not(:disabled):hover {
+  border-color: var(--prose);
+  background: var(--hover);
+}
+.chip.toggle.on {
+  border-color: var(--teal);
+  color: var(--bg);
+  background: var(--teal);
+  font-weight: 600;
+}
+.chip.toggle.on:not(:disabled):hover {
+  background: var(--teal);
+  border-color: var(--teal);
+}
+/* On, and not yours to turn off: still readable, plainly not a control. */
+.chip.toggle:disabled {
+  cursor: default;
+  opacity: 0.7;
+}
+
+/* -------- admin --------
+   Five jobs, a nav instead of one long scroll. The nav sticks because the
+   satellite and session lists are unbounded — on a busy fleet you were
+   scrolling back up past the whole of Libraries to change section. */
+.admin {
+  display: flex;
+  gap: 28px;
+  align-items: flex-start;
+  flex-wrap: wrap;
+}
+.admin-nav {
+  width: min(190px, 100%);
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  position: sticky;
+  top: 16px;
+}
+.admin-tab {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  text-align: left;
+  background: none;
+  color: var(--dim);
+  border: none;
+  border-left: 2px solid transparent;
+  border-radius: 0 4px 4px 0;
+  padding: 8px 12px;
+  font: inherit;
+  font-size: 13.5px;
+  cursor: pointer;
+}
+.admin-tab:hover {
+  color: var(--text);
+  background: var(--hover);
+}
+.admin-tab.on {
+  background: var(--surface);
+  color: var(--text);
+  border-left-color: var(--teal);
+}
+.admin-badge {
+  margin-left: auto;
+  font-family: var(--mono);
+  font-size: 11px;
+  background: var(--teal-dim);
+  color: var(--teal);
+  border-radius: 8px;
+  padding: 0 7px;
+}
+.admin-badge.urgent {
+  animation: pulse 1.4s ease-in-out infinite;
+}
+/* Enough room that a satellite row's chips do not wrap on a laptop. */
+.admin-panel {
+  flex: 1;
+  min-width: min(420px, 100%);
+}
+.admin-panel > h1 {
+  margin: 0 0 4px;
+}
+.admin-intro {
+  font-size: 13px;
+  margin: 0 0 14px;
+  max-width: 640px;
+  text-wrap: pretty;
+}
+.admin-panel h2 {
+  margin-top: 22px;
+}
+.admin-panel h2:first-of-type {
+  margin-top: 0;
+}
+/* Provider precedence: the same drag as the language pills, because it is
+   the same kind of setting — an order, where position is the whole meaning. */
+/* A provider name is the label here, and "OpenSubtitles" is a lot longer
+   than "audio" — the prototype's 112px, not Settings' 76px. */
+.admin-cards {
+  max-width: 720px;
+}
+.admin-cards .card-plain {
+  --pref-label-w: 112px;
+}
+.pref-narrow {
+  flex: 0 1 130px !important;
+  min-width: 110px !important;
+}
+.enrich-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 4px;
+}
+/* Work in progress, and the numbers under it are stale until it finishes. */
+.enrich-row .enriching {
+  color: var(--sand);
+  animation: pulse 1.2s ease-in-out infinite;
+}
+.chain-pill {
+  gap: 5px;
+  border: 1px solid var(--teal-dim);
+  cursor: grab;
+}
+.chain-pill.lifting {
+  opacity: 0.4;
+}
+.chain-pill.over {
+  border-color: var(--teal);
+  background: rgba(95, 200, 183, 0.08);
+}
+
+/* A satellite is an identity and, if it encodes, a set of measurements.
+   Two stacked rows rather than one wide one: the measurements are the part
+   that varies in length, and inline they shoved the buttons out of line
+   with every other row. */
+.rows li.sat-row {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 0;
+  padding: 0;
+}
+.sat-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 14px;
+}
+/* The identity line has to be allowed to wrap. Without this it set its own
+   min-content width, every row overflowed the panel by a different amount,
+   and no two rows' buttons lined up. */
+.sat-head > .chips {
+  flex: 1 1 auto;
+  min-width: 0;
+  flex-wrap: wrap;
+}
+.sat-actions {
+  display: flex;
+  gap: 8px;
+  flex: none;
+}
+.sat-facts {
+  /* Deliberately no wrap: the label is a column and the chips wrap inside
+     it. Wrapping here moved the whole chip block down as one, which left
+     `measured` sitting alone on a line of its own. */
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  border-top: 1px solid var(--hairline);
+  padding: 8px 14px 10px;
+  --pref-label-w: 64px;
+}
+.sat-facts > .chips {
+  flex: 1 1 0;
+  min-width: 0;
+}
+
+/* An account on one line, the libraries it may see underneath — the same
+   shape as a satellite and its measurements, for the same reason: the part
+   that varies in length was shoving everything else out of alignment.
+   Qualified selector because `.rows li` is (0,1,1). */
+.rows li.user-row {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 0;
+  padding: 0;
+}
+.user-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 14px;
+  flex-wrap: wrap;
+}
+/* A fixed column, so admin and all-libraries start at the same place on
+   every row rather than wherever the username ended. */
+.user-name {
+  font-weight: 600;
+  font-size: 14px;
+  width: 90px;
+  flex: none;
+}
+.user-tail {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: none;
+}
+.user-note {
+  font-size: 11.5px;
+}
+.user-libs {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  border-top: 1px solid var(--hairline);
+  padding: 8px 14px 10px;
+  /* The username's column, to the pixel: the granted libraries line up
+     under `admin` and `all libraries` rather than starting a column of
+     their own 100px to the left. */
+  --pref-label-w: 90px;
+}
+.user-libs > .chips {
+  flex: 1 1 0;
+  min-width: 0;
+}
+/* The state and the way out of it are the same control. */
+.btn.ghost.warn {
+  color: var(--warn);
+  border-color: var(--warn);
+}
+.btn.ghost.warn:hover {
+  border-color: var(--warn);
+  filter: brightness(1.15);
+}
+
+/* A wait, not an error: it covers the picture because there is nothing to
+   look at behind it, and carries one control because there is nothing to
+   decide. */
+/* Inside `.videobox` now, which is the element that goes fullscreen — outside
+   it, none of this was painted while fullscreen and the only way out of a
+   stopped picture was invisible.
+
+   `absolute`, not `fixed`: `.mode-theater .videobox` carries a transform, which
+   makes it the containing block for fixed descendants. Left `fixed`, this
+   dialog would size to the viewport in window mode and to the videobox in
+   theater and fullscreen — three geometries for one dialog. */
+.standby {
+  position: absolute;
+  inset: 0;
+  z-index: 40;
+  display: grid;
+  place-items: center;
+  background: rgba(10, 16, 18, 0.82);
+}
+.standby-box {
+  /* `.videobox` is `overflow: hidden` and only as tall as the picture, which in
+     a short window is not much. Without this the dialog's one control — Go
+     home — could be clipped with no way to reach it. */
+  max-height: 100%;
+  overflow: auto;
+  max-width: 420px;
+  text-align: center;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  align-items: center;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 26px 28px;
+}
+.standby-box h2 {
+  margin: 0;
+  font-size: 17px;
+}
+.standby-box p {
+  margin: 0;
+  font-size: 13px;
+  text-wrap: pretty;
+}
+/* The one moving part, so the dialog does not read as frozen. */
+.standby-at {
+  font-size: 11.5px;
+  animation: pulse 1.8s ease-in-out infinite;
+}
+
+/* A load that failed, with a way out. Centred and roomy on purpose: this is
+   a stop, and it should look like one rather than like a chip that got lost. */
+.failed {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  text-align: center;
+  margin: 12vh auto 0;
+  max-width: 460px;
+  padding: 0 20px;
+}
+.failed-glyph {
+  display: inline-flex;
+  line-height: 0;
+  color: var(--warn);
+}
+.failed h2 {
+  margin: 0;
+  font-size: 17px;
+}
+/* The hub's own words, kept: sometimes the only clue anybody gets. */
+.failed-why {
+  margin: 0;
+  font-size: 12px;
+  text-wrap: pretty;
+  max-height: 6em;
+  overflow: auto;
+}
+.failed-do {
+  display: flex;
+  gap: 10px;
+  margin-top: 4px;
+}
+
+/* The player's own transient message. Inside `.videobox` on purpose: that is
+   the element that goes fullscreen, and while it is, nothing outside its
+   subtree is painted — the shell's toast included. Anything the player must
+   say has to live in here. */
+.player-note {
+  position: absolute;
+  left: 50%;
+  bottom: 5.5rem;
+  transform: translateX(-50%);
+  max-width: min(46rem, 90%);
+  padding: 0.55rem 0.9rem;
+  border-radius: 0.5rem;
+  background: rgb(0 0 0 / 0.82);
+  color: #fff;
+  font-size: 0.82rem;
+  line-height: 1.35;
+  text-align: center;
+  pointer-events: none;
+  z-index: 6;
+}

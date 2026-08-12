@@ -1,7 +1,18 @@
 import { useState } from 'react'
 import { storeTokens, type Tokens } from '../api'
 
-export default function Auth({ mode, onDone }: { mode: 'setup' | 'login'; onDone: () => void }) {
+export default function Auth({
+  mode,
+  onDone,
+  note,
+}: {
+  mode: 'setup' | 'login'
+  onDone: () => void
+  /// Why you are here, when you did not ask to be. A session that expired
+  /// mid-use lands on this screen with no explanation otherwise, which reads
+  /// as the app having forgotten you for no reason.
+  note?: string
+}) {
   const [token, setToken] = useState('')
   const [user, setUser] = useState('')
   const [password, setPassword] = useState('')
@@ -16,11 +27,23 @@ export default function Auth({ mode, onDone }: { mode: 'setup' | 'login'; onDone
       mode === 'setup'
         ? ['/api/v1/setup', { token, username: user, password }]
         : ['/api/v1/auth/token', { username: user, password }]
-    const r = await fetch(url as string, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(body),
-    })
+    // Raw `fetch`, because there is no token yet and `api()` exists to
+    // attach one — but that also means nothing here turns an unreachable hub
+    // into a sentence. Unhandled, the rejection skipped `setBusy(false)` and
+    // left the only button on the screen greyed out with nothing said: one
+    // wifi blip and signing in needed a reload.
+    let r: Response
+    try {
+      r = await fetch(url as string, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      })
+    } catch {
+      setBusy(false)
+      setError('Could not reach the hub.')
+      return
+    }
     setBusy(false)
     if (!r.ok) {
       setError((await r.text()) || 'Something went wrong')
@@ -38,11 +61,10 @@ export default function Auth({ mode, onDone }: { mode: 'setup' | 'login'; onDone
         </div>
         {mode === 'setup' ? (
           <p className="auth-hint">
-            First run. Enter the setup token printed on the hub console to
-            create the admin account.
+            First run. Enter the setup token printed on the hub console to create the admin account.
           </p>
         ) : (
-          <p className="auth-hint">Sign in to your library.</p>
+          <p className="auth-hint">{note ?? 'Sign in to your library.'}</p>
         )}
         {mode === 'setup' && (
           <input

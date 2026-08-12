@@ -198,7 +198,8 @@ function applyMask(p: CapabilityProfile, m: CapabilityMask): CapabilityProfile {
   const out: CapabilityProfile = { ...p, video: [...p.video] }
   if (m.video?.length) out.video = out.video.filter((c) => !m.video!.includes(c.codec))
   if (m.audio?.length) out.audio = out.audio.filter((c) => !m.audio!.includes(c))
-  if (m.containers?.length) out.containers = out.containers.filter((c) => !m.containers!.includes(c))
+  if (m.containers?.length)
+    out.containers = out.containers.filter((c) => !m.containers!.includes(c))
   // Ceilings tighten, never loosen.
   if (m.max_height) out.max_height = Math.min(m.max_height, out.max_height ?? m.max_height)
   if (m.max_audio_channels) out.max_audio_channels = m.max_audio_channels

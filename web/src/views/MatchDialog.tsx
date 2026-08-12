@@ -1,11 +1,5 @@
 import { useEffect, useState } from 'react'
-import placeholder from '../assets/placeholder.svg'
-import {
-  adminApplyMatch,
-  adminReviewSearch,
-  type Item,
-  type MatchCandidate,
-} from '../api'
+import { adminApplyMatch, adminReviewSearch, type Item, type MatchCandidate } from '../api'
 
 /// HUB-8 hand-matching, launched from a card's search button: provider
 /// search prefilled with the item's title, poster grid, one-click pick.
@@ -76,18 +70,34 @@ export default function MatchDialog({
             ✕
           </button>
         </div>
+        {/* Why the heading is the FILE's title and not the matched one:
+            without saying so, a wrong match looks like the thing being
+            searched for. */}
+        <p className="dialog-note mono">
+          anchored on the file identity — the display title is the match being judged
+        </p>
         {weak && (
-          <div className="row-form dialog-weak">
-            <span className="dim">
+          <div className="callout sand-callout">
+            <span>
               Uncertain match: <b>{item.matched_title ?? item.title}</b>
               {item.year ? ` (${item.year})` : ''} — confirm it or pick a better one.
             </span>
-            <button className="btn small" disabled={busy} onClick={() => void apply('confirm')}>
-              Confirm current
-            </button>
-            <button className="btn ghost small" disabled={busy} onClick={() => void apply('reject')}>
-              Reject
-            </button>
+            <span className="callout-acts">
+              <button
+                className="btn small sand-btn"
+                disabled={busy}
+                onClick={() => void apply('confirm')}
+              >
+                Confirm current
+              </button>
+              <button
+                className="btn ghost small"
+                disabled={busy}
+                onClick={() => void apply('reject')}
+              >
+                Reject
+              </button>
+            </span>
           </div>
         )}
         <div className="row-form">
@@ -108,16 +118,20 @@ export default function MatchDialog({
             {results.map((c) => (
               <li key={`${c.provider}-${c.id}`}>
                 <button className="card" disabled={busy} onClick={() => void apply('pick', c)}>
-                  <img
-                    className="card-art"
-                    src={c.poster_url ?? placeholder}
-                    alt=""
-                    loading="lazy"
-                    onError={(e) => {
-                      e.currentTarget.onerror = null
-                      e.currentTarget.src = placeholder
-                    }}
-                  />
+                  <span className="card-artbox">
+                    {/* A provider with no poster for a candidate gets the
+                        swell on the box, like everything else. */}
+                    {c.poster_url && (
+                      <img
+                        className="card-art"
+                        src={c.poster_url}
+                        alt=""
+                        loading="lazy"
+                        onError={(e) => e.currentTarget.classList.add('art-failed')}
+                      />
+                    )}
+                    {!c.poster_url && <span className="card-art" />}
+                  </span>
                   <span className="card-title">{c.title}</span>
                   <span className="card-meta mono">
                     {c.release_date?.slice(0, 4) ?? '—'} · {c.provider}

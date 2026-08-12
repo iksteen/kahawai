@@ -1,6 +1,8 @@
-import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react'
-import { artworkUrl, fetchItems, fetchLibraries, isAdmin, type Item } from '../api'
-import placeholder from '../assets/placeholder.svg'
+import { useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { artworkSrcSet, artworkUrl, fetchItems, fetchLibraries, isAdmin, type Item } from '../api'
+import Icon, { type IconName } from '../icons'
+import { metaLine, targetOf, watchedPct } from '../label'
+import { notify } from '../toast'
 import MatchDialog from './MatchDialog'
 
 /// Items per request. Smaller than the hub's 200 default because a chunk
@@ -11,49 +13,23 @@ const CHUNK = 100
 const OVERSCAN = 3
 /// Must match `.grid { gap }` in styles.css — the one number this file
 /// cannot measure, because it is between the cells rather than in one.
-const GAP = 12
+const GAP = 14
 
-// Kind glyph for the card art corner (feather icons, MIT).
-function KindIcon({ kind }: { kind: string }) {
-  const paths: Record<string, ReactNode> = {
-    movie: (
-      <>
-        <rect x="2" y="2" width="20" height="20" rx="2.18" />
-        <path d="M7 2v20M17 2v20M2 12h20M2 7h5M2 17h5M17 7h5M17 17h5" />
-      </>
-    ),
-    show: (
-      <>
-        <rect x="2" y="7" width="20" height="15" rx="2" />
-        <polyline points="17 2 12 7 7 2" />
-      </>
-    ),
-    album: (
-      <>
-        <path d="M9 18V5l12-2v13" />
-        <circle cx="6" cy="18" r="3" />
-        <circle cx="18" cy="16" r="3" />
-      </>
-    ),
-  }
-  const glyph = paths[kind]
-  if (!glyph) return null
-  return (
-    <span className="kind-badge" title={kind === 'show' ? 'series' : kind}>
-      <svg
-        width="14"
-        height="14"
-        viewBox="0 0 24 24"
-        fill="none"
-        stroke="currentColor"
-        strokeWidth="2"
-        strokeLinecap="round"
-        strokeLinejoin="round"
-      >
-        {glyph}
-      </svg>
-    </span>
-  )
+/// How a library's items are shaped. A sleeve is square and a poster is
+/// two by three, and the narrower shape can sit in a narrower column.
+/// Both are handed to CSS as custom properties so the stylesheet keeps
+/// the rules and this keeps only the values.
+function shapeOf(mediaType: string) {
+  return mediaType === 'music'
+    ? { '--card-min': '150px', '--card-ratio': '1' }
+    : { '--card-min': '140px', '--card-ratio': '2 / 3' }
+}
+
+function kindGlyph(kind: string): IconName | null {
+  if (kind === 'movie') return 'movie'
+  if (kind === 'show' || kind === 'episode') return 'show'
+  if (kind === 'album' || kind === 'track') return 'album'
+  return null
 }
 
 function Card({
@@ -70,7 +46,9 @@ function Card({
       {isAdmin() && (i.kind === 'movie' || i.kind === 'show') && (
         <button
           className={`match-btn ${
-            !i.match_confidence || i.match_confidence === 'miss' || i.match_confidence === 'rejected'
+            !i.match_confidence ||
+            i.match_confidence === 'miss' ||
+            i.match_confidence === 'rejected'
               ? 'miss'
               : i.match_confidence === 'weak'
                 ? 'weak'
@@ -100,58 +78,38 @@ function Card({
           </svg>
         </button>
       )}
-      <button
-        className="card"
-        onClick={() => onOpen(i.kind === 'track' && i.parent_id ? i.parent_id : i.id)}
-      >
+      <button className="card" onClick={() => onOpen(targetOf(i))}>
         <span className="card-artbox">
           <img
             className="card-art"
             src={artworkUrl(i.id, i.art_version, 'card')}
+            srcSet={artworkSrcSet(i.id, i.art_version)}
             loading="lazy"
             alt=""
-            onError={(e) => {
-              e.currentTarget.onerror = null
-              e.currentTarget.src = placeholder
-            }}
+            // See Libraries.tsx: hide it and let the swell behind show.
+            onError={(e) => e.currentTarget.classList.add('art-failed')}
           />
-          <KindIcon kind={i.kind} />
-          {i.played && (
-            <span className="seen-badge" title="seen">
-              <svg
-                width="14"
-                height="14"
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="2.5"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-              >
-                <polyline points="20 6 9 17 4 12" />
-              </svg>
+          {kindGlyph(i.kind) && (
+            <span className="kind-badge" title={i.kind === 'show' ? 'series' : i.kind}>
+              <Icon name={kindGlyph(i.kind) as IconName} />
             </span>
           )}
-          {!i.played && !!i.resume_position_ms && !!i.resume_duration_ms && (
-            <span className="card-progress">
-              <span
-                className="card-progress-fill"
-                style={{
-                  width: `${Math.min(100, (i.resume_position_ms / i.resume_duration_ms) * 100)}%`,
-                }}
-              />
+          {i.played && (
+            <span className="seen-badge" title="seen">
+              <Icon name="check" />
+            </span>
+          )}
+          {!i.played && watchedPct(i) !== null && (
+            <span className="card-progress" title="Partly watched">
+              <span className="card-progress-fill" style={{ width: `${watchedPct(i)}%` }} />
             </span>
           )}
         </span>
         <span className="card-title">{i.title}</span>
         <span className="card-meta mono">
-          {i.kind === 'episode'
-            ? `${i.parent_title ?? ''} · S${i.season ?? '?'}E${i.episode ?? '?'}`
-            : i.kind === 'track'
-              ? [i.artist, i.parent_title].filter(Boolean).join(' · ')
-              : (i.kind === 'album' ? (i.artist ?? '—') : (i.year ?? '—'))}
-          {i.kind === 'album' && i.year ? ` · ${i.year}` : ''}
-          {i.sources > 1 ? ` · ${i.sources} sources` : ''}
+          {[metaLine(i) || '—', i.sources > 1 ? `${i.sources} sources` : '']
+            .filter(Boolean)
+            .join(' · ')}
         </span>
       </button>
     </>
@@ -163,6 +121,7 @@ export default function Library({
   query,
   onOpen,
   onResetSearch,
+  onHome,
 }: {
   libraryId: string
   /// Already debounced, and owned by the header's search box — on this
@@ -172,10 +131,18 @@ export default function Library({
   /// The library title doubles as "show me everything again": the
   /// filter lives in the app header, so the view can only ask.
   onResetSearch: () => void
+  onHome: () => void
 }) {
   const [name, setName] = useState('Library')
+  // Decides the card's shape, so it is an input to the row-height
+  // measurement below and not merely a label.
+  const [mediaType, setMediaType] = useState('')
   const [sort, setSort] = useState('title')
   const [total, setTotal] = useState<number | null>(null)
+  // The library's size with no filter applied, remembered from the last
+  // time there was none, so a filtered count can say "12 of 2242" without
+  // a second request asking something we already knew.
+  const [libTotal, setLibTotal] = useState<number | null>(null)
   // Sparse: index in the FULL result set → item. Holes are rows that
   // exist and have not been fetched, which is not the same as rows that
   // do not exist, and the difference is what keeps the layout still.
@@ -193,6 +160,9 @@ export default function Library({
   const wrapRef = useRef<HTMLDivElement>(null)
   const gridRef = useRef<HTMLUListElement>(null)
   const asked = useRef(new Set<number>())
+  /// Chunks that failed and have not since succeeded. The error line is about
+  /// this set being non-empty, not about the last thing that happened.
+  const failed = useRef(new Set<number>())
   // Bumped whenever the result set changes identity. A reply carrying an
   // older generation describes a library or a search we have left.
   const gen = useRef(0)
@@ -210,6 +180,14 @@ export default function Library({
     gen.current += 1
     replacing.current = gen.current
     asked.current.clear()
+    // The failures belonged to the result set being replaced. Left standing,
+    // the line stayed on screen over results that had loaded perfectly — the
+    // only thing that clears it is a chunk arriving while `failed` is empty,
+    // and the chunk that failed is in a set nobody is asking for any more. So
+    // a filter keystroke or a jump to another library carried the old
+    // library's red line with it, for as long as the page was open.
+    failed.current.clear()
+    setError('')
     setRows({ start: 0, end: 0 })
   }
 
@@ -223,15 +201,23 @@ export default function Library({
         const swap = replacing.current === mine
         if (swap) replacing.current = 0
         setTotal(r.total)
+        if (!query) setLibTotal(r.total)
         setLoaded((prev) => {
           const next = swap ? new Map<number, Item>() : new Map(prev)
           r.items.forEach((it, k) => next.set(r.offset + k, it))
           return next
         })
+        // Cleared only when nothing is still missing. Clearing on ANY arrival
+        // hid a real hole — one chunk failing beside one succeeding left a
+        // hundred placeholder cards and silence — and never clearing left a
+        // red line over a grid that had been complete for minutes.
+        failed.current.delete(chunk)
+        if (failed.current.size === 0) setError('')
       })
       .catch((e) => {
         if (mine !== gen.current) return
         asked.current.delete(chunk) // a failed chunk must be retryable
+        failed.current.add(chunk)
         setError(String(e))
       })
   }
@@ -241,9 +227,22 @@ export default function Library({
   // whole point of following a library through from its results.
   useEffect(() => {
     reset()
+    setLibTotal(null)
     fetchLibraries()
-      .then((r) => setName(r.libraries.find((l) => l.id === libraryId)?.name ?? 'Library'))
-      .catch(() => {})
+      .then((r) => {
+        const lib = r.libraries.find((l) => l.id === libraryId)
+        setName(lib?.name ?? 'Library')
+        setMediaType(lib?.media_type ?? '')
+      })
+      // Silence here read as a library called "Library" holding cards of the
+      // wrong shape: `mediaType` is what `shapeOf` reads for the poster aspect
+      // ratio, so a music library laid itself out as films with nothing said.
+      // A toast rather than taking the screen, because this request failing
+      // alone leaves a perfectly good grid underneath it. When the whole hub is
+      // down the grid says so too and this is a second sentence about the same
+      // outage — worth it, since the two name different things and neither is
+      // guessable from the other.
+      .catch((e: unknown) => notify(`Could not load the library details: ${e}`))
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [libraryId])
 
@@ -263,7 +262,14 @@ export default function Library({
   // Deliberately NOT run on every render. Measuring writes state, so a
   // render-driven measurement is a cycle, and it only stays quiet while
   // every cell is the same height — one that is not locks the renderer.
-  // These three inputs are the only things that can change the answer.
+  // These four inputs are the only things that can change the answer.
+  //
+  // `mediaType` is one of them: it sets the art's aspect ratio, so it
+  // decides the cell's height. It arrives a round trip after the first
+  // cards, and without it here a music library would keep the row pitch
+  // it measured while its square sleeves were still poster-shaped — every
+  // row then reserving a poster's height for a sleeve, so the reserved
+  // total ran long and the last screenful was empty space.
   useLayoutEffect(() => {
     const grid = gridRef.current
     const cell = grid?.firstElementChild as HTMLElement | null
@@ -271,11 +277,16 @@ export default function Library({
     const cols = getComputedStyle(grid).gridTemplateColumns.split(' ').filter(Boolean).length
     const rowH = cell.getBoundingClientRect().height + GAP
     if (!cols || rowH <= GAP) return
+    // ponytail: the half-pixel tolerance exists so a hair of text-metric
+    // jitter cannot start a measure/render loop, and its cost is that the
+    // same hair is multiplied by the row count — measured at 5px of slack
+    // over 321 rows of a 2242-album library, 0.007% of the reserved
+    // height. Reserve from an integer pitch if that ever shows.
     if (!metric || metric.cols !== cols || Math.abs(metric.rowH - rowH) > 0.5) {
       setMetric({ cols, rowH })
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [total, width, loaded.size > 0])
+  }, [total, width, loaded.size > 0, mediaType])
 
   // Which rows the window is over. Re-run on scroll and on resize; resize
   // also invalidates the measurement, which the layout effect above
@@ -339,15 +350,16 @@ export default function Library({
 
   return (
     <main>
+      {/* The wordmark opens the jump menu now, so home needs saying
+          somewhere. */}
+      <button className="btn ghost small back" onClick={onHome}>
+        ← Home
+      </button>
       <div className="library-head">
         <h1 className="clickable" onClick={onResetSearch}>
           {name}
         </h1>
-        <select
-          className="sort filter"
-          value={sort}
-          onChange={(e) => setSort(e.target.value)}
-        >
+        <select className="sort filter" value={sort} onChange={(e) => setSort(e.target.value)}>
           <option value="title">Title A–Z</option>
           <option value="-title">Title Z–A</option>
           <option value="-added">Recently added</option>
@@ -355,9 +367,34 @@ export default function Library({
           <option value="-year">Newest first</option>
           <option value="year">Oldest first</option>
         </select>
-        <span className="count mono">{total ?? ''}</span>
+        {/* Filtering says what it is filtering: 12 on its own leaves you
+            wondering whether the other 2230 are missing or excluded. */}
+        <span className="count mono">
+          {total === null ? '' : query && libTotal !== null ? `${total}/${libTotal}` : total}
+        </span>
       </div>
-      {error && <p className="error">{error}</p>}
+      {error && (
+        <p className="error">
+          {error}{' '}
+          <button
+            className="linklike"
+            onClick={() => {
+              setError('')
+              // Ask again, rather than only repainting. `loaded` is not a
+              // dependency of the effect that fetches, so a new Map identity
+              // ran nothing at all — the message went and the page stayed
+              // empty for ever. `rows` IS one, so a fresh object re-runs it;
+              // and when the FIRST chunk failed there is no `total`, so that
+              // effect returns early and chunk 0 has to be asked for by hand.
+              for (const c of failed.current) asked.current.delete(c)
+              if (total === null) loadChunk(0)
+              else setRows((r) => ({ ...r }))
+            }}
+          >
+            Try again
+          </button>
+        </p>
+      )}
       {total === 0 && (
         <p className="dim">
           {query
@@ -377,7 +414,12 @@ export default function Library({
         <ul
           className="grid"
           ref={gridRef}
-          style={metric ? { transform: `translateY(${rows.start * metric.rowH}px)` } : undefined}
+          style={
+            {
+              ...shapeOf(mediaType),
+              ...(metric ? { transform: `translateY(${rows.start * metric.rowH}px)` } : {}),
+            } as React.CSSProperties
+          }
         >
           {window_.map((i) => {
             const item = loaded.get(i)

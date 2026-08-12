@@ -54,7 +54,10 @@ export default function CapabilityDebug({
     update(next)
   }
 
-  const setFlag = (flag: 'hdr' | 'ass_render' | 'graphics_overlay' | 'vtt_render', value: boolean) => {
+  const setFlag = (
+    flag: 'hdr' | 'ass_render' | 'graphics_overlay' | 'vtt_render',
+    value: boolean,
+  ) => {
     const next = { ...mask }
     // Back at the probe's own answer = no override at all, so the
     // summary never reports a mask that changes nothing.
@@ -98,8 +101,8 @@ export default function CapabilityDebug({
   return (
     <div className="caps-panel mono">
       <div className="dim caps-intro">
-        Unchecking removes a capability from the profile sent to the hub — and from what this
-        player renders — so the negotiation takes the branch a lesser client would. Encodes target
+        Unchecking removes a capability from the profile sent to the hub — and from what this player
+        renders — so the negotiation takes the branch a lesser client would. Encodes target
         h264/aac, so dropping those makes sources that need an encode honestly UNPLAYABLE — that
         refusal is the branch under test.
       </div>
@@ -117,7 +120,11 @@ export default function CapabilityDebug({
         <span className="caps-opts">
           {(['hdr', 'ass_render', 'graphics_overlay', 'vtt_render'] as const).map((k) => (
             <label key={k} className={flag(k) ? '' : 'caps-off'}>
-              <input type="checkbox" checked={flag(k)} onChange={(e) => setFlag(k, e.target.checked)} />
+              <input
+                type="checkbox"
+                checked={flag(k)}
+                onChange={(e) => setFlag(k, e.target.checked)}
+              />
               {k}
             </label>
           ))}
@@ -237,9 +244,10 @@ export default function CapabilityDebug({
         >
           {copied ? 'copied' : 'copy profile json'}
         </button>
-        <span className="dim">
-          {summary.length ? `masked: ${summary.join(' ')}` : 'no mask — the browser as it is'}
-        </span>
+        {/* Only when there is a mask. Unmasked is the ordinary state of this
+            panel, and saying so on every visit spent a line to report that
+            nothing had happened — the checkboxes above already show it. */}
+        {summary.length > 0 && <span className="dim">masked: {summary.join(' ')}</span>}
       </div>
     </div>
   )
