@@ -160,6 +160,16 @@ async fn direct_play_ranges_end_to_end() {
         .await
         .unwrap();
     let bearer = format!("Bearer {}", pair.access_token);
+    auth.create_user("other", "other-password", false)
+        .await
+        .unwrap();
+    let foreign = format!(
+        "Bearer {}",
+        auth.login("other", "other-password")
+            .await
+            .unwrap()
+            .access_token
+    );
     let api = test_router(registry.clone(), auth, sessions.clone());
 
     // Wait for the item to resolve.
@@ -206,6 +216,43 @@ async fn direct_play_ranges_end_to_end() {
     assert_eq!(v["size"], FILE_LEN as u64);
     let stream_url = v["stream_url"].as_str().unwrap().to_string();
     let session_id = v["session_id"].as_str().unwrap().to_string();
+
+    // AUTH-11 / CI-6: the ownership boundary wraps every user-facing shape,
+    // before mode, artifact-name or body validation. A foreign live id is
+    // indistinguishable from an id that does not exist, and none of these
+    // requests can touch or end the owner's session.
+    for (method, suffix, body) in [
+        ("GET", "/stream", ""),
+        ("GET", "/master.m3u8", ""),
+        ("GET", "/segment00000.ts", ""),
+        ("GET", "/subs-1.ass", ""),
+        ("POST", "/seek", r#"{"position_ms":1}"#),
+        ("POST", "/progress", r#"{"position_ms":1}"#),
+        ("DELETE", "", ""),
+    ] {
+        let request = |id: &str| {
+            Request::builder()
+                .method(method)
+                .uri(format!("/api/v1/playback/sessions/{id}{suffix}"))
+                .header("authorization", &foreign)
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap()
+        };
+        let live = api.clone().oneshot(request(&session_id)).await.unwrap();
+        let absent = api
+            .clone()
+            .oneshot(request("01FOREIGNORABSENTSESSION"))
+            .await
+            .unwrap();
+        assert_eq!(live.status(), StatusCode::NOT_FOUND, "{method} {suffix}");
+        assert_eq!(live.status(), absent.status(), "{method} {suffix}");
+        assert_eq!(
+            body_bytes(live).await,
+            body_bytes(absent).await,
+            "{method} {suffix}"
+        );
+    }
 
     let get = |range: Option<&str>| {
         let mut req = Request::get(&stream_url).header("authorization", bearer.clone());
@@ -258,8 +305,8 @@ async fn direct_play_ranges_end_to_end() {
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
     let resp = get(None).await.unwrap();
     // Ended is ended, however it ended: a client streaming this session
-    // gets GONE and knows to start a new one rather than to give up.
-    assert_eq!(resp.status(), StatusCode::GONE);
+    // gets 404 and knows to start a new one rather than to give up.
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
     // AR-6, the mediahost half. Start one more session and leave it running,
     // so the disconnect has something to act on.
@@ -291,7 +338,7 @@ async fn direct_play_ranges_end_to_end() {
     .unwrap();
 
     // The session that was reading from it is ended, not left to stall on a
-    // lease that will never produce another byte. GONE is the whole recovery
+    // lease that will never produce another byte. A 404 is the recovery
     // contract: the client learns to start again rather than waiting.
     let resp = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
@@ -305,7 +352,7 @@ async fn direct_play_ranges_end_to_end() {
                 )
                 .await
                 .unwrap();
-            if r.status() == StatusCode::GONE {
+            if r.status() == StatusCode::NOT_FOUND {
                 return r;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -313,7 +360,7 @@ async fn direct_play_ranges_end_to_end() {
     })
     .await
     .expect("the disconnect must end sessions reading from that host");
-    assert_eq!(resp.status(), StatusCode::GONE);
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
     // And starting again says WHY it cannot: 503, not 409. Every other
     // refusal here is about the item and will fail again forever; this one is

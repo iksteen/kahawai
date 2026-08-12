@@ -191,7 +191,7 @@ export default function App() {
   /// session" — two different things. React tears a component down and builds
   /// it again whenever it likes, and does exactly that on every mount under
   /// StrictMode: the rebuilt player then inherited a session the hub had
-  /// already disposed of, and answered 410 on the playlist, on every segment
+  /// already disposed of, and answered 404 on the playlist, on every segment
   /// and on the progress ping. Playback simply did not work in development.
   ///
   /// The route owns it instead, because the route is what changes when the
@@ -366,7 +366,7 @@ export default function App() {
   // than the token lived. Measured 2026-08-07 — token issued 14:38:07,
   // dead 14:53:07, refreshed 14:56:48. In those three minutes hls.js
   // got 401s, stopped loading, and the session it was reading was
-  // reaped for idleness; the 401 also masked the 410 that would have
+  // reaped for idleness; the 401 also masked the 404 that would have
   // told the player to recover.
   useEffect(() => {
     if (phase !== 'app') return

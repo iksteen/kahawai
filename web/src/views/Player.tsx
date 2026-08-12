@@ -181,7 +181,7 @@ export default function Player({
   /// means nothing — the truth is still the resume point, and reporting 0 wrote
   /// the beginning of the film over it. So `positionKnown` picks the value here
   /// instead of gating the callers: gating suppressed the keepalive ping too,
-  /// and that ping's 410 is the only automatic notice a direct session gets
+  /// and that ping's 404 is the only automatic notice a direct session gets
   /// that its session has died.
   /// `v` defaults to the live ref, but the callers that outlive it pass the
   /// element they captured. React detaches a ref while deleting the tree, and
@@ -266,7 +266,7 @@ export default function Player({
   /// HUB-33 picks the audio track asynchronously after mount, but the session
   /// effect below is keyed `[session.session_id]` and captures the FIRST
   /// render's `recover` — where both of these are still 0. So an automatic
-  /// restart after a 410 asked for track 0 whatever you were listening to:
+  /// restart after a 404 asked for track 0 whatever you were listening to:
   /// an anime set to Japanese came back in English, with the selector still
   /// claiming Japanese because the remounted player re-resolves it. Same
   /// pattern as `switchBurnRef` above, for the same reason.
@@ -295,7 +295,7 @@ export default function Player({
   useEffect(() => {
     // Fenced, because everything this reports goes through `playerNote`, whose
     // single module-level listener belongs to whichever player is mounted when
-    // it fires. A blip that 410s the session also fails these three fetches;
+    // it fires. A blip that 404s the session also fails these three fetches;
     // recovery then remounts the player on a new session, and the late
     // rejection painted "Could not load the track list" over video that was
     // playing perfectly — the same shape as the give-up timer speaking after a
@@ -415,7 +415,7 @@ export default function Player({
   /// releases the one it replaced, so this is the capability-restart path
   /// with a different trigger.
   ///
-  /// Driven only by a 410 from the hub. Nothing here knows or guesses how
+  /// Driven only by a 404 from the hub. Nothing here knows or guesses how
   /// long a session is allowed to idle — see recovery.ts.
 
   /// True once the player is gone. A restart that lands after that produced a
@@ -482,7 +482,7 @@ export default function Player({
     // `mine` is non-zero by construction here, so the gen-0 special case is
     // gone — both bugs in the first draft of this timer came from it.
     // Held, because the generation check does not cover the case this player
-    // is REPLACED. A 410 or a 503 recovers by starting a new session, and the
+    // is REPLACED. A 404 or a 503 recovers by starting a new session, and the
     // route remounts this component on it — deliberately, and with
     // `awaitingGen` still set, since those paths keep the veil up rather than
     // settling. The old closure's `healthRef` freezes that way, so the check
@@ -577,7 +577,7 @@ export default function Player({
   /// `ourPause`: the caller paused the element itself for a restart, so the
   /// check below must not read that as the viewer having stopped watching. That
   /// bail is why an automatic part transition ended the film silently — the
-  /// 410 handler called this, it no-op'd, and the early return skipped the note
+  /// 404 handler called this, it no-op'd, and the early return skipped the note
   /// underneath, so nothing was said and nothing was offered.
   const recover = async (ourPause = false) => {
     if (!ourPause && videoRef.current?.paused) {
@@ -715,7 +715,7 @@ export default function Player({
       if (startRetry(e) !== 'wait') {
         sendTrack({ type: 'tracks-chosen', audio: was.audio, video: was.video })
         // And the ref, in the same breath. It is assigned during RENDER, while
-        // `recover` below runs in this microtask — so a 410 answered the
+        // `recover` below runs in this microtask — so a 404 answered the
         // selector by snapping back to the old track and then opened the
         // recovery session on the new one, leaving Japanese audio playing under
         // a selector reading English. Which is the disagreement the revert is
@@ -745,7 +745,7 @@ export default function Player({
       // element, nothing on this path starts the loader again, and the `settle`
       // below disarms the give-up ceiling by moving the generation on. So the
       // buffer played out and the picture froze for good, with the keepalive
-      // holding the session alive so the 410 `recover` waits for never came.
+      // holding the session alive so the 404 `recover` waits for never came.
       // Only leaving the player recovered it. `giveUp` hands the retry back
       // now, because the answer is already in and it was no.
       giveUp(`Could not switch track: ${e}`, mine)
@@ -806,7 +806,7 @@ export default function Player({
       // element, nothing on this path starts the loader again, and the `settle`
       // below disarms the give-up ceiling by moving the generation on. So the
       // buffer played out and the picture froze for good, with the keepalive
-      // holding the session alive so the 410 `recover` waits for never came.
+      // holding the session alive so the 404 `recover` waits for never came.
       // Only leaving the player recovered it. `giveUp` hands the retry back
       // now, because the answer is already in and it was no.
       giveUp(`Could not change subtitles: ${e}`, mine)
@@ -903,7 +903,7 @@ export default function Player({
         liveMaxLatencyDurationCount: Infinity,
         maxBufferLength: 60,
       })
-      // A dead session 410s every segment and playlist refresh. hls.js
+      // A dead session 404s every segment and playlist refresh. hls.js
       // hands us the status; without this it retries internally and then
       // stalls with nothing to explain it.
       // A segment arrived, so whatever the link was doing, it is doing it
@@ -919,7 +919,7 @@ export default function Player({
         }
         // hls.js fetches with its own XHR, so it never gets api()'s
         // refresh-and-retry. Without this an expired token stops
-        // playback dead — and worse, hides a 410 behind a 401, because
+        // playback dead — and worse, hides a 404 behind a 401, because
         // auth runs before the handler that would have said GONE.
         if (code === 401) {
           void refreshTokens().then((ok) => ok && hls.startLoad())
@@ -933,8 +933,8 @@ export default function Player({
         // Recording it was all this did, and hls.js does not restart itself
         // after a fatal error — so nothing fetched another segment, ever. The
         // picture froze without pausing, so no veil appeared; the ping kept
-        // succeeding, so the session was never reaped and never answered 410;
-        // and 410 was the only thing that called `recover`. A viewer whose
+        // succeeding, so the session was never reaped and never answered 404;
+        // and 404 was the only thing that called `recover`. A viewer whose
         // wifi dropped for twenty seconds sat looking at a still frame with
         // nothing on screen to say so.
         //
@@ -1071,10 +1071,10 @@ export default function Player({
       attach(mine)
       owned = true
     } catch (e) {
-      // A 410 here is not a message, it is the recovery contract: the
+      // A 404 here is not a message, it is the recovery contract: the
       // session is gone and the answer is a new one at this position.
       // Toasting it left the picture stopped by `stopLoad`/`pause` above,
-      // and the ping's own 410 then reached `recover`, which bails on a
+      // and the ping's own 404 then reached `recover`, which bails on a
       // paused element — so an automatic part transition simply ended the
       // film.
       // The session is gone: `recover` owns the outcome from here — a new
@@ -1105,7 +1105,7 @@ export default function Player({
       // which is the only thing that makes pressing play retry, and the
       // `settle` below disarms the ceiling by moving the generation on. So the
       // buffer played out and the picture stalled for good, with the keepalive
-      // holding the session alive so the 410 that `recover` waits for never
+      // holding the session alive so the 404 that `recover` waits for never
       // came. Hand the retry back HERE instead of in 25 seconds' time: the
       // answer is already in, and it was no.
       giveUp(`Could not seek: ${e}`, mine)
@@ -1158,7 +1158,7 @@ export default function Player({
     // viewer's segment directory out from under them.
     //
     // The ping doubles as the earliest death detector: it runs every
-    // 10 s, so a session lost to ANY cause answers 410 here, usually
+    // 10 s, so a session lost to ANY cause answers 404 here, usually
     // before the picture stalls.
     const stopPinging = keepSessionAlive(
       () => absMs(video),
@@ -1178,7 +1178,7 @@ export default function Player({
     }
     video.addEventListener('play', onPlay)
     // Direct play has no hls.js to report a status: the element just
-    // fails. Ask the hub which kind of failure it was — a 410 is a dead
+    // fails. Ask the hub which kind of failure it was — a 404 is a dead
     // session, anything else is a real media fault and stays one.
     const onError = () => {
       void postProgress(session.session_id, absMs(video)).then((r) => {

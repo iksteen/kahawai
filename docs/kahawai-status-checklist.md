@@ -242,7 +242,12 @@ How something works and why it was built that way belong in
       concurrent demotion/delete cannot take the total to zero; a refused delete
       ends no sessions.
       Grants are untouched by a demotion — the account falls back to the
-      `user_libraries` rows it already had.
+      `user_libraries` rows it already had. Every user-facing route below a
+      playback session id crosses one owner middleware; stream, playlist,
+      segment, subtitle, seek, progress and end all return the same 404 for an
+      absent id and another user's live id. `direct_play_ranges_end_to_end`
+      exercises every shape with two users; admin session routes remain behind
+      their separate administrator gate.
       Parental control needs no separate mechanism: it is a library the
       admin composes and grants.
       Watch state is writable without playing: `PUT
@@ -358,9 +363,9 @@ How something works and why it was built that way belong in
       playlist would remove the contradiction rather than bound it, but
       nothing observed now requires one: `kahawai-vod-plan.md`.*
 - [x] HUB-18 Sessions: per-user concurrency caps, progress checkpoints/resume,
-      idle reaping, seek-anywhere with pipeline restart. A reaped session
-      answers 410 Gone on every session endpoint (404 stays "sub-resource
-      missing"), and both players recover from it automatically
+      idle reaping, seek-anywhere with pipeline restart. A reaped or otherwise
+      absent session answers the same owner-scoped 404 as a foreign live id,
+      and both players recover from it automatically
 - [x] HUB-19 Music: playback + queue live, gapless delivery (two elements,
       the idle one warmed 30 s ahead) and ReplayGain pass-through. Every
       track plays direct — the browser gets a byte-range URL and no
@@ -375,8 +380,8 @@ How something works and why it was built that way belong in
 - [x] HUB-27 MVP player: login, browse, detail w/ stream info, direct/remux playback,
       audio/video/subtitle track selection, resume, watch state
 - [x] HUB-28 Web UI is a pure client of the public API — including session
-      recovery, which is driven by the 410 contract rather than by any
-      client-side copy of the hub's idle timeout
+      recovery, which is driven by the owner-scoped 404 contract rather than by
+      any client-side copy of the hub's idle timeout
 
 ## Hub — anime (HUB-29..33)
 

@@ -22,7 +22,7 @@ use crate::sessions::Sessions;
 /// the sessions reading them cannot recover — left alive they stall, and the
 /// client waits on a stream that will never produce another byte.
 ///
-/// Ending them turns that silence into 410 on the next request, which is the
+/// Ending them turns that silence into 404 on the next request, which is the
 /// one signal the recovery contract defines. What the client does with it is
 /// its own business: start again, and find out from THAT whether the host is
 /// back.
@@ -310,7 +310,7 @@ impl MediahostLink for MediahostLinkService {
             // holds this host's upserts and reconciliation — deepest exactly
             // when a mediahost dies mid-scan. Ending afterwards left its
             // sessions stalling for as long as the backlog took, which is the
-            // stall AR-6 exists to turn into a prompt 410.
+            // stall AR-6 exists to turn into a prompt 404.
             //
             // But leaving `unregister_link` after the drain split the two maps
             // apart, and a host that reconnects during it is clobbered in the

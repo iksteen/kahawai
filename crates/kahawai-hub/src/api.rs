@@ -92,6 +92,26 @@ pub fn router(
             state.clone(),
             require_item_access,
         ));
+    // AUTH-11: every user-facing resource below a session id crosses one
+    // ownership boundary. Keeping the routes together means a new playlist,
+    // segment, subtitle or control endpoint cannot accidentally rely on the
+    // session id as a bearer capability. Administrative routes are separate.
+    let session_resources = Router::new()
+        .route(
+            "/api/v1/playback/sessions/{id}",
+            axum::routing::delete(end_session),
+        )
+        .route("/api/v1/playback/sessions/{id}/stream", get(stream_session))
+        .route(
+            "/api/v1/playback/sessions/{id}/progress",
+            post(post_progress),
+        )
+        .route("/api/v1/playback/sessions/{id}/seek", post(seek_session))
+        .route("/api/v1/playback/sessions/{id}/{file}", get(session_file))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            require_session_owner,
+        ));
     let protected = Router::new()
         .route("/api/v1/collections", get(list_collections))
         .route("/api/v1/libraries", get(list_libraries))
@@ -106,20 +126,9 @@ pub fn router(
         .route("/api/v1/prefs", get(get_prefs).put(put_pref))
         .route("/api/v1/events", get(events))
         .route("/api/v1/playback/sessions", post(start_session))
-        .route(
-            "/api/v1/playback/sessions/{id}",
-            axum::routing::delete(end_session),
-        )
-        .route("/api/v1/playback/sessions/{id}/stream", get(stream_session))
-        .route(
-            "/api/v1/playback/sessions/{id}/progress",
-            post(post_progress),
-        )
-        .route("/api/v1/playback/sessions/{id}/seek", post(seek_session))
-        .route("/api/v1/playback/sessions/{id}/{file}", get(session_file))
-        // Merged BEFORE this layer, so `require_auth` wraps the item
-        // group from outside and its Claims extension is present by the
-        // time `require_item_access` looks for it.
+        // Merged BEFORE this layer, so `require_auth` wraps both inner
+        // authorization groups and installs Claims before either runs.
+        .merge(session_resources)
         .merge(items)
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -254,22 +263,11 @@ fn internal(e: impl std::fmt::Display) -> ApiError {
     (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
 }
 
-/// A session that existed and no longer does — reaped for idleness
-/// (HUB-18), ended by the user, or lost with its module or the hub.
-///
-/// **410, never 404.** This is the whole client contract for recovery:
-/// a client that sees GONE on any `/api/v1/playback/sessions/{id}/…`
-/// endpoint knows the session is unrecoverable and that starting a new
-/// one at its current position is the correct response. 404 stays what
-/// it should mean, a missing sub-resource — `session_file` answers it
-/// for "no such embedded track" on a perfectly live session, and that
-/// ambiguity is exactly why the two must not share a status.
-///
-/// The status carries the whole signal deliberately: a third-party
-/// client (HUB-28) must not have to parse a body, match English prose,
-/// or know how long our idle timeout happens to be this month.
+/// Session absence is deliberately indistinguishable from denied ownership.
+/// Keep races after the ownership boundary and administrative misses on the
+/// same non-oracular response too.
 fn session_gone() -> ApiError {
-    (StatusCode::GONE, "no such session".into())
+    hidden("session")
 }
 
 /// The token as a client presents it: Authorization header first, the
@@ -400,6 +398,30 @@ async fn require_auth(
         )
     })?;
     req.extensions_mut().insert(claims);
+    Ok(next.run(req).await)
+}
+
+/// AUTH-11: one ownership check for every user-facing session resource.
+///
+/// Missing and foreign ids deliberately have the same 404 response. A caller
+/// cannot use stream/control/artifact routes to discover another user's live
+/// session ids. A session disappearing after this check gets the same response.
+async fn require_session_owner(
+    State(state): State<AppState>,
+    axum::extract::Path(params): axum::extract::Path<std::collections::HashMap<String, String>>,
+    axum::Extension(claims): axum::Extension<crate::auth::Claims>,
+    req: Request,
+    next: Next,
+) -> Result<Response, ApiError> {
+    let id = params.get("id").map(String::as_str).unwrap_or_default();
+    let owned = state
+        .sessions
+        .get(id)
+        .is_some_and(|session| session.user_id == claims.sub);
+    if !owned {
+        tracing::debug!(user = %claims.username, session = %id, "session hidden by ownership");
+        return Err(hidden("session"));
+    }
     Ok(next.run(req).await)
 }
 
@@ -3101,9 +3123,6 @@ async fn post_progress(
     Json(body): Json<ProgressRequest>,
 ) -> Result<Json<Value>, ApiError> {
     let session = state.sessions.get(&id).ok_or_else(session_gone)?;
-    if session.user_id != claims.sub {
-        return Err((StatusCode::FORBIDDEN, "not your session".into()));
-    }
     session.touch();
     // Pacing (§4.6): the worker throttles its lead over this position.
     state

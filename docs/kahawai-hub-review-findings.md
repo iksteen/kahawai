@@ -195,17 +195,14 @@ they are usually the only clue anyone gets — so the fix belongs at the source.
 The pattern to copy is already here: `item_artwork` logs the error and returns
 a fixed `"artwork unavailable"`, citing SEC-WEB-7.
 
-## 7. `seek` and `end` take a session id and no owner
+## 7. `seek` and `end` take a session id and no owner — resolved
 
-`end_session` and `seek_session` destructure only `Path(id)`. `post_progress`
-rejects `session.user_id != claims.sub` with 403. So any authenticated account
-holding a session ULID can restart another user's pipeline or end their
-session, while the third endpoint on the same resource refuses.
-
-Bounded by ULID unguessability, and the ids only ever go to their owner — a
-capability rather than an open door. But the asymmetry looks unintended, and
-`end_session` is one of the ways a session dies with nothing recording who did
-it.
+All user-facing routes below a session id now cross one ownership middleware,
+including stream, playlist, segment, subtitle, seek, progress and end. Missing
+and foreign live ids are the same byte-for-byte 404; administrative session
+routes remain separately administrator-gated. `direct_play_ranges_end_to_end`
+exercises every route shape with two users and then proves the owner's session
+was not touched.
 
 ## 8. Ours, recorded here because it is a rule about your constants
 

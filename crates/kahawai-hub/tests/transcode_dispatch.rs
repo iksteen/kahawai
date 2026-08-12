@@ -532,9 +532,9 @@ async fn dispatches_encode_session_to_transcoder() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
     let resp = api.clone().oneshot(get(stream_url)).await.unwrap();
-    // GONE: the transcoder's slot went back to the pool with the session,
-    // so a client must negotiate a new one rather than retry this URL.
-    assert_eq!(resp.status(), StatusCode::GONE);
+    // 404: the transcoder's slot went back to the pool with the session, so a
+    // client must negotiate a new one rather than retry this URL.
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
 /// Router with default admin plumbing for tests that don't exercise it.

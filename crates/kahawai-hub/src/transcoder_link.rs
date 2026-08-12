@@ -317,7 +317,7 @@ impl TranscoderLink for TranscoderLinkService {
                 // running still point at a pipeline that died with it, and
                 // rescheduling is the only thing that moves them. Returning
                 // here left them `active` against a dead pipeline: the ping
-                // kept succeeding, so no 410 and no client recovery, and the
+                // kept succeeding, so no 404 and no client recovery, and the
                 // picture was frozen for good rather than for the two seconds
                 // a reschedule costs. Their slots stayed booked on the
                 // reconnected box, too.

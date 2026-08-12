@@ -11,17 +11,13 @@ import {
   startRetry,
 } from '../src/recovery.ts'
 
-test('only 410 means the session is gone', () => {
+test('only 404 means the session is gone', () => {
   assert.equal(isSessionGone({ status: SESSION_GONE }), true)
-  // 404 on a session path is a missing sub-resource on a LIVE session
-  // ("no such embedded track"). Restarting on it would kill playback
-  // over a subtitle that was never there.
-  assert.equal(isSessionGone({ status: 404 }), false)
   assert.equal(isSessionGone({ status: 200 }), false)
   assert.equal(isSessionGone({ status: 409 }), false)
-  // Every case above sits BELOW 410, so `>= 410` passed them all: a rate
-  // limit or a hub error would have been read as a session that is gone,
-  // and answered by restarting the pipeline.
+  assert.equal(isSessionGone({ status: 410 }), false)
+  // Do not read every later error as absence: a rate limit or a hub error
+  // must not be answered by restarting the pipeline.
   assert.equal(isSessionGone({ status: 429 }), false)
   assert.equal(isSessionGone({ status: 500 }), false)
   // A network failure resolves to undefined — not a dead session.
@@ -76,7 +72,7 @@ test('the guard remembers more than one key at a time', () => {
 
 test('only 503 means the machine holding the file is away', () => {
   // The player branches on this to decide between standing by and reporting
-  // that playback stopped. Reading 410 here — the other status the contract
+  // that playback stopped. Reading 404 here — the other status the contract
   // names — turns a wait into "Playback stopped", which is the disagreement
   // the stand-by work exists to remove.
   assert.equal(isSourceOffline({ status: SOURCE_OFFLINE }), true)
@@ -93,12 +89,12 @@ test('only 503 means the machine holding the file is away', () => {
   assert.equal(isSourceOffline(null), false)
 })
 
-test('a thrown failure says the session is gone only on 410', () => {
+test('a thrown failure says the session is gone only on 404', () => {
   assert.equal(isSessionDead({ status: SESSION_GONE }), true)
   assert.equal(isSessionDead({ status: SOURCE_OFFLINE }), false)
-  assert.equal(isSessionDead({ status: 404 }), false)
-  // Nor "any 4xx from 410 up": a 429 restarts a pipeline that was only
-  // being rate-limited, which is the conflation this module forbids.
+  assert.equal(isSessionDead({ status: 410 }), false)
+  // Nor "any later 4xx": a 429 restarts a pipeline that was only being
+  // rate-limited, which is the conflation this module forbids.
   assert.equal(isSessionDead({ status: 429 }), false)
   assert.equal(isSessionDead({ status: 451 }), false)
   assert.equal(isSessionDead(undefined), false)

@@ -282,10 +282,10 @@ export default function AlbumPlayer({
   const activeSession = slots.current[active].session
   const idleSession = slots.current[1 - active].session
 
-  /// The hub answered 410: this session is gone and no ping will bring
+  /// The hub answered 404: this session is gone and no ping will bring
   /// it back. A direct-play music session is cheap to rebuild — a lease,
   /// not a pipeline — so take a fresh one and put the playhead back where
-  /// it was. Nothing here knows how long a session may idle; the 410 is
+  /// it was. Nothing here knows how long a session may idle; the 404 is
   /// the entire trigger (see recovery.ts).
   /// Not while the queue is paused: a restart there spends a lease on
   /// audio nobody is listening to, and the fresh session goes idle and
@@ -603,7 +603,7 @@ export default function AlbumPlayer({
                   resumeAt.current = null
                 }}
                 // The element reports a failure with no status of its own,
-                // so ask the hub what kind it was — 410 means the session
+                // so ask the hub what kind it was — 404 means the session
                 // went away, anything else is a real media fault.
                 onError={() => {
                   const s = slots.current[which].session

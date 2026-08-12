@@ -138,17 +138,19 @@ marked in that document.
       requires an HTTPS public URL, which determines the canonical Origin and
       enables `Secure` cookies; forwarded scheme/host values are trusted only
       from configured trusted proxies
-- [ ] AUTH-11 Put one owner check in front of every user session resource:
-      stream, playlist, segment, subtitle, seek, progress and end. A missing or
-      foreign session returns the same 404; administrative session routes remain
-      separately administrator-gated
+- [x] AUTH-11 One owner middleware wraps every user-facing session resource:
+      stream, playlist, segment, subtitle, seek, progress and end. Missing and
+      foreign live ids return the same 404 body; administrative session routes
+      remain separately administrator-gated. The web player's recovery contract
+      follows the owner-scoped 404 rather than retaining the former 410 oracle
 - [~] AUTH-12 Setup already becomes inaccessible after the first administrator
       is created and compares token digests rather than plaintext. Replace the
       current 32-bit setup token with at least 128 random bits and apply explicit
       setup throttling by trusted client IP plus a global bound; cite the current
       primary security basis for the entropy and throttling requirements. The
-      current remotely brute-forceable first-run state is an internet-exposure
-      release blocker
+      current remotely brute-forceable first-run state remains an internet-
+      exposure blocker; the maintainer explicitly deferred changing the setup
+      experience for the next non-production RC on 2026-08-12
 - [~] AUTH-13 Retain existing Argon2id hashes and adopt a documented password
       policy from current primary guidance; the proposed remaining change is a
       minimum 12 characters without composition rules instead of the current
@@ -459,8 +461,10 @@ marked in that document.
       checks, browser secret storage, setup entropy/throttling and durable
       setup closure remain. `cargo test --workspace`, formatting and clippy
       all exited 0 locally on 2026-08-09
-- [ ] CI-6 With two users, exercise every session-scoped endpoint using a
-      foreign session ID and prove all denials are indistinguishable 404s
+- [x] CI-6 `direct_play_ranges_end_to_end` creates two users and sends the
+      foreign account through stream, playlist, segment, subtitle, seek,
+      progress and end routes. Every response is byte-for-byte the same 404 as
+      an absent id, and the owner then reads and ends the still-live session
 - [ ] CI-7 Test identical paths in separate roots, root reordering, overlapping
       root rejection, protocol-version rejection, the forced rescan and
       preservation of durable identities and user state

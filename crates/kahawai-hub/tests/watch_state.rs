@@ -260,10 +260,10 @@ async fn progress_resume_played_caps_and_idle() {
         "cap of 2 sessions per user"
     );
 
-    // A LIVE session still answers 404 for a sub-resource that does not
-    // exist. This is the discrimination the recovery contract rests on:
-    // a client may only restart a session on GONE, so "no such embedded
-    // track" must never wear the same status as "no such session".
+    // A live session still answers 404 for a sub-resource that does not
+    // exist. AUTH-11 deliberately spends that distinction: session absence
+    // must be indistinguishable from a foreign live id, so clients treat a
+    // missing session resource as a reason to renegotiate.
     let resp = api
         .clone()
         .oneshot(get(format!(
@@ -274,11 +274,11 @@ async fn progress_resume_played_caps_and_idle() {
     assert_eq!(
         resp.status(),
         StatusCode::NOT_FOUND,
-        "a missing sub-resource on a live session is 404, not GONE"
+        "a missing session sub-resource is hidden"
     );
 
     // Idle reaping: stop touching; the janitor ends both within ~2 s.
-    // The reaped session answers GONE — the one signal a client needs to
+    // The reaped session answers 404 — the one signal a client needs to
     // know it should start a new session at its current position.
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
@@ -287,13 +287,13 @@ async fn progress_resume_played_caps_and_idle() {
                 .oneshot(get(format!("/api/v1/playback/sessions/{s1}/stream")))
                 .await
                 .unwrap();
-            if resp.status() == StatusCode::GONE {
+            if resp.status() == StatusCode::NOT_FOUND {
                 return;
             }
             assert_ne!(
                 resp.status(),
-                StatusCode::NOT_FOUND,
-                "a reaped session must be GONE, never 404"
+                StatusCode::GONE,
+                "session absence must not reveal a distinct gone state"
             );
             // NB: polling the stream endpoint touches the session, so
             // back off beyond the idle timeout between checks.

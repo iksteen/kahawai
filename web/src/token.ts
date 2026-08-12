@@ -9,7 +9,7 @@
 /// for <video>, <img> and EventSource, and hls.js sends it as a Bearer
 /// header from its own XHR. None of those pass through api(), so an
 /// expired token just fails the media request — and worse, makes the
-/// hub answer 401 where it would have answered 410, so session recovery
+/// hub answer 401 where it would have answered 404, so session recovery
 /// cannot see its trigger either (observed 2026-08-07: a paused film
 /// died this way and had to be restarted by hand).
 

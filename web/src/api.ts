@@ -188,7 +188,7 @@ let refreshTimer: ReturnType<typeof setTimeout> | undefined
 /// media request, hls.js stops loading, and the session it was reading
 /// goes idle and is reaped. Observed 2026-08-07: a paused film died
 /// this way, and because the expired token makes the hub answer 401
-/// where it would have answered 410, session recovery could not see
+/// where it would have answered 404, session recovery could not see
 /// its own trigger either.
 export function keepTokenFresh() {
   clearTimeout(refreshTimer)

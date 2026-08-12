@@ -8,13 +8,12 @@
 /// cannot know it either, and any behaviour that depends on guessing it
 /// breaks silently the day the constant changes.
 ///
-/// The whole signal is one status code: **410 Gone** on any
-/// `/api/v1/playback/sessions/{id}/…` endpoint means the session is
-/// unrecoverable, and the correct response is to start a new one at the
-/// current position. 404 on those paths keeps its ordinary meaning —
-/// `session_file` answers it for "no such embedded track" on a live
-/// session — so the two must never be conflated.
-export const SESSION_GONE = 410
+/// The whole signal is one status code: **404 Not Found** on a session
+/// request means the session is unavailable to this account, and the correct
+/// response for the account that held it is to start a new one at the current
+/// position. AUTH-11 deliberately makes an absent id and another user's live
+/// id indistinguishable; session ids are not bearer capabilities.
+export const SESSION_GONE = 404
 
 /// **503 Service Unavailable** on a session START means the item's bytes are
 /// on a mediahost that is not connected. Nothing is wrong with the item and
@@ -41,8 +40,8 @@ export function isSessionGone(r: { status: number } | undefined): boolean {
 
 /// True when a THROWN request failure says the session is gone. The sibling
 /// of `isSessionGone`, for the calls that reject rather than resolve — a seek
-/// or a track switch. Those catches used to report 410 to the viewer as
-/// prose, which is the one status the contract above says to act on.
+/// or a track switch. Those catches used to report session absence to the
+/// viewer as prose instead of acting on the status contract above.
 export function isSessionDead(e: unknown): boolean {
   return typeof e === 'object' && e !== null && (e as { status?: number }).status === SESSION_GONE
 }
