@@ -33,8 +33,11 @@ The audit found a strong functional candidate: the locked Rust workspace tests,
 formatting and clippy pass, and the web application builds and passes its small
 test suite. It is not yet ready for public deployment. In particular, deleted
 administrator access can survive a quick restart, session endpoints are not all
-owner-scoped, refresh rotation races, restore does not restore configuration and
-multi-root collections can alias files. The CI implementation added after the
+owner-scoped, restore does not restore configuration and multi-root collections
+can alias files. (Refresh rotation was on that list and is not any more: AUTH-4
+below is ticked, with `BEGIN IMMEDIATE` and a test that releases two callers
+together — this paragraph is the audit's summary and had not been re-read
+against the items under it.) The CI implementation added after the
 audit now includes the complete locked workspace, no-default and web gates, but
 the hosted jobs and first release run remain evidence that must be observed
 before those outcomes can be checked.
@@ -46,6 +49,13 @@ implementation whose ownership, failure and resource invariants are not encoded
 in its types. Passing playback tests therefore does not yet establish media-core
 code quality. The `GST` findings require explicit disposition in the evidence
 matrix rather than being dismissed as post-MVP cleanup.
+
+A review of the `ui-redesign` branch found eleven hub-side issues — two of them
+windows that AR-6 widened. They are written up in
+`kahawai-hub-review-findings.md` for whoever owns `crates/`, rather than carried
+as web work. Three were fixed on the branch after all, where leaving them would
+have meant shipping a client that depended on the broken behaviour; those are
+marked in that document.
 
 ## Release posture (REL)
 
@@ -420,7 +430,9 @@ matrix rather than being dismissed as post-MVP cleanup.
       with Git. All operations completed locally and in the hosted run for
       `ad8e764` on 2026-08-08
 - [x] CI-3 Web lint is scoped to `src` and `test`, excluding generated output
-      and dependencies. The stale `capsRev` calculation and `switchBurn`
+      and dependencies, and `.oxlintrc.json` carries `"ignorePatterns":
+      ["dist"]` so the exclusion holds for anything that does not go through
+      the npm script — an editor lints the workspace, not `package.json`. The stale `capsRev` calculation and `switchBurn`
       callback capture were corrected rather than suppressed, and lint exited 0
       locally and in the hosted run for `ad8e764` on 2026-08-08
 - [x] CI-4 Worker integration tests remove inherited `KAHAWAI_*` settings
@@ -532,34 +544,200 @@ matrix rather than being dismissed as post-MVP cleanup.
       current/previous-major serving and a protocol baseline used by automated
       breaking-change and version-skew checks
 
-## Web experience and performance (UX; postponed pending redesign)
+## Web experience and performance (UX; re-audited after the redesign)
 
-**Status: postponed.** A new design is in progress, so none of the current UX
-items is an MVP release blocker or authorised implementation work. Retain them
-as historical audit observations only. Once the new design lands, re-audit the
-resulting interface and replace this section rather than carrying these gates
-forward by assumption.
+**Status: re-audited.** The redesign landed on `ui-redesign`: the clickable
+prototype in `web-mockup/` was ported screen by screen, and this section
+replaces the postponed one rather than inheriting its gates, as the postponed
+version instructed. Where the built UI is knowingly narrower than the design,
+or where the design assumed data the API does not carry, the entry lives in
+`docs/kahawai-ui-checklist.md` — that ledger is the design-vs-built record;
+this section is the release gate.
 
-- [ ] UX-1 Replace silently swallowed request and save failures with an error
+Two of the five are now answered by measurement. Two were written as proposals
+pending a live pass and are restated as what was actually observed rather than
+promoted or ticked. One is unchanged.
+
+- [x] UX-1 Replace silently swallowed request and save failures with an error
       boundary plus actionable inline/toast retry states; preserve useful errors
-      across login refresh and playback recovery
+      across login refresh and playback recovery.
+      An error boundary sits under every routed screen, keyed on the route so
+      leaving clears it: a render throw used to take the app with it and leave
+      a white page with nothing to report. It is the app's one class component,
+      because React offers no other way to catch a render throw, and its doc
+      names what it cannot catch — handler and promise rejections, which are
+      the `Failed` path's job.
+      A load that fails offers Try again and somewhere to go, on the item,
+      season, home and settings screens. Try again re-runs the load that
+      failed rather than a second code path.
+      Login refresh: which screen you are on was decided once, at startup, so a
+      session that died an hour in left the shell up with every panel showing
+      its own 401 and a retry that could never work. Clearing the tokens now
+      reaches the shell, which goes to sign-in and says why, and the route is
+      untouched so signing back in returns you to the page you were reading.
+      Playback recovery: fatal `hls.js` errors are kept and named, so the loop
+      guard's refusal says WHY the restart produced nothing instead of
+      shrugging — everything except 410 and 401 used to fall off the end of
+      that handler. The unrecoverable case is a dialog with a retry, not a
+      line of text.
+      Deliberately NOT done, and the reasoning is in
+      `docs/kahawai-ui-checklist.md`: toasts carry no actions. Auditing every
+      site showed the test that discriminates is "is the control that caused
+      this still on screen?", and for almost all of them it is — so a toast
+      button would duplicate it five seconds before vanishing. The two cases
+      where the affordance genuinely was missing were given INLINE retries
+      instead, anchored to where the content is absent.
+      **This item no longer quotes a count of swallowed failures.** Three
+      attempts produced three different numbers — four, then twelve, then a
+      paragraph whose own list disagreed with its total — and one of them named
+      a site that does not exist. A total nobody can re-derive is worse than no
+      total, so what follows is the list by name, and the recipe: grep `web/src`
+      for `catch` and read each body, which is the only method that has been
+      right.
+      **Per-item tolerance, not request failures.** A malformed JSON line in a
+      cue or overlay stream (`Player.tsx`, the live-text and overlay effects), an
+      unparseable access token (`claims`), a malformed SSE hint (`openEvents`),
+      and the two `localStorage` reads for the capability mask (`loadMask`,
+      `saveMask` — these are storage, NOT codec probes, which is what an earlier
+      draft of this paragraph claimed). The surrounding stream carries on and
+      dropping one item is the design. Out of scope for this requirement.
+      **Deliberately silent, with the reason in each case.** The four track- and
+      subtitle-memory writes (`putPref`); the font list, because libass has its
+      own default; the up-next lookup; the anime view preference; the header's
+      library list; `refreshTokens`' transient failure, whose caller reports the
+      401 it could not repair; `signOut`'s call to the hub, fire-and-forget
+      because the browser's copies are already gone; `postProgress` and
+      `endSession`, which run on unload where there is nowhere to put a message;
+      and `startPlaybackSession`'s own prefs read WHEN its caller asks for
+      quiet, which is the automatic recovery and the stand-by retry — the latter
+      runs every five seconds for as long as a host is away, and a report there
+      is a toast on a timer about weather its own dialog is already describing.
+      Quiet is opt-in and the default reports: the first cut had it the other
+      way round and took the report away from three deliberate presses — a Play
+      in the season view, an Apply in the capability dialog, a Try again — that
+      read prefs through this function and nowhere else.
+      **Newly found and NOT closed:** `syncOrigin` gives up after three attempts
+      with no report, which leaves every subtitle path computing against a wrong
+      timeline origin. That is a request failure with a user-visible consequence,
+      so it is listed as open rather than accepted.
+      **Closed here.** Everything where a viewer lost something they had chosen
+      with no way to know. Preferences were the bulk of it, and were five
+      separate silent catches: now one `prefsOrNone` helper that keeps the
+      empty-list fallback — a page rendering on source order beats one that does
+      not render — and says what happened. What was being lost: the audio track
+      last chosen, the remembered subtitle track, the per-media-type language
+      wishlist, and the bandwidth cap typed into Settings. Beside those: the
+      library page's own details, whose absence left a music library laid out as
+      films under the title "Library"; and BOTH subtitle rendering paths, styled
+      and image, where there is no `.vtt` fallback to inherit — the `<track>`
+      renders only for `delivery === 'text'` — so a failed feed was simply no
+      subtitles, indistinguishable from a track that never had any.
+      **Known and not fixed, found while doing this:** when a styled-subtitle
+      tap dies AFTER its header, the renderer already exists and the hub's copy
+      is fetched on top of it, so the overlap is drawn twice. Gating the
+      fallback on the renderer was tried and is worse — a canvas holding the few
+      cues that arrived, a complete copy on the hub untouched, and silence. The
+      fix is for the feed to be able to replace a renderer rather than only
+      append to one.
+      **A known limit on where the player can report.** It uses `showNote`
+      rather than `notify` because the toast host is a sibling of the element
+      that goes fullscreen, so a toast raised there is painted nowhere. But
+      `showNote` is dropped while a stand-by or playback-stopped dialog is up,
+      and lost if the player unmounts before it renders. Neither reporter covers
+      every case; the fix is to paint the notice host inside the fullscreen
+      subtree, which is a change to the shell and not to these call sites.
+      Recorded rather than done.
 - [ ] UX-2 Proposal pending live UI verification: exercise library, provider,
       satellite, scan and session views under loading, empty, degraded and
       offline conditions; record what is actually absent, then add only the
-      missing intentional states accepted into MVP scope
+      missing intentional states accepted into MVP scope.
+      Exercised, and what it found is fixed. The recurring fault was one shape,
+      in five places: **a failure rendered as an empty success.** A shelf whose
+      fetch failed became an empty shelf and empty shelves are dropped, so a
+      library vanished from the home screen without a word. Continue-watching
+      failing left no row, which reads as nothing on the go. A cross-library
+      search turned every failure into an empty result, so a dead hub was
+      indistinguishable from nothing matching. Settings rendered every control
+      at its default, which reads as "these are your settings". Each of those
+      now says what happened, and the search says it once, after every library
+      has answered, so it can tell a bad connection from one bad library.
+      Loading: the home screen shows skeletons per shelf the moment the library
+      list is known and fills them in independently — it used to wait on the
+      slowest library and show nothing, which a GPRS simulator made obvious and
+      a LAN never could. Ghosts sit at half strength and do NOT show the
+      missing-artwork mark, and a picture still in flight is dimmer than one
+      that is genuinely absent; three states, three appearances.
+      Degraded: an offline collection is marked on its library row; a mediahost
+      that could not read files says so on the satellite itself (MH-8, count
+      only — see below); a satellite lost mid-playback is handled and exercised
+      against the live fleet (AR-6).
+      Offline: `api()` throws `Offline` on a network failure, so a dead hub
+      reads as "Could not reach the hub." rather than `TypeError: Failed to
+      fetch`, which is what it used to show people.
+      Left as accepted gaps rather than built: a home screen sitting idle says
+      nothing, because nothing is wrong until you ask for something and a
+      heartbeat would be machinery for a state you find the moment you act.
+      The library grid — the biggest screen, and virtualised — has NOT been
+      exercised under a slow link; its reserved scroll height comes from
+      measuring one cell, and how that behaves when cells arrive slowly is
+      unknown. A scan that cannot run at all has no signal to show: the
+      protocol carries per-file errors only, and `FileError` is logged and
+      never stored, so the chip can give a count but not which files.
+      Unchecked for the grid and the scan-level signal, not for the rest
 - [ ] UX-3 Proposal pending an interactive accessibility pass: verify keyboard
       navigation, focus restoration, fullscreen escape, labels for glyph-only
       controls, meaningful artwork alternatives where appropriate and
-      responsive player behaviour; turn reproduced failures into named gates
-- [ ] UX-4 Lazy-load administration, settings, player and subtitle rendering;
-      load JASSUB/WASM only for playback modes that need it
-- [ ] UX-5 Measure the initial application payload and approve a budget against
+      responsive player behaviour; turn reproduced failures into named gates.
+      Unaudited. Nothing in the redesign was verified with a keyboard-only run
+      or a screen reader (`UI-17`). Keyboard reachability was preserved by
+      construction where a pointer-only gesture was introduced — clicking a
+      language pill still promotes it, the subtitle-fallback rows take the
+      arrow keys, and a lane arrow at its limit is disabled rather than removed
+      so it keeps its place in the tab order — and glyph-only controls carry
+      titles. None of that is an audit. This item is unchanged in substance
+- [~] UX-4 Lazy-load administration, settings, player and subtitle rendering;
+      load JASSUB/WASM only for playback modes that need it.
+      Done, in the shape the measurement justified rather than the shape
+      proposed. The player is `lazy`, which takes `hls.js` and `jassub` with it
+      — 164 KiB gzip that browsing never fetches. Inside the player, libass is
+      imported only once a track turns out to be styled, so an audio-only or
+      plain-text evening never pulls the worker or its wasm. Verified on a live
+      hub: a first load fetches only the entry bundle and the runtime; the
+      player and jassub chunks arrive on play; a styled track then renders
+      through libass. Administration and settings were split too and put back
+      — 9 KiB of an 83 KiB bundle, in exchange for a chunk request on opening
+      either (`UI-18`). So two of the four named here are done and two were
+      tried and deliberately reverted — which is a partial outcome, not a met
+      gate, and it was ticked anyway. `[~]` until whoever owns the gate either
+      accepts the narrower scope or asks for the split back
+- [~] UX-5 Measure the initial application payload and approve a budget against
       startup latency on the supported client/network envelope. The proposed
-      ceiling is 200 KiB gzip excluding documented player/WASM chunks. At
-      `7c0a5f5`, the initial JavaScript measured 245,213 bytes gzip plus roughly
-      12 KiB CSS; that measurement is evidence for the decision, not a failure
-      until the budget is accepted. Once accepted, fail the production check on
-      an unapproved regression
+      ceiling is 200 KiB gzip excluding documented player/WASM chunks.
+      Measured, and under the proposed ceiling. **A first load is 100,512 bytes
+      (98.2 KiB) of code and markup, against a 200 KiB ceiling** — 91,789 bytes
+      gzip of entry JavaScript, a 361-byte preloaded runtime chunk, 8,014 bytes
+      of CSS and the 349-byte document, read off the wire with
+      `Accept-Encoding: gzip`. The lazy player chunk is a further 163,161 bytes
+      gzip and is excluded by the ceiling's own terms.
+      Re-take this rather than quote it. It has been wrong in this file three
+      times, each time low, because the number was copied forward while the
+      bundle grew: `for a in $(curl -s localhost:8420/app/ | grep -oE
+      'assets/[^"]+'); do curl -s -H 'Accept-Encoding: gzip' -o /dev/null -w
+      '%{size_download}\n' localhost:8420/app/$a; done`. The earlier figure — 245,213 bytes at `7c0a5f5` — was a build
+      report, not a measurement: the hub ignored `Accept-Encoding` and served
+      every asset uncompressed, so nothing had ever actually been sent gzipped
+      and the budget was being compared against a number nobody served. With
+      compression on the web routes and the player split out, the wire agrees
+      with the build. Remaining before this can be a gate: accept the ceiling,
+      and fail the production check on an unapproved regression. Neither has
+      happened — nothing in `scripts/` measures the bundle and no CI job
+      compares it against a budget — so a regression still ships silently and
+      the item is `[~]`, not `[x]`. The measurement is the part that is done.
+      Note for whoever accepts it: on the home screen, code is no longer the
+      cost. That screen also fetches 59 artwork requests totalling 2.05 MB,
+      because `card` artwork is generated at 480 px and displayed at 128 px on
+      a dpr-1 display (`UI-16`). A 200 KiB code budget is worth having, and it
+      governs about four per cent of what a first visit downloads
 
 ## MVP exit criteria
 

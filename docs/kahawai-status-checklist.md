@@ -30,7 +30,14 @@ How something works and why it was built that way belong in
       replaced by direct file reads (AR-11 short-circuit); the satellite
       listener stays up so external mediahosts/transcoders dial in;
       encode work runs in the hub's supervised local workers
-- [x] AR-6 Disconnect tolerance: collections go unavailable, never deleted
+- [x] AR-6 Disconnect tolerance: collections go unavailable, never deleted.
+      A transcoder that drops has its sessions moved to another box
+      (`reschedule_for_transcoder`), and only the ones that cannot be moved
+      are ended. A mediahost has nothing to be moved to — the bytes are on
+      it — so its sessions are ended rather than left stalling on a dead
+      lease, which turns silence into the 410 the recovery contract defines.
+      Starting again then answers 503, not 409: every other refusal is about
+      the item and will refuse forever, this one is about the moment
 - [x] AR-7 Versioned protocol; Hello/HelloAck major-version gate
 - [ ] AR-8 *(optional v1.x)* Delegated direct-fetch tokens
 - [x] AR-9 Control plane client ↔ hub only
@@ -215,15 +222,47 @@ How something works and why it was built that way belong in
       OP/ED), because cost follows the COMPOSITION CHANGE RATE and
       every real script sits at 2-7% — numbers and method in the
       `assraster` module doc.
-- [x] HUB-10 Multi-user: accounts with create and delete, admin flag,
+- [x] HUB-10 Multi-user: accounts with create and delete, a settable admin
+      flag,
       per-user watch state, and per-library access grants — a
       `users.all_libraries` flag plus a `user_libraries` list
       (`hub/grants.rs`), enforced on browse, cross-library search, item
       detail, children, artwork, fonts, subtitles, collections and
       playback. Admins are not bound by grants; denials answer 404.
       Managed from the admin UI's users panel and `kahawai-users.sh`.
+      `PUT /admin/v1/users/{id}/admin` promotes and demotes
+      (`kahawai-users.sh promote|demote`). It refuses 409 on any change to the
+      requester's OWN flag, in either direction, and refuses to demote the last
+      admin, also with 409. `DELETE /admin/v1/users/{id}` answers the same way
+      for the same reasons — 409 for deleting the account you are signed in as
+      and 409 for the last admin, 404 for a stranger — so a client can tell a
+      refusal of the request from `require_admin`'s 403, which means the token
+      is not an admin at all. A refused delete ends no sessions.
+      Both directions matter: `require_admin` trusts `claims.admin` from
+      a 15-minute JWT (AUTH-2 is the fix and has not landed), so a just-demoted
+      account still holds a token saying otherwise — allowing self-promotion
+      would let it restore `is_admin` permanently, turning a bounded stale
+      claim into a durable one.
+      Grants are untouched by a demotion — the account falls back to the
+      `user_libraries` rows it already had.
       Parental control needs no separate mechanism: it is a library the
       admin composes and grants.
+      Watch state is writable without playing: `PUT
+      /api/v1/items/{id}/watched` marks an item watched or unwatched
+      (`kahawai-watched.sh`), for something seen elsewhere or a tick
+      undone. Either direction clears the resume position, since
+      "watched, and also 40 minutes in" is not a state a card can draw.
+      `play_count` only climbs — unmarking changes what is shown, not
+      what happened.
+      An `items` list marks a batch — a season, or a whole show — in one
+      call and one statement, so it cannot half-apply; the client decides
+      which episodes a season holds, because the season a viewer sees may
+      be a projection of absolute numbering (HUB-31). Every id must be the
+      addressed item or one of its children, which is what lets a single
+      access check cover the batch: access keys on
+      `COALESCE(parent_id, id)`. Ids outside it are skipped, not reported.
+      Checked by `tests/watch_mark.rs`, including that a batch cannot
+      reach into another show.
 - [x] HUB-11 Versioned HTTP/JSON API + /api/v1/events SSE channel
       (invalidation hints: scan progress, satellite connectivity,
       sessions, enrichment; cookie-authenticated for EventSource).
@@ -236,6 +275,18 @@ How something works and why it was built that way belong in
       and paging, item detail with stream info, artwork at named sizes,
       playback and admin endpoints. Client behaviour and the API shape
       are in implementation §4.4/§4.7.
+      `in_progress=true` narrows the same endpoint to what is started and
+      unfinished, most recently watched first — the continue-watching row
+      (`kahawai-list.sh -p`). Its own query shape, driven from
+      `watch_state` rather than from `items`, because the set is "rows
+      this account has a position in": 3525 items answered as 19 without
+      a candidate scan. It is not a `sort` name — the browse's watch join
+      is in the outer dressing query, and pulling it into the candidate
+      scan is the join-first shape that costs 912 ms. `sort` and `q` do
+      not apply to it; `library` still scopes it, and grants still bind
+      it. Checked by `tests/browse_in_progress.rs`, including that a
+      withheld library's item cannot appear even when the account has a
+      position in it.
 - [x] HUB-13 All hub state in embedded storage; survives restart without rescan
 - [x] HUB-14 Capability-profile negotiation: browser-probed profile with
       every play request, hub decides per stream (`negotiate.rs`,
