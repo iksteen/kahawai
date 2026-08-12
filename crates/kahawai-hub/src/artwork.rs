@@ -45,10 +45,15 @@ pub struct Artwork {
 ///
 /// Add, rename or re-number freely: the next startup drops whatever no
 /// longer appears here, and the first request for a new entry builds it.
-/// Values are generous enough for a 2× display of the element that uses
-/// them — `thumb` for the 34px search-result rows, `card` for the 220px
-/// library grid. Asking for no size still serves the original.
-pub const SIZES: &[(&str, u32)] = &[("thumb", 96), ("card", 480)];
+/// `card` and `card1x` are one poster at two densities, offered together
+/// in a `srcset` so the client picks: a 1× display showing a 128px shelf
+/// card was being sent 320×480 and scaling it down, 6× the pixels it had
+/// any use for. `card` stays sized for 2×; `card1x` covers the widest 1×
+/// use, which is the library grid rather than the narrower shelves.
+///
+/// `thumb` is for the search-result rows and is asked for on its own.
+/// Asking for no size still serves the original.
+pub const SIZES: &[(&str, u32)] = &[("thumb", 96), ("card1x", 320), ("card", 480)];
 
 /// Directory holding one size's derivatives. The pixel count is IN the
 /// name, so changing a size in [`SIZES`] renames the directory and the
@@ -82,6 +87,20 @@ impl Artwork {
     ///
     /// Best effort throughout. An unreadable cache directory costs disk,
     /// never correctness, and originals are never touched.
+    /// Write a cache file so that a reader never sees a partial one.
+    ///
+    /// A straight write to the final path is durable only if nothing interrupts
+    /// it: kill the hub or fill the disk halfway through an original and the
+    /// file exists, reads back as a complete image for ever, and is not a
+    /// derivative so the sweep below never collects it. Decoding then fails on
+    /// every request, which this branch answers with a fixed 500 — a permanent
+    /// failure for that item with no path back but deleting the file by hand.
+    fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+        let tmp = path.with_extension("part");
+        std::fs::write(&tmp, bytes)?;
+        std::fs::rename(&tmp, path)
+    }
+
     fn sweep_stale_sizes(&self) {
         let keep: Vec<String> = SIZES
             .iter()
@@ -92,6 +111,22 @@ impl Artwork {
         };
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
+            // A miss sentinel whose hour is up, and any `.part` left by a
+            // write that was interrupted. Neither is a size directory, so
+            // without this they accumulate one file per coverless poster for
+            // the life of the install.
+            if name.ends_with(".miss") || name.ends_with(".part") {
+                let stale = entry
+                    .metadata()
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|m| m.elapsed().ok())
+                    .is_some_and(|age| age > MISS_TTL);
+                if stale {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+                continue;
+            }
             if !name.starts_with("size-") {
                 continue;
             }
@@ -163,7 +198,7 @@ impl Artwork {
         // Written next to the read above, not atomically: two requests
         // racing write identical bytes, and a torn file is re-made on the
         // next miss.
-        let _ = std::fs::write(&path, &small);
+        let _ = Self::write_atomic(&path, &small);
         Ok(Some((small, "image/jpeg")))
     }
 
@@ -238,12 +273,24 @@ impl Artwork {
             .await?;
         let bytes = read_all(lease).await?;
         std::fs::create_dir_all(&self.dir)?;
-        std::fs::write(&cache_path, &bytes)?;
+        Self::write_atomic(&cache_path, &bytes)?;
         Ok(Some((bytes, ctype, cache_key)))
     }
 }
 
 impl Artwork {
+    /// `remote_poster` for the integration test that counts provider requests.
+    /// The real caller reaches it through `original`, which needs a registry, a
+    /// mediahost and a resolved item — none of which say anything about whether
+    /// a miss is remembered.
+    #[doc(hidden)]
+    pub async fn remote_poster_for_test(
+        &self,
+        poster: &str,
+    ) -> Result<Option<(Vec<u8>, &'static str, String)>> {
+        self.remote_poster(poster).await
+    }
+
     /// A poster held by the provider itself, cached like local artwork.
     async fn remote_poster(&self, poster: &str) -> Result<Option<(Vec<u8>, &'static str, String)>> {
         let cache_key = format!(
@@ -259,9 +306,37 @@ impl Artwork {
         if let Ok(bytes) = std::fs::read(&cache_path) {
             return Ok(Some((bytes, "image/jpeg", cache_key)));
         }
-        let bytes = self.enricher.fetch_poster(poster).await?;
+        // A miss is remembered for an hour, as an empty file beside the real
+        // ones. Nothing was written before, on the reasoning that an upload
+        // later should be picked up with nothing to invalidate — true, and it
+        // made every request for a coverless release an outbound provider
+        // fetch. Those go through the per-host gate one at a time, spaced
+        // seconds apart, so a shelf of coverless records could hold that queue
+        // at saturation for as long as somebody kept asking: enrichment for the
+        // whole hub starves behind it, and on the stricter providers it walks
+        // towards the ban the gate exists to avoid.
+        //
+        // An hour, because the sentinel expires: the upload is still picked up
+        // without anybody invalidating anything, just not within the minute.
+        let miss_path = self.dir.join(format!("{cache_key}.miss"));
+        if let Ok(meta) = std::fs::metadata(&miss_path)
+            && meta
+                .modified()
+                .ok()
+                .and_then(|m| m.elapsed().ok())
+                .is_some_and(|age| age < MISS_TTL)
+        {
+            return Ok(None);
+        }
+        let Some(bytes) = self.enricher.fetch_poster(poster).await? else {
+            std::fs::create_dir_all(&self.dir)?;
+            // Best effort: failing to remember a miss costs a provider request,
+            // not correctness.
+            let _ = std::fs::write(&miss_path, []);
+            return Ok(None);
+        };
         std::fs::create_dir_all(&self.dir)?;
-        std::fs::write(&cache_path, &bytes)?;
+        Self::write_atomic(&cache_path, &bytes)?;
         Ok(Some((bytes, "image/jpeg", cache_key)))
     }
 }
@@ -283,6 +358,11 @@ fn resize_to(bytes: &[u8], px: u32) -> Result<Vec<u8>> {
         .context("encoding resized artwork")?;
     Ok(out.into_inner())
 }
+
+/// How long a provider's "no poster" answer is remembered. Long enough that a
+/// browse cannot hammer the outbound gate, short enough that an artwork upload
+/// appears without anybody clearing a cache.
+const MISS_TTL: std::time::Duration = std::time::Duration::from_secs(3600);
 
 /// Scheme marking a `poster_path` that names a file in a collection
 /// rather than a provider's own URL.

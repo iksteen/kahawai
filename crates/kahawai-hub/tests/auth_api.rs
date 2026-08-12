@@ -225,8 +225,8 @@ async fn setup_then_auth_flow() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 
-    // Embedded SPA: / redirects, /app/ serves the shell, client routes
-    // fall back to it, hashed assets are immutable.
+    // Embedded SPA: / redirects, /app/ serves the shell, and client routes fall
+    // back to it — but a missing ASSET must not.
     let resp = api
         .clone()
         .oneshot(Request::get("/").body(Body::empty()).unwrap())
@@ -246,6 +246,29 @@ async fn setup_then_auth_flow() {
             .unwrap();
         assert!(String::from_utf8_lossy(&body).contains("kahawai"));
     }
+
+    // A content-hashed chunk that this build does not embed is a 404, never the
+    // shell. Answering it with `index.html` and a 200 is what broke every tab
+    // that was open across a hub upgrade: the app code-splits its player, so
+    // pressing Play fetched a hash the new binary no longer had, the browser
+    // got HTML where a module was promised, and `React.lazy` caches that
+    // rejection for the life of the page — the error boundary's Try again could
+    // never work. The client turns this 404 into one reload; it cannot do that
+    // for a 200.
+    let resp = api
+        .clone()
+        .oneshot(
+            Request::get("/app/assets/Player-NOTINTHISBUILD.js")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "a missing asset must not fall back to the SPA shell"
+    );
 }
 
 /// Router with default admin plumbing for tests that don't exercise it.
@@ -1006,10 +1029,49 @@ async fn admin_deletes_users() {
     );
     // Nor may an admin delete themselves: it would revoke the token
     // mid-request, and for the only admin there is no way back.
+    //
+    // CONFLICT, not FORBIDDEN — which is the point of the pair. The assertion
+    // above is `require_admin` turning away a token that is not an admin at
+    // all; this is an admin whose request is refused by the state. Sharing one
+    // status meant a client could not tell "re-authenticate" from "pick a
+    // different account".
     assert_eq!(
         del(admin_token.clone(), admin_id.clone()).await.status(),
-        StatusCode::FORBIDDEN
+        StatusCode::CONFLICT
     );
+    // And the last-admin refusal over HTTP, which was only ever asserted against
+    // `Auth` directly — the same gap that left the admin-flag route's status
+    // unpinned. Reachable by the stale-claim route: promote bob, take a token
+    // while it says `admin: true`, demote bob again. Aiming a delete at the
+    // remaining admin then passes `require_admin` on the stale claim and passes
+    // the self-guard, so it lands on this refusal.
+    auth.set_admin(&victim, true).await.unwrap();
+    let bob_admin_token = auth.login("bob", "hunter22222").await.unwrap().access_token;
+    auth.set_admin(&victim, false).await.unwrap();
+    let resp = del(bob_admin_token.clone(), admin_id.clone()).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::CONFLICT,
+        "refusing the last admin is a conflict, not the 403 that means \
+         'your token is not an admin'"
+    );
+    let body = String::from_utf8(
+        axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(
+        body.contains("last admin"),
+        "and it says which conflict, since the self-guard shares the status: {body}"
+    );
+    let still: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE is_admin = 1")
+        .fetch_one(&db)
+        .await
+        .unwrap();
+    assert_eq!(still, 1, "nothing was deleted");
+
     assert_eq!(
         del(admin_token.clone(), "nobody".into()).await.status(),
         StatusCode::NOT_FOUND

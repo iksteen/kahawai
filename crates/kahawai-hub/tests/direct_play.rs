@@ -261,20 +261,13 @@ async fn direct_play_ranges_end_to_end() {
     // gets GONE and knows to start a new one rather than to give up.
     assert_eq!(resp.status(), StatusCode::GONE);
 
-    // Kill the link: new sessions must fail with "no source available".
-    drop(tx);
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while registry.is_connected("01HOST") {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .unwrap();
+    // AR-6, the mediahost half. Start one more session and leave it running,
+    // so the disconnect has something to act on.
     let resp = api
         .clone()
         .oneshot(
             Request::post("/api/v1/playback/sessions")
-                .header("authorization", bearer)
+                .header("authorization", &bearer)
                 .header("content-type", "application/json")
                 .body(Body::from(format!(
                     "{{\"item_id\":\"{item_id}\",\"mode\":\"direct\"}}"
@@ -283,7 +276,99 @@ async fn direct_play_ranges_end_to_end() {
         )
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let doomed: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+    let doomed = doomed["session_id"].as_str().unwrap().to_string();
+
+    // Kill the link.
+    drop(tx);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while registry.is_connected("01HOST") {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap();
+
+    // The session that was reading from it is ended, not left to stall on a
+    // lease that will never produce another byte. GONE is the whole recovery
+    // contract: the client learns to start again rather than waiting.
+    let resp = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let r = api
+                .clone()
+                .oneshot(
+                    Request::get(format!("/api/v1/playback/sessions/{doomed}/file"))
+                        .header("authorization", &bearer)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            if r.status() == StatusCode::GONE {
+                return r;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the disconnect must end sessions reading from that host");
+    assert_eq!(resp.status(), StatusCode::GONE);
+
+    // And starting again says WHY it cannot: 503, not 409. Every other
+    // refusal here is about the item and will fail again forever; this one is
+    // about the moment, and a client is meant to stand by and retry. Matching
+    // that difference out of the message text is what this asserts against.
+    let resp = api
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/playback/sessions")
+                .header("authorization", &bearer)
+                .header("content-type", "application/json")
+                .body(Body::from(format!(
+                    "{{\"item_id\":\"{item_id}\",\"mode\":\"direct\"}}"
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    // Same moment, with a burned-in subtitle picked: still 503.
+    //
+    // A burn pins the source it binds to, and that refusal ("none of the
+    // sources carries this track") is permanent — 409, give up. An absent
+    // host is not that. The two used to be checked in the wrong order, so an
+    // offline host reached the burn arm first and the one condition stand-by
+    // exists for was told to give up.
+    let track_id: i64 = sqlx::query_scalar(
+        "INSERT INTO subtitle_tracks
+             (item_id, origin, module_id, collection_id, path_rel, stream_index, format)
+         VALUES (?, 'stream', '01HOST', 'movies', 'Heat (1995).mkv', 3, 'ass')
+         RETURNING id",
+    )
+    .bind(&item_id)
+    .fetch_one(&db)
+    .await
+    .unwrap();
+    let resp = api
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/playback/sessions")
+                .header("authorization", &bearer)
+                .header("content-type", "application/json")
+                .body(Body::from(format!(
+                    "{{\"item_id\":\"{item_id}\",\"subtitle_track\":{track_id}}}"
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "a burn pick must not turn an absent host into a permanent refusal"
+    );
 }
 
 /// Router with default admin plumbing for tests that don't exercise it.

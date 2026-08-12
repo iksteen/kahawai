@@ -1,19 +1,23 @@
 #!/usr/bin/env bash
 # List kahawai items.
 #
-#   kahawai-list.sh [-a host:port] <username> <password> [filter]
+#   kahawai-list.sh [-a host:port] [-p] <username> <password> [filter]
 #
 #   -a host:port  API address (default: $KAHAWAI_API or localhost:8420)
+#   -p            only what is started and unfinished, most recent first
+#                 (what the web UI's "continue watching" row is made of)
 #   password "-"  prompt for it instead of passing on the command line
 #   filter        case-insensitive title substring
 set -euo pipefail
 
 API="${KAHAWAI_API:-localhost:8420}"
+QUERY=""
 
-while getopts "a:h" opt; do
+while getopts "a:ph" opt; do
     case $opt in
         a) API="$OPTARG" ;;
-        h|*) grep '^#' "$0" | sed 's/^# \{0,1\}//' | head -7; exit 0 ;;
+        p) QUERY="?in_progress=true" ;;
+        h|*) grep '^#' "$0" | sed 's/^# \{0,1\}//' | head -9; exit 0 ;;
     esac
 done
 shift $((OPTIND - 1))
@@ -30,7 +34,7 @@ TOKEN=$(python3 -c 'import json,sys;print(json.dumps({"username":sys.argv[1],"pa
     | python3 -c 'import json,sys;print(json.load(sys.stdin)["access_token"])') \
     || { echo "login failed" >&2; exit 1; }
 
-curl -sf -H "Authorization: Bearer $TOKEN" "http://$API/api/v1/items" \
+curl -sf -H "Authorization: Bearer $TOKEN" "http://$API/api/v1/items$QUERY" \
     | python3 -c '
 import json, sys
 needle = sys.argv[1].lower()

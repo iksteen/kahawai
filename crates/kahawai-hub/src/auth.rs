@@ -51,6 +51,17 @@ pub struct Claims {
     pub exp: i64,
 }
 
+/// What `set_admin` did, or why it declined to.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SetAdmin {
+    Changed,
+    /// Already the requested state; nothing to do and nothing wrong.
+    Unchanged,
+    NoSuchUser,
+    /// Demoting this account would leave the hub with no admin at all.
+    LastAdmin,
+}
+
 #[derive(Debug, Serialize)]
 pub struct TokenPair {
     pub access_token: String,
@@ -313,6 +324,71 @@ impl Auth {
         let ttl = std::time::Duration::from_secs(ACCESS_TTL_SECS as u64);
         map.retain(|_, at| at.elapsed() < ttl);
         map.contains_key(user_id)
+    }
+
+    /// Promote or demote an account.
+    ///
+    /// Refuses to demote the last remaining admin, for the same reason
+    /// `delete_user` refuses to delete one — and the consequence is worse
+    /// than "inconvenient". `setup_required` is decided once at `Auth::new`
+    /// from `users == 0`, NOT from `admins == 0`, so a hub with no admin and
+    /// any ordinary account left does not fall back into setup mode on a
+    /// restart either. It is unadministrable until somebody edits SQLite by
+    /// hand.
+    ///
+    /// The count and the write are ONE statement on purpose. Read-then-write
+    /// let two admins demoting each other concurrently both see two admins
+    /// and both proceed, reaching zero — reproduced in
+    /// `library_grants::concurrent_mutual_demotion_keeps_an_admin`, which
+    /// found it within twenty attempts. Neither call is a self-demotion, so
+    /// the route's self-guard never fires; only atomicity helps. SQLite runs
+    /// this under its write lock, so the subquery cannot go stale between
+    /// being read and being acted on. Same shape as the `BEGIN IMMEDIATE`
+    /// AUTH-4 used for refresh rotation, which is the same class of bug.
+    ///
+    /// This one does NOT go away when AUTH-1/2/3 land: those invalidate stale
+    /// tokens, and this is a database race with no token in it.
+    ///
+    /// The outcome is a value, not a message: the caller has to answer 409
+    /// for a refusal and 404 for a missing account, and neither is something
+    /// to recover by reading prose off an error.
+    pub async fn set_admin(&self, id: &str, admin: bool) -> Result<SetAdmin> {
+        let Some(was): Option<bool> = sqlx::query_scalar("SELECT is_admin FROM users WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&self.db)
+            .await?
+        else {
+            return Ok(SetAdmin::NoSuchUser);
+        };
+        // Idempotent on purpose: a panel that shows the state and sets it
+        // with the same control will re-send what is already true. Answering
+        // before the write also keeps a no-op demotion from being refused as
+        // the last admin, which it is not — nothing would have changed.
+        if was == admin {
+            return Ok(SetAdmin::Unchanged);
+        }
+        let changed = sqlx::query(
+            "UPDATE users SET is_admin = ?1
+              WHERE id = ?2
+                AND (?1 OR (SELECT COUNT(*) FROM users WHERE is_admin = 1) > 1)",
+        )
+        .bind(admin)
+        .bind(id)
+        .execute(&self.db)
+        .await?
+        .rows_affected();
+        if changed == 1 {
+            return Ok(SetAdmin::Changed);
+        }
+        // Nothing written. On a promotion the guard is `?1 OR …` = true, so
+        // the only way to match no rows is that the id stopped existing;
+        // on a demotion it is the last-admin guard, since the row was there
+        // a moment ago.
+        Ok(if admin {
+            SetAdmin::NoSuchUser
+        } else {
+            SetAdmin::LastAdmin
+        })
     }
 
     /// Remove a user and everything that is theirs alone.

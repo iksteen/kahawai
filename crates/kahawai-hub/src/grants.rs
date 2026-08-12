@@ -140,6 +140,23 @@ AND EXISTS (SELECT 1 FROM item_libraries il
                 ON ul.library_id = il.library_id AND ul.user_id = ?1
              WHERE il.item_id = COALESCE(c.parent_id, c.id))";
 
+/// The same restriction, for the navigation library a browse row carries.
+///
+/// `VISIBLE_C` decides which items a restricted account may SEE; this decides
+/// which library such a row is allowed to NAME. Without it the row reports
+/// `MIN(library_id)` over every library the item belongs to, which for an item
+/// in a withheld and a granted library is the withheld one — a denial that
+/// answers, in the module whose whole point is that denials do not. The client
+/// then navigates there and gets a 404.
+///
+/// Correlated on `il`, so it belongs inside that subquery rather than beside
+/// it, and interpolated only when [`restricted`] said so: an unrestricted
+/// account has no `user_libraries` rows at all, so applying this to everyone
+/// would answer NULL for everyone.
+pub const VISIBLE_LIB: &str = "\
+AND EXISTS (SELECT 1 FROM user_libraries ul
+             WHERE ul.library_id = il.library_id AND ul.user_id = ?1)";
+
 /// Every account with its access, for the admin panel. Sorted by name,
 /// which is how the panel lists them and how a diff between two hubs
 /// stays readable.

@@ -10,6 +10,8 @@
 #   list                          accounts, and what each may see
 #   create <user> <pass> [admin]  new account (open until you say otherwise)
 #   delete <user>                 remove it, its watch state and its sessions
+#   promote <user>                make it an admin
+#   demote <user>                 back to an ordinary account, bound by grants
 #   open <user>                   every library, including ones made later
 #   close <user>                  nothing at all
 #   grant <user> <library>        add one library (by name or id)
@@ -124,6 +126,16 @@ elif cmd == "delete":
         sys.exit("usage: delete <user>")
     r = call("DELETE", "/admin/v1/users/%s" % find(args[0])["id"])
     print("deleted %s (%d session(s) ended)" % (args[0], r["sessions_ended"]))
+
+elif cmd in ("promote", "demote"):
+    if not args:
+        sys.exit("usage: %s <user>" % cmd)
+    u = find(args[0])
+    # The hub refuses to strip the rights of the account you are signed in
+    # as, and refuses to demote the last admin. Both come back as 409 with
+    # the reason, so there is nothing to re-check here.
+    call("PUT", "/admin/v1/users/%s/admin" % u["id"], {"admin": cmd == "promote"})
+    print("%s is now %s" % (args[0], "an admin" if cmd == "promote" else "an ordinary account"))
 
 elif cmd in ("open", "close"):
     if not args:

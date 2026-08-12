@@ -3077,19 +3077,35 @@ impl Enricher {
 
     /// Fetch a TMDB poster (used by the artwork store when an item has
     /// no local artwork).
-    pub async fn fetch_poster(&self, poster_path: &str) -> Result<Vec<u8>> {
+    /// `Ok(None)` when the provider says there is no such image.
+    ///
+    /// A provider holding no artwork is an ANSWER, not a failure: Cover
+    /// Art Archive 404s for a release group nobody has uploaded a cover
+    /// for, which is the ordinary case for obscure records. Carried as an
+    /// `Err` it reached the client as a 500 whose body quoted the upstream
+    /// URL — a server error for a record with no sleeve, and the provider's
+    /// own address handed to whoever asked (SEC-WEB-7).
+    ///
+    /// Anything else — a timeout, a 5xx, a refused connection — stays an
+    /// `Err`, because that one really is our problem and might not be true
+    /// a minute later.
+    pub async fn fetch_poster(&self, poster_path: &str) -> Result<Option<Vec<u8>>> {
         // TMDB stores relative paths; TVDB image URLs are absolute.
         let url = if poster_path.starts_with("http") {
             poster_path.to_string()
         } else {
             format!("https://image.tmdb.org/t/p/w500{poster_path}")
         };
-        let resp = self
-            .http
-            .send(self.http.get(&url))
-            .await?
-            .error_for_status()?;
-        Ok(resp.bytes().await?.to_vec())
+        let resp = self.http.send(self.http.get(&url)).await?;
+        if matches!(
+            resp.status(),
+            reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::GONE
+        ) {
+            tracing::debug!(%url, "provider holds no poster here");
+            return Ok(None);
+        }
+        let resp = resp.error_for_status()?;
+        Ok(Some(resp.bytes().await?.to_vec()))
     }
 }
 

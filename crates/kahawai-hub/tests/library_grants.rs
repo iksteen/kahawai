@@ -492,3 +492,344 @@ async fn deleting_an_account_takes_its_grants() {
         .unwrap();
     assert_eq!(left, 0, "grants must not outlive the account");
 }
+
+/// Promotion and demotion (HUB-10). The endpoint exists so an operator can
+/// hand out admin rights from the panel; the reason it needs tests is the
+/// two ways it must refuse, because both of them are how a hub ends up with
+/// nobody who can administer it.
+#[tokio::test]
+async fn admin_rights_are_grantable_but_not_removable_from_yourself() {
+    let h = harness().await;
+    let boss_id: String = sqlx::query_scalar("SELECT id FROM users WHERE username = 'boss'")
+        .fetch_one(&h.db)
+        .await
+        .unwrap();
+    let is_admin = |id: String| {
+        let db = h.db.clone();
+        async move {
+            sqlx::query_scalar::<_, bool>("SELECT is_admin FROM users WHERE id = ?")
+                .bind(id)
+                .fetch_one(&db)
+                .await
+                .unwrap()
+        }
+    };
+    let promote = |tok: String, id: String, admin: bool| {
+        let api = h.api.clone();
+        async move {
+            call(
+                &api,
+                &tok,
+                "PUT",
+                &format!("/admin/v1/users/{id}/admin"),
+                Some(json!({ "admin": admin })),
+            )
+            .await
+            .0
+        }
+    };
+
+    // The obvious attack first: an ordinary account promoting itself.
+    assert_eq!(
+        promote(h.kid.clone(), h.kid_id.clone(), true).await,
+        StatusCode::FORBIDDEN,
+        "a non-admin must not be able to promote anyone, least of all itself"
+    );
+    assert!(!is_admin(h.kid_id.clone()).await);
+
+    // What the panel is for.
+    assert_eq!(
+        promote(h.boss.clone(), h.kid_id.clone(), true).await,
+        StatusCode::OK
+    );
+    assert!(is_admin(h.kid_id.clone()).await);
+
+    // Idempotent: the panel shows the state and sets it with one control,
+    // so it will re-send what is already true.
+    assert_eq!(
+        promote(h.boss.clone(), h.kid_id.clone(), true).await,
+        StatusCode::OK
+    );
+    assert!(is_admin(h.kid_id.clone()).await);
+
+    // Nobody touches their own flag, in either direction.
+    //
+    // The demotion half is the one a viewer meets: one click, in a list where
+    // every other row is somebody else. The promotion half is the one that
+    // matters, and it is not obvious — `require_admin` trusts a 15-minute JWT,
+    // so a just-demoted account still holds a token saying it is an admin.
+    // Were self-promotion allowed it could write `is_admin` back and keep it,
+    // which is a permanent escalation out of a stale claim.
+    assert_eq!(
+        promote(h.boss.clone(), boss_id.clone(), false).await,
+        StatusCode::CONFLICT,
+        "an admin must not be able to remove its own rights"
+    );
+    assert!(
+        is_admin(boss_id.clone()).await,
+        "a refused demotion must not have written anything"
+    );
+    assert_eq!(
+        promote(h.boss.clone(), boss_id.clone(), true).await,
+        StatusCode::CONFLICT,
+        "nobody sets their own admin flag, not even to the value it already has"
+    );
+
+    // A token minted while the kid IS an admin: this is the stale claim the
+    // whole guard exists for. The kid's original token says `admin: false`
+    // and would be turned away by `require_admin` before reaching the
+    // endpoint, which would prove nothing.
+    let kid_admin_token = {
+        let (status, body) = call(
+            &h.api,
+            "",
+            "POST",
+            "/api/v1/auth/token",
+            Some(json!({ "username": "kid", "password": "hunter22222hunter" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "kid must be able to log in");
+        serde_json::from_str::<Value>(&body).unwrap()["access_token"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+
+    // The escalation itself, spelled out: demote the kid, then let the kid use
+    // the token it still holds — the one that says `admin: true` — to put its
+    // own flag back. `require_admin` lets it through the door; this endpoint
+    // must not let it through the second one.
+    assert_eq!(
+        promote(h.boss.clone(), h.kid_id.clone(), false).await,
+        StatusCode::OK
+    );
+    assert!(!is_admin(h.kid_id.clone()).await);
+    assert_eq!(
+        promote(kid_admin_token.clone(), h.kid_id.clone(), true).await,
+        StatusCode::CONFLICT,
+        "a demoted account must not re-promote itself with its stale token"
+    );
+    assert!(
+        !is_admin(h.kid_id.clone()).await,
+        "the refused self-promotion must not have written anything"
+    );
+    // Put it back so the rest of the test reads as before.
+    assert_eq!(
+        promote(h.boss.clone(), h.kid_id.clone(), true).await,
+        StatusCode::OK
+    );
+
+    // Demoting somebody else is allowed, and there is still an admin left.
+    assert_eq!(
+        promote(h.boss.clone(), h.kid_id.clone(), false).await,
+        StatusCode::OK
+    );
+    assert!(!is_admin(h.kid_id.clone()).await);
+    let admins: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE is_admin = 1")
+        .fetch_one(&h.db)
+        .await
+        .unwrap();
+    assert_eq!(admins, 1);
+
+    // The last-admin backstop IS reachable over HTTP, by the same stale-token
+    // route as the escalation above: the kid was an admin, still holds the token
+    // that says so, and the boss is now the only admin left. Demoting the boss
+    // is not a self-change, so it passes that guard and lands on this one. An
+    // earlier comment here said it could not be reached and asserted the enum
+    // directly instead, which left the handler's own status unpinned.
+    let (status, body) = call(
+        &h.api,
+        &kid_admin_token,
+        "PUT",
+        &format!("/admin/v1/users/{boss_id}/admin"),
+        Some(json!({ "admin": false })),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "refusing the last admin is a conflict, not a 403 — that is what
+         `require_admin` says when the token is not an admin at all"
+    );
+    assert!(
+        body.contains("last admin"),
+        "and it says which conflict, since the self-guard shares the status: {body}"
+    );
+    assert!(is_admin(boss_id.clone()).await, "nothing was written");
+
+    // Still asserted at the layer below, so it stays true for any caller that
+    // does not go through the handler.
+    let dir = tempfile::tempdir().unwrap();
+    let auth = kahawai_hub::auth::Auth::new(h.db.clone(), dir.path())
+        .await
+        .unwrap();
+    assert_eq!(
+        auth.set_admin(&boss_id, false).await.unwrap(),
+        kahawai_hub::auth::SetAdmin::LastAdmin
+    );
+    assert!(is_admin(boss_id).await);
+
+    // And a stranger is a 404, not a silent success.
+    assert_eq!(
+        promote(h.boss.clone(), "nope".to_string(), true).await,
+        StatusCode::NOT_FOUND
+    );
+}
+
+/// Two admins demoting each other at the same time must not leave zero.
+///
+/// The tempting argument is that this cannot happen because nobody can demote
+/// themselves — and that is true, and not enough: neither call here IS a
+/// self-demotion, so the route's guard never fires. What used to save it was
+/// a `SELECT COUNT(*)` taken before the `UPDATE`, which both callers passed.
+///
+/// Probabilistic by nature, so it runs the race repeatedly; against the
+/// read-then-write version it reached zero within about twenty attempts.
+#[tokio::test]
+async fn concurrent_mutual_demotion_keeps_an_admin() {
+    let h = harness().await;
+    let boss_id: String = sqlx::query_scalar("SELECT id FROM users WHERE username = 'boss'")
+        .fetch_one(&h.db)
+        .await
+        .unwrap();
+
+    // Its own handle on the same pool — the race is in SQL, not in process
+    // state, so where the `Auth` came from does not matter.
+    let dir = tempfile::tempdir().unwrap();
+    let auth = std::sync::Arc::new(
+        kahawai_hub::auth::Auth::new(h.db.clone(), dir.path())
+            .await
+            .unwrap(),
+    );
+
+    for attempt in 0..30 {
+        // Both admins again at the top of every round.
+        for id in [&boss_id, &h.kid_id] {
+            sqlx::query("UPDATE users SET is_admin = 1 WHERE id = ?")
+                .bind(id)
+                .execute(&h.db)
+                .await
+                .unwrap();
+        }
+
+        let a = auth.clone();
+        let b = auth.clone();
+        let (one, two) = (boss_id.clone(), h.kid_id.clone());
+        let (r1, r2) = tokio::join!(
+            tokio::spawn(async move { a.set_admin(&two, false).await.unwrap() }),
+            tokio::spawn(async move { b.set_admin(&one, false).await.unwrap() }),
+        );
+        let (r1, r2) = (r1.unwrap(), r2.unwrap());
+
+        let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE is_admin = 1")
+            .fetch_one(&h.db)
+            .await
+            .unwrap();
+        assert_eq!(
+            left, 1,
+            "attempt {attempt}: {r1:?} / {r2:?} left {left} admins — a hub with none \
+             cannot be recovered without editing the database by hand"
+        );
+        // Exactly one of them got through; the other was told why.
+        assert!(
+            matches!(
+                (&r1, &r2),
+                (
+                    kahawai_hub::auth::SetAdmin::Changed,
+                    kahawai_hub::auth::SetAdmin::LastAdmin
+                ) | (
+                    kahawai_hub::auth::SetAdmin::LastAdmin,
+                    kahawai_hub::auth::SetAdmin::Changed
+                )
+            ),
+            "attempt {attempt}: expected one Changed and one LastAdmin, got {r1:?} / {r2:?}"
+        );
+    }
+}
+
+/// The library a browse row names must be one the caller may open.
+///
+/// An item can belong to several libraries — `library_collections` is keyed
+/// per collection, and 0036 says so explicitly. When one of those is withheld
+/// and one is granted, the row used to report `MIN(library_id)` over both,
+/// which is the withheld one whenever its id sorts first. Two things wrong at
+/// once: a denial that answers, and a client sent to a library it will be
+/// refused.
+#[tokio::test]
+async fn a_browse_row_names_only_a_library_you_may_open() {
+    let h = harness().await;
+
+    // A second library whose id sorts BEFORE the granted one, holding the
+    // same collection as L1 — so `m1` is in both and MIN prefers the withheld.
+    sqlx::query("INSERT INTO libraries (id, name, media_type) VALUES ('AAA','Withheld','movies')")
+        .execute(&h.db)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO library_collections (library_id, module_id, collection_id)
+         VALUES ('AAA','m','c1')",
+    )
+    .execute(&h.db)
+    .await
+    .unwrap();
+
+    // The kid holds L1 only. Confirm the fixture really is ambiguous.
+    let both: Vec<String> =
+        sqlx::query_scalar("SELECT library_id FROM item_libraries WHERE item_id = 'm1' ORDER BY 1")
+            .fetch_all(&h.db)
+            .await
+            .unwrap();
+    assert_eq!(both, ["AAA", "L1"], "the fixture must be in both libraries");
+
+    let named = |v: &Value| -> Vec<String> {
+        v["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|i| i["id"] == "m1")
+            .map(|i| i["library_id"].as_str().unwrap_or("null").to_string())
+            .collect()
+    };
+
+    // Every shape that can carry the column, including the one that named a
+    // library explicitly — that request agreeing with itself is the sharpest
+    // of the three.
+    for path in [
+        "/api/v1/items",
+        "/api/v1/items?library=L1",
+        "/api/v1/items?q=test",
+    ] {
+        let (status, v) = get(&h.api, &h.kid, path).await;
+        assert_eq!(status, StatusCode::OK, "{path}");
+        assert_eq!(
+            named(&v),
+            ["L1"],
+            "{path}: a restricted account must be told the library it holds"
+        );
+    }
+
+    // An unrestricted account is not narrowed by this: it may open both, so
+    // either answer is honest and it keeps the cheap MIN.
+    let (_, v) = get(&h.api, &h.guest, "/api/v1/items").await;
+    assert_eq!(named(&v), ["AAA"]);
+
+    // ...but a request that NAMES a library must be answered with that one,
+    // and only an account holding both can tell the difference. Above, the
+    // grant filter collapses the set to a single element, so the assertion
+    // passes whether or not the query prefers what was asked for — the check
+    // could not fail for the behaviour it is written about.
+    let (status, v) = get(&h.api, &h.guest, "/api/v1/items?library=L1").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        named(&v),
+        ["L1"],
+        "browsing L1 must name L1, not whichever id happens to sort first"
+    );
+    // The other way round is a CONTROL, not evidence: `AAA` is what `MIN`
+    // returns anyway, so this cannot fail for the behaviour above. It is here
+    // to kill the other wrong answer — a query that always names the library
+    // asked for by ignoring membership entirely, which the assertion above
+    // would be perfectly happy with.
+    let (_, v) = get(&h.api, &h.guest, "/api/v1/items?library=AAA").await;
+    assert_eq!(named(&v), ["AAA"], "naming AAA must not narrow it away");
+}

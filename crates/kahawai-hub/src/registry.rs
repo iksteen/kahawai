@@ -176,8 +176,11 @@ pub struct Registry {
     /// Cleared on disconnect for the same reason.
     tc_link_rate: Mutex<HashMap<String, u64>>,
     /// Admin-disabled satellites: placement skips them; active sessions
-    /// finish. ponytail: in-memory (an ops/testing toggle) — persist in
-    /// the satellites table if drain-across-restarts is ever needed.
+    /// finish. Persisted in `satellites.disabled` and read back at startup by
+    /// `load_allowlist`, so a drain survives a hub restart — the note that once
+    /// stood here calling it a throwaway in-memory toggle is what made clearing
+    /// it inside `unregister_link` look free. Only `set_disabled` and
+    /// `delete_satellite` may touch it.
     disabled: Mutex<std::collections::HashSet<String>>,
     /// Command senders for connected hosts' Link streams.
     links: Mutex<
@@ -713,9 +716,64 @@ impl Registry {
         self.links.lock().unwrap().insert(module_id.to_string(), tx);
     }
 
+    /// Drop a host's send side. Called from every teardown path.
+    ///
+    /// It does NOT touch `disabled`. That set is the admin's drain toggle,
+    /// persisted in `satellites` precisely so a box stays drained across a hub
+    /// restart (see `set_disabled`) — and clearing it here undid that on
+    /// something far more common than a restart: any disconnect. A drained
+    /// satellite that bounced came back enabled in memory while the row still
+    /// said disabled, placement started sending it work again, and the admin
+    /// panel reported it as enabled to match.
     pub fn unregister_link(&self, module_id: &str) {
         self.links.lock().unwrap().remove(module_id);
-        self.disabled.lock().unwrap().remove(module_id);
+    }
+
+    /// Drop a host's send side, but only if it is still the one `tx` opened.
+    ///
+    /// Returns whether anything was removed, so a teardown can tell "I was the
+    /// live link" from "somebody reconnected while I was dying".
+    ///
+    /// Without this, a link that died without a FIN — power, cable, wifi — sat
+    /// in its 35 s heartbeat window while the box came back, connected, and was
+    /// registered afresh; the old task's timeout then cleared the NEW link's
+    /// entries by module id. Nothing restores them: `seen` only writes
+    /// `last_seen`, which nothing reads. A healthy, heartbeating host stayed
+    /// invisible until the hub or the host restarted.
+    /// Forget a host's link AND mark it absent, as one step.
+    ///
+    /// Two calls could not hold the invariant they were written for. Between a
+    /// `remove` and a `disconnected`, the box can reconnect and register: the
+    /// late `disconnected` then flips the NEW entry to absent, and nothing
+    /// sets it back — `seen` only writes `last_seen`. The host goes on
+    /// heartbeating into a hub that will not offer its files, will not send it
+    /// another manifest, and so will never scan it again.
+    ///
+    /// Both locks, `connected` before `links` is released, so no observer sees
+    /// "present but unreachable" — the state that reads as a 409 give-up about
+    /// a healthy host.
+    pub fn unregister_link_if_current(
+        &self,
+        module_id: &str,
+        tx: &tokio::sync::mpsc::Sender<Result<kahawai_proto::v1::HubToHost, tonic::Status>>,
+    ) -> bool {
+        let mut links = self.links.lock().unwrap();
+        match links.get(module_id) {
+            Some(current) if current.same_channel(tx) => {
+                links.remove(module_id);
+                if let Some(s) = self.connected.lock().unwrap().get_mut(module_id) {
+                    s.connected = false;
+                    s.last_seen = SystemTime::now();
+                }
+                drop(links);
+                tracing::info!(%module_id, "satellite disconnected");
+                self.emit(serde_json::json!({
+                    "kind": "satellite", "module_id": module_id, "connected": false,
+                }));
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Send a command down a connected host's Link stream.
@@ -1793,13 +1851,31 @@ impl Registry {
             .insert(module_id.to_string(), tx);
     }
 
-    pub fn unregister_tc_link(&self, module_id: &str) {
-        self.tc_links.lock().unwrap().remove(module_id);
-        self.tc_load.lock().unwrap().remove(module_id);
-        // The measured pace SURVIVES a disconnect — it describes the
-        // hardware, which is still whatever it was. The link rate does
-        // not: it described a connection that no longer exists.
-        self.tc_link_rate.lock().unwrap().remove(module_id);
+    /// Drop a transcoder link only if it is still the one the caller owns.
+    ///
+    /// The twin of `unregister_link_if_current`, and it was missed when that
+    /// one was written. A transcoder that dies without a FIN sits in its
+    /// 35-second heartbeat window; if the box comes back inside it, the old
+    /// task's teardown deleted the LIVE connection's sender, its capabilities
+    /// and its load accounting. Capabilities are sent once per connection, so
+    /// `choose` — which requires both a link and caps — never saw that box
+    /// again until the transcoder process itself restarted.
+    pub fn unregister_tc_link_if_current(
+        &self,
+        module_id: &str,
+        tx: &tokio::sync::mpsc::Sender<Result<kahawai_proto::v1::HubToTc, tonic::Status>>,
+    ) -> bool {
+        let mut links = self.tc_links.lock().unwrap();
+        match links.get(module_id) {
+            Some(current) if current.same_channel(tx) => {
+                links.remove(module_id);
+                drop(links);
+                self.tc_load.lock().unwrap().remove(module_id);
+                self.tc_link_rate.lock().unwrap().remove(module_id);
+                true
+            }
+            _ => false,
+        }
     }
 
     pub async fn send_to_tc(
@@ -2309,6 +2385,12 @@ impl Registry {
         self.allowed.remove(&fingerprint);
         self.links.lock().unwrap().remove(module_id);
         self.connected.lock().unwrap().remove(module_id);
+        // Deleting the satellite forgets the drain with it. This used to happen
+        // by accident, because `unregister_link` cleared the set as a side
+        // effect; with that gone it has to be said where it is actually true.
+        // Otherwise a re-enrolled module id came back drained in memory against
+        // a fresh row saying enabled.
+        self.disabled.lock().unwrap().remove(module_id);
         tracing::info!(%module_id, fingerprint = %fingerprint, "satellite deleted; cert no longer admitted");
         Ok(fingerprint)
     }

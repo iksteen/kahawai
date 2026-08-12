@@ -30,6 +30,26 @@ pub enum Mode {
     },
 }
 
+/// Every other refusal from `start` is about the item: it has no sources, it
+/// cannot be played, you already hold too many streams. This one is about the
+/// moment — the bytes exist, on a host that is not answering right now — and
+/// the same request may well succeed in a minute.
+///
+/// A type rather than a sentence, because the caller has to ACT on the
+/// difference: it becomes 503 at the API edge, and a client that sees 503
+/// stands by and tries again instead of giving up. Matching that distinction
+/// out of an error message would break the first time someone rewords it.
+#[derive(Debug, Clone, Copy)]
+pub struct SourceOffline;
+
+impl std::fmt::Display for SourceOffline {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("no source is currently available (mediahost offline)")
+    }
+}
+
+impl std::error::Error for SourceOffline {}
+
 /// How a remux/transcode pipeline runs. The hub always spawns the
 /// supervised worker (§1.1: a GStreamer crash kills one session, not the
 /// process — observed twice on a real library via hlssink3 panics).
@@ -518,17 +538,33 @@ impl<'a> Negotiation<'a> {
                     .sessions
                     .candidate_sources(self.registry, item_id)
                     .await?;
+                // Nothing at all first. This is the host being away, and it
+                // has to be told apart from the burn refusal below: one is a
+                // moment (503, stand by), the other is this item (409, give
+                // up). Checked in the other order, an offline host reached
+                // the burn arm — `retain` on an empty set stays empty — so
+                // the one condition stand-by exists for was the one told to
+                // give up.
+                if candidates.is_empty() {
+                    // Only "the rows exist and every host holding them is
+                    // away" is a wait. An item with no sources at all is a
+                    // permanent refusal, and telling the client to stand by
+                    // for it produced an unbounded retry.
+                    if self.sessions.has_any_source(self.registry, item_id).await {
+                        bail!(SourceOffline);
+                    }
+                    bail!("no sources for item");
+                }
                 // A burn pick pins the source it binds to: judging the
                 // others would let a cheaper copy win and silently drop
-                // the burn the user explicitly selected.
+                // the burn the user explicitly selected. Reaching here means
+                // sources DO exist and none of them carries the pinned
+                // track, which no amount of waiting fixes.
                 if self.burn_row.is_some() {
                     candidates.retain(|(parts, _)| self.pick_for(parts).is_some());
                     if candidates.is_empty() {
                         bail!("the picked subtitle track's source is not available");
                     }
-                }
-                if candidates.is_empty() {
-                    bail!("no source is currently available (mediahost offline)");
                 }
                 // Completeness first, then cost — the same rule
                 // `negotiate` already uses to choose between TS and
@@ -846,6 +882,22 @@ pub struct Sessions {
     /// Registry handle for teardown messages from the sync `end()` path
     /// (set once at startup; None only in tests without dispatch).
     registry_for_teardown: Mutex<Option<Arc<Registry>>>,
+}
+
+/// Holds a per-user admission slot for as long as a start is in flight.
+///
+/// Drop is the only exit every path shares: the thirteen early returns inside
+/// `start_inner`, the error paths, and the caller abandoning the request, which
+/// drops the whole future and runs no statement after the await.
+struct SlotGuard<'a> {
+    sessions: &'a Sessions,
+    id: String,
+}
+
+impl Drop for SlotGuard<'_> {
+    fn drop(&mut self) {
+        self.sessions.release(&self.id);
+    }
 }
 
 impl Sessions {
@@ -1202,7 +1254,46 @@ impl Sessions {
             }
         }
         if by_part.is_empty() {
-            bail!("no source is currently available (mediahost offline)");
+            bail!(SourceOffline);
+        }
+        // Two questions, two answers, from the same rows.
+        //
+        // `wanted` is every part number this item HAS, connected or not, so
+        // comparing it against the connected set answers "is a host away" — at
+        // any position. That is transient: SourceOffline, stand by, the host may
+        // come back. Dropping this in favour of a contiguity check alone was a
+        // regression: a seven-part film losing part 1 to an offline host left
+        // {2..7}, which is a perfectly contiguous run, and played from part two
+        // rebased to zero — the exact fault the check exists to stop.
+        let wanted = rows
+            .iter()
+            .filter_map(|r| r.get::<Option<i64>, _>("part"))
+            .collect::<std::collections::BTreeSet<_>>();
+        if by_part.len() != wanted.len() {
+            bail!(SourceOffline);
+        }
+        // Contiguity answers the other question: is a part MISSING ENTIRELY —
+        // renamed out of the filename fold, reconciled off disk — in which case
+        // it is absent from `wanted` too and the comparison above cannot see it.
+        // `base_ms` accumulates over the parts present, so a hole silently
+        // became a shorter film whose timeline started at zero: the seekbar
+        // reading 20:00 of a 45-minute film, and 20 minutes in really an hour
+        // and twenty.
+        //
+        // No amount of waiting fixes a hole, so this is NOT SourceOffline —
+        // answering that would put the client in a stand-by loop it retries for
+        // ever. `first > 1` catches a missing beginning; a span rather than
+        // `1..=len` because the filename parsers accept `CD0` and refusing a
+        // 0-based set would be a new failure rather than a caught one.
+        let first = *by_part.keys().next().expect("checked non-empty above");
+        let last = *by_part.keys().next_back().expect("checked non-empty above");
+        if first > 1 || last - first + 1 != by_part.len() as i64 {
+            bail!(
+                "multi-part source is incomplete: parts {first}-{last} present, \
+                 {} of {} expected",
+                by_part.len(),
+                last - first + 1
+            );
         }
         let mut parts = Vec::new();
         let mut base = 0u64;
@@ -1273,15 +1364,56 @@ impl Sessions {
         }
         // The part set (if any) as one trailing candidate, via the
         // existing assembly which already handles ordering and dedup.
-        if rows
-            .iter()
-            .any(|r| r.get::<Option<i64>, _>("part").is_some())
-            && let Ok(ps) = self.source_parts(registry, item_id).await
-            && ps.0.len() > 1
+        //
+        // `>= 1`, not `> 1`: an item whose only row carries a part number —
+        // a CD1 with no CD2 — is one playable file, and dropping it left no
+        // candidates at all. Since an empty candidate set now means "the
+        // hosts are away", that turned a complete item into a permanent
+        // stand-by the client retried for ever.
+        //
+        // Only when no whole-file candidate was found above. `source_parts`
+        // prefers a connected part-NULL row over the part set, so for an item
+        // that has both this pushed a byte-identical copy of `out[0]` — one
+        // extra query and one extra `plan_auto` per negotiation, and a
+        // candidate list that no longer means "distinct playable sources".
+        // The `!is_empty()` this replaces could never be false: every
+        // `source_parts` exit either bails or returns a non-empty vec.
+        if out.is_empty()
+            && rows
+                .iter()
+                .any(|r| r.get::<Option<i64>, _>("part").is_some())
         {
-            out.push(ps);
+            // Propagated, NOT swallowed. `let Ok(..)` turned `source_parts`'
+            // permanent refusal of an incomplete part set into no candidates,
+            // which `best_source` reads as "the rows exist and every host is
+            // away" and answers 503 — the unbounded stand-by loop that refusal
+            // exists to prevent. It only ever reached a client through the
+            // FORCED path, and the web player negotiates: every video session
+            // it starts sends no mode and came through here.
+            out.push(self.source_parts(registry, item_id).await?);
         }
         Ok(out)
+    }
+
+    /// Does this item have any source rows at all, connected or not?
+    ///
+    /// The difference between "wait, the host is away" and "there is nothing
+    /// here": `candidate_sources` returning empty cannot tell them apart, and
+    /// answering 503 to both had clients retrying a condition that no amount
+    /// of waiting fixes.
+    pub(crate) async fn has_any_source(&self, registry: &Registry, item_id: &str) -> bool {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT EXISTS (
+               SELECT 1 FROM item_sources s
+               JOIN files f ON (f.module_id, f.collection_id, f.path_rel)
+                             = (s.module_id, s.collection_id, s.path_rel)
+              WHERE s.item_id = ?)",
+        )
+        .bind(item_id)
+        .fetch_one(registry.db())
+        .await
+        .unwrap_or(0)
+            == 1
     }
 
     /// Open a read lease on an arbitrary path within a collection (also
@@ -1333,9 +1465,22 @@ impl Sessions {
                 path_rel: path_rel.to_string(),
             })),
         };
+        // A send failure here means the host went away between being judged
+        // present and being asked for bytes — a window no ordering can close,
+        // because candidate selection and this call are separated by DB work.
+        // Left as a plain error it reached `session_refusal` as 409, "give up
+        // on this item", for a source that is merely offline; the recovery
+        // contract's answer to an absent host is 503 and stand by.
         self.leases
             .establish(&token, registry.send_to_host(module_id, msg))
             .await
+            .map_err(|e| {
+                if registry.is_connected(module_id) {
+                    e
+                } else {
+                    anyhow::Error::new(SourceOffline).context(format!("{e:#}"))
+                }
+            })
     }
 
     /// Start a session for an item. With an explicit `mode` (scripts,
@@ -1375,8 +1520,20 @@ impl Sessions {
         // because that function has thirteen early returns, every one of
         // which would otherwise have to remember to give the slot back.
         self.admit(&id, user_id)?;
-        let started = self
-            .start_inner(
+        let started = {
+            // ...and a fourteenth exit a trailing statement cannot cover: the
+            // caller going away. `start_session` awaits this inline, so an
+            // abandoned request — a closed tab, or a client that gave up on a
+            // slow start — drops this future mid-`start_inner` and any code
+            // after the await simply never runs. The id stayed in `reserved`
+            // for the life of the process and went on counting, so four
+            // abandoned starts left an account unable to begin anything until
+            // the hub was restarted. Dropping is the one exit every path has.
+            let _slot = SlotGuard {
+                sessions: self,
+                id: id.clone(),
+            };
+            self.start_inner(
                 &id,
                 registry,
                 subtitles,
@@ -1389,8 +1546,8 @@ impl Sessions {
                 video_track,
                 subtitle_track,
             )
-            .await;
-        self.release(&id);
+            .await
+        };
         if let Err(e) = &started
             && let Some(data_dir) = self.scratch_root.parent()
         {
@@ -3037,13 +3194,26 @@ impl Sessions {
         n
     }
 
+    /// End every session that reads from this mediahost.
+    ///
+    /// Any part, not just the one it started on. `Session::module_id` is
+    /// `parts[start_idx].module_id`, and a multi-part source can have a host
+    /// per part — a CD1/CD2 item whose discs sit on different mediahosts is
+    /// the ordinary case, not a contrived one. Keyed on the starting part
+    /// alone, a session playing part two survived part two's host going
+    /// away, which is exactly the stall AR-6 exists to prevent.
+    ///
+    /// Deliberately generous in the other direction: a session that has
+    /// moved past a part still counts as reading from its host, because the
+    /// viewer can seek back into it. Ending the session is the honest answer
+    /// there — the alternative is a seek that fails later with no warning.
     pub fn end_for_module(&self, module_id: &str) -> usize {
         let ids: Vec<String> = self
             .active
             .lock()
             .unwrap()
             .values()
-            .filter(|s| s.module_id == module_id)
+            .filter(|s| reads_from(&s.module_id, &s.parts, module_id))
             .map(|s| s.id.clone())
             .collect();
         let n = ids.len();
@@ -3127,6 +3297,81 @@ impl Sessions {
         }
         tracing::info!(session = id, "session ended");
         true
+    }
+}
+
+/// Does this session read bytes from `module_id`?
+///
+/// Any part, not just the one it started on. `Session::module_id` is
+/// `parts[start_idx].module_id`, and a multi-part source can have a host per
+/// part — CD1 and CD2 on different mediahosts is ordinary. Keyed on the
+/// starting part alone, a session playing CD2 survived CD2's host leaving.
+///
+/// True for a part already played, on purpose: the viewer can seek back into
+/// it, so the session does still depend on that host.
+///
+/// A free function so the predicate can be tested without standing up a
+/// session: a real multi-part one is remux-only, which means GStreamer and
+/// real media to assert one boolean.
+fn reads_from(start_host: &str, parts: &[PartSource], module_id: &str) -> bool {
+    start_host == module_id || parts.iter().any(|p| p.module_id == module_id)
+}
+
+#[cfg(test)]
+mod reads_from_tests {
+    use super::{PartSource, reads_from};
+
+    fn part(host: &str) -> PartSource {
+        PartSource {
+            module_id: host.into(),
+            collection_id: "movies".into(),
+            path_rel: "x.mkv".into(),
+            size: 1,
+            base_ms: 0,
+            duration_ms: 1,
+        }
+    }
+
+    #[test]
+    fn a_session_reads_from_every_host_its_parts_live_on() {
+        // CD1 on A, CD2 on B, started on CD1.
+        let parts = [part("A"), part("B")];
+
+        assert!(reads_from("A", &parts, "A"), "the host it started on");
+        // The one that was missed: B going away used to leave this session
+        // alive on a dead lease, which is the stall AR-6 exists to prevent.
+        assert!(reads_from("A", &parts, "B"), "a later part's host");
+        assert!(!reads_from("A", &parts, "C"), "a host it never reads from");
+    }
+
+    #[test]
+    fn a_part_already_passed_still_counts() {
+        // Deliberate, and the reason the doc no longer claims to have fixed
+        // an "over-match": the position is not the whole story, because the
+        // viewer can seek back into CD1 whenever they like. Ending the
+        // session when its host leaves is the honest answer; the alternative
+        // is a seek that fails minutes later with nothing to explain it.
+        //
+        // Asked from the far side, because `reads_from` has no position to
+        // pass: a session STARTED on CD2 still reads from CD1's host. The
+        // version of this test that asked `reads_from("A", &parts, "A")` was
+        // the first assertion of the test above it word for word, and named a
+        // property this signature cannot express — an implementation that
+        // scanned only the parts from `start_idx` onwards, which is exactly
+        // the "already played does not count" mistake, passed it.
+        let parts = [part("A"), part("B")];
+        assert!(
+            reads_from("B", &parts, "A"),
+            "a session playing CD2 still depends on CD1's host: the viewer \
+             can seek back into it"
+        );
+    }
+
+    #[test]
+    fn a_single_part_session_is_unchanged() {
+        let parts = [part("A")];
+        assert!(reads_from("A", &parts, "A"));
+        assert!(!reads_from("A", &parts, "B"));
     }
 }
 

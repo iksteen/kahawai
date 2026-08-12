@@ -16,6 +16,59 @@ use tonic::{Request, Response, Status, Streaming};
 use crate::registry::Registry;
 use crate::sessions::Sessions;
 
+/// AR-6, the mediahost half. A transcoder that drops has its sessions moved
+/// to another box (`reschedule_for_transcoder`); a mediahost has nothing to
+/// be moved to, because the bytes are on it. Its leases are already dead, so
+/// the sessions reading them cannot recover — left alive they stall, and the
+/// client waits on a stream that will never produce another byte.
+///
+/// Ending them turns that silence into 410 on the next request, which is the
+/// one signal the recovery contract defines. What the client does with it is
+/// its own business: start again, and find out from THAT whether the host is
+/// back.
+fn end_sessions_on(sessions: &Sessions, module_id: &str) {
+    let ended = sessions.end_for_module(module_id);
+    if ended > 0 {
+        tracing::warn!(%module_id, ended, "mediahost lost; its sessions ended");
+    }
+}
+
+/// Forget a lost mediahost: both maps, then its sessions.
+///
+/// One function because the three teardown paths were writing the same three
+/// calls in two different orders, and the order is the whole point.
+///
+/// `links` (the send side) and `connected` (what `is_connected` answers, and so
+/// whether this host's files are offered at all) must never be left
+/// disagreeing. Split across a drain, they were: a host that reconnected in
+/// between kept `connected: true` while the late `unregister_link` deleted its
+/// fresh sender, so its files were still offered, `open_lease` failed with a
+/// plain error, and the client was told 409 — give up on this item — about a
+/// host that was healthy. It also never got another manifest, so it never
+/// scanned again.
+///
+/// Called before any drain, so nothing after it touches registry state and a
+/// reconnect cannot be clobbered.
+pub(crate) fn forget_link(
+    registry: &Registry,
+    sessions: &Sessions,
+    module_id: &str,
+    tx: &tokio::sync::mpsc::Sender<Result<HubToHost, Status>>,
+) {
+    // Only if this task's link is still the registered one. A link that dies
+    // without a FIN sits in its heartbeat window while the box comes back and
+    // registers afresh; clearing by module id then wiped the LIVE link, and
+    // nothing restores it — `seen` writes `last_seen`, which nothing reads.
+    // Sender and state together, under `links`: splitting them left a window
+    // in which the box reconnected between the two and the late `disconnected`
+    // marked the LIVE connection absent, which nothing ever undoes.
+    if !registry.unregister_link_if_current(module_id, tx) {
+        tracing::info!(%module_id, "link already replaced; leaving the new one alone");
+        return;
+    }
+    end_sessions_on(sessions, module_id);
+}
+
 pub struct MediahostLinkService {
     registry: Arc<Registry>,
     sessions: Arc<Sessions>,
@@ -96,6 +149,14 @@ pub fn local_link(
                 tracing::error!(%module_id, error = format!("{e:#}"), "handling local link message");
             }
         }
+        // Not `forget_link`: this path has no `Sessions` handle. Sessions are
+        // deliberately left alone — the in-process host's byte plane is
+        // `reads_locally`, so playback does not go through a link at all — but
+        // this is NOT only reached on shutdown: `run_local` returning an error
+        // logs and exits while the hub keeps serving, after which artwork,
+        // subtitle and scan paths that gate on `is_connected` stop working for
+        // the hub's own library with nothing to re-establish it. Recorded
+        // rather than fixed here. Both maps together, before the task returns.
         registry.unregister_link(&module_id);
         registry.disconnected(&module_id);
     });
@@ -135,7 +196,13 @@ impl MediahostLink for MediahostLinkService {
         let registry = self.registry.clone();
         let outer_subtitles = self.subtitles.clone();
         let outer_enricher = self.enricher.clone();
+        let sessions = self.sessions.clone();
         let module_id = peer.module_id.clone();
+        // Sender first, and only then "present". The reverse order left this
+        // host offered as a playback source across the renewal settlement's DB
+        // work below — SELECT, sometimes an UPDATE with an audit row — with no
+        // way to reach it, which is answered 409 rather than 503.
+        registry.register_link(&module_id, tx.clone());
         registry.connected(
             &module_id,
             &peer.module_type,
@@ -146,7 +213,6 @@ impl MediahostLink for MediahostLinkService {
         if let Err(e) = registry.settle_renewal(&module_id, &peer.fingerprint).await {
             tracing::warn!(%module_id, error = format!("{e:#}"), "renewal settlement failed");
         }
-        registry.register_link(&module_id, tx.clone());
 
         tokio::spawn(async move {
             let ack = HubToHost {
@@ -156,8 +222,7 @@ impl MediahostLink for MediahostLinkService {
                 })),
             };
             if tx.send(Ok(ack)).await.is_err() {
-                registry.unregister_link(&module_id);
-                registry.disconnected(&module_id);
+                forget_link(&registry, &sessions, &module_id, &tx);
                 return;
             }
             // Heavy messages (upserts with resolution, reconciliation)
@@ -238,9 +303,27 @@ impl MediahostLink for MediahostLinkService {
                 }
             }
             drop(work_tx);
-            let _ = worker.await; // drain in order before cleanup
-            registry.unregister_link(&module_id);
-            registry.disconnected(&module_id);
+            // Every map mutation before the drain, and none after it.
+            //
+            // Ending before the drain is the point: the link is dead at the
+            // break and nothing in the queue can revive it, but that queue
+            // holds this host's upserts and reconciliation — deepest exactly
+            // when a mediahost dies mid-scan. Ending afterwards left its
+            // sessions stalling for as long as the backlog took, which is the
+            // stall AR-6 exists to turn into a prompt 410.
+            //
+            // But leaving `unregister_link` after the drain split the two maps
+            // apart, and a host that reconnects during it is clobbered in the
+            // worse direction: `connected` says yes while `links` has lost the
+            // live sender, so the host's files are still offered, `open_lease`
+            // fails with a plain error, and `session_refusal` answers 409 —
+            // "give up on this item" — for a host that is healthy. It also
+            // never receives another manifest, so it never scans again. With
+            // the old ordering the leftover was `connected: false`, which at
+            // least produced the 503 stand-by. Safe to move because nothing in
+            // the drained queue sends to the host; it only writes the DB.
+            forget_link(&registry, &sessions, &module_id, &tx);
+            let _ = worker.await; // then drain in order, touching no maps
         });
 
         Ok(Response::new(ReceiverStream::new(rx)))
@@ -896,5 +979,84 @@ mod chunk_tests {
             Chunk::TooBig(_)
         ));
         assert!(partial.is_empty(), "the partial is dropped, not kept");
+    }
+}
+
+#[cfg(test)]
+mod forget_link_tests {
+    use super::forget_link;
+    use crate::registry::Registry;
+    use crate::sessions::Sessions;
+    use std::sync::Arc;
+
+    /// A fence, not a proof: it cannot fail for the ordering bug it was written
+    /// after, because that bug lived in the CALLER — three sites writing these
+    /// calls in two orders, one of them split across a drain. What it pins is
+    /// that the two maps are cleared by one call, so a future edit cannot put a
+    /// drain between them again without deleting this.
+    #[tokio::test]
+    async fn both_maps_are_forgotten_together() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::open(dir.path()).await.unwrap();
+        let registry = Arc::new(Registry::new(db, Default::default()));
+        let sessions = Arc::new(Sessions::new(dir.path().join("scratch")));
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        registry.connected("01HOST", "mediahost", "nas", "fp", "test");
+        registry.register_link("01HOST", tx.clone());
+        assert!(registry.is_connected("01HOST"));
+
+        forget_link(&registry, &sessions, "01HOST", &tx);
+
+        assert!(
+            !registry.is_connected("01HOST"),
+            "the state map must say gone"
+        );
+        assert!(
+            registry
+                .send_to_host("01HOST", Default::default())
+                .await
+                .is_err(),
+            "and the send side must be gone with it — a host reported present \
+             with no way to reach it is answered 409 instead of 503"
+        );
+    }
+
+    /// A dying link must not clear a live one's state.
+    ///
+    /// A drop without a FIN leaves the old task waiting out its heartbeat
+    /// window while the box comes back and registers afresh. Clearing by module
+    /// id then wiped the NEW link, and nothing puts it back — the host goes on
+    /// heartbeating into a hub that thinks it is gone.
+    #[tokio::test]
+    async fn a_replaced_link_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::open(dir.path()).await.unwrap();
+        let registry = Arc::new(Registry::new(db, Default::default()));
+        let sessions = Arc::new(Sessions::new(dir.path().join("scratch")));
+
+        let (old_tx, _old_rx) = tokio::sync::mpsc::channel(1);
+        registry.connected("01HOST", "mediahost", "nas", "fp", "test");
+        registry.register_link("01HOST", old_tx.clone());
+
+        // The box reconnects before the old task notices.
+        let (new_tx, _new_rx) = tokio::sync::mpsc::channel(1);
+        registry.register_link("01HOST", new_tx.clone());
+        registry.connected("01HOST", "mediahost", "nas", "fp", "test");
+
+        // Now the old task times out and tears down.
+        forget_link(&registry, &sessions, "01HOST", &old_tx);
+
+        assert!(
+            registry.is_connected("01HOST"),
+            "the live connection must survive its predecessor's teardown"
+        );
+        assert!(
+            registry
+                .send_to_host("01HOST", Default::default())
+                .await
+                .is_ok(),
+            "and its sender must still be reachable"
+        );
     }
 }

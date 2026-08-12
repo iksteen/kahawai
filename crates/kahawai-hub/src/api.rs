@@ -72,6 +72,10 @@ pub fn router(
     let items = Router::new()
         .route("/api/v1/items/{id}", get(item_detail).fallback(item_query))
         .route("/api/v1/items/{id}/children", get(item_children))
+        .route(
+            "/api/v1/items/{id}/watched",
+            axum::routing::put(item_set_watched),
+        )
         .route("/api/v1/items/{id}/artwork", get(item_artwork))
         .route("/api/v1/items/{id}/subtitles/search", post(subtitle_search))
         .route(
@@ -158,6 +162,10 @@ pub fn router(
         .route(
             "/admin/v1/users/{id}/libraries",
             axum::routing::put(admin_set_user_libraries),
+        )
+        .route(
+            "/admin/v1/users/{id}/admin",
+            axum::routing::put(admin_set_user_admin),
         )
         .route("/admin/v1/providers", get(admin_providers))
         .route(
@@ -1029,6 +1037,69 @@ async fn admin_set_user_libraries(
 }
 
 #[derive(Deserialize)]
+struct SetAdminBody {
+    admin: bool,
+}
+
+/// HUB-10: promote or demote an account.
+///
+/// **Nobody changes their own admin flag, in either direction.** Not a
+/// question of what is sensible — it is what keeps the endpoint from being an
+/// escalation. `require_admin` reads `claims.admin` out of a 15-minute JWT and
+/// never asks the database (AUTH-2 is the fix for that, and is not landed), so
+/// an account demoted a moment ago still presents a token that says otherwise.
+/// Allowing self-promotion would let it set `is_admin` back to 1 for good, and
+/// `refresh` would then mint genuine admin tokens for ever: a bounded stale
+/// claim turned into a permanent one, by this endpoint.
+///
+/// Refusing the demotion direction alone is not enough, and refusing both
+/// costs nothing — the first admin comes from `complete_setup`, so there is no
+/// legitimate way to reach this asking about yourself.
+///
+/// **Removable once AUTH-1/2/3 land.** They are what make a stale claim
+/// impossible: `auth_version` invalidates the old token, and administrator
+/// status starts coming from the database on every request. After that this
+/// guard protects nothing that is not already protected, and the demotion
+/// half can go back to being the ordinary courtesy it looks like.
+///
+/// Note what does NOT go with it: the last-admin check in `Auth::set_admin`
+/// is a database race, not a token one, and survives all three.
+///
+/// Grants are untouched. A demoted admin falls back to whatever its
+/// `user_libraries` rows already said, which is what the panel then shows.
+async fn admin_set_user_admin(
+    State(state): State<AppState>,
+    axum::Extension(claims): axum::Extension<crate::auth::Claims>,
+    Path(id): Path<String>,
+    Json(body): Json<SetAdminBody>,
+) -> Result<Json<Value>, ApiError> {
+    if id == claims.sub {
+        return Err((
+            StatusCode::CONFLICT,
+            "cannot change your own admin rights".into(),
+        ));
+    }
+    match state
+        .auth
+        .set_admin(&id, body.admin)
+        .await
+        .map_err(internal)?
+    {
+        crate::auth::SetAdmin::NoSuchUser => Err(hidden("user")),
+        crate::auth::SetAdmin::LastAdmin => Err((
+            // Not FORBIDDEN: `require_admin` above already answers that for
+            // "your token is not an admin", and a client cannot tell
+            // re-authenticate from pick-another-account without reading the
+            // prose. CONFLICT is what the self-guard uses, and this is the
+            // same class — the request is well formed and the state says no.
+            StatusCode::CONFLICT,
+            "refusing to demote the last admin".into(),
+        )),
+        _ => Ok(Json(json!({ "id": id, "is_admin": body.admin }))),
+    }
+}
+
+#[derive(Deserialize)]
 struct CreateUser {
     username: String,
     password: String,
@@ -1064,21 +1135,44 @@ async fn admin_delete_user(
     // for the only admin, leave nobody who can undo it.
     if id == claims.sub {
         return Err((
-            StatusCode::FORBIDDEN,
+            // CONFLICT, as the admin-flag route's self-guard answers. FORBIDDEN
+            // is what `require_admin` says when your token is not an admin at
+            // all, so a client could not tell "re-authenticate" from "pick a
+            // different account" without reading the prose.
+            StatusCode::CONFLICT,
             "cannot delete the account you are signed in as".into(),
         ));
     }
-    let sessions_ended = state.sessions.end_for_user(&id);
     let username = state.auth.delete_user(&id).await.map_err(|e| {
         let msg = format!("{e:#}");
-        // "no such user" is a 404; refusing the last admin is a 403.
+        // "no such user" is a 404; refusing the last admin is a 409, the same
+        // as the admin-flag route — the request is well formed and the state
+        // says no, which is not what FORBIDDEN means here.
+        //
+        // Still branching on the message text, which the project's own rule
+        // forbids, and the `else` is a catch-all: a SQLITE_BUSY or a disk error
+        // now reports 409, which this project defines as "will refuse for
+        // ever", when the honest answer is 500 and retry. Both wants the same
+        // thing — a typed result from `Auth::delete_user` — and that belongs
+        // with making its last-admin check atomic, so both are recorded for
+        // whoever owns `auth.rs` rather than edited around their live AUTH
+        // work.
         let code = if msg.contains("no such user") {
             StatusCode::NOT_FOUND
         } else {
-            StatusCode::FORBIDDEN
+            StatusCode::CONFLICT
         };
         (code, msg)
     })?;
+    // After the delete, not before. Sessions still go first in the sense that
+    // matters — nothing outlives its owner — but ending them ahead of the
+    // refusal meant a REFUSED delete had already killed the target's playback.
+    // Reachable on purpose: a demoted admin holding a token that still says
+    // `admin: true` can aim this at the remaining admin and get 409 every time,
+    // killing their streams on each attempt. It also fires on the transient
+    // failure recorded in kahawai-hub-review-findings.md, so an innocent
+    // viewer's stream dies for a race nobody asked about.
+    let sessions_ended = state.sessions.end_for_user(&id);
     Ok(Json(
         json!({ "deleted": id, "username": username, "sessions_ended": sessions_ended }),
     ))
@@ -1567,6 +1661,19 @@ async fn put_pref(
     Ok(Json(json!({ "ok": true })))
 }
 
+/// 409 says "not with this item"; 503 says "not right now". Every other
+/// refusal from the session layer is about the item and will refuse again
+/// forever; an absent mediahost is about the moment, and a client is meant
+/// to stand by and retry rather than give up.
+fn session_refusal(e: anyhow::Error) -> ApiError {
+    let status = if e.downcast_ref::<crate::sessions::SourceOffline>().is_some() {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::CONFLICT
+    };
+    (status, format!("{e:#}"))
+}
+
 async fn start_session(
     State(state): State<AppState>,
     axum::Extension(claims): axum::Extension<crate::auth::Claims>,
@@ -1596,7 +1703,7 @@ async fn start_session(
             body.subtitle_track,
         )
         .await
-        .map_err(|e| (StatusCode::CONFLICT, format!("{e:#}")))?;
+        .map_err(session_refusal)?;
     let (mode, stream_url, ctype) = match &session.mode {
         crate::sessions::Mode::Direct { .. } => (
             "direct",
@@ -1681,7 +1788,7 @@ async fn seek_session(
             tracing::warn!(session = %id, position_ms = body.position_ms,
                 audio_track = ?body.audio_track, video_track = ?body.video_track,
                 error = format!("{e:#}"), "seek failed");
-            (StatusCode::CONFLICT, format!("{e:#}"))
+            session_refusal(e)
         })?;
     // A track switch re-planned: hand back the verdicts of what plays
     // NOW so the overlay never lies about the current streams.
@@ -1851,9 +1958,9 @@ async fn list_collections(
 #[derive(serde::Deserialize, Default)]
 struct ArtworkQuery {
     size: Option<String>,
-    /// Cache-buster the client appends; read only so it does not land in
-    /// `size` by accident.
-    #[allow(dead_code)]
+    /// The client's cache-buster. Load-bearing rather than merely accepted: its
+    /// presence is what makes caching a MISS safe, because only a URL that can
+    /// change may hold a "there is nothing here" for long.
     v: Option<String>,
 }
 
@@ -1862,22 +1969,67 @@ async fn item_artwork(
     Path(id): Path<String>,
     Query(q): Query<ArtworkQuery>,
 ) -> Result<Response, ApiError> {
-    match state
+    // The detail goes to the log, not to the caller: what fails here is
+    // usually a fetch from a metadata provider, and its error names the
+    // upstream URL. SEC-WEB-7 — a provider's address is not the client's
+    // business, and "the poster did not load" is all an <img> can use.
+    let found = match state
         .artwork
         .get_at(&state.registry, &state.sessions, &id, q.size.as_deref())
         .await
-        .map_err(internal)?
     {
+        Ok(found) => found,
+        Err(e) => {
+            tracing::warn!(item = %id, error = %e, "artwork could not be served");
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "artwork unavailable".into(),
+            ));
+        }
+    };
+    match found {
         Some((bytes, ctype)) => Ok((
             [
                 (axum::http::header::CONTENT_TYPE, ctype),
                 // Local artwork changes only on rescan; let clients keep it.
+                // Knowingly asymmetric with the miss below: a versionless HIT
+                // is also cached for a day, so an episode row can show a
+                // re-matched show's old poster until then. Kept because the
+                // costs are not alike — shortening this spends image bandwidth
+                // on every card, while a miss costs one cheap query.
                 (axum::http::header::CACHE_CONTROL, "private, max-age=86400"),
             ],
             bytes,
         )
             .into_response()),
-        None => Err((StatusCode::NOT_FOUND, "no artwork".into())),
+        // Cacheable only when the URL can change. A provider with no poster
+        // for a release is answered with nothing written to disk on purpose —
+        // an upload later is picked up with nothing to invalidate — but an
+        // uncacheable 404 meant every render of a shelf of coverless albums was
+        // a live request per card, repeated on every scroll back, route change
+        // and second tab, and doubled by the srcset.
+        //
+        // The version is what makes caching safe, and one caller deliberately
+        // omits it: an episode row asks for its SHOW's poster, and pinning the
+        // parent's URL with the child's version would be a cache key that lies.
+        // Caching a miss under a URL that never changes would hide a poster
+        // that arrived minutes later for the rest of the hour.
+        None => Ok((
+            StatusCode::NOT_FOUND,
+            // Half a minute for a URL that cannot change: enough to collapse
+            // the per-render, per-scroll-back storm inside one browse, short
+            // enough that a poster arriving moments later is not hidden.
+            // `no-store` was the first answer and gave the storm back; an hour
+            // hides the poster. Revalidation is not an option — this 404
+            // carries no validator, so a conditional request costs a full one.
+            if q.v.is_some() {
+                [(axum::http::header::CACHE_CONTROL, "private, max-age=3600")]
+            } else {
+                [(axum::http::header::CACHE_CONTROL, "private, max-age=30")]
+            },
+            "no artwork",
+        )
+            .into_response()),
     }
 }
 
@@ -2088,6 +2240,10 @@ struct ItemsQuery {
     /// `title` (default), `year`, `added`. Prefixed with `-` for
     /// descending: `-year`.
     sort: Option<String>,
+    /// Started and not finished — what a "continue watching" row is made
+    /// of. Ordered by when you last watched it, so `sort` and `q` do not
+    /// apply; `library` still scopes it.
+    in_progress: Option<bool>,
     /// NFR-1: a page, not the catalogue. Absent = the default page size,
     /// never "everything" — that is the shape that took 13 s over 250k
     /// items and shipped 100 MB.
@@ -2185,7 +2341,33 @@ const COUNT_IN_LIBRARY: &str = "SELECT COUNT(*) FROM item_libraries WHERE librar
 
 /// The columns a browse row carries, resolved for the ≤200 rows of ONE
 /// page — never for a candidate. See [`item_page_sql`].
-const ITEM_PAGE_COLS: &str = "\
+///
+/// Takes the caller's reach because one column depends on it: see the
+/// `library_id` note below and `grants::VISIBLE_LIB`.
+fn item_page_cols(restricted: bool, scoped: bool) -> String {
+    // When the request named a library, prefer THAT one. `MIN` answers "some
+    // library it is in", which for an item in two is as likely to be the one
+    // the caller did not ask for — so browsing "3d" handed back cards whose
+    // every link, breadcrumb and back target pointed at "movies". Grant
+    // scoping is a different question and still applies to both halves.
+    let (lib_pref, lib_pref_end) = if scoped {
+        (
+            "COALESCE((SELECT il.library_id FROM item_libraries il
+                        WHERE il.item_id = COALESCE(i.parent_id, i.id)
+                          AND il.library_id = ?2),
+                      ",
+            ")",
+        )
+    } else {
+        ("", "")
+    };
+    let lib = if restricted {
+        crate::grants::VISIBLE_LIB
+    } else {
+        ""
+    };
+    format!(
+        "\
 i.id, i.kind, i.season, i.episode, i.artist,
 COALESCE(md.title, i.title) AS title,
 COALESCE(i.year, CAST(substr(md.premiered, 1, 4) AS INTEGER)) AS year,
@@ -2196,7 +2378,24 @@ md.updated_at AS art_version,
 (SELECT COUNT(*) FROM item_sources s WHERE s.item_id = i.id) AS sources,
 i.parent_id,
 (SELECT p.sort_title FROM items p WHERE p.id = i.parent_id) AS parent_title,
-w.position_ms, w.duration_ms, w.played, w.play_count";
+-- A library this item is in, as navigation context: item URLs live under
+-- a library, and a row that arrives from a cross-library browse (search,
+-- continue watching) has no other way to know one. Membership is
+-- many-to-many, so this is deliberately \"a library it is in\" and not
+-- \"its library\" — MIN so the same row always answers the same way.
+-- Keyed on COALESCE(parent_id, id) because membership only ever holds
+-- top-level items: an episode belongs to a library through its show.
+-- Indexed by item_libraries_item (0036), and paid on the ≤200 rows of a
+-- page beside the source count above, never on a candidate.
+-- Scoped to what this account may open (grants::VISIBLE_LIB): an item
+-- can be in more than one library, and naming one the caller was refused
+-- both answers a question the grant said no to and sends the client
+-- somewhere it will get a 404.
+{lib_pref}(SELECT MIN(il.library_id) FROM item_libraries il
+  WHERE il.item_id = COALESCE(i.parent_id, i.id) {lib}){lib_pref_end} AS library_id,
+w.position_ms, w.duration_ms, w.played, w.play_count"
+    )
+}
 
 /// Wrap an id-producing inner query in the joins that dress a page.
 ///
@@ -2211,9 +2410,10 @@ w.position_ms, w.duration_ms, w.played, w.play_count";
 /// The outer ORDER BY re-sorts only the returned page: the inner query
 /// already chose and ordered the ids, the join just does not promise to
 /// preserve that order.
-fn item_page_sql(inner: &str, order_out: &str) -> String {
+fn item_page_sql(inner: &str, order_out: &str, restricted: bool, scoped: bool) -> String {
+    let cols = item_page_cols(restricted, scoped);
     format!(
-        "SELECT {ITEM_PAGE_COLS}
+        "SELECT {cols}
            FROM ({inner}) page
            JOIN items i ON i.id = page.item_id
            LEFT JOIN watch_state w ON w.item_id = i.id AND w.user_id = ?1
@@ -2267,73 +2467,147 @@ async fn list_items(
         ""
     };
 
-    // Three explicit shapes rather than one query with
-    // `(?N IS NULL OR ...)` guards: a guard is opaque at plan time, which
-    // is the pattern that has cost us an index twice now.
-    let (rows, total) = match (&q.library, &needle) {
-        // A library, no search — the overwhelmingly common browse. The
-        // page comes off `item_libraries_browse` (0040) alone: membership
-        // and sort keys live in one covering index, so a deep page skips
-        // rows at one index step each instead of probing `items` per
-        // skipped row. That probe chain is what made the last page of a
-        // 250k library cost 1.2 s; this shape measures 21 ms there.
-        (Some(library), None) => {
-            let (order_in, order_out) = membership_order(q.sort.as_deref());
-            let sql = item_page_sql(
-                &format!(
-                    "SELECT item_id FROM item_libraries WHERE library_id = ?2
+    // Continue watching. Its own path ahead of the three shapes below,
+    // rather than a fourth arm or a sort name, for two reasons.
+    //
+    // It is driven from `watch_state`, not from `items`: the set is
+    // "rows this account has a position in", which is small by
+    // construction, so starting there reads a key range of one user's
+    // rows instead of asking every item whether it has been started.
+    // A sort name could not have expressed that — the browse's watch
+    // join is in the OUTER dressing query, on the ≤200 rows of a page,
+    // and pulling it into the candidate scan is exactly the join-first
+    // shape that costs 912 ms.
+    //
+    // And the three shapes below stay byte for byte the queries their
+    // NFR-1 numbers were measured on.
+    //
+    // ponytail: sorts one account's watch rows without an index for it.
+    // Bounded by items you have touched, so it is milliseconds at any
+    // plausible size; a (user_id, updated_at) index if that stops being
+    // true.
+    let in_progress = q.in_progress.unwrap_or(false);
+    let (rows, total) = if in_progress {
+        // Tracks stay out: a resume position on a song is not something
+        // anyone comes back to, and one would sit among the films.
+        // Episodes very much stay in — they are most of this row.
+        let member = match &q.library {
+            Some(_) => {
+                "AND EXISTS (SELECT 1 FROM item_libraries il
+                              WHERE il.library_id = ?2
+                                AND il.item_id = COALESCE(c.parent_id, c.id))"
+            }
+            None => visible,
+        };
+        let sql = item_page_sql(
+            &format!(
+                "SELECT w2.item_id FROM watch_state w2
+                   JOIN items c ON c.id = w2.item_id
+                  WHERE w2.user_id = ?1 AND w2.position_ms > 0 AND w2.played = 0
+                    AND c.kind <> 'track' {member}
+                  ORDER BY w2.updated_at DESC, w2.item_id DESC
+                  LIMIT ?3 OFFSET ?4"
+            ),
+            // The outer query already joins this account's watch row as
+            // `w`, so re-ordering the page needs nothing new. Ends in a
+            // unique column: `item_id` is unique per user by the primary
+            // key, so the order is total and a tie cannot straddle a page
+            // boundary two different ways.
+            "w.updated_at DESC, i.id DESC",
+            restricted,
+            true,
+        );
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(&claims.sub)
+            .bind(q.library.as_deref().unwrap_or(""))
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(db)
+            .await
+            .map_err(internal)?;
+        let count = format!(
+            "SELECT COUNT(*) FROM watch_state w2
+               JOIN items c ON c.id = w2.item_id
+              WHERE w2.user_id = ?1 AND w2.position_ms > 0 AND w2.played = 0
+                AND c.kind <> 'track' {member}"
+        );
+        let total: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(count))
+            .bind(&claims.sub)
+            .bind(q.library.as_deref().unwrap_or(""))
+            .fetch_one(db)
+            .await
+            .map_err(internal)?;
+        (rows, total)
+    } else {
+        // Three explicit shapes rather than one query with
+        // `(?N IS NULL OR ...)` guards: a guard is opaque at plan time,
+        // which is the pattern that has cost us an index twice now.
+        match (&q.library, &needle) {
+            // A library, no search — the overwhelmingly common browse. The
+            // page comes off `item_libraries_browse` (0040) alone: membership
+            // and sort keys live in one covering index, so a deep page skips
+            // rows at one index step each instead of probing `items` per
+            // skipped row. That probe chain is what made the last page of a
+            // 250k library cost 1.2 s; this shape measures 21 ms there.
+            (Some(library), None) => {
+                let (order_in, order_out) = membership_order(q.sort.as_deref());
+                let sql = item_page_sql(
+                    &format!(
+                        "SELECT item_id FROM item_libraries WHERE library_id = ?2
                       ORDER BY {order_in} LIMIT ?3 OFFSET ?4"
-                ),
-                order_out,
-            );
-            let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
-                .bind(&claims.sub)
-                .bind(library)
-                .bind(limit)
-                .bind(offset)
-                .fetch_all(db)
-                .await
-                .map_err(internal)?;
-            let total: i64 = sqlx::query_scalar(COUNT_IN_LIBRARY)
-                .bind(library)
-                .fetch_one(db)
-                .await
-                .map_err(internal)?;
-            (rows, total)
-        }
-        // Searching. The title predicate has to look at candidates, so
-        // the scan follows the sort index and streams: an underfull page
-        // means the scan ran out, and the total is known without a
-        // second pass. Only a FULL page pays the counting scan.
-        //
-        // What is searchable: titles by their folded filename and their
-        // resolved title, albums additionally by folded artist, and
-        // EPISODES by their resolved titles — sort_title is parent-aware
-        // since 0041, so an episode's is the title its show's assigned
-        // provider gave it. Episodes belong to a library through their
-        // parent, hence the COALESCE in the membership probe. Tracks
-        // stay out deliberately: matching "iron maiden" should offer the
-        // albums, not five hundred track rows above them.
-        (library, Some(needle)) => {
-            let member = match library {
-                Some(_) => {
-                    "AND EXISTS (SELECT 1 FROM item_libraries il
+                    ),
+                    order_out,
+                    restricted,
+                    true,
+                );
+                let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
+                    .bind(&claims.sub)
+                    .bind(library)
+                    .bind(limit)
+                    .bind(offset)
+                    .fetch_all(db)
+                    .await
+                    .map_err(internal)?;
+                let total: i64 = sqlx::query_scalar(COUNT_IN_LIBRARY)
+                    .bind(library)
+                    .fetch_one(db)
+                    .await
+                    .map_err(internal)?;
+                (rows, total)
+            }
+            // Searching. The title predicate has to look at candidates, so
+            // the scan follows the sort index and streams: an underfull page
+            // means the scan ran out, and the total is known without a
+            // second pass. Only a FULL page pays the counting scan.
+            //
+            // What is searchable: titles by their folded filename and their
+            // resolved title, albums additionally by folded artist, and
+            // EPISODES by their resolved titles — sort_title is parent-aware
+            // since 0041, so an episode's is the title its show's assigned
+            // provider gave it. Episodes belong to a library through their
+            // parent, hence the COALESCE in the membership probe. Tracks
+            // stay out deliberately: matching "iron maiden" should offer the
+            // albums, not five hundred track rows above them.
+            (library, Some(needle)) => {
+                let member = match library {
+                    Some(_) => {
+                        "AND EXISTS (SELECT 1 FROM item_libraries il
                                   WHERE il.library_id = ?2
                                     AND il.item_id = COALESCE(c.parent_id, c.id))"
-                }
-                // Cross-library search by a restricted account: the same
-                // shape, over every library it holds instead of one.
-                None => visible,
-            };
-            let order_c = items_order_c(q.sort.as_deref());
-            let sql = item_page_sql(
-                &format!(
-                    // +c.kind: degraded on purpose. As a plain term the
-                    // 5-value IN steers the planner onto items_kind_title
-                    // and every candidate pays a random table probe for
-                    // its LIKE columns — a search predicate this dense
-                    // (LIKE over most rows) wants the sequential scan.
-                    "SELECT c.id AS item_id FROM items c
+                    }
+                    // Cross-library search by a restricted account: the same
+                    // shape, over every library it holds instead of one.
+                    None => visible,
+                };
+                let order_c = items_order_c(q.sort.as_deref());
+                let sql = item_page_sql(
+                    &format!(
+                        // +c.kind: degraded on purpose. As a plain term the
+                        // 5-value IN steers the planner onto items_kind_title
+                        // and every candidate pays a random table probe for
+                        // its LIKE columns — a search predicate this dense
+                        // (LIKE over most rows) wants the sequential scan.
+                        "SELECT c.id AS item_id FROM items c
                       WHERE +c.kind IN ('movie', 'show', 'album', 'episode', 'track') {member}
                         AND (c.norm_title LIKE '%' || ?3 || '%'
                              OR c.sort_title LIKE '%' || ?3 || '%'
@@ -2342,79 +2616,86 @@ async fn list_items(
                              -- albums; titles are how songs are found.
                              OR (c.kind = 'album' AND c.norm_artist LIKE '%' || ?3 || '%'))
                       ORDER BY {order_c} LIMIT ?4 OFFSET ?5"
-                ),
-                items_order(q.sort.as_deref()),
-            );
-            // ?2 must exist even without a library, so numbering is
-            // uniform; it is simply never referenced then.
-            let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
-                .bind(&claims.sub)
-                .bind(library.as_deref().unwrap_or(""))
-                .bind(needle)
-                .bind(limit)
-                .bind(offset)
-                .fetch_all(db)
-                .await
-                .map_err(internal)?;
-            let total: i64 = if rows.len() < limit as usize && !(rows.is_empty() && offset > 0) {
-                // The page underfilled: the scan saw everything.
-                offset as i64 + rows.len() as i64
-            } else {
-                let count = format!(
-                    // Same +c.kind degrade as the page query above.
-                    "SELECT COUNT(*) FROM items c
+                    ),
+                    items_order(q.sort.as_deref()),
+                    restricted,
+                    true,
+                );
+                // ?2 must exist even without a library, so numbering is
+                // uniform; it is simply never referenced then.
+                let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
+                    .bind(&claims.sub)
+                    .bind(library.as_deref().unwrap_or(""))
+                    .bind(needle)
+                    .bind(limit)
+                    .bind(offset)
+                    .fetch_all(db)
+                    .await
+                    .map_err(internal)?;
+                let total: i64 = if rows.len() < limit as usize && !(rows.is_empty() && offset > 0)
+                {
+                    // The page underfilled: the scan saw everything.
+                    offset as i64 + rows.len() as i64
+                } else {
+                    let count = format!(
+                        // Same +c.kind degrade as the page query above.
+                        "SELECT COUNT(*) FROM items c
                       WHERE +c.kind IN ('movie', 'show', 'album', 'episode', 'track') {member}
                         AND (c.norm_title LIKE '%' || ?3 || '%'
                              OR c.sort_title LIKE '%' || ?3 || '%'
                              OR (c.kind = 'album' AND c.norm_artist LIKE '%' || ?3 || '%'))"
-                );
-                sqlx::query_scalar(sqlx::AssertSqlSafe(count))
-                    // ?1 is the user id as everywhere else — unused here
-                    // unless `member` is the grant predicate, and bound
-                    // either way so the numbering stays shared.
-                    .bind(&claims.sub)
-                    .bind(library.as_deref().unwrap_or(""))
-                    .bind(needle)
-                    .fetch_one(db)
-                    .await
-                    .map_err(internal)?
-            };
-            (rows, total)
-        }
-        // Unscoped, no search: everything, in sort order.
-        (None, None) => {
-            let order_c = items_order_c(q.sort.as_deref());
-            let sql = item_page_sql(
-                &format!(
-                    "SELECT c.id AS item_id FROM items c
+                    );
+                    sqlx::query_scalar(sqlx::AssertSqlSafe(count))
+                        // ?1 is the user id as everywhere else — unused here
+                        // unless `member` is the grant predicate, and bound
+                        // either way so the numbering stays shared.
+                        .bind(&claims.sub)
+                        .bind(library.as_deref().unwrap_or(""))
+                        .bind(needle)
+                        .fetch_one(db)
+                        .await
+                        .map_err(internal)?
+                };
+                (rows, total)
+            }
+            // Unscoped, no search: everything, in sort order.
+            (None, None) => {
+                let order_c = items_order_c(q.sort.as_deref());
+                let sql = item_page_sql(
+                    &format!(
+                        "SELECT c.id AS item_id FROM items c
                       WHERE c.kind NOT IN ('episode', 'track') {visible}
                       ORDER BY {order_c} LIMIT ?2 OFFSET ?3"
-                ),
-                items_order(q.sort.as_deref()),
-            );
-            let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
-                .bind(&claims.sub)
-                .bind(limit)
-                .bind(offset)
-                .fetch_all(db)
-                .await
-                .map_err(internal)?;
-            // The same predicate as the page, not the cheaper
-            // `COUNT(*) FROM item_libraries` a granted set would allow:
-            // a total that disagrees with the rows it counts is a paging
-            // bug that only shows up on the last page.
-            // ponytail: an unrestricted account keeps the bare count, so
-            // the extra probe is paid only where it decides something.
-            let count = format!(
-                "SELECT COUNT(*) FROM items c
+                    ),
+                    items_order(q.sort.as_deref()),
+                    restricted,
+                    // ?2 is the row limit on this branch, not a library.
+                    false,
+                );
+                let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
+                    .bind(&claims.sub)
+                    .bind(limit)
+                    .bind(offset)
+                    .fetch_all(db)
+                    .await
+                    .map_err(internal)?;
+                // The same predicate as the page, not the cheaper
+                // `COUNT(*) FROM item_libraries` a granted set would allow:
+                // a total that disagrees with the rows it counts is a paging
+                // bug that only shows up on the last page.
+                // ponytail: an unrestricted account keeps the bare count, so
+                // the extra probe is paid only where it decides something.
+                let count = format!(
+                    "SELECT COUNT(*) FROM items c
                   WHERE c.kind NOT IN ('episode', 'track') {visible}"
-            );
-            let mut counter = sqlx::query_scalar(sqlx::AssertSqlSafe(count));
-            if restricted {
-                counter = counter.bind(&claims.sub);
+                );
+                let mut counter = sqlx::query_scalar(sqlx::AssertSqlSafe(count));
+                if restricted {
+                    counter = counter.bind(&claims.sub);
+                }
+                let total: i64 = counter.fetch_one(db).await.map_err(internal)?;
+                (rows, total)
             }
-            let total: i64 = counter.fetch_one(db).await.map_err(internal)?;
-            (rows, total)
         }
     };
     let items: Vec<Value> = rows.iter().map(item_row_json).collect();
@@ -2451,6 +2732,10 @@ fn item_row_json(r: &sqlx::sqlite::SqliteRow) -> Value {
         // hit open its ALBUM — tracks have no detail view of their own.
         "parent_id": r.try_get::<Option<String>, _>("parent_id").ok().flatten(),
         "parent_title": r.try_get::<Option<String>, _>("parent_title").ok().flatten(),
+        // Navigation context, not ownership — see ITEM_PAGE_COLS. Null for
+        // an item in no library at all, which only an unrestricted account
+        // can be looking at.
+        "library_id": r.try_get::<Option<String>, _>("library_id").ok().flatten(),
         "proj_season": r.try_get::<Option<i64>, _>("proj_season").ok().flatten(),
         "proj_episode": r.try_get::<Option<i64>, _>("proj_episode").ok().flatten(),
         "sources": r.get::<i64, _>("sources"),
@@ -2857,6 +3142,24 @@ async fn post_progress(
 
     let duration = session.duration_ms;
     let finished = duration.is_some_and(|d| d > 0 && body.position_ms * 10 >= d * 9);
+    // A track keeps no resume POSITION — but it keeps its played mark, which
+    // the album page renders per row.
+    //
+    // Continue-watching is driven off `watch_state` and excludes tracks by
+    // kind, but only AFTER joining `items`: every track ever skipped part-way
+    // left a row matching both of its predicates that was then thrown away, and
+    // nothing prunes them. A shuffle listener accumulates tens of thousands and
+    // the home page pays for all of them, twice, on every load. Storing zero
+    // keeps them out of that set for good, and costs nothing else: a record is
+    // resumed from its place in the queue, never from a stored offset.
+    let is_track = sqlx::query_scalar::<_, String>("SELECT kind FROM items WHERE id = ?")
+        .bind(&session.item_id)
+        .fetch_optional(state.registry.db())
+        .await
+        .ok()
+        .flatten()
+        .is_some_and(|k| k == "track");
+    let stored_position = if is_track { 0 } else { body.position_ms };
     let row = sqlx::query(
         "INSERT INTO watch_state (user_id, item_id, position_ms, duration_ms, played, play_count, updated_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?5, unixepoch())
@@ -2870,7 +3173,7 @@ async fn post_progress(
     )
     .bind(&claims.sub)
     .bind(&session.item_id)
-    .bind(body.position_ms as i64)
+    .bind(stored_position as i64)
     .bind(duration.map(|d| d as i64))
     .bind(finished)
     .fetch_one(state.registry.db())
@@ -2881,6 +3184,120 @@ async fn post_progress(
         "played": row.get::<i64, _>("played") != 0,
         "play_count": row.get::<i64, _>("play_count"),
     })))
+}
+
+/// The most items one mark may touch. A season is tens and a show is
+/// hundreds; past this the caller is doing something other than ticking
+/// off what it just listed.
+const WATCHED_BATCH_MAX: usize = 2000;
+
+#[derive(Deserialize)]
+struct WatchedRequest {
+    played: bool,
+    /// Apply to these items instead of just this one. Every id must be
+    /// this item or one of its children — a show's episodes, an album's
+    /// tracks — which is what lets one grant check cover the batch:
+    /// access is keyed on `COALESCE(parent_id, id)`, so a visible show's
+    /// episodes are visible by construction (`grants::can_see`).
+    ///
+    /// Absent means this item alone.
+    #[serde(default)]
+    items: Option<Vec<String>>,
+}
+
+/// Mark items watched or unwatched without playing them (HUB-10).
+///
+/// `post_progress` above was the only way into `watch_state`, and it needs
+/// a live session — so there was no way to tick off something watched
+/// elsewhere, and no way to undo a mistaken one.
+///
+/// A whole season or show goes in ONE call, as one statement. The client
+/// used to loop, which was fine on a LAN and poor over a link (a
+/// 26-episode season is 26 round trips), and it could half-apply: a
+/// failure at episode 14 left 13 marked. One `INSERT … SELECT` either
+/// applies or does not.
+///
+/// Either direction clears the resume position: a card carries both a
+/// played tick and a resume bar, and "watched, and also 40 minutes in" is
+/// not a state the interface can draw honestly.
+///
+/// `play_count` only ever climbs. Marking watched asserts a viewing and
+/// counts it; unmarking says "show this as unwatched", which is not a
+/// claim that the earlier viewings never happened. The `AND NOT played`
+/// guard means re-marking something already marked counts nothing.
+async fn item_set_watched(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    axum::Extension(claims): axum::Extension<crate::auth::Claims>,
+    Json(body): Json<WatchedRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let ids = body.items.unwrap_or_else(|| vec![id.clone()]);
+    if ids.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "no items to mark".into()));
+    }
+    if ids.len() > WATCHED_BATCH_MAX {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("at most {WATCHED_BATCH_MAX} items per mark"),
+        ));
+    }
+    let list = serde_json::to_string(&ids).map_err(internal)?;
+
+    // One statement, so the whole mark is atomic without a transaction to
+    // manage. `json_each` unrolls the id list from a single bound
+    // parameter — no placeholder building, and nothing of the caller's
+    // ever reaches the SQL text.
+    //
+    // The join onto `items` is what enforces the boundary: an id that is
+    // neither this item nor one of its children simply is not selected, so
+    // a marked row is always one the grant check above already covered.
+    // Ids outside it are skipped rather than reported, because saying
+    // which ones failed would answer questions about items the caller
+    // cannot see. The response lists what WAS marked; a caller that cares
+    // can compare.
+    //
+    // `duration_ms` is absent from the SET list, so an existing one
+    // survives being marked watched. Progress overwrites it because
+    // progress has just measured it; this has not.
+    let rows = sqlx::query(
+        "INSERT INTO watch_state (user_id, item_id, position_ms, duration_ms, played, play_count, updated_at)
+         SELECT ?1, i.id, 0, NULL, ?3, ?3, unixepoch()
+           FROM items i
+          WHERE i.id IN (SELECT value FROM json_each(?2))
+            AND (i.id = ?4 OR i.parent_id = ?4)
+         ON CONFLICT (user_id, item_id) DO UPDATE SET
+           position_ms = 0,
+           play_count = play_count + (excluded.played AND NOT played),
+           played = excluded.played,
+           updated_at = unixepoch()
+         RETURNING item_id, played, play_count",
+    )
+    .bind(&claims.sub)
+    .bind(&list)
+    .bind(body.played)
+    .bind(&id)
+    .fetch_all(state.registry.db())
+    .await
+    .map_err(internal)?;
+
+    if rows.is_empty() {
+        // Nothing matched: either the item does not exist, or none of the
+        // ids belong to it. The same 404 as a hidden item, deliberately —
+        // which of the two it was is not the caller's business.
+        return Err(hidden("item"));
+    }
+    let updated: Vec<Value> = rows
+        .iter()
+        .map(|r| {
+            json!({
+                "item_id": r.get::<String, _>("item_id"),
+                "position_ms": 0,
+                "played": r.get::<i64, _>("played") != 0,
+                "play_count": r.get::<i64, _>("play_count"),
+            })
+        })
+        .collect();
+    Ok(Json(json!({ "updated": updated })))
 }
 
 /// Proxy one artifact of a dispatched session from its transcoder.

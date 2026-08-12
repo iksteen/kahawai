@@ -73,6 +73,10 @@ impl TranscoderLink for TranscoderLinkService {
         let registry = self.registry.clone();
         let sessions = self.sessions.clone();
         let module_id = peer.module_id.clone();
+        // Sender first, then "present" — the same reason as the mediahost link:
+        // the renewal settlement below is DB work, and a box announced as
+        // present without a way to reach it is a placement target that fails.
+        registry.register_tc_link(&module_id, tx.clone());
         registry.connected(
             &module_id,
             &peer.module_type,
@@ -83,7 +87,6 @@ impl TranscoderLink for TranscoderLinkService {
         if let Err(e) = registry.settle_renewal(&module_id, &peer.fingerprint).await {
             tracing::warn!(%module_id, error = format!("{e:#}"), "renewal settlement failed");
         }
-        registry.register_tc_link(&module_id, tx.clone());
 
         tokio::spawn(async move {
             let ack = HubToTc {
@@ -93,8 +96,19 @@ impl TranscoderLink for TranscoderLinkService {
                 })),
             };
             if tx.send(Ok(ack)).await.is_err() {
-                registry.unregister_tc_link(&module_id);
-                registry.disconnected(&module_id);
+                // Gated on the return, like the teardown below. The comment
+                // here used to claim nothing had awaited since
+                // `register_tc_link` — the `tx.send(...).await` on the line
+                // above is one, and it only fails because the receiver is
+                // gone. So a box that drops during the ack and reconnects
+                // inside that window had its NEW registration marked absent,
+                // and nothing sets it back: placement still worked, because
+                // `choose` reads the link map, but the admin panel and the
+                // event stream reported a healthy transcoder as offline until
+                // it bounced again.
+                if registry.unregister_tc_link_if_current(&module_id, &tx) {
+                    registry.disconnected(&module_id);
+                }
                 return;
             }
             // Heartbeats arrive every 10 s; three missed = dead link.
@@ -286,10 +300,29 @@ impl TranscoderLink for TranscoderLinkService {
                     }
                 }
             }
-            // Unregister FIRST so rescheduling never re-picks the dead box.
-            registry.unregister_tc_link(&module_id);
-            registry.clear_transcoder_caps(&module_id);
-            registry.disconnected(&module_id);
+            // Unregister FIRST so rescheduling never re-picks the dead box —
+            // and only if this task's link is still the registered one. A
+            // transcoder that dies without a FIN sits out its heartbeat window
+            // while the box reconnects into it; clearing by module id then
+            // deleted the LIVE connection's sender and capabilities, and since
+            // capabilities are sent once per connection, placement never chose
+            // that box again until the transcoder process restarted.
+            let ours = registry.unregister_tc_link_if_current(&module_id, &tx);
+            if ours {
+                registry.clear_transcoder_caps(&module_id);
+                registry.disconnected(&module_id);
+            } else {
+                // The box is already back on a fresh link. Leave its
+                // registration alone — but the sessions this connection was
+                // running still point at a pipeline that died with it, and
+                // rescheduling is the only thing that moves them. Returning
+                // here left them `active` against a dead pipeline: the ping
+                // kept succeeding, so no 410 and no client recovery, and the
+                // picture was frozen for good rather than for the two seconds
+                // a reschedule costs. Their slots stayed booked on the
+                // reconnected box, too.
+                tracing::info!(%module_id, "transcoder link already replaced; rescheduling its sessions anyway");
+            }
             let (moved, ended) = sessions
                 .reschedule_for_transcoder(&registry, &module_id)
                 .await;
