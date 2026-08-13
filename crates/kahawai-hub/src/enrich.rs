@@ -275,7 +275,7 @@ pub fn pick_candidate<'c>(
 /// full-catalogue re-select against the one statement whose cost this
 /// doc calls a standing tax.
 pub const GENERIC_SELECTION_SQL: &str = "SELECT i.id,i.kind,i.title,i.norm_title,i.year,
-                    (SELECT f.path_rel FROM files f WHERE f.item_id=i.id LIMIT 1) AS src_path,
+                    (SELECT f.path_rel FROM files f JOIN file_bindings fb ON fb.file_id=f.id WHERE fb.item_id=i.id LIMIT 1) AS src_path,
                     c0.media_type AS media_type
              FROM items i JOIN collections c0
                ON (c0.module_id,c0.collection_id)=(i.module_id,i.collection_id)
@@ -949,7 +949,7 @@ impl Enricher {
                JOIN collections col ON (col.module_id, col.collection_id)
                                      = (f.module_id, f.collection_id)
                WHERE col.media_type = 'anime' AND f.ed2k IS NOT NULL
-                 AND f.item_id IS NULL
+                 AND NOT EXISTS(SELECT 1 FROM file_bindings fb WHERE fb.file_id=f.id)
                  AND NOT EXISTS (SELECT 1 FROM ed2k_aid c
                                   WHERE c.ed2k = f.ed2k
                                     AND (c.aid IS NULL OR c.epno IS NOT NULL)))",
@@ -1355,7 +1355,7 @@ impl Enricher {
                  -- Same shape, same reason: one pass over the unmapped
                  -- hashes rather than one per candidate item.
                  OR i.id IN (SELECT COALESCE(ch.parent_id,ch.id)
-                               FROM files f JOIN items ch ON ch.id=f.item_id
+                               FROM files f JOIN file_bindings fb ON fb.file_id=f.id JOIN items ch ON ch.id=fb.item_id
                               WHERE f.ed2k IS NOT NULL
                                 AND f.ed2k NOT IN (SELECT ed2k FROM ed2k_aid)))
              ORDER BY i.title",
@@ -1588,7 +1588,7 @@ impl Enricher {
         let Some(row) = sqlx::query(
             "SELECT f.ed2k,f.size FROM files f
              WHERE f.ed2k IS NOT NULL
-               AND (f.item_id=?1 OR f.item_id IN (SELECT id FROM items WHERE parent_id=?1))
+               AND (EXISTS(SELECT 1 FROM file_bindings fb WHERE fb.file_id=f.id AND (fb.item_id=?1 OR fb.item_id IN (SELECT id FROM items WHERE parent_id=?1))))
              -- Prefer a file AniDB has never been asked about: a cached
              -- miss on the alphabetically-first file must not block the
              -- siblings from ever being consulted.
@@ -1646,7 +1646,7 @@ impl Enricher {
         // A row with an aid but no epno predates 0042 and is re-asked
         // once; a NULL aid is a recorded miss and stays terminal.
         let files: Vec<(String, i64)> = sqlx::query_as(
-            "SELECT f.ed2k,f.size FROM files f JOIN items ep ON ep.id=f.item_id
+            "SELECT f.ed2k,f.size FROM files f JOIN file_bindings fb ON fb.file_id=f.id JOIN items ep ON ep.id=fb.item_id
              WHERE ep.parent_id = ?1 AND f.ed2k IS NOT NULL
                -- Span episodes (batch files, 0045) answer to their
                -- range, not to a single-epno FILE reply: skip the ask.
@@ -1704,7 +1704,7 @@ impl Enricher {
              JOIN collections col ON (col.module_id, col.collection_id)
                                    = (f.module_id, f.collection_id)
              WHERE col.media_type = 'anime' AND f.ed2k IS NOT NULL
-               AND f.item_id IS NULL
+               AND NOT EXISTS(SELECT 1 FROM file_bindings fb WHERE fb.file_id=f.id)
                AND NOT EXISTS (SELECT 1 FROM ed2k_aid c
                                 WHERE c.ed2k = f.ed2k
                                   AND (c.aid IS NULL OR c.epno IS NOT NULL))
@@ -1746,7 +1746,7 @@ impl Enricher {
              JOIN ed2k_aid c ON c.ed2k = f.ed2k
              WHERE col.media_type = 'anime'
                AND c.aid IS NOT NULL AND c.epno IS NOT NULL
-               AND f.item_id IS NULL
+               AND NOT EXISTS(SELECT 1 FROM file_bindings fb WHERE fb.file_id=f.id)
              ORDER BY f.path_rel",
         )
         .fetch_all(db)
@@ -1947,7 +1947,7 @@ impl Enricher {
         let rows = sqlx::query(
             "SELECT f.id AS source_id,f.path_rel AS source_path,ep.id AS item_id,
                     ep.title,ep.norm_title,ep.season,ep.episode,c.aid,c.epno,c.eid
-             FROM files f JOIN items ep ON ep.id=f.item_id
+             FROM files f JOIN file_bindings fb ON fb.file_id=f.id JOIN items ep ON ep.id=fb.item_id
              JOIN ed2k_aid c ON c.ed2k = f.ed2k
              WHERE ep.parent_id = ?1 AND c.aid IS NOT NULL AND c.epno IS NOT NULL
                -- Span episodes (batch files, 0045) are their own truth;
@@ -2069,7 +2069,7 @@ impl Enricher {
             sqlx::query(
                 "DELETE FROM items
                  WHERE id = ?1 AND kind = 'episode'
-                   AND NOT EXISTS(SELECT 1 FROM files f WHERE f.item_id=?1)",
+                   AND NOT EXISTS(SELECT 1 FROM playable_sources s WHERE s.item_id=?1)",
             )
             .bind(&item_id)
             .execute(&mut *tx)
@@ -2434,8 +2434,8 @@ impl Enricher {
                SELECT i.id AS item_id,
                  (SELECT ea.aid FROM ed2k_aid ea
                     JOIN files f ON f.ed2k = ea.ed2k
-                   WHERE (f.item_id=i.id
-                          OR f.item_id IN (SELECT id FROM items WHERE parent_id=i.id))
+                   WHERE EXISTS(SELECT 1 FROM file_bindings fb WHERE fb.file_id=f.id
+                          AND (fb.item_id=i.id OR fb.item_id IN (SELECT id FROM items WHERE parent_id=i.id)))
                      AND ea.aid IS NOT NULL
                    -- Same file the identification used, so the same answer.
                    ORDER BY f.path_rel LIMIT 1) AS aid,
@@ -3945,8 +3945,8 @@ async fn nfo_source(
         "SELECT f.module_id,f.collection_id,r.root_token,
                 json_extract(f.streams_json,'$.nfo') AS nfo
          FROM files f JOIN collection_roots r ON r.id=f.root_id
-         WHERE (f.item_id=?1
-                OR f.item_id IN (SELECT id FROM items WHERE parent_id=?1))
+         WHERE EXISTS(SELECT 1 FROM file_bindings fb WHERE fb.file_id=f.id
+                AND (fb.item_id=?1 OR fb.item_id IN (SELECT id FROM items WHERE parent_id=?1)))
            AND nfo IS NOT NULL
          LIMIT 1",
     )

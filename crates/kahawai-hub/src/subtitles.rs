@@ -1210,7 +1210,8 @@ impl Subtitles {
                AND NOT EXISTS (
                      SELECT 1 FROM subtitle_tracks d
                      WHERE d.derived_from = t.id AND d.origin = 'ocr')
-             ORDER BY f.item_id, t.id",
+             ORDER BY COALESCE((SELECT MIN(fb.item_id) FROM file_bindings fb
+                                 WHERE fb.file_id=f.id),''), t.id",
         )
         .fetch_all(registry.db())
         .await
@@ -1659,7 +1660,8 @@ pub async fn ocr_stream_set(
         "SELECT f.module_id,f.collection_id,r.root_token,f.path_rel,t.stream_index
          FROM subtitle_tracks t JOIN files f ON f.id=t.source_id
          JOIN collection_roots r ON r.id=f.root_id
-         WHERE f.item_id=? AND t.origin='embedded'
+         JOIN file_bindings fb ON fb.file_id=f.id
+         WHERE fb.item_id=? AND t.origin='embedded'
            AND EXISTS (
                  SELECT 1 FROM subtitle_tracks d
                  WHERE d.derived_from = t.id AND d.origin = 'ocr')",
@@ -1742,7 +1744,8 @@ pub(crate) async fn source_row(
         "SELECT f.module_id,f.collection_id,r.root_token,f.path_rel AS source_path,
                 f.streams_json
          FROM files f JOIN collection_roots r ON r.id=f.root_id
-         WHERE f.item_id=? ORDER BY f.size DESC",
+         JOIN file_bindings fb ON fb.file_id=f.id
+         WHERE fb.item_id=? ORDER BY f.size DESC",
     )
     .bind(item_id)
     .fetch_all(registry.db())

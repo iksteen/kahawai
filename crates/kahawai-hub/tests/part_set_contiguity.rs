@@ -77,7 +77,7 @@ async fn item_with(
         .unwrap();
     assert_eq!(items.len(), 1, "the fixture must fold to exactly one item");
     let item = items.into_iter().next().unwrap();
-    let sources: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM files WHERE item_id = ?")
+    let sources: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM file_bindings WHERE item_id = ?")
         .bind(&item)
         .fetch_one(&db)
         .await
@@ -189,7 +189,7 @@ async fn multipart_names_never_merge_across_collections() {
         .await
         .unwrap();
     let rows: Vec<(String, String, Option<i64>)> = sqlx::query_as(
-        "SELECT i.module_id,i.id,f.part FROM items i JOIN files f ON f.item_id=i.id
+        "SELECT i.module_id,i.id,fb.part FROM items i JOIN file_bindings fb ON fb.item_id=i.id
           ORDER BY i.module_id",
     )
     .fetch_all(&db)

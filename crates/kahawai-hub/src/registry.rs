@@ -62,7 +62,9 @@ const ARCHIVE_WATCH_FOR_FILE_SQL: &str = "
     SELECT w.user_id, f.size, f.head_xxh3, f.tail_xxh3,
            w.position_ms, w.duration_ms, w.played, w.play_count
     FROM files f
-    JOIN watch_state w ON w.item_id = f.item_id
+    JOIN playable_source_parts p ON p.file_id=f.id
+    JOIN playable_sources s ON s.id=p.playable_source_id
+    JOIN watch_state w ON w.item_id=s.item_id
     WHERE f.module_id = ? AND f.collection_id = ? AND f.path_rel = ?";
 
 fn source_fingerprint(parts: &[(i64, i64, i64)]) -> String {
@@ -1896,12 +1898,6 @@ impl Registry {
             };
 
             if let Some(item_id) = resolved_item {
-                sqlx::query("UPDATE files SET item_id=?,part=? WHERE id=?")
-                    .bind(&item_id)
-                    .bind(source_part)
-                    .bind(source_id)
-                    .execute(&mut *tx)
-                    .await?;
                 Self::bind_playable_source(
                     &mut tx,
                     module_id,
@@ -1991,7 +1987,7 @@ impl Registry {
         // deleted — sweep orphans here, not only in reconciliation.
         sqlx::query(
             "DELETE FROM items WHERE kind NOT IN ('show','album')
-               AND NOT EXISTS (SELECT 1 FROM files f WHERE f.item_id=items.id)",
+               AND NOT EXISTS (SELECT 1 FROM playable_sources src WHERE src.item_id=items.id)",
         )
         .execute(&mut *tx)
         .await?;
@@ -2295,8 +2291,15 @@ impl Registry {
             .await?;
         }
         sqlx::query(
+            "DELETE FROM playable_sources
+              WHERE NOT EXISTS(SELECT 1 FROM playable_source_parts p
+                                WHERE p.playable_source_id=playable_sources.id)",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
             "DELETE FROM items WHERE kind NOT IN ('show','album')
-               AND NOT EXISTS (SELECT 1 FROM files f WHERE f.item_id=items.id)",
+               AND NOT EXISTS (SELECT 1 FROM playable_sources src WHERE src.item_id=items.id)",
         )
         .execute(&mut *tx)
         .await?;
@@ -2953,7 +2956,9 @@ impl Registry {
                (user_id, size, head_xxh3, tail_xxh3, position_ms, duration_ms, played, play_count)
              SELECT w.user_id, f.size, f.head_xxh3, f.tail_xxh3,
                     w.position_ms, w.duration_ms, w.played, w.play_count
-             FROM files f JOIN watch_state w ON w.item_id=f.item_id
+             FROM files f JOIN playable_source_parts p ON p.file_id=f.id
+             JOIN playable_sources s ON s.id=p.playable_source_id
+             JOIN watch_state w ON w.item_id=s.item_id
              WHERE f.module_id=?",
         )
         .bind(module_id)
@@ -2977,7 +2982,7 @@ impl Registry {
         }
         sqlx::query(
             "DELETE FROM items WHERE kind NOT IN ('show','album')
-               AND NOT EXISTS (SELECT 1 FROM files f WHERE f.item_id=items.id)",
+               AND NOT EXISTS (SELECT 1 FROM playable_sources src WHERE src.item_id=items.id)",
         )
         .execute(&mut *tx)
         .await?;

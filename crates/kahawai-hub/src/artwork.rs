@@ -415,8 +415,9 @@ pub(crate) async fn find_artwork_source(
         "SELECT f.module_id,f.collection_id,r.root_token,
                 json_extract(f.streams_json,'$.artwork') AS art
          FROM files f JOIN collection_roots r ON r.id=f.root_id
-         WHERE (f.item_id=?1
-                OR f.item_id IN (SELECT id FROM items WHERE parent_id=?1))
+         WHERE EXISTS(SELECT 1 FROM file_bindings fb WHERE fb.file_id=f.id
+                AND (fb.item_id=?1 OR fb.item_id IN
+                     (SELECT id FROM items WHERE parent_id=?1)))
            AND art IS NOT NULL
          ORDER BY f.size DESC",
     )

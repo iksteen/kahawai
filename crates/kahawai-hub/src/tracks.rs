@@ -233,13 +233,16 @@ pub fn delivery(
 
 pub async fn get(db: &sqlx::SqlitePool, id: i64) -> Result<Option<Track>> {
     Ok(sqlx::query(
-        "SELECT t.id,COALESCE(t.item_id,f.item_id) AS item_id,t.origin,t.source_id,
-                f.module_id,f.collection_id,r.root_token,f.path_rel AS source_path,
-                f.path_rel,t.stream_index,t.format,t.language,t.label,t.machine,
-                t.derived_from,t.payload_id,t.created_by
+        "SELECT t.id,COALESCE(t.item_id,(SELECT MIN(s.item_id) FROM playable_source_parts p
+                                         JOIN playable_sources s ON s.id=p.playable_source_id
+                                        WHERE p.file_id=t.source_id)) AS item_id,
+                t.origin,t.source_id,f.module_id,f.collection_id,r.root_token,
+                f.path_rel AS source_path,f.path_rel,t.stream_index,t.format,t.language,
+                t.label,t.machine,t.derived_from,t.payload_id,t.created_by
          FROM subtitle_tracks t LEFT JOIN files f ON f.id=t.source_id
          LEFT JOIN collection_roots r ON r.id=f.root_id
-         WHERE t.id=? AND COALESCE(t.item_id,f.item_id) IS NOT NULL",
+         WHERE t.id=? AND (t.item_id IS NOT NULL OR EXISTS(
+             SELECT 1 FROM playable_source_parts p WHERE p.file_id=t.source_id))",
     )
     .bind(id)
     .fetch_optional(db)
@@ -251,13 +254,15 @@ pub async fn get(db: &sqlx::SqlitePool, id: i64) -> Result<Option<Track>> {
 /// item from `files`; an unbound or foreign source is deliberately invisible.
 pub async fn get_for_item(db: &sqlx::SqlitePool, item_id: &str, id: i64) -> Result<Option<Track>> {
     Ok(sqlx::query(
-        "SELECT t.id,COALESCE(t.item_id,f.item_id) AS item_id,t.origin,t.source_id,
+        "SELECT t.id,?1 AS item_id,t.origin,t.source_id,
                 f.module_id,f.collection_id,r.root_token,f.path_rel AS source_path,
                 f.path_rel,t.stream_index,t.format,t.language,t.label,t.machine,
                 t.derived_from,t.payload_id,t.created_by
          FROM subtitle_tracks t LEFT JOIN files f ON f.id=t.source_id
          LEFT JOIN collection_roots r ON r.id=f.root_id
-         WHERE t.id=?2 AND COALESCE(t.item_id,f.item_id)=?1",
+         WHERE t.id=?2 AND (t.item_id=?1 OR EXISTS(
+             SELECT 1 FROM playable_source_parts p JOIN playable_sources s
+               ON s.id=p.playable_source_id WHERE p.file_id=t.source_id AND s.item_id=?1))",
     )
     .bind(item_id)
     .bind(id)
@@ -277,16 +282,19 @@ pub async fn for_item_source(
     source_path: &str,
 ) -> Result<Vec<Track>> {
     Ok(sqlx::query(
-        "SELECT t.id,COALESCE(t.item_id,f.item_id) AS item_id,t.origin,t.source_id,
+        "SELECT t.id,? AS item_id,t.origin,t.source_id,
                 f.module_id,f.collection_id,r.root_token,f.path_rel AS source_path,
                 f.path_rel,t.stream_index,t.format,t.language,t.label,t.machine,
                 t.derived_from,t.payload_id,t.created_by
          FROM subtitle_tracks t LEFT JOIN files f ON f.id=t.source_id
          LEFT JOIN collection_roots r ON r.id=f.root_id
-         WHERE t.item_id=? OR (f.item_id=? AND
+         WHERE t.item_id=? OR (EXISTS(
+              SELECT 1 FROM playable_source_parts p JOIN playable_sources s
+                ON s.id=p.playable_source_id WHERE p.file_id=t.source_id AND s.item_id=?) AND
               (f.module_id,f.collection_id,r.root_token,f.path_rel)=(?,?,?,?))
          ORDER BY t.origin='embedded' DESC,t.origin='sidecar' DESC,t.id",
     )
+    .bind(item_id)
     .bind(item_id)
     .bind(item_id)
     .bind(module_id)

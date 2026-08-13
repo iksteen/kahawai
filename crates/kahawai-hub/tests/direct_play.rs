@@ -447,7 +447,8 @@ async fn direct_play_ranges_end_to_end() {
     let track_id: i64 = sqlx::query_scalar(
         "INSERT INTO subtitle_tracks(source_id,origin,stream_index,format)
          SELECT f.id,'embedded',3,'ass' FROM files f
-          WHERE f.item_id=? ORDER BY f.size DESC LIMIT 1
+          JOIN file_bindings fb ON fb.file_id=f.id
+          WHERE fb.item_id=? ORDER BY f.size DESC LIMIT 1
          RETURNING id",
     )
     .bind(&item_id)

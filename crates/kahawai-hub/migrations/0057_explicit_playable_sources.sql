@@ -42,6 +42,23 @@ CREATE INDEX playable_source_parts_ordinal
 
 -- Keep presentation ownership aligned while legacy callers are moved from
 -- files.item_id to the explicit table. This is bounded to the one source row.
+CREATE TRIGGER files_playable_insert
+AFTER INSERT ON files
+WHEN NEW.item_id IS NOT NULL
+BEGIN
+    INSERT INTO playable_sources
+      (module_id,collection_id,item_id,root_id,family_key,expected_parts)
+    VALUES(NEW.module_id,NEW.collection_id,NEW.item_id,NEW.root_id,'file:'||NEW.id,1)
+    ON CONFLICT(module_id,collection_id,root_id,family_key) DO UPDATE SET
+      item_id=excluded.item_id;
+    INSERT INTO playable_source_parts
+      (playable_source_id,module_id,collection_id,ordinal,file_id)
+    SELECT id,NEW.module_id,NEW.collection_id,COALESCE(NEW.part,1),NEW.id
+      FROM playable_sources
+     WHERE module_id=NEW.module_id AND collection_id=NEW.collection_id
+       AND root_id IS NEW.root_id AND family_key='file:'||NEW.id;
+END;
+
 CREATE TRIGGER files_playable_rebind
 AFTER UPDATE OF item_id ON files
 WHEN NEW.item_id IS NOT OLD.item_id
@@ -50,6 +67,20 @@ BEGIN
      WHERE id IN(SELECT playable_source_id FROM playable_source_parts
                   WHERE file_id=NEW.id)
        AND NEW.item_id IS NOT NULL;
+    INSERT INTO playable_sources
+      (module_id,collection_id,item_id,root_id,family_key,expected_parts)
+    SELECT NEW.module_id,NEW.collection_id,NEW.item_id,NEW.root_id,'file:'||NEW.id,1
+     WHERE NEW.item_id IS NOT NULL AND NOT EXISTS(
+       SELECT 1 FROM playable_source_parts WHERE file_id=NEW.id)
+    ON CONFLICT(module_id,collection_id,root_id,family_key) DO UPDATE SET
+      item_id=excluded.item_id;
+    INSERT INTO playable_source_parts
+      (playable_source_id,module_id,collection_id,ordinal,file_id)
+    SELECT id,NEW.module_id,NEW.collection_id,1,NEW.id FROM playable_sources
+     WHERE NEW.item_id IS NOT NULL AND module_id=NEW.module_id
+       AND collection_id=NEW.collection_id AND root_id IS NEW.root_id
+       AND family_key='file:'||NEW.id
+    ON CONFLICT(file_id) DO NOTHING;
     DELETE FROM playable_source_parts WHERE file_id=NEW.id AND NEW.item_id IS NULL;
     DELETE FROM playable_sources
      WHERE NOT EXISTS(SELECT 1 FROM playable_source_parts p
@@ -78,5 +109,9 @@ SELECT ps.id,f.module_id,f.collection_id,COALESCE(f.part,1),f.id
    AND ps.family_key=CASE WHEN f.part IS NULL THEN 'file:'||f.id
                           ELSE 'legacy-item:'||f.item_id END
  WHERE f.item_id IS NOT NULL;
+
+CREATE VIEW file_bindings AS
+SELECT p.file_id,s.item_id,p.ordinal AS part,s.id AS playable_source_id
+  FROM playable_source_parts p JOIN playable_sources s ON s.id=p.playable_source_id;
 
 ANALYZE;

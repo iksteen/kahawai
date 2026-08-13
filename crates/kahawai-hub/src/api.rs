@@ -887,7 +887,8 @@ async fn admin_review_list(State(state): State<AppState>) -> Result<Json<Value>,
     let rows = sqlx::query(
         "SELECT i.id, i.kind, i.title, i.year, m.confidence,
                 m.title AS matched_title, m.premiered, m.provider, m.provider_id,
-                (SELECT f.path_rel FROM files f WHERE f.item_id=i.id LIMIT 1) AS path
+                (SELECT f.path_rel FROM files f JOIN file_bindings fb ON fb.file_id=f.id
+                  WHERE fb.item_id=i.id LIMIT 1) AS path
          FROM items i
          JOIN resolved_metadata m ON m.item_id = i.id
          -- Only what a human can act on: episodes and tracks inherit their

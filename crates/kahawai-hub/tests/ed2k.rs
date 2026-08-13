@@ -171,8 +171,8 @@ async fn anime_collection_resolves_movies_but_not_extras() {
     // held. The hash still refines the slot when AniDB knows the file.
     let nc: Option<(Option<i64>, i64, String)> = sqlx::query_as(
         "SELECT i.season,i.episode,p.title
-           FROM files f JOIN items i ON i.id=f.item_id
-           JOIN items p ON p.id=i.parent_id
+           FROM files f JOIN file_bindings fb ON fb.file_id=f.id
+           JOIN items i ON i.id=fb.item_id JOIN items p ON p.id=i.parent_id
           WHERE f.path_rel LIKE '%NCED2%'",
     )
     .fetch_optional(&db)

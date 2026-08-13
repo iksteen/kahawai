@@ -497,9 +497,9 @@ async fn capability_changes_delivery_not_existence() {
     // sync_source_tracks ran).
     q(
         "INSERT INTO subtitle_tracks(source_id,origin,stream_index,format,language)
-       VALUES((SELECT id FROM files WHERE item_id='subs-item'),'embedded',0,'srt','en'),
-             ((SELECT id FROM files WHERE item_id='subs-item'),'embedded',1,'ass','en'),
-             ((SELECT id FROM files WHERE item_id='subs-item'),'embedded',2,'pgs','en')",
+       VALUES((SELECT file_id FROM file_bindings WHERE item_id='subs-item'),'embedded',0,'srt','en'),
+             ((SELECT file_id FROM file_bindings WHERE item_id='subs-item'),'embedded',1,'ass','en'),
+             ((SELECT file_id FROM file_bindings WHERE item_id='subs-item'),'embedded',2,'pgs','en')",
     )
     .await;
 

@@ -68,8 +68,8 @@ async fn files_and_items_survive_restart() {
     assert!(!cols[0].available, "no mediahost connected after restart");
 
     let titles: Vec<(String, Option<i64>, i64)> = sqlx::query_as(
-        "SELECT i.title, i.year, COUNT(f.id) FROM items i
-         JOIN files f ON f.item_id = i.id
+        "SELECT i.title, i.year, COUNT(fb.file_id) FROM items i
+         JOIN file_bindings fb ON fb.item_id = i.id
          GROUP BY i.id ORDER BY i.title",
     )
     .fetch_all(&db)
@@ -494,9 +494,9 @@ async fn multipart_movies_group_into_one_item() {
     assert_eq!(items, ["12 Monkeys", "Heat"], "{items:?}");
 
     let parts: Vec<(String, Option<i64>)> = sqlx::query(
-        "SELECT f.path_rel AS source_path,f.part FROM files f
-         JOIN items i ON i.id=f.item_id WHERE i.title='12 Monkeys'
-         ORDER BY f.part",
+        "SELECT f.path_rel AS source_path,fb.part FROM files f
+         JOIN file_bindings fb ON fb.file_id=f.id JOIN items i ON i.id=fb.item_id
+         WHERE i.title='12 Monkeys' ORDER BY fb.part",
     )
     .fetch_all(&db)
     .await
@@ -512,8 +512,10 @@ async fn multipart_movies_group_into_one_item() {
         ]
     );
     let heat_part: Option<i64> = sqlx::query_scalar(
-        "SELECT f.part FROM files f JOIN items i ON i.id=f.item_id
-         WHERE i.title='Heat'",
+        "SELECT CASE WHEN s.expected_parts=1 THEN NULL ELSE fb.part END
+           FROM files f JOIN file_bindings fb ON fb.file_id=f.id
+           JOIN playable_sources s ON s.id=fb.playable_source_id
+           JOIN items i ON i.id=fb.item_id WHERE i.title='Heat'",
     )
     .fetch_one(&db)
     .await
