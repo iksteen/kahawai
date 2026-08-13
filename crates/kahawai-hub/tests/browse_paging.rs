@@ -115,17 +115,9 @@ async fn pages_partition_a_library_even_across_ties() {
     for n in 0..11 {
         let id = format!("i{n:02}");
         sqlx::query(
-            "INSERT INTO items (id, kind, title, norm_title, year) VALUES (?, 'movie', 'Same', 'same', 2020)",
+            "INSERT INTO items(id,kind,title,norm_title,year,module_id,collection_id)
+             VALUES(?,'movie','Same','same',2020,'m','c')",
         )
-        .bind(&id)
-        .execute(&db)
-        .await
-        .unwrap();
-        sqlx::query(
-            "INSERT INTO item_sources (item_id, module_id, collection_id, path_rel)
-             VALUES (?, 'm', 'c', ? || '.mkv')",
-        )
-        .bind(&id)
         .bind(&id)
         .execute(&db)
         .await
@@ -205,25 +197,24 @@ async fn search_finds_artists_and_episode_titles() {
     // An album by an accented artist. norm_artist is what the write
     // sites store; here it is set the way the registry would.
     q(
-        "INSERT INTO items (id, kind, title, norm_title, artist, norm_artist)
-       VALUES ('alb','album','Ace of Spades','ace of spades','Motörhead','motorhead')",
+        "INSERT INTO items(id,kind,title,norm_title,artist,norm_artist,module_id,collection_id)
+       VALUES('alb','album','Ace of Spades','ace of spades','Motörhead','motorhead','m','c')",
     )
     .await;
 
     // A show whose episode has a projected title that is NOT in the
     // filename — the 19% case.
-    q("INSERT INTO items (id, kind, title, norm_title) VALUES ('sh','show','A Show','a show')")
-        .await;
     q(
-        "INSERT INTO items (id, kind, title, norm_title, parent_id, season, episode)
-       VALUES ('ep','episode','S03E14','s03e14','sh',3,14)",
+        "INSERT INTO items(id,kind,title,norm_title,module_id,collection_id)
+       VALUES('sh','show','A Show','a show','m','c')",
     )
     .await;
     q(
-        "INSERT INTO item_sources (item_id, module_id, collection_id, path_rel)
-       VALUES ('ep','m','c','s03e14.mkv')",
+        "INSERT INTO items(id,kind,title,norm_title,parent_id,season,episode,module_id,collection_id)
+       VALUES('ep','episode','S03E14','s03e14','sh',3,14,'m','c')",
     )
     .await;
+
     kahawai_hub::providers::store_answer(
         &db,
         "sh",
@@ -268,8 +259,8 @@ async fn search_finds_artists_and_episode_titles() {
     // Tracks match by TITLE, never by artist: "motorhead" must not bury
     // the album under a row per song, but the song itself is findable.
     q(
-        "INSERT INTO items (id, kind, title, norm_title, parent_id, artist, norm_artist)
-       VALUES ('trk','track','Overkill','overkill','alb','Motörhead','motorhead')",
+        "INSERT INTO items(id,kind,title,norm_title,parent_id,artist,norm_artist,module_id,collection_id)
+       VALUES('trk','track','Overkill','overkill','alb','Motörhead','motorhead','m','c')",
     )
     .await;
     let v = page(&api, &token, "/api/v1/items?q=motorhead").await;
@@ -313,28 +304,32 @@ async fn capability_changes_delivery_not_existence() {
        VALUES ('m2','c2','movies','[\"/m\"]',1)",
     )
     .await;
-    q("INSERT INTO items (id, kind, title, norm_title) VALUES ('subs-item','movie','Subbed','subbed')").await;
+    q(
+        "INSERT INTO items(id,kind,title,norm_title,module_id,collection_id)
+       VALUES('subs-item','movie','Subbed','subbed','m2','c2')",
+    )
+    .await;
+    q(
+        "INSERT INTO collection_roots(module_id,collection_id,root_token,normalized_path)
+       VALUES('m2','c2','root','/m')",
+    )
+    .await;
     q(r#"INSERT INTO files
-              (module_id, collection_id, path_rel, root_token, source_path,
-               size, mtime_unix, head_xxh3, tail_xxh3, oshash, subs_extracted, streams_json)
-       VALUES ('m2','c2','key','root','subbed.mkv', 700, 1, 0, 0, 0, 0,
+              (module_id,collection_id,root_id,path_rel,item_id,size,mtime_unix,
+               head_xxh3,tail_xxh3,oshash,subs_extracted,streams_json)
+       VALUES ('m2','c2',(SELECT id FROM collection_roots WHERE module_id='m2'),
+               'subbed.mkv','subs-item',700,1,0,0,0,0,
                '{"container":"matroska",
                  "subtitles":[{"format":"srt","language":"en"},
                               {"format":"ass","language":"en"},
                               {"format":"pgs","language":"en"}]}')"#)
     .await;
-    q("INSERT INTO item_sources
-              (item_id, module_id, collection_id, path_rel, root_token, source_path)
-       VALUES ('subs-item','m2','c2','key','root','subbed.mkv')")
-    .await;
     // What a scan would materialize (tests seed by SQL, so no
     // sync_source_tracks ran).
-    q("INSERT INTO subtitle_tracks
-              (item_id, origin, module_id, collection_id, root_token, source_path,
-               path_rel, stream_index, format, language)
-       VALUES ('subs-item','embedded','m2','c2','root','subbed.mkv','key',0,'srt','en'),
-              ('subs-item','embedded','m2','c2','root','subbed.mkv','key',1,'ass','en'),
-              ('subs-item','embedded','m2','c2','root','subbed.mkv','key',2,'pgs','en')")
+    q("INSERT INTO subtitle_tracks(item_id,source_id,origin,stream_index,format,language)
+       VALUES('subs-item',(SELECT id FROM files WHERE item_id='subs-item'),'embedded',0,'srt','en'),
+             ('subs-item',(SELECT id FROM files WHERE item_id='subs-item'),'embedded',1,'ass','en'),
+             ('subs-item',(SELECT id FROM files WHERE item_id='subs-item'),'embedded',2,'pgs','en')")
     .await;
 
     // Straight at `Subtitles::list`, not over HTTP: the listing endpoint
@@ -396,10 +391,35 @@ async fn capability_changes_delivery_not_existence() {
 #[tokio::test]
 async fn scan_sync_preserves_track_ids() {
     let (_api, _token, db) = harness().await;
-    sqlx::query("INSERT INTO items (id, kind, title, norm_title) VALUES ('it','movie','M','m')")
-        .execute(&db)
-        .await
-        .unwrap();
+    sqlx::query(
+        "INSERT INTO satellites(module_id,module_type,name,cert_fingerprint)
+                 VALUES('sync','mediahost','sync','fp')",
+    )
+    .execute(&db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO collections(module_id,collection_id,media_type)
+                 VALUES('sync','c','movies')",
+    )
+    .execute(&db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO items(id,kind,title,norm_title,module_id,collection_id)
+                 VALUES('it','movie','M','m','sync','c')",
+    )
+    .execute(&db)
+    .await
+    .unwrap();
+    let source_id: i64 = sqlx::query_scalar(
+        "INSERT INTO files(module_id,collection_id,path_rel,item_id,size,mtime_unix,
+                           head_xxh3,tail_xxh3,oshash,streams_json)
+         VALUES('sync','c','m.mkv','it',1,1,0,0,0,'{}') RETURNING id",
+    )
+    .fetch_one(&db)
+    .await
+    .unwrap();
     let info: kahawai_core::media::MediaInfo = serde_json::from_str(
         r#"{"subtitles":[{"format":"srt","language":"en"},{"format":"pgs","language":"nl"}],
             "external_subtitles":[{"path_rel":"m.idx","format":"vobsub","language":"en","track":0}]}"#,
@@ -409,11 +429,9 @@ async fn scan_sync_preserves_track_ids() {
         let db = db.clone();
         async move {
             let mut tx = db.begin().await.unwrap();
-            kahawai_hub::tracks::sync_source_tracks(
-                &mut tx, "it", "m", "c", "root", "m.mkv", "key", &info,
-            )
-            .await
-            .unwrap();
+            kahawai_hub::tracks::sync_source_tracks(&mut tx, "it", source_id, &info)
+                .await
+                .unwrap();
             tx.commit().await.unwrap();
         }
     };

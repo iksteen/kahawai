@@ -127,8 +127,10 @@ pub fn local_link(
     registry.register_link(module_id, hub_tx);
     let module_id = module_id.to_string();
     tokio::spawn(async move {
-        let mut seen: std::collections::HashMap<String, std::collections::HashSet<String>> =
-            Default::default();
+        let mut seen: std::collections::HashMap<
+            String,
+            std::collections::HashSet<crate::registry::SourcePath>,
+        > = Default::default();
         let mut partial: std::collections::HashMap<(String, String, String, u32), PartialSets> =
             Default::default();
         while let Some(HostToHub { msg }) = host_rx.recv().await {
@@ -244,7 +246,7 @@ impl MediahostLink for MediahostLinkService {
                 tokio::spawn(async move {
                     let mut seen: std::collections::HashMap<
                         String,
-                        std::collections::HashSet<String>,
+                        std::collections::HashSet<crate::registry::SourcePath>,
                     > = std::collections::HashMap::new();
                     let mut partial: std::collections::HashMap<
                         (String, String, String, u32),
@@ -564,7 +566,10 @@ async fn handle_host_msg(
     enricher: &Arc<crate::enrich::Enricher>,
     module_id: &str,
     msg: host_to_hub::Msg,
-    seen: &mut std::collections::HashMap<String, std::collections::HashSet<String>>,
+    seen: &mut std::collections::HashMap<
+        String,
+        std::collections::HashSet<crate::registry::SourcePath>,
+    >,
     partial: &mut std::collections::HashMap<(String, String, String, u32), PartialSets>,
 ) -> anyhow::Result<()> {
     use crate::registry::FileUpsertRecord;
@@ -647,7 +652,10 @@ async fn handle_host_msg(
                     .resolve_root_token(module_id, &u.collection_id, &source.root_token)
                     .await?;
                 if let Some(paths) = seen.get_mut(&u.collection_id) {
-                    paths.insert(crate::registry::source_key(&root_token, &source.path_rel));
+                    paths.insert(crate::registry::SourcePath {
+                        root_token: root_token.clone(),
+                        path_rel: source.path_rel.clone(),
+                    });
                 }
                 files.push(FileUpsertRecord {
                     root_token,
@@ -673,7 +681,10 @@ async fn handle_host_msg(
             if !source.path_rel.is_empty()
                 && let Some(paths) = seen.get_mut(&e.collection_id)
             {
-                paths.insert(crate::registry::source_key(&root_token, &source.path_rel));
+                paths.insert(crate::registry::SourcePath {
+                    root_token: root_token.clone(),
+                    path_rel: source.path_rel.clone(),
+                });
             }
             tracing::warn!(%module_id, collection = %e.collection_id, %root_token,
                 path = %source.path_rel, error = %e.error, "mediahost reported unreadable source");
@@ -878,7 +889,10 @@ async fn handle_host_msg(
                     let token = registry
                         .resolve_root_token(module_id, &s.collection_id, &source.root_token)
                         .await?;
-                    paths.insert(crate::registry::source_key(&token, &source.path_rel));
+                    paths.insert(crate::registry::SourcePath {
+                        root_token: token,
+                        path_rel: source.path_rel,
+                    });
                 }
             }
         }

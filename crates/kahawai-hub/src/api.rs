@@ -887,7 +887,7 @@ async fn admin_review_list(State(state): State<AppState>) -> Result<Json<Value>,
     let rows = sqlx::query(
         "SELECT i.id, i.kind, i.title, i.year, m.confidence,
                 m.title AS matched_title, m.premiered, m.provider, m.provider_id,
-                (SELECT s.source_path FROM item_sources s WHERE s.item_id = i.id LIMIT 1) AS path
+                (SELECT f.path_rel FROM files f WHERE f.item_id=i.id LIMIT 1) AS path
          FROM items i
          JOIN resolved_metadata m ON m.item_id = i.id
          -- Only what a human can act on: episodes and tracks inherit their
@@ -2284,9 +2284,8 @@ fn items_order_c(sort: Option<&str>) -> String {
     items_order(sort).replace("i.", "c.")
 }
 
-/// ORDER BY pairs for a library page driven from the membership table:
-/// the inner scan of `item_libraries_browse` (0040) and the outer
-/// re-order of the joined page.
+/// ORDER BY pairs for a library page driven from the collection-scoped item
+/// index and the outer re-order of the joined page.
 ///
 /// Every inner order ends in `item_id`, which is IN the covering index,
 /// so the order is total for free — a tie cannot straddle a page
@@ -2297,39 +2296,32 @@ fn items_order_c(sort: Option<&str>) -> String {
 fn membership_order(sort: Option<&str>) -> (&'static str, &'static str) {
     match sort.unwrap_or("title") {
         "year" => (
-            "year IS NULL, year, sort_title, item_id",
+            "c.year IS NULL,c.year,c.sort_title,c.id",
             "i.year IS NULL, i.year, i.sort_title, i.id",
         ),
         "-year" => (
-            "year IS NULL, year DESC, sort_title, item_id",
+            "c.year IS NULL,c.year DESC,c.sort_title,c.id",
             "i.year IS NULL, i.year DESC, i.sort_title, i.id",
         ),
-        "added" => ("item_id", "i.id"),
-        "-added" => ("item_id DESC", "i.id DESC"),
+        "added" => ("c.id", "i.id"),
+        "-added" => ("c.id DESC", "i.id DESC"),
         "-title" => (
-            "sort_title DESC, year DESC, item_id DESC",
+            "c.sort_title DESC,c.year DESC,c.id DESC",
             "i.sort_title DESC, i.year DESC, i.id DESC",
         ),
-        _ => ("sort_title, year, item_id", "i.sort_title, i.year, i.id"),
+        _ => ("c.sort_title,c.year,c.id", "i.sort_title, i.year, i.id"),
     }
 }
 
 /// The total for a library with no search term — the overwhelmingly
 /// common browse.
 ///
-/// `item_libraries` IS the answer: it is keyed `(library_id, item_id)`,
-/// so counting a library is one key-range scan. Counting `items` and
-/// probing membership per row instead cost 47 ms at 50k and 523 ms at
-/// 250k, against 3.4 ms and 15.5 ms here — on every request, including
-/// the first page.
-///
-/// No `kind` filter, because membership only ever holds TOP-LEVEL items:
-/// the 0036/0039 triggers project `COALESCE(parent_id, id)`, so an
-/// episode's source lands its show. Re-checking the invariant with a
-/// join costs more than the query it protects (73 ms / 594 ms — worse
-/// than what it replaced), so it is pinned by a test instead:
-/// `library_membership_holds_only_top_level_items` in tests/sort_title.rs.
-const COUNT_IN_LIBRARY: &str = "SELECT COUNT(*) FROM item_libraries WHERE library_id = ?1";
+/// Libraries compose collections. The count joins the small composition row
+/// set to `items_collection_browse` and excludes children explicitly; there is
+/// no item-level membership cache to synchronize.
+const COUNT_IN_LIBRARY: &str = "SELECT COUNT(*) FROM items i JOIN library_collections lc
+ ON (lc.module_id,lc.collection_id)=(i.module_id,i.collection_id)
+ WHERE lc.library_id=?1 AND i.parent_id IS NULL";
 
 /// The columns a browse row carries, resolved for the ≤200 rows of ONE
 /// page — never for a candidate. See [`item_page_sql`].
@@ -2344,9 +2336,9 @@ fn item_page_cols(restricted: bool, scoped: bool) -> String {
     // scoping is a different question and still applies to both halves.
     let (lib_pref, lib_pref_end) = if scoped {
         (
-            "COALESCE((SELECT il.library_id FROM item_libraries il
-                        WHERE il.item_id = COALESCE(i.parent_id, i.id)
-                          AND il.library_id = ?2),
+            "COALESCE((SELECT lc.library_id FROM library_collections lc
+                        WHERE (lc.module_id,lc.collection_id)=(i.module_id,i.collection_id)
+                          AND lc.library_id=?2),
                       ",
             ")",
         )
@@ -2367,7 +2359,7 @@ i.title AS file_title, i.year AS file_year,
 md.title AS matched_title,
 md.confidence AS match_confidence,
 md.updated_at AS art_version,
-(SELECT COUNT(*) FROM item_sources s WHERE s.item_id = i.id) AS sources,
+(SELECT COUNT(*) FROM files f WHERE f.item_id=i.id) AS sources,
 i.parent_id,
 (SELECT p.sort_title FROM items p WHERE p.id = i.parent_id) AS parent_title,
 -- A library this item is in, as navigation context: item URLs live under
@@ -2377,14 +2369,14 @@ i.parent_id,
 -- \"its library\" — MIN so the same row always answers the same way.
 -- Keyed on COALESCE(parent_id, id) because membership only ever holds
 -- top-level items: an episode belongs to a library through its show.
--- Indexed by item_libraries_item (0036), and paid on the ≤200 rows of a
--- page beside the source count above, never on a candidate.
+-- Indexed by library_collections and paid on the ≤200 rows of a page beside
+-- the source count above, never on a candidate.
 -- Scoped to what this account may open (grants::VISIBLE_LIB): an item
 -- can be in more than one library, and naming one the caller was refused
 -- both answers a question the grant said no to and sends the client
 -- somewhere it will get a 404.
-{lib_pref}(SELECT MIN(il.library_id) FROM item_libraries il
-  WHERE il.item_id = COALESCE(i.parent_id, i.id) {lib}){lib_pref_end} AS library_id,
+{lib_pref}(SELECT MIN(lc.library_id) FROM library_collections lc
+  WHERE (lc.module_id,lc.collection_id)=(i.module_id,i.collection_id) {lib}){lib_pref_end} AS library_id,
 w.position_ms, w.duration_ms, w.played, w.play_count"
     )
 }
@@ -2485,9 +2477,9 @@ async fn list_items(
         // Episodes very much stay in — they are most of this row.
         let member = match &q.library {
             Some(_) => {
-                "AND EXISTS (SELECT 1 FROM item_libraries il
-                              WHERE il.library_id = ?2
-                                AND il.item_id = COALESCE(c.parent_id, c.id))"
+                "AND EXISTS(SELECT 1 FROM library_collections lc
+                              WHERE lc.library_id=?2
+                                AND (lc.module_id,lc.collection_id)=(c.module_id,c.collection_id))"
             }
             None => visible,
         };
@@ -2536,16 +2528,15 @@ async fn list_items(
         // which is the pattern that has cost us an index twice now.
         match (&q.library, &needle) {
             // A library, no search — the overwhelmingly common browse. The
-            // page comes off `item_libraries_browse` (0040) alone: membership
-            // and sort keys live in one covering index, so a deep page skips
-            // rows at one index step each instead of probing `items` per
-            // skipped row. That probe chain is what made the last page of a
-            // 250k library cost 1.2 s; this shape measures 21 ms there.
+            // page comes from the collection-scoped item browse index after
+            // resolving the library's small collection composition.
             (Some(library), None) => {
                 let (order_in, order_out) = membership_order(q.sort.as_deref());
                 let sql = item_page_sql(
                     &format!(
-                        "SELECT item_id FROM item_libraries WHERE library_id = ?2
+                        "SELECT c.id AS item_id FROM items c JOIN library_collections lc
+                          ON (lc.module_id,lc.collection_id)=(c.module_id,c.collection_id)
+                         WHERE lc.library_id=?2 AND c.parent_id IS NULL
                       ORDER BY {order_in} LIMIT ?3 OFFSET ?4"
                     ),
                     order_out,
@@ -2583,9 +2574,9 @@ async fn list_items(
             (library, Some(needle)) => {
                 let member = match library {
                     Some(_) => {
-                        "AND EXISTS (SELECT 1 FROM item_libraries il
-                                  WHERE il.library_id = ?2
-                                    AND il.item_id = COALESCE(c.parent_id, c.id))"
+                        "AND EXISTS(SELECT 1 FROM library_collections lc
+                                  WHERE lc.library_id=?2
+                                    AND (lc.module_id,lc.collection_id)=(c.module_id,c.collection_id))"
                     }
                     // Cross-library search by a restricted account: the same
                     // shape, over every library it holds instead of one.
@@ -2672,7 +2663,7 @@ async fn list_items(
                     .await
                     .map_err(internal)?;
                 // The same predicate as the page, not the cheaper
-                // `COUNT(*) FROM item_libraries` a granted set would allow:
+                // a separate composition count a granted set would allow:
                 // a total that disagrees with the rows it counts is a paging
                 // bug that only shows up on the last page.
                 // ponytail: an unrestricted account keeps the bare count, so
@@ -2757,7 +2748,7 @@ async fn item_children(
                 md.premiered AS premiered,
                 md.updated_at AS art_version,
                 md.proj_season, md.proj_episode,
-                COUNT(s.item_id) AS sources,
+                COUNT(f.id) AS sources,
                 -- HUB-19: the file's own loudness statement, passed
                 -- through for the player to apply. MIN() picks one
                 -- deterministically when an item has several sources;
@@ -2766,9 +2757,7 @@ async fn item_children(
                 MIN(json_extract(f.streams_json, '$.replay_gain')) AS replay_gain,
                 w.position_ms, w.duration_ms, w.played, w.play_count
          FROM items i
-         LEFT JOIN item_sources s ON s.item_id = i.id
-         LEFT JOIN files f ON (f.module_id, f.collection_id, f.path_rel)
-                            = (s.module_id, s.collection_id, s.path_rel)
+         LEFT JOIN files f ON f.item_id=i.id
          LEFT JOIN watch_state w ON w.item_id = i.id AND w.user_id = ?
          LEFT JOIN resolved_metadata md ON md.item_id = i.id
          WHERE i.parent_id = ?
@@ -2811,7 +2800,7 @@ async fn item_body(
                 p.id AS parent_id,
                 md.updated_at AS art_version,
                 COALESCE(pmd.title, p.title) AS show_title,
-                (SELECT COUNT(*) FROM item_sources s WHERE s.item_id = i.id) AS sources,
+                (SELECT COUNT(*) FROM files f WHERE f.item_id=i.id) AS sources,
                 w.position_ms, w.duration_ms, w.played, w.play_count
          FROM items i
          LEFT JOIN items p ON p.id = i.parent_id
@@ -2828,12 +2817,9 @@ async fn item_body(
     .ok_or((StatusCode::NOT_FOUND, "no such item".to_string()))?;
 
     let sources = sqlx::query(
-        "SELECT s.module_id, s.collection_id, s.source_path, f.size, f.streams_json,
-                COALESCE(f.revision, 1) AS revision
-         FROM item_sources s
-         JOIN files f ON (f.module_id, f.collection_id, f.path_rel)
-                       = (s.module_id, s.collection_id, s.path_rel)
-         WHERE s.item_id = ?
+        "SELECT f.module_id,f.collection_id,f.path_rel AS source_path,f.size,f.streams_json,
+                COALESCE(f.revision,1) AS revision
+         FROM files f WHERE f.item_id=?
          -- Same order playback picks in (sessions::source_parts), so the
          -- list a user reads is the preference the player acts on.
          ORDER BY COALESCE(json_extract(f.streams_json, '$.video[0].height'), 0) DESC,

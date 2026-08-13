@@ -252,28 +252,21 @@ async fn root_adoption_suppresses_only_its_own_generation_mismatch() {
     .await
     .unwrap();
     sqlx::query(
-        "INSERT INTO items (id,kind,title,norm_title) VALUES ('legacy','movie','Legacy','legacy')",
+        "INSERT INTO items(id,kind,title,norm_title,module_id,collection_id)
+         VALUES('legacy','movie','Legacy','legacy','01ADOPT','movies')",
     )
     .execute(hub.registry.db())
     .await
     .unwrap();
     sqlx::query(
         "INSERT INTO files
-           (module_id,collection_id,path_rel,size,mtime_unix,
+           (module_id,collection_id,path_rel,item_id,size,mtime_unix,
             head_xxh3,tail_xxh3,oshash,streams_json)
-         VALUES ('01ADOPT','movies','legacy.mkv',10,1,2,3,4,'{}')",
+         VALUES('01ADOPT','movies','legacy.mkv','legacy',10,1,2,3,4,'{}')",
     )
     .execute(hub.registry.db())
     .await
     .unwrap();
-    sqlx::query(
-        "INSERT INTO item_sources (module_id,collection_id,path_rel,item_id)
-         VALUES ('01ADOPT','movies','legacy.mkv','legacy')",
-    )
-    .execute(hub.registry.db())
-    .await
-    .unwrap();
-
     let tls = kahawai_transport::mtls::mtls_client_config(&id).unwrap();
     let channel = kahawai_transport::tls::grpc_channel_with(&hub.addr, tls)
         .await
@@ -343,8 +336,8 @@ async fn root_adoption_suppresses_only_its_own_generation_mismatch() {
     );
     assert_ne!(
         sqlx::query_scalar::<_, String>(
-            "SELECT root_token FROM files
-             WHERE module_id = '01ADOPT' AND collection_id = 'movies'",
+            "SELECT r.root_token FROM files f JOIN collection_roots r ON r.id=f.root_id
+             WHERE f.module_id='01ADOPT' AND f.collection_id='movies'",
         )
         .fetch_one(hub.registry.db())
         .await

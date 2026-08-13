@@ -93,33 +93,26 @@ async fn seed(dir: &std::path::Path, items: usize) -> Bench {
         let collection = format!("c{m}");
         let path = format!("Film {n} (2020).mkv");
         sqlx::query(
-            "INSERT INTO items (id, kind, title, norm_title, year) VALUES (?, 'movie', ?, ?, 2020)",
+            "INSERT INTO items(id,kind,title,norm_title,year,module_id,collection_id)
+             VALUES(?,'movie',?,?,2020,?,?)",
         )
         .bind(&id)
         .bind(format!("Film {n}"))
         .bind(format!("film {n}"))
+        .bind(&module)
+        .bind(&collection)
         .execute(&mut *tx)
         .await
         .unwrap();
         sqlx::query(
-            "INSERT INTO files (module_id, collection_id, path_rel, size, mtime_unix,
-                                head_xxh3, tail_xxh3, oshash, streams_json, subs_extracted)
-             VALUES (?, ?, ?, 1000000, 1, 0, 0, 0, '{}', 0)",
+            "INSERT INTO files(module_id,collection_id,path_rel,item_id,size,mtime_unix,
+                                head_xxh3,tail_xxh3,oshash,streams_json,subs_extracted)
+             VALUES(?,?,?,?,1000000,1,0,0,0,'{}',0)",
         )
         .bind(&module)
         .bind(&collection)
         .bind(&path)
-        .execute(&mut *tx)
-        .await
-        .unwrap();
-        sqlx::query(
-            "INSERT INTO item_sources (item_id, module_id, collection_id, path_rel)
-             VALUES (?, ?, ?, ?)",
-        )
         .bind(&id)
-        .bind(&module)
-        .bind(&collection)
-        .bind(&path)
         .execute(&mut *tx)
         .await
         .unwrap();
@@ -405,20 +398,21 @@ async fn browse_latency_and_scale() {
         let mut tx = b.db.begin().await.unwrap();
         for n in 0..1000 {
             sqlx::query(
-                "INSERT INTO item_sources (item_id, module_id, collection_id, path_rel)
-                 VALUES (?, ?, ?, ?)",
+                "INSERT INTO files(module_id,collection_id,path_rel,item_id,size,mtime_unix,
+                                   head_xxh3,tail_xxh3,oshash,streams_json)
+                 VALUES(?,?,?,?,1000000,1,0,0,0,'{}')",
             )
-            .bind(format!("01BENCHITEM{n:015}"))
             .bind(format!("01BENCHMODULE{:011}", n % MEDIAHOSTS))
             .bind(format!("c{}", n % MEDIAHOSTS))
             .bind(format!("extra {n}.mkv"))
+            .bind(format!("01BENCHITEM{n:015}"))
             .execute(&mut *tx)
             .await
             .unwrap();
         }
         tx.commit().await.unwrap();
         eprintln!(
-            "  1000 item_sources {:>8.1} ms  (scan path)",
+            "  1000 direct sources {:>8.1} ms  (scan path)",
             t.elapsed().as_secs_f64() * 1e3
         );
 

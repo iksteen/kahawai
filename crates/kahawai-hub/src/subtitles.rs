@@ -627,10 +627,7 @@ impl Subtitles {
 
         // The mediahost's oshash IS the OpenSubtitles moviehash (HUB-22).
         let hash: Option<i64> = sqlx::query_scalar(
-            "SELECT f.oshash FROM item_sources s
-             JOIN files f ON (f.module_id, f.collection_id, f.path_rel)
-                           = (s.module_id, s.collection_id, s.path_rel)
-             WHERE s.item_id = ? ORDER BY f.size DESC LIMIT 1",
+            "SELECT oshash FROM files WHERE item_id=? ORDER BY size DESC LIMIT 1",
         )
         .bind(item_id)
         .fetch_optional(registry.db())
@@ -943,25 +940,11 @@ impl Subtitles {
         registry: &Registry,
         parent: &crate::tracks::Track,
     ) -> Result<(u32, u32, (u32, u32))> {
-        let (m, c, token, path) = (
-            parent
-                .module_id
-                .clone()
-                .context("hub-stored track has no source")?,
-            parent.collection_id.clone().unwrap_or_default(),
-            parent.root_token.clone().unwrap_or_default(),
-            parent.source_path.clone().unwrap_or_default(),
-        );
-        let streams: String = sqlx::query_scalar(
-            "SELECT streams_json FROM files
-             WHERE (module_id, collection_id, root_token, source_path) = (?, ?, ?, ?)",
-        )
-        .bind(&m)
-        .bind(&c)
-        .bind(&token)
-        .bind(&path)
-        .fetch_one(registry.db())
-        .await?;
+        let source_id = parent.source_id.context("track has no physical source")?;
+        let streams: String = sqlx::query_scalar("SELECT streams_json FROM files WHERE id=?")
+            .bind(source_id)
+            .fetch_one(registry.db())
+            .await?;
         let info: kahawai_core::media::MediaInfo = serde_json::from_str(&streams)?;
         let v = info.video.first().context("source has no video track")?;
         anyhow::ensure!(v.width > 0 && v.height > 0, "source video has no size");
@@ -1012,16 +995,12 @@ impl Subtitles {
                 track.language.clone(),
             )),
             "sidecar" => {
-                let streams: String = sqlx::query_scalar(
-                    "SELECT streams_json FROM files
-                     WHERE (module_id, collection_id, root_token, source_path) = (?, ?, ?, ?)",
-                )
-                .bind(&module_id)
-                .bind(&collection_id)
-                .bind(&root_token)
-                .bind(&media_rel)
-                .fetch_one(registry.db())
-                .await?;
+                let source_id = track.source_id.context("track has no physical source")?;
+                let streams: String =
+                    sqlx::query_scalar("SELECT streams_json FROM files WHERE id=?")
+                        .bind(source_id)
+                        .fetch_one(registry.db())
+                        .await?;
                 let info: kahawai_core::media::MediaInfo = serde_json::from_str(&streams)?;
                 let ext = info
                     .external_subtitles
@@ -1221,8 +1200,7 @@ impl Subtitles {
     async fn ocr_candidates(&self, registry: &Registry) -> Vec<i64> {
         sqlx::query_scalar(
             "SELECT t.id FROM subtitle_tracks t
-             WHERE t.origin IN ('embedded', 'sidecar')
-               AND COALESCE(t.root_token, '') <> ''
+             WHERE t.origin IN ('embedded','sidecar') AND t.source_id IS NOT NULL
                AND t.format IN ('pgs', 'vobsub', 'dvdsub')
                AND NOT EXISTS (
                      SELECT 1 FROM subtitle_tracks d
@@ -1313,32 +1291,28 @@ impl Subtitles {
         sub_index: u32,
         error: &str,
     ) -> Result<()> {
-        let mtime: Option<i64> = sqlx::query_scalar(
-            "SELECT mtime_unix FROM files
-              WHERE module_id = ?1 AND collection_id = ?2
-                AND root_token = ?3 AND source_path = ?4",
+        let source: Option<(i64, i64)> = sqlx::query_as(
+            "SELECT f.id,f.mtime_unix FROM files f JOIN collection_roots r ON r.id=f.root_id
+              WHERE f.module_id=?1 AND f.collection_id=?2
+                AND r.root_token=?3 AND f.path_rel=?4",
         )
         .bind(module_id)
         .bind(collection_id)
         .bind(root_token)
         .bind(path_rel)
         .fetch_optional(registry.db())
-        .await?
-        .flatten();
+        .await?;
+        let Some((source_id, mtime)) = source else {
+            return Ok(());
+        };
         sqlx::query(
             "INSERT INTO image_set_failures
-                 (module_id, collection_id, path_rel, root_token, source_path,
-                  sub_index, mtime_unix, error, at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, unixepoch())
-             ON CONFLICT (module_id, collection_id, root_token, source_path, sub_index)
-                 WHERE root_token <> '' DO UPDATE
-             SET mtime_unix = excluded.mtime_unix, error = excluded.error, at = excluded.at",
+                 (source_id,sub_index,mtime_unix,error,at)
+             VALUES (?1,?2,?3,?4,unixepoch())
+             ON CONFLICT(source_id,sub_index) DO UPDATE SET
+               mtime_unix=excluded.mtime_unix,error=excluded.error,at=excluded.at",
         )
-        .bind(module_id)
-        .bind(collection_id)
-        .bind(crate::registry::source_key(root_token, path_rel))
-        .bind(root_token)
-        .bind(path_rel)
+        .bind(source_id)
         .bind(sub_index)
         .bind(mtime)
         .bind(error)
@@ -1358,12 +1332,10 @@ impl Subtitles {
         sub_index: usize,
     ) -> bool {
         sqlx::query_scalar::<_, i64>(
-            "SELECT 1 FROM image_set_failures f
-               JOIN files fi ON (fi.module_id, fi.collection_id, fi.root_token, fi.source_path)
-                              = (f.module_id, f.collection_id, f.root_token, f.source_path)
-              WHERE f.module_id = ?1 AND f.collection_id = ?2
-                AND f.root_token = ?3 AND f.source_path = ?4
-                AND f.sub_index = ?5 AND f.mtime_unix IS fi.mtime_unix",
+            "SELECT 1 FROM image_set_failures x JOIN files f ON f.id=x.source_id
+               JOIN collection_roots r ON r.id=f.root_id
+              WHERE f.module_id=?1 AND f.collection_id=?2 AND r.root_token=?3
+                AND f.path_rel=?4 AND x.sub_index=?5 AND x.mtime_unix IS f.mtime_unix",
         )
         .bind(module_id)
         .bind(collection_id)
@@ -1679,9 +1651,10 @@ pub async fn ocr_stream_set(
     item_id: &str,
 ) -> std::collections::HashSet<(String, String, String, String, i64)> {
     sqlx::query_as(
-        "SELECT t.module_id, t.collection_id, t.root_token, t.source_path, t.stream_index
-         FROM subtitle_tracks t
-         WHERE t.item_id = ? AND t.origin = 'embedded'
+        "SELECT f.module_id,f.collection_id,r.root_token,f.path_rel,t.stream_index
+         FROM subtitle_tracks t JOIN files f ON f.id=t.source_id
+         JOIN collection_roots r ON r.id=f.root_id
+         WHERE t.item_id=? AND t.origin='embedded'
            AND EXISTS (
                  SELECT 1 FROM subtitle_tracks d
                  WHERE d.derived_from = t.id AND d.origin = 'ocr')",
@@ -1761,12 +1734,10 @@ pub(crate) async fn source_row(
     kahawai_core::media::MediaInfo,
 )> {
     let rows = sqlx::query(
-        "SELECT s.module_id, s.collection_id, s.root_token, s.source_path,
+        "SELECT f.module_id,f.collection_id,r.root_token,f.path_rel AS source_path,
                 f.streams_json
-         FROM item_sources s
-         JOIN files f ON (f.module_id, f.collection_id, f.path_rel)
-                       = (s.module_id, s.collection_id, s.path_rel)
-         WHERE s.item_id = ? AND s.root_token <> '' ORDER BY f.size DESC",
+         FROM files f JOIN collection_roots r ON r.id=f.root_id
+         WHERE f.item_id=? ORDER BY f.size DESC",
     )
     .bind(item_id)
     .fetch_all(registry.db())

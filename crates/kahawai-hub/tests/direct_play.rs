@@ -247,11 +247,13 @@ async fn direct_play_ranges_end_to_end() {
     assert_eq!(v["mode"], "direct");
     assert_eq!(v["content_type"], "video/x-matroska");
     assert_eq!(v["size"], FILE_LEN as u64);
-    let exact_sources: Vec<(String, String)> =
-        sqlx::query_as("SELECT root_token, source_path FROM files ORDER BY root_token")
-            .fetch_all(&db)
-            .await
-            .unwrap();
+    let exact_sources: Vec<(String, String)> = sqlx::query_as(
+        "SELECT r.root_token,f.path_rel FROM files f JOIN collection_roots r ON r.id=f.root_id
+         ORDER BY r.root_token",
+    )
+    .fetch_all(&db)
+    .await
+    .unwrap();
     assert_eq!(exact_sources.len(), 2);
     assert!(
         exact_sources
@@ -260,9 +262,7 @@ async fn direct_play_ranges_end_to_end() {
     );
     assert_eq!(
         sqlx::query_scalar::<_, String>(
-            "SELECT s.root_token FROM item_sources s JOIN files f
-             ON (f.module_id, f.collection_id, f.path_rel)
-              = (s.module_id, s.collection_id, s.path_rel)
+            "SELECT r.root_token FROM files f JOIN collection_roots r ON r.id=f.root_id
              ORDER BY f.size DESC LIMIT 1",
         )
         .fetch_one(&db)
@@ -445,11 +445,12 @@ async fn direct_play_ranges_end_to_end() {
     // offline host reached the burn arm first and the one condition stand-by
     // exists for was told to give up.
     let track_id: i64 = sqlx::query_scalar(
-        "INSERT INTO subtitle_tracks
-             (item_id, origin, module_id, collection_id, path_rel, stream_index, format)
-         VALUES (?, 'stream', '01HOST', 'movies', 'Heat (1995).mkv', 3, 'ass')
+        "INSERT INTO subtitle_tracks(item_id,source_id,origin,stream_index,format)
+         SELECT ?,f.id,'embedded',3,'ass' FROM files f
+          WHERE f.item_id=? ORDER BY f.size DESC LIMIT 1
          RETURNING id",
     )
+    .bind(&item_id)
     .bind(&item_id)
     .fetch_one(&db)
     .await

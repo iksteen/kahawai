@@ -20,6 +20,8 @@ use std::sync::Arc;
 use kahawai_hub::registry::{FileUpsertRecord, Registry};
 use tower::ServiceExt;
 
+const TEST_ROOT: &str = "/kahawai-test-root";
+
 /// Built from the real structs, never hand-written JSON. A literal
 /// omitting one required field parses to an EMPTY `MediaInfo` —
 /// `parse_info` in the negotiator swallows the error — and every stream
@@ -59,7 +61,7 @@ fn info(subs: &[(&str, &str)]) -> kahawai_core::media::MediaInfo {
 /// read, so no bytes are needed to pose the question.
 fn ass_rec(path: &str) -> FileUpsertRecord {
     FileUpsertRecord {
-        root_token: "root".into(),
+        root_token: kahawai_core::media::root_token(std::path::Path::new(TEST_ROOT)),
         streams_json: serde_json::to_string(&info(&[("ass", "en")])).unwrap(),
         ..rec(path, 200)
     }
@@ -67,7 +69,7 @@ fn ass_rec(path: &str) -> FileUpsertRecord {
 
 fn rec(path: &str, size: u64) -> FileUpsertRecord {
     FileUpsertRecord {
-        root_token: "root".into(),
+        root_token: kahawai_core::media::root_token(std::path::Path::new(TEST_ROOT)),
         path_rel: path.into(),
         size,
         mtime_unix: 1,
@@ -134,7 +136,7 @@ async fn fixture_with(file: FileUpsertRecord) -> Fx {
     let dir = tempfile::tempdir().unwrap();
     let db = kahawai_hub::db::open(dir.path()).await.unwrap();
     let reg = Arc::new(Registry::new(db.clone(), Default::default()));
-    reg.announce_collection("01H", "movies", "movies", &[])
+    reg.announce_collection("01H", "movies", "movies", &[TEST_ROOT.into()])
         .await
         .unwrap();
     reg.upsert_files("01H", "movies", vec![file]).await.unwrap();

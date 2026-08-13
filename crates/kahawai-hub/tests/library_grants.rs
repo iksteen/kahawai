@@ -162,10 +162,10 @@ async fn harness() -> Hub {
     .await
     .unwrap();
     sqlx::query(
-        "INSERT INTO items (id, kind, title, norm_title, year)
-         VALUES ('m1','movie','Test Alpha','test alpha',2020),
-                ('s1','show','Test Bravo','test bravo',2021),
-                ('g1','movie','Test Gamma','test gamma',2022)",
+        "INSERT INTO items(id,kind,title,norm_title,year,module_id,collection_id)
+         VALUES('m1','movie','Test Alpha','test alpha',2020,'m','c1'),
+               ('s1','show','Test Bravo','test bravo',2021,'m','c2'),
+               ('g1','movie','Test Gamma','test gamma',2022,'m','c3')",
     )
     .execute(&db)
     .await
@@ -173,22 +173,12 @@ async fn harness() -> Hub {
     // The episode carries the source; membership projects it onto the
     // show, which is what makes the parent hop below worth asserting.
     sqlx::query(
-        "INSERT INTO items (id, kind, title, norm_title, parent_id, season, episode)
-         VALUES ('e1','episode','Episode One','episode one','s1',1,1)",
+        "INSERT INTO items(id,kind,title,norm_title,parent_id,season,episode,module_id,collection_id)
+         VALUES('e1','episode','Episode One','episode one','s1',1,1,'m','c2')",
     )
     .execute(&db)
     .await
     .unwrap();
-    sqlx::query(
-        "INSERT INTO item_sources (item_id, module_id, collection_id, path_rel)
-         VALUES ('m1','m','c1','alpha.mkv'),
-                ('e1','m','c2','bravo-s01e01.mkv'),
-                ('g1','m','c3','gamma.mkv')",
-    )
-    .execute(&db)
-    .await
-    .unwrap();
-
     let kid_id = auth
         .create_user("kid", "hunter22222hunter", false)
         .await
@@ -737,11 +727,14 @@ async fn a_browse_row_names_only_a_library_you_may_open() {
     .unwrap();
 
     // The kid holds L1 only. Confirm the fixture really is ambiguous.
-    let both: Vec<String> =
-        sqlx::query_scalar("SELECT library_id FROM item_libraries WHERE item_id = 'm1' ORDER BY 1")
-            .fetch_all(&h.db)
-            .await
-            .unwrap();
+    let both: Vec<String> = sqlx::query_scalar(
+        "SELECT lc.library_id FROM items i JOIN library_collections lc
+           ON (lc.module_id,lc.collection_id)=(i.module_id,i.collection_id)
+          WHERE i.id='m1' ORDER BY lc.library_id",
+    )
+    .fetch_all(&h.db)
+    .await
+    .unwrap();
     assert_eq!(both, ["AAA", "L1"], "the fixture must be in both libraries");
 
     let named = |v: &Value| -> Vec<String> {

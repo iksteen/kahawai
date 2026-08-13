@@ -412,13 +412,11 @@ pub(crate) async fn find_artwork_source(
     item_id: &str,
 ) -> Result<Option<(String, String, String, String)>> {
     let rows = sqlx::query(
-        "SELECT s.module_id, s.collection_id, s.root_token,
-                json_extract(f.streams_json, '$.artwork') AS art
-         FROM item_sources s
-         JOIN files f ON (f.module_id, f.collection_id, f.path_rel)
-                       = (s.module_id, s.collection_id, s.path_rel)
-         WHERE (s.item_id = ?1
-                OR s.item_id IN (SELECT id FROM items WHERE parent_id = ?1))
+        "SELECT f.module_id,f.collection_id,r.root_token,
+                json_extract(f.streams_json,'$.artwork') AS art
+         FROM files f JOIN collection_roots r ON r.id=f.root_id
+         WHERE (f.item_id=?1
+                OR f.item_id IN (SELECT id FROM items WHERE parent_id=?1))
            AND art IS NOT NULL
          ORDER BY f.size DESC",
     )

@@ -1,18 +1,12 @@
 //! Registry (HUB-1): connection state in memory, everything else in SQLite
 //! so a hub restart recovers without a rescan (NFR-3).
 //!
-//! Scan-derived source identity is `(module_id, collection_id, root_token,
-//! source_path)`. Historical relational columns named `path_rel` contain an
-//! NUL-prefixed injective encoding of `(root_token, source_path)` so the existing
-//! indexed joins remain useful. NUL cannot occur in a filesystem path, so this
-//! namespace cannot collide with a legacy relative path; the explicit columns
-//! are authoritative and the byte plane always receives them separately.
-//!
-//! `item_libraries` depends on a source's module, collection and item—not its
-//! path spelling. Its update trigger is consequently scoped to those three
-//! columns. Exact-root adoption rewrites only the relational source key; firing
-//! presentation maintenance for that identity-only change made adoption
-//! quadratic in the collection's presentation size.
+//! Item identity is `(module_id, collection_id, item_id)`: a library composes
+//! collections and never changes, clones, or merges their items. A physical file
+//! has one stable integer id and one optional `collection_roots` reference.
+//! Exact-root adoption assigns that reference without rewriting paths or any
+//! dependent row. Protocol values still use `(root_token, path_rel)` and are
+//! translated only at the database boundary.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -44,18 +38,7 @@ pub struct FileUpsertRecord {
     pub streams_json: String,
 }
 
-/// Injective relational key for an exact root-relative source.
-///
-/// Both components are NUL-free: root tokens use a fixed ASCII grammar and
-/// operating systems reject NUL in paths. The leading NUL also makes collision
-/// with every legacy bare relative-path key structurally impossible.
-pub fn source_key(root_token: &str, source_path: &str) -> String {
-    debug_assert!(!root_token.contains('\0'));
-    debug_assert!(!source_path.contains('\0'));
-    format!("\0{root_token}\0{source_path}")
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SourcePath {
     pub root_token: String,
     pub path_rel: String,
@@ -78,9 +61,7 @@ const ARCHIVE_WATCH_FOR_FILE_SQL: &str = "
     SELECT w.user_id, f.size, f.head_xxh3, f.tail_xxh3,
            w.position_ms, w.duration_ms, w.played, w.play_count
     FROM files f
-    JOIN item_sources s ON (s.module_id, s.collection_id, s.path_rel)
-                         = (f.module_id, f.collection_id, f.path_rel)
-    JOIN watch_state w ON w.item_id = s.item_id
+    JOIN watch_state w ON w.item_id = f.item_id
     WHERE f.module_id = ? AND f.collection_id = ? AND f.path_rel = ?";
 
 /// What a session needs from a transcoder (derived from plan + source).
@@ -467,10 +448,11 @@ impl Registry {
         collection_id: &str,
     ) -> Result<Vec<SourcePath>> {
         let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
-            "SELECT root_token, source_path FROM files
-             WHERE module_id = ? AND collection_id = ? AND root_token <> ''
+            "SELECT r.root_token, f.path_rel FROM files f
+             JOIN collection_roots r ON r.id=f.root_id
+             WHERE f.module_id = ? AND f.collection_id = ?
                AND ({predicate})
-             ORDER BY root_token, source_path"
+             ORDER BY r.root_token, f.path_rel"
         )))
         .bind(module_id)
         .bind(collection_id)
@@ -480,9 +462,30 @@ impl Registry {
             .into_iter()
             .map(|r| SourcePath {
                 root_token: r.get("root_token"),
-                path_rel: r.get("source_path"),
+                path_rel: r.get("path_rel"),
             })
             .collect())
+    }
+
+    /// Resolve protocol exact-source identity to the one physical row id.
+    pub async fn source_id(
+        &self,
+        module_id: &str,
+        collection_id: &str,
+        root_token: &str,
+        path_rel: &str,
+    ) -> Result<Option<i64>> {
+        Ok(sqlx::query_scalar(
+            "SELECT f.id FROM files f JOIN collection_roots r ON r.id=f.root_id
+              WHERE f.module_id=? AND f.collection_id=?
+                AND r.root_token=? AND r.configured=1 AND f.path_rel=?",
+        )
+        .bind(module_id)
+        .bind(collection_id)
+        .bind(root_token)
+        .bind(path_rel)
+        .fetch_optional(&self.db)
+        .await?)
     }
 
     /// MH-9: store a reported hash — only if the row still describes the
@@ -496,20 +499,19 @@ impl Registry {
         ed2k: &str,
         size: u64,
     ) -> Result<bool> {
-        let n = sqlx::query(
-            "UPDATE files SET ed2k = ?
-             WHERE module_id = ? AND collection_id = ?
-               AND root_token = ? AND source_path = ? AND size = ?",
-        )
-        .bind(ed2k)
-        .bind(module_id)
-        .bind(collection_id)
-        .bind(root_token)
-        .bind(path_rel)
-        .bind(size as i64)
-        .execute(&self.db)
-        .await?
-        .rows_affected();
+        let Some(source_id) = self
+            .source_id(module_id, collection_id, root_token, path_rel)
+            .await?
+        else {
+            return Ok(false);
+        };
+        let n = sqlx::query("UPDATE files SET ed2k=? WHERE id=? AND size=?")
+            .bind(ed2k)
+            .bind(source_id)
+            .bind(size as i64)
+            .execute(&self.db)
+            .await?
+            .rows_affected();
         Ok(n > 0)
     }
 
@@ -580,19 +582,20 @@ impl Registry {
         size: u64,
         ms: Option<u32>,
     ) -> Result<bool> {
+        let Some(source_id) = self
+            .source_id(module_id, collection_id, root_token, path_rel)
+            .await?
+        else {
+            return Ok(false);
+        };
         let n = sqlx::query(
-            "UPDATE files
-                SET streams_json = json_set(streams_json,
-                    '$.video[0].max_keyframe_interval_ms', ?)
-              WHERE module_id = ? AND collection_id = ?
-                AND root_token = ? AND source_path = ? AND size = ?
-                AND json_extract(streams_json, '$.video[0].codec') IS NOT NULL",
+            "UPDATE files SET streams_json=json_set(streams_json,
+                '$.video[0].max_keyframe_interval_ms',?)
+              WHERE id=? AND size=?
+                AND json_extract(streams_json,'$.video[0].codec') IS NOT NULL",
         )
         .bind(ms.map(|v| v as i64).unwrap_or(-1))
-        .bind(module_id)
-        .bind(collection_id)
-        .bind(root_token)
-        .bind(path_rel)
+        .bind(source_id)
         .bind(size as i64)
         .execute(&self.db)
         .await?
@@ -616,16 +619,18 @@ impl Registry {
         let parsed: Result<Vec<kahawai_core::media::Attachment>, _> =
             serde_json::from_str(attachments_json);
         anyhow::ensure!(parsed.is_ok(), "malformed attachments json");
+        let Some(source_id) = self
+            .source_id(module_id, collection_id, root_token, path_rel)
+            .await?
+        else {
+            return Ok(false);
+        };
         let n = sqlx::query(
-            "UPDATE files SET streams_json = json_set(streams_json, '$.attachments', json(?))
-             WHERE module_id = ? AND collection_id = ?
-               AND root_token = ? AND source_path = ? AND size = ?",
+            "UPDATE files SET streams_json=json_set(streams_json,'$.attachments',json(?))
+              WHERE id=? AND size=?",
         )
         .bind(attachments_json)
-        .bind(module_id)
-        .bind(collection_id)
-        .bind(root_token)
-        .bind(path_rel)
+        .bind(source_id)
         .bind(size as i64)
         .execute(&self.db)
         .await?
@@ -677,32 +682,24 @@ impl Registry {
         path_rel: &str,
         size: Option<u64>,
     ) -> Result<bool> {
+        let Some(source_id) = self
+            .source_id(module_id, collection_id, root_token, path_rel)
+            .await?
+        else {
+            return Ok(false);
+        };
         let n = match size {
-            Some(size) => sqlx::query(
-                "UPDATE files SET subs_extracted = 1
-                 WHERE module_id = ? AND collection_id = ?
-                   AND root_token = ? AND source_path = ? AND size = ?",
-            )
-            .bind(module_id)
-            .bind(collection_id)
-            .bind(root_token)
-            .bind(path_rel)
-            .bind(size as i64)
-            .execute(&self.db)
-            .await?
-            .rows_affected(),
-            None => sqlx::query(
-                "UPDATE files SET subs_extracted = 1
-                 WHERE module_id = ? AND collection_id = ?
-                   AND root_token = ? AND source_path = ?",
-            )
-            .bind(module_id)
-            .bind(collection_id)
-            .bind(root_token)
-            .bind(path_rel)
-            .execute(&self.db)
-            .await?
-            .rows_affected(),
+            Some(size) => sqlx::query("UPDATE files SET subs_extracted=1 WHERE id=? AND size=?")
+                .bind(source_id)
+                .bind(size as i64)
+                .execute(&self.db)
+                .await?
+                .rows_affected(),
+            None => sqlx::query("UPDATE files SET subs_extracted=1 WHERE id=?")
+                .bind(source_id)
+                .execute(&self.db)
+                .await?
+                .rows_affected(),
         };
         Ok(n > 0)
     }
@@ -1006,98 +1003,80 @@ impl Registry {
                 Err(error) => return Err(error.into()),
             }
         };
-        // The path is persisted beside the digest so even a cryptographic
-        // collision cannot silently retarget existing source identities.
-        // Check before the collection row is replaced, including its previous
-        // announcement.
-        let persisted: Vec<String> = sqlx::query_scalar("SELECT exact_roots_json FROM collections")
-            .fetch_all(&mut *tx)
-            .await?;
-        for json in persisted {
-            for root in serde_json::from_str::<Vec<serde_json::Value>>(&json)
-                .context("decoding persisted exact collection roots")?
-            {
-                let (Some(token), Some(path)) = (
-                    root.get("token").and_then(serde_json::Value::as_str),
-                    root.get("path").and_then(serde_json::Value::as_str),
-                ) else {
-                    continue;
-                };
-                if let Some((_, announced_path)) =
-                    exact_roots.iter().find(|(announced, _)| announced == token)
-                {
-                    anyhow::ensure!(
-                        announced_path == path,
-                        "root token {token} was previously stored for {path}, not {announced_path}"
-                    );
-                }
-            }
-        }
         sqlx::query(
-            "INSERT INTO collections
-                (module_id, collection_id, media_type, roots_json, exact_roots_json)
-             VALUES (?, ?, ?, ?, ?)
-             ON CONFLICT (module_id, collection_id) DO UPDATE
-             SET media_type = excluded.media_type, roots_json = excluded.roots_json,
-                 exact_roots_json = excluded.exact_roots_json",
+            "INSERT INTO collections (module_id,collection_id,media_type,roots_json)
+             VALUES (?,?,?,?)
+             ON CONFLICT(module_id,collection_id) DO UPDATE SET
+               media_type=excluded.media_type, roots_json=excluded.roots_json",
         )
         .bind(module_id)
         .bind(collection_id)
         .bind(media_type)
         .bind(serde_json::to_string(roots)?)
-        .bind(serde_json::to_string(
-            &exact_roots
-                .iter()
-                .map(|(token, path)| serde_json::json!({"token": token, "path": path}))
-                .collect::<Vec<_>>(),
-        )?)
         .execute(&mut *tx)
         .await?;
 
-        // A single configured root proves every legacy row's root without
-        // touching media or changing the collection generation. Convert all
-        // source-bearing tables in one transaction. Multi-root legacy rows
-        // remain unresolved and cannot be read or reconciled by root order.
-        let mut adopted = 0;
-        if let [(root_token, _)] = exact_roots.as_slice() {
-            // SQLite evaluates every SET expression from the old row. Keep the
-            // human path in source_path while replacing the historical join
-            // key with the injective exact-source encoding. Four set-based
-            // writes replace four statements per file: on the 37,674-row live
-            // catalogue the latter held later manifest requests beyond the
-            // scanner's old 30 s timeout and accidentally caused full scans.
-            for (table, nullable_root) in [
-                ("files", false),
-                ("item_sources", false),
-                ("subtitle_tracks", true),
-                ("image_set_failures", false),
-            ] {
-                let root_filter = if nullable_root {
-                    "COALESCE(root_token, '') = ''"
-                } else {
-                    "root_token = ''"
-                };
-                adopted += sqlx::query(sqlx::AssertSqlSafe(format!(
-                    "UPDATE {table}
-                     SET source_path = path_rel,
-                         path_rel = char(0) || ? || char(0) || path_rel,
-                         root_token = ?
-                     WHERE module_id = ? AND collection_id = ?
-                       AND {root_filter}"
-                )))
-                .bind(root_token)
-                .bind(root_token)
-                .bind(module_id)
-                .bind(collection_id)
-                .execute(&mut *tx)
-                .await?
-                .rows_affected();
-            }
+        // Historical roots remain as foreign-key targets for unavailable
+        // sources, but only this announcement's roots may serve new reads.
+        sqlx::query(
+            "UPDATE collection_roots SET configured=0
+              WHERE module_id=? AND collection_id=?",
+        )
+        .bind(module_id)
+        .bind(collection_id)
+        .execute(&mut *tx)
+        .await?;
+        for (token, path) in &exact_roots {
+            let persisted: Option<String> = sqlx::query_scalar(
+                "SELECT normalized_path FROM collection_roots WHERE root_token=? LIMIT 1",
+            )
+            .bind(token)
+            .fetch_optional(&mut *tx)
+            .await?;
+            anyhow::ensure!(
+                persisted.as_deref().is_none_or(|old| old == path),
+                "root token {token} was previously stored for {}, not {path}",
+                persisted.as_deref().unwrap_or_default()
+            );
+            sqlx::query(
+                "INSERT INTO collection_roots
+                   (module_id,collection_id,root_token,normalized_path,configured)
+                 VALUES (?,?,?,?,1)
+                 ON CONFLICT(module_id,collection_id,root_token) DO UPDATE SET
+                   normalized_path=excluded.normalized_path, configured=1",
+            )
+            .bind(module_id)
+            .bind(collection_id)
+            .bind(token)
+            .bind(path)
+            .execute(&mut *tx)
+            .await?;
         }
+
+        // One root proves every legacy file's root. This is one indexed update;
+        // dependent source, subtitle and failure rows already reference file id.
+        let adopted = if let [(root_token, _)] = exact_roots.as_slice() {
+            sqlx::query(
+                "UPDATE files SET root_id=(
+                    SELECT id FROM collection_roots
+                     WHERE module_id=? AND collection_id=? AND root_token=?)
+                  WHERE module_id=? AND collection_id=? AND root_id IS NULL",
+            )
+            .bind(module_id)
+            .bind(collection_id)
+            .bind(root_token)
+            .bind(module_id)
+            .bind(collection_id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected()
+        } else {
+            0
+        };
         if adopted > 0 {
             sqlx::query(
-                "UPDATE collections SET root_adoption_pending = 1
-                 WHERE module_id = ? AND collection_id = ?",
+                "UPDATE collections SET root_adoption_pending=1
+                  WHERE module_id=? AND collection_id=?",
             )
             .bind(module_id)
             .bind(collection_id)
@@ -1139,7 +1118,7 @@ impl Registry {
              WHERE module_id = ? AND collection_id = ?
                AND NOT EXISTS (
                    SELECT 1 FROM files
-                    WHERE module_id = ? AND collection_id = ? AND root_token = '')",
+                    WHERE module_id = ? AND collection_id = ? AND root_id IS NULL)",
         )
         .bind(module_id)
         .bind(collection_id)
@@ -1156,8 +1135,8 @@ impl Registry {
         collection_id: &str,
     ) -> Result<Vec<kahawai_proto::v1::LegacySource>> {
         let rows = sqlx::query(
-            "SELECT path_rel, size, head_xxh3, tail_xxh3, oshash FROM files
-             WHERE module_id = ? AND collection_id = ? AND root_token = ''",
+            "SELECT path_rel,size,head_xxh3,tail_xxh3,oshash FROM files
+             WHERE module_id=? AND collection_id=? AND root_id IS NULL",
         )
         .bind(module_id)
         .bind(collection_id)
@@ -1182,17 +1161,22 @@ impl Registry {
         root_token: &str,
         legacy_path: &str,
     ) -> Result<()> {
-        self.resolve_root_token(module_id, collection_id, root_token)
-            .await?;
-        let key = source_key(root_token, legacy_path);
+        let root_id: i64 = sqlx::query_scalar(
+            "SELECT id FROM collection_roots
+              WHERE module_id=? AND collection_id=? AND root_token=? AND configured=1",
+        )
+        .bind(module_id)
+        .bind(collection_id)
+        .bind(root_token)
+        .fetch_one(&self.db)
+        .await
+        .context("unknown exact root token")?;
         let mut tx = self.db.begin_with("BEGIN IMMEDIATE").await?;
         let changed = sqlx::query(
-            "UPDATE files SET path_rel = ?, root_token = ?, source_path = ?
-             WHERE module_id = ? AND collection_id = ? AND path_rel = ? AND root_token = ''",
+            "UPDATE files SET root_id=?
+              WHERE module_id=? AND collection_id=? AND path_rel=? AND root_id IS NULL",
         )
-        .bind(&key)
-        .bind(root_token)
-        .bind(legacy_path)
+        .bind(root_id)
         .bind(module_id)
         .bind(collection_id)
         .bind(legacy_path)
@@ -1203,21 +1187,6 @@ impl Registry {
             changed == 1,
             "legacy source vanished or was already adopted"
         );
-        for table in ["item_sources", "subtitle_tracks", "image_set_failures"] {
-            sqlx::query(sqlx::AssertSqlSafe(format!(
-                "UPDATE {table} SET path_rel = ?, root_token = ?, source_path = ?
-                 WHERE module_id = ? AND collection_id = ? AND path_rel = ?
-                   AND COALESCE(root_token, '') = ''"
-            )))
-            .bind(&key)
-            .bind(root_token)
-            .bind(legacy_path)
-            .bind(module_id)
-            .bind(collection_id)
-            .bind(legacy_path)
-            .execute(&mut *tx)
-            .await?;
-        }
         sqlx::query(
             "UPDATE collections SET root_adoption_pending = 1
              WHERE module_id = ? AND collection_id = ?",
@@ -1238,23 +1207,18 @@ impl Registry {
         collection_id: &str,
         supplied: &str,
     ) -> Result<String> {
-        let json: Option<String> = sqlx::query_scalar(
-            "SELECT exact_roots_json FROM collections
-             WHERE module_id = ? AND collection_id = ?",
+        anyhow::ensure!(!supplied.is_empty(), "exact source has an empty root token");
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM collection_roots
+              WHERE module_id=? AND collection_id=? AND root_token=? AND configured=1)",
         )
         .bind(module_id)
         .bind(collection_id)
-        .fetch_optional(&self.db)
+        .bind(supplied)
+        .fetch_one(&self.db)
         .await?;
-        let roots: Vec<serde_json::Value> = json
-            .as_deref()
-            .and_then(|v| serde_json::from_str(v).ok())
-            .unwrap_or_default();
-        anyhow::ensure!(!supplied.is_empty(), "exact source has an empty root token");
         anyhow::ensure!(
-            roots
-                .iter()
-                .any(|r| r.get("token").and_then(|v| v.as_str()) == Some(supplied)),
+            exists,
             "unknown root token {supplied} for {module_id}/{collection_id}"
         );
         Ok(supplied.to_string())
@@ -1425,8 +1389,8 @@ impl Registry {
         collection_id: &str,
     ) -> Result<usize> {
         Ok(sqlx::query_scalar::<_, i64>(
-            "SELECT COALESCE(json_array_length(exact_roots_json), 0)
-             FROM collections WHERE module_id = ? AND collection_id = ?",
+            "SELECT count(*) FROM collection_roots
+              WHERE module_id=? AND collection_id=? AND configured=1",
         )
         .bind(module_id)
         .bind(collection_id)
@@ -1486,29 +1450,38 @@ impl Registry {
         let n = files.len();
         for f in files {
             anyhow::ensure!(!f.root_token.is_empty(), "file record has no root token");
-            let key = source_key(&f.root_token, &f.path_rel);
-            sqlx::query(
-                "INSERT INTO files
-                   (module_id, collection_id, path_rel, root_token, source_path,
-                    size, mtime_unix, head_xxh3, tail_xxh3, oshash, streams_json, revision)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                 ON CONFLICT (module_id, collection_id, path_rel) DO UPDATE SET
-                   root_token = excluded.root_token, source_path = excluded.source_path,
-                   revision = excluded.revision,
-                   ed2k = CASE WHEN excluded.size = files.size
-                                AND excluded.mtime_unix = files.mtime_unix
-                               THEN files.ed2k ELSE NULL END,
-                   subs_extracted = CASE WHEN excluded.size = files.size
-                                          AND excluded.mtime_unix = files.mtime_unix
-                                         THEN files.subs_extracted ELSE 0 END,
-                   size = excluded.size, mtime_unix = excluded.mtime_unix,
-                   head_xxh3 = excluded.head_xxh3, tail_xxh3 = excluded.tail_xxh3,
-                   oshash = excluded.oshash, streams_json = excluded.streams_json",
+            let root_id: i64 = sqlx::query_scalar(
+                "SELECT id FROM collection_roots
+                  WHERE module_id=? AND collection_id=? AND root_token=? AND configured=1",
             )
             .bind(module_id)
             .bind(collection_id)
-            .bind(&key)
             .bind(&f.root_token)
+            .fetch_one(&mut *tx)
+            .await
+            .context("file record names an unknown collection root")?;
+            let source_id: i64 = sqlx::query_scalar(
+                "INSERT INTO files
+                   (module_id,collection_id,root_id,path_rel,size,mtime_unix,
+                    head_xxh3,tail_xxh3,oshash,streams_json,revision)
+                 VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                 ON CONFLICT (module_id,collection_id,root_id,path_rel)
+                   WHERE root_id IS NOT NULL DO UPDATE SET
+                   revision=excluded.revision,
+                   ed2k=CASE WHEN excluded.size=files.size
+                              AND excluded.mtime_unix=files.mtime_unix
+                             THEN files.ed2k ELSE NULL END,
+                   subs_extracted=CASE WHEN excluded.size=files.size
+                                        AND excluded.mtime_unix=files.mtime_unix
+                                       THEN files.subs_extracted ELSE 0 END,
+                   size=excluded.size,mtime_unix=excluded.mtime_unix,
+                   head_xxh3=excluded.head_xxh3,tail_xxh3=excluded.tail_xxh3,
+                   oshash=excluded.oshash,streams_json=excluded.streams_json
+                 RETURNING id",
+            )
+            .bind(module_id)
+            .bind(collection_id)
+            .bind(root_id)
             .bind(&f.path_rel)
             .bind(f.size as i64)
             .bind(f.mtime_unix)
@@ -1517,7 +1490,7 @@ impl Registry {
             .bind(f.oshash as i64)
             .bind(&f.streams_json)
             .bind(names::release_revision(&f.path_rel) as i64)
-            .execute(&mut *tx)
+            .fetch_one(&mut *tx)
             .await?;
 
             // Resolve to a playable item: movies map straight to a
@@ -1529,8 +1502,11 @@ impl Registry {
                 source_part = guess.part;
                 let norm = names::normalize_title(&guess.title);
                 let existing: Option<String> = sqlx::query_scalar(
-                    "SELECT id FROM items WHERE kind = 'movie' AND norm_title = ? AND year IS ?",
+                    "SELECT id FROM items WHERE module_id=? AND collection_id=?
+                       AND kind='movie' AND norm_title=? AND year IS ?",
                 )
+                .bind(module_id)
+                .bind(collection_id)
                 .bind(&norm)
                 .bind(guess.year)
                 .fetch_optional(&mut *tx)
@@ -1540,13 +1516,16 @@ impl Registry {
                     None => {
                         let id = ulid::Ulid::generate().to_string();
                         sqlx::query(
-                            "INSERT INTO items (id, kind, title, norm_title, year)
-                             VALUES (?, 'movie', ?, ?, ?)",
+                            "INSERT INTO items
+                               (id,kind,title,norm_title,year,module_id,collection_id)
+                             VALUES (?,'movie',?,?,?,?,?)",
                         )
                         .bind(&id)
                         .bind(&guess.title)
                         .bind(&norm)
                         .bind(guess.year)
+                        .bind(module_id)
+                        .bind(collection_id)
                         .execute(&mut *tx)
                         .await?;
                         id
@@ -1580,9 +1559,11 @@ impl Registry {
                         let album_norm = names::normalize_title(&album);
                         let existing: Option<String> = sqlx::query_scalar(
                             "SELECT id FROM items
-                             WHERE kind = 'album' AND norm_title = ?
-                               AND LOWER(artist) = LOWER(?)",
+                             WHERE module_id=? AND collection_id=? AND kind='album'
+                               AND norm_title=? AND LOWER(artist)=LOWER(?)",
                         )
+                        .bind(module_id)
+                        .bind(collection_id)
                         .bind(&album_norm)
                         .bind(&artist)
                         .fetch_optional(&mut *tx)
@@ -1592,9 +1573,10 @@ impl Registry {
                             None => {
                                 let id = ulid::Ulid::generate().to_string();
                                 sqlx::query(
-                                    "INSERT INTO items (id, kind, title, norm_title, year, artist,
-                                                        norm_artist)
-                                     VALUES (?, 'album', ?, ?, ?, ?, ?)",
+                                    "INSERT INTO items
+                                       (id,kind,title,norm_title,year,artist,norm_artist,
+                                        module_id,collection_id)
+                                     VALUES (?,'album',?,?,?,?,?,?,?)",
                                 )
                                 .bind(&id)
                                 .bind(&album)
@@ -1604,6 +1586,8 @@ impl Registry {
                                 // Folded like the search needle is, or an
                                 // accented artist can never be found.
                                 .bind(crate::enrich::fold(&artist))
+                                .bind(module_id)
+                                .bind(collection_id)
                                 .execute(&mut *tx)
                                 .await?;
                                 id
@@ -1627,9 +1611,9 @@ impl Registry {
                                 let id = ulid::Ulid::generate().to_string();
                                 sqlx::query(
                                     "INSERT INTO items
-                                       (id, kind, title, norm_title, year,
-                                        parent_id, season, episode, artist, norm_artist)
-                                     VALUES (?, 'track', ?, ?, NULL, ?, ?, ?, ?, ?)",
+                                       (id,kind,title,norm_title,year,parent_id,season,episode,
+                                        artist,norm_artist,module_id,collection_id)
+                                     VALUES (?,'track',?,?,NULL,?,?,?,?,?,?,?)",
                                 )
                                 .bind(&id)
                                 .bind(&title)
@@ -1639,6 +1623,8 @@ impl Registry {
                                 .bind(track)
                                 .bind(&artist)
                                 .bind(crate::enrich::fold(&artist))
+                                .bind(module_id)
+                                .bind(collection_id)
                                 .execute(&mut *tx)
                                 .await?;
                                 id
@@ -1670,9 +1656,11 @@ impl Registry {
                         source_part = mg.part;
                         let norm = names::normalize_title(&mg.title);
                         let existing: Option<String> = sqlx::query_scalar(
-                            "SELECT id FROM items
-                             WHERE kind = 'movie' AND norm_title = ? AND year IS ?",
+                            "SELECT id FROM items WHERE module_id=? AND collection_id=?
+                               AND kind='movie' AND norm_title=? AND year IS ?",
                         )
+                        .bind(module_id)
+                        .bind(collection_id)
                         .bind(&norm)
                         .bind(mg.year)
                         .fetch_optional(&mut *tx)
@@ -1682,13 +1670,16 @@ impl Registry {
                             None => {
                                 let id = ulid::Ulid::generate().to_string();
                                 sqlx::query(
-                                    "INSERT INTO items (id, kind, title, norm_title, year)
-                                     VALUES (?, 'movie', ?, ?, ?)",
+                                    "INSERT INTO items
+                                       (id,kind,title,norm_title,year,module_id,collection_id)
+                                     VALUES (?,'movie',?,?,?,?,?)",
                                 )
                                 .bind(&id)
                                 .bind(&mg.title)
                                 .bind(&norm)
                                 .bind(mg.year)
+                                .bind(module_id)
+                                .bind(collection_id)
                                 .execute(&mut *tx)
                                 .await?;
                                 id
@@ -1704,9 +1695,11 @@ impl Registry {
                     Some(g) => {
                         let norm = names::normalize_title(&g.show_title);
                         let show: Option<String> = sqlx::query_scalar(
-                            "SELECT id FROM items
-                             WHERE kind = 'show' AND norm_title = ? AND year IS ?",
+                            "SELECT id FROM items WHERE module_id=? AND collection_id=?
+                               AND kind='show' AND norm_title=? AND year IS ?",
                         )
+                        .bind(module_id)
+                        .bind(collection_id)
                         .bind(&norm)
                         .bind(g.show_year)
                         .fetch_optional(&mut *tx)
@@ -1716,13 +1709,16 @@ impl Registry {
                             None => {
                                 let id = ulid::Ulid::generate().to_string();
                                 sqlx::query(
-                                    "INSERT INTO items (id, kind, title, norm_title, year)
-                                     VALUES (?, 'show', ?, ?, ?)",
+                                    "INSERT INTO items
+                                       (id,kind,title,norm_title,year,module_id,collection_id)
+                                     VALUES (?,'show',?,?,?,?,?)",
                                 )
                                 .bind(&id)
                                 .bind(&g.show_title)
                                 .bind(&norm)
                                 .bind(g.show_year)
+                                .bind(module_id)
+                                .bind(collection_id)
                                 .execute(&mut *tx)
                                 .await?;
                                 id
@@ -1777,9 +1773,9 @@ impl Registry {
                                 });
                                 sqlx::query(
                                     "INSERT INTO items
-                                       (id, kind, title, norm_title, year,
-                                        parent_id, season, episode, episode_end)
-                                     VALUES (?, 'episode', ?, ?, NULL, ?, ?, ?, ?)",
+                                       (id,kind,title,norm_title,year,parent_id,season,episode,
+                                        episode_end,module_id,collection_id)
+                                     VALUES (?,'episode',?,?,NULL,?,?,?,?,?,?)",
                                 )
                                 .bind(&id)
                                 .bind(&title)
@@ -1788,6 +1784,8 @@ impl Registry {
                                 .bind(g.season)
                                 .bind(g.episode)
                                 .bind(g.episode_end)
+                                .bind(module_id)
+                                .bind(collection_id)
                                 .execute(&mut *tx)
                                 .await?;
                                 id
@@ -1800,23 +1798,12 @@ impl Registry {
             };
 
             if let Some(item_id) = resolved_item {
-                sqlx::query(
-                    "INSERT INTO item_sources
-                        (module_id, collection_id, path_rel, root_token, source_path, item_id, part)
-                     VALUES (?, ?, ?, ?, ?, ?, ?)
-                     ON CONFLICT (module_id, collection_id, path_rel) DO UPDATE
-                     SET root_token = excluded.root_token, source_path = excluded.source_path,
-                         item_id = excluded.item_id, part = excluded.part",
-                )
-                .bind(module_id)
-                .bind(collection_id)
-                .bind(&key)
-                .bind(&f.root_token)
-                .bind(&f.path_rel)
-                .bind(&item_id)
-                .bind(source_part)
-                .execute(&mut *tx)
-                .await?;
+                sqlx::query("UPDATE files SET item_id=?,part=? WHERE id=?")
+                    .bind(&item_id)
+                    .bind(source_part)
+                    .bind(source_id)
+                    .execute(&mut *tx)
+                    .await?;
 
                 // Subtitle tracks are first-class rows synced from the
                 // probe (unification, 2026-07-31): only changed files
@@ -1824,17 +1811,7 @@ impl Registry {
                 if let Ok(info) =
                     serde_json::from_str::<kahawai_core::media::MediaInfo>(&f.streams_json)
                 {
-                    crate::tracks::sync_source_tracks(
-                        &mut tx,
-                        &item_id,
-                        module_id,
-                        collection_id,
-                        &f.root_token,
-                        &f.path_rel,
-                        &key,
-                        &info,
-                    )
-                    .await?;
+                    crate::tracks::sync_source_tracks(&mut tx, &item_id, source_id, &info).await?;
                 }
 
                 // HUB-20/MH-5: the same bytes came back (any host, any
@@ -1868,10 +1845,8 @@ impl Registry {
         // (multi-part regrouping, better parses) without any file being
         // deleted — sweep orphans here, not only in reconciliation.
         sqlx::query(
-            "DELETE FROM items WHERE kind NOT IN ('show', 'album') AND id IN (
-                SELECT i.id FROM items i
-                LEFT JOIN item_sources s ON s.item_id = i.id
-                WHERE s.item_id IS NULL)",
+            "DELETE FROM items WHERE kind NOT IN ('show','album')
+               AND NOT EXISTS (SELECT 1 FROM files f WHERE f.item_id=items.id)",
         )
         .execute(&mut *tx)
         .await?;
@@ -1950,11 +1925,12 @@ impl Registry {
         collection_id: &str,
     ) -> Result<Vec<kahawai_proto::v1::FileStat>> {
         let rows = sqlx::query(
-            "SELECT root_token, source_path, size, mtime_unix,
-                    COALESCE(json_extract(streams_json, '$.nfo'), '') AS nfo,
-                    COALESCE(json_extract(streams_json, '$.artwork'), '') AS art,
-                    COALESCE(json_extract(streams_json, '$.external_subtitles'), '[]') AS subs
-             FROM files WHERE module_id = ? AND collection_id = ?",
+            "SELECT r.root_token,f.path_rel,size,mtime_unix,
+                    COALESCE(json_extract(streams_json,'$.nfo'),'') AS nfo,
+                    COALESCE(json_extract(streams_json,'$.artwork'),'') AS art,
+                    COALESCE(json_extract(streams_json,'$.external_subtitles'),'[]') AS subs
+             FROM files f JOIN collection_roots r ON r.id=f.root_id
+             WHERE f.module_id=? AND f.collection_id=?",
         )
         .bind(module_id)
         .bind(collection_id)
@@ -1975,7 +1951,7 @@ impl Registry {
                 subs.dedup();
                 kahawai_proto::v1::FileStat {
                     source: Some(kahawai_proto::v1::SourcePath {
-                        path_rel: r.get("source_path"),
+                        path_rel: r.get("path_rel"),
                         root_token: r.get("root_token"),
                     }),
                     size: r.get::<i64, _>("size") as u64,
@@ -2010,45 +1986,52 @@ impl Registry {
         &self,
         module_id: &str,
         collection_id: &str,
-        seen: &std::collections::HashSet<String>,
+        seen: &std::collections::HashSet<SourcePath>,
     ) -> Result<usize> {
-        let known: Vec<String> = sqlx::query_scalar(
-            "SELECT path_rel FROM files WHERE module_id = ? AND collection_id = ?",
+        let known = sqlx::query(
+            "SELECT r.root_token,f.path_rel FROM files f
+             JOIN collection_roots r ON r.id=f.root_id
+             WHERE f.module_id=? AND f.collection_id=?",
         )
         .bind(module_id)
         .bind(collection_id)
         .fetch_all(&self.db)
-        .await?;
-        let stale: Vec<&String> = known.iter().filter(|p| !seen.contains(*p)).collect();
+        .await?
+        .into_iter()
+        .map(|r| SourcePath {
+            root_token: r.get("root_token"),
+            path_rel: r.get("path_rel"),
+        });
+        let stale: Vec<SourcePath> = known.filter(|p| !seen.contains(p)).collect();
         if stale.is_empty() {
             return Ok(0);
         }
         let mut tx = self.db.begin().await?;
-        for path in &stale {
+        for source in &stale {
             sqlx::query(ARCHIVE_WATCH_FOR_FILE_SQL)
                 .bind(module_id)
                 .bind(collection_id)
-                .bind(path)
+                .bind(&source.path_rel)
                 .execute(&mut *tx)
                 .await?;
-            for table in ["subtitle_tracks", "item_sources", "files"] {
-                // Safe by construction: `table` comes from the literal array
-                // above, never from a caller.
-                sqlx::query(sqlx::AssertSqlSafe(format!(
-                    "DELETE FROM {table} WHERE module_id = ? AND collection_id = ? AND path_rel = ?"
-                )))
-                .bind(module_id)
-                .bind(collection_id)
-                .bind(path)
-                .execute(&mut *tx)
-                .await?;
-            }
+            sqlx::query(
+                "DELETE FROM files WHERE module_id=? AND collection_id=?
+                  AND root_id=(SELECT id FROM collection_roots
+                    WHERE module_id=? AND collection_id=? AND root_token=?)
+                  AND path_rel=?",
+            )
+            .bind(module_id)
+            .bind(collection_id)
+            .bind(module_id)
+            .bind(collection_id)
+            .bind(&source.root_token)
+            .bind(&source.path_rel)
+            .execute(&mut *tx)
+            .await?;
         }
         sqlx::query(
-            "DELETE FROM items WHERE kind NOT IN ('show', 'album') AND id IN (
-                SELECT i.id FROM items i
-                LEFT JOIN item_sources s ON s.item_id = i.id
-                WHERE s.item_id IS NULL)",
+            "DELETE FROM items WHERE kind NOT IN ('show','album')
+               AND NOT EXISTS (SELECT 1 FROM files f WHERE f.item_id=items.id)",
         )
         .execute(&mut *tx)
         .await?;
@@ -2705,19 +2688,14 @@ impl Registry {
                (user_id, size, head_xxh3, tail_xxh3, position_ms, duration_ms, played, play_count)
              SELECT w.user_id, f.size, f.head_xxh3, f.tail_xxh3,
                     w.position_ms, w.duration_ms, w.played, w.play_count
-             FROM files f
-             JOIN item_sources s ON (s.module_id, s.collection_id, s.path_rel)
-                                  = (f.module_id, f.collection_id, f.path_rel)
-             JOIN watch_state w ON w.item_id = s.item_id
-             WHERE f.module_id = ?",
+             FROM files f JOIN watch_state w ON w.item_id=f.item_id
+             WHERE f.module_id=?",
         )
         .bind(module_id)
         .execute(&mut *tx)
         .await?;
         for sql in [
-            "DELETE FROM subtitle_tracks WHERE module_id = ?",
-            "DELETE FROM item_sources WHERE module_id = ?",
-            "DELETE FROM files WHERE module_id = ?",
+            "DELETE FROM files WHERE module_id=?",
             "DELETE FROM collections WHERE module_id = ?",
             // HUB-36: what it achieved described hardware the fleet no
             // longer has. A re-enrolment mints a new id and learns again.
@@ -2727,10 +2705,8 @@ impl Registry {
             sqlx::query(sql).bind(module_id).execute(&mut *tx).await?;
         }
         sqlx::query(
-            "DELETE FROM items WHERE kind NOT IN ('show', 'album') AND id IN (
-                SELECT i.id FROM items i
-                LEFT JOIN item_sources s ON s.item_id = i.id
-                WHERE s.item_id IS NULL)",
+            "DELETE FROM items WHERE kind NOT IN ('show','album')
+               AND NOT EXISTS (SELECT 1 FROM files f WHERE f.item_id=items.id)",
         )
         .execute(&mut *tx)
         .await?;

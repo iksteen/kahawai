@@ -8,13 +8,30 @@ use sqlx::Row;
 use sqlx::SqlitePool;
 
 async fn item(db: &SqlitePool, id: &str) {
-    sqlx::query("INSERT INTO items (id, kind, title, norm_title) VALUES (?, 'movie', ?, ?)")
-        .bind(id)
-        .bind(id)
-        .bind(id)
-        .execute(db)
-        .await
-        .unwrap();
+    sqlx::query(
+        "INSERT OR IGNORE INTO satellites(module_id,module_type,name,cert_fingerprint)
+                 VALUES('fixture','mediahost','fixture','fp')",
+    )
+    .execute(db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT OR IGNORE INTO collections(module_id,collection_id,media_type)
+                 VALUES('fixture','default','movies')",
+    )
+    .execute(db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO items(id,kind,title,norm_title,module_id,collection_id)
+                 VALUES(?,'movie',?,?,'fixture','default')",
+    )
+    .bind(id)
+    .bind(id)
+    .bind(id)
+    .execute(db)
+    .await
+    .unwrap();
 }
 
 async fn merged(
@@ -218,13 +235,10 @@ async fn an_items_media_type_comes_from_the_collection_it_lives_in() {
     .execute(&db)
     .await
     .unwrap();
-    sqlx::query(
-        "INSERT INTO item_sources (item_id, module_id, collection_id, path_rel)
-         VALUES ('i1', 'mh', 'c1', 'a.mkv')",
-    )
-    .execute(&db)
-    .await
-    .unwrap();
+    sqlx::query("UPDATE items SET module_id='mh',collection_id='c1' WHERE id='i1'")
+        .execute(&db)
+        .await
+        .unwrap();
     assert_eq!(media_type_of_item(&db, "i1").await, "anime");
     assert_eq!(
         chain_in_force(&db, "anime").await,
@@ -257,13 +271,10 @@ async fn the_anime_composites_answer_ranks_as_the_chain_entry() {
     .execute(&db)
     .await
     .unwrap();
-    sqlx::query(
-        "INSERT INTO item_sources (item_id, module_id, collection_id, path_rel)
-         VALUES ('i1', 'mh', 'c1', 'a.mkv')",
-    )
-    .execute(&db)
-    .await
-    .unwrap();
+    sqlx::query("UPDATE items SET module_id='mh',collection_id='c1' WHERE id='i1'")
+        .execute(&db)
+        .await
+        .unwrap();
     store_answer(
         &db,
         "i1",
@@ -416,13 +427,14 @@ async fn due_work_is_offered_to_the_next_run() {
 async fn episodes_are_never_left_queued() {
     let dir = tempfile::tempdir().unwrap();
     let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    item(&db, "show1").await;
     sqlx::query(
-        "INSERT INTO items (id, kind, title, norm_title) VALUES ('ep', 'episode', 'e', 'e')",
+        "INSERT INTO items(id,kind,title,norm_title,module_id,collection_id)
+         VALUES('ep','episode','e','e','fixture','default')",
     )
     .execute(&db)
     .await
     .unwrap();
-    item(&db, "show1").await;
     for id in ["ep", "show1"] {
         sqlx::query(
             "INSERT INTO enrichment_queue (item_id, provider, due_at) VALUES (?, 'tmdb', unixepoch())",
@@ -907,7 +919,8 @@ async fn refused_records_are_skipped_until_something_new_appears() {
 async fn episodes_are_never_assigned() {
     let dir = tempfile::tempdir().unwrap();
     let db = kahawai_hub::db::open(dir.path()).await.unwrap();
-    sqlx::query("INSERT INTO items (id, kind, title, norm_title) VALUES ('ep','episode','e','e')")
+    item(&db, "ep").await;
+    sqlx::query("UPDATE items SET kind='episode' WHERE id='ep'")
         .execute(&db)
         .await
         .unwrap();
@@ -1156,8 +1169,9 @@ async fn the_view_resolves_an_episode_through_its_show() {
     let db = kahawai_hub::db::open(dir.path()).await.unwrap();
     item(&db, "show1").await;
     sqlx::query(
-        "INSERT INTO items (id, kind, title, norm_title, parent_id, season, episode)
-         VALUES ('ep1', 'episode', 'e', 'e', 'show1', 1, 1)",
+        "INSERT INTO items(id,kind,title,norm_title,parent_id,season,episode,module_id,collection_id)
+         SELECT 'ep1','episode','e','e','show1',1,1,module_id,collection_id
+           FROM items WHERE id='show1'",
     )
     .execute(&db)
     .await
@@ -1675,17 +1689,18 @@ async fn a_restart_that_re_selects_a_matched_item_does_not_erase_it() {
     // to re-select the item for the generic pass, per the SQL's local
     // OR-branch.
     sqlx::query(
-        "INSERT INTO files (module_id, collection_id, path_rel, size, mtime_unix,
-                            head_xxh3, tail_xxh3, oshash, streams_json)
-         VALUES ('m0', 'c0', 'Fight Club (1999).mkv', 1000, 1, 0, 0, 0,
-                 '{\"nfo\":\"Fight Club.nfo\"}')",
+        "INSERT INTO collection_roots(module_id,collection_id,root_token,normalized_path)
+                 VALUES('fixture','default','root','/fixture')",
     )
     .execute(&db)
     .await
     .unwrap();
     sqlx::query(
-        "INSERT INTO item_sources (module_id, collection_id, path_rel, item_id)
-         VALUES ('m0', 'c0', 'Fight Club (1999).mkv', 'i1')",
+        "INSERT INTO files(module_id,collection_id,root_id,path_rel,item_id,size,mtime_unix,
+                           head_xxh3,tail_xxh3,oshash,streams_json)
+         VALUES('fixture','default',(SELECT id FROM collection_roots WHERE module_id='fixture'),
+                'Fight Club (1999).mkv','i1',1000,1,0,0,0,
+                '{\"nfo\":\"Fight Club.nfo\"}')",
     )
     .execute(&db)
     .await

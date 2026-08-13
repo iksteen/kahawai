@@ -24,6 +24,8 @@ use axum::http::{Request, StatusCode};
 use kahawai_hub::registry::{FileUpsertRecord, Registry};
 use tower::ServiceExt;
 
+const TEST_ROOT: &str = "/kahawai-test-root";
+
 struct Fx {
     api: axum::Router,
     bearer: String,
@@ -35,14 +37,14 @@ async fn fixture() -> Fx {
     let dir = tempfile::tempdir().unwrap();
     let db = kahawai_hub::db::open(dir.path()).await.unwrap();
     let reg = Arc::new(Registry::new(db.clone(), Default::default()));
-    reg.announce_collection("01H", "movies", "movies", &[])
+    reg.announce_collection("01H", "movies", "movies", &[TEST_ROOT.into()])
         .await
         .unwrap();
     reg.upsert_files(
         "01H",
         "movies",
         vec![FileUpsertRecord {
-            root_token: "root".into(),
+            root_token: kahawai_core::media::root_token(std::path::Path::new(TEST_ROOT)),
             path_rel: "Heat (1995).mkv".into(),
             size: 100,
             mtime_unix: 1,

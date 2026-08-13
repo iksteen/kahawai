@@ -99,23 +99,46 @@ async fn seed(
     library: Option<&str>,
     watch: Option<(i64, i64, i64)>,
 ) {
-    sqlx::query("INSERT INTO items (id, kind, title, norm_title, sort_title) VALUES (?,?,?,?,?)")
-        .bind(id)
-        .bind(kind)
-        .bind(title)
-        .bind(title.to_lowercase())
-        .bind(title.to_lowercase())
+    sqlx::query(
+        "INSERT OR IGNORE INTO satellites(module_id,module_type,name,cert_fingerprint)
+                 VALUES('fixture','mediahost','fixture','fp')",
+    )
+    .execute(db)
+    .await
+    .unwrap();
+    let collection = library.unwrap_or("unattached");
+    sqlx::query(
+        "INSERT OR IGNORE INTO collections(module_id,collection_id,media_type)
+                 VALUES('fixture',?,'movies')",
+    )
+    .bind(collection)
+    .execute(db)
+    .await
+    .unwrap();
+    if let Some(lib) = library {
+        sqlx::query(
+            "INSERT OR IGNORE INTO library_collections(library_id,module_id,collection_id)
+                     VALUES(?,'fixture',?)",
+        )
+        .bind(lib)
+        .bind(collection)
         .execute(db)
         .await
         .unwrap();
-    if let Some(lib) = library {
-        sqlx::query("INSERT INTO item_libraries (library_id, item_id) VALUES (?,?)")
-            .bind(lib)
-            .bind(id)
-            .execute(db)
-            .await
-            .unwrap();
     }
+    sqlx::query(
+        "INSERT INTO items(id,kind,title,norm_title,sort_title,module_id,collection_id)
+                 VALUES(?,?,?,?,?,'fixture',?)",
+    )
+    .bind(id)
+    .bind(kind)
+    .bind(title)
+    .bind(title.to_lowercase())
+    .bind(title.to_lowercase())
+    .bind(collection)
+    .execute(db)
+    .await
+    .unwrap();
     if let Some((position_ms, played, age_secs)) = watch {
         sqlx::query(
             "INSERT INTO watch_state (user_id, item_id, position_ms, played, updated_at)

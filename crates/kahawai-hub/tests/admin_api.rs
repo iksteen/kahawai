@@ -23,9 +23,11 @@ async fn body_json(resp: axum::response::Response) -> serde_json::Value {
     serde_json::from_slice(&b).unwrap_or(serde_json::Value::Null)
 }
 
+const TEST_ROOT: &str = "/kahawai-test-root";
+
 fn rec(path: &str, size: u64, head: u64, tail: u64) -> FileUpsertRecord {
     FileUpsertRecord {
-        root_token: "root".into(),
+        root_token: kahawai_core::media::root_token(std::path::Path::new(TEST_ROOT)),
         path_rel: path.into(),
         size,
         mtime_unix: 1,
@@ -181,7 +183,7 @@ async fn admin_flow_enrollments_satellites_archive_restore() {
 
     // Give it a collection, a file, and admin watch state on the item.
     registry
-        .announce_collection("01ADM", "movies", "movies", &[])
+        .announce_collection("01ADM", "movies", "movies", &[TEST_ROOT.into()])
         .await
         .unwrap();
     registry
@@ -265,7 +267,7 @@ async fn admin_flow_enrollments_satellites_archive_restore() {
         .await
         .unwrap();
     registry
-        .announce_collection("local", "movies", "movies", &[])
+        .announce_collection("local", "movies", "movies", &[TEST_ROOT.into()])
         .await
         .unwrap();
     let resp = api
@@ -301,7 +303,7 @@ async fn admin_flow_enrollments_satellites_archive_restore() {
 
     // The same bytes return on a DIFFERENT host: watch state restored.
     registry
-        .announce_collection("01NEW", "movies", "movies", &[])
+        .announce_collection("01NEW", "movies", "movies", &[TEST_ROOT.into()])
         .await
         .unwrap();
     registry
@@ -397,7 +399,7 @@ async fn review_queue_flow() {
         .await
         .unwrap();
     registry
-        .announce_collection("01HOST", "movies", "movies", &["/srv/m".into()])
+        .announce_collection("01HOST", "movies", "movies", &[TEST_ROOT.into()])
         .await
         .unwrap();
     registry

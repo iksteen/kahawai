@@ -352,8 +352,8 @@ async fn auth_harness() -> (
 #[tokio::test]
 async fn items_filter_by_library() {
     use kahawai_hub::registry::FileUpsertRecord;
-    let rec = |path: &str, size: u64| FileUpsertRecord {
-        root_token: "root".into(),
+    let rec = |root: &str, path: &str, size: u64| FileUpsertRecord {
+        root_token: kahawai_core::media::root_token(std::path::Path::new(root)),
         path_rel: path.into(),
         size,
         mtime_unix: 1,
@@ -401,14 +401,18 @@ async fn items_filter_by_library() {
         .await
         .unwrap();
     registry
-        .upsert_files("01HOST", "movies", vec![rec("Heat (1995).mkv", 100)])
+        .upsert_files(
+            "01HOST",
+            "movies",
+            vec![rec("/srv/movies", "Heat (1995).mkv", 100)],
+        )
         .await
         .unwrap();
     registry
         .upsert_files(
             "01HOST",
             "series",
-            vec![rec("Andor/Season 1/Andor.S01E01.mkv", 200)],
+            vec![rec("/srv/series", "Andor/Season 1/Andor.S01E01.mkv", 200)],
         )
         .await
         .unwrap();
@@ -1276,10 +1280,27 @@ async fn admin_deletes_users() {
     // Everything a user owns: a live token, watch state, a preference,
     // and an archived row that has no foreign key to hold it down.
     let bob = auth.login("bob", "hunter22222").await.unwrap().access_token;
-    sqlx::query("INSERT INTO items (id, kind, title, norm_title) VALUES ('i1','movie','M','m')")
-        .execute(&db)
-        .await
-        .unwrap();
+    sqlx::query(
+        "INSERT INTO satellites(module_id,module_type,name,cert_fingerprint)
+                 VALUES('fixture','mediahost','fixture','fp')",
+    )
+    .execute(&db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO collections(module_id,collection_id,media_type)
+                 VALUES('fixture','default','movies')",
+    )
+    .execute(&db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO items(id,kind,title,norm_title,module_id,collection_id)
+                 VALUES('i1','movie','M','m','fixture','default')",
+    )
+    .execute(&db)
+    .await
+    .unwrap();
     sqlx::query("INSERT INTO watch_state (user_id, item_id, position_ms) VALUES (?, 'i1', 5)")
         .bind(&victim)
         .execute(&db)

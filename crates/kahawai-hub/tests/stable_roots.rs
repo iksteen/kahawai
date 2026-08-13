@@ -1,6 +1,6 @@
 //! DATA-1..6: deterministic exact-root identity and lossless adoption.
 
-use kahawai_hub::registry::{FileUpsertRecord, Registry, source_key};
+use kahawai_hub::registry::{FileUpsertRecord, Registry};
 use sqlx::Row;
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!();
@@ -33,18 +33,17 @@ fn exact_read_uses_the_token_not_root_order() {
         media_type: "movies".into(),
         roots: vec![b.path().into(), a.path().into()],
     };
-
     let a_path = kahawai_mediahost::serve::resolve_rel(
         std::slice::from_ref(&collection),
         "movies",
-        &kahawai_core::media::root_token(a.path()),
+        &root(a.path().to_str().unwrap()),
         "same.mkv",
     )
     .unwrap();
     let b_path = kahawai_mediahost::serve::resolve_rel(
         &[collection],
         "movies",
-        &kahawai_core::media::root_token(b.path()),
+        &root(b.path().to_str().unwrap()),
         "same.mkv",
     )
     .unwrap();
@@ -61,14 +60,11 @@ async fn persisted_root_token_path_mismatches_are_rejected() {
         .announce_collection("host", "movies", "movies", &["/media/a".into()])
         .await
         .unwrap();
-    sqlx::query(
-        "UPDATE collections SET exact_roots_json = json_array(json_object('token', ?, 'path', '/different'))",
-    )
-    .bind(token)
-    .execute(&db)
-    .await
-    .unwrap();
-
+    sqlx::query("UPDATE collection_roots SET normalized_path='/different' WHERE root_token=?")
+        .bind(&token)
+        .execute(&db)
+        .await
+        .unwrap();
     let error = registry
         .announce_collection("host", "movies", "movies", &["/media/a".into()])
         .await
@@ -99,194 +95,107 @@ async fn identical_relative_paths_persist_as_distinct_sources() {
         )
         .await
         .unwrap();
-
-    let rows: Vec<(String, String, String)> =
-        sqlx::query_as("SELECT path_rel, root_token, source_path FROM files ORDER BY root_token")
-            .fetch_all(&db)
-            .await
-            .unwrap();
+    let rows: Vec<(i64, String, String)> = sqlx::query_as(
+        "SELECT f.id,r.root_token,f.path_rel FROM files f
+         JOIN collection_roots r ON r.id=f.root_id ORDER BY r.root_token",
+    )
+    .fetch_all(&db)
+    .await
+    .unwrap();
     assert_eq!(rows.len(), 2);
     assert!(rows.iter().all(|(_, _, path)| path == "same.mkv"));
-    assert_eq!(rows[0].0, source_key(&rows[0].1, "same.mkv"));
-    assert_eq!(rows[1].0, source_key(&rows[1].1, "same.mkv"));
     assert_ne!(rows[0].0, rows[1].0);
+    assert_ne!(rows[0].1, rows[1].1);
+}
+
+async fn level52_fixture() -> (tempfile::TempDir, sqlx::SqlitePool) {
+    let dir = tempfile::tempdir().unwrap();
+    let db = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(dir.path().join("hub.db"))
+                .create_if_missing(true)
+                .foreign_keys(true),
+        )
+        .await
+        .unwrap();
+    MIGRATOR.run_to(52, &db).await.unwrap();
+    sqlx::raw_sql(
+        "INSERT INTO satellites(module_id,module_type,name,cert_fingerprint)
+           VALUES('host','mediahost','host','cert');
+         INSERT INTO collections(module_id,collection_id,media_type,roots_json,sync_version)
+           VALUES('host','movies','movies','[\"/media/only\"]',91);
+         INSERT INTO libraries(id,name,media_type) VALUES('lib','Movies','movies');
+         INSERT INTO library_collections(library_id,module_id,collection_id)
+           VALUES('lib','host','movies');
+         INSERT INTO users(id,username,password_hash,is_admin) VALUES('user','u','x',0);
+         INSERT INTO user_libraries(user_id,library_id) VALUES('user','lib');
+         INSERT INTO items(id,kind,title,norm_title) VALUES('item','movie','Same','same');
+         INSERT INTO files(module_id,collection_id,path_rel,size,mtime_unix,
+                           head_xxh3,tail_xxh3,oshash,streams_json)
+           VALUES('host','movies','same.mkv',10,7,11,12,13,'{}');
+         INSERT INTO item_sources(module_id,collection_id,path_rel,item_id)
+           VALUES('host','movies','same.mkv','item');
+         INSERT INTO provider_metadata(item_id,provider,provider_id,title,confidence,updated_at)
+           VALUES('item','tmdb','42','Same','auto',1);
+         INSERT INTO provider_queries(item_id,provider,query_type,query,rev,asked_at)
+           VALUES('item','tmdb','title','Same',1,1);
+         INSERT INTO manual_match(item_id,provider,provider_id,pinned_at)
+           VALUES('item','tmdb','42',1);
+         INSERT INTO enrichment_queue(item_id,provider,due_at,attempts,reason)
+           VALUES('item','tvdb',9,2,'retry');
+         INSERT INTO item_relations(from_item,kind,target_anilist,target_title)
+           VALUES('item','sequel',99,'Next');
+         INSERT INTO watch_state(user_id,item_id,position_ms,play_count)
+           VALUES('user','item',1234,3);
+         INSERT INTO subtitle_tracks(id,item_id,origin,module_id,collection_id,path_rel,
+                                     stream_index,format)
+           VALUES(44,'item','embedded','host','movies','same.mkv',0,'srt');
+         INSERT INTO image_set_failures(module_id,collection_id,path_rel,sub_index,error,at)
+           VALUES('host','movies','same.mkv',0,'no index',1);",
+    )
+    .execute(&db)
+    .await
+    .unwrap();
+    (dir, db)
 }
 
 #[tokio::test]
 async fn migration_and_single_root_adoption_preserve_durable_state() {
-    let dir = tempfile::tempdir().unwrap();
-    let options = sqlx::sqlite::SqliteConnectOptions::new()
-        .filename(dir.path().join("hub.db"))
-        .create_if_missing(true)
-        .foreign_keys(true);
-    let db = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect_with(options)
-        .await
-        .unwrap();
-    MIGRATOR.run_to(52, &db).await.unwrap();
-
-    sqlx::query(
-        "INSERT INTO satellites (module_id,module_type,name,cert_fingerprint)
-         VALUES ('host','mediahost','host','cert')",
-    )
-    .execute(&db)
-    .await
-    .unwrap();
-    sqlx::query(
-        "INSERT INTO collections (module_id,collection_id,media_type,roots_json,sync_version)
-         VALUES ('host','movies','movies','[\"/media/only\"]',91)",
-    )
-    .execute(&db)
-    .await
-    .unwrap();
-    sqlx::query("INSERT INTO libraries (id,name,media_type) VALUES ('lib','Movies','movies')")
-        .execute(&db)
-        .await
-        .unwrap();
-    sqlx::query(
-        "INSERT INTO library_collections (library_id,module_id,collection_id)
-         VALUES ('lib','host','movies')",
-    )
-    .execute(&db)
-    .await
-    .unwrap();
-    sqlx::query("INSERT INTO users (id,username,password_hash,is_admin) VALUES ('user','u','x',0)")
-        .execute(&db)
-        .await
-        .unwrap();
-    sqlx::query("INSERT INTO user_libraries (user_id,library_id) VALUES ('user','lib')")
-        .execute(&db)
-        .await
-        .unwrap();
-    sqlx::query(
-        "INSERT INTO items (id,kind,title,norm_title) VALUES ('item','movie','Same','same')",
-    )
-    .execute(&db)
-    .await
-    .unwrap();
-    sqlx::query(
-        "INSERT INTO files
-           (module_id,collection_id,path_rel,size,mtime_unix,head_xxh3,tail_xxh3,oshash,streams_json)
-         VALUES ('host','movies','same.mkv',10,7,11,12,13,'{}')",
-    )
-    .execute(&db)
-    .await
-    .unwrap();
-    sqlx::query(
-        "INSERT INTO item_sources (module_id,collection_id,path_rel,item_id)
-         VALUES ('host','movies','same.mkv','item')",
-    )
-    .execute(&db)
-    .await
-    .unwrap();
-    sqlx::query(
-        "INSERT INTO provider_metadata
-           (item_id,provider,provider_id,title,confidence,updated_at)
-         VALUES ('item','tmdb','42','Same','auto',1)",
-    )
-    .execute(&db)
-    .await
-    .unwrap();
-    sqlx::query(
-        "INSERT INTO provider_queries
-           (item_id,provider,query_type,query,rev,asked_at)
-         VALUES ('item','tmdb','title','Same',1,1)",
-    )
-    .execute(&db)
-    .await
-    .unwrap();
-    sqlx::query(
-        "INSERT INTO manual_match (item_id,provider,provider_id,pinned_at)
-         VALUES ('item','tmdb','42',1)",
-    )
-    .execute(&db)
-    .await
-    .unwrap();
-    sqlx::query(
-        "INSERT INTO enrichment_queue (item_id,provider,due_at,attempts,reason)
-         VALUES ('item','tvdb',9,2,'retry')",
-    )
-    .execute(&db)
-    .await
-    .unwrap();
-    sqlx::query(
-        "INSERT INTO item_relations (from_item,kind,target_anilist,target_title)
-         VALUES ('item','sequel',99,'Next')",
-    )
-    .execute(&db)
-    .await
-    .unwrap();
-    sqlx::query(
-        "INSERT INTO watch_state (user_id,item_id,position_ms,play_count)
-         VALUES ('user','item',1234,3)",
-    )
-    .execute(&db)
-    .await
-    .unwrap();
-    sqlx::query(
-        "INSERT INTO subtitle_tracks
-           (id,item_id,origin,module_id,collection_id,path_rel,stream_index,format)
-         VALUES (44,'item','embedded','host','movies','same.mkv',0,'srt')",
-    )
-    .execute(&db)
-    .await
-    .unwrap();
-    sqlx::query(
-        "INSERT INTO image_set_failures
-           (module_id,collection_id,path_rel,sub_index,error,at)
-         VALUES ('host','movies','same.mkv',0,'no index',1)",
-    )
-    .execute(&db)
-    .await
-    .unwrap();
-
+    let (_dir, db) = level52_fixture().await;
     MIGRATOR.run(&db).await.unwrap();
-    sqlx::raw_sql(
-        "CREATE TABLE item_library_write_audit (operation TEXT NOT NULL);
-         CREATE TRIGGER audit_item_libraries_insert AFTER INSERT ON item_libraries BEGIN
-           INSERT INTO item_library_write_audit VALUES ('insert');
-         END;
-         CREATE TRIGGER audit_item_libraries_delete AFTER DELETE ON item_libraries BEGIN
-           INSERT INTO item_library_write_audit VALUES ('delete');
-         END;
-         CREATE TRIGGER audit_item_libraries_update AFTER UPDATE ON item_libraries BEGIN
-           INSERT INTO item_library_write_audit VALUES ('update');
-         END;",
-    )
-    .execute(&db)
-    .await
-    .unwrap();
     let registry = Registry::new(db.clone(), Default::default());
     registry
         .announce_collection("host", "movies", "movies", &["/media/only".into()])
         .await
         .unwrap();
+
+    let row = sqlx::query(
+        "SELECT f.id,f.item_id,r.root_token,f.path_rel FROM files f
+         JOIN collection_roots r ON r.id=f.root_id",
+    )
+    .fetch_one(&db)
+    .await
+    .unwrap();
+    let source_id = row.get::<i64, _>("id");
+    assert_eq!(row.get::<String, _>("item_id"), "item");
+    assert_eq!(row.get::<String, _>("root_token"), root("/media/only"));
+    assert_eq!(row.get::<String, _>("path_rel"), "same.mkv");
     assert_eq!(
-        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM item_library_write_audit")
+        sqlx::query_scalar::<_, i64>("SELECT source_id FROM subtitle_tracks WHERE id=44")
             .fetch_one(&db)
             .await
             .unwrap(),
-        0,
-        "an identity-only source-key rewrite must not rebuild presentation membership"
+        source_id
     );
-
-    let token = root("/media/only");
-    for table in [
-        "files",
-        "item_sources",
-        "subtitle_tracks",
-        "image_set_failures",
-    ] {
-        let row = sqlx::query(sqlx::AssertSqlSafe(format!(
-            "SELECT root_token, source_path FROM {table}"
-        )))
-        .fetch_one(&db)
-        .await
-        .unwrap();
-        assert_eq!(row.get::<String, _>("root_token"), token, "{table}");
-        assert_eq!(row.get::<String, _>("source_path"), "same.mkv", "{table}");
-    }
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT source_id FROM image_set_failures")
+            .fetch_one(&db)
+            .await
+            .unwrap(),
+        source_id
+    );
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT sync_version FROM collections")
             .fetch_one(&db)
@@ -297,31 +206,17 @@ async fn migration_and_single_root_adoption_preserve_durable_state() {
     assert_eq!(
         sqlx::query_scalar::<_, i64>(
             "SELECT (SELECT COUNT(*) FROM provider_metadata)
-                  + (SELECT COUNT(*) FROM provider_queries)
-                  + (SELECT COUNT(*) FROM manual_match)
-                  + (SELECT COUNT(*) FROM enrichment_queue)
-                  + (SELECT COUNT(*) FROM item_relations)
-                  + (SELECT COUNT(*) FROM watch_state)
-                  + (SELECT COUNT(*) FROM user_libraries)"
+                  +(SELECT COUNT(*) FROM provider_queries)
+                  +(SELECT COUNT(*) FROM manual_match)
+                  +(SELECT COUNT(*) FROM enrichment_queue)
+                  +(SELECT COUNT(*) FROM item_relations)
+                  +(SELECT COUNT(*) FROM watch_state)
+                  +(SELECT COUNT(*) FROM user_libraries)"
         )
         .fetch_one(&db)
         .await
         .unwrap(),
         7
-    );
-    assert_eq!(
-        sqlx::query_scalar::<_, String>("SELECT item_id FROM item_sources")
-            .fetch_one(&db)
-            .await
-            .unwrap(),
-        "item"
-    );
-    assert_eq!(
-        sqlx::query_scalar::<_, i64>("SELECT id FROM subtitle_tracks")
-            .fetch_one(&db)
-            .await
-            .unwrap(),
-        44
     );
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM pragma_foreign_key_check")
@@ -340,47 +235,30 @@ async fn single_root_announcement_adopts_legacy_state_without_rescan() {
         .announce_collection("host", "movies", "movies", &[])
         .await
         .unwrap();
+    sqlx::query("UPDATE collections SET sync_version=91 WHERE module_id='host'")
+        .execute(&db)
+        .await
+        .unwrap();
     sqlx::query(
-        "UPDATE collections SET sync_version = 91 WHERE module_id='host' AND collection_id='movies'",
+        "INSERT INTO items(id,kind,title,norm_title,module_id,collection_id)
+         VALUES('item','movie','Same','same','host','movies')",
     )
     .execute(&db)
     .await
     .unwrap();
-    sqlx::query(
-        "INSERT INTO items (id, kind, title, norm_title) VALUES ('item','movie','Same','same')",
+    let source_id: i64 = sqlx::query_scalar(
+        "INSERT INTO files(module_id,collection_id,path_rel,item_id,size,mtime_unix,
+                           head_xxh3,tail_xxh3,oshash,streams_json)
+         VALUES('host','movies','same.mkv','item',10,7,11,12,13,'{}') RETURNING id",
     )
-    .execute(&db)
+    .fetch_one(&db)
     .await
     .unwrap();
     sqlx::query(
-        "INSERT INTO files
-           (module_id, collection_id, path_rel, size, mtime_unix,
-            head_xxh3, tail_xxh3, oshash, streams_json)
-         VALUES ('host','movies','same.mkv',10,7,11,12,13,'{}')",
+        "INSERT INTO subtitle_tracks(id,item_id,source_id,origin,stream_index,format)
+         VALUES(44,'item',?,'embedded',0,'srt')",
     )
-    .execute(&db)
-    .await
-    .unwrap();
-    sqlx::query(
-        "INSERT INTO item_sources (module_id, collection_id, path_rel, item_id)
-         VALUES ('host','movies','same.mkv','item')",
-    )
-    .execute(&db)
-    .await
-    .unwrap();
-    sqlx::query(
-        "INSERT INTO subtitle_tracks
-           (id,item_id,origin,module_id,collection_id,path_rel,stream_index,format)
-         VALUES (44,'item','embedded','host','movies','same.mkv',0,'srt')",
-    )
-    .execute(&db)
-    .await
-    .unwrap();
-    sqlx::query(
-        "INSERT INTO image_set_failures
-           (module_id,collection_id,path_rel,sub_index,error,at)
-         VALUES ('host','movies','same.mkv',0,'no index',1)",
-    )
+    .bind(source_id)
     .execute(&db)
     .await
     .unwrap();
@@ -389,23 +267,19 @@ async fn single_root_announcement_adopts_legacy_state_without_rescan() {
         .announce_collection("host", "movies", "movies", &["/media/only".into()])
         .await
         .unwrap();
-
-    let token = root("/media/only");
-    for table in [
-        "files",
-        "item_sources",
-        "subtitle_tracks",
-        "image_set_failures",
-    ] {
-        let row = sqlx::query(sqlx::AssertSqlSafe(format!(
-            "SELECT root_token, source_path FROM {table}"
-        )))
-        .fetch_one(&db)
-        .await
-        .unwrap();
-        assert_eq!(row.get::<String, _>("root_token"), token, "{table}");
-        assert_eq!(row.get::<String, _>("source_path"), "same.mkv", "{table}");
-    }
+    assert_eq!(
+        registry
+            .source_id("host", "movies", &root("/media/only"), "same.mkv")
+            .await
+            .unwrap(),
+        Some(source_id)
+    );
+    assert!(
+        registry
+            .root_adoption_pending("host", "movies")
+            .await
+            .unwrap()
+    );
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT sync_version FROM collections")
             .fetch_one(&db)
@@ -414,18 +288,11 @@ async fn single_root_announcement_adopts_legacy_state_without_rescan() {
         91
     );
     assert_eq!(
-        sqlx::query_scalar::<_, String>("SELECT item_id FROM item_sources")
+        sqlx::query_scalar::<_, i64>("SELECT source_id FROM subtitle_tracks WHERE id=44")
             .fetch_one(&db)
             .await
             .unwrap(),
-        "item"
-    );
-    assert_eq!(
-        sqlx::query_scalar::<_, i64>("SELECT id FROM subtitle_tracks")
-            .fetch_one(&db)
-            .await
-            .unwrap(),
-        44
+        source_id
     );
 }
 
@@ -438,24 +305,18 @@ async fn multi_root_legacy_state_is_never_guessed() {
         .await
         .unwrap();
     sqlx::query(
-        "INSERT INTO items (id,kind,title,norm_title) VALUES ('item','movie','Same','same')",
+        "INSERT INTO items(id,kind,title,norm_title,module_id,collection_id)
+         VALUES('item','movie','Same','same','host','movies')",
     )
     .execute(&db)
     .await
     .unwrap();
-    sqlx::query(
-        "INSERT INTO files
-           (module_id,collection_id,path_rel,size,mtime_unix,head_xxh3,tail_xxh3,oshash,streams_json)
-         VALUES ('host','movies','same.mkv',10,7,11,12,13,'{}')",
+    let source_id: i64 = sqlx::query_scalar(
+        "INSERT INTO files(module_id,collection_id,path_rel,item_id,size,mtime_unix,
+                           head_xxh3,tail_xxh3,oshash,streams_json)
+         VALUES('host','movies','same.mkv','item',10,7,11,12,13,'{}') RETURNING id",
     )
-    .execute(&db)
-    .await
-    .unwrap();
-    sqlx::query(
-        "INSERT INTO item_sources (module_id,collection_id,path_rel,item_id)
-         VALUES ('host','movies','same.mkv','item')",
-    )
-    .execute(&db)
+    .fetch_one(&db)
     .await
     .unwrap();
 
@@ -468,11 +329,6 @@ async fn multi_root_legacy_state_is_never_guessed() {
         )
         .await
         .unwrap();
-    let error = registry
-        .resolve_root_token("host", "movies", "")
-        .await
-        .unwrap_err();
-    assert!(error.to_string().contains("empty root token"), "{error:#}");
     assert_eq!(
         registry
             .unresolved_legacy_sources("host", "movies")
@@ -482,31 +338,30 @@ async fn multi_root_legacy_state_is_never_guessed() {
         1
     );
     assert_eq!(
-        sqlx::query_scalar::<_, String>("SELECT root_token FROM files")
+        sqlx::query_scalar::<_, Option<i64>>("SELECT root_id FROM files WHERE id=?")
+            .bind(source_id)
             .fetch_one(&db)
             .await
             .unwrap(),
-        ""
+        None
     );
-
     let token = root("/media/b");
     registry
         .adopt_legacy_source("host", "movies", &token, "same.mkv")
         .await
         .unwrap();
-    assert_eq!(
+    assert!(
         registry
             .unresolved_legacy_sources("host", "movies")
             .await
             .unwrap()
-            .len(),
-        0
+            .is_empty()
     );
     assert_eq!(
-        sqlx::query_scalar::<_, String>("SELECT root_token FROM item_sources")
-            .fetch_one(&db)
+        registry
+            .source_id("host", "movies", &token, "same.mkv")
             .await
             .unwrap(),
-        token
+        Some(source_id)
     );
 }

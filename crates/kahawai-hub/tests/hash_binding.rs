@@ -29,10 +29,13 @@ async fn harness() -> (Enricher, SqlitePool, tempfile::TempDir) {
     .execute(&db)
     .await
     .unwrap();
-    sqlx::query("INSERT INTO items (id, kind, title, norm_title) VALUES ('show','show','X','x')")
-        .execute(&db)
-        .await
-        .unwrap();
+    sqlx::query(
+        "INSERT INTO items(id,kind,title,norm_title,module_id,collection_id)
+                 VALUES('show','show','X','x','m','c')",
+    )
+    .execute(&db)
+    .await
+    .unwrap();
     (enricher, db, dir)
 }
 
@@ -47,8 +50,8 @@ async fn episode(
     epno: &str,
 ) {
     sqlx::query(
-        "INSERT INTO items (id, kind, title, norm_title, parent_id, season, episode)
-         VALUES (?, 'episode', ?, ?, 'show', ?, ?)",
+        "INSERT INTO items(id,kind,title,norm_title,parent_id,season,episode,module_id,collection_id)
+         VALUES(?,'episode',?,?,'show',?,?,'m','c')",
     )
     .bind(id)
     .bind(format!("title {id}"))
@@ -59,19 +62,11 @@ async fn episode(
     .await
     .unwrap();
     sqlx::query(
-        "INSERT INTO files (module_id, collection_id, path_rel, size, mtime_unix,
-                            head_xxh3, tail_xxh3, oshash, streams_json, subs_extracted, ed2k)
-         VALUES ('m','c', ? || '.mkv', 700, 1, 0, 0, 0, '{}', 0, 'hash-' || ?)",
+        "INSERT INTO files(module_id,collection_id,path_rel,item_id,size,mtime_unix,
+                           head_xxh3,tail_xxh3,oshash,streams_json,subs_extracted,ed2k)
+         VALUES('m','c',?||'.mkv',?,700,1,0,0,0,'{}',0,'hash-'||?)",
     )
     .bind(id)
-    .bind(id)
-    .execute(db)
-    .await
-    .unwrap();
-    sqlx::query(
-        "INSERT INTO item_sources (item_id, module_id, collection_id, path_rel)
-         VALUES (?, 'm', 'c', ? || '.mkv')",
-    )
     .bind(id)
     .bind(id)
     .execute(db)
@@ -91,8 +86,8 @@ async fn episode(
 
 async fn slot_of(db: &SqlitePool, path: &str) -> (Option<i64>, i64, String) {
     sqlx::query_as::<_, (Option<i64>, i64, String)>(
-        "SELECT i.season, i.episode, i.id FROM item_sources s JOIN items i ON i.id = s.item_id
-          WHERE s.path_rel = ?",
+        "SELECT i.season,i.episode,i.id FROM files f JOIN items i ON i.id=f.item_id
+          WHERE f.path_rel=?",
     )
     .bind(path)
     .fetch_one(db)
@@ -116,7 +111,7 @@ async fn bare_files_bind_to_what_their_hash_names() {
         }
     };
     q("INSERT INTO anime_ids (item_id, anidb_id) VALUES ('show', 1234)").await;
-    q("INSERT INTO items (id, kind, title, norm_title) VALUES ('film','movie','A Film','a film')")
+    q("INSERT INTO items(id,kind,title,norm_title,module_id,collection_id) VALUES('film','movie','A Film','a film','m','c')")
         .await;
     q("INSERT INTO anime_ids (item_id, anidb_id) VALUES ('film', 9999)").await;
 
@@ -162,17 +157,17 @@ async fn bare_files_bind_to_what_their_hash_names() {
         102,
         "C2 lands in the credits band"
     );
-    let film: String =
-        sqlx::query_scalar("SELECT item_id FROM item_sources WHERE path_rel='film.mkv'")
-            .fetch_one(&db)
-            .await
-            .unwrap();
+    let film: String = sqlx::query_scalar("SELECT item_id FROM files WHERE path_rel='film.mkv'")
+        .fetch_one(&db)
+        .await
+        .unwrap();
     assert_eq!(film, "film", "a movie file becomes the movie's own source");
-    let stray: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM item_sources WHERE path_rel='stray.mkv'")
-            .fetch_one(&db)
-            .await
-            .unwrap();
+    let stray: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM files WHERE item_id IS NOT NULL AND path_rel='stray.mkv'",
+    )
+    .fetch_one(&db)
+    .await
+    .unwrap();
     assert_eq!(stray, 0, "an anime not in the catalogue binds nothing");
 
     // Idempotent.
@@ -208,8 +203,8 @@ async fn ownerless_movies_are_minted_or_adopted_from_the_hash() {
     xml(800, "OVA", 4, "Serial OVA", "2005-01-01");
     // The adoptable twin: same normalized title and year, no anime_ids.
     sqlx::query(
-        "INSERT INTO items (id, kind, title, norm_title, year)
-         VALUES ('twin','movie','Adopted Film','adopted film',2001)",
+        "INSERT INTO items(id,kind,title,norm_title,year,module_id,collection_id)
+         VALUES('twin','movie','Adopted Film','adopted film',2001,'m','c')",
     )
     .execute(&db)
     .await
@@ -249,7 +244,7 @@ async fn ownerless_movies_are_minted_or_adopted_from_the_hash() {
         "movie, adoption and single-episode OVA bind; stray episode and serial OVA do not"
     );
     let lone: Option<String> = sqlx::query_scalar(
-        "SELECT i.title FROM item_sources s JOIN items i ON i.id=s.item_id WHERE s.path_rel='lone-ova.mkv'",
+        "SELECT i.title FROM files f JOIN items i ON i.id=f.item_id WHERE f.path_rel='lone-ova.mkv'",
     )
     .fetch_optional(&db)
     .await
@@ -259,17 +254,16 @@ async fn ownerless_movies_are_minted_or_adopted_from_the_hash() {
         Some("Lone OVA"),
         "single-episode OVA minted as a movie"
     );
-    let serial: Option<String> = sqlx::query_scalar(
-        "SELECT s.item_id FROM item_sources s WHERE s.path_rel='serial-ova.mkv'",
-    )
-    .fetch_optional(&db)
-    .await
-    .unwrap();
+    let serial: Option<String> =
+        sqlx::query_scalar("SELECT f.item_id FROM files f WHERE f.path_rel='serial-ova.mkv'")
+            .fetch_one(&db)
+            .await
+            .unwrap();
     assert!(serial.is_none(), "multi-episode OVA stays bare");
 
     let akira: (String, Option<i64>, String) = sqlx::query_as(
-        "SELECT i.title, i.year, i.id FROM item_sources s JOIN items i ON i.id=s.item_id
-          WHERE s.path_rel='akira.mkv'",
+        "SELECT i.title,i.year,i.id FROM files f JOIN items i ON i.id=f.item_id
+          WHERE f.path_rel='akira.mkv'",
     )
     .fetch_one(&db)
     .await
@@ -287,7 +281,7 @@ async fn ownerless_movies_are_minted_or_adopted_from_the_hash() {
     assert_eq!(aid_of, 979);
 
     let adopted: String =
-        sqlx::query_scalar("SELECT item_id FROM item_sources WHERE path_rel='adopt.mkv'")
+        sqlx::query_scalar("SELECT item_id FROM files WHERE path_rel='adopt.mkv'")
             .fetch_one(&db)
             .await
             .unwrap();
@@ -296,11 +290,12 @@ async fn ownerless_movies_are_minted_or_adopted_from_the_hash() {
         "an aid-less twin is adopted, not duplicated"
     );
 
-    let stray: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM item_sources WHERE path_rel='stray-ep.mkv'")
-            .fetch_one(&db)
-            .await
-            .unwrap();
+    let stray: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM files WHERE item_id IS NOT NULL AND path_rel='stray-ep.mkv'",
+    )
+    .fetch_one(&db)
+    .await
+    .unwrap();
     assert_eq!(stray, 0, "a series-type aid must not scaffold a show");
     // And no phantom show was created for it.
     let shows: i64 =
@@ -450,13 +445,13 @@ async fn selection_follows_the_question_not_the_miss() {
     // Membership in an anime collection (the harness show has no source
     // yet — give it one, unhashed so the hash branch stays quiet).
     sqlx::query(
-        "INSERT INTO items (id, kind, title, norm_title, parent_id) VALUES ('ep','episode','e','e','show')",
+        "INSERT INTO items(id,kind,title,norm_title,parent_id,module_id,collection_id) VALUES('ep','episode','e','e','show','m','c')",
     )
     .execute(&db)
     .await
     .unwrap();
     sqlx::query(
-        "INSERT INTO item_sources (item_id, module_id, collection_id, path_rel) VALUES ('ep','m','c','e.mkv')",
+        "INSERT INTO files(module_id,collection_id,path_rel,item_id,size,mtime_unix,head_xxh3,tail_xxh3,oshash,streams_json) VALUES('m','c','e.mkv','ep',1,1,0,0,0,'{}')",
     )
     .execute(&db)
     .await
@@ -563,19 +558,11 @@ async fn extra_source(
     epno: &str,
 ) {
     sqlx::query(
-        "INSERT INTO files (module_id, collection_id, path_rel, size, mtime_unix,
-                            head_xxh3, tail_xxh3, oshash, streams_json, subs_extracted, ed2k)
-         VALUES ('m','c', ? || '.mkv', 700, 1, 0, 0, 0, '{}', 0, 'hash-' || ?)",
+        "INSERT INTO files(module_id,collection_id,path_rel,item_id,size,mtime_unix,
+                           head_xxh3,tail_xxh3,oshash,streams_json,subs_extracted,ed2k)
+         VALUES('m','c',?||'.mkv',?,700,1,0,0,0,'{}',0,'hash-'||?)",
     )
     .bind(name)
-    .bind(name)
-    .execute(db)
-    .await
-    .unwrap();
-    sqlx::query(
-        "INSERT INTO item_sources (item_id, module_id, collection_id, path_rel)
-         VALUES (?, 'm', 'c', ? || '.mkv')",
-    )
     .bind(item_id)
     .bind(name)
     .execute(db)

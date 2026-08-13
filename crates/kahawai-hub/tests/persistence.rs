@@ -7,9 +7,11 @@ use kahawai_hub::registry::{FileUpsertRecord, Registry};
 use sqlx::Row;
 use tower::ServiceExt;
 
+const TEST_ROOT: &str = "/kahawai-test-root";
+
 fn rec(path: &str, size: u64) -> FileUpsertRecord {
     FileUpsertRecord {
-        root_token: "root".into(),
+        root_token: kahawai_core::media::root_token(std::path::Path::new(TEST_ROOT)),
         path_rel: path.into(),
         size,
         mtime_unix: 1,
@@ -27,7 +29,7 @@ async fn files_and_items_survive_restart() {
     {
         let db = kahawai_hub::db::open(dir.path()).await.unwrap();
         let reg = Registry::new(db.clone(), Default::default());
-        reg.announce_collection("01H", "movies", "movies", &[])
+        reg.announce_collection("01H", "movies", "movies", &[TEST_ROOT.into()])
             .await
             .unwrap();
         reg.upsert_files(
@@ -66,8 +68,8 @@ async fn files_and_items_survive_restart() {
     assert!(!cols[0].available, "no mediahost connected after restart");
 
     let titles: Vec<(String, Option<i64>, i64)> = sqlx::query_as(
-        "SELECT i.title, i.year, COUNT(s.item_id) FROM items i
-         JOIN item_sources s ON s.item_id = i.id
+        "SELECT i.title, i.year, COUNT(f.id) FROM items i
+         JOIN files f ON f.item_id = i.id
          GROUP BY i.id ORDER BY i.title",
     )
     .fetch_all(&db)
@@ -155,7 +157,7 @@ async fn reconcile_drops_files_missing_from_scan() {
     let dir = tempfile::tempdir().unwrap();
     let db = kahawai_hub::db::open(dir.path()).await.unwrap();
     let reg = Registry::new(db.clone(), Default::default());
-    reg.announce_collection("01H", "movies", "movies", &[])
+    reg.announce_collection("01H", "movies", "movies", &[TEST_ROOT.into()])
         .await
         .unwrap();
     reg.upsert_files(
@@ -182,8 +184,11 @@ async fn reconcile_drops_files_missing_from_scan() {
         .unwrap();
 
     // Rescan saw only Heat.
-    let seen: std::collections::HashSet<String> =
-        [kahawai_hub::registry::source_key("root", "Heat (1995).mkv")].into();
+    let seen = [kahawai_hub::registry::SourcePath {
+        root_token: kahawai_core::media::root_token(std::path::Path::new(TEST_ROOT)),
+        path_rel: "Heat (1995).mkv".into(),
+    }]
+    .into();
     let removed = reg.reconcile_files("01H", "movies", &seen).await.unwrap();
     assert_eq!(removed, 1);
 
@@ -465,7 +470,7 @@ async fn multipart_movies_group_into_one_item() {
         .await
         .unwrap();
     registry
-        .announce_collection("01HOST", "movies", "movies", &["/srv/movies".into()])
+        .announce_collection("01HOST", "movies", "movies", &[TEST_ROOT.into()])
         .await
         .unwrap();
     registry
@@ -489,9 +494,9 @@ async fn multipart_movies_group_into_one_item() {
     assert_eq!(items, ["12 Monkeys", "Heat"], "{items:?}");
 
     let parts: Vec<(String, Option<i64>)> = sqlx::query(
-        "SELECT s.source_path, s.part FROM item_sources s
-         JOIN items i ON i.id = s.item_id WHERE i.title = '12 Monkeys'
-         ORDER BY s.part",
+        "SELECT f.path_rel AS source_path,f.part FROM files f
+         JOIN items i ON i.id=f.item_id WHERE i.title='12 Monkeys'
+         ORDER BY f.part",
     )
     .fetch_all(&db)
     .await
@@ -507,8 +512,8 @@ async fn multipart_movies_group_into_one_item() {
         ]
     );
     let heat_part: Option<i64> = sqlx::query_scalar(
-        "SELECT s.part FROM item_sources s JOIN items i ON i.id = s.item_id
-         WHERE i.title = 'Heat'",
+        "SELECT f.part FROM files f JOIN items i ON i.id=f.item_id
+         WHERE i.title='Heat'",
     )
     .fetch_one(&db)
     .await

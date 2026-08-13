@@ -647,9 +647,10 @@ pub(crate) async fn fill_verdict_track_ids(
 ) {
     let Some(p) = parts.first() else { return };
     let map: std::collections::HashMap<i64, i64> = sqlx::query_as(
-        "SELECT stream_index, id FROM subtitle_tracks
-         WHERE origin = 'embedded'
-           AND (module_id, collection_id, root_token, source_path) = (?, ?, ?, ?)",
+        "SELECT t.stream_index,t.id FROM subtitle_tracks t
+         JOIN files f ON f.id=t.source_id JOIN collection_roots r ON r.id=f.root_id
+         WHERE t.origin='embedded'
+           AND (f.module_id,f.collection_id,r.root_token,f.path_rel)=(?,?,?,?)",
     )
     .bind(&p.module_id)
     .bind(&p.collection_id)
@@ -1268,17 +1269,15 @@ impl Sessions {
         item_id: &str,
     ) -> Result<(Vec<PartSource>, kahawai_core::media::MediaInfo)> {
         let rows = sqlx::query(
-            "SELECT s.module_id, s.collection_id, s.root_token, s.source_path,
-                    s.part, f.size, f.streams_json
-             FROM item_sources s
-             JOIN files f ON (f.module_id, f.collection_id, f.path_rel)
-                           = (s.module_id, s.collection_id, s.path_rel)
-             WHERE s.item_id = ? AND s.root_token <> ''
+            "SELECT f.module_id,f.collection_id,r.root_token,f.path_rel AS source_path,
+                    f.part,f.size,f.streams_json
+             FROM files f JOIN collection_roots r ON r.id=f.root_id
+             WHERE f.item_id=?
              -- HUB-3 ranking. Resolution tier first: that is a deliberate
              -- quality choice. Within a tier the CORRECTED release wins
              -- (revision — a v2/REPACK is often smaller than the broken
              -- encode it replaces, so size cannot decide this), then size.
-             ORDER BY s.part IS NOT NULL,
+             ORDER BY f.part IS NOT NULL,
                       COALESCE(json_extract(f.streams_json, '$.video[0].height'), 0) DESC,
                       COALESCE(f.revision, 1) DESC,
                       f.size DESC",
@@ -1397,13 +1396,11 @@ impl Sessions {
         item_id: &str,
     ) -> Result<Vec<(Vec<PartSource>, kahawai_core::media::MediaInfo)>> {
         let rows = sqlx::query(
-            "SELECT s.module_id, s.collection_id, s.root_token, s.source_path,
-                    s.part, f.size, f.streams_json
-             FROM item_sources s
-             JOIN files f ON (f.module_id, f.collection_id, f.path_rel)
-                           = (s.module_id, s.collection_id, s.path_rel)
-             WHERE s.item_id = ? AND s.root_token <> ''
-             ORDER BY s.part IS NOT NULL,
+            "SELECT f.module_id,f.collection_id,r.root_token,f.path_rel AS source_path,
+                    f.part,f.size,f.streams_json
+             FROM files f JOIN collection_roots r ON r.id=f.root_id
+             WHERE f.item_id=?
+             ORDER BY f.part IS NOT NULL,
                       COALESCE(json_extract(f.streams_json, '$.video[0].height'), 0) DESC,
                       COALESCE(f.revision, 1) DESC,
                       f.size DESC",
@@ -1474,11 +1471,7 @@ impl Sessions {
     /// of waiting fixes.
     pub(crate) async fn has_any_source(&self, registry: &Registry, item_id: &str) -> bool {
         sqlx::query_scalar::<_, i64>(
-            "SELECT EXISTS (
-               SELECT 1 FROM item_sources s
-               JOIN files f ON (f.module_id, f.collection_id, f.path_rel)
-                             = (s.module_id, s.collection_id, s.path_rel)
-              WHERE s.item_id = ? AND s.root_token <> '')",
+            "SELECT EXISTS(SELECT 1 FROM files WHERE item_id=? AND root_id IS NOT NULL)",
         )
         .bind(item_id)
         .fetch_one(registry.db())

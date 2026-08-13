@@ -71,9 +71,7 @@ pub struct Enricher {
 /// what AniDB says it is, and which slot it currently shares.
 struct SlotOccupant {
     item_id: String,
-    module_id: String,
-    collection_id: String,
-    source_key: String,
+    source_id: i64,
     path: String,
     season: Option<i64>,
     episode: i64,
@@ -276,19 +274,11 @@ pub fn pick_candidate<'c>(
 /// nothing in the chain could ever clear that debt — a permanent
 /// full-catalogue re-select against the one statement whose cost this
 /// doc calls a standing tax.
-pub const GENERIC_SELECTION_SQL: &str =
-            "SELECT i.id, i.kind, i.title, i.norm_title, i.year,
-                    (SELECT s.source_path FROM item_sources s
-                     WHERE s.item_id = i.id LIMIT 1) AS src_path,
-                    -- Movies and series have separate chains (HUB-5), so
-                    -- the walk needs each item's OWN media type.
+pub const GENERIC_SELECTION_SQL: &str = "SELECT i.id,i.kind,i.title,i.norm_title,i.year,
+                    (SELECT f.path_rel FROM files f WHERE f.item_id=i.id LIMIT 1) AS src_path,
                     c0.media_type AS media_type
-             FROM items i
-             LEFT JOIN collections c0 ON (c0.module_id, c0.collection_id) = (
-                 SELECT s3.module_id, s3.collection_id FROM item_sources s3
-                 WHERE s3.item_id = i.id
-                    OR s3.item_id IN (SELECT id FROM items WHERE parent_id = i.id)
-                 LIMIT 1)
+             FROM items i JOIN collections c0
+               ON (c0.module_id,c0.collection_id)=(i.module_id,i.collection_id)
              WHERE i.kind IN ('movie', 'show')
                AND (
                     -- HUB-5: a searcher is owed work while its CURRENT
@@ -324,18 +314,12 @@ pub const GENERIC_SELECTION_SQL: &str =
                                  WHERE pl.item_id = i.id AND pl.provider = 'local'
                                    AND pl.provider_id <> '')
                         != (i.id IN (SELECT COALESCE(ch.parent_id, ch.id)
-                                       FROM item_sources s5
-                                       JOIN files f5 ON (f5.module_id, f5.collection_id, f5.path_rel)
-                                                      = (s5.module_id, s5.collection_id, s5.path_rel)
-                                       JOIN items ch ON ch.id = s5.item_id
+                                       FROM files f5 JOIN items ch ON ch.id=f5.item_id
                                       WHERE json_extract(f5.streams_json, '$.nfo') IS NOT NULL)))
                     OR (NOT EXISTS (SELECT 1 FROM provider_metadata pl
                                      WHERE pl.item_id = i.id AND pl.provider = 'local')
                         AND i.id IN (SELECT COALESCE(ch.parent_id, ch.id)
-                                       FROM item_sources s4
-                                       JOIN files f4 ON (f4.module_id, f4.collection_id, f4.path_rel)
-                                                      = (s4.module_id, s4.collection_id, s4.path_rel)
-                                       JOIN items ch ON ch.id = s4.item_id
+                                       FROM files f4 JOIN items ch ON ch.id=f4.item_id
                                       WHERE json_extract(f4.streams_json, '$.artwork') IS NOT NULL
                                          OR json_extract(f4.streams_json, '$.nfo') IS NOT NULL))
                     -- or a provider refused and is due again (bans and
@@ -343,13 +327,7 @@ pub const GENERIC_SELECTION_SQL: &str =
                     OR EXISTS (
                       SELECT 1 FROM enrichment_queue q
                       WHERE q.item_id = i.id AND q.due_at <= unixepoch()))
-               AND NOT EXISTS (
-                 SELECT 1 FROM item_sources s2
-                 JOIN collections c2 ON (c2.module_id, c2.collection_id)
-                                      = (s2.module_id, s2.collection_id)
-                 WHERE c2.media_type = 'anime'
-                   AND (s2.item_id = i.id
-                        OR s2.item_id IN (SELECT id FROM items WHERE parent_id = i.id)))
+               AND c0.media_type<>'anime'
              ORDER BY i.title";
 
 /// Is this error, anywhere in its chain, an HTTP 404? A mapped id that
@@ -971,9 +949,7 @@ impl Enricher {
                JOIN collections col ON (col.module_id, col.collection_id)
                                      = (f.module_id, f.collection_id)
                WHERE col.media_type = 'anime' AND f.ed2k IS NOT NULL
-                 AND NOT EXISTS (SELECT 1 FROM item_sources s
-                                  WHERE (s.module_id, s.collection_id, s.path_rel)
-                                      = (f.module_id, f.collection_id, f.path_rel))
+                 AND f.item_id IS NULL
                  AND NOT EXISTS (SELECT 1 FROM ed2k_aid c
                                   WHERE c.ed2k = f.ed2k
                                     AND (c.aid IS NULL OR c.epno IS NOT NULL)))",
@@ -1158,18 +1134,12 @@ impl Enricher {
                                  WHERE pl.item_id = i.id AND pl.provider = 'local'
                                    AND pl.provider_id <> '')
                         != (i.id IN (SELECT COALESCE(ch.parent_id, ch.id)
-                                       FROM item_sources s5
-                                       JOIN files f5 ON (f5.module_id, f5.collection_id, f5.path_rel)
-                                                      = (s5.module_id, s5.collection_id, s5.path_rel)
-                                       JOIN items ch ON ch.id = s5.item_id
+                                       FROM files f5 JOIN items ch ON ch.id=f5.item_id
                                       WHERE json_extract(f5.streams_json, '$.nfo') IS NOT NULL)))
                     OR (NOT EXISTS (SELECT 1 FROM provider_metadata pl
                                      WHERE pl.item_id = i.id AND pl.provider = 'local')
                         AND i.id IN (SELECT COALESCE(ch.parent_id, ch.id)
-                                       FROM item_sources s4
-                                       JOIN files f4 ON (f4.module_id, f4.collection_id, f4.path_rel)
-                                                      = (s4.module_id, s4.collection_id, s4.path_rel)
-                                       JOIN items ch ON ch.id = s4.item_id
+                                       FROM files f4 JOIN items ch ON ch.id=f4.item_id
                                       WHERE json_extract(f4.streams_json, '$.artwork') IS NOT NULL
                                          OR json_extract(f4.streams_json, '$.nfo') IS NOT NULL))
                     -- Work the chain still owes: a provider that refused
@@ -1321,13 +1291,9 @@ impl Enricher {
              -- 1.1k anime items. Resolving each source to its top-level
              -- item with COALESCE(parent_id, id) makes the set computable
              -- once, off the primary keys.
-             WHERE i.kind IN ('movie', 'show')
-               AND i.id IN (SELECT COALESCE(ch.parent_id, ch.id)
-                              FROM item_sources s
-                              JOIN items ch ON ch.id = s.item_id
-                              JOIN collections c ON (c.module_id, c.collection_id)
-                                                  = (s.module_id, s.collection_id)
-                             WHERE c.media_type = 'anime')
+             JOIN collections own ON (own.module_id,own.collection_id)
+                                  =(i.module_id,i.collection_id)
+             WHERE i.kind IN ('movie','show') AND own.media_type='anime'
                AND (
                  -- The NAME question is owed: no anime identity stands
                  -- and the current title anchor was never asked. A
@@ -1375,18 +1341,12 @@ impl Enricher {
                                  WHERE pl.item_id = i.id AND pl.provider = 'local'
                                    AND pl.provider_id <> '')
                         != (i.id IN (SELECT COALESCE(ch.parent_id, ch.id)
-                                       FROM item_sources s5
-                                       JOIN files f5 ON (f5.module_id, f5.collection_id, f5.path_rel)
-                                                      = (s5.module_id, s5.collection_id, s5.path_rel)
-                                       JOIN items ch ON ch.id = s5.item_id
+                                       FROM files f5 JOIN items ch ON ch.id=f5.item_id
                                       WHERE json_extract(f5.streams_json, '$.nfo') IS NOT NULL)))
                     OR (NOT EXISTS (SELECT 1 FROM provider_metadata pl
                                      WHERE pl.item_id = i.id AND pl.provider = 'local')
                         AND i.id IN (SELECT COALESCE(ch.parent_id, ch.id)
-                                       FROM item_sources s4
-                                       JOIN files f4 ON (f4.module_id, f4.collection_id, f4.path_rel)
-                                                      = (s4.module_id, s4.collection_id, s4.path_rel)
-                                       JOIN items ch ON ch.id = s4.item_id
+                                       FROM files f4 JOIN items ch ON ch.id=f4.item_id
                                       WHERE json_extract(f4.streams_json, '$.artwork') IS NOT NULL
                                          OR json_extract(f4.streams_json, '$.nfo') IS NOT NULL))
                  OR EXISTS (
@@ -1394,11 +1354,8 @@ impl Enricher {
                    WHERE q.item_id = i.id AND q.due_at <= unixepoch())
                  -- Same shape, same reason: one pass over the unmapped
                  -- hashes rather than one per candidate item.
-                 OR i.id IN (SELECT COALESCE(ch.parent_id, ch.id)
-                               FROM files f
-                               JOIN item_sources s2 ON (s2.module_id, s2.collection_id, s2.path_rel)
-                                                     = (f.module_id, f.collection_id, f.path_rel)
-                               JOIN items ch ON ch.id = s2.item_id
+                 OR i.id IN (SELECT COALESCE(ch.parent_id,ch.id)
+                               FROM files f JOIN items ch ON ch.id=f.item_id
                               WHERE f.ed2k IS NOT NULL
                                 AND f.ed2k NOT IN (SELECT ed2k FROM ed2k_aid)))
              ORDER BY i.title",
@@ -1629,17 +1586,14 @@ impl Enricher {
         item_id: &str,
     ) -> Result<Option<u32>> {
         let Some(row) = sqlx::query(
-            "SELECT f.ed2k, f.size FROM files f
-             JOIN item_sources s ON (s.module_id, s.collection_id, s.path_rel)
-                                  = (f.module_id, f.collection_id, f.path_rel)
+            "SELECT f.ed2k,f.size FROM files f
              WHERE f.ed2k IS NOT NULL
-               AND (s.item_id = ?1
-                    OR s.item_id IN (SELECT id FROM items WHERE parent_id = ?1))
+               AND (f.item_id=?1 OR f.item_id IN (SELECT id FROM items WHERE parent_id=?1))
              -- Prefer a file AniDB has never been asked about: a cached
              -- miss on the alphabetically-first file must not block the
              -- siblings from ever being consulted.
-             ORDER BY EXISTS (SELECT 1 FROM ed2k_aid c WHERE c.ed2k = f.ed2k),
-                      s.path_rel LIMIT 1",
+             ORDER BY EXISTS (SELECT 1 FROM ed2k_aid c WHERE c.ed2k=f.ed2k),
+                      f.path_rel LIMIT 1",
         )
         .bind(item_id)
         .fetch_optional(db)
@@ -1692,10 +1646,7 @@ impl Enricher {
         // A row with an aid but no epno predates 0042 and is re-asked
         // once; a NULL aid is a recorded miss and stays terminal.
         let files: Vec<(String, i64)> = sqlx::query_as(
-            "SELECT f.ed2k, f.size FROM files f
-             JOIN item_sources s ON (s.module_id, s.collection_id, s.path_rel)
-                                  = (f.module_id, f.collection_id, f.path_rel)
-             JOIN items ep ON ep.id = s.item_id
+            "SELECT f.ed2k,f.size FROM files f JOIN items ep ON ep.id=f.item_id
              WHERE ep.parent_id = ?1 AND f.ed2k IS NOT NULL
                -- Span episodes (batch files, 0045) answer to their
                -- range, not to a single-epno FILE reply: skip the ask.
@@ -1703,7 +1654,7 @@ impl Enricher {
                AND NOT EXISTS (SELECT 1 FROM ed2k_aid c
                                 WHERE c.ed2k = f.ed2k
                                   AND (c.aid IS NULL OR c.epno IS NOT NULL))
-             ORDER BY s.path_rel",
+             ORDER BY f.path_rel",
         )
         .bind(show_id)
         .fetch_all(db)
@@ -1753,9 +1704,7 @@ impl Enricher {
              JOIN collections col ON (col.module_id, col.collection_id)
                                    = (f.module_id, f.collection_id)
              WHERE col.media_type = 'anime' AND f.ed2k IS NOT NULL
-               AND NOT EXISTS (SELECT 1 FROM item_sources s
-                                WHERE (s.module_id, s.collection_id, s.path_rel)
-                                    = (f.module_id, f.collection_id, f.path_rel))
+               AND f.item_id IS NULL
                AND NOT EXISTS (SELECT 1 FROM ed2k_aid c
                                 WHERE c.ed2k = f.ed2k
                                   AND (c.aid IS NULL OR c.epno IS NOT NULL))
@@ -1790,17 +1739,14 @@ impl Enricher {
     /// work; a file whose aid matches nothing stays bare and is logged.
     pub async fn bind_bare_files(&self, db: &sqlx::SqlitePool) -> Result<usize> {
         let rows = sqlx::query(
-            "SELECT f.module_id, f.collection_id, f.path_rel AS source_key,
-                    f.root_token, f.source_path, c.aid, c.epno
+            "SELECT f.id AS source_id,f.module_id,f.collection_id,f.path_rel,c.aid,c.epno
              FROM files f
              JOIN collections col ON (col.module_id, col.collection_id)
                                    = (f.module_id, f.collection_id)
              JOIN ed2k_aid c ON c.ed2k = f.ed2k
              WHERE col.media_type = 'anime'
                AND c.aid IS NOT NULL AND c.epno IS NOT NULL
-               AND NOT EXISTS (SELECT 1 FROM item_sources s
-                                WHERE (s.module_id, s.collection_id, s.path_rel)
-                                    = (f.module_id, f.collection_id, f.path_rel))
+               AND f.item_id IS NULL
              ORDER BY f.path_rel",
         )
         .fetch_all(db)
@@ -1808,12 +1754,16 @@ impl Enricher {
         let mut bound = 0;
         for r in rows {
             let (aid, epno) = (r.get::<i64, _>("aid"), r.get::<String, _>("epno"));
-            let path: String = r.get("source_path");
+            let path: String = r.get("path_rel");
+            let module_id: String = r.get("module_id");
+            let collection_id: String = r.get("collection_id");
             let owner_row = sqlx::query_as::<_, (String, String)>(
-                "SELECT i.id, i.kind FROM anime_ids a JOIN items i ON i.id = a.item_id
-                  WHERE a.anidb_id = ? LIMIT 1",
+                "SELECT i.id,i.kind FROM anime_ids a JOIN items i ON i.id=a.item_id
+                  WHERE a.anidb_id=? AND i.module_id=? AND i.collection_id=? LIMIT 1",
             )
             .bind(aid)
+            .bind(&module_id)
+            .bind(&collection_id)
             .fetch_optional(db)
             .await?;
             let (owner, kind) = match owner_row {
@@ -1825,7 +1775,10 @@ impl Enricher {
                 // agreed 2026-07-28, because a yearless "Akira.mkv" can
                 // never earn an item any other way. A series stays bare:
                 // one stray file must not scaffold a show.
-                None => match self.mint_movie_for_aid(db, aid as u32).await {
+                None => match self
+                    .mint_movie_for_aid(db, aid as u32, &module_id, &collection_id)
+                    .await
+                {
                     Ok(Some(id)) => (id, "movie".to_string()),
                     Ok(None) => continue,
                     Err(e) => {
@@ -1868,8 +1821,9 @@ impl Enricher {
                                 .unwrap_or(&path)
                                 .to_string();
                             sqlx::query(
-                                "INSERT INTO items (id, kind, title, norm_title, parent_id, season, episode)
-                                 VALUES (?, 'episode', ?, ?, ?, ?, ?)",
+                                "INSERT INTO items
+                                   (id,kind,title,norm_title,parent_id,season,episode,module_id,collection_id)
+                                 VALUES (?,'episode',?,?,?,?,?,?,?)",
                             )
                             .bind(&id)
                             .bind(&stem)
@@ -1877,6 +1831,8 @@ impl Enricher {
                             .bind(&owner)
                             .bind(slot.0)
                             .bind(slot.1)
+                            .bind(&module_id)
+                            .bind(&collection_id)
                             .execute(db)
                             .await?;
                             id
@@ -1884,19 +1840,11 @@ impl Enricher {
                     }
                 }
             };
-            sqlx::query(
-                "INSERT INTO item_sources
-                    (item_id, module_id, collection_id, path_rel, root_token, source_path)
-                 VALUES (?, ?, ?, ?, ?, ?)",
-            )
-            .bind(&target)
-            .bind(r.get::<String, _>("module_id"))
-            .bind(r.get::<String, _>("collection_id"))
-            .bind(r.get::<String, _>("source_key"))
-            .bind(r.get::<String, _>("root_token"))
-            .bind(&path)
-            .execute(db)
-            .await?;
+            sqlx::query("UPDATE files SET item_id=? WHERE id=?")
+                .bind(&target)
+                .bind(r.get::<i64, _>("source_id"))
+                .execute(db)
+                .await?;
             tracing::info!(path = %path, epno = %epno, "bare file identified by hash and bound");
             bound += 1;
         }
@@ -1907,7 +1855,13 @@ impl Enricher {
     /// twin exists under the same normalized title and year (a TMDB
     /// title-match of the same film), minted from AniDB's answer
     /// otherwise. Returns None for non-movie types.
-    async fn mint_movie_for_aid(&self, db: &sqlx::SqlitePool, aid: u32) -> Result<Option<String>> {
+    async fn mint_movie_for_aid(
+        &self,
+        db: &sqlx::SqlitePool,
+        aid: u32,
+        module_id: &str,
+        collection_id: &str,
+    ) -> Result<Option<String>> {
         let info = crate::anime::anidb_anime_info(&self.http, &self.data_dir, aid).await?;
         // Movie-shaped: AniDB's Movie type, or a single-episode OVA/Web
         // entry — one sitting, no series structure to invent. Multi-
@@ -1921,11 +1875,13 @@ impl Enricher {
         }
         let norm = kahawai_core::names::normalize_title(&info.title);
         let twin: Option<String> = sqlx::query_scalar(
-            "SELECT i.id FROM items i
-              WHERE i.kind = 'movie' AND i.norm_title = ?1 AND i.year IS ?2
-                AND NOT EXISTS (SELECT 1 FROM anime_ids a
-                                 WHERE a.item_id = i.id AND a.anidb_id IS NOT NULL)",
+            "SELECT i.id FROM items i WHERE i.module_id=?1 AND i.collection_id=?2
+                AND i.kind='movie' AND i.norm_title=?3 AND i.year IS ?4
+                AND NOT EXISTS(SELECT 1 FROM anime_ids a
+                                WHERE a.item_id=i.id AND a.anidb_id IS NOT NULL)",
         )
+        .bind(module_id)
+        .bind(collection_id)
         .bind(&norm)
         .bind(info.year)
         .fetch_optional(db)
@@ -1939,13 +1895,16 @@ impl Enricher {
             None => {
                 let id = ulid::Ulid::generate().to_string();
                 sqlx::query(
-                    "INSERT INTO items (id, kind, title, norm_title, year)
-                     VALUES (?, 'movie', ?, ?, ?)",
+                    "INSERT INTO items
+                       (id,kind,title,norm_title,year,module_id,collection_id)
+                     VALUES (?,'movie',?,?,?,?,?)",
                 )
                 .bind(&id)
                 .bind(&info.title)
                 .bind(&norm)
                 .bind(info.year)
+                .bind(module_id)
+                .bind(collection_id)
                 .execute(db)
                 .await?;
                 tracing::info!(aid, title = %info.title, year = ?info.year,
@@ -1986,19 +1945,15 @@ impl Enricher {
         show_aid: u32,
     ) -> Result<Vec<EpisodeRebind>> {
         let rows = sqlx::query(
-            "SELECT s.module_id, s.collection_id, s.path_rel AS source_key,
-                    s.source_path, ep.id AS item_id, ep.title, ep.norm_title, ep.season, ep.episode,
-                    c.aid, c.epno, c.eid
-             FROM item_sources s
-             JOIN items ep ON ep.id = s.item_id
-             JOIN files f ON (f.module_id, f.collection_id, f.path_rel)
-                           = (s.module_id, s.collection_id, s.path_rel)
+            "SELECT f.id AS source_id,f.path_rel AS source_path,ep.id AS item_id,
+                    ep.title,ep.norm_title,ep.season,ep.episode,c.aid,c.epno,c.eid
+             FROM files f JOIN items ep ON ep.id=f.item_id
              JOIN ed2k_aid c ON c.ed2k = f.ed2k
              WHERE ep.parent_id = ?1 AND c.aid IS NOT NULL AND c.epno IS NOT NULL
                -- Span episodes (batch files, 0045) are their own truth;
                -- a single-epno answer must not collapse the range.
                AND ep.episode_end IS NULL
-             ORDER BY s.path_rel",
+             ORDER BY f.path_rel",
         )
         .bind(show_id)
         .fetch_all(db)
@@ -2021,9 +1976,7 @@ impl Enricher {
                     "file belongs to a different anidb entry; not rebinding");
                 elsewhere.push(SlotOccupant {
                     item_id: r.get("item_id"),
-                    module_id: r.get("module_id"),
-                    collection_id: r.get("collection_id"),
-                    source_key: r.get("source_key"),
+                    source_id: r.get("source_id"),
                     season: r.get::<Option<i64>, _>("season"),
                     episode: r.get::<i64, _>("episode"),
                     eid: r.get::<Option<i64>, _>("eid"),
@@ -2076,8 +2029,10 @@ impl Enricher {
                     // The file's own title travels with it: it described
                     // this content, whatever number it wore.
                     sqlx::query(
-                        "INSERT INTO items (id, kind, title, norm_title, parent_id, season, episode)
-                         VALUES (?, 'episode', ?, ?, ?, ?, ?)",
+                        "INSERT INTO items
+                           (id,kind,title,norm_title,parent_id,season,episode,module_id,collection_id)
+                         SELECT ?,'episode',?,?,?,?,?,module_id,collection_id
+                           FROM items WHERE id=?",
                     )
                     .bind(&id)
                     .bind(r.get::<String, _>("title"))
@@ -2085,21 +2040,17 @@ impl Enricher {
                     .bind(show_id)
                     .bind(target.0)
                     .bind(target.1)
+                    .bind(show_id)
                     .execute(&mut *tx)
                     .await?;
                     id
                 }
             };
-            sqlx::query(
-                "UPDATE item_sources SET item_id = ?1
-                 WHERE module_id = ?2 AND collection_id = ?3 AND path_rel = ?4",
-            )
-            .bind(&target_id)
-            .bind(r.get::<String, _>("module_id"))
-            .bind(r.get::<String, _>("collection_id"))
-            .bind(r.get::<String, _>("source_key"))
-            .execute(&mut *tx)
-            .await?;
+            sqlx::query("UPDATE files SET item_id=? WHERE id=?")
+                .bind(&target_id)
+                .bind(r.get::<i64, _>("source_id"))
+                .execute(&mut *tx)
+                .await?;
             // Watch state follows the FILE — the user watched this
             // content under whatever number it was misfiled as.
             sqlx::query(
@@ -2118,7 +2069,7 @@ impl Enricher {
             sqlx::query(
                 "DELETE FROM items
                  WHERE id = ?1 AND kind = 'episode'
-                   AND NOT EXISTS (SELECT 1 FROM item_sources s WHERE s.item_id = ?1)",
+                   AND NOT EXISTS(SELECT 1 FROM files f WHERE f.item_id=?1)",
             )
             .bind(&item_id)
             .execute(&mut *tx)
@@ -2202,8 +2153,10 @@ impl Enricher {
                 let mut tx = db.begin().await?;
                 let id = ulid::Ulid::generate().to_string();
                 sqlx::query(
-                    "INSERT INTO items (id, kind, title, norm_title, parent_id, season, episode)
-                     VALUES (?, 'episode', ?, ?, ?, ?, ?)",
+                    "INSERT INTO items
+                       (id,kind,title,norm_title,parent_id,season,episode,module_id,collection_id)
+                     SELECT ?,'episode',?,?,?,?,?,module_id,collection_id
+                       FROM items WHERE id=?",
                 )
                 .bind(&id)
                 .bind(&title)
@@ -2211,18 +2164,14 @@ impl Enricher {
                 .bind(show_id)
                 .bind(o.season)
                 .bind(episode)
+                .bind(show_id)
                 .execute(&mut *tx)
                 .await?;
-                sqlx::query(
-                    "UPDATE item_sources SET item_id = ?1
-                      WHERE module_id = ?2 AND collection_id = ?3 AND path_rel = ?4",
-                )
-                .bind(&id)
-                .bind(&o.module_id)
-                .bind(&o.collection_id)
-                .bind(&o.source_key)
-                .execute(&mut *tx)
-                .await?;
+                sqlx::query("UPDATE files SET item_id=? WHERE id=?")
+                    .bind(&id)
+                    .bind(o.source_id)
+                    .execute(&mut *tx)
+                    .await?;
                 // Watch state follows the FILE, as everywhere else here:
                 // the user watched this content under the shared number.
                 sqlx::query(
@@ -2485,14 +2434,11 @@ impl Enricher {
                SELECT i.id AS item_id,
                  (SELECT ea.aid FROM ed2k_aid ea
                     JOIN files f ON f.ed2k = ea.ed2k
-                    JOIN item_sources s
-                      ON (s.module_id, s.collection_id, s.path_rel)
-                       = (f.module_id, f.collection_id, f.path_rel)
-                   WHERE (s.item_id = i.id
-                          OR s.item_id IN (SELECT id FROM items WHERE parent_id = i.id))
+                   WHERE (f.item_id=i.id
+                          OR f.item_id IN (SELECT id FROM items WHERE parent_id=i.id))
                      AND ea.aid IS NOT NULL
                    -- Same file the identification used, so the same answer.
-                   ORDER BY s.path_rel LIMIT 1) AS aid,
+                   ORDER BY f.path_rel LIMIT 1) AS aid,
                  (SELECT CAST(pm.provider_id AS INTEGER) FROM provider_metadata pm
                    WHERE pm.item_id = i.id AND pm.provider = 'anilist'
                      AND pm.provider_id <> '') AS anilist
@@ -3033,13 +2979,9 @@ impl Enricher {
         // generic providers at equal relevance — and vice versa.
         let anime_first = match item {
             Some(id) => sqlx::query_scalar::<_, i64>(
-                "SELECT EXISTS (
-                   SELECT 1 FROM item_sources s
-                   JOIN collections c ON (c.module_id, c.collection_id)
-                                       = (s.module_id, s.collection_id)
-                   WHERE c.media_type = 'anime'
-                     AND (s.item_id = ?1 OR s.item_id IN
-                          (SELECT id FROM items WHERE parent_id = ?1)))",
+                "SELECT EXISTS(SELECT 1 FROM items i JOIN collections c
+                    ON (c.module_id,c.collection_id)=(i.module_id,i.collection_id)
+                  WHERE i.id=?1 AND c.media_type='anime')",
             )
             .bind(id)
             .fetch_one(registry.db())
@@ -4000,13 +3942,11 @@ async fn nfo_source(
     item_id: &str,
 ) -> Result<Option<(String, String, String, String)>> {
     let row = sqlx::query(
-        "SELECT s.module_id, s.collection_id, s.root_token,
-                json_extract(f.streams_json, '$.nfo') AS nfo
-         FROM item_sources s
-         JOIN files f ON (f.module_id, f.collection_id, f.path_rel)
-                       = (s.module_id, s.collection_id, s.path_rel)
-         WHERE (s.item_id = ?1
-                OR s.item_id IN (SELECT id FROM items WHERE parent_id = ?1))
+        "SELECT f.module_id,f.collection_id,r.root_token,
+                json_extract(f.streams_json,'$.nfo') AS nfo
+         FROM files f JOIN collection_roots r ON r.id=f.root_id
+         WHERE (f.item_id=?1
+                OR f.item_id IN (SELECT id FROM items WHERE parent_id=?1))
            AND nfo IS NOT NULL
          LIMIT 1",
     )

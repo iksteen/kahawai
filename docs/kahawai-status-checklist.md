@@ -113,19 +113,16 @@ How something works and why it was built that way belong in
       content-identity copy-forward (at-most-once per content)
 - [x] MH-10 Sync generation per collection: persisted mediahost-side, compared
       on reconnect, in-sync = no manifest/no walk; FilesSeen reconciliation.
-      Migration 53 adds exact-root columns without resetting generations. A
-      protocol 3 rejects protocol-2 satellites and uses one required exact
-      source shape. A single-root announcement adopts pre-migration rows with
-      set-based transactional writes; migration 54 prevents identity-only key
-      rewrites from firing presentation-membership maintenance per file, and
-      migration 55 plus protocol 3 persist/acknowledge scan suppression across
-      crashes without changing either side's generation. After acknowledgement,
-      the consumed startup trigger is retried immediately so a real generation
-      mismatch enters normal incremental reconciliation. Ambiguous multi-root rows use a targeted
-      content-identity worklist and suppress reconciliation until resolved,
-      without a catalogue scan or rematch. An unavailable root preserves its
-      manifest rows while other roots continue; root-aware caches safely
-      promote old artifacts only for single-root collections
+      Direct migration 53 converts level 52 to collection-owned items, stable
+      source IDs and relational exact roots without changing generations.
+      Protocol 3 rejects protocol-2 satellites and has one exact source shape.
+      A single-root announcement adopts root-less file IDs with one indexed
+      transactional update; dependent subtitle/failure rows already follow the
+      source ID. A persisted acknowledgement bit repeats scan suppression across
+      crashes, then immediately retries the consumed startup trigger so real
+      generation drift enters normal reconciliation. Ambiguous multi-root rows
+      use a targeted content-identity worklist with no scan/rematch. Unavailable
+      roots preserve their manifest rows while other roots continue.
 - [x] MH-11 Three-tier job runner: urgent extraction > ED2K > subtitle
       pre-warm, idle = no scan and no lease being served
 - [~] MH-12 WITHDRAWN 2026-08-02, false premise — see the amendment in
@@ -140,7 +137,12 @@ How something works and why it was built that way belong in
 
 - [x] HUB-1 Registry of mediahosts, collections, transcoders (live + persistent)
 - [x] HUB-2 Libraries composed from same-typed collections
-- [x] HUB-3 Dedup: same logical item from multiple sources → one item, source list
+- [x] HUB-3 Collection-scoped identity: each item belongs to one collection;
+      alternate sources deduplicate only within that item/collection. Libraries
+      compose collections and reuse the same item IDs/watch state; equal works
+      in different collections remain independent (provider/manual/query/watch
+      state included). Direct level-52→53 migration and conflict-detecting
+      migration-56 replay are runnable and real-catalogue proven.
 - [x] HUB-4 Filename/dirname parsing (movies, episodes, anime conventions, music layout)
 - [x] HUB-20 Mediahost deletion cascade + watch-state/match archives restored on re-enroll
 - [x] HUB-5 Provider trait + declared chains + walker (TMDB, TVDB, anime

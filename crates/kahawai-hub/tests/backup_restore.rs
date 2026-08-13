@@ -20,7 +20,22 @@ async fn a_snapshot_restores_the_database_pki_and_subtitles() {
     // the CA that admits it, a downloaded subtitle, and a token secret.
     let db = kahawai_hub::db::open(live.path()).await.unwrap();
     sqlx::query(
-        "INSERT INTO items (id, kind, title, norm_title) VALUES ('i1','movie','Solaris','solaris')",
+        "INSERT INTO satellites(module_id,module_type,name,cert_fingerprint)
+                 VALUES('fixture','mediahost','fixture','fp')",
+    )
+    .execute(&db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO collections(module_id,collection_id,media_type)
+                 VALUES('fixture','default','movies')",
+    )
+    .execute(&db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO items(id,kind,title,norm_title,module_id,collection_id)
+         VALUES('i1','movie','Solaris','solaris','fixture','default')",
     )
     .execute(&db)
     .await

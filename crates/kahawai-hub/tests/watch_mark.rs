@@ -21,6 +21,20 @@ use tower::ServiceExt;
 async fn harness() -> (axum::Router, String, sqlx::SqlitePool) {
     let dir = tempfile::tempdir().unwrap();
     let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    sqlx::query(
+        "INSERT INTO satellites(module_id,module_type,name,cert_fingerprint)
+                 VALUES('fixture','mediahost','fixture','fp')",
+    )
+    .execute(&db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO collections(module_id,collection_id,media_type)
+                 VALUES('fixture','default','movies')",
+    )
+    .execute(&db)
+    .await
+    .unwrap();
     let registry = Arc::new(kahawai_hub::registry::Registry::new(
         db.clone(),
         Default::default(),
@@ -136,7 +150,8 @@ async fn state(db: &sqlx::SqlitePool, id: &str) -> (i64, Option<i64>, i64, i64) 
 async fn marking_watched_clears_resume_and_never_loses_the_count() {
     let (api, token, db) = harness().await;
     sqlx::query(
-        "INSERT INTO items (id, kind, title, norm_title) VALUES ('i1','movie','Heat','heat')",
+        "INSERT INTO items(id,kind,title,norm_title,module_id,collection_id)
+         VALUES('i1','movie','Heat','heat','fixture','default')",
     )
     .execute(&db)
     .await
@@ -210,7 +225,8 @@ async fn a_whole_season_is_one_call_and_cannot_reach_outside_the_show() {
         ("oth1", "episode", Some("other")),
     ] {
         sqlx::query(
-            "INSERT INTO items (id, kind, title, norm_title, parent_id) VALUES (?,?,?,?,?)",
+            "INSERT INTO items(id,kind,title,norm_title,parent_id,module_id,collection_id)
+             VALUES(?,?,?,?,?,'fixture','default')",
         )
         .bind(id)
         .bind(kind)
@@ -268,10 +284,13 @@ async fn a_whole_season_is_one_call_and_cannot_reach_outside_the_show() {
 #[tokio::test]
 async fn a_batch_that_matches_nothing_is_404_and_writes_nothing() {
     let (api, token, db) = harness().await;
-    sqlx::query("INSERT INTO items (id, kind, title, norm_title) VALUES ('m','movie','M','m')")
-        .execute(&db)
-        .await
-        .unwrap();
+    sqlx::query(
+        "INSERT INTO items(id,kind,title,norm_title,module_id,collection_id)
+                 VALUES('m','movie','M','m','fixture','default')",
+    )
+    .execute(&db)
+    .await
+    .unwrap();
     let (status, _) = mark_many(&api, &token, "m", true, Some(&["nope", "also-nope"])).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM watch_state")

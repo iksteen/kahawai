@@ -19,13 +19,14 @@ use kahawai_hub::registry::{FileUpsertRecord, Registry};
 use kahawai_hub::sessions::Sessions;
 
 const CAP: usize = 4;
+const TEST_ROOT: &str = "/kahawai-test-root";
 
 async fn fixture() -> (Arc<Registry>, Arc<Sessions>, String, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let db = kahawai_hub::db::open(dir.path()).await.unwrap();
     let registry = Arc::new(Registry::new(db.clone(), Default::default()));
     registry
-        .announce_collection("01HOST", "movies", "movies", &[])
+        .announce_collection("01HOST", "movies", "movies", &[TEST_ROOT.into()])
         .await
         .unwrap();
     registry
@@ -33,7 +34,7 @@ async fn fixture() -> (Arc<Registry>, Arc<Sessions>, String, tempfile::TempDir) 
             "01HOST",
             "movies",
             vec![FileUpsertRecord {
-                root_token: "root".into(),
+                root_token: kahawai_core::media::root_token(std::path::Path::new(TEST_ROOT)),
                 path_rel: "Heat (1995).mkv".into(),
                 size: 1_000_000,
                 mtime_unix: 1,

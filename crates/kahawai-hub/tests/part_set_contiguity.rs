@@ -16,9 +16,11 @@ use std::sync::Arc;
 use kahawai_hub::registry::{FileUpsertRecord, Registry};
 use kahawai_hub::sessions::{Sessions, SourceOffline};
 
+const TEST_ROOT: &str = "/kahawai-test-root";
+
 fn rec(path: &str) -> FileUpsertRecord {
     FileUpsertRecord {
-        root_token: "root".into(),
+        root_token: kahawai_core::media::root_token(std::path::Path::new(TEST_ROOT)),
         path_rel: path.into(),
         size: 1_000_000,
         mtime_unix: 1,
@@ -42,7 +44,7 @@ async fn item_with(
     let hosts: std::collections::BTreeSet<&str> = files.iter().map(|(h, _)| *h).collect();
     for host in &hosts {
         registry
-            .announce_collection(host, "movies", "movies", &[])
+            .announce_collection(host, "movies", "movies", &[TEST_ROOT.into()])
             .await
             .unwrap();
         registry
@@ -75,7 +77,7 @@ async fn item_with(
         .unwrap();
     assert_eq!(items.len(), 1, "the fixture must fold to exactly one item");
     let item = items.into_iter().next().unwrap();
-    let sources: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM item_sources WHERE item_id = ?")
+    let sources: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM files WHERE item_id = ?")
         .bind(&item)
         .fetch_one(&db)
         .await
@@ -169,40 +171,37 @@ async fn a_whole_part_set_negotiates() {
 }
 
 #[tokio::test]
-async fn a_part_whose_host_is_away_still_stands_by_when_negotiating() {
-    // And the transient case must stay transient on this path: a part behind an
-    // absent host is a wait, not a refusal.
-    let verdict = negotiated(
-        vec![
-            ("01AWAY", "Split (1999) - CD1.avi"),
-            ("02HERE", "Split (1999) - CD2.avi"),
-        ],
-        &["02HERE"],
+async fn multipart_names_never_merge_across_collections() {
+    let db = kahawai_hub::db::open_in_memory().await.unwrap();
+    let registry = Registry::new(db.clone(), Default::default());
+    for host in ["01AWAY", "02HERE"] {
+        registry
+            .announce_collection(host, "movies", "movies", &[TEST_ROOT.into()])
+            .await
+            .unwrap();
+    }
+    registry
+        .upsert_files("01AWAY", "movies", vec![rec("Split (1999) - CD1.avi")])
+        .await
+        .unwrap();
+    registry
+        .upsert_files("02HERE", "movies", vec![rec("Split (1999) - CD2.avi")])
+        .await
+        .unwrap();
+    let rows: Vec<(String, String, Option<i64>)> = sqlx::query_as(
+        "SELECT i.module_id,i.id,f.part FROM items i JOIN files f ON f.item_id=i.id
+          ORDER BY i.module_id",
     )
-    .await;
-    assert_eq!(verdict, "source-offline", "an absent host is still a wait");
-}
-
-#[tokio::test]
-async fn a_part_whose_host_is_away_stands_by() {
-    // CD1 on a host that is gone, CD2 on one that is present. Transient: the
-    // item is whole, so the answer is to wait.
-    //
-    // This is the regression fence for the check I nearly deleted. A contiguity
-    // test alone sees {2}, a perfectly contiguous run of one, and would have
-    // played CD2 rebased to zero.
-    let verdict = refusal(
-        vec![
-            ("01AWAY", "Split (1999) - CD1.avi"),
-            ("02HERE", "Split (1999) - CD2.avi"),
-        ],
-        &["02HERE"],
-    )
-    .await;
-    assert_eq!(
-        verdict, "source-offline",
-        "a part behind an absent host is a wait"
+    .fetch_all(&db)
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_ne!(
+        rows[0].1, rows[1].1,
+        "different collections have different item ids"
     );
+    assert_eq!(rows[0].2, Some(1));
+    assert_eq!(rows[1].2, Some(2));
 }
 
 #[tokio::test]

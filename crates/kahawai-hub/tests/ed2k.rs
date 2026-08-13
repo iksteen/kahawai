@@ -4,9 +4,11 @@
 
 use kahawai_hub::registry::{FileUpsertRecord, Registry};
 
+const TEST_ROOT: &str = "/kahawai-test-root";
+
 fn rec(path: &str, size: u64, mtime: i64) -> FileUpsertRecord {
     FileUpsertRecord {
-        root_token: "root".into(),
+        root_token: kahawai_core::media::root_token(std::path::Path::new(TEST_ROOT)),
         path_rel: path.into(),
         size,
         mtime_unix: mtime,
@@ -20,10 +22,10 @@ fn rec(path: &str, size: u64, mtime: i64) -> FileUpsertRecord {
 async fn setup(dir: &std::path::Path) -> Registry {
     let db = kahawai_hub::db::open(dir).await.unwrap();
     let reg = Registry::new(db, Default::default());
-    reg.announce_collection("01H", "anime", "anime", &[])
+    reg.announce_collection("01H", "anime", "anime", &[TEST_ROOT.into()])
         .await
         .unwrap();
-    reg.announce_collection("01H", "movies", "movies", &[])
+    reg.announce_collection("01H", "movies", "movies", &[TEST_ROOT.into()])
         .await
         .unwrap();
     reg.upsert_files(
@@ -47,7 +49,10 @@ async fn worklist_is_anime_only_and_shrinks_as_hashes_land() {
     assert!(reg.ed2k_worklist("01H", "movies").await.unwrap().is_empty());
     let work = reg.ed2k_worklist("01H", "anime").await.unwrap();
     assert_eq!(work.len(), 1);
-    assert_eq!(work[0].root_token, "root");
+    assert_eq!(
+        work[0].root_token,
+        kahawai_core::media::root_token(std::path::Path::new(TEST_ROOT))
+    );
     assert_eq!(work[0].path_rel, "[G] Show - 01 [ABCD1234].mkv");
 
     // Stale result (size moved on): dropped, still on the list.
@@ -89,7 +94,7 @@ async fn copy_forward_and_content_change_semantics() {
     reg.record_ed2k(
         "01H",
         "anime",
-        "root",
+        &kahawai_core::media::root_token(std::path::Path::new(TEST_ROOT)),
         "[G] Show - 01 [ABCD1234].mkv",
         &hash,
         100,
@@ -133,7 +138,7 @@ async fn anime_collection_resolves_movies_but_not_extras() {
     let dir = tempfile::tempdir().unwrap();
     let db = kahawai_hub::db::open(dir.path()).await.unwrap();
     let reg = Registry::new(db.clone(), Default::default());
-    reg.announce_collection("01H", "anime", "anime", &[])
+    reg.announce_collection("01H", "anime", "anime", &[TEST_ROOT.into()])
         .await
         .unwrap();
     reg.upsert_files(
@@ -165,10 +170,10 @@ async fn anime_collection_resolves_movies_but_not_extras() {
     // "ed2k will identify it later", which never came for a file no item
     // held. The hash still refines the slot when AniDB knows the file.
     let nc: Option<(Option<i64>, i64, String)> = sqlx::query_as(
-        "SELECT i.season, i.episode, p.title
-           FROM item_sources s JOIN items i ON i.id = s.item_id
-           JOIN items p ON p.id = i.parent_id
-          WHERE s.source_path LIKE '%NCED2%'",
+        "SELECT i.season,i.episode,p.title
+           FROM files f JOIN items i ON i.id=f.item_id
+           JOIN items p ON p.id=i.parent_id
+          WHERE f.path_rel LIKE '%NCED2%'",
     )
     .fetch_optional(&db)
     .await

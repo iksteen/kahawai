@@ -15,22 +15,17 @@
 //! writes it.
 //!
 //! **Inputs** are facts nothing can recompute: what a provider answered,
-//! the order the owner wants providers tried in, which records they
-//! refused, which record they pinned, where an item's files live. Code
-//! writes these.
+//! the order the owner wants providers tried in, which records they refused,
+//! which record they pinned, and the collection an item belongs to. Code writes
+//! these.
 //!
-//! **Derivations** are functions of the inputs, stored only because a
-//! read cannot afford to compute them — browse cannot sort or filter on a
-//! value resolved per read and still answer in 200 ms. `item_match`
-//! (which record an item IS), `items.sort_title` (0035) and
-//! `item_libraries` (0036) are all of this kind. **Nothing in this crate
-//! writes them.** Triggers do, on every write to the inputs they depend
-//! on:
-//!
-//! > Write `provider_metadata`, `provider_ranks`, `rejected_matches`,
-//! > `manual_match`, `item_sources`, `collections`, `items` or
-//! > `library_collections`, and everything derived from them is already
-//! > correct. There is nothing to remember and nothing to call.
+//! **Derivations** are functions of the inputs, stored only because a read
+//! cannot afford to compute them — browse cannot sort on a value resolved per
+//! row and still answer in 200 ms. `item_match` (which record an item IS) and
+//! `items.sort_title` (0035) are of this kind. Triggers maintain them on every
+//! write to `provider_metadata`, `provider_ranks`, `rejected_matches`,
+//! `manual_match`, `collections`, or collection ownership on `items`; there is
+//! nothing for a caller to remember.
 //!
 //! Storing what a read can derive is what `merged_metadata` did, and it
 //! was wrong for exactly one reason: it went stale, because staying
@@ -333,18 +328,13 @@ SELECT item_id, provider, provider_id, media_type, pinned, unixepoch() FROM (
              pm.provider) AS n
     FROM (
       SELECT i.id AS item_id,
-             COALESCE((SELECT CASE WHEN c.media_type IN ('movies','series','anime','music')
-                                   THEN c.media_type ELSE 'movies' END
-                         FROM item_sources s
-                         JOIN collections c ON (c.module_id, c.collection_id)
-                                             = (s.module_id, s.collection_id)
-                        WHERE s.item_id = i.id
-                           OR s.item_id IN (SELECT id FROM items WHERE parent_id = i.id)
-                        LIMIT 1), 'movies') AS media_type
-        FROM items i
+             CASE WHEN c.media_type IN ('movies','series','anime','music')
+                  THEN c.media_type ELSE 'movies' END AS media_type
+        FROM items i JOIN collections c
+          ON (c.module_id,c.collection_id)=(i.module_id,i.collection_id)
        -- Top level only. Episodes and tracks follow their parent, and this
        -- filter is the only thing enforcing that.
-       WHERE i.kind IN ('movie', 'show', 'album')
+       WHERE i.kind IN ('movie','show','album')
          AND (?1 IS NULL OR i.id = ?1)
     ) t
     JOIN provider_metadata pm ON pm.item_id = t.item_id
@@ -440,26 +430,9 @@ fn repick_body(item: Option<&str>, media_type: Option<&str>) -> String {
 /// names only the columns the pick actually reads, because the enrichment
 /// run's own `UPDATE provider_metadata` statements (details backfill,
 /// episode projection) touch none of them and would otherwise cost a
-/// recompute each, thousands per run. **WHEN guards**: the cascade from
-/// `DELETE FROM items` and the bulk `item_sources` insert on every scan
-/// are the two hottest paths in the system, and both can skip the body
-/// entirely.
+/// recompute each, thousands per run. **WHEN guards** skip cascades whose
+/// parent item is already gone.
 pub fn repick_triggers() -> Vec<(String, String)> {
-    // The item an `item_sources` row decides for: episodes and tracks
-    // give their PARENT its media type, never themselves one.
-    let src_item = |side: &str| {
-        format!("COALESCE((SELECT parent_id FROM items WHERE id = {side}.item_id), {side}.item_id)")
-    };
-    // A scan inserts item_sources in bulk for items nothing has enriched
-    // yet, where the pick has nothing to find. Skip those outright.
-    let has_answers = |side: &str| {
-        format!(
-            "EXISTS (SELECT 1 FROM provider_metadata pm WHERE pm.item_id = {})",
-            src_item(side)
-        )
-    };
-    // An FK cascade from `DELETE FROM items` fires these with the parent
-    // already gone. The pick would find nothing; don't ask it to look.
     let survives = "EXISTS (SELECT 1 FROM items WHERE id = OLD.item_id)";
 
     let mut out = Vec::new();
@@ -559,29 +532,14 @@ pub fn repick_triggers() -> Vec<(String, String)> {
         by_old_item,
     );
 
-    // Which collection an item's files live in decides its media type,
-    // and the media type decides the chain — so moving a source can move
-    // the answer. Nothing maintained this before; it simply drifted.
+    // Collection ownership determines the chain. Moving one item is rare but
+    // must immediately re-rank its already recorded answers.
     add(
-        "repick_source_ins",
-        "INSERT",
-        "item_sources",
-        Some(has_answers("NEW")),
-        repick_body(Some(&src_item("NEW")), None),
-    );
-    add(
-        "repick_source_upd",
+        "repick_item_collection_upd",
         "UPDATE OF module_id, collection_id",
-        "item_sources",
-        Some(has_answers("NEW")),
-        repick_body(Some(&src_item("NEW")), None),
-    );
-    add(
-        "repick_source_del",
-        "DELETE",
-        "item_sources",
-        Some(format!("{survives} AND {}", has_answers("OLD"))),
-        repick_body(Some(&src_item("OLD")), None),
+        "items",
+        None,
+        repick_body(Some("NEW.id"), None),
     );
 
     // A satellite re-announcing a collection can change its media type.
@@ -712,16 +670,12 @@ fn chain_name(provider: &str) -> &str {
     }
 }
 
-/// The chain an item belongs to, from the collections its sources live
-/// in. Anything that isn't anime or music enriches as movies/series.
+/// The chain an item belongs to comes directly from its collection.
 pub async fn media_type_of_item(db: &SqlitePool, item_id: &str) -> String {
     let mt: Option<String> = sqlx::query_scalar(
-        "SELECT c.media_type FROM item_sources s
-         JOIN collections c ON (c.module_id, c.collection_id)
-                             = (s.module_id, s.collection_id)
-         WHERE s.item_id = ?1
-            OR s.item_id IN (SELECT id FROM items WHERE parent_id = ?1)
-         LIMIT 1",
+        "SELECT c.media_type FROM items i JOIN collections c
+           ON (c.module_id,c.collection_id)=(i.module_id,i.collection_id)
+          WHERE i.id=?1",
     )
     .bind(item_id)
     .fetch_optional(db)

@@ -95,27 +95,20 @@ async fn backfill_norm_artist(pool: &SqlitePool) -> Result<()> {
 /// `norm_artist`: the parse is Rust, so the migration could not do it,
 /// and this is a no-op after its first run.
 async fn backfill_revision(pool: &SqlitePool) -> Result<()> {
-    let missing: Vec<(String, String, String, String)> = sqlx::query_as(
-        "SELECT module_id, collection_id, path_rel,
-                CASE WHEN source_path = '' THEN path_rel ELSE source_path END
-         FROM files WHERE revision IS NULL",
-    )
-    .fetch_all(pool)
-    .await?;
+    let missing: Vec<(i64, String)> =
+        sqlx::query_as("SELECT id,path_rel FROM files WHERE revision IS NULL")
+            .fetch_all(pool)
+            .await?;
     if missing.is_empty() {
         return Ok(());
     }
     let mut tx = pool.begin().await?;
-    for (m, c, key, source_path) in &missing {
-        sqlx::query(
-            "UPDATE files SET revision = ? WHERE module_id = ? AND collection_id = ? AND path_rel = ?",
-        )
-        .bind(kahawai_core::names::release_revision(source_path) as i64)
-        .bind(m)
-        .bind(c)
-        .bind(key)
-        .execute(&mut *tx)
-        .await?;
+    for (id, path) in &missing {
+        sqlx::query("UPDATE files SET revision=? WHERE id=?")
+            .bind(kahawai_core::names::release_revision(path) as i64)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
     }
     tx.commit().await?;
     tracing::info!(rows = missing.len(), "release revisions backfilled");
@@ -131,22 +124,25 @@ async fn backfill_revision(pool: &SqlitePool) -> Result<()> {
 /// reconciliation — renaming into a collision would create twins the
 /// dedup key can no longer tell apart.
 async fn repair_release_tag_titles(pool: &SqlitePool) -> Result<()> {
-    let rows: Vec<(String, String, Option<i64>, String)> = sqlx::query_as(
-        "SELECT id, title, year, kind FROM items
-          WHERE kind IN ('show', 'movie') AND title LIKE '%)'",
+    let rows: Vec<(String, String, Option<i64>, String, String, String)> = sqlx::query_as(
+        "SELECT id,title,year,kind,module_id,collection_id FROM items
+          WHERE kind IN ('show','movie') AND title LIKE '%)'",
     )
     .fetch_all(pool)
     .await?;
     let mut fixed = 0;
-    for (id, title, year, kind) in rows {
+    for (id, title, year, kind, module_id, collection_id) in rows {
         let stripped = kahawai_core::names::strip_release_tags(&title);
         if stripped == title || stripped.is_empty() {
             continue;
         }
         let norm = kahawai_core::names::normalize_title(&stripped);
         let taken: Option<String> = sqlx::query_scalar(
-            "SELECT id FROM items WHERE kind = ?1 AND norm_title = ?2 AND year IS ?3 AND id <> ?4",
+            "SELECT id FROM items WHERE module_id=?1 AND collection_id=?2
+               AND kind=?3 AND norm_title=?4 AND year IS ?5 AND id<>?6",
         )
+        .bind(&module_id)
+        .bind(&collection_id)
         .bind(&kind)
         .bind(&norm)
         .bind(year)

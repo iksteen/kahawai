@@ -36,18 +36,14 @@ WITH truth AS (
                           WHERE r.provider = CASE pm.provider
                                                  WHEN 'anilist' THEN 'anime'
                                                  ELSE pm.provider END
-                            AND r.media_type = COALESCE(
-                                  (SELECT CASE WHEN c.media_type
-                                                    IN ('movies','series','anime','music')
+                            AND r.media_type=COALESCE(
+                                  (SELECT CASE WHEN c.media_type IN
+                                                    ('movies','series','anime','music')
                                                THEN c.media_type ELSE 'movies' END
-                                     FROM item_sources s
-                                     JOIN collections c
-                                       ON (c.module_id, c.collection_id)
-                                        = (s.module_id, s.collection_id)
-                                    WHERE s.item_id = i.id
-                                       OR s.item_id IN (SELECT id FROM items
-                                                         WHERE parent_id = i.id)
-                                    LIMIT 1), 'movies')), 99),
+                                     FROM collections c
+                                    WHERE (c.module_id,c.collection_id)=
+                                          (i.module_id,i.collection_id)),
+                                  'movies')),99),
                pm.provider) AS n
       FROM items i JOIN provider_metadata pm ON pm.item_id = i.id
      WHERE i.kind IN ('movie', 'show', 'album')
@@ -79,13 +75,30 @@ async fn assigned(db: &SqlitePool, id: &str) -> Option<(String, String, bool)> {
 }
 
 async fn item(db: &SqlitePool, id: &str) {
-    sqlx::query("INSERT INTO items (id, kind, title, norm_title) VALUES (?, 'movie', ?, ?)")
-        .bind(id)
-        .bind(id)
-        .bind(id)
-        .execute(db)
-        .await
-        .unwrap();
+    sqlx::query(
+        "INSERT OR IGNORE INTO satellites(module_id,module_type,name,cert_fingerprint)
+                 VALUES('fixture','mediahost','fixture','fp')",
+    )
+    .execute(db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT OR IGNORE INTO collections(module_id,collection_id,media_type)
+                 VALUES('fixture','default','movies')",
+    )
+    .execute(db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO items(id,kind,title,norm_title,module_id,collection_id)
+                 VALUES(?,'movie',?,?,'fixture','default')",
+    )
+    .bind(id)
+    .bind(id)
+    .bind(id)
+    .execute(db)
+    .await
+    .unwrap();
 }
 
 /// Raw SQL only. Not one call into the provider API, so every assignment
@@ -325,13 +338,10 @@ async fn moving_a_source_between_collections_re_ranks_the_item() {
         .unwrap();
     }
     item(&db, "i1").await;
-    sqlx::query(
-        "INSERT INTO item_sources (item_id, module_id, collection_id, path_rel)
-         VALUES ('i1','c-movies','c','f.mkv')",
-    )
-    .execute(&db)
-    .await
-    .unwrap();
+    sqlx::query("UPDATE items SET module_id='c-movies',collection_id='c' WHERE id='i1'")
+        .execute(&db)
+        .await
+        .unwrap();
     // Both answer; the anime chain ranks `anime` first, movies has no
     // entry for it at all, so the media type alone decides the winner.
     answer(&db, "i1", "tmdb", "63", "auto").await;
@@ -342,7 +352,7 @@ async fn moving_a_source_between_collections_re_ranks_the_item() {
     );
     assert_eq!(drifted(&db).await, 0);
 
-    sqlx::query("UPDATE item_sources SET module_id = 'c-anime' WHERE item_id = 'i1'")
+    sqlx::query("UPDATE items SET module_id='c-anime' WHERE id='i1'")
         .execute(&db)
         .await
         .unwrap();

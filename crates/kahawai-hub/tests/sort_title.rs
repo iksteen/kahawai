@@ -33,13 +33,30 @@ async fn sort_title(db: &SqlitePool, id: &str) -> Option<String> {
 }
 
 async fn item(db: &SqlitePool, id: &str, title: &str) {
-    sqlx::query("INSERT INTO items (id, kind, title, norm_title) VALUES (?, 'movie', ?, ?)")
-        .bind(id)
-        .bind(title)
-        .bind(title.to_lowercase())
-        .execute(db)
-        .await
-        .unwrap();
+    sqlx::query(
+        "INSERT OR IGNORE INTO satellites(module_id,module_type,name,cert_fingerprint)
+                 VALUES('fixture','mediahost','fixture','fp')",
+    )
+    .execute(db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT OR IGNORE INTO collections(module_id,collection_id,media_type)
+                 VALUES('fixture','default','movies')",
+    )
+    .execute(db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO items(id,kind,title,norm_title,module_id,collection_id)
+                 VALUES(?,'movie',?,?,'fixture','default')",
+    )
+    .bind(id)
+    .bind(title)
+    .bind(title.to_lowercase())
+    .execute(db)
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
@@ -168,15 +185,15 @@ async fn sort_title_never_drifts() {
 async fn an_episodes_sort_title_follows_the_shows_assignment() {
     let dir = tempfile::tempdir().unwrap();
     let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    item(&db, "show1", "A Show").await;
+    sqlx::query("UPDATE items SET kind='show' WHERE id='show1'")
+        .execute(&db)
+        .await
+        .unwrap();
     sqlx::query(
-        "INSERT INTO items (id, kind, title, norm_title) VALUES ('show1','show','A Show','a show')",
-    )
-    .execute(&db)
-    .await
-    .unwrap();
-    sqlx::query(
-        "INSERT INTO items (id, kind, title, norm_title, parent_id, season, episode)
-         VALUES ('ep1','episode','S01E01','s01e01','show1',1,1)",
+        "INSERT INTO items(id,kind,title,norm_title,parent_id,season,episode,module_id,collection_id)
+         SELECT 'ep1','episode','S01E01','s01e01','show1',1,1,module_id,collection_id
+           FROM items WHERE id='show1'",
     )
     .execute(&db)
     .await
@@ -301,334 +318,139 @@ async fn a_full_enrichment_leaves_nothing_stale() {
     assert_eq!(drifted(&db).await, 0, "after rejections");
 }
 
-/// `item_libraries` is the second denormalised table, and gets the same
-/// treatment: a truth query run after every kind of write that can move
-/// membership. Deriving it per query is what made browse slow; deriving
-/// it wrongly is what made `merged_metadata` untrustworthy, so this
-/// checks the stored answer against a fresh derivation each time.
-const LIB_TRUTH: &str = "SELECT (
-    SELECT COUNT(*) FROM item_libraries il
-     WHERE NOT EXISTS (
-       SELECT 1 FROM item_sources ls
-         JOIN items ci ON ci.id = ls.item_id
-         JOIN library_collections lc
-           ON lc.module_id = ls.module_id AND lc.collection_id = ls.collection_id
-        WHERE lc.library_id = il.library_id
-          AND COALESCE(ci.parent_id, ci.id) = il.item_id)
-  ) + (
-    SELECT COUNT(*) FROM (
-      SELECT DISTINCT lc.library_id AS lid, COALESCE(ci.parent_id, ci.id) AS iid
-        FROM item_sources ls
-        JOIN items ci ON ci.id = ls.item_id
-        JOIN library_collections lc
-          ON lc.module_id = ls.module_id AND lc.collection_id = ls.collection_id)
-     WHERE NOT EXISTS (SELECT 1 FROM item_libraries il
-                        WHERE il.library_id = lid AND il.item_id = iid))
-  + (
-    -- 0040: membership carries copies of the item's sort keys, so a deep
-    -- page is one covering scan. A copy that disagrees with items is the
-    -- browse showing rows in an order the user cannot see.
-    SELECT COUNT(*) FROM item_libraries il JOIN items i ON i.id = il.item_id
-     WHERE il.sort_title IS NOT i.sort_title OR il.year IS NOT i.year)";
-
-async fn lib_drift(db: &SqlitePool) -> i64 {
-    sqlx::query_scalar(LIB_TRUTH).fetch_one(db).await.unwrap()
-}
-
+/// Libraries compose collections directly. Reusing one collection in two
+/// libraries exposes the same item id; changing collection composition changes
+/// visibility without cloning or synchronising catalogue rows.
 #[tokio::test]
-async fn library_membership_never_drifts() {
-    let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
-    let q = |sql: &'static str| {
-        let db = db.clone();
-        async move {
-            sqlx::query(sql)
-                .execute(&db)
-                .await
-                .unwrap_or_else(|e| panic!("{sql}\n  -> {e}"))
-        }
-    };
-
-    q("INSERT INTO libraries (id, name, media_type) VALUES ('lib1','A','movies')").await;
-    q("INSERT INTO libraries (id, name, media_type) VALUES ('lib2','B','movies')").await;
-    q("INSERT INTO satellites (module_id, module_type, name, cert_fingerprint, enrolled_at, disabled)
-       VALUES ('m1','mediahost','h','',unixepoch(),0)").await;
-    for c in ["c1", "c2"] {
-        sqlx::query(
-            "INSERT INTO collections (module_id, collection_id, media_type, roots_json, sync_version)
-             VALUES ('m1', ?, 'movies', '[\"/m\"]', 1)",
-        )
-        .bind(c)
-        .execute(&db)
-        .await
-        .unwrap();
-    }
-    assert_eq!(lib_drift(&db).await, 0, "empty");
-
-    // A show whose EPISODE carries the source: membership belongs to the
-    // show, which is the case a naive delta gets wrong.
-    item(&db, "show1", "A Show").await;
-    q("INSERT INTO items (id, kind, title, norm_title, parent_id)
-       VALUES ('ep1','episode','E1','e1','show1')")
-    .await;
-    q(
-        "INSERT INTO files (module_id, collection_id, path_rel, size, mtime_unix,
-                          head_xxh3, tail_xxh3, oshash, streams_json, subs_extracted)
-       VALUES ('m1','c1','ep1.mkv',1,1,0,0,0,'{}',0)",
+async fn libraries_compose_collection_items_directly() {
+    let db = kahawai_hub::db::open_in_memory().await.unwrap();
+    sqlx::query(
+        "INSERT INTO libraries(id,name,media_type) VALUES
+                 ('l1','One','movies'),('l2','Two','movies')",
     )
-    .await;
-    q(
-        "INSERT INTO item_sources (item_id, module_id, collection_id, path_rel)
-       VALUES ('ep1','m1','c1','ep1.mkv')",
-    )
-    .await;
-    q(
-        "INSERT INTO library_collections (library_id, module_id, collection_id)
-       VALUES ('lib1','m1','c1')",
-    )
-    .await;
-    assert_eq!(lib_drift(&db).await, 0, "after composing a library");
-    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM item_libraries WHERE library_id='lib1'")
-        .fetch_one(&db)
-        .await
-        .unwrap();
-    assert_eq!(n, 1, "the SHOW is in the library, via its episode's source");
-
-    // The same collection in a second library.
-    q(
-        "INSERT INTO library_collections (library_id, module_id, collection_id)
-       VALUES ('lib2','m1','c1')",
-    )
-    .await;
-    assert_eq!(lib_drift(&db).await, 0, "two libraries over one collection");
-
-    // The sort-key copies (0040) must follow a retitle through the whole
-    // chain: answer → items.sort_title (0035) → item_libraries (0040).
-    kahawai_hub::providers::store_answer(
-        &db,
-        "show1",
-        "tmdb",
-        "77",
-        "auto",
-        kahawai_hub::providers::Fields {
-            title: Some("Renamed Show".into()),
-            ..Default::default()
-        },
-    )
+    .execute(&db)
     .await
     .unwrap();
-    assert_eq!(lib_drift(&db).await, 0, "after a provider retitle");
-    let key: Option<String> = sqlx::query_scalar(
-        "SELECT sort_title FROM item_libraries WHERE library_id='lib1' AND item_id='show1'",
+    sqlx::query(
+        "INSERT INTO satellites(module_id,module_type,name,cert_fingerprint)
+                 VALUES('m','mediahost','m','fp')",
     )
-    .fetch_one(&db)
+    .execute(&db)
     .await
     .unwrap();
-    assert_eq!(
-        key.as_deref(),
-        Some("Renamed Show"),
-        "the membership copy follows the retitle"
-    );
-    // Including by RAW SQL, which is how the old merge drifted.
-    q("UPDATE provider_metadata SET title='Renamed Again' WHERE item_id='show1'").await;
-    assert_eq!(lib_drift(&db).await, 0, "after a raw retitle");
-    q("UPDATE items SET year=1999 WHERE id='show1'").await;
-    assert_eq!(lib_drift(&db).await, 0, "after a raw year change");
-
-    // A second source in another collection of lib1 — removing one must
-    // not evict the item while the other still holds it.
-    q(
-        "INSERT INTO library_collections (library_id, module_id, collection_id)
-       VALUES ('lib1','m1','c2')",
+    sqlx::query(
+        "INSERT INTO collections(module_id,collection_id,media_type) VALUES
+                 ('m','c1','movies'),('m','c2','movies')",
     )
-    .await;
-    q(
-        "INSERT INTO files (module_id, collection_id, path_rel, size, mtime_unix,
-                          head_xxh3, tail_xxh3, oshash, streams_json, subs_extracted)
-       VALUES ('m1','c2','ep1-copy.mkv',1,1,0,0,0,'{}',0)",
-    )
-    .await;
-    q(
-        "INSERT INTO item_sources (item_id, module_id, collection_id, path_rel)
-       VALUES ('ep1','m1','c2','ep1-copy.mkv')",
-    )
-    .await;
-    assert_eq!(lib_drift(&db).await, 0, "two sources");
-    q("DELETE FROM item_sources WHERE collection_id='c1'").await;
-    assert_eq!(lib_drift(&db).await, 0, "one source removed");
-    let still: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM item_libraries WHERE library_id='lib1' AND item_id='show1'",
-    )
-    .fetch_one(&db)
+    .execute(&db)
     .await
     .unwrap();
-    assert_eq!(still, 1, "the other collection still puts it in lib1");
-
-    // Removing a collection from a library.
-    q("DELETE FROM library_collections WHERE library_id='lib1' AND collection_id='c2'").await;
-    assert_eq!(lib_drift(&db).await, 0, "collection removed from a library");
-
-    // Re-parenting an episode moves membership to the new show.
-    q(
-        "INSERT INTO library_collections (library_id, module_id, collection_id)
-       VALUES ('lib1','m1','c2')",
+    sqlx::query(
+        "INSERT INTO library_collections(library_id,module_id,collection_id) VALUES
+                 ('l1','m','c1'),('l2','m','c1')",
     )
-    .await;
-    item(&db, "show2", "Another Show").await;
-    q("UPDATE items SET parent_id='show2' WHERE id='ep1'").await;
-    assert_eq!(lib_drift(&db).await, 0, "after re-parenting");
-
-    // A source MOVED between collections — an UPDATE, not delete+insert.
-    // 0037's update trigger re-creates membership rows, and 0040 forgot
-    // to teach it the sort keys: the rows came back keyless and the item
-    // vanished to the top of every sorted browse (fixed in 0041).
-    q("UPDATE item_sources SET collection_id='c1' WHERE item_id='ep1'").await;
-    assert_eq!(lib_drift(&db).await, 0, "after a source moved collections");
-    q("UPDATE item_sources SET collection_id='c2' WHERE item_id='ep1'").await;
-    assert_eq!(lib_drift(&db).await, 0, "and moved back");
-
-    // And removing the item — sources first, as the app does, since
-    // item_sources has no cascade — takes its membership with it.
-    q("DELETE FROM item_sources WHERE item_id='ep1'").await;
-    q("DELETE FROM items WHERE id='ep1'").await;
-    assert_eq!(lib_drift(&db).await, 0, "after deleting the episode");
-    let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM item_libraries")
-        .fetch_one(&db)
-        .await
-        .unwrap();
-    assert_eq!(left, 0, "nothing should still claim membership");
-}
-
-/// The gap an AFTER UPDATE trigger keyed on NEW leaves: a row that MOVES
-/// to a different item. Nothing in the hub does this — `item_id` is the
-/// primary key of `item_match` and part of `provider_metadata`'s — but
-/// "nothing does it today" is the reasoning that let `merged_metadata`
-/// drift, so it is checked rather than assumed.
-/// `item_libraries` holds TOP-LEVEL items only — an episode's source
-/// lands its show, never the episode.
-///
-/// This is load-bearing, not incidental: the browse count is a bare
-/// `COUNT(*) FROM item_libraries WHERE library_id = ?`, with no `kind`
-/// filter, because re-checking one costs more than the query it would
-/// protect (73 ms against 47 ms at 50k items, and worse at 250k). So the
-/// invariant is pinned here instead. If it ever breaks, every library's
-/// item total silently gains its episodes.
-#[tokio::test]
-async fn library_membership_holds_only_top_level_items() {
-    let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
-    let q = |sql: &'static str| {
-        let db = db.clone();
-        async move {
-            sqlx::query(sql)
-                .execute(&db)
-                .await
-                .unwrap_or_else(|e| panic!("{sql}\n  -> {e}"))
-        }
-    };
-    q("INSERT INTO libraries (id, name, media_type) VALUES ('lib1','A','series')").await;
-    q("INSERT INTO satellites (module_id, module_type, name, cert_fingerprint, enrolled_at, disabled)
-       VALUES ('m1','mediahost','h','',unixepoch(),0)").await;
-    q(
-        "INSERT INTO collections (module_id, collection_id, media_type, roots_json, sync_version)
-       VALUES ('m1','c1','series','[\"/m\"]',1)",
+    .execute(&db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO items(id,kind,title,norm_title,module_id,collection_id)
+                 VALUES('i','movie','Film','film','m','c1')",
     )
-    .await;
-    q(
-        "INSERT INTO library_collections (library_id, module_id, collection_id)
-       VALUES ('lib1','m1','c1')",
-    )
-    .await;
+    .execute(&db)
+    .await
+    .unwrap();
 
-    // A show with episodes, and a film — the sources hang off the
-    // EPISODES, which is the shape that would put them in membership if
-    // the projection were ever dropped.
-    item(&db, "show1", "A Show").await;
-    item(&db, "movie1", "A Film").await;
-    for (ep, path) in [("ep1", "s01e01.mkv"), ("ep2", "s01e02.mkv")] {
-        sqlx::query(
-            "INSERT INTO items (id, kind, title, norm_title, parent_id)
-             VALUES (?, 'episode', ?, ?, 'show1')",
-        )
-        .bind(ep)
-        .bind(ep)
-        .bind(ep)
-        .execute(&db)
-        .await
-        .unwrap();
-        for (item_id, p) in [(ep, path)] {
-            sqlx::query(
-                "INSERT INTO files (module_id, collection_id, path_rel, size, mtime_unix,
-                                    head_xxh3, tail_xxh3, oshash, streams_json, subs_extracted)
-                 VALUES ('m1','c1',?,1,1,0,0,0,'{}',0)",
-            )
-            .bind(p)
-            .execute(&db)
-            .await
-            .unwrap();
-            sqlx::query(
-                "INSERT INTO item_sources (item_id, module_id, collection_id, path_rel)
-                 VALUES (?, 'm1','c1', ?)",
-            )
-            .bind(item_id)
-            .bind(p)
-            .execute(&db)
-            .await
-            .unwrap();
-        }
-    }
-    q(
-        "INSERT INTO files (module_id, collection_id, path_rel, size, mtime_unix,
-                          head_xxh3, tail_xxh3, oshash, streams_json, subs_extracted)
-       VALUES ('m1','c1','film.mkv',1,1,0,0,0,'{}',0)",
-    )
-    .await;
-    q(
-        "INSERT INTO item_sources (item_id, module_id, collection_id, path_rel)
-       VALUES ('movie1','m1','c1','film.mkv')",
-    )
-    .await;
-
-    let offenders: Vec<String> = sqlx::query_scalar(
-        "SELECT il.item_id FROM item_libraries il JOIN items i ON i.id = il.item_id
-          WHERE i.kind IN ('episode','track') OR i.parent_id IS NOT NULL",
+    let visible: Vec<(String, String)> = sqlx::query_as(
+        "SELECT lc.library_id,i.id FROM items i JOIN library_collections lc
+           ON (lc.module_id,lc.collection_id)=(i.module_id,i.collection_id)
+          WHERE i.id='i' ORDER BY lc.library_id",
     )
     .fetch_all(&db)
     .await
     .unwrap();
-    assert!(
-        offenders.is_empty(),
-        "membership must be top-level only, got {offenders:?}"
+    assert_eq!(
+        visible,
+        vec![("l1".into(), "i".into()), ("l2".into(), "i".into())]
     );
 
-    // And the bare count the endpoint runs agrees with the careful one.
-    let bare: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM item_libraries WHERE library_id='lib1'")
-            .fetch_one(&db)
-            .await
-            .unwrap();
-    let careful: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM items i WHERE i.kind NOT IN ('episode','track')
-          AND EXISTS (SELECT 1 FROM item_libraries il
-                       WHERE il.library_id = 'lib1' AND il.item_id = i.id)",
+    sqlx::query("UPDATE items SET collection_id='c2' WHERE id='i'")
+        .execute(&db)
+        .await
+        .unwrap();
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM items i JOIN library_collections lc
+           ON (lc.module_id,lc.collection_id)=(i.module_id,i.collection_id)
+          WHERE i.id='i'",
     )
     .fetch_one(&db)
     .await
     .unwrap();
     assert_eq!(
-        (bare, careful),
-        (2, 2),
-        "the show and the film, not the episodes"
+        count, 0,
+        "an uncomposed collection is not visible through either library"
     );
 }
 
+/// Child items carry the same collection as their parent; browse excludes
+/// children explicitly rather than relying on a projected membership table.
+#[tokio::test]
+async fn library_browse_counts_only_top_level_collection_items() {
+    let db = kahawai_hub::db::open_in_memory().await.unwrap();
+    sqlx::query("INSERT INTO libraries(id,name,media_type) VALUES('l','Series','series')")
+        .execute(&db)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO satellites(module_id,module_type,name,cert_fingerprint)
+                 VALUES('m','mediahost','m','fp')",
+    )
+    .execute(&db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO collections(module_id,collection_id,media_type)
+                 VALUES('m','c','series')",
+    )
+    .execute(&db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO library_collections(library_id,module_id,collection_id)
+                 VALUES('l','m','c')",
+    )
+    .execute(&db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO items(id,kind,title,norm_title,module_id,collection_id) VALUES
+                 ('show','show','Show','show','m','c'),
+                 ('film','movie','Film','film','m','c')",
+    )
+    .execute(&db)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO items(id,kind,title,norm_title,parent_id,season,episode,module_id,collection_id)
+                 VALUES('ep','episode','Episode','episode','show',1,1,'m','c')")
+        .execute(&db).await.unwrap();
+    let ids: Vec<String> = sqlx::query_scalar(
+        "SELECT i.id FROM items i JOIN library_collections lc
+           ON (lc.module_id,lc.collection_id)=(i.module_id,i.collection_id)
+          WHERE lc.library_id='l' AND i.parent_id IS NULL ORDER BY i.id",
+    )
+    .fetch_all(&db)
+    .await
+    .unwrap();
+    assert_eq!(ids, vec!["film".to_string(), "show".to_string()]);
+}
+
+/// Moving durable provider rows between items must still leave sort-title
+/// derivation exact; catalogue visibility no longer has a copied row to drift.
 #[tokio::test]
 async fn moving_a_row_between_items_leaves_nothing_stale() {
     let dir = tempfile::tempdir().unwrap();
     let db = kahawai_hub::db::open(dir.path()).await.unwrap();
     item(&db, "a", "Item A").await;
     item(&db, "b", "Item B").await;
-
     kahawai_hub::providers::store_answer(
         &db,
         "a",
@@ -642,85 +464,15 @@ async fn moving_a_row_between_items_leaves_nothing_stale() {
     )
     .await
     .unwrap();
-    assert_eq!(sort_title(&db, "a").await.as_deref(), Some("From TMDB"));
-
-    // Re-point the ANSWER at the other item.
-    sqlx::query("UPDATE provider_metadata SET item_id = 'b' WHERE item_id = 'a'")
+    sqlx::query("UPDATE provider_metadata SET item_id='b' WHERE item_id='a'")
         .execute(&db)
         .await
         .unwrap();
-    assert_eq!(drifted(&db).await, 0, "answer moved between items");
-
-    // And the ASSIGNMENT.
-    sqlx::query("UPDATE item_match SET item_id = 'b' WHERE item_id = 'a'")
+    sqlx::query("UPDATE item_match SET item_id='b' WHERE item_id='a'")
         .execute(&db)
         .await
         .unwrap();
-    assert_eq!(drifted(&db).await, 0, "assignment moved between items");
-
-    // The same shape on the membership side: a source moving collection,
-    // and a collection moving library.
-    sqlx::query(
-        "INSERT INTO satellites (module_id, module_type, name, cert_fingerprint, enrolled_at, disabled)
-         VALUES ('m1','mediahost','h','',unixepoch(),0)",
-    )
-    .execute(&db)
-    .await
-    .unwrap();
-    for c in ["c1", "c2"] {
-        sqlx::query(
-            "INSERT INTO collections (module_id, collection_id, media_type, roots_json, sync_version)
-             VALUES ('m1', ?, 'movies', '[\"/m\"]', 1)",
-        )
-        .bind(c)
-        .execute(&db)
-        .await
-        .unwrap();
-        sqlx::query(
-            "INSERT INTO files (module_id, collection_id, path_rel, size, mtime_unix,
-                                head_xxh3, tail_xxh3, oshash, streams_json, subs_extracted)
-             VALUES ('m1', ?, 'f.mkv', 1, 1, 0, 0, 0, '{}', 0)",
-        )
-        .bind(c)
-        .execute(&db)
-        .await
-        .unwrap();
-    }
-    sqlx::query("INSERT INTO libraries (id, name, media_type) VALUES ('L1','L','movies')")
-        .execute(&db)
-        .await
-        .unwrap();
-    sqlx::query("INSERT INTO libraries (id, name, media_type) VALUES ('L2','M','movies')")
-        .execute(&db)
-        .await
-        .unwrap();
-    sqlx::query(
-        "INSERT INTO library_collections (library_id, module_id, collection_id)
-                 VALUES ('L1','m1','c1')",
-    )
-    .execute(&db)
-    .await
-    .unwrap();
-    sqlx::query(
-        "INSERT INTO item_sources (item_id, module_id, collection_id, path_rel)
-                 VALUES ('a','m1','c1','f.mkv')",
-    )
-    .execute(&db)
-    .await
-    .unwrap();
-    assert_eq!(lib_drift(&db).await, 0, "seeded");
-
-    sqlx::query("UPDATE item_sources SET collection_id='c2' WHERE item_id='a'")
-        .execute(&db)
-        .await
-        .unwrap();
-    assert_eq!(lib_drift(&db).await, 0, "source moved collection");
-
-    sqlx::query("UPDATE library_collections SET library_id='L2' WHERE library_id='L1'")
-        .execute(&db)
-        .await
-        .unwrap();
-    assert_eq!(lib_drift(&db).await, 0, "collection moved library");
+    assert_eq!(drifted(&db).await, 0);
 }
 
 /// Reordering providers re-decides which record an item IS, and the new

@@ -4,9 +4,11 @@
 use kahawai_hub::registry::{FileUpsertRecord, Registry};
 use sqlx::Row;
 
+const TEST_ROOT: &str = "/kahawai-test-root";
+
 fn rec(path: &str, size: u64) -> FileUpsertRecord {
     FileUpsertRecord {
-        root_token: "root".into(),
+        root_token: kahawai_core::media::root_token(std::path::Path::new(TEST_ROOT)),
         path_rel: path.into(),
         size,
         mtime_unix: 1,
@@ -26,7 +28,7 @@ async fn resolves_series_into_shows_and_episodes() {
         .await
         .unwrap();
     registry
-        .announce_collection("01HOST", "series", "series", &["/srv/series".into()])
+        .announce_collection("01HOST", "series", "series", &[TEST_ROOT.into()])
         .await
         .unwrap();
 
@@ -108,14 +110,17 @@ async fn resolves_series_into_shows_and_episodes() {
 
     // Reconcile away every Wire file: its episode goes, and the
     // childless show is swept with it.
-    let keep: std::collections::HashSet<String> = [
+    let keep: std::collections::HashSet<kahawai_hub::registry::SourcePath> = [
         "Andor/Season 1/Star Wars - Andor - S01E01 - Kassa.mkv",
         "Andor/Season 1/Star Wars - Andor - S01E02 - That Would Be Me.mkv",
         "Andor/Season 2/Andor.S02E01.1080p.mkv",
         "Andor/Season 1/behind-the-scenes.mkv",
     ]
     .into_iter()
-    .map(|path| kahawai_hub::registry::source_key("root", path))
+    .map(|path| kahawai_hub::registry::SourcePath {
+        root_token: kahawai_core::media::root_token(std::path::Path::new(TEST_ROOT)),
+        path_rel: path.into(),
+    })
     .collect();
     registry
         .reconcile_files("01HOST", "series", &keep)
@@ -138,11 +143,11 @@ async fn libraries_auto_provision_and_enforce_types() {
         .await
         .unwrap();
     registry
-        .announce_collection("01HOST", "movies", "movies", &["/srv/movies".into()])
+        .announce_collection("01HOST", "movies", "movies", &[TEST_ROOT.into()])
         .await
         .unwrap();
     registry
-        .announce_collection("01HOST", "anime", "anime", &["/srv/anime".into()])
+        .announce_collection("01HOST", "anime", "anime", &[TEST_ROOT.into()])
         .await
         .unwrap();
 
@@ -155,7 +160,7 @@ async fn libraries_auto_provision_and_enforce_types() {
 
     // Re-announce (reconnect) must not duplicate memberships.
     registry
-        .announce_collection("01HOST", "movies", "movies", &["/srv/movies".into()])
+        .announce_collection("01HOST", "movies", "movies", &[TEST_ROOT.into()])
         .await
         .unwrap();
     assert_eq!(registry.libraries_overview().await.unwrap().len(), 2);
@@ -192,13 +197,13 @@ async fn resolves_music_into_albums_and_tracks() {
         .await
         .unwrap();
     registry
-        .announce_collection("01HOST", "music", "music", &["/srv/music".into()])
+        .announce_collection("01HOST", "music", "music", &[TEST_ROOT.into()])
         .await
         .unwrap();
 
     // Tagged file: tags win over the filename.
     let tagged = FileUpsertRecord {
-        root_token: "root".into(),
+        root_token: kahawai_core::media::root_token(std::path::Path::new(TEST_ROOT)),
         streams_json: serde_json::json!({
             "tags": {
                 "artist": "Rotting Christ",
@@ -220,7 +225,7 @@ async fn resolves_music_into_albums_and_tracks() {
     );
     // Same album name, different artist: must be a separate album.
     let other = FileUpsertRecord {
-        root_token: "root".into(),
+        root_token: kahawai_core::media::root_token(std::path::Path::new(TEST_ROOT)),
         streams_json: serde_json::json!({
             "tags": {"artist": "Other Band", "album": "Khronos", "title": "Song", "track_number": "1"}
         })
@@ -277,13 +282,16 @@ async fn resolves_music_into_albums_and_tracks() {
     );
 
     // Reconcile away one artist: their album dies of childlessness.
-    let keep: std::collections::HashSet<String> = [
+    let keep: std::collections::HashSet<kahawai_hub::registry::SourcePath> = [
         "Rotting Christ/Khronos (2000)/Rotting Christ - Khronos - 01 - WRONG.flac",
         "Rotting Christ/Khronos (2000)/Rotting Christ - Khronos - 02 - If It Ends Tomorrow.flac",
         "Rotting Christ/Khronos (2000)/rip-log.flac",
     ]
     .into_iter()
-    .map(|path| kahawai_hub::registry::source_key("root", path))
+    .map(|path| kahawai_hub::registry::SourcePath {
+        root_token: kahawai_core::media::root_token(std::path::Path::new(TEST_ROOT)),
+        path_rel: path.into(),
+    })
     .collect();
     registry
         .reconcile_files("01HOST", "music", &keep)

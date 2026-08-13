@@ -20,13 +20,11 @@
 //! The flag also makes the upgrade honest — an existing hub migrates with
 //! every account unrestricted, which is what it had a moment earlier.
 //!
-//! Grants attach to libraries, never to collections (0008): a collection
-//! is where files happen to live, a library is the thing a person is
-//! given. An item reaches a library through `item_libraries`, which holds
-//! TOP-LEVEL items only — the 0036/0039 triggers project
-//! `COALESCE(parent_id, id)`, so an episode is visible exactly when its
-//! show is, and a track exactly when its album is. Every predicate here
-//! projects the same way rather than joining a second level.
+//! Grants attach to libraries, never directly to collections (0008): a
+//! collection owns catalogue identities, while a library is the composition a
+//! person is given. `library_collections` therefore decides visibility. Child
+//! items carry the same collection as their parent, so episodes and tracks
+//! inherit visibility naturally without an item-level membership projection.
 //!
 //! An item in no library at all is invisible to a restricted account.
 //! There is nothing to grant that would reach it; attach its collection
@@ -93,12 +91,11 @@ pub async fn can_see(db: &SqlitePool, claims: &Claims, item_id: &str) -> Result<
         return Ok(true);
     }
     let ok: i64 = sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM users WHERE id = ?1 AND all_libraries = 1)
-             OR EXISTS (SELECT 1 FROM item_libraries il
-                          JOIN user_libraries ul
-                            ON ul.library_id = il.library_id AND ul.user_id = ?1
-                         WHERE il.item_id
-                               = COALESCE((SELECT parent_id FROM items WHERE id = ?2), ?2))",
+        "SELECT EXISTS(SELECT 1 FROM users WHERE id=?1 AND all_libraries=1)
+             OR EXISTS(SELECT 1 FROM items i JOIN library_collections lc
+                  ON (lc.module_id,lc.collection_id)=(i.module_id,i.collection_id)
+                  JOIN user_libraries ul ON ul.library_id=lc.library_id AND ul.user_id=?1
+                 WHERE i.id=?2)",
     )
     .bind(&claims.sub)
     .bind(item_id)
@@ -135,10 +132,10 @@ pub async fn can_see_library(db: &SqlitePool, claims: &Claims, library_id: &str)
 /// `all_libraries` check of its own, which is what keeps it a single
 /// indexed probe instead of a per-row lookup in `users`.
 pub const VISIBLE_C: &str = "\
-AND EXISTS (SELECT 1 FROM item_libraries il
+AND EXISTS (SELECT 1 FROM library_collections lc
               JOIN user_libraries ul
-                ON ul.library_id = il.library_id AND ul.user_id = ?1
-             WHERE il.item_id = COALESCE(c.parent_id, c.id))";
+                ON ul.library_id=lc.library_id AND ul.user_id=?1
+             WHERE (lc.module_id,lc.collection_id)=(c.module_id,c.collection_id))";
 
 /// The same restriction, for the navigation library a browse row carries.
 ///
@@ -155,7 +152,7 @@ AND EXISTS (SELECT 1 FROM item_libraries il
 /// would answer NULL for everyone.
 pub const VISIBLE_LIB: &str = "\
 AND EXISTS (SELECT 1 FROM user_libraries ul
-             WHERE ul.library_id = il.library_id AND ul.user_id = ?1)";
+             WHERE ul.library_id=lc.library_id AND ul.user_id=?1)";
 
 /// Every account with its access, for the admin panel. Sorted by name,
 /// which is how the panel lists them and how a diff between two hubs

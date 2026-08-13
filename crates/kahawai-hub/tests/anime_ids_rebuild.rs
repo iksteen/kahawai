@@ -13,22 +13,38 @@ async fn seed(db: &sqlx::SqlitePool) {
     // One anime show whose first file carries an ed2k AniDB identified,
     // and an AniList answer whose provider_id IS the AniList media id.
     sqlx::query(
-        "INSERT INTO items (id, kind, title, norm_title) VALUES ('show1','show','Lain','lain')",
+        "INSERT INTO satellites(module_id,module_type,name,cert_fingerprint)
+                 VALUES('m','mediahost','m','fp')",
     )
     .execute(db)
     .await
     .unwrap();
     sqlx::query(
-        "INSERT INTO files (module_id, collection_id, path_rel, size, mtime_unix,
-                            head_xxh3, tail_xxh3, oshash, streams_json, subs_extracted, ed2k)
-         VALUES ('m','c','Lain/ep01.mkv', 1, 1, 0, 0, 0, '{}', 0, 'deadbeef')",
+        "INSERT INTO collections(module_id,collection_id,media_type)
+                 VALUES('m','c','anime')",
     )
     .execute(db)
     .await
     .unwrap();
     sqlx::query(
-        "INSERT INTO item_sources (item_id, module_id, collection_id, path_rel)
-         VALUES ('show1','m','c','Lain/ep01.mkv')",
+        "INSERT INTO items(id,kind,title,norm_title,module_id,collection_id)
+                 VALUES('show1','show','Lain','lain','m','c')",
+    )
+    .execute(db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO collection_roots(module_id,collection_id,root_token,normalized_path)
+                 VALUES('m','c','root','/anime')",
+    )
+    .execute(db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO files(module_id,collection_id,root_id,path_rel,item_id,size,mtime_unix,
+                           head_xxh3,tail_xxh3,oshash,streams_json,subs_extracted,ed2k)
+         VALUES('m','c',(SELECT id FROM collection_roots),'Lain/ep01.mkv','show1',
+                1,1,0,0,0,'{}',0,'deadbeef')",
     )
     .execute(db)
     .await
