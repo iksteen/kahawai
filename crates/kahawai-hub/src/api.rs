@@ -3016,7 +3016,7 @@ async fn item_query(
     // offline has none right now. Both are ordinary items whose detail
     // page must still load, so the converged half comes back null with
     // the reason beside it.
-    let (parts, _info, sp, mode) = match neg.best_source(&id, q.mode.as_deref()).await {
+    let (parts, info, sp, mode) = match neg.best_source(&id, q.mode.as_deref()).await {
         Ok(v) => v,
         Err(e) => {
             out["negotiated"] = Value::Null;
@@ -3063,11 +3063,17 @@ async fn item_query(
     };
 
     out["negotiated"] = json!({
-        "source": parts.first().map(|p| json!({
-            "module_id": p.module_id,
-            "collection_id": p.collection_id,
-            "path_rel": p.path_rel,
-        })),
+        "source": parts.first().map(|p| {
+            let video = info.video.first();
+            json!({
+                "module_id": p.module_id,
+                "collection_id": p.collection_id,
+                "path_rel": p.path_rel,
+                "display_width": video.and_then(|v| v.display_width),
+                "display_height": video.and_then(|v| v.display_height),
+                "orientation": video.and_then(|v| v.orientation.as_deref()),
+            })
+        }),
         // What negotiation decided. A `remux` may still be dispatched to
         // a transcoder at session start — that is placement, which QUERY
         // does not do because it would claim a box.

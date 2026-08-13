@@ -56,6 +56,8 @@ message HostToHub {
     // Confirms receipt of the adoption-complete manifest. Until this lands,
     // reconnects repeat the harmless scan suppression.
     RootAdoptionAck root_adoption_ack = 15;
+    // Targeted PAR/orientation/display-size result for one exact source.
+    FileVideoGeometry file_video_geometry = 16;
   }
 }
 
@@ -251,12 +253,32 @@ message HubToHost {
     // reads only, no decoding.
     KeyframeWorklist keyframe_worklist = 10;
     RootResolutionWorklist root_resolution_worklist = 11;
+    // Files scanned before display geometry was recorded. This probes only
+    // the named exact sources and never enters reconciliation.
+    VideoGeometryWorklist video_geometry_worklist = 12;
   }
 }
 
 message KeyframeWorklist {
   string collection_id = 1;
   repeated SourcePath sources = 2;
+}
+
+message VideoGeometryWorklist {
+  string collection_id = 1;
+  repeated SourcePath sources = 2;
+}
+
+message FileVideoGeometry {
+  string collection_id = 1;
+  SourcePath source = 2;
+  // Size at probe time: the hub drops a stale result after replacement.
+  uint64 size = 3;
+  // kahawai_core::media::VideoGeometry array. Empty only on failure.
+  string geometry_json = 4;
+  // A terminal source-owned failure; replaced by a later successful probe or
+  // by the next FileUpsert for changed physical content.
+  string error = 5;
 }
 
 message ExtractSubs {

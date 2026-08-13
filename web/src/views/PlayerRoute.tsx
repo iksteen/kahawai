@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type ComponentType } from 'react'
+import { useEffect, useRef, useState, type ComponentType, type CSSProperties } from 'react'
 import {
   endSession,
   fetchItem,
@@ -213,7 +213,18 @@ export default function PlayerRoute({
         </button>
       )}
       {!item || !session || !PlayerComp ? (
-        <div className="videobox" data-starting="1">
+        <div
+          className="videobox"
+          data-starting="1"
+          style={
+            {
+              '--video-ratio':
+                item?.negotiated?.source?.display_width && item.negotiated.source.display_height
+                  ? `${item.negotiated.source.display_width} / ${item.negotiated.source.display_height}`
+                  : '16 / 9',
+            } as CSSProperties
+          }
+        >
           <div className="seek-veil" aria-label="Starting playback">
             <span className="seek-veil-spin">&#10227;</span>
           </div>

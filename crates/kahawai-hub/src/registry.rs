@@ -603,6 +603,90 @@ impl Registry {
         Ok(n > 0)
     }
 
+    /// Exact video sources whose PAR/orientation/display geometry has not been
+    /// targeted yet. A recorded success or failure is terminal for this source
+    /// revision; a later FileUpsert replaces the JSON and makes changed content
+    /// eligible again without a catalogue-wide reset.
+    pub async fn video_geometry_worklist(
+        &self,
+        module_id: &str,
+        collection_id: &str,
+    ) -> Result<Vec<SourcePath>> {
+        self.source_worklist(
+            "json_extract(streams_json, '$.video[0].codec') IS NOT NULL
+             AND COALESCE(json_extract(streams_json, '$.video_geometry_probed'),0)=0",
+            module_id,
+            collection_id,
+        )
+        .await
+    }
+
+    /// Store one targeted result against the exact stable source row. The size
+    /// guard rejects an answer raced by content replacement. Failure is data,
+    /// not silence: it prevents a corrupt file becoming an endless idle loop.
+    #[allow(clippy::too_many_arguments)] // exact source tuple + stale-result guard + payload
+    pub async fn record_file_video_geometry(
+        &self,
+        module_id: &str,
+        collection_id: &str,
+        root_token: &str,
+        path_rel: &str,
+        size: u64,
+        geometry_json: &str,
+        error: &str,
+    ) -> Result<bool> {
+        let Some(source_id) = self
+            .source_id(module_id, collection_id, root_token, path_rel)
+            .await?
+        else {
+            return Ok(false);
+        };
+        let geometry: Vec<kahawai_core::media::VideoGeometry> = if error.is_empty() {
+            serde_json::from_str(geometry_json).context("invalid video geometry result")?
+        } else {
+            Vec::new()
+        };
+        let mut tx = self.db.begin().await?;
+        let Some(mut info) =
+            sqlx::query_scalar::<_, String>("SELECT streams_json FROM files WHERE id=? AND size=?")
+                .bind(source_id)
+                .bind(size as i64)
+                .fetch_optional(&mut *tx)
+                .await?
+                .map(|json| serde_json::from_str::<kahawai_core::media::MediaInfo>(&json))
+                .transpose()?
+        else {
+            return Ok(false);
+        };
+        if error.is_empty() {
+            anyhow::ensure!(
+                geometry.len() == info.video.len(),
+                "geometry stream count {} does not match stored video stream count {}",
+                geometry.len(),
+                info.video.len()
+            );
+            for (video, value) in info.video.iter_mut().zip(geometry) {
+                video.pixel_aspect_ratio = Some(value.pixel_aspect_ratio);
+                video.orientation = Some(value.orientation);
+                video.display_width = Some(value.display_width);
+                video.display_height = Some(value.display_height);
+            }
+            info.video_geometry_error = None;
+        } else {
+            info.video_geometry_error = Some(error.to_string());
+        }
+        info.video_geometry_probed = true;
+        let n = sqlx::query("UPDATE files SET streams_json=? WHERE id=? AND size=?")
+            .bind(serde_json::to_string(&info)?)
+            .bind(source_id)
+            .bind(size as i64)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        tx.commit().await?;
+        Ok(n > 0)
+    }
+
     /// Store a mediahost attachment declaration (size-guarded like ED2K:
     /// dropped when the row moved on). Writes into streams_json so the
     /// record looks exactly as if the scan had declared it.

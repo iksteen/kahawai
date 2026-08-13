@@ -89,7 +89,12 @@ How something works and why it was built that way belong in
 - [x] MH-2 Scan on start/demand + watching + sweeps; on-demand scans are
       collection-scoped only (the global rescan is gone), with interim
       progress reports every 500 files
-- [x] MH-3 GStreamer discovery for technical metadata
+- [x] MH-3 GStreamer discovery for technical metadata, including exact PAR,
+      normalized display orientation and resulting display dimensions. Legacy
+      rows use an exact-source idle worklist rather than scans/reconciliation;
+      results and terminal failures are source-owned and size-guarded, scan
+      generations remain unchanged, and changed source JSON retries only that
+      physical revision
 - [x] MH-4 Sidecars + artwork + attachment declaration: embedded fonts are
       declared (name/mime/byte range, payload never read) in the file record
       at scan via a sparse EBML walk; pre-existing records are backfilled by

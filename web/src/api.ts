@@ -466,6 +466,10 @@ export type StreamInfo = {
     codec: string
     width: number
     height: number
+    display_width?: number | null
+    display_height?: number | null
+    orientation?: string | null
+    pixel_aspect_ratio?: [number, number] | null
     profile?: string | null
     level?: string | null
   }[]
@@ -700,7 +704,14 @@ const BOOTSTRAP_TIMEOUT_MS = 10_000
 /// What this client would actually be served, for the profile it asked
 /// with — the converged half of the item resource.
 export type Negotiated = {
-  source: { module_id: string; collection_id: string; path_rel: string } | null
+  source: {
+    module_id: string
+    collection_id: string
+    path_rel: string
+    display_width?: number | null
+    display_height?: number | null
+    orientation?: string | null
+  } | null
   /// What negotiation decided. A `remux` may still be dispatched to a
   /// transcoder when the session starts; that is placement, which a
   /// safe method does not do.

@@ -1455,11 +1455,21 @@ export default function Player({
   }, [next, upNextOff, startingNext, durationMs])
 
   const producedPct = durationMs > 0 ? Math.min(100, (producedMs / durationMs) * 100) : 0
+  // QUERY carries the geometry of the exact source negotiation chose. Shape
+  // the box before the first media byte; `auto` still lets intrinsic metadata
+  // take over once the browser has decoded it. Old/unprobed rows keep 16:9.
+  const display = item.negotiated?.source
+  const preplayRatio =
+    display?.display_width && display.display_height
+      ? `${display.display_width} / ${display.display_height}`
+      : '16 / 9'
 
   return (
     <>
       <div
         className={`videobox${barShown || paused ? ' bar-up' : ''}`}
+        data-ratio={preplayRatio}
+        style={{ '--video-ratio': preplayRatio } as React.CSSProperties}
         onMouseMove={wake}
         onMouseLeave={() => setBarShown(false)}
       >

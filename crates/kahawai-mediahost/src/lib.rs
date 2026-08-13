@@ -469,6 +469,13 @@ impl Engine {
                 let _ = self.hash_tx.try_send(hasher::JobMsg::KeyframeWorklist(w));
                 Ok(None)
             }
+            hub_to_host::Msg::VideoGeometryWorklist(w) => {
+                validate_sources("VideoGeometryWorklist", &w.sources)?;
+                let _ = self
+                    .hash_tx
+                    .try_send(hasher::JobMsg::VideoGeometryWorklist(w));
+                Ok(None)
+            }
             hub_to_host::Msg::AttachmentsWorklist(w) => {
                 validate_sources("AttachmentsWorklist", &w.sources)?;
                 let _ = self

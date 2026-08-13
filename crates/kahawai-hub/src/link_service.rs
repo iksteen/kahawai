@@ -530,6 +530,9 @@ fn validate_exact_host_msg(m: &host_to_hub::Msg) -> anyhow::Result<()> {
         host_to_hub::Msg::FileKeyframeInterval(message) => {
             valid(&message.source, "FileKeyframeInterval")?
         }
+        host_to_hub::Msg::FileVideoGeometry(message) => {
+            valid(&message.source, "FileVideoGeometry")?
+        }
         host_to_hub::Msg::ImageSubtitles(message) => valid(&message.source, "ImageSubtitles")?,
         _ => {}
     }
@@ -550,6 +553,7 @@ fn kind_name(m: &host_to_hub::Msg) -> &'static str {
         host_to_hub::Msg::FileSubtitles(_) => "file_subtitles",
         host_to_hub::Msg::FileAttachments(_) => "file_attachments",
         host_to_hub::Msg::FileKeyframeInterval(_) => "file_keyframe_interval",
+        host_to_hub::Msg::FileVideoGeometry(_) => "file_video_geometry",
         host_to_hub::Msg::ImageSubtitles(_) => "image_subtitles",
         host_to_hub::Msg::RootResolutions(_) => "root_resolutions",
         host_to_hub::Msg::RootAdoptionAck(_) => "root_adoption_ack",
@@ -801,6 +805,7 @@ async fn handle_host_msg(
                 push_subs_worklist(registry, module_id, &r.collection_id).await;
                 push_attachments_worklist(registry, module_id, &r.collection_id).await;
                 push_keyframe_worklist(registry, module_id, &r.collection_id).await;
+                push_video_geometry_worklist(registry, module_id, &r.collection_id).await;
                 return Ok(());
             }
             // Incremental rescan (MH-5): what we already know, so the
@@ -931,6 +936,7 @@ async fn handle_host_msg(
             push_subs_worklist(registry, module_id, &p.collection_id).await;
             push_attachments_worklist(registry, module_id, &p.collection_id).await;
             push_keyframe_worklist(registry, module_id, &p.collection_id).await;
+            push_video_geometry_worklist(registry, module_id, &p.collection_id).await;
             enricher.scan_complete(registry.clone());
         }
         host_to_hub::Msg::FileAttachments(fa) => {
@@ -968,6 +974,28 @@ async fn handle_host_msg(
                     k.max_keyframe_interval_ms,
                 )
                 .await?;
+        }
+        host_to_hub::Msg::FileVideoGeometry(g) => {
+            let source = exact_source(g.source, "FileVideoGeometry")?;
+            let root_token = registry
+                .resolve_root_token(module_id, &g.collection_id, &source.root_token)
+                .await?;
+            let stored = registry
+                .record_file_video_geometry(
+                    module_id,
+                    &g.collection_id,
+                    &root_token,
+                    &source.path_rel,
+                    g.size,
+                    &g.geometry_json,
+                    &g.error,
+                )
+                .await?;
+            if !g.error.is_empty() {
+                tracing::warn!(%module_id, collection = %g.collection_id,
+                    path = %source.path_rel, stored, error = %g.error,
+                    "targeted video geometry probe failed");
+            }
         }
         host_to_hub::Msg::FileSubtitles(fs) => {
             let source = exact_source(fs.source, "FileSubtitles")?;
@@ -1174,6 +1202,49 @@ async fn push_keyframe_worklist(
         if let Err(e) = registry.send_to_host(module_id, msg).await {
             tracing::warn!(%module_id, error = format!("{e:#}"), "keyframe worklist send failed");
             return;
+        }
+    }
+}
+
+/// Source-owned PAR/orientation/display-size backfill. Sent only after an
+/// in-sync handshake or completed scan, but it is not part of either: the host
+/// opens exactly the named files and reports no manifest/generation changes.
+async fn push_video_geometry_worklist(registry: &Registry, module_id: &str, collection_id: &str) {
+    let paths = match registry
+        .video_geometry_worklist(module_id, collection_id)
+        .await
+    {
+        Ok(paths) => paths,
+        Err(e) => {
+            tracing::warn!(%module_id, collection = %collection_id,
+                error = format!("{e:#}"), "video geometry worklist failed");
+            return;
+        }
+    };
+    if paths.is_empty() {
+        return;
+    }
+    tracing::info!(%module_id, collection = %collection_id, files = paths.len(),
+        "sending video geometry worklist");
+    const CHUNK: usize = 8000;
+    for sources in paths.chunks(CHUNK) {
+        let msg = kahawai_proto::v1::HubToHost {
+            msg: Some(kahawai_proto::v1::hub_to_host::Msg::VideoGeometryWorklist(
+                kahawai_proto::v1::VideoGeometryWorklist {
+                    collection_id: collection_id.to_string(),
+                    sources: sources
+                        .iter()
+                        .map(|source| {
+                            kahawai_proto::v1::SourcePath::new(&source.root_token, &source.path_rel)
+                        })
+                        .collect(),
+                },
+            )),
+        };
+        if let Err(e) = registry.send_to_host(module_id, msg).await {
+            tracing::warn!(%module_id, error = format!("{e:#}"),
+                "video geometry worklist send failed");
+            break;
         }
     }
 }

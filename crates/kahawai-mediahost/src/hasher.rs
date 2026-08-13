@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use kahawai_proto::v1::{
     AttachmentsWorklist, ExtractSubs, FileAttachments, FileHash, FileHashes, FileKeyframeInterval,
-    FileSubtitles, Hashlist, HostToHub, SubTrack, SubsWorklist, host_to_hub,
+    FileSubtitles, FileVideoGeometry, Hashlist, HostToHub, SubTrack, SubsWorklist, host_to_hub,
 };
 
 use crate::Activity;
@@ -28,6 +28,7 @@ pub enum JobMsg {
     SubsWorklist(SubsWorklist),
     AttachmentsWorklist(AttachmentsWorklist),
     KeyframeWorklist(kahawai_proto::v1::KeyframeWorklist),
+    VideoGeometryWorklist(kahawai_proto::v1::VideoGeometryWorklist),
     Urgent(ExtractSubs),
     UrgentImage(kahawai_proto::v1::ExtractImageSubs),
 }
@@ -61,39 +62,44 @@ impl Tier {
     }
 }
 
+#[derive(Default)]
+struct Queues {
+    urgent: VecDeque<(String, String, String)>,
+    urgent_image: VecDeque<kahawai_proto::v1::ExtractImageSubs>,
+    ed2k: Tier,
+    subs: Tier,
+    atts: Tier,
+    keys: Tier,
+    geometry: Tier,
+}
+
 /// Route one message into its tier; returns true for urgent work.
-fn intake(
-    msg: JobMsg,
-    urgent: &mut VecDeque<(String, String, String)>,
-    urgent_image: &mut VecDeque<kahawai_proto::v1::ExtractImageSubs>,
-    ed2k: &mut Tier,
-    subs: &mut Tier,
-    atts: &mut Tier,
-    keys: &mut Tier,
-) -> bool {
+fn intake(msg: JobMsg, queues: &mut Queues) -> bool {
     match msg {
         // Same urgency as a text extraction: a viewer is waiting on it
         // to start a burn-in session.
         JobMsg::UrgentImage(e) => {
-            urgent_image.push_back(e);
+            queues.urgent_image.push_back(e);
             true
         }
         JobMsg::Urgent(e) => {
             if let Some(source) = e.source {
-                urgent.push_back((e.collection_id, source.root_token, source.path_rel));
+                queues
+                    .urgent
+                    .push_back((e.collection_id, source.root_token, source.path_rel));
             }
             true
         }
         JobMsg::Hashlist(h) => {
-            ed2k.push(&h.collection_id, h.sources);
+            queues.ed2k.push(&h.collection_id, h.sources);
             false
         }
         JobMsg::SubsWorklist(w) => {
-            subs.push(&w.collection_id, w.sources);
+            queues.subs.push(&w.collection_id, w.sources);
             false
         }
         JobMsg::AttachmentsWorklist(w) => {
-            atts.push(&w.collection_id, w.sources);
+            queues.atts.push(&w.collection_id, w.sources);
             false
         }
         JobMsg::KeyframeWorklist(w) => {
@@ -102,7 +108,13 @@ fn intake(
             // rather than a guess.
             tracing::info!(collection = %w.collection_id, files = w.sources.len(),
                 "keyframe worklist received");
-            keys.push(&w.collection_id, w.sources);
+            queues.keys.push(&w.collection_id, w.sources);
+            false
+        }
+        JobMsg::VideoGeometryWorklist(w) => {
+            tracing::info!(collection = %w.collection_id, files = w.sources.len(),
+                "video geometry worklist received");
+            queues.geometry.push(&w.collection_id, w.sources);
             false
         }
     }
@@ -114,6 +126,7 @@ fn intake(
 enum Bg {
     Atts,
     Keyframe,
+    Geometry,
     Subs,
 }
 
@@ -123,12 +136,7 @@ pub async fn run(
     collections: Vec<CollectionConfig>,
     activity: Activity,
 ) {
-    let mut urgent: VecDeque<(String, String, String)> = VecDeque::new();
-    let mut urgent_image: VecDeque<kahawai_proto::v1::ExtractImageSubs> = VecDeque::new();
-    let mut ed2k = Tier::default();
-    let mut subs = Tier::default();
-    let mut atts = Tier::default();
-    let mut keys = Tier::default();
+    let mut queues = Queues::default();
 
     loop {
         // Drain new work; block only when every queue is empty.
@@ -139,10 +147,10 @@ pub async fn run(
         // waiting for a message that never comes — which is exactly
         // what a fourth tier did on the day it was added.
         loop {
-            let background = [&atts, &keys, &subs];
-            let empty = urgent.is_empty()
-                && urgent_image.is_empty()
-                && ed2k.q.is_empty()
+            let background = [&queues.atts, &queues.keys, &queues.geometry, &queues.subs];
+            let empty = queues.urgent.is_empty()
+                && queues.urgent_image.is_empty()
+                && queues.ed2k.q.is_empty()
                 && background.iter().all(|t| t.q.is_empty());
             let msg = if empty {
                 match rx.recv().await {
@@ -155,24 +163,16 @@ pub async fn run(
                     Err(_) => break,
                 }
             };
-            intake(
-                msg,
-                &mut urgent,
-                &mut urgent_image,
-                &mut ed2k,
-                &mut subs,
-                &mut atts,
-                &mut keys,
-            );
+            intake(msg, &mut queues);
         }
 
         // Tier order: urgent (never idle-gated — the active lease IS the
         // requesting viewer) → ED2K → background subs.
-        if let Some((collection_id, root_token, path_rel)) = urgent.pop_front() {
+        if let Some((collection_id, root_token, path_rel)) = queues.urgent.pop_front() {
             extract_and_send(&collections, &collection_id, &root_token, &path_rel, &tx).await;
             continue;
         }
-        if let Some(e) = urgent_image.pop_front() {
+        if let Some(e) = queues.urgent_image.pop_front() {
             if let Some(source) = e.source {
                 extract_image_and_send(
                     &collections,
@@ -186,7 +186,7 @@ pub async fn run(
             }
             continue;
         }
-        if let Some((collection_id, root_token, path_rel)) = ed2k.q.pop_front() {
+        if let Some((collection_id, root_token, path_rel)) = queues.ed2k.q.pop_front() {
             match hash_one(
                 &collections,
                 &collection_id,
@@ -214,7 +214,10 @@ pub async fn run(
                 Err(e) => tracing::debug!(collection = %collection_id, path = %path_rel,
                     error = format!("{e:#}"), "ed2k skipped"),
             }
-            ed2k.seen.remove(&(collection_id, root_token, path_rel));
+            queues
+                .ed2k
+                .seen
+                .remove(&(collection_id, root_token, path_rel));
             continue;
         }
         // Background tiers share the idle gate. Attachment declaration
@@ -225,11 +228,14 @@ pub async fn run(
         // keyframe intervals — the same index-read cost, and every file
         // still missing one forces a conservative TARGETDURATION until
         // it lands. The subs pre-warm is the long tail and waits.
-        let (which, job) = match atts.q.pop_front() {
+        let (which, job) = match queues.atts.q.pop_front() {
             Some(j) => (Bg::Atts, Some(j)),
-            None => match keys.q.pop_front() {
+            None => match queues.keys.q.pop_front() {
                 Some(j) => (Bg::Keyframe, Some(j)),
-                None => (Bg::Subs, subs.q.pop_front()),
+                None => match queues.geometry.q.pop_front() {
+                    Some(j) => (Bg::Geometry, Some(j)),
+                    None => (Bg::Subs, queues.subs.q.pop_front()),
+                },
             },
         };
         if let Some((collection_id, root_token, path_rel)) = job {
@@ -239,15 +245,7 @@ pub async fn run(
             while activity.busy() {
                 match tokio::time::timeout(BUSY_POLL, rx.recv()).await {
                     Ok(Some(m)) => {
-                        if intake(
-                            m,
-                            &mut urgent,
-                            &mut urgent_image,
-                            &mut ed2k,
-                            &mut subs,
-                            &mut atts,
-                            &mut keys,
-                        ) {
+                        if intake(m, &mut queues) {
                             preempted = true;
                             break;
                         }
@@ -257,11 +255,12 @@ pub async fn run(
                 }
             }
             let tier = match which {
-                Bg::Subs => &mut subs,
-                Bg::Atts => &mut atts,
-                Bg::Keyframe => &mut keys,
+                Bg::Subs => &mut queues.subs,
+                Bg::Atts => &mut queues.atts,
+                Bg::Keyframe => &mut queues.keys,
+                Bg::Geometry => &mut queues.geometry,
             };
-            if preempted || !urgent.is_empty() {
+            if preempted || !queues.urgent.is_empty() {
                 // Preempted: put the background job back and loop.
                 tier.q.push_front((collection_id, root_token, path_rel));
                 continue;
@@ -277,6 +276,16 @@ pub async fn run(
                 }
                 Bg::Keyframe => {
                     measure_keyframes_and_send(
+                        &collections,
+                        &collection_id,
+                        &root_token,
+                        &path_rel,
+                        &tx,
+                    )
+                    .await
+                }
+                Bg::Geometry => {
+                    probe_geometry_and_send(
                         &collections,
                         &collection_id,
                         &root_token,
@@ -376,6 +385,58 @@ async fn measure_keyframes_and_send(
                 max_keyframe_interval_ms: ms,
             },
         )),
+    };
+    let _ = tx.send(msg).await;
+}
+
+/// Source-owned PAR/orientation/display dimensions for one exact file. This is
+/// deliberately a targeted probe: it opens only the named source and does no
+/// directory walk, hash, sidecar inspection, reconciliation or generation work.
+async fn probe_geometry_and_send(
+    collections: &[CollectionConfig],
+    collection_id: &str,
+    root_token: &str,
+    path_rel: &str,
+    tx: &tokio::sync::mpsc::Sender<HostToHub>,
+) {
+    let path = match crate::serve::resolve_rel(collections, collection_id, root_token, path_rel) {
+        Ok(path) => path,
+        Err(e) => {
+            let _ = tx
+                .send(HostToHub {
+                    msg: Some(host_to_hub::Msg::FileVideoGeometry(FileVideoGeometry {
+                        collection_id: collection_id.to_string(),
+                        source: source(root_token, path_rel),
+                        size: 0,
+                        geometry_json: String::new(),
+                        error: format!("{e:#}"),
+                    })),
+                })
+                .await;
+            return;
+        }
+    };
+    let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+    let result = tokio::task::spawn_blocking(move || {
+        kahawai_media::probe_video_geometry(&path, Duration::from_secs(30))
+    })
+    .await;
+    let (geometry_json, error) = match result {
+        Ok(Ok(geometry)) => (
+            serde_json::to_string(&geometry).unwrap_or_default(),
+            String::new(),
+        ),
+        Ok(Err(e)) => (String::new(), format!("{e:#}")),
+        Err(e) => (String::new(), format!("geometry probe task failed: {e}")),
+    };
+    let msg = HostToHub {
+        msg: Some(host_to_hub::Msg::FileVideoGeometry(FileVideoGeometry {
+            collection_id: collection_id.to_string(),
+            source: source(root_token, path_rel),
+            size,
+            geometry_json,
+            error,
+        })),
     };
     let _ = tx.send(msg).await;
 }

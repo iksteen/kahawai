@@ -1192,7 +1192,7 @@ h2 {
    265ms is usually the shape the picture will be — the alternative was an
    arbitrary height and a visible jump when the video arrived. */
 .videobox:not(:has(video)) {
-  aspect-ratio: 16 / 9;
+  aspect-ratio: var(--video-ratio, 16 / 9);
   /* A dialog's body is a hub error string of unbounded length, so the shape is
      a floor rather than a cage: it may grow past 16:9 to fit one. */
   min-height: min(20rem, 60vh);
@@ -1252,7 +1252,7 @@ h2 {
      only decides the shape before it. Without it the element uses the HTML
      default of 300x150, which at full width is a 7.5:1 letterbox slot — the
      second of the two jumps a cold start used to make. */
-  aspect-ratio: auto 16 / 9;
+  aspect-ratio: auto var(--video-ratio, 16 / 9);
   max-height: 78vh;
   display: block;
   background: #000;

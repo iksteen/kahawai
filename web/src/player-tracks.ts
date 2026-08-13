@@ -3,7 +3,14 @@ import type { StreamVerdict, Subtitle } from './api'
 /// The shapes the pickers show. Structural rather than imported: the hub sends
 /// these inside a source's streams, and this only ever lists them.
 export type AudioChoice = { codec: string; channels: number; language?: string | null }
-export type VideoChoice = { codec: string; width: number; height: number }
+export type VideoChoice = {
+  codec: string
+  width: number
+  height: number
+  display_width?: number | null
+  display_height?: number | null
+  orientation?: string | null
+}
 
 /// What is being played and with which tracks.
 ///

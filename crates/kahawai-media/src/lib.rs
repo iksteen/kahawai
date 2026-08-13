@@ -25,7 +25,7 @@ use anyhow::{Context, Result};
 use gstreamer as gst;
 use gstreamer_pbutils::prelude::*;
 use gstreamer_pbutils::{Discoverer, DiscovererAudioInfo, DiscovererInfo, DiscovererStreamInfo};
-use kahawai_core::media::{AudioStream, MediaInfo, SubtitleStream, VideoStream};
+use kahawai_core::media::{AudioStream, MediaInfo, SubtitleStream, VideoGeometry, VideoStream};
 
 pub fn init() -> Result<()> {
     static INIT: OnceLock<Result<(), String>> = OnceLock::new();
@@ -125,6 +125,25 @@ pub fn discover(path: &Path, timeout: Duration) -> Result<MediaInfo> {
     Ok(mapped)
 }
 
+/// Inspect only display geometry for one exact source. This deliberately uses
+/// the same Discoverer facts as a scan without becoming a scan: no directory
+/// walk, reconciliation, hashes, sidecars or catalogue writes.
+pub fn probe_video_geometry(path: &Path, timeout: Duration) -> Result<Vec<VideoGeometry>> {
+    init()?;
+    let uri = gst::glib::filename_to_uri(path, None)
+        .with_context(|| format!("building uri for {}", path.display()))?;
+    let discoverer = Discoverer::new(gst::ClockTime::from_mseconds(timeout.as_millis() as u64))?;
+    let info = discoverer
+        .discover_uri(&uri)
+        .with_context(|| format!("probing video geometry for {}", path.display()))?;
+    Ok(info
+        .video_streams()
+        .into_iter()
+        .filter(is_terminal)
+        .map(|stream| geometry(&stream, orientation_for(&info, &stream)))
+        .collect())
+}
+
 /// Whether a non-Ok discovery may still be believed if it described a
 /// usable audio/video core.
 fn result_is_partial(result: gstreamer_pbutils::DiscovererResult) -> bool {
@@ -174,6 +193,64 @@ fn discover_uri_partial(uri: &str, timeout: Duration) -> Result<DiscovererInfo> 
         .context("acquiring a main context for discovery")?
 }
 
+fn orientation_for(
+    info: &DiscovererInfo,
+    stream: &gstreamer_pbutils::DiscovererVideoInfo,
+) -> String {
+    // GStreamer primary docs define these as the clockwise transform to apply
+    // for display, with `flip` meaning horizontal mirroring:
+    // https://gstreamer.freedesktop.org/documentation/gstreamer/gsttaglist.html#GST_TAG_IMAGE_ORIENTATION
+    stream
+        .tags()
+        .or_else(|| info.tags())
+        .and_then(|tags| tags.get::<gst::tags::ImageOrientation>())
+        .map(|value| value.get().to_string())
+        .filter(|value| {
+            matches!(
+                value.as_str(),
+                "rotate-0"
+                    | "rotate-90"
+                    | "rotate-180"
+                    | "rotate-270"
+                    | "flip-rotate-0"
+                    | "flip-rotate-90"
+                    | "flip-rotate-180"
+                    | "flip-rotate-270"
+            )
+        })
+        .unwrap_or_else(|| "rotate-0".into())
+}
+
+fn geometry(stream: &gstreamer_pbutils::DiscovererVideoInfo, orientation: String) -> VideoGeometry {
+    // Discoverer exposes PAR as numerator/denominator (primary API docs):
+    // https://gstreamer.freedesktop.org/documentation/pbutils/gstdiscoverer.html#gst_discoverer_video_info_get_par_num
+    let par = stream.par();
+    let (mut n, mut d) = (par.numer().max(1) as u32, par.denom().max(1) as u32);
+    let gcd = |mut a: u32, mut b: u32| {
+        while b != 0 {
+            (a, b) = (b, a % b);
+        }
+        a.max(1)
+    };
+    let g = gcd(n, d);
+    (n, d) = (n / g, d / g);
+    let mut width = ((stream.width() as u64 * n as u64 + d as u64 / 2) / d as u64)
+        .clamp(1, u32::MAX as u64) as u32;
+    let mut height = stream.height().max(1);
+    if matches!(
+        orientation.as_str(),
+        "rotate-90" | "rotate-270" | "flip-rotate-90" | "flip-rotate-270"
+    ) {
+        (width, height) = (height, width);
+    }
+    VideoGeometry {
+        pixel_aspect_ratio: (n, d),
+        orientation,
+        display_width: width,
+        display_height: height,
+    }
+}
+
 fn map_info(info: &DiscovererInfo) -> MediaInfo {
     let mut out = MediaInfo {
         container: info
@@ -189,6 +266,7 @@ fn map_info(info: &DiscovererInfo) -> MediaInfo {
     // terminal entries — the real bitstream type, and the caps the remux
     // pipeline will actually see.
     for s in info.video_streams().into_iter().filter(is_terminal) {
+        let geometry = geometry(&s, orientation_for(info, &s));
         let caps = s.caps();
         let st_get = |field: &str| {
             caps.as_ref()
@@ -224,8 +302,13 @@ fn map_info(info: &DiscovererInfo) -> MediaInfo {
             // mediahost fills this from the container index after the
             // probe (scan.rs).
             max_keyframe_interval_ms: None,
+            pixel_aspect_ratio: Some(geometry.pixel_aspect_ratio),
+            orientation: Some(geometry.orientation),
+            display_width: Some(geometry.display_width),
+            display_height: Some(geometry.display_height),
         });
     }
+    out.video_geometry_probed = true;
 
     for s in info.audio_streams().into_iter().filter(is_terminal) {
         // Codec, width and layout come from the widest link; language and
@@ -536,6 +619,22 @@ mod tests {
         assert_eq!(info.video[0].codec, "h264");
         assert_eq!((info.video[0].width, info.video[0].height), (320, 240));
         assert_eq!(info.video[0].fps, Some((25, 1)));
+        assert!(info.video_geometry_probed);
+        assert_eq!(info.video[0].pixel_aspect_ratio, Some((1, 1)));
+        assert_eq!(info.video[0].orientation.as_deref(), Some("rotate-0"));
+        assert_eq!(
+            (info.video[0].display_width, info.video[0].display_height),
+            (Some(320), Some(240))
+        );
+        assert_eq!(
+            probe_video_geometry(&path, Duration::from_secs(15)).unwrap(),
+            vec![VideoGeometry {
+                pixel_aspect_ratio: (1, 1),
+                orientation: "rotate-0".into(),
+                display_width: 320,
+                display_height: 240,
+            }]
+        );
         // MH-3 extension: x264enc+h264parse emit profile/level in caps.
         assert!(
             info.video[0].profile.is_some(),
@@ -565,6 +664,16 @@ mod tests {
         }"#;
         let info: kahawai_core::media::MediaInfo = serde_json::from_str(old).unwrap();
         let v = &info.video[0];
+        assert!(!info.video_geometry_probed);
+        assert_eq!(
+            (
+                v.pixel_aspect_ratio,
+                v.orientation.as_deref(),
+                v.display_width,
+                v.display_height
+            ),
+            (None, None, None, None)
+        );
         assert_eq!(
             (
                 v.profile.as_deref(),

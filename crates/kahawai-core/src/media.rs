@@ -6,6 +6,10 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 /// A file's own loudness statement (HUB-19).
 ///
 /// Gains are dB to apply; peaks are linear sample values where 1.0 is
@@ -84,6 +88,16 @@ pub struct MediaInfo {
     /// `Some([...])` = read these exact ranges (HUB-34 fonts rung).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attachments: Option<Vec<Attachment>>,
+    /// Whether the exact source was inspected for PAR/orientation. This is
+    /// separate from scanning/reconciliation: old rows are filled by a
+    /// targeted, idle mediahost worklist. New discovery gets it for free.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub video_geometry_probed: bool,
+    /// A terminal targeted-probe failure. It keeps an unreadable source out of
+    /// an infinite work loop and is replaced when that physical row changes or
+    /// a later targeted probe succeeds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video_geometry_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -139,6 +153,30 @@ pub struct VideoStream {
     /// that cut on a time grid would make this field irrelevant.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_keyframe_interval_ms: Option<u32>,
+    /// Pixel aspect ratio as an exact reduced fraction. `(1,1)` is a measured
+    /// square-pixel source; `None` means this row predates geometry probing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pixel_aspect_ratio: Option<(u32, u32)>,
+    /// GStreamer's normalized display transform (`rotate-0`, `rotate-90`, …,
+    /// including the four `flip-rotate-*` forms). This is the transform to
+    /// apply, not merely the container's raw rotation tag.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orientation: Option<String>,
+    /// Display dimensions after pixel aspect and orientation. Coded dimensions
+    /// remain in `width`/`height`; clients size the pre-play frame from these.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_width: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_height: Option<u32>,
+}
+
+/// The source-owned subset returned by a targeted geometry probe.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct VideoGeometry {
+    pub pixel_aspect_ratio: (u32, u32),
+    pub orientation: String,
+    pub display_width: u32,
+    pub display_height: u32,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
