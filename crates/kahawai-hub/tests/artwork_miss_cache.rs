@@ -42,6 +42,7 @@ async fn fixture() -> Fx {
         "01H",
         "movies",
         vec![FileUpsertRecord {
+            root_token: "root".into(),
             path_rel: "Heat (1995).mkv".into(),
             size: 100,
             mtime_unix: 1,

@@ -9,6 +9,7 @@ use tower::ServiceExt;
 
 fn rec(path: &str, size: u64) -> FileUpsertRecord {
     FileUpsertRecord {
+        root_token: "root".into(),
         path_rel: path.into(),
         size,
         mtime_unix: 1,
@@ -181,7 +182,8 @@ async fn reconcile_drops_files_missing_from_scan() {
         .unwrap();
 
     // Rescan saw only Heat.
-    let seen: std::collections::HashSet<String> = ["Heat (1995).mkv".to_string()].into();
+    let seen: std::collections::HashSet<String> =
+        [kahawai_hub::registry::source_key("root", "Heat (1995).mkv")].into();
     let removed = reg.reconcile_files("01H", "movies", &seen).await.unwrap();
     assert_eq!(removed, 1);
 
@@ -371,6 +373,7 @@ async fn manifest_and_files_seen_survive_rescan() {
                     msg: Some(pb::host_to_hub::Msg::FileUpsert(pb::FileUpsert {
                         collection_id: "movies".into(),
                         files: vec![pb::FileRecord {
+                            root_token: String::new(),
                             path_rel: "Heat (1995).mkv".into(),
                             size: 100,
                             mtime_unix: 42,
@@ -393,6 +396,7 @@ async fn manifest_and_files_seen_survive_rescan() {
                     msg: Some(pb::host_to_hub::Msg::FilesSeen(pb::FilesSeen {
                         collection_id: "movies".into(),
                         path_rel: vec!["Heat (1995).mkv".into()],
+                        sources: Vec::new(),
                     })),
                 })
                 .await
@@ -478,7 +482,7 @@ async fn multipart_movies_group_into_one_item() {
     assert_eq!(items, ["12 Monkeys", "Heat"], "{items:?}");
 
     let parts: Vec<(String, Option<i64>)> = sqlx::query(
-        "SELECT s.path_rel, s.part FROM item_sources s
+        "SELECT s.source_path, s.part FROM item_sources s
          JOIN items i ON i.id = s.item_id WHERE i.title = '12 Monkeys'
          ORDER BY s.part",
     )
@@ -486,7 +490,7 @@ async fn multipart_movies_group_into_one_item() {
     .await
     .unwrap()
     .into_iter()
-    .map(|r| (r.get::<String, _>("path_rel"), r.get("part")))
+    .map(|r| (r.get::<String, _>("source_path"), r.get("part")))
     .collect();
     assert_eq!(
         parts,

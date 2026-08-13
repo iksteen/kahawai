@@ -185,6 +185,7 @@ async fn negotiation_picks_cheapest_source_and_honors_caps() {
             collection_id: "movies".into(),
             files: vec![
                 pb::FileRecord {
+                    root_token: String::new(),
                     path_rel: "Heat (1995).mp4".into(),
                     size: mp4_facts.0,
                     mtime_unix: 1,
@@ -194,6 +195,7 @@ async fn negotiation_picks_cheapest_source_and_honors_caps() {
                     streams_json: mp4_facts.1.clone(),
                 },
                 pb::FileRecord {
+                    root_token: String::new(),
                     path_rel: "Heat (1995).mkv".into(),
                     size: mkv_facts.0,
                     mtime_unix: 1,

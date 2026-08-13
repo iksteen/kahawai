@@ -59,6 +59,7 @@ fn info(subs: &[(&str, &str)]) -> kahawai_core::media::MediaInfo {
 /// read, so no bytes are needed to pose the question.
 fn ass_rec(path: &str) -> FileUpsertRecord {
     FileUpsertRecord {
+        root_token: "root".into(),
         streams_json: serde_json::to_string(&info(&[("ass", "en")])).unwrap(),
         ..rec(path, 200)
     }
@@ -66,6 +67,7 @@ fn ass_rec(path: &str) -> FileUpsertRecord {
 
 fn rec(path: &str, size: u64) -> FileUpsertRecord {
     FileUpsertRecord {
+        root_token: "root".into(),
         path_rel: path.into(),
         size,
         mtime_unix: 1,

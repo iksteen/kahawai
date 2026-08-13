@@ -17,7 +17,12 @@ const CHUNK: usize = 256 * 1024;
 /// Resolve an OpenRead against the configured collections, refusing
 /// anything that escapes a collection root (NFR-4).
 pub fn resolve_path(collections: &[CollectionConfig], req: &OpenRead) -> Result<PathBuf> {
-    resolve_rel(collections, &req.collection_id, &req.path_rel)
+    resolve_rel(
+        collections,
+        &req.collection_id,
+        &req.root_token,
+        &req.path_rel,
+    )
 }
 
 /// Resolve a collection-relative path against the collection's roots,
@@ -25,28 +30,41 @@ pub fn resolve_path(collections: &[CollectionConfig], req: &OpenRead) -> Result<
 pub fn resolve_rel(
     collections: &[CollectionConfig],
     collection_id: &str,
+    root_token: &str,
     path_rel: &str,
 ) -> Result<PathBuf> {
     let col = collections
         .iter()
         .find(|c| c.name == collection_id)
         .with_context(|| format!("unknown collection {collection_id}"))?;
-    for root in &col.roots {
-        let root = match std::fs::canonicalize(root) {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
-        // Canonicalize the candidate too: symlinks and `..` both resolve,
-        // so a path that lands outside the root is rejected regardless of
-        // how it was spelled.
-        if let Ok(candidate) = std::fs::canonicalize(root.join(path_rel))
-            && candidate.starts_with(&root)
-            && candidate.is_file()
-        {
-            return Ok(candidate);
+    let roots: Vec<_> = col.resolved_roots().collect();
+    let configured = if root_token.is_empty() {
+        match roots.as_slice() {
+            [root] => root.clone(),
+            _ => bail!(
+                "legacy root-less operation is ambiguous in multi-root collection {collection_id}"
+            ),
         }
+    } else {
+        roots
+            .into_iter()
+            .find(|r| r.token == root_token)
+            .with_context(|| {
+                format!("unknown root token {root_token} in collection {collection_id}")
+            })?
+    };
+    let root = std::fs::canonicalize(&configured.path)
+        .with_context(|| format!("root unavailable: {}", configured.path.display()))?;
+    // Canonicalize the candidate too: symlinks and `..` both resolve,
+    // so a path that lands outside the exact root is rejected regardless of
+    // how it was spelled.
+    if let Ok(candidate) = std::fs::canonicalize(root.join(path_rel))
+        && candidate.starts_with(&root)
+        && candidate.is_file()
+    {
+        return Ok(candidate);
     }
-    bail!("path not found or outside collection roots: {path_rel}")
+    bail!("path not found or outside exact collection root: {path_rel}")
 }
 
 /// Open the byte channel and serve read requests for one lease.
@@ -138,11 +156,12 @@ mod tests {
         }]
     }
 
-    fn req(collection: &str, path: &str) -> OpenRead {
+    fn req(collection: &str, root: &Path, path: &str) -> OpenRead {
         OpenRead {
             lease_token: "t".into(),
             collection_id: collection.into(),
             path_rel: path.into(),
+            root_token: kahawai_core::media::root_token(root),
         }
     }
 
@@ -153,11 +172,21 @@ mod tests {
         std::fs::write(dir.path().join("sub/a.mkv"), b"x").unwrap();
         std::fs::write(dir.path().join("../escape.mkv"), b"x").ok();
 
-        assert!(resolve_path(&cols(dir.path()), &req("movies", "sub/a.mkv")).is_ok());
-        assert!(resolve_path(&cols(dir.path()), &req("movies", "../escape.mkv")).is_err());
-        assert!(resolve_path(&cols(dir.path()), &req("movies", "/etc/passwd")).is_err());
-        assert!(resolve_path(&cols(dir.path()), &req("movies", "missing.mkv")).is_err());
-        assert!(resolve_path(&cols(dir.path()), &req("other", "sub/a.mkv")).is_err());
+        assert!(resolve_path(&cols(dir.path()), &req("movies", dir.path(), "sub/a.mkv")).is_ok());
+        assert!(
+            resolve_path(
+                &cols(dir.path()),
+                &req("movies", dir.path(), "../escape.mkv")
+            )
+            .is_err()
+        );
+        assert!(
+            resolve_path(&cols(dir.path()), &req("movies", dir.path(), "/etc/passwd")).is_err()
+        );
+        assert!(
+            resolve_path(&cols(dir.path()), &req("movies", dir.path(), "missing.mkv")).is_err()
+        );
+        assert!(resolve_path(&cols(dir.path()), &req("other", dir.path(), "sub/a.mkv")).is_err());
     }
 
     #[test]
@@ -170,6 +199,6 @@ mod tests {
             dir.path().join("link.mkv"),
         )
         .unwrap();
-        assert!(resolve_path(&cols(dir.path()), &req("movies", "link.mkv")).is_err());
+        assert!(resolve_path(&cols(dir.path()), &req("movies", dir.path(), "link.mkv")).is_err());
     }
 }

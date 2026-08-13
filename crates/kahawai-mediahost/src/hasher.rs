@@ -32,17 +32,34 @@ pub enum JobMsg {
     UrgentImage(kahawai_proto::v1::ExtractImageSubs),
 }
 
-/// One deduped work queue (collection, path_rel) per tier.
+/// One deduped work queue (collection, root token, path_rel) per tier.
 #[derive(Default)]
 struct Tier {
-    q: VecDeque<(String, String)>,
-    seen: HashSet<(String, String)>,
+    q: VecDeque<(String, String, String)>,
+    seen: HashSet<(String, String, String)>,
 }
 
 impl Tier {
-    fn push(&mut self, collection_id: &str, paths: Vec<String>) {
-        for path in paths {
-            let key = (collection_id.to_string(), path);
+    fn push(
+        &mut self,
+        collection_id: &str,
+        mut sources: Vec<kahawai_proto::v1::SourcePath>,
+        legacy_paths: Vec<String>,
+    ) {
+        if sources.is_empty() {
+            sources.extend(legacy_paths.into_iter().map(|path_rel| {
+                kahawai_proto::v1::SourcePath {
+                    root_token: String::new(),
+                    path_rel,
+                }
+            }));
+        }
+        for source in sources {
+            let key = (
+                collection_id.to_string(),
+                source.root_token,
+                source.path_rel,
+            );
             if self.seen.insert(key.clone()) {
                 self.q.push_back(key);
             }
@@ -53,7 +70,7 @@ impl Tier {
 /// Route one message into its tier; returns true for urgent work.
 fn intake(
     msg: JobMsg,
-    urgent: &mut VecDeque<(String, String)>,
+    urgent: &mut VecDeque<(String, String, String)>,
     urgent_image: &mut VecDeque<kahawai_proto::v1::ExtractImageSubs>,
     ed2k: &mut Tier,
     subs: &mut Tier,
@@ -68,28 +85,28 @@ fn intake(
             true
         }
         JobMsg::Urgent(e) => {
-            urgent.push_back((e.collection_id, e.path_rel));
+            urgent.push_back((e.collection_id, e.root_token, e.path_rel));
             true
         }
         JobMsg::Hashlist(h) => {
-            ed2k.push(&h.collection_id, h.paths);
+            ed2k.push(&h.collection_id, h.sources, h.paths);
             false
         }
         JobMsg::SubsWorklist(w) => {
-            subs.push(&w.collection_id, w.paths);
+            subs.push(&w.collection_id, w.sources, w.paths);
             false
         }
         JobMsg::AttachmentsWorklist(w) => {
-            atts.push(&w.collection_id, w.paths);
+            atts.push(&w.collection_id, w.sources, w.paths);
             false
         }
         JobMsg::KeyframeWorklist(w) => {
             // Logged on receipt, mirroring the hub's "sending" line:
             // between them, a worklist that never arrives is one grep
             // rather than a guess.
-            tracing::info!(collection = %w.collection_id, files = w.paths.len(),
+            tracing::info!(collection = %w.collection_id, files = w.sources.len(),
                 "keyframe worklist received");
-            keys.push(&w.collection_id, w.paths);
+            keys.push(&w.collection_id, w.sources, w.paths);
             false
         }
     }
@@ -110,7 +127,7 @@ pub async fn run(
     collections: Vec<CollectionConfig>,
     activity: Activity,
 ) {
-    let mut urgent: VecDeque<(String, String)> = VecDeque::new();
+    let mut urgent: VecDeque<(String, String, String)> = VecDeque::new();
     let mut urgent_image: VecDeque<kahawai_proto::v1::ExtractImageSubs> = VecDeque::new();
     let mut ed2k = Tier::default();
     let mut subs = Tier::default();
@@ -155,14 +172,15 @@ pub async fn run(
 
         // Tier order: urgent (never idle-gated — the active lease IS the
         // requesting viewer) → ED2K → background subs.
-        if let Some((collection_id, path_rel)) = urgent.pop_front() {
-            extract_and_send(&collections, &collection_id, &path_rel, &tx).await;
+        if let Some((collection_id, root_token, path_rel)) = urgent.pop_front() {
+            extract_and_send(&collections, &collection_id, &root_token, &path_rel, &tx).await;
             continue;
         }
         if let Some(e) = urgent_image.pop_front() {
             extract_image_and_send(
                 &collections,
                 &e.collection_id,
+                &e.root_token,
                 &e.path_rel,
                 e.sub_index,
                 &tx,
@@ -170,9 +188,18 @@ pub async fn run(
             .await;
             continue;
         }
-        if let Some((collection_id, path_rel)) = ed2k.q.pop_front() {
-            match hash_one(&collections, &collection_id, &path_rel, &activity).await {
+        if let Some((collection_id, root_token, path_rel)) = ed2k.q.pop_front() {
+            match hash_one(
+                &collections,
+                &collection_id,
+                &root_token,
+                &path_rel,
+                &activity,
+            )
+            .await
+            {
                 Ok(mut fh) => {
+                    fh.root_token = root_token.clone();
                     fh.path_rel = path_rel.clone();
                     tracing::info!(collection = %collection_id, path = %fh.path_rel,
                         ed2k = %fh.ed2k_hex, crc_ok = fh.crc_ok || !fh.crc_checked, "ed2k computed");
@@ -190,7 +217,7 @@ pub async fn run(
                 Err(e) => tracing::debug!(collection = %collection_id, path = %path_rel,
                     error = format!("{e:#}"), "ed2k skipped"),
             }
-            ed2k.seen.remove(&(collection_id, path_rel));
+            ed2k.seen.remove(&(collection_id, root_token, path_rel));
             continue;
         }
         // Background tiers share the idle gate. Attachment declaration
@@ -208,7 +235,7 @@ pub async fn run(
                 None => (Bg::Subs, subs.q.pop_front()),
             },
         };
-        if let Some((collection_id, path_rel)) = job {
+        if let Some((collection_id, root_token, path_rel)) = job {
             // Idle gate before starting; the work itself is a bounded
             // local read (ponytail: can't pause a gst pipeline mid-walk).
             let mut preempted = false;
@@ -239,17 +266,30 @@ pub async fn run(
             };
             if preempted || !urgent.is_empty() {
                 // Preempted: put the background job back and loop.
-                tier.q.push_front((collection_id, path_rel));
+                tier.q.push_front((collection_id, root_token, path_rel));
                 continue;
             }
             match which {
-                Bg::Subs => extract_and_send(&collections, &collection_id, &path_rel, &tx).await,
-                Bg::Atts => declare_and_send(&collections, &collection_id, &path_rel, &tx).await,
+                Bg::Subs => {
+                    extract_and_send(&collections, &collection_id, &root_token, &path_rel, &tx)
+                        .await
+                }
+                Bg::Atts => {
+                    declare_and_send(&collections, &collection_id, &root_token, &path_rel, &tx)
+                        .await
+                }
                 Bg::Keyframe => {
-                    measure_keyframes_and_send(&collections, &collection_id, &path_rel, &tx).await
+                    measure_keyframes_and_send(
+                        &collections,
+                        &collection_id,
+                        &root_token,
+                        &path_rel,
+                        &tx,
+                    )
+                    .await
                 }
             }
-            tier.seen.remove(&(collection_id, path_rel));
+            tier.seen.remove(&(collection_id, root_token, path_rel));
         }
     }
 }
@@ -260,11 +300,12 @@ pub async fn run(
 async fn declare_and_send(
     collections: &[CollectionConfig],
     collection_id: &str,
+    root_token: &str,
     path_rel: &str,
     tx: &tokio::sync::mpsc::Sender<HostToHub>,
 ) {
     let result: anyhow::Result<(u64, String)> = async {
-        let path = crate::serve::resolve_rel(collections, collection_id, path_rel)?;
+        let path = crate::serve::resolve_rel(collections, collection_id, root_token, path_rel)?;
         let size = std::fs::metadata(&path)?.len();
         let atts = tokio::task::spawn_blocking(move || {
             kahawai_media::subindex::declare_attachments(&path)
@@ -290,6 +331,7 @@ async fn declare_and_send(
             path_rel: path_rel.to_string(),
             size,
             attachments_json,
+            root_token: root_token.to_string(),
         })),
     };
     let _ = tx.send(msg).await;
@@ -302,11 +344,12 @@ async fn declare_and_send(
 async fn measure_keyframes_and_send(
     collections: &[CollectionConfig],
     collection_id: &str,
+    root_token: &str,
     path_rel: &str,
     tx: &tokio::sync::mpsc::Sender<HostToHub>,
 ) {
     let result: anyhow::Result<(u64, Option<u32>)> = async {
-        let path = crate::serve::resolve_rel(collections, collection_id, path_rel)?;
+        let path = crate::serve::resolve_rel(collections, collection_id, root_token, path_rel)?;
         let size = std::fs::metadata(&path)?.len();
         let ms = tokio::task::spawn_blocking(move || {
             kahawai_media::subindex::max_keyframe_interval_ms(&path)
@@ -335,6 +378,7 @@ async fn measure_keyframes_and_send(
                 path_rel: path_rel.to_string(),
                 size,
                 max_keyframe_interval_ms: ms,
+                root_token: root_token.to_string(),
             },
         )),
     };
@@ -348,18 +392,20 @@ async fn measure_keyframes_and_send(
 async fn extract_image_and_send(
     collections: &[CollectionConfig],
     collection_id: &str,
+    root_token: &str,
     path_rel: &str,
     sub_index: u32,
     tx: &tokio::sync::mpsc::Sender<HostToHub>,
 ) {
     let started = std::time::Instant::now();
-    let (collections2, cid, prel) = (
+    let (collections2, cid, token, prel) = (
         collections.to_vec(),
         collection_id.to_string(),
+        root_token.to_string(),
         path_rel.to_string(),
     );
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-        let path = crate::serve::resolve_rel(&collections2, &cid, &prel)?;
+        let path = crate::serve::resolve_rel(&collections2, &cid, &token, &prel)?;
         // A `.idx` path means a VobSub sidecar pair, not a container:
         // `sub_index` is the track index INSIDE the idx, and the result
         // is shaped exactly like a demuxed S_VOBSUB track (idx text as
@@ -417,6 +463,7 @@ async fn extract_image_and_send(
             send_chunked(
                 tx,
                 collection_id,
+                root_token,
                 path_rel,
                 sub_index,
                 track.codec,
@@ -442,6 +489,7 @@ async fn extract_image_and_send(
                 error,
                 // One message, and it is the last one.
                 done: Some(true),
+                root_token: root_token.into(),
                 ..Default::default()
             }
         }
@@ -458,12 +506,13 @@ async fn extract_image_and_send(
 async fn extract_and_send(
     collections: &[CollectionConfig],
     collection_id: &str,
+    root_token: &str,
     path_rel: &str,
     tx: &tokio::sync::mpsc::Sender<HostToHub>,
 ) {
     let started = std::time::Instant::now();
     let result: anyhow::Result<(u64, Vec<(usize, kahawai_media::subtitles::Extracted)>)> = async {
-        let path = crate::serve::resolve_rel(collections, collection_id, path_rel)?;
+        let path = crate::serve::resolve_rel(collections, collection_id, root_token, path_rel)?;
         let size = std::fs::metadata(&path)?.len();
         let tracks = tokio::task::spawn_blocking(move || {
             // Sparse first (index-driven reads, no demux); trust it
@@ -503,6 +552,7 @@ async fn extract_and_send(
                     })
                     .collect(),
                 error: String::new(),
+                root_token: root_token.to_string(),
             }
         }
         Err(e) => {
@@ -514,6 +564,7 @@ async fn extract_and_send(
                 size: 0,
                 tracks: vec![],
                 error: format!("{e:#}"),
+                root_token: root_token.to_string(),
             }
         }
     };
@@ -527,10 +578,11 @@ async fn extract_and_send(
 async fn hash_one(
     collections: &[CollectionConfig],
     collection_id: &str,
+    root_token: &str,
     path_rel: &str,
     activity: &Activity,
 ) -> anyhow::Result<FileHash> {
-    let path = crate::serve::resolve_rel(collections, collection_id, path_rel)?;
+    let path = crate::serve::resolve_rel(collections, collection_id, root_token, path_rel)?;
     let claimed_crc = path
         .file_name()
         .and_then(|n| n.to_str())
@@ -572,6 +624,7 @@ async fn hash_one(
         size,
         crc_checked: claimed_crc.is_some(),
         crc_ok: crc_ok.unwrap_or(false),
+        root_token: String::new(), // caller fills
     })
 }
 
@@ -586,9 +639,11 @@ const SETS_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 /// Send one track's display sets as a run of messages, the last marked
 /// done. The header fields ride on every chunk so the receiver can key
 /// them without remembering an opening message.
+#[allow(clippy::too_many_arguments)] // one complete wire source/track identity
 async fn send_chunked(
     tx: &tokio::sync::mpsc::Sender<HostToHub>,
     collection_id: &str,
+    root_token: &str,
     path_rel: &str,
     sub_index: u32,
     codec: String,
@@ -617,6 +672,7 @@ async fn send_chunked(
             blocks: std::mem::take(&mut chunk),
             error: String::new(),
             done: Some(last),
+            root_token: root_token.into(),
         };
         bytes = 0;
         if tx
@@ -650,6 +706,7 @@ async fn send_chunked(
                         codec,
                         codec_private,
                         done: Some(true),
+                        root_token: root_token.into(),
                         ..Default::default()
                     },
                 )),

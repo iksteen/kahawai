@@ -95,8 +95,10 @@ async fn backfill_norm_artist(pool: &SqlitePool) -> Result<()> {
 /// `norm_artist`: the parse is Rust, so the migration could not do it,
 /// and this is a no-op after its first run.
 async fn backfill_revision(pool: &SqlitePool) -> Result<()> {
-    let missing: Vec<(String, String, String)> = sqlx::query_as(
-        "SELECT module_id, collection_id, path_rel FROM files WHERE revision IS NULL",
+    let missing: Vec<(String, String, String, String)> = sqlx::query_as(
+        "SELECT module_id, collection_id, path_rel,
+                CASE WHEN source_path = '' THEN path_rel ELSE source_path END
+         FROM files WHERE revision IS NULL",
     )
     .fetch_all(pool)
     .await?;
@@ -104,14 +106,14 @@ async fn backfill_revision(pool: &SqlitePool) -> Result<()> {
         return Ok(());
     }
     let mut tx = pool.begin().await?;
-    for (m, c, path) in &missing {
+    for (m, c, key, source_path) in &missing {
         sqlx::query(
             "UPDATE files SET revision = ? WHERE module_id = ? AND collection_id = ? AND path_rel = ?",
         )
-        .bind(kahawai_core::names::release_revision(path) as i64)
+        .bind(kahawai_core::names::release_revision(source_path) as i64)
         .bind(m)
         .bind(c)
-        .bind(path)
+        .bind(key)
         .execute(&mut *tx)
         .await?;
     }

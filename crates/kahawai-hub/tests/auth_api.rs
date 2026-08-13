@@ -353,6 +353,7 @@ async fn auth_harness() -> (
 async fn items_filter_by_library() {
     use kahawai_hub::registry::FileUpsertRecord;
     let rec = |path: &str, size: u64| FileUpsertRecord {
+        root_token: "root".into(),
         path_rel: path.into(),
         size,
         mtime_unix: 1,

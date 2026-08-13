@@ -18,6 +18,7 @@ use kahawai_hub::sessions::{Sessions, SourceOffline};
 
 fn rec(path: &str) -> FileUpsertRecord {
     FileUpsertRecord {
+        root_token: "root".into(),
         path_rel: path.into(),
         size: 1_000_000,
         mtime_unix: 1,

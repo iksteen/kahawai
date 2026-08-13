@@ -1,5 +1,12 @@
 //! Registry (HUB-1): connection state in memory, everything else in SQLite
 //! so a hub restart recovers without a rescan (NFR-3).
+//!
+//! Scan-derived source identity is `(module_id, collection_id, root_token,
+//! source_path)`. Historical relational columns named `path_rel` contain an
+//! NUL-prefixed injective encoding of `(root_token, source_path)` so the existing
+//! indexed joins remain useful. NUL cannot occur in a filesystem path, so this
+//! namespace cannot collide with a legacy relative path; the explicit columns are authoritative and the
+//! byte plane always receives them separately.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -21,6 +28,7 @@ pub struct SatelliteState {
 }
 
 pub struct FileUpsertRecord {
+    pub root_token: String,
     pub path_rel: String,
     pub size: u64,
     pub mtime_unix: i64,
@@ -28,6 +36,23 @@ pub struct FileUpsertRecord {
     pub tail_xxh3: u64,
     pub oshash: u64,
     pub streams_json: String,
+}
+
+/// Injective relational key for an exact root-relative source.
+///
+/// Both components are NUL-free: root tokens use a fixed ASCII grammar and
+/// operating systems reject NUL in paths. The leading NUL also makes collision
+/// with every legacy bare relative-path key structurally impossible.
+pub fn source_key(root_token: &str, source_path: &str) -> String {
+    debug_assert!(!root_token.contains('\0'));
+    debug_assert!(!source_path.contains('\0'));
+    format!("\0{root_token}\0{source_path}")
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourcePath {
+    pub root_token: String,
+    pub path_rel: String,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -393,7 +418,11 @@ impl Registry {
     /// Copy-forward first: identical content identity elsewhere (renames,
     /// moves, duplicates) donates its hash — full reads happen at most
     /// once per content identity, with the files table as the journal.
-    pub async fn ed2k_worklist(&self, module_id: &str, collection_id: &str) -> Result<Vec<String>> {
+    pub async fn ed2k_worklist(
+        &self,
+        module_id: &str,
+        collection_id: &str,
+    ) -> Result<Vec<SourcePath>> {
         let media_type: Option<String> = sqlx::query_scalar(
             "SELECT media_type FROM collections WHERE module_id = ? AND collection_id = ?",
         )
@@ -421,16 +450,33 @@ impl Registry {
         .bind(collection_id)
         .execute(&self.db)
         .await?;
-        let paths = sqlx::query_scalar(
-            "SELECT path_rel FROM files
-             WHERE module_id = ? AND collection_id = ? AND ed2k IS NULL
-             ORDER BY path_rel",
-        )
+        self.source_worklist("ed2k IS NULL", module_id, collection_id)
+            .await
+    }
+
+    async fn source_worklist(
+        &self,
+        predicate: &'static str,
+        module_id: &str,
+        collection_id: &str,
+    ) -> Result<Vec<SourcePath>> {
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SELECT root_token, source_path FROM files
+             WHERE module_id = ? AND collection_id = ? AND root_token <> ''
+               AND ({predicate})
+             ORDER BY root_token, source_path"
+        )))
         .bind(module_id)
         .bind(collection_id)
         .fetch_all(&self.db)
         .await?;
-        Ok(paths)
+        Ok(rows
+            .into_iter()
+            .map(|r| SourcePath {
+                root_token: r.get("root_token"),
+                path_rel: r.get("source_path"),
+            })
+            .collect())
     }
 
     /// MH-9: store a reported hash — only if the row still describes the
@@ -439,17 +485,20 @@ impl Registry {
         &self,
         module_id: &str,
         collection_id: &str,
+        root_token: &str,
         path_rel: &str,
         ed2k: &str,
         size: u64,
     ) -> Result<bool> {
         let n = sqlx::query(
             "UPDATE files SET ed2k = ?
-             WHERE module_id = ? AND collection_id = ? AND path_rel = ? AND size = ?",
+             WHERE module_id = ? AND collection_id = ?
+               AND root_token = ? AND source_path = ? AND size = ?",
         )
         .bind(ed2k)
         .bind(module_id)
         .bind(collection_id)
+        .bind(root_token)
         .bind(path_rel)
         .bind(size as i64)
         .execute(&self.db)
@@ -466,7 +515,7 @@ impl Registry {
         &self,
         module_id: &str,
         collection_id: &str,
-    ) -> Result<Vec<String>> {
+    ) -> Result<Vec<SourcePath>> {
         let media_type: Option<String> = sqlx::query_scalar(
             "SELECT media_type FROM collections WHERE module_id = ? AND collection_id = ?",
         )
@@ -480,18 +529,13 @@ impl Registry {
         ) {
             return Ok(Vec::new());
         }
-        let paths = sqlx::query_scalar(
-            "SELECT path_rel FROM files
-             WHERE module_id = ? AND collection_id = ?
-               AND json_extract(streams_json, '$.container') IN ('matroska', 'webm')
-               AND json_extract(streams_json, '$.attachments') IS NULL
-             ORDER BY path_rel",
+        self.source_worklist(
+            "json_extract(streams_json, '$.container') IN ('matroska', 'webm')
+             AND json_extract(streams_json, '$.attachments') IS NULL",
+            module_id,
+            collection_id,
         )
-        .bind(module_id)
-        .bind(collection_id)
-        .fetch_all(&self.db)
-        .await?;
-        Ok(paths)
+        .await
     }
 
     /// Files whose longest keyframe gap was never measured — rows
@@ -506,19 +550,14 @@ impl Registry {
         &self,
         module_id: &str,
         collection_id: &str,
-    ) -> Result<Vec<String>> {
-        let paths = sqlx::query_scalar(
-            "SELECT path_rel FROM files
-             WHERE module_id = ? AND collection_id = ?
-               AND json_extract(streams_json, '$.video[0].codec') IS NOT NULL
-               AND json_extract(streams_json, '$.video[0].max_keyframe_interval_ms') IS NULL
-             ORDER BY path_rel",
+    ) -> Result<Vec<SourcePath>> {
+        self.source_worklist(
+            "json_extract(streams_json, '$.video[0].codec') IS NOT NULL
+             AND json_extract(streams_json, '$.video[0].max_keyframe_interval_ms') IS NULL",
+            module_id,
+            collection_id,
         )
-        .bind(module_id)
-        .bind(collection_id)
-        .fetch_all(&self.db)
-        .await?;
-        Ok(paths)
+        .await
     }
 
     /// Store a measured keyframe interval, size-guarded like the others.
@@ -530,6 +569,7 @@ impl Registry {
         &self,
         module_id: &str,
         collection_id: &str,
+        root_token: &str,
         path_rel: &str,
         size: u64,
         ms: Option<u32>,
@@ -538,12 +578,14 @@ impl Registry {
             "UPDATE files
                 SET streams_json = json_set(streams_json,
                     '$.video[0].max_keyframe_interval_ms', ?)
-              WHERE module_id = ? AND collection_id = ? AND path_rel = ? AND size = ?
+              WHERE module_id = ? AND collection_id = ?
+                AND root_token = ? AND source_path = ? AND size = ?
                 AND json_extract(streams_json, '$.video[0].codec') IS NOT NULL",
         )
         .bind(ms.map(|v| v as i64).unwrap_or(-1))
         .bind(module_id)
         .bind(collection_id)
+        .bind(root_token)
         .bind(path_rel)
         .bind(size as i64)
         .execute(&self.db)
@@ -559,6 +601,7 @@ impl Registry {
         &self,
         module_id: &str,
         collection_id: &str,
+        root_token: &str,
         path_rel: &str,
         size: u64,
         attachments_json: &str,
@@ -569,11 +612,13 @@ impl Registry {
         anyhow::ensure!(parsed.is_ok(), "malformed attachments json");
         let n = sqlx::query(
             "UPDATE files SET streams_json = json_set(streams_json, '$.attachments', json(?))
-             WHERE module_id = ? AND collection_id = ? AND path_rel = ? AND size = ?",
+             WHERE module_id = ? AND collection_id = ?
+               AND root_token = ? AND source_path = ? AND size = ?",
         )
         .bind(attachments_json)
         .bind(module_id)
         .bind(collection_id)
+        .bind(root_token)
         .bind(path_rel)
         .bind(size as i64)
         .execute(&self.db)
@@ -585,7 +630,11 @@ impl Registry {
     /// Efficiency ladder step 2: video-collection files with embedded
     /// text subtitle tracks not yet extracted — the background pre-warm
     /// worklist, drained below ED2K on the mediahost.
-    pub async fn subs_worklist(&self, module_id: &str, collection_id: &str) -> Result<Vec<String>> {
+    pub async fn subs_worklist(
+        &self,
+        module_id: &str,
+        collection_id: &str,
+    ) -> Result<Vec<SourcePath>> {
         let media_type: Option<String> = sqlx::query_scalar(
             "SELECT media_type FROM collections WHERE module_id = ? AND collection_id = ?",
         )
@@ -599,20 +648,15 @@ impl Registry {
         ) {
             return Ok(Vec::new());
         }
-        let paths = sqlx::query_scalar(
-            "SELECT path_rel FROM files
-             WHERE module_id = ? AND collection_id = ? AND subs_extracted = 0
-               AND EXISTS (
+        self.source_worklist(
+            "subs_extracted = 0 AND EXISTS (
                  SELECT 1 FROM json_each(json_extract(streams_json, '$.subtitles')) je
                  WHERE json_extract(je.value, '$.format')
-                       IN ('ass','ssa','srt','subrip','text','vtt','webvtt'))
-             ORDER BY path_rel",
+                       IN ('ass','ssa','srt','subrip','text','vtt','webvtt'))",
+            module_id,
+            collection_id,
         )
-        .bind(module_id)
-        .bind(collection_id)
-        .fetch_all(&self.db)
-        .await?;
-        Ok(paths)
+        .await
     }
 
     /// Mark a file's subtitles extracted. `size` Some → guarded like
@@ -623,16 +667,19 @@ impl Registry {
         &self,
         module_id: &str,
         collection_id: &str,
+        root_token: &str,
         path_rel: &str,
         size: Option<u64>,
     ) -> Result<bool> {
         let n = match size {
             Some(size) => sqlx::query(
                 "UPDATE files SET subs_extracted = 1
-                 WHERE module_id = ? AND collection_id = ? AND path_rel = ? AND size = ?",
+                 WHERE module_id = ? AND collection_id = ?
+                   AND root_token = ? AND source_path = ? AND size = ?",
             )
             .bind(module_id)
             .bind(collection_id)
+            .bind(root_token)
             .bind(path_rel)
             .bind(size as i64)
             .execute(&self.db)
@@ -640,10 +687,12 @@ impl Registry {
             .rows_affected(),
             None => sqlx::query(
                 "UPDATE files SET subs_extracted = 1
-                 WHERE module_id = ? AND collection_id = ? AND path_rel = ?",
+                 WHERE module_id = ? AND collection_id = ?
+                   AND root_token = ? AND source_path = ?",
             )
             .bind(module_id)
             .bind(collection_id)
+            .bind(root_token)
             .bind(path_rel)
             .execute(&self.db)
             .await?
@@ -908,22 +957,271 @@ impl Registry {
         media_type: &str,
         roots: &[String],
     ) -> Result<()> {
+        let exact_roots: Vec<(String, String)> = roots
+            .iter()
+            .map(|path| {
+                let path = std::path::Path::new(path);
+                let normalized =
+                    kahawai_core::media::normalize_root_path(path, std::path::Path::new("/"))
+                        .map_err(anyhow::Error::msg)?;
+                anyhow::ensure!(
+                    path.is_absolute() && normalized == path,
+                    "mediahost announced non-normalized root {}; upgrade it to protocol 2.4",
+                    path.display()
+                );
+                Ok((
+                    kahawai_core::media::root_token(&normalized),
+                    path.to_string_lossy().into_owned(),
+                ))
+            })
+            .collect::<Result<_>>()?;
+        let mut tokens = std::collections::HashMap::<&str, &str>::new();
+        for (token, path) in &exact_roots {
+            if let Some(old) = tokens.insert(token, path) {
+                anyhow::ensure!(
+                    old == path,
+                    "root token {token} names both {old} and {path}"
+                );
+            }
+        }
+
+        let mut tx = self.db.begin_with("BEGIN IMMEDIATE").await?;
+        // The path is persisted beside the digest so even a cryptographic
+        // collision cannot silently retarget existing source identities.
+        // Check before the collection row is replaced, including its previous
+        // announcement.
+        let persisted: Vec<String> = sqlx::query_scalar("SELECT exact_roots_json FROM collections")
+            .fetch_all(&mut *tx)
+            .await?;
+        for json in persisted {
+            for root in serde_json::from_str::<Vec<serde_json::Value>>(&json)
+                .context("decoding persisted exact collection roots")?
+            {
+                let (Some(token), Some(path)) = (
+                    root.get("token").and_then(serde_json::Value::as_str),
+                    root.get("path").and_then(serde_json::Value::as_str),
+                ) else {
+                    continue;
+                };
+                if let Some((_, announced_path)) =
+                    exact_roots.iter().find(|(announced, _)| announced == token)
+                {
+                    anyhow::ensure!(
+                        announced_path == path,
+                        "root token {token} was previously stored for {path}, not {announced_path}"
+                    );
+                }
+            }
+        }
         sqlx::query(
-            "INSERT INTO collections (module_id, collection_id, media_type, roots_json)
-             VALUES (?, ?, ?, ?)
+            "INSERT INTO collections
+                (module_id, collection_id, media_type, roots_json, exact_roots_json)
+             VALUES (?, ?, ?, ?, ?)
              ON CONFLICT (module_id, collection_id) DO UPDATE
-             SET media_type = excluded.media_type, roots_json = excluded.roots_json",
+             SET media_type = excluded.media_type, roots_json = excluded.roots_json,
+                 exact_roots_json = excluded.exact_roots_json",
         )
         .bind(module_id)
         .bind(collection_id)
         .bind(media_type)
         .bind(serde_json::to_string(roots)?)
-        .execute(&self.db)
+        .bind(serde_json::to_string(
+            &exact_roots
+                .iter()
+                .map(|(token, path)| serde_json::json!({"token": token, "path": path}))
+                .collect::<Vec<_>>(),
+        )?)
+        .execute(&mut *tx)
         .await?;
+
+        // A single configured root proves every legacy row's root without
+        // touching media or changing the collection generation. Convert all
+        // source-bearing tables in one transaction. Multi-root legacy rows
+        // remain unresolved and cannot be read or reconciled by root order.
+        if let [(root_token, _)] = exact_roots.as_slice() {
+            let rows: Vec<String> = sqlx::query_scalar(
+                "SELECT path_rel FROM files
+                 WHERE module_id = ? AND collection_id = ? AND root_token = ''",
+            )
+            .bind(module_id)
+            .bind(collection_id)
+            .fetch_all(&mut *tx)
+            .await?;
+            for legacy_path in rows {
+                let key = source_key(root_token, &legacy_path);
+                sqlx::query(
+                    "UPDATE files SET path_rel = ?, root_token = ?, source_path = ?
+                     WHERE module_id = ? AND collection_id = ? AND path_rel = ?
+                       AND root_token = ''",
+                )
+                .bind(&key)
+                .bind(root_token)
+                .bind(&legacy_path)
+                .bind(module_id)
+                .bind(collection_id)
+                .bind(&legacy_path)
+                .execute(&mut *tx)
+                .await?;
+                sqlx::query(
+                    "UPDATE item_sources SET path_rel = ?, root_token = ?, source_path = ?
+                     WHERE module_id = ? AND collection_id = ? AND path_rel = ?
+                       AND root_token = ''",
+                )
+                .bind(&key)
+                .bind(root_token)
+                .bind(&legacy_path)
+                .bind(module_id)
+                .bind(collection_id)
+                .bind(&legacy_path)
+                .execute(&mut *tx)
+                .await?;
+                sqlx::query(
+                    "UPDATE subtitle_tracks SET path_rel = ?, root_token = ?, source_path = ?
+                     WHERE module_id = ? AND collection_id = ? AND path_rel = ?
+                       AND COALESCE(root_token, '') = ''",
+                )
+                .bind(&key)
+                .bind(root_token)
+                .bind(&legacy_path)
+                .bind(module_id)
+                .bind(collection_id)
+                .bind(&legacy_path)
+                .execute(&mut *tx)
+                .await?;
+                sqlx::query(
+                    "UPDATE image_set_failures
+                     SET path_rel = ?, root_token = ?, source_path = ?
+                     WHERE module_id = ? AND collection_id = ? AND path_rel = ?
+                       AND root_token = ''",
+                )
+                .bind(&key)
+                .bind(root_token)
+                .bind(&legacy_path)
+                .bind(module_id)
+                .bind(collection_id)
+                .bind(&legacy_path)
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
+        tx.commit().await?;
         tracing::info!(%module_id, collection = collection_id, media_type, "collection announced");
         self.ensure_library(module_id, collection_id, media_type)
             .await?;
         Ok(())
+    }
+
+    pub async fn unresolved_legacy_sources(
+        &self,
+        module_id: &str,
+        collection_id: &str,
+    ) -> Result<Vec<kahawai_proto::v1::LegacySource>> {
+        let rows = sqlx::query(
+            "SELECT path_rel, size, head_xxh3, tail_xxh3, oshash FROM files
+             WHERE module_id = ? AND collection_id = ? AND root_token = ''",
+        )
+        .bind(module_id)
+        .bind(collection_id)
+        .fetch_all(&self.db)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| kahawai_proto::v1::LegacySource {
+                path_rel: r.get("path_rel"),
+                size: r.get::<i64, _>("size") as u64,
+                head_xxh3: r.get::<i64, _>("head_xxh3") as u64,
+                tail_xxh3: r.get::<i64, _>("tail_xxh3") as u64,
+                oshash: r.get::<i64, _>("oshash") as u64,
+            })
+            .collect())
+    }
+
+    pub async fn adopt_legacy_source(
+        &self,
+        module_id: &str,
+        collection_id: &str,
+        root_token: &str,
+        legacy_path: &str,
+    ) -> Result<()> {
+        self.resolve_root_token(module_id, collection_id, root_token)
+            .await?;
+        let key = source_key(root_token, legacy_path);
+        let mut tx = self.db.begin_with("BEGIN IMMEDIATE").await?;
+        let changed = sqlx::query(
+            "UPDATE files SET path_rel = ?, root_token = ?, source_path = ?
+             WHERE module_id = ? AND collection_id = ? AND path_rel = ? AND root_token = ''",
+        )
+        .bind(&key)
+        .bind(root_token)
+        .bind(legacy_path)
+        .bind(module_id)
+        .bind(collection_id)
+        .bind(legacy_path)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        anyhow::ensure!(
+            changed == 1,
+            "legacy source vanished or was already adopted"
+        );
+        for table in ["item_sources", "subtitle_tracks", "image_set_failures"] {
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "UPDATE {table} SET path_rel = ?, root_token = ?, source_path = ?
+                 WHERE module_id = ? AND collection_id = ? AND path_rel = ?
+                   AND COALESCE(root_token, '') = ''"
+            )))
+            .bind(&key)
+            .bind(root_token)
+            .bind(legacy_path)
+            .bind(module_id)
+            .bind(collection_id)
+            .bind(legacy_path)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Validate an exact token, or adopt a legacy root-less operation when the
+    /// announced collection has exactly one root. Ambiguous multi-root legacy
+    /// traffic is an actionable upgrade error, never a root-order lookup.
+    pub async fn resolve_root_token(
+        &self,
+        module_id: &str,
+        collection_id: &str,
+        supplied: &str,
+    ) -> Result<String> {
+        let json: Option<String> = sqlx::query_scalar(
+            "SELECT exact_roots_json FROM collections
+             WHERE module_id = ? AND collection_id = ?",
+        )
+        .bind(module_id)
+        .bind(collection_id)
+        .fetch_optional(&self.db)
+        .await?;
+        let roots: Vec<serde_json::Value> = json
+            .as_deref()
+            .and_then(|v| serde_json::from_str(v).ok())
+            .unwrap_or_default();
+        if !supplied.is_empty() {
+            anyhow::ensure!(
+                roots
+                    .iter()
+                    .any(|r| r.get("token").and_then(|v| v.as_str()) == Some(supplied)),
+                "unknown root token {supplied} for {module_id}/{collection_id}"
+            );
+            return Ok(supplied.to_string());
+        }
+        anyhow::ensure!(
+            roots.len() == 1,
+            "legacy root-less operation for multi-root collection {module_id}/{collection_id}; upgrade the mediahost"
+        );
+        Ok(roots[0]
+            .get("token")
+            .and_then(|v| v.as_str())
+            .context("announced root has no token")?
+            .to_string())
     }
 
     /// Every collection lives in at least one library: on first sight,
@@ -1085,6 +1383,34 @@ impl Registry {
     }
 
     /// All known collections (for the admin attach picker).
+    pub async fn collection_root_count(
+        &self,
+        module_id: &str,
+        collection_id: &str,
+    ) -> Result<usize> {
+        Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT COALESCE(json_array_length(exact_roots_json), 0)
+             FROM collections WHERE module_id = ? AND collection_id = ?",
+        )
+        .bind(module_id)
+        .bind(collection_id)
+        .fetch_optional(&self.db)
+        .await?
+        .unwrap_or(0) as usize)
+    }
+
+    pub async fn module_has_multi_root_collection(&self, module_id: &str) -> Result<bool> {
+        Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT EXISTS (
+                SELECT 1 FROM collections
+                 WHERE module_id = ? AND json_array_length(roots_json) > 1)",
+        )
+        .bind(module_id)
+        .fetch_one(&self.db)
+        .await?
+            != 0)
+    }
+
     pub async fn collections_overview(&self) -> Result<Vec<serde_json::Value>> {
         let rows = sqlx::query(
             "SELECT c.module_id, c.collection_id, c.media_type, s.name AS host_name
@@ -1135,12 +1461,15 @@ impl Registry {
         let mut tx = self.db.begin().await?;
         let n = files.len();
         for f in files {
+            anyhow::ensure!(!f.root_token.is_empty(), "file record has no root token");
+            let key = source_key(&f.root_token, &f.path_rel);
             sqlx::query(
                 "INSERT INTO files
-                   (module_id, collection_id, path_rel, size, mtime_unix,
-                    head_xxh3, tail_xxh3, oshash, streams_json, revision)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   (module_id, collection_id, path_rel, root_token, source_path,
+                    size, mtime_unix, head_xxh3, tail_xxh3, oshash, streams_json, revision)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                  ON CONFLICT (module_id, collection_id, path_rel) DO UPDATE SET
+                   root_token = excluded.root_token, source_path = excluded.source_path,
                    revision = excluded.revision,
                    ed2k = CASE WHEN excluded.size = files.size
                                 AND excluded.mtime_unix = files.mtime_unix
@@ -1154,6 +1483,8 @@ impl Registry {
             )
             .bind(module_id)
             .bind(collection_id)
+            .bind(&key)
+            .bind(&f.root_token)
             .bind(&f.path_rel)
             .bind(f.size as i64)
             .bind(f.mtime_unix)
@@ -1446,13 +1777,17 @@ impl Registry {
 
             if let Some(item_id) = resolved_item {
                 sqlx::query(
-                    "INSERT INTO item_sources (module_id, collection_id, path_rel, item_id, part)
-                     VALUES (?, ?, ?, ?, ?)
+                    "INSERT INTO item_sources
+                        (module_id, collection_id, path_rel, root_token, source_path, item_id, part)
+                     VALUES (?, ?, ?, ?, ?, ?, ?)
                      ON CONFLICT (module_id, collection_id, path_rel) DO UPDATE
-                     SET item_id = excluded.item_id, part = excluded.part",
+                     SET root_token = excluded.root_token, source_path = excluded.source_path,
+                         item_id = excluded.item_id, part = excluded.part",
                 )
                 .bind(module_id)
                 .bind(collection_id)
+                .bind(&key)
+                .bind(&f.root_token)
                 .bind(&f.path_rel)
                 .bind(&item_id)
                 .bind(source_part)
@@ -1470,7 +1805,9 @@ impl Registry {
                         &item_id,
                         module_id,
                         collection_id,
+                        &f.root_token,
                         &f.path_rel,
+                        &key,
                         &info,
                     )
                     .await?;
@@ -1589,7 +1926,7 @@ impl Registry {
         collection_id: &str,
     ) -> Result<Vec<kahawai_proto::v1::FileStat>> {
         let rows = sqlx::query(
-            "SELECT path_rel, size, mtime_unix,
+            "SELECT root_token, source_path, size, mtime_unix,
                     COALESCE(json_extract(streams_json, '$.nfo'), '') AS nfo,
                     COALESCE(json_extract(streams_json, '$.artwork'), '') AS art,
                     COALESCE(json_extract(streams_json, '$.external_subtitles'), '[]') AS subs
@@ -1613,7 +1950,8 @@ impl Registry {
                 subs.sort();
                 subs.dedup();
                 kahawai_proto::v1::FileStat {
-                    path_rel: r.get("path_rel"),
+                    path_rel: r.get("source_path"),
+                    root_token: r.get("root_token"),
                     size: r.get::<i64, _>("size") as u64,
                     mtime_unix: r.get("mtime_unix"),
                     sidecars: Self::sidecar_sig(

@@ -73,6 +73,7 @@ struct SlotOccupant {
     item_id: String,
     module_id: String,
     collection_id: String,
+    source_key: String,
     path: String,
     season: Option<i64>,
     episode: i64,
@@ -277,7 +278,7 @@ pub fn pick_candidate<'c>(
 /// doc calls a standing tax.
 pub const GENERIC_SELECTION_SQL: &str =
             "SELECT i.id, i.kind, i.title, i.norm_title, i.year,
-                    (SELECT s.path_rel FROM item_sources s
+                    (SELECT s.source_path FROM item_sources s
                      WHERE s.item_id = i.id LIMIT 1) AS src_path,
                     -- Movies and series have separate chains (HUB-5), so
                     -- the walk needs each item's OWN media type.
@@ -1789,7 +1790,8 @@ impl Enricher {
     /// work; a file whose aid matches nothing stays bare and is logged.
     pub async fn bind_bare_files(&self, db: &sqlx::SqlitePool) -> Result<usize> {
         let rows = sqlx::query(
-            "SELECT f.module_id, f.collection_id, f.path_rel, c.aid, c.epno
+            "SELECT f.module_id, f.collection_id, f.path_rel AS source_key,
+                    f.root_token, f.source_path, c.aid, c.epno
              FROM files f
              JOIN collections col ON (col.module_id, col.collection_id)
                                    = (f.module_id, f.collection_id)
@@ -1806,7 +1808,7 @@ impl Enricher {
         let mut bound = 0;
         for r in rows {
             let (aid, epno) = (r.get::<i64, _>("aid"), r.get::<String, _>("epno"));
-            let path: String = r.get("path_rel");
+            let path: String = r.get("source_path");
             let owner_row = sqlx::query_as::<_, (String, String)>(
                 "SELECT i.id, i.kind FROM anime_ids a JOIN items i ON i.id = a.item_id
                   WHERE a.anidb_id = ? LIMIT 1",
@@ -1883,12 +1885,15 @@ impl Enricher {
                 }
             };
             sqlx::query(
-                "INSERT INTO item_sources (item_id, module_id, collection_id, path_rel)
-                 VALUES (?, ?, ?, ?)",
+                "INSERT INTO item_sources
+                    (item_id, module_id, collection_id, path_rel, root_token, source_path)
+                 VALUES (?, ?, ?, ?, ?, ?)",
             )
             .bind(&target)
             .bind(r.get::<String, _>("module_id"))
             .bind(r.get::<String, _>("collection_id"))
+            .bind(r.get::<String, _>("source_key"))
+            .bind(r.get::<String, _>("root_token"))
             .bind(&path)
             .execute(db)
             .await?;
@@ -1981,8 +1986,8 @@ impl Enricher {
         show_aid: u32,
     ) -> Result<Vec<EpisodeRebind>> {
         let rows = sqlx::query(
-            "SELECT s.module_id, s.collection_id, s.path_rel,
-                    ep.id AS item_id, ep.title, ep.norm_title, ep.season, ep.episode,
+            "SELECT s.module_id, s.collection_id, s.path_rel AS source_key,
+                    s.source_path, ep.id AS item_id, ep.title, ep.norm_title, ep.season, ep.episode,
                     c.aid, c.epno, c.eid
              FROM item_sources s
              JOIN items ep ON ep.id = s.item_id
@@ -2003,7 +2008,7 @@ impl Enricher {
         let mut elsewhere: Vec<SlotOccupant> = Vec::new();
         for r in rows {
             let (aid, epno) = (r.get::<i64, _>("aid") as u32, r.get::<String, _>("epno"));
-            let path: String = r.get("path_rel");
+            let path: String = r.get("source_path");
             if aid != show_aid {
                 // Declined by measurement, not by omission: AniDB splits a
                 // televised series into an entry per season, so most files
@@ -2018,6 +2023,7 @@ impl Enricher {
                     item_id: r.get("item_id"),
                     module_id: r.get("module_id"),
                     collection_id: r.get("collection_id"),
+                    source_key: r.get("source_key"),
                     season: r.get::<Option<i64>, _>("season"),
                     episode: r.get::<i64, _>("episode"),
                     eid: r.get::<Option<i64>, _>("eid"),
@@ -2091,7 +2097,7 @@ impl Enricher {
             .bind(&target_id)
             .bind(r.get::<String, _>("module_id"))
             .bind(r.get::<String, _>("collection_id"))
-            .bind(&path)
+            .bind(r.get::<String, _>("source_key"))
             .execute(&mut *tx)
             .await?;
             // Watch state follows the FILE — the user watched this
@@ -2214,7 +2220,7 @@ impl Enricher {
                 .bind(&id)
                 .bind(&o.module_id)
                 .bind(&o.collection_id)
-                .bind(&o.path)
+                .bind(&o.source_key)
                 .execute(&mut *tx)
                 .await?;
                 // Watch state follows the FILE, as everywhere else here:
@@ -3947,7 +3953,7 @@ impl crate::providers::Provider for LocalProvider {
         let mut fields = crate::providers::Fields {
             poster_path: art
                 .as_ref()
-                .map(|(_, _, p)| format!("{}{p}", crate::artwork::LOCAL)),
+                .map(|(_, _, _, p)| format!("{}{p}", crate::artwork::LOCAL)),
             ..Default::default()
         };
         // Empty id on purpose: a cover is a field, not an identity. It
@@ -3956,10 +3962,16 @@ impl crate::providers::Provider for LocalProvider {
         // become the item's match. A .nfo does state that, and sets one.
         let mut provider_id = String::new();
         // A .nfo is a lease read, so only when the scan saw one.
-        if let Some((module_id, collection_id, nfo_rel)) = nfo {
+        if let Some((module_id, collection_id, root_token, nfo_rel)) = nfo {
             let lease = self
                 .sessions
-                .open_lease(&self.registry, &module_id, &collection_id, &nfo_rel)
+                .open_lease(
+                    &self.registry,
+                    &module_id,
+                    &collection_id,
+                    &root_token,
+                    &nfo_rel,
+                )
                 .await?;
             let bytes = read_nfo(lease).await?;
             if let Some((parsed, unique)) = parse_nfo(&String::from_utf8_lossy(&bytes)) {
@@ -3986,9 +3998,9 @@ impl crate::providers::Provider for LocalProvider {
 async fn nfo_source(
     registry: &Registry,
     item_id: &str,
-) -> Result<Option<(String, String, String)>> {
+) -> Result<Option<(String, String, String, String)>> {
     let row = sqlx::query(
-        "SELECT s.module_id, s.collection_id,
+        "SELECT s.module_id, s.collection_id, s.root_token,
                 json_extract(f.streams_json, '$.nfo') AS nfo
          FROM item_sources s
          JOIN files f ON (f.module_id, f.collection_id, f.path_rel)
@@ -4002,7 +4014,14 @@ async fn nfo_source(
     .fetch_optional(registry.db())
     .await
     .context("nfo lookup")?;
-    Ok(row.map(|r| (r.get("module_id"), r.get("collection_id"), r.get("nfo"))))
+    Ok(row.map(|r| {
+        (
+            r.get("module_id"),
+            r.get("collection_id"),
+            r.get("root_token"),
+            r.get("nfo"),
+        )
+    }))
 }
 
 /// Drain a (small) .nfo through a lease. Capped: a file claiming to be

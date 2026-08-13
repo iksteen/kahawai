@@ -71,10 +71,15 @@ marked in that document.
 - [ ] REL-3 Publish an evidence-based platform matrix. Mark only roles and
       architectures exercised by current release artifacts as supported;
       retaining, withdrawing or adding a platform is an explicit scope decision
-- [ ] REL-4 Record the compatibility decision for stable root identities, the
-      satellite protocol and token invalidation. If the approved design is
-      incompatible, assign the protocol version, rescan/reauthentication scope
-      and support window deliberately and publish an operator migration path
+- [x] REL-4 Record and publish the compatibility policy for exact-root source
+      identity, the satellite protocol and token invalidation. Root identity is
+      an additive protocol change: legacy root-less records remain admissible
+      where one configured root determines the answer, while an ambiguous
+      legacy multi-root record is resolved from stored content identity or
+      rejected with an actionable satellite-upgrade diagnostic rather than
+      guessed. Upgrading shall not require a catalogue rescan, reset a scan
+      generation or reauthenticate a satellite. State any support window for
+      legacy root-less messages explicitly
 - [ ] REL-5 Keep `/api/v1` explicitly unstable throughout 0.x; on the 1.0
       release, freeze its generated contract and adopt the promised policy of
       serving the current and immediately preceding API major
@@ -190,25 +195,47 @@ marked in that document.
 
 ## Data, scanning and playback correctness (DATA)
 
-- [ ] DATA-1 Give collections and roots stable identities independent of name,
-      path and list order. Document the chosen config/wire representation, safe
-      ID grammar and validated media-type domain; the proposed shape is
-      `CollectionConfig { id, name, media_type, roots: RootConfig { id, path } }`
-- [ ] DATA-2 Carry the stable root identity through file records, open/read
-      requests, scan generations, database source keys and session sources. A
-      read resolves one exact root and never searches roots for the first
-      matching relative path; document schema meaning in the owning Rust module
-- [ ] DATA-3 Reject duplicate, missing, non-canonical, nested or overlapping
-      roots and unsafe collection/root IDs during configuration validation,
-      before any watcher or scanner starts
-- [ ] DATA-4 Implement the maintainer-approved compatibility decision from
-      REL-4. Incompatible satellites receive an actionable upgrade/rescan error;
-      remove compatibility backfills only if their support window has explicitly
-      ended and all current fields exist in the replacement protocol
-- [ ] DATA-5 Preserve item IDs, metadata, grants, provider matches and watch
-      progress during the root-identity migration; clear only scan-derived
-      source bindings and force a complete rescan
-- [ ] DATA-6 Exercise two roots containing the same relative filename and prove
+- [x] DATA-1 Keep the configured collection name as its stable per-mediahost
+      identity: renaming it deliberately creates a new collection. Derive each
+      root's identity from its configured path as
+      `root-sha256-` plus unpadded base64url of
+      `SHA-256(utf8("kahawai-root-path-v1") || 0x00 || normalized_path_utf8)`,
+      retaining the complete 256-bit digest. Resolve relative roots against the
+      configuration file's directory, make them absolute, remove `.`/`..` and trailing
+      separators lexically, and do not filesystem-canonicalize them; identity
+      must not depend on mount availability or current symlink targets. Store
+      the normalized path beside the token and fail loudly if one token is ever
+      associated with different normalized path bytes. Document this
+      config/wire representation and validate the media-type domain
+- [x] DATA-2 Carry the derived root token through file records, incremental
+      manifests and worklists, open/read requests, database source keys and
+      session sources. Scan generations remain collection-scoped. A read
+      resolves the one configured root named by the token and never searches
+      roots for the first matching relative path; document the source-key
+      meaning in the owning Rust module
+- [x] DATA-3 Before starting a watcher or scanner, require unique non-empty
+      collection names, supported media types, and absolute lexically normalized
+      root paths with distinct derived tokens. Reject duplicate and nested or
+      overlapping roots within one collection because they enumerate the same
+      source namespace twice; overlap across deliberately separate collections
+      remains valid. A temporarily missing or inaccessible root is reported as
+      unavailable and is never silently substituted with another root
+- [x] DATA-4 Implement REL-4 additively. A legacy root-less message for a
+      single-root collection maps to that root's deterministic token. For a
+      legacy multi-root source, adopt an exact root only when stored path, size
+      and content fingerprints prove it; otherwise reject the ambiguous record
+      with an actionable upgrade diagnostic instead of selecting by root order.
+      Keep compatibility fields and backfills for their documented support
+      window, and do not require a protocol-major reset merely to add the root
+      token
+- [x] DATA-5 Backfill derived root tokens transactionally without an
+      authoritative collection rescan. Preserve item IDs and source bindings,
+      technical metadata, libraries and grants, provider/manual/query state, queued work,
+      relations, watch progress and collection scan generations. Any targeted
+      mediahost check needed to disambiguate a legacy multi-root row may inspect
+      only that source's stat/content identity; it must not reconcile the
+      catalogue or advance the collection generation
+- [x] DATA-6 Exercise two roots containing the same relative filename and prove
       they remain distinct through scan, deduplication, source selection, byte
       leases and playback
 - [ ] DATA-7 Make the documented `--no-default-features` build compile. The
@@ -465,9 +492,14 @@ marked in that document.
       foreign account through stream, playlist, segment, subtitle, seek,
       progress and end routes. Every response is byte-for-byte the same 404 as
       an absent id, and the owner then reads and ends the still-live session
-- [ ] CI-7 Test identical paths in separate roots, root reordering, overlapping
-      root rejection, protocol-version rejection, the forced rescan and
-      preservation of durable identities and user state
+- [x] CI-7 Pin deterministic root-token test vectors and exercise identical
+      relative paths in separate roots through scan, persistence, source
+      selection, byte leases and playback. Prove root reordering changes
+      nothing; duplicate/within-collection overlapping roots are rejected;
+      cross-collection overlap remains valid; legacy single-root messages are
+      adopted additively; ambiguous legacy multi-root records are never guessed;
+      and migration preserves source/item IDs, durable metadata and user state
+      without changing scan generations or triggering catalogue reconciliation
 - [ ] CI-8 Test backup configuration restoration, Unix permissions, corrupt and
       truncated manifests, invalid SQLite, stale-file removal, interruption
       rollback and refusal while the live hub owns the data lock

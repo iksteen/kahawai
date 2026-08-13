@@ -32,12 +32,19 @@ async fn body_bytes(resp: axum::response::Response) -> Vec<u8> {
 async fn direct_play_ranges_end_to_end() {
     // Media root with one known file.
     let root = tempfile::tempdir().unwrap();
+    let preferred = tempfile::tempdir().unwrap();
     let content = pattern(FILE_LEN);
-    std::fs::write(root.path().join("Heat (1995).mkv"), &content).unwrap();
+    let decoy = vec![0xee; FILE_LEN - 1];
+    // Same collection-relative spelling in two roots. The larger preferred
+    // source wins the existing quality tie-break; config order is deliberately
+    // the opposite and must never decide which bytes are opened.
+    std::fs::write(root.path().join("Heat (1995).mkv"), &decoy).unwrap();
+    std::fs::write(preferred.path().join("Heat (1995).mkv"), &content).unwrap();
+    let preferred_token = kahawai_core::media::root_token(preferred.path());
     let collections = vec![CollectionConfig {
         name: "movies".into(),
         media_type: "movies".into(),
-        roots: vec![root.path().to_path_buf()],
+        roots: vec![root.path().to_path_buf(), preferred.path().to_path_buf()],
     }];
 
     // Hub: link service + sessions + API.
@@ -115,21 +122,37 @@ async fn direct_play_ranges_end_to_end() {
         pb::AnnounceCollection {
             id: "movies".into(),
             media_type: "movies".into(),
-            roots: vec![root.path().display().to_string()],
+            roots: vec![
+                root.path().display().to_string(),
+                preferred.path().display().to_string(),
+            ],
         },
     ))
     .await;
     send(pb::host_to_hub::Msg::FileUpsert(pb::FileUpsert {
         collection_id: "movies".into(),
-        files: vec![pb::FileRecord {
-            path_rel: "Heat (1995).mkv".into(),
-            size: FILE_LEN as u64,
-            mtime_unix: 1,
-            head_xxh3: 1,
-            tail_xxh3: 2,
-            oshash: 3,
-            streams_json: r#"{"container":"matroska"}"#.into(),
-        }],
+        files: vec![
+            pb::FileRecord {
+                root_token: kahawai_core::media::root_token(root.path()),
+                path_rel: "Heat (1995).mkv".into(),
+                size: decoy.len() as u64,
+                mtime_unix: 1,
+                head_xxh3: 10,
+                tail_xxh3: 20,
+                oshash: 30,
+                streams_json: r#"{"container":"matroska"}"#.into(),
+            },
+            pb::FileRecord {
+                root_token: preferred_token.clone(),
+                path_rel: "Heat (1995).mkv".into(),
+                size: FILE_LEN as u64,
+                mtime_unix: 1,
+                head_xxh3: 1,
+                tail_xxh3: 2,
+                oshash: 3,
+                streams_json: r#"{"container":"matroska"}"#.into(),
+            },
+        ],
     }))
     .await;
     // OpenRead responder — the real mediahost serving path.
@@ -214,6 +237,29 @@ async fn direct_play_ranges_end_to_end() {
     assert_eq!(v["mode"], "direct");
     assert_eq!(v["content_type"], "video/x-matroska");
     assert_eq!(v["size"], FILE_LEN as u64);
+    let exact_sources: Vec<(String, String)> =
+        sqlx::query_as("SELECT root_token, source_path FROM files ORDER BY root_token")
+            .fetch_all(&db)
+            .await
+            .unwrap();
+    assert_eq!(exact_sources.len(), 2);
+    assert!(
+        exact_sources
+            .iter()
+            .all(|(_, path)| path == "Heat (1995).mkv")
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT s.root_token FROM item_sources s JOIN files f
+             ON (f.module_id, f.collection_id, f.path_rel)
+              = (s.module_id, s.collection_id, s.path_rel)
+             ORDER BY f.size DESC LIMIT 1",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap(),
+        preferred_token,
+    );
     let stream_url = v["stream_url"].as_str().unwrap().to_string();
     let session_id = v["session_id"].as_str().unwrap().to_string();
 

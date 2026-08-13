@@ -33,6 +33,7 @@ async fn fixture() -> (Arc<Registry>, Arc<Sessions>, String, tempfile::TempDir) 
             "01HOST",
             "movies",
             vec![FileUpsertRecord {
+                root_token: "root".into(),
                 path_rel: "Heat (1995).mkv".into(),
                 size: 1_000_000,
                 mtime_unix: 1,

@@ -81,7 +81,11 @@ How something works and why it was built that way belong in
 
 ## Mediahost (MH)
 
-- [x] MH-1 Collections: media type + roots per collection
+- [x] MH-1 Collections: the configured name is the stable per-mediahost
+      collection identity; each root has a deterministic full-SHA-256 token
+      derived from its absolute lexically normalized configured path. Exact
+      root identity survives scanning, manifests/worklists, storage, sessions
+      and byte leases; equal relative filenames in separate roots stay distinct
 - [x] MH-2 Scan on start/demand + watching + sweeps; on-demand scans are
       collection-scoped only (the global rescan is gone), with interim
       progress reports every 500 files
@@ -98,7 +102,9 @@ How something works and why it was built that way belong in
       and is discovered on the next scan
 - [x] MH-5 Content identity (size/mtime fast path; head/tail xxh3 + oshash) with
       incremental rescan (manifest + FilesSeen reconciliation, sync-version handshake)
-- [x] MH-6 Byte-range lease serving (dedicated byte-plane connection)
+- [x] MH-6 Byte-range lease serving (dedicated byte-plane connection); reads
+      resolve the one root token carried by the source and never search roots
+      in configuration order
 - [x] MH-7 Scan batching + incremental rescans keep large scans cheap
       *(no explicit rate-limit knob; stat batching + in-sync skip in practice)*
 - [x] MH-8 Unreadable files reported with diagnostics (FileError)
@@ -106,7 +112,13 @@ How something works and why it was built that way belong in
       filename-CRC32 verify in the same pass, hub-side journal with
       content-identity copy-forward (at-most-once per content)
 - [x] MH-10 Sync generation per collection: persisted mediahost-side, compared
-      on reconnect, in-sync = no manifest/no walk; FilesSeen reconciliation
+      on reconnect, in-sync = no manifest/no walk; FilesSeen reconciliation.
+      Migration 53 adds exact-root columns without resetting generations. A
+      single-root announcement adopts legacy rows transactionally; ambiguous
+      multi-root rows use a targeted content-identity worklist and suppress
+      reconciliation until resolved, without a catalogue scan. An unavailable
+      root preserves its manifest rows while other roots continue; root-aware
+      caches safely promote old artifacts only for single-root collections
 - [x] MH-11 Three-tier job runner: urgent extraction > ED2K > subtitle
       pre-warm, idle = no scan and no lease being served
 - [~] MH-12 WITHDRAWN 2026-08-02, false premise — see the amendment in

@@ -151,6 +151,7 @@ async fn enrolled_mediahost_links_and_disconnect_is_tracked() {
                 kahawai_proto::v1::FileUpsert {
                     collection_id: "movies".into(),
                     files: vec![kahawai_proto::v1::FileRecord {
+                        root_token: String::new(),
                         path_rel: "Heat (1995)/Heat.mkv".into(),
                         size: 123,
                         mtime_unix: 456,
@@ -305,6 +306,101 @@ async fn try_link(addr: &str, id: &SatelliteIdentity) -> Result<(), Box<dyn std:
     tokio::time::timeout(Duration::from_secs(10), attempt)
         .await
         .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?
+}
+
+#[tokio::test]
+async fn protocol_23_is_additive_for_one_root_and_refused_for_two() {
+    async fn announce(hub: &Hub, id: SatelliteIdentity, roots: Vec<String>) -> tonic::Status {
+        let tls = kahawai_transport::mtls::mtls_client_config(&id).unwrap();
+        let channel = kahawai_transport::tls::grpc_channel_with(&hub.addr, tls)
+            .await
+            .unwrap();
+        let mut client =
+            kahawai_proto::v1::mediahost_link_client::MediahostLinkClient::new(channel);
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        tx.send(kahawai_proto::v1::HostToHub {
+            msg: Some(kahawai_proto::v1::host_to_hub::Msg::Hello(
+                kahawai_proto::v1::Hello {
+                    protocol_major: 2,
+                    protocol_minor: 3,
+                    name: "legacy".into(),
+                    build: String::new(),
+                },
+            )),
+        })
+        .await
+        .unwrap();
+        let mut inbound = client
+            .link(tokio_stream::wrappers::ReceiverStream::new(rx))
+            .await
+            .unwrap()
+            .into_inner();
+        inbound.message().await.unwrap().unwrap(); // HelloAck
+        tx.send(kahawai_proto::v1::HostToHub {
+            msg: Some(kahawai_proto::v1::host_to_hub::Msg::AnnounceCollection(
+                kahawai_proto::v1::AnnounceCollection {
+                    id: "movies".into(),
+                    media_type: "movies".into(),
+                    roots,
+                },
+            )),
+        })
+        .await
+        .unwrap();
+        inbound.message().await.unwrap_err()
+    }
+
+    let one = spawn_hub().await;
+    let one_id = enroll(&one, "01OLDONE", "legacy-one");
+    // A one-root 2.3 announcement remains accepted; there is no error message.
+    let one_tls = kahawai_transport::mtls::mtls_client_config(&one_id).unwrap();
+    let channel = kahawai_transport::tls::grpc_channel_with(&one.addr, one_tls)
+        .await
+        .unwrap();
+    let mut client = kahawai_proto::v1::mediahost_link_client::MediahostLinkClient::new(channel);
+    let (tx, rx) = tokio::sync::mpsc::channel(4);
+    tx.send(kahawai_proto::v1::HostToHub {
+        msg: Some(kahawai_proto::v1::host_to_hub::Msg::Hello(
+            kahawai_proto::v1::Hello {
+                protocol_major: 2,
+                protocol_minor: 3,
+                name: "legacy".into(),
+                build: String::new(),
+            },
+        )),
+    })
+    .await
+    .unwrap();
+    let mut inbound = client
+        .link(tokio_stream::wrappers::ReceiverStream::new(rx))
+        .await
+        .unwrap()
+        .into_inner();
+    inbound.message().await.unwrap().unwrap();
+    tx.send(kahawai_proto::v1::HostToHub {
+        msg: Some(kahawai_proto::v1::host_to_hub::Msg::AnnounceCollection(
+            kahawai_proto::v1::AnnounceCollection {
+                id: "movies".into(),
+                media_type: "movies".into(),
+                roots: vec!["/media/one".into()],
+            },
+        )),
+    })
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        one.registry
+            .resolve_root_token("01OLDONE", "movies", "")
+            .await
+            .is_ok()
+    );
+
+    let two = spawn_hub().await;
+    let two_id = enroll(&two, "01OLDTWO", "legacy-two");
+    let status = announce(&two, two_id, vec!["/media/a".into(), "/media/b".into()]).await;
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+    assert!(status.message().contains("protocol 2.4"), "{status}");
 }
 
 #[tokio::test]

@@ -6,6 +6,7 @@ use kahawai_hub::registry::{FileUpsertRecord, Registry};
 
 fn rec(path: &str, size: u64, mtime: i64) -> FileUpsertRecord {
     FileUpsertRecord {
+        root_token: "root".into(),
         path_rel: path.into(),
         size,
         mtime_unix: mtime,
@@ -45,21 +46,37 @@ async fn worklist_is_anime_only_and_shrinks_as_hashes_land() {
 
     assert!(reg.ed2k_worklist("01H", "movies").await.unwrap().is_empty());
     let work = reg.ed2k_worklist("01H", "anime").await.unwrap();
-    assert_eq!(work, vec!["[G] Show - 01 [ABCD1234].mkv".to_string()]);
+    assert_eq!(work.len(), 1);
+    assert_eq!(work[0].root_token, "root");
+    assert_eq!(work[0].path_rel, "[G] Show - 01 [ABCD1234].mkv");
 
     // Stale result (size moved on): dropped, still on the list.
     assert!(
-        !reg.record_ed2k("01H", "anime", &work[0], "aa".repeat(16).as_str(), 999)
-            .await
-            .unwrap()
+        !reg.record_ed2k(
+            "01H",
+            "anime",
+            &work[0].root_token,
+            &work[0].path_rel,
+            "aa".repeat(16).as_str(),
+            999,
+        )
+        .await
+        .unwrap()
     );
     assert_eq!(reg.ed2k_worklist("01H", "anime").await.unwrap().len(), 1);
 
     // Matching result: stored, list empty.
     assert!(
-        reg.record_ed2k("01H", "anime", &work[0], "ab".repeat(16).as_str(), 100)
-            .await
-            .unwrap()
+        reg.record_ed2k(
+            "01H",
+            "anime",
+            &work[0].root_token,
+            &work[0].path_rel,
+            "ab".repeat(16).as_str(),
+            100,
+        )
+        .await
+        .unwrap()
     );
     assert!(reg.ed2k_worklist("01H", "anime").await.unwrap().is_empty());
 }
@@ -69,9 +86,16 @@ async fn copy_forward_and_content_change_semantics() {
     let dir = tempfile::tempdir().unwrap();
     let reg = setup(dir.path()).await;
     let hash = "cd".repeat(16);
-    reg.record_ed2k("01H", "anime", "[G] Show - 01 [ABCD1234].mkv", &hash, 100)
-        .await
-        .unwrap();
+    reg.record_ed2k(
+        "01H",
+        "anime",
+        "root",
+        "[G] Show - 01 [ABCD1234].mkv",
+        &hash,
+        100,
+    )
+    .await
+    .unwrap();
 
     // A rename/copy with identical content identity inherits the hash —
     // no second full read ever happens for known content.
@@ -99,8 +123,8 @@ async fn copy_forward_and_content_change_semantics() {
     .await
     .unwrap();
     assert_eq!(
-        reg.ed2k_worklist("01H", "anime").await.unwrap(),
-        vec!["[G] Show - 01 [ABCD1234].mkv".to_string()]
+        reg.ed2k_worklist("01H", "anime").await.unwrap()[0].path_rel,
+        "[G] Show - 01 [ABCD1234].mkv"
     );
 }
 
@@ -144,7 +168,7 @@ async fn anime_collection_resolves_movies_but_not_extras() {
         "SELECT i.season, i.episode, p.title
            FROM item_sources s JOIN items i ON i.id = s.item_id
            JOIN items p ON p.id = i.parent_id
-          WHERE s.path_rel LIKE '%NCED2%'",
+          WHERE s.source_path LIKE '%NCED2%'",
     )
     .fetch_optional(&db)
     .await

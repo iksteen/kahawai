@@ -102,7 +102,7 @@ pub async fn run_local(
     tx: tokio::sync::mpsc::Sender<HostToHub>,
     mut rx: tokio::sync::mpsc::Receiver<Result<HubToHost, tonic::Status>>,
 ) -> Result<()> {
-    let engine = Engine::start(&collections, rescan_minutes, state_dir, tx.clone());
+    let engine = Engine::start(&collections, rescan_minutes, state_dir, tx.clone(), true);
     let mut ticker = tokio::time::interval(HEARTBEAT_INTERVAL);
     loop {
         tokio::select! {
@@ -192,6 +192,8 @@ pub struct Engine {
         >,
     >,
     hash_tx: tokio::sync::mpsc::Sender<hasher::JobMsg>,
+    collections: Vec<CollectionConfig>,
+    tx: tokio::sync::mpsc::Sender<HostToHub>,
     pub activity: Activity,
     _guards: AbortOnDrop,
 }
@@ -202,6 +204,7 @@ impl Engine {
         rescan_minutes: u64,
         state_dir: &Path,
         tx: tokio::sync::mpsc::Sender<HostToHub>,
+        exact_roots: bool,
     ) -> Engine {
         // Manifest responses are routed to the scan task of their collection.
         let manifest_waiters: std::sync::Arc<
@@ -254,7 +257,17 @@ impl Engine {
                 let handshake = if trig.initial { version } else { 0 };
                 let next = version + 1;
                 let _busy = activity.scan();
-                match scan_cycle(&c, &tx, &waiters, trig.force_dirs, handshake, next).await {
+                match scan_cycle(
+                    &c,
+                    &tx,
+                    &waiters,
+                    trig.force_dirs,
+                    handshake,
+                    next,
+                    exact_roots,
+                )
+                .await
+                {
                     Ok(true) => {
                         version = next;
                         if let Some(dir) = ver_path.parent() {
@@ -341,14 +354,16 @@ impl Engine {
                         tokio::select! {
                             ev = erx.recv() => {
                                 let Some(path) = ev else { return };
-                                if let Some((cname, _)) =
-                                    roots.iter().find(|(_, r)| path.starts_with(r))
-                                {
-                                    let dir = path.parent().unwrap_or(&path).to_path_buf();
+                                // Cross-collection overlap is deliberate and
+                                // valid: one file can feed separate presentation
+                                // namespaces. Route an event to every matching
+                                // collection, never just root-list order's first.
+                                let dir = path.parent().unwrap_or(&path).to_path_buf();
+                                for (cname, _) in roots.iter().filter(|(_, r)| path.starts_with(r)) {
                                     let e = dirty
                                         .entry(cname.clone())
                                         .or_insert_with(|| (Default::default(), tokio::time::Instant::now()));
-                                    e.0.insert(dir);
+                                    e.0.insert(dir.clone());
                                     e.1 = tokio::time::Instant::now();
                                 }
                             }
@@ -395,6 +410,8 @@ impl Engine {
             triggers,
             manifest_waiters,
             hash_tx,
+            collections: collections.to_vec(),
+            tx,
             activity,
             _guards: AbortOnDrop(guards),
         }
@@ -455,10 +472,69 @@ impl Engine {
                 let _ = self.hash_tx.try_send(hasher::JobMsg::UrgentImage(e));
                 None
             }
+            hub_to_host::Msg::RootResolutionWorklist(work) => {
+                let collections = self.collections.clone();
+                let tx = self.tx.clone();
+                tokio::spawn(async move {
+                    resolve_legacy_roots(&collections, work, &tx).await;
+                });
+                None
+            }
             hub_to_host::Msg::OpenRead(req) => Some(req),
             _ => None,
         }
     }
+}
+
+/// Resolve only the legacy source rows the hub named. This is not a scan: no
+/// directory walk, discovery, sidecar reconciliation or generation update.
+async fn resolve_legacy_roots(
+    collections: &[CollectionConfig],
+    work: kahawai_proto::v1::RootResolutionWorklist,
+    tx: &tokio::sync::mpsc::Sender<HostToHub>,
+) {
+    let Some(collection) = collections.iter().find(|c| c.name == work.collection_id) else {
+        return;
+    };
+    let mut resolutions = Vec::with_capacity(work.sources.len());
+    for source in work.sources {
+        let mut matches = Vec::new();
+        for root in collection.resolved_roots() {
+            let path = root.path.join(&source.path_rel);
+            let Ok(meta) = std::fs::metadata(&path) else {
+                continue;
+            };
+            if meta.len() != source.size {
+                continue;
+            }
+            let Ok((head, tail, oshash)) = scan::identity_hashes(&path, source.size) else {
+                continue;
+            };
+            if (head, tail, oshash) == (source.head_xxh3, source.tail_xxh3, source.oshash) {
+                matches.push(root.token);
+            }
+        }
+        let (root_token, error) = match matches.as_slice() {
+            [token] => (token.clone(), String::new()),
+            [] => (String::new(), "missing".into()),
+            _ => (String::new(), "ambiguous".into()),
+        };
+        resolutions.push(kahawai_proto::v1::RootResolution {
+            path_rel: source.path_rel,
+            root_token,
+            error,
+        });
+    }
+    let _ = tx
+        .send(HostToHub {
+            msg: Some(host_to_hub::Msg::RootResolutions(
+                kahawai_proto::v1::RootResolutions {
+                    collection_id: work.collection_id,
+                    resolutions,
+                },
+            )),
+        })
+        .await;
 }
 
 /// One link session: Hello/HelloAck, then per-collection scan
@@ -504,20 +580,37 @@ async fn link_once(
         .into_inner();
 
     // Hub speaks first: HelloAck with its protocol version (AR-7).
-    match inbound.message().await.context("awaiting HelloAck")? {
+    let exact_roots = match inbound.message().await.context("awaiting HelloAck")? {
         Some(m) => match m.msg {
             Some(hub_to_host::Msg::HelloAck(ack)) => {
+                if ack.protocol_major == 2
+                    && ack.protocol_minor < 4
+                    && collections.iter().any(|c| c.roots.len() > 1)
+                {
+                    bail!(
+                        "hub protocol {}.{} cannot distinguish files in multiple collection roots; upgrade the hub",
+                        ack.protocol_major,
+                        ack.protocol_minor
+                    );
+                }
                 tracing::info!(
                     hub_protocol = format!("{}.{}", ack.protocol_major, ack.protocol_minor),
                     "link established"
                 );
+                ack.protocol_minor >= 4
             }
             _ => bail!("hub did not open with HelloAck"),
         },
         None => bail!("hub closed the link before HelloAck"),
-    }
+    };
 
-    let engine = Engine::start(collections, rescan_minutes, state_dir, tx.clone());
+    let engine = Engine::start(
+        collections,
+        rescan_minutes,
+        state_dir,
+        tx.clone(),
+        exact_roots,
+    );
 
     let mut ticker = tokio::time::interval(HEARTBEAT_INTERVAL);
     loop {
@@ -577,6 +670,7 @@ async fn scan_cycle(
     force_dirs: std::collections::HashSet<std::path::PathBuf>,
     handshake_version: u64,
     report_version: u64,
+    exact_roots: bool,
 ) -> Result<bool> {
     tx.send(HostToHub {
         msg: Some(host_to_hub::Msg::AnnounceCollection(AnnounceCollection {
@@ -599,5 +693,58 @@ async fn scan_cycle(
     })
     .await
     .context("link closed before manifest request")?;
-    scan::scan_collection(c.clone(), tx.clone(), mrx, force_dirs, report_version).await
+    scan::scan_collection(
+        c.clone(),
+        tx.clone(),
+        mrx,
+        force_dirs,
+        report_version,
+        exact_roots,
+    )
+    .await
+}
+
+#[cfg(test)]
+mod root_resolution_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn targeted_resolution_never_guesses_between_identical_candidates() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        for dir in [&a, &b] {
+            std::fs::write(dir.path().join("same.mkv"), b"identical bytes").unwrap();
+        }
+        let size = std::fs::metadata(a.path().join("same.mkv")).unwrap().len();
+        let (head_xxh3, tail_xxh3, oshash) =
+            crate::scan::identity_hashes(&a.path().join("same.mkv"), size).unwrap();
+        let collections = vec![CollectionConfig {
+            name: "movies".into(),
+            media_type: "movies".into(),
+            roots: vec![a.path().into(), b.path().into()],
+        }];
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        resolve_legacy_roots(
+            &collections,
+            kahawai_proto::v1::RootResolutionWorklist {
+                collection_id: "movies".into(),
+                sources: vec![kahawai_proto::v1::LegacySource {
+                    path_rel: "same.mkv".into(),
+                    size,
+                    head_xxh3,
+                    tail_xxh3,
+                    oshash,
+                }],
+            },
+            &tx,
+        )
+        .await;
+        let message = rx.recv().await.unwrap();
+        let host_to_hub::Msg::RootResolutions(result) = message.msg.unwrap() else {
+            panic!("wrong result kind")
+        };
+        assert_eq!(result.resolutions.len(), 1);
+        assert_eq!(result.resolutions[0].root_token, "");
+        assert_eq!(result.resolutions[0].error, "ambiguous");
+    }
 }

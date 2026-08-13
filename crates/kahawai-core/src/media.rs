@@ -338,13 +338,108 @@ pub struct SidecarSubtitle {
     pub track: Option<u32>,
 }
 
-/// One mediahost collection as configured (name, media type, roots).
-/// Lives in core because every binary parses the full config file —
-/// including builds that carry no mediahost module at all.
+/// One mediahost collection as configured (stable name, media type, roots).
+///
+/// The collection name is its per-mediahost identity. A root's identity is
+/// derived from its normalized configured path rather than another operator-
+/// maintained name; see [`root_token`]. Config loading normalizes and validates
+/// the paths before any mediahost worker sees this type.
+///
+/// Lives in core because every binary parses the full config file — including
+/// builds that carry no mediahost module at all.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CollectionConfig {
     pub name: String,
     pub media_type: String,
     pub roots: Vec<std::path::PathBuf>,
+}
+
+/// Exact identity of one configured collection root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CollectionRoot {
+    pub token: String,
+    pub path: std::path::PathBuf,
+}
+
+impl CollectionConfig {
+    pub fn resolved_roots(&self) -> impl Iterator<Item = CollectionRoot> + '_ {
+        self.roots.iter().map(|path| CollectionRoot {
+            token: root_token(path),
+            path: path.clone(),
+        })
+    }
+}
+
+/// Resolve a configured path against its config directory and normalize it
+/// lexically, without consulting the filesystem.
+pub fn normalize_root_path(
+    path: &std::path::Path,
+    config_dir: &std::path::Path,
+) -> Result<std::path::PathBuf, String> {
+    use std::path::Component;
+
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        config_dir.join(path)
+    };
+    if !path.is_absolute() {
+        return Err(format!(
+            "root path is not absolute after config resolution: {}",
+            path.display()
+        ));
+    }
+    let mut out = std::path::PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => out.push(prefix.as_os_str()),
+            Component::RootDir => out.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !out.pop() {
+                    return Err(format!(
+                        "root path escapes its filesystem root: {}",
+                        path.display()
+                    ));
+                }
+            }
+            Component::Normal(part) => out.push(part),
+        }
+    }
+    Ok(out)
+}
+
+/// Deterministic root identity from the normalized configured path.
+///
+/// Full SHA-256 is retained. Configured paths come from TOML strings and are
+/// therefore UTF-8; config validation guarantees an absolute, lexically
+/// normalized input before this is called.
+pub fn root_token(path: &std::path::Path) -> String {
+    use data_encoding::BASE64URL_NOPAD;
+    use sha2::{Digest, Sha256};
+
+    let path = path
+        .to_str()
+        .expect("configured collection roots are UTF-8 TOML strings");
+    let mut hash = Sha256::new();
+    hash.update(b"kahawai-root-path-v1");
+    hash.update([0]);
+    hash.update(path.as_bytes());
+    format!("root-sha256-{}", BASE64URL_NOPAD.encode(&hash.finalize()))
+}
+
+#[cfg(test)]
+mod root_identity_tests {
+    use super::*;
+
+    #[test]
+    fn root_token_vector_is_stable_and_full_width() {
+        let token = root_token(std::path::Path::new("/srv/media/movies"));
+        assert_eq!(
+            token,
+            "root-sha256-3RBdn0tNKZrWf3uzPvhpTAjPkGYwOkF2L1ql5BR_8Dc"
+        );
+        assert_eq!(token.len(), "root-sha256-".len() + 43);
+    }
 }

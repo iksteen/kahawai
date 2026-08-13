@@ -32,6 +32,7 @@ pub async fn scan_collection(
     mut manifest: tokio::sync::mpsc::Receiver<kahawai_proto::v1::Manifest>,
     force_dirs: std::collections::HashSet<std::path::PathBuf>,
     sync_version: u64,
+    exact_roots: bool,
 ) -> Result<bool> {
     let (mut scanned, mut failed, mut skipped) = (0u32, 0u32, 0u32);
     // Live progress (HUB-35/HUB-26): a start beacon (after the in-sync
@@ -42,7 +43,8 @@ pub async fn scan_collection(
 
     // Collect the hub's manifest (chunked); an old hub never answers, so
     // a timeout degrades to the full rescan.
-    let mut known: std::collections::HashMap<String, (u64, i64, String)> = Default::default();
+    let mut known: std::collections::HashMap<(String, String), (u64, i64, String)> =
+        Default::default();
     // Whether the hub sent sidecar signatures at all. An older hub sends
     // none, and an empty signature then means "not sent" rather than
     // "none recorded" — comparing against it would rescan everything.
@@ -56,11 +58,19 @@ pub async fn scan_collection(
                     return Ok(false);
                 }
                 compare_sidecars |= m.sidecars_compared;
-                known.extend(
-                    m.entries
-                        .into_iter()
-                        .map(|e| (e.path_rel, (e.size, e.mtime_unix, e.sidecars))),
-                );
+                known.extend(m.entries.into_iter().map(|e| {
+                    (
+                        (
+                            if exact_roots {
+                                e.root_token
+                            } else {
+                                String::new()
+                            },
+                            e.path_rel,
+                        ),
+                        (e.size, e.mtime_unix, e.sidecars),
+                    )
+                }));
                 if m.done {
                     break;
                 }
@@ -83,19 +93,64 @@ pub async fn scan_collection(
     })
     .await
     .context("link closed")?;
-    let mut seen_batch: Vec<String> = Vec::new();
+    let mut seen_batch: Vec<kahawai_proto::v1::SourcePath> = Vec::new();
 
     let include_audio = cfg.media_type == "music";
     let force = std::sync::Arc::new(force_dirs);
-    for root in &cfg.roots {
-        let root = root.clone();
-        let paths = tokio::task::spawn_blocking(move || walk(&root, include_audio)).await??;
+    for configured_root in cfg.resolved_roots() {
+        let root_token = configured_root.token;
+        // Protocol 2.3 has no root fields. It is admitted only for a
+        // single-root collection, where an empty token is unambiguous on both
+        // peers; populate its legacy path lists rather than fields it cannot
+        // see.
+        let wire_root_token = if exact_roots {
+            root_token.clone()
+        } else {
+            String::new()
+        };
+        let root = configured_root.path;
+        let paths = match tokio::task::spawn_blocking(move || walk(&root, include_audio)).await? {
+            Ok(paths) => paths,
+            Err(error) => {
+                // One unavailable mount must not make another root stand in
+                // for it, nor may reconciliation interpret its whole manifest
+                // as deleted. Report the exact root and carry its prior rows
+                // forward as seen; later sweeps retry it independently.
+                failed += 1;
+                tracing::warn!(collection = %cfg.name, %root_token,
+                    error = format!("{error:#}"), "collection root unavailable");
+                tx.send(HostToHub {
+                    msg: Some(host_to_hub::Msg::FileError(FileError {
+                        collection_id: cfg.name.clone(),
+                        path_rel: String::new(),
+                        error: format!("root unavailable: {error:#}"),
+                        root_token: wire_root_token.clone(),
+                    })),
+                })
+                .await
+                .context("link closed")?;
+                seen_batch.extend(
+                    known
+                        .keys()
+                        .filter(|(token, _)| token == &wire_root_token)
+                        .map(|(token, path_rel)| kahawai_proto::v1::SourcePath {
+                            root_token: token.clone(),
+                            path_rel: path_rel.clone(),
+                        }),
+                );
+                if seen_batch.len() >= 1000 {
+                    send_seen(&tx, &cfg.name, std::mem::take(&mut seen_batch), exact_roots).await?;
+                }
+                continue;
+            }
+        };
         // Stat in batches ON THE BLOCKING POOL: a network mount makes
         // each stat a round trip, and doing tens of thousands of them
         // inline starved async peers of this task for tens of seconds.
         // Each batch yields (rel, unchanged) verdicts.
         for stat_batch in paths.chunks(250).map(<[_]>::to_vec) {
             let known2 = known.clone();
+            let root_token2 = wire_root_token.clone();
             let force2 = force.clone();
             let compare2 = compare_sidecars;
             let verdicts: Vec<((std::path::PathBuf, std::path::PathBuf), String, bool)> =
@@ -109,27 +164,31 @@ pub async fn scan_collection(
                                 .to_string_lossy()
                                 .into_owned();
                             let unchanged = !path.parent().is_some_and(|p| force2.contains(p))
-                                && known2.get(&rel).is_some_and(|(size, mtime, sidecars)| {
-                                    let stat_matches = std::fs::metadata(&path).is_ok_and(|m| {
-                                        m.len() == *size
-                                            && m.modified()
-                                                .ok()
-                                                .and_then(|t| {
-                                                    t.duration_since(std::time::UNIX_EPOCH).ok()
-                                                })
-                                                .map(|d| d.as_secs() as i64)
-                                                == Some(*mtime)
-                                    });
-                                    // Size and mtime describe the MEDIA file and do
-                                    // not move when a .nfo or a cover appears beside
-                                    // it, so a sidecar dropped in next to an
-                                    // already-scanned file used to stay invisible
-                                    // until the file itself changed. Costs a few
-                                    // stats per file, and only where the hub asked.
-                                    stat_matches
-                                        && (!compare2
-                                            || &sidecar_sig(&root_local, &path) == sidecars)
-                                });
+                                && known2.get(&(root_token2.clone(), rel.clone())).is_some_and(
+                                    |(size, mtime, sidecars)| {
+                                        let stat_matches =
+                                            std::fs::metadata(&path).is_ok_and(|m| {
+                                                m.len() == *size
+                                                    && m.modified()
+                                                        .ok()
+                                                        .and_then(|t| {
+                                                            t.duration_since(std::time::UNIX_EPOCH)
+                                                                .ok()
+                                                        })
+                                                        .map(|d| d.as_secs() as i64)
+                                                        == Some(*mtime)
+                                            });
+                                        // Size and mtime describe the MEDIA file and do
+                                        // not move when a .nfo or a cover appears beside
+                                        // it, so a sidecar dropped in next to an
+                                        // already-scanned file used to stay invisible
+                                        // until the file itself changed. Costs a few
+                                        // stats per file, and only where the hub asked.
+                                        stat_matches
+                                            && (!compare2
+                                                || &sidecar_sig(&root_local, &path) == sidecars)
+                                    },
+                                );
                             ((root_local, path), rel, unchanged)
                         })
                         .collect()
@@ -138,9 +197,13 @@ pub async fn scan_collection(
             for ((root_local, path), rel, unchanged) in verdicts {
                 if unchanged {
                     skipped += 1;
-                    seen_batch.push(rel);
+                    seen_batch.push(kahawai_proto::v1::SourcePath {
+                        root_token: wire_root_token.clone(),
+                        path_rel: rel,
+                    });
                     if seen_batch.len() >= 1000 {
-                        send_seen(&tx, &cfg.name, std::mem::take(&mut seen_batch)).await?;
+                        send_seen(&tx, &cfg.name, std::mem::take(&mut seen_batch), exact_roots)
+                            .await?;
                     }
                     continue;
                 }
@@ -151,6 +214,7 @@ pub async fn scan_collection(
                         scanned += 1;
                         batch.push(FileRecord {
                             path_rel: rel,
+                            root_token: wire_root_token.clone(),
                             size,
                             mtime_unix,
                             head_xxh3,
@@ -170,6 +234,7 @@ pub async fn scan_collection(
                                 collection_id: cfg.name.clone(),
                                 path_rel: rel,
                                 error: format!("{e:#}"),
+                                root_token: wire_root_token.clone(),
                             })),
                         })
                         .await
@@ -202,7 +267,7 @@ pub async fn scan_collection(
         send_upsert(&tx, &cfg.name, batch).await?;
     }
     if !seen_batch.is_empty() {
-        send_seen(&tx, &cfg.name, seen_batch).await?;
+        send_seen(&tx, &cfg.name, seen_batch, exact_roots).await?;
     }
     tx.send(HostToHub {
         msg: Some(host_to_hub::Msg::ScanProgress(ScanProgress {
@@ -220,11 +285,26 @@ pub async fn scan_collection(
     Ok(true)
 }
 
-async fn send_seen(tx: &Sender<HostToHub>, collection: &str, paths: Vec<String>) -> Result<()> {
+async fn send_seen(
+    tx: &Sender<HostToHub>,
+    collection: &str,
+    sources: Vec<kahawai_proto::v1::SourcePath>,
+    exact_roots: bool,
+) -> Result<()> {
+    let path_rel = if exact_roots {
+        Vec::new()
+    } else {
+        sources
+            .iter()
+            .map(|source| source.path_rel.clone())
+            .collect()
+    };
+    let sources = if exact_roots { sources } else { Vec::new() };
     tx.send(HostToHub {
         msg: Some(host_to_hub::Msg::FilesSeen(kahawai_proto::v1::FilesSeen {
             collection_id: collection.to_string(),
-            path_rel: paths,
+            path_rel,
+            sources,
         })),
     })
     .await
@@ -648,6 +728,189 @@ id: nl, index: 1
                 ("m/Heat (1995).vtt", "vtt", None),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn protocol_23_single_root_scan_populates_only_legacy_fields() {
+        if !kahawai_media::testutil::require_elements(&["x264enc", "flacenc"]) {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        kahawai_media::testutil::render_h264_flac_mkv(&root.path().join("legacy.mkv"));
+        let cfg = CollectionConfig {
+            name: "movies".into(),
+            media_type: "movies".into(),
+            roots: vec![root.path().into()],
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let (manifest_tx, manifest_rx) = tokio::sync::mpsc::channel(1);
+        manifest_tx
+            .send(kahawai_proto::v1::Manifest {
+                collection_id: "movies".into(),
+                entries: Vec::new(),
+                done: true,
+                in_sync: false,
+                sidecars_compared: true,
+            })
+            .await
+            .unwrap();
+        drop(manifest_tx);
+
+        scan_collection(cfg, tx.clone(), manifest_rx, Default::default(), 1, false)
+            .await
+            .unwrap();
+        send_seen(
+            &tx,
+            "movies",
+            vec![kahawai_proto::v1::SourcePath {
+                root_token: String::new(),
+                path_rel: "unchanged.mkv".into(),
+            }],
+            false,
+        )
+        .await
+        .unwrap();
+        drop(tx);
+
+        let mut upsert_root = None;
+        let mut seen = None;
+        while let Some(message) = rx.recv().await {
+            match message.msg.unwrap() {
+                host_to_hub::Msg::FileUpsert(upsert) => {
+                    upsert_root = Some(upsert.files[0].root_token.clone());
+                }
+                host_to_hub::Msg::FilesSeen(files) => seen = Some(files),
+                _ => {}
+            }
+        }
+        assert_eq!(upsert_root.as_deref(), Some(""));
+        let seen = seen.unwrap();
+        assert_eq!(seen.path_rel, ["unchanged.mkv"]);
+        assert!(seen.sources.is_empty());
+    }
+
+    #[tokio::test]
+    async fn equal_relative_names_under_two_roots_scan_as_exact_sources() {
+        if !kahawai_media::testutil::require_elements(&["x264enc", "flacenc"]) {
+            return;
+        }
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let path = a.path().join("same.mkv");
+        kahawai_media::testutil::render_h264_flac_mkv(&path);
+        std::fs::copy(&path, b.path().join("same.mkv")).unwrap();
+        let a_token = kahawai_core::media::root_token(a.path());
+        let b_token = kahawai_core::media::root_token(b.path());
+        let cfg = CollectionConfig {
+            name: "movies".into(),
+            media_type: "movies".into(),
+            // Deliberately reversed relative to token ordering: list order has
+            // no place in the records emitted by the scanner.
+            roots: vec![b.path().into(), a.path().into()],
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let (manifest_tx, manifest_rx) = tokio::sync::mpsc::channel(1);
+        manifest_tx
+            .send(kahawai_proto::v1::Manifest {
+                collection_id: "movies".into(),
+                entries: Vec::new(),
+                done: true,
+                in_sync: false,
+                sidecars_compared: true,
+            })
+            .await
+            .unwrap();
+        drop(manifest_tx);
+
+        assert!(
+            scan_collection(cfg, tx, manifest_rx, Default::default(), 1, true)
+                .await
+                .unwrap()
+        );
+        let mut sources = Vec::new();
+        while let Ok(message) = rx.try_recv() {
+            if let host_to_hub::Msg::FileUpsert(upsert) = message.msg.unwrap() {
+                sources.extend(
+                    upsert
+                        .files
+                        .into_iter()
+                        .map(|file| (file.root_token, file.path_rel)),
+                );
+            }
+        }
+        sources.sort();
+        let mut expected = vec![
+            (a_token, "same.mkv".to_string()),
+            (b_token, "same.mkv".to_string()),
+        ];
+        expected.sort();
+        assert_eq!(sources, expected);
+    }
+
+    #[tokio::test]
+    async fn an_unavailable_root_preserves_its_manifest_and_other_roots_continue() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing");
+        let available = dir.path().join("available");
+        std::fs::create_dir(&available).unwrap();
+        let missing_token = kahawai_core::media::root_token(&missing);
+        let cfg = CollectionConfig {
+            name: "movies".into(),
+            media_type: "movies".into(),
+            roots: vec![missing, available],
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let (manifest_tx, manifest_rx) = tokio::sync::mpsc::channel(1);
+        manifest_tx
+            .send(kahawai_proto::v1::Manifest {
+                collection_id: "movies".into(),
+                entries: vec![kahawai_proto::v1::FileStat {
+                    root_token: missing_token.clone(),
+                    path_rel: "kept.mkv".into(),
+                    size: 10,
+                    mtime_unix: 1,
+                    sidecars: String::new(),
+                }],
+                done: true,
+                in_sync: false,
+                sidecars_compared: true,
+            })
+            .await
+            .unwrap();
+        drop(manifest_tx);
+
+        assert!(
+            scan_collection(cfg, tx, manifest_rx, Default::default(), 9, true)
+                .await
+                .unwrap()
+        );
+        let mut unavailable = false;
+        let mut preserved = false;
+        let mut complete = false;
+        while let Ok(message) = rx.try_recv() {
+            match message.msg.unwrap() {
+                host_to_hub::Msg::FileError(error) => {
+                    unavailable = error.root_token == missing_token
+                        && error.path_rel.is_empty()
+                        && error.error.contains("root unavailable");
+                }
+                host_to_hub::Msg::FilesSeen(seen) => {
+                    preserved = seen.sources.iter().any(|source| {
+                        source.root_token == missing_token && source.path_rel == "kept.mkv"
+                    });
+                }
+                host_to_hub::Msg::ScanProgress(progress) if progress.complete => {
+                    complete = progress.sync_version == 9;
+                }
+                _ => {}
+            }
+        }
+        assert!(unavailable, "the exact unavailable root must be reported");
+        assert!(
+            preserved,
+            "its old catalogue rows must survive reconciliation"
+        );
+        assert!(complete, "the collection scan must continue and finish");
     }
 
     #[test]

@@ -124,6 +124,7 @@ async fn remux_to_hls_end_to_end() {
         pb::host_to_hub::Msg::FileUpsert(pb::FileUpsert {
             collection_id: "movies".into(),
             files: vec![pb::FileRecord {
+                root_token: String::new(),
                 path_rel: "Heat (1995).mkv".into(),
                 size,
                 mtime_unix: 1,

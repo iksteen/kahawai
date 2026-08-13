@@ -51,6 +51,8 @@ message HostToHub {
     ImageSubtitles image_subtitles = 12;
     // Longest keyframe gap of one file (HUB-17 backfill).
     FileKeyframeInterval file_keyframe_interval = 13;
+    // Protocol 2.4: targeted, non-scanning legacy root adoption.
+    RootResolutions root_resolutions = 14;
   }
 }
 
@@ -62,6 +64,8 @@ message FileSubtitles {
   repeated SubTrack tracks = 4;
   // Whole-file failure (unreadable, no text tracks despite discovery…).
   string error = 5;
+  // Added in protocol 2.4. Empty only on a legacy root-less message.
+  string root_token = 6;
 }
 
 message SubTrack {
@@ -87,6 +91,8 @@ message FileHash {
   // Filename-embedded CRC32 verified during the same read (MH-9).
   bool crc_checked = 4;
   bool crc_ok = 5;
+  // Added in protocol 2.4. Empty only on a legacy root-less message.
+  string root_token = 6;
 }
 
 message ManifestRequest {
@@ -106,6 +112,8 @@ message FileStat {
   // describe the MEDIA file and never move when a sidecar changes beside
   // it, which is why a dropped-in .nfo used to stay invisible forever.
   string sidecars = 4;
+  // Added in protocol 2.4. Empty only on a legacy root-less message.
+  string root_token = 5;
 }
 
 // The hub's current knowledge of a collection, chunked; `done` on the
@@ -126,7 +134,9 @@ message Manifest {
 // for reconciliation, no re-inspection, no upsert.
 message FilesSeen {
   string collection_id = 1;
+  // Legacy protocol 2.3 field. New senders leave it empty.
   repeated string path_rel = 2;
+  repeated SourcePath sources = 3;
 }
 
 // A collection this mediahost serves (MH-1). Announced after Hello and
@@ -135,7 +145,39 @@ message AnnounceCollection {
   // Stable per-mediahost collection identifier (the configured name).
   string id = 1;
   string media_type = 2; // series|movies|music|anime
+  // Normalized configured paths. Both peers derive exact root tokens.
   repeated string roots = 3;
+}
+
+message SourcePath {
+  string root_token = 1;
+  string path_rel = 2;
+}
+
+message RootResolutionWorklist {
+  string collection_id = 1;
+  repeated LegacySource sources = 2;
+}
+
+message LegacySource {
+  string path_rel = 1;
+  uint64 size = 2;
+  uint64 head_xxh3 = 3;
+  uint64 tail_xxh3 = 4;
+  uint64 oshash = 5;
+}
+
+message RootResolutions {
+  string collection_id = 1;
+  repeated RootResolution resolutions = 2;
+}
+
+message RootResolution {
+  string path_rel = 1;
+  // Present only when exactly one configured root matched every fact.
+  string root_token = 2;
+  // "missing" or "ambiguous" when root_token is empty.
+  string error = 3;
 }
 
 message FileUpsert {
@@ -154,6 +196,8 @@ message FileRecord {
   uint64 oshash = 6;
   // kahawai_core::media::MediaInfo as JSON (schema evolves without proto churn).
   string streams_json = 7;
+  // Added in protocol 2.4. Empty only on a legacy root-less message.
+  string root_token = 8;
 }
 
 // Unreadable/corrupt file diagnostic (MH-8).
@@ -161,6 +205,7 @@ message FileError {
   string collection_id = 1;
   string path_rel = 2;
   string error = 3;
+  string root_token = 4;
 }
 
 message ScanProgress {
@@ -201,17 +246,21 @@ message HubToHost {
     // measured. Same cheapest tier as the attachment worklist: index
     // reads only, no decoding.
     KeyframeWorklist keyframe_worklist = 10;
+    RootResolutionWorklist root_resolution_worklist = 11;
   }
 }
 
 message KeyframeWorklist {
   string collection_id = 1;
+  // Legacy protocol 2.3 field. New senders use sources.
   repeated string paths = 2;
+  repeated SourcePath sources = 3;
 }
 
 message ExtractSubs {
   string collection_id = 1;
   string path_rel = 2;
+  string root_token = 3;
 }
 
 message ExtractImageSubs {
@@ -219,6 +268,7 @@ message ExtractImageSubs {
   string path_rel = 2;
   // Which subtitle track, in the e{n} numbering discovery uses.
   uint32 sub_index = 3;
+  string root_token = 4;
 }
 
 /// One image subtitle track, undecoded: the payloads are still PGS
@@ -247,6 +297,7 @@ message ImageSubtitles {
   // field at all, and that must read as "one message, complete" rather
   // than as "false, more coming" — which would wait forever.
   optional bool done = 8;
+  string root_token = 9;
 }
 
 message ImageSubBlock {
@@ -258,12 +309,16 @@ message ImageSubBlock {
 
 message SubsWorklist {
   string collection_id = 1;
+  // Legacy protocol 2.3 field. New senders use sources.
   repeated string paths = 2;
+  repeated SourcePath sources = 3;
 }
 
 message AttachmentsWorklist {
   string collection_id = 1;
+  // Legacy protocol 2.3 field. New senders use sources.
   repeated string paths = 2;
+  repeated SourcePath sources = 3;
 }
 
 message FileAttachments {
@@ -274,6 +329,7 @@ message FileAttachments {
   // JSON array of {file_name, mime_type, offset, size} — exactly what
   // MediaInfo.attachments serializes to. "[]" = checked, none found.
   string attachments_json = 4;
+  string root_token = 5;
 }
 
 message FileKeyframeInterval {
@@ -285,11 +341,14 @@ message FileKeyframeInterval {
   // container with no index we can read), which is not the same as 0
   // and must not be treated as "cuts possible anywhere".
   optional uint32 max_keyframe_interval_ms = 4;
+  string root_token = 5;
 }
 
 message Hashlist {
   string collection_id = 1;
+  // Legacy protocol 2.3 field. New senders use sources.
   repeated string paths = 2;
+  repeated SourcePath sources = 3;
 }
 
 message RescanRequest {
@@ -300,6 +359,7 @@ message OpenRead {
   string lease_token = 1;
   string collection_id = 2;
   string path_rel = 3;
+  string root_token = 4;
 }
 
 message ByteChunk {

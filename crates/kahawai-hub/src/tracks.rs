@@ -16,11 +16,11 @@
 //!   (HUB-32c machine-read text), `raster` (HUB-32d: a styled script
 //!   rendered to display sets, served item-level rather than through
 //!   the session tap).
-//! - `module_id`/`collection_id`/`path_rel` — the MEDIA file the track
-//!   belongs to, for embedded/sidecar rows (NULL for hub-stored
-//!   origins, which bind to the item). List filtering and the load
-//!   path both key on the media file, so sidecar rows bind to it too;
-//!   the sidecar file's own path lives in `external_subtitles`.
+//! - `module_id`/`collection_id`/`root_token`/`source_path` — the exact
+//!   MEDIA file the track belongs to, for embedded/sidecar rows (NULL for
+//!   hub-stored origins, which bind to the item). `path_rel` is the injective
+//!   relational source key; the sidecar file's own path lives in
+//!   `external_subtitles`.
 //! - `stream_index` — embedded: index into `streams_json.subtitles`;
 //!   sidecar: index into `streams_json.external_subtitles`. The
 //!   pipeline's tap files (`subs-e{n}.*`) and the burn plan still
@@ -55,6 +55,10 @@ pub struct Track {
     pub module_id: Option<String>,
     #[serde(skip)]
     pub collection_id: Option<String>,
+    #[serde(skip)]
+    pub root_token: Option<String>,
+    #[serde(skip)]
+    pub source_path: Option<String>,
     #[serde(skip)]
     pub path_rel: Option<String>,
     pub stream_index: Option<i64>,
@@ -225,8 +229,8 @@ pub fn delivery(
 
 pub async fn get(db: &sqlx::SqlitePool, id: i64) -> Result<Option<Track>> {
     Ok(sqlx::query(
-        "SELECT id, item_id, origin, module_id, collection_id, path_rel,
-                stream_index, format, language, label, machine, derived_from,
+        "SELECT id, item_id, origin, module_id, collection_id, root_token, source_path,
+                path_rel, stream_index, format, language, label, machine, derived_from,
                 created_by
          FROM subtitle_tracks WHERE id = ?",
     )
@@ -244,22 +248,24 @@ pub async fn for_item_source(
     item_id: &str,
     module_id: &str,
     collection_id: &str,
-    path_rel: &str,
+    root_token: &str,
+    source_path: &str,
 ) -> Result<Vec<Track>> {
     Ok(sqlx::query(
-        "SELECT id, item_id, origin, module_id, collection_id, path_rel,
-                stream_index, format, language, label, machine, derived_from,
+        "SELECT id, item_id, origin, module_id, collection_id, root_token, source_path,
+                path_rel, stream_index, format, language, label, machine, derived_from,
                 created_by
          FROM subtitle_tracks
          WHERE item_id = ?
            AND (module_id IS NULL
-                OR (module_id, collection_id, path_rel) = (?, ?, ?))
+                OR (module_id, collection_id, root_token, source_path) = (?, ?, ?, ?))
          ORDER BY origin = 'embedded' DESC, origin = 'sidecar' DESC, id",
     )
     .bind(item_id)
     .bind(module_id)
     .bind(collection_id)
-    .bind(path_rel)
+    .bind(root_token)
+    .bind(source_path)
     .fetch_all(db)
     .await?
     .into_iter()
@@ -286,6 +292,8 @@ fn row_to_track(r: sqlx::sqlite::SqliteRow) -> Track {
         origin: r.get("origin"),
         module_id: r.get("module_id"),
         collection_id: r.get("collection_id"),
+        root_token: r.get("root_token"),
+        source_path: r.get("source_path"),
         path_rel: r.get("path_rel"),
         stream_index: r.get("stream_index"),
         format: r.get("format"),
@@ -303,23 +311,28 @@ fn row_to_track(r: sqlx::sqlite::SqliteRow) -> Track {
 /// its position (ON CONFLICT updates in place); deletes rows for
 /// streams that vanished, and rows left under a previous item after a
 /// re-match.
+#[allow(clippy::too_many_arguments)] // transaction, item, and complete source identity
 pub async fn sync_source_tracks(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     item_id: &str,
     module_id: &str,
     collection_id: &str,
+    root_token: &str,
+    source_path: &str,
     path_rel: &str,
     info: &kahawai_core::media::MediaInfo,
 ) -> Result<()> {
-    // A re-match moved this source to another item: rows bound to the
+    // A re-match moved this exact source to another item: rows bound to the
     // source under any OTHER item are stale.
     sqlx::query(
         "DELETE FROM subtitle_tracks
-         WHERE (module_id, collection_id, path_rel) = (?, ?, ?) AND item_id != ?",
+         WHERE (module_id, collection_id, root_token, source_path) = (?, ?, ?, ?)
+           AND item_id != ?",
     )
     .bind(module_id)
     .bind(collection_id)
-    .bind(path_rel)
+    .bind(root_token)
+    .bind(source_path)
     .bind(item_id)
     .execute(&mut **tx)
     .await?;
@@ -331,32 +344,37 @@ pub async fn sync_source_tracks(
         sqlx::query(
             "DELETE FROM subtitle_tracks
              WHERE item_id = ? AND origin = ?
-               AND (module_id, collection_id, path_rel) = (?, ?, ?)
+               AND (module_id, collection_id, root_token, source_path) = (?, ?, ?, ?)
                AND stream_index >= ?",
         )
         .bind(item_id)
         .bind(origin)
         .bind(module_id)
         .bind(collection_id)
-        .bind(path_rel)
+        .bind(root_token)
+        .bind(source_path)
         .bind(count)
         .execute(&mut **tx)
         .await?;
     }
 
     let upsert = "INSERT INTO subtitle_tracks
-            (item_id, origin, module_id, collection_id, path_rel,
+            (item_id, origin, module_id, collection_id, root_token, source_path, path_rel,
              stream_index, format, language)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT (item_id, module_id, collection_id, path_rel, origin, stream_index)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT
+            (item_id, module_id, collection_id, root_token, source_path, origin, stream_index)
              WHERE origin IN ('embedded', 'sidecar')
-         DO UPDATE SET format = excluded.format, language = excluded.language";
+         DO UPDATE SET path_rel = excluded.path_rel,
+                       format = excluded.format, language = excluded.language";
     for (i, s) in info.subtitles.iter().enumerate() {
         sqlx::query(upsert)
             .bind(item_id)
             .bind("embedded")
             .bind(module_id)
             .bind(collection_id)
+            .bind(root_token)
+            .bind(source_path)
             .bind(path_rel)
             .bind(i as i64)
             .bind(&s.format)
@@ -370,6 +388,8 @@ pub async fn sync_source_tracks(
             .bind("sidecar")
             .bind(module_id)
             .bind(collection_id)
+            .bind(root_token)
+            .bind(source_path)
             .bind(path_rel)
             .bind(i as i64)
             .bind(&s.format)
@@ -447,7 +467,9 @@ mod tests {
             origin: origin.into(),
             module_id: Some("m".into()),
             collection_id: Some("c".into()),
-            path_rel: Some("f.mkv".into()),
+            root_token: Some("root".into()),
+            source_path: Some("f.mkv".into()),
+            path_rel: Some("key".into()),
             stream_index: Some(0),
             format: format.into(),
             language: None,

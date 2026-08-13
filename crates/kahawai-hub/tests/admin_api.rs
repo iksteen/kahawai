@@ -25,6 +25,7 @@ async fn body_json(resp: axum::response::Response) -> serde_json::Value {
 
 fn rec(path: &str, size: u64, head: u64, tail: u64) -> FileUpsertRecord {
     FileUpsertRecord {
+        root_token: "root".into(),
         path_rel: path.into(),
         size,
         mtime_unix: 1,

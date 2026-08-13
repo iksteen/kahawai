@@ -314,30 +314,27 @@ async fn capability_changes_delivery_not_existence() {
     )
     .await;
     q("INSERT INTO items (id, kind, title, norm_title) VALUES ('subs-item','movie','Subbed','subbed')").await;
-    q(
-        r#"INSERT INTO files (module_id, collection_id, path_rel, size, mtime_unix,
-                            head_xxh3, tail_xxh3, oshash, subs_extracted, streams_json)
-       VALUES ('m2','c2','subbed.mkv', 700, 1, 0, 0, 0, 0,
+    q(r#"INSERT INTO files
+              (module_id, collection_id, path_rel, root_token, source_path,
+               size, mtime_unix, head_xxh3, tail_xxh3, oshash, subs_extracted, streams_json)
+       VALUES ('m2','c2','key','root','subbed.mkv', 700, 1, 0, 0, 0, 0,
                '{"container":"matroska",
                  "subtitles":[{"format":"srt","language":"en"},
                               {"format":"ass","language":"en"},
-                              {"format":"pgs","language":"en"}]}')"#,
-    )
+                              {"format":"pgs","language":"en"}]}')"#)
     .await;
-    q(
-        "INSERT INTO item_sources (item_id, module_id, collection_id, path_rel)
-       VALUES ('subs-item','m2','c2','subbed.mkv')",
-    )
+    q("INSERT INTO item_sources
+              (item_id, module_id, collection_id, path_rel, root_token, source_path)
+       VALUES ('subs-item','m2','c2','key','root','subbed.mkv')")
     .await;
     // What a scan would materialize (tests seed by SQL, so no
     // sync_source_tracks ran).
-    q(
-        "INSERT INTO subtitle_tracks (item_id, origin, module_id, collection_id,
-                                      path_rel, stream_index, format, language)
-       VALUES ('subs-item','embedded','m2','c2','subbed.mkv',0,'srt','en'),
-              ('subs-item','embedded','m2','c2','subbed.mkv',1,'ass','en'),
-              ('subs-item','embedded','m2','c2','subbed.mkv',2,'pgs','en')",
-    )
+    q("INSERT INTO subtitle_tracks
+              (item_id, origin, module_id, collection_id, root_token, source_path,
+               path_rel, stream_index, format, language)
+       VALUES ('subs-item','embedded','m2','c2','root','subbed.mkv','key',0,'srt','en'),
+              ('subs-item','embedded','m2','c2','root','subbed.mkv','key',1,'ass','en'),
+              ('subs-item','embedded','m2','c2','root','subbed.mkv','key',2,'pgs','en')")
     .await;
 
     // Straight at `Subtitles::list`, not over HTTP: the listing endpoint
@@ -365,7 +362,7 @@ async fn capability_changes_delivery_not_existence() {
                 &ass,
                 "u",
                 false,
-                ("m2", "c2", "subbed.mkv"),
+                ("m2", "c2", "root", "subbed.mkv"),
             )
             .await
             .unwrap()
@@ -412,9 +409,11 @@ async fn scan_sync_preserves_track_ids() {
         let db = db.clone();
         async move {
             let mut tx = db.begin().await.unwrap();
-            kahawai_hub::tracks::sync_source_tracks(&mut tx, "it", "m", "c", "m.mkv", &info)
-                .await
-                .unwrap();
+            kahawai_hub::tracks::sync_source_tracks(
+                &mut tx, "it", "m", "c", "root", "m.mkv", "key", &info,
+            )
+            .await
+            .unwrap();
             tx.commit().await.unwrap();
         }
     };

@@ -289,7 +289,7 @@ pub fn load(explicit: Option<&Path>) -> Result<(Config, Option<PathBuf>)> {
         None => default_config_path(),
     };
     let used = path.exists().then(|| path.clone());
-    let cfg = Figment::new()
+    let mut cfg: Config = Figment::new()
         .merge(Toml::file(&path))
         // Only KAHAWAI_<SECTION>__<KEY> shapes are config; other
         // KAHAWAI_* vars (worker knobs like KAHAWAI_PACE_WINDOW_MS)
@@ -301,7 +301,92 @@ pub fn load(explicit: Option<&Path>) -> Result<(Config, Option<PathBuf>)> {
         )
         .extract()
         .with_context(|| format!("loading config from {}", path.display()))?;
+    let base = match path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        Some(parent) if parent.is_absolute() => parent.to_path_buf(),
+        Some(parent) => std::env::current_dir()?.join(parent),
+        None => std::env::current_dir()?,
+    };
+    normalize_and_validate_collections(&mut cfg.mediahost.collections, &base)?;
     Ok((cfg, used))
+}
+
+const MEDIA_TYPES: &[&str] = &["movies", "series", "anime", "music"];
+
+/// Normalize source namespaces before any watcher/scanner starts. This is
+/// lexical by design: an unavailable mount or changed symlink target must not
+/// change durable root identity.
+fn normalize_and_validate_collections(
+    collections: &mut [kahawai_core::media::CollectionConfig],
+    config_dir: &Path,
+) -> Result<()> {
+    let mut names = std::collections::HashSet::new();
+    for collection in collections {
+        if collection.name.is_empty() {
+            bail!("mediahost collection name must not be empty");
+        }
+        if !names.insert(collection.name.clone()) {
+            bail!("duplicate mediahost collection name {:?}", collection.name);
+        }
+        if !MEDIA_TYPES.contains(&collection.media_type.as_str()) {
+            bail!(
+                "collection {:?} has unsupported media_type {:?}; expected one of {}",
+                collection.name,
+                collection.media_type,
+                MEDIA_TYPES.join(", ")
+            );
+        }
+        if collection.roots.is_empty() {
+            bail!(
+                "collection {:?} must have at least one root",
+                collection.name
+            );
+        }
+
+        for root in &mut collection.roots {
+            let absolute = if root.is_absolute() {
+                root.clone()
+            } else {
+                config_dir.join(&*root)
+            };
+            *root = kahawai_core::media::normalize_root_path(&absolute, config_dir)
+                .map_err(anyhow::Error::msg)?;
+        }
+
+        for (i, root) in collection.roots.iter().enumerate() {
+            for other in &collection.roots[..i] {
+                if root == other {
+                    bail!(
+                        "collection {:?} configures duplicate root {}",
+                        collection.name,
+                        root.display()
+                    );
+                }
+                if root.starts_with(other) || other.starts_with(root) {
+                    bail!(
+                        "collection {:?} has overlapping roots {} and {}",
+                        collection.name,
+                        other.display(),
+                        root.display()
+                    );
+                }
+            }
+        }
+
+        let mut tokens = std::collections::HashMap::<String, &Path>::new();
+        for root in &collection.roots {
+            let token = kahawai_core::media::root_token(root);
+            if let Some(other) = tokens.insert(token.clone(), root)
+                && other.as_os_str() != root.as_os_str()
+            {
+                bail!(
+                    "root token collision {token}: {} and {}",
+                    other.display(),
+                    root.display()
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -387,6 +472,60 @@ mod tests {
             assert!(used.is_some());
             assert_eq!(cfg.hub.bind, "127.0.0.1:9000".parse().unwrap());
             assert_eq!(cfg.hub.data_dir, PathBuf::from("/tmp/kh"));
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn collection_roots_are_lexical_and_relative_to_the_config() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_dir("conf")?;
+            jail.create_file(
+                "conf/kahawai.toml",
+                "[[mediahost.collections]]\nname='movies'\nmedia_type='movies'\nroots=['../media/./films/../movies/']\n",
+            )?;
+            let (cfg, _) = load(Some(Path::new("conf/kahawai.toml"))).unwrap();
+            assert_eq!(
+                cfg.mediahost.collections[0].roots,
+                vec![jail.directory().join("media/movies")]
+            );
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn invalid_collection_names_types_and_overlaps_are_rejected() {
+        figment::Jail::expect_with(|jail| {
+            for (needle, body) in [
+                (
+                    "duplicate mediahost collection name",
+                    "[[mediahost.collections]]\nname='x'\nmedia_type='movies'\nroots=['/a']\n[[mediahost.collections]]\nname='x'\nmedia_type='series'\nroots=['/b']\n",
+                ),
+                (
+                    "unsupported media_type",
+                    "[[mediahost.collections]]\nname='x'\nmedia_type='books'\nroots=['/a']\n",
+                ),
+                (
+                    "overlap",
+                    "[[mediahost.collections]]\nname='x'\nmedia_type='movies'\nroots=['/a','/a/sub']\n",
+                ),
+            ] {
+                jail.create_file("kahawai.toml", body)?;
+                let error = load(Some(Path::new("kahawai.toml"))).unwrap_err();
+                assert!(error.to_string().contains(needle), "{error:#}");
+            }
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn roots_may_overlap_across_separate_collections() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file(
+                "kahawai.toml",
+                "[[mediahost.collections]]\nname='a'\nmedia_type='movies'\nroots=['/media']\n[[mediahost.collections]]\nname='b'\nmedia_type='series'\nroots=['/media/series']\n",
+            )?;
+            load(Some(Path::new("kahawai.toml"))).unwrap();
             Ok(())
         });
     }

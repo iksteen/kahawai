@@ -186,6 +186,7 @@ async fn keeps_audio_encode_local_and_dispatches_video_encode() {
         pb::host_to_hub::Msg::FileUpsert(pb::FileUpsert {
             collection_id: "movies".into(),
             files: vec![pb::FileRecord {
+                root_token: String::new(),
                 path_rel: "Concert (2020).mkv".into(),
                 size,
                 mtime_unix: 1,

@@ -137,7 +137,7 @@ rescan_minutes = 60              # backup sweep; the fs watcher reacts immediate
 [[mediahost.collections]]
 name = "movies"                  # stable id — renaming makes it a new collection
 media_type = "movies"            # movies | series | anime | music
-roots = ["/mnt/media/movies"]
+roots = ["/mnt/media/movies"]  # absolute paths; each gets a deterministic identity
 
 [[mediahost.collections]]
 name = "series"
@@ -151,8 +151,12 @@ max_sessions = 2                 # concurrent encodes this machine offers
 ```
 
 Metadata providers (TMDB key, TheTVDB key/PIN) are configured in the admin
-web UI, not the config file. Mediahost roots are treated as strictly
-read-only — kahawai never writes next to your media.
+web UI, not the config file. Mediahost roots are treated as strictly read-only —
+Kahawai never writes next to your media. Root list order has no identity meaning:
+every source is bound to the deterministic token of its absolute, lexically
+normalized configured root path, so equal relative filenames in separate roots
+remain distinct. Protocol 2.3 satellites remain supported for single-root
+collections throughout 0.x; exact multi-root operation requires protocol 2.4.
 
 ## License
 

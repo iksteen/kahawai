@@ -887,7 +887,7 @@ async fn admin_review_list(State(state): State<AppState>) -> Result<Json<Value>,
     let rows = sqlx::query(
         "SELECT i.id, i.kind, i.title, i.year, m.confidence,
                 m.title AS matched_title, m.premiered, m.provider, m.provider_id,
-                (SELECT s.path_rel FROM item_sources s WHERE s.item_id = i.id LIMIT 1) AS path
+                (SELECT s.source_path FROM item_sources s WHERE s.item_id = i.id LIMIT 1) AS path
          FROM items i
          JOIN resolved_metadata m ON m.item_id = i.id
          -- Only what a human can act on: episodes and tracks inherit their
@@ -2828,7 +2828,7 @@ async fn item_body(
     .ok_or((StatusCode::NOT_FOUND, "no such item".to_string()))?;
 
     let sources = sqlx::query(
-        "SELECT s.module_id, s.collection_id, s.path_rel, f.size, f.streams_json,
+        "SELECT s.module_id, s.collection_id, s.source_path, f.size, f.streams_json,
                 COALESCE(f.revision, 1) AS revision
          FROM item_sources s
          JOIN files f ON (f.module_id, f.collection_id, f.path_rel)
@@ -2854,7 +2854,7 @@ async fn item_body(
             let mut src = json!({
                 "module_id": module_id,
                 "collection_id": r.get::<String, _>("collection_id"),
-                "path_rel": r.get::<String, _>("path_rel"),
+                "path_rel": r.get::<String, _>("source_path"),
                 "size": r.get::<i64, _>("size"),
                 "available": state.registry.is_connected(&module_id),
                 "revision": r.get::<i64, _>("revision"),
@@ -3069,7 +3069,7 @@ async fn item_query(
                 &neg.ass,
                 &claims.sub,
                 claims.admin,
-                (&p.module_id, &p.collection_id, &p.path_rel),
+                (&p.module_id, &p.collection_id, &p.root_token, &p.path_rel),
             )
             .await
             .map_err(internal)?,

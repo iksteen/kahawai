@@ -236,7 +236,7 @@ impl Artwork {
         // The answer names the file; which mediahost serves it is decided
         // now, since a collection can be reachable through more than one
         // and only the connected ones can answer a lease.
-        let Some((module_id, collection_id, art_rel)) =
+        let Some((module_id, collection_id, root_token, art_rel)) =
             find_artwork_source(registry, item_id).await?
         else {
             return Ok(None);
@@ -255,6 +255,12 @@ impl Artwork {
         let cache_key = format!(
             "{:016x}",
             xxhash_rust::xxh3::xxh3_64(
+                format!("{module_id}\n{collection_id}\n{root_token}\n{art_rel}").as_bytes()
+            )
+        );
+        let legacy_key = format!(
+            "{:016x}",
+            xxhash_rust::xxh3::xxh3_64(
                 format!("{module_id}\n{collection_id}\n{art_rel}").as_bytes()
             )
         );
@@ -265,11 +271,27 @@ impl Artwork {
         let _guard = lock.lock().await;
 
         let cache_path = self.dir.join(&cache_key);
+        if registry
+            .collection_root_count(&module_id, &collection_id)
+            .await
+            .unwrap_or(0)
+            == 1
+        {
+            let legacy_path = self.dir.join(&legacy_key);
+            let _ = crate::subtitles::promote_legacy_cache(&cache_path, &legacy_path);
+            for (name, px) in SIZES {
+                let dir = self.dir.join(variant_dir(name, *px));
+                let _ = crate::subtitles::promote_legacy_cache(
+                    &dir.join(&cache_key),
+                    &dir.join(&legacy_key),
+                );
+            }
+        }
         if let Ok(bytes) = std::fs::read(&cache_path) {
             return Ok(Some((bytes, ctype, cache_key)));
         }
         let lease = sessions
-            .open_lease(registry, &module_id, &collection_id, &art_rel)
+            .open_lease(registry, &module_id, &collection_id, &root_token, &art_rel)
             .await?;
         let bytes = read_all(lease).await?;
         std::fs::create_dir_all(&self.dir)?;
@@ -388,9 +410,9 @@ async fn resolved_poster(registry: &Registry, item_id: &str) -> Result<Option<St
 pub(crate) async fn find_artwork_source(
     registry: &Registry,
     item_id: &str,
-) -> Result<Option<(String, String, String)>> {
+) -> Result<Option<(String, String, String, String)>> {
     let rows = sqlx::query(
-        "SELECT s.module_id, s.collection_id,
+        "SELECT s.module_id, s.collection_id, s.root_token,
                 json_extract(f.streams_json, '$.artwork') AS art
          FROM item_sources s
          JOIN files f ON (f.module_id, f.collection_id, f.path_rel)
@@ -408,7 +430,14 @@ pub(crate) async fn find_artwork_source(
         .iter()
         .find(|r| registry.is_connected(&r.get::<String, _>("module_id")))
         .or(rows.first());
-    Ok(row.map(|r| (r.get("module_id"), r.get("collection_id"), r.get("art"))))
+    Ok(row.map(|r| {
+        (
+            r.get("module_id"),
+            r.get("collection_id"),
+            r.get("root_token"),
+            r.get("art"),
+        )
+    }))
 }
 
 /// Drain a whole (small) file through a lease in chunks.

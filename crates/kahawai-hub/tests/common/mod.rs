@@ -156,6 +156,7 @@ pub async fn harness(file_name: &str, render: fn(&Path)) -> Harness {
         pb::host_to_hub::Msg::FileUpsert(pb::FileUpsert {
             collection_id: "movies".into(),
             files: vec![pb::FileRecord {
+                root_token: String::new(),
                 path_rel: file_name.into(),
                 size,
                 mtime_unix: 1,

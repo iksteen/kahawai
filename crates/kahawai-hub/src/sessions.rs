@@ -100,6 +100,7 @@ impl RemuxRunner {
 pub struct PartSource {
     pub module_id: String,
     pub collection_id: String,
+    pub root_token: String,
     pub path_rel: String,
     pub size: u64,
     pub base_ms: u64,
@@ -261,7 +262,7 @@ pub(crate) struct Negotiation<'a> {
     pub ass: kahawai_media::negotiate::AssPolicy,
     /// HUB-32c: image tracks that already have OCR text derived from
     /// them, keyed per source.
-    ocr_set: std::collections::HashSet<(String, String, String, i64)>,
+    ocr_set: std::collections::HashSet<(String, String, String, String, i64)>,
     /// An explicit burn pick, if the caller named one and it is a track
     /// some tier could actually burn.
     burn_row: Option<crate::tracks::Track>,
@@ -371,10 +372,12 @@ impl<'a> Negotiation<'a> {
         if (
             t.module_id.as_deref(),
             t.collection_id.as_deref(),
-            t.path_rel.as_deref(),
+            t.root_token.as_deref(),
+            t.source_path.as_deref(),
         ) != (
             Some(p.module_id.as_str()),
             Some(p.collection_id.as_str()),
+            Some(p.root_token.as_str()),
             Some(p.path_rel.as_str()),
         ) {
             return None;
@@ -469,6 +472,7 @@ impl<'a> Negotiation<'a> {
                         &self.ocr_set,
                         &p.module_id,
                         &p.collection_id,
+                        &p.root_token,
                         &p.path_rel,
                         info.subtitles.len(),
                     )
@@ -645,10 +649,11 @@ pub(crate) async fn fill_verdict_track_ids(
     let map: std::collections::HashMap<i64, i64> = sqlx::query_as(
         "SELECT stream_index, id FROM subtitle_tracks
          WHERE origin = 'embedded'
-           AND (module_id, collection_id, path_rel) = (?, ?, ?)",
+           AND (module_id, collection_id, root_token, source_path) = (?, ?, ?, ?)",
     )
     .bind(&p.module_id)
     .bind(&p.collection_id)
+    .bind(&p.root_token)
     .bind(&p.path_rel)
     .fetch_all(registry.db())
     .await
@@ -833,7 +838,8 @@ fn playlist_span_secs(playlist: &str) -> f64 {
         .sum()
 }
 
-type LocalResolver = std::sync::Arc<dyn Fn(&str, &str) -> Result<std::path::PathBuf> + Send + Sync>;
+type LocalResolver =
+    std::sync::Arc<dyn Fn(&str, &str, &str) -> Result<std::path::PathBuf> + Send + Sync>;
 
 /// How long a burn-in session waits for the mediahost to walk its
 /// index. Milliseconds on local disk; this is the sanity bound, well
@@ -1242,7 +1248,13 @@ impl Sessions {
         let (parts, info) = self.source_parts(registry, item_id).await?;
         let p = &parts[0];
         let lease = self
-            .open_lease(registry, &p.module_id, &p.collection_id, &p.path_rel)
+            .open_lease(
+                registry,
+                &p.module_id,
+                &p.collection_id,
+                &p.root_token,
+                &p.path_rel,
+            )
             .await?;
         Ok((p.module_id.clone(), p.path_rel.clone(), p.size, info, lease))
     }
@@ -1256,11 +1268,12 @@ impl Sessions {
         item_id: &str,
     ) -> Result<(Vec<PartSource>, kahawai_core::media::MediaInfo)> {
         let rows = sqlx::query(
-            "SELECT s.module_id, s.collection_id, s.path_rel, s.part, f.size, f.streams_json
+            "SELECT s.module_id, s.collection_id, s.root_token, s.source_path,
+                    s.part, f.size, f.streams_json
              FROM item_sources s
              JOIN files f ON (f.module_id, f.collection_id, f.path_rel)
                            = (s.module_id, s.collection_id, s.path_rel)
-             WHERE s.item_id = ?
+             WHERE s.item_id = ? AND s.root_token <> ''
              -- HUB-3 ranking. Resolution tier first: that is a deliberate
              -- quality choice. Within a tier the CORRECTED release wins
              -- (revision — a v2/REPACK is often smaller than the broken
@@ -1289,7 +1302,8 @@ impl Sessions {
                 vec![PartSource {
                     module_id: r.get("module_id"),
                     collection_id: r.get("collection_id"),
-                    path_rel: r.get("path_rel"),
+                    root_token: r.get("root_token"),
+                    path_rel: r.get("source_path"),
                     size: r.get::<i64, _>("size") as u64,
                     base_ms: 0,
                     duration_ms: info.duration_ms.unwrap_or(0),
@@ -1360,7 +1374,8 @@ impl Sessions {
             parts.push(PartSource {
                 module_id: r.get("module_id"),
                 collection_id: r.get("collection_id"),
-                path_rel: r.get("path_rel"),
+                root_token: r.get("root_token"),
+                path_rel: r.get("source_path"),
                 size: r.get::<i64, _>("size") as u64,
                 base_ms: base,
                 duration_ms: dur,
@@ -1382,11 +1397,12 @@ impl Sessions {
         item_id: &str,
     ) -> Result<Vec<(Vec<PartSource>, kahawai_core::media::MediaInfo)>> {
         let rows = sqlx::query(
-            "SELECT s.module_id, s.collection_id, s.path_rel, s.part, f.size, f.streams_json
+            "SELECT s.module_id, s.collection_id, s.root_token, s.source_path,
+                    s.part, f.size, f.streams_json
              FROM item_sources s
              JOIN files f ON (f.module_id, f.collection_id, f.path_rel)
                            = (s.module_id, s.collection_id, s.path_rel)
-             WHERE s.item_id = ?
+             WHERE s.item_id = ? AND s.root_token <> ''
              ORDER BY s.part IS NOT NULL,
                       COALESCE(json_extract(f.streams_json, '$.video[0].height'), 0) DESC,
                       COALESCE(f.revision, 1) DESC,
@@ -1408,7 +1424,8 @@ impl Sessions {
                 vec![PartSource {
                     module_id: r.get("module_id"),
                     collection_id: r.get("collection_id"),
-                    path_rel: r.get("path_rel"),
+                    root_token: r.get("root_token"),
+                    path_rel: r.get("source_path"),
                     size: r.get::<i64, _>("size") as u64,
                     base_ms: 0,
                     duration_ms: info.duration_ms.unwrap_or(0),
@@ -1461,7 +1478,7 @@ impl Sessions {
                SELECT 1 FROM item_sources s
                JOIN files f ON (f.module_id, f.collection_id, f.path_rel)
                              = (s.module_id, s.collection_id, s.path_rel)
-              WHERE s.item_id = ?)",
+              WHERE s.item_id = ? AND s.root_token <> '')",
         )
         .bind(item_id)
         .fetch_one(registry.db())
@@ -1487,7 +1504,7 @@ impl Sessions {
     pub fn set_local_source(
         &self,
         module_id: &str,
-        resolve: impl Fn(&str, &str) -> Result<std::path::PathBuf> + Send + Sync + 'static,
+        resolve: impl Fn(&str, &str, &str) -> Result<std::path::PathBuf> + Send + Sync + 'static,
     ) {
         *self.local_source.lock().unwrap() =
             Some((module_id.to_string(), std::sync::Arc::new(resolve)));
@@ -1498,6 +1515,7 @@ impl Sessions {
         registry: &Registry,
         module_id: &str,
         collection_id: &str,
+        root_token: &str,
         path_rel: &str,
     ) -> Result<Lease> {
         // AR-5/AR-11: the in-process mediahost's byte plane is a
@@ -1505,7 +1523,7 @@ impl Sessions {
         let local = {
             let guard = self.local_source.lock().unwrap();
             guard.as_ref().and_then(|(id, resolve)| {
-                (id == module_id).then(|| resolve(collection_id, path_rel))
+                (id == module_id).then(|| resolve(collection_id, root_token, path_rel))
             })
         };
         if let Some(path) = local {
@@ -1517,6 +1535,7 @@ impl Sessions {
                 lease_token: token.clone(),
                 collection_id: collection_id.to_string(),
                 path_rel: path_rel.to_string(),
+                root_token: root_token.to_string(),
             })),
         };
         // A send failure here means the host went away between being judged
@@ -1674,6 +1693,7 @@ impl Sessions {
                     registry,
                     &part.module_id,
                     &part.collection_id,
+                    &part.root_token,
                     &walk_rel,
                     walk_idx,
                     BURN_SETS_WAIT,
@@ -1705,6 +1725,7 @@ impl Sessions {
                     item_id,
                     &part.module_id,
                     &part.collection_id,
+                    &part.root_token,
                     &part.path_rel,
                     user_id,
                 )
@@ -1764,6 +1785,7 @@ impl Sessions {
                 registry,
                 &part.module_id,
                 &part.collection_id,
+                &part.root_token,
                 &part.path_rel,
             )
             .await?;
@@ -2045,6 +2067,7 @@ impl Sessions {
                     registry,
                     &part.module_id,
                     &part.collection_id,
+                    &part.root_token,
                     &part.path_rel,
                 )
                 .await?;
@@ -2694,7 +2717,8 @@ impl Sessions {
             let new_pick = ((is_image || is_ass)
                 && track.module_id.as_deref() == Some(part.module_id.as_str())
                 && track.collection_id.as_deref() == Some(part.collection_id.as_str())
-                && track.path_rel.as_deref() == Some(part.path_rel.as_str()))
+                && track.root_token.as_deref() == Some(part.root_token.as_str())
+                && track.source_path.as_deref() == Some(part.path_rel.as_str()))
             .then(|| {
                 let i = track.stream_index.unwrap_or(0) as usize;
                 match track.origin.as_str() {
@@ -2739,13 +2763,14 @@ impl Sessions {
                     // renderer takes the demuxer's pad or the script.
                     Some(_) if is_ass => None,
                     Some(_) => {
-                        let (module_id, collection_id, walk_rel, walk_idx, _) =
+                        let (module_id, collection_id, root_token, walk_rel, walk_idx, _) =
                             subtitles.extract_ref(registry, &track).await?;
                         let sets = subtitles
                             .image_sets(
                                 registry,
                                 &module_id,
                                 &collection_id,
+                                &root_token,
                                 &walk_rel,
                                 walk_idx,
                                 BURN_SETS_WAIT,
@@ -2855,7 +2880,8 @@ impl Sessions {
             // Switching tracks re-plans: the new track's codec decides
             // copy vs encode, not the old one's — and a burn-pick
             // change re-plans even with the same tracks.
-            let (_, _, _, info) = crate::subtitles::source_row(registry, &session.item_id).await?;
+            let (_, _, _, _, info) =
+                crate::subtitles::source_row(registry, &session.item_id).await?;
             // HUB-15a: the executor is already chosen here — ask IT.
             // Plain hub-local audio work is not a video executor.
             let tonemap = match &session.mode {
@@ -2907,6 +2933,7 @@ impl Sessions {
                         &ocr_set,
                         &p.module_id,
                         &p.collection_id,
+                        &p.root_token,
                         &p.path_rel,
                         info.subtitles.len(),
                     )
@@ -3400,6 +3427,7 @@ mod reads_from_tests {
         PartSource {
             module_id: host.into(),
             collection_id: "movies".into(),
+            root_token: "root".into(),
             path_rel: "x.mkv".into(),
             size: 1,
             base_ms: 0,
@@ -3537,6 +3565,7 @@ mod tests {
         PartSource {
             module_id: "m".into(),
             collection_id: "c".into(),
+            root_token: "root".into(),
             path_rel: format!("CD{}.avi", base_ms),
             size: 1,
             base_ms,

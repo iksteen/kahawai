@@ -88,11 +88,46 @@ const RASTER_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Cache key for one subtitle track of one source file — shared by the
 /// lazy extractors and the mediahost ingestion path.
-fn cache_key(module_id: &str, collection_id: &str, path_rel: &str, key: &str) -> String {
+fn legacy_cache_key(module_id: &str, collection_id: &str, path_rel: &str, key: &str) -> String {
     format!(
         "v2-{:016x}-{key}",
         xxhash_rust::xxh3::xxh3_64(format!("{module_id}\n{collection_id}\n{path_rel}").as_bytes())
     )
+}
+
+fn cache_key(
+    module_id: &str,
+    collection_id: &str,
+    root_token: &str,
+    path_rel: &str,
+    key: &str,
+) -> String {
+    format!(
+        "v2-{:016x}-{key}",
+        xxhash_rust::xxh3::xxh3_64(
+            format!("{module_id}\n{collection_id}\n{root_token}\n{path_rel}").as_bytes()
+        )
+    )
+}
+
+pub(crate) fn promote_legacy_cache(
+    exact: &std::path::Path,
+    legacy: &std::path::Path,
+) -> std::io::Result<()> {
+    if exact.exists() || !legacy.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = exact.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    // Rename preserves the already-paid artifact without duplicating it. A
+    // concurrent winner is harmless: if exact appeared, leave it authoritative.
+    if let Err(error) = std::fs::rename(legacy, exact)
+        && !exact.exists()
+    {
+        return Err(error);
+    }
+    Ok(())
 }
 
 pub struct Subtitles {
@@ -184,13 +219,14 @@ impl Subtitles {
         // orders by size, a different rule from the one playback uses,
         // so on a multi-source item it can list the tracks of a file
         // the session will not play.
-        (module_id, collection_id, path_rel): (&str, &str, &str),
+        (module_id, collection_id, root_token, path_rel): (&str, &str, &str, &str),
     ) -> Result<Vec<TrackListing>> {
         let tracks = crate::tracks::for_item_source(
             registry.db(),
             item_id,
             module_id,
             collection_id,
+            root_token,
             path_rel,
         )
         .await?;
@@ -301,7 +337,8 @@ impl Subtitles {
             let ex = self.load(registry, sessions, item_id, key).await?;
             return Ok(AssBody::Full(ex.ass.context("subtitle has no ASS form")?));
         }
-        let (module_id, collection_id, path_rel, info) = source_row(registry, item_id).await?;
+        let (module_id, collection_id, root_token, path_rel, info) =
+            source_row(registry, item_id).await?;
         let entry = entries(&info)
             .into_iter()
             .find(|e| e.key == key)
@@ -318,20 +355,39 @@ impl Subtitles {
         };
         let idx: usize = n.parse().context("bad embedded key")?;
 
-        let cache_key = cache_key(&module_id, &collection_id, &path_rel, key);
+        let cache_key = cache_key(&module_id, &collection_id, &root_token, &path_rel, key);
         let lock = {
             let mut map = self.inflight.lock().unwrap();
             map.entry(cache_key.clone()).or_default().clone()
         };
         let guard = lock.lock_owned().await;
         let cache_path = self.dir.join(format!("{cache_key}.json"));
+        let legacy_path = self.dir.join(format!(
+            "{}.json",
+            legacy_cache_key(&module_id, &collection_id, &path_rel, key)
+        ));
+        if registry
+            .collection_root_count(&module_id, &collection_id)
+            .await
+            .unwrap_or(0)
+            == 1
+        {
+            let _ = promote_legacy_cache(&cache_path, &legacy_path);
+        }
         if let Ok(bytes) = std::fs::read(&cache_path) {
             let ex: Extracted = serde_json::from_slice(&bytes)?;
             return Ok(AssBody::Full(ex.ass.context("subtitle has no ASS form")?));
         }
 
         if let Some(ex) = self
-            .request_extraction(registry, &module_id, &collection_id, &path_rel, key)
+            .request_extraction(
+                registry,
+                &module_id,
+                &collection_id,
+                &root_token,
+                &path_rel,
+                key,
+            )
             .await
         {
             return Ok(AssBody::Full(ex.ass.context("subtitle has no ASS form")?));
@@ -344,10 +400,15 @@ impl Subtitles {
         };
         let (tx, rx) = tokio::sync::mpsc::channel::<String>(256);
         let this = self.clone();
-        let (module_id2, collection_id2, path_rel2) =
-            (module_id.clone(), collection_id.clone(), path_rel.clone());
+        let (module_id2, collection_id2, root_token2, path_rel2) = (
+            module_id.clone(),
+            collection_id.clone(),
+            root_token.clone(),
+            path_rel.clone(),
+        );
         tokio::spawn(async move {
-            let (module_id, collection_id, path_rel) = (module_id2, collection_id2, path_rel2);
+            let (module_id, collection_id, root_token, path_rel) =
+                (module_id2, collection_id2, root_token2, path_rel2);
             let _guard = guard; // held until the cache is written
             let extraction = tokio::task::spawn_blocking(move || {
                 kahawai_media::subtitles::extract_embedded_stream(
@@ -371,6 +432,7 @@ impl Subtitles {
                         if let Err(e) = this.store_extracted(
                             &module_id,
                             &collection_id,
+                            &root_token,
                             &path_rel,
                             &format!("e{i}"),
                             ex,
@@ -407,14 +469,15 @@ impl Subtitles {
                 .context("downloaded subtitle missing from cache — download it again")?;
             return Ok(serde_json::from_slice(&bytes)?);
         }
-        let (module_id, collection_id, path_rel, info) = source_row(registry, item_id).await?;
+        let (module_id, collection_id, root_token, path_rel, info) =
+            source_row(registry, item_id).await?;
         entries(&info)
             .into_iter()
             .find(|e| e.key == key)
             .with_context(|| format!("no subtitle {key} on this item"))?;
 
         // v2: the cache holds cues + optional faithful ASS.
-        let cache_key = cache_key(&module_id, &collection_id, &path_rel, key);
+        let cache_key = cache_key(&module_id, &collection_id, &root_token, &path_rel, key);
         let lock = {
             let mut map = self.inflight.lock().unwrap();
             map.entry(cache_key.clone()).or_default().clone()
@@ -422,6 +485,18 @@ impl Subtitles {
         let _guard = lock.lock().await;
 
         let cache_path = self.dir.join(format!("{cache_key}.json"));
+        let legacy_path = self.dir.join(format!(
+            "{}.json",
+            legacy_cache_key(&module_id, &collection_id, &path_rel, key)
+        ));
+        if registry
+            .collection_root_count(&module_id, &collection_id)
+            .await
+            .unwrap_or(0)
+            == 1
+        {
+            let _ = promote_legacy_cache(&cache_path, &legacy_path);
+        }
         if let Ok(bytes) = std::fs::read(&cache_path) {
             return Ok(serde_json::from_slice(&bytes)?);
         }
@@ -432,7 +507,13 @@ impl Subtitles {
                 .get(idx)
                 .context("sidecar index out of range")?;
             let lease = sessions
-                .open_lease(registry, &module_id, &collection_id, &sidecar.path_rel)
+                .open_lease(
+                    registry,
+                    &module_id,
+                    &collection_id,
+                    &root_token,
+                    &sidecar.path_rel,
+                )
                 .await?;
             let bytes = read_all(lease).await?;
             let text = decode_text(&bytes);
@@ -442,7 +523,14 @@ impl Subtitles {
         } else if let Some(n) = key.strip_prefix('e') {
             let idx: usize = n.parse().context("bad embedded key")?;
             if let Some(ex) = self
-                .request_extraction(registry, &module_id, &collection_id, &path_rel, key)
+                .request_extraction(
+                    registry,
+                    &module_id,
+                    &collection_id,
+                    &root_token,
+                    &path_rel,
+                    key,
+                )
                 .await
             {
                 return Ok(ex);
@@ -465,7 +553,14 @@ impl Subtitles {
                 if i == idx {
                     requested = Some(ex.clone());
                 }
-                self.store_extracted(&module_id, &collection_id, &path_rel, &format!("e{i}"), &ex)?;
+                self.store_extracted(
+                    &module_id,
+                    &collection_id,
+                    &root_token,
+                    &path_rel,
+                    &format!("e{i}"),
+                    &ex,
+                )?;
             }
             return requested.with_context(|| {
                 format!("no cues extracted (track {idx} missing or not a text track)")
@@ -779,6 +874,7 @@ impl Subtitles {
         item_id: &str,
         module_id: &str,
         collection_id: &str,
+        root_token: &str,
         path_rel: &str,
         user_id: &str,
     ) -> bool {
@@ -787,6 +883,7 @@ impl Subtitles {
             item_id,
             module_id,
             collection_id,
+            root_token,
             path_rel,
         )
         .await
@@ -846,20 +943,23 @@ impl Subtitles {
         registry: &Registry,
         parent: &crate::tracks::Track,
     ) -> Result<(u32, u32, (u32, u32))> {
-        let (m, c, p) = (
+        let (m, c, token, path) = (
             parent
                 .module_id
                 .clone()
                 .context("hub-stored track has no source")?,
             parent.collection_id.clone().unwrap_or_default(),
-            parent.path_rel.clone().unwrap_or_default(),
+            parent.root_token.clone().unwrap_or_default(),
+            parent.source_path.clone().unwrap_or_default(),
         );
         let streams: String = sqlx::query_scalar(
-            "SELECT streams_json FROM files WHERE (module_id, collection_id, path_rel) = (?, ?, ?)",
+            "SELECT streams_json FROM files
+             WHERE (module_id, collection_id, root_token, source_path) = (?, ?, ?, ?)",
         )
         .bind(&m)
         .bind(&c)
-        .bind(&p)
+        .bind(&token)
+        .bind(&path)
         .fetch_one(registry.db())
         .await?;
         let info: kahawai_core::media::MediaInfo = serde_json::from_str(&streams)?;
@@ -885,26 +985,28 @@ impl Subtitles {
         &self,
         registry: &Registry,
         track: &crate::tracks::Track,
-    ) -> Result<(String, String, String, usize, Option<String>)> {
+    ) -> Result<(String, String, String, String, usize, Option<String>)> {
         anyhow::ensure!(
             crate::tracks::is_image_format(&track.format),
             "track {} is {}, not an image subtitle",
             track.id,
             track.format
         );
-        let (module_id, collection_id, media_rel) = (
+        let (module_id, collection_id, root_token, media_rel) = (
             track
                 .module_id
                 .clone()
                 .context("hub-stored track has no source to extract")?,
             track.collection_id.clone().unwrap_or_default(),
-            track.path_rel.clone().unwrap_or_default(),
+            track.root_token.clone().unwrap_or_default(),
+            track.source_path.clone().unwrap_or_default(),
         );
         let idx = track.stream_index.unwrap_or(0) as usize;
         match track.origin.as_str() {
             "embedded" => Ok((
                 module_id,
                 collection_id,
+                root_token,
                 media_rel,
                 idx,
                 track.language.clone(),
@@ -912,10 +1014,11 @@ impl Subtitles {
             "sidecar" => {
                 let streams: String = sqlx::query_scalar(
                     "SELECT streams_json FROM files
-                     WHERE (module_id, collection_id, path_rel) = (?, ?, ?)",
+                     WHERE (module_id, collection_id, root_token, source_path) = (?, ?, ?, ?)",
                 )
                 .bind(&module_id)
                 .bind(&collection_id)
+                .bind(&root_token)
                 .bind(&media_rel)
                 .fetch_one(registry.db())
                 .await?;
@@ -927,6 +1030,7 @@ impl Subtitles {
                 Ok((
                     module_id,
                     collection_id,
+                    root_token,
                     ext.path_rel.clone(),
                     ext.track.unwrap_or(0) as usize,
                     ext.language.clone().or_else(|| track.language.clone()),
@@ -964,7 +1068,7 @@ impl Subtitles {
         let parent = crate::tracks::get(registry.db(), parent_id)
             .await?
             .with_context(|| format!("no subtitle track {parent_id}"))?;
-        let (module_id, collection_id, extract_rel, extract_idx, language) =
+        let (module_id, collection_id, root_token, extract_rel, extract_idx, language) =
             self.extract_ref(registry, &parent).await?;
         let model = crate::ocr::model_for(language.as_deref()).with_context(|| {
             format!(
@@ -980,6 +1084,7 @@ impl Subtitles {
                 registry,
                 &module_id,
                 &collection_id,
+                &root_token,
                 &extract_rel,
                 extract_idx,
                 sets_wait,
@@ -1053,8 +1158,14 @@ impl Subtitles {
                         failed.insert(id);
                         continue;
                     };
-                    let Ok((module_id, collection_id, extract_rel, extract_idx, language)) =
-                        subs.extract_ref(&registry, &track).await
+                    let Ok((
+                        module_id,
+                        collection_id,
+                        root_token,
+                        extract_rel,
+                        extract_idx,
+                        language,
+                    )) = subs.extract_ref(&registry, &track).await
                     else {
                         failed.insert(id);
                         continue;
@@ -1073,6 +1184,7 @@ impl Subtitles {
                                 &registry,
                                 &module_id,
                                 &collection_id,
+                                &root_token,
                                 &extract_rel,
                                 extract_idx,
                                 SETS_WAIT_IDLE,
@@ -1160,6 +1272,7 @@ impl Subtitles {
         &self,
         module_id: &str,
         collection_id: &str,
+        root_token: &str,
         path_rel: &str,
         key: &str,
         ex: &Extracted,
@@ -1167,7 +1280,7 @@ impl Subtitles {
         std::fs::create_dir_all(&self.dir)?;
         let path = self.dir.join(format!(
             "{}.json",
-            cache_key(module_id, collection_id, path_rel, key)
+            cache_key(module_id, collection_id, root_token, path_rel, key)
         ));
         std::fs::write(&path, serde_json::to_vec(ex)?)?;
         Ok(())
@@ -1188,34 +1301,42 @@ impl Subtitles {
     /// replaced file is a different question, and re-asking it is right.
     /// A file the hub has no row for records NULL, which never matches
     /// and so never suppresses.
+    #[allow(clippy::too_many_arguments)] // exact source/track identity plus its answer
     pub async fn remember_extraction_failure(
         &self,
         registry: &Registry,
         module_id: &str,
         collection_id: &str,
+        root_token: &str,
         path_rel: &str,
         sub_index: u32,
         error: &str,
     ) -> Result<()> {
         let mtime: Option<i64> = sqlx::query_scalar(
             "SELECT mtime_unix FROM files
-              WHERE module_id = ?1 AND collection_id = ?2 AND path_rel = ?3",
+              WHERE module_id = ?1 AND collection_id = ?2
+                AND root_token = ?3 AND source_path = ?4",
         )
         .bind(module_id)
         .bind(collection_id)
+        .bind(root_token)
         .bind(path_rel)
         .fetch_optional(registry.db())
         .await?
         .flatten();
         sqlx::query(
             "INSERT INTO image_set_failures
-                 (module_id, collection_id, path_rel, sub_index, mtime_unix, error, at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, unixepoch())
-             ON CONFLICT (module_id, collection_id, path_rel, sub_index) DO UPDATE
+                 (module_id, collection_id, path_rel, root_token, source_path,
+                  sub_index, mtime_unix, error, at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, unixepoch())
+             ON CONFLICT (module_id, collection_id, root_token, source_path, sub_index)
+                 WHERE root_token <> '' DO UPDATE
              SET mtime_unix = excluded.mtime_unix, error = excluded.error, at = excluded.at",
         )
         .bind(module_id)
         .bind(collection_id)
+        .bind(crate::registry::source_key(root_token, path_rel))
+        .bind(root_token)
         .bind(path_rel)
         .bind(sub_index)
         .bind(mtime)
@@ -1231,18 +1352,21 @@ impl Subtitles {
         registry: &Registry,
         module_id: &str,
         collection_id: &str,
+        root_token: &str,
         path_rel: &str,
         sub_index: usize,
     ) -> bool {
         sqlx::query_scalar::<_, i64>(
             "SELECT 1 FROM image_set_failures f
-               JOIN files fi ON (fi.module_id, fi.collection_id, fi.path_rel)
-                              = (f.module_id, f.collection_id, f.path_rel)
-              WHERE f.module_id = ?1 AND f.collection_id = ?2 AND f.path_rel = ?3
-                AND f.sub_index = ?4 AND f.mtime_unix IS fi.mtime_unix",
+               JOIN files fi ON (fi.module_id, fi.collection_id, fi.root_token, fi.source_path)
+                              = (f.module_id, f.collection_id, f.root_token, f.source_path)
+              WHERE f.module_id = ?1 AND f.collection_id = ?2
+                AND f.root_token = ?3 AND f.source_path = ?4
+                AND f.sub_index = ?5 AND f.mtime_unix IS fi.mtime_unix",
         )
         .bind(module_id)
         .bind(collection_id)
+        .bind(root_token)
         .bind(path_rel)
         .bind(sub_index as i64)
         .fetch_optional(registry.db())
@@ -1252,11 +1376,13 @@ impl Subtitles {
         .is_some()
     }
 
+    #[allow(clippy::too_many_arguments)] // exact source/track identity plus wait policy
     pub async fn image_sets(
         &self,
         registry: &Registry,
         module_id: &str,
         collection_id: &str,
+        root_token: &str,
         path_rel: &str,
         sub_index: usize,
         wait: std::time::Duration,
@@ -1264,8 +1390,20 @@ impl Subtitles {
         let key = format!("i{sub_index}");
         let cache_path = self.dir.join(format!(
             "{}.sets",
-            cache_key(module_id, collection_id, path_rel, &key)
+            cache_key(module_id, collection_id, root_token, path_rel, &key)
         ));
+        let legacy_path = self.dir.join(format!(
+            "{}.sets",
+            legacy_cache_key(module_id, collection_id, path_rel, &key)
+        ));
+        if registry
+            .collection_root_count(module_id, collection_id)
+            .await
+            .unwrap_or(0)
+            == 1
+        {
+            let _ = promote_legacy_cache(&cache_path, &legacy_path);
+        }
         if tokio::fs::metadata(&cache_path).await.is_ok() {
             return Some(cache_path);
         }
@@ -1277,7 +1415,14 @@ impl Subtitles {
         // track was requested again on every hub start for days, and
         // each request cost a mediahost walk.
         if self
-            .extraction_failed_before(registry, module_id, collection_id, path_rel, sub_index)
+            .extraction_failed_before(
+                registry,
+                module_id,
+                collection_id,
+                root_token,
+                path_rel,
+                sub_index,
+            )
             .await
         {
             return None;
@@ -1288,6 +1433,7 @@ impl Subtitles {
                     collection_id: collection_id.to_string(),
                     path_rel: path_rel.to_string(),
                     sub_index: sub_index as u32,
+                    root_token: root_token.to_string(),
                 },
             )),
         };
@@ -1320,7 +1466,13 @@ impl Subtitles {
         let key = format!("i{}", msg.sub_index);
         let path = self.dir.join(format!(
             "{}.sets",
-            cache_key(module_id, &msg.collection_id, &msg.path_rel, &key)
+            cache_key(
+                module_id,
+                &msg.collection_id,
+                &msg.root_token,
+                &msg.path_rel,
+                &key
+            )
         ));
         let blocks: Vec<(u64, Option<u64>, Vec<u8>)> = msg
             .blocks
@@ -1350,6 +1502,7 @@ impl Subtitles {
         registry: &Registry,
         module_id: &str,
         collection_id: &str,
+        root_token: &str,
         path_rel: &str,
         key: &str,
     ) -> Option<Extracted> {
@@ -1361,6 +1514,7 @@ impl Subtitles {
                 kahawai_proto::v1::ExtractSubs {
                     collection_id: collection_id.to_string(),
                     path_rel: path_rel.to_string(),
+                    root_token: root_token.to_string(),
                 },
             )),
         };
@@ -1369,7 +1523,7 @@ impl Subtitles {
             "urgent subtitle extraction requested from mediahost");
         let cache_path = self.dir.join(format!(
             "{}.json",
-            cache_key(module_id, collection_id, path_rel, key)
+            cache_key(module_id, collection_id, root_token, path_rel, key)
         ));
         // The mediahost is never slower than dragging the file over the
         // lease ourselves — wait while its link is alive (10 min sanity
@@ -1397,11 +1551,12 @@ impl Subtitles {
         sessions: &Sessions,
         item_id: &str,
     ) -> Result<Vec<(String, Vec<u8>)>> {
-        let (module_id, collection_id, path_rel, info) = source_row(registry, item_id).await?;
+        let (module_id, collection_id, root_token, path_rel, info) =
+            source_row(registry, item_id).await?;
         let cache_key = format!(
             "fonts-{:016x}",
             xxhash_rust::xxh3::xxh3_64(
-                format!("{module_id}\n{collection_id}\n{path_rel}").as_bytes()
+                format!("{module_id}\n{collection_id}\n{root_token}\n{path_rel}").as_bytes()
             )
         );
         let lock = {
@@ -1410,6 +1565,20 @@ impl Subtitles {
         };
         let _guard = lock.lock().await;
         let dir = self.dir.join(&cache_key);
+        let legacy_dir = self.dir.join(format!(
+            "fonts-{:016x}",
+            xxhash_rust::xxh3::xxh3_64(
+                format!("{module_id}\n{collection_id}\n{path_rel}").as_bytes()
+            )
+        ));
+        if registry
+            .collection_root_count(&module_id, &collection_id)
+            .await
+            .unwrap_or(0)
+            == 1
+        {
+            let _ = promote_legacy_cache(&dir, &legacy_dir);
+        }
         let index = dir.join("index.json");
         if let Ok(bytes) = std::fs::read(&index) {
             let names: Vec<String> = serde_json::from_slice(&bytes)?;
@@ -1499,9 +1668,9 @@ fn is_font(a: &kahawai_core::media::Attachment) -> bool {
 pub async fn ocr_stream_set(
     db: &sqlx::SqlitePool,
     item_id: &str,
-) -> std::collections::HashSet<(String, String, String, i64)> {
+) -> std::collections::HashSet<(String, String, String, String, i64)> {
     sqlx::query_as(
-        "SELECT t.module_id, t.collection_id, t.path_rel, t.stream_index
+        "SELECT t.module_id, t.collection_id, t.root_token, t.source_path, t.stream_index
          FROM subtitle_tracks t
          WHERE t.item_id = ? AND t.origin = 'embedded'
            AND EXISTS (
@@ -1519,9 +1688,10 @@ pub async fn ocr_stream_set(
 /// [`ocr_stream_set`] as `negotiate()`'s per-stream flag vec, for the
 /// source one plan is judging.
 pub fn ocr_flags_for(
-    set: &std::collections::HashSet<(String, String, String, i64)>,
+    set: &std::collections::HashSet<(String, String, String, String, i64)>,
     module_id: &str,
     collection_id: &str,
+    root_token: &str,
     path_rel: &str,
     n_subs: usize,
 ) -> Vec<bool> {
@@ -1530,6 +1700,7 @@ pub fn ocr_flags_for(
             set.contains(&(
                 module_id.to_string(),
                 collection_id.to_string(),
+                root_token.to_string(),
                 path_rel.to_string(),
                 i as i64,
             ))
@@ -1573,9 +1744,16 @@ fn entries(info: &kahawai_core::media::MediaInfo) -> Vec<SubtitleEntry> {
 pub(crate) async fn source_row(
     registry: &Registry,
     item_id: &str,
-) -> Result<(String, String, String, kahawai_core::media::MediaInfo)> {
+) -> Result<(
+    String,
+    String,
+    String,
+    String,
+    kahawai_core::media::MediaInfo,
+)> {
     let rows = sqlx::query(
-        "SELECT s.module_id, s.collection_id, s.path_rel, f.streams_json
+        "SELECT s.module_id, s.collection_id, s.root_token, s.source_path,
+                f.streams_json
          FROM item_sources s
          JOIN files f ON (f.module_id, f.collection_id, f.path_rel)
                        = (s.module_id, s.collection_id, s.path_rel)
@@ -1594,7 +1772,8 @@ pub(crate) async fn source_row(
     Ok((
         row.get("module_id"),
         row.get("collection_id"),
-        row.get("path_rel"),
+        row.get("root_token"),
+        row.get("source_path"),
         info,
     ))
 }
@@ -1618,5 +1797,37 @@ async fn read_all(lease: crate::leases::Lease) -> Result<Vec<u8>> {
         if got < CHUNK {
             return Ok(out);
         }
+    }
+}
+
+#[cfg(test)]
+mod cache_upgrade_tests {
+    use super::promote_legacy_cache;
+
+    #[test]
+    fn legacy_artifact_is_moved_to_its_exact_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join("legacy.json");
+        let exact = dir.path().join("exact.json");
+        std::fs::write(&legacy, b"paid artifact").unwrap();
+
+        promote_legacy_cache(&exact, &legacy).unwrap();
+
+        assert_eq!(std::fs::read(&exact).unwrap(), b"paid artifact");
+        assert!(!legacy.exists());
+    }
+
+    #[test]
+    fn exact_artifact_is_never_replaced_by_a_legacy_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join("legacy.json");
+        let exact = dir.path().join("exact.json");
+        std::fs::write(&legacy, b"old").unwrap();
+        std::fs::write(&exact, b"exact").unwrap();
+
+        promote_legacy_cache(&exact, &legacy).unwrap();
+
+        assert_eq!(std::fs::read(&exact).unwrap(), b"exact");
+        assert_eq!(std::fs::read(&legacy).unwrap(), b"old");
     }
 }

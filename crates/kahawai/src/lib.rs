@@ -225,8 +225,8 @@ async fn run_hub_inner(
             &mh.name,
         );
         let cols = mh.collections.clone();
-        sessions.set_local_source(LOCAL_ID, move |collection, path| {
-            kahawai_mediahost::serve::resolve_rel(&cols, collection, path)
+        sessions.set_local_source(LOCAL_ID, move |collection, root_token, path| {
+            kahawai_mediahost::serve::resolve_rel(&cols, collection, root_token, path)
         });
         let state_dir = mh.state_dir.clone();
         // Same reason as run_mediahost. Ranks are process-global, so in

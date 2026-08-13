@@ -6,6 +6,7 @@ use sqlx::Row;
 
 fn rec(path: &str, size: u64) -> FileUpsertRecord {
     FileUpsertRecord {
+        root_token: "root".into(),
         path_rel: path.into(),
         size,
         mtime_unix: 1,
@@ -114,7 +115,7 @@ async fn resolves_series_into_shows_and_episodes() {
         "Andor/Season 1/behind-the-scenes.mkv",
     ]
     .into_iter()
-    .map(String::from)
+    .map(|path| kahawai_hub::registry::source_key("root", path))
     .collect();
     registry
         .reconcile_files("01HOST", "series", &keep)
@@ -197,6 +198,7 @@ async fn resolves_music_into_albums_and_tracks() {
 
     // Tagged file: tags win over the filename.
     let tagged = FileUpsertRecord {
+        root_token: "root".into(),
         streams_json: serde_json::json!({
             "tags": {
                 "artist": "Rotting Christ",
@@ -218,6 +220,7 @@ async fn resolves_music_into_albums_and_tracks() {
     );
     // Same album name, different artist: must be a separate album.
     let other = FileUpsertRecord {
+        root_token: "root".into(),
         streams_json: serde_json::json!({
             "tags": {"artist": "Other Band", "album": "Khronos", "title": "Song", "track_number": "1"}
         })
@@ -280,7 +283,7 @@ async fn resolves_music_into_albums_and_tracks() {
         "Rotting Christ/Khronos (2000)/rip-log.flac",
     ]
     .into_iter()
-    .map(String::from)
+    .map(|path| kahawai_hub::registry::source_key("root", path))
     .collect();
     registry
         .reconcile_files("01HOST", "music", &keep)
