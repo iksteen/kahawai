@@ -10,6 +10,24 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
+fn deserialize_nonnegative_u32<'de, D>(deserializer: D) -> Result<Option<u32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+
+    let value = Option::<i64>::deserialize(deserializer)?;
+    match value {
+        Some(value) if value >= 0 => u32::try_from(value)
+            .map(Some)
+            .map_err(|_| D::Error::custom("integer exceeds u32")),
+        // Legacy indexers wrote -1 for an unsupported measurement. It means
+        // unknown, just like null; accepting it here lets unrelated targeted
+        // updates preserve and normalize those deployed source rows.
+        Some(_) | None => Ok(None),
+    }
+}
+
 /// A file's own loudness statement (HUB-19).
 ///
 /// Gains are dB to apply; peaks are linear sample values where 1.0 is
@@ -151,7 +169,11 @@ pub struct VideoStream {
     /// boundaries"), and §3 explicitly allows a segment whose leading
     /// frames are "downloaded but possibly discarded". A segmenter
     /// that cut on a time grid would make this field irrelevant.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_nonnegative_u32"
+    )]
     pub max_keyframe_interval_ms: Option<u32>,
     /// Pixel aspect ratio as an exact reduced fraction. `(1,1)` is a measured
     /// square-pixel source; `None` means this row predates geometry probing.
@@ -177,6 +199,25 @@ pub struct VideoGeometry {
     pub orientation: String,
     pub display_width: u32,
     pub display_height: u32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_negative_keyframe_interval_is_unknown() {
+        let stream: VideoStream = serde_json::from_str(
+            r#"{"codec":"h264","width":1920,"height":1080,"fps":null,"bit_depth":null,"interlaced":false,"hdr":null,"profile":null,"level":null,"bitrate_kbps":null,"max_keyframe_interval_ms":-1}"#,
+        )
+        .unwrap();
+        assert_eq!(stream.max_keyframe_interval_ms, None);
+        assert!(
+            !serde_json::to_string(&stream)
+                .unwrap()
+                .contains("max_keyframe_interval_ms")
+        );
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]

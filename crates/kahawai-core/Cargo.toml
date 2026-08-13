@@ -9,3 +9,6 @@ sha2 = { workspace = true }
 data-encoding = { workspace = true }
 rcgen = { workspace = true }
 serde = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
