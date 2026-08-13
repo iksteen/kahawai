@@ -200,6 +200,55 @@ fn bare_part(title: &str) -> Option<u32> {
     n.parse().ok()
 }
 
+/// Stable rendition family within one root. It removes only the multipart
+/// marker, retaining release names/tags so two CD1/CD2 editions of one work do
+/// not become one source. The root is deliberately supplied by the caller as a
+/// relational key; this string only distinguishes directory/name families.
+pub fn rendition_family_key(path_rel: &str) -> String {
+    let path = std::path::Path::new(path_rel);
+    let parent = path.parent().and_then(|p| p.to_str()).unwrap_or_default();
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(path_rel);
+    let words: Vec<String> = stem
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .map(|word| word.to_lowercase())
+        .collect();
+    let is_number = |word: &str| {
+        !word.is_empty() && word.len() <= 2 && word.chars().all(|c| c.is_ascii_digit())
+    };
+    let attached = |word: &str| {
+        ["cd", "disc", "disk"]
+            .iter()
+            .any(|marker| word.strip_prefix(marker).is_some_and(is_number))
+    };
+    let bare_part = words.len() == 1 && words[0].strip_prefix("part").is_some_and(is_number);
+    let mut kept = Vec::new();
+    let mut i = 0;
+    while i < words.len() {
+        if attached(&words[i]) {
+            i += 1;
+            continue;
+        }
+        if matches!(words[i].as_str(), "cd" | "disc" | "disk")
+            && words.get(i + 1).is_some_and(|word| is_number(word))
+        {
+            i += 2;
+            continue;
+        }
+        kept.push(words[i].as_str());
+        i += 1;
+    }
+    let release = if bare_part || kept.is_empty() {
+        "@parts".to_string()
+    } else {
+        kept.join("-")
+    };
+    format!("{parent}\n{release}")
+}
+
 fn parse_year_token(tok: &str) -> Option<u16> {
     let t = tok.trim_matches(|c| matches!(c, '(' | ')' | '[' | ']'));
     if t.len() != 4 {
@@ -1267,6 +1316,26 @@ mod tests {
                 .unwrap();
         assert_eq!(g.show_title, "Mr Robot");
         assert_eq!((g.season, g.episode), (Some(1), 1));
+    }
+
+    #[test]
+    fn rendition_families_keep_editions_apart() {
+        assert_eq!(
+            rendition_family_key("Cut A/Movie.REPACK-CD1.avi"),
+            "Cut A\nmovie-repack"
+        );
+        assert_eq!(
+            rendition_family_key("Cut A/Movie.REPACK-CD2.avi"),
+            "Cut A\nmovie-repack"
+        );
+        assert_ne!(
+            rendition_family_key("Cut A/Movie.REPACK-CD1.avi"),
+            rendition_family_key("Cut B/Movie.REPACK-CD2.avi")
+        );
+        assert_eq!(
+            rendition_family_key("Nescaflowne (Eng,-Audio)/part7.mp4"),
+            "Nescaflowne (Eng,-Audio)\n@parts"
+        );
     }
 
     #[test]

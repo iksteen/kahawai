@@ -261,6 +261,57 @@ async fn a_whole_part_set_is_assembled() {
 }
 
 #[tokio::test]
+async fn two_complete_editions_never_mix_parts() {
+    let (registry, sessions, item, _dir) = item_with(
+        vec![
+            ("01A", "Mixed (1999) - Cut A - CD1.avi"),
+            ("01A", "Mixed (1999) - Cut A - CD2.avi"),
+            ("01A", "Mixed (1999) - Cut B - CD1.avi"),
+            ("01A", "Mixed (1999) - Cut B - CD2.avi"),
+        ],
+        &["01A"],
+    )
+    .await;
+    let candidates = sessions.candidate_sources(&registry, &item).await.unwrap();
+    assert_eq!(candidates.len(), 2);
+    for (parts, _) in candidates {
+        assert_eq!(parts.len(), 2);
+        assert!(
+            parts.iter().all(|part| part.path_rel.contains("Cut A"))
+                || parts.iter().all(|part| part.path_rel.contains("Cut B")),
+            "assembled parts from different editions: {:?}",
+            parts.iter().map(|part| &part.path_rel).collect::<Vec<_>>()
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_unavailable_part_disables_only_its_rendition() {
+    let (registry, sessions, item, _dir) = item_with(
+        vec![
+            ("01A", "Available (1999) - Cut A - CD1.avi"),
+            ("01A", "Available (1999) - Cut A - CD2.avi"),
+            ("01A", "Available (1999) - Cut B - CD1.avi"),
+            ("01A", "Available (1999) - Cut B - CD2.avi"),
+        ],
+        &["01A"],
+    )
+    .await;
+    sqlx::query("DELETE FROM files WHERE path_rel LIKE '%Cut B%CD2.avi'")
+        .execute(registry.db())
+        .await
+        .unwrap();
+    let candidates = sessions.candidate_sources(&registry, &item).await.unwrap();
+    assert_eq!(candidates.len(), 1);
+    assert!(
+        candidates[0]
+            .0
+            .iter()
+            .all(|part| part.path_rel.contains("Cut A"))
+    );
+}
+
+#[tokio::test]
 async fn a_lone_part_is_a_playable_film() {
     // A CD1 with no CD2 is one file that happens to carry a part number. An
     // earlier guard required more than one part and dropped it entirely, which

@@ -1888,6 +1888,17 @@ impl Registry {
                     .bind(source_id)
                     .execute(&mut *tx)
                     .await?;
+                Self::bind_playable_source(
+                    &mut tx,
+                    module_id,
+                    collection_id,
+                    root_id,
+                    source_id,
+                    &item_id,
+                    &f.path_rel,
+                    source_part,
+                )
+                .await?;
 
                 // Subtitle tracks are first-class rows synced from the
                 // probe (unification, 2026-07-31): only changed files
@@ -1942,6 +1953,68 @@ impl Registry {
         .await?;
         tx.commit().await?;
         Ok(n)
+    }
+
+    /// Bind one physical file to one explicit playable rendition. The update
+    /// touches only this file and, for multipart input, its one release family;
+    /// no catalogue-wide regrouping occurs during ingestion.
+    #[allow(clippy::too_many_arguments)]
+    async fn bind_playable_source(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        module_id: &str,
+        collection_id: &str,
+        root_id: i64,
+        file_id: i64,
+        item_id: &str,
+        path_rel: &str,
+        part: Option<u32>,
+    ) -> Result<()> {
+        sqlx::query("DELETE FROM playable_source_parts WHERE file_id=?")
+            .bind(file_id)
+            .execute(&mut **tx)
+            .await?;
+        let family = part
+            .map(|_| kahawai_core::names::rendition_family_key(path_rel))
+            .unwrap_or_else(|| format!("file:{file_id}"));
+        let expected = part.unwrap_or(1) as i64;
+        let source_id: i64 = sqlx::query_scalar(
+            "INSERT INTO playable_sources
+               (module_id,collection_id,item_id,root_id,family_key,expected_parts)
+             VALUES(?,?,?,?,?,?)
+             ON CONFLICT(module_id,collection_id,root_id,family_key) DO UPDATE SET
+               item_id=excluded.item_id,
+               expected_parts=MAX(playable_sources.expected_parts,excluded.expected_parts)
+             RETURNING id",
+        )
+        .bind(module_id)
+        .bind(collection_id)
+        .bind(item_id)
+        .bind(root_id)
+        .bind(&family)
+        .bind(expected)
+        .fetch_one(&mut **tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO playable_source_parts
+               (playable_source_id,module_id,collection_id,ordinal,file_id)
+             VALUES(?,?,?,?,?)",
+        )
+        .bind(source_id)
+        .bind(module_id)
+        .bind(collection_id)
+        .bind(expected)
+        .bind(file_id)
+        .execute(&mut **tx)
+        .await?;
+        // Rebinding may leave an empty ordinary source or obsolete family.
+        sqlx::query(
+            "DELETE FROM playable_sources
+              WHERE NOT EXISTS(SELECT 1 FROM playable_source_parts p
+                                WHERE p.playable_source_id=playable_sources.id)",
+        )
+        .execute(&mut **tx)
+        .await?;
+        Ok(())
     }
 
     /// After a completed scan, drop files the scan no longer reported and

@@ -2359,7 +2359,7 @@ i.title AS file_title, i.year AS file_year,
 md.title AS matched_title,
 md.confidence AS match_confidence,
 md.updated_at AS art_version,
-(SELECT COUNT(*) FROM files f WHERE f.item_id=i.id) AS sources,
+(SELECT COUNT(*) FROM playable_sources ps WHERE ps.item_id=i.id) AS sources,
 i.parent_id,
 (SELECT p.sort_title FROM items p WHERE p.id = i.parent_id) AS parent_title,
 -- A library this item is in, as navigation context: item URLs live under
@@ -2748,7 +2748,7 @@ async fn item_children(
                 md.premiered AS premiered,
                 md.updated_at AS art_version,
                 md.proj_season, md.proj_episode,
-                COUNT(f.id) AS sources,
+                COUNT(DISTINCT ps.id) AS sources,
                 -- HUB-19: the file's own loudness statement, passed
                 -- through for the player to apply. MIN() picks one
                 -- deterministically when an item has several sources;
@@ -2757,7 +2757,9 @@ async fn item_children(
                 MIN(json_extract(f.streams_json, '$.replay_gain')) AS replay_gain,
                 w.position_ms, w.duration_ms, w.played, w.play_count
          FROM items i
-         LEFT JOIN files f ON f.item_id=i.id
+         LEFT JOIN playable_sources ps ON ps.item_id=i.id
+         LEFT JOIN playable_source_parts psp ON psp.playable_source_id=ps.id
+         LEFT JOIN files f ON f.id=psp.file_id
          LEFT JOIN watch_state w ON w.item_id = i.id AND w.user_id = ?
          LEFT JOIN resolved_metadata md ON md.item_id = i.id
          WHERE i.parent_id = ?
@@ -2800,7 +2802,7 @@ async fn item_body(
                 p.id AS parent_id,
                 md.updated_at AS art_version,
                 COALESCE(pmd.title, p.title) AS show_title,
-                (SELECT COUNT(*) FROM files f WHERE f.item_id=i.id) AS sources,
+                (SELECT COUNT(*) FROM playable_sources ps WHERE ps.item_id=i.id) AS sources,
                 w.position_ms, w.duration_ms, w.played, w.play_count
          FROM items i
          LEFT JOIN items p ON p.id = i.parent_id
@@ -2819,7 +2821,10 @@ async fn item_body(
     let sources = sqlx::query(
         "SELECT f.module_id,f.collection_id,f.path_rel AS source_path,f.size,f.streams_json,
                 COALESCE(f.revision,1) AS revision
-         FROM files f WHERE f.item_id=?
+         FROM playable_sources ps
+         JOIN playable_source_parts p ON p.playable_source_id=ps.id
+         JOIN files f ON f.id=p.file_id
+         WHERE ps.item_id=?
          -- Same order playback picks in (sessions::source_parts), so the
          -- list a user reads is the preference the player acts on.
          ORDER BY COALESCE(json_extract(f.streams_json, '$.video[0].height'), 0) DESC,

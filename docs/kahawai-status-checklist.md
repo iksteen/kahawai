@@ -146,8 +146,11 @@ How something works and why it was built that way belong in
       alternate sources deduplicate only within that item/collection. Libraries
       compose collections and reuse the same item IDs/watch state; equal works
       in different collections remain independent (provider/manual/query/watch
-      state included). Direct level-52→53 migration and conflict-detecting
-      migration-56 replay are runnable and real-catalogue proven.
+      state included). Playable renditions are explicit: one source row owns
+      one ordered file set, multipart families are root/directory/release-local,
+      and incomplete or ambiguous editions cannot mix with another edition.
+      Direct level-52→57 migration and conflict-detecting migration-56 replay
+      are runnable and real-catalogue proven.
 - [x] HUB-4 Filename/dirname parsing (movies, episodes, anime conventions, music layout)
 - [x] HUB-20 Mediahost deletion cascade + watch-state/match archives restored on re-enroll
 - [x] HUB-5 Provider trait + declared chains + walker (TMDB, TVDB, anime

@@ -60,6 +60,7 @@ pub async fn open(data_dir: &Path) -> Result<SqlitePool> {
     install_derived(&pool).await?;
     backfill_norm_artist(&pool).await?;
     backfill_revision(&pool).await?;
+    backfill_playable_source_families(&pool).await?;
     repair_release_tag_titles(&pool).await?;
     Ok(pool)
 }
@@ -112,6 +113,82 @@ async fn backfill_revision(pool: &SqlitePool) -> Result<()> {
     }
     tx.commit().await?;
     tracing::info!(rows = missing.len(), "release revisions backfilled");
+    Ok(())
+}
+
+/// Replace migration 57's lossless temporary multipart grouping keys with the
+/// filename-derived rendition family. Existing ordinary rows are already
+/// final (`file:<id>`). This is bounded to the handful of multipart files and
+/// never changes item identity or scan generations.
+async fn backfill_playable_source_families(pool: &SqlitePool) -> Result<()> {
+    type Row = (i64, String, String, String, Option<i64>, i64, i64, String);
+    let rows: Vec<Row> = sqlx::query_as(
+        "SELECT ps.id,ps.module_id,ps.collection_id,ps.item_id,ps.root_id,
+                p.file_id,p.ordinal,f.path_rel
+           FROM playable_sources ps
+           JOIN playable_source_parts p ON p.playable_source_id=ps.id
+           JOIN files f ON f.id=p.file_id
+          WHERE ps.family_key LIKE 'legacy-item:%'
+          ORDER BY ps.id,p.ordinal,p.file_id",
+    )
+    .fetch_all(pool)
+    .await?;
+    if rows.is_empty() {
+        return Ok(());
+    }
+    type Families = std::collections::BTreeMap<String, Vec<(i64, i64)>>;
+    type Source = (String, String, String, Option<i64>, Families);
+    let mut by_source: std::collections::BTreeMap<i64, Source> = Default::default();
+    for (source_id, module, collection, item, root, file_id, ordinal, path) in rows {
+        by_source
+            .entry(source_id)
+            .or_insert_with(|| (module, collection, item, root, Default::default()))
+            .4
+            .entry(kahawai_core::names::rendition_family_key(&path))
+            .or_default()
+            .push((file_id, ordinal));
+    }
+    let mut tx = pool.begin().await?;
+    for (source_id, (module, collection, item, root, families)) in by_source {
+        for (n, (family, parts)) in families.into_iter().enumerate() {
+            let expected = parts.iter().map(|(_, ordinal)| *ordinal).max().unwrap_or(1);
+            let target = if n == 0 {
+                sqlx::query("UPDATE playable_sources SET family_key=?,expected_parts=? WHERE id=?")
+                    .bind(&family)
+                    .bind(expected)
+                    .bind(source_id)
+                    .execute(&mut *tx)
+                    .await?;
+                source_id
+            } else {
+                sqlx::query_scalar(
+                    "INSERT INTO playable_sources
+                       (module_id,collection_id,item_id,root_id,family_key,expected_parts)
+                     VALUES(?,?,?,?,?,?) RETURNING id",
+                )
+                .bind(&module)
+                .bind(&collection)
+                .bind(&item)
+                .bind(root)
+                .bind(&family)
+                .bind(expected)
+                .fetch_one(&mut *tx)
+                .await?
+            };
+            if target != source_id {
+                for (file_id, _) in parts {
+                    sqlx::query(
+                        "UPDATE playable_source_parts SET playable_source_id=? WHERE file_id=?",
+                    )
+                    .bind(target)
+                    .bind(file_id)
+                    .execute(&mut *tx)
+                    .await?;
+                }
+            }
+        }
+    }
+    tx.commit().await?;
     Ok(())
 }
 

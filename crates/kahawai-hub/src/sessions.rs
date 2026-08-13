@@ -1264,121 +1264,91 @@ impl Sessions {
         registry: &Registry,
         item_id: &str,
     ) -> Result<(Vec<PartSource>, kahawai_core::media::MediaInfo)> {
-        let rows = sqlx::query(
-            "SELECT f.module_id,f.collection_id,r.root_token,f.path_rel AS source_path,
-                    f.part,f.size,f.streams_json
-             FROM files f JOIN collection_roots r ON r.id=f.root_id
-             WHERE f.item_id=?
-             -- HUB-3 ranking. Resolution tier first: that is a deliberate
-             -- quality choice. Within a tier the CORRECTED release wins
-             -- (revision — a v2/REPACK is often smaller than the broken
-             -- encode it replaces, so size cannot decide this), then size.
-             ORDER BY f.part IS NOT NULL,
-                      COALESCE(json_extract(f.streams_json, '$.video[0].height'), 0) DESC,
-                      COALESCE(f.revision, 1) DESC,
-                      f.size DESC",
-        )
-        .bind(item_id)
-        .fetch_all(registry.db())
-        .await?;
+        let rows = self.playable_rows(registry, item_id).await?;
         if rows.is_empty() {
             bail!("no sources for item");
         }
         let parse_info = |r: &sqlx::sqlite::SqliteRow| -> kahawai_core::media::MediaInfo {
             serde_json::from_str(r.get::<String, _>("streams_json").as_str()).unwrap_or_default()
         };
-        // Complete single file first (query put part-NULL rows up front).
-        if let Some(r) = rows.iter().find(|r| {
-            r.get::<Option<i64>, _>("part").is_none()
-                && registry.is_connected(&r.get::<String, _>("module_id"))
+        let mut any_complete = false;
+        for group in rows.chunk_by(|a, b| {
+            a.get::<i64, _>("playable_source_id") == b.get::<i64, _>("playable_source_id")
         }) {
-            let info = parse_info(r);
-            return Ok((
-                vec![PartSource {
+            let expected = group[0].get::<i64, _>("expected_parts");
+            let ordinals: Vec<i64> = group.iter().map(|r| r.get("part")).collect();
+            let complete =
+                group.len() as i64 == expected && ordinals.iter().copied().eq(1..=expected);
+            if !complete {
+                continue;
+            }
+            any_complete = true;
+            if !group
+                .iter()
+                .all(|r| registry.is_connected(&r.get::<String, _>("module_id")))
+            {
+                continue;
+            }
+            let mut parts = Vec::with_capacity(group.len());
+            let mut base = 0;
+            let mut first_info = None;
+            for r in group {
+                let info = parse_info(r);
+                let duration_ms = if expected > 1 {
+                    info.duration_ms
+                        .context("multi-part source with unknown part duration")?
+                } else {
+                    info.duration_ms.unwrap_or(0)
+                };
+                parts.push(PartSource {
                     module_id: r.get("module_id"),
                     collection_id: r.get("collection_id"),
                     root_token: r.get("root_token"),
                     path_rel: r.get("source_path"),
                     size: r.get::<i64, _>("size") as u64,
-                    base_ms: 0,
-                    duration_ms: info.duration_ms.unwrap_or(0),
-                }],
-                info,
-            ));
-        }
-        // Part set: connected parts, ordered, deduped by part number.
-        let mut by_part: std::collections::BTreeMap<i64, &sqlx::sqlite::SqliteRow> =
-            Default::default();
-        for r in &rows {
-            if let Some(part) = r.get::<Option<i64>, _>("part")
-                && registry.is_connected(&r.get::<String, _>("module_id"))
-            {
-                by_part.entry(part).or_insert(r);
+                    base_ms: base,
+                    duration_ms,
+                });
+                base += duration_ms;
+                first_info.get_or_insert(info);
             }
+            return Ok((parts, first_info.unwrap()));
         }
-        if by_part.is_empty() {
+        if any_complete {
             bail!(SourceOffline);
         }
-        // Two questions, two answers, from the same rows.
-        //
-        // `wanted` is every part number this item HAS, connected or not, so
-        // comparing it against the connected set answers "is a host away" — at
-        // any position. That is transient: SourceOffline, stand by, the host may
-        // come back. Dropping this in favour of a contiguity check alone was a
-        // regression: a seven-part film losing part 1 to an offline host left
-        // {2..7}, which is a perfectly contiguous run, and played from part two
-        // rebased to zero — the exact fault the check exists to stop.
-        let wanted = rows
-            .iter()
-            .filter_map(|r| r.get::<Option<i64>, _>("part"))
-            .collect::<std::collections::BTreeSet<_>>();
-        if by_part.len() != wanted.len() {
-            bail!(SourceOffline);
-        }
-        // Contiguity answers the other question: is a part MISSING ENTIRELY —
-        // renamed out of the filename fold, reconciled off disk — in which case
-        // it is absent from `wanted` too and the comparison above cannot see it.
-        // `base_ms` accumulates over the parts present, so a hole silently
-        // became a shorter film whose timeline started at zero: the seekbar
-        // reading 20:00 of a 45-minute film, and 20 minutes in really an hour
-        // and twenty.
-        //
-        // No amount of waiting fixes a hole, so this is NOT SourceOffline —
-        // answering that would put the client in a stand-by loop it retries for
-        // ever. `first > 1` catches a missing beginning; a span rather than
-        // `1..=len` because the filename parsers accept `CD0` and refusing a
-        // 0-based set would be a new failure rather than a caught one.
-        let first = *by_part.keys().next().expect("checked non-empty above");
-        let last = *by_part.keys().next_back().expect("checked non-empty above");
-        if first > 1 || last - first + 1 != by_part.len() as i64 {
-            bail!(
-                "multi-part source is incomplete: parts {first}-{last} present, \
-                 {} of {} expected",
-                by_part.len(),
-                last - first + 1
-            );
-        }
-        let mut parts = Vec::new();
-        let mut base = 0u64;
-        let mut first_info = None;
-        for (_, r) in by_part {
-            let info = parse_info(r);
-            let dur = info
-                .duration_ms
-                .context("multi-part source with unknown part duration")?;
-            parts.push(PartSource {
-                module_id: r.get("module_id"),
-                collection_id: r.get("collection_id"),
-                root_token: r.get("root_token"),
-                path_rel: r.get("source_path"),
-                size: r.get::<i64, _>("size") as u64,
-                base_ms: base,
-                duration_ms: dur,
-            });
-            base += dur;
-            first_info.get_or_insert(info);
-        }
-        Ok((parts, first_info.unwrap()))
+        bail!("every playable rendition is incomplete or ambiguous")
+    }
+
+    async fn playable_rows(
+        &self,
+        registry: &Registry,
+        item_id: &str,
+    ) -> Result<Vec<sqlx::sqlite::SqliteRow>> {
+        Ok(sqlx::query(
+            "SELECT ps.id AS playable_source_id,ps.expected_parts,
+                    p.ordinal AS part,f.module_id,f.collection_id,r.root_token,
+                    f.path_rel AS source_path,f.size,f.streams_json
+             FROM playable_sources ps
+             JOIN playable_source_parts p ON p.playable_source_id=ps.id
+             JOIN files f ON f.id=p.file_id
+             JOIN collection_roots r ON r.id=f.root_id
+             WHERE ps.item_id=?
+             ORDER BY ps.expected_parts>1,
+                      (SELECT MIN(COALESCE(json_extract(f2.streams_json,'$.video[0].height'),0))
+                         FROM playable_source_parts p2 JOIN files f2 ON f2.id=p2.file_id
+                        WHERE p2.playable_source_id=ps.id) DESC,
+                      (SELECT MIN(COALESCE(f2.revision,1))
+                         FROM playable_source_parts p2 JOIN files f2 ON f2.id=p2.file_id
+                        WHERE p2.playable_source_id=ps.id) DESC,
+                      (SELECT SUM(f2.size) FROM playable_source_parts p2
+                         JOIN files f2 ON f2.id=p2.file_id
+                        WHERE p2.playable_source_id=ps.id) DESC,
+                      ps.id,p.ordinal,f.id",
+        )
+        .bind(item_id)
+        .fetch_all(registry.db())
+        .await?)
     }
 
     /// HUB-16: EVERY playable candidate, in the established rank order —
@@ -1386,75 +1356,59 @@ impl Sessions {
     /// part-set candidate at the end. `source_parts` remains "the best
     /// by rank"; negotiation instead judges each candidate by COST and
     /// only falls back to rank as the tiebreak.
-    pub(crate) async fn candidate_sources(
+    pub async fn candidate_sources(
         &self,
         registry: &Registry,
         item_id: &str,
     ) -> Result<Vec<(Vec<PartSource>, kahawai_core::media::MediaInfo)>> {
-        let rows = sqlx::query(
-            "SELECT f.module_id,f.collection_id,r.root_token,f.path_rel AS source_path,
-                    f.part,f.size,f.streams_json
-             FROM files f JOIN collection_roots r ON r.id=f.root_id
-             WHERE f.item_id=?
-             ORDER BY f.part IS NOT NULL,
-                      COALESCE(json_extract(f.streams_json, '$.video[0].height'), 0) DESC,
-                      COALESCE(f.revision, 1) DESC,
-                      f.size DESC",
-        )
-        .bind(item_id)
-        .fetch_all(registry.db())
-        .await?;
+        let rows = self.playable_rows(registry, item_id).await?;
         let parse_info = |r: &sqlx::sqlite::SqliteRow| -> kahawai_core::media::MediaInfo {
             serde_json::from_str(r.get::<String, _>("streams_json").as_str()).unwrap_or_default()
         };
         let mut out = Vec::new();
-        for r in rows.iter().filter(|r| {
-            r.get::<Option<i64>, _>("part").is_none()
-                && registry.is_connected(&r.get::<String, _>("module_id"))
+        let mut any_complete = false;
+        for group in rows.chunk_by(|a, b| {
+            a.get::<i64, _>("playable_source_id") == b.get::<i64, _>("playable_source_id")
         }) {
-            let info = parse_info(r);
-            out.push((
-                vec![PartSource {
+            let expected = group[0].get::<i64, _>("expected_parts");
+            let ordinals: Vec<i64> = group.iter().map(|r| r.get("part")).collect();
+            if group.len() as i64 != expected || !ordinals.iter().copied().eq(1..=expected) {
+                continue;
+            }
+            any_complete = true;
+            if !group
+                .iter()
+                .all(|r| registry.is_connected(&r.get::<String, _>("module_id")))
+            {
+                continue;
+            }
+            let mut parts = Vec::with_capacity(group.len());
+            let mut base_ms = 0;
+            let mut first_info = None;
+            for r in group {
+                let info = parse_info(r);
+                let duration_ms = if expected > 1 {
+                    info.duration_ms
+                        .context("multi-part source with unknown part duration")?
+                } else {
+                    info.duration_ms.unwrap_or(0)
+                };
+                parts.push(PartSource {
                     module_id: r.get("module_id"),
                     collection_id: r.get("collection_id"),
                     root_token: r.get("root_token"),
                     path_rel: r.get("source_path"),
                     size: r.get::<i64, _>("size") as u64,
-                    base_ms: 0,
-                    duration_ms: info.duration_ms.unwrap_or(0),
-                }],
-                info,
-            ));
+                    base_ms,
+                    duration_ms,
+                });
+                base_ms += duration_ms;
+                first_info.get_or_insert(info);
+            }
+            out.push((parts, first_info.unwrap()));
         }
-        // The part set (if any) as one trailing candidate, via the
-        // existing assembly which already handles ordering and dedup.
-        //
-        // `>= 1`, not `> 1`: an item whose only row carries a part number —
-        // a CD1 with no CD2 — is one playable file, and dropping it left no
-        // candidates at all. Since an empty candidate set now means "the
-        // hosts are away", that turned a complete item into a permanent
-        // stand-by the client retried for ever.
-        //
-        // Only when no whole-file candidate was found above. `source_parts`
-        // prefers a connected part-NULL row over the part set, so for an item
-        // that has both this pushed a byte-identical copy of `out[0]` — one
-        // extra query and one extra `plan_auto` per negotiation, and a
-        // candidate list that no longer means "distinct playable sources".
-        // The `!is_empty()` this replaces could never be false: every
-        // `source_parts` exit either bails or returns a non-empty vec.
-        if out.is_empty()
-            && rows
-                .iter()
-                .any(|r| r.get::<Option<i64>, _>("part").is_some())
-        {
-            // Propagated, NOT swallowed. `let Ok(..)` turned `source_parts`'
-            // permanent refusal of an incomplete part set into no candidates,
-            // which `best_source` reads as "the rows exist and every host is
-            // away" and answers 503 — the unbounded stand-by loop that refusal
-            // exists to prevent. It only ever reached a client through the
-            // FORCED path, and the web player negotiates: every video session
-            // it starts sends no mode and came through here.
-            out.push(self.source_parts(registry, item_id).await?);
+        if out.is_empty() && !any_complete && !rows.is_empty() {
+            bail!("every playable rendition is incomplete or ambiguous");
         }
         Ok(out)
     }
@@ -1467,7 +1421,7 @@ impl Sessions {
     /// of waiting fixes.
     pub(crate) async fn has_any_source(&self, registry: &Registry, item_id: &str) -> bool {
         sqlx::query_scalar::<_, i64>(
-            "SELECT EXISTS(SELECT 1 FROM files WHERE item_id=? AND root_id IS NOT NULL)",
+            "SELECT EXISTS(SELECT 1 FROM playable_sources WHERE item_id=?)",
         )
         .bind(item_id)
         .fetch_one(registry.db())
