@@ -918,6 +918,10 @@ async fn handle_host_msg(
                 registry
                     .reconcile_files(module_id, &p.collection_id, &paths)
                     .await?;
+                let removed = subtitles.clean_orphaned_payloads(registry).await?;
+                if removed > 0 {
+                    tracing::info!(removed, "removed unreachable subtitle payloads");
+                }
             }
             if p.sync_version != 0 {
                 registry

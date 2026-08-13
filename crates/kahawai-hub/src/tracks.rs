@@ -231,7 +231,10 @@ pub fn delivery(
     }
 }
 
-pub async fn get(db: &sqlx::SqlitePool, id: i64) -> Result<Option<Track>> {
+/// Resolve a track without an HTTP item context. This is intentionally only
+/// for internal derivative workers that start from a trusted parent row ID;
+/// user-facing and session paths must use [`get_for_item`].
+pub(crate) async fn get_internal(db: &sqlx::SqlitePool, id: i64) -> Result<Option<Track>> {
     Ok(sqlx::query(
         "SELECT t.id,COALESCE(t.item_id,(SELECT MIN(s.item_id) FROM playable_source_parts p
                                          JOIN playable_sources s ON s.id=p.playable_source_id

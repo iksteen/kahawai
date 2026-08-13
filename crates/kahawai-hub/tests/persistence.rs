@@ -182,6 +182,47 @@ async fn reconcile_drops_files_missing_from_scan() {
         .execute(&db)
         .await
         .unwrap();
+    let source: i64 =
+        sqlx::query_scalar("SELECT fb.file_id FROM file_bindings fb WHERE fb.item_id=?")
+            .bind(&ronin)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    let parent: i64 = sqlx::query_scalar(
+        "INSERT INTO subtitle_tracks(source_id,origin,stream_index,format)
+         VALUES(?,'embedded',0,'pgs') RETURNING id",
+    )
+    .bind(source)
+    .fetch_one(&db)
+    .await
+    .unwrap();
+    let derived: Vec<i64> = sqlx::query_scalar(
+        "INSERT INTO subtitle_tracks(source_id,origin,format,derived_from)
+         VALUES(?,'ocr','srt',?),(?,'raster','raster',?) RETURNING id",
+    )
+    .bind(source)
+    .bind(parent)
+    .bind(source)
+    .bind(parent)
+    .fetch_all(&db)
+    .await
+    .unwrap();
+    let payload_dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        payload_dir
+            .path()
+            .join(format!("downloaded-{}.json", derived[0])),
+        b"{}",
+    )
+    .unwrap();
+    std::fs::write(
+        payload_dir
+            .path()
+            .join(format!("raster-{}.jsonl", derived[1])),
+        b"{}",
+    )
+    .unwrap();
+    let subtitles = kahawai_hub::subtitles::Subtitles::new(payload_dir.path().to_owned());
 
     // Rescan saw only Heat.
     let seen = [kahawai_hub::registry::SourcePath {
@@ -207,6 +248,13 @@ async fn reconcile_drops_files_missing_from_scan() {
     assert_eq!(files, 1);
     assert_eq!(items, vec!["Heat".to_string()]);
     assert_eq!(watch, 0, "watch state cascades with the removed item");
+    assert_eq!(subtitles.clean_orphaned_payloads(&reg).await.unwrap(), 2);
+    assert!(
+        std::fs::read_dir(payload_dir.path())
+            .unwrap()
+            .next()
+            .is_none()
+    );
 
     // Idempotent when nothing changed.
     assert_eq!(

@@ -582,6 +582,53 @@ impl Subtitles {
         self.dir.join(format!("downloaded-{id}.json"))
     }
 
+    /// Remove row-keyed derived payloads whose database rows have cascaded
+    /// away with a physical source. Extraction caches are exact-source keyed
+    /// and may be reused if the same source returns; only these first-class
+    /// OCR/raster payloads become unreachable. This is a reachability cleanup,
+    /// not cache eviction: live rows and their expensive artifacts are kept.
+    pub async fn clean_orphaned_payloads(&self, registry: &Registry) -> Result<usize> {
+        let Ok(entries) = std::fs::read_dir(&self.dir) else {
+            return Ok(0);
+        };
+        let mut candidates = Vec::new();
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            let id = name
+                .strip_prefix("downloaded-")
+                .and_then(|s| s.strip_suffix(".json"))
+                .or_else(|| {
+                    name.strip_prefix("raster-")
+                        .and_then(|s| s.strip_suffix(".jsonl"))
+                })
+                .and_then(|s| s.parse::<i64>().ok());
+            if let Some(id) = id {
+                candidates.push((id, entry.path()));
+            }
+        }
+        if candidates.is_empty() {
+            return Ok(0);
+        }
+        let live: std::collections::HashSet<i64> = sqlx::query_scalar(
+            "SELECT id FROM subtitle_tracks WHERE id IN (SELECT value FROM json_each(?))",
+        )
+        .bind(serde_json::to_string(
+            &candidates.iter().map(|(id, _)| id).collect::<Vec<_>>(),
+        )?)
+        .fetch_all(registry.db())
+        .await?
+        .into_iter()
+        .collect();
+        let mut removed = 0;
+        for (id, path) in candidates {
+            if !live.contains(&id) && std::fs::remove_file(path).is_ok() {
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+
     /// HUB-32d: the rasterised display sets for a `raster` row, in the
     /// exact NDJSON the client already consumes for PGS — one line per
     /// composition. Keyed by row id, so `delete_track` removes it with
@@ -805,7 +852,7 @@ impl Subtitles {
         {
             return Ok(id);
         }
-        let parent = crate::tracks::get(registry.db(), parent_id)
+        let parent = crate::tracks::get_internal(registry.db(), parent_id)
             .await?
             .with_context(|| format!("no subtitle track {parent_id}"))?;
         anyhow::ensure!(
@@ -1050,7 +1097,7 @@ impl Subtitles {
         {
             return Ok(id);
         }
-        let parent = crate::tracks::get(registry.db(), parent_id)
+        let parent = crate::tracks::get_internal(registry.db(), parent_id)
             .await?
             .with_context(|| format!("no subtitle track {parent_id}"))?;
         let (module_id, collection_id, root_token, extract_rel, extract_idx, language) =
@@ -1139,7 +1186,8 @@ impl Subtitles {
                     // The row may have vanished under a rescan since the
                     // candidate query ran; only try where the model and
                     // the mediahost exist.
-                    let Ok(Some(track)) = crate::tracks::get(registry.db(), id).await else {
+                    let Ok(Some(track)) = crate::tracks::get_internal(registry.db(), id).await
+                    else {
                         failed.insert(id);
                         continue;
                     };
