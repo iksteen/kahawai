@@ -14,7 +14,12 @@ use axum::body::Body;
 use axum::http::Request;
 use tower::ServiceExt;
 
-async fn harness() -> (axum::Router, String, sqlx::SqlitePool) {
+async fn harness() -> (
+    axum::Router,
+    String,
+    sqlx::SqlitePool,
+    Arc<kahawai_hub::registry::Registry>,
+) {
     let dir = tempfile::tempdir().unwrap();
     let db = kahawai_hub::db::open(dir.path()).await.unwrap();
     let registry = Arc::new(kahawai_hub::registry::Registry::new(
@@ -41,7 +46,7 @@ async fn harness() -> (axum::Router, String, sqlx::SqlitePool) {
     ));
     let enricher = Arc::new(kahawai_hub::enrich::Enricher::new(dir.path().to_path_buf()));
     let api = kahawai_hub::api::router(
-        registry,
+        registry.clone(),
         auth.clone(),
         sessions,
         enrollments,
@@ -61,7 +66,7 @@ async fn harness() -> (axum::Router, String, sqlx::SqlitePool) {
         .unwrap()
         .access_token;
     std::mem::forget(dir);
-    (api, token, db)
+    (api, token, db, registry)
 }
 
 async fn page(api: &axum::Router, token: &str, uri: &str) -> serde_json::Value {
@@ -82,9 +87,173 @@ async fn page(api: &axum::Router, token: &str, uri: &str) -> serde_json::Value {
     serde_json::from_slice(&b).unwrap()
 }
 
+#[derive(Debug, PartialEq)]
+struct CompositionState {
+    item_count: i64,
+    source_id: i64,
+    provider_id: String,
+    manual_id: String,
+    watch: (i64, i64),
+    generation: i64,
+}
+
+async fn composition_state(db: &sqlx::SqlitePool) -> CompositionState {
+    CompositionState {
+        item_count: sqlx::query_scalar("SELECT count(*) FROM items WHERE id='composed-item'")
+            .fetch_one(db)
+            .await
+            .unwrap(),
+        source_id: sqlx::query_scalar("SELECT id FROM files WHERE item_id='composed-item'")
+            .fetch_one(db)
+            .await
+            .unwrap(),
+        provider_id: sqlx::query_scalar(
+            "SELECT provider_id FROM provider_metadata WHERE item_id='composed-item'",
+        )
+        .fetch_one(db)
+        .await
+        .unwrap(),
+        manual_id: sqlx::query_scalar(
+            "SELECT provider_id FROM manual_match WHERE item_id='composed-item'",
+        )
+        .fetch_one(db)
+        .await
+        .unwrap(),
+        watch: sqlx::query_as(
+            "SELECT position_ms,play_count FROM watch_state WHERE item_id='composed-item'",
+        )
+        .fetch_one(db)
+        .await
+        .unwrap(),
+        generation: sqlx::query_scalar(
+            "SELECT sync_version FROM collections WHERE module_id='compose-host' AND collection_id='films'",
+        )
+        .fetch_one(db)
+        .await
+        .unwrap(),
+    }
+}
+
+fn item_ids(v: &serde_json::Value) -> Vec<&str> {
+    v["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|i| i["id"].as_str())
+        .collect()
+}
+
+/// Composition is a live visibility edge, not a materialized presentation.
+/// Attaching or detaching a populated collection must neither wait for a later
+/// file upsert nor rewrite any durable catalogue/user state.
+#[tokio::test]
+async fn attach_and_detach_change_only_visibility() {
+    let (api, token, db, registry) = harness().await;
+    sqlx::raw_sql(
+        "INSERT INTO satellites(module_id,module_type,name,cert_fingerprint)
+           VALUES('compose-host','mediahost','compose-host','fp');
+         INSERT INTO collections(module_id,collection_id,media_type,sync_version)
+           VALUES('compose-host','films','movies',91);
+         INSERT INTO items(id,kind,title,norm_title,module_id,collection_id)
+           VALUES('composed-item','movie','Composed','composed','compose-host','films');
+         INSERT INTO files(module_id,collection_id,path_rel,item_id,size,mtime_unix,
+                           head_xxh3,tail_xxh3,oshash,streams_json)
+           VALUES('compose-host','films','composed.mkv','composed-item',100,1,2,3,4,'{}');
+         INSERT INTO provider_metadata(item_id,provider,provider_id,title,confidence,updated_at)
+           VALUES('composed-item','tmdb','42','Composed','auto',1);
+         INSERT INTO manual_match(item_id,provider,provider_id,pinned_at)
+           VALUES('composed-item','tmdb','42',1);",
+    )
+    .execute(&db)
+    .await
+    .unwrap();
+    let user_id: String = sqlx::query_scalar("SELECT id FROM users WHERE username='pager'")
+        .fetch_one(&db)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO watch_state(user_id,item_id,position_ms,play_count)
+         VALUES(?,'composed-item',1234,3)",
+    )
+    .bind(user_id)
+    .execute(&db)
+    .await
+    .unwrap();
+
+    let first = registry
+        .create_library("composition-one", "movies")
+        .await
+        .unwrap();
+    let second = registry
+        .create_library("composition-two", "movies")
+        .await
+        .unwrap();
+    registry
+        .attach_collection(&first, "compose-host", "films")
+        .await
+        .unwrap();
+    let baseline = composition_state(&db).await;
+
+    assert_eq!(
+        item_ids(&page(&api, &token, &format!("/api/v1/items?library={first}")).await),
+        ["composed-item"]
+    );
+    assert!(
+        item_ids(&page(&api, &token, &format!("/api/v1/items?library={second}")).await).is_empty()
+    );
+
+    registry
+        .attach_collection(&second, "compose-host", "films")
+        .await
+        .unwrap();
+    assert_eq!(
+        item_ids(&page(&api, &token, &format!("/api/v1/items?library={second}")).await),
+        ["composed-item"],
+        "an already populated collection was not immediately visible"
+    );
+    assert_eq!(composition_state(&db).await, baseline);
+
+    assert!(
+        registry
+            .detach_collection(&second, "compose-host", "films")
+            .await
+            .unwrap()
+    );
+    assert!(
+        item_ids(&page(&api, &token, &format!("/api/v1/items?library={second}")).await).is_empty()
+    );
+    assert_eq!(
+        item_ids(&page(&api, &token, &format!("/api/v1/items?library={first}")).await),
+        ["composed-item"],
+        "detaching another library hid the shared collection"
+    );
+    assert_eq!(composition_state(&db).await, baseline);
+
+    assert!(
+        registry
+            .detach_collection(&first, "compose-host", "films")
+            .await
+            .unwrap()
+    );
+    assert!(
+        item_ids(&page(&api, &token, &format!("/api/v1/items?library={first}")).await).is_empty()
+    );
+    assert_eq!(composition_state(&db).await, baseline);
+
+    registry
+        .attach_collection(&second, "compose-host", "films")
+        .await
+        .unwrap();
+    assert_eq!(
+        item_ids(&page(&api, &token, &format!("/api/v1/items?library={second}")).await),
+        ["composed-item"]
+    );
+    assert_eq!(composition_state(&db).await, baseline);
+}
+
 #[tokio::test]
 async fn pages_partition_a_library_even_across_ties() {
-    let (api, token, db) = harness().await;
+    let (api, token, db, _registry) = harness().await;
 
     sqlx::query("INSERT INTO libraries (id, name, media_type) VALUES ('L','l','movies')")
         .execute(&db)
@@ -174,7 +343,7 @@ async fn pages_partition_a_library_even_across_ties() {
 /// titles — through the real router, folded like a person types.
 #[tokio::test]
 async fn search_finds_artists_and_episode_titles() {
-    let (api, token, db) = harness().await;
+    let (api, token, db, _registry) = harness().await;
     let q = |sql: &'static str| {
         let db = db.clone();
         async move {
@@ -287,7 +456,7 @@ async fn search_finds_artists_and_episode_titles() {
 #[tokio::test]
 async fn capability_changes_delivery_not_existence() {
     // No router needed: this one asks `Subtitles::list` directly.
-    let (_api, _token, db) = harness().await;
+    let (_api, _token, db, _registry) = harness().await;
     let q = |sql: &'static str| {
         let db = db.clone();
         async move {
@@ -391,7 +560,7 @@ async fn capability_changes_delivery_not_existence() {
 /// orphan them); a vanished stream deletes its reproducible derivatives.
 #[tokio::test]
 async fn scan_sync_preserves_track_ids() {
-    let (_api, _token, db) = harness().await;
+    let (_api, _token, db, _registry) = harness().await;
     sqlx::query(
         "INSERT INTO satellites(module_id,module_type,name,cert_fingerprint)
                  VALUES('sync','mediahost','sync','fp')",
