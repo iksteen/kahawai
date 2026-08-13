@@ -314,6 +314,14 @@ pub async fn link_once(
     match inbound.message().await.context("awaiting HelloAck")? {
         Some(m) => match m.msg {
             Some(hub_to_tc::Msg::HelloAck(ack)) => {
+                anyhow::ensure!(
+                    ack.protocol_major == PROTOCOL_MAJOR,
+                    "incompatible hub protocol {}.{}; this transcoder requires {}.{}",
+                    ack.protocol_major,
+                    ack.protocol_minor,
+                    PROTOCOL_MAJOR,
+                    PROTOCOL_MINOR
+                );
                 tracing::info!(
                     hub_protocol = format!("{}.{}", ack.protocol_major, ack.protocol_minor),
                     "link established"

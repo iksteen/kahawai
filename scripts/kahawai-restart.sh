@@ -16,7 +16,7 @@
 #      nothing looks exactly like a kill that worked. So: match either
 #      flavor, and verify the pid actually changed.
 #
-# Usage: kahawai-restart.sh <hub|all-in-one|transcoder|mediahost> [--build]
+# Usage: kahawai-restart.sh <hub|all-in-one|transcoder|mediahost> [--build|--stop-only]
 set -euo pipefail
 
 svc="${1:-}"
@@ -28,7 +28,13 @@ case "$svc" in
     ;;
 esac
 build=false
-[ "${2:-}" = "--build" ] && build=true
+stop_only=false
+case "${2:-}" in
+  "") ;;
+  --build) build=true ;;
+  --stop-only) stop_only=true ;;
+  *) echo "usage: $0 <hub|all-in-one|transcoder|mediahost> [--build|--stop-only]" >&2; exit 2 ;;
+esac
 
 repo=$(cd "$(dirname "$0")/.." && pwd)
 cd "$repo"
@@ -71,6 +77,7 @@ if [ -n "${before// /}" ]; then
 fi
 [ -z "$(pids)" ] || { echo "FAILED to stop $svc" >&2; exit 1; }
 echo "==> stopped" >&2
+$stop_only && exit 0
 
 # A locally staged codec stack, if one is present: patches/gstreamer/
 # 0004 changes the size of a public H.264 struct, so the plugins holding

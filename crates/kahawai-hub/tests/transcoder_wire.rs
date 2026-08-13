@@ -124,6 +124,34 @@ async fn open_link(
 }
 
 #[tokio::test]
+async fn protocol_2_transcoder_is_rejected_during_hello() {
+    let hub = spawn_hub().await;
+    let id = enroll(&hub, "transcoder", "01OLDTC", "old-tc");
+    let tls = kahawai_transport::mtls::mtls_client_config(&id).unwrap();
+    let channel = kahawai_transport::tls::grpc_channel_with(&hub.addr, tls)
+        .await
+        .unwrap();
+    let mut client = TranscoderLinkClient::new(channel);
+    let (tx, rx) = tokio::sync::mpsc::channel(1);
+    tx.send(TcToHub {
+        msg: Some(tc_to_hub::Msg::Hello(Hello {
+            protocol_major: 2,
+            protocol_minor: 4,
+            name: "old-tc".into(),
+            build: String::new(),
+        })),
+    })
+    .await
+    .unwrap();
+    let status = client
+        .link(tokio_stream::wrappers::ReceiverStream::new(rx))
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+    assert!(status.message().contains("hub speaks 3.0"), "{status}");
+}
+
+#[tokio::test]
 async fn transcoder_registers_capabilities_and_clears_on_disconnect() {
     let hub = spawn_hub().await;
     let id = enroll(&hub, "transcoder", "01TC", "gpu-box");

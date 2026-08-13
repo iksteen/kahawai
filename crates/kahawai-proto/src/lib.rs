@@ -6,8 +6,25 @@ pub mod v1 {
     tonic::include_proto!("kahawai.v1");
 }
 
-/// Inter-module protocol version (AR-7). Hub accepts current and previous
-/// minor (OPS-7).
-pub const PROTOCOL_MAJOR: u32 = 2;
-pub const PROTOCOL_MINOR: u32 = 4; // 4: additive exact-root source identity
-// 2: Hello.build stamp; SessionReady facts (AR-13)
+/// Inter-module protocol version (AR-7). Protocol 3 deliberately rejects all
+/// protocol 2 satellites: exact-root identity has one authoritative wire shape.
+pub const PROTOCOL_MAJOR: u32 = 3;
+pub const PROTOCOL_MINOR: u32 = 0;
+
+impl v1::SourcePath {
+    pub fn new(root_token: impl Into<String>, path_rel: impl Into<String>) -> Self {
+        Self {
+            root_token: root_token.into(),
+            path_rel: path_rel.into(),
+        }
+    }
+}
+
+impl v1::CollectionRoot {
+    pub fn new(root_token: impl Into<String>, normalized_path: impl Into<String>) -> Self {
+        Self {
+            root_token: root_token.into(),
+            normalized_path: normalized_path.into(),
+        }
+    }
+}

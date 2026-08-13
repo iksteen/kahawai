@@ -181,13 +181,18 @@ async fn keeps_audio_encode_local_and_dispatches_video_encode() {
         pb::host_to_hub::Msg::AnnounceCollection(pb::AnnounceCollection {
             id: "movies".into(),
             media_type: "movies".into(),
-            roots: vec![root.path().display().to_string()],
+            roots: vec![pb::CollectionRoot::new(
+                kahawai_core::media::root_token(root.path()),
+                root.path().display().to_string(),
+            )],
         }),
         pb::host_to_hub::Msg::FileUpsert(pb::FileUpsert {
             collection_id: "movies".into(),
             files: vec![pb::FileRecord {
-                root_token: String::new(),
-                path_rel: "Concert (2020).mkv".into(),
+                source: Some(pb::SourcePath::new(
+                    kahawai_core::media::root_token(root.path()),
+                    "Concert (2020).mkv",
+                )),
                 size,
                 mtime_unix: 1,
                 head_xxh3: 1,

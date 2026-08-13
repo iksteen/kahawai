@@ -64,8 +64,12 @@ impl TranscoderLink for TranscoderLinkService {
         };
         if hello.protocol_major != PROTOCOL_MAJOR {
             return Err(Status::failed_precondition(format!(
-                "incompatible protocol {}.{} (hub speaks {}.{})",
-                hello.protocol_major, hello.protocol_minor, PROTOCOL_MAJOR, PROTOCOL_MINOR
+                "incompatible protocol {}.{} (hub speaks {}.{}); upgrade this transcoder to protocol {}",
+                hello.protocol_major,
+                hello.protocol_minor,
+                PROTOCOL_MAJOR,
+                PROTOCOL_MINOR,
+                PROTOCOL_MAJOR
             )));
         }
 

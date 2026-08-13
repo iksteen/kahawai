@@ -1222,6 +1222,7 @@ impl Subtitles {
         sqlx::query_scalar(
             "SELECT t.id FROM subtitle_tracks t
              WHERE t.origin IN ('embedded', 'sidecar')
+               AND COALESCE(t.root_token, '') <> ''
                AND t.format IN ('pgs', 'vobsub', 'dvdsub')
                AND NOT EXISTS (
                      SELECT 1 FROM subtitle_tracks d
@@ -1431,9 +1432,11 @@ impl Subtitles {
             msg: Some(kahawai_proto::v1::hub_to_host::Msg::ExtractImageSubs(
                 kahawai_proto::v1::ExtractImageSubs {
                     collection_id: collection_id.to_string(),
-                    path_rel: path_rel.to_string(),
+                    source: Some(kahawai_proto::v1::SourcePath {
+                        root_token: root_token.to_string(),
+                        path_rel: path_rel.to_string(),
+                    }),
                     sub_index: sub_index as u32,
-                    root_token: root_token.to_string(),
                 },
             )),
         };
@@ -1464,13 +1467,17 @@ impl Subtitles {
         msg: &kahawai_proto::v1::ImageSubtitles,
     ) -> Result<()> {
         let key = format!("i{}", msg.sub_index);
+        let source = msg
+            .source
+            .as_ref()
+            .context("ImageSubtitles missing source")?;
         let path = self.dir.join(format!(
             "{}.sets",
             cache_key(
                 module_id,
                 &msg.collection_id,
-                &msg.root_token,
-                &msg.path_rel,
+                &source.root_token,
+                &source.path_rel,
                 &key
             )
         ));
@@ -1513,8 +1520,10 @@ impl Subtitles {
             msg: Some(kahawai_proto::v1::hub_to_host::Msg::ExtractSubs(
                 kahawai_proto::v1::ExtractSubs {
                     collection_id: collection_id.to_string(),
-                    path_rel: path_rel.to_string(),
-                    root_token: root_token.to_string(),
+                    source: Some(kahawai_proto::v1::SourcePath {
+                        root_token: root_token.to_string(),
+                        path_rel: path_rel.to_string(),
+                    }),
                 },
             )),
         };
@@ -1757,7 +1766,7 @@ pub(crate) async fn source_row(
          FROM item_sources s
          JOIN files f ON (f.module_id, f.collection_id, f.path_rel)
                        = (s.module_id, s.collection_id, s.path_rel)
-         WHERE s.item_id = ? ORDER BY f.size DESC",
+         WHERE s.item_id = ? AND s.root_token <> '' ORDER BY f.size DESC",
     )
     .bind(item_id)
     .fetch_all(registry.db())

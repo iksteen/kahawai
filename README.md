@@ -155,8 +155,9 @@ web UI, not the config file. Mediahost roots are treated as strictly read-only â
 Kahawai never writes next to your media. Root list order has no identity meaning:
 every source is bound to the deterministic token of its absolute, lexically
 normalized configured root path, so equal relative filenames in separate roots
-remain distinct. Protocol 2.3 satellites remain supported for single-root
-collections throughout 0.x; exact multi-root operation requires protocol 2.4.
+remain distinct. Exact-root identity is satellite protocol 3; protocol 2
+mediahosts and transcoders must be upgraded before they reconnect. This wire
+break does not rescan or rematch the catalogue.
 
 ## License
 

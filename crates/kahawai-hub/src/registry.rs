@@ -5,8 +5,14 @@
 //! source_path)`. Historical relational columns named `path_rel` contain an
 //! NUL-prefixed injective encoding of `(root_token, source_path)` so the existing
 //! indexed joins remain useful. NUL cannot occur in a filesystem path, so this
-//! namespace cannot collide with a legacy relative path; the explicit columns are authoritative and the
-//! byte plane always receives them separately.
+//! namespace cannot collide with a legacy relative path; the explicit columns
+//! are authoritative and the byte plane always receives them separately.
+//!
+//! `item_libraries` depends on a source's module, collection and item—not its
+//! path spelling. Its update trigger is consequently scoped to those three
+//! columns. Exact-root adoption rewrites only the relational source key; firing
+//! presentation maintenance for that identity-only change made adoption
+//! quadratic in the collection's presentation size.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -966,7 +972,7 @@ impl Registry {
                         .map_err(anyhow::Error::msg)?;
                 anyhow::ensure!(
                     path.is_absolute() && normalized == path,
-                    "mediahost announced non-normalized root {}; upgrade it to protocol 2.4",
+                    "mediahost announced non-normalized protocol-3 root {}",
                     path.display()
                 );
                 Ok((
@@ -985,7 +991,21 @@ impl Registry {
             }
         }
 
-        let mut tx = self.db.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx = loop {
+            match self.db.begin_with("BEGIN IMMEDIATE").await {
+                Ok(tx) => break tx,
+                Err(sqlx::Error::Database(error)) if error.code().as_deref() == Some("5") => {
+                    // Startup derivations can legitimately own the sole SQLite
+                    // writer while satellites reconnect. Dropping an
+                    // announcement here loses its one root-adoption chance and
+                    // turns the following generation mismatch into a scan.
+                    tracing::warn!(%module_id, collection = collection_id,
+                        "waiting for SQLite writer before root adoption");
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        };
         // The path is persisted beside the digest so even a cryptographic
         // collision cannot silently retarget existing source identities.
         // Check before the collection row is replaced, including its previous
@@ -1038,76 +1058,95 @@ impl Registry {
         // touching media or changing the collection generation. Convert all
         // source-bearing tables in one transaction. Multi-root legacy rows
         // remain unresolved and cannot be read or reconciled by root order.
+        let mut adopted = 0;
         if let [(root_token, _)] = exact_roots.as_slice() {
-            let rows: Vec<String> = sqlx::query_scalar(
-                "SELECT path_rel FROM files
-                 WHERE module_id = ? AND collection_id = ? AND root_token = ''",
+            // SQLite evaluates every SET expression from the old row. Keep the
+            // human path in source_path while replacing the historical join
+            // key with the injective exact-source encoding. Four set-based
+            // writes replace four statements per file: on the 37,674-row live
+            // catalogue the latter held later manifest requests beyond the
+            // scanner's old 30 s timeout and accidentally caused full scans.
+            for (table, nullable_root) in [
+                ("files", false),
+                ("item_sources", false),
+                ("subtitle_tracks", true),
+                ("image_set_failures", false),
+            ] {
+                let root_filter = if nullable_root {
+                    "COALESCE(root_token, '') = ''"
+                } else {
+                    "root_token = ''"
+                };
+                adopted += sqlx::query(sqlx::AssertSqlSafe(format!(
+                    "UPDATE {table}
+                     SET source_path = path_rel,
+                         path_rel = char(0) || ? || char(0) || path_rel,
+                         root_token = ?
+                     WHERE module_id = ? AND collection_id = ?
+                       AND {root_filter}"
+                )))
+                .bind(root_token)
+                .bind(root_token)
+                .bind(module_id)
+                .bind(collection_id)
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
+            }
+        }
+        if adopted > 0 {
+            sqlx::query(
+                "UPDATE collections SET root_adoption_pending = 1
+                 WHERE module_id = ? AND collection_id = ?",
             )
             .bind(module_id)
             .bind(collection_id)
-            .fetch_all(&mut *tx)
+            .execute(&mut *tx)
             .await?;
-            for legacy_path in rows {
-                let key = source_key(root_token, &legacy_path);
-                sqlx::query(
-                    "UPDATE files SET path_rel = ?, root_token = ?, source_path = ?
-                     WHERE module_id = ? AND collection_id = ? AND path_rel = ?
-                       AND root_token = ''",
-                )
-                .bind(&key)
-                .bind(root_token)
-                .bind(&legacy_path)
-                .bind(module_id)
-                .bind(collection_id)
-                .bind(&legacy_path)
-                .execute(&mut *tx)
-                .await?;
-                sqlx::query(
-                    "UPDATE item_sources SET path_rel = ?, root_token = ?, source_path = ?
-                     WHERE module_id = ? AND collection_id = ? AND path_rel = ?
-                       AND root_token = ''",
-                )
-                .bind(&key)
-                .bind(root_token)
-                .bind(&legacy_path)
-                .bind(module_id)
-                .bind(collection_id)
-                .bind(&legacy_path)
-                .execute(&mut *tx)
-                .await?;
-                sqlx::query(
-                    "UPDATE subtitle_tracks SET path_rel = ?, root_token = ?, source_path = ?
-                     WHERE module_id = ? AND collection_id = ? AND path_rel = ?
-                       AND COALESCE(root_token, '') = ''",
-                )
-                .bind(&key)
-                .bind(root_token)
-                .bind(&legacy_path)
-                .bind(module_id)
-                .bind(collection_id)
-                .bind(&legacy_path)
-                .execute(&mut *tx)
-                .await?;
-                sqlx::query(
-                    "UPDATE image_set_failures
-                     SET path_rel = ?, root_token = ?, source_path = ?
-                     WHERE module_id = ? AND collection_id = ? AND path_rel = ?
-                       AND root_token = ''",
-                )
-                .bind(&key)
-                .bind(root_token)
-                .bind(&legacy_path)
-                .bind(module_id)
-                .bind(collection_id)
-                .bind(&legacy_path)
-                .execute(&mut *tx)
-                .await?;
-            }
         }
         tx.commit().await?;
-        tracing::info!(%module_id, collection = collection_id, media_type, "collection announced");
+        tracing::info!(%module_id, collection = collection_id, media_type, adopted,
+            "collection announced");
         self.ensure_library(module_id, collection_id, media_type)
             .await?;
+        Ok(())
+    }
+
+    pub async fn root_adoption_pending(
+        &self,
+        module_id: &str,
+        collection_id: &str,
+    ) -> Result<bool> {
+        Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT root_adoption_pending FROM collections
+             WHERE module_id = ? AND collection_id = ?",
+        )
+        .bind(module_id)
+        .bind(collection_id)
+        .fetch_optional(&self.db)
+        .await?
+        .unwrap_or_default()
+            != 0)
+    }
+
+    pub async fn acknowledge_root_adoption(
+        &self,
+        module_id: &str,
+        collection_id: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE collections SET root_adoption_pending = 0
+             WHERE module_id = ? AND collection_id = ?
+               AND NOT EXISTS (
+                   SELECT 1 FROM files
+                    WHERE module_id = ? AND collection_id = ? AND root_token = '')",
+        )
+        .bind(module_id)
+        .bind(collection_id)
+        .bind(module_id)
+        .bind(collection_id)
+        .execute(&self.db)
+        .await?;
         Ok(())
     }
 
@@ -1179,13 +1218,20 @@ impl Registry {
             .execute(&mut *tx)
             .await?;
         }
+        sqlx::query(
+            "UPDATE collections SET root_adoption_pending = 1
+             WHERE module_id = ? AND collection_id = ?",
+        )
+        .bind(module_id)
+        .bind(collection_id)
+        .execute(&mut *tx)
+        .await?;
         tx.commit().await?;
         Ok(())
     }
 
-    /// Validate an exact token, or adopt a legacy root-less operation when the
-    /// announced collection has exactly one root. Ambiguous multi-root legacy
-    /// traffic is an actionable upgrade error, never a root-order lookup.
+    /// Validate a protocol-3 exact root token against the collection's
+    /// persisted token/path bindings. Empty tokens are never wire-compatible.
     pub async fn resolve_root_token(
         &self,
         module_id: &str,
@@ -1204,24 +1250,14 @@ impl Registry {
             .as_deref()
             .and_then(|v| serde_json::from_str(v).ok())
             .unwrap_or_default();
-        if !supplied.is_empty() {
-            anyhow::ensure!(
-                roots
-                    .iter()
-                    .any(|r| r.get("token").and_then(|v| v.as_str()) == Some(supplied)),
-                "unknown root token {supplied} for {module_id}/{collection_id}"
-            );
-            return Ok(supplied.to_string());
-        }
+        anyhow::ensure!(!supplied.is_empty(), "exact source has an empty root token");
         anyhow::ensure!(
-            roots.len() == 1,
-            "legacy root-less operation for multi-root collection {module_id}/{collection_id}; upgrade the mediahost"
+            roots
+                .iter()
+                .any(|r| r.get("token").and_then(|v| v.as_str()) == Some(supplied)),
+            "unknown root token {supplied} for {module_id}/{collection_id}"
         );
-        Ok(roots[0]
-            .get("token")
-            .and_then(|v| v.as_str())
-            .context("announced root has no token")?
-            .to_string())
+        Ok(supplied.to_string())
     }
 
     /// Every collection lives in at least one library: on first sight,
@@ -1397,18 +1433,6 @@ impl Registry {
         .fetch_optional(&self.db)
         .await?
         .unwrap_or(0) as usize)
-    }
-
-    pub async fn module_has_multi_root_collection(&self, module_id: &str) -> Result<bool> {
-        Ok(sqlx::query_scalar::<_, i64>(
-            "SELECT EXISTS (
-                SELECT 1 FROM collections
-                 WHERE module_id = ? AND json_array_length(roots_json) > 1)",
-        )
-        .bind(module_id)
-        .fetch_one(&self.db)
-        .await?
-            != 0)
     }
 
     pub async fn collections_overview(&self) -> Result<Vec<serde_json::Value>> {
@@ -1950,8 +1974,10 @@ impl Registry {
                 subs.sort();
                 subs.dedup();
                 kahawai_proto::v1::FileStat {
-                    path_rel: r.get("source_path"),
-                    root_token: r.get("root_token"),
+                    source: Some(kahawai_proto::v1::SourcePath {
+                        path_rel: r.get("source_path"),
+                        root_token: r.get("root_token"),
+                    }),
                     size: r.get::<i64, _>("size") as u64,
                     mtime_unix: r.get("mtime_unix"),
                     sidecars: Self::sidecar_sig(

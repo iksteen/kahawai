@@ -39,21 +39,15 @@ struct Tier {
     seen: HashSet<(String, String, String)>,
 }
 
+fn source(root_token: &str, path_rel: &str) -> Option<kahawai_proto::v1::SourcePath> {
+    Some(kahawai_proto::v1::SourcePath {
+        root_token: root_token.to_string(),
+        path_rel: path_rel.to_string(),
+    })
+}
+
 impl Tier {
-    fn push(
-        &mut self,
-        collection_id: &str,
-        mut sources: Vec<kahawai_proto::v1::SourcePath>,
-        legacy_paths: Vec<String>,
-    ) {
-        if sources.is_empty() {
-            sources.extend(legacy_paths.into_iter().map(|path_rel| {
-                kahawai_proto::v1::SourcePath {
-                    root_token: String::new(),
-                    path_rel,
-                }
-            }));
-        }
+    fn push(&mut self, collection_id: &str, sources: Vec<kahawai_proto::v1::SourcePath>) {
         for source in sources {
             let key = (
                 collection_id.to_string(),
@@ -85,19 +79,21 @@ fn intake(
             true
         }
         JobMsg::Urgent(e) => {
-            urgent.push_back((e.collection_id, e.root_token, e.path_rel));
+            if let Some(source) = e.source {
+                urgent.push_back((e.collection_id, source.root_token, source.path_rel));
+            }
             true
         }
         JobMsg::Hashlist(h) => {
-            ed2k.push(&h.collection_id, h.sources, h.paths);
+            ed2k.push(&h.collection_id, h.sources);
             false
         }
         JobMsg::SubsWorklist(w) => {
-            subs.push(&w.collection_id, w.sources, w.paths);
+            subs.push(&w.collection_id, w.sources);
             false
         }
         JobMsg::AttachmentsWorklist(w) => {
-            atts.push(&w.collection_id, w.sources, w.paths);
+            atts.push(&w.collection_id, w.sources);
             false
         }
         JobMsg::KeyframeWorklist(w) => {
@@ -106,7 +102,7 @@ fn intake(
             // rather than a guess.
             tracing::info!(collection = %w.collection_id, files = w.sources.len(),
                 "keyframe worklist received");
-            keys.push(&w.collection_id, w.sources, w.paths);
+            keys.push(&w.collection_id, w.sources);
             false
         }
     }
@@ -177,15 +173,17 @@ pub async fn run(
             continue;
         }
         if let Some(e) = urgent_image.pop_front() {
-            extract_image_and_send(
-                &collections,
-                &e.collection_id,
-                &e.root_token,
-                &e.path_rel,
-                e.sub_index,
-                &tx,
-            )
-            .await;
+            if let Some(source) = e.source {
+                extract_image_and_send(
+                    &collections,
+                    &e.collection_id,
+                    &source.root_token,
+                    &source.path_rel,
+                    e.sub_index,
+                    &tx,
+                )
+                .await;
+            }
             continue;
         }
         if let Some((collection_id, root_token, path_rel)) = ed2k.q.pop_front() {
@@ -199,9 +197,8 @@ pub async fn run(
             .await
             {
                 Ok(mut fh) => {
-                    fh.root_token = root_token.clone();
-                    fh.path_rel = path_rel.clone();
-                    tracing::info!(collection = %collection_id, path = %fh.path_rel,
+                    fh.source = source(&root_token, &path_rel);
+                    tracing::info!(collection = %collection_id, path = %path_rel,
                         ed2k = %fh.ed2k_hex, crc_ok = fh.crc_ok || !fh.crc_checked, "ed2k computed");
                     let msg = HostToHub {
                         msg: Some(host_to_hub::Msg::FileHashes(FileHashes {
@@ -328,10 +325,9 @@ async fn declare_and_send(
     let msg = HostToHub {
         msg: Some(host_to_hub::Msg::FileAttachments(FileAttachments {
             collection_id: collection_id.to_string(),
-            path_rel: path_rel.to_string(),
+            source: source(root_token, path_rel),
             size,
             attachments_json,
-            root_token: root_token.to_string(),
         })),
     };
     let _ = tx.send(msg).await;
@@ -375,10 +371,9 @@ async fn measure_keyframes_and_send(
         msg: Some(host_to_hub::Msg::FileKeyframeInterval(
             FileKeyframeInterval {
                 collection_id: collection_id.to_string(),
-                path_rel: path_rel.to_string(),
+                source: source(root_token, path_rel),
                 size,
                 max_keyframe_interval_ms: ms,
-                root_token: root_token.to_string(),
             },
         )),
     };
@@ -484,12 +479,11 @@ async fn extract_image_and_send(
                 %error, "image display-set extraction failed");
             kahawai_proto::v1::ImageSubtitles {
                 collection_id: collection_id.into(),
-                path_rel: path_rel.into(),
+                source: source(root_token, path_rel),
                 sub_index,
                 error,
                 // One message, and it is the last one.
                 done: Some(true),
-                root_token: root_token.into(),
                 ..Default::default()
             }
         }
@@ -541,7 +535,7 @@ async fn extract_and_send(
                 tracks = tracks.len(), elapsed = ?started.elapsed(), "subtitles extracted");
             FileSubtitles {
                 collection_id: collection_id.to_string(),
-                path_rel: path_rel.to_string(),
+                source: source(root_token, path_rel),
                 size,
                 tracks: tracks
                     .into_iter()
@@ -552,7 +546,6 @@ async fn extract_and_send(
                     })
                     .collect(),
                 error: String::new(),
-                root_token: root_token.to_string(),
             }
         }
         Err(e) => {
@@ -560,11 +553,10 @@ async fn extract_and_send(
                 error = format!("{e:#}"), "subtitle extraction failed");
             FileSubtitles {
                 collection_id: collection_id.to_string(),
-                path_rel: path_rel.to_string(),
+                source: source(root_token, path_rel),
                 size: 0,
                 tracks: vec![],
                 error: format!("{e:#}"),
-                root_token: root_token.to_string(),
             }
         }
     };
@@ -619,12 +611,11 @@ async fn hash_one(
         tracing::warn!(path = %path.display(), "filename CRC32 mismatch — file may be corrupt");
     }
     Ok(FileHash {
-        path_rel: String::new(), // caller fills
+        source: None, // caller fills
         ed2k_hex: ed2k.finish(),
         size,
         crc_checked: claimed_crc.is_some(),
         crc_ok: crc_ok.unwrap_or(false),
-        root_token: String::new(), // caller fills
     })
 }
 
@@ -665,14 +656,13 @@ async fn send_chunked(
         sent += chunk.len();
         let msg = kahawai_proto::v1::ImageSubtitles {
             collection_id: collection_id.into(),
-            path_rel: path_rel.into(),
+            source: source(root_token, path_rel),
             sub_index,
             codec: codec.clone(),
             codec_private: codec_private.clone(),
             blocks: std::mem::take(&mut chunk),
             error: String::new(),
             done: Some(last),
-            root_token: root_token.into(),
         };
         bytes = 0;
         if tx
@@ -701,12 +691,11 @@ async fn send_chunked(
                 msg: Some(host_to_hub::Msg::ImageSubtitles(
                     kahawai_proto::v1::ImageSubtitles {
                         collection_id: collection_id.into(),
-                        path_rel: path_rel.into(),
+                        source: source(root_token, path_rel),
                         sub_index,
                         codec,
                         codec_private,
                         done: Some(true),
-                        root_token: root_token.into(),
                         ..Default::default()
                     },
                 )),

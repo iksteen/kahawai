@@ -123,8 +123,14 @@ async fn direct_play_ranges_end_to_end() {
             id: "movies".into(),
             media_type: "movies".into(),
             roots: vec![
-                root.path().display().to_string(),
-                preferred.path().display().to_string(),
+                pb::CollectionRoot::new(
+                    kahawai_core::media::root_token(root.path()),
+                    root.path().display().to_string(),
+                ),
+                pb::CollectionRoot::new(
+                    kahawai_core::media::root_token(preferred.path()),
+                    preferred.path().display().to_string(),
+                ),
             ],
         },
     ))
@@ -133,8 +139,10 @@ async fn direct_play_ranges_end_to_end() {
         collection_id: "movies".into(),
         files: vec![
             pb::FileRecord {
-                root_token: kahawai_core::media::root_token(root.path()),
-                path_rel: "Heat (1995).mkv".into(),
+                source: Some(pb::SourcePath::new(
+                    kahawai_core::media::root_token(root.path()),
+                    "Heat (1995).mkv",
+                )),
                 size: decoy.len() as u64,
                 mtime_unix: 1,
                 head_xxh3: 10,
@@ -143,8 +151,10 @@ async fn direct_play_ranges_end_to_end() {
                 streams_json: r#"{"container":"matroska"}"#.into(),
             },
             pb::FileRecord {
-                root_token: preferred_token.clone(),
-                path_rel: "Heat (1995).mkv".into(),
+                source: Some(pb::SourcePath::new(
+                    preferred_token.clone(),
+                    "Heat (1995).mkv",
+                )),
                 size: FILE_LEN as u64,
                 mtime_unix: 1,
                 head_xxh3: 1,

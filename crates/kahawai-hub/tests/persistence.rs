@@ -330,7 +330,10 @@ async fn manifest_and_files_seen_survive_rescan() {
                     pb::AnnounceCollection {
                         id: "movies".into(),
                         media_type: "movies".into(),
-                        roots: vec!["/srv/movies".into()],
+                        roots: vec![pb::CollectionRoot::new(
+                            kahawai_core::media::root_token(std::path::Path::new("/srv/movies")),
+                            "/srv/movies",
+                        )],
                     },
                 )),
             })
@@ -373,8 +376,12 @@ async fn manifest_and_files_seen_survive_rescan() {
                     msg: Some(pb::host_to_hub::Msg::FileUpsert(pb::FileUpsert {
                         collection_id: "movies".into(),
                         files: vec![pb::FileRecord {
-                            root_token: String::new(),
-                            path_rel: "Heat (1995).mkv".into(),
+                            source: Some(pb::SourcePath::new(
+                                kahawai_core::media::root_token(std::path::Path::new(
+                                    "/srv/movies",
+                                )),
+                                "Heat (1995).mkv",
+                            )),
                             size: 100,
                             mtime_unix: 42,
                             head_xxh3: 1,
@@ -389,14 +396,14 @@ async fn manifest_and_files_seen_survive_rescan() {
             } else {
                 // Round 2: hub knows the file; report it seen, upsert nothing.
                 assert_eq!(entries.len(), 1, "{entries:?}");
-                assert_eq!(entries[0].path_rel, "Heat (1995).mkv");
+                let source = entries[0].source.as_ref().unwrap();
+                assert_eq!(source.path_rel, "Heat (1995).mkv");
                 assert_eq!(entries[0].size, 100);
                 assert_eq!(entries[0].mtime_unix, 42);
                 tx.send(pb::HostToHub {
                     msg: Some(pb::host_to_hub::Msg::FilesSeen(pb::FilesSeen {
                         collection_id: "movies".into(),
-                        path_rel: vec!["Heat (1995).mkv".into()],
-                        sources: Vec::new(),
+                        sources: vec![source.clone()],
                     })),
                 })
                 .await

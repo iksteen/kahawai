@@ -102,7 +102,7 @@ pub async fn run_local(
     tx: tokio::sync::mpsc::Sender<HostToHub>,
     mut rx: tokio::sync::mpsc::Receiver<Result<HubToHost, tonic::Status>>,
 ) -> Result<()> {
-    let engine = Engine::start(&collections, rescan_minutes, state_dir, tx.clone(), true);
+    let engine = Engine::start(&collections, rescan_minutes, state_dir, tx.clone());
     let mut ticker = tokio::time::interval(HEARTBEAT_INTERVAL);
     loop {
         tokio::select! {
@@ -117,7 +117,7 @@ pub async fn run_local(
             msg = rx.recv() => {
                 match msg {
                     Some(Ok(m)) => {
-                        if let Some(req) = engine.dispatch(m) {
+                        if let Some(req) = engine.dispatch(m)? {
                             tracing::warn!(token = %req.lease_token,
                                 "unexpected OpenRead on the in-process link (hub reads directly)");
                         }
@@ -204,7 +204,6 @@ impl Engine {
         rescan_minutes: u64,
         state_dir: &Path,
         tx: tokio::sync::mpsc::Sender<HostToHub>,
-        exact_roots: bool,
     ) -> Engine {
         // Manifest responses are routed to the scan task of their collection.
         let manifest_waiters: std::sync::Arc<
@@ -256,31 +255,39 @@ impl Engine {
                 }
                 let handshake = if trig.initial { version } else { 0 };
                 let next = version + 1;
+                let force_dirs = trig.force_dirs;
                 let _busy = activity.scan();
-                match scan_cycle(
-                    &c,
-                    &tx,
-                    &waiters,
-                    trig.force_dirs,
-                    handshake,
-                    next,
-                    exact_roots,
-                )
-                .await
-                {
-                    Ok(true) => {
-                        version = next;
-                        if let Some(dir) = ver_path.parent() {
-                            let _ = std::fs::create_dir_all(dir);
+                loop {
+                    match scan_cycle(
+                        &c,
+                        &tx,
+                        &waiters,
+                        force_dirs.clone(),
+                        handshake,
+                        next,
+                    )
+                    .await
+                    {
+                        Ok(scan::ScanOutcome::Completed) => {
+                            version = next;
+                            if let Some(dir) = ver_path.parent() {
+                                let _ = std::fs::create_dir_all(dir);
+                            }
+                            if let Err(e) = std::fs::write(&ver_path, version.to_string()) {
+                                tracing::warn!(collection = %c.name, error = %e, "persisting sync version failed");
+                            }
+                            break;
                         }
-                        if let Err(e) = std::fs::write(&ver_path, version.to_string()) {
-                            tracing::warn!(collection = %c.name, error = %e, "persisting sync version failed");
+                        Ok(scan::ScanOutcome::InSync) => break,
+                        // Adoption consumed this trigger only to establish the
+                        // new source identity safely. Once acknowledged, retry
+                        // it immediately: a restored hub can have a genuinely
+                        // older catalogue generation than this mediahost.
+                        Ok(scan::ScanOutcome::RootAdoptionAcknowledged) => continue,
+                        Err(e) => {
+                            tracing::warn!(collection = %c.name, error = format!("{e:#}"), "scan cycle failed");
+                            return; // link is gone; the session restart rescans
                         }
-                    }
-                    Ok(false) => {} // in sync: nothing scanned, version unchanged
-                    Err(e) => {
-                        tracing::warn!(collection = %c.name, error = format!("{e:#}"), "scan cycle failed");
-                        return; // link is gone; the session restart rescans
                     }
                 }
             }
@@ -327,10 +334,10 @@ impl Engine {
                     let triggers2 = triggers.clone();
                     guards.push(tokio::spawn(async move {
                     // Installing recursive watches walks every directory
-                    // — minutes over sshfs. Done here, off the link's
-                    // critical path: blocking it starved the inbound
-                    // loop and made startup manifests (and in_sync
-                    // replies) time out into full rescans.
+                    // — minutes over sshfs. Keep it off the link's critical
+                    // path so startup manifests and in-sync replies are routed
+                    // promptly; protocol 3 waits rather than turning hub
+                    // latency into a full scan.
                     let watcher = tokio::task::spawn_blocking(move || {
                         use notify::Watcher as _;
                         let mut watcher = watcher;
@@ -420,15 +427,25 @@ impl Engine {
     /// Route one hub→host message. OpenRead is returned to the caller:
     /// the byte plane is transport-specific (gRPC channel on the wire,
     /// a direct file read in all-in-one — AR-11 short-circuit).
-    pub fn dispatch(&self, m: HubToHost) -> Option<kahawai_proto::v1::OpenRead> {
-        match m.msg? {
+    pub fn dispatch(&self, m: HubToHost) -> Result<Option<kahawai_proto::v1::OpenRead>> {
+        let Some(message) = m.msg else {
+            return Ok(None);
+        };
+        let validate_sources = |kind: &str, sources: &[kahawai_proto::v1::SourcePath]| {
+            anyhow::ensure!(
+                sources.iter().all(|source| !source.root_token.is_empty()),
+                "protocol-3 {kind} contains an empty root token"
+            );
+            Ok(())
+        };
+        match message {
             hub_to_host::Msg::RescanRequest(r) => {
                 for (name, t) in &self.triggers {
                     if r.collection_id.is_empty() || *name == r.collection_id {
                         t.send(ScanTrigger::default());
                     }
                 }
-                None
+                Ok(None)
             }
             hub_to_host::Msg::Manifest(m) => {
                 let sender = self
@@ -440,37 +457,57 @@ impl Engine {
                 if let Some(s) = sender {
                     let _ = s.try_send(m);
                 }
-                None
+                Ok(None)
             }
             hub_to_host::Msg::Hashlist(h) => {
+                validate_sources("Hashlist", &h.sources)?;
                 let _ = self.hash_tx.try_send(hasher::JobMsg::Hashlist(h));
-                None
+                Ok(None)
             }
             hub_to_host::Msg::KeyframeWorklist(w) => {
+                validate_sources("KeyframeWorklist", &w.sources)?;
                 let _ = self.hash_tx.try_send(hasher::JobMsg::KeyframeWorklist(w));
-                None
+                Ok(None)
             }
             hub_to_host::Msg::AttachmentsWorklist(w) => {
+                validate_sources("AttachmentsWorklist", &w.sources)?;
                 let _ = self
                     .hash_tx
                     .try_send(hasher::JobMsg::AttachmentsWorklist(w));
-                None
+                Ok(None)
             }
             hub_to_host::Msg::SubsWorklist(w) => {
+                validate_sources("SubsWorklist", &w.sources)?;
                 let _ = self.hash_tx.try_send(hasher::JobMsg::SubsWorklist(w));
-                None
+                Ok(None)
             }
             hub_to_host::Msg::ExtractSubs(e) => {
+                let source = e
+                    .source
+                    .as_ref()
+                    .context("ExtractSubs missing exact source")?;
+                anyhow::ensure!(
+                    !source.root_token.is_empty(),
+                    "ExtractSubs has empty root token"
+                );
                 let _ = self.hash_tx.try_send(hasher::JobMsg::Urgent(e));
-                None
+                Ok(None)
             }
             // HUB-32b: an image subtitle track's display sets, walked
             // from the container index here — on local disk it costs
             // milliseconds, and over the hub's byte plane it would not
             // finish inside a session start at all.
             hub_to_host::Msg::ExtractImageSubs(e) => {
+                let source = e
+                    .source
+                    .as_ref()
+                    .context("ExtractImageSubs missing exact source")?;
+                anyhow::ensure!(
+                    !source.root_token.is_empty(),
+                    "ExtractImageSubs has empty root token"
+                );
                 let _ = self.hash_tx.try_send(hasher::JobMsg::UrgentImage(e));
-                None
+                Ok(None)
             }
             hub_to_host::Msg::RootResolutionWorklist(work) => {
                 let collections = self.collections.clone();
@@ -478,10 +515,20 @@ impl Engine {
                 tokio::spawn(async move {
                     resolve_legacy_roots(&collections, work, &tx).await;
                 });
-                None
+                Ok(None)
             }
-            hub_to_host::Msg::OpenRead(req) => Some(req),
-            _ => None,
+            hub_to_host::Msg::OpenRead(req) => {
+                let source = req
+                    .source
+                    .as_ref()
+                    .context("OpenRead missing exact source")?;
+                anyhow::ensure!(
+                    !source.root_token.is_empty(),
+                    "OpenRead has empty root token"
+                );
+                Ok(Some(req))
+            }
+            _ => Ok(None),
         }
     }
 }
@@ -520,8 +567,11 @@ async fn resolve_legacy_roots(
             _ => (String::new(), "ambiguous".into()),
         };
         resolutions.push(kahawai_proto::v1::RootResolution {
-            path_rel: source.path_rel,
-            root_token,
+            path_rel: source.path_rel.clone(),
+            source: (!root_token.is_empty()).then_some(kahawai_proto::v1::SourcePath {
+                root_token,
+                path_rel: source.path_rel,
+            }),
             error,
         });
     }
@@ -580,37 +630,28 @@ async fn link_once(
         .into_inner();
 
     // Hub speaks first: HelloAck with its protocol version (AR-7).
-    let exact_roots = match inbound.message().await.context("awaiting HelloAck")? {
+    match inbound.message().await.context("awaiting HelloAck")? {
         Some(m) => match m.msg {
             Some(hub_to_host::Msg::HelloAck(ack)) => {
-                if ack.protocol_major == 2
-                    && ack.protocol_minor < 4
-                    && collections.iter().any(|c| c.roots.len() > 1)
-                {
-                    bail!(
-                        "hub protocol {}.{} cannot distinguish files in multiple collection roots; upgrade the hub",
-                        ack.protocol_major,
-                        ack.protocol_minor
-                    );
-                }
+                anyhow::ensure!(
+                    ack.protocol_major == PROTOCOL_MAJOR,
+                    "incompatible hub protocol {}.{}; this mediahost requires {}.{}",
+                    ack.protocol_major,
+                    ack.protocol_minor,
+                    PROTOCOL_MAJOR,
+                    PROTOCOL_MINOR
+                );
                 tracing::info!(
                     hub_protocol = format!("{}.{}", ack.protocol_major, ack.protocol_minor),
                     "link established"
                 );
-                ack.protocol_minor >= 4
             }
             _ => bail!("hub did not open with HelloAck"),
         },
         None => bail!("hub closed the link before HelloAck"),
-    };
+    }
 
-    let engine = Engine::start(
-        collections,
-        rescan_minutes,
-        state_dir,
-        tx.clone(),
-        exact_roots,
-    );
+    let engine = Engine::start(collections, rescan_minutes, state_dir, tx.clone());
 
     let mut ticker = tokio::time::interval(HEARTBEAT_INTERVAL);
     loop {
@@ -633,7 +674,7 @@ async fn link_once(
             msg = inbound.message() => {
                 match msg {
                     Ok(Some(m)) => {
-                        if let Some(req) = engine.dispatch(m) {
+                        if let Some(req) = engine.dispatch(m)? {
                             let path = serve::resolve_path(collections, &req);
                             if let Err(e) = &path {
                                 tracing::warn!(error = format!("{e:#}"), "refusing OpenRead");
@@ -670,13 +711,18 @@ async fn scan_cycle(
     force_dirs: std::collections::HashSet<std::path::PathBuf>,
     handshake_version: u64,
     report_version: u64,
-    exact_roots: bool,
-) -> Result<bool> {
+) -> Result<scan::ScanOutcome> {
     tx.send(HostToHub {
         msg: Some(host_to_hub::Msg::AnnounceCollection(AnnounceCollection {
             id: c.name.clone(),
             media_type: c.media_type.clone(),
-            roots: c.roots.iter().map(|r| r.display().to_string()).collect(),
+            roots: c
+                .resolved_roots()
+                .map(|root| kahawai_proto::v1::CollectionRoot {
+                    root_token: root.token,
+                    normalized_path: root.path.display().to_string(),
+                })
+                .collect(),
         })),
     })
     .await
@@ -693,20 +739,107 @@ async fn scan_cycle(
     })
     .await
     .context("link closed before manifest request")?;
-    scan::scan_collection(
-        c.clone(),
-        tx.clone(),
-        mrx,
-        force_dirs,
-        report_version,
-        exact_roots,
-    )
-    .await
+    scan::scan_collection(c.clone(), tx.clone(), mrx, force_dirs, report_version).await
 }
 
 #[cfg(test)]
 mod root_resolution_tests {
     use super::*;
+
+    async fn recv_host_message(
+        rx: &mut tokio::sync::mpsc::Receiver<HostToHub>,
+    ) -> host_to_hub::Msg {
+        tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("mediahost message timed out")
+            .expect("mediahost message channel closed")
+            .msg
+            .expect("empty mediahost message")
+    }
+
+    #[tokio::test]
+    async fn adoption_acknowledgement_immediately_retries_the_startup_scan() {
+        let root = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        std::fs::create_dir(state.path().join("sync")).unwrap();
+        std::fs::write(state.path().join("sync/movies.ver"), "99").unwrap();
+        let collections = vec![CollectionConfig {
+            name: "movies".into(),
+            media_type: "movies".into(),
+            roots: vec![root.path().into()],
+        }];
+        let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+        let engine = Engine::start(&collections, 0, state.path(), tx);
+
+        assert!(matches!(
+            recv_host_message(&mut rx).await,
+            host_to_hub::Msg::AnnounceCollection(_)
+        ));
+        let host_to_hub::Msg::ManifestRequest(first_request) = recv_host_message(&mut rx).await
+        else {
+            panic!("startup did not request a manifest")
+        };
+        assert_eq!(first_request.sync_version, 99);
+
+        engine
+            .dispatch(HubToHost {
+                msg: Some(hub_to_host::Msg::Manifest(kahawai_proto::v1::Manifest {
+                    collection_id: "movies".into(),
+                    entries: Vec::new(),
+                    done: true,
+                    in_sync: true,
+                    sidecars_compared: true,
+                    root_adoption: true,
+                })),
+            })
+            .unwrap();
+        assert!(matches!(
+            recv_host_message(&mut rx).await,
+            host_to_hub::Msg::RootAdoptionAck(_)
+        ));
+        assert!(matches!(
+            recv_host_message(&mut rx).await,
+            host_to_hub::Msg::AnnounceCollection(_)
+        ));
+        let host_to_hub::Msg::ManifestRequest(retry_request) = recv_host_message(&mut rx).await
+        else {
+            panic!("adoption acknowledgement did not retry the manifest")
+        };
+        assert_eq!(
+            retry_request.sync_version, 99,
+            "the deferred startup trigger must retain the host generation"
+        );
+
+        engine
+            .dispatch(HubToHost {
+                msg: Some(hub_to_host::Msg::Manifest(kahawai_proto::v1::Manifest {
+                    collection_id: "movies".into(),
+                    entries: Vec::new(),
+                    done: true,
+                    in_sync: false,
+                    sidecars_compared: true,
+                    root_adoption: false,
+                })),
+            })
+            .unwrap();
+        loop {
+            if let host_to_hub::Msg::ScanProgress(progress) = recv_host_message(&mut rx).await
+                && progress.complete
+            {
+                assert_eq!(progress.sync_version, 100);
+                break;
+            }
+        }
+        for _ in 0..20 {
+            if std::fs::read_to_string(state.path().join("sync/movies.ver"))
+                .is_ok_and(|version| version == "100")
+            {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("completed retry did not persist generation 100");
+    }
 
     #[tokio::test]
     async fn targeted_resolution_never_guesses_between_identical_candidates() {
@@ -744,7 +877,7 @@ mod root_resolution_tests {
             panic!("wrong result kind")
         };
         assert_eq!(result.resolutions.len(), 1);
-        assert_eq!(result.resolutions[0].root_token, "");
+        assert!(result.resolutions[0].source.is_none());
         assert_eq!(result.resolutions[0].error, "ambiguous");
     }
 }

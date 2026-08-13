@@ -114,11 +114,18 @@ How something works and why it was built that way belong in
 - [x] MH-10 Sync generation per collection: persisted mediahost-side, compared
       on reconnect, in-sync = no manifest/no walk; FilesSeen reconciliation.
       Migration 53 adds exact-root columns without resetting generations. A
-      single-root announcement adopts legacy rows transactionally; ambiguous
-      multi-root rows use a targeted content-identity worklist and suppress
-      reconciliation until resolved, without a catalogue scan. An unavailable
-      root preserves its manifest rows while other roots continue; root-aware
-      caches safely promote old artifacts only for single-root collections
+      protocol 3 rejects protocol-2 satellites and uses one required exact
+      source shape. A single-root announcement adopts pre-migration rows with
+      set-based transactional writes; migration 54 prevents identity-only key
+      rewrites from firing presentation-membership maintenance per file, and
+      migration 55 plus protocol 3 persist/acknowledge scan suppression across
+      crashes without changing either side's generation. After acknowledgement,
+      the consumed startup trigger is retried immediately so a real generation
+      mismatch enters normal incremental reconciliation. Ambiguous multi-root rows use a targeted
+      content-identity worklist and suppress reconciliation until resolved,
+      without a catalogue scan or rematch. An unavailable root preserves its
+      manifest rows while other roots continue; root-aware caches safely
+      promote old artifacts only for single-root collections
 - [x] MH-11 Three-tier job runner: urgent extraction > ED2K > subtitle
       pre-warm, idle = no scan and no lease being served
 - [~] MH-12 WITHDRAWN 2026-08-02, false premise — see the amendment in
@@ -540,13 +547,11 @@ How something works and why it was built that way belong in
       unreachability, not quota: resized artwork whose size left the code
       list, or whose original is gone, dropped at startup.
 - [x] OPS-7 Cross-version satellite compatibility: protocol gated on major
-      version (Hello/HelloAck) — per decision 2026-07-25, major-gating IS the
-      compatibility contract; no previous-minor guarantee
-      *(TODO before 1.0.0, per the 2026-08-03 amendment: flatten the
-      protocol into one clean major and force a full rescan, deleting
-      the accumulated backfill messages and the "scanned before this
-      existed" branches they exist to serve. Currently carried: MH-4
-      attachments, the keyframe interval.)*
+      version (Hello/HelloAck). Protocol 3 is a coordinated satellite upgrade:
+      every protocol-2 peer is refused with both versions and an upgrade
+      instruction. The clean exact-source wire shape does not force a catalogue
+      rescan or rematch; migration and bounded fact-specific worklists preserve
+      identity and fill facts absent from older scanner records.
 - [x] OPS-8 Reverse-proxy support: trusted_proxies (exact IPs and CIDR
       ranges — docker/traefik bridges) gate X-Forwarded-For for OPS-2
       throttling (rightmost-untrusted, spoof-safe), configurable CORS

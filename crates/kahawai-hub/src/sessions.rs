@@ -1534,8 +1534,10 @@ impl Sessions {
             msg: Some(hub_to_host::Msg::OpenRead(OpenRead {
                 lease_token: token.clone(),
                 collection_id: collection_id.to_string(),
-                path_rel: path_rel.to_string(),
-                root_token: root_token.to_string(),
+                source: Some(kahawai_proto::v1::SourcePath {
+                    root_token: root_token.to_string(),
+                    path_rel: path_rel.to_string(),
+                }),
             })),
         };
         // A send failure here means the host went away between being judged

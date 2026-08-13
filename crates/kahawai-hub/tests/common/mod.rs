@@ -151,13 +151,18 @@ pub async fn harness(file_name: &str, render: fn(&Path)) -> Harness {
         pb::host_to_hub::Msg::AnnounceCollection(pb::AnnounceCollection {
             id: "movies".into(),
             media_type: "movies".into(),
-            roots: vec![root.path().display().to_string()],
+            roots: vec![pb::CollectionRoot::new(
+                kahawai_core::media::root_token(root.path()),
+                root.path().display().to_string(),
+            )],
         }),
         pb::host_to_hub::Msg::FileUpsert(pb::FileUpsert {
             collection_id: "movies".into(),
             files: vec![pb::FileRecord {
-                root_token: String::new(),
-                path_rel: file_name.into(),
+                source: Some(pb::SourcePath::new(
+                    kahawai_core::media::root_token(root.path()),
+                    file_name,
+                )),
                 size,
                 mtime_unix: 1,
                 head_xxh3: 1,

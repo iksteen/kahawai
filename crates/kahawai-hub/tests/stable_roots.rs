@@ -242,11 +242,34 @@ async fn migration_and_single_root_adoption_preserve_durable_state() {
     .unwrap();
 
     MIGRATOR.run(&db).await.unwrap();
+    sqlx::raw_sql(
+        "CREATE TABLE item_library_write_audit (operation TEXT NOT NULL);
+         CREATE TRIGGER audit_item_libraries_insert AFTER INSERT ON item_libraries BEGIN
+           INSERT INTO item_library_write_audit VALUES ('insert');
+         END;
+         CREATE TRIGGER audit_item_libraries_delete AFTER DELETE ON item_libraries BEGIN
+           INSERT INTO item_library_write_audit VALUES ('delete');
+         END;
+         CREATE TRIGGER audit_item_libraries_update AFTER UPDATE ON item_libraries BEGIN
+           INSERT INTO item_library_write_audit VALUES ('update');
+         END;",
+    )
+    .execute(&db)
+    .await
+    .unwrap();
     let registry = Registry::new(db.clone(), Default::default());
     registry
         .announce_collection("host", "movies", "movies", &["/media/only".into()])
         .await
         .unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM item_library_write_audit")
+            .fetch_one(&db)
+            .await
+            .unwrap(),
+        0,
+        "an identity-only source-key rewrite must not rebuild presentation membership"
+    );
 
     let token = root("/media/only");
     for table in [
@@ -445,12 +468,11 @@ async fn multi_root_legacy_state_is_never_guessed() {
         )
         .await
         .unwrap();
-    assert!(
-        registry
-            .resolve_root_token("host", "movies", "")
-            .await
-            .is_err()
-    );
+    let error = registry
+        .resolve_root_token("host", "movies", "")
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("empty root token"), "{error:#}");
     assert_eq!(
         registry
             .unresolved_legacy_sources("host", "movies")

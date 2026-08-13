@@ -71,15 +71,14 @@ marked in that document.
 - [ ] REL-3 Publish an evidence-based platform matrix. Mark only roles and
       architectures exercised by current release artifacts as supported;
       retaining, withdrawing or adding a platform is an explicit scope decision
-- [x] REL-4 Record and publish the compatibility policy for exact-root source
-      identity, the satellite protocol and token invalidation. Root identity is
-      an additive protocol change: legacy root-less records remain admissible
-      where one configured root determines the answer, while an ambiguous
-      legacy multi-root record is resolved from stored content identity or
-      rejected with an actionable satellite-upgrade diagnostic rather than
-      guessed. Upgrading shall not require a catalogue rescan, reset a scan
-      generation or reauthenticate a satellite. State any support window for
-      legacy root-less messages explicitly
+- [x] REL-4 Exact-root source identity is satellite protocol 3 and requires a
+      coordinated upgrade of every mediahost and transcoder; protocol 2 peers
+      are rejected during `Hello` negotiation with an actionable upgrade
+      diagnostic. Protocol 3 has one required exact-source wire shape and no
+      root-less compatibility fields or empty-token semantics. This wire break
+      must not become a catalogue break: upgrading may not trigger an
+      authoritative rescan, reset a scan generation, clear source bindings,
+      rematch media, repeat provider work or reauthenticate a satellite
 - [ ] REL-5 Keep `/api/v1` explicitly unstable throughout 0.x; on the 1.0
       release, freeze its generated contract and adopt the promised policy of
       serving the current and immediately preceding API major
@@ -220,21 +219,26 @@ marked in that document.
       source namespace twice; overlap across deliberately separate collections
       remains valid. A temporarily missing or inaccessible root is reported as
       unavailable and is never silently substituted with another root
-- [x] DATA-4 Implement REL-4 additively. A legacy root-less message for a
-      single-root collection maps to that root's deterministic token. For a
-      legacy multi-root source, adopt an exact root only when stored path, size
-      and content fingerprints prove it; otherwise reject the ambiguous record
-      with an actionable upgrade diagnostic instead of selecting by root order.
-      Keep compatibility fields and backfills for their documented support
-      window, and do not require a protocol-major reset merely to add the root
-      token
+- [x] DATA-4 Implement REL-4 as protocol 3 with one required
+      `SourcePath { root_token, path_rel }` representation in every
+      source-bearing record, worklist and read request. Reject every protocol 2
+      satellite at negotiation; retain no root-less wire fields, peer-minor
+      branches or empty-token adapters. Database adoption remains lossless and
+      separate from wire compatibility: infer a legacy single-root row without
+      media access, and for a legacy multi-root row adopt an exact root only
+      when stored path, size and content fingerprints prove it. Otherwise block
+      that collection with an actionable diagnostic rather than guessing,
+      rescanning or rematching
 - [x] DATA-5 Backfill derived root tokens transactionally without an
-      authoritative collection rescan. Preserve item IDs and source bindings,
-      technical metadata, libraries and grants, provider/manual/query state, queued work,
-      relations, watch progress and collection scan generations. Any targeted
-      mediahost check needed to disambiguate a legacy multi-root row may inspect
-      only that source's stat/content identity; it must not reconcile the
-      catalogue or advance the collection generation
+      authoritative collection rescan or media rematch. Preserve item IDs and
+      source bindings, technical metadata, libraries and grants,
+      provider/manual/query state, recorded misses, queued work, relations,
+      watch progress and collection scan generations. Any targeted mediahost
+      check needed to disambiguate a legacy multi-root row may inspect only that
+      source's stat/content identity; it must not reconcile the catalogue,
+      advance the collection generation, clear an assignment or enqueue broad
+      enrichment. Zero or multiple matches leave the collection blocked for
+      operator correction
 - [x] DATA-6 Exercise two roots containing the same relative filename and prove
       they remain distinct through scan, deduplication, source selection, byte
       leases and playback
@@ -496,10 +500,11 @@ marked in that document.
       relative paths in separate roots through scan, persistence, source
       selection, byte leases and playback. Prove root reordering changes
       nothing; duplicate/within-collection overlapping roots are rejected;
-      cross-collection overlap remains valid; legacy single-root messages are
-      adopted additively; ambiguous legacy multi-root records are never guessed;
-      and migration preserves source/item IDs, durable metadata and user state
-      without changing scan generations or triggering catalogue reconciliation
+      cross-collection overlap remains valid; protocol 2 peers are rejected;
+      protocol 3 exposes only the required exact-source shape; ambiguous legacy
+      database rows are never guessed; and migration preserves source/item IDs,
+      durable metadata, provider questions/answers and user state without
+      changing scan generations, reconciling the catalogue or rematching media
 - [ ] CI-8 Test backup configuration restoration, Unix permissions, corrupt and
       truncated manifests, invalid SQLite, stale-file removal, interruption
       rollback and refusal while the live hub owns the data lock

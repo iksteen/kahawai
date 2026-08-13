@@ -17,11 +17,15 @@ const CHUNK: usize = 256 * 1024;
 /// Resolve an OpenRead against the configured collections, refusing
 /// anything that escapes a collection root (NFR-4).
 pub fn resolve_path(collections: &[CollectionConfig], req: &OpenRead) -> Result<PathBuf> {
+    let source = req
+        .source
+        .as_ref()
+        .context("OpenRead missing exact source")?;
     resolve_rel(
         collections,
         &req.collection_id,
-        &req.root_token,
-        &req.path_rel,
+        &source.root_token,
+        &source.path_rel,
     )
 }
 
@@ -37,22 +41,16 @@ pub fn resolve_rel(
         .iter()
         .find(|c| c.name == collection_id)
         .with_context(|| format!("unknown collection {collection_id}"))?;
-    let roots: Vec<_> = col.resolved_roots().collect();
-    let configured = if root_token.is_empty() {
-        match roots.as_slice() {
-            [root] => root.clone(),
-            _ => bail!(
-                "legacy root-less operation is ambiguous in multi-root collection {collection_id}"
-            ),
-        }
-    } else {
-        roots
-            .into_iter()
-            .find(|r| r.token == root_token)
-            .with_context(|| {
-                format!("unknown root token {root_token} in collection {collection_id}")
-            })?
-    };
+    anyhow::ensure!(
+        !root_token.is_empty(),
+        "exact source has an empty root token"
+    );
+    let configured = col
+        .resolved_roots()
+        .find(|r| r.token == root_token)
+        .with_context(|| {
+            format!("unknown root token {root_token} in collection {collection_id}")
+        })?;
     let root = std::fs::canonicalize(&configured.path)
         .with_context(|| format!("root unavailable: {}", configured.path.display()))?;
     // Canonicalize the candidate too: symlinks and `..` both resolve,
@@ -160,8 +158,10 @@ mod tests {
         OpenRead {
             lease_token: "t".into(),
             collection_id: collection.into(),
-            path_rel: path.into(),
-            root_token: kahawai_core::media::root_token(root),
+            source: Some(kahawai_proto::v1::SourcePath {
+                root_token: kahawai_core::media::root_token(root),
+                path_rel: path.into(),
+            }),
         }
     }
 
