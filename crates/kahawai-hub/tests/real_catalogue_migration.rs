@@ -22,7 +22,7 @@ async fn embedded_migrator_upgrades_a_real_catalogue_copy() {
             .fetch_one(&db)
             .await
             .unwrap(),
-        55
+        56
     );
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT count(*) FROM pragma_foreign_key_check")

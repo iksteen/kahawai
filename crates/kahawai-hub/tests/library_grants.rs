@@ -254,6 +254,40 @@ async fn a_grant_bounds_browse_search_and_detail() {
     let (_, v) = get(&h.api, &h.guest, "/api/v1/items?q=test").await;
     assert_eq!(titles(&v), ["Test Alpha", "Test Bravo", "Test Gamma"]);
 
+    // A nested subtitle id is not a bearer capability. Even an unrestricted
+    // account cannot borrow a physical track from another item route.
+    let root: i64 = sqlx::query_scalar(
+        "INSERT INTO collection_roots(module_id,collection_id,root_token,normalized_path)
+         VALUES('m','c2','root-c2','/m/c2') RETURNING id",
+    )
+    .fetch_one(&h.db)
+    .await
+    .unwrap();
+    let source: i64 = sqlx::query_scalar(
+        "INSERT INTO files(module_id,collection_id,root_id,path_rel,item_id,size,mtime_unix,
+                           head_xxh3,tail_xxh3,oshash,streams_json)
+         VALUES('m','c2',?,'episode.mkv','e1',1,1,1,1,1,'{}') RETURNING id",
+    )
+    .bind(root)
+    .fetch_one(&h.db)
+    .await
+    .unwrap();
+    let track: i64 = sqlx::query_scalar(
+        "INSERT INTO subtitle_tracks(source_id,origin,stream_index,format)
+         VALUES(?,'embedded',0,'srt') RETURNING id",
+    )
+    .bind(source)
+    .fetch_one(&h.db)
+    .await
+    .unwrap();
+    let (status, _) = get(
+        &h.api,
+        &h.guest,
+        &format!("/api/v1/items/m1/subtitles/{track}.vtt"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
     // Every route keyed by an item id, through the one middleware.
     for uri in [
         "/api/v1/items/s1",

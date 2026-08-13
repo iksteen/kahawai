@@ -134,6 +134,14 @@ async fn cross_collection_references_are_rejected_and_source_tracks_follow_the_s
         .is_err(),
         "derivative accepted another owner"
     );
+    assert!(
+        sqlx::query("UPDATE subtitle_tracks SET source_id=NULL,item_id='a2' WHERE id=?")
+            .bind(track_id)
+            .execute(&db)
+            .await
+            .is_err(),
+        "parent owner changed without its derivative"
+    );
 
     // Bare physical facts survive temporary catalogue unbinding but disappear
     // from item-scoped lookup. Item-owned downloads are unaffected.
