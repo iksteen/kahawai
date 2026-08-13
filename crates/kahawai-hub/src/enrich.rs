@@ -1840,11 +1840,12 @@ impl Enricher {
                     }
                 }
             };
-            sqlx::query("UPDATE files SET item_id=? WHERE id=?")
-                .bind(&target)
-                .bind(r.get::<i64, _>("source_id"))
-                .execute(db)
-                .await?;
+            crate::registry::bind_file_to_item(
+                &mut *db.acquire().await?,
+                r.get::<i64, _>("source_id"),
+                &target,
+            )
+            .await?;
             tracing::info!(path = %path, epno = %epno, "bare file identified by hash and bound");
             bound += 1;
         }
@@ -2046,10 +2047,7 @@ impl Enricher {
                     id
                 }
             };
-            sqlx::query("UPDATE files SET item_id=? WHERE id=?")
-                .bind(&target_id)
-                .bind(r.get::<i64, _>("source_id"))
-                .execute(&mut *tx)
+            crate::registry::bind_file_to_item(&mut tx, r.get::<i64, _>("source_id"), &target_id)
                 .await?;
             // Watch state follows the FILE — the user watched this
             // content under whatever number it was misfiled as.
@@ -2167,11 +2165,7 @@ impl Enricher {
                 .bind(show_id)
                 .execute(&mut *tx)
                 .await?;
-                sqlx::query("UPDATE files SET item_id=? WHERE id=?")
-                    .bind(&id)
-                    .bind(o.source_id)
-                    .execute(&mut *tx)
-                    .await?;
+                crate::registry::bind_file_to_item(&mut tx, o.source_id, &id).await?;
                 // Watch state follows the FILE, as everywhere else here:
                 // the user watched this content under the shared number.
                 sqlx::query(

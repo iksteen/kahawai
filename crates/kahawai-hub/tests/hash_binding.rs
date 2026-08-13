@@ -86,7 +86,7 @@ async fn episode(
 
 async fn slot_of(db: &SqlitePool, path: &str) -> (Option<i64>, i64, String) {
     sqlx::query_as::<_, (Option<i64>, i64, String)>(
-        "SELECT i.season,i.episode,i.id FROM files f JOIN items i ON i.id=f.item_id
+        "SELECT i.season,i.episode,i.id FROM files f JOIN file_bindings fb ON fb.file_id=f.id JOIN items i ON i.id=fb.item_id
           WHERE f.path_rel=?",
     )
     .bind(path)
@@ -157,13 +157,13 @@ async fn bare_files_bind_to_what_their_hash_names() {
         102,
         "C2 lands in the credits band"
     );
-    let film: String = sqlx::query_scalar("SELECT item_id FROM files WHERE path_rel='film.mkv'")
+    let film: String = sqlx::query_scalar("SELECT fb.item_id FROM files f JOIN file_bindings fb ON fb.file_id=f.id WHERE f.path_rel='film.mkv'")
         .fetch_one(&db)
         .await
         .unwrap();
     assert_eq!(film, "film", "a movie file becomes the movie's own source");
     let stray: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM files WHERE item_id IS NOT NULL AND path_rel='stray.mkv'",
+        "SELECT COUNT(*) FROM files f JOIN file_bindings fb ON fb.file_id=f.id WHERE f.path_rel='stray.mkv'",
     )
     .fetch_one(&db)
     .await
@@ -244,7 +244,7 @@ async fn ownerless_movies_are_minted_or_adopted_from_the_hash() {
         "movie, adoption and single-episode OVA bind; stray episode and serial OVA do not"
     );
     let lone: Option<String> = sqlx::query_scalar(
-        "SELECT i.title FROM files f JOIN items i ON i.id=f.item_id WHERE f.path_rel='lone-ova.mkv'",
+        "SELECT i.title FROM files f JOIN file_bindings fb ON fb.file_id=f.id JOIN items i ON i.id=fb.item_id WHERE f.path_rel='lone-ova.mkv'",
     )
     .fetch_optional(&db)
     .await
@@ -255,14 +255,14 @@ async fn ownerless_movies_are_minted_or_adopted_from_the_hash() {
         "single-episode OVA minted as a movie"
     );
     let serial: Option<String> =
-        sqlx::query_scalar("SELECT f.item_id FROM files f WHERE f.path_rel='serial-ova.mkv'")
+        sqlx::query_scalar("SELECT fb.item_id FROM files f LEFT JOIN file_bindings fb ON fb.file_id=f.id WHERE f.path_rel='serial-ova.mkv'")
             .fetch_one(&db)
             .await
             .unwrap();
     assert!(serial.is_none(), "multi-episode OVA stays bare");
 
     let akira: (String, Option<i64>, String) = sqlx::query_as(
-        "SELECT i.title,i.year,i.id FROM files f JOIN items i ON i.id=f.item_id
+        "SELECT i.title,i.year,i.id FROM files f JOIN file_bindings fb ON fb.file_id=f.id JOIN items i ON i.id=fb.item_id
           WHERE f.path_rel='akira.mkv'",
     )
     .fetch_one(&db)
@@ -281,7 +281,7 @@ async fn ownerless_movies_are_minted_or_adopted_from_the_hash() {
     assert_eq!(aid_of, 979);
 
     let adopted: String =
-        sqlx::query_scalar("SELECT item_id FROM files WHERE path_rel='adopt.mkv'")
+        sqlx::query_scalar("SELECT fb.item_id FROM files f JOIN file_bindings fb ON fb.file_id=f.id WHERE f.path_rel='adopt.mkv'")
             .fetch_one(&db)
             .await
             .unwrap();
@@ -291,7 +291,7 @@ async fn ownerless_movies_are_minted_or_adopted_from_the_hash() {
     );
 
     let stray: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM files WHERE item_id IS NOT NULL AND path_rel='stray-ep.mkv'",
+        "SELECT COUNT(*) FROM files f JOIN file_bindings fb ON fb.file_id=f.id WHERE f.path_rel='stray-ep.mkv'",
     )
     .fetch_one(&db)
     .await

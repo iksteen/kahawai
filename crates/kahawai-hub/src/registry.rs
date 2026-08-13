@@ -80,6 +80,22 @@ fn source_fingerprint(parts: &[(i64, i64, i64)]) -> String {
     format!("source-sha256-{}", BASE64URL_NOPAD.encode(&hash.finalize()))
 }
 
+/// Rebind through the compatibility write boundary. Migration 57 mirrors the
+/// assignment into explicit renditions; migration 59 removes this legacy
+/// column after every caller and fixture has moved.
+pub(crate) async fn bind_file_to_item(
+    conn: &mut sqlx::SqliteConnection,
+    file_id: i64,
+    item_id: &str,
+) -> Result<()> {
+    sqlx::query("UPDATE files SET item_id=? WHERE id=?")
+        .bind(item_id)
+        .bind(file_id)
+        .execute(conn)
+        .await?;
+    Ok(())
+}
+
 /// What a session needs from a transcoder (derived from plan + source).
 #[derive(Debug, Clone, Default)]
 pub struct PlacementNeed {
