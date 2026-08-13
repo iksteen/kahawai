@@ -1695,16 +1695,19 @@ async fn a_restart_that_re_selects_a_matched_item_does_not_erase_it() {
     .execute(&db)
     .await
     .unwrap();
-    sqlx::query(
-        "INSERT INTO files(module_id,collection_id,root_id,path_rel,item_id,size,mtime_unix,
+    let file_id: i64 = sqlx::query_scalar(
+        "INSERT INTO files(module_id,collection_id,root_id,path_rel,size,mtime_unix,
                            head_xxh3,tail_xxh3,oshash,streams_json)
          VALUES('fixture','default',(SELECT id FROM collection_roots WHERE module_id='fixture'),
-                'Fight Club (1999).mkv','i1',1000,1,0,0,0,
-                '{\"nfo\":\"Fight Club.nfo\"}')",
+                'Fight Club (1999).mkv',1000,1,0,0,0,
+                '{\"nfo\":\"Fight Club.nfo\"}') RETURNING id",
     )
-    .execute(&db)
+    .fetch_one(&db)
     .await
     .unwrap();
+    kahawai_hub::registry::bind_file_to_item(&mut db.acquire().await.unwrap(), file_id, "i1")
+        .await
+        .unwrap();
 
     let rows = sqlx::query(kahawai_hub::enrich::GENERIC_SELECTION_SQL)
         .bind(kahawai_hub::providers::QUERY_REV)

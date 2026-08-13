@@ -172,7 +172,8 @@ async fn migration_and_single_root_adoption_preserve_durable_state() {
         .unwrap();
 
     let row = sqlx::query(
-        "SELECT f.id,f.item_id,r.root_token,f.path_rel FROM files f
+        "SELECT f.id,fb.item_id,r.root_token,f.path_rel FROM files f
+         JOIN file_bindings fb ON fb.file_id=f.id
          JOIN collection_roots r ON r.id=f.root_id",
     )
     .fetch_one(&db)
@@ -247,13 +248,16 @@ async fn single_root_announcement_adopts_legacy_state_without_rescan() {
     .await
     .unwrap();
     let source_id: i64 = sqlx::query_scalar(
-        "INSERT INTO files(module_id,collection_id,path_rel,item_id,size,mtime_unix,
+        "INSERT INTO files(module_id,collection_id,path_rel,size,mtime_unix,
                            head_xxh3,tail_xxh3,oshash,streams_json)
-         VALUES('host','movies','same.mkv','item',10,7,11,12,13,'{}') RETURNING id",
+         VALUES('host','movies','same.mkv',10,7,11,12,13,'{}') RETURNING id",
     )
     .fetch_one(&db)
     .await
     .unwrap();
+    kahawai_hub::registry::bind_file_to_item(&mut db.acquire().await.unwrap(), source_id, "item")
+        .await
+        .unwrap();
     sqlx::query(
         "INSERT INTO subtitle_tracks(id,source_id,origin,stream_index,format)
          VALUES(44,?,'embedded',0,'srt')",
@@ -312,9 +316,9 @@ async fn multi_root_legacy_state_is_never_guessed() {
     .await
     .unwrap();
     let source_id: i64 = sqlx::query_scalar(
-        "INSERT INTO files(module_id,collection_id,path_rel,item_id,size,mtime_unix,
+        "INSERT INTO files(module_id,collection_id,path_rel,size,mtime_unix,
                            head_xxh3,tail_xxh3,oshash,streams_json)
-         VALUES('host','movies','same.mkv','item',10,7,11,12,13,'{}') RETURNING id",
+         VALUES('host','movies','same.mkv',10,7,11,12,13,'{}') RETURNING id",
     )
     .fetch_one(&db)
     .await

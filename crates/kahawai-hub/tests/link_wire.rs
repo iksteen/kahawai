@@ -258,13 +258,20 @@ async fn root_adoption_suppresses_only_its_own_generation_mismatch() {
     .execute(hub.registry.db())
     .await
     .unwrap();
-    sqlx::query(
+    let file_id: i64 = sqlx::query_scalar(
         "INSERT INTO files
-           (module_id,collection_id,path_rel,item_id,size,mtime_unix,
+           (module_id,collection_id,path_rel,size,mtime_unix,
             head_xxh3,tail_xxh3,oshash,streams_json)
-         VALUES('01ADOPT','movies','legacy.mkv','legacy',10,1,2,3,4,'{}')",
+         VALUES('01ADOPT','movies','legacy.mkv',10,1,2,3,4,'{}') RETURNING id",
     )
-    .execute(hub.registry.db())
+    .fetch_one(hub.registry.db())
+    .await
+    .unwrap();
+    kahawai_hub::registry::bind_file_to_item(
+        &mut hub.registry.db().acquire().await.unwrap(),
+        file_id,
+        "legacy",
+    )
     .await
     .unwrap();
     let tls = kahawai_transport::mtls::mtls_client_config(&id).unwrap();

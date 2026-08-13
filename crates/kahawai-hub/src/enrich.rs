@@ -314,12 +314,12 @@ pub const GENERIC_SELECTION_SQL: &str = "SELECT i.id,i.kind,i.title,i.norm_title
                                  WHERE pl.item_id = i.id AND pl.provider = 'local'
                                    AND pl.provider_id <> '')
                         != (i.id IN (SELECT COALESCE(ch.parent_id, ch.id)
-                                       FROM files f5 JOIN items ch ON ch.id=f5.item_id
+                                       FROM files f5 JOIN file_bindings fb5 ON fb5.file_id=f5.id JOIN items ch ON ch.id=fb5.item_id
                                       WHERE json_extract(f5.streams_json, '$.nfo') IS NOT NULL)))
                     OR (NOT EXISTS (SELECT 1 FROM provider_metadata pl
                                      WHERE pl.item_id = i.id AND pl.provider = 'local')
                         AND i.id IN (SELECT COALESCE(ch.parent_id, ch.id)
-                                       FROM files f4 JOIN items ch ON ch.id=f4.item_id
+                                       FROM files f4 JOIN file_bindings fb4 ON fb4.file_id=f4.id JOIN items ch ON ch.id=fb4.item_id
                                       WHERE json_extract(f4.streams_json, '$.artwork') IS NOT NULL
                                          OR json_extract(f4.streams_json, '$.nfo') IS NOT NULL))
                     -- or a provider refused and is due again (bans and
@@ -1134,12 +1134,12 @@ impl Enricher {
                                  WHERE pl.item_id = i.id AND pl.provider = 'local'
                                    AND pl.provider_id <> '')
                         != (i.id IN (SELECT COALESCE(ch.parent_id, ch.id)
-                                       FROM files f5 JOIN items ch ON ch.id=f5.item_id
+                                       FROM files f5 JOIN file_bindings fb5 ON fb5.file_id=f5.id JOIN items ch ON ch.id=fb5.item_id
                                       WHERE json_extract(f5.streams_json, '$.nfo') IS NOT NULL)))
                     OR (NOT EXISTS (SELECT 1 FROM provider_metadata pl
                                      WHERE pl.item_id = i.id AND pl.provider = 'local')
                         AND i.id IN (SELECT COALESCE(ch.parent_id, ch.id)
-                                       FROM files f4 JOIN items ch ON ch.id=f4.item_id
+                                       FROM files f4 JOIN file_bindings fb4 ON fb4.file_id=f4.id JOIN items ch ON ch.id=fb4.item_id
                                       WHERE json_extract(f4.streams_json, '$.artwork') IS NOT NULL
                                          OR json_extract(f4.streams_json, '$.nfo') IS NOT NULL))
                     -- Work the chain still owes: a provider that refused
@@ -1341,12 +1341,12 @@ impl Enricher {
                                  WHERE pl.item_id = i.id AND pl.provider = 'local'
                                    AND pl.provider_id <> '')
                         != (i.id IN (SELECT COALESCE(ch.parent_id, ch.id)
-                                       FROM files f5 JOIN items ch ON ch.id=f5.item_id
+                                       FROM files f5 JOIN file_bindings fb5 ON fb5.file_id=f5.id JOIN items ch ON ch.id=fb5.item_id
                                       WHERE json_extract(f5.streams_json, '$.nfo') IS NOT NULL)))
                     OR (NOT EXISTS (SELECT 1 FROM provider_metadata pl
                                      WHERE pl.item_id = i.id AND pl.provider = 'local')
                         AND i.id IN (SELECT COALESCE(ch.parent_id, ch.id)
-                                       FROM files f4 JOIN items ch ON ch.id=f4.item_id
+                                       FROM files f4 JOIN file_bindings fb4 ON fb4.file_id=f4.id JOIN items ch ON ch.id=fb4.item_id
                                       WHERE json_extract(f4.streams_json, '$.artwork') IS NOT NULL
                                          OR json_extract(f4.streams_json, '$.nfo') IS NOT NULL))
                  OR EXISTS (

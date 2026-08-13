@@ -264,14 +264,17 @@ async fn a_grant_bounds_browse_search_and_detail() {
     .await
     .unwrap();
     let source: i64 = sqlx::query_scalar(
-        "INSERT INTO files(module_id,collection_id,root_id,path_rel,item_id,size,mtime_unix,
+        "INSERT INTO files(module_id,collection_id,root_id,path_rel,size,mtime_unix,
                            head_xxh3,tail_xxh3,oshash,streams_json)
-         VALUES('m','c2',?,'episode.mkv','e1',1,1,1,1,1,'{}') RETURNING id",
+         VALUES('m','c2',?,'episode.mkv',1,1,1,1,1,'{}') RETURNING id",
     )
     .bind(root)
     .fetch_one(&h.db)
     .await
     .unwrap();
+    kahawai_hub::registry::bind_file_to_item(&mut h.db.acquire().await.unwrap(), source, "e1")
+        .await
+        .unwrap();
     let track: i64 = sqlx::query_scalar(
         "INSERT INTO subtitle_tracks(source_id,origin,stream_index,format)
          VALUES(?,'embedded',0,'srt') RETURNING id",

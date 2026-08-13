@@ -632,7 +632,8 @@ impl Subtitles {
 
         // The mediahost's oshash IS the OpenSubtitles moviehash (HUB-22).
         let hash: Option<i64> = sqlx::query_scalar(
-            "SELECT oshash FROM files WHERE item_id=? ORDER BY size DESC LIMIT 1",
+            "SELECT f.oshash FROM files f JOIN file_bindings fb ON fb.file_id=f.id
+              WHERE fb.item_id=? ORDER BY f.size DESC LIMIT 1",
         )
         .bind(item_id)
         .fetch_optional(registry.db())

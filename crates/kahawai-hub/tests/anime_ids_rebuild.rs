@@ -40,15 +40,18 @@ async fn seed(db: &sqlx::SqlitePool) {
     .execute(db)
     .await
     .unwrap();
-    sqlx::query(
-        "INSERT INTO files(module_id,collection_id,root_id,path_rel,item_id,size,mtime_unix,
+    let file_id: i64 = sqlx::query_scalar(
+        "INSERT INTO files(module_id,collection_id,root_id,path_rel,size,mtime_unix,
                            head_xxh3,tail_xxh3,oshash,streams_json,subs_extracted,ed2k)
-         VALUES('m','c',(SELECT id FROM collection_roots),'Lain/ep01.mkv','show1',
-                1,1,0,0,0,'{}',0,'deadbeef')",
+         VALUES('m','c',(SELECT id FROM collection_roots),'Lain/ep01.mkv',
+                1,1,0,0,0,'{}',0,'deadbeef') RETURNING id",
     )
-    .execute(db)
+    .fetch_one(db)
     .await
     .unwrap();
+    kahawai_hub::registry::bind_file_to_item(&mut db.acquire().await.unwrap(), file_id, "show1")
+        .await
+        .unwrap();
     sqlx::query(
         "INSERT INTO ed2k_aid (ed2k, aid, updated_at) VALUES ('deadbeef', 2129, unixepoch())",
     )

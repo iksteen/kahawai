@@ -103,7 +103,7 @@ async fn composition_state(db: &sqlx::SqlitePool) -> CompositionState {
             .fetch_one(db)
             .await
             .unwrap(),
-        source_id: sqlx::query_scalar("SELECT id FROM files WHERE item_id='composed-item'")
+        source_id: sqlx::query_scalar("SELECT file_id FROM file_bindings WHERE item_id='composed-item'")
             .fetch_one(db)
             .await
             .unwrap(),
@@ -156,9 +156,13 @@ async fn attach_and_detach_change_only_visibility() {
            VALUES('compose-host','films','movies',91);
          INSERT INTO items(id,kind,title,norm_title,module_id,collection_id)
            VALUES('composed-item','movie','Composed','composed','compose-host','films');
-         INSERT INTO files(module_id,collection_id,path_rel,item_id,size,mtime_unix,
+         INSERT INTO files(module_id,collection_id,path_rel,size,mtime_unix,
                            head_xxh3,tail_xxh3,oshash,streams_json)
-           VALUES('compose-host','films','composed.mkv','composed-item',100,1,2,3,4,'{}');
+           VALUES('compose-host','films','composed.mkv',100,1,2,3,4,'{}');
+         INSERT INTO playable_sources(module_id,collection_id,item_id,root_id,family_key,expected_parts)
+           VALUES('compose-host','films','composed-item',NULL,'file:composed',1);
+         INSERT INTO playable_source_parts(playable_source_id,module_id,collection_id,ordinal,file_id)
+           SELECT last_insert_rowid(),'compose-host','films',1,id FROM files WHERE path_rel='composed.mkv';
          INSERT INTO provider_metadata(item_id,provider,provider_id,title,confidence,updated_at)
            VALUES('composed-item','tmdb','42','Composed','auto',1);
          INSERT INTO manual_match(item_id,provider,provider_id,pinned_at)
@@ -483,16 +487,27 @@ async fn capability_changes_delivery_not_existence() {
        VALUES('m2','c2','root','/m')",
     )
     .await;
-    q(r#"INSERT INTO files
-              (module_id,collection_id,root_id,path_rel,item_id,size,mtime_unix,
+    let source_id: i64 = sqlx::query_scalar(
+        r#"INSERT INTO files
+              (module_id,collection_id,root_id,path_rel,size,mtime_unix,
                head_xxh3,tail_xxh3,oshash,subs_extracted,streams_json)
        VALUES ('m2','c2',(SELECT id FROM collection_roots WHERE module_id='m2'),
-               'subbed.mkv','subs-item',700,1,0,0,0,0,
+               'subbed.mkv',700,1,0,0,0,0,
                '{"container":"matroska",
                  "subtitles":[{"format":"srt","language":"en"},
                               {"format":"ass","language":"en"},
-                              {"format":"pgs","language":"en"}]}')"#)
-    .await;
+                              {"format":"pgs","language":"en"}]}') RETURNING id"#,
+    )
+    .fetch_one(&db)
+    .await
+    .unwrap();
+    kahawai_hub::registry::bind_file_to_item(
+        &mut db.acquire().await.unwrap(),
+        source_id,
+        "subs-item",
+    )
+    .await
+    .unwrap();
     // What a scan would materialize (tests seed by SQL, so no
     // sync_source_tracks ran).
     q(
@@ -583,13 +598,16 @@ async fn scan_sync_preserves_track_ids() {
     .await
     .unwrap();
     let source_id: i64 = sqlx::query_scalar(
-        "INSERT INTO files(module_id,collection_id,path_rel,item_id,size,mtime_unix,
+        "INSERT INTO files(module_id,collection_id,path_rel,size,mtime_unix,
                            head_xxh3,tail_xxh3,oshash,streams_json)
-         VALUES('sync','c','m.mkv','it',1,1,0,0,0,'{}') RETURNING id",
+         VALUES('sync','c','m.mkv',1,1,0,0,0,'{}') RETURNING id",
     )
     .fetch_one(&db)
     .await
     .unwrap();
+    kahawai_hub::registry::bind_file_to_item(&mut db.acquire().await.unwrap(), source_id, "it")
+        .await
+        .unwrap();
     let info: kahawai_core::media::MediaInfo = serde_json::from_str(
         r#"{"subtitles":[{"format":"srt","language":"en"},{"format":"pgs","language":"nl"}],
             "external_subtitles":[{"path_rel":"m.idx","format":"vobsub","language":"en","track":0}]}"#,

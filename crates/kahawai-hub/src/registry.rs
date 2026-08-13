@@ -80,19 +80,65 @@ fn source_fingerprint(parts: &[(i64, i64, i64)]) -> String {
     format!("source-sha256-{}", BASE64URL_NOPAD.encode(&hash.finalize()))
 }
 
-/// Rebind through the compatibility write boundary. Migration 57 mirrors the
-/// assignment into explicit renditions; migration 59 removes this legacy
-/// column after every caller and fixture has moved.
-pub(crate) async fn bind_file_to_item(
+/// Move one physical file's rendition to another item. Hash correction acts
+/// on one exact file; a multipart rendition is therefore split rather than
+/// dragging unrelated sibling parts across logical identity.
+pub async fn bind_file_to_item(
     conn: &mut sqlx::SqliteConnection,
     file_id: i64,
     item_id: &str,
 ) -> Result<()> {
-    sqlx::query("UPDATE files SET item_id=? WHERE id=?")
-        .bind(item_id)
-        .bind(file_id)
-        .execute(conn)
-        .await?;
+    let current: Option<(i64, i64)> = sqlx::query_as(
+        "SELECT p.playable_source_id,(SELECT count(*) FROM playable_source_parts allp
+          WHERE allp.playable_source_id=p.playable_source_id)
+          FROM playable_source_parts p WHERE p.file_id=?",
+    )
+    .bind(file_id)
+    .fetch_optional(&mut *conn)
+    .await?;
+    if let Some((source_id, 1)) = current {
+        sqlx::query("UPDATE playable_sources SET item_id=? WHERE id=?")
+            .bind(item_id)
+            .bind(source_id)
+            .execute(conn)
+            .await?;
+        return Ok(());
+    }
+    if current.is_some() {
+        sqlx::query("DELETE FROM playable_source_parts WHERE file_id=?")
+            .bind(file_id)
+            .execute(&mut *conn)
+            .await?;
+    }
+    let (module, collection, root): (String, String, Option<i64>) =
+        sqlx::query_as("SELECT module_id,collection_id,root_id FROM files WHERE id=?")
+            .bind(file_id)
+            .fetch_one(&mut *conn)
+            .await?;
+    let source_id: i64 = sqlx::query_scalar(
+        "INSERT INTO playable_sources
+          (module_id,collection_id,item_id,root_id,family_key,expected_parts)
+          VALUES(?,?,?,?,?,1) RETURNING id",
+    )
+    .bind(&module)
+    .bind(&collection)
+    .bind(item_id)
+    .bind(root)
+    .bind(format!("file:{file_id}"))
+    .fetch_one(&mut *conn)
+    .await?;
+    sqlx::query(
+        "INSERT INTO playable_source_parts
+          (playable_source_id,module_id,collection_id,ordinal,file_id)
+          VALUES(?,?,?,?,?)",
+    )
+    .bind(source_id)
+    .bind(module)
+    .bind(collection)
+    .bind(1)
+    .bind(file_id)
+    .execute(conn)
+    .await?;
     Ok(())
 }
 

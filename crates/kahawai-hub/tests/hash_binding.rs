@@ -61,17 +61,19 @@ async fn episode(
     .execute(db)
     .await
     .unwrap();
-    sqlx::query(
-        "INSERT INTO files(module_id,collection_id,path_rel,item_id,size,mtime_unix,
+    let file_id: i64 = sqlx::query_scalar(
+        "INSERT INTO files(module_id,collection_id,path_rel,size,mtime_unix,
                            head_xxh3,tail_xxh3,oshash,streams_json,subs_extracted,ed2k)
-         VALUES('m','c',?||'.mkv',?,700,1,0,0,0,'{}',0,'hash-'||?)",
+         VALUES('m','c',?||'.mkv',700,1,0,0,0,'{}',0,'hash-'||?) RETURNING id",
     )
     .bind(id)
     .bind(id)
-    .bind(id)
-    .execute(db)
+    .fetch_one(db)
     .await
     .unwrap();
+    kahawai_hub::registry::bind_file_to_item(&mut db.acquire().await.unwrap(), file_id, id)
+        .await
+        .unwrap();
     sqlx::query(
         "INSERT OR REPLACE INTO ed2k_aid (ed2k, aid, eid, epno, gid, group_name, updated_at)
          VALUES ('hash-' || ?, ?, 9, ?, 7, 'Grp', unixepoch())",
@@ -450,12 +452,15 @@ async fn selection_follows_the_question_not_the_miss() {
     .execute(&db)
     .await
     .unwrap();
-    sqlx::query(
-        "INSERT INTO files(module_id,collection_id,path_rel,item_id,size,mtime_unix,head_xxh3,tail_xxh3,oshash,streams_json) VALUES('m','c','e.mkv','ep',1,1,0,0,0,'{}')",
+    let file_id: i64 = sqlx::query_scalar(
+        "INSERT INTO files(module_id,collection_id,path_rel,size,mtime_unix,head_xxh3,tail_xxh3,oshash,streams_json) VALUES('m','c','e.mkv',1,1,0,0,0,'{}') RETURNING id",
     )
-    .execute(&db)
+    .fetch_one(&db)
     .await
     .unwrap();
+    kahawai_hub::registry::bind_file_to_item(&mut db.acquire().await.unwrap(), file_id, "ep")
+        .await
+        .unwrap();
 
     // Never asked: the name question is owed.
     assert!(
@@ -557,17 +562,19 @@ async fn extra_source(
     eid: i64,
     epno: &str,
 ) {
-    sqlx::query(
-        "INSERT INTO files(module_id,collection_id,path_rel,item_id,size,mtime_unix,
+    let file_id: i64 = sqlx::query_scalar(
+        "INSERT INTO files(module_id,collection_id,path_rel,size,mtime_unix,
                            head_xxh3,tail_xxh3,oshash,streams_json,subs_extracted,ed2k)
-         VALUES('m','c',?||'.mkv',?,700,1,0,0,0,'{}',0,'hash-'||?)",
+         VALUES('m','c',?||'.mkv',700,1,0,0,0,'{}',0,'hash-'||?) RETURNING id",
     )
     .bind(name)
-    .bind(item_id)
     .bind(name)
-    .execute(db)
+    .fetch_one(db)
     .await
     .unwrap();
+    kahawai_hub::registry::bind_file_to_item(&mut db.acquire().await.unwrap(), file_id, item_id)
+        .await
+        .unwrap();
     sqlx::query(
         "INSERT OR REPLACE INTO ed2k_aid (ed2k, aid, eid, epno, gid, group_name, updated_at)
          VALUES ('hash-' || ?, ?, ?, ?, 7, 'Grp', unixepoch())",

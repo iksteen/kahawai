@@ -22,7 +22,7 @@ async fn embedded_migrator_upgrades_a_real_catalogue_copy() {
             .fetch_one(&db)
             .await
             .unwrap(),
-        58
+        59
     );
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT count(*) FROM pragma_foreign_key_check")
@@ -41,16 +41,16 @@ async fn embedded_migrator_upgrades_a_real_catalogue_copy() {
     let invalid: i64 = sqlx::query_scalar(
         "SELECT (SELECT count(*) FROM items i JOIN items p ON p.id=i.parent_id
                   WHERE (i.module_id,i.collection_id)!=(p.module_id,p.collection_id))
-              +(SELECT count(*) FROM files f JOIN items i ON i.id=f.item_id
-                  WHERE (f.module_id,f.collection_id)!=(i.module_id,i.collection_id))
+              +(SELECT count(*) FROM playable_sources s JOIN items i ON i.id=s.item_id
+                  WHERE (s.module_id,s.collection_id)!=(i.module_id,i.collection_id))
               +(SELECT count(*) FROM subtitle_tracks
                   WHERE (item_id IS NULL)=(source_id IS NULL))
               +(SELECT count(*) FROM subtitle_tracks t JOIN subtitle_tracks p
                   ON p.id=t.derived_from
                   WHERE t.item_id IS NOT p.item_id OR t.source_id IS NOT p.source_id)
               +(SELECT count(*) FROM files f
-                  WHERE f.item_id IS NOT NULL AND NOT EXISTS(
-                    SELECT 1 FROM playable_source_parts p WHERE p.file_id=f.id))
+                  WHERE NOT EXISTS(SELECT 1 FROM playable_source_parts p WHERE p.file_id=f.id)
+                    AND EXISTS(SELECT 1 FROM subtitle_tracks t WHERE t.source_id=f.id))
               +(SELECT count(*) FROM playable_source_parts p
                   JOIN playable_sources s ON s.id=p.playable_source_id
                   JOIN files f ON f.id=p.file_id

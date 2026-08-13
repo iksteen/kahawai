@@ -24,14 +24,12 @@ async fn cross_collection_references_are_rejected_and_source_tracks_follow_the_s
          VALUES('bad','movie','Bad','bad','m','missing')",
         "INSERT INTO items(id,kind,title,norm_title,parent_id,module_id,collection_id)
          VALUES('child','episode','Child','child','b1','m','a')",
-        "INSERT INTO files(module_id,collection_id,root_id,path_rel,item_id,size,mtime_unix,
+        "INSERT INTO files(module_id,collection_id,root_id,path_rel,size,mtime_unix,
                            head_xxh3,tail_xxh3,oshash,streams_json)
          VALUES('m','a',(SELECT id FROM collection_roots WHERE root_token='rb'),
-                'bad-root.mkv','a1',1,1,0,0,0,'{}')",
-        "INSERT INTO files(module_id,collection_id,root_id,path_rel,item_id,size,mtime_unix,
-                           head_xxh3,tail_xxh3,oshash,streams_json)
-         VALUES('m','a',(SELECT id FROM collection_roots WHERE root_token='ra'),
-                'bad-item.mkv','b1',1,1,0,0,0,'{}')",
+                'bad-root.mkv',1,1,0,0,0,'{}')",
+        "INSERT INTO playable_sources(module_id,collection_id,item_id,root_id,family_key,expected_parts)
+         VALUES('m','a','b1',(SELECT id FROM collection_roots WHERE root_token='ra'),'bad',1)",
     ] {
         assert!(
             sqlx::query(sql).execute(&db).await.is_err(),
@@ -40,14 +38,18 @@ async fn cross_collection_references_are_rejected_and_source_tracks_follow_the_s
     }
 
     let source_id: i64 = sqlx::query_scalar(
-        "INSERT INTO files(module_id,collection_id,root_id,path_rel,item_id,size,mtime_unix,
+        "INSERT INTO files(module_id,collection_id,root_id,path_rel,size,mtime_unix,
                            head_xxh3,tail_xxh3,oshash,streams_json)
          VALUES('m','a',(SELECT id FROM collection_roots WHERE root_token='ra'),
-                'a.mkv','a1',1,1,0,0,0,'{}') RETURNING id",
+                'a.mkv',1,1,0,0,0,'{}') RETURNING id",
     )
     .fetch_one(&db)
     .await
     .unwrap();
+
+    kahawai_hub::registry::bind_file_to_item(&mut db.acquire().await.unwrap(), source_id, "a1")
+        .await
+        .unwrap();
 
     // Exactly one direct owner: physical tracks name only the source and
     // independently acquired tracks name only the item.
@@ -93,9 +95,7 @@ async fn cross_collection_references_are_rejected_and_source_tracks_follow_the_s
 
     // Rebinding the physical source changes its catalogue context without
     // rewriting the source-owned track.
-    sqlx::query("UPDATE files SET item_id='a2' WHERE id=?")
-        .bind(source_id)
-        .execute(&db)
+    kahawai_hub::registry::bind_file_to_item(&mut db.acquire().await.unwrap(), source_id, "a2")
         .await
         .unwrap();
     assert!(
@@ -145,11 +145,18 @@ async fn cross_collection_references_are_rejected_and_source_tracks_follow_the_s
 
     // Bare physical facts survive temporary catalogue unbinding but disappear
     // from item-scoped lookup. Item-owned downloads are unaffected.
-    sqlx::query("UPDATE files SET item_id=NULL WHERE id=?")
+    sqlx::query("DELETE FROM playable_source_parts WHERE file_id=?")
         .bind(source_id)
         .execute(&db)
         .await
         .unwrap();
+    sqlx::query(
+        "DELETE FROM playable_sources WHERE NOT EXISTS(
+           SELECT 1 FROM playable_source_parts p WHERE p.playable_source_id=playable_sources.id)",
+    )
+    .execute(&db)
+    .await
+    .unwrap();
     assert!(
         kahawai_hub::tracks::get_for_item(&db, "a2", track_id)
             .await

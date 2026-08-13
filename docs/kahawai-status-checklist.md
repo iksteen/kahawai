@@ -149,8 +149,10 @@ How something works and why it was built that way belong in
       state included). Playable renditions are explicit: one source row owns
       one ordered file set, multipart families are root/directory/release-local,
       and incomplete or ambiguous editions cannot mix with another edition.
-      Direct level-52→57 migration and conflict-detecting migration-56 replay
-      are runnable and real-catalogue proven.
+      `files` contains physical facts only; rendition ownership and ordinals
+      live in the explicit source tables. Direct level-52→59 migration and
+      conflict-detecting migration-56 replay are runnable and real-catalogue
+      proven.
 - [x] HUB-4 Filename/dirname parsing (movies, episodes, anime conventions, music layout)
 - [x] HUB-20 Mediahost deletion cascade + watch-state/match archives restored on re-enroll
 - [x] HUB-5 Provider trait + declared chains + walker (TMDB, TVDB, anime

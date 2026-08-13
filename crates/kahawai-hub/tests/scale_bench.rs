@@ -104,18 +104,20 @@ async fn seed(dir: &std::path::Path, items: usize) -> Bench {
         .execute(&mut *tx)
         .await
         .unwrap();
-        sqlx::query(
-            "INSERT INTO files(module_id,collection_id,path_rel,item_id,size,mtime_unix,
+        let file_id: i64 = sqlx::query_scalar(
+            "INSERT INTO files(module_id,collection_id,path_rel,size,mtime_unix,
                                 head_xxh3,tail_xxh3,oshash,streams_json,subs_extracted)
-             VALUES(?,?,?,?,1000000,1,0,0,0,'{}',0)",
+             VALUES(?,?,?,1000000,1,0,0,0,'{}',0) RETURNING id",
         )
         .bind(&module)
         .bind(&collection)
         .bind(&path)
-        .bind(&id)
-        .execute(&mut *tx)
+        .fetch_one(&mut *tx)
         .await
         .unwrap();
+        kahawai_hub::registry::bind_file_to_item(&mut tx, file_id, &id)
+            .await
+            .unwrap();
         // Two providers each, so the resolved view has something to
         // choose between — a catalogue with one answer per item would
         // flatter the read path.
@@ -397,22 +399,28 @@ async fn browse_latency_and_scale() {
         let t = Instant::now();
         let mut tx = b.db.begin().await.unwrap();
         for n in 0..1000 {
-            sqlx::query(
-                "INSERT INTO files(module_id,collection_id,path_rel,item_id,size,mtime_unix,
+            let file_id: i64 = sqlx::query_scalar(
+                "INSERT INTO files(module_id,collection_id,path_rel,size,mtime_unix,
                                    head_xxh3,tail_xxh3,oshash,streams_json)
-                 VALUES(?,?,?,?,1000000,1,0,0,0,'{}')",
+                 VALUES(?,?,?,1000000,1,0,0,0,'{}') RETURNING id",
             )
             .bind(format!("01BENCHMODULE{:011}", n % MEDIAHOSTS))
             .bind(format!("c{}", n % MEDIAHOSTS))
             .bind(format!("extra {n}.mkv"))
-            .bind(format!("01BENCHITEM{n:015}"))
-            .execute(&mut *tx)
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+            kahawai_hub::registry::bind_file_to_item(
+                &mut tx,
+                file_id,
+                &format!("01BENCHITEM{n:015}"),
+            )
             .await
             .unwrap();
         }
         tx.commit().await.unwrap();
         eprintln!(
-            "  1000 direct sources {:>8.1} ms  (scan path)",
+            "  1000 explicit sources {:>8.1} ms  (scan path)",
             t.elapsed().as_secs_f64() * 1e3
         );
 
