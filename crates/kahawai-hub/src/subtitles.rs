@@ -264,10 +264,15 @@ impl Subtitles {
     /// The internal key (`e{n}`/`s{n}`/`d{id}`) a track id resolves to —
     /// the notation the caches and the pipeline still speak. Public API
     /// surfaces speak track ids only.
-    pub async fn internal_key(&self, registry: &Registry, id: i64) -> Result<crate::tracks::Track> {
-        crate::tracks::get(registry.db(), id)
+    pub async fn internal_key(
+        &self,
+        registry: &Registry,
+        item_id: &str,
+        id: i64,
+    ) -> Result<crate::tracks::Track> {
+        crate::tracks::get_for_item(registry.db(), item_id, id)
             .await?
-            .with_context(|| format!("no subtitle track {id}"))
+            .with_context(|| format!("no subtitle track {id} for item {item_id}"))
     }
 
     /// WebVTT for one subtitle key, cue timestamps shifted by `shift_ms`
@@ -833,11 +838,11 @@ impl Subtitles {
         // faithful than the flattened VTT, not less.
         let id: i64 = sqlx::query_scalar(
             "INSERT INTO subtitle_tracks
-               (item_id, origin, format, language, label, provider, machine,
-                created_by, derived_from)
-             VALUES (?, 'raster', 'raster', ?, ?, 'assraster', 0, ?, ?) RETURNING id",
+               (item_id,source_id,origin,format,language,label,provider,machine,
+                created_by,derived_from)
+             SELECT item_id,source_id,'raster','raster',?,?,'assraster',0,?,id
+               FROM subtitle_tracks WHERE id=? RETURNING id",
         )
-        .bind(&parent.item_id)
         .bind(&parent.language)
         .bind(format!("{width}x{height}"))
         .bind(user_id)
@@ -1081,11 +1086,11 @@ impl Subtitles {
 
         let id: i64 = sqlx::query_scalar(
             "INSERT INTO subtitle_tracks
-               (item_id, origin, format, language, label, provider, machine,
-                created_by, derived_from)
-             VALUES (?, 'ocr', 'srt', ?, ?, 'ocr', 1, ?, ?) RETURNING id",
+               (item_id,source_id,origin,format,language,label,provider,machine,
+                created_by,derived_from)
+             SELECT item_id,source_id,'ocr','srt',?,?,'ocr',1,?,id
+               FROM subtitle_tracks WHERE id=? RETURNING id",
         )
-        .bind(&parent.item_id)
         .bind(&language)
         .bind(&model)
         .bind(user_id)
@@ -1199,13 +1204,13 @@ impl Subtitles {
     #[cfg(feature = "ocr")]
     async fn ocr_candidates(&self, registry: &Registry) -> Vec<i64> {
         sqlx::query_scalar(
-            "SELECT t.id FROM subtitle_tracks t
-             WHERE t.origin IN ('embedded','sidecar') AND t.source_id IS NOT NULL
+            "SELECT t.id FROM subtitle_tracks t JOIN files f ON f.id=t.source_id
+             WHERE t.origin IN ('embedded','sidecar')
                AND t.format IN ('pgs', 'vobsub', 'dvdsub')
                AND NOT EXISTS (
                      SELECT 1 FROM subtitle_tracks d
                      WHERE d.derived_from = t.id AND d.origin = 'ocr')
-             ORDER BY t.item_id, t.id",
+             ORDER BY f.item_id, t.id",
         )
         .fetch_all(registry.db())
         .await
@@ -1654,7 +1659,7 @@ pub async fn ocr_stream_set(
         "SELECT f.module_id,f.collection_id,r.root_token,f.path_rel,t.stream_index
          FROM subtitle_tracks t JOIN files f ON f.id=t.source_id
          JOIN collection_roots r ON r.id=f.root_id
-         WHERE t.item_id=? AND t.origin='embedded'
+         WHERE f.item_id=? AND t.origin='embedded'
            AND EXISTS (
                  SELECT 1 FROM subtitle_tracks d
                  WHERE d.derived_from = t.id AND d.origin = 'ocr')",

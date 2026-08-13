@@ -1811,7 +1811,7 @@ impl Registry {
                 if let Ok(info) =
                     serde_json::from_str::<kahawai_core::media::MediaInfo>(&f.streams_json)
                 {
-                    crate::tracks::sync_source_tracks(&mut tx, &item_id, source_id, &info).await?;
+                    crate::tracks::sync_source_tracks(&mut tx, source_id, &info).await?;
                 }
 
                 // HUB-20/MH-5: the same bytes came back (any host, any

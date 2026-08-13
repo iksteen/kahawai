@@ -106,9 +106,6 @@ async fn run_hub_inner(
         &kahawai_hub::pki::pki_dir(&cfg.data_dir),
     )?);
     let db = kahawai_hub::db::open(&cfg.data_dir).await?;
-    // One-time after migration 0046: point migrated OCR rows at their
-    // parent stream rows (idempotent, cheap when nothing is pending).
-    kahawai_hub::tracks::backfill_derived_from(&db).await?;
     // The satellites table IS the mTLS allowlist (SEC-5): load it, then
     // the registry keeps it in sync on approve/delete.
     let allowed = kahawai_transport::mtls::AllowedCerts::default();

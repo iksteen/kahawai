@@ -255,8 +255,8 @@ async fn single_root_announcement_adopts_legacy_state_without_rescan() {
     .await
     .unwrap();
     sqlx::query(
-        "INSERT INTO subtitle_tracks(id,item_id,source_id,origin,stream_index,format)
-         VALUES(44,'item',?,'embedded',0,'srt')",
+        "INSERT INTO subtitle_tracks(id,source_id,origin,stream_index,format)
+         VALUES(44,?,'embedded',0,'srt')",
     )
     .bind(source_id)
     .execute(&db)

@@ -2067,10 +2067,10 @@ async fn item_subtitle_file(
     if let Some(raw) = file.strip_suffix(".jsonl") {
         let track_id = resolve(raw)
             .ok_or_else(|| ApiError::from((StatusCode::BAD_REQUEST, "bad track id".to_string())))?;
-        let track = crate::tracks::get(state.registry.db(), track_id)
+        let track = crate::tracks::get_for_item(state.registry.db(), &id, track_id)
             .await
             .map_err(internal)?
-            .filter(|t| t.item_id == id && t.origin == "raster")
+            .filter(|t| t.origin == "raster")
             .ok_or((
                 StatusCode::NOT_FOUND,
                 "no such rasterised track".to_string(),
@@ -2092,7 +2092,7 @@ async fn item_subtitle_file(
             .ok_or_else(|| ApiError::from((StatusCode::BAD_REQUEST, "bad track id".to_string())))?;
         let track = state
             .subtitles
-            .internal_key(&state.registry, track_id)
+            .internal_key(&state.registry, &id, track_id)
             .await
             .map_err(|e| (StatusCode::NOT_FOUND, format!("{e:#}")))?;
         refuse_image(&track)?;
@@ -2125,7 +2125,7 @@ async fn item_subtitle_file(
         .ok_or_else(|| ApiError::from((StatusCode::BAD_REQUEST, "bad track id".to_string())))?;
     let track = state
         .subtitles
-        .internal_key(&state.registry, track_id)
+        .internal_key(&state.registry, &id, track_id)
         .await
         .map_err(|e| (StatusCode::NOT_FOUND, format!("{e:#}")))?;
     refuse_image(&track)?;
@@ -3373,11 +3373,15 @@ async fn session_file(
         // only embedded tracks are in the pipeline, so only they tap.
         let file = match file[5..].split_once('.') {
             Some((num, ext)) if num.chars().all(|c| c.is_ascii_digit()) => {
-                let track = crate::tracks::get(state.registry.db(), num.parse().unwrap())
-                    .await
-                    .map_err(internal)?
-                    .filter(|t| t.origin == "embedded")
-                    .ok_or((StatusCode::NOT_FOUND, "no such embedded track".to_string()))?;
+                let track = crate::tracks::get_for_item(
+                    state.registry.db(),
+                    &session.item_id,
+                    num.parse().unwrap(),
+                )
+                .await
+                .map_err(internal)?
+                .filter(|t| t.origin == "embedded")
+                .ok_or((StatusCode::NOT_FOUND, "no such embedded track".to_string()))?;
                 format!("subs-{}.{ext}", track.internal_key())
             }
             _ => file.clone(),

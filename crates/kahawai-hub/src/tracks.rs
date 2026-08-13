@@ -16,10 +16,11 @@
 //!   (HUB-32c machine-read text), `raster` (HUB-32d: a styled script
 //!   rendered to display sets, served item-level rather than through
 //!   the session tap).
-//! - `source_id` — the exact physical file for embedded/sidecar rows. Root
-//!   and path are projected from `files`; hub-stored origins bind only to the
-//!   collection item. `payload_id` preserves immutable cache-file identity
-//!   when an old cross-collection item is split.
+//! - ownership — exactly one of `source_id` or `item_id`. Embedded/sidecar
+//!   rows and derivatives of them follow the stable physical `files.id`;
+//!   independently acquired tracks and their derivatives follow the collection
+//!   item. `derived_from` records lineage, never a second ownership rule.
+//!   `payload_id` preserves immutable cache-file identity across migrations.
 //! - `stream_index` — embedded: index into `streams_json.subtitles`;
 //!   sidecar: index into `streams_json.external_subtitles`. The
 //!   pipeline's tap files (`subs-e{n}.*`) and the burn plan still
@@ -232,11 +233,13 @@ pub fn delivery(
 
 pub async fn get(db: &sqlx::SqlitePool, id: i64) -> Result<Option<Track>> {
     Ok(sqlx::query(
-        "SELECT t.id,t.item_id,t.origin,t.source_id,f.module_id,f.collection_id,r.root_token,
-                f.path_rel AS source_path,f.path_rel,t.stream_index,t.format,t.language,
-                t.label,t.machine,t.derived_from,t.payload_id,t.created_by
+        "SELECT t.id,COALESCE(t.item_id,f.item_id) AS item_id,t.origin,t.source_id,
+                f.module_id,f.collection_id,r.root_token,f.path_rel AS source_path,
+                f.path_rel,t.stream_index,t.format,t.language,t.label,t.machine,
+                t.derived_from,t.payload_id,t.created_by
          FROM subtitle_tracks t LEFT JOIN files f ON f.id=t.source_id
-         LEFT JOIN collection_roots r ON r.id=f.root_id WHERE t.id=?",
+         LEFT JOIN collection_roots r ON r.id=f.root_id
+         WHERE t.id=? AND COALESCE(t.item_id,f.item_id) IS NOT NULL",
     )
     .bind(id)
     .fetch_optional(db)
@@ -244,9 +247,27 @@ pub async fn get(db: &sqlx::SqlitePool, id: i64) -> Result<Option<Track>> {
     .map(row_to_track))
 }
 
-/// Every track of an item that is either hub-stored (downloaded/ocr) or
-/// bound to the given source — the source `source_row` picked, so the
-/// list matches what a session would actually play.
+/// Resolve a track beneath one item route. Physical tracks derive their current
+/// item from `files`; an unbound or foreign source is deliberately invisible.
+pub async fn get_for_item(db: &sqlx::SqlitePool, item_id: &str, id: i64) -> Result<Option<Track>> {
+    Ok(sqlx::query(
+        "SELECT t.id,COALESCE(t.item_id,f.item_id) AS item_id,t.origin,t.source_id,
+                f.module_id,f.collection_id,r.root_token,f.path_rel AS source_path,
+                f.path_rel,t.stream_index,t.format,t.language,t.label,t.machine,
+                t.derived_from,t.payload_id,t.created_by
+         FROM subtitle_tracks t LEFT JOIN files f ON f.id=t.source_id
+         LEFT JOIN collection_roots r ON r.id=f.root_id
+         WHERE t.id=?2 AND COALESCE(t.item_id,f.item_id)=?1",
+    )
+    .bind(item_id)
+    .bind(id)
+    .fetch_optional(db)
+    .await?
+    .map(row_to_track))
+}
+
+/// Every item-owned track or physical track bound to the source `source_row`
+/// picked, so the list matches what a session would actually play.
 pub async fn for_item_source(
     db: &sqlx::SqlitePool,
     item_id: &str,
@@ -256,15 +277,17 @@ pub async fn for_item_source(
     source_path: &str,
 ) -> Result<Vec<Track>> {
     Ok(sqlx::query(
-        "SELECT t.id,t.item_id,t.origin,t.source_id,f.module_id,f.collection_id,r.root_token,
-                f.path_rel AS source_path,f.path_rel,t.stream_index,t.format,t.language,
-                t.label,t.machine,t.derived_from,t.payload_id,t.created_by
+        "SELECT t.id,COALESCE(t.item_id,f.item_id) AS item_id,t.origin,t.source_id,
+                f.module_id,f.collection_id,r.root_token,f.path_rel AS source_path,
+                f.path_rel,t.stream_index,t.format,t.language,t.label,t.machine,
+                t.derived_from,t.payload_id,t.created_by
          FROM subtitle_tracks t LEFT JOIN files f ON f.id=t.source_id
          LEFT JOIN collection_roots r ON r.id=f.root_id
-         WHERE t.item_id=? AND (t.source_id IS NULL OR
+         WHERE t.item_id=? OR (f.item_id=? AND
               (f.module_id,f.collection_id,r.root_token,f.path_rel)=(?,?,?,?))
          ORDER BY t.origin='embedded' DESC,t.origin='sidecar' DESC,t.id",
     )
+    .bind(item_id)
     .bind(item_id)
     .bind(module_id)
     .bind(collection_id)
@@ -315,7 +338,6 @@ fn row_to_track(r: sqlx::sqlite::SqliteRow) -> Track {
 /// stable while stream positions remain stable, independent of root adoption.
 pub async fn sync_source_tracks(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    item_id: &str,
     source_id: i64,
     info: &kahawai_core::media::MediaInfo,
 ) -> Result<()> {
@@ -334,14 +356,13 @@ pub async fn sync_source_tracks(
     }
 
     let upsert = "INSERT INTO subtitle_tracks
-            (item_id,source_id,origin,stream_index,format,language)
-         VALUES (?,?,?,?,?,?)
+            (source_id,origin,stream_index,format,language)
+         VALUES (?,?,?,?,?)
          ON CONFLICT(source_id,origin,stream_index)
            WHERE origin IN ('embedded','sidecar') DO UPDATE SET
-             item_id=excluded.item_id,format=excluded.format,language=excluded.language";
+             format=excluded.format,language=excluded.language";
     for (i, s) in info.subtitles.iter().enumerate() {
         sqlx::query(upsert)
-            .bind(item_id)
             .bind(source_id)
             .bind("embedded")
             .bind(i as i64)
@@ -352,7 +373,6 @@ pub async fn sync_source_tracks(
     }
     for (i, s) in info.external_subtitles.iter().enumerate() {
         sqlx::query(upsert)
-            .bind(item_id)
             .bind(source_id)
             .bind("sidecar")
             .bind(i as i64)
@@ -360,62 +380,6 @@ pub async fn sync_source_tracks(
             .bind(&s.language)
             .execute(&mut **tx)
             .await?;
-    }
-    Ok(())
-}
-
-/// One-time startup pass: migrated OCR rows carry their linkage only as
-/// the legacy `label` (`ocr:e{n}:{model}` / `ocr:s{n}:{model}`); point
-/// `derived_from` at the matching stream row. Idempotent — rows with a
-/// link are skipped, unmatchable labels stay NULL (their tracks still
-/// serve; they just can't dedupe regeneration by parent).
-pub async fn backfill_derived_from(db: &sqlx::SqlitePool) -> Result<()> {
-    let rows = sqlx::query(
-        "SELECT id, item_id, label FROM subtitle_tracks
-         WHERE origin = 'ocr' AND derived_from IS NULL AND label LIKE 'ocr:%'",
-    )
-    .fetch_all(db)
-    .await?;
-    let mut fixed = 0usize;
-    for r in &rows {
-        let id: i64 = r.get("id");
-        let item: String = r.get("item_id");
-        let label: String = r.get("label");
-        let Some(rest) = label.strip_prefix("ocr:") else {
-            continue;
-        };
-        let Some(key) = rest.split(':').next() else {
-            continue;
-        };
-        let (origin, idx) = match key.split_at(1) {
-            ("e", n) => ("embedded", n),
-            ("s", n) => ("sidecar", n),
-            _ => continue,
-        };
-        let Ok(idx) = idx.parse::<i64>() else {
-            continue;
-        };
-        let parent: Option<i64> = sqlx::query_scalar(
-            "SELECT id FROM subtitle_tracks
-             WHERE item_id = ? AND origin = ? AND stream_index = ?
-             ORDER BY id LIMIT 1",
-        )
-        .bind(&item)
-        .bind(origin)
-        .bind(idx)
-        .fetch_optional(db)
-        .await?;
-        if let Some(parent) = parent {
-            sqlx::query("UPDATE subtitle_tracks SET derived_from = ? WHERE id = ?")
-                .bind(parent)
-                .bind(id)
-                .execute(db)
-                .await?;
-            fixed += 1;
-        }
-    }
-    if fixed > 0 {
-        tracing::info!(fixed, "OCR track lineage backfilled from legacy labels");
     }
     Ok(())
 }

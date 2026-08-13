@@ -445,12 +445,11 @@ async fn direct_play_ranges_end_to_end() {
     // offline host reached the burn arm first and the one condition stand-by
     // exists for was told to give up.
     let track_id: i64 = sqlx::query_scalar(
-        "INSERT INTO subtitle_tracks(item_id,source_id,origin,stream_index,format)
-         SELECT ?,f.id,'embedded',3,'ass' FROM files f
+        "INSERT INTO subtitle_tracks(source_id,origin,stream_index,format)
+         SELECT f.id,'embedded',3,'ass' FROM files f
           WHERE f.item_id=? ORDER BY f.size DESC LIMIT 1
          RETURNING id",
     )
-    .bind(&item_id)
     .bind(&item_id)
     .fetch_one(&db)
     .await

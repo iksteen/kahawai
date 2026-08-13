@@ -326,10 +326,12 @@ async fn capability_changes_delivery_not_existence() {
     .await;
     // What a scan would materialize (tests seed by SQL, so no
     // sync_source_tracks ran).
-    q("INSERT INTO subtitle_tracks(item_id,source_id,origin,stream_index,format,language)
-       VALUES('subs-item',(SELECT id FROM files WHERE item_id='subs-item'),'embedded',0,'srt','en'),
-             ('subs-item',(SELECT id FROM files WHERE item_id='subs-item'),'embedded',1,'ass','en'),
-             ('subs-item',(SELECT id FROM files WHERE item_id='subs-item'),'embedded',2,'pgs','en')")
+    q(
+        "INSERT INTO subtitle_tracks(source_id,origin,stream_index,format,language)
+       VALUES((SELECT id FROM files WHERE item_id='subs-item'),'embedded',0,'srt','en'),
+             ((SELECT id FROM files WHERE item_id='subs-item'),'embedded',1,'ass','en'),
+             ((SELECT id FROM files WHERE item_id='subs-item'),'embedded',2,'pgs','en')",
+    )
     .await;
 
     // Straight at `Subtitles::list`, not over HTTP: the listing endpoint
@@ -386,8 +388,7 @@ async fn capability_changes_delivery_not_existence() {
 
 /// Unification materialization: a rescan preserves row ids while a
 /// stream keeps its position (preferences pin ids, so churn would
-/// orphan them); a vanished stream deletes its row and lineage links
-/// go NULL rather than dangling.
+/// orphan them); a vanished stream deletes its reproducible derivatives.
 #[tokio::test]
 async fn scan_sync_preserves_track_ids() {
     let (_api, _token, db) = harness().await;
@@ -429,7 +430,7 @@ async fn scan_sync_preserves_track_ids() {
         let db = db.clone();
         async move {
             let mut tx = db.begin().await.unwrap();
-            kahawai_hub::tracks::sync_source_tracks(&mut tx, "it", source_id, &info)
+            kahawai_hub::tracks::sync_source_tracks(&mut tx, source_id, &info)
                 .await
                 .unwrap();
             tx.commit().await.unwrap();
@@ -454,9 +455,10 @@ async fn scan_sync_preserves_track_ids() {
 
     // An OCR row derived from the PGS track.
     let ocr: i64 = sqlx::query_scalar(
-        "INSERT INTO subtitle_tracks (item_id, origin, format, machine, derived_from)
-         VALUES ('it','ocr','srt',1,?) RETURNING id",
+        "INSERT INTO subtitle_tracks (source_id, origin, format, machine, derived_from)
+         VALUES (?,'ocr','srt',1,?) RETURNING id",
     )
+    .bind(source_id)
     .bind(first[1])
     .fetch_one(&db)
     .await
@@ -466,17 +468,19 @@ async fn scan_sync_preserves_track_ids() {
     sync(info.clone()).await;
     assert_eq!(ids("embedded").await, first, "rescan must preserve ids");
 
-    // The PGS stream vanishes: its row goes, the OCR row stays but its
-    // lineage link nulls (ON DELETE SET NULL).
+    // The PGS stream vanishes: its row and reproducible OCR derivative go
+    // together. A later scan can regenerate it from the physical stream.
     let mut less = info.clone();
     less.subtitles.truncate(1);
     sync(less).await;
     assert_eq!(ids("embedded").await, vec![first[0]]);
-    let link: Option<i64> =
-        sqlx::query_scalar("SELECT derived_from FROM subtitle_tracks WHERE id = ?")
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM subtitle_tracks WHERE id = ?")
             .bind(ocr)
             .fetch_one(&db)
             .await
-            .unwrap();
-    assert_eq!(link, None, "lineage must null, not dangle");
+            .unwrap(),
+        0,
+        "source derivative survived its parent stream"
+    );
 }

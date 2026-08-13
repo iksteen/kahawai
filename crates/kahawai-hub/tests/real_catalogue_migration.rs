@@ -22,7 +22,7 @@ async fn embedded_migrator_upgrades_a_real_catalogue_copy() {
             .fetch_one(&db)
             .await
             .unwrap(),
-        53
+        54
     );
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT count(*) FROM pragma_foreign_key_check")
@@ -43,8 +43,11 @@ async fn embedded_migrator_upgrades_a_real_catalogue_copy() {
                   WHERE (i.module_id,i.collection_id)!=(p.module_id,p.collection_id))
               +(SELECT count(*) FROM files f JOIN items i ON i.id=f.item_id
                   WHERE (f.module_id,f.collection_id)!=(i.module_id,i.collection_id))
-              +(SELECT count(*) FROM subtitle_tracks t JOIN files f ON f.id=t.source_id
-                  WHERE f.item_id!=t.item_id)",
+              +(SELECT count(*) FROM subtitle_tracks
+                  WHERE (item_id IS NULL)=(source_id IS NULL))
+              +(SELECT count(*) FROM subtitle_tracks t JOIN subtitle_tracks p
+                  ON p.id=t.derived_from
+                  WHERE t.item_id IS NOT p.item_id OR t.source_id IS NOT p.source_id)",
     )
     .fetch_one(&db)
     .await

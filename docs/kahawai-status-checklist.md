@@ -462,7 +462,12 @@ How something works and why it was built that way belong in
       one `subtitle_tracks` keyspace for every origin
       (embedded/sidecar/downloaded/ocr), synced at scan with stable ids,
       OCR lineage via `derived_from` (per source — the multi-source flag
-      bug died with the name parsing). Capability adjusts each track's
+      bug died with the name parsing). Every row has one direct owner:
+      physical streams and their OCR/raster derivatives carry stable
+      `source_id`; downloaded/manual tracks carry `item_id`; derivatives
+      inherit their parent's owner. Source rebinding needs no track rewrite
+      and source/stream deletion evicts reproducible derivatives. Capability
+      adjusts each track's
       computed delivery (text/ass/overlay/burn/none), never existence;
       the UI disables instead of the API filtering. Explicit burn: an
       image track picked by id forces the encode (overrides overlay +

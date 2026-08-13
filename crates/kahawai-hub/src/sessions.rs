@@ -324,13 +324,9 @@ impl<'a> Negotiation<'a> {
         // other sources would silently drop the burn the user asked for.
         let picked_row = match subtitle_track {
             Some(tid) => {
-                let t = crate::tracks::get(registry.db(), tid)
+                let t = crate::tracks::get_for_item(registry.db(), item_id, tid)
                     .await?
-                    .with_context(|| format!("no subtitle track {tid}"))?;
-                anyhow::ensure!(
-                    t.item_id == item_id,
-                    "subtitle track {tid} belongs to another item"
-                );
+                    .with_context(|| format!("no subtitle track {tid} for item {item_id}"))?;
                 Some(t)
             }
             None => None,
@@ -2693,13 +2689,9 @@ impl Sessions {
                 replan_subs = true;
             }
         } else if let Some(tid) = subtitle_track {
-            let track = crate::tracks::get(registry.db(), tid)
+            let track = crate::tracks::get_for_item(registry.db(), &session.item_id, tid)
                 .await?
-                .with_context(|| format!("no subtitle track {tid}"))?;
-            anyhow::ensure!(
-                track.item_id == session.item_id,
-                "subtitle track {tid} belongs to another item"
-            );
+                .with_context(|| format!("no subtitle track {tid} for item {}", session.item_id))?;
             let part = session.parts.first().context("session has no parts")?;
             let is_image = crate::tracks::is_image_format(&track.format);
             // HUB-32a: an ASS pick has to reach negotiation too, but
