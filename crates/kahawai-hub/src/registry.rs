@@ -14,6 +14,7 @@ use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
 use kahawai_core::names;
+use sha2::{Digest, Sha256};
 use sqlx::{Row, SqlitePool};
 
 #[derive(Debug, Clone)]
@@ -63,6 +64,19 @@ const ARCHIVE_WATCH_FOR_FILE_SQL: &str = "
     FROM files f
     JOIN watch_state w ON w.item_id = f.item_id
     WHERE f.module_id = ? AND f.collection_id = ? AND f.path_rel = ?";
+
+fn source_fingerprint(parts: &[(i64, i64, i64)]) -> String {
+    use data_encoding::BASE64URL_NOPAD;
+
+    let mut hash = Sha256::new();
+    hash.update(b"kahawai-playable-source-v1\0");
+    for (size, head, tail) in parts {
+        hash.update(size.to_be_bytes());
+        hash.update(head.to_be_bytes());
+        hash.update(tail.to_be_bytes());
+    }
+    format!("source-sha256-{}", BASE64URL_NOPAD.encode(&hash.finalize()))
+}
 
 /// What a session needs from a transcoder (derived from plan + source).
 #[derive(Debug, Clone, Default)]
@@ -1934,6 +1948,42 @@ impl Registry {
                 .bind(f.tail_xxh3 as i64)
                 .execute(&mut *tx)
                 .await?;
+                let rendition: Option<(i64, i64)> = sqlx::query_as(
+                    "SELECT ps.id,ps.expected_parts FROM playable_sources ps
+                       JOIN playable_source_parts p ON p.playable_source_id=ps.id
+                      WHERE p.file_id=?",
+                )
+                .bind(source_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+                if let Some((rendition_id, expected)) = rendition {
+                    let parts: Vec<(i64, i64, i64)> = sqlx::query_as(
+                        "SELECT f.size,f.head_xxh3,f.tail_xxh3
+                           FROM playable_source_parts p JOIN files f ON f.id=p.file_id
+                          WHERE p.playable_source_id=? ORDER BY p.ordinal,p.file_id",
+                    )
+                    .bind(rendition_id)
+                    .fetch_all(&mut *tx)
+                    .await?;
+                    if parts.len() as i64 == expected {
+                        let fingerprint = source_fingerprint(&parts);
+                        sqlx::query(
+                            "INSERT INTO watch_state
+                               (user_id,item_id,position_ms,duration_ms,played,play_count)
+                             SELECT user_id,?,position_ms,duration_ms,played,play_count
+                               FROM watch_source_archive WHERE source_fingerprint=?
+                             ON CONFLICT(user_id,item_id) DO NOTHING",
+                        )
+                        .bind(&item_id)
+                        .bind(&fingerprint)
+                        .execute(&mut *tx)
+                        .await?;
+                        sqlx::query("DELETE FROM watch_source_archive WHERE source_fingerprint=?")
+                            .bind(fingerprint)
+                            .execute(&mut *tx)
+                            .await?;
+                    }
+                }
             }
         }
         // Re-resolution can repoint every source away from an item
@@ -2139,6 +2189,52 @@ impl Registry {
         format!("n:{nfo}|a:{artwork}|s:{}", subs.join(","))
     }
 
+    async fn archive_playable_sources(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        source_ids: &[i64],
+    ) -> Result<()> {
+        type ArchiveSource = (String, i64, Vec<(i64, i64, i64)>);
+        for source_id in source_ids {
+            let row: Option<ArchiveSource> = sqlx::query(
+                "SELECT ps.item_id,ps.expected_parts,p.ordinal,f.size,f.head_xxh3,f.tail_xxh3
+                   FROM playable_sources ps
+                   JOIN playable_source_parts p ON p.playable_source_id=ps.id
+                   JOIN files f ON f.id=p.file_id
+                  WHERE ps.id=? ORDER BY p.ordinal,p.file_id",
+            )
+            .bind(source_id)
+            .fetch_all(&mut **tx)
+            .await?
+            .into_iter()
+            .fold(None, |acc, row| {
+                let mut value = acc
+                    .unwrap_or_else(|| (row.get("item_id"), row.get("expected_parts"), Vec::new()));
+                value
+                    .2
+                    .push((row.get("size"), row.get("head_xxh3"), row.get("tail_xxh3")));
+                Some(value)
+            });
+            let Some((item_id, expected, parts)) = row else {
+                continue;
+            };
+            if parts.len() as i64 != expected {
+                continue; // only a complete rendition is stable restoration identity
+            }
+            let fingerprint = source_fingerprint(&parts);
+            sqlx::query(
+                "INSERT OR REPLACE INTO watch_source_archive
+                   (user_id,source_fingerprint,position_ms,duration_ms,played,play_count)
+                 SELECT user_id,?,position_ms,duration_ms,played,play_count
+                   FROM watch_state WHERE item_id=?",
+            )
+            .bind(fingerprint)
+            .bind(item_id)
+            .execute(&mut **tx)
+            .await?;
+        }
+        Ok(())
+    }
+
     pub async fn reconcile_files(
         &self,
         module_id: &str,
@@ -2165,6 +2261,18 @@ impl Registry {
         }
         let mut tx = self.db.begin().await?;
         for source in &stale {
+            let rendition_ids: Vec<i64> = sqlx::query_scalar(
+                "SELECT p.playable_source_id FROM playable_source_parts p
+                   JOIN files f ON f.id=p.file_id JOIN collection_roots r ON r.id=f.root_id
+                  WHERE f.module_id=? AND f.collection_id=? AND r.root_token=? AND f.path_rel=?",
+            )
+            .bind(module_id)
+            .bind(collection_id)
+            .bind(&source.root_token)
+            .bind(&source.path_rel)
+            .fetch_all(&mut *tx)
+            .await?;
+            Self::archive_playable_sources(&mut tx, &rendition_ids).await?;
             sqlx::query(ARCHIVE_WATCH_FOR_FILE_SQL)
                 .bind(module_id)
                 .bind(collection_id)
@@ -2851,6 +2959,12 @@ impl Registry {
         .bind(module_id)
         .execute(&mut *tx)
         .await?;
+        let rendition_ids: Vec<i64> =
+            sqlx::query_scalar("SELECT id FROM playable_sources WHERE module_id=?")
+                .bind(module_id)
+                .fetch_all(&mut *tx)
+                .await?;
+        Self::archive_playable_sources(&mut tx, &rendition_ids).await?;
         for sql in [
             "DELETE FROM files WHERE module_id=?",
             "DELETE FROM collections WHERE module_id = ?",

@@ -442,6 +442,10 @@ impl Auth {
             .bind(id)
             .execute(&mut *tx)
             .await?;
+        sqlx::query("DELETE FROM watch_source_archive WHERE user_id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
         // The count and delete are one statement under SQLite's write lock.
         // Other user-owned rows and refresh families cascade from users.
         let changed = sqlx::query(
