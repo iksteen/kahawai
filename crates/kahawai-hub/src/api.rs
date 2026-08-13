@@ -1196,8 +1196,14 @@ async fn admin_delete_satellite(
         .delete_satellite(&id)
         .await
         .map_err(|e| (StatusCode::NOT_FOUND, format!("{e:#}")))?;
+    let removed_payloads = state
+        .subtitles
+        .clean_orphaned_payloads(&state.registry)
+        .await
+        .map_err(internal)?;
     Ok(Json(
-        json!({ "deleted": id, "removed": fingerprint, "sessions_ended": ended }),
+        json!({ "deleted": id, "removed": fingerprint, "sessions_ended": ended,
+                "subtitle_payloads_removed": removed_payloads }),
     ))
 }
 
