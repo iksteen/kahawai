@@ -7,9 +7,17 @@ same-origin only, no proxy trust.
 
 First-run setup is intentionally outside the reverse proxy. `setup_bind`
 (default `127.0.0.1:8422`) must remain loopback-only; open it locally or
-forward it over SSH. Headless/container operators can instead run
+forward it over SSH. Headless operators can instead run
 `kahawai hub init-admin`, which uses `bootstrap.sock` under the hub data
-directory. Neither first-admin path exists after setup succeeds.
+directory. With the container image, run that command inside the already-running
+hub container and allocate a TTY; the hidden password prompt reads from the
+terminal rather than piped stdin:
+
+```sh
+docker exec -it <container-name> kahawai hub init-admin
+```
+
+Neither first-admin path exists after setup succeeds.
 
 ## Reverse proxy
 

@@ -96,8 +96,15 @@ gst-libav"). Essential gaps abort startup; everything else degrades.
 The public API remains locked on first run. Create the administrator through
 the trusted-local control plane: open http://localhost:8422 on the hub (or
 forward that loopback port over SSH), or run `kahawai hub init-admin` in a
-second terminal. The local browser listener and private Unix socket disappear
-after the first account commits. The mediahost (and any transcoder) prints an
+second terminal. For the container image, run it inside the already-running
+hub container with a TTY (the password prompt deliberately reads the terminal):
+
+```sh
+docker exec -it <container-name> kahawai hub init-admin
+```
+
+The local browser listener and private Unix socket disappear after the first
+account commits. The mediahost (and any transcoder) prints an
 **enrollment code** on first connect; approve it on the admin page. Satellites
 receive certificates from the hub (it is its own CA) and reconnect on their
 own ever after.
