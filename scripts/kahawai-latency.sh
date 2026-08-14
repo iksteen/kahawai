@@ -60,7 +60,7 @@ fi
 json_field() { python3 -c "import json,sys;print(json.load(sys.stdin).get(sys.argv[1],''))" "$1"; }
 
 login() {
-    python3 -c 'import json,sys;print(json.dumps({"username":sys.argv[1],"password":sys.argv[2]}))' \
+    python3 -c 'import json,sys;print(json.dumps({"client":"api","username":sys.argv[1],"password":sys.argv[2]}))' \
         "$USERNAME" "$PASSWORD" \
         | curl -sf -X POST "http://$API/api/v1/auth/token" -H content-type:application/json -d @- \
         | json_field access_token
@@ -210,7 +210,7 @@ if [ "$USERS" -gt 0 ]; then
                   -H "Authorization: Bearer $ADMIN" -H content-type:application/json -d @- \
               | json_field id) || { echo "creating $name failed" >&2; exit 1; }
         USER_IDS+=("$uid")
-        USER_TOKENS+=("$(USERNAME=$name PASSWORD=$pw; python3 -c 'import json,sys;print(json.dumps({"username":sys.argv[1],"password":sys.argv[2]}))' "$name" "$pw" \
+        USER_TOKENS+=("$(USERNAME=$name PASSWORD=$pw; python3 -c 'import json,sys;print(json.dumps({"client":"api","username":sys.argv[1],"password":sys.argv[2]}))' "$name" "$pw" \
               | curl -sf -X POST "http://$API/api/v1/auth/token" -H content-type:application/json -d @- \
               | json_field access_token)")
     done

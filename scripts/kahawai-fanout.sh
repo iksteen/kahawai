@@ -46,7 +46,7 @@ BIN=$(cd "$(dirname "$0")/.." && pwd)/target/release/kahawai
 
 json_field() { python3 -c "import json,sys;print(json.load(sys.stdin).get(sys.argv[1],''))" "$1"; }
 login() {
-    python3 -c 'import json,sys;print(json.dumps({"username":sys.argv[1],"password":sys.argv[2]}))' \
+    python3 -c 'import json,sys;print(json.dumps({"client":"api","username":sys.argv[1],"password":sys.argv[2]}))' \
         "$USERNAME" "$PASSWORD" \
         | curl -sf -X POST "http://$API/api/v1/auth/token" -H content-type:application/json -d @- \
         | json_field access_token

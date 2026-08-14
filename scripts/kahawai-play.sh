@@ -41,7 +41,7 @@ fi
 
 json_field() { python3 -c "import json,sys;print(json.load(sys.stdin)[sys.argv[1]])" "$1"; }
 
-TOKEN=$(python3 -c 'import json,sys;print(json.dumps({"username":sys.argv[1],"password":sys.argv[2]}))' "$USERNAME" "$PASSWORD" \
+TOKEN=$(python3 -c 'import json,sys;print(json.dumps({"client":"api","username":sys.argv[1],"password":sys.argv[2]}))' "$USERNAME" "$PASSWORD" \
     | curl -sf -X POST "http://$API/api/v1/auth/token" -H content-type:application/json -d @- \
     | json_field access_token) || { echo "login failed" >&2; exit 1; }
 

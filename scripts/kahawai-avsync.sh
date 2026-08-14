@@ -45,7 +45,7 @@ command -v ffprobe >/dev/null || { echo "ffprobe not found" >&2; exit 2; }
 
 TOKEN=$(curl -fsS -X POST "http://$API/api/v1/auth/token" \
     -H 'content-type: application/json' \
-    -d "{\"username\":\"$USERNAME\",\"password\":\"$PASSWORD\"}" |
+    -d "{\"client\":\"api\",\"username\":\"$USERNAME\",\"password\":\"$PASSWORD\"}" |
     python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])')
 
 # A profile that forces a transcode: no passthrough codecs offered.

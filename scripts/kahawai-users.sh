@@ -39,7 +39,7 @@ if [ "$PASSWORD" = "-" ]; then
     read -rsp "Password for $ADMIN: " PASSWORD; echo >&2
 fi
 
-TOKEN=$(python3 -c 'import json,sys;print(json.dumps({"username":sys.argv[1],"password":sys.argv[2]}))' "$ADMIN" "$PASSWORD" \
+TOKEN=$(python3 -c 'import json,sys;print(json.dumps({"client":"api","username":sys.argv[1],"password":sys.argv[2]}))' "$ADMIN" "$PASSWORD" \
     | curl -sf -X POST "http://$API/api/v1/auth/token" -H content-type:application/json -d @- \
     | python3 -c 'import json,sys;print(json.load(sys.stdin)["access_token"])') \
     || { echo "login failed" >&2; exit 1; }
