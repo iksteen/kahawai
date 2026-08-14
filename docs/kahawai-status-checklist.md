@@ -548,6 +548,7 @@ How something works and why it was built that way belong in
 
 - [x] OPS-1 First-run setup mode: public API locked; atomic initial-admin
       creation through either the loopback-only, same-origin browser listener
+      on a port distinct from the public and satellite listeners
       or the mode-0600 local Unix socket, bound only after its mode-0700 control
       directory exists, used by `kahawai hub init-admin`; typed setup outcomes
       distinguish invalid input, a completed race, and internal failure

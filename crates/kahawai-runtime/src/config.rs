@@ -310,14 +310,25 @@ pub fn load(explicit: Option<&Path>) -> Result<(Config, Option<PathBuf>)> {
         Some(parent) => std::env::current_dir()?.join(parent),
         None => std::env::current_dir()?,
     };
-    if !cfg.hub.setup_bind.ip().is_loopback() {
-        bail!("hub.setup_bind must be a loopback address");
-    }
-    if cfg.hub.setup_bind == cfg.hub.bind {
-        bail!("hub.setup_bind must differ from hub.bind");
-    }
+    validate_hub_binds(&cfg.hub)?;
     normalize_and_validate_collections(&mut cfg.mediahost.collections, &base)?;
     Ok((cfg, used))
+}
+
+/// Validate listener separation by port rather than exact socket address.
+/// Wildcards overlap concrete addresses, and loopback aliases that bind
+/// separately on Linux are not portable to macOS.
+pub fn validate_hub_binds(cfg: &HubConfig) -> Result<()> {
+    if !cfg.setup_bind.ip().is_loopback() {
+        bail!("hub.setup_bind must be a loopback address");
+    }
+    if cfg.setup_bind.port() == cfg.bind.port() {
+        bail!("hub.setup_bind must use a different port from hub.bind");
+    }
+    if cfg.setup_bind.port() == cfg.satellite_bind.port() {
+        bail!("hub.setup_bind must use a different port from hub.satellite_bind");
+    }
+    Ok(())
 }
 
 const MEDIA_TYPES: &[&str] = &["movies", "series", "anime", "music"];
@@ -451,17 +462,35 @@ mod tests {
     }
 
     #[test]
-    fn setup_listener_must_be_distinct_and_loopback_only() {
+    fn setup_listener_must_be_port_distinct_and_loopback_only() {
         figment::Jail::expect_with(|jail| {
             jail.create_file("kahawai.toml", "[hub]\nsetup_bind = \"0.0.0.0:8422\"")?;
             let error = load(Some(Path::new("kahawai.toml"))).unwrap_err();
             assert!(error.to_string().contains("loopback"), "{error}");
+
+            // A wildcard public listener overlaps the concrete loopback bind.
             jail.create_file(
                 "kahawai.toml",
-                "[hub]\nbind = \"127.0.0.1:8420\"\nsetup_bind = \"127.0.0.1:8420\"",
+                "[hub]\nbind = \"0.0.0.0:8422\"\nsetup_bind = \"127.0.0.1:8422\"",
             )?;
             let error = load(Some(Path::new("kahawai.toml"))).unwrap_err();
-            assert!(error.to_string().contains("must differ"), "{error}");
+            assert!(error.to_string().contains("different port"), "{error}");
+
+            // Distinct loopback aliases work on Linux but are not portable.
+            jail.create_file(
+                "kahawai.toml",
+                "[hub]\nbind = \"127.0.0.2:8422\"\nsetup_bind = \"127.0.0.1:8422\"",
+            )?;
+            let error = load(Some(Path::new("kahawai.toml"))).unwrap_err();
+            assert!(error.to_string().contains("different port"), "{error}");
+
+            // The setup listener must not overlap the satellite wildcard either.
+            jail.create_file(
+                "kahawai.toml",
+                "[hub]\nsetup_bind = \"127.0.0.1:8422\"\nsatellite_bind = \"0.0.0.0:8422\"",
+            )?;
+            let error = load(Some(Path::new("kahawai.toml"))).unwrap_err();
+            assert!(error.to_string().contains("satellite_bind"), "{error}");
             Ok(())
         });
     }

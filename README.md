@@ -128,7 +128,7 @@ transcoder = true               # set false (then restart) to keep encoding off 
 
 [hub]
 bind = "127.0.0.1:8420"          # client API + web app; put a reverse proxy in front for TLS
-setup_bind = "127.0.0.1:8422"    # first-run browser only; must stay loopback
+setup_bind = "127.0.0.1:8422"    # first-run browser only; loopback and a distinct listener port
 satellite_bind = "0.0.0.0:8421"  # enrollment + mTLS link for satellites
 data_dir = "~/.local/share/kahawai"  # db, PKI, caches (default shown for user installs)
 hostnames = ["localhost"]        # names/IPs baked into the hub's certificate SANs —

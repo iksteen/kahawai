@@ -257,14 +257,7 @@ async fn run_hub_inner(
     // The file SIGHUP re-reads (NFR-6). None when defaults were used.
     config_path: Option<PathBuf>,
 ) -> Result<()> {
-    anyhow::ensure!(
-        cfg.setup_bind.ip().is_loopback(),
-        "hub.setup_bind must be a loopback address"
-    );
-    anyhow::ensure!(
-        cfg.setup_bind != cfg.bind,
-        "hub.setup_bind must differ from hub.bind"
-    );
+    config::validate_hub_binds(&cfg)?;
     let ca = Arc::new(kahawai_hub::pki::HubCa::load_or_create(
         &kahawai_hub::pki::pki_dir(&cfg.data_dir),
     )?);
@@ -549,6 +542,16 @@ mod tests {
             .unwrap()
             .local_addr()
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn directly_constructed_config_rejects_listener_port_overlap() {
+        let mut cfg = config::Config::default();
+        let port = unused_loopback_addr().port();
+        cfg.hub.bind = format!("0.0.0.0:{port}").parse().unwrap();
+        cfg.hub.setup_bind = format!("127.0.0.1:{port}").parse().unwrap();
+        let error = run_all_in_one(cfg, None).await.unwrap_err();
+        assert!(error.to_string().contains("different port"), "{error:#}");
     }
 
     #[tokio::test]

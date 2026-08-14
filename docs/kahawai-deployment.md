@@ -6,7 +6,8 @@ in front. Everything below is opt-in config; the defaults are
 same-origin only, no proxy trust.
 
 First-run setup is intentionally outside the reverse proxy. `setup_bind`
-(default `127.0.0.1:8422`) must remain loopback-only; open it locally or
+(default `127.0.0.1:8422`) must remain loopback-only and use a port distinct
+from the public and satellite listeners; open it locally or
 forward it over SSH. Headless operators can instead run
 `kahawai hub init-admin`, which uses `control/bootstrap.sock` under the hub data
 directory. The control directory is mode `0700` before the mode-`0600` socket is
