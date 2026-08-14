@@ -65,6 +65,10 @@ function fmt(ms: number) {
 /// sits through it waiting.
 const UP_NEXT_S = 9
 
+/// How long controls stay visible after a fresh player mounts or the pointer
+/// moves over it.
+const CONTROLS_HIDE_MS = 2600
+
 /// How long a restart gets to produce a frame before the veil comes down. Not
 /// a guess at the hub's speed — a ceiling on how long a spinner is allowed to
 /// be the whole story. Past it the picture is frozen and the play veil at
@@ -1323,15 +1327,17 @@ export default function Player({
   const wake = () => {
     setBarShown(true)
     clearTimeout(barTimer.current)
-    barTimer.current = setTimeout(() => setBarShown(false), 2600)
+    barTimer.current = setTimeout(() => setBarShown(false), CONTROLS_HIDE_MS)
   }
-  useEffect(
-    () => () => {
+  useEffect(() => {
+    // A recovered session remounts the player without moving the pointer. Arm
+    // the same countdown on mount or its fresh controls stay up indefinitely.
+    barTimer.current = setTimeout(() => setBarShown(false), CONTROLS_HIDE_MS)
+    return () => {
       clearTimeout(barTimer.current)
       clearTimeout(giveUpTimer.current)
-    },
-    [],
-  )
+    }
+  }, [])
 
   // The deferred burn, once the pipeline is the viewer's to steer again.
   useEffect(() => {
