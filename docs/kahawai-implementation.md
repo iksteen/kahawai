@@ -318,6 +318,28 @@ Sessions end for reasons a client cannot predict — idle reaping (HUB-18), a hu
 
 QUERY is **safe and idempotent, and returns only what is knowable now**: it starts no extraction, generates no raster, opens no lease and claims no transcoder, so no session is ever slower because someone asked a question about it. Tiers gated on an artefact report the artefact that already exists — the overlay rung only where a raster row is already there — which under-promises on first play rather than over-promising the expensive tier. `Accept-Query: application/json` advertises it, a missing or inconsistent `Content-Type` is refused per the RFC, and an unsupported method answers 405 with `Allow: GET, QUERY`.
 
+**Generated contract.** The public listener serves its code-first OpenAPI 3.2
+document at `/api-docs/openapi.json` and a vendored Swagger UI at
+`/swagger-ui`. `ItemQuery` and `ItemQueryResponse` are the first end-to-end
+typed slice: the Axum handler deserializes and serializes those DTOs directly,
+and the same Rust types derive the request, response and nested media schemas.
+The document declares the JWT bearer scheme used by the route. This is the
+start of ENG-1/2, not their completion: other stable handlers still construct
+untyped JSON, and TypeScript generation plus a whole-contract compatibility
+snapshot remain.
+
+`utoipa` and `utoipa-swagger-ui` are pinned together at commit
+`e092565a9724b07a5ebf122e80ffa3d70addbe5d`, after its OpenAPI 3.2 model and
+`version = "3.2.0"` derive support landed but before the 6.0 release. The model
+has `PathItem.query`; the path macro still has no QUERY verb. Until it does,
+the real handler is described through the macro's POST arm and
+`openapi_document` moves that generated operation from `post` to `query`.
+`api::tests::openapi_uses_3_2_query_with_typed_bodies` makes the workaround
+fail closed: it requires 3.2, QUERY, the DTO references and bearer scheme, and
+rejects a leftover POST operation. The vendored Swagger assets trade one
+pinned source dependency for builds that do not require curl or network
+access.
+
 *This breaks v1 in place, against NFR-7* ("breaking changes only in a new major API version"). Deliberate, with the maintainer's sanction: there are no external clients yet, and carrying a `/api/v2` for a pre-release keyspace costs more than it protects. NFR-7 governs from the first outside consumer.
 
 **Every browse page is a deferred join.** An inner query chooses WHICH ≤200 ids make the page using only indexed scalar columns — the membership covering index for a library browse, the sort index for search and unscoped — and the resolved-metadata view, watch state and source counts join onto those ids afterwards. Joining first and paging second resolves the view for every candidate the sort visits, which is the recurring 900 ms failure mode whenever an ORDER BY stops matching an index. A search page streams the sort index and stops early; when it underfills, the scan saw everything, so the total is known without a counting pass — only a full page pays one.

@@ -38,7 +38,7 @@ where
 /// applying per-track gain across an album flattens the quiet tracks
 /// the artist meant to be quiet. A client that has both should prefer
 /// album when playing an album and track when shuffling.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ReplayGain {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub track_gain_db: Option<f64>,
@@ -67,7 +67,7 @@ impl ReplayGain {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, utoipa::ToSchema)]
 pub struct MediaInfo {
     /// Container format, normalized ("matroska", "mp4", "webm", …).
     pub container: Option<String>,
@@ -118,7 +118,7 @@ pub struct MediaInfo {
     pub video_geometry_error: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, utoipa::ToSchema)]
 pub struct Attachment {
     pub file_name: String,
     pub mime_type: String,
@@ -127,7 +127,7 @@ pub struct Attachment {
     pub size: u64,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, utoipa::ToSchema)]
 pub struct VideoStream {
     pub codec: String,
     pub width: u32,
@@ -220,7 +220,7 @@ mod tests {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, utoipa::ToSchema)]
 pub struct AudioStream {
     pub codec: String,
     pub channels: u32,
@@ -247,7 +247,7 @@ pub struct AudioStream {
 /// within three target durations of the end, so an HONEST value on
 /// such a file is conforming and still awkward. The client is the only
 /// party that knows which it can live with, so it says.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case", tag = "mode")]
 pub enum TargetDuration {
     /// Don't care: declare the cheap constant and accept that segments
@@ -286,7 +286,7 @@ impl TargetDuration {
 /// partial; a client must now state what it needs from the playlist,
 /// because there is no answer that is right for all three kinds of
 /// client and a silent default would pick one of them for it.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, utoipa::ToSchema)]
 pub struct CapabilityProfile {
     /// Containers the client demuxes natively (normalized like
     /// `MediaInfo.container`: "mp4", "webm", "matroska", …).
@@ -357,7 +357,7 @@ fn default_true() -> bool {
     true
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, utoipa::ToSchema)]
 pub struct VideoCap {
     /// Normalized codec name ("h264", "hevc", "vp9", "av1").
     pub codec: String,
@@ -394,14 +394,14 @@ impl Default for CapabilityProfile {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, utoipa::ToSchema)]
 pub struct SubtitleStream {
     /// "srt", "ass", "pgs", "vobsub", "webvtt", …
     pub format: String,
     pub language: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, utoipa::ToSchema)]
 pub struct SidecarSubtitle {
     /// Path relative to the collection root (same keying as the media file).
     pub path_rel: String,

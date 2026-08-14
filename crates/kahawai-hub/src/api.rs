@@ -11,9 +11,11 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sqlx::Row;
+use utoipa::{Modify, OpenApi, ToSchema};
+use utoipa_swagger_ui::SwaggerUi;
 
 use crate::auth::{Auth, CompleteSetupError};
 use crate::registry::Registry;
@@ -81,6 +83,49 @@ pub struct NetOptions {
     pub setup_url: Option<String>,
     /// Configured canonical browser origin; request-derived when absent.
     pub public_origin: Option<PublicOrigin>,
+}
+#[derive(OpenApi)]
+#[openapi(
+    version = "3.2.0",
+    paths(item_query),
+    modifiers(&BearerSecurity)
+)]
+struct ApiDoc;
+
+struct BearerSecurity;
+
+impl Modify for BearerSecurity {
+    fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
+        use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
+
+        openapi
+            .components
+            .as_mut()
+            .expect("the generated API document has components")
+            .add_security_scheme(
+                "bearer_auth",
+                SecurityScheme::Http(
+                    HttpBuilder::new()
+                        .scheme(HttpAuthScheme::Bearer)
+                        .bearer_format("JWT")
+                        .build(),
+                ),
+            );
+    }
+}
+
+fn openapi_document() -> utoipa::openapi::OpenApi {
+    let mut openapi = ApiDoc::openapi();
+    let item = openapi
+        .paths
+        .paths
+        .get_mut("/api/v1/items/{id}")
+        .expect("item QUERY path is generated");
+    // utoipa's 3.2 model supports QUERY, but its path macro does not yet
+    // accept the verb. Generate the operation through its POST arm, then
+    // move it to the correct 3.2 Path Item field.
+    item.query = item.post.take();
+    openapi
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -295,7 +340,10 @@ pub fn router(
     if let Some(cors) = cors {
         app = app.layer(cors);
     }
-    app.merge(crate::web::router())
+    app.merge(Router::from(
+        SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", openapi_document()),
+    ))
+    .merge(crate::web::router())
 }
 
 #[derive(Clone)]
@@ -3042,49 +3090,75 @@ async fn list_items(
     })))
 }
 
-fn item_row_json(r: &sqlx::sqlite::SqliteRow) -> Value {
-    json!({
-        "id": r.get::<String, _>("id"),
-        "kind": r.get::<String, _>("kind"),
-        "title": r.get::<String, _>("title"),
-        "artist": r.try_get::<Option<String>, _>("artist").ok().flatten(),
-        "match_confidence": r.try_get::<Option<String>, _>("match_confidence").ok().flatten(),
+#[derive(Serialize, ToSchema)]
+struct ItemRow<S> {
+    id: String,
+    kind: String,
+    title: String,
+    artist: Option<String>,
+    match_confidence: Option<String>,
+    art_version: Option<i64>,
+    premiered: Option<String>,
+    file_title: Option<String>,
+    file_year: Option<i64>,
+    matched_title: Option<String>,
+    year: Option<i64>,
+    season: Option<i64>,
+    episode: Option<i64>,
+    episode_end: Option<i64>,
+    parent_id: Option<String>,
+    parent_title: Option<String>,
+    library_id: Option<String>,
+    proj_season: Option<i64>,
+    proj_episode: Option<i64>,
+    sources: S,
+    replay_gain: Option<kahawai_core::media::ReplayGain>,
+    resume_position_ms: Option<i64>,
+    resume_duration_ms: Option<i64>,
+    played: bool,
+    play_count: i64,
+}
+
+fn item_row<S>(r: &sqlx::sqlite::SqliteRow, sources: S) -> ItemRow<S> {
+    ItemRow {
+        id: r.get("id"),
+        kind: r.get("kind"),
+        title: r.get("title"),
+        artist: r.try_get("artist").ok().flatten(),
+        match_confidence: r.try_get("match_confidence").ok().flatten(),
         // Artwork is cached hard by the browser (a day), so the URL has
         // to change when the metadata does — otherwise re-matching an
         // item leaves yesterday's poster on the card.
-        "art_version": r.try_get::<Option<i64>, _>("art_version").ok().flatten(),
-        "premiered": r.try_get::<Option<String>, _>("premiered").ok().flatten(),
-        "file_title": r.try_get::<Option<String>, _>("file_title").ok().flatten(),
-        "file_year": r.try_get::<Option<i64>, _>("file_year").ok().flatten(),
-        "matched_title": r.try_get::<Option<String>, _>("matched_title").ok().flatten(),
-        "year": r.get::<Option<i64>, _>("year"),
-        "season": r.get::<Option<i64>, _>("season"),
-        "episode": r.get::<Option<i64>, _>("episode"),
-        // Batch span (0045): the file covers episode..episode_end.
-        "episode_end": r.try_get::<Option<i64>, _>("episode_end").ok().flatten(),
-        // The show an episode belongs to, so a search hit called "Pilot"
-        // says which of its eight namesakes it is. The id lets a track
-        // hit open its ALBUM — tracks have no detail view of their own.
-        "parent_id": r.try_get::<Option<String>, _>("parent_id").ok().flatten(),
-        "parent_title": r.try_get::<Option<String>, _>("parent_title").ok().flatten(),
-        // Navigation context, not ownership — see ITEM_PAGE_COLS. Null for
-        // an item in no library at all, which only an unrestricted account
-        // can be looking at.
-        "library_id": r.try_get::<Option<String>, _>("library_id").ok().flatten(),
-        "proj_season": r.try_get::<Option<i64>, _>("proj_season").ok().flatten(),
-        "proj_episode": r.try_get::<Option<i64>, _>("proj_episode").ok().flatten(),
-        "sources": r.get::<i64, _>("sources"),
-        // HUB-19 ReplayGain, as stored: absent for anything untagged.
-        "replay_gain": r
+        art_version: r.try_get("art_version").ok().flatten(),
+        premiered: r.try_get("premiered").ok().flatten(),
+        file_title: r.try_get("file_title").ok().flatten(),
+        file_year: r.try_get("file_year").ok().flatten(),
+        matched_title: r.try_get("matched_title").ok().flatten(),
+        year: r.get("year"),
+        season: r.get("season"),
+        episode: r.get("episode"),
+        episode_end: r.try_get("episode_end").ok().flatten(),
+        parent_id: r.try_get("parent_id").ok().flatten(),
+        parent_title: r.try_get("parent_title").ok().flatten(),
+        library_id: r.try_get("library_id").ok().flatten(),
+        proj_season: r.try_get("proj_season").ok().flatten(),
+        proj_episode: r.try_get("proj_episode").ok().flatten(),
+        sources,
+        replay_gain: r
             .try_get::<Option<String>, _>("replay_gain")
             .ok()
             .flatten()
-            .and_then(|j| serde_json::from_str::<Value>(&j).ok()),
-        "resume_position_ms": r.get::<Option<i64>, _>("position_ms"),
-        "resume_duration_ms": r.try_get::<Option<i64>, _>("duration_ms").ok().flatten(),
-        "played": r.get::<Option<i64>, _>("played").unwrap_or(0) != 0,
-        "play_count": r.get::<Option<i64>, _>("play_count").unwrap_or(0),
-    })
+            .and_then(|value| serde_json::from_str(&value).ok()),
+        resume_position_ms: r.get("position_ms"),
+        resume_duration_ms: r.try_get("duration_ms").ok().flatten(),
+        played: r.get::<Option<i64>, _>("played").unwrap_or(0) != 0,
+        play_count: r.get::<Option<i64>, _>("play_count").unwrap_or(0),
+    }
+}
+
+fn item_row_json(r: &sqlx::sqlite::SqliteRow) -> Value {
+    serde_json::to_value(item_row(r, r.get::<i64, _>("sources")))
+        .expect("an item row contains only JSON values")
 }
 
 /// Episodes of a show (docs: /items/{id}/children — seasons are a
@@ -3125,12 +3199,179 @@ async fn item_children(
     let children: Vec<Value> = rows.iter().map(item_row_json).collect();
     Ok(Json(json!({ "children": children })))
 }
+#[derive(Serialize, ToSchema)]
+struct ItemSource {
+    module_id: String,
+    collection_id: String,
+    path_rel: String,
+    size: i64,
+    available: bool,
+    revision: i64,
+    /// Outer `None` omits streams from GET; inner `None` preserves a
+    /// malformed legacy stream record as JSON null on QUERY.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    streams: Option<Option<kahawai_core::media::MediaInfo>>,
+}
+
+#[derive(Serialize, ToSchema)]
+struct ItemMetadata {
+    overview: Option<String>,
+    rating: Option<f64>,
+    premiered: Option<String>,
+    confidence: String,
+    provider: Option<String>,
+    original_language: Option<String>,
+    genres: Option<Vec<String>>,
+    cast: Option<Vec<CastMember>>,
+}
+
+#[derive(Serialize, serde::Deserialize, ToSchema)]
+struct CastMember {
+    name: String,
+    character: Option<String>,
+}
+
+#[derive(Serialize, ToSchema)]
+struct RelatedItem {
+    kind: String,
+    title: Option<String>,
+    item_id: Option<String>,
+}
+
+#[derive(Serialize, ToSchema)]
+struct ItemDetailResponse {
+    #[serde(flatten)]
+    item: ItemRow<Vec<ItemSource>>,
+    show_title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metadata: Option<ItemMetadata>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    related: Vec<RelatedItem>,
+}
+
+#[derive(Serialize, ToSchema)]
+struct ItemQueryResponse {
+    #[serde(flatten)]
+    item: ItemDetailResponse,
+    #[serde(flatten)]
+    query: ItemQueryResult,
+}
+
+#[derive(Serialize, ToSchema)]
+struct ItemQueryResult {
+    negotiated: Option<NegotiatedItem>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unavailable: Option<String>,
+}
+
+#[derive(Serialize, ToSchema)]
+struct NegotiatedItem {
+    source: Option<NegotiatedSource>,
+    mode: String,
+    cost: String,
+    target_duration_secs: u32,
+    streams: NegotiatedStreams,
+    subtitles: Vec<SubtitleTrack>,
+}
+
+#[derive(Serialize, ToSchema)]
+struct NegotiatedSource {
+    module_id: String,
+    collection_id: String,
+    path_rel: String,
+    display_width: Option<u32>,
+    display_height: Option<u32>,
+    orientation: Option<String>,
+}
+
+#[derive(Serialize, ToSchema)]
+struct NegotiatedStreams {
+    video: String,
+    audio: String,
+    subtitles: Vec<SubtitleVerdict>,
+}
+
+#[derive(Serialize, ToSchema)]
+struct SubtitleVerdict {
+    index: usize,
+    track_id: Option<i64>,
+    format: String,
+    language: Option<String>,
+    tier: String,
+    note: String,
+}
+
+#[derive(Serialize, ToSchema)]
+struct SubtitleTrack {
+    id: i64,
+    item_id: String,
+    origin: String,
+    stream_index: Option<i64>,
+    format: String,
+    language: Option<String>,
+    label: Option<String>,
+    machine: bool,
+    derived_from: Option<i64>,
+    delivery: String,
+    note: String,
+    deletable: bool,
+}
+impl From<kahawai_media::negotiate::SubtitleVerdict> for SubtitleVerdict {
+    fn from(verdict: kahawai_media::negotiate::SubtitleVerdict) -> Self {
+        use kahawai_media::negotiate::SubtitleTier;
+
+        let tier = match verdict.tier {
+            SubtitleTier::Text => "text",
+            SubtitleTier::Convert => "convert",
+            SubtitleTier::Graphics => "graphics",
+            SubtitleTier::Ocr => "ocr",
+            SubtitleTier::Burn => "burn",
+            SubtitleTier::Unavailable => "unavailable",
+        };
+        Self {
+            index: verdict.index,
+            track_id: verdict.track_id,
+            format: verdict.format,
+            language: verdict.language,
+            tier: tier.to_string(),
+            note: verdict.note.to_string(),
+        }
+    }
+}
+
+impl From<crate::subtitles::TrackListing> for SubtitleTrack {
+    fn from(listing: crate::subtitles::TrackListing) -> Self {
+        use crate::tracks::Delivery;
+
+        let delivery = match listing.delivery {
+            Delivery::Text => "text",
+            Delivery::Ass => "ass",
+            Delivery::Overlay => "overlay",
+            Delivery::Burn => "burn",
+            Delivery::None => "none",
+        };
+        Self {
+            id: listing.track.id,
+            item_id: listing.track.item_id,
+            origin: listing.track.origin,
+            stream_index: listing.track.stream_index,
+            format: listing.track.format,
+            language: listing.track.language,
+            label: listing.track.label,
+            machine: listing.track.machine,
+            derived_from: listing.track.derived_from,
+            delivery: delivery.to_string(),
+            note: listing.note.to_string(),
+            deletable: listing.deletable,
+        }
+    }
+}
 
 async fn item_detail(
     State(state): State<AppState>,
     Path(id): Path<String>,
     axum::Extension(claims): axum::Extension<crate::auth::Claims>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<ItemDetailResponse>, ApiError> {
     Ok(Json(item_body(&state, &id, &claims.sub, false).await?))
 }
 
@@ -3146,7 +3387,7 @@ async fn item_body(
     id: &str,
     user_id: &str,
     with_streams: bool,
-) -> Result<Value, ApiError> {
+) -> Result<ItemDetailResponse, ApiError> {
     let item = sqlx::query(
         "SELECT i.id, i.kind, i.season, i.episode, i.artist,
                 COALESCE(md.title, i.title) AS title,
@@ -3188,32 +3429,25 @@ async fn item_body(
     .await
     .map_err(internal)?;
 
-    let sources: Vec<Value> = sources
+    let sources: Vec<ItemSource> = sources
         .iter()
         .map(|r| {
             let module_id: String = r.get("module_id");
-            let streams: Value = serde_json::from_str(r.get::<String, _>("streams_json").as_str())
-                .unwrap_or(Value::Null);
-            let mut src = json!({
-                "module_id": module_id,
-                "collection_id": r.get::<String, _>("collection_id"),
-                "path_rel": r.get::<String, _>("source_path"),
-                "size": r.get::<i64, _>("size"),
-                "available": state.registry.is_connected(&module_id),
-                "revision": r.get::<i64, _>("revision"),
-            });
-            if with_streams {
-                src["streams"] = streams;
+            ItemSource {
+                available: state.registry.is_connected(&module_id),
+                module_id,
+                collection_id: r.get("collection_id"),
+                path_rel: r.get("source_path"),
+                size: r.get("size"),
+                revision: r.get("revision"),
+                streams: with_streams.then(|| {
+                    serde_json::from_str(r.get::<String, _>("streams_json").as_str()).ok()
+                }),
             }
-            src
         })
         .collect();
 
-    let mut out = item_row_json(&item);
-    out["show_title"] = json!(item.get::<Option<String>, _>("show_title"));
-    // Hierarchical navigation (episode → its show):
-    out["parent_id"] = json!(item.get::<Option<String>, _>("parent_id"));
-    out["sources"] = json!(sources);
+    let show_title = item.get("show_title");
     // Enrichment (own metadata, or the parent show's for episodes).
     let meta = sqlx::query(
         "SELECT m.overview, m.rating, m.premiered, m.confidence, m.provider,
@@ -3233,26 +3467,24 @@ async fn item_body(
     .fetch_optional(state.registry.db())
     .await
     .map_err(internal)?;
-    if let Some(m) = meta {
-        out["metadata"] = json!({
-            "overview": m.get::<Option<String>, _>("overview"),
-            "rating": m.get::<Option<f64>, _>("rating"),
-            "premiered": m.get::<Option<String>, _>("premiered"),
-            "confidence": m.get::<String, _>("confidence"),
-            "provider": m.try_get::<Option<String>, _>("provider").ok().flatten(),
-            "original_language": m
-                .get::<Option<String>, _>("original_language")
-                .filter(|l| !l.is_empty()),
-            // Stored as JSON; hand them out as arrays rather than making
-            // every client parse a string out of a field (HUB-6).
-            "genres": m
-                .get::<Option<String>, _>("genres")
-                .and_then(|g| serde_json::from_str::<Value>(&g).ok()),
-            "cast": m
-                .get::<Option<String>, _>("cast_json")
-                .and_then(|c| serde_json::from_str::<Value>(&c).ok()),
-        });
-    }
+    let metadata = meta.map(|m| ItemMetadata {
+        overview: m.get("overview"),
+        rating: m.get("rating"),
+        premiered: m.get("premiered"),
+        confidence: m.get("confidence"),
+        provider: m.try_get("provider").ok().flatten(),
+        original_language: m
+            .get::<Option<String>, _>("original_language")
+            .filter(|language| !language.is_empty()),
+        // Stored as JSON; hand them out as arrays rather than making
+        // every client parse a string out of a field (HUB-6).
+        genres: m
+            .get::<Option<String>, _>("genres")
+            .and_then(|genres| serde_json::from_str(&genres).ok()),
+        cast: m
+            .get::<Option<String>, _>("cast_json")
+            .and_then(|cast| serde_json::from_str(&cast).ok()),
+    });
 
     // Anime relations (HUB-29): watchable related entries, resolved to
     // in-library items where the target exists here.
@@ -3270,27 +3502,26 @@ async fn item_body(
     .fetch_all(state.registry.db())
     .await
     .map_err(internal)?;
-    if !related.is_empty() {
-        out["related"] = Value::Array(
-            related
-                .iter()
-                .map(|r| {
-                    json!({
-                        "kind": r.get::<String, _>("kind"),
-                        "title": r.get::<Option<String>, _>("target_title"),
-                        "item_id": r.get::<Option<String>, _>("local_id"),
-                    })
-                })
-                .collect(),
-        );
-    }
-    Ok(out)
+    let related = related
+        .iter()
+        .map(|r| RelatedItem {
+            kind: r.get("kind"),
+            title: r.get("target_title"),
+            item_id: r.get("local_id"),
+        })
+        .collect();
+    Ok(ItemDetailResponse {
+        item: item_row(&item, sources),
+        show_title,
+        metadata,
+        related,
+    })
 }
 
 /// The question `QUERY /api/v1/items/{id}` answers. Same inputs a
 /// session start takes, minus everything that only matters once you
 /// are actually playing.
-#[derive(Deserialize, Default)]
+#[derive(Deserialize, Default, ToSchema)]
 struct ItemQuery {
     /// Absent = the conservative fallback, exactly as `start_session`
     /// treats a missing profile.
@@ -3324,6 +3555,21 @@ struct ItemQuery {
 /// EVERY unmatched method, so the method is checked here and the
 /// `Allow` header written by hand — axum's own 405 machinery no longer
 /// runs for this route.
+#[utoipa::path(
+    post,
+    path = "/api/v1/items/{id}",
+    params(("id" = String, Path, description = "Library item identifier")),
+    request_body = ItemQuery,
+    responses(
+        (status = 200, description = "Item details and current playback negotiation", body = ItemQueryResponse),
+        (status = 401, description = "Missing or invalid bearer token"),
+        (status = 404, description = "Item does not exist or is outside the account's libraries"),
+        (status = 409, description = "Playback capabilities cannot be negotiated"),
+        (status = 415, description = "QUERY requires an application/json body")
+    ),
+    security(("bearer_auth" = [])),
+    tag = "items"
+)]
 async fn item_query(
     State(state): State<AppState>,
     axum::Extension(claims): axum::Extension<crate::auth::Claims>,
@@ -3355,7 +3601,7 @@ async fn item_query(
         "QUERY needs a body with Content-Type: application/json".to_string(),
     ))?;
 
-    let mut out = item_body(&state, &id, &claims.sub, true).await?;
+    let out = item_body(&state, &id, &claims.sub, true).await?;
     let neg = crate::sessions::Negotiation::new(
         &state.sessions,
         &state.registry,
@@ -3376,14 +3622,17 @@ async fn item_query(
     let (parts, info, sp, mode) = match neg.best_source(&id, q.mode.as_deref()).await {
         Ok(v) => v,
         Err(e) => {
-            out["negotiated"] = Value::Null;
-            // Negotiation cannot tell those two apart — it sees an empty
-            // candidate set either way and blames the fleet. The source
-            // list is already in hand here, so say which it is.
-            out["unavailable"] = if out["sources"].as_array().is_some_and(|s| s.is_empty()) {
-                json!("this item has no media of its own")
+            let unavailable = if out.item.sources.is_empty() {
+                "this item has no media of its own".to_string()
             } else {
-                json!(format!("{e:#}"))
+                format!("{e:#}")
+            };
+            let out = ItemQueryResponse {
+                item: out,
+                query: ItemQueryResult {
+                    negotiated: None,
+                    unavailable: Some(unavailable),
+                },
             };
             return Ok((
                 [(
@@ -3419,35 +3668,40 @@ async fn item_query(
         None => Vec::new(),
     };
 
-    out["negotiated"] = json!({
-        "source": parts.first().map(|p| {
-            let video = info.video.first();
-            json!({
-                "module_id": p.module_id,
-                "collection_id": p.collection_id,
-                "path_rel": p.path_rel,
-                "display_width": video.and_then(|v| v.display_width),
-                "display_height": video.and_then(|v| v.display_height),
-                "orientation": video.and_then(|v| v.orientation.as_deref()),
-            })
-        }),
-        // What negotiation decided. A `remux` may still be dispatched to
-        // a transcoder at session start — that is placement, which QUERY
-        // does not do because it would claim a box.
-        "mode": mode,
-        "cost": sp.cost.as_str(),
-        // What the playlist would declare. Part of "what would I be
-        // served": for a `short` client it is the guarantee it asked
-        // for, and for an `accurate` one it is how long its player will
-        // wait before it may start (RFC 8216 §6.3.3).
-        "target_duration_secs": sp.target_duration_secs,
-        "streams": {
-            "video": sp.video_verdict,
-            "audio": sp.audio_verdict,
-            "subtitles": verdicts,
-        },
-        "subtitles": subtitles,
+    let source = parts.first().map(|part| {
+        let video = info.video.first();
+        NegotiatedSource {
+            module_id: part.module_id.clone(),
+            collection_id: part.collection_id.clone(),
+            path_rel: part.path_rel.clone(),
+            display_width: video.and_then(|stream| stream.display_width),
+            display_height: video.and_then(|stream| stream.display_height),
+            orientation: video.and_then(|stream| stream.orientation.clone()),
+        }
     });
+    let out = ItemQueryResponse {
+        item: out,
+        query: ItemQueryResult {
+            negotiated: Some(NegotiatedItem {
+                source,
+                // What negotiation decided. A `remux` may still be dispatched to
+                // a transcoder at session start — that is placement, which QUERY
+                // does not do because it would claim a box.
+                mode,
+                cost: sp.cost.as_str().to_string(),
+                // Part of "what would I be served": an accurate client learns
+                // how long its player must wait before it may start.
+                target_duration_secs: sp.target_duration_secs,
+                streams: NegotiatedStreams {
+                    video: sp.video_verdict,
+                    audio: sp.audio_verdict,
+                    subtitles: verdicts.into_iter().map(Into::into).collect(),
+                },
+                subtitles: subtitles.into_iter().map(Into::into).collect(),
+            }),
+            unavailable: None,
+        },
+    };
     Ok((
         [(
             axum::http::HeaderName::from_static("accept-query"),
@@ -3853,7 +4107,7 @@ async fn session_file(
 
 #[cfg(test)]
 mod tests {
-    use super::{PublicOrigin, parse_range};
+    use super::{PublicOrigin, openapi_document, parse_range};
 
     #[test]
     fn range_forms() {
@@ -3904,5 +4158,26 @@ mod tests {
         ] {
             assert!(PublicOrigin::parse(invalid).is_err(), "{invalid}");
         }
+    }
+
+    #[test]
+    fn openapi_uses_3_2_query_with_typed_bodies() {
+        let document = serde_json::to_value(openapi_document()).unwrap();
+        let path = &document["paths"]["/api/v1/items/{id}"];
+
+        assert_eq!(document["openapi"], "3.2.0");
+        assert!(path.get("post").is_none());
+        assert_eq!(
+            path["query"]["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/ItemQuery"
+        );
+        assert_eq!(
+            path["query"]["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/ItemQueryResponse"
+        );
+        assert_eq!(
+            document["components"]["securitySchemes"]["bearer_auth"]["scheme"],
+            "bearer"
+        );
     }
 }

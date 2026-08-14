@@ -169,6 +169,8 @@ authentication cookies and tokens cross the network in cleartext. When it is
 unset, only peers in `hub.trusted_proxies` may replace the `http://Host`
 default through `X-Forwarded-Proto` and `X-Forwarded-Host`.
 
+The live OpenAPI 3.2 document is served at `/api-docs/openapi.json`; browse and
+exercise it through the embedded Swagger UI at `/swagger-ui`.
 Metadata providers (TMDB key, TheTVDB key/PIN) are configured in the admin
 web UI, not the config file. Mediahost roots are treated as strictly read-only —
 Kahawai never writes next to your media. Root list order has no identity meaning:

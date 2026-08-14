@@ -75,3 +75,5 @@ rust-embed = "8"
 libc = "0.2"
 rpassword = "7"
 url = "2"
+utoipa = { git = "https://github.com/juhaku/utoipa", rev = "e092565a9724b07a5ebf122e80ffa3d70addbe5d" }
+utoipa-swagger-ui = { git = "https://github.com/juhaku/utoipa", rev = "e092565a9724b07a5ebf122e80ffa3d70addbe5d", default-features = false, features = ["axum", "vendored"] }
