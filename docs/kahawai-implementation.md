@@ -318,15 +318,23 @@ Sessions end for reasons a client cannot predict — idle reaping (HUB-18), a hu
 
 QUERY is **safe and idempotent, and returns only what is knowable now**: it starts no extraction, generates no raster, opens no lease and claims no transcoder, so no session is ever slower because someone asked a question about it. Tiers gated on an artefact report the artefact that already exists — the overlay rung only where a raster row is already there — which under-promises on first play rather than over-promising the expensive tier. `Accept-Query: application/json` advertises it, a missing or inconsistent `Content-Type` is refused per the RFC, and an unsupported method answers 405 with `Allow: GET, QUERY`.
 
-**Generated contract.** The public listener serves its code-first OpenAPI 3.2
+**Generated contract.** The public listener serves the code-first OpenAPI 3.2
 document at `/api-docs/openapi.json` and a vendored Swagger UI at
-`/swagger-ui`. `ItemQuery` and `ItemQueryResponse` are the first end-to-end
-typed slice: the Axum handler deserializes and serializes those DTOs directly,
-and the same Rust types derive the request, response and nested media schemas.
-The document declares the JWT bearer scheme used by the route. This is the
-start of ENG-1/2, not their completion: other stable handlers still construct
-untyped JSON, and TypeScript generation plus a whole-contract compatibility
-snapshot remain.
+`/swagger-ui`. The document has 62 distinct method/path operations for all 63
+application bindings: the public and trusted-local listeners share
+`GET /api/v1/bootstrap`. The SPA catch-all and the Swagger/document-serving
+routes remain mounted infrastructure, not self-described application
+operations.
+
+Every handler request and JSON response is a concrete Rust model. Producer-owned
+wire values stay owned by their domain modules — registry overviews and events,
+health, grants, enrichment candidates, subtitle tracks and negotiation verdicts
+— rather than being copied into API-local JSON assembly. `ToSchema` on those
+same types supplies every nested component. Required nullable fields and
+`serde`-omitted fields are marked separately, preserving the deployed
+null-versus-absent distinction. The operations also declare path/query/header
+parameters, response statuses and content types, binary/streaming headers, and
+their JWT bearer, media query-token or static metrics-token boundary.
 
 `utoipa` and `utoipa-swagger-ui` are pinned together at commit
 `e092565a9724b07a5ebf122e80ffa3d70addbe5d`, after its OpenAPI 3.2 model and
@@ -334,11 +342,14 @@ snapshot remain.
 has `PathItem.query`; the path macro still has no QUERY verb. Until it does,
 the real handler is described through the macro's POST arm and
 `openapi_document` moves that generated operation from `post` to `query`.
-`api::tests::openapi_uses_3_2_query_with_typed_bodies` makes the workaround
-fail closed: it requires 3.2, QUERY, the DTO references and bearer scheme, and
-rejects a leftover POST operation. The vendored Swagger assets trade one
-pinned source dependency for builds that do not require curl or network
-access.
+`api::tests::openapi_covers_exact_application_surface_with_typed_bodies` fails
+closed on the exact 62-operation set, 3.2/QUERY placement, typed JSON bodies,
+security schemes and nullable/omitted schema boundaries.
+`admin_api::admin_flow_enrollments_satellites_archive_restore` then fetches the
+served document and proves every documented protected method/path reaches a
+mounted authentication boundary rather than the SPA fallback. The vendored
+Swagger assets keep builds and rendering independent of a CDN. TypeScript
+generation and a post-1.0 compatibility baseline remain ENG-2/6 work.
 
 *This breaks v1 in place, against NFR-7* ("breaking changes only in a new major API version"). Deliberate, with the maintainer's sanction: there are no external clients yet, and carrying a `/api/v2` for a pre-release keyspace costs more than it protects. NFR-7 governs from the first outside consumer.
 

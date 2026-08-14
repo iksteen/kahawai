@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::body::Body;
-use axum::http::{Request, StatusCode};
+use axum::http::{Method, Request, StatusCode};
 use kahawai_hub::auth::Auth;
 use kahawai_hub::enrollment_service::EnrollmentService;
 use kahawai_hub::pki::HubCa;
@@ -72,7 +72,7 @@ async fn admin_flow_enrollments_satellites_archive_restore() {
 
     let api = kahawai_hub::api::router(
         registry.clone(),
-        auth,
+        auth.clone(),
         sessions,
         enrollments.clone(),
         Arc::new(kahawai_hub::subtitles::Subtitles::new(
@@ -89,6 +89,111 @@ async fn admin_flow_enrollments_satellites_archive_restore() {
         )),
         kahawai_hub::api::NetOptions::default(),
     );
+
+    // Contract closure: every documented protected operation must be an
+    // actual method/path binding. A bogus bearer is deliberate: matching
+    // application routes stop at their auth layer with 401, while the SPA
+    // catch-all would answer 200 and a wrong method would answer 405.
+    let contract = body_json(
+        api.clone()
+            .oneshot(
+                Request::get("/api-docs/openapi.json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(contract["openapi"], "3.2.0");
+    let methods = [
+        "get", "put", "post", "delete", "options", "head", "patch", "trace", "query",
+    ];
+    let public = [
+        ("get", "/health"),
+        ("get", "/metrics"),
+        ("get", "/api/v1/bootstrap"),
+        ("post", "/api/v1/setup"),
+        ("post", "/api/v1/auth/token"),
+        ("post", "/api/v1/auth/refresh"),
+    ];
+    let mut mounted = 0;
+    for (path, item) in contract["paths"].as_object().unwrap() {
+        for method in methods {
+            if item.get(method).is_none() || public.contains(&(method, path.as_str())) {
+                continue;
+            }
+            let uri = path
+                .replace("{track_id}", "1")
+                .replace("{media_type}", "movies")
+                .replace("{module_id}", "host")
+                .replace("{collection_id}", "collection")
+                .replace("{file}", "file")
+                .replace("{n}", "0")
+                .replace("{id}", "missing");
+            let response = api
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::from_bytes(method.to_ascii_uppercase().as_bytes()).unwrap())
+                        .uri(uri)
+                        .header("authorization", "Bearer invalid")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{method} {path} is documented but not mounted behind authentication"
+            );
+            mounted += 1;
+        }
+    }
+    assert_eq!(mounted, 56);
+    assert_eq!(
+        api.clone()
+            .oneshot(Request::get("/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    for path in ["/api/v1/auth/token", "/api/v1/auth/refresh"] {
+        assert_eq!(
+            api.clone()
+                .oneshot(
+                    Request::post(path)
+                        .header("content-type", "application/json")
+                        .body(Body::from("{}"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::BAD_REQUEST,
+            "{path} is not mounted"
+        );
+    }
+    let setup_api = kahawai_hub::api::setup_router(auth.clone());
+    assert_eq!(
+        setup_api
+            .oneshot(
+                Request::post("/api/v1/setup")
+                    .header("host", "127.0.0.1:8421")
+                    .header("origin", "http://127.0.0.1:8421")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"username":"again","password":"password-123"}"#
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::CONFLICT
+    );
     let get = |uri: &str, bearer: &str| {
         Request::get(uri)
             .header("authorization", bearer.to_string())
@@ -103,12 +208,62 @@ async fn admin_flow_enrollments_satellites_archive_restore() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-    let resp = api
-        .clone()
-        .oneshot(get("/admin/v1/satellites", &admin_bearer))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
+    let v = body_json(
+        api.clone()
+            .oneshot(get("/admin/v1/satellites", &admin_bearer))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(v, serde_json::json!({ "satellites": [] }));
+
+    for (path, expected) in [
+        (
+            "/admin/v1/libraries",
+            serde_json::json!({ "libraries": [] }),
+        ),
+        (
+            "/admin/v1/collections",
+            serde_json::json!({ "collections": [] }),
+        ),
+        ("/admin/v1/sessions", serde_json::json!({ "sessions": [] })),
+    ] {
+        let v = body_json(api.clone().oneshot(get(path, &admin_bearer)).await.unwrap()).await;
+        assert_eq!(v, expected, "{path}");
+    }
+    let v = body_json(
+        api.clone()
+            .oneshot(get("/admin/v1/providers", &admin_bearer))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        v,
+        serde_json::json!({
+            "tmdb": { "configured": false },
+            "tvdb": { "configured": false },
+            "anidb": { "configured": false },
+            "chains": {
+                "movies": {
+                    "order": ["tmdb", "tvdb"],
+                    "default": ["tmdb", "tvdb"],
+                },
+                "series": {
+                    "order": ["tmdb", "tvdb"],
+                    "default": ["tmdb", "tvdb"],
+                },
+                "anime": {
+                    "order": ["anime", "tmdb", "tvdb"],
+                    "default": ["anime", "tmdb", "tvdb"],
+                },
+                "music": {
+                    "order": ["musicbrainz"],
+                    "default": ["musicbrainz"],
+                },
+            },
+        })
+    );
 
     // Enrollment via HTTP: submit a CSR (gRPC surface, called in-process),
     // see it listed, approve it with the console code.

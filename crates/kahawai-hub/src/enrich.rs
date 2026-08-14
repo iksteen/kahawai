@@ -9,8 +9,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sqlx::Row;
+use utoipa::ToSchema;
 
 use crate::registry::Registry;
 
@@ -63,6 +64,14 @@ pub struct Enricher {
     /// mediahost that holds it. Attached at startup; absent in tests, where
     /// the local provider then simply is not in the chain.
     sessions: std::sync::OnceLock<Arc<crate::sessions::Sessions>>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct EnrichStatus {
+    pub running: bool,
+    pub matched: usize,
+    pub weak: usize,
+    pub missed: usize,
 }
 
 /// One file moved to the episode its hash says it is (HUB-30).
@@ -150,6 +159,105 @@ pub struct Candidate {
     /// ISO 639-1 from TMDB search; TVDB maps primary_language into it.
     #[serde(default)]
     original_language: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct CatalogCandidate {
+    pub id: u64,
+    pub provider: &'static str,
+    pub title: String,
+    #[schema(required)]
+    pub original_title: Option<String>,
+    #[schema(required)]
+    pub overview: Option<String>,
+    #[schema(required)]
+    pub poster_path: Option<String>,
+    #[schema(required)]
+    pub vote_average: Option<f64>,
+    #[schema(required)]
+    pub release_date: Option<String>,
+    #[schema(required)]
+    pub original_language: Option<String>,
+    pub format: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub poster_url: Option<String>,
+}
+
+impl CatalogCandidate {
+    fn from_provider(
+        candidate: Candidate,
+        provider: &'static str,
+        format: &'static str,
+        poster_url: Option<String>,
+    ) -> Self {
+        Self {
+            id: candidate.id,
+            provider,
+            title: candidate.title,
+            original_title: candidate.original_title,
+            overview: candidate.overview,
+            poster_path: candidate.poster_path,
+            vote_average: candidate.vote_average,
+            release_date: candidate.release_date,
+            original_language: candidate.original_language,
+            format,
+            poster_url,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct AnilistCandidate {
+    pub id: u32,
+    pub provider: &'static str,
+    #[schema(required)]
+    pub title: Option<String>,
+    #[schema(required)]
+    pub overview: Option<String>,
+    #[schema(required)]
+    pub poster_path: Option<String>,
+    #[schema(required)]
+    pub poster_url: Option<String>,
+    #[schema(required)]
+    pub release_date: Option<String>,
+    #[schema(required)]
+    pub vote_average: Option<f64>,
+    #[schema(required)]
+    pub format: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+#[serde(untagged)]
+pub enum ProviderCandidate {
+    Catalog(CatalogCandidate),
+    Anilist(AnilistCandidate),
+}
+
+impl ProviderCandidate {
+    fn title(&self) -> Option<&str> {
+        match self {
+            Self::Catalog(candidate) => Some(&candidate.title),
+            Self::Anilist(candidate) => candidate.title.as_deref(),
+        }
+    }
+
+    fn release_date(&self) -> Option<&str> {
+        match self {
+            Self::Catalog(candidate) => candidate.release_date.as_deref(),
+            Self::Anilist(candidate) => candidate.release_date.as_deref(),
+        }
+    }
+
+    fn vote_average(&self) -> Option<f64> {
+        match self {
+            Self::Catalog(candidate) => candidate.vote_average,
+            Self::Anilist(candidate) => candidate.vote_average,
+        }
+    }
+
+    fn is_anilist(&self) -> bool {
+        matches!(self, Self::Anilist(_))
+    }
 }
 
 impl Candidate {
@@ -427,13 +535,13 @@ impl Enricher {
         &self.data_dir
     }
 
-    pub fn status(&self) -> serde_json::Value {
-        serde_json::json!({
-            "running": self.running.load(Ordering::SeqCst),
-            "matched": self.progress.0.load(Ordering::SeqCst),
-            "weak": self.progress.1.load(Ordering::SeqCst),
-            "missed": self.progress.2.load(Ordering::SeqCst),
-        })
+    pub fn status(&self) -> EnrichStatus {
+        EnrichStatus {
+            running: self.running.load(Ordering::SeqCst),
+            matched: self.progress.0.load(Ordering::SeqCst),
+            weak: self.progress.1.load(Ordering::SeqCst),
+            missed: self.progress.2.load(Ordering::SeqCst),
+        }
     }
 
     async fn search(
@@ -871,7 +979,10 @@ impl Enricher {
         self: &Arc<Self>,
         registry: &Arc<Registry>,
     ) -> Result<(usize, usize, usize)> {
-        registry.emit(serde_json::json!({ "kind": "enrich", "running": true }));
+        registry.emit(crate::registry::RegistryEvent::EnrichRunning {
+            kind: "enrich",
+            running: true,
+        });
         // HUB-5a: OPTIONAL. Chains are declared per media type, so one
         // type's credential must not decide whether another type runs —
         // `chain_for("music")` is musicbrainz alone and needs no key at
@@ -1077,7 +1188,10 @@ impl Enricher {
             self.progress.2.load(Ordering::SeqCst),
         );
         tracing::info!(matched = m, weak = w, missed = x, "enrichment run complete");
-        registry.emit(serde_json::json!({ "kind": "enrich", "running": false }));
+        registry.emit(crate::registry::RegistryEvent::EnrichRunning {
+            kind: "enrich",
+            running: false,
+        });
         // Both are TMDB's own passes: no key, nothing for them to do.
         // Skipped, not fatal — the chains above may have enriched
         // plenty without one (HUB-5a).
@@ -2967,7 +3081,7 @@ impl Enricher {
         query: &str,
         year: Option<i64>,
         item: Option<&str>,
-    ) -> Result<serde_json::Value> {
+    ) -> Result<Vec<ProviderCandidate>> {
         // Which identity space does this item live in? An anime-
         // collection item wants AniList candidates ahead of the
         // generic providers at equal relevance — and vice versa.
@@ -2984,22 +3098,20 @@ impl Enricher {
             .unwrap_or(false),
             None => false,
         };
-        let mut out: Vec<serde_json::Value> = Vec::new();
+        let mut out = Vec::new();
         if let Some(key) = registry.get_setting(TMDB_KEY_SETTING).await? {
             match self.search(&key, kind, query, year).await {
-                Ok(cands) => out.extend(cands.iter().map(|c| {
-                    let mut v = serde_json::to_value(c).unwrap();
-                    v["provider"] = serde_json::json!("tmdb");
-                    // The search hit one typed endpoint, so the format
-                    // is the endpoint's, not per-candidate data.
-                    v["format"] =
-                        serde_json::json!(if kind == "movie" { "Movie" } else { "Series" });
-                    // Absolute preview URL for the admin UI.
-                    if let Some(p) = c.poster_path.as_deref() {
-                        v["poster_url"] =
-                            serde_json::json!(format!("https://image.tmdb.org/t/p/w154{p}"));
-                    }
-                    v
+                Ok(candidates) => out.extend(candidates.into_iter().map(|candidate| {
+                    let poster_url = candidate
+                        .poster_path
+                        .as_deref()
+                        .map(|path| format!("https://image.tmdb.org/t/p/w154{path}"));
+                    ProviderCandidate::Catalog(CatalogCandidate::from_provider(
+                        candidate,
+                        "tmdb",
+                        if kind == "movie" { "Movie" } else { "Series" },
+                        poster_url,
+                    ))
                 })),
                 Err(e) => tracing::warn!(error = format!("{e:#}"), "review tmdb search failed"),
             }
@@ -3013,15 +3125,14 @@ impl Enricher {
             // titles in a row used to log in five times.
             if let Ok(token) = self.tvdb_token(&creds).await {
                 match self.tvdb_search(&token, kind, query).await {
-                    Ok(cands) => out.extend(cands.iter().map(|c| {
-                        let mut v = serde_json::to_value(c).unwrap();
-                        v["provider"] = serde_json::json!("tvdb");
-                        v["format"] =
-                            serde_json::json!(if kind == "movie" { "Movie" } else { "Series" });
-                        if let Some(p) = c.poster_path.as_deref() {
-                            v["poster_url"] = serde_json::json!(p);
-                        }
-                        v
+                    Ok(candidates) => out.extend(candidates.into_iter().map(|candidate| {
+                        let poster_url = candidate.poster_path.clone();
+                        ProviderCandidate::Catalog(CatalogCandidate::from_provider(
+                            candidate,
+                            "tvdb",
+                            if kind == "movie" { "Movie" } else { "Series" },
+                            poster_url,
+                        ))
                     })),
                     Err(e) => {
                         tracing::warn!(error = format!("{e:#}"), "review tvdb search failed")
@@ -3034,34 +3145,39 @@ impl Enricher {
         // pin machinery is provider-generic, so offering 'anilist'
         // candidates is all HUB-8 needs to hand-match anime.
         match self.anilist.search(query).await {
-            Ok(media) => out.extend(media.iter().map(|m| {
-                serde_json::json!({
-                    "id": m.id,
-                    "provider": "anilist",
-                    "title": m.display_title(),
-                    "overview": m.plain_description(),
-                    "poster_path": m.cover_image.as_ref()
-                        .and_then(|c| c.extra_large.clone().or_else(|| c.large.clone())),
-                    "poster_url": m.cover_image.as_ref()
-                        .and_then(|c| c.large.clone().or_else(|| c.extra_large.clone())),
-                    "release_date": m.premiered(),
-                    "vote_average": m.average_score.map(|s| s / 10.0),
-                    "format": m.format.as_deref().map(|f| match f {
-                        "TV" => "TV",
-                        "TV_SHORT" => "TV Short",
-                        "MOVIE" => "Movie",
-                        "OVA" => "OVA",
-                        "ONA" => "ONA",
-                        "SPECIAL" => "Special",
-                        "MUSIC" => "Music",
-                        other => other,
+            Ok(media) => out.extend(media.iter().map(|media| {
+                ProviderCandidate::Anilist(AnilistCandidate {
+                    id: media.id,
+                    provider: "anilist",
+                    title: media.display_title(),
+                    overview: media.plain_description(),
+                    poster_path: media.cover_image.as_ref().and_then(|cover| {
+                        cover.extra_large.clone().or_else(|| cover.large.clone())
+                    }),
+                    poster_url: media.cover_image.as_ref().and_then(|cover| {
+                        cover.large.clone().or_else(|| cover.extra_large.clone())
+                    }),
+                    release_date: media.premiered(),
+                    vote_average: media.average_score.map(|score| score / 10.0),
+                    format: media.format.as_deref().map(|format| {
+                        match format {
+                            "TV" => "TV",
+                            "TV_SHORT" => "TV Short",
+                            "MOVIE" => "Movie",
+                            "OVA" => "OVA",
+                            "ONA" => "ONA",
+                            "SPECIAL" => "Special",
+                            "MUSIC" => "Music",
+                            other => other,
+                        }
+                        .to_string()
                     }),
                 })
             })),
             Err(e) => tracing::warn!(error = format!("{e:#}"), "review anilist search failed"),
         }
         rank_candidates(&mut out, query, year, anime_first);
-        Ok(serde_json::json!(out))
+        Ok(out)
     }
 
     /// Fetch a TMDB poster (used by the artwork store when an item has
@@ -4028,34 +4144,35 @@ mod nfo_tests {
 /// the things actually CALLED Kite above "One Day A Letter Arrives
 /// from the Dog Kingdom".
 pub fn rank_candidates(
-    out: &mut [serde_json::Value],
+    out: &mut [ProviderCandidate],
     query: &str,
     year: Option<i64>,
     anime_first: bool,
 ) {
     let q = fold(query);
-    let key = |v: &serde_json::Value| {
-        let t = v["title"].as_str().map(fold).unwrap_or_default();
-        let title_score = if t == q {
+    let key = |candidate: &ProviderCandidate| {
+        let title = candidate.title().map(fold).unwrap_or_default();
+        let title_score = if title == q {
             0u8
-        } else if t.starts_with(&q) {
+        } else if title.starts_with(&q) {
             1
-        } else if t.contains(&q) {
+        } else if title.contains(&q) {
             2
         } else {
             3
         };
-        let year_miss = match (year, v["release_date"].as_str().and_then(|d| d.get(..4))) {
+        let year_miss = match (
+            year,
+            candidate.release_date().and_then(|date| date.get(..4)),
+        ) {
             (Some(want), Some(got)) => (got.parse::<i64>().ok() != Some(want)) as u8,
             _ => 0,
         };
         // At equal relevance, the provider that owns the item's
-        // identity space leads: anilist for anime items, the generic
-        // pair otherwise.
-        let is_anilist = v["provider"].as_str() == Some("anilist");
-        let provider_rank = (is_anilist != anime_first) as u8;
+        // identity space leads: anilist for anime items, generic otherwise.
+        let provider_rank = (candidate.is_anilist() != anime_first) as u8;
         // Rating descending, NaN-safe, as an integer key.
-        let rating = -(v["vote_average"].as_f64().unwrap_or(0.0) * 10.0) as i64;
+        let rating = -(candidate.vote_average().unwrap_or(0.0) * 10.0) as i64;
         (title_score, year_miss, provider_rank, rating)
     };
     out.sort_by_key(key);
@@ -4063,24 +4180,58 @@ pub fn rank_candidates(
 
 #[cfg(test)]
 mod candidate_rank_tests {
-    use super::rank_candidates;
-    use serde_json::json;
+    use super::{AnilistCandidate, CatalogCandidate, ProviderCandidate, rank_candidates};
+
+    fn candidate(
+        provider: &'static str,
+        title: &str,
+        release_date: &str,
+        vote_average: f64,
+    ) -> ProviderCandidate {
+        if provider == "anilist" {
+            ProviderCandidate::Anilist(AnilistCandidate {
+                id: 0,
+                provider,
+                title: Some(title.into()),
+                overview: None,
+                poster_path: None,
+                poster_url: None,
+                release_date: Some(release_date.into()),
+                vote_average: Some(vote_average),
+                format: None,
+            })
+        } else {
+            ProviderCandidate::Catalog(CatalogCandidate {
+                id: 0,
+                provider,
+                title: title.into(),
+                original_title: None,
+                overview: None,
+                poster_path: None,
+                vote_average: Some(vote_average),
+                release_date: Some(release_date.into()),
+                original_language: None,
+                format: "Movie",
+                poster_url: None,
+            })
+        }
+    }
 
     #[test]
     fn typed_title_beats_provider_order() {
-        let mut cands = vec![
-            json!({"title": "One Day A Letter Arrives", "release_date": "2015-01-01", "vote_average": 9.0}),
-            json!({"title": "Kite Liberator", "release_date": "2008-03-21", "vote_average": 6.0}),
-            json!({"title": "Kite", "release_date": "2014-10-09", "vote_average": 5.0}),
-            json!({"title": "Kite", "release_date": "1998-02-25", "vote_average": 7.0}),
+        let mut candidates = vec![
+            candidate("tmdb", "One Day A Letter Arrives", "2015-01-01", 9.0),
+            candidate("tmdb", "Kite Liberator", "2008-03-21", 6.0),
+            candidate("tmdb", "Kite", "2014-10-09", 5.0),
+            candidate("tmdb", "Kite", "1998-02-25", 7.0),
         ];
-        rank_candidates(&mut cands, "Kite", Some(1998), false);
-        let titles: Vec<(&str, &str)> = cands
+        rank_candidates(&mut candidates, "Kite", Some(1998), false);
+        let titles: Vec<(&str, &str)> = candidates
             .iter()
-            .map(|c| {
+            .map(|candidate| {
                 (
-                    c["title"].as_str().unwrap(),
-                    &c["release_date"].as_str().unwrap()[..4],
+                    candidate.title().unwrap(),
+                    &candidate.release_date().unwrap()[..4],
                 )
             })
             .collect();
@@ -4098,20 +4249,20 @@ mod candidate_rank_tests {
 
     #[test]
     fn collection_identity_space_leads_at_equal_relevance() {
-        let mk = || {
+        let candidates = || {
             vec![
-                json!({"title": "Kite", "provider": "tmdb", "release_date": "2014-10-09", "vote_average": 9.0}),
-                json!({"title": "Kite", "provider": "anilist", "release_date": "1998-02-25", "vote_average": 7.0}),
+                candidate("tmdb", "Kite", "2014-10-09", 9.0),
+                candidate("anilist", "Kite", "1998-02-25", 7.0),
             ]
         };
-        let mut anime = mk();
+        let mut anime = candidates();
         rank_candidates(&mut anime, "Kite", None, true);
-        assert_eq!(
-            anime[0]["provider"], "anilist",
+        assert!(
+            anime[0].is_anilist(),
             "anime item: anilist leads its rating notwithstanding"
         );
-        let mut generic = mk();
+        let mut generic = candidates();
         rank_candidates(&mut generic, "Kite", None, false);
-        assert_eq!(generic[0]["provider"], "tmdb", "generic item: tmdb leads");
+        assert!(!generic[0].is_anilist(), "generic item: tmdb leads");
     }
 }

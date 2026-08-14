@@ -51,34 +51,42 @@ pub struct ProviderConfig {
 }
 
 /// One search result the user can choose to download.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
 pub struct Candidate {
     pub provider: &'static str,
     /// Opaque download handle (OpenSubtitles file_id, stringified).
     pub file_id: String,
+    #[schema(required)]
     pub language: Option<String>,
+    #[schema(required)]
     pub release_name: Option<String>,
     /// True when the provider matched by moviehash (exact file, HUB-22)
     /// rather than by title — surfaced so the UI can rank/badge it.
     pub hash_match: bool,
     pub downloads: i64,
     /// HUB-24 display fields: who uploaded it and how it rates.
+    #[schema(required)]
     pub uploader: Option<String>,
+    #[schema(required)]
     pub rating: Option<f64>,
     /// Frames per second the subtitle was timed against, when the
     /// provider knows it (0/None = unknown). A mismatch with the file
     /// is the classic cause of progressive drift.
+    #[schema(required)]
     pub fps: Option<f64>,
 }
 
 /// HUB-21/24: what is left of the download entitlement. Anonymous
 /// usage shares one budget across the whole deployment, which the UI
 /// must say out loud.
-#[derive(Debug, Clone, Default, serde::Serialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, utoipa::ToSchema)]
 pub struct Quota {
+    #[schema(required)]
     pub remaining: Option<i64>,
+    #[schema(required)]
     pub total: Option<i64>,
     /// Seconds until the entitlement resets, when the provider says.
+    #[schema(required)]
     pub resets_in_secs: Option<i64>,
     /// False = anonymous, i.e. shared by everyone using this hub.
     pub per_account: bool,

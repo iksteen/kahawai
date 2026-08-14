@@ -19,7 +19,8 @@
 use std::fmt::Write as _;
 
 use anyhow::Result;
-use serde_json::json;
+use serde::Serialize;
+use utoipa::ToSchema;
 
 use crate::registry::Registry;
 use crate::sessions::Sessions;
@@ -38,6 +39,7 @@ pub struct Snapshot {
     pub anidb_banned_secs: i64,
 }
 
+#[derive(Debug, Clone)]
 pub struct ModuleHealth {
     pub module_id: String,
     pub name: String,
@@ -58,6 +60,7 @@ pub struct ModuleHealth {
     pub tonemap_2160: Option<f64>,
 }
 
+#[derive(Debug, Clone)]
 pub struct EncoderSpeed {
     pub codec: String,
     pub element: String,
@@ -68,6 +71,40 @@ pub struct EncoderSpeed {
     /// much louder claim.
     pub s1080: Option<f64>,
     pub s2160: Option<f64>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct HealthResponse {
+    pub status: &'static str,
+    pub version: &'static str,
+    pub sessions_active: usize,
+    pub modules: Vec<HealthModule>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct HealthModule {
+    pub module_id: String,
+    pub name: String,
+    pub kind: String,
+    pub status: &'static str,
+    pub build: String,
+    #[schema(required)]
+    pub encoders: Option<Vec<HealthEncoder>>,
+    #[schema(required)]
+    pub tonemap_realtime_1080: Option<f64>,
+    #[schema(required)]
+    pub tonemap_realtime_2160: Option<f64>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct HealthEncoder {
+    pub codec: String,
+    pub element: String,
+    pub hardware: bool,
+    #[schema(required)]
+    pub realtime_1080: Option<f64>,
+    #[schema(required)]
+    pub realtime_2160: Option<f64>,
 }
 
 /// One scrape. Cheap by construction; see the module note.
@@ -81,31 +118,35 @@ pub async fn gather(
         .satellites_overview()
         .await?
         .into_iter()
-        .map(|v| {
-            let caps = &v["capabilities"];
+        .map(|satellite| {
+            let capabilities = satellite.capabilities.as_ref();
             ModuleHealth {
-                module_id: v["module_id"].as_str().unwrap_or_default().to_string(),
-                name: v["name"].as_str().unwrap_or_default().to_string(),
-                kind: v["module_type"].as_str().unwrap_or_default().to_string(),
-                connected: v["connected"].as_bool().unwrap_or(false),
-                disabled: v["disabled"].as_bool().unwrap_or(false),
-                build: v["build"].as_str().unwrap_or_default().to_string(),
-                encoders: caps["encoders"]
-                    .as_array()
-                    .map(|a| {
-                        a.iter()
-                            .map(|e| EncoderSpeed {
-                                codec: e["codec"].as_str().unwrap_or_default().to_string(),
-                                element: e["element"].as_str().unwrap_or_default().to_string(),
-                                hardware: e["hardware"].as_bool().unwrap_or(false),
-                                s1080: e["speed_1080"].as_f64(),
-                                s2160: e["speed_2160"].as_f64(),
+                module_id: satellite.module_id,
+                name: satellite.name,
+                kind: satellite.module_type,
+                connected: satellite.connected,
+                disabled: satellite.disabled,
+                build: satellite.build.unwrap_or_default(),
+                encoders: capabilities
+                    .map(|caps| {
+                        caps.encoders
+                            .iter()
+                            .map(|encoder| EncoderSpeed {
+                                codec: encoder.codec.clone(),
+                                element: encoder.element.clone(),
+                                hardware: encoder.hardware,
+                                s1080: encoder.speed_1080.map(f64::from),
+                                s2160: encoder.speed_2160.map(f64::from),
                             })
                             .collect()
                     })
                     .unwrap_or_default(),
-                tonemap_1080: caps["tonemap_speed_1080"].as_f64(),
-                tonemap_2160: caps["tonemap_speed_2160"].as_f64(),
+                tonemap_1080: capabilities
+                    .and_then(|caps| caps.tonemap_speed_1080)
+                    .map(f64::from),
+                tonemap_2160: capabilities
+                    .and_then(|caps| caps.tonemap_speed_2160)
+                    .map(f64::from),
             }
         })
         .collect();
@@ -311,43 +352,50 @@ pub fn render(s: &Snapshot) -> String {
 /// "Degraded" rather than "down" when a satellite is missing: the hub is
 /// still serving everything the other modules hold, and a monitor that
 /// pages for one unplugged Pi at 3am is a monitor people mute.
-pub fn health(s: &Snapshot) -> serde_json::Value {
-    let offline: Vec<&ModuleHealth> = s
+pub fn health(s: &Snapshot) -> HealthResponse {
+    let offline = s
         .modules
         .iter()
-        .filter(|m| !m.connected && !m.disabled)
-        .collect();
-    let status = if offline.is_empty() { "ok" } else { "degraded" };
-    json!({
-        "status": status,
-        "version": env!("CARGO_PKG_VERSION"),
-        "sessions_active": s.sessions_active,
-        "modules": s.modules.iter().map(|m| json!({
-            "module_id": m.module_id,
-            "name": m.name,
-            "kind": m.kind,
-            // A disabled module is not unhealthy — somebody meant it.
-            "status": if m.disabled { "disabled" }
-                      else if m.connected { "ok" } else { "offline" },
-            "build": m.build,
-            // HUB-36: what this box can encode and how fast it measured
-            // itself. Omitted entirely for modules that report none, so
-            // a mediahost's entry stays as small as it was.
-            "encoders": if m.encoders.is_empty() { serde_json::Value::Null } else {
-                m.encoders.iter().map(|e| json!({
-                    "codec": e.codec,
-                    "element": e.element,
-                    "hardware": e.hardware,
-                    // null = unmeasured; a small number means measured
-                    // and slow, which is the opposite conclusion.
-                    "realtime_1080": e.s1080,
-                    "realtime_2160": e.s2160,
-                })).collect::<Vec<_>>().into()
-            },
-            "tonemap_realtime_1080": m.tonemap_1080,
-            "tonemap_realtime_2160": m.tonemap_2160,
-        })).collect::<Vec<_>>(),
-    })
+        .any(|module| !module.connected && !module.disabled);
+    HealthResponse {
+        status: if offline { "degraded" } else { "ok" },
+        version: env!("CARGO_PKG_VERSION"),
+        sessions_active: s.sessions_active,
+        modules: s
+            .modules
+            .iter()
+            .map(|module| HealthModule {
+                module_id: module.module_id.clone(),
+                name: module.name.clone(),
+                kind: module.kind.clone(),
+                // A disabled module is not unhealthy — somebody meant it.
+                status: if module.disabled {
+                    "disabled"
+                } else if module.connected {
+                    "ok"
+                } else {
+                    "offline"
+                },
+                build: module.build.clone(),
+                // The API keeps this explicit null for modules that report none.
+                encoders: (!module.encoders.is_empty()).then(|| {
+                    module
+                        .encoders
+                        .iter()
+                        .map(|encoder| HealthEncoder {
+                            codec: encoder.codec.clone(),
+                            element: encoder.element.clone(),
+                            hardware: encoder.hardware,
+                            realtime_1080: encoder.s1080,
+                            realtime_2160: encoder.s2160,
+                        })
+                        .collect()
+                }),
+                tonemap_realtime_1080: module.tonemap_1080,
+                tonemap_realtime_2160: module.tonemap_2160,
+            })
+            .collect(),
+    }
 }
 
 /// Prometheus label values may not carry a bare quote or backslash.

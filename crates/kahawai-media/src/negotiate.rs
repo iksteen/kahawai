@@ -84,13 +84,15 @@ pub struct SourcePlan {
     pub subtitles: Vec<SubtitleVerdict>,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
 pub struct SubtitleVerdict {
     pub index: usize,
     /// The unified track id (hub fills it in; the negotiation itself
     /// only knows stream indexes).
+    #[schema(required)]
     pub track_id: Option<i64>,
     pub format: String,
+    #[schema(required)]
     pub language: Option<String>,
     pub tier: SubtitleTier,
     pub note: &'static str,
@@ -98,7 +100,7 @@ pub struct SubtitleVerdict {
 
 /// HUB-32a/b/c policy order as data: bitmap streaming → OCR text →
 /// burn-in, `Unavailable` when none of them can happen.
-#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum SubtitleTier {
     Text,

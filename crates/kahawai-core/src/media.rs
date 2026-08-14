@@ -70,7 +70,9 @@ impl ReplayGain {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, utoipa::ToSchema)]
 pub struct MediaInfo {
     /// Container format, normalized ("matroska", "mp4", "webm", …).
+    #[schema(required)]
     pub container: Option<String>,
+    #[schema(required)]
     pub duration_ms: Option<u64>,
     #[serde(default)]
     pub video: Vec<VideoStream>,
@@ -133,22 +135,28 @@ pub struct VideoStream {
     pub width: u32,
     pub height: u32,
     /// Frames per second as (numerator, denominator).
+    #[schema(required)]
     pub fps: Option<(u32, u32)>,
+    #[schema(required)]
     pub bit_depth: Option<u32>,
     pub interlaced: bool,
     /// "hdr10" | "hlg", from caps colorimetry (MH-3). None = SDR or a
     /// row probed before extraction existed — negotiation treats both
     /// as SDR (HUB-15a).
+    #[schema(required)]
     pub hdr: Option<String>,
     /// Caps profile string ("high", "main-10", …). None = unknown
     /// (pre-extension row) — negotiation is unknown-permissive.
     #[serde(default)]
+    #[schema(required)]
     pub profile: Option<String>,
     /// Caps level string ("4.1"). Same unknown semantics as `profile`.
     #[serde(default)]
+    #[schema(required)]
     pub level: Option<String>,
     /// Stream bitrate where the container states one; 0 is never stored.
     #[serde(default)]
+    #[schema(required)]
     pub bitrate_kbps: Option<u32>,
     /// Longest gap between keyframes, from the container index at scan
     /// (MH-3). `None` = not measured: an unsupported container, an
@@ -225,13 +233,16 @@ pub struct AudioStream {
     pub codec: String,
     pub channels: u32,
     pub sample_rate: u32,
+    #[schema(required)]
     pub language: Option<String>,
     #[serde(default)]
+    #[schema(required)]
     pub bitrate_kbps: Option<u32>,
     /// Channel mask as a hex string ("0x3f") when the caps carry one —
     /// enough to distinguish 5.1 from 6.0 later without committing to a
     /// pretty-printer now.
     #[serde(default)]
+    #[schema(required)]
     pub layout: Option<String>,
 }
 
@@ -398,6 +409,7 @@ impl Default for CapabilityProfile {
 pub struct SubtitleStream {
     /// "srt", "ass", "pgs", "vobsub", "webvtt", …
     pub format: String,
+    #[schema(required)]
     pub language: Option<String>,
 }
 
@@ -410,6 +422,7 @@ pub struct SidecarSubtitle {
     pub format: String,
     /// Language token from the filename ("Movie.en.srt" → "en") — or,
     /// for vobsub, the track's own `id:` from inside the .idx.
+    #[schema(required)]
     pub language: Option<String>,
     /// VobSub only: the track index within the .idx (one sidecar file
     /// can carry many languages; each becomes its own entry).

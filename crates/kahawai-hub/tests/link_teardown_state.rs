@@ -30,10 +30,9 @@ async fn shown_as_disabled(reg: &Registry) -> bool {
         .await
         .unwrap()
         .into_iter()
-        .find(|s| s["module_id"] == "01MH")
-        .expect("the satellite is enrolled")["disabled"]
-        .as_bool()
-        .unwrap()
+        .find(|satellite| satellite.module_id == "01MH")
+        .expect("the satellite is enrolled")
+        .disabled
 }
 
 #[tokio::test]

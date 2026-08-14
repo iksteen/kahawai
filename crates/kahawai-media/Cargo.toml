@@ -19,6 +19,7 @@ gstreamer-app = "0.25.2"
 gstreamer-video = "0.25"
 flate2 = { workspace = true }
 zstd = { workspace = true }
+utoipa = { workspace = true }
 
 [build-dependencies]
 pkg-config = "0.3"

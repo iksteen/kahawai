@@ -583,14 +583,19 @@ marked in that document.
 
 ## API contracts and maintainability (ENG)
 
-- [ ] ENG-1 Establish one authoritative typed definition for public request,
-      response and error DTOs and remove handler-local untyped JSON for stable
-      resources. A shared API crate is the proposed boundary, subject to the
-      documented dependency and compile-cost criteria
-- [ ] ENG-2 Produce OpenAPI and TypeScript client/types from the same
-      authoritative contract, snapshot the wire contract and fail CI on
-      unexplained changes. Code generation direction and committed artifacts are
-      implementation decisions justified by reproducibility and toolchain cost
+- [~] ENG-1 Every application request and JSON response now has one concrete
+      Rust DTO, including producer-owned registry, health, grants, enrichment,
+      subtitle and negotiation values; no stable handler assembles
+      `serde_json::Value`. The remaining gap is SEC-WEB-6's stable JSON error
+      DTO: failures still use `(StatusCode, String)`. A separate shared API
+      crate remains unjustified while the binary is the only Rust consumer
+- [~] ENG-2 The same DTOs generate a complete OpenAPI 3.2 document for the
+      exact 62-operation application surface and vendored Swagger UI.
+      Generation fails closed on operation membership, typed JSON schemas,
+      security declarations, QUERY placement and null-versus-omitted fields;
+      the mounted-route integration check proves documented protected
+      operations reach authentication instead of the SPA fallback. TypeScript
+      generation and the post-1.0 compatibility baseline remain
 - [ ] ENG-3 After characterization tests cover the existing wire behaviour,
       define API ownership boundaries that prevent auth, library, playback,
       admin, provider and observability changes from sharing one implementation

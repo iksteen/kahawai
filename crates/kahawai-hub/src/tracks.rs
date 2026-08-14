@@ -46,7 +46,7 @@ use anyhow::Result;
 use serde::Serialize;
 use sqlx::Row;
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
 pub struct Track {
     pub id: i64,
     pub item_id: String,
@@ -63,11 +63,15 @@ pub struct Track {
     pub source_path: Option<String>,
     #[serde(skip)]
     pub path_rel: Option<String>,
+    #[schema(required)]
     pub stream_index: Option<i64>,
     pub format: String,
+    #[schema(required)]
     pub language: Option<String>,
+    #[schema(required)]
     pub label: Option<String>,
     pub machine: bool,
+    #[schema(required)]
     pub derived_from: Option<i64>,
     #[serde(skip)]
     pub payload_id: Option<i64>,
@@ -80,7 +84,7 @@ pub struct Track {
 
 /// How a track can be served to a given client — the tier ladder
 /// (HUB-32a/b/c) expressed per track instead of per plan.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Delivery {
     /// Plain timed text (VTT/live cue tap).

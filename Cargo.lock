@@ -2079,6 +2079,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tracing",
+ "utoipa",
  "zstd",
 ]
 

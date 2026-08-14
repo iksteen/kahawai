@@ -154,9 +154,9 @@ async fn libraries_auto_provision_and_enforce_types() {
     // One auto-library per collection, matching name + type.
     let libs = registry.libraries_overview().await.unwrap();
     assert_eq!(libs.len(), 2, "{libs:?}");
-    let anime = libs.iter().find(|l| l["name"] == "anime").unwrap();
-    assert_eq!(anime["media_type"], "anime");
-    assert_eq!(anime["collections"].as_array().unwrap().len(), 1);
+    let anime = libs.iter().find(|library| library.name == "anime").unwrap();
+    assert_eq!(anime.media_type, "anime");
+    assert_eq!(anime.collections.len(), 1);
 
     // Re-announce (reconnect) must not duplicate memberships.
     registry
@@ -166,7 +166,7 @@ async fn libraries_auto_provision_and_enforce_types() {
     assert_eq!(registry.libraries_overview().await.unwrap().len(), 2);
 
     // Type enforcement: a movies collection cannot join an anime library.
-    let anime_id = anime["id"].as_str().unwrap();
+    let anime_id = anime.id.as_str();
     let err = registry
         .attach_collection(anime_id, "01HOST", "movies")
         .await

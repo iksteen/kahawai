@@ -12,7 +12,6 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
 use sqlx::Row;
 use utoipa::{Modify, OpenApi, ToSchema};
 use utoipa_swagger_ui::SwaggerUi;
@@ -87,7 +86,70 @@ pub struct NetOptions {
 #[derive(OpenApi)]
 #[openapi(
     version = "3.2.0",
-    paths(item_query),
+    paths(
+        health,
+        metrics,
+        bootstrap,
+        setup,
+        login,
+        refresh,
+        logout,
+        events,
+        list_collections,
+        list_libraries,
+        list_items,
+        item_detail,
+        item_query,
+        item_children,
+        item_set_watched,
+        subtitle_search,
+        subtitle_download,
+        subtitle_delete,
+        item_artwork,
+        item_subtitle_file,
+        item_fonts,
+        item_font,
+        get_prefs,
+        put_pref,
+        start_session,
+        end_session,
+        post_progress,
+        seek_session,
+        stream_session,
+        session_file,
+        admin_enrollments,
+        admin_approve,
+        admin_satellites,
+        admin_delete_satellite,
+        admin_set_disabled,
+        admin_libraries,
+        admin_create_library,
+        admin_delete_library,
+        admin_attach_collection,
+        admin_detach_collection,
+        admin_collections,
+        admin_users,
+        admin_create_user,
+        admin_delete_user,
+        admin_set_user_libraries,
+        admin_set_user_admin,
+        admin_providers,
+        admin_set_chain,
+        admin_set_tmdb,
+        admin_set_tvdb,
+        admin_set_anidb,
+        admin_verify_anidb,
+        admin_enrich_status,
+        admin_enrich_run,
+        admin_refresh_library,
+        admin_review_list,
+        admin_review_search,
+        admin_apply_match,
+        admin_sessions,
+        admin_end_session,
+        admin_session_log,
+        admin_item_log
+    ),
     modifiers(&BearerSecurity)
 )]
 struct ApiDoc;
@@ -96,7 +158,9 @@ struct BearerSecurity;
 
 impl Modify for BearerSecurity {
     fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
-        use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
+        use utoipa::openapi::security::{
+            ApiKey, ApiKeyValue, HttpAuthScheme, HttpBuilder, SecurityScheme,
+        };
 
         openapi
             .components
@@ -111,6 +175,23 @@ impl Modify for BearerSecurity {
                         .build(),
                 ),
             );
+        let components = openapi
+            .components
+            .as_mut()
+            .expect("the generated API document has components");
+        components.add_security_scheme(
+            "media_token",
+            SecurityScheme::ApiKey(ApiKey::Query(ApiKeyValue::new("token"))),
+        );
+        components.add_security_scheme(
+            "metrics_token",
+            SecurityScheme::Http(
+                HttpBuilder::new()
+                    .scheme(HttpAuthScheme::Bearer)
+                    .bearer_format("Static metrics token")
+                    .build(),
+            ),
+        );
     }
 }
 
@@ -390,6 +471,351 @@ fn cors_layer(origins: &[String]) -> Option<tower_http::cors::CorsLayer> {
 
 type ApiError = (StatusCode, String);
 
+#[derive(Serialize, ToSchema)]
+struct BootstrapResponse {
+    setup_required: bool,
+    setup_available: bool,
+    #[schema(required)]
+    setup_url: Option<String>,
+}
+
+#[derive(Serialize, ToSchema)]
+struct PendingEnrollment {
+    csr_fingerprint: String,
+    module_type: String,
+    module_id: String,
+    name: String,
+}
+
+#[derive(Serialize, ToSchema)]
+struct EnrollmentsResponse {
+    pending: Vec<PendingEnrollment>,
+}
+
+#[derive(Serialize, ToSchema)]
+struct ApprovedResponse {
+    approved: String,
+}
+
+#[derive(Serialize, ToSchema)]
+struct ProviderConfiguration {
+    configured: bool,
+}
+
+#[derive(Serialize, ToSchema)]
+struct ProviderChain {
+    order: Vec<String>,
+    default: Vec<String>,
+}
+
+#[derive(Serialize, ToSchema)]
+struct ProvidersResponse {
+    tmdb: ProviderConfiguration,
+    tvdb: ProviderConfiguration,
+    anidb: ProviderConfiguration,
+    chains: std::collections::BTreeMap<String, ProviderChain>,
+}
+
+#[derive(Serialize, ToSchema)]
+struct OkResponse {
+    ok: bool,
+}
+
+#[derive(Serialize, ToSchema)]
+struct SavedResponse {
+    saved: bool,
+}
+
+#[derive(Serialize, ToSchema)]
+struct SubtitleSearchResponse {
+    candidates: Vec<crate::opensubtitles::Candidate>,
+    quota: crate::opensubtitles::Quota,
+}
+
+#[derive(Serialize, ToSchema)]
+struct SubtitleDownloadResponse {
+    track_id: i64,
+    quota: crate::opensubtitles::Quota,
+}
+
+#[derive(Serialize, ToSchema)]
+struct RemovedResponse {
+    removed: bool,
+}
+
+#[derive(Serialize, ToSchema)]
+struct VerificationResponse {
+    verified: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+#[derive(Serialize, ToSchema)]
+struct SavedVerificationResponse {
+    saved: bool,
+    verified: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+#[derive(Serialize, ToSchema)]
+struct StartedResponse {
+    started: bool,
+}
+
+#[derive(Serialize, ToSchema)]
+struct RefreshResponse {
+    asked: usize,
+    offline: usize,
+}
+
+#[derive(Serialize, ToSchema)]
+struct ReviewEntry {
+    item_id: String,
+    kind: String,
+    title: String,
+    #[schema(required)]
+    year: Option<i64>,
+    #[schema(required)]
+    path: Option<String>,
+    confidence: String,
+    #[schema(required)]
+    matched_title: Option<String>,
+    #[schema(required)]
+    premiered: Option<String>,
+    #[schema(required)]
+    provider: Option<String>,
+}
+
+#[derive(Serialize, ToSchema)]
+struct ReviewEntriesResponse {
+    entries: Vec<ReviewEntry>,
+}
+
+#[derive(Serialize, ToSchema)]
+struct ReviewCandidatesResponse {
+    candidates: Vec<crate::enrich::ProviderCandidate>,
+}
+
+#[derive(Deserialize, ToSchema)]
+struct ManualMatchCandidate {
+    #[serde(default, deserialize_with = "candidate_id")]
+    id: Option<u64>,
+    title: Option<String>,
+    overview: Option<String>,
+    poster_path: Option<String>,
+    vote_average: Option<f64>,
+    release_date: Option<String>,
+}
+
+fn candidate_id<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(serde_json::Value::deserialize(deserializer)
+        .ok()
+        .and_then(|value| value.as_u64()))
+}
+
+#[derive(Serialize, ToSchema)]
+struct UsersResponse {
+    users: Vec<crate::grants::UserAccess>,
+}
+
+#[derive(Serialize, ToSchema)]
+struct UserAccessResponse {
+    id: String,
+    all_libraries: bool,
+    libraries: Vec<String>,
+}
+
+#[derive(Serialize, ToSchema)]
+struct UserAdminResponse {
+    id: String,
+    is_admin: bool,
+}
+
+#[derive(Serialize, ToSchema)]
+struct CreatedUserResponse {
+    id: String,
+    username: String,
+    admin: bool,
+}
+
+#[derive(Serialize, ToSchema)]
+struct DeletedUserResponse {
+    deleted: String,
+    username: String,
+    sessions_ended: usize,
+}
+
+#[derive(Serialize, ToSchema)]
+struct SatellitesResponse {
+    satellites: Vec<crate::registry::SatelliteOverview>,
+}
+
+#[derive(Serialize, ToSchema)]
+struct DeletedSatelliteResponse {
+    deleted: String,
+    removed: String,
+    sessions_ended: usize,
+    subtitle_payloads_removed: usize,
+}
+
+#[derive(Serialize, ToSchema)]
+struct AdminLibrariesResponse {
+    libraries: Vec<crate::registry::LibraryOverview>,
+}
+
+#[derive(Serialize, ToSchema)]
+struct AdminCollectionsResponse {
+    collections: Vec<crate::registry::CollectionOverview>,
+}
+
+#[derive(Serialize, ToSchema)]
+struct CreatedLibraryResponse {
+    id: String,
+}
+
+#[derive(Serialize, ToSchema)]
+struct SessionStreamSummary {
+    #[schema(required)]
+    cost: Option<&'static str>,
+    video: String,
+    audio: String,
+}
+
+#[derive(Serialize, ToSchema)]
+struct AdminSession {
+    session_id: String,
+    #[schema(required)]
+    username: Option<String>,
+    #[schema(required)]
+    title: Option<String>,
+    mode: &'static str,
+    module_id: String,
+    idle_secs: u64,
+    #[schema(required)]
+    streams: Option<SessionStreamSummary>,
+}
+
+#[derive(Serialize, ToSchema)]
+struct AdminSessionsResponse {
+    sessions: Vec<AdminSession>,
+}
+
+#[derive(Serialize, ToSchema)]
+struct BrowserTokenResponse {
+    access_token: String,
+    expires_in: i64,
+}
+
+#[allow(dead_code)]
+#[derive(ToSchema)]
+#[serde(untagged)]
+enum AuthSuccessResponse {
+    Api(crate::auth::TokenPair),
+    Browser(BrowserTokenResponse),
+}
+
+#[derive(Serialize, ToSchema)]
+struct Preference {
+    scope: String,
+    key: String,
+    value: String,
+}
+
+#[derive(Serialize, ToSchema)]
+struct PreferencesResponse {
+    prefs: Vec<Preference>,
+}
+
+#[derive(Serialize, ToSchema)]
+struct PlaybackStreams {
+    #[schema(required)]
+    cost: Option<&'static str>,
+    video: String,
+    audio: String,
+    subtitles: Vec<kahawai_media::negotiate::SubtitleVerdict>,
+}
+
+#[derive(Serialize, ToSchema)]
+struct StartSessionResponse {
+    session_id: String,
+    mode: &'static str,
+    size: u64,
+    #[schema(required)]
+    duration_ms: Option<u64>,
+    part_base_ms: u64,
+    parts: usize,
+    content_type: String,
+    stream_url: String,
+    #[schema(required)]
+    streams: Option<PlaybackStreams>,
+}
+
+#[derive(Serialize, ToSchema)]
+struct SeekResponse {
+    part_base_ms: u64,
+    #[schema(required)]
+    streams: Option<PlaybackStreams>,
+}
+
+#[derive(Serialize, ToSchema)]
+struct CollectionsResponse {
+    collections: Vec<crate::registry::CollectionRow>,
+}
+
+#[derive(Serialize, ToSchema)]
+struct FontsResponse {
+    fonts: Vec<String>,
+}
+
+#[derive(Serialize, ToSchema)]
+struct LibrarySummary {
+    id: String,
+    name: String,
+    media_type: String,
+}
+
+#[derive(Serialize, ToSchema)]
+struct LibrariesResponse {
+    libraries: Vec<LibrarySummary>,
+}
+
+#[derive(Serialize, ToSchema)]
+struct ItemsResponse {
+    items: Vec<ItemRow<i64>>,
+    total: i64,
+    limit: u32,
+    offset: u32,
+}
+
+#[derive(Serialize, ToSchema)]
+struct ChildrenResponse {
+    children: Vec<ItemRow<i64>>,
+}
+
+#[derive(Serialize, ToSchema)]
+struct ProgressResponse {
+    position_ms: u64,
+    played: bool,
+    play_count: i64,
+}
+
+#[derive(Serialize, ToSchema)]
+struct WatchUpdate {
+    item_id: String,
+    position_ms: u64,
+    played: bool,
+    play_count: i64,
+}
+
+#[derive(Serialize, ToSchema)]
+struct UpdatedResponse {
+    updated: Vec<WatchUpdate>,
+}
+
 fn internal(e: impl std::fmt::Display) -> ApiError {
     (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
 }
@@ -452,6 +878,18 @@ fn request_token(req: &Request, allow_media_cookie: bool) -> Result<Option<&str>
 /// scraping does not advertise an endpoint reporting its library size.
 /// A configured-but-wrong token is 401, so an operator can tell "off
 /// here" from "wrong secret".
+#[utoipa::path(
+    get,
+    path = "/metrics",
+    tag = "Observability",
+    security(("metrics_token" = [])),
+    responses(
+        (status = 200, description = "Prometheus exposition", body = String, content_type = "text/plain; version=0.0.4; charset=utf-8"),
+        (status = 401, description = "Wrong metrics token", body = String, content_type = "text/plain"),
+        (status = 404, description = "Metrics are not enabled", body = String, content_type = "text/plain"),
+        (status = 500, description = "Snapshot failed", body = String, content_type = "text/plain")
+    )
+)]
 async fn metrics(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
@@ -486,20 +924,41 @@ async fn metrics(
 /// its collections go unavailable, nothing is lost (AR-6), and a check
 /// that fails the whole server because one Pi is unplugged gets muted.
 /// The body carries the detail, and `status` distinguishes the two.
-async fn health(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+#[utoipa::path(
+    get,
+    path = "/health",
+    tag = "Observability",
+    responses(
+        (status = 200, description = "Hub and satellite health", body = crate::metrics::HealthResponse),
+        (status = 500, description = "Snapshot failed", body = String, content_type = "text/plain")
+    )
+)]
+async fn health(
+    State(state): State<AppState>,
+) -> Result<Json<crate::metrics::HealthResponse>, ApiError> {
     let snap = crate::metrics::gather(&state.registry, &state.sessions, state.enricher.data_dir())
         .await
         .map_err(internal)?;
     Ok(Json(crate::metrics::health(&snap)))
 }
 
-async fn bootstrap(State(state): State<AppState>) -> Json<Value> {
+#[utoipa::path(
+    get,
+    path = "/api/v1/bootstrap",
+    tag = "Authentication",
+    responses((status = 200, description = "Client startup state", body = BootstrapResponse))
+)]
+async fn bootstrap(State(state): State<AppState>) -> Json<BootstrapResponse> {
     let setup_required = state.auth.setup_required();
-    Json(json!({
-        "setup_required": setup_required,
-        "setup_available": false,
-        "setup_url": if setup_required { state.setup_url.as_ref().clone() } else { None },
-    }))
+    Json(BootstrapResponse {
+        setup_required,
+        setup_available: false,
+        setup_url: if setup_required {
+            state.setup_url.as_ref().clone()
+        } else {
+            None
+        },
+    })
 }
 
 async fn require_bearer(
@@ -618,41 +1077,70 @@ async fn require_admin(req: Request, next: Next) -> Result<Response, ApiError> {
     Ok(next.run(req).await)
 }
 
-async fn admin_enrollments(State(state): State<AppState>) -> Json<Value> {
-    let pending: Vec<Value> = state
+#[utoipa::path(
+    get, path = "/admin/v1/enrollments", tag = "Admin",
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, body = EnrollmentsResponse),
+        (status = 401, body = String, content_type = "text/plain"),
+        (status = 403, body = String, content_type = "text/plain")
+    )
+)]
+async fn admin_enrollments(State(state): State<AppState>) -> Json<EnrollmentsResponse> {
+    let pending = state
         .enrollments
         .pending()
         .iter()
-        .map(|p| {
-            json!({
-                "csr_fingerprint": p.csr_fingerprint,
-                "module_type": p.module_type,
-                "module_id": p.module_id,
-                "name": p.name,
-            })
+        .map(|pending| PendingEnrollment {
+            csr_fingerprint: pending.csr_fingerprint.clone(),
+            module_type: pending.module_type.clone(),
+            module_id: pending.module_id.clone(),
+            name: pending.name.clone(),
         })
         .collect();
-    Json(json!({ "pending": pending }))
+    Json(EnrollmentsResponse { pending })
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 struct ApproveRequest {
     code: String,
 }
 
+#[utoipa::path(
+    post, path = "/admin/v1/enrollments/approve", tag = "Admin",
+    security(("bearer_auth" = [])),
+    request_body = ApproveRequest,
+    responses(
+        (status = 200, body = ApprovedResponse),
+        (status = 401, body = String, content_type = "text/plain"),
+        (status = 403, body = String, content_type = "text/plain")
+    )
+)]
 async fn admin_approve(
     State(state): State<AppState>,
     Json(body): Json<ApproveRequest>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<ApprovedResponse>, ApiError> {
     let summary = state
         .enrollments
         .approve(&body.code)
         .await
         .map_err(|e| (StatusCode::FORBIDDEN, format!("{e:#}")))?;
-    Ok(Json(json!({ "approved": summary })))
+    Ok(Json(ApprovedResponse { approved: summary }))
 }
 
-async fn admin_providers(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+#[utoipa::path(
+    get, path = "/admin/v1/providers", tag = "Admin providers",
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, body = ProvidersResponse),
+        (status = 401, body = String, content_type = "text/plain"),
+        (status = 403, body = String, content_type = "text/plain"),
+        (status = 500, body = String, content_type = "text/plain")
+    )
+)]
+async fn admin_providers(
+    State(state): State<AppState>,
+) -> Result<Json<ProvidersResponse>, ApiError> {
     let tmdb = state
         .registry
         .get_setting(crate::enrich::TMDB_KEY_SETTING)
@@ -672,25 +1160,28 @@ async fn admin_providers(State(state): State<AppState>) -> Result<Json<Value>, A
         .map_err(internal)?
         .is_some();
     let db = state.registry.db();
-    let mut chains = serde_json::Map::new();
-    for mt in crate::providers::MEDIA_TYPES {
+    let mut chains = std::collections::BTreeMap::new();
+    for media_type in crate::providers::MEDIA_TYPES {
         chains.insert(
-            mt.to_string(),
-            json!({
-                "order": crate::providers::chain_in_force(db, mt).await,
-                "default": crate::providers::chain_for(mt),
-            }),
+            media_type.to_string(),
+            ProviderChain {
+                order: crate::providers::chain_in_force(db, media_type).await,
+                default: crate::providers::chain_for(media_type)
+                    .iter()
+                    .map(|provider| (*provider).to_string())
+                    .collect(),
+            },
         );
     }
-    Ok(Json(json!({
-        "tmdb": { "configured": tmdb },
-        "tvdb": { "configured": tvdb },
-        "anidb": { "configured": anidb },
-        "chains": chains,
-    })))
+    Ok(Json(ProvidersResponse {
+        tmdb: ProviderConfiguration { configured: tmdb },
+        tvdb: ProviderConfiguration { configured: tvdb },
+        anidb: ProviderConfiguration { configured: anidb },
+        chains,
+    }))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 struct SetChain {
     order: Vec<String>,
 }
@@ -698,21 +1189,36 @@ struct SetChain {
 /// HUB-5: reorder a media type's providers. Precedence is per field, so
 /// this decides who wins where two providers both have an answer — and
 /// it re-merges from stored answers, sending no provider a request.
+#[utoipa::path(
+    post, path = "/admin/v1/providers/chains/{media_type}", tag = "Admin providers",
+    security(("bearer_auth" = [])),
+    params(("media_type" = String, Path)),
+    request_body = SetChain,
+    responses(
+        (status = 200, body = OkResponse),
+        (status = 400, body = String, content_type = "text/plain"),
+        (status = 401, body = String, content_type = "text/plain"),
+        (status = 403, body = String, content_type = "text/plain")
+    )
+)]
 async fn admin_set_chain(
     State(state): State<AppState>,
     Path(media_type): Path<String>,
     Json(body): Json<SetChain>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<OkResponse>, ApiError> {
     crate::providers::set_chain(state.registry.db(), &media_type, &body.order)
         .await
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     state
         .registry
-        .emit(json!({ "kind": "enrich", "chain": media_type }));
-    Ok(Json(json!({ "ok": true })))
+        .emit(crate::registry::RegistryEvent::EnrichChain {
+            kind: "enrich",
+            chain: media_type,
+        });
+    Ok(Json(OkResponse { ok: true }))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 struct SubtitleSearchRequest {
     /// Preferred languages, ordered. Empty = whatever the provider has.
     #[serde(default)]
@@ -720,21 +1226,33 @@ struct SubtitleSearchRequest {
 }
 
 /// HUB-21/22: search external providers for this item's subtitles.
+#[utoipa::path(
+    post, path = "/api/v1/items/{id}/subtitles/search", tag = "Subtitles",
+    security(("bearer_auth" = [])),
+    params(("id" = String, Path)),
+    request_body = SubtitleSearchRequest,
+    responses(
+        (status = 200, body = SubtitleSearchResponse),
+        (status = 401, body = String, content_type = "text/plain"),
+        (status = 404, body = String, content_type = "text/plain"),
+        (status = 502, body = String, content_type = "text/plain")
+    )
+)]
 async fn subtitle_search(
     State(state): State<AppState>,
     Path(id): Path<String>,
     axum::Extension(claims): axum::Extension<crate::auth::Claims>,
     Json(body): Json<SubtitleSearchRequest>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<SubtitleSearchResponse>, ApiError> {
     let (candidates, quota) = state
         .subtitles
         .search_external(&state.registry, &id, body.languages, &claims.sub)
         .await
         .map_err(|e| (StatusCode::BAD_GATEWAY, format!("{e:#}")))?;
-    Ok(Json(json!({ "candidates": candidates, "quota": quota })))
+    Ok(Json(SubtitleSearchResponse { candidates, quota }))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 struct SubtitleDownloadRequest {
     file_id: String,
     #[serde(default)]
@@ -743,12 +1261,24 @@ struct SubtitleDownloadRequest {
 
 /// HUB-24: user-initiated download; the result becomes a normal
 /// subtitle track on the item.
+#[utoipa::path(
+    post, path = "/api/v1/items/{id}/subtitles/download", tag = "Subtitles",
+    security(("bearer_auth" = [])),
+    params(("id" = String, Path)),
+    request_body = SubtitleDownloadRequest,
+    responses(
+        (status = 200, body = SubtitleDownloadResponse),
+        (status = 401, body = String, content_type = "text/plain"),
+        (status = 404, body = String, content_type = "text/plain"),
+        (status = 502, body = String, content_type = "text/plain")
+    )
+)]
 async fn subtitle_download(
     State(state): State<AppState>,
     Path(id): Path<String>,
     axum::Extension(claims): axum::Extension<crate::auth::Claims>,
     Json(body): Json<SubtitleDownloadRequest>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<SubtitleDownloadResponse>, ApiError> {
     let (track_id, quota) = state
         .subtitles
         .download_external(
@@ -760,7 +1290,7 @@ async fn subtitle_download(
         )
         .await
         .map_err(|e| (StatusCode::BAD_GATEWAY, format!("{e:#}")))?;
-    Ok(Json(json!({ "track_id": track_id, "quota": quota })))
+    Ok(Json(SubtitleDownloadResponse { track_id, quota }))
 }
 
 /// HUB-32c: OCR an image subtitle track (embedded or VobSub sidecar)
@@ -771,21 +1301,44 @@ async fn subtitle_download(
 /// Remove a DOWNLOADED track, as its creator or an admin. Anything
 /// else — a cache, a scan-owned row, someone else's download — refuses
 /// with 404-shaped `removed: false`.
+#[utoipa::path(
+    delete, path = "/api/v1/subtitles/{track_id}", tag = "Subtitles",
+    security(("bearer_auth" = [])),
+    params(("track_id" = i64, Path)),
+    responses(
+        (status = 200, body = RemovedResponse),
+        (status = 401, body = String, content_type = "text/plain"),
+        (status = 500, body = String, content_type = "text/plain")
+    )
+)]
 async fn subtitle_delete(
     State(state): State<AppState>,
     axum::Extension(claims): axum::Extension<crate::auth::Claims>,
     Path(track_id): Path<i64>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<RemovedResponse>, ApiError> {
     let removed = state
         .subtitles
         .delete_track(&state.registry, track_id, &claims.sub, claims.admin)
         .await
         .map_err(internal)?;
-    Ok(Json(json!({ "removed": removed })))
+    Ok(Json(RemovedResponse { removed }))
 }
 
 /// Re-validate the STORED AniDB credentials (no resend needed).
-async fn admin_verify_anidb(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+#[utoipa::path(
+    post, path = "/admin/v1/providers/anidb/verify", tag = "Admin providers",
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, body = VerificationResponse),
+        (status = 400, body = String, content_type = "text/plain"),
+        (status = 401, body = String, content_type = "text/plain"),
+        (status = 403, body = String, content_type = "text/plain"),
+        (status = 500, body = String, content_type = "text/plain")
+    )
+)]
+async fn admin_verify_anidb(
+    State(state): State<AppState>,
+) -> Result<Json<VerificationResponse>, ApiError> {
     let user = state
         .registry
         .get_setting(crate::anidb::USER_SETTING)
@@ -812,15 +1365,19 @@ async fn admin_verify_anidb(State(state): State<AppState>) -> Result<Json<Value>
     {
         Ok(client) => {
             client.finish().await;
-            Ok(Json(json!({ "verified": true })))
+            Ok(Json(VerificationResponse {
+                verified: true,
+                error: None,
+            }))
         }
-        Err(e) => Ok(Json(
-            json!({ "verified": false, "error": format!("{e:#}") }),
-        )),
+        Err(error) => Ok(Json(VerificationResponse {
+            verified: false,
+            error: Some(format!("{error:#}")),
+        })),
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 struct SetAnidb {
     username: String,
     password: String,
@@ -831,10 +1388,22 @@ struct SetAnidb {
 /// AniDB account for the UDP FILE-by-ED2K gold path (HUB-30). The
 /// client identity ("kahawai" v1) is compiled in; only the account is
 /// configuration. Optional UDP API key upgrades to an encrypted session.
+#[utoipa::path(
+    post, path = "/admin/v1/providers/anidb", tag = "Admin providers",
+    security(("bearer_auth" = [])),
+    request_body = SetAnidb,
+    responses(
+        (status = 200, body = SavedVerificationResponse),
+        (status = 400, body = String, content_type = "text/plain"),
+        (status = 401, body = String, content_type = "text/plain"),
+        (status = 403, body = String, content_type = "text/plain"),
+        (status = 500, body = String, content_type = "text/plain")
+    )
+)]
 async fn admin_set_anidb(
     State(state): State<AppState>,
     Json(body): Json<SetAnidb>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<SavedVerificationResponse>, ApiError> {
     let (user, pass) = (body.username.trim(), body.password.trim());
     if user.is_empty() || pass.is_empty() {
         return Err((
@@ -880,25 +1449,43 @@ async fn admin_set_anidb(
                     tracing::warn!(error = format!("{e:#}"), "enrichment run failed");
                 }
             });
-            Ok(Json(json!({ "saved": true, "verified": true })))
+            Ok(Json(SavedVerificationResponse {
+                saved: true,
+                verified: true,
+                error: None,
+            }))
         }
-        Err(e) => Ok(Json(
-            json!({ "saved": true, "verified": false, "error": format!("{e:#}") }),
-        )),
+        Err(error) => Ok(Json(SavedVerificationResponse {
+            saved: true,
+            verified: false,
+            error: Some(format!("{error:#}")),
+        })),
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 struct SetTvdb {
     api_key: String,
     #[serde(default)]
     pin: Option<String>,
 }
 
+#[utoipa::path(
+    post, path = "/admin/v1/providers/tvdb", tag = "Admin providers",
+    security(("bearer_auth" = [])),
+    request_body = SetTvdb,
+    responses(
+        (status = 200, body = SavedResponse),
+        (status = 400, body = String, content_type = "text/plain"),
+        (status = 401, body = String, content_type = "text/plain"),
+        (status = 403, body = String, content_type = "text/plain"),
+        (status = 500, body = String, content_type = "text/plain")
+    )
+)]
 async fn admin_set_tvdb(
     State(state): State<AppState>,
     Json(body): Json<SetTvdb>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<SavedResponse>, ApiError> {
     let key = body.api_key.trim();
     if key.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "api_key required".into()));
@@ -922,18 +1509,30 @@ async fn admin_set_tvdb(
             tracing::warn!(error = format!("{e:#}"), "enrichment run failed");
         }
     });
-    Ok(Json(json!({ "saved": true })))
+    Ok(Json(SavedResponse { saved: true }))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 struct SetTmdb {
     api_key: String,
 }
 
+#[utoipa::path(
+    post, path = "/admin/v1/providers/tmdb", tag = "Admin providers",
+    security(("bearer_auth" = [])),
+    request_body = SetTmdb,
+    responses(
+        (status = 200, body = SavedResponse),
+        (status = 400, body = String, content_type = "text/plain"),
+        (status = 401, body = String, content_type = "text/plain"),
+        (status = 403, body = String, content_type = "text/plain"),
+        (status = 500, body = String, content_type = "text/plain")
+    )
+)]
 async fn admin_set_tmdb(
     State(state): State<AppState>,
     Json(body): Json<SetTmdb>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<SavedResponse>, ApiError> {
     let key = body.api_key.trim();
     if key.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "api_key required".into()));
@@ -951,14 +1550,34 @@ async fn admin_set_tmdb(
             tracing::warn!(error = format!("{e:#}"), "enrichment run failed");
         }
     });
-    Ok(Json(json!({ "saved": true })))
+    Ok(Json(SavedResponse { saved: true }))
 }
 
-async fn admin_enrich_status(State(state): State<AppState>) -> Json<Value> {
+#[utoipa::path(
+    get, path = "/admin/v1/enrich", tag = "Admin enrichment",
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, body = crate::enrich::EnrichStatus),
+        (status = 401, body = String, content_type = "text/plain"),
+        (status = 403, body = String, content_type = "text/plain")
+    )
+)]
+async fn admin_enrich_status(State(state): State<AppState>) -> Json<crate::enrich::EnrichStatus> {
     Json(state.enricher.status())
 }
 
-async fn admin_enrich_run(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+#[utoipa::path(
+    post, path = "/admin/v1/enrich", tag = "Admin enrichment",
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, body = StartedResponse),
+        (status = 401, body = String, content_type = "text/plain"),
+        (status = 403, body = String, content_type = "text/plain")
+    )
+)]
+async fn admin_enrich_run(
+    State(state): State<AppState>,
+) -> Result<Json<StartedResponse>, ApiError> {
     let enricher = state.enricher.clone();
     let registry = state.registry.clone();
     tokio::spawn(async move {
@@ -966,10 +1585,10 @@ async fn admin_enrich_run(State(state): State<AppState>) -> Result<Json<Value>, 
             tracing::warn!(error = format!("{e:#}"), "enrichment run failed");
         }
     });
-    Ok(Json(json!({ "started": true })))
+    Ok(Json(StartedResponse { started: true }))
 }
 
-#[derive(serde::Deserialize, Default)]
+#[derive(serde::Deserialize, Default, ToSchema, utoipa::IntoParams)]
 struct RefreshQuery {
     deep: Option<bool>,
 }
@@ -977,11 +1596,22 @@ struct RefreshQuery {
 /// HUB-35: granular refresh. The admin-facing unit is the LIBRARY —
 /// fan out collection-scoped scan requests to each member collection's
 /// mediahost. There is deliberately no global rescan.
+#[utoipa::path(
+    post, path = "/admin/v1/libraries/{id}/refresh", tag = "Admin libraries",
+    security(("bearer_auth" = [])),
+    params(("id" = String, Path), RefreshQuery),
+    responses(
+        (status = 200, body = RefreshResponse),
+        (status = 401, body = String, content_type = "text/plain"),
+        (status = 403, body = String, content_type = "text/plain"),
+        (status = 500, body = String, content_type = "text/plain")
+    )
+)]
 async fn admin_refresh_library(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Query(q): Query<RefreshQuery>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<RefreshResponse>, ApiError> {
     let members: Vec<(String, String)> = sqlx::query_as(
         "SELECT module_id, collection_id FROM library_collections WHERE library_id = ?",
     )
@@ -992,7 +1622,7 @@ async fn admin_refresh_library(
     if members.is_empty() {
         return Err((StatusCode::NOT_FOUND, "library has no collections".into()));
     }
-    let (mut asked, mut offline) = (0, 0);
+    let (mut asked, mut offline) = (0usize, 0usize);
     for (module_id, collection_id) in members {
         // ?deep=true: re-probe every file, stat-unchanged or not — how
         // rows probed by an older binary pick up new stream facts.
@@ -1005,7 +1635,7 @@ async fn admin_refresh_library(
             offline += 1;
         }
     }
-    Ok(Json(json!({ "asked": asked, "offline": offline })))
+    Ok(Json(RefreshResponse { asked, offline }))
 }
 
 /// Send one collection-scoped scan request (MH-2); the mediahost's
@@ -1027,7 +1657,19 @@ async fn request_scan(state: &AppState, module_id: &str, collection_id: &str) ->
 /// HUB-8 review queue: everything not matched confidently — misses,
 /// weak matches (with their current guess for confirm/reject), and
 /// rejected items.
-async fn admin_review_list(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+#[utoipa::path(
+    get, path = "/admin/v1/enrich/review", tag = "Admin enrichment",
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, body = ReviewEntriesResponse),
+        (status = 401, body = String, content_type = "text/plain"),
+        (status = 403, body = String, content_type = "text/plain"),
+        (status = 500, body = String, content_type = "text/plain")
+    )
+)]
+async fn admin_review_list(
+    State(state): State<AppState>,
+) -> Result<Json<ReviewEntriesResponse>, ApiError> {
     let rows = sqlx::query(
         "SELECT i.id, i.kind, i.title, i.year, m.confidence,
                 m.title AS matched_title, m.premiered, m.provider, m.provider_id,
@@ -1044,26 +1686,24 @@ async fn admin_review_list(State(state): State<AppState>) -> Result<Json<Value>,
     .fetch_all(state.registry.db())
     .await
     .map_err(internal)?;
-    let entries: Vec<Value> = rows
+    let entries = rows
         .iter()
-        .map(|r| {
-            json!({
-                "item_id": r.get::<String, _>("id"),
-                "kind": r.get::<String, _>("kind"),
-                "title": r.get::<String, _>("title"),
-                "year": r.get::<Option<i64>, _>("year"),
-                "path": r.get::<Option<String>, _>("path"),
-                "confidence": r.get::<String, _>("confidence"),
-                "matched_title": r.get::<Option<String>, _>("matched_title"),
-                "premiered": r.get::<Option<String>, _>("premiered"),
-                "provider": r.try_get::<Option<String>, _>("provider").ok().flatten(),
-            })
+        .map(|row| ReviewEntry {
+            item_id: row.get("id"),
+            kind: row.get("kind"),
+            title: row.get("title"),
+            year: row.get("year"),
+            path: row.get("path"),
+            confidence: row.get("confidence"),
+            matched_title: row.get("matched_title"),
+            premiered: row.get("premiered"),
+            provider: row.try_get("provider").ok().flatten(),
         })
         .collect();
-    Ok(Json(json!({ "entries": entries })))
+    Ok(Json(ReviewEntriesResponse { entries }))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 struct ReviewSearch {
     kind: String,
     query: String,
@@ -1073,10 +1713,21 @@ struct ReviewSearch {
     item: Option<String>,
 }
 
+#[utoipa::path(
+    post, path = "/admin/v1/enrich/search", tag = "Admin enrichment",
+    security(("bearer_auth" = [])),
+    request_body = ReviewSearch,
+    responses(
+        (status = 200, body = ReviewCandidatesResponse),
+        (status = 401, body = String, content_type = "text/plain"),
+        (status = 403, body = String, content_type = "text/plain"),
+        (status = 500, body = String, content_type = "text/plain")
+    )
+)]
 async fn admin_review_search(
     State(state): State<AppState>,
     Json(body): Json<ReviewSearch>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<ReviewCandidatesResponse>, ApiError> {
     let candidates = state
         .enricher
         .search_candidates(
@@ -1088,24 +1739,37 @@ async fn admin_review_search(
         )
         .await
         .map_err(internal)?;
-    Ok(Json(json!({ "candidates": candidates })))
+    Ok(Json(ReviewCandidatesResponse { candidates }))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 struct ApplyMatch {
     /// "pick": store the supplied candidate; "confirm": promote the
     /// current weak match; "reject": clear the match, excluded from
     /// auto-retries.
     action: String,
     provider: Option<String>,
-    candidate: Option<Value>,
+    candidate: Option<ManualMatchCandidate>,
 }
 
+#[utoipa::path(
+    post, path = "/admin/v1/items/{id}/match", tag = "Admin enrichment",
+    security(("bearer_auth" = [])),
+    params(("id" = String, Path)),
+    request_body = ApplyMatch,
+    responses(
+        (status = 200, body = OkResponse),
+        (status = 400, body = String, content_type = "text/plain"),
+        (status = 401, body = String, content_type = "text/plain"),
+        (status = 403, body = String, content_type = "text/plain"),
+        (status = 500, body = String, content_type = "text/plain")
+    )
+)]
 async fn admin_apply_match(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(body): Json<ApplyMatch>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<OkResponse>, ApiError> {
     let db = state.registry.db();
     match body.action.as_str() {
         "confirm" => {
@@ -1126,14 +1790,14 @@ async fn admin_apply_match(
                 .map_err(internal)?;
         }
         "pick" => {
-            let c = body
+            let candidate = body
                 .candidate
                 .ok_or((StatusCode::BAD_REQUEST, "candidate required".into()))?;
             let provider = body
                 .provider
                 .ok_or((StatusCode::BAD_REQUEST, "provider required".into()))?;
-            let pid = c["id"]
-                .as_u64()
+            let provider_id = candidate
+                .id
                 .ok_or((StatusCode::BAD_REQUEST, "candidate.id required".into()))?;
             // A human's choice: stored as that provider's answer and pinned,
             // so automatic re-picking leaves it alone whatever lands later.
@@ -1141,13 +1805,13 @@ async fn admin_apply_match(
                 db,
                 &id,
                 &provider,
-                &pid.to_string(),
+                &provider_id.to_string(),
                 crate::providers::Fields {
-                    title: c["title"].as_str().map(str::to_string),
-                    overview: c["overview"].as_str().map(str::to_string),
-                    poster_path: c["poster_path"].as_str().map(str::to_string),
-                    rating: c["vote_average"].as_f64(),
-                    premiered: c["release_date"].as_str().map(str::to_string),
+                    title: candidate.title,
+                    overview: candidate.overview,
+                    poster_path: candidate.poster_path,
+                    rating: candidate.vote_average,
+                    premiered: candidate.release_date,
                     ..Default::default()
                 },
             )
@@ -1156,18 +1820,28 @@ async fn admin_apply_match(
         }
         other => return Err((StatusCode::BAD_REQUEST, format!("unknown action {other}"))),
     }
-    Ok(Json(json!({ "ok": true })))
+    Ok(Json(OkResponse { ok: true }))
 }
 
 /// HUB-10: the accounts and what each may see (HUB-26 users panel).
-async fn admin_users(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+#[utoipa::path(
+    get, path = "/admin/v1/users", tag = "Admin users",
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, body = UsersResponse),
+        (status = 401, body = String, content_type = "text/plain"),
+        (status = 403, body = String, content_type = "text/plain"),
+        (status = 500, body = String, content_type = "text/plain")
+    )
+)]
+async fn admin_users(State(state): State<AppState>) -> Result<Json<UsersResponse>, ApiError> {
     let users = crate::grants::users_with_access(state.registry.db())
         .await
         .map_err(internal)?;
-    Ok(Json(json!({ "users": users })))
+    Ok(Json(UsersResponse { users }))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 struct SetAccess {
     /// Everything, including libraries made later. When true the list is
     /// stored but not consulted — see the `grants` module doc.
@@ -1187,11 +1861,24 @@ struct SetAccess {
 /// Running sessions are left alone. Revoking a library does not reach
 /// into a stream already playing; the next request the client makes is
 /// where it finds out.
+#[utoipa::path(
+    put, path = "/admin/v1/users/{id}/libraries", tag = "Admin users",
+    security(("bearer_auth" = [])),
+    params(("id" = String, Path)),
+    request_body = SetAccess,
+    responses(
+        (status = 200, body = UserAccessResponse),
+        (status = 401, body = String, content_type = "text/plain"),
+        (status = 403, body = String, content_type = "text/plain"),
+        (status = 404, body = String, content_type = "text/plain"),
+        (status = 500, body = String, content_type = "text/plain")
+    )
+)]
 async fn admin_set_user_libraries(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(body): Json<SetAccess>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<UserAccessResponse>, ApiError> {
     let db = state.registry.db();
     let existed = crate::grants::set_access(db, &id, body.all_libraries, &body.libraries)
         .await
@@ -1205,12 +1892,14 @@ async fn admin_set_user_libraries(
             .fetch_all(db)
             .await
             .map_err(internal)?;
-    Ok(Json(
-        json!({ "id": id, "all_libraries": body.all_libraries, "libraries": stored }),
-    ))
+    Ok(Json(UserAccessResponse {
+        id,
+        all_libraries: body.all_libraries,
+        libraries: stored,
+    }))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 struct SetAdminBody {
     admin: bool,
 }
@@ -1222,11 +1911,25 @@ struct SetAdminBody {
 /// AUTH-3 increments the account's durable access generation in the same write,
 /// so even a self-demotion takes effect on the next request; the last-admin
 /// predicate remains the independent database backstop against reaching zero.
+#[utoipa::path(
+    put, path = "/admin/v1/users/{id}/admin", tag = "Admin users",
+    security(("bearer_auth" = [])),
+    params(("id" = String, Path)),
+    request_body = SetAdminBody,
+    responses(
+        (status = 200, body = UserAdminResponse),
+        (status = 401, body = String, content_type = "text/plain"),
+        (status = 403, body = String, content_type = "text/plain"),
+        (status = 404, body = String, content_type = "text/plain"),
+        (status = 409, body = String, content_type = "text/plain"),
+        (status = 500, body = String, content_type = "text/plain")
+    )
+)]
 async fn admin_set_user_admin(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(body): Json<SetAdminBody>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<UserAdminResponse>, ApiError> {
     match state
         .auth
         .set_admin(&id, body.admin)
@@ -1243,11 +1946,14 @@ async fn admin_set_user_admin(
             StatusCode::CONFLICT,
             "refusing to demote the last admin".into(),
         )),
-        _ => Ok(Json(json!({ "id": id, "is_admin": body.admin }))),
+        _ => Ok(Json(UserAdminResponse {
+            id,
+            is_admin: body.admin,
+        })),
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 struct CreateUser {
     username: String,
     password: String,
@@ -1255,18 +1961,31 @@ struct CreateUser {
     admin: bool,
 }
 
+#[utoipa::path(
+    post, path = "/admin/v1/users", tag = "Admin users",
+    security(("bearer_auth" = [])),
+    request_body = CreateUser,
+    responses(
+        (status = 200, body = CreatedUserResponse),
+        (status = 400, body = String, content_type = "text/plain"),
+        (status = 401, body = String, content_type = "text/plain"),
+        (status = 403, body = String, content_type = "text/plain")
+    )
+)]
 async fn admin_create_user(
     State(state): State<AppState>,
     Json(body): Json<CreateUser>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<CreatedUserResponse>, ApiError> {
     let id = state
         .auth
         .create_user(&body.username, &body.password, body.admin)
         .await
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;
-    Ok(Json(
-        json!({ "id": id, "username": body.username, "admin": body.admin }),
-    ))
+    Ok(Json(CreatedUserResponse {
+        id,
+        username: body.username,
+        admin: body.admin,
+    }))
 }
 
 /// HUB-10: remove an account. Sessions first — a stream outliving its
@@ -1274,11 +1993,24 @@ async fn admin_create_user(
 ///
 /// What survives on purpose: subtitles this user downloaded. They are
 /// attached to the item, not to the person who fetched them.
+#[utoipa::path(
+    delete, path = "/admin/v1/users/{id}", tag = "Admin users",
+    security(("bearer_auth" = [])),
+    params(("id" = String, Path)),
+    responses(
+        (status = 200, body = DeletedUserResponse),
+        (status = 401, body = String, content_type = "text/plain"),
+        (status = 403, body = String, content_type = "text/plain"),
+        (status = 404, body = String, content_type = "text/plain"),
+        (status = 409, body = String, content_type = "text/plain"),
+        (status = 500, body = String, content_type = "text/plain")
+    )
+)]
 async fn admin_delete_user(
     State(state): State<AppState>,
     axum::Extension(claims): axum::Extension<crate::auth::Claims>,
     Path(id): Path<String>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<DeletedUserResponse>, ApiError> {
     // Deleting yourself would revoke your own token mid-request and,
     // for the only admin, leave nobody who can undo it.
     if id == claims.sub {
@@ -1305,26 +2037,53 @@ async fn admin_delete_user(
     // somebody's sessions. Authentication now rejects the missing user row on
     // every request, so no process-local tombstone is needed.
     let sessions_ended = state.sessions.end_for_user(&id);
-    Ok(Json(
-        json!({ "deleted": id, "username": username, "sessions_ended": sessions_ended }),
-    ))
+    Ok(Json(DeletedUserResponse {
+        deleted: id,
+        username,
+        sessions_ended,
+    }))
 }
 
-async fn admin_satellites(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
-    let sats = state
+#[utoipa::path(
+    get, path = "/admin/v1/satellites", tag = "Admin satellites",
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, body = SatellitesResponse),
+        (status = 401, body = String, content_type = "text/plain"),
+        (status = 403, body = String, content_type = "text/plain"),
+        (status = 500, body = String, content_type = "text/plain")
+    )
+)]
+async fn admin_satellites(
+    State(state): State<AppState>,
+) -> Result<Json<SatellitesResponse>, ApiError> {
+    let satellites = state
         .registry
         .satellites_overview()
         .await
         .map_err(internal)?;
-    Ok(Json(json!({ "satellites": sats })))
+    Ok(Json(SatellitesResponse { satellites }))
 }
 
 /// SEC-6/HUB-20: allowlist removal + end sessions + cascade. Refusal of
 /// reconnection happens at the TLS layer (fingerprint no longer admitted).
+#[utoipa::path(
+    delete, path = "/admin/v1/satellites/{id}", tag = "Admin satellites",
+    security(("bearer_auth" = [])),
+    params(("id" = String, Path)),
+    responses(
+        (status = 200, body = DeletedSatelliteResponse),
+        (status = 401, body = String, content_type = "text/plain"),
+        (status = 403, body = String, content_type = "text/plain"),
+        (status = 404, body = String, content_type = "text/plain"),
+        (status = 409, body = String, content_type = "text/plain"),
+        (status = 500, body = String, content_type = "text/plain")
+    )
+)]
 async fn admin_delete_satellite(
     State(state): State<AppState>,
     Path(id): Path<String>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<DeletedSatelliteResponse>, ApiError> {
     // Before ending anything: the hub's own mediahost is not a satellite
     // this operation can act on, and refusing after tearing its sessions
     // down would be the destructive half of an operation that then fails.
@@ -1345,47 +2104,85 @@ async fn admin_delete_satellite(
         .clean_orphaned_payloads(&state.registry)
         .await
         .map_err(internal)?;
-    Ok(Json(
-        json!({ "deleted": id, "removed": fingerprint, "sessions_ended": ended,
-                "subtitle_payloads_removed": removed_payloads }),
-    ))
+    Ok(Json(DeletedSatelliteResponse {
+        deleted: id,
+        removed: fingerprint,
+        sessions_ended: ended,
+        subtitle_payloads_removed: removed_payloads,
+    }))
 }
 
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, ToSchema)]
 struct SetDisabled {
     disabled: bool,
 }
 
 /// Admin drain toggle: placement skips a disabled satellite; running
 /// sessions finish on their own.
-async fn admin_libraries(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+#[utoipa::path(
+    get, path = "/admin/v1/libraries", tag = "Admin libraries",
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, body = AdminLibrariesResponse),
+        (status = 401, body = String, content_type = "text/plain"),
+        (status = 403, body = String, content_type = "text/plain"),
+        (status = 500, body = String, content_type = "text/plain")
+    )
+)]
+async fn admin_libraries(
+    State(state): State<AppState>,
+) -> Result<Json<AdminLibrariesResponse>, ApiError> {
     let libraries = state
         .registry
         .libraries_overview()
         .await
         .map_err(internal)?;
-    Ok(Json(json!({ "libraries": libraries })))
+    Ok(Json(AdminLibrariesResponse { libraries }))
 }
 
-async fn admin_collections(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+#[utoipa::path(
+    get, path = "/admin/v1/collections", tag = "Admin libraries",
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, body = AdminCollectionsResponse),
+        (status = 401, body = String, content_type = "text/plain"),
+        (status = 403, body = String, content_type = "text/plain"),
+        (status = 500, body = String, content_type = "text/plain")
+    )
+)]
+async fn admin_collections(
+    State(state): State<AppState>,
+) -> Result<Json<AdminCollectionsResponse>, ApiError> {
     let collections = state
         .registry
         .collections_overview()
         .await
         .map_err(internal)?;
-    Ok(Json(json!({ "collections": collections })))
+    Ok(Json(AdminCollectionsResponse { collections }))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 struct CreateLibraryRequest {
     name: String,
     media_type: String,
 }
 
+#[utoipa::path(
+    post, path = "/admin/v1/libraries", tag = "Admin libraries",
+    security(("bearer_auth" = [])),
+    request_body = CreateLibraryRequest,
+    responses(
+        (status = 200, body = CreatedLibraryResponse),
+        (status = 400, body = String, content_type = "text/plain"),
+        (status = 401, body = String, content_type = "text/plain"),
+        (status = 403, body = String, content_type = "text/plain"),
+        (status = 409, body = String, content_type = "text/plain")
+    )
+)]
 async fn admin_create_library(
     State(state): State<AppState>,
     Json(body): Json<CreateLibraryRequest>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<CreatedLibraryResponse>, ApiError> {
     let name = body.name.trim();
     if name.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "library name required".into()));
@@ -1395,9 +2192,21 @@ async fn admin_create_library(
         .create_library(name, &body.media_type)
         .await
         .map_err(|e| (StatusCode::CONFLICT, format!("{e:#}")))?;
-    Ok(Json(json!({ "id": id })))
+    Ok(Json(CreatedLibraryResponse { id }))
 }
 
+#[utoipa::path(
+    delete, path = "/admin/v1/libraries/{id}", tag = "Admin libraries",
+    security(("bearer_auth" = [])),
+    params(("id" = String, Path)),
+    responses(
+        (status = 204, description = "Library deleted"),
+        (status = 401, body = String, content_type = "text/plain"),
+        (status = 403, body = String, content_type = "text/plain"),
+        (status = 404, body = String, content_type = "text/plain"),
+        (status = 500, body = String, content_type = "text/plain")
+    )
+)]
 async fn admin_delete_library(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -1409,12 +2218,24 @@ async fn admin_delete_library(
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 struct AttachCollectionRequest {
     module_id: String,
     collection_id: String,
 }
 
+#[utoipa::path(
+    post, path = "/admin/v1/libraries/{id}/collections", tag = "Admin libraries",
+    security(("bearer_auth" = [])),
+    params(("id" = String, Path)),
+    request_body = AttachCollectionRequest,
+    responses(
+        (status = 204, description = "Collection attached"),
+        (status = 401, body = String, content_type = "text/plain"),
+        (status = 403, body = String, content_type = "text/plain"),
+        (status = 409, body = String, content_type = "text/plain")
+    )
+)]
 async fn admin_attach_collection(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -1428,6 +2249,22 @@ async fn admin_attach_collection(
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[utoipa::path(
+    delete, path = "/admin/v1/libraries/{id}/collections/{module_id}/{collection_id}", tag = "Admin libraries",
+    security(("bearer_auth" = [])),
+    params(
+        ("id" = String, Path),
+        ("module_id" = String, Path),
+        ("collection_id" = String, Path)
+    ),
+    responses(
+        (status = 204, description = "Collection detached"),
+        (status = 401, body = String, content_type = "text/plain"),
+        (status = 403, body = String, content_type = "text/plain"),
+        (status = 404, body = String, content_type = "text/plain"),
+        (status = 500, body = String, content_type = "text/plain")
+    )
+)]
 async fn admin_detach_collection(
     State(state): State<AppState>,
     Path((id, module_id, collection_id)): Path<(String, String, String)>,
@@ -1444,6 +2281,18 @@ async fn admin_detach_collection(
     }
 }
 
+#[utoipa::path(
+    post, path = "/admin/v1/satellites/{id}/disabled", tag = "Admin satellites",
+    security(("bearer_auth" = [])),
+    params(("id" = String, Path)),
+    request_body = SetDisabled,
+    responses(
+        (status = 204, description = "Placement state updated"),
+        (status = 401, body = String, content_type = "text/plain"),
+        (status = 403, body = String, content_type = "text/plain"),
+        (status = 500, body = String, content_type = "text/plain")
+    )
+)]
 async fn admin_set_disabled(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -1458,45 +2307,74 @@ async fn admin_set_disabled(
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn admin_sessions(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
-    let mut out = Vec::new();
-    for s in state.sessions.list() {
-        let title: Option<String> = sqlx::query_scalar("SELECT title FROM items WHERE id = ?")
-            .bind(&s.item_id)
+#[utoipa::path(
+    get, path = "/admin/v1/sessions", tag = "Admin sessions",
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, body = AdminSessionsResponse),
+        (status = 401, body = String, content_type = "text/plain"),
+        (status = 403, body = String, content_type = "text/plain"),
+        (status = 500, body = String, content_type = "text/plain")
+    )
+)]
+async fn admin_sessions(
+    State(state): State<AppState>,
+) -> Result<Json<AdminSessionsResponse>, ApiError> {
+    let mut sessions = Vec::new();
+    for session in state.sessions.list() {
+        let title = sqlx::query_scalar("SELECT title FROM items WHERE id = ?")
+            .bind(&session.item_id)
             .fetch_optional(state.registry.db())
             .await
             .map_err(internal)?;
-        let username: Option<String> =
-            sqlx::query_scalar("SELECT username FROM users WHERE id = ?")
-                .bind(&s.user_id)
-                .fetch_optional(state.registry.db())
-                .await
-                .map_err(internal)?;
-        out.push(json!({
-            "session_id": s.id,
-            "username": username,
-            "title": title,
-            "mode": match &s.mode {
+        let username = sqlx::query_scalar("SELECT username FROM users WHERE id = ?")
+            .bind(&session.user_id)
+            .fetch_optional(state.registry.db())
+            .await
+            .map_err(internal)?;
+        let streams = session
+            .verdict
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|(video, audio)| SessionStreamSummary {
+                cost: session.delivery_cost(),
+                video: video.clone(),
+                audio: audio.clone(),
+            });
+        sessions.push(AdminSession {
+            session_id: session.id.clone(),
+            username,
+            title,
+            mode: match &session.mode {
                 crate::sessions::Mode::Direct { .. } => "direct",
                 crate::sessions::Mode::Remux { .. } => "remux",
                 crate::sessions::Mode::Transcode { .. } => "transcode",
             },
-            "module_id": s.module_id,
-            "idle_secs": s.idle_for().as_secs(),
-            "streams": s.verdict.lock().unwrap().as_ref().map(|(video, audio)| json!({
-                "cost": s.delivery_cost(),
-                "video": video,
-                "audio": audio,
-            })),
-        }));
+            module_id: session.module_id.clone(),
+            idle_secs: session.idle_for().as_secs(),
+            streams,
+        });
     }
-    Ok(Json(json!({ "sessions": out })))
+    Ok(Json(AdminSessionsResponse { sessions }))
 }
 
 /// OPS-10: a session's diagnostics, as an attachment. A live session is
 /// collected on the spot; an ended one is served from what teardown
 /// stored, which is the case that matters — nobody presses a button on
 /// a session they already closed.
+#[utoipa::path(
+    get, path = "/admin/v1/sessions/{id}/log", tag = "Admin sessions",
+    security(("bearer_auth" = [])),
+    params(("id" = String, Path)),
+    responses(
+        (status = 200, body = String, content_type = "text/plain; charset=utf-8",
+            headers(("content-disposition" = String))),
+        (status = 401, body = String, content_type = "text/plain"),
+        (status = 403, body = String, content_type = "text/plain"),
+        (status = 404, body = String, content_type = "text/plain")
+    )
+)]
 async fn admin_session_log(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -1510,6 +2388,19 @@ async fn admin_session_log(
 }
 
 /// The newest bundle for an item, whoever played it.
+#[utoipa::path(
+    get, path = "/admin/v1/items/{id}/log", tag = "Admin sessions",
+    security(("bearer_auth" = [])),
+    params(("id" = String, Path)),
+    responses(
+        (status = 200, body = String, content_type = "text/plain; charset=utf-8",
+            headers(("content-disposition" = String))),
+        (status = 401, body = String, content_type = "text/plain"),
+        (status = 403, body = String, content_type = "text/plain"),
+        (status = 404, body = String, content_type = "text/plain"),
+        (status = 500, body = String, content_type = "text/plain")
+    )
+)]
 async fn admin_item_log(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -1545,6 +2436,17 @@ fn log_attachment(filename: String, body: String) -> Response {
         .into_response()
 }
 
+#[utoipa::path(
+    delete, path = "/admin/v1/sessions/{id}", tag = "Admin sessions",
+    security(("bearer_auth" = [])),
+    params(("id" = String, Path)),
+    responses(
+        (status = 204, description = "Session ended"),
+        (status = 401, body = String, content_type = "text/plain"),
+        (status = 403, body = String, content_type = "text/plain"),
+        (status = 410, body = String, content_type = "text/plain")
+    )
+)]
 async fn admin_end_session(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -1556,20 +2458,31 @@ async fn admin_end_session(
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 struct SetupRequest {
     username: String,
     password: String,
 }
 
-async fn setup_bootstrap(State(state): State<SetupState>) -> Json<Value> {
-    Json(json!({
-        "setup_required": state.auth.setup_required(),
-        "setup_available": true,
-        "setup_url": Value::Null,
-    }))
+async fn setup_bootstrap(State(state): State<SetupState>) -> Json<BootstrapResponse> {
+    Json(BootstrapResponse {
+        setup_required: state.auth.setup_required(),
+        setup_available: true,
+        setup_url: None,
+    })
 }
 
+#[utoipa::path(
+    post, path = "/api/v1/setup", tag = "Setup (trusted local listener)",
+    request_body = SetupRequest,
+    responses(
+        (status = 204, description = "Initial admin created"),
+        (status = 400, body = String, content_type = "text/plain"),
+        (status = 403, body = String, content_type = "text/plain"),
+        (status = 409, body = String, content_type = "text/plain"),
+        (status = 500, body = String, content_type = "text/plain")
+    )
+)]
 async fn setup(
     State(state): State<SetupState>,
     headers: axum::http::HeaderMap,
@@ -1623,28 +2536,28 @@ async fn setup(
     Ok(StatusCode::NO_CONTENT)
 }
 
-#[derive(Clone, Copy, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Deserialize, Eq, PartialEq, ToSchema)]
 #[serde(rename_all = "lowercase")]
 enum AuthClient {
     Browser,
     Api,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 struct LoginRequest {
     client: AuthClient,
     username: String,
     password: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 struct RefreshRequest {
     client: AuthClient,
     #[serde(default)]
     refresh_token: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 struct LogoutRequest {
     client: AuthClient,
     #[serde(default)]
@@ -1786,12 +2699,12 @@ fn clear_auth_cookies(response: &mut Response, secure: bool) {
 
 fn token_response(tokens: crate::auth::TokenPair, client: AuthClient, secure: bool) -> Response {
     if client == AuthClient::Api {
-        return Json(json!(tokens)).into_response();
+        return Json(tokens).into_response();
     }
-    let mut response = Json(json!({
-        "access_token": tokens.access_token,
-        "expires_in": tokens.expires_in,
-    }))
+    let mut response = Json(BrowserTokenResponse {
+        access_token: tokens.access_token.clone(),
+        expires_in: tokens.expires_in,
+    })
     .into_response();
     append_auth_cookies(&mut response, &tokens, secure);
     response
@@ -1802,6 +2715,19 @@ fn token_response(tokens: crate::auth::TokenPair, client: AuthClient, secure: bo
 const THROTTLE_USER_AFTER: u32 = 5;
 const THROTTLE_IP_AFTER: u32 = 20;
 
+#[utoipa::path(
+    post, path = "/api/v1/auth/token", tag = "Authentication",
+    request_body = LoginRequest,
+    params(("Origin" = Option<String>, Header, description = "Required for browser mode; must match the canonical browser origin")),
+    responses(
+        (status = 200, body = AuthSuccessResponse, headers(("set-cookie" = String, description = "Browser clients receive refresh and media cookies"))),
+        (status = 400, body = String, content_type = "text/plain"),
+        (status = 401, body = String, content_type = "text/plain"),
+        (status = 403, body = String, content_type = "text/plain"),
+        (status = 429, body = String, content_type = "text/plain"),
+        (status = 503, body = String, content_type = "text/plain")
+    )
+)]
 async fn login(
     State(state): State<AppState>,
     ClientIp(ip): ClientIp,
@@ -1849,6 +2775,17 @@ async fn login(
     }
 }
 
+#[utoipa::path(
+    post, path = "/api/v1/auth/refresh", tag = "Authentication",
+    request_body = RefreshRequest,
+    responses(
+        (status = 200, body = AuthSuccessResponse, headers(("set-cookie" = String, description = "Rotated browser cookies"))),
+        (status = 400, body = String, content_type = "text/plain"),
+        (status = 401, body = String, content_type = "text/plain"),
+        (status = 403, body = String, content_type = "text/plain"),
+        (status = 500, body = String, content_type = "text/plain")
+    )
+)]
 async fn refresh(
     State(state): State<AppState>,
     meta: AuthRequestMeta,
@@ -1898,6 +2835,18 @@ async fn refresh(
     }
 }
 
+#[utoipa::path(
+    post, path = "/api/v1/auth/logout", tag = "Authentication",
+    security(("bearer_auth" = [])),
+    request_body = LogoutRequest,
+    responses(
+        (status = 204, description = "Refresh token revoked", headers(("set-cookie" = String, description = "Browser cookies cleared"))),
+        (status = 400, body = String, content_type = "text/plain"),
+        (status = 401, body = String, content_type = "text/plain"),
+        (status = 403, body = String, content_type = "text/plain"),
+        (status = 500, body = String, content_type = "text/plain")
+    )
+)]
 async fn logout(
     State(state): State<AppState>,
     axum::Extension(claims): axum::Extension<crate::auth::Claims>,
@@ -1938,7 +2887,7 @@ async fn logout(
     Ok(response)
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 struct StartSessionRequest {
     item_id: String,
     /// Explicit mode = the pre-negotiation contract, verbatim (scripts,
@@ -1969,13 +2918,24 @@ struct StartSessionRequest {
 /// EventSource authenticates via the `kahawai_media` cookie (it cannot
 /// set headers), like the other browser media resources. Hints, not state —
 /// clients refetch whatever a hint names.
+#[utoipa::path(
+    get, path = "/api/v1/events", tag = "Events",
+    security(("bearer_auth" = []), ("media_token" = [])),
+    responses(
+        (status = 200, body = String, content_type = "text/event-stream", headers(("x-accel-buffering" = String))),
+        (status = 401, body = String, content_type = "text/plain")
+    )
+)]
 async fn events(State(state): State<AppState>) -> impl axum::response::IntoResponse {
     use axum::response::sse::{Event, KeepAlive, Sse};
     use tokio_stream::StreamExt;
     let rx = state.registry.subscribe_events();
-    let stream = tokio_stream::wrappers::BroadcastStream::new(rx).filter_map(|v| {
-        v.ok()
-            .map(|v| Ok::<_, std::convert::Infallible>(Event::default().data(v.to_string())))
+    let stream = tokio_stream::wrappers::BroadcastStream::new(rx).filter_map(|event| {
+        event.ok().map(|event| {
+            Ok::<_, std::convert::Infallible>(
+                Event::default().data(serde_json::to_string(&event).expect("serializable event")),
+            )
+        })
     });
     // OPS-8: tell buffering proxies (nginx) to pass events through live.
     (
@@ -1986,29 +2946,36 @@ async fn events(State(state): State<AppState>) -> impl axum::response::IntoRespo
 
 /// Per-user preferences (HUB-33): tiny generic KV, scope = library id
 /// or '' for user-global keys.
+#[utoipa::path(
+    get, path = "/api/v1/prefs", tag = "Preferences",
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, body = PreferencesResponse),
+        (status = 401, body = String, content_type = "text/plain"),
+        (status = 500, body = String, content_type = "text/plain")
+    )
+)]
 async fn get_prefs(
     State(state): State<AppState>,
     axum::Extension(claims): axum::Extension<crate::auth::Claims>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<PreferencesResponse>, ApiError> {
     let rows = sqlx::query("SELECT scope, key, value FROM user_prefs WHERE user_id = ?")
         .bind(&claims.sub)
         .fetch_all(state.registry.db())
         .await
         .map_err(internal)?;
-    let prefs: Vec<Value> = rows
+    let prefs = rows
         .iter()
-        .map(|r| {
-            json!({
-                "scope": r.get::<String, _>("scope"),
-                "key": r.get::<String, _>("key"),
-                "value": r.get::<String, _>("value"),
-            })
+        .map(|row| Preference {
+            scope: row.get("scope"),
+            key: row.get("key"),
+            value: row.get("value"),
         })
         .collect();
-    Ok(Json(json!({ "prefs": prefs })))
+    Ok(Json(PreferencesResponse { prefs }))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 struct PutPrefRequest {
     #[serde(default)]
     scope: String,
@@ -2017,11 +2984,22 @@ struct PutPrefRequest {
     value: String,
 }
 
+#[utoipa::path(
+    put, path = "/api/v1/prefs", tag = "Preferences",
+    security(("bearer_auth" = [])),
+    request_body = PutPrefRequest,
+    responses(
+        (status = 200, body = OkResponse),
+        (status = 400, body = String, content_type = "text/plain"),
+        (status = 401, body = String, content_type = "text/plain"),
+        (status = 500, body = String, content_type = "text/plain")
+    )
+)]
 async fn put_pref(
     State(state): State<AppState>,
     axum::Extension(claims): axum::Extension<crate::auth::Claims>,
     Json(body): Json<PutPrefRequest>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<OkResponse>, ApiError> {
     if body.key.len() > 64 || body.value.len() > 256 || body.scope.len() > 64 {
         return Err((StatusCode::BAD_REQUEST, "preference too long".into()));
     }
@@ -2046,7 +3024,7 @@ async fn put_pref(
         .await
         .map_err(internal)?;
     }
-    Ok(Json(json!({ "ok": true })))
+    Ok(Json(OkResponse { ok: true }))
 }
 
 /// 409 says "not with this item"; 503 says "not right now". Every other
@@ -2062,11 +3040,24 @@ fn session_refusal(e: anyhow::Error) -> ApiError {
     (status, format!("{e:#}"))
 }
 
+#[utoipa::path(
+    post, path = "/api/v1/playback/sessions", tag = "Playback",
+    security(("bearer_auth" = [])),
+    request_body = StartSessionRequest,
+    responses(
+        (status = 201, body = StartSessionResponse),
+        (status = 401, body = String, content_type = "text/plain"),
+        (status = 404, body = String, content_type = "text/plain"),
+        (status = 409, body = String, content_type = "text/plain"),
+        (status = 500, body = String, content_type = "text/plain"),
+        (status = 503, body = String, content_type = "text/plain")
+    )
+)]
 async fn start_session(
     State(state): State<AppState>,
     axum::Extension(claims): axum::Extension<crate::auth::Claims>,
     Json(body): Json<StartSessionRequest>,
-) -> Result<(StatusCode, Json<Value>), ApiError> {
+) -> Result<(StatusCode, Json<StartSessionResponse>), ApiError> {
     // HUB-10. Here rather than inside `Sessions::start`: authorization is
     // the API edge's job, and the session-scoped routes that follow are
     // reachable only with the ULID this call hands back.
@@ -2109,33 +3100,37 @@ async fn start_session(
             "application/vnd.apple.mpegurl".to_string(),
         ),
     };
+    let streams = session
+        .verdict
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|(video, audio)| PlaybackStreams {
+            // Aggregate semantic work, separate from `mode`, which says
+            // where/how the pipeline runs.
+            cost: session.delivery_cost(),
+            video: video.clone(),
+            audio: audio.clone(),
+            // Additive (HUB-32a/b); [] on explicit-mode sessions.
+            subtitles: session.sub_verdicts.lock().unwrap().clone(),
+        });
     Ok((
         StatusCode::CREATED,
-        Json(json!({
-            "session_id": session.id,
-            "mode": mode,
-            "size": session.size,
-            "duration_ms": session.duration_ms,
-            "part_base_ms": session.part_base_ms(),
-            "parts": session.parts.len(),
-            "content_type": ctype,
-            "stream_url": stream_url,
-            "streams": session.verdict.lock().unwrap().as_ref().map(|(video, audio)| json!({
-                // Aggregate semantic work, separate from `mode`, which says
-                // where/how the pipeline runs. A remux pipeline can encode
-                // audio; a dispatched pipeline can copy video.
-                "cost": session.delivery_cost(),
-                "video": video,
-                "audio": audio,
-                // Additive (HUB-32a/b): per-subtitle tier verdicts on
-                // negotiated sessions; [] on explicit-mode sessions.
-                "subtitles": *session.sub_verdicts.lock().unwrap(),
-            })),
-        })),
+        Json(StartSessionResponse {
+            session_id: session.id.clone(),
+            mode,
+            size: session.size,
+            duration_ms: session.duration_ms,
+            part_base_ms: session.part_base_ms(),
+            parts: session.parts.len(),
+            content_type: ctype,
+            stream_url,
+            streams,
+        }),
     ))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 struct SeekRequest {
     position_ms: u64,
     /// Switch tracks during the restart (HUB-27).
@@ -2150,11 +3145,24 @@ struct SeekRequest {
 
 /// Seek-restart (§6): restart the session's pipeline at the offset.
 /// Same session id and URLs; the client re-attaches to the playlist.
+#[utoipa::path(
+    post, path = "/api/v1/playback/sessions/{id}/seek", tag = "Playback",
+    security(("bearer_auth" = [])),
+    params(("id" = String, Path)),
+    request_body = SeekRequest,
+    responses(
+        (status = 200, body = SeekResponse),
+        (status = 401, body = String, content_type = "text/plain"),
+        (status = 409, body = String, content_type = "text/plain"),
+        (status = 410, body = String, content_type = "text/plain"),
+        (status = 503, body = String, content_type = "text/plain")
+    )
+)]
 async fn seek_session(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(body): Json<SeekRequest>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<SeekResponse>, ApiError> {
     // Before the seek, not inside it: `Sessions::seek` reports a missing
     // session as an ordinary error, which lands as the same 409 a real
     // seek failure does. A client cannot recover from an ambiguous
@@ -2185,17 +3193,35 @@ async fn seek_session(
     // A track switch re-planned: hand back the verdicts of what plays
     // NOW so the overlay never lies about the current streams.
     let session = state.sessions.get(&id);
-    let streams = session.as_ref().and_then(|s| {
-        s.verdict.lock().unwrap().as_ref().map(|(video, audio)| {
-            json!({ "cost": s.delivery_cost(), "video": video, "audio": audio,
-                        "subtitles": *s.sub_verdicts.lock().unwrap() })
-        })
+    let streams = session.as_ref().and_then(|session| {
+        session
+            .verdict
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|(video, audio)| PlaybackStreams {
+                cost: session.delivery_cost(),
+                video: video.clone(),
+                audio: audio.clone(),
+                subtitles: session.sub_verdicts.lock().unwrap().clone(),
+            })
     });
-    Ok(Json(
-        json!({ "part_base_ms": part_base_ms, "streams": streams }),
-    ))
+    Ok(Json(SeekResponse {
+        part_base_ms,
+        streams,
+    }))
 }
 
+#[utoipa::path(
+    delete, path = "/api/v1/playback/sessions/{id}", tag = "Playback",
+    security(("bearer_auth" = [])),
+    params(("id" = String, Path)),
+    responses(
+        (status = 204, description = "Session ended"),
+        (status = 401, body = String, content_type = "text/plain"),
+        (status = 410, body = String, content_type = "text/plain")
+    )
+)]
 async fn end_session(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -2262,6 +3288,22 @@ fn parse_range(header: Option<&str>, size: u64) -> Result<Option<(u64, u64)>, ()
     }
 }
 
+#[utoipa::path(
+    get, path = "/api/v1/playback/sessions/{id}/stream", tag = "Playback media",
+    security(("bearer_auth" = []), ("media_token" = [])),
+    params(
+        ("id" = String, Path),
+        ("range" = Option<String>, Header)
+    ),
+    responses(
+        (status = 200, body = Vec<u8>, content_type = "application/octet-stream", headers(("accept-ranges" = String), ("content-length" = u64))),
+        (status = 206, body = Vec<u8>, content_type = "application/octet-stream", headers(("accept-ranges" = String), ("content-length" = u64), ("content-range" = String))),
+        (status = 401, body = String, content_type = "text/plain"),
+        (status = 409, body = String, content_type = "text/plain"),
+        (status = 410, body = String, content_type = "text/plain"),
+        (status = 416, description = "Invalid or unsatisfiable byte range", headers(("content-range" = String)))
+    )
+)]
 async fn stream_session(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -2311,10 +3353,19 @@ async fn stream_session(
     Ok(resp.body(body).unwrap())
 }
 
+#[utoipa::path(
+    get, path = "/api/v1/collections", tag = "Browse",
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, body = CollectionsResponse),
+        (status = 401, body = String, content_type = "text/plain"),
+        (status = 500, body = String, content_type = "text/plain")
+    )
+)]
 async fn list_collections(
     State(state): State<AppState>,
     axum::Extension(claims): axum::Extension<crate::auth::Claims>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<CollectionsResponse>, ApiError> {
     let db = state.registry.db();
     let cols = state.registry.collections().await.map_err(internal)?;
     // HUB-10: a restricted account is told about the collections behind
@@ -2325,7 +3376,7 @@ async fn list_collections(
         .await
         .map_err(internal)?
     {
-        return Ok(Json(json!({ "collections": cols })));
+        return Ok(Json(CollectionsResponse { collections: cols }));
     }
     let mine: Vec<(String, String)> = sqlx::query_as(
         "SELECT lc.module_id, lc.collection_id FROM library_collections lc
@@ -2342,12 +3393,12 @@ async fn list_collections(
                 .any(|(m, i)| *m == c.module_id && *i == c.collection_id)
         })
         .collect();
-    Ok(Json(json!({ "collections": cols })))
+    Ok(Json(CollectionsResponse { collections: cols }))
 }
 
 /// `?size=` names one of `artwork::SIZES`; anything else, including
 /// nothing, serves the original.
-#[derive(serde::Deserialize, Default)]
+#[derive(serde::Deserialize, Default, ToSchema, utoipa::IntoParams)]
 struct ArtworkQuery {
     size: Option<String>,
     /// The client's cache-buster. Load-bearing rather than merely accepted: its
@@ -2356,6 +3407,17 @@ struct ArtworkQuery {
     v: Option<String>,
 }
 
+#[utoipa::path(
+    get, path = "/api/v1/items/{id}/artwork", tag = "Item media",
+    security(("bearer_auth" = []), ("media_token" = [])),
+    params(("id" = String, Path), ArtworkQuery),
+    responses(
+        (status = 200, content((Vec<u8> = "image/jpeg"), (Vec<u8> = "image/png"), (Vec<u8> = "image/webp")), headers(("cache-control" = String))),
+        (status = 401, body = String, content_type = "text/plain"),
+        (status = 404, body = String, content_type = "text/plain", headers(("cache-control" = String))),
+        (status = 500, body = String, content_type = "text/plain")
+    )
+)]
 async fn item_artwork(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -2425,7 +3487,7 @@ async fn item_artwork(
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema, utoipa::IntoParams)]
 struct VttQuery {
     /// f64 so a client that computed a fractional shift still works.
     #[serde(default)]
@@ -2434,6 +3496,23 @@ struct VttQuery {
 
 /// .vtt (flattened, shiftable) or .ass (faithful, absolute times —
 /// ASS renderers offset via the player clock).
+#[utoipa::path(
+    get, path = "/api/v1/items/{id}/subtitles/{file}", tag = "Item media",
+    security(("bearer_auth" = []), ("media_token" = [])),
+    params(
+        ("id" = String, Path),
+        ("file" = String, Path),
+        VttQuery
+    ),
+    responses(
+        (status = 200, content((String = "text/vtt; charset=utf-8"), (String = "text/x-ssa; charset=utf-8"), (Vec<u8> = "application/x-ndjson; charset=utf-8")), headers(("cache-control" = String))),
+        (status = 400, body = String, content_type = "text/plain"),
+        (status = 401, body = String, content_type = "text/plain"),
+        (status = 404, body = String, content_type = "text/plain"),
+        (status = 422, body = String, content_type = "text/plain"),
+        (status = 500, body = String, content_type = "text/plain")
+    )
+)]
 async fn item_subtitle_file(
     State(state): State<AppState>,
     Path((id, file)): Path<(String, String)>,
@@ -2550,19 +3629,46 @@ async fn item_subtitle_file(
         .into_response())
 }
 
+#[utoipa::path(
+    get, path = "/api/v1/items/{id}/fonts", tag = "Item media",
+    security(("bearer_auth" = [])),
+    params(("id" = String, Path)),
+    responses(
+        (status = 200, body = FontsResponse),
+        (status = 401, body = String, content_type = "text/plain"),
+        (status = 404, body = String, content_type = "text/plain"),
+        (status = 500, body = String, content_type = "text/plain")
+    )
+)]
 async fn item_fonts(
     State(state): State<AppState>,
     Path(id): Path<String>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<FontsResponse>, ApiError> {
     let fonts = state
         .subtitles
         .fonts(&state.registry, &state.sessions, &id)
         .await
-        .map_err(internal)?;
-    let names: Vec<&String> = fonts.iter().map(|(n, _)| n).collect();
-    Ok(Json(json!({ "fonts": names })))
+        .map_err(internal)?
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    Ok(Json(FontsResponse { fonts }))
 }
 
+#[utoipa::path(
+    get, path = "/api/v1/items/{id}/fonts/{n}", tag = "Item media",
+    security(("bearer_auth" = []), ("media_token" = [])),
+    params(
+        ("id" = String, Path),
+        ("n" = usize, Path)
+    ),
+    responses(
+        (status = 200, body = Vec<u8>, content_type = "font/ttf", headers(("cache-control" = String))),
+        (status = 401, body = String, content_type = "text/plain"),
+        (status = 404, body = String, content_type = "text/plain"),
+        (status = 500, body = String, content_type = "text/plain")
+    )
+)]
 async fn item_font(
     State(state): State<AppState>,
     Path((id, n)): Path<(String, usize)>,
@@ -2589,10 +3695,19 @@ async fn item_font(
 /// HUB-10: the libraries THIS account holds. Everything the client shows
 /// hangs off this list, so filtering it here is what makes a restricted
 /// account's whole UI right rather than nine views right one at a time.
+#[utoipa::path(
+    get, path = "/api/v1/libraries", tag = "Browse",
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, body = LibrariesResponse),
+        (status = 401, body = String, content_type = "text/plain"),
+        (status = 500, body = String, content_type = "text/plain")
+    )
+)]
 async fn list_libraries(
     State(state): State<AppState>,
     axum::Extension(claims): axum::Extension<crate::auth::Claims>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<LibrariesResponse>, ApiError> {
     let db = state.registry.db();
     let restricted = crate::grants::restricted(db, &claims)
         .await
@@ -2610,20 +3725,18 @@ async fn list_libraries(
         query = query.bind(&claims.sub);
     }
     let rows = query.fetch_all(db).await.map_err(internal)?;
-    let libraries: Vec<Value> = rows
+    let libraries = rows
         .iter()
-        .map(|r| {
-            json!({
-                "id": r.get::<String, _>("id"),
-                "name": r.get::<String, _>("name"),
-                "media_type": r.get::<String, _>("media_type"),
-            })
+        .map(|row| LibrarySummary {
+            id: row.get("id"),
+            name: row.get("name"),
+            media_type: row.get("media_type"),
         })
         .collect();
-    Ok(Json(json!({ "libraries": libraries })))
+    Ok(Json(LibrariesResponse { libraries }))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema, utoipa::IntoParams)]
 struct ItemsQuery {
     library: Option<String>,
     /// HUB-12 server-side search: a substring of the title, folded the
@@ -2806,11 +3919,22 @@ fn item_page_sql(inner: &str, order_out: &str, restricted: bool, scoped: bool) -
     )
 }
 
+#[utoipa::path(
+    get, path = "/api/v1/items", tag = "Browse",
+    security(("bearer_auth" = [])),
+    params(ItemsQuery),
+    responses(
+        (status = 200, body = ItemsResponse),
+        (status = 401, body = String, content_type = "text/plain"),
+        (status = 404, body = String, content_type = "text/plain"),
+        (status = 500, body = String, content_type = "text/plain")
+    )
+)]
 async fn list_items(
     State(state): State<AppState>,
     Query(q): Query<ItemsQuery>,
     axum::Extension(claims): axum::Extension<crate::auth::Claims>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<ItemsResponse>, ApiError> {
     let limit = q.limit.unwrap_or(ITEMS_PAGE_DEFAULT).min(ITEMS_PAGE_MAX);
     let offset = q.offset.unwrap_or(0);
     // Folded once here, matched against norm_title (already folded) and
@@ -3081,39 +4205,62 @@ async fn list_items(
             }
         }
     };
-    let items: Vec<Value> = rows.iter().map(item_row_json).collect();
-    Ok(Json(json!({
-        "items": items,
-        "total": total,
-        "limit": limit,
-        "offset": offset,
-    })))
+    let items = rows
+        .iter()
+        .map(|row| item_row(row, row.get::<i64, _>("sources")))
+        .collect();
+    Ok(Json(ItemsResponse {
+        items,
+        total,
+        limit,
+        offset,
+    }))
 }
 
 #[derive(Serialize, ToSchema)]
+#[schema(as = ItemRow<S>)]
 struct ItemRow<S> {
     id: String,
     kind: String,
     title: String,
+    #[schema(required)]
     artist: Option<String>,
+    #[schema(required)]
     match_confidence: Option<String>,
+    #[schema(required)]
     art_version: Option<i64>,
+    #[schema(required)]
     premiered: Option<String>,
+    #[schema(required)]
     file_title: Option<String>,
+    #[schema(required)]
     file_year: Option<i64>,
+    #[schema(required)]
     matched_title: Option<String>,
+    #[schema(required)]
     year: Option<i64>,
+    #[schema(required)]
     season: Option<i64>,
+    #[schema(required)]
     episode: Option<i64>,
+    #[schema(required)]
     episode_end: Option<i64>,
+    #[schema(required)]
     parent_id: Option<String>,
+    #[schema(required)]
     parent_title: Option<String>,
+    #[schema(required)]
     library_id: Option<String>,
+    #[schema(required)]
     proj_season: Option<i64>,
+    #[schema(required)]
     proj_episode: Option<i64>,
     sources: S,
+    #[schema(required)]
     replay_gain: Option<kahawai_core::media::ReplayGain>,
+    #[schema(required)]
     resume_position_ms: Option<i64>,
+    #[schema(required)]
     resume_duration_ms: Option<i64>,
     played: bool,
     play_count: i64,
@@ -3156,18 +4303,24 @@ fn item_row<S>(r: &sqlx::sqlite::SqliteRow, sources: S) -> ItemRow<S> {
     }
 }
 
-fn item_row_json(r: &sqlx::sqlite::SqliteRow) -> Value {
-    serde_json::to_value(item_row(r, r.get::<i64, _>("sources")))
-        .expect("an item row contains only JSON values")
-}
-
 /// Episodes of a show (docs: /items/{id}/children — seasons are a
 /// projection of the season column, not items).
+#[utoipa::path(
+    get, path = "/api/v1/items/{id}/children", tag = "Items",
+    security(("bearer_auth" = [])),
+    params(("id" = String, Path)),
+    responses(
+        (status = 200, body = ChildrenResponse),
+        (status = 401, body = String, content_type = "text/plain"),
+        (status = 404, body = String, content_type = "text/plain"),
+        (status = 500, body = String, content_type = "text/plain")
+    )
+)]
 async fn item_children(
     State(state): State<AppState>,
     Path(id): Path<String>,
     axum::Extension(claims): axum::Extension<crate::auth::Claims>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<ChildrenResponse>, ApiError> {
     let rows = sqlx::query(
         "SELECT i.id, i.kind, i.year, i.season, i.episode, i.episode_end, i.artist,
                 COALESCE(md.title, i.title) AS title,
@@ -3196,8 +4349,11 @@ async fn item_children(
     .fetch_all(state.registry.db())
     .await
     .map_err(internal)?;
-    let children: Vec<Value> = rows.iter().map(item_row_json).collect();
-    Ok(Json(json!({ "children": children })))
+    let children = rows
+        .iter()
+        .map(|row| item_row(row, row.get::<i64, _>("sources")))
+        .collect();
+    Ok(Json(ChildrenResponse { children }))
 }
 #[derive(Serialize, ToSchema)]
 struct ItemSource {
@@ -3215,26 +4371,36 @@ struct ItemSource {
 
 #[derive(Serialize, ToSchema)]
 struct ItemMetadata {
+    #[schema(required)]
     overview: Option<String>,
+    #[schema(required)]
     rating: Option<f64>,
+    #[schema(required)]
     premiered: Option<String>,
     confidence: String,
+    #[schema(required)]
     provider: Option<String>,
+    #[schema(required)]
     original_language: Option<String>,
+    #[schema(required)]
     genres: Option<Vec<String>>,
+    #[schema(required)]
     cast: Option<Vec<CastMember>>,
 }
 
 #[derive(Serialize, serde::Deserialize, ToSchema)]
 struct CastMember {
     name: String,
+    #[schema(required)]
     character: Option<String>,
 }
 
 #[derive(Serialize, ToSchema)]
 struct RelatedItem {
     kind: String,
+    #[schema(required)]
     title: Option<String>,
+    #[schema(required)]
     item_id: Option<String>,
 }
 
@@ -3242,6 +4408,7 @@ struct RelatedItem {
 struct ItemDetailResponse {
     #[serde(flatten)]
     item: ItemRow<Vec<ItemSource>>,
+    #[schema(required)]
     show_title: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     metadata: Option<ItemMetadata>,
@@ -3259,6 +4426,7 @@ struct ItemQueryResponse {
 
 #[derive(Serialize, ToSchema)]
 struct ItemQueryResult {
+    #[schema(required)]
     negotiated: Option<NegotiatedItem>,
     #[serde(skip_serializing_if = "Option::is_none")]
     unavailable: Option<String>,
@@ -3266,12 +4434,13 @@ struct ItemQueryResult {
 
 #[derive(Serialize, ToSchema)]
 struct NegotiatedItem {
+    #[schema(required)]
     source: Option<NegotiatedSource>,
     mode: String,
     cost: String,
     target_duration_secs: u32,
     streams: NegotiatedStreams,
-    subtitles: Vec<SubtitleTrack>,
+    subtitles: Vec<crate::subtitles::TrackListing>,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -3279,8 +4448,11 @@ struct NegotiatedSource {
     module_id: String,
     collection_id: String,
     path_rel: String,
+    #[schema(required)]
     display_width: Option<u32>,
+    #[schema(required)]
     display_height: Option<u32>,
+    #[schema(required)]
     orientation: Option<String>,
 }
 
@@ -3288,85 +4460,20 @@ struct NegotiatedSource {
 struct NegotiatedStreams {
     video: String,
     audio: String,
-    subtitles: Vec<SubtitleVerdict>,
+    subtitles: Vec<kahawai_media::negotiate::SubtitleVerdict>,
 }
 
-#[derive(Serialize, ToSchema)]
-struct SubtitleVerdict {
-    index: usize,
-    track_id: Option<i64>,
-    format: String,
-    language: Option<String>,
-    tier: String,
-    note: String,
-}
-
-#[derive(Serialize, ToSchema)]
-struct SubtitleTrack {
-    id: i64,
-    item_id: String,
-    origin: String,
-    stream_index: Option<i64>,
-    format: String,
-    language: Option<String>,
-    label: Option<String>,
-    machine: bool,
-    derived_from: Option<i64>,
-    delivery: String,
-    note: String,
-    deletable: bool,
-}
-impl From<kahawai_media::negotiate::SubtitleVerdict> for SubtitleVerdict {
-    fn from(verdict: kahawai_media::negotiate::SubtitleVerdict) -> Self {
-        use kahawai_media::negotiate::SubtitleTier;
-
-        let tier = match verdict.tier {
-            SubtitleTier::Text => "text",
-            SubtitleTier::Convert => "convert",
-            SubtitleTier::Graphics => "graphics",
-            SubtitleTier::Ocr => "ocr",
-            SubtitleTier::Burn => "burn",
-            SubtitleTier::Unavailable => "unavailable",
-        };
-        Self {
-            index: verdict.index,
-            track_id: verdict.track_id,
-            format: verdict.format,
-            language: verdict.language,
-            tier: tier.to_string(),
-            note: verdict.note.to_string(),
-        }
-    }
-}
-
-impl From<crate::subtitles::TrackListing> for SubtitleTrack {
-    fn from(listing: crate::subtitles::TrackListing) -> Self {
-        use crate::tracks::Delivery;
-
-        let delivery = match listing.delivery {
-            Delivery::Text => "text",
-            Delivery::Ass => "ass",
-            Delivery::Overlay => "overlay",
-            Delivery::Burn => "burn",
-            Delivery::None => "none",
-        };
-        Self {
-            id: listing.track.id,
-            item_id: listing.track.item_id,
-            origin: listing.track.origin,
-            stream_index: listing.track.stream_index,
-            format: listing.track.format,
-            language: listing.track.language,
-            label: listing.track.label,
-            machine: listing.track.machine,
-            derived_from: listing.track.derived_from,
-            delivery: delivery.to_string(),
-            note: listing.note.to_string(),
-            deletable: listing.deletable,
-        }
-    }
-}
-
+#[utoipa::path(
+    get, path = "/api/v1/items/{id}", tag = "Items",
+    security(("bearer_auth" = [])),
+    params(("id" = String, Path)),
+    responses(
+        (status = 200, body = ItemDetailResponse),
+        (status = 401, body = String, content_type = "text/plain"),
+        (status = 404, body = String, content_type = "text/plain"),
+        (status = 500, body = String, content_type = "text/plain")
+    )
+)]
 async fn item_detail(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -3558,17 +4665,18 @@ struct ItemQuery {
 #[utoipa::path(
     post,
     path = "/api/v1/items/{id}",
-    params(("id" = String, Path, description = "Library item identifier")),
-    request_body = ItemQuery,
-    responses(
-        (status = 200, description = "Item details and current playback negotiation", body = ItemQueryResponse),
-        (status = 401, description = "Missing or invalid bearer token"),
-        (status = 404, description = "Item does not exist or is outside the account's libraries"),
-        (status = 409, description = "Playback capabilities cannot be negotiated"),
-        (status = 415, description = "QUERY requires an application/json body")
-    ),
+    tag = "Items",
     security(("bearer_auth" = [])),
-    tag = "items"
+    params(("id" = String, Path, description = "Library item identifier")),
+    request_body = Option<ItemQuery>,
+    responses(
+        (status = 200, description = "Item details and current playback negotiation", body = ItemQueryResponse, headers(("accept-query" = String))),
+        (status = 401, description = "Missing or invalid bearer token", body = String, content_type = "text/plain"),
+        (status = 404, description = "Item does not exist or is outside the account's libraries", body = String, content_type = "text/plain"),
+        (status = 409, description = "Playback capabilities cannot be negotiated", body = String, content_type = "text/plain"),
+        (status = 415, description = "QUERY requires an application/json body", body = String, content_type = "text/plain"),
+        (status = 500, body = String, content_type = "text/plain")
+    )
 )]
 async fn item_query(
     State(state): State<AppState>,
@@ -3695,9 +4803,9 @@ async fn item_query(
                 streams: NegotiatedStreams {
                     video: sp.video_verdict,
                     audio: sp.audio_verdict,
-                    subtitles: verdicts.into_iter().map(Into::into).collect(),
+                    subtitles: verdicts,
                 },
-                subtitles: subtitles.into_iter().map(Into::into).collect(),
+                subtitles,
             }),
             unavailable: None,
         },
@@ -3712,19 +4820,31 @@ async fn item_query(
         .into_response())
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 struct ProgressRequest {
     position_ms: u64,
 }
 
 /// Record playback progress (HUB-10/18): durable resume position, played
 /// flag + play count on crossing 90%, and a session keep-alive.
+#[utoipa::path(
+    post, path = "/api/v1/playback/sessions/{id}/progress", tag = "Playback",
+    security(("bearer_auth" = [])),
+    params(("id" = String, Path)),
+    request_body = ProgressRequest,
+    responses(
+        (status = 200, body = ProgressResponse),
+        (status = 401, body = String, content_type = "text/plain"),
+        (status = 410, body = String, content_type = "text/plain"),
+        (status = 500, body = String, content_type = "text/plain")
+    )
+)]
 async fn post_progress(
     State(state): State<AppState>,
     Path(id): Path<String>,
     axum::Extension(claims): axum::Extension<crate::auth::Claims>,
     Json(body): Json<ProgressRequest>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<ProgressResponse>, ApiError> {
     let session = state.sessions.get(&id).ok_or_else(session_gone)?;
     session.touch();
     // Pacing (§4.6): the worker throttles its lead over this position.
@@ -3771,11 +4891,11 @@ async fn post_progress(
     .fetch_one(state.registry.db())
     .await
     .map_err(internal)?;
-    Ok(Json(json!({
-        "position_ms": body.position_ms,
-        "played": row.get::<i64, _>("played") != 0,
-        "play_count": row.get::<i64, _>("play_count"),
-    })))
+    Ok(Json(ProgressResponse {
+        position_ms: body.position_ms,
+        played: row.get::<i64, _>("played") != 0,
+        play_count: row.get("play_count"),
+    }))
 }
 
 /// The most items one mark may touch. A season is tens and a show is
@@ -3783,7 +4903,7 @@ async fn post_progress(
 /// off what it just listed.
 const WATCHED_BATCH_MAX: usize = 2000;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 struct WatchedRequest {
     played: bool,
     /// Apply to these items instead of just this one. Every id must be
@@ -3817,12 +4937,25 @@ struct WatchedRequest {
 /// counts it; unmarking says "show this as unwatched", which is not a
 /// claim that the earlier viewings never happened. The `AND NOT played`
 /// guard means re-marking something already marked counts nothing.
+#[utoipa::path(
+    put, path = "/api/v1/items/{id}/watched", tag = "Items",
+    security(("bearer_auth" = [])),
+    params(("id" = String, Path)),
+    request_body = WatchedRequest,
+    responses(
+        (status = 200, body = UpdatedResponse),
+        (status = 400, body = String, content_type = "text/plain"),
+        (status = 401, body = String, content_type = "text/plain"),
+        (status = 404, body = String, content_type = "text/plain"),
+        (status = 500, body = String, content_type = "text/plain")
+    )
+)]
 async fn item_set_watched(
     State(state): State<AppState>,
     Path(id): Path<String>,
     axum::Extension(claims): axum::Extension<crate::auth::Claims>,
     Json(body): Json<WatchedRequest>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<UpdatedResponse>, ApiError> {
     let ids = body.items.unwrap_or_else(|| vec![id.clone()]);
     if ids.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "no items to mark".into()));
@@ -3878,18 +5011,16 @@ async fn item_set_watched(
         // which of the two it was is not the caller's business.
         return Err(hidden("item"));
     }
-    let updated: Vec<Value> = rows
+    let updated = rows
         .iter()
-        .map(|r| {
-            json!({
-                "item_id": r.get::<String, _>("item_id"),
-                "position_ms": 0,
-                "played": r.get::<i64, _>("played") != 0,
-                "play_count": r.get::<i64, _>("play_count"),
-            })
+        .map(|row| WatchUpdate {
+            item_id: row.get("item_id"),
+            position_ms: 0,
+            played: row.get::<i64, _>("played") != 0,
+            play_count: row.get("play_count"),
         })
         .collect();
-    Ok(Json(json!({ "updated": updated })))
+    Ok(Json(UpdatedResponse { updated }))
 }
 
 /// Proxy one artifact of a dispatched session from its transcoder.
@@ -3967,6 +5098,22 @@ fn declare_target_duration(bytes: Vec<u8>, secs: u32) -> Vec<u8> {
 /// local scratch, dispatched sessions via the transcoder proxy. Only
 /// plain filenames are accepted — no separators, no dotfiles — so
 /// traversal is impossible by construction.
+#[utoipa::path(
+    get, path = "/api/v1/playback/sessions/{id}/{file}", tag = "Playback media",
+    security(("bearer_auth" = []), ("media_token" = [])),
+    params(
+        ("id" = String, Path),
+        ("file" = String, Path)
+    ),
+    responses(
+        (status = 200, content((Vec<u8> = "application/vnd.apple.mpegurl"), (Vec<u8> = "video/mp4"), (Vec<u8> = "video/mp2t"), (Vec<u8> = "text/plain"), (Vec<u8> = "text/x-ssa"), (Vec<u8> = "application/x-ndjson"))),
+        (status = 400, body = String, content_type = "text/plain"),
+        (status = 401, body = String, content_type = "text/plain"),
+        (status = 404, body = String, content_type = "text/plain"),
+        (status = 410, body = String, content_type = "text/plain"),
+        (status = 500, body = String, content_type = "text/plain")
+    )
+)]
 async fn session_file(
     State(state): State<AppState>,
     Path((id, file)): Path<(String, String)>,
@@ -4161,23 +5308,263 @@ mod tests {
     }
 
     #[test]
-    fn openapi_uses_3_2_query_with_typed_bodies() {
-        let document = serde_json::to_value(openapi_document()).unwrap();
-        let path = &document["paths"]["/api/v1/items/{id}"];
+    fn openapi_covers_exact_application_surface_with_typed_bodies() {
+        use std::collections::BTreeSet;
 
+        let document = serde_json::to_value(openapi_document()).unwrap();
+        let expected = [
+            ("get", "/health"),
+            ("get", "/metrics"),
+            ("get", "/api/v1/bootstrap"),
+            ("post", "/api/v1/setup"),
+            ("post", "/api/v1/auth/token"),
+            ("post", "/api/v1/auth/refresh"),
+            ("post", "/api/v1/auth/logout"),
+            ("get", "/api/v1/events"),
+            ("get", "/api/v1/collections"),
+            ("get", "/api/v1/libraries"),
+            ("get", "/api/v1/items"),
+            ("get", "/api/v1/items/{id}"),
+            ("query", "/api/v1/items/{id}"),
+            ("get", "/api/v1/items/{id}/children"),
+            ("put", "/api/v1/items/{id}/watched"),
+            ("post", "/api/v1/items/{id}/subtitles/search"),
+            ("post", "/api/v1/items/{id}/subtitles/download"),
+            ("delete", "/api/v1/subtitles/{track_id}"),
+            ("get", "/api/v1/items/{id}/artwork"),
+            ("get", "/api/v1/items/{id}/subtitles/{file}"),
+            ("get", "/api/v1/items/{id}/fonts"),
+            ("get", "/api/v1/items/{id}/fonts/{n}"),
+            ("get", "/api/v1/prefs"),
+            ("put", "/api/v1/prefs"),
+            ("post", "/api/v1/playback/sessions"),
+            ("delete", "/api/v1/playback/sessions/{id}"),
+            ("post", "/api/v1/playback/sessions/{id}/progress"),
+            ("post", "/api/v1/playback/sessions/{id}/seek"),
+            ("get", "/api/v1/playback/sessions/{id}/stream"),
+            ("get", "/api/v1/playback/sessions/{id}/{file}"),
+            ("get", "/admin/v1/enrollments"),
+            ("post", "/admin/v1/enrollments/approve"),
+            ("get", "/admin/v1/satellites"),
+            ("delete", "/admin/v1/satellites/{id}"),
+            ("post", "/admin/v1/satellites/{id}/disabled"),
+            ("get", "/admin/v1/libraries"),
+            ("post", "/admin/v1/libraries"),
+            ("delete", "/admin/v1/libraries/{id}"),
+            ("post", "/admin/v1/libraries/{id}/collections"),
+            (
+                "delete",
+                "/admin/v1/libraries/{id}/collections/{module_id}/{collection_id}",
+            ),
+            ("get", "/admin/v1/collections"),
+            ("get", "/admin/v1/users"),
+            ("post", "/admin/v1/users"),
+            ("delete", "/admin/v1/users/{id}"),
+            ("put", "/admin/v1/users/{id}/libraries"),
+            ("put", "/admin/v1/users/{id}/admin"),
+            ("get", "/admin/v1/providers"),
+            ("post", "/admin/v1/providers/chains/{media_type}"),
+            ("post", "/admin/v1/providers/tmdb"),
+            ("post", "/admin/v1/providers/tvdb"),
+            ("post", "/admin/v1/providers/anidb"),
+            ("post", "/admin/v1/providers/anidb/verify"),
+            ("get", "/admin/v1/enrich"),
+            ("post", "/admin/v1/enrich"),
+            ("post", "/admin/v1/libraries/{id}/refresh"),
+            ("get", "/admin/v1/enrich/review"),
+            ("post", "/admin/v1/enrich/search"),
+            ("post", "/admin/v1/items/{id}/match"),
+            ("get", "/admin/v1/sessions"),
+            ("delete", "/admin/v1/sessions/{id}"),
+            ("get", "/admin/v1/sessions/{id}/log"),
+            ("get", "/admin/v1/items/{id}/log"),
+        ]
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+        let methods = [
+            "get", "put", "post", "delete", "options", "head", "patch", "trace", "query",
+        ];
+        let actual = document["paths"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .flat_map(|(path, item)| {
+                methods
+                    .into_iter()
+                    .filter(|method| item.get(*method).is_some())
+                    .map(|method| (method, path.as_str()))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(actual, expected);
         assert_eq!(document["openapi"], "3.2.0");
-        assert!(path.get("post").is_none());
-        assert_eq!(
-            path["query"]["requestBody"]["content"]["application/json"]["schema"]["$ref"],
-            "#/components/schemas/ItemQuery"
+        assert!(
+            document["paths"]["/api/v1/items/{id}"]
+                .get("post")
+                .is_none()
+        );
+        let query_request_schema = &document["paths"]["/api/v1/items/{id}"]["query"]["requestBody"]
+            ["content"]["application/json"]["schema"];
+        assert!(
+            query_request_schema
+                .to_string()
+                .contains("#/components/schemas/ItemQuery"),
+            "{query_request_schema}"
         );
         assert_eq!(
-            path["query"]["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+            document["paths"]["/api/v1/items/{id}"]["query"]["responses"]["200"]["content"]["application/json"]
+                ["schema"]["$ref"],
             "#/components/schemas/ItemQueryResponse"
+        );
+        assert_eq!(
+            document["paths"]["/api/v1/items"]["get"]["responses"]["200"]["content"]["application/json"]
+                ["schema"]["$ref"],
+            "#/components/schemas/ItemsResponse"
+        );
+        assert_eq!(
+            document["paths"]["/health"]["get"]["responses"]["200"]["content"]["application/json"]
+                ["schema"]["$ref"],
+            "#/components/schemas/HealthResponse"
         );
         assert_eq!(
             document["components"]["securitySchemes"]["bearer_auth"]["scheme"],
             "bearer"
         );
+        assert_eq!(
+            document["components"]["securitySchemes"]["media_token"]["in"],
+            "query"
+        );
+        assert_eq!(
+            document["components"]["securitySchemes"]["media_token"]["name"],
+            "token"
+        );
+        assert!(
+            document["components"]["schemas"].get("Value").is_none(),
+            "generic serde_json::Value leaked into the contract"
+        );
+        let bootstrap_required = document["components"]["schemas"]["BootstrapResponse"]["required"]
+            .as_array()
+            .expect("BootstrapResponse has a required field list");
+        assert!(
+            bootstrap_required.iter().any(|field| field == "setup_url"),
+            "setup_url is always present and nullable: {}",
+            document["components"]["schemas"]["BootstrapResponse"]
+        );
+        assert!(
+            document["components"]["schemas"]["BootstrapResponse"]["properties"]
+                .get("authenticated")
+                .is_none(),
+            "bootstrap no longer inspects credentials"
+        );
+        let login = &document["paths"]["/api/v1/auth/token"]["post"];
+        assert!(
+            login["parameters"].as_array().is_some_and(|parameters| {
+                parameters
+                    .iter()
+                    .any(|parameter| parameter["name"] == "Origin")
+            }),
+            "browser login must document its Origin boundary"
+        );
+        assert!(
+            login["responses"].get("403").is_some(),
+            "browser login must document foreign-Origin rejection"
+        );
+        assert_ne!(
+            document["paths"]["/api/v1/items/{id}"]["query"]["requestBody"]["required"], true,
+            "QUERY body is optional"
+        );
+        fn schema_requires(schema: &serde_json::Value, field: &str) -> bool {
+            schema["required"]
+                .as_array()
+                .is_some_and(|required| required.iter().any(|name| name == field))
+                || schema.as_object().is_some_and(|object| {
+                    object.values().any(|value| schema_requires(value, field))
+                })
+                || schema
+                    .as_array()
+                    .is_some_and(|array| array.iter().any(|value| schema_requires(value, field)))
+        }
+        let is_required = |schema: &str, field: &str| {
+            schema_requires(&document["components"]["schemas"][schema], field)
+        };
+        assert!(is_required("ItemDetailResponse", "show_title"));
+        assert!(!is_required("ItemDetailResponse", "metadata"));
+        assert!(!is_required("ItemDetailResponse", "related"));
+        assert!(!is_required("ItemSource", "streams"));
+        assert!(is_required("ItemQueryResult", "negotiated"));
+        assert!(!is_required("ItemQueryResult", "unavailable"));
+        assert!(!is_required("VerificationResponse", "error"));
+        for field in ["stream_index", "language", "label", "derived_from"] {
+            assert!(is_required("Track", field), "Track.{field}");
+        }
+        assert!(
+            document["components"]["schemas"]["Track"]["properties"]
+                .get("source_id")
+                .is_none(),
+            "serde-skipped Track internals are not part of the API"
+        );
+        for (method, path) in expected {
+            let operation = &document["paths"][path][method];
+            assert!(
+                operation["responses"].as_object().is_some(),
+                "{method} {path}"
+            );
+            assert!(
+                operation["tags"]
+                    .as_array()
+                    .is_some_and(|tags| !tags.is_empty()),
+                "{method} {path} has no tag"
+            );
+            for response in operation["responses"]
+                .as_object()
+                .into_iter()
+                .flatten()
+                .map(|(_, response)| response)
+            {
+                if let Some(schema) = response["content"]["application/json"]["schema"].as_object()
+                {
+                    assert!(
+                        schema.contains_key("$ref") || schema.contains_key("type"),
+                        "{method} {path} has a generic JSON response schema: {schema:?}"
+                    );
+                }
+            }
+            if let Some(schema) =
+                operation["requestBody"]["content"]["application/json"]["schema"].as_object()
+            {
+                assert!(
+                    schema.contains_key("$ref")
+                        || schema.contains_key("type")
+                        || serde_json::to_string(schema).unwrap().contains("\"$ref\""),
+                    "{method} {path} has a generic JSON request schema: {schema:?}"
+                );
+            }
+            let public = matches!(
+                (method, path),
+                ("get", "/health")
+                    | ("get", "/api/v1/bootstrap")
+                    | ("post", "/api/v1/setup")
+                    | ("post", "/api/v1/auth/token")
+                    | ("post", "/api/v1/auth/refresh")
+            );
+            if public {
+                assert!(operation.get("security").is_none(), "{method} {path}");
+            } else if path == "/metrics" {
+                assert_eq!(
+                    operation["security"][0]["metrics_token"],
+                    serde_json::json!([])
+                );
+            } else {
+                assert!(
+                    operation["security"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|requirement| requirement.get("bearer_auth").is_some()),
+                    "{method} {path} does not declare bearer authentication"
+                );
+            }
+        }
     }
 }

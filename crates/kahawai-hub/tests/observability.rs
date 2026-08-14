@@ -83,12 +83,22 @@ async fn health_answers_without_a_credential_and_metrics_does_not() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers()["content-type"],
+        "application/json",
+        "health is a JSON contract"
+    );
     let v: serde_json::Value = serde_json::from_str(&body_text(resp).await).unwrap();
     assert_eq!(
-        v["status"], "ok",
-        "a hub with no satellites is not unhealthy"
+        v,
+        serde_json::json!({
+            "status": "ok",
+            "version": env!("CARGO_PKG_VERSION"),
+            "sessions_active": 0,
+            "modules": [],
+        }),
+        "a hub with no satellites is healthy and still reports every field"
     );
-    assert!(v["version"].is_string());
 
     // Metrics need their OWN static token: an access token lives 15
     // minutes and no scraper refreshes one, so a login credential would
@@ -128,6 +138,10 @@ async fn health_answers_without_a_credential_and_metrics_does_not() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers()["content-type"],
+        "text/plain; version=0.0.4; charset=utf-8"
+    );
     let text = body_text(resp).await;
     // Prometheus rejects a body without TYPE/HELP pairing, and a name
     // typo is invisible until a dashboard is silently empty.

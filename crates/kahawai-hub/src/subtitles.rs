@@ -46,7 +46,7 @@ pub struct SubtitleEntry {
 }
 
 /// One track plus what it means for the requesting client.
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, utoipa::ToSchema)]
 pub struct TrackListing {
     #[serde(flatten)]
     pub track: crate::tracks::Track,

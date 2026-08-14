@@ -534,7 +534,7 @@ async fn keeps_audio_encode_local_and_dispatches_video_encode() {
             let sats = registry.satellites_overview().await.unwrap();
             if sats
                 .iter()
-                .any(|s| s["module_id"] == "02TC" && s["connected"] == true)
+                .any(|satellite| satellite.module_id == "02TC" && satellite.connected)
             {
                 return;
             }

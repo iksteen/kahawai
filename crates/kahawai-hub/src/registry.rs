@@ -14,8 +14,10 @@ use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
 use kahawai_core::names;
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 use sqlx::{Row, SqlitePool};
+use utoipa::ToSchema;
 
 #[derive(Debug, Clone)]
 pub struct SatelliteState {
@@ -45,7 +47,7 @@ pub struct SourcePath {
     pub path_rel: String,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct CollectionRow {
     pub module_id: String,
     pub collection_id: String,
@@ -238,7 +240,7 @@ pub struct Registry {
     connected: Mutex<HashMap<String, SatelliteState>>,
     /// Live capability reports from connected transcoders (TC-1); cleared
     /// on disconnect — a report is only valid while the link is up.
-    transcoder_caps: Mutex<HashMap<String, serde_json::Value>>,
+    transcoder_caps: Mutex<HashMap<String, TranscoderCapabilities>>,
     /// HUB-36: what AIO's optional full local transcoder measured about
     /// itself. Plain hub never fills this: its local worker is limited to
     /// remux and audio-only transcode, neither of which needs video pace.
@@ -291,10 +293,10 @@ pub struct Registry {
     /// HUB-11 event bus: invalidation hints pushed to /api/v1/events
     /// subscribers ({kind, ...} JSON). Lagging receivers drop events —
     /// hints, not state; clients refetch what a hint names.
-    events: tokio::sync::broadcast::Sender<serde_json::Value>,
+    events: tokio::sync::broadcast::Sender<RegistryEvent>,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ScanState {
     pub scanned: u32,
     pub failed: u32,
@@ -302,6 +304,112 @@ pub struct ScanState {
     pub complete: bool,
     #[serde(skip)]
     pub updated: SystemTime,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct LibraryCollectionMember {
+    pub module_id: String,
+    pub collection_id: String,
+    #[schema(required)]
+    pub host_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct LibraryOverview {
+    pub id: String,
+    pub name: String,
+    pub media_type: String,
+    pub collections: Vec<LibraryCollectionMember>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct CollectionOverview {
+    pub module_id: String,
+    pub collection_id: String,
+    pub media_type: String,
+    #[schema(required)]
+    pub host_name: Option<String>,
+    pub connected: bool,
+    #[schema(required)]
+    pub scan: Option<ScanState>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct EncoderCapability {
+    pub codec: String,
+    pub element: String,
+    pub hardware: bool,
+    #[schema(required)]
+    pub speed_1080: Option<f32>,
+    #[schema(required)]
+    pub speed_2160: Option<f32>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct TranscoderCapabilities {
+    pub encoders: Vec<EncoderCapability>,
+    pub max_sessions: u32,
+    pub decode_caps: Vec<String>,
+    pub tonemap: bool,
+    pub ass_burn: bool,
+    #[schema(required)]
+    pub tonemap_speed_1080: Option<f32>,
+    #[schema(required)]
+    pub tonemap_speed_2160: Option<f32>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct SatellitePace {
+    pub class: String,
+    pub multiple: f64,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct SatelliteOverview {
+    pub module_id: String,
+    pub module_type: String,
+    pub name: String,
+    pub cert_fingerprint: String,
+    pub enrolled_at: i64,
+    pub connected: bool,
+    #[schema(required)]
+    pub build: Option<String>,
+    #[schema(required)]
+    pub capabilities: Option<TranscoderCapabilities>,
+    pub disabled: bool,
+    pub pace: Vec<SatellitePace>,
+    #[schema(required)]
+    pub link_bytes_per_sec: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+#[serde(untagged)]
+pub enum RegistryEvent {
+    Scan {
+        kind: &'static str,
+        module_id: String,
+        collection_id: String,
+        scanned: u32,
+        failed: u32,
+        skipped: u32,
+        complete: bool,
+    },
+    Satellite {
+        kind: &'static str,
+        module_id: String,
+        connected: bool,
+    },
+    EnrichChain {
+        kind: &'static str,
+        chain: String,
+    },
+    EnrichRunning {
+        kind: &'static str,
+        running: bool,
+    },
+    Sessions {
+        kind: &'static str,
+    },
 }
 
 impl Registry {
@@ -337,11 +445,11 @@ impl Registry {
     }
 
     /// Push an event hint to /api/v1/events subscribers (HUB-11).
-    pub fn emit(&self, event: serde_json::Value) {
+    pub fn emit(&self, event: RegistryEvent) {
         let _ = self.events.send(event); // no subscribers = no-op
     }
 
-    pub fn subscribe_events(&self) -> tokio::sync::broadcast::Receiver<serde_json::Value> {
+    pub fn subscribe_events(&self) -> tokio::sync::broadcast::Receiver<RegistryEvent> {
         self.events.subscribe()
     }
 
@@ -364,15 +472,15 @@ impl Registry {
                 updated: SystemTime::now(),
             },
         );
-        self.emit(serde_json::json!({
-            "kind": "scan",
-            "module_id": module_id,
-            "collection_id": collection_id,
-            "scanned": scanned,
-            "failed": failed,
-            "skipped": skipped,
-            "complete": complete,
-        }));
+        self.emit(RegistryEvent::Scan {
+            kind: "scan",
+            module_id: module_id.to_string(),
+            collection_id: collection_id.to_string(),
+            scanned,
+            failed,
+            skipped,
+            complete,
+        });
     }
 
     /// Live scan state for the admin overview. Completed states linger a
@@ -981,9 +1089,11 @@ impl Registry {
                 }
                 drop(links);
                 tracing::info!(%module_id, "satellite disconnected");
-                self.emit(serde_json::json!({
-                    "kind": "satellite", "module_id": module_id, "connected": false,
-                }));
+                self.emit(RegistryEvent::Satellite {
+                    kind: "satellite",
+                    module_id: module_id.to_string(),
+                    connected: false,
+                });
                 true
             }
             _ => false,
@@ -1034,9 +1144,11 @@ impl Registry {
             },
         );
         tracing::info!(%module_id, module_type, name, build, "satellite connected");
-        self.emit(serde_json::json!({
-            "kind": "satellite", "module_id": module_id, "connected": true,
-        }));
+        self.emit(RegistryEvent::Satellite {
+            kind: "satellite",
+            module_id: module_id.to_string(),
+            connected: true,
+        });
     }
 
     pub fn seen(&self, module_id: &str) {
@@ -1052,9 +1164,11 @@ impl Registry {
             s.connected = false;
             s.last_seen = SystemTime::now();
             tracing::info!(%module_id, "satellite disconnected");
-            self.emit(serde_json::json!({
-                "kind": "satellite", "module_id": module_id, "connected": false,
-            }));
+            self.emit(RegistryEvent::Satellite {
+                kind: "satellite",
+                module_id: module_id.to_string(),
+                connected: false,
+            });
         }
     }
 
@@ -1507,7 +1621,7 @@ impl Registry {
     }
 
     /// Libraries with their member collections, for the admin UI.
-    pub async fn libraries_overview(&self) -> Result<Vec<serde_json::Value>> {
+    pub async fn libraries_overview(&self) -> Result<Vec<LibraryOverview>> {
         let libs = sqlx::query("SELECT id, name, media_type FROM libraries ORDER BY name")
             .fetch_all(&self.db)
             .await?;
@@ -1523,23 +1637,21 @@ impl Registry {
             .iter()
             .map(|l| {
                 let id: String = l.get("id");
-                let cols: Vec<serde_json::Value> = members
+                let collections = members
                     .iter()
                     .filter(|m| m.get::<String, _>("library_id") == id)
-                    .map(|m| {
-                        serde_json::json!({
-                            "module_id": m.get::<String, _>("module_id"),
-                            "collection_id": m.get::<String, _>("collection_id"),
-                            "host_name": m.get::<Option<String>, _>("host_name"),
-                        })
+                    .map(|m| LibraryCollectionMember {
+                        module_id: m.get("module_id"),
+                        collection_id: m.get("collection_id"),
+                        host_name: m.get("host_name"),
                     })
                     .collect();
-                serde_json::json!({
-                    "id": id,
-                    "name": l.get::<String, _>("name"),
-                    "media_type": l.get::<String, _>("media_type"),
-                    "collections": cols,
-                })
+                LibraryOverview {
+                    id,
+                    name: l.get("name"),
+                    media_type: l.get("media_type"),
+                    collections,
+                }
             })
             .collect())
     }
@@ -1561,7 +1673,7 @@ impl Registry {
         .unwrap_or(0) as usize)
     }
 
-    pub async fn collections_overview(&self) -> Result<Vec<serde_json::Value>> {
+    pub async fn collections_overview(&self) -> Result<Vec<CollectionOverview>> {
         let rows = sqlx::query(
             "SELECT c.module_id, c.collection_id, c.media_type, s.name AS host_name
              FROM collections c LEFT JOIN satellites s ON s.module_id = c.module_id
@@ -1576,15 +1688,14 @@ impl Registry {
                     r.get::<String, _>("module_id"),
                     r.get::<String, _>("collection_id"),
                 );
-                let scan = self.scan_state(&module_id, &collection_id);
-                serde_json::json!({
-                    "module_id": module_id,
-                    "collection_id": collection_id,
-                    "media_type": r.get::<String, _>("media_type"),
-                    "host_name": r.get::<Option<String>, _>("host_name"),
-                    "connected": self.is_connected(&module_id),
-                    "scan": scan,
-                })
+                CollectionOverview {
+                    scan: self.scan_state(&module_id, &collection_id),
+                    connected: self.is_connected(&module_id),
+                    module_id,
+                    collection_id,
+                    media_type: r.get("media_type"),
+                    host_name: r.get("host_name"),
+                }
             })
             .collect())
     }
@@ -2380,25 +2491,29 @@ impl Registry {
     }
 
     pub fn set_transcoder_caps(&self, module_id: &str, caps: &kahawai_proto::v1::CapabilityReport) {
-        let json = serde_json::json!({
-            "encoders": caps.encoders.iter()
-                .map(|e| serde_json::json!({
-                    "codec": e.codec, "element": e.element, "hardware": e.hardware,
-                    // HUB-36: 0 = unmeasured (legacy box or pre-benchmark).
-                    "speed_1080": e.speed_1080, "speed_2160": e.speed_2160,
-                }))
-                .collect::<Vec<_>>(),
-            "max_sessions": caps.max_sessions,
-            "decode_caps": caps.decode_caps,
-            "tonemap": caps.tonemap,
-            "ass_burn": caps.ass_burn,
-            "tonemap_speed_1080": caps.tonemap_speed_1080,
-            "tonemap_speed_2160": caps.tonemap_speed_2160,
-        });
+        let capabilities = TranscoderCapabilities {
+            encoders: caps
+                .encoders
+                .iter()
+                .map(|e| EncoderCapability {
+                    codec: e.codec.clone(),
+                    element: e.element.clone(),
+                    hardware: e.hardware,
+                    speed_1080: e.speed_1080,
+                    speed_2160: e.speed_2160,
+                })
+                .collect(),
+            max_sessions: caps.max_sessions,
+            decode_caps: caps.decode_caps.clone(),
+            tonemap: caps.tonemap,
+            ass_burn: caps.ass_burn,
+            tonemap_speed_1080: caps.tonemap_speed_1080,
+            tonemap_speed_2160: caps.tonemap_speed_2160,
+        };
         self.transcoder_caps
             .lock()
             .unwrap()
-            .insert(module_id.to_string(), json);
+            .insert(module_id.to_string(), capabilities);
     }
 
     pub fn mark_deep_rescan(&self, module_id: &str, collection_id: &str) {
@@ -2425,12 +2540,7 @@ impl Registry {
             .lock()
             .unwrap()
             .get(module_id)
-            .and_then(|c| c.get("encoders")?.as_array().cloned())
-            .map(|a| {
-                a.iter()
-                    .filter_map(|e| e["codec"].as_str().map(str::to_string))
-                    .collect()
-            })
+            .map(|c| c.encoders.iter().map(|e| e.codec.clone()).collect())
             .unwrap_or_default()
     }
 
@@ -2449,32 +2559,27 @@ impl Registry {
     /// read as "no data", never as slow.
     pub fn transcoder_speed(&self, module_id: &str, codec: &str, height: u32) -> Option<f32> {
         let caps = self.transcoder_caps.lock().unwrap();
-        let e = caps
+        let encoder = caps
             .get(module_id)?
-            .get("encoders")?
-            .as_array()?
+            .encoders
             .iter()
-            .find(|e| e["codec"] == codec)?;
-        let key = if height > 1080 {
-            "speed_2160"
+            .find(|encoder| encoder.codec == codec)?;
+        if height > 1080 {
+            encoder.speed_2160
         } else {
-            "speed_1080"
-        };
-        // as_f64() on a JSON null returns None — absence stays absence,
-        // and a tiny measured value survives as the measurement it is.
-        Some(e.get(key)?.as_f64()? as f32)
+            encoder.speed_1080
+        }
     }
 
     /// Same for the GL tone-map segment (HUB-15a's boolean, measured).
     pub fn transcoder_tonemap_speed(&self, module_id: &str, height: u32) -> Option<f32> {
         let caps = self.transcoder_caps.lock().unwrap();
-        let c = caps.get(module_id)?;
-        let key = if height > 1080 {
-            "tonemap_speed_2160"
+        let capabilities = caps.get(module_id)?;
+        if height > 1080 {
+            capabilities.tonemap_speed_2160
         } else {
-            "tonemap_speed_1080"
-        };
-        Some(c.get(key)?.as_f64()? as f32)
+            capabilities.tonemap_speed_1080
+        }
     }
 
     /// HUB-15a: does this transcoder report the GL tone-map segment?
@@ -2483,9 +2588,7 @@ impl Registry {
             .lock()
             .unwrap()
             .get(module_id)
-            .and_then(|c| c.get("tonemap"))
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false)
+            .is_some_and(|c| c.tonemap)
     }
 
     pub fn transcoder_reports_ass_burn(&self, module_id: &str) -> bool {
@@ -2493,9 +2596,7 @@ impl Registry {
             .lock()
             .unwrap()
             .get(module_id)
-            .and_then(|c| c.get("ass_burn"))
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false)
+            .is_some_and(|c| c.ass_burn)
     }
 
     /// HUB-32a: can ANY connected transcoder burn ASS? A fleet-wide
@@ -2509,7 +2610,7 @@ impl Registry {
             .lock()
             .unwrap()
             .values()
-            .any(|c| c.get("ass_burn").and_then(|v| v.as_bool()).unwrap_or(false))
+            .any(|c| c.ass_burn)
     }
 
     pub fn clear_transcoder_caps(&self, module_id: &str) {
@@ -2678,8 +2779,8 @@ impl Registry {
             .iter()
             .filter(|(id, _)| links.contains_key(*id) && !disabled.contains(*id))
             .filter_map(|(id, c)| {
-                let encoders = c.get("encoders")?.as_array()?;
-                let has = |codec: &str| encoders.iter().any(|e| e["codec"] == codec);
+                let encoders = &c.encoders;
+                let has = |codec: &str| encoders.iter().any(|e| e.codec == codec);
                 // HUB-15b: match the TARGET the plan asks for; an empty
                 // need means "any encoder of that kind".
                 let video_ok = || match need.video_codec.as_str() {
@@ -2697,13 +2798,8 @@ impl Registry {
                 // stream of each kind it will encode. Empty inventory =
                 // older satellite that didn't report; assume capable
                 // (OPS-7 tolerance).
-                let decoders: Vec<&str> = c
-                    .get("decode_caps")
-                    .and_then(|d| d.as_array())
-                    .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
-                    .unwrap_or_default();
                 let can = |wanted: &[String]| {
-                    decoders.is_empty() || wanted.iter().any(|w| decoders.contains(&w.as_str()))
+                    c.decode_caps.is_empty() || wanted.iter().any(|w| c.decode_caps.contains(w))
                 };
                 if (need.encode_video && !can(&need.video_caps))
                     || (need.encode_audio && !can(&need.audio_caps))
@@ -2711,29 +2807,26 @@ impl Registry {
                     return None;
                 }
                 let current = load.get(id).copied().unwrap_or(0);
-                let max = c.get("max_sessions").and_then(|m| m.as_u64()).unwrap_or(0) as usize;
+                let max = c.max_sessions as usize;
                 if max > 0 && current >= max {
                     return None; // at capacity (TC-6)
                 }
                 // Rank hardware on the codec the session will actually
                 // run (empty need: any hw video encoder counts).
-                if need.needs_ass_burn
-                    && !c.get("ass_burn").and_then(|v| v.as_bool()).unwrap_or(false)
-                {
+                if need.needs_ass_burn && !c.ass_burn {
                     return None; // cannot burn ASS; not a candidate at all
                 }
                 let hw = encoders.iter().any(|e| {
-                    e["hardware"] == true
+                    e.hardware
                         && match need.video_codec.as_str() {
                             "" => true,
-                            c => e["codec"] == c,
+                            c => e.codec == c,
                         }
                 });
                 // HUB-15a: an HDR encode prefers a box that can tone-map
                 // — a preference, not a filter: with no capable box the
                 // job still runs (worker encodes as-is, verdict said so).
-                let tm = !need.needs_tonemap
-                    || c.get("tonemap").and_then(|v| v.as_bool()).unwrap_or(false);
+                let tm = !need.needs_tonemap || c.tonemap;
                 // HUB-36: what this box is expected to sustain on
                 // exactly this work. None = never measured, which ranks
                 // as neutral rather than last: a fresh box has to run
@@ -2850,32 +2943,27 @@ impl Registry {
         }
         let caps = self.transcoder_caps.lock().unwrap().get(id).cloned()?;
         let big = Self::is_2160(need);
-        let key = if big { "speed_2160" } else { "speed_1080" };
         let pos = |v: f32| (v > 0.0).then_some(v); // 0 on the wire = unmeasured
 
         let mut terms: Vec<f32> = Vec::new();
-        if let Some(encoders) = caps.get("encoders").and_then(|e| e.as_array()) {
-            let best = encoders
-                .iter()
-                .filter(|e| match need.video_codec.as_str() {
-                    "" => true,
-                    c => e["codec"] == c,
-                })
-                .filter_map(|e| e.get(key).and_then(|v| v.as_f64()).map(|v| v as f32))
-                .filter_map(pos)
-                .fold(None::<f32>, |acc, v| Some(acc.map_or(v, |a| a.max(v))));
-            terms.extend(best);
-        }
+        let best = caps
+            .encoders
+            .iter()
+            .filter(|e| match need.video_codec.as_str() {
+                "" => true,
+                c => e.codec == c,
+            })
+            .filter_map(|e| if big { e.speed_2160 } else { e.speed_1080 })
+            .filter_map(pos)
+            .fold(None::<f32>, |acc, v| Some(acc.map_or(v, |a| a.max(v))));
+        terms.extend(best);
         if need.needs_tonemap {
-            let tm = caps
-                .get(if big {
-                    "tonemap_speed_2160"
-                } else {
-                    "tonemap_speed_1080"
-                })
-                .and_then(|v| v.as_f64())
-                .map(|v| v as f32)
-                .and_then(pos);
+            let tm = if big {
+                caps.tonemap_speed_2160
+            } else {
+                caps.tonemap_speed_1080
+            }
+            .and_then(pos);
             terms.extend(tm);
         }
         // The link term applies to DISPATCHED work only: the bytes have
@@ -2933,7 +3021,7 @@ impl Registry {
         Ok(fp.as_deref() == Some(Self::IN_PROCESS))
     }
 
-    pub async fn satellites_overview(&self) -> Result<Vec<serde_json::Value>> {
+    pub async fn satellites_overview(&self) -> Result<Vec<SatelliteOverview>> {
         let rows = sqlx::query(
             "SELECT module_id, module_type, name, cert_fingerprint, enrolled_at
              FROM satellites ORDER BY enrolled_at",
@@ -2952,29 +3040,28 @@ impl Registry {
             .map(|r| {
                 let id: String = r.get("module_id");
                 let state = connected.get(&id);
-                let mut observed: Vec<(&str, f64)> = pace
+                let mut observed: Vec<SatellitePace> = pace
                     .iter()
                     .filter(|((m, _), _)| *m == id)
-                    .map(|((_, class), v)| (class.as_str(), *v))
+                    .map(|((_, class), multiple)| SatellitePace {
+                        class: class.clone(),
+                        multiple: *multiple,
+                    })
                     .collect();
-                observed.sort_by(|a, b| a.0.cmp(b.0));
-                serde_json::json!({
-                    "module_id": id,
-                    "module_type": r.get::<String, _>("module_type"),
-                    "name": r.get::<String, _>("name"),
-                    "cert_fingerprint": r.get::<String, _>("cert_fingerprint"),
-                    "enrolled_at": r.get::<i64, _>("enrolled_at"),
-                    "connected": state.is_some_and(|s| s.connected),
-                    "build": state.map(|s| s.build.as_str()),
-                    "capabilities": caps.get(&id),
-                    "disabled": self.disabled.lock().unwrap().contains(&id),
-                    // Measured, not claimed: per work class, and the
-                    // source-plane rate this box actually sustained.
-                    "pace": observed.iter()
-                        .map(|(c, v)| serde_json::json!({"class": c, "multiple": v}))
-                        .collect::<Vec<_>>(),
-                    "link_bytes_per_sec": link_rates.get(&id),
-                })
+                observed.sort_by(|a, b| a.class.cmp(&b.class));
+                SatelliteOverview {
+                    module_id: id.clone(),
+                    module_type: r.get("module_type"),
+                    name: r.get("name"),
+                    cert_fingerprint: r.get("cert_fingerprint"),
+                    enrolled_at: r.get("enrolled_at"),
+                    connected: state.is_some_and(|s| s.connected),
+                    build: state.map(|s| s.build.clone()),
+                    capabilities: caps.get(&id).cloned(),
+                    disabled: self.disabled.lock().unwrap().contains(&id),
+                    pace: observed,
+                    link_bytes_per_sec: link_rates.get(&id).copied(),
+                }
             })
             .collect())
     }

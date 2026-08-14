@@ -1988,7 +1988,7 @@ impl Sessions {
             .unwrap()
             .insert(session.id.clone(), session.clone());
         tracing::info!(session = %session.id, item = item_id, path = %path_rel, mode, "session started");
-        registry.emit(serde_json::json!({ "kind": "sessions" }));
+        registry.emit(crate::registry::RegistryEvent::Sessions { kind: "sessions" });
         Ok(session)
     }
 
@@ -3298,7 +3298,7 @@ impl Sessions {
             kept.insert(id.to_string(), header);
         }
         if let Some(registry) = self.registry_for_teardown.lock().unwrap().clone() {
-            registry.emit(serde_json::json!({ "kind": "sessions" }));
+            registry.emit(crate::registry::RegistryEvent::Sessions { kind: "sessions" });
         }
         match &session.mode {
             Mode::Remux { dir, runner } => {

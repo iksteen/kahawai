@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use kahawai_hub::pki::HubCa;
-use kahawai_hub::registry::{PlacementNeed, Registry};
+use kahawai_hub::registry::{PlacementNeed, Registry, SatelliteOverview};
 use kahawai_hub::transcoder_link::TranscoderLinkService;
 use kahawai_proto::v1::transcoder_link_client::TranscoderLinkClient;
 use kahawai_proto::v1::{CapabilityReport, EncoderCap, Hello, TcToHub, tc_to_hub};
@@ -75,7 +75,7 @@ fn enroll(hub: &Hub, module_type: &str, module_id: &str, name: &str) -> Satellit
 /// Poll the satellites overview until `check` passes (or panic).
 async fn wait_overview(
     registry: &Arc<Registry>,
-    check: impl Fn(&[serde_json::Value]) -> bool,
+    check: impl Fn(&[SatelliteOverview]) -> bool,
     what: &str,
 ) {
     tokio::time::timeout(Duration::from_secs(10), async {
@@ -201,11 +201,16 @@ async fn transcoder_registers_capabilities_and_clears_on_disconnect() {
     wait_overview(
         &hub.registry,
         |sats| {
-            sats.iter().any(|s| {
-                s["module_id"] == "01TC"
-                    && s["connected"] == true
-                    && s["capabilities"]["encoders"][0]["codec"] == "h264"
-                    && s["capabilities"]["max_sessions"] == 2
+            sats.iter().any(|satellite| {
+                satellite.module_id == "01TC"
+                    && satellite.connected
+                    && satellite.capabilities.as_ref().is_some_and(|capabilities| {
+                        capabilities
+                            .encoders
+                            .first()
+                            .is_some_and(|encoder| encoder.codec == "h264")
+                            && capabilities.max_sessions == 2
+                    })
             })
         },
         "capability report in overview",
@@ -285,7 +290,7 @@ async fn transcoder_registers_capabilities_and_clears_on_disconnect() {
     let sats = reborn.satellites_overview().await.unwrap();
     assert!(
         sats.iter()
-            .any(|s| s["module_id"] == "01TC" && s["disabled"] == true),
+            .any(|satellite| satellite.module_id == "01TC" && satellite.disabled),
         "disabled flag not persisted: {sats:?}"
     );
 
@@ -297,8 +302,10 @@ async fn transcoder_registers_capabilities_and_clears_on_disconnect() {
     wait_overview(
         &hub.registry,
         |sats| {
-            sats.iter().any(|s| {
-                s["module_id"] == "01TC" && s["connected"] == false && s["capabilities"].is_null()
+            sats.iter().any(|satellite| {
+                satellite.module_id == "01TC"
+                    && !satellite.connected
+                    && satellite.capabilities.is_none()
             })
         },
         "capabilities cleared on disconnect",

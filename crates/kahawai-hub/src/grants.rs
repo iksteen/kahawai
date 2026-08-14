@@ -59,8 +59,9 @@
 //! search predicate that has always been there.
 
 use anyhow::Result;
-use serde_json::{Value, json};
+use serde::Serialize;
 use sqlx::{Row, SqlitePool};
+use utoipa::ToSchema;
 
 use crate::auth::Claims;
 
@@ -154,10 +155,20 @@ pub const VISIBLE_LIB: &str = "\
 AND EXISTS (SELECT 1 FROM user_libraries ul
              WHERE ul.library_id=lc.library_id AND ul.user_id=?1)";
 
+#[derive(Debug, Serialize, ToSchema)]
+pub struct UserAccess {
+    pub id: String,
+    pub username: String,
+    pub is_admin: bool,
+    pub all_libraries: bool,
+    pub created_at: i64,
+    pub libraries: Vec<String>,
+}
+
 /// Every account with its access, for the admin panel. Sorted by name,
 /// which is how the panel lists them and how a diff between two hubs
 /// stays readable.
-pub async fn users_with_access(db: &SqlitePool) -> Result<Vec<Value>> {
+pub async fn users_with_access(db: &SqlitePool) -> Result<Vec<UserAccess>> {
     let rows = sqlx::query(
         "SELECT u.id, u.username, u.is_admin, u.all_libraries, u.created_at,
                 (SELECT json_group_array(ul.library_id)
@@ -168,16 +179,13 @@ pub async fn users_with_access(db: &SqlitePool) -> Result<Vec<Value>> {
     .await?;
     Ok(rows
         .iter()
-        .map(|r| {
-            json!({
-                "id": r.get::<String, _>("id"),
-                "username": r.get::<String, _>("username"),
-                "is_admin": r.get::<i64, _>("is_admin") != 0,
-                "all_libraries": r.get::<i64, _>("all_libraries") != 0,
-                "created_at": r.get::<i64, _>("created_at"),
-                "libraries": serde_json::from_str::<Value>(&r.get::<String, _>("libraries"))
-                    .unwrap_or_else(|_| json!([])),
-            })
+        .map(|r| UserAccess {
+            id: r.get("id"),
+            username: r.get("username"),
+            is_admin: r.get::<i64, _>("is_admin") != 0,
+            all_libraries: r.get::<i64, _>("all_libraries") != 0,
+            created_at: r.get("created_at"),
+            libraries: serde_json::from_str(&r.get::<String, _>("libraries")).unwrap_or_default(),
         })
         .collect())
 }
