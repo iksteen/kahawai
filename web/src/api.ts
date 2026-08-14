@@ -19,6 +19,14 @@ let onCleared: ((deliberate: boolean) => void) | null = null
 const REFRESH_TIMEOUT_MS = 15_000
 const LOCK_WAIT_MS = 20_000
 
+const authChannel =
+  typeof window === 'undefined' || typeof BroadcastChannel === 'undefined'
+    ? null
+    : new BroadcastChannel('kahawai.auth')
+authChannel?.addEventListener('message', (event) => {
+  if (event.data === 'sign-out') clearAccess(true)
+})
+
 export function scrubLegacyCredentials() {
   localStorage.removeItem('kahawai.access')
   localStorage.removeItem('kahawai.refresh')
@@ -181,6 +189,7 @@ async function revoke(capturedAccess: string): Promise<void> {
 export async function signOut(): Promise<void> {
   const capturedAccess = access
   clearAccess(true)
+  authChannel?.postMessage('sign-out')
   if (capturedAccess) {
     await revoke(capturedAccess).catch((error: unknown) => {
       notify(`Signed out here, but ${error}. The session may still work on other devices.`)

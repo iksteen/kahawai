@@ -51,6 +51,38 @@ class SerialLocks {
   }
 }
 
+type BroadcastListener = (event: MessageEvent<unknown>) => void
+
+class TestBroadcastChannel {
+  static instances: TestBroadcastChannel[] = []
+  messages: unknown[] = []
+  private listener: BroadcastListener | null = null
+  readonly name: string
+
+  constructor(name: string) {
+    this.name = name
+    TestBroadcastChannel.instances.push(this)
+  }
+
+  addEventListener(_type: 'message', listener: BroadcastListener) {
+    this.listener = listener
+  }
+
+  postMessage(message: unknown) {
+    this.messages.push(message)
+  }
+
+  receive(message: unknown) {
+    this.listener?.({ data: message } as MessageEvent<unknown>)
+  }
+}
+
+Object.defineProperty(globalThis, 'window', { configurable: true, value: {} })
+Object.defineProperty(globalThis, 'BroadcastChannel', {
+  configurable: true,
+  value: TestBroadcastChannel,
+})
+
 const locks = new SerialLocks()
 Object.defineProperty(globalThis, 'navigator', {
   configurable: true,
@@ -141,10 +173,30 @@ function assertBrowserBodies() {
 beforeEach(async () => {
   setHub(() => response({}, 204))
   await signOut()
+  TestBroadcastChannel.instances[0]?.messages.splice(0)
   calls = []
   storageOps.length = 0
   cookieWrites.length = 0
   locks.reset()
+})
+
+test('sign-out clears access tokens in every open tab', async () => {
+  setHub((call) =>
+    call.url.endsWith('/auth/logout')
+      ? response({}, 204)
+      : response({ access_token: 'access-1', expires_in: 900 }),
+  )
+  await browserLogin('root', 'password-123')
+  assert.equal(accessToken(), 'access-1')
+
+  const channel = TestBroadcastChannel.instances[0]
+  assert.equal(channel?.name, 'kahawai.auth')
+  channel?.receive('sign-out')
+  assert.equal(accessToken(), null, 'a peer-tab sign-out clears this tab immediately')
+
+  await browserLogin('root', 'password-123')
+  await signOut()
+  assert.deepEqual(channel?.messages, ['sign-out'], 'local sign-out notifies peer tabs')
 })
 
 test('concurrent 401 repair shares one same-tab refresh', async () => {

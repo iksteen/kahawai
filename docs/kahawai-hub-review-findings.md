@@ -257,8 +257,9 @@ row count so the caller can tell. We have not touched it.
 Also not a defect, but worth stating because the web client now depends on it:
 `verify` only checks signature and expiry, so the access token stays good for
 its remaining life after `logout`, and the hub never clears `kahawai_token`.
-Dropping the browser's copies is entirely the client's job — which it does — so
-a copy taken beforehand outlives the sign-out by up to the token's lifetime.
+Dropping the browser's copies is entirely the client's job; open same-origin
+tabs coordinate that drop through `BroadcastChannel`. A copy taken beforehand
+still outlives the sign-out by up to the token's lifetime.
 That is the usual stateless-JWT trade and matches AUTH-2's framing, but it means
 "signed out" is a statement about this browser, not about the credential.
 
