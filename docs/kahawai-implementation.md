@@ -495,11 +495,46 @@ In all-in-one mode the bounded local queues bypass TLS and enrollment entirely �
 
 ### 7.5 Client API
 
-Unchanged by the PKI: Argon2id password hashes, 15-min JWT access tokens, and rotating refresh-token families. Each login has one database row containing only its current token hash: rotation conditionally replaces that hash in an immediate transaction, concurrent use has one winner, and presentation of a consumed token revokes that family. The token's random family selector makes old-token replay identifiable without retaining one row per rotation. API logout requires the access bearer plus the current refresh token and revokes that login only; password reset revokes every family for the account.
+Client authentication has explicit transport modes. `client: "api"` login and
+refresh return a 15-minute access JWT and a rotating 30-day refresh bearer;
+logout takes that refresh bearer alongside the access bearer, and none of
+those responses sets authentication cookies. `client: "browser"` returns only
+`{access_token, expires_in}`. The SPA holds that access token in module memory.
+The server owns `kahawai_refresh` (`Path=/api/v1/auth`, 30 days) and
+`kahawai_media` (`Path=/api/v1`, 15 minutes) as host-only, `HttpOnly`,
+`SameSite=Strict` cookies. Reload bootstraps publicly, then refreshes through
+the cookie; the one-time protocol cutover deletes rather than migrates the old
+Web Storage and JavaScript-readable cookie credentials.
 
-Access tokens additionally carry the account's durable `auth_version`. Every authenticated request verifies the JWT signature/expiry, loads the user by primary key, compares that generation, and constructs mutable username and administrator state from the row rather than trusting those token claims. Password resets and role changes increment the generation in the same transaction/statement as the mutation; deletion removes the authoritative row. Invalidation is therefore immediate across hub restart and when `reset-password` runs in a separate process. The migration introducing the generation intentionally revokes all existing refresh families and old access tokens lack its required claim, so the upgrade has an explicit one-time reauthentication boundary.
+Each login still has one database row containing only its current refresh-token
+hash. Rotation conditionally replaces that hash in an immediate transaction,
+concurrent use has one winner, and presentation of a consumed token revokes
+that family. API and browser logout revoke that login only; password reset
+revokes every family. Access JWTs carry the account's durable `auth_version`.
+Every protected request verifies signature and expiry, loads the user by primary
+key, compares that generation, and derives mutable username and administrator
+state from the row. Password resets and role changes increment the generation
+with the mutation; deletion removes the authoritative row, so invalidation is
+immediate across processes and restart.
 
-Per-route authorization middleware maps user grants → library visibility (one `require_item_access` layer over the whole `/api/v1/items/{id}…` group, plus the browse and playback checks). The client-facing listener may use the hub CA's leaf cert, an ACME cert, or sit behind a reverse proxy; client apps are *not* enrolled in the internal CA.
+Bearer authentication is the default and never falls back after a malformed or
+invalid `Authorization` header. The media cookie is accepted only for
+`GET`/`HEAD` bootstrap, events, item artwork/subtitle/font files, and playback
+session streams/files. Item grants and session ownership remain inside that
+authentication boundary. Catalogue/detail/children/font-list reads,
+preferences, playback mutations and every admin route remain bearer-only.
+
+Browser refresh and logout require an exact, non-`null` Origin. Configured
+`hub.public_url` is authoritative; otherwise the origin is `http://Host`, with
+the rightmost `X-Forwarded-Proto`/`X-Forwarded-Host` used only for a socket peer
+in `trusted_proxies`. HTTPS sets `Secure`; configured HTTP logs a cleartext
+credential warning. CORS stays independent and credential-free because
+cross-origin clients use API mode.
+
+Passwords remain Argon2id. Establishment and reset require 12 Unicode scalar
+values, impose no composition rules, and retain login throttling. Existing
+shorter Argon2id hashes remain valid at login; the minimum applies only before
+a new hash is written.
 
 ## 8. Configuration example
 

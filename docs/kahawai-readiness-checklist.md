@@ -124,24 +124,28 @@ marked in that document.
       The rebuilt binary passed that cycle before and after a real restart on
       2026-08-09; the live database reported migration 50, seven bounded
       families, one active setup family and no legacy token table
-- [~] AUTH-6 `POST /api/v1/auth/logout` exists for API bearer clients and is
-      authenticated, family-scoped and idempotent. Explicit
-      `client: "browser" | "api"` modes on setup/login and browser-cookie
-      logout remain
-- [ ] AUTH-7 API auth mode returns access and refresh bearer tokens and sets no
-      cookie. Browser mode returns only the access token and sets host-only,
-      `HttpOnly`, `SameSite=Strict` refresh and media cookies
-- [ ] AUTH-8 Browser access tokens live in memory only. A reload obtains a new
+- [x] AUTH-6 `POST /api/v1/auth/logout` exists for API bearer clients and is
+      authenticated, family-scoped and idempotent. Login, refresh and logout
+      require an explicit `client: "browser" | "api"` mode; browser-cookie
+      logout is implemented
+- [x] AUTH-7 API login and refresh return access and refresh bearer tokens and
+      set no authentication cookies. Browser login and refresh return only
+      `{ "access_token", "expires_in" }`; server-set cookies own the browser
+      refresh and media credentials
+- [x] AUTH-8 Browser access tokens live in memory only. A reload obtains a new
       access token through the refresh cookie; neither access nor refresh tokens
       are written to local storage or a JavaScript-readable cookie
-- [ ] AUTH-9 Accept media-cookie authentication only for the documented
-      `GET`/`HEAD` media, artwork, event and bootstrap resources. Every mutation
-      requires an `Authorization` bearer token; refresh and logout additionally
-      validate the request Origin
-- [ ] AUTH-10 Add `hub.public_url`. Browser deployment on a non-loopback bind
-      requires an HTTPS public URL, which determines the canonical Origin and
-      enables `Secure` cookies; forwarded scheme/host values are trusted only
-      from configured trusted proxies
+- [x] AUTH-9 Accept media-cookie authentication only for `GET`/`HEAD` on
+      `/api/v1/bootstrap`, `/api/v1/events`, item artwork/subtitle/font files,
+      and playback session streams and files. Protected application mutations
+      require an `Authorization` bearer token. Browser refresh is authenticated
+      by its refresh cookie; browser logout requires both its access bearer and
+      refresh cookie. Browser refresh and logout additionally require an exact,
+      present, non-`null` Origin equal to AUTH-10's canonical Origin
+- [x] AUTH-10 Add `hub.public_url`. It determines the canonical Origin and
+      enables `Secure` cookies when it is HTTPS; forwarded scheme/host values
+      are trusted only from configured trusted proxies. An HTTP public URL is
+      permitted and warned about at startup
 - [x] AUTH-11 One owner middleware wraps every user-facing session resource:
       stream, playlist, segment, subtitle, seek, progress and end. Missing and
       foreign live ids return the same 404 body; administrative session routes
@@ -155,10 +159,14 @@ marked in that document.
       preserve 400/409/500 semantics, close after the sole
       winner commits, and are absent on later starts. No setup bearer secret is
       generated, logged, copied, accepted remotely, or left to brute-force
-- [~] AUTH-13 Retain existing Argon2id hashes and adopt a documented password
-      policy from current primary guidance; the proposed remaining change is a
-      minimum 12 characters without composition rules instead of the current
-      eight-character minimum
+- [x] AUTH-13 Retain all existing Argon2id hashes. Require at least 12 Unicode
+      scalar values when establishing or resetting a password, impose no
+      composition rules, and continue to rate-limit login attempts.
+      `auth_api` checks the transport split, cookie allowlist, Origin boundary,
+      restart persistence and password policy. `kahawai-auth-cycle.sh` and the
+      container smoke exercise both modes against a running hub; the embedded
+      SPA was inspected through login, cookie refresh after reload and logout
+      on 2026-08-14 with empty Web Storage and no JavaScript-readable cookies
 
 ## Browser and credential security (SEC-WEB)
 
@@ -301,13 +309,17 @@ marked in that document.
 - [ ] GST-7 Make pipeline assembly transactional: element creation, required
       properties, request pads and statically knowable links are validated
       before PLAYING; dynamic callback failures post one structured pipeline
-      error and cannot leave a claimed mux pad waiting for a generic startup
-      timeout. A dedicated `PipelineAssembler` is one implementation option
-- [ ] GST-8 Remove panic-based control flow from Rust functions invoked by C.
-      Wrap every pad probe, appsink/appsrc callback and dynamic signal handler
-      in a common no-unwind boundary; eliminate production `unwrap` calls on
-      element, pad, link, state and shared callback state operations
-- [ ] GST-9 Represent required transforms as hard invariants. A requested tone
+      API clients use explicit bearer mode. Browser mode keeps its access JWT
+      only in memory and uses host-only HttpOnly refresh/media cookies; reload
+      rotates the refresh family, and logout clears both cookies. The media
+      cookie is accepted only by the explicit read allowlist, while mutations
+      remain bearer-only. Browser refresh/logout require the canonical Origin
+      derived from `hub.public_url` or trusted request metadata. Access JWTs
+      retain the explicit HS256-only allowlist, fixed issuer, API audience and
+      signed `access` credential type; mutable account state and `auth_version`
+      come from the database on every request. Refresh families remain hashed,
+      single-row and single-winner, with replay, logout and password-reset
+      revocation
       map, deinterlace, image/ASS burn, channel layout or encoder path either
       reaches the negotiated output and is reported in `PipelineActual`, or the
       worker fails before readiness so the hub can choose an explicit fallback

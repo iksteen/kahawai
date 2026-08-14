@@ -304,13 +304,17 @@ How something works and why it was built that way belong in
 - [x] HUB-11 Versioned HTTP/JSON API + /api/v1/events SSE channel
       (invalidation hints: scan progress, satellite connectivity,
       sessions, enrichment; cookie-authenticated for EventSource).
-      API authentication has 15-minute access JWTs with an explicit HS256-only
-      allowlist, signature/expiry validation, and required fixed issuer, API
-      audience and signed `access` credential type. Mutable account state and
-      the durable access generation come from the database on every request.
-      Refresh credentials use hashed, rotating families: conditional
-      single-winner rotation, family revocation on replay, family-scoped logout,
-      and all-family revocation on password reset
+      API clients use explicit bearer mode. Browser mode keeps its access JWT
+      only in memory and uses host-only HttpOnly refresh/media cookies; reload
+      rotates the refresh family, and logout clears both cookies. The media
+      cookie is accepted only by the explicit read allowlist, while mutations
+      remain bearer-only. Browser refresh/logout require the canonical Origin
+      derived from `hub.public_url` or trusted request metadata. Access JWTs
+      retain the explicit HS256-only allowlist, fixed issuer, API audience and
+      signed `access` credential type; mutable account state and `auth_version`
+      come from the database on every request. Refresh families remain hashed,
+      single-row and single-winner, with replay, logout and password-reset
+      revocation
 - [x] HUB-12 Browse/search/filter/sort. Hierarchical browse, one
       endpoint for browse and cross-library search with server-side sort
       and paging, item detail with stream info, artwork at named sizes,

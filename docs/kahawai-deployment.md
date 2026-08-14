@@ -27,6 +27,7 @@ Neither first-admin path exists after setup succeeds.
 ```toml
 [hub]
 bind = "127.0.0.1:8420"
+public_url = "https://kahawai.example.com"  # canonical browser origin
 # Peers allowed to speak for clients via X-Forwarded-For. Exact IPs
 # and/or CIDR ranges. REQUIRED for login throttling (OPS-2) to see
 # real client addresses — without it, every client behind the proxy
@@ -49,10 +50,16 @@ trusted_proxies = ["127.0.0.1"]          # proxy on the same host
 #                                        # per-IP throttling.
 ```
 
-X-Forwarded-For is resolved right-to-left: the first address that is
-not itself a trusted proxy wins, so clients cannot spoof their way
-into someone else's throttle bucket. `X-Forwarded-Proto` is currently
-unused (no absolute URLs are generated; cookies are set client-side).
+`public_url` is optional for direct loopback use and must be an absolute
+HTTP(S) origin with no credentials, non-root path, query or fragment. HTTPS
+makes browser authentication cookies `Secure`; configured HTTP is permitted
+but logs that browser authentication cookies and tokens cross the network in
+cleartext. Without `public_url`, the hub derives the browser origin from
+`http://Host`. For a trusted socket peer only, the rightmost valid
+`X-Forwarded-Proto` and `X-Forwarded-Host` replace that value. Untrusted or
+missing peers cannot influence it. X-Forwarded-For is resolved right-to-left:
+the first address that is not itself a trusted proxy wins, so clients cannot
+spoof their way into someone else's throttle bucket.
 
 ### nginx
 
@@ -61,6 +68,7 @@ location / {
     proxy_pass http://127.0.0.1:8420;
     proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
     proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Forwarded-Host $http_host;
     proxy_http_version 1.1;
     # Media: range requests pass through untouched; raise the body
     # timeout if clients pause long direct-play streams.
@@ -106,12 +114,11 @@ cors_origins = ["https://app.example.com"]   # exact origins
 # cors_origins = ["*"]                       # any origin
 ```
 
-Absent (default): no CORS headers — the embedded web UI is
-same-origin and unaffected. Third-party browser clients authenticate
-with bearer tokens (`Authorization` is an allowed header); cookies are
-NOT shared cross-origin, which today means `<video>`/HLS playback —
-which authenticates by cookie — remains same-origin-only. A delegated
-media-token mechanism (AR-8) is the planned fix.
+Absent (default): no CORS headers — the embedded web UI is same-origin and
+unaffected. Third-party browser clients use explicit API mode and bearer
+tokens (`Authorization` is an allowed header). Authentication cookies are
+`SameSite=Strict` and never become a cross-origin credential; native media,
+artwork and EventSource therefore remain same-origin-only.
 
 ## Subtitles (OpenSubtitles)
 
