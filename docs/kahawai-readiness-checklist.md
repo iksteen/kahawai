@@ -243,9 +243,11 @@ marked in that document.
       they remain distinct through scan, deduplication, source selection, byte
       leases and playback
 - [ ] DATA-7 Make the documented `--no-default-features` build compile. The
-      currently reproduced failure is the unconditional `spawn_ocr_sweep` call;
-      keep the complete build as the acceptance check so any later optional-
-      feature failure is reported rather than guessed in advance
+      former unconditional `spawn_ocr_sweep` failure is fixed and
+      `cargo build --workspace --no-default-features --locked` exits 0 locally.
+      CI and release now run that complete build rather than `cargo check`; mark
+      this complete after the equivalent hosted gate passes so any later
+      optional-feature failure is reported rather than guessed in advance
 - [ ] DATA-8 Give every provider HTTP client explicit connect and request
       deadlines, bounded metadata/subtitle/artwork bodies, streamed large
       downloads, a restricted redirect policy and jittered retries only for

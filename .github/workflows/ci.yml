@@ -140,7 +140,9 @@ jobs:
             target
           key: ubuntu-26.04-no-default-rust-1.97.1-${{ hashFiles('Cargo.lock') }}
           restore-keys: ubuntu-26.04-no-default-rust-1.97.1-
-      - run: cargo check --locked --workspace --no-default-features
+      # DATA-7 is a complete-build promise: `check` can miss link/build-script
+      # failures in the feature-off artifact.
+      - run: cargo build --locked --workspace --no-default-features
 
   web:
     name: web
