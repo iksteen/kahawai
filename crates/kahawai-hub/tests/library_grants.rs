@@ -593,7 +593,7 @@ async fn admin_role_changes_invalidate_access_and_keep_one_admin() {
                 "",
                 "POST",
                 "/api/v1/auth/token",
-                Some(json!({ "username": username, "password": "hunter22222hunter" })),
+                Some(json!({ "client": "api", "username": username, "password": "hunter22222hunter" })),
             )
             .await;
             assert_eq!(status, StatusCode::OK);

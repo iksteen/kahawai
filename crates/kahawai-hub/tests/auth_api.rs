@@ -16,12 +16,42 @@ async fn body_json(resp: axum::response::Response) -> serde_json::Value {
         .unwrap();
     serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)
 }
+fn set_cookies(response: &axum::response::Response) -> Vec<String> {
+    response
+        .headers()
+        .get_all(axum::http::header::SET_COOKIE)
+        .iter()
+        .map(|value| value.to_str().unwrap().to_string())
+        .collect()
+}
+
+fn cookie_value(cookies: &[String], name: &str) -> String {
+    cookies
+        .iter()
+        .find_map(|cookie| {
+            cookie
+                .strip_prefix(&format!("{name}="))
+                .and_then(|value| value.split_once(';'))
+                .map(|(value, _)| value.to_string())
+        })
+        .unwrap()
+}
 
 fn post(uri: &str, body: serde_json::Value) -> Request<Body> {
     Request::post(uri)
         .header("content-type", "application/json")
         .body(Body::from(body.to_string()))
         .unwrap()
+}
+fn post_headers(uri: &str, body: serde_json::Value, headers: &[(&str, &str)]) -> Request<Body> {
+    let mut request = post(uri, body);
+    for (name, value) in headers {
+        request.headers_mut().insert(
+            axum::http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+            axum::http::HeaderValue::from_str(value).unwrap(),
+        );
+    }
+    request
 }
 
 fn get_authed(uri: &str, token: &str) -> Request<Body> {
@@ -68,7 +98,6 @@ async fn setup_maps_validation_and_storage_failures_separately() {
     assert_eq!(unavailable.status(), StatusCode::INTERNAL_SERVER_ERROR);
     assert!(auth.setup_required());
 }
-
 #[tokio::test]
 async fn password_establishment_uses_twelve_unicode_scalars_and_preserves_legacy_hashes() {
     let dir = tempfile::tempdir().unwrap();
@@ -157,7 +186,7 @@ async fn setup_then_auth_flow() {
         .clone()
         .oneshot(post(
             "/api/v1/auth/token",
-            serde_json::json!({"username": "a", "password": "b"}),
+            serde_json::json!({"client": "api", "username": "a", "password": "b"}),
         ))
         .await
         .unwrap();
@@ -222,10 +251,7 @@ async fn setup_then_auth_flow() {
     );
     let tokens = body_json(
         api.clone()
-            .oneshot(post(
-                "/api/v1/auth/token",
-                serde_json::json!({"username": "ingmar", "password": "hunter222222"}),
-            ))
+            .oneshot(post("/api/v1/auth/token", serde_json::json!({"client": "api", "username": "ingmar", "password": "hunter222222"})))
             .await
             .unwrap(),
     )
@@ -267,10 +293,7 @@ async fn setup_then_auth_flow() {
     // Login: wrong password rejected, right password issues tokens.
     let resp = api
         .clone()
-        .oneshot(post(
-            "/api/v1/auth/token",
-            serde_json::json!({"username": "ingmar", "password": "wrong-password"}),
-        ))
+        .oneshot(post("/api/v1/auth/token", serde_json::json!({"client": "api", "username": "ingmar", "password": "wrong-password"})))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
@@ -278,7 +301,7 @@ async fn setup_then_auth_flow() {
         .clone()
         .oneshot(post(
             "/api/v1/auth/token",
-            serde_json::json!({"username": "ingmar", "password": "hunter222222"}),
+            serde_json::json!({"client": "api", "username": "ingmar", "password": "hunter222222"}),
         ))
         .await
         .unwrap();
@@ -289,7 +312,7 @@ async fn setup_then_auth_flow() {
         .clone()
         .oneshot(post(
             "/api/v1/auth/refresh",
-            serde_json::json!({"refresh_token": refresh}),
+            serde_json::json!({"client": "api", "refresh_token": refresh}),
         ))
         .await
         .unwrap();
@@ -301,7 +324,7 @@ async fn setup_then_auth_flow() {
         .clone()
         .oneshot(post(
             "/api/v1/auth/refresh",
-            serde_json::json!({"refresh_token": refresh}),
+            serde_json::json!({"client": "api", "refresh_token": refresh}),
         ))
         .await
         .unwrap();
@@ -314,7 +337,7 @@ async fn setup_then_auth_flow() {
         .clone()
         .oneshot(post(
             "/api/v1/auth/refresh",
-            serde_json::json!({"refresh_token": rotated_refresh}),
+            serde_json::json!({"client": "api", "refresh_token": rotated_refresh}),
         ))
         .await
         .unwrap();
@@ -349,32 +372,34 @@ async fn setup_then_auth_flow() {
         "password-reset invalidation did not survive Auth restart"
     );
 
-    // Cookie auth: media elements can't set headers, so a current access token
-    // in the kahawai_token cookie satisfies the middleware. The pre-reset one
-    // does not.
-    let cookie_get = |token: String| {
+    // Bootstrap is public but understands the narrow media cookie. Catalogue
+    // reads remain bearer-only.
+    let cookie_bootstrap = |token: String| {
         let api = api.clone();
         async move {
-            api.oneshot(
-                Request::get("/api/v1/items")
-                    .header("cookie", format!("other=1; kahawai_token={token}"))
-                    .body(Body::empty())
-                    .unwrap(),
+            body_json(
+                api.oneshot(
+                    Request::get("/api/v1/bootstrap")
+                        .header("cookie", format!("other=1; kahawai_media={token}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
             )
             .await
-            .unwrap()
         }
     };
-    assert_eq!(cookie_get(access).await.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(cookie_bootstrap(access).await["authenticated"], false);
     assert_eq!(
-        cookie_get(after_reset.access_token).await.status(),
-        StatusCode::OK
+        cookie_bootstrap(after_reset.access_token).await["authenticated"],
+        true
     );
     let resp = api
         .clone()
         .oneshot(
             Request::get("/api/v1/items")
-                .header("cookie", "kahawai_token=garbage")
+                .header("cookie", "kahawai_media=garbage")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -430,10 +455,20 @@ async fn setup_then_auth_flow() {
 
 /// Router with default admin plumbing for tests that don't exercise it.
 fn test_router(
-    registry: std::sync::Arc<kahawai_hub::registry::Registry>,
-    auth: std::sync::Arc<kahawai_hub::auth::Auth>,
-    sessions: std::sync::Arc<kahawai_hub::sessions::Sessions>,
+    registry: Arc<Registry>,
+    auth: Arc<Auth>,
+    sessions: Arc<kahawai_hub::sessions::Sessions>,
 ) -> axum::Router {
+    test_router_with_net(registry, auth, sessions, Default::default())
+}
+
+fn test_router_with_net(
+    registry: Arc<Registry>,
+    auth: Arc<Auth>,
+    sessions: Arc<kahawai_hub::sessions::Sessions>,
+    mut net: kahawai_hub::api::NetOptions,
+) -> axum::Router {
+    net.setup_url = Some("http://127.0.0.1:8422".into());
     let ca = std::sync::Arc::new(
         kahawai_hub::pki::HubCa::load_or_create(tempfile::tempdir().unwrap().keep().as_path())
             .unwrap(),
@@ -461,10 +496,7 @@ fn test_router(
         Arc::new(kahawai_hub::enrich::Enricher::new(
             tempfile::tempdir().unwrap().keep(),
         )),
-        kahawai_hub::api::NetOptions {
-            setup_url: Some("http://127.0.0.1:8422".into()),
-            ..Default::default()
-        },
+        net,
     )
 }
 
@@ -491,6 +523,430 @@ async fn auth_harness() -> (
         )),
     );
     (dir, db, auth, api, setup)
+}
+#[tokio::test]
+async fn explicit_auth_modes_split_bearers_from_browser_cookies_and_enforce_origin() {
+    let (_dir, _db, _auth, api, _root) = auth_harness().await;
+    for body in [
+        serde_json::json!({"username": "root", "password": "hunter22222hunter"}),
+        serde_json::json!({"client": "desktop", "username": "root", "password": "hunter22222hunter"}),
+    ] {
+        let response = api
+            .clone()
+            .oneshot(post("/api/v1/auth/token", body))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    let api_login = api
+        .clone()
+        .oneshot(post(
+            "/api/v1/auth/token",
+            serde_json::json!({
+                "client": "api",
+                "username": "root",
+                "password": "hunter22222hunter"
+            }),
+        ))
+        .await
+        .unwrap();
+    assert!(set_cookies(&api_login).is_empty());
+    let api_tokens = body_json(api_login).await;
+    assert!(api_tokens["access_token"].is_string());
+    assert!(api_tokens["refresh_token"].is_string());
+    assert!(api_tokens["expires_in"].is_number());
+
+    let api_refresh = api
+        .clone()
+        .oneshot(post(
+            "/api/v1/auth/refresh",
+            serde_json::json!({
+                "client": "api",
+                "refresh_token": api_tokens["refresh_token"]
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(api_refresh.status(), StatusCode::OK);
+    assert!(set_cookies(&api_refresh).is_empty());
+    assert!(body_json(api_refresh).await["refresh_token"].is_string());
+    assert_eq!(
+        api.clone()
+            .oneshot(post(
+                "/api/v1/auth/refresh",
+                serde_json::json!({"client": "api"}),
+            ))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+
+    let browser_login = api
+        .clone()
+        .oneshot(post_headers(
+            "/api/v1/auth/token",
+            serde_json::json!({
+                "client": "browser",
+                "username": "root",
+                "password": "hunter22222hunter"
+            }),
+            &[("host", "hub.test:8420")],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(browser_login.status(), StatusCode::OK);
+    let cookies = set_cookies(&browser_login);
+    let refresh = cookie_value(&cookies, "kahawai_refresh");
+    let media = cookie_value(&cookies, "kahawai_media");
+    assert_eq!(
+        cookies,
+        vec![
+            format!(
+                "kahawai_refresh={refresh}; Path=/api/v1/auth; Max-Age=2592000; HttpOnly; SameSite=Strict"
+            ),
+            format!("kahawai_media={media}; Path=/api/v1; Max-Age=900; HttpOnly; SameSite=Strict"),
+        ]
+    );
+    let browser_body = body_json(browser_login).await;
+    assert_eq!(browser_body["access_token"], media);
+    assert!(browser_body.get("refresh_token").is_none());
+    assert!(browser_body["expires_in"].is_number());
+
+    assert_eq!(
+        api.clone()
+            .oneshot(post_headers(
+                "/api/v1/auth/refresh",
+                serde_json::json!({
+                    "client": "browser",
+                    "refresh_token": refresh
+                }),
+                &[("host", "hub.test:8420")],
+            ))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+
+    for origin in [
+        None,
+        Some("null"),
+        Some("https://foreign.test"),
+        Some("https://["),
+    ] {
+        let cookie_header = format!("kahawai_refresh={refresh}");
+        let mut request = post_headers(
+            "/api/v1/auth/refresh",
+            serde_json::json!({"client": "browser"}),
+            &[("host", "hub.test:8420"), ("cookie", &cookie_header)],
+        );
+        if let Some(origin) = origin {
+            request.headers_mut().insert(
+                axum::http::header::ORIGIN,
+                axum::http::HeaderValue::from_str(origin).unwrap(),
+            );
+        }
+        let response = api.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{origin:?}");
+        assert!(set_cookies(&response).is_empty());
+    }
+
+    let cookie_header = format!("kahawai_refresh={refresh}");
+    let browser_refresh = api
+        .clone()
+        .oneshot(post_headers(
+            "/api/v1/auth/refresh",
+            serde_json::json!({"client": "browser"}),
+            &[
+                ("host", "hub.test:8420"),
+                ("origin", "http://hub.test:8420"),
+                ("cookie", &cookie_header),
+            ],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(browser_refresh.status(), StatusCode::OK);
+    let rotated_cookies = set_cookies(&browser_refresh);
+    let rotated_refresh = cookie_value(&rotated_cookies, "kahawai_refresh");
+    let refreshed_body = body_json(browser_refresh).await;
+    assert!(refreshed_body.get("refresh_token").is_none());
+    let invalid_cookie = "kahawai_refresh=garbage";
+    let invalid_refresh = api
+        .clone()
+        .oneshot(post_headers(
+            "/api/v1/auth/refresh",
+            serde_json::json!({"client": "browser"}),
+            &[
+                ("host", "hub.test:8420"),
+                ("origin", "http://hub.test:8420"),
+                ("cookie", invalid_cookie),
+            ],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(invalid_refresh.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(set_cookies(&invalid_refresh).len(), 2);
+    assert!(
+        set_cookies(&invalid_refresh)
+            .iter()
+            .all(|cookie| cookie.contains("Max-Age=0"))
+    );
+
+    let cookie_header = format!("kahawai_refresh={rotated_refresh}");
+    let authorization = format!(
+        "Bearer {}",
+        refreshed_body["access_token"].as_str().unwrap()
+    );
+    let browser_logout = api
+        .oneshot(post_headers(
+            "/api/v1/auth/logout",
+            serde_json::json!({"client": "browser"}),
+            &[
+                ("host", "hub.test:8420"),
+                ("origin", "http://hub.test:8420"),
+                ("cookie", &cookie_header),
+                ("authorization", &authorization),
+            ],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(browser_logout.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        set_cookies(&browser_logout),
+        vec![
+            "kahawai_refresh=; Path=/api/v1/auth; Max-Age=0; HttpOnly; SameSite=Strict",
+            "kahawai_media=; Path=/api/v1; Max-Age=0; HttpOnly; SameSite=Strict",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn browser_refresh_internal_errors_do_not_clear_cookies() {
+    let (_dir, db, _auth, api, _root) = auth_harness().await;
+    let login = api
+        .clone()
+        .oneshot(post_headers(
+            "/api/v1/auth/token",
+            serde_json::json!({
+                "client": "browser",
+                "username": "root",
+                "password": "hunter22222hunter"
+            }),
+            &[("host", "hub.test:8420")],
+        ))
+        .await
+        .unwrap();
+    let refresh = cookie_value(&set_cookies(&login), "kahawai_refresh");
+    db.close().await;
+    let cookie_header = format!("kahawai_refresh={refresh}");
+    let response = api
+        .oneshot(post_headers(
+            "/api/v1/auth/refresh",
+            serde_json::json!({"client": "browser"}),
+            &[
+                ("host", "hub.test:8420"),
+                ("origin", "http://hub.test:8420"),
+                ("cookie", &cookie_header),
+            ],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(set_cookies(&response).is_empty());
+}
+
+#[tokio::test]
+async fn media_cookie_is_limited_to_the_explicit_read_allowlist() {
+    let (_dir, _db, _auth, api, root) = auth_harness().await;
+    let cookie = format!("kahawai_media={}", root.access_token);
+    let request = |method: axum::http::Method, uri: &str| {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("cookie", &cookie)
+            .body(Body::empty())
+            .unwrap()
+    };
+
+    let bootstrap = api
+        .clone()
+        .oneshot(request(axum::http::Method::GET, "/api/v1/bootstrap"))
+        .await
+        .unwrap();
+    assert_eq!(body_json(bootstrap).await["authenticated"], true);
+    assert_eq!(
+        api.clone()
+            .oneshot(request(axum::http::Method::GET, "/api/v1/events"))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        api.clone()
+            .oneshot(request(axum::http::Method::HEAD, "/api/v1/events"))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    for (method, uri) in [
+        (axum::http::Method::GET, "/api/v1/items"),
+        (axum::http::Method::GET, "/admin/v1/users"),
+        (axum::http::Method::POST, "/api/v1/playback/sessions"),
+    ] {
+        assert_eq!(
+            api.clone()
+                .oneshot(request(method, uri))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED,
+            "{uri}"
+        );
+    }
+    assert_eq!(
+        api.clone()
+            .oneshot(request(
+                axum::http::Method::GET,
+                "/api/v1/items/missing/artwork",
+            ))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NOT_FOUND,
+        "item grants must run after cookie authentication"
+    );
+    assert_eq!(
+        api.clone()
+            .oneshot(request(
+                axum::http::Method::GET,
+                "/api/v1/playback/sessions/missing/stream",
+            ))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NOT_FOUND,
+        "session ownership must run after cookie authentication"
+    );
+    let invalid_bearer = Request::get("/api/v1/events")
+        .header("authorization", "Bearer invalid")
+        .header("cookie", cookie)
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        api.oneshot(invalid_bearer).await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+#[tokio::test]
+async fn configured_and_forwarded_origins_control_browser_cookie_security() {
+    let (_dir, db, auth, _api, _root) = auth_harness().await;
+    let router = |net| {
+        test_router_with_net(
+            Arc::new(Registry::new(db.clone(), Default::default())),
+            auth.clone(),
+            Arc::new(kahawai_hub::sessions::Sessions::new(
+                tempfile::tempdir().unwrap().keep(),
+            )),
+            net,
+        )
+    };
+    let login = |host: &str| {
+        post_headers(
+            "/api/v1/auth/token",
+            serde_json::json!({
+                "client": "browser",
+                "username": "root",
+                "password": "hunter22222hunter"
+            }),
+            &[("host", host)],
+        )
+    };
+
+    let configured = router(kahawai_hub::api::NetOptions {
+        public_origin: Some(
+            kahawai_hub::api::PublicOrigin::parse("https://Public.Example:443").unwrap(),
+        ),
+        ..Default::default()
+    });
+    let response = configured
+        .clone()
+        .oneshot(login("attacker.invalid"))
+        .await
+        .unwrap();
+    let cookies = set_cookies(&response);
+    assert!(cookies.iter().all(|cookie| cookie.ends_with("; Secure")));
+    let configured_refresh = cookie_value(&cookies, "kahawai_refresh");
+    let cookie_header = format!("kahawai_refresh={configured_refresh}");
+    assert_eq!(
+        configured
+            .oneshot(post_headers(
+                "/api/v1/auth/refresh",
+                serde_json::json!({"client": "browser"}),
+                &[
+                    ("host", "attacker.invalid"),
+                    ("origin", "https://public.example"),
+                    ("x-forwarded-proto", "http"),
+                    ("x-forwarded-host", "attacker.invalid"),
+                    ("cookie", &cookie_header),
+                ],
+            ))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK,
+        "configured public_url must take precedence"
+    );
+
+    let trust = Arc::new(kahawai_hub::proxy::ProxyTrust::parse(&["127.0.0.1".into()]).unwrap());
+    let forwarded = router(kahawai_hub::api::NetOptions {
+        proxy_trust: trust.clone(),
+        ..Default::default()
+    });
+    let mut request = login("internal:8420");
+    request
+        .headers_mut()
+        .insert("x-forwarded-proto", "http, https".parse().unwrap());
+    request.headers_mut().insert(
+        "x-forwarded-host",
+        "spoofed.invalid, Public.Example:443".parse().unwrap(),
+    );
+    request.extensions_mut().insert(axum::extract::ConnectInfo(
+        "127.0.0.1:1234".parse::<std::net::SocketAddr>().unwrap(),
+    ));
+    let response = forwarded.oneshot(request).await.unwrap();
+    assert!(
+        set_cookies(&response)
+            .iter()
+            .all(|cookie| cookie.ends_with("; Secure")),
+        "trusted rightmost forwarded origin must select HTTPS"
+    );
+
+    let untrusted = router(kahawai_hub::api::NetOptions {
+        proxy_trust: trust,
+        ..Default::default()
+    });
+    let mut request = login("internal:8420");
+    request
+        .headers_mut()
+        .insert("x-forwarded-proto", "https".parse().unwrap());
+    request
+        .headers_mut()
+        .insert("x-forwarded-host", "public.example".parse().unwrap());
+    request.extensions_mut().insert(axum::extract::ConnectInfo(
+        "203.0.113.9:1234".parse::<std::net::SocketAddr>().unwrap(),
+    ));
+    let response = untrusted.oneshot(request).await.unwrap();
+    assert!(
+        set_cookies(&response)
+            .iter()
+            .all(|cookie| !cookie.contains("; Secure")),
+        "untrusted forwarded headers must be ignored"
+    );
 }
 
 #[tokio::test]
@@ -713,7 +1169,7 @@ async fn admin_creates_users() {
     // Admin creates a plain user; the new user can log in but not create.
     let resp = create(
         admin_token.clone(),
-        serde_json::json!({"username": "tester", "password": "longenough"}),
+        serde_json::json!({"username": "tester", "password": "longenough12"}),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::OK);
@@ -721,7 +1177,7 @@ async fn admin_creates_users() {
         .clone()
         .oneshot(post(
             "/api/v1/auth/token",
-            serde_json::json!({"username": "tester", "password": "longenough"}),
+            serde_json::json!({"client": "api", "username": "tester", "password": "longenough12"}),
         ))
         .await
         .unwrap();
@@ -773,7 +1229,7 @@ async fn login_throttles_after_repeated_failures() {
             .clone()
             .oneshot(post(
                 "/api/v1/auth/token",
-                serde_json::json!({"username": "ingmar", "password": "wrong"}),
+                serde_json::json!({"client": "api", "username": "ingmar", "password": "wrong"}),
             ))
             .await
             .unwrap();
@@ -784,7 +1240,7 @@ async fn login_throttles_after_repeated_failures() {
         .clone()
         .oneshot(post(
             "/api/v1/auth/token",
-            serde_json::json!({"username": "ingmar", "password": "wrong"}),
+            serde_json::json!({"client": "api", "username": "ingmar", "password": "wrong"}),
         ))
         .await
         .unwrap();
@@ -794,7 +1250,7 @@ async fn login_throttles_after_repeated_failures() {
         .clone()
         .oneshot(post(
             "/api/v1/auth/token",
-            serde_json::json!({"username": "ingmar", "password": "hunter222222"}),
+            serde_json::json!({"client": "api", "username": "ingmar", "password": "hunter222222"}),
         ))
         .await
         .unwrap();
@@ -806,7 +1262,7 @@ async fn login_throttles_after_repeated_failures() {
         .clone()
         .oneshot(post(
             "/api/v1/auth/token",
-            serde_json::json!({"username": "someone-else", "password": "wrong"}),
+            serde_json::json!({"client": "api", "username": "someone-else", "password": "wrong"}),
         ))
         .await
         .unwrap();
@@ -861,10 +1317,7 @@ async fn bootstrap_states_setup_and_auth_without_a_token() {
 
     let token = body_json(
         api.clone()
-            .oneshot(post(
-                "/api/v1/auth/token",
-                serde_json::json!({"username": "ingmar", "password": "hunter222222"}),
-            ))
+            .oneshot(post("/api/v1/auth/token", serde_json::json!({"client": "api", "username": "ingmar", "password": "hunter222222"})))
             .await
             .unwrap(),
     )
@@ -1227,13 +1680,25 @@ async fn api_logout_revokes_only_the_callers_current_family() {
     auth.create_user("bob", "hunter22222hunter", false)
         .await
         .unwrap();
+    assert_eq!(
+        api.clone()
+            .oneshot(post_authed(
+                "/api/v1/auth/logout",
+                &root.access_token,
+                serde_json::json!({"client": "api"}),
+            ))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
     let bob = auth.login("bob", "hunter22222hunter").await.unwrap();
 
     let resp = api
         .clone()
         .oneshot(post(
             "/api/v1/auth/logout",
-            serde_json::json!({"refresh_token": root.refresh_token}),
+            serde_json::json!({"client": "api", "refresh_token": root.refresh_token}),
         ))
         .await
         .unwrap();
@@ -1244,11 +1709,12 @@ async fn api_logout_revokes_only_the_callers_current_family() {
         .oneshot(post_authed(
             "/api/v1/auth/logout",
             &root.access_token,
-            serde_json::json!({"refresh_token": bob.refresh_token}),
+            serde_json::json!({"client": "api", "refresh_token": bob.refresh_token}),
         ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert!(set_cookies(&resp).is_empty());
     let bob = auth.refresh(&bob.refresh_token).await.unwrap();
 
     for _ in 0..2 {
@@ -1257,11 +1723,12 @@ async fn api_logout_revokes_only_the_callers_current_family() {
             .oneshot(post_authed(
                 "/api/v1/auth/logout",
                 &bob.access_token,
-                serde_json::json!({"refresh_token": bob.refresh_token}),
+                serde_json::json!({"client": "api", "refresh_token": bob.refresh_token}),
             ))
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert!(set_cookies(&resp).is_empty());
     }
     assert!(matches!(
         auth.refresh(&bob.refresh_token).await,
