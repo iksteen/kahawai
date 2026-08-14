@@ -107,6 +107,9 @@ pub struct HubConfig {
     /// Client API listener. Defaults to loopback until authentication
     /// (HUB-10/11) lands — override deliberately if you must.
     pub bind: SocketAddr,
+    /// Trusted-local first-run browser listener. It exists only until the
+    /// initial administrator is committed and must remain loopback-only.
+    pub setup_bind: SocketAddr,
     /// Satellite listener: enrollment + (later) mTLS control/byte plane.
     pub satellite_bind: SocketAddr,
     pub data_dir: PathBuf,
@@ -161,6 +164,7 @@ impl Default for HubConfig {
     fn default() -> Self {
         Self {
             bind: "127.0.0.1:8420".parse().unwrap(),
+            setup_bind: "127.0.0.1:8422".parse().unwrap(),
             satellite_bind: "0.0.0.0:8421".parse().unwrap(),
             data_dir: default_hub_data_dir(),
             hostnames: vec!["localhost".into()],
@@ -306,6 +310,12 @@ pub fn load(explicit: Option<&Path>) -> Result<(Config, Option<PathBuf>)> {
         Some(parent) => std::env::current_dir()?.join(parent),
         None => std::env::current_dir()?,
     };
+    if !cfg.hub.setup_bind.ip().is_loopback() {
+        bail!("hub.setup_bind must be a loopback address");
+    }
+    if cfg.hub.setup_bind == cfg.hub.bind {
+        bail!("hub.setup_bind must differ from hub.bind");
+    }
     normalize_and_validate_collections(&mut cfg.mediahost.collections, &base)?;
     Ok((cfg, used))
 }
@@ -414,6 +424,7 @@ mod tests {
             let (cfg, used) = load(None).unwrap();
             assert!(used.is_none());
             assert_eq!(cfg.hub.bind, "127.0.0.1:8420".parse().unwrap());
+            assert_eq!(cfg.hub.setup_bind, "127.0.0.1:8422".parse().unwrap());
             assert_eq!(cfg.hub.satellite_bind, "0.0.0.0:8421".parse().unwrap());
             assert_eq!(
                 cfg.hub.data_dir,
@@ -435,6 +446,22 @@ mod tests {
             jail.create_file("kahawai.toml", "[all_in_one]\ntranscoder = false\n")?;
             let (cfg, _) = load(Some(Path::new("kahawai.toml"))).unwrap();
             assert!(!cfg.all_in_one.transcoder);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn setup_listener_must_be_distinct_and_loopback_only() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file("kahawai.toml", "[hub]\nsetup_bind = \"0.0.0.0:8422\"")?;
+            let error = load(Some(Path::new("kahawai.toml"))).unwrap_err();
+            assert!(error.to_string().contains("loopback"), "{error}");
+            jail.create_file(
+                "kahawai.toml",
+                "[hub]\nbind = \"127.0.0.1:8420\"\nsetup_bind = \"127.0.0.1:8420\"",
+            )?;
+            let error = load(Some(Path::new("kahawai.toml"))).unwrap_err();
+            assert!(error.to_string().contains("must differ"), "{error}");
             Ok(())
         });
     }

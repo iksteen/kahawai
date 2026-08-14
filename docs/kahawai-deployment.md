@@ -5,6 +5,12 @@ The hub serves the client API and the embedded web UI on `[hub] bind`
 in front. Everything below is opt-in config; the defaults are
 same-origin only, no proxy trust.
 
+First-run setup is intentionally outside the reverse proxy. `setup_bind`
+(default `127.0.0.1:8422`) must remain loopback-only; open it locally or
+forward it over SSH. Headless/container operators can instead run
+`kahawai hub init-admin`, which uses `bootstrap.sock` under the hub data
+directory. Neither first-admin path exists after setup succeeds.
+
 ## Reverse proxy
 
 ```toml

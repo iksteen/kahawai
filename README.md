@@ -93,8 +93,11 @@ gst-libav"). Essential gaps abort startup; everything else degrades.
 ./target/release/kahawai mediahost
 ```
 
-The hub prints a one-time **setup token** — open http://localhost:8420, paste
-it, and create the admin account. The mediahost (and any transcoder) prints an
+The public API remains locked on first run. Create the administrator through
+the trusted-local control plane: open http://localhost:8422 on the hub (or
+forward that loopback port over SSH), or run `kahawai hub init-admin` in a
+second terminal. The local browser listener and private Unix socket disappear
+after the first account commits. The mediahost (and any transcoder) prints an
 **enrollment code** on first connect; approve it on the admin page. Satellites
 receive certificates from the hub (it is its own CA) and reconnect on their
 own ever after.
@@ -118,6 +121,7 @@ transcoder = true               # set false (then restart) to keep encoding off 
 
 [hub]
 bind = "127.0.0.1:8420"          # client API + web app; put a reverse proxy in front for TLS
+setup_bind = "127.0.0.1:8422"    # first-run browser only; must stay loopback
 satellite_bind = "0.0.0.0:8421"  # enrollment + mTLS link for satellites
 data_dir = "~/.local/share/kahawai"  # db, PKI, caches (default shown for user installs)
 hostnames = ["localhost"]        # names/IPs baked into the hub's certificate SANs —

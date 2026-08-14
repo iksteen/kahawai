@@ -111,6 +111,8 @@ enum Cmd {
 
 #[derive(Subcommand)]
 enum HubCmd {
+    /// Create the first administrator through the hub's private local socket.
+    InitAdmin,
     /// Overwrite a user's password (reads the new password from stdin).
     ResetPassword { username: String },
     /// Snapshot the hub (OPS-5) — database, PKI, subtitles, config —
@@ -152,6 +154,9 @@ async fn main() -> Result<()> {
     }
     match cli.command {
         Cmd::Hub { cmd: None } => kahawai::run_hub(cfg.hub, config_used).await,
+        Cmd::Hub {
+            cmd: Some(HubCmd::InitAdmin),
+        } => kahawai::init_admin(cfg.hub).await,
         Cmd::Hub {
             cmd: Some(HubCmd::ResetPassword { username }),
         } => kahawai::reset_password(cfg.hub, &username).await,

@@ -157,8 +157,11 @@ async fn seed(
 #[tokio::test]
 async fn continue_watching_is_started_unfinished_most_recent_first() {
     let (api, auth, db) = harness().await;
+    auth.complete_setup("owner", "hunter22222hunter")
+        .await
+        .unwrap();
     let token = auth
-        .complete_setup(&auth.setup_token().unwrap(), "owner", "hunter22222hunter")
+        .login("owner", "hunter22222hunter")
         .await
         .unwrap()
         .access_token;
@@ -201,8 +204,11 @@ async fn continue_watching_is_started_unfinished_most_recent_first() {
 #[tokio::test]
 async fn continue_watching_respects_library_grants() {
     let (api, auth, db) = harness().await;
+    auth.complete_setup("owner", "hunter22222hunter")
+        .await
+        .unwrap();
     let admin_token = auth
-        .complete_setup(&auth.setup_token().unwrap(), "owner", "hunter22222hunter")
+        .login("owner", "hunter22222hunter")
         .await
         .unwrap()
         .access_token;

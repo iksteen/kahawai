@@ -5,6 +5,8 @@ export default function Auth({
   mode,
   onDone,
   note,
+  setupAvailable = false,
+  setupUrl,
 }: {
   mode: 'setup' | 'login'
   onDone: () => void
@@ -12,12 +14,14 @@ export default function Auth({
   /// mid-use lands on this screen with no explanation otherwise, which reads
   /// as the app having forgotten you for no reason.
   note?: string
+  setupAvailable?: boolean
+  setupUrl?: string
 }) {
-  const [token, setToken] = useState('')
   const [user, setUser] = useState('')
   const [password, setPassword] = useState('')
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
+  const [setupDone, setSetupDone] = useState(false)
 
   async function submit(e: React.FormEvent) {
     e.preventDefault()
@@ -25,7 +29,7 @@ export default function Auth({
     setError('')
     const [url, body] =
       mode === 'setup'
-        ? ['/api/v1/setup', { token, username: user, password }]
+        ? ['/api/v1/setup', { username: user, password }]
         : ['/api/v1/auth/token', { username: user, password }]
     // Raw `fetch`, because there is no token yet and `api()` exists to
     // attach one — but that also means nothing here turns an unreachable hub
@@ -49,8 +53,49 @@ export default function Auth({
       setError((await r.text()) || 'Something went wrong')
       return
     }
+    if (mode === 'setup') {
+      // The trusted-local listener closes after this response. Its origin is
+      // deliberately not the normal hub origin, so its tokens would not be
+      // useful there; tell the operator to return to the address they use.
+      setSetupDone(true)
+      return
+    }
     storeTokens((await r.json()) as Tokens)
     onDone()
+  }
+
+  if (mode === 'setup' && !setupAvailable) {
+    return (
+      <div className="auth-wrap">
+        <div className="auth-card">
+          <div className="wordmark big">
+            kahawai<span className="tilde">~</span>
+          </div>
+          <p className="auth-hint">
+            Initial setup is available only through the hub’s local control plane.
+          </p>
+          <p className="auth-hint">
+            Open <code>{setupUrl ?? 'the local setup URL printed by the hub'}</code> on the hub,
+            connect to it with an SSH tunnel, or run <code>kahawai hub init-admin</code>.
+          </p>
+        </div>
+      </div>
+    )
+  }
+
+  if (setupDone) {
+    return (
+      <div className="auth-wrap">
+        <div className="auth-card">
+          <div className="wordmark big">
+            kahawai<span className="tilde">~</span>
+          </div>
+          <p className="auth-hint">
+            Administrator created. Return to your normal Kahawai address and sign in.
+          </p>
+        </div>
+      </div>
+    )
   }
 
   return (
@@ -61,24 +106,16 @@ export default function Auth({
         </div>
         {mode === 'setup' ? (
           <p className="auth-hint">
-            First run. Enter the setup token printed on the hub console to create the admin account.
+            First run. Create the initial administrator from this local-only page.
           </p>
         ) : (
           <p className="auth-hint">{note ?? 'Sign in to your library.'}</p>
-        )}
-        {mode === 'setup' && (
-          <input
-            placeholder="Setup token (XXXX-XXXX)"
-            value={token}
-            onChange={(e) => setToken(e.target.value)}
-            autoFocus
-          />
         )}
         <input
           placeholder="Username"
           value={user}
           onChange={(e) => setUser(e.target.value)}
-          autoFocus={mode === 'login'}
+          autoFocus
           autoComplete="username"
         />
         <input

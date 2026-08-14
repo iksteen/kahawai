@@ -546,7 +546,9 @@ How something works and why it was built that way belong in
 
 ## Operations (OPS)
 
-- [x] OPS-1 First-run setup mode (console setup token → admin creation)
+- [x] OPS-1 First-run setup mode: public API locked; atomic initial-admin
+      creation through either the loopback-only, same-origin browser listener
+      or the mode-0600 local Unix socket used by `kahawai hub init-admin`
 - [x] OPS-2 Login throttling: consecutive-failure lockout with
       exponential backoff (30 s → 15 min cap), keyed per account (5) and
       per source address (20, higher so a shared NAT survives), failures

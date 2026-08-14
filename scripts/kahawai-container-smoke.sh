@@ -96,11 +96,13 @@ docker run --rm --user "$user" -v "$work:/data" --entrypoint sh "$TAG" -c \
 [ -s "$work/media/movies/Smoke.Test.2026.mkv" ] || fail "the image could not mux a test clip"
 
 echo "==> starting all-in-one from $TAG" >&2
-docker run -d --name "$name" --user "$user" -p 0:8420 -v "$work:/data" \
+docker run -d --name "$name" --user "$user" -p 0:8420 -p 127.0.0.1::8422 -v "$work:/data" \
     "$TAG" all-in-one --config /data/kahawai.toml >/dev/null 2>&1 \
     || fail "docker run"
 api=$(docker port "$name" 8420/tcp | head -1)
 api="localhost:${api##*:}"
+setup=$(docker port "$name" 8422/tcp | head -1)
+setup="localhost:${setup##*:}"
 
 logs() { docker logs "$name" 2>&1 | sed 's/\x1b\[[0-9;]*m//g'; }
 # `d` is the parsed body; the expression prints what it wants from it.
@@ -111,16 +113,18 @@ py() { python3 -c "import json,sys; d=json.load(sys.stdin); $1"; }
 items='it = d if isinstance(d, list) else d["items"];'
 
 for _ in $(seq 30); do
-    tok=$(logs | grep -oE 'Setup token: [A-Za-z0-9-]+' | head -1 | awk '{print $3}')
-    [ -n "$tok" ] && break
+    curl -sf "http://$setup/api/v1/bootstrap" >/dev/null && break
     sleep 2
 done
-[ -n "${tok:-}" ] || { logs | tail -20 >&2; fail "no setup token; the hub never started"; }
 
-auth=$(curl -sf -X POST "http://$api/api/v1/setup" -H content-type:application/json \
-    -d "{\"token\":\"$tok\",\"username\":\"smoke\",\"password\":\"smoke-password-1\"}" \
+curl -sf -X POST "http://$setup/api/v1/setup" \
+    -H "Origin: http://$setup" -H content-type:application/json \
+    -d '{"username":"smoke","password":"smoke-password-1"}' >/dev/null \
+    || { logs | tail -20 >&2; fail "local setup failed"; }
+auth=$(curl -sf -X POST "http://$api/api/v1/auth/token" -H content-type:application/json \
+    -d '{"username":"smoke","password":"smoke-password-1"}' \
     | py 'print(d["access_token"])')
-[ -n "$auth" ] || fail "setup did not return a token"
+[ -n "$auth" ] || fail "login after setup did not return a token"
 
 echo "==> waiting for the scan" >&2
 for _ in $(seq 30); do

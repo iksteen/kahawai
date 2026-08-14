@@ -688,7 +688,12 @@ export const fetchItems = (page: ItemsPage) => {
 
 /// Which screen to open on. Public: needs no token, and answers before
 /// setup has happened.
-export type Bootstrap = { setup_required: boolean; authenticated: boolean }
+export type Bootstrap = {
+  setup_required: boolean
+  setup_available: boolean
+  setup_url?: string
+  authenticated: boolean
+}
 
 /// Which screen to open on. The app renders NOTHING until this answers, so it
 /// is the one request that must not be able to hang: no timeout meant a hub

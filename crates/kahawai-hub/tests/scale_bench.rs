@@ -176,8 +176,11 @@ async fn seed(dir: &std::path::Path, items: usize) -> Bench {
         enricher,
         kahawai_hub::api::NetOptions::default(),
     );
+    auth.complete_setup("bench", "hunter22222hunter")
+        .await
+        .unwrap();
     let token = auth
-        .complete_setup(&auth.setup_token().unwrap(), "bench", "hunter22222hunter")
+        .login("bench", "hunter22222hunter")
         .await
         .unwrap()
         .access_token;

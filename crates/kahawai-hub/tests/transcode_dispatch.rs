@@ -293,10 +293,8 @@ async fn keeps_audio_encode_local_and_dispatches_video_encode() {
             .await
             .unwrap(),
     );
-    let pair = auth
-        .complete_setup(&auth.setup_token().unwrap(), "admin", "password-123")
-        .await
-        .unwrap();
+    auth.complete_setup("admin", "password-123").await.unwrap();
+    let pair = auth.login("admin", "password-123").await.unwrap();
     let bearer = format!("Bearer {}", pair.access_token);
     let api = test_router(registry.clone(), auth, sessions.clone());
     let get = |uri: String| {

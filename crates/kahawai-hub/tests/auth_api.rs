@@ -45,7 +45,8 @@ async fn setup_then_auth_flow() {
     let db = kahawai_hub::db::open(dir.path()).await.unwrap();
     let registry = Arc::new(Registry::new(db.clone(), Default::default()));
     let auth = Arc::new(Auth::new(db.clone(), dir.path()).await.unwrap());
-    let setup_token = auth.setup_token().expect("fresh hub must be in setup mode");
+    assert!(auth.setup_required());
+    let local = kahawai_hub::api::setup_router(auth.clone(), "127.0.0.1:8422".parse().unwrap());
     let api = test_router(
         registry,
         auth.clone(),
@@ -72,39 +73,89 @@ async fn setup_then_auth_flow() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
 
-    // Wrong setup token → rejected, still in setup mode.
+    // The public listener has no initial-admin mutation at all.
     let resp = api
         .clone()
         .oneshot(post(
             "/api/v1/setup",
-            serde_json::json!({"token": "NOPE-NOPE", "username": "ingmar", "password": "hunter22222"}),
+            serde_json::json!({"username": "attacker", "password": "hunter22222"}),
         ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    assert!(auth.setup_required());
+
+    // A foreign web origin cannot drive the loopback listener (DNS rebinding
+    // and blind form posts do not become local presence).
+    let resp = local
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/setup")
+                .header("host", "localhost:8422")
+                .header("origin", "https://attacker.example")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"username": "attacker", "password": "hunter22222"})
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     assert!(auth.setup_required());
 
-    // Correct token creates the admin and returns a working token pair.
-    let resp = api
+    // The local same-origin page creates the admin without minting a token on
+    // the disposable setup origin.
+    let resp = local
         .clone()
-        .oneshot(post(
-            "/api/v1/setup",
-            serde_json::json!({"token": setup_token, "username": "ingmar", "password": "hunter22222"}),
-        ))
+        .oneshot(
+            Request::post("/api/v1/setup")
+                .header("host", "localhost:8422")
+                .header("origin", "http://localhost:8422")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"username": "ingmar", "password": "hunter22222"})
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::CREATED);
-    let tokens = body_json(resp).await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM refresh_families")
+            .fetch_one(&db)
+            .await
+            .unwrap(),
+        0
+    );
+    let tokens = body_json(
+        api.clone()
+            .oneshot(post(
+                "/api/v1/auth/token",
+                serde_json::json!({"username": "ingmar", "password": "hunter22222"}),
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
     let access = tokens["access_token"].as_str().unwrap().to_string();
     let refresh = tokens["refresh_token"].as_str().unwrap().to_string();
 
     // Setup cannot run twice.
-    let resp = api
+    let resp = local
         .clone()
-        .oneshot(post(
-            "/api/v1/setup",
-            serde_json::json!({"token": setup_token, "username": "eve", "password": "evil-password"}),
-        ))
+        .oneshot(
+            Request::post("/api/v1/setup")
+                .header("host", "127.0.0.1:8422")
+                .header("origin", "http://127.0.0.1:8422")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"username": "eve", "password": "evil-password"}).to_string(),
+                ))
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::CONFLICT);
@@ -320,7 +371,10 @@ fn test_router(
         Arc::new(kahawai_hub::enrich::Enricher::new(
             tempfile::tempdir().unwrap().keep(),
         )),
-        kahawai_hub::api::NetOptions::default(),
+        kahawai_hub::api::NetOptions {
+            setup_url: Some("http://127.0.0.1:8422".into()),
+            ..Default::default()
+        },
     )
 }
 
@@ -335,10 +389,10 @@ async fn auth_harness() -> (
     let db = kahawai_hub::db::open(dir.path()).await.unwrap();
     let registry = Arc::new(Registry::new(db.clone(), Default::default()));
     let auth = Arc::new(Auth::new(db.clone(), dir.path()).await.unwrap());
-    let setup = auth
-        .complete_setup(&auth.setup_token().unwrap(), "root", "hunter22222hunter")
+    auth.complete_setup("root", "hunter22222hunter")
         .await
         .unwrap();
+    let setup = auth.login("root", "hunter22222hunter").await.unwrap();
     let api = test_router(
         registry,
         auth.clone(),
@@ -347,6 +401,26 @@ async fn auth_harness() -> (
         )),
     );
     (dir, db, auth, api, setup)
+}
+
+#[tokio::test]
+async fn concurrent_local_setup_has_exactly_one_winner() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    let auth = Arc::new(Auth::new(db.clone(), dir.path()).await.unwrap());
+    let (a, b) = tokio::join!(
+        auth.complete_setup("browser", "hunter22222"),
+        auth.complete_setup("cli", "hunter22222")
+    );
+    assert_ne!(a.is_ok(), b.is_ok(), "two local setup transports won");
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM users")
+            .fetch_one(&db)
+            .await
+            .unwrap(),
+        1
+    );
+    assert!(!auth.setup_required());
 }
 
 #[tokio::test]
@@ -367,7 +441,6 @@ async fn items_filter_by_library() {
     let db = kahawai_hub::db::open(dir.path()).await.unwrap();
     let registry = Arc::new(Registry::new(db.clone(), Default::default()));
     let auth = Arc::new(Auth::new(db.clone(), dir.path()).await.unwrap());
-    let setup_token = auth.setup_token().unwrap();
     let api = test_router(
         registry.clone(),
         auth.clone(),
@@ -375,18 +448,12 @@ async fn items_filter_by_library() {
             tempfile::tempdir().unwrap().keep(),
         )),
     );
-    let resp = api
-        .clone()
-        .oneshot(post(
-            "/api/v1/setup",
-            serde_json::json!({"token": setup_token, "username": "ingmar", "password": "hunter22222"}),
-        ))
+    auth.complete_setup("ingmar", "hunter22222").await.unwrap();
+    let token = auth
+        .login("ingmar", "hunter22222")
         .await
-        .unwrap();
-    let token = body_json(resp).await["access_token"]
-        .as_str()
         .unwrap()
-        .to_string();
+        .access_token;
 
     registry
         .record_satellite("01HOST", "mediahost", "nas", "fp")
@@ -524,7 +591,12 @@ async fn admin_creates_users() {
     let db = kahawai_hub::db::open(dir.path()).await.unwrap();
     let registry = Arc::new(Registry::new(db.clone(), Default::default()));
     let auth = Arc::new(Auth::new(db.clone(), dir.path()).await.unwrap());
-    let setup_token = auth.setup_token().unwrap();
+    auth.complete_setup("root", "hunter22222").await.unwrap();
+    let admin_token = auth
+        .login("root", "hunter22222")
+        .await
+        .unwrap()
+        .access_token;
     let api = test_router(
         registry,
         auth,
@@ -532,18 +604,6 @@ async fn admin_creates_users() {
             tempfile::tempdir().unwrap().keep(),
         )),
     );
-    let resp = api
-        .clone()
-        .oneshot(post(
-            "/api/v1/setup",
-            serde_json::json!({"token": setup_token, "username": "root", "password": "hunter22222"}),
-        ))
-        .await
-        .unwrap();
-    let admin_token = body_json(resp).await["access_token"]
-        .as_str()
-        .unwrap()
-        .to_string();
 
     let create = |token: String, body: serde_json::Value| {
         let api = api.clone();
@@ -609,7 +669,7 @@ async fn login_throttles_after_repeated_failures() {
     let db = kahawai_hub::db::open(dir.path()).await.unwrap();
     let registry = Arc::new(Registry::new(db.clone(), Default::default()));
     let auth = Arc::new(Auth::new(db.clone(), dir.path()).await.unwrap());
-    let setup_token = auth.setup_token().unwrap();
+    auth.complete_setup("ingmar", "hunter22222").await.unwrap();
     let api = test_router(
         registry,
         auth.clone(),
@@ -617,15 +677,6 @@ async fn login_throttles_after_repeated_failures() {
             tempfile::tempdir().unwrap().keep(),
         )),
     );
-    let resp = api
-        .clone()
-        .oneshot(post(
-            "/api/v1/setup",
-            serde_json::json!({"token": setup_token, "username": "ingmar", "password": "hunter22222"}),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::CREATED);
 
     for _ in 0..4 {
         let resp = api
@@ -681,7 +732,6 @@ async fn bootstrap_states_setup_and_auth_without_a_token() {
     let db = kahawai_hub::db::open(dir.path()).await.unwrap();
     let registry = Arc::new(Registry::new(db.clone(), Default::default()));
     let auth = Arc::new(Auth::new(db.clone(), dir.path()).await.unwrap());
-    let setup_token = auth.setup_token().expect("fresh hub is in setup mode");
     let api = test_router(
         registry,
         auth.clone(),
@@ -700,15 +750,11 @@ async fn bootstrap_states_setup_and_auth_without_a_token() {
     assert_eq!(resp.status(), StatusCode::OK);
     let v = body_json(resp).await;
     assert_eq!(v["setup_required"], true);
+    assert_eq!(v["setup_available"], false);
+    assert_eq!(v["setup_url"], "http://127.0.0.1:8422");
     assert_eq!(v["authenticated"], false);
 
-    api.clone()
-        .oneshot(post(
-            "/api/v1/setup",
-            serde_json::json!({"token": setup_token, "username": "ingmar", "password": "hunter22222"}),
-        ))
-        .await
-        .unwrap();
+    auth.complete_setup("ingmar", "hunter22222").await.unwrap();
 
     // Setup done, no token presented: the login screen, said plainly.
     let v = body_json(api.clone().oneshot(probe()).await.unwrap()).await;
@@ -749,9 +795,7 @@ async fn expired_refresh_families_prune_at_open() {
     let dir = tempfile::tempdir().unwrap();
     let db = kahawai_hub::db::open(dir.path()).await.unwrap();
     let auth = Auth::new(db.clone(), dir.path()).await.unwrap();
-    auth.complete_setup(&auth.setup_token().unwrap(), "u", "hunter22222hunter")
-        .await
-        .unwrap();
+    auth.complete_setup("u", "hunter22222hunter").await.unwrap();
     sqlx::query(
         "INSERT INTO refresh_families (id, user_id, current_token_hash, expires_at)
          SELECT 'dead', id, 'dead-hash', unixepoch() - 1 FROM users LIMIT 1",
@@ -1253,7 +1297,12 @@ async fn admin_deletes_users() {
     let db = kahawai_hub::db::open(dir.path()).await.unwrap();
     let registry = Arc::new(Registry::new(db.clone(), Default::default()));
     let auth = Arc::new(Auth::new(db.clone(), dir.path()).await.unwrap());
-    let setup_token = auth.setup_token().unwrap();
+    auth.complete_setup("root", "hunter22222").await.unwrap();
+    let admin_token = auth
+        .login("root", "hunter22222")
+        .await
+        .unwrap()
+        .access_token;
     let api = test_router(
         registry,
         auth.clone(),
@@ -1261,16 +1310,6 @@ async fn admin_deletes_users() {
             tempfile::tempdir().unwrap().keep(),
         )),
     );
-    let resp = api
-        .clone()
-        .oneshot(post(
-            "/api/v1/setup",
-            serde_json::json!({"token": setup_token, "username": "root", "password": "hunter22222"}),
-        ))
-        .await
-        .unwrap();
-    let setup = body_json(resp).await;
-    let admin_token = setup["access_token"].as_str().unwrap().to_string();
     let admin_id: String = sqlx::query_scalar("SELECT id FROM users WHERE username = 'root'")
         .fetch_one(&db)
         .await

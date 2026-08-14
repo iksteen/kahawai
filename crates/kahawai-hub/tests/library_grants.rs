@@ -123,8 +123,11 @@ async fn harness() -> Hub {
         enricher,
         kahawai_hub::api::NetOptions::default(),
     );
+    auth.complete_setup("boss", "hunter22222hunter")
+        .await
+        .unwrap();
     let boss = auth
-        .complete_setup(&auth.setup_token().unwrap(), "boss", "hunter22222hunter")
+        .login("boss", "hunter22222hunter")
         .await
         .unwrap()
         .access_token;

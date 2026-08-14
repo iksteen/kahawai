@@ -55,10 +55,8 @@ async fn admin_flow_enrollments_satellites_archive_restore() {
         90,
     ));
     let auth = Arc::new(Auth::new(db.clone(), dir.path()).await.unwrap());
-    let pair = auth
-        .complete_setup(&auth.setup_token().unwrap(), "admin", "password-123")
-        .await
-        .unwrap();
+    auth.complete_setup("admin", "password-123").await.unwrap();
+    let pair = auth.login("admin", "password-123").await.unwrap();
     let admin_bearer = format!("Bearer {}", pair.access_token);
 
     // A non-admin user, created directly (no user management API yet).
@@ -344,7 +342,8 @@ async fn review_queue_flow() {
             .await
             .unwrap(),
     );
-    let setup = auth.setup_token().unwrap();
+    auth.complete_setup("a", "password-1").await.unwrap();
+    let token = auth.login("a", "password-1").await.unwrap().access_token;
     let sessions = Arc::new(kahawai_hub::sessions::Sessions::new(
         tempfile::tempdir().unwrap().keep(),
     ));
@@ -375,24 +374,6 @@ async fn review_queue_flow() {
         )),
         kahawai_hub::api::NetOptions::default(),
     );
-    let resp = api
-        .clone()
-        .oneshot(
-            axum::http::Request::post("/api/v1/setup")
-                .header("content-type", "application/json")
-                .body(axum::body::Body::from(
-                    serde_json::json!({"token": setup, "username": "a", "password": "password-1"})
-                        .to_string(),
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let token = body_json(resp).await["access_token"]
-        .as_str()
-        .unwrap()
-        .to_string();
-
     // Two movie items with metadata states: one miss, one weak.
     registry
         .record_satellite("01HOST", "mediahost", "nas", "fp")

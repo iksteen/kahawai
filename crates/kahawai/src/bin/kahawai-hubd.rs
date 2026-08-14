@@ -57,6 +57,8 @@ enum Cmd {
         #[arg(long)]
         fix: bool,
     },
+    /// Create the first administrator through the hub's private local socket.
+    InitAdmin,
     /// Overwrite a user's password (reads the new password from stdin).
     ResetPassword { username: String },
     /// Snapshot the hub (OPS-5) without stopping it.
@@ -107,6 +109,7 @@ async fn main() -> Result<()> {
             fix,
             config_used.as_deref(),
         ),
+        Some(Cmd::InitAdmin) => kahawai::init_admin(cfg.hub).await,
         Some(Cmd::ResetPassword { username }) => kahawai::reset_password(cfg.hub, &username).await,
         Some(Cmd::Backup { dest }) => {
             let m = kahawai_hub::backup::backup(&cfg.hub.data_dir, config_used.as_deref(), &dest)

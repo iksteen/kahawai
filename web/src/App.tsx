@@ -161,6 +161,8 @@ export default function App() {
   /// nothing to put a toast on.
   const [bootError, setBootError] = useState('')
   const [bootAttempt, setBootAttempt] = useState(0)
+  const [setupAvailable, setSetupAvailable] = useState(false)
+  const [setupUrl, setSetupUrl] = useState<string>()
   /// Readable from the token-cleared handler, which is registered once and
   /// would otherwise only ever see 'boot'.
   const phaseRef = useRef(phase)
@@ -338,6 +340,8 @@ export default function App() {
       try {
         const s = await fetchBootstrap()
         setBootError('')
+        setSetupAvailable(s.setup_available)
+        setSetupUrl(s.setup_url)
         if (s.setup_required) setPhase('setup')
         else setPhase(s.authenticated ? 'app' : 'login')
       } catch (e) {
@@ -488,6 +492,8 @@ export default function App() {
       <Auth
         mode={phase}
         note={endedNote}
+        setupAvailable={setupAvailable}
+        setupUrl={setupUrl}
         // The route is untouched by any of this, so signing back in returns
         // you to the page you were reading rather than to the home screen.
         onDone={() => {

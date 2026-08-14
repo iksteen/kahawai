@@ -11,6 +11,117 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use kahawai_runtime::config;
 
+pub async fn init_admin(cfg: config::HubConfig) -> Result<()> {
+    #[cfg(not(unix))]
+    anyhow::bail!("initial-admin CLI currently requires a Unix local socket");
+    #[cfg(unix)]
+    {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        let socket = cfg.data_dir.join("bootstrap.sock");
+        let mut stream = tokio::net::UnixStream::connect(&socket)
+            .await
+            .with_context(|| {
+                format!(
+                    "connecting to {} (start the hub in first-run mode first)",
+                    socket.display()
+                )
+            })?;
+        eprint!("Admin username: ");
+        let mut username = String::new();
+        std::io::stdin().read_line(&mut username)?;
+        let password = rpassword::prompt_password("Admin password: ")?;
+        let confirm = rpassword::prompt_password("Confirm password: ")?;
+        anyhow::ensure!(password == confirm, "passwords do not match");
+        let request = serde_json::json!({
+            "username": username.trim(),
+            "password": password,
+        });
+        stream.write_all(request.to_string().as_bytes()).await?;
+        stream.write_all(b"\n").await?;
+        let mut response = String::new();
+        tokio::io::BufReader::new(stream)
+            .read_line(&mut response)
+            .await?;
+        let response: serde_json::Value = serde_json::from_str(&response)
+            .context("invalid response from the hub bootstrap socket")?;
+        anyhow::ensure!(
+            response["ok"].as_bool() == Some(true),
+            "{}",
+            response["error"].as_str().unwrap_or("setup failed")
+        );
+        println!("initial administrator created; sign in through the normal hub URL");
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+async fn bind_bootstrap_socket(
+    data_dir: &std::path::Path,
+) -> Result<(tokio::net::UnixListener, PathBuf)> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(data_dir)?;
+    let path = data_dir.join("bootstrap.sock");
+    if path.exists() {
+        if tokio::net::UnixStream::connect(&path).await.is_ok() {
+            anyhow::bail!("bootstrap socket {} is already in use", path.display());
+        }
+        std::fs::remove_file(&path)?;
+    }
+    let listener = tokio::net::UnixListener::bind(&path)?;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    Ok((listener, path))
+}
+
+#[cfg(unix)]
+async fn serve_bootstrap_socket(
+    listener: tokio::net::UnixListener,
+    path: PathBuf,
+    auth: Arc<kahawai_hub::auth::Auth>,
+) {
+    loop {
+        tokio::select! {
+            _ = auth.wait_setup_complete() => break,
+            accepted = listener.accept() => match accepted {
+                Ok((stream, _)) => {
+                    let auth = auth.clone();
+                    tokio::spawn(async move {
+                        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+                        let (read, mut write) = stream.into_split();
+                        let mut line = String::new();
+                        let result = tokio::io::BufReader::new(read)
+                            .take(16 * 1024)
+                            .read_line(&mut line)
+                            .await
+                            .map_err(anyhow::Error::from)
+                            .and_then(|n| {
+                                anyhow::ensure!(n > 0 && n < 16 * 1024, "invalid setup request");
+                                let body: serde_json::Value = serde_json::from_str(&line)?;
+                                let username = body["username"].as_str().context("username required")?;
+                                let password = body["password"].as_str().context("password required")?;
+                                Ok((username.to_owned(), password.to_owned()))
+                            });
+                        let response = match result {
+                            Ok((username, password)) => match auth.complete_setup(&username, &password).await {
+                                Ok(_) => serde_json::json!({"ok": true}),
+                                Err(e) => serde_json::json!({"ok": false, "error": e.to_string()}),
+                            },
+                            Err(e) => serde_json::json!({"ok": false, "error": e.to_string()}),
+                        };
+                        let _ = write.write_all(response.to_string().as_bytes()).await;
+                        let _ = write.write_all(b"\n").await;
+                    });
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "bootstrap socket failed");
+                    break;
+                }
+            }
+        }
+    }
+    drop(listener);
+    let _ = std::fs::remove_file(path);
+}
+
 pub async fn reset_password(cfg: config::HubConfig, username: &str) -> Result<()> {
     let db = kahawai_hub::db::open(&cfg.data_dir).await?;
     eprint!("New password for {username}: ");
@@ -102,6 +213,14 @@ async fn run_hub_inner(
     // The file SIGHUP re-reads (NFR-6). None when defaults were used.
     config_path: Option<PathBuf>,
 ) -> Result<()> {
+    anyhow::ensure!(
+        cfg.setup_bind.ip().is_loopback(),
+        "hub.setup_bind must be a loopback address"
+    );
+    anyhow::ensure!(
+        cfg.setup_bind != cfg.bind,
+        "hub.setup_bind must differ from hub.bind"
+    );
     let ca = Arc::new(kahawai_hub::pki::HubCa::load_or_create(
         &kahawai_hub::pki::pki_dir(&cfg.data_dir),
     )?);
@@ -131,6 +250,35 @@ async fn run_hub_inner(
         tracing::info!("local video transcoder disabled; hub retains remux and audio transcode");
     }
     let auth = Arc::new(kahawai_hub::auth::Auth::new(db.clone(), &cfg.data_dir).await?);
+    let setup_url = format!("http://{}", cfg.setup_bind);
+    if auth.setup_required() {
+        let setup_listener = tokio::net::TcpListener::bind(cfg.setup_bind)
+            .await
+            .with_context(|| format!("binding local setup UI on {}", cfg.setup_bind))?;
+        let setup_api = kahawai_hub::api::setup_router(auth.clone(), cfg.setup_bind);
+        let setup_done = auth.clone();
+        tokio::spawn(async move {
+            if let Err(e) = axum::serve(setup_listener, setup_api)
+                .with_graceful_shutdown(async move { setup_done.wait_setup_complete().await })
+                .await
+            {
+                tracing::error!(error = %e, "local setup UI failed");
+            }
+        });
+        #[cfg(unix)]
+        {
+            let (listener, path) = bind_bootstrap_socket(&cfg.data_dir).await?;
+            tokio::spawn(serve_bootstrap_socket(listener, path, auth.clone()));
+        }
+        println!(
+            "\n  First run: open {setup_url} on the hub, use an SSH tunnel,\n  or run `kahawai hub init-admin`.\n"
+        );
+    } else {
+        #[cfg(unix)]
+        {
+            let _ = std::fs::remove_file(cfg.data_dir.join("bootstrap.sock"));
+        }
+    }
     let sessions = Arc::new(
         kahawai_hub::sessions::Sessions::with_limits(
             cfg.data_dir.join("sessions"),
@@ -249,6 +397,7 @@ async fn run_hub_inner(
         proxy_trust: proxy_trust.clone(),
         cors_origins: cfg.cors_origins.clone(),
         metrics_token: cfg.metrics_token.clone().filter(|t| !t.is_empty()),
+        setup_url: Some(setup_url),
     };
     match cfg.metrics_token.as_deref() {
         Some(t) if !t.is_empty() => tracing::info!("/metrics enabled (hub.metrics_token)"),
@@ -359,6 +508,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = config::Config::default();
         cfg.hub.bind = unused_loopback_addr();
+        cfg.hub.setup_bind = unused_loopback_addr();
         cfg.hub.satellite_bind = unused_loopback_addr();
         cfg.hub.data_dir = dir.path().join("hub");
         cfg.mediahost.state_dir = dir.path().join("mediahost");
@@ -366,6 +516,7 @@ mod tests {
         assert!(cfg.mediahost.collections.is_empty());
 
         let api_addr = cfg.hub.bind;
+        let setup_addr = cfg.hub.setup_bind;
         let server = tokio::spawn(run_all_in_one(cfg, None));
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         loop {
@@ -383,7 +534,81 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
 
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let body = r#"{"username":"browser","password":"hunter22222"}"#;
+        let mut local = tokio::net::TcpStream::connect(setup_addr).await.unwrap();
+        local
+            .write_all(
+                format!(
+                    "POST /api/v1/setup HTTP/1.1\r\nHost: {setup_addr}\r\nOrigin: http://{setup_addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        local.read_to_end(&mut response).await.unwrap();
+        assert!(
+            String::from_utf8_lossy(&response).starts_with("HTTP/1.1 204"),
+            "{}",
+            String::from_utf8_lossy(&response)
+        );
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while tokio::net::TcpStream::connect(setup_addr).await.is_ok() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "setup UI stayed open"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(tokio::net::TcpStream::connect(api_addr).await.is_ok());
+
         server.abort();
         let _ = server.await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn private_socket_creates_one_admin_and_then_disappears() {
+        use std::os::unix::fs::PermissionsExt;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+        let auth = Arc::new(
+            kahawai_hub::auth::Auth::new(db.clone(), dir.path())
+                .await
+                .unwrap(),
+        );
+        let (listener, path) = bind_bootstrap_socket(dir.path()).await.unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let task = tokio::spawn(serve_bootstrap_socket(listener, path.clone(), auth));
+        let mut stream = tokio::net::UnixStream::connect(&path).await.unwrap();
+        stream
+            .write_all(b"{\"username\":\"local\",\"password\":\"hunter22222\"}\n")
+            .await
+            .unwrap();
+        let mut response = String::new();
+        tokio::io::BufReader::new(stream)
+            .read_line(&mut response)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&response).unwrap()["ok"],
+            true
+        );
+        task.await.unwrap();
+        assert!(!path.exists());
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM users WHERE is_admin=1")
+                .fetch_one(&db)
+                .await
+                .unwrap(),
+            1
+        );
     }
 }

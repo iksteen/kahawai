@@ -196,10 +196,8 @@ pub async fn harness(file_name: &str, render: fn(&Path)) -> Harness {
             .await
             .unwrap(),
     );
-    let pair = auth
-        .complete_setup(&auth.setup_token().unwrap(), "admin", "password-123")
-        .await
-        .unwrap();
+    auth.complete_setup("admin", "password-123").await.unwrap();
+    let pair = auth.login("admin", "password-123").await.unwrap();
     let bearer = format!("Bearer {}", pair.access_token);
     let enrollments = Arc::new(kahawai_hub::enrollment_service::EnrollmentService::new(
         ca,

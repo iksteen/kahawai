@@ -188,10 +188,8 @@ async fn direct_play_ranges_end_to_end() {
             .await
             .unwrap(),
     );
-    let pair = auth
-        .complete_setup(&auth.setup_token().unwrap(), "admin", "password-123")
-        .await
-        .unwrap();
+    auth.complete_setup("admin", "password-123").await.unwrap();
+    let pair = auth.login("admin", "password-123").await.unwrap();
     let bearer = format!("Bearer {}", pair.access_token);
     auth.create_user("other", "other-password", false)
         .await

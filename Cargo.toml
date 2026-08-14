@@ -73,3 +73,4 @@ sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio",
 axum = "0.8"
 rust-embed = "8"
 libc = "0.2"
+rpassword = "7"

@@ -163,10 +163,8 @@ async fn remux_to_hls_end_to_end() {
             .await
             .unwrap(),
     );
-    let pair = auth
-        .complete_setup(&auth.setup_token().unwrap(), "admin", "password-123")
-        .await
-        .unwrap();
+    auth.complete_setup("admin", "password-123").await.unwrap();
+    let pair = auth.login("admin", "password-123").await.unwrap();
     let bearer = format!("Bearer {}", pair.access_token);
     let api = test_router(registry.clone(), auth, sessions.clone());
     let get = |uri: String| {

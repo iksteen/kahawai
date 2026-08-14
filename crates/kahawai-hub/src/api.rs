@@ -1,6 +1,7 @@
 //! Client API (HUB-11/12 first cut): setup + token auth, then browse —
 //! collections, items, item detail with full technical stream info.
-//! During setup mode (OPS-1) nothing but /setup is reachable.
+//! During setup mode (OPS-1) the public router is locked; initial-admin
+//! creation exists only on the separately bound trusted-local router.
 
 use std::sync::Arc;
 
@@ -28,6 +29,7 @@ pub struct AppState {
     pub enricher: Arc<crate::enrich::Enricher>,
     pub proxy_trust: Arc<crate::proxy::ProxyTrust>,
     pub metrics_token: Arc<Option<String>>,
+    pub setup_url: Arc<Option<String>>,
 }
 
 /// OPS-8 knobs, both defaulting to "off" (same-origin, no proxies).
@@ -41,6 +43,8 @@ pub struct NetOptions {
     pub cors_origins: Vec<String>,
     /// NFR-6 scrape credential. None = `/metrics` is not served.
     pub metrics_token: Option<String>,
+    /// Trusted-local first-run URL advertised while the public API is locked.
+    pub setup_url: Option<String>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -65,6 +69,7 @@ pub fn router(
         enricher,
         proxy_trust: net.proxy_trust,
         metrics_token: Arc::new(net.metrics_token),
+        setup_url: Arc::new(net.setup_url),
     };
     // HUB-10: everything keyed by an item id, behind ONE grant check.
     // Their own group so `require_item_access` is stated once — a check
@@ -221,7 +226,8 @@ pub fn router(
         // `metrics`. Outside the admin group on purpose.
         .route("/metrics", get(metrics))
         .route("/api/v1/bootstrap", get(bootstrap))
-        .route("/api/v1/setup", post(setup))
+        // Initial-admin creation deliberately does not exist on this public
+        // router. It lives on the dedicated loopback setup listener.
         .route("/api/v1/auth/token", post(login))
         .route("/api/v1/auth/refresh", post(refresh))
         .merge(protected)
@@ -230,6 +236,27 @@ pub fn router(
         app = app.layer(cors);
     }
     app.merge(crate::web::router())
+}
+
+#[derive(Clone)]
+struct SetupState {
+    auth: Arc<Auth>,
+}
+
+/// First-admin browser flow on a dedicated loopback listener. Keeping this a
+/// separate router makes accidental publication impossible: the public router
+/// has no setup mutation to protect with a header or source-address check.
+pub fn setup_router(auth: Arc<Auth>, addr: std::net::SocketAddr) -> Router {
+    assert!(
+        addr.ip().is_loopback(),
+        "setup router must bind to loopback"
+    );
+    let state = SetupState { auth };
+    Router::new()
+        .route("/api/v1/bootstrap", get(setup_bootstrap))
+        .route("/api/v1/setup", post(setup))
+        .with_state(state)
+        .merge(crate::web::router())
 }
 
 /// OPS-8 CORS: absent config = no CORS headers (same-origin only, the
@@ -369,6 +396,8 @@ async fn bootstrap(State(state): State<AppState>, req: Request) -> Json<Value> {
     };
     Json(json!({
         "setup_required": setup_required,
+        "setup_available": false,
+        "setup_url": if setup_required { state.setup_url.as_ref().clone() } else { None },
         "authenticated": authenticated,
     }))
 }
@@ -1414,24 +1443,63 @@ async fn admin_end_session(
 
 #[derive(Deserialize)]
 struct SetupRequest {
-    token: String,
     username: String,
     password: String,
 }
 
+async fn setup_bootstrap(State(state): State<SetupState>) -> Json<Value> {
+    Json(json!({
+        "setup_required": state.auth.setup_required(),
+        "setup_available": true,
+        "setup_url": Value::Null,
+        "authenticated": false,
+    }))
+}
+
 async fn setup(
-    State(state): State<AppState>,
+    State(state): State<SetupState>,
+    headers: axum::http::HeaderMap,
     Json(body): Json<SetupRequest>,
-) -> Result<(StatusCode, Json<Value>), ApiError> {
+) -> Result<StatusCode, ApiError> {
+    let host = headers
+        .get(axum::http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<axum::http::uri::Authority>().ok());
+    let origin = headers
+        .get(axum::http::header::ORIGIN)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("http://"))
+        .and_then(|v| v.parse::<axum::http::uri::Authority>().ok());
+    let local_host = |authority: &axum::http::uri::Authority| {
+        authority.host().eq_ignore_ascii_case("localhost")
+            || authority
+                .host()
+                .trim_matches(['[', ']'])
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback())
+    };
+    if !matches!((&host, &origin), (Some(h), Some(o)) if h == o && local_host(h)) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "setup requires its local same-origin page".into(),
+        ));
+    }
     if !state.auth.setup_required() {
         return Err((StatusCode::CONFLICT, "setup already completed".into()));
     }
-    let tokens = state
+    state
         .auth
-        .complete_setup(&body.token, &body.username, &body.password)
+        .complete_setup(&body.username, &body.password)
         .await
-        .map_err(|e| (StatusCode::FORBIDDEN, e.to_string()))?;
-    Ok((StatusCode::CREATED, Json(json!(tokens))))
+        .map_err(|e| {
+            let status = if state.auth.setup_required() {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::CONFLICT
+            };
+            (status, e.to_string())
+        })?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[derive(Deserialize)]

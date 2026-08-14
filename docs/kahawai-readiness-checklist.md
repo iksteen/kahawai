@@ -147,14 +147,12 @@ marked in that document.
       foreign live ids return the same 404 body; administrative session routes
       remain separately administrator-gated. The web player's recovery contract
       follows the owner-scoped 404 rather than retaining the former 410 oracle
-- [~] AUTH-12 Setup already becomes inaccessible after the first administrator
-      is created and compares token digests rather than plaintext. Replace the
-      current 32-bit setup token with at least 128 random bits and apply explicit
-      setup throttling by trusted client IP plus a global bound; cite the current
-      primary security basis for the entropy and throttling requirements. The
-      current remotely brute-forceable first-run state remains an internet-
-      exposure blocker; the maintainer explicitly deferred changing the setup
-      experience for the next non-production RC on 2026-08-12
+- [x] AUTH-12 Initial-admin creation is absent from the public router. First run
+      exposes only a dedicated loopback browser listener with strict same-origin
+      validation and a mode-0600 Unix socket for the interactive CLI; both call
+      one `BEGIN IMMEDIATE` create-if-empty operation, close after the sole
+      winner commits, and are absent on later starts. No setup bearer secret is
+      generated, logged, copied, accepted remotely, or left to brute-force
 - [~] AUTH-13 Retain existing Argon2id hashes and adopt a documented password
       policy from current primary guidance; the proposed remaining change is a
       minimum 12 characters without composition rules instead of the current
@@ -488,9 +486,10 @@ marked in that document.
       family-isolated API logout, password-reset revocation of all refresh
       families across `Auth` restart, deletion cascade and migration-time
       invalidation of legacy refresh tokens. Access-token invalidation after
-      deletion/demotion/reset, browser logout, cookie attributes, Origin
-      checks, browser secret storage, setup entropy/throttling and durable
-      setup closure remain. `cargo test --workspace`, formatting and clippy
+      deletion/demotion/reset, browser logout, cookie attributes and browser
+      secret storage remain. Local setup now has foreign-Origin rejection,
+      atomic concurrent-claim coverage and durable listener/socket closure.
+      `cargo test --workspace`, formatting and clippy
       all exited 0 locally on 2026-08-09
 - [x] CI-6 `direct_play_ranges_end_to_end` creates two users and sends the
       foreign account through stream, playlist, segment, subtitle, seek,

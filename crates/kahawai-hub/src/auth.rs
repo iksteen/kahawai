@@ -6,7 +6,8 @@
 //!
 //! ## Refresh families
 //!
-//! Every setup or login creates one independent refresh family. Its bearer
+//! Every login creates one independent refresh family. First-run setup creates
+//! only the account; the operator then logs in through the normal origin. Its bearer
 //! token is `v1.<family selector>.<secret>`: the 128-bit random selector finds
 //! the family, while only the SHA-256 hash of the complete token is stored.
 //! The 256-bit secret never enters the database or logs. A family has exactly
@@ -41,6 +42,7 @@
 
 use std::path::Path;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result, bail};
 use argon2::Argon2;
@@ -119,8 +121,10 @@ pub struct Auth {
     db: SqlitePool,
     enc: EncodingKey,
     dec: DecodingKey,
-    /// `Some(token)` while in setup mode (no users yet, OPS-1).
-    setup_token: Mutex<Option<String>>,
+    /// True only while the database has never had its first account created.
+    /// The local browser and Unix-socket CLI share the same atomic transition.
+    setup_required: AtomicBool,
+    setup_done: tokio::sync::Notify,
     /// OPS-2 login throttle (in-memory; resets on restart).
     pub throttle: Throttle,
 }
@@ -280,68 +284,64 @@ impl Auth {
         let users: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
             .fetch_one(&db)
             .await?;
-        let setup_token = if users == 0 {
-            let raw = random_token(4).to_uppercase();
-            let token = format!("{}-{}", &raw[..4], &raw[4..]);
-            // OPS-1: printed to the console; gates the one-time setup flow.
-            println!(
-                "\n  Setup token: {token}\n  Open the web UI (or POST /api/v1/setup) to create the admin account.\n"
-            );
-            Some(token)
-        } else {
-            None
-        };
-
         Ok(Self {
             db,
             enc: EncodingKey::from_secret(&secret),
             dec: DecodingKey::from_secret(&secret),
-            setup_token: Mutex::new(setup_token),
+            setup_required: AtomicBool::new(users == 0),
+            setup_done: tokio::sync::Notify::new(),
             throttle: Throttle::default(),
         })
     }
 
     pub fn setup_required(&self) -> bool {
-        self.setup_token.lock().unwrap().is_some()
+        self.setup_required.load(Ordering::Acquire)
     }
 
-    /// The one-time setup token, while in setup mode (console/CLI display).
-    pub fn setup_token(&self) -> Option<String> {
-        self.setup_token.lock().unwrap().clone()
-    }
-
-    /// One-time initial admin creation, gated by the printed token (OPS-1).
-    pub async fn complete_setup(
-        &self,
-        token: &str,
-        username: &str,
-        password: &str,
-    ) -> Result<TokenPair> {
-        {
-            let guard = self.setup_token.lock().unwrap();
-            let Some(expected) = guard.as_ref() else {
-                bail!("setup already completed");
-            };
-            if hash_token(token.trim()) != hash_token(expected) {
-                bail!("wrong setup token");
+    /// Wait until one local setup transport commits the initial account.
+    pub async fn wait_setup_complete(&self) {
+        loop {
+            let notified = self.setup_done.notified();
+            if !self.setup_required() {
+                return;
             }
+            notified.await;
         }
-        if username.trim().is_empty() || password.len() < 8 {
+    }
+
+    /// The one operation behind both trusted-local setup transports. The
+    /// immediate transaction makes concurrent browser/CLI claims serialize;
+    /// exactly one can observe an empty user table and commit the first admin.
+    pub async fn complete_setup(&self, username: &str, password: &str) -> Result<()> {
+        let username = username.trim();
+        if username.is_empty() || password.len() < 8 {
             bail!("username required and password must be at least 8 characters");
         }
-        let id = ulid::Ulid::generate().to_string();
+        // Deliberately outside SQLite's write lock: Argon2 is expensive, but
+        // the transaction below is still the authority on who won the race.
         let hash = hash_password(password)?;
+        let id = ulid::Ulid::generate().to_string();
+        let mut tx = self.db.begin_with("BEGIN IMMEDIATE").await?;
+        let users: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
+            .fetch_one(&mut *tx)
+            .await?;
+        if users != 0 {
+            tx.rollback().await?;
+            bail!("setup already completed");
+        }
         sqlx::query(
             "INSERT INTO users (id, username, password_hash, is_admin) VALUES (?, ?, ?, 1)",
         )
         .bind(&id)
-        .bind(username.trim())
+        .bind(username)
         .bind(&hash)
-        .execute(&self.db)
+        .execute(&mut *tx)
         .await?;
-        *self.setup_token.lock().unwrap() = None;
+        tx.commit().await?;
+        self.setup_required.store(false, Ordering::Release);
+        self.setup_done.notify_waiters();
         tracing::info!(username, "initial admin created; setup complete");
-        self.issue_tokens(&id, username.trim(), true, 1).await
+        Ok(())
     }
 
     /// Promote or demote an account.

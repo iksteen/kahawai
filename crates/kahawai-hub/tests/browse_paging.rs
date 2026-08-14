@@ -60,8 +60,11 @@ async fn harness() -> (
         enricher,
         kahawai_hub::api::NetOptions::default(),
     );
+    auth.complete_setup("pager", "hunter22222hunter")
+        .await
+        .unwrap();
     let token = auth
-        .complete_setup(&auth.setup_token().unwrap(), "pager", "hunter22222hunter")
+        .login("pager", "hunter22222hunter")
         .await
         .unwrap()
         .access_token;

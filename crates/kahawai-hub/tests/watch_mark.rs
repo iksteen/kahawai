@@ -73,8 +73,11 @@ async fn harness() -> (axum::Router, String, sqlx::SqlitePool) {
         enricher,
         kahawai_hub::api::NetOptions::default(),
     );
+    auth.complete_setup("marker", "hunter22222hunter")
+        .await
+        .unwrap();
     let token = auth
-        .complete_setup(&auth.setup_token().unwrap(), "marker", "hunter22222hunter")
+        .login("marker", "hunter22222hunter")
         .await
         .unwrap()
         .access_token;

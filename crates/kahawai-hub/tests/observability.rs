@@ -56,10 +56,10 @@ async fn harness() -> (axum::Router, String) {
             ..Default::default()
         },
     );
-    let token = auth
-        .complete_setup(&auth.setup_token().unwrap(), "admin", "hunter22222hunter")
+    auth.complete_setup("admin", "hunter22222hunter")
         .await
         .unwrap();
+    let token = auth.login("admin", "hunter22222hunter").await.unwrap();
     std::mem::forget(dir); // the router holds paths under it
     (api, token.access_token)
 }
