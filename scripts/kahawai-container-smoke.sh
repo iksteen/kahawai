@@ -126,6 +126,14 @@ for _ in $(seq 30); do
 done
 [ -n "$setup_ready" ] \
     || { logs | tail -20 >&2; fail "the local setup control plane never opened"; }
+setup_modes=$(docker exec "$name" sh -c '
+    stat -c "%a %n" "$KAHAWAI_HUB__DATA_DIR/control" \
+        "$KAHAWAI_HUB__DATA_DIR/control/bootstrap.sock"
+') || fail "could not inspect setup control permissions"
+printf '%s\n' "$setup_modes" | grep -q '^700 .*/control$' \
+    || fail "setup control directory is not mode 0700: $setup_modes"
+printf '%s\n' "$setup_modes" | grep -q '^600 .*/control/bootstrap.sock$' \
+    || fail "bootstrap socket is not mode 0600: $setup_modes"
 # Exercise the operator path exactly as documented. `init-admin` deliberately
 # reads passwords from a terminal, so give docker exec a real PTY and answer
 # each prompt only after it appears (feeding all input early can echo secrets).
@@ -186,6 +194,13 @@ printf '%s' "$setup_output" | grep -q 'initial administrator created' \
 case "$setup_output" in
     *smoke-password-1*) fail "init-admin echoed the password" ;;
 esac
+for _ in $(seq 30); do
+    docker exec "$name" sh -c 'test ! -e "$KAHAWAI_HUB__DATA_DIR/control"' \
+        >/dev/null 2>&1 && break
+    sleep 0.1
+done
+docker exec "$name" sh -c 'test ! -e "$KAHAWAI_HUB__DATA_DIR/control"' \
+    >/dev/null 2>&1 || fail "setup control directory remained after init-admin"
 auth=$(curl -sf -X POST "http://$api/api/v1/auth/token" -H content-type:application/json \
     -d '{"username":"smoke","password":"smoke-password-1"}' \
     | py 'print(d["access_token"])')

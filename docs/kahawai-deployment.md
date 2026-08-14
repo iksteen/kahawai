@@ -8,8 +8,10 @@ same-origin only, no proxy trust.
 First-run setup is intentionally outside the reverse proxy. `setup_bind`
 (default `127.0.0.1:8422`) must remain loopback-only; open it locally or
 forward it over SSH. Headless operators can instead run
-`kahawai hub init-admin`, which uses `bootstrap.sock` under the hub data
-directory. With the container image, run that command inside the already-running
+`kahawai hub init-admin`, which uses `control/bootstrap.sock` under the hub data
+directory. The control directory is mode `0700` before the mode-`0600` socket is
+bound, so no permissive create-then-chmod interval exists. With the container
+image, run that command inside the already-running
 hub container and allocate a TTY; the hidden password prompt reads from the
 terminal rather than piped stdin:
 

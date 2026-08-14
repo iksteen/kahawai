@@ -17,7 +17,7 @@ pub async fn init_admin(cfg: config::HubConfig) -> Result<()> {
     #[cfg(unix)]
     {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
-        let socket = cfg.data_dir.join("bootstrap.sock");
+        let socket = bootstrap_socket_path(&cfg.data_dir);
         let mut stream = tokio::net::UnixStream::connect(&socket)
             .await
             .with_context(|| {
@@ -55,12 +55,42 @@ pub async fn init_admin(cfg: config::HubConfig) -> Result<()> {
 }
 
 #[cfg(unix)]
+fn bootstrap_control_dir(data_dir: &std::path::Path) -> PathBuf {
+    data_dir.join("control")
+}
+
+#[cfg(unix)]
+fn bootstrap_socket_path(data_dir: &std::path::Path) -> PathBuf {
+    bootstrap_control_dir(data_dir).join("bootstrap.sock")
+}
+
+#[cfg(unix)]
 async fn bind_bootstrap_socket(
     data_dir: &std::path::Path,
 ) -> Result<(tokio::net::UnixListener, PathBuf)> {
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
     std::fs::create_dir_all(data_dir)?;
-    let path = data_dir.join("bootstrap.sock");
+    let control_dir = bootstrap_control_dir(data_dir);
+    let mut builder = std::fs::DirBuilder::new();
+    builder.mode(0o700);
+    if let Err(e) = builder.create(&control_dir)
+        && e.kind() != std::io::ErrorKind::AlreadyExists
+    {
+        return Err(e.into());
+    }
+    let metadata = std::fs::symlink_metadata(&control_dir)?;
+    anyhow::ensure!(
+        metadata.file_type().is_dir() && !metadata.file_type().is_symlink(),
+        "bootstrap control path {} is not a directory",
+        control_dir.display()
+    );
+    // Existing installations may have created this directory with a broader
+    // mode. Restrict it before bind: unlike chmodding the socket afterward,
+    // this leaves no interval in which another local user can connect.
+    std::fs::set_permissions(&control_dir, std::fs::Permissions::from_mode(0o700))?;
+
+    let path = bootstrap_socket_path(data_dir);
     if path.exists() {
         if tokio::net::UnixStream::connect(&path).await.is_ok() {
             anyhow::bail!("bootstrap socket {} is already in use", path.display());
@@ -68,6 +98,8 @@ async fn bind_bootstrap_socket(
         std::fs::remove_file(&path)?;
     }
     let listener = tokio::net::UnixListener::bind(&path)?;
+    // Defense in depth. The mode transition is safe because the containing
+    // directory was atomically created (or restricted) to 0700 before bind.
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
     Ok((listener, path))
 }
@@ -119,7 +151,11 @@ async fn serve_bootstrap_socket(
         }
     }
     drop(listener);
+    let control_dir = path.parent().map(std::path::Path::to_path_buf);
     let _ = std::fs::remove_file(path);
+    if let Some(control_dir) = control_dir {
+        let _ = std::fs::remove_dir(control_dir);
+    }
 }
 
 pub async fn reset_password(cfg: config::HubConfig, username: &str) -> Result<()> {
@@ -276,6 +312,10 @@ async fn run_hub_inner(
     } else {
         #[cfg(unix)]
         {
+            let control_dir = bootstrap_control_dir(&cfg.data_dir);
+            let _ = std::fs::remove_file(bootstrap_socket_path(&cfg.data_dir));
+            let _ = std::fs::remove_dir(control_dir);
+            // Clean up a stale pre-control-directory socket after an upgrade.
             let _ = std::fs::remove_file(cfg.data_dir.join("bootstrap.sock"));
         }
     }
@@ -581,7 +621,19 @@ mod tests {
                 .await
                 .unwrap(),
         );
+        let control_dir = bootstrap_control_dir(dir.path());
+        std::fs::create_dir(&control_dir).unwrap();
+        std::fs::set_permissions(&control_dir, std::fs::Permissions::from_mode(0o777)).unwrap();
         let (listener, path) = bind_bootstrap_socket(dir.path()).await.unwrap();
+        assert_eq!(path, control_dir.join("bootstrap.sock"));
+        assert_eq!(
+            std::fs::metadata(&control_dir)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
         assert_eq!(
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
@@ -603,6 +655,7 @@ mod tests {
         );
         task.await.unwrap();
         assert!(!path.exists());
+        assert!(!control_dir.exists());
         assert_eq!(
             sqlx::query_scalar::<_, i64>("SELECT count(*) FROM users WHERE is_admin=1")
                 .fetch_one(&db)
@@ -610,5 +663,21 @@ mod tests {
                 .unwrap(),
             1
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bootstrap_control_directory_must_not_be_a_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        symlink(elsewhere.path(), bootstrap_control_dir(dir.path())).unwrap();
+        let error = bind_bootstrap_socket(dir.path()).await.unwrap_err();
+        assert!(
+            error.to_string().contains("is not a directory"),
+            "{error:#}"
+        );
+        assert!(!elsewhere.path().join("bootstrap.sock").exists());
     }
 }
