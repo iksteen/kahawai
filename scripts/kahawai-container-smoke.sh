@@ -126,16 +126,66 @@ for _ in $(seq 30); do
 done
 [ -n "$setup_ready" ] \
     || { logs | tail -20 >&2; fail "the local setup control plane never opened"; }
-setup_body='{"username":"smoke","password":"smoke-password-1"}'
-setup_response=$(docker exec "$name" bash -c '
-    set -e
-    body=$1
-    exec 3<>/dev/tcp/127.0.0.1/8422
-    printf "POST /api/v1/setup HTTP/1.1\r\nHost: localhost:8422\r\nOrigin: http://localhost:8422\r\nContent-Type: application/json\r\nContent-Length: %s\r\nConnection: close\r\n\r\n%s" "${#body}" "$body" >&3
-    cat <&3
-' _ "$setup_body") || { logs | tail -20 >&2; fail "local setup request failed"; }
-printf '%s' "$setup_response" | grep -q '^HTTP/1.1 204' \
-    || { printf '%s\n' "$setup_response" >&2; fail "local setup was not accepted"; }
+# Exercise the operator path exactly as documented. `init-admin` deliberately
+# reads passwords from a terminal, so give docker exec a real PTY and answer
+# each prompt only after it appears (feeding all input early can echo secrets).
+setup_output=$(python3 - "$name" <<'PY'
+import errno
+import os
+import pty
+import select
+import signal
+import sys
+import time
+
+container = sys.argv[1]
+pid, fd = pty.fork()
+if pid == 0:
+    os.execvp(
+        "docker",
+        ["docker", "exec", "-it", container, "kahawai", "hub", "init-admin"],
+    )
+
+answers = [
+    (b"Admin username: ", b"smoke\n"),
+    (b"Admin password: ", b"smoke-password-1\n"),
+    (b"Confirm password: ", b"smoke-password-1\n"),
+]
+output = bytearray()
+next_answer = 0
+deadline = time.monotonic() + 30
+status = None
+while status is None:
+    if time.monotonic() >= deadline:
+        os.kill(pid, signal.SIGKILL)
+        os.waitpid(pid, 0)
+        sys.stderr.write("init-admin timed out\n")
+        sys.exit(1)
+    readable, _, _ = select.select([fd], [], [], 0.1)
+    if readable:
+        try:
+            chunk = os.read(fd, 4096)
+        except OSError as error:
+            if error.errno != errno.EIO:
+                raise
+            chunk = b""
+        output.extend(chunk)
+        if next_answer < len(answers) and answers[next_answer][0] in output:
+            os.write(fd, answers[next_answer][1])
+            next_answer += 1
+    waited, wait_status = os.waitpid(pid, os.WNOHANG)
+    if waited == pid:
+        status = wait_status
+
+sys.stdout.buffer.write(output)
+sys.exit(os.waitstatus_to_exitcode(status))
+PY
+) || { printf '%s\n' "$setup_output" >&2; logs | tail -20 >&2; fail "init-admin failed"; }
+printf '%s' "$setup_output" | grep -q 'initial administrator created' \
+    || { printf '%s\n' "$setup_output" >&2; fail "init-admin did not report success"; }
+case "$setup_output" in
+    *smoke-password-1*) fail "init-admin echoed the password" ;;
+esac
 auth=$(curl -sf -X POST "http://$api/api/v1/auth/token" -H content-type:application/json \
     -d '{"username":"smoke","password":"smoke-password-1"}' \
     | py 'print(d["access_token"])')
