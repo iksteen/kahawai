@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import { browserLogin } from '../api'
+import { setup } from '../generated/kahawai'
 
 export default function Auth({
   mode,
@@ -38,24 +39,14 @@ export default function Auth({
       }
       return
     }
-    let r: Response
     try {
-      r = await fetch('/api/v1/setup', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ username: user, password }),
-      })
-    } catch {
+      await setup({ username: user, password }, { skipAuthRefresh: true, skipAuthorization: true })
+      setSetupDone(true)
+    } catch (error) {
+      setError(String(error))
+    } finally {
       setBusy(false)
-      setError('Could not reach the hub.')
-      return
     }
-    setBusy(false)
-    if (!r.ok) {
-      setError((await r.text()) || 'Something went wrong')
-      return
-    }
-    setSetupDone(true)
   }
 
   if (mode === 'setup' && !setupAvailable) {

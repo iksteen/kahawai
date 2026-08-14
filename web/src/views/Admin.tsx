@@ -4,6 +4,7 @@ import { moved, useDragOrder } from '../reorder'
 import { SerialQueue } from '../serial'
 import Icon from '../icons'
 import {
+  adminSessionLogUrl,
   adminApprove,
   adminEnrichRun,
   adminEnrichStatus,
@@ -1218,9 +1219,9 @@ export default function Admin() {
                     <button
                       className="btn ghost small"
                       onClick={() =>
-                        downloadWithAuth(
-                          `/admin/v1/sessions/${encodeURIComponent(s.session_id)}/log`,
-                        ).catch((err: unknown) => setError(String(err)))
+                        downloadWithAuth(adminSessionLogUrl(s.session_id)).catch((err: unknown) =>
+                          setError(String(err)),
+                        )
                       }
                     >
                       Log

@@ -164,10 +164,9 @@ function setHub(handle: (call: Call) => Response | Promise<Response>) {
     input: string | URL | Request,
     init: RequestInit = {},
   ) => {
-    const headers = (init.headers ?? {}) as Record<string, string>
     const call: Call = {
       url: String(input),
-      bearer: headers.Authorization ?? null,
+      bearer: new Headers(init.headers).get('authorization'),
       body: init.body ? (JSON.parse(String(init.body)) as Record<string, unknown>) : {},
     }
     calls.push(call)

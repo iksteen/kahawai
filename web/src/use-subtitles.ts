@@ -1,6 +1,14 @@
 import { useEffect, useRef } from 'react'
 import type JASSUB from 'jassub'
-import { fetchFonts, isRasterSub, overlayUrl, type Session, type Subtitle } from './api'
+import {
+  fetchFonts,
+  fontUrl,
+  isRasterSub,
+  overlayUrl,
+  subtitleFileUrl,
+  type Session,
+  type Subtitle,
+} from './api'
 import { loadChunk } from './chunk'
 import { playerNote } from './player-note'
 import type { SubtitleRoute } from './subtitle-route'
@@ -283,7 +291,7 @@ export function useSubtitleRenderers(p: {
       let fonts: string[] = []
       try {
         const f = await fetchFonts(item.id)
-        fonts = f.fonts.map((_, i) => `/api/v1/items/${item.id}/fonts/${i}`)
+        fonts = f.fonts.map((_, i) => fontUrl(item.id, i))
       } catch {
         /* no fonts — libass falls back */
       }
@@ -362,7 +370,7 @@ export function useSubtitleRenderers(p: {
       // for `feed` to be able to replace a renderer rather than only append,
       // which is more than this change should carry.
       if (!fed && !dead) {
-        await feed(`/api/v1/items/${item.id}/subtitles/${selected.id}.ass`).catch(() => false)
+        await feed(subtitleFileUrl(item.id, `${selected.id}.ass`)).catch(() => false)
       }
       // There is no fallback on this path, which an earlier comment here
       // claimed there was: the `.vtt` <track> renders only for

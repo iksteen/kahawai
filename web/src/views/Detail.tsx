@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import Failed from '../Failed'
 import { fetchItem } from '../item-query'
 import {
+  adminItemLogUrl,
   artworkSrcSet,
   artworkUrl,
   fetchChildren,
@@ -956,8 +957,8 @@ export default function Detail({
                 <button
                   className="btn ghost small log-link"
                   onClick={() =>
-                    downloadWithAuth(`/admin/v1/items/${encodeURIComponent(id)}/log`).catch(
-                      (e: unknown) => notify(`Could not download the session log: ${e}`),
+                    downloadWithAuth(adminItemLogUrl(id)).catch((e: unknown) =>
+                      notify(`Could not download the session log: ${e}`),
                     )
                   }
                 >

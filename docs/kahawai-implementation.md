@@ -364,11 +364,18 @@ comparison and catches an incomplete fingerprint manifest.
 
 Orval regenerates the ignored fetch client and models under
 `web/src/generated` from the committed JSON during `npm install` and before
-each web entry point. The custom fetch mutator retains the web client's bearer
-refresh and `ApiError` behaviour. `QUERY /api/v1/items/{id}` is the first
-generated binding used by the UI; the other routes remain on the existing
-wrapper until migrated. The post-1.0 compatibility baseline remains ENG-6
-work.
+each web entry point. Every ordinary web API operation now calls those
+generated bindings. `api.ts` remains the application-behaviour facade for
+token rotation, preference write ordering, capability refinement, timeouts
+and view-model narrowing; it no longer owns HTTP methods, application route
+strings or JSON serialization. The custom mutator in `api-client.ts` is the
+single authenticated transport: bearer injection, one refresh-and-retry,
+typed `ApiError`, empty/JSON/text/binary decoding, and raw `Response` access
+for the progress ping whose 404 drives session recovery. EventSource,
+streaming subtitle readers and media elements still use their native browser
+transports, but take application URLs from generated URL builders or
+server-returned session URLs. The post-1.0 compatibility baseline remains
+ENG-6 work.
 
 *This breaks v1 in place, against NFR-7* ("breaking changes only in a new major API version"). Deliberate, with the maintainer's sanction: there are no external clients yet, and carrying a `/api/v2` for a pre-release keyspace costs more than it protects. NFR-7 governs from the first outside consumer.
 

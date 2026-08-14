@@ -598,9 +598,11 @@ marked in that document.
       document. Working-tree build gates and a staged pre-commit gate reject a
       stale snapshot. Orval 8.24.0 regenerates the ignored fetch bindings for
       every operation during installation and before each web entry point,
-      without a running hub; the UI uses the generated item QUERY binding
-      through its existing authenticated transport. The remaining web routes
-      and post-1.0 compatibility baseline remain open
+      without a running hub. Every ordinary UI operation uses those generated
+      bindings through one authenticated mutator; streaming subtitles,
+      EventSource and media elements retain native browser transports while
+      consuming generated or server-returned URLs. The post-1.0 compatibility
+      baseline remains open
 - [ ] ENG-3 After characterization tests cover the existing wire behaviour,
       define API ownership boundaries that prevent auth, library, playback,
       admin, provider and observability changes from sharing one implementation

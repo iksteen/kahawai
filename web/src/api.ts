@@ -2,12 +2,71 @@
 // are HttpOnly cookies; the short-lived access token exists only in memory.
 
 import { buildProfile } from './capabilities.ts'
-
+import {
+  adminApplyMatch as generatedAdminApplyMatch,
+  adminApprove as generatedAdminApprove,
+  adminAttachCollection as generatedAdminAttachCollection,
+  adminCollections as generatedAdminCollections,
+  adminCreateLibrary as generatedAdminCreateLibrary,
+  adminCreateUser as generatedAdminCreateUser,
+  adminDeleteLibrary as generatedAdminDeleteLibrary,
+  adminDeleteSatellite as generatedAdminDeleteSatellite,
+  adminDeleteUser as generatedAdminDeleteUser,
+  adminDetachCollection as generatedAdminDetachCollection,
+  adminEndSession as generatedAdminEndSession,
+  adminEnrollments as generatedAdminEnrollments,
+  adminEnrichRun as generatedAdminEnrichRun,
+  adminEnrichStatus as generatedAdminEnrichStatus,
+  adminLibraries as generatedAdminLibraries,
+  adminProviders as generatedAdminProviders,
+  adminRefreshLibrary as generatedAdminRefreshLibrary,
+  adminReviewSearch as generatedAdminReviewSearch,
+  adminSatellites as generatedAdminSatellites,
+  adminSessions as generatedAdminSessions,
+  adminSetAnidb as generatedAdminSetAnidb,
+  adminSetChain as generatedAdminSetChain,
+  adminSetDisabled as generatedAdminSetDisabled,
+  adminSetTmdb as generatedAdminSetTmdb,
+  adminSetTvdb as generatedAdminSetTvdb,
+  adminSetUserAdmin as generatedAdminSetUserAdmin,
+  adminSetUserLibraries as generatedAdminSetUserLibraries,
+  adminUsers as generatedAdminUsers,
+  bootstrap as generatedBootstrap,
+  endSession as generatedEndSession,
+  getAdminItemLogUrl,
+  getAdminSessionLogUrl,
+  getEventsUrl,
+  getItemArtworkUrl,
+  getItemFontUrl,
+  getItemSubtitleFileUrl,
+  getSessionFileUrl,
+  getPrefs as generatedGetPrefs,
+  itemChildren as generatedItemChildren,
+  itemFonts as generatedItemFonts,
+  itemSetWatched as generatedItemSetWatched,
+  listItems as generatedListItems,
+  listLibraries as generatedListLibraries,
+  login as generatedLogin,
+  logout as generatedLogout,
+  postProgress as generatedPostProgress,
+  putPref as generatedPutPref,
+  refresh as generatedRefresh,
+  seekSession as generatedSeekSession,
+  startSession as generatedStartSession,
+  subtitleDelete as generatedSubtitleDelete,
+  subtitleDownload as generatedSubtitleDownload,
+  subtitleSearch as generatedSubtitleSearch,
+} from './generated/kahawai.ts'
+import type { ProviderCandidate } from './generated/model/index.ts'
+import { ApiError, Offline, api, configureApiClient } from './api-client.ts'
 import { notify } from './toast.ts'
 import { SerialQueue } from './serial.ts'
 import { REFRESH_RETRY_MS, refreshDelayMs } from './token.ts'
 
-export type BrowserSession = { access_token: string; expires_in: number }
+export { ApiError, Offline, api }
+
+// Browser auth state is application behavior; its wire DTO comes from the
+// generated login/refresh bindings.
 export type RestoreResult = 'authenticated' | 'anonymous'
 
 let access: string | null = null
@@ -98,29 +157,24 @@ async function alone<T>(run: () => Promise<T>): Promise<T> {
 
 async function rotate(started: number, throwTransient: boolean): Promise<boolean> {
   if (generation !== started) return false
-  let response: Response
   try {
-    response = await fetch('/api/v1/auth/refresh', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ client: 'browser' }),
-      signal: AbortSignal.timeout(REFRESH_TIMEOUT_MS),
-    })
-  } catch {
-    if (throwTransient) throw new Offline()
+    const fresh = await generatedRefresh(
+      { client: 'browser' },
+      {
+        signal: AbortSignal.timeout(REFRESH_TIMEOUT_MS),
+        skipAuthRefresh: true,
+        skipAuthorization: true,
+      },
+    )
+    return installAccess(fresh.access_token, started)
+  } catch (error) {
+    if (error instanceof ApiError && (error.status === 401 || error.status === 403)) {
+      clearAccess(false, started)
+      return false
+    }
+    if (throwTransient) throw error
     return false
   }
-  if (response.status === 401 || response.status === 403) {
-    clearAccess(false, started)
-    return false
-  }
-  if (!response.ok) {
-    if (throwTransient)
-      throw new ApiError(response.status, (await response.text()) || `${response.status}`)
-    return false
-  }
-  const fresh = (await response.json()) as BrowserSession
-  return installAccess(fresh.access_token, started)
 }
 
 export function refreshTokens(): Promise<boolean> {
@@ -134,6 +188,8 @@ export function refreshTokens(): Promise<boolean> {
   return refreshInFlight
 }
 
+configureApiClient(accessToken, refreshTokens)
+
 export async function restoreSession(): Promise<RestoreResult> {
   const started = generation
   return (await alone(() => rotate(started, true))) ? 'authenticated' : 'anonymous'
@@ -142,19 +198,10 @@ export async function restoreSession(): Promise<RestoreResult> {
 export async function browserLogin(username: string, password: string): Promise<void> {
   const started = ++generation
   await alone(async () => {
-    let response: Response
-    try {
-      response = await fetch('/api/v1/auth/token', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ client: 'browser', username, password }),
-      })
-    } catch {
-      throw new Offline()
-    }
-    if (!response.ok)
-      throw new ApiError(response.status, (await response.text()) || `${response.status}`)
-    const session = (await response.json()) as BrowserSession
+    const session = await generatedLogin(
+      { client: 'browser', username, password },
+      { skipAuthRefresh: true, skipAuthorization: true },
+    )
     installAccess(session.access_token, started)
   })
 }
@@ -162,27 +209,27 @@ export async function browserLogin(username: string, password: string): Promise<
 async function revoke(capturedAccess: string): Promise<void> {
   await alone(async () => {
     const post = (bearer: string) =>
-      fetch('/api/v1/auth/logout', {
-        method: 'POST',
-        headers: {
-          'content-type': 'application/json',
-          Authorization: `Bearer ${bearer}`,
+      generatedLogout(
+        { client: 'browser' },
+        {
+          headers: { Authorization: `Bearer ${bearer}` },
+          skipAuthRefresh: true,
         },
-        body: JSON.stringify({ client: 'browser' }),
-      })
-    let response = await post(capturedAccess)
-    if (response.status === 401) {
-      const refreshed = await fetch('/api/v1/auth/refresh', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ client: 'browser' }),
-        signal: AbortSignal.timeout(REFRESH_TIMEOUT_MS),
-      })
-      if (!refreshed.ok) throw new Error(`the hub did not end the session (${refreshed.status})`)
-      const session = (await refreshed.json()) as BrowserSession
-      response = await post(session.access_token)
+      )
+    try {
+      await post(capturedAccess)
+    } catch (error) {
+      if (!(error instanceof ApiError) || error.status !== 401) throw error
+      const session = await generatedRefresh(
+        { client: 'browser' },
+        {
+          signal: AbortSignal.timeout(REFRESH_TIMEOUT_MS),
+          skipAuthRefresh: true,
+          skipAuthorization: true,
+        },
+      )
+      await post(session.access_token)
     }
-    if (!response.ok) throw new Error(`the hub did not end the session (${response.status})`)
   })
 }
 
@@ -197,86 +244,8 @@ export async function signOut(): Promise<void> {
   }
 }
 
-/// The hub could not be reached at all: no response, rather than a bad one.
-/// Distinct from `ApiError`, which means the hub answered and said no.
-///
-/// It exists to be readable. A dead hub surfaced as `TypeError: Failed to
-/// fetch` in every error banner in the app — true, and no use to anybody
-/// deciding whether to look at their wifi or at the server.
-export class Offline extends Error {
-  constructor() {
-    super('Could not reach the hub.')
-    this.name = 'Offline'
-  }
-  override toString() {
-    return this.message
-  }
-}
-
-export async function api(path: string, init?: RequestInit): Promise<Response> {
-  const go = () => {
-    const headers: Record<string, string> = { ...(init?.headers as Record<string, string>) }
-    const t = accessToken()
-    if (t) headers['Authorization'] = `Bearer ${t}`
-    if (init?.body) headers['content-type'] = 'application/json'
-    return fetch(path, { ...init, headers })
-  }
-  // Both attempts, because the retry can be the one that finds the hub gone.
-  const send = async () => {
-    try {
-      return await go()
-    } catch {
-      throw new Offline()
-    }
-  }
-  let r = await send()
-  if (r.status === 401 && (await refreshTokens())) r = await send()
-  return r
-}
-
-/// A failed request, with the status still attached.
-///
-/// The status is the part a caller can act on: 503 from a session start
-/// means the source is on a host that is not answering and the same request
-/// may work in a minute, where 409 means it never will. That difference
-/// cannot be read out of the message — the message is the server's to
-/// reword, and a client that greps it breaks the day somebody does.
-///
-/// `toString` is the message alone, because these are shown to people and
-/// an `Error:` prefix has never told anybody anything.
-export class ApiError extends Error {
-  // A field, not a constructor parameter property: `erasableSyntaxOnly` is
-  // on so that `node --test` can strip the types natively, and a parameter
-  // property is syntax that has to be compiled rather than erased.
-  status: number
-  constructor(status: number, message: string) {
-    super(message)
-    this.name = 'ApiError'
-    this.status = status
-  }
-  override toString() {
-    return this.message
-  }
-}
-
-export async function json<T>(path: string, init?: RequestInit): Promise<T> {
-  const r = await api(path, init)
-  if (!r.ok) throw new ApiError(r.status, (await r.text()) || `${r.status}`)
-  return r.json()
-}
-
-/// A mutation whose answer is only pass or fail.
-///
-/// `api` resolves for EVERY status — it is the transport, and only `json`
-/// turns a refusal into a rejection. A mutation built on `api` therefore ran
-/// its caller's `.then()` on a 403 or a 500: the list reloaded, no error was
-/// shown, and the operator was told the thing had happened. These have no
-/// body worth reading, so they cannot use `json`, which would then choke on
-/// the empty one.
-async function ok(path: string, init?: RequestInit): Promise<void> {
-  const r = await api(path, init)
-  if (!r.ok) throw new ApiError(r.status, (await r.text()) || `${r.status}`)
-}
+// The transport and its errors live beside Orval's mutator so generated
+// bindings never import this application facade back and form a cycle.
 
 export type Item = {
   id: string
@@ -397,13 +366,7 @@ export const artworkUrl = (
   id: string,
   version?: number | null,
   size?: 'thumb' | 'card1x' | 'card',
-) => {
-  const p = new URLSearchParams()
-  if (size) p.set('size', size)
-  if (version) p.set('v', String(version))
-  const q = p.toString()
-  return `/api/v1/items/${id}/artwork${q ? `?${q}` : ''}`
-}
+) => getItemArtworkUrl(id, { size, v: version ? String(version) : undefined })
 
 /// One poster at both densities, for the `srcset` of anything that shows a
 /// card. What varies between clients here is the display, not the layout —
@@ -414,7 +377,7 @@ export const artworkSrcSet = (id: string, version?: number | null) =>
   `${artworkUrl(id, version, 'card1x')} 1x, ${artworkUrl(id, version, 'card')} 2x`
 
 export const fetchChildren = (id: string) =>
-  json<{ children: Item[] }>(`/api/v1/items/${id}/children`)
+  generatedItemChildren(id) as Promise<{ children: Item[] }>
 
 /// One unified track row (subtitle unification): the id is THE key for
 /// serving, selection, OCR, deletion and preference memory. `delivery`
@@ -450,8 +413,8 @@ export const isRasterSub = (s: Subtitle) => s.origin === 'raster'
 /// a rasterised one is a finished artefact on the item.
 export const overlayUrl = (s: Subtitle, itemId: string, streamUrl: string) =>
   isRasterSub(s)
-    ? `/api/v1/items/${itemId}/subtitles/${s.id}.jsonl`
-    : `${streamUrl.replace(/[^/]*$/, '')}subs-${s.id}.jsonl`
+    ? getItemSubtitleFileUrl(itemId, `${s.id}.jsonl`)
+    : getSessionFileUrl(streamUrl.split('/').at(-2) ?? '', `subs-${s.id}.jsonl`)
 
 /// HUB-21/22/24: external subtitle search + download.
 export type SubtitleCandidate = {
@@ -476,16 +439,10 @@ export type SubtitleQuota = {
 }
 
 export const searchSubtitles = (itemId: string, languages: string[]) =>
-  json<{ candidates: SubtitleCandidate[]; quota: SubtitleQuota }>(
-    `/api/v1/items/${itemId}/subtitles/search`,
-    { method: 'POST', body: JSON.stringify({ languages }) },
-  )
+  generatedSubtitleSearch(itemId, { languages })
 
 export const downloadSubtitle = (itemId: string, fileId: string, language: string | null) =>
-  json<{ track_id: number; quota: SubtitleQuota }>(`/api/v1/items/${itemId}/subtitles/download`, {
-    method: 'POST',
-    body: JSON.stringify({ file_id: fileId, language }),
-  })
+  generatedSubtitleDownload(itemId, { file_id: fileId, language })
 
 /// "3 of 5 downloads left today (shared by everyone on this server)"
 export function quotaLabel(q: SubtitleQuota | null): string {
@@ -499,14 +456,15 @@ export function quotaLabel(q: SubtitleQuota | null): string {
 }
 
 /// Hub-stored tracks (downloaded/OCR) only; scan-owned rows refuse.
-export const deleteSubtitle = (id: number) =>
-  json<{ removed: boolean }>(`/api/v1/subtitles/${id}`, { method: 'DELETE' })
+export const deleteSubtitle = (id: number) => generatedSubtitleDelete(id)
 
 /// HUB-32c: OCR an image track (embedded or VobSub sidecar) into a new
 /// text track. Synchronous — a feature film takes ~30 s; cached, and
 
-export const fetchFonts = (itemId: string) =>
-  json<{ fonts: string[] }>(`/api/v1/items/${itemId}/fonts`)
+export const fetchFonts = (itemId: string) => generatedItemFonts(itemId)
+export const fontUrl = (itemId: string, index: number) => getItemFontUrl(itemId, index)
+export const subtitleFileUrl = (itemId: string, file: string, shiftMs?: number) =>
+  getItemSubtitleFileUrl(itemId, file, { shift_ms: shiftMs })
 
 // One uniform label across origins; delivery adds the honest suffix
 // (a burn restarts the session; 'none' renders disabled).
@@ -525,7 +483,7 @@ export const subtitleLabel = (s: Subtitle) =>
 
 export type LibrarySummary = { id: string; name: string; media_type: string }
 
-export const fetchLibraries = () => json<{ libraries: LibrarySummary[] }>('/api/v1/libraries')
+export const fetchLibraries = () => generatedListLibraries()
 
 /// How a library is browsed. `sort` is one of the names the hub knows
 /// (`title`, `-title`, `year`, `-year`, `added`, `-added`); anything else
@@ -546,18 +504,13 @@ export type ItemsPage = {
 /// at 1000. Sending no window is not "give me everything", it is "give me
 /// the first 200 and do not mention the rest", which is how the browser
 /// spent three commits showing 200 of 881 films. Always read `total`.
-export const fetchItems = (page: ItemsPage) => {
-  const p = new URLSearchParams()
-  if (page.library) p.set('library', page.library)
-  if (page.q) p.set('q', page.q)
-  if (page.sort) p.set('sort', page.sort)
-  if (page.limit !== undefined) p.set('limit', String(page.limit))
-  if (page.offset) p.set('offset', String(page.offset))
-  if (page.in_progress) p.set('in_progress', 'true')
-  return json<{ items: Item[]; total: number; limit: number; offset: number }>(
-    `/api/v1/items?${p.toString()}`,
-  )
-}
+export const fetchItems = (page: ItemsPage) =>
+  generatedListItems(page) as Promise<{
+    items: Item[]
+    total: number
+    limit: number
+    offset: number
+  }>
 
 /// Which screen to open on. Public: needs no token, and answers before
 /// setup has happened.
@@ -571,8 +524,12 @@ export type Bootstrap = {
 /// is the one request that must not be able to hang: no timeout meant a hub
 /// that accepted the connection and then wedged left a permanently blank page
 /// with no header, no message and nothing to press.
-export const fetchBootstrap = () =>
-  json<Bootstrap>('/api/v1/bootstrap', { signal: AbortSignal.timeout(BOOTSTRAP_TIMEOUT_MS) })
+export const fetchBootstrap = async (): Promise<Bootstrap> => {
+  const state = await generatedBootstrap({
+    signal: AbortSignal.timeout(BOOTSTRAP_TIMEOUT_MS),
+  })
+  return { ...state, setup_url: state.setup_url ?? undefined }
+}
 
 /// Shorter than a session start's ceiling: this is a database read and a token
 /// check, and the page is blank until it lands.
@@ -657,10 +614,8 @@ export function startSession(
   videoTrack = 0,
   subtitleTrack?: number,
 ): Promise<Session> {
-  return json('/api/v1/playback/sessions', {
-    method: 'POST',
-    signal: AbortSignal.timeout(START_TIMEOUT_MS),
-    body: JSON.stringify({
+  return generatedStartSession(
+    {
       item_id: itemId,
       profile,
       start_ms: Math.round(startMs),
@@ -669,8 +624,9 @@ export function startSession(
       // An IMAGE track id forces its burn-in from the first segment;
       // text tracks need no session involvement.
       subtitle_track: subtitleTrack ?? null,
-    }),
-  })
+    },
+    { signal: AbortSignal.timeout(START_TIMEOUT_MS) },
+  ) as Promise<Session>
 }
 
 /// One place builds a play request: bandwidth pref → probed profile →
@@ -720,11 +676,7 @@ export async function startPlaybackSession(
 /// Music plays direct by operator contract (browsers decode flac/mp3
 /// natively; HUB-19 owns future music delivery shapes).
 export function startSessionDirect(itemId: string, signal?: AbortSignal): Promise<Session> {
-  return json('/api/v1/playback/sessions', {
-    method: 'POST',
-    body: JSON.stringify({ item_id: itemId, mode: 'direct' }),
-    signal,
-  })
+  return generatedStartSession({ item_id: itemId, mode: 'direct' }, { signal }) as Promise<Session>
 }
 
 export type Pref = { scope: string; key: string; value: string }
@@ -865,13 +817,13 @@ export function pickSubtitle(wishlist: string[], subs: Subtitle[]): Subtitle | n
   return null
 }
 
-export const fetchPrefs = () => json<{ prefs: Pref[] }>('/api/v1/prefs')
+export const fetchPrefs = () => generatedGetPrefs()
 
 /// HUB-11 event channel: invalidation hints ({kind, ...}). Authenticates
 /// via the HttpOnly `kahawai_media` cookie (EventSource cannot set headers).
 /// The browser auto-reconnects; callers just react to hints.
 export function openEvents(onEvent: (e: { kind: string } & Record<string, unknown>) => void) {
-  const es = new EventSource('/api/v1/events')
+  const es = new EventSource(getEventsUrl())
   es.onmessage = (m) => {
     try {
       onEvent(JSON.parse(m.data))
@@ -891,12 +843,7 @@ export const putPref = (scope: string, key: string, value: string) => {
   const target = `${scope}\0${key}`
   const queue = prefWrites.get(target) ?? new SerialQueue()
   prefWrites.set(target, queue)
-  return queue.run(() =>
-    json<{ ok: boolean }>('/api/v1/prefs', {
-      method: 'PUT',
-      body: JSON.stringify({ scope, key, value }),
-    }),
-  )
+  return queue.run(() => generatedPutPref({ scope, key, value }))
 }
 
 /// Seek-restart: the pipeline restarts at the offset; re-attach the
@@ -908,24 +855,14 @@ export function seekSession(
   videoTrack?: number,
   subtitleTrack?: number,
 ): Promise<{ part_base_ms: number; streams?: StreamVerdict | null }> {
-  return json(`/api/v1/playback/sessions/${sessionId}/seek`, {
-    method: 'POST',
-    body: JSON.stringify({
-      position_ms: Math.round(positionMs),
-      audio_track: audioTrack ?? null,
-      video_track: videoTrack ?? null,
-      // An image track id switches the burn mid-session; 0 withdraws
-      // an explicit burn; absent = keep as is.
-      subtitle_track: subtitleTrack ?? null,
-    }),
-  })
-}
-
-export type WatchedRow = {
-  item_id: string
-  position_ms: number
-  played: boolean
-  play_count: number
+  return generatedSeekSession(sessionId, {
+    position_ms: Math.round(positionMs),
+    audio_track: audioTrack ?? null,
+    video_track: videoTrack ?? null,
+    // An image track id switches the burn mid-session; 0 withdraws
+    // an explicit burn; absent = keep as is.
+    subtitle_track: subtitleTrack ?? null,
+  }) as Promise<{ part_base_ms: number; streams?: StreamVerdict | null }>
 }
 
 /// Mark an item watched, or not, without playing it — something seen on
@@ -942,24 +879,20 @@ export type WatchedRow = {
 /// Looping here instead meant 26 round trips for an anime season and a
 /// half-applied mark whenever one of them failed.
 export const setWatched = (itemId: string, played: boolean, items?: string[]) =>
-  json<{ updated: WatchedRow[] }>(`/api/v1/items/${itemId}/watched`, {
-    method: 'PUT',
-    body: JSON.stringify(items ? { played, items } : { played }),
-  })
+  generatedItemSetWatched(itemId, items ? { played, items } : { played })
 
 export function postProgress(sessionId: string, positionMs: number, keepalive = false) {
-  return api(`/api/v1/playback/sessions/${sessionId}/progress`, {
-    method: 'POST',
-    body: JSON.stringify({ position_ms: Math.round(positionMs) }),
-    keepalive,
-  }).catch(() => undefined)
+  return (
+    generatedPostProgress(
+      sessionId,
+      { position_ms: Math.round(positionMs) },
+      { keepalive, rawResponse: true },
+    ) as unknown as Promise<Response>
+  ).catch(() => undefined)
 }
 
 export function endSession(sessionId: string, keepalive = false) {
-  return api(`/api/v1/playback/sessions/${sessionId}`, {
-    method: 'DELETE',
-    keepalive,
-  }).catch(() => undefined)
+  return generatedEndSession(sessionId, { keepalive }).catch(() => undefined)
 }
 
 // ---- admin ----
@@ -979,6 +912,9 @@ export async function downloadWithAuth(path: string): Promise<void> {
     URL.revokeObjectURL(url)
   }
 }
+
+export const adminSessionLogUrl = getAdminSessionLogUrl
+export const adminItemLogUrl = getAdminItemLogUrl
 
 export type PendingEnrollment = {
   csr_fingerprint: string
@@ -1038,16 +974,10 @@ export type AdminSession = {
   streams: StreamVerdict | null
 }
 
-export const adminEnrollments = () =>
-  json<{ pending: PendingEnrollment[] }>('/admin/v1/enrollments')
-export const adminApprove = (code: string) =>
-  json<{ approved: string }>('/admin/v1/enrollments/approve', {
-    method: 'POST',
-    body: JSON.stringify({ code }),
-  })
-export const adminSatellites = () => json<{ satellites: Satellite[] }>('/admin/v1/satellites')
-export const adminDeleteSatellite = (id: string) =>
-  json<unknown>(`/admin/v1/satellites/${id}`, { method: 'DELETE' })
+export const adminEnrollments = () => generatedAdminEnrollments()
+export const adminApprove = (code: string) => generatedAdminApprove({ code })
+export const adminSatellites = () => generatedAdminSatellites()
+export const adminDeleteSatellite = (id: string) => generatedAdminDeleteSatellite(id)
 
 export type LibraryCollection = {
   module_id: string
@@ -1075,118 +1005,63 @@ export type CollectionInfo = LibraryCollection & {
   scan: ScanState | null
 }
 
-export const adminLibraries = () => json<{ libraries: Library[] }>('/admin/v1/libraries')
+export const adminLibraries = () => generatedAdminLibraries()
 
-export const adminCollections = () =>
-  json<{ collections: CollectionInfo[] }>('/admin/v1/collections')
+export const adminCollections = () => generatedAdminCollections()
 
 export type ProviderChain = { order: string[]; default: string[] }
 
-export const adminProviders = () =>
-  json<{
-    tmdb: { configured: boolean }
-    tvdb: { configured: boolean }
-    anidb: { configured: boolean }
-    chains: Record<string, ProviderChain>
-  }>('/admin/v1/providers')
+export const adminProviders = () => generatedAdminProviders()
 
 /// HUB-5: precedence per media type. Earlier wins a field; later ones
 /// fill what it left empty. Applying re-merges from stored answers, so
 /// it is instant and sends no provider a request.
 export const adminSetChain = (mediaType: string, order: string[]) =>
-  json<{ ok: boolean }>(`/admin/v1/providers/chains/${mediaType}`, {
-    method: 'POST',
-    body: JSON.stringify({ order }),
-  })
+  generatedAdminSetChain(mediaType, { order })
 export const adminSetAnidb = (username: string, password: string, udpApiKey?: string) =>
-  json<{ saved: boolean; verified: boolean; error?: string }>('/admin/v1/providers/anidb', {
-    method: 'POST',
-    body: JSON.stringify({ username, password, udp_api_key: udpApiKey || null }),
-  })
+  generatedAdminSetAnidb({ username, password, udp_api_key: udpApiKey || null })
 export const adminSetTvdbKey = (apiKey: string, pin?: string) =>
-  json<{ saved: boolean }>('/admin/v1/providers/tvdb', {
-    method: 'POST',
-    body: JSON.stringify({ api_key: apiKey, pin: pin || null }),
-  })
-export const adminSetTmdbKey = (apiKey: string) =>
-  json<{ saved: boolean }>('/admin/v1/providers/tmdb', {
-    method: 'POST',
-    body: JSON.stringify({ api_key: apiKey }),
-  })
-export const adminEnrichStatus = () =>
-  json<{ running: boolean; matched: number; weak: number; missed: number }>('/admin/v1/enrich')
-export type MatchCandidate = {
-  format?: string | null
-  id: number
-  title: string
-  overview?: string | null
-  poster_path?: string | null
-  poster_url?: string
-  release_date?: string | null
-  vote_average?: number | null
-  provider: 'tmdb' | 'tvdb'
-}
+  generatedAdminSetTvdb({ api_key: apiKey, pin: pin || null })
+export const adminSetTmdbKey = (apiKey: string) => generatedAdminSetTmdb({ api_key: apiKey })
+export const adminEnrichStatus = () => generatedAdminEnrichStatus()
+export type MatchCandidate = ProviderCandidate
 
 export const adminReviewSearch = (
   kind: string,
   query: string,
   year?: number | null,
   item?: string,
-) =>
-  json<{ candidates: MatchCandidate[] }>('/admin/v1/enrich/search', {
-    method: 'POST',
-    body: JSON.stringify({ kind, query, year: year ?? null, item: item ?? null }),
-  })
+) => generatedAdminReviewSearch({ kind, query, year: year ?? null, item: item ?? null })
 export const adminApplyMatch = (
   itemId: string,
   action: 'pick' | 'confirm' | 'reject',
   candidate?: MatchCandidate,
 ) =>
-  json<{ ok: boolean }>(`/admin/v1/items/${itemId}/match`, {
-    method: 'POST',
-    body: JSON.stringify({
-      action,
-      provider: candidate?.provider ?? null,
-      candidate: candidate ?? null,
-    }),
+  generatedAdminApplyMatch(itemId, {
+    action,
+    provider: candidate?.provider ?? null,
+    candidate: candidate ?? null,
   })
 
-export const adminRefreshLibrary = (id: string) =>
-  json<{ asked: number; offline: number }>(`/admin/v1/libraries/${id}/refresh`, {
-    method: 'POST',
-    body: '{}',
-  })
+export const adminRefreshLibrary = (id: string) => generatedAdminRefreshLibrary(id)
 
-export const adminEnrichRun = () =>
-  json<{ started: boolean }>('/admin/v1/enrich', { method: 'POST' })
+export const adminEnrichRun = () => generatedAdminEnrichRun()
 
 export const adminCreateLibrary = (name: string, mediaType: string) =>
-  json<{ id: string }>('/admin/v1/libraries', {
-    method: 'POST',
-    body: JSON.stringify({ name, media_type: mediaType }),
-  })
+  generatedAdminCreateLibrary({ name, media_type: mediaType })
 
-export const adminDeleteLibrary = (id: string) =>
-  ok(`/admin/v1/libraries/${id}`, { method: 'DELETE' })
+export const adminDeleteLibrary = (id: string) => generatedAdminDeleteLibrary(id)
 
 export const adminAttachCollection = (id: string, moduleId: string, collectionId: string) =>
-  ok(`/admin/v1/libraries/${id}/collections`, {
-    method: 'POST',
-    body: JSON.stringify({ module_id: moduleId, collection_id: collectionId }),
-  })
+  generatedAdminAttachCollection(id, { module_id: moduleId, collection_id: collectionId })
 
 export const adminDetachCollection = (id: string, moduleId: string, collectionId: string) =>
-  ok(`/admin/v1/libraries/${id}/collections/${moduleId}/${collectionId}`, {
-    method: 'DELETE',
-  })
+  generatedAdminDetachCollection(id, moduleId, collectionId)
 
 export const adminSetSatelliteDisabled = (id: string, disabled: boolean) =>
-  ok(`/admin/v1/satellites/${id}/disabled`, {
-    method: 'POST',
-    body: JSON.stringify({ disabled }),
-  })
-export const adminSessions = () => json<{ sessions: AdminSession[] }>('/admin/v1/sessions')
-export const adminEndSession = (id: string) => ok(`/admin/v1/sessions/${id}`, { method: 'DELETE' })
+  generatedAdminSetDisabled(id, { disabled })
+export const adminSessions = () => generatedAdminSessions() as Promise<{ sessions: AdminSession[] }>
+export const adminEndSession = (id: string) => generatedAdminEndSession(id)
 
 /// HUB-10. `all_libraries` wins over `libraries`: with it set the list is
 /// stored but not consulted, and libraries created later are included.
@@ -1199,7 +1074,7 @@ export type AdminUser = {
   created_at: number
 }
 
-export const adminUsers = () => json<{ users: AdminUser[] }>('/admin/v1/users')
+export const adminUsers = () => generatedAdminUsers()
 
 /// HUB-10: promote or demote. The hub refuses to strip your own rights and
 /// refuses to demote the last admin, so this cannot lock an operator out — the
@@ -1208,24 +1083,15 @@ export const adminUsers = () => json<{ users: AdminUser[] }>('/admin/v1/users')
 /// for "this token is not an admin": otherwise a client could not tell
 /// re-authenticate from pick-a-different-account.
 export const adminSetUserAdmin = (id: string, admin: boolean) =>
-  json<{ id: string; is_admin: boolean }>(`/admin/v1/users/${id}/admin`, {
-    method: 'PUT',
-    body: JSON.stringify({ admin }),
-  })
+  generatedAdminSetUserAdmin(id, { admin })
 
 export const adminCreateUser = (username: string, password: string, admin: boolean) =>
-  json<{ id: string }>('/admin/v1/users', {
-    method: 'POST',
-    body: JSON.stringify({ username, password, admin }),
-  })
+  generatedAdminCreateUser({ username, password, admin })
 
-export const adminDeleteUser = (id: string) => ok(`/admin/v1/users/${id}`, { method: 'DELETE' })
+export const adminDeleteUser = (id: string) => generatedAdminDeleteUser(id)
 
 /// Whole state, not a toggle: the panel holds every box, and sending all
 /// of them is what keeps two admins from interleaving into a set neither
 /// picked.
 export const adminSetUserLibraries = (id: string, allLibraries: boolean, libraries: string[]) =>
-  json<{ all_libraries: boolean; libraries: string[] }>(`/admin/v1/users/${id}/libraries`, {
-    method: 'PUT',
-    body: JSON.stringify({ all_libraries: allLibraries, libraries }),
-  })
+  generatedAdminSetUserLibraries(id, { all_libraries: allLibraries, libraries })

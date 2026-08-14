@@ -2,6 +2,7 @@ import { useEffect, useReducer, useRef, useState } from 'react'
 import Hls from 'hls.js'
 import { fetchItem } from '../item-query'
 import {
+  adminSessionLogUrl,
   fetchChildren,
   artworkUrl,
   accessToken,
@@ -16,6 +17,7 @@ import {
   seekSession,
   startPlaybackSession,
   subtitleLabel,
+  subtitleFileUrl,
   type ItemDetail,
   type Session,
   isAdmin,
@@ -1483,7 +1485,7 @@ export default function Player({
               key={`${subKey}-${trackEpoch}`}
               default
               kind="subtitles"
-              src={`/api/v1/items/${item.id}/subtitles/${subKey}.vtt?shift_ms=${-Math.round(offsetRef.current)}`}
+              src={subtitleFileUrl(item.id, `${subKey}.vtt`, -Math.round(offsetRef.current))}
             />
           )}
         </video>
@@ -1550,9 +1552,9 @@ export default function Player({
               <button
                 className="info-log"
                 onClick={() =>
-                  downloadWithAuth(
-                    `/admin/v1/sessions/${encodeURIComponent(session.session_id)}/log`,
-                  ).catch((e: unknown) => notify(`Could not download the session log: ${e}`))
+                  downloadWithAuth(adminSessionLogUrl(session.session_id)).catch((e: unknown) =>
+                    notify(`Could not download the session log: ${e}`),
+                  )
                 }
               >
                 download session log
