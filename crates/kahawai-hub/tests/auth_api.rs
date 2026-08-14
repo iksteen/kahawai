@@ -372,28 +372,29 @@ async fn setup_then_auth_flow() {
         "password-reset invalidation did not survive Auth restart"
     );
 
-    // Bootstrap is public but understands the narrow media cookie. Catalogue
-    // reads remain bearer-only.
-    let cookie_bootstrap = |token: String| {
-        let api = api.clone();
-        async move {
-            body_json(
-                api.oneshot(
-                    Request::get("/api/v1/bootstrap")
-                        .header("cookie", format!("other=1; kahawai_media={token}"))
-                        .body(Body::empty())
-                        .unwrap(),
-                )
-                .await
-                .unwrap(),
+    // Bootstrap is public and does not inspect bearer or media credentials.
+    let bootstrap = body_json(
+        api.clone()
+            .oneshot(
+                Request::get("/api/v1/bootstrap")
+                    .header(
+                        "cookie",
+                        format!("other=1; kahawai_media={}", after_reset.access_token),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
             )
             .await
-        }
-    };
-    assert_eq!(cookie_bootstrap(access).await["authenticated"], false);
+            .unwrap(),
+    )
+    .await;
     assert_eq!(
-        cookie_bootstrap(after_reset.access_token).await["authenticated"],
-        true
+        bootstrap,
+        serde_json::json!({
+            "setup_required": false,
+            "setup_available": false,
+            "setup_url": null,
+        })
     );
     let resp = api
         .clone()
@@ -583,6 +584,27 @@ async fn explicit_auth_modes_split_bearers_from_browser_cookies_and_enforce_orig
         StatusCode::BAD_REQUEST
     );
 
+    for origin in [None, Some("null"), Some("https://foreign.test")] {
+        let mut request = post_headers(
+            "/api/v1/auth/token",
+            serde_json::json!({
+                "client": "browser",
+                "username": "root",
+                "password": "hunter22222hunter"
+            }),
+            &[("host", "hub.test:8420")],
+        );
+        if let Some(origin) = origin {
+            request.headers_mut().insert(
+                axum::http::header::ORIGIN,
+                axum::http::HeaderValue::from_str(origin).unwrap(),
+            );
+        }
+        let response = api.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{origin:?}");
+        assert!(set_cookies(&response).is_empty());
+    }
+
     let browser_login = api
         .clone()
         .oneshot(post_headers(
@@ -592,7 +614,10 @@ async fn explicit_auth_modes_split_bearers_from_browser_cookies_and_enforce_orig
                 "username": "root",
                 "password": "hunter22222hunter"
             }),
-            &[("host", "hub.test:8420")],
+            &[
+                ("host", "hub.test:8420"),
+                ("origin", "http://hub.test:8420"),
+            ],
         ))
         .await
         .unwrap();
@@ -734,7 +759,10 @@ async fn browser_refresh_internal_errors_do_not_clear_cookies() {
                 "username": "root",
                 "password": "hunter22222hunter"
             }),
-            &[("host", "hub.test:8420")],
+            &[
+                ("host", "hub.test:8420"),
+                ("origin", "http://hub.test:8420"),
+            ],
         ))
         .await
         .unwrap();
@@ -770,12 +798,21 @@ async fn media_cookie_is_limited_to_the_explicit_read_allowlist() {
             .unwrap()
     };
 
-    let bootstrap = api
-        .clone()
-        .oneshot(request(axum::http::Method::GET, "/api/v1/bootstrap"))
-        .await
-        .unwrap();
-    assert_eq!(body_json(bootstrap).await["authenticated"], true);
+    let bootstrap = body_json(
+        api.clone()
+            .oneshot(request(axum::http::Method::GET, "/api/v1/bootstrap"))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        bootstrap,
+        serde_json::json!({
+            "setup_required": false,
+            "setup_available": false,
+            "setup_url": null,
+        })
+    );
     assert_eq!(
         api.clone()
             .oneshot(request(axum::http::Method::GET, "/api/v1/events"))
@@ -855,7 +892,7 @@ async fn configured_and_forwarded_origins_control_browser_cookie_security() {
             net,
         )
     };
-    let login = |host: &str| {
+    let login = |host: &str, origin: &str| {
         post_headers(
             "/api/v1/auth/token",
             serde_json::json!({
@@ -863,7 +900,7 @@ async fn configured_and_forwarded_origins_control_browser_cookie_security() {
                 "username": "root",
                 "password": "hunter22222hunter"
             }),
-            &[("host", host)],
+            &[("host", host), ("origin", origin)],
         )
     };
 
@@ -875,7 +912,7 @@ async fn configured_and_forwarded_origins_control_browser_cookie_security() {
     });
     let response = configured
         .clone()
-        .oneshot(login("attacker.invalid"))
+        .oneshot(login("attacker.invalid", "https://public.example"))
         .await
         .unwrap();
     let cookies = set_cookies(&response);
@@ -907,7 +944,7 @@ async fn configured_and_forwarded_origins_control_browser_cookie_security() {
         proxy_trust: trust.clone(),
         ..Default::default()
     });
-    let mut request = login("internal:8420");
+    let mut request = login("internal:8420", "https://public.example");
     request
         .headers_mut()
         .insert("x-forwarded-proto", "http, https".parse().unwrap());
@@ -930,7 +967,7 @@ async fn configured_and_forwarded_origins_control_browser_cookie_security() {
         proxy_trust: trust,
         ..Default::default()
     });
-    let mut request = login("internal:8420");
+    let mut request = login("internal:8420", "http://internal:8420");
     request
         .headers_mut()
         .insert("x-forwarded-proto", "https".parse().unwrap());
@@ -1273,11 +1310,12 @@ async fn login_throttles_after_repeated_failures() {
 /// inferring it from an error status on an unrelated endpoint — which is
 /// what made the web UI fetch the whole catalogue on every load.
 #[tokio::test]
-async fn bootstrap_states_setup_and_auth_without_a_token() {
+async fn bootstrap_states_setup_without_authentication() {
     let dir = tempfile::tempdir().unwrap();
     let db = kahawai_hub::db::open(dir.path()).await.unwrap();
     let registry = Arc::new(Registry::new(db.clone(), Default::default()));
     let auth = Arc::new(Auth::new(db.clone(), dir.path()).await.unwrap());
+    let local = kahawai_hub::api::setup_router(auth.clone());
     let api = test_router(
         registry,
         auth.clone(),
@@ -1285,51 +1323,68 @@ async fn bootstrap_states_setup_and_auth_without_a_token() {
             tempfile::tempdir().unwrap().keep(),
         )),
     );
-    let probe = || {
-        Request::get("/api/v1/bootstrap")
-            .body(Body::empty())
-            .unwrap()
-    };
 
-    // Reachable in setup mode, unlike everything behind require_auth.
-    let resp = api.clone().oneshot(probe()).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let v = body_json(resp).await;
-    assert_eq!(v["setup_required"], true);
-    assert_eq!(v["setup_available"], false);
-    assert_eq!(v["setup_url"], "http://127.0.0.1:8422");
-    assert_eq!(v["authenticated"], false);
-
-    auth.complete_setup("ingmar", "hunter222222").await.unwrap();
-
-    // Setup done, no token presented: the login screen, said plainly.
-    let v = body_json(api.clone().oneshot(probe()).await.unwrap()).await;
-    assert_eq!(v["setup_required"], false);
-    assert_eq!(v["authenticated"], false);
-
-    // A garbage token is not authentication.
-    let resp = api
-        .clone()
-        .oneshot(get_authed("/api/v1/bootstrap", "not-a-jwt"))
-        .await
-        .unwrap();
-    assert_eq!(body_json(resp).await["authenticated"], false);
-
-    let token = body_json(
+    let public = body_json(
         api.clone()
-            .oneshot(post("/api/v1/auth/token", serde_json::json!({"client": "api", "username": "ingmar", "password": "hunter222222"})))
+            .oneshot(
+                Request::get("/api/v1/bootstrap")
+                    .header("authorization", "Bearer not-a-jwt")
+                    .header("cookie", "kahawai_media=not-a-jwt")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap(),
     )
-    .await["access_token"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    let resp = api
-        .oneshot(get_authed("/api/v1/bootstrap", &token))
+    .await;
+    assert_eq!(
+        public,
+        serde_json::json!({
+            "setup_required": true,
+            "setup_available": false,
+            "setup_url": "http://127.0.0.1:8422",
+        })
+    );
+    let local = body_json(
+        local
+            .oneshot(
+                Request::get("/api/v1/bootstrap")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        local,
+        serde_json::json!({
+            "setup_required": true,
+            "setup_available": true,
+            "setup_url": null,
+        })
+    );
+
+    auth.complete_setup("ingmar", "hunter222222").await.unwrap();
+
+    let public = body_json(
+        api.oneshot(
+            Request::get("/api/v1/bootstrap")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
-        .unwrap();
-    assert_eq!(body_json(resp).await["authenticated"], true);
+        .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        public,
+        serde_json::json!({
+            "setup_required": false,
+            "setup_available": false,
+            "setup_url": null,
+        })
+    );
 }
 
 /// Expired refresh families are pruned when Auth opens; live ones stay.

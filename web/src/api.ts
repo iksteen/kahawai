@@ -565,7 +565,6 @@ export type Bootstrap = {
   setup_required: boolean
   setup_available: boolean
   setup_url?: string
-  authenticated: boolean
 }
 
 /// Which screen to open on. The app renders NOTHING until this answers, so it

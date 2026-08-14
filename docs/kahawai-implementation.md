@@ -521,12 +521,12 @@ immediate across processes and restart.
 
 Bearer authentication is the default and never falls back after a malformed or
 invalid `Authorization` header. The media cookie is accepted only for
-`GET`/`HEAD` bootstrap, events, item artwork/subtitle/font files, and playback
+`GET`/`HEAD` events, item artwork/subtitle/font files, and playback
 session streams/files. Item grants and session ownership remain inside that
 authentication boundary. Catalogue/detail/children/font-list reads,
 preferences, playback mutations and every admin route remain bearer-only.
 
-Browser refresh and logout require an exact, non-`null` Origin. Configured
+Browser login, refresh and logout require an exact, non-`null` Origin. Configured
 `hub.public_url` is authoritative; otherwise the origin is `http://Host`, with
 the rightmost `X-Forwarded-Proto`/`X-Forwarded-Host` used only for a socket peer
 in `trusted_proxies`. HTTPS sets `Secure`; configured HTTP logs a cleartext

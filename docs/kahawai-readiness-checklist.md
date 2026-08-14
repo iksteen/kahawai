@@ -138,11 +138,11 @@ marked in that document.
       sign-out tells every open same-origin tab to drop its per-tab access token
       before the shared refresh family is revoked
 - [x] AUTH-9 Accept media-cookie authentication only for `GET`/`HEAD` on
-      `/api/v1/bootstrap`, `/api/v1/events`, item artwork/subtitle/font files,
-      and playback session streams and files. Protected application mutations
-      require an `Authorization` bearer token. Browser refresh is authenticated
-      by its refresh cookie; browser logout requires both its access bearer and
-      refresh cookie. Browser refresh and logout additionally require an exact,
+      `/api/v1/events`, item artwork/subtitle/font files, and playback session
+      streams and files. Protected application mutations require an
+      `Authorization` bearer token. Browser refresh is authenticated by its
+      refresh cookie; browser logout requires both its access bearer and refresh
+      cookie. Browser login, refresh and logout additionally require an exact,
       present, non-`null` Origin equal to AUTH-10's canonical Origin
 - [x] AUTH-10 Add `hub.public_url`. It determines the canonical Origin and
       enables `Secure` cookies when it is HTTPS; forwarded scheme/host values

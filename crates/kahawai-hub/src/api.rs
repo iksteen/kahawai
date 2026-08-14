@@ -391,9 +391,8 @@ fn request_token(req: &Request, allow_media_cookie: bool) -> Result<Option<&str>
 /// `/api/v1/items` and pulled the entire catalogue (1.4 MB, 578 ms here)
 /// to read a status line it then threw away.
 ///
-/// Says nothing a caller could not learn by trying to log in, so it needs
-/// no token: `setup_required` is already printed on the console at
-/// startup, and `authenticated` describes the request's OWN token.
+/// Says nothing a caller could not learn by trying to log in:
+/// `setup_required` is already printed on the console at startup.
 /// NFR-6: Prometheus text exposition, behind its own static token.
 ///
 /// NOT a login token. Access tokens live 15 minutes and no scraper
@@ -446,21 +445,12 @@ async fn health(State(state): State<AppState>) -> Result<Json<Value>, ApiError> 
     Ok(Json(crate::metrics::health(&snap)))
 }
 
-async fn bootstrap(State(state): State<AppState>, req: Request) -> Json<Value> {
+async fn bootstrap(State(state): State<AppState>) -> Json<Value> {
     let setup_required = state.auth.setup_required();
-    let authenticated = if setup_required {
-        false
-    } else {
-        match request_token(&req, true) {
-            Ok(Some(token)) => state.auth.authenticate(token).await.is_ok(),
-            Ok(None) | Err(()) => false,
-        }
-    };
     Json(json!({
         "setup_required": setup_required,
         "setup_available": false,
         "setup_url": if setup_required { state.setup_url.as_ref().clone() } else { None },
-        "authenticated": authenticated,
     }))
 }
 
@@ -1529,7 +1519,6 @@ async fn setup_bootstrap(State(state): State<SetupState>) -> Json<Value> {
         "setup_required": state.auth.setup_required(),
         "setup_available": true,
         "setup_url": Value::Null,
-        "authenticated": false,
     }))
 }
 
@@ -1775,6 +1764,10 @@ async fn login(
     if state.auth.setup_required() {
         return Err((StatusCode::SERVICE_UNAVAILABLE, "setup required".into()));
     }
+    let secure = match body.client {
+        AuthClient::Browser => validate_browser_origin(&state, &meta)?.secure(),
+        AuthClient::Api => false,
+    };
     let user_key = format!("u:{}", body.username.to_lowercase());
     let ip_key = ip.map(|i| format!("ip:{i}"));
     let locked = state.auth.throttle.locked(&user_key).or_else(|| {
@@ -1795,8 +1788,6 @@ async fn login(
             if let Some(key) = &ip_key {
                 state.auth.throttle.clear(key);
             }
-            let secure = body.client == AuthClient::Browser
-                && browser_origin(&state, &meta).is_some_and(|origin| origin.secure());
             Ok(token_response(tokens, body.client, secure))
         }
         Err(_) => {
