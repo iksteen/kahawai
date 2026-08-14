@@ -80,7 +80,7 @@ pub struct NetOptions {
     pub metrics_token: Option<String>,
     /// Trusted-local first-run URL advertised while the public API is locked.
     pub setup_url: Option<String>,
-    /// Configured canonical browser origin; request-derived when absent.
+    /// Configured canonical browser origin; absent disables Origin validation.
     pub public_origin: Option<PublicOrigin>,
 }
 #[derive(OpenApi)]
@@ -2610,10 +2610,7 @@ impl axum::extract::FromRequestParts<AppState> for AuthRequestMeta {
     }
 }
 
-fn browser_origin(state: &AppState, meta: &AuthRequestMeta) -> Option<PublicOrigin> {
-    if let Some(origin) = &state.public_origin {
-        return Some(origin.clone());
-    }
+fn request_browser_origin(state: &AppState, meta: &AuthRequestMeta) -> Option<PublicOrigin> {
     let header = |name| meta.headers.get(name).and_then(|value| value.to_str().ok());
     state
         .proxy_trust
@@ -2628,27 +2625,26 @@ fn browser_origin(state: &AppState, meta: &AuthRequestMeta) -> Option<PublicOrig
         })
 }
 
-fn validate_browser_origin(
-    state: &AppState,
-    meta: &AuthRequestMeta,
-) -> Result<PublicOrigin, ApiError> {
+fn browser_cookie_secure(state: &AppState, meta: &AuthRequestMeta) -> Result<bool, ApiError> {
+    let Some(expected) = &state.public_origin else {
+        return Ok(request_browser_origin(state, meta).is_some_and(|origin| origin.secure()));
+    };
     let forbidden = || {
         (
             StatusCode::FORBIDDEN,
             "browser authentication requires the canonical Origin".into(),
         )
     };
-    let expected = browser_origin(state, meta).ok_or_else(forbidden)?;
     let presented = meta
         .headers
         .get(axum::http::header::ORIGIN)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| PublicOrigin::parse(value).ok())
         .ok_or_else(forbidden)?;
-    if presented != expected {
+    if &presented != expected {
         return Err(forbidden());
     }
-    Ok(expected)
+    Ok(expected.secure())
 }
 
 fn auth_cookie(
@@ -2720,7 +2716,7 @@ const THROTTLE_IP_AFTER: u32 = 20;
 #[utoipa::path(
     post, path = "/api/v1/auth/token", tag = "Authentication",
     request_body = LoginRequest,
-    params(("Origin" = Option<String>, Header, description = "Required for browser mode; must match the canonical browser origin")),
+    params(("Origin" = Option<String>, Header, description = "Required for browser mode when hub.public_url is configured; must match it exactly")),
     responses(
         (status = 200, body = AuthSuccessResponse, headers(("set-cookie" = String, description = "Browser clients receive refresh and media cookies"))),
         (status = 400, body = String, content_type = "text/plain"),
@@ -2741,7 +2737,7 @@ async fn login(
         return Err((StatusCode::SERVICE_UNAVAILABLE, "setup required".into()));
     }
     let secure = match body.client {
-        AuthClient::Browser => validate_browser_origin(&state, &meta)?.secure(),
+        AuthClient::Browser => browser_cookie_secure(&state, &meta)?,
         AuthClient::Api => false,
     };
     let user_key = format!("u:{}", body.username.to_lowercase());
@@ -2780,6 +2776,7 @@ async fn login(
 #[utoipa::path(
     post, path = "/api/v1/auth/refresh", tag = "Authentication",
     request_body = RefreshRequest,
+    params(("Origin" = Option<String>, Header, description = "Required for browser mode when hub.public_url is configured; must match it exactly")),
     responses(
         (status = 200, body = AuthSuccessResponse, headers(("set-cookie" = String, description = "Rotated browser cookies"))),
         (status = 400, body = String, content_type = "text/plain"),
@@ -2794,7 +2791,7 @@ async fn refresh(
     body: Result<Json<RefreshRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Response, ApiError> {
     let Json(body) = body.map_err(|error| (StatusCode::BAD_REQUEST, error.body_text()))?;
-    let (token, origin) = match body.client {
+    let (token, secure) = match body.client {
         AuthClient::Api => (
             body.refresh_token
                 .as_deref()
@@ -2809,25 +2806,21 @@ async fn refresh(
                     "browser refresh_token must be omitted".into(),
                 ));
             }
-            let origin = validate_browser_origin(&state, &meta)?;
+            let secure = browser_cookie_secure(&state, &meta)?;
             let Some(token) = cookie(&meta.headers, "kahawai_refresh") else {
                 let mut response =
                     (StatusCode::UNAUTHORIZED, "invalid refresh token").into_response();
-                clear_auth_cookies(&mut response, origin.secure());
+                clear_auth_cookies(&mut response, secure);
                 return Ok(response);
             };
-            (token, Some(origin))
+            (token, Some(secure))
         }
     };
     match state.auth.refresh(token).await {
-        Ok(tokens) => Ok(token_response(
-            tokens,
-            body.client,
-            origin.is_some_and(|origin| origin.secure()),
-        )),
+        Ok(tokens) => Ok(token_response(tokens, body.client, secure.unwrap_or(false))),
         Err(crate::auth::RefreshError::Invalid) if body.client == AuthClient::Browser => {
             let mut response = (StatusCode::UNAUTHORIZED, "invalid refresh token").into_response();
-            clear_auth_cookies(&mut response, origin.is_some_and(|origin| origin.secure()));
+            clear_auth_cookies(&mut response, secure.unwrap_or(false));
             Ok(response)
         }
         Err(crate::auth::RefreshError::Invalid) => {
@@ -2841,6 +2834,7 @@ async fn refresh(
     post, path = "/api/v1/auth/logout", tag = "Authentication",
     security(("bearer_auth" = [])),
     request_body = LogoutRequest,
+    params(("Origin" = Option<String>, Header, description = "Required for browser mode when hub.public_url is configured; must match it exactly")),
     responses(
         (status = 204, description = "Refresh token revoked", headers(("set-cookie" = String, description = "Browser cookies cleared"))),
         (status = 400, body = String, content_type = "text/plain"),
@@ -2856,7 +2850,7 @@ async fn logout(
     body: Result<Json<LogoutRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Response, ApiError> {
     let Json(body) = body.map_err(|error| (StatusCode::BAD_REQUEST, error.body_text()))?;
-    let (token, origin) = match body.client {
+    let (token, secure) = match body.client {
         AuthClient::Api => (
             body.refresh_token
                 .as_deref()
@@ -2871,10 +2865,10 @@ async fn logout(
                     "browser refresh_token must be omitted".into(),
                 ));
             }
-            let origin = validate_browser_origin(&state, &meta)?;
+            let secure = browser_cookie_secure(&state, &meta)?;
             let token = cookie(&meta.headers, "kahawai_refresh")
                 .ok_or((StatusCode::UNAUTHORIZED, "refresh cookie required".into()))?;
-            (token, Some(origin))
+            (token, Some(secure))
         }
     };
     state
@@ -2883,8 +2877,8 @@ async fn logout(
         .await
         .map_err(internal)?;
     let mut response = StatusCode::NO_CONTENT.into_response();
-    if let Some(origin) = origin {
-        clear_auth_cookies(&mut response, origin.secure());
+    if let Some(secure) = secure {
+        clear_auth_cookies(&mut response, secure);
     }
     Ok(response)
 }

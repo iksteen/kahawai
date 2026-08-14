@@ -27,7 +27,7 @@ Neither first-admin path exists after setup succeeds.
 ```toml
 [hub]
 bind = "127.0.0.1:8420"
-public_url = "https://kahawai.example.com"  # canonical browser origin
+public_url = "https://kahawai.example.com"  # enables strict browser Origin checks
 # Peers allowed to speak for clients via X-Forwarded-For. Exact IPs
 # and/or CIDR ranges. REQUIRED for login throttling (OPS-2) to see
 # real client addresses — without it, every client behind the proxy
@@ -50,14 +50,16 @@ trusted_proxies = ["127.0.0.1"]          # proxy on the same host
 #                                        # per-IP throttling.
 ```
 
-`public_url` is optional for direct loopback use and must be an absolute
-HTTP(S) origin with no credentials, non-root path, query or fragment. HTTPS
-makes browser authentication cookies `Secure`; configured HTTP is permitted
-but logs that browser authentication cookies and tokens cross the network in
-cleartext. Without `public_url`, the hub derives the browser origin from
-`http://Host`. For a trusted socket peer only, the rightmost valid
-`X-Forwarded-Proto` and `X-Forwarded-Host` replace that value. Untrusted or
-missing peers cannot influence it. X-Forwarded-For is resolved right-to-left:
+`public_url` is optional and must be an absolute HTTP(S) origin with no
+credentials, non-root path, query or fragment. When configured, browser login,
+refresh and logout require that exact Origin. HTTPS makes browser authentication
+cookies `Secure`; configured HTTP is permitted but logs that browser
+authentication cookies and tokens cross the network in cleartext. When
+`public_url` is absent, browser Origin headers are not validated. For a trusted
+socket peer only, the rightmost valid `X-Forwarded-Proto` and
+`X-Forwarded-Host` may still identify HTTPS and mark the cookies `Secure`.
+Untrusted or missing peers cannot influence cookie security. X-Forwarded-For is
+resolved right-to-left:
 the first address that is not itself a trusted proxy wins, so clients cannot
 spoof their way into someone else's throttle bucket.
 

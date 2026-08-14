@@ -526,7 +526,7 @@ async fn auth_harness() -> (
     (dir, db, auth, api, setup)
 }
 #[tokio::test]
-async fn explicit_auth_modes_split_bearers_from_browser_cookies_and_enforce_origin() {
+async fn explicit_auth_modes_split_bearers_from_browser_cookies() {
     let (_dir, _db, _auth, api, _root) = auth_harness().await;
     for body in [
         serde_json::json!({"username": "root", "password": "hunter22222hunter"}),
@@ -584,27 +584,6 @@ async fn explicit_auth_modes_split_bearers_from_browser_cookies_and_enforce_orig
         StatusCode::BAD_REQUEST
     );
 
-    for origin in [None, Some("null"), Some("https://foreign.test")] {
-        let mut request = post_headers(
-            "/api/v1/auth/token",
-            serde_json::json!({
-                "client": "browser",
-                "username": "root",
-                "password": "hunter22222hunter"
-            }),
-            &[("host", "hub.test:8420")],
-        );
-        if let Some(origin) = origin {
-            request.headers_mut().insert(
-                axum::http::header::ORIGIN,
-                axum::http::HeaderValue::from_str(origin).unwrap(),
-            );
-        }
-        let response = api.clone().oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{origin:?}");
-        assert!(set_cookies(&response).is_empty());
-    }
-
     let browser_login = api
         .clone()
         .oneshot(post_headers(
@@ -616,7 +595,7 @@ async fn explicit_auth_modes_split_bearers_from_browser_cookies_and_enforce_orig
             }),
             &[
                 ("host", "hub.test:8420"),
-                ("origin", "http://hub.test:8420"),
+                ("origin", "https://foreign.test"),
             ],
         ))
         .await
@@ -655,40 +634,13 @@ async fn explicit_auth_modes_split_bearers_from_browser_cookies_and_enforce_orig
         StatusCode::BAD_REQUEST
     );
 
-    for origin in [
-        None,
-        Some("null"),
-        Some("https://foreign.test"),
-        Some("https://["),
-    ] {
-        let cookie_header = format!("kahawai_refresh={refresh}");
-        let mut request = post_headers(
-            "/api/v1/auth/refresh",
-            serde_json::json!({"client": "browser"}),
-            &[("host", "hub.test:8420"), ("cookie", &cookie_header)],
-        );
-        if let Some(origin) = origin {
-            request.headers_mut().insert(
-                axum::http::header::ORIGIN,
-                axum::http::HeaderValue::from_str(origin).unwrap(),
-            );
-        }
-        let response = api.clone().oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{origin:?}");
-        assert!(set_cookies(&response).is_empty());
-    }
-
     let cookie_header = format!("kahawai_refresh={refresh}");
     let browser_refresh = api
         .clone()
         .oneshot(post_headers(
             "/api/v1/auth/refresh",
             serde_json::json!({"client": "browser"}),
-            &[
-                ("host", "hub.test:8420"),
-                ("origin", "http://hub.test:8420"),
-                ("cookie", &cookie_header),
-            ],
+            &[("host", "hub.test:8420"), ("cookie", &cookie_header)],
         ))
         .await
         .unwrap();
@@ -730,7 +682,7 @@ async fn explicit_auth_modes_split_bearers_from_browser_cookies_and_enforce_orig
             serde_json::json!({"client": "browser"}),
             &[
                 ("host", "hub.test:8420"),
-                ("origin", "http://hub.test:8420"),
+                ("origin", "null"),
                 ("cookie", &cookie_header),
                 ("authorization", &authorization),
             ],
@@ -880,7 +832,7 @@ async fn media_cookie_is_limited_to_the_explicit_read_allowlist() {
 }
 
 #[tokio::test]
-async fn configured_and_forwarded_origins_control_browser_cookie_security() {
+async fn configured_origin_controls_validation_and_request_metadata_controls_cookie_security() {
     let (_dir, db, auth, _api, _root) = auth_harness().await;
     let router = |net| {
         test_router_with_net(
@@ -892,16 +844,23 @@ async fn configured_and_forwarded_origins_control_browser_cookie_security() {
             net,
         )
     };
-    let login = |host: &str, origin: &str| {
-        post_headers(
+    let login = |host: &str, origin: Option<&str>| {
+        let mut request = post_headers(
             "/api/v1/auth/token",
             serde_json::json!({
                 "client": "browser",
                 "username": "root",
                 "password": "hunter22222hunter"
             }),
-            &[("host", host), ("origin", origin)],
-        )
+            &[("host", host)],
+        );
+        if let Some(origin) = origin {
+            request.headers_mut().insert(
+                axum::http::header::ORIGIN,
+                axum::http::HeaderValue::from_str(origin).unwrap(),
+            );
+        }
+        request
     };
 
     let configured = router(kahawai_hub::api::NetOptions {
@@ -910,33 +869,106 @@ async fn configured_and_forwarded_origins_control_browser_cookie_security() {
         ),
         ..Default::default()
     });
+    for origin in [None, Some("null"), Some("https://foreign.test")] {
+        let response = configured
+            .clone()
+            .oneshot(login("attacker.invalid", origin))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{origin:?}");
+        assert!(set_cookies(&response).is_empty());
+    }
     let response = configured
         .clone()
-        .oneshot(login("attacker.invalid", "https://public.example"))
+        .oneshot(login("attacker.invalid", Some("https://public.example")))
         .await
         .unwrap();
     let cookies = set_cookies(&response);
     assert!(cookies.iter().all(|cookie| cookie.ends_with("; Secure")));
     let configured_refresh = cookie_value(&cookies, "kahawai_refresh");
     let cookie_header = format!("kahawai_refresh={configured_refresh}");
+    let refresh = |origin: Option<&str>, cookie: &str| {
+        let mut request = post_headers(
+            "/api/v1/auth/refresh",
+            serde_json::json!({"client": "browser"}),
+            &[
+                ("host", "attacker.invalid"),
+                ("x-forwarded-proto", "http"),
+                ("x-forwarded-host", "attacker.invalid"),
+                ("cookie", cookie),
+            ],
+        );
+        if let Some(origin) = origin {
+            request.headers_mut().insert(
+                axum::http::header::ORIGIN,
+                axum::http::HeaderValue::from_str(origin).unwrap(),
+            );
+        }
+        request
+    };
     assert_eq!(
         configured
-            .oneshot(post_headers(
-                "/api/v1/auth/refresh",
-                serde_json::json!({"client": "browser"}),
-                &[
-                    ("host", "attacker.invalid"),
-                    ("origin", "https://public.example"),
-                    ("x-forwarded-proto", "http"),
-                    ("x-forwarded-host", "attacker.invalid"),
-                    ("cookie", &cookie_header),
-                ],
-            ))
+            .clone()
+            .oneshot(refresh(None, &cookie_header))
             .await
             .unwrap()
             .status(),
+        StatusCode::FORBIDDEN
+    );
+    let response = configured
+        .clone()
+        .oneshot(refresh(Some("https://public.example"), &cookie_header))
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
         StatusCode::OK,
         "configured public_url must take precedence"
+    );
+    let cookies = set_cookies(&response);
+    let cookie_header = format!(
+        "kahawai_refresh={}",
+        cookie_value(&cookies, "kahawai_refresh")
+    );
+    let authorization = format!(
+        "Bearer {}",
+        body_json(response).await["access_token"].as_str().unwrap()
+    );
+    let logout = |origin: Option<&str>| {
+        let mut request = post_headers(
+            "/api/v1/auth/logout",
+            serde_json::json!({"client": "browser"}),
+            &[
+                ("host", "attacker.invalid"),
+                ("cookie", &cookie_header),
+                ("authorization", &authorization),
+            ],
+        );
+        if let Some(origin) = origin {
+            request.headers_mut().insert(
+                axum::http::header::ORIGIN,
+                axum::http::HeaderValue::from_str(origin).unwrap(),
+            );
+        }
+        request
+    };
+    assert_eq!(
+        configured
+            .clone()
+            .oneshot(logout(None))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        configured
+            .clone()
+            .oneshot(logout(Some("https://public.example")))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NO_CONTENT
     );
 
     let trust = Arc::new(kahawai_hub::proxy::ProxyTrust::parse(&["127.0.0.1".into()]).unwrap());
@@ -944,7 +976,7 @@ async fn configured_and_forwarded_origins_control_browser_cookie_security() {
         proxy_trust: trust.clone(),
         ..Default::default()
     });
-    let mut request = login("internal:8420", "https://public.example");
+    let mut request = login("internal:8420", Some("https://public.example"));
     request
         .headers_mut()
         .insert("x-forwarded-proto", "http, https".parse().unwrap());
@@ -967,7 +999,7 @@ async fn configured_and_forwarded_origins_control_browser_cookie_security() {
         proxy_trust: trust,
         ..Default::default()
     });
-    let mut request = login("internal:8420", "http://internal:8420");
+    let mut request = login("internal:8420", Some("http://internal:8420"));
     request
         .headers_mut()
         .insert("x-forwarded-proto", "https".parse().unwrap());

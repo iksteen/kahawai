@@ -9,7 +9,7 @@
     },
     "version": "0.0.0-dev"
   },
-  "x-kahawai-source-sha256": "ef3f8e3dbb073a2c6753e46aa4aa7db4d6e33b4defa0f2a8ffa299fdc57d0bca",
+  "x-kahawai-source-sha256": "415d776acd5b10dfd5517941634ab94ed55c9076091f5343f5ae7445532a333c",
   "paths": {
     "/admin/v1/collections": {
       "get": {
@@ -2045,6 +2045,20 @@
           "Authentication"
         ],
         "operationId": "logout",
+        "parameters": [
+          {
+            "name": "Origin",
+            "in": "header",
+            "description": "Required for browser mode when hub.public_url is configured; must match it exactly",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -2117,6 +2131,20 @@
           "Authentication"
         ],
         "operationId": "refresh",
+        "parameters": [
+          {
+            "name": "Origin",
+            "in": "header",
+            "description": "Required for browser mode when hub.public_url is configured; must match it exactly",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -2194,7 +2222,7 @@
           {
             "name": "Origin",
             "in": "header",
-            "description": "Required for browser mode; must match the canonical browser origin",
+            "description": "Required for browser mode when hub.public_url is configured; must match it exactly",
             "required": false,
             "schema": {
               "type": [

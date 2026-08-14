@@ -588,10 +588,12 @@ session streams/files. Item grants and session ownership remain inside that
 authentication boundary. Catalogue/detail/children/font-list reads,
 preferences, playback mutations and every admin route remain bearer-only.
 
-Browser login, refresh and logout require an exact, non-`null` Origin. Configured
-`hub.public_url` is authoritative; otherwise the origin is `http://Host`, with
-the rightmost `X-Forwarded-Proto`/`X-Forwarded-Host` used only for a socket peer
-in `trusted_proxies`. HTTPS sets `Secure`; configured HTTP logs a cleartext
+Browser login, refresh and logout require an exact, non-`null` Origin only when
+`hub.public_url` is configured; the configured value is authoritative. Without
+`public_url`, Origin validation is disabled. Cookie security remains
+request-aware: the rightmost `X-Forwarded-Proto`/`X-Forwarded-Host` identifies
+HTTPS only for a socket peer in `trusted_proxies`; otherwise cookies use the
+hub's direct HTTP view. HTTPS sets `Secure`; configured HTTP logs a cleartext
 credential warning. CORS stays independent and credential-free because
 cross-origin clients use API mode.
 

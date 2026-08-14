@@ -143,12 +143,14 @@ marked in that document.
       streams and files. Protected application mutations require an
       `Authorization` bearer token. Browser refresh is authenticated by its
       refresh cookie; browser logout requires both its access bearer and refresh
-      cookie. Browser login, refresh and logout additionally require an exact,
-      present, non-`null` Origin equal to AUTH-10's canonical Origin
-- [x] AUTH-10 Add `hub.public_url`. It determines the canonical Origin and
-      enables `Secure` cookies when it is HTTPS; forwarded scheme/host values
-      are trusted only from configured trusted proxies. An HTTP public URL is
-      permitted and warned about at startup
+      cookie. When AUTH-10 is configured, browser login, refresh and logout
+      additionally require an exact, present, non-`null` matching Origin
+- [x] AUTH-10 Add optional `hub.public_url`. When set, it determines the
+      canonical Origin, enables strict browser Origin checks, and marks cookies
+      `Secure` when it is HTTPS. When absent, Origin validation is disabled;
+      forwarded scheme/host values affect cookie security only when received
+      from configured trusted proxies. Configured HTTP is permitted and warned
+      about at startup
 - [x] AUTH-11 One owner middleware wraps every user-facing session resource:
       stream, playlist, segment, subtitle, seek, progress and end. Missing and
       foreign live ids return the same 404 body; administrative session routes

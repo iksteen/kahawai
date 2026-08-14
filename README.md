@@ -128,7 +128,7 @@ transcoder = true               # set false (then restart) to keep encoding off 
 
 [hub]
 bind = "127.0.0.1:8420"          # client API + web app; put a reverse proxy in front for TLS
-# public_url = "https://kahawai.example.com" # canonical browser origin; HTTPS sets Secure cookies
+# public_url = "https://kahawai.example.com" # enables strict browser Origin checks; HTTPS sets Secure cookies
 setup_bind = "127.0.0.1:8422"    # first-run browser only; loopback and a distinct listener port
 satellite_bind = "0.0.0.0:8421"  # enrollment + mTLS link for satellites
 data_dir = "~/.local/share/kahawai"  # db, PKI, caches (default shown for user installs)
@@ -162,12 +162,13 @@ name = "gpu-box"
 max_sessions = 2                 # concurrent encodes this machine offers
 ```
 
-`hub.public_url` is optional for direct loopback use. Set it to the exact
-browser-facing HTTP(S) origin behind a proxy. HTTPS adds `Secure` to the
-server-managed browser cookies; configured HTTP is allowed but logs that
-authentication cookies and tokens cross the network in cleartext. When it is
-unset, only peers in `hub.trusted_proxies` may replace the `http://Host`
-default through `X-Forwarded-Proto` and `X-Forwarded-Host`.
+`hub.public_url` is optional. When set, it must be the exact browser-facing
+HTTP(S) origin; browser login, refresh and logout then require that Origin
+exactly. HTTPS adds `Secure` to the server-managed browser cookies; configured
+HTTP is allowed but logs that authentication cookies and tokens cross the
+network in cleartext. When `public_url` is unset, Kahawai does not validate
+browser Origin headers. Trusted `X-Forwarded-Proto` and `X-Forwarded-Host`
+values may still mark cookies `Secure`.
 
 The live OpenAPI 3.2 document is served at `/api-docs/openapi.json`; browse and
 exercise it through the embedded Swagger UI at `/swagger-ui`.
