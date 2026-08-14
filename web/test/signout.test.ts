@@ -77,6 +77,28 @@ class TestBroadcastChannel {
   }
 }
 
+type ScheduledTimer = {
+  run: () => void
+  delayMs: number
+}
+
+let nextTimer = 1
+const timers = new Map<number, ScheduledTimer>()
+Object.defineProperty(globalThis, 'setTimeout', {
+  configurable: true,
+  value: (run: () => void, delayMs = 0) => {
+    const id = nextTimer++
+    timers.set(id, { run, delayMs })
+    return id
+  },
+})
+Object.defineProperty(globalThis, 'clearTimeout', {
+  configurable: true,
+  value: (id?: number) => {
+    if (id !== undefined) timers.delete(id)
+  },
+})
+
 Object.defineProperty(globalThis, 'window', { configurable: true, value: {} })
 Object.defineProperty(globalThis, 'BroadcastChannel', {
   configurable: true,
@@ -190,6 +212,34 @@ beforeEach(async () => {
   cookieWrites.length = 0
   downloaded.length = 0
   locks.reset()
+  timers.clear()
+  nextTimer = 1
+})
+
+test('the server lifetime refreshes an opaque access token before expiry', async () => {
+  let refreshCalls = 0
+  setHub((call) => {
+    if (call.url.endsWith('/auth/refresh')) refreshCalls++
+    return response({
+      access_token: refreshCalls ? 'refreshed-opaque-access-token' : 'opaque-access-token',
+      expires_in: 900,
+    })
+  })
+
+  await browserLogin('root', 'password-123')
+  const [[timerId, timer]] = timers
+  assert.equal(timer?.delayMs, 14 * 60_000)
+
+  timers.delete(timerId)
+  timer?.run()
+  await new Promise<void>((resolve) => setImmediate(resolve))
+
+  assert.equal(refreshCalls, 1)
+  assert.equal(accessToken(), 'refreshed-opaque-access-token')
+  assert.deepEqual(
+    [...timers.values()].map((scheduled) => scheduled.delayMs),
+    [14 * 60_000],
+  )
 })
 
 test('sign-out clears access tokens in every open tab', async () => {

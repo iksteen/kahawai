@@ -134,9 +134,10 @@ marked in that document.
       refresh and media credentials
 - [x] AUTH-8 Browser access tokens live in memory only. A reload obtains a new
       access token through the refresh cookie; neither access nor refresh tokens
-      are written to local storage or a JavaScript-readable cookie. Deliberate
-      sign-out tells every open same-origin tab to drop its per-tab access token
-      before the shared refresh family is revoked
+      are written to local storage or a JavaScript-readable cookie. Proactive
+      rotation is scheduled from the server-returned `expires_in`, without
+      decoding the bearer. Deliberate sign-out tells every open same-origin tab
+      to drop its per-tab access token before the shared refresh family is revoked
 - [x] AUTH-9 Accept media-cookie authentication only for `GET`/`HEAD` on
       `/api/v1/events`, item artwork/subtitle/font files, and playback session
       streams and files. Protected application mutations require an

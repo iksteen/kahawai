@@ -305,9 +305,10 @@ How something works and why it was built that way belong in
       (invalidation hints: scan progress, satellite connectivity,
       sessions, enrichment; cookie-authenticated for EventSource).
       API clients use explicit bearer mode. Browser mode keeps its access JWT
-      only in memory and uses host-only HttpOnly refresh/media cookies; reload
-      rotates the refresh family, and logout clears both cookies. The media
-      cookie is accepted only by the explicit read allowlist, while mutations
+      only in memory, schedules rotation from the returned `expires_in` rather
+      than decoding the bearer, and uses host-only HttpOnly refresh/media
+      cookies; reload rotates the refresh family, and logout clears both cookies.
+      The media cookie is accepted only by the explicit read allowlist, while mutations
       remain bearer-only. Browser login, refresh and logout require the
       canonical Origin derived from `hub.public_url` or trusted request metadata.
       Access JWTs retain the explicit HS256-only allowlist, fixed issuer,

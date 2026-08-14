@@ -96,10 +96,10 @@ export function onTokensCleared(cb: ((deliberate: boolean) => void) | null) {
   onCleared = cb
 }
 
-function installAccess(token: string, expected = generation): boolean {
+function installAccess(token: string, expiresIn: number, expected = generation): boolean {
   if (generation !== expected) return false
   access = token
-  keepTokenFresh()
+  scheduleTokenRefresh(refreshDelayMs(expiresIn * 1000))
   return true
 }
 
@@ -127,18 +127,13 @@ function claims(): { username?: string; admin?: boolean; exp?: number } {
   }
 }
 
-export function keepTokenFresh() {
+function scheduleTokenRefresh(delayMs: number) {
   clearTimeout(refreshTimer)
-  const exp = claims().exp
-  if (!exp) return
-  refreshTimer = setTimeout(
-    () => {
-      void refreshTokens().then((ok) => {
-        if (!ok && accessToken()) refreshTimer = setTimeout(keepTokenFresh, REFRESH_RETRY_MS)
-      })
-    },
-    refreshDelayMs(exp * 1000, Date.now()),
-  )
+  refreshTimer = setTimeout(() => {
+    void refreshTokens().then((ok) => {
+      if (!ok && accessToken()) scheduleTokenRefresh(REFRESH_RETRY_MS)
+    })
+  }, delayMs)
 }
 
 export function username(): string {
@@ -166,7 +161,7 @@ async function rotate(started: number, throwTransient: boolean): Promise<boolean
         skipAuthorization: true,
       },
     )
-    return installAccess(fresh.access_token, started)
+    return installAccess(fresh.access_token, fresh.expires_in, started)
   } catch (error) {
     if (error instanceof ApiError && (error.status === 401 || error.status === 403)) {
       clearAccess(false, started)
@@ -202,7 +197,7 @@ export async function browserLogin(username: string, password: string): Promise<
       { client: 'browser', username, password },
       { skipAuthRefresh: true, skipAuthorization: true },
     )
-    installAccess(session.access_token, started)
+    installAccess(session.access_token, session.expires_in, started)
   })
 }
 

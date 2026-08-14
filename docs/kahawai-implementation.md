@@ -558,9 +558,12 @@ Client authentication has explicit transport modes. `client: "api"` login and
 refresh return a 15-minute access JWT and a rotating 30-day refresh bearer;
 logout takes that refresh bearer alongside the access bearer, and none of
 those responses sets authentication cookies. `client: "browser"` returns only
-`{access_token, expires_in}`. The SPA holds that access token in module memory;
-deliberate sign-out broadcasts a non-secret invalidation to every open
-same-origin tab before the shared refresh family is revoked.
+`{access_token, expires_in}`. The SPA holds that access token in module memory
+and schedules rotation from `expires_in` one minute before expiry. Refresh
+scheduling does not decode the bearer, so claim-decoding failure cannot disable
+rotation. Deliberate sign-out
+broadcasts a non-secret invalidation to every open same-origin tab before the
+shared refresh family is revoked.
 The server owns `kahawai_refresh` (`Path=/api/v1/auth`, 30 days) and
 `kahawai_media` (`Path=/api/v1`, 15 minutes) as host-only, `HttpOnly`,
 `SameSite=Strict` cookies. Reload bootstraps publicly, then refreshes through

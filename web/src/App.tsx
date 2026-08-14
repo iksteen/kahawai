@@ -4,7 +4,6 @@ import {
   fetchBootstrap,
   fetchLibraries,
   isAdmin,
-  keepTokenFresh,
   onTokensCleared,
   restoreSession,
   signOut,
@@ -363,23 +362,6 @@ export default function App() {
       }
     })()
   }, [bootAttempt])
-
-  // Keep the media cookie fresh: <video> and hls.js requests authenticate
-  // with it, and access tokens expire after 15 minutes.
-  //
-  // Scheduled from the token's OWN expiry, not on a fixed interval. A
-  // 10-minute interval looks like enough margin against a 15-minute
-  // token until it restarts: every mount began the count again without
-  // refreshing, so a reload landing partway through left a gap longer
-  // than the token lived. Measured 2026-08-07 — token issued 14:38:07,
-  // dead 14:53:07, refreshed 14:56:48. In those three minutes hls.js
-  // got 401s, stopped loading, and the session it was reading was
-  // reaped for idleness; the 401 also masked the 404 that would have
-  // told the player to recover.
-  useEffect(() => {
-    if (phase !== 'app') return
-    keepTokenFresh()
-  }, [phase])
 
   // The jump menu lists the libraries, so the shell needs them. Failing
   // to get them costs the menu its entries and nothing else, so it stays
