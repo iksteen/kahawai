@@ -96,13 +96,11 @@ docker run --rm --user "$user" -v "$work:/data" --entrypoint sh "$TAG" -c \
 [ -s "$work/media/movies/Smoke.Test.2026.mkv" ] || fail "the image could not mux a test clip"
 
 echo "==> starting all-in-one from $TAG" >&2
-docker run -d --name "$name" --user "$user" -p 0:8420 -p 127.0.0.1::8422 -v "$work:/data" \
+docker run -d --name "$name" --user "$user" -p 0:8420 -v "$work:/data" \
     "$TAG" all-in-one --config /data/kahawai.toml >/dev/null 2>&1 \
     || fail "docker run"
 api=$(docker port "$name" 8420/tcp | head -1)
 api="localhost:${api##*:}"
-setup=$(docker port "$name" 8422/tcp | head -1)
-setup="localhost:${setup##*:}"
 
 logs() { docker logs "$name" 2>&1 | sed 's/\x1b\[[0-9;]*m//g'; }
 # `d` is the parsed body; the expression prints what it wants from it.
@@ -112,15 +110,26 @@ py() { python3 -c "import json,sys; d=json.load(sys.stdin); $1"; }
 # Items come back as a bare list or under "items", depending on version.
 items='it = d if isinstance(d, list) else d["items"];'
 
+# `setup_bind` is loopback inside the container. Publishing 8422 would DNAT
+# to the container's bridge address and cannot reach a listener on its own
+# 127.0.0.1, so make this request from inside the network namespace. The
+# runtime image has bash; /dev/tcp avoids adding curl solely for this check.
 for _ in $(seq 30); do
-    curl -sf "http://$setup/api/v1/bootstrap" >/dev/null && break
+    [ -S "$work/state/bootstrap.sock" ] && break
     sleep 2
 done
-
-curl -sf -X POST "http://$setup/api/v1/setup" \
-    -H "Origin: http://$setup" -H content-type:application/json \
-    -d '{"username":"smoke","password":"smoke-password-1"}' >/dev/null \
-    || { logs | tail -20 >&2; fail "local setup failed"; }
+[ -S "$work/state/bootstrap.sock" ] \
+    || { logs | tail -20 >&2; fail "the local setup control plane never opened"; }
+setup_body='{"username":"smoke","password":"smoke-password-1"}'
+setup_response=$(docker exec "$name" bash -c '
+    set -e
+    body=$1
+    exec 3<>/dev/tcp/127.0.0.1/8422
+    printf "POST /api/v1/setup HTTP/1.1\r\nHost: localhost:8422\r\nOrigin: http://localhost:8422\r\nContent-Type: application/json\r\nContent-Length: %s\r\nConnection: close\r\n\r\n%s" "${#body}" "$body" >&3
+    cat <&3
+' _ "$setup_body") || { logs | tail -20 >&2; fail "local setup request failed"; }
+printf '%s' "$setup_response" | grep -q '^HTTP/1.1 204' \
+    || { printf '%s\n' "$setup_response" >&2; fail "local setup was not accepted"; }
 auth=$(curl -sf -X POST "http://$api/api/v1/auth/token" -H content-type:application/json \
     -d '{"username":"smoke","password":"smoke-password-1"}' \
     | py 'print(d["access_token"])')
