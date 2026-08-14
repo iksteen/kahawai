@@ -55,6 +55,7 @@ use sqlx::{Row, SqlitePool};
 
 const ACCESS_TTL_SECS: i64 = 15 * 60;
 const REFRESH_TTL_SECS: i64 = 30 * 24 * 3600;
+pub const MIN_PASSWORD_CHARS: usize = 12;
 
 /// JWT issuer: the authority that minted the credential. The per-hub signing
 /// secret distinguishes installations; this stable value names the authority
@@ -108,6 +109,13 @@ pub struct TokenPair {
     pub refresh_token: String,
     pub expires_in: i64,
 }
+#[derive(Debug, thiserror::Error)]
+pub enum CredentialPolicyError {
+    #[error("username required")]
+    UsernameRequired,
+    #[error("password must be at least 12 characters")]
+    PasswordTooShort,
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum RefreshError {
@@ -120,8 +128,8 @@ pub enum RefreshError {
 /// Why the one-time trusted-local setup transition did not commit.
 #[derive(Debug, thiserror::Error)]
 pub enum CompleteSetupError {
-    #[error("username required and password must be at least 8 characters")]
-    InvalidInput,
+    #[error(transparent)]
+    InvalidInput(#[from] CredentialPolicyError),
     #[error("setup already completed")]
     AlreadyCompleted,
     #[error(transparent)]
@@ -244,6 +252,19 @@ fn parse_refresh_token(token: &str) -> Option<(&str, String)> {
     }
     Some((family_id, hash_token(token)))
 }
+fn validate_credentials<'a>(
+    username: &'a str,
+    password: &str,
+) -> std::result::Result<&'a str, CredentialPolicyError> {
+    let username = username.trim();
+    if username.is_empty() {
+        return Err(CredentialPolicyError::UsernameRequired);
+    }
+    if password.chars().count() < MIN_PASSWORD_CHARS {
+        return Err(CredentialPolicyError::PasswordTooShort);
+    }
+    Ok(username)
+}
 
 pub fn hash_password(password: &str) -> Result<String> {
     let salt = SaltString::generate(&mut OsRng);
@@ -328,10 +349,7 @@ impl Auth {
         username: &str,
         password: &str,
     ) -> std::result::Result<(), CompleteSetupError> {
-        let username = username.trim();
-        if username.is_empty() || password.len() < 8 {
-            return Err(CompleteSetupError::InvalidInput);
-        }
+        let username = validate_credentials(username, password)?;
         // Deliberately outside SQLite's write lock: Argon2 is expensive, but
         // the transaction below is still the authority on who won the race.
         let hash = hash_password(password)?;
@@ -494,16 +512,14 @@ impl Auth {
 
     /// Admin user creation (HUB-26 first cut).
     pub async fn create_user(&self, username: &str, password: &str, admin: bool) -> Result<String> {
-        if username.trim().is_empty() || password.len() < 8 {
-            bail!("username required and password must be at least 8 characters");
-        }
+        let username = validate_credentials(username, password)?;
         let id = ulid::Ulid::generate().to_string();
         let hash = hash_password(password)?;
         sqlx::query(
             "INSERT INTO users (id, username, password_hash, is_admin) VALUES (?, ?, ?, ?)",
         )
         .bind(&id)
-        .bind(username.trim())
+        .bind(username)
         .bind(&hash)
         .bind(admin)
         .execute(&self.db)
@@ -748,6 +764,7 @@ impl Auth {
 /// CLI escape hatch (OPS-1): overwrite a user's password hash and revoke
 /// every refresh family in the same committed transaction.
 pub async fn reset_password(db: &SqlitePool, username: &str, new_password: &str) -> Result<()> {
+    let username = validate_credentials(username, new_password)?;
     let hash = hash_password(new_password)?;
     let mut tx = db.begin_with("BEGIN IMMEDIATE").await?;
     let res = sqlx::query(

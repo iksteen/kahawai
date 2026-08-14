@@ -342,8 +342,8 @@ async fn review_queue_flow() {
             .await
             .unwrap(),
     );
-    auth.complete_setup("a", "password-1").await.unwrap();
-    let token = auth.login("a", "password-1").await.unwrap().access_token;
+    auth.complete_setup("a", "password-123").await.unwrap();
+    let token = auth.login("a", "password-123").await.unwrap().access_token;
     let sessions = Arc::new(kahawai_hub::sessions::Sessions::new(
         tempfile::tempdir().unwrap().keep(),
     ));

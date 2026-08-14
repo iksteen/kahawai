@@ -172,7 +172,6 @@ pub async fn reset_password(cfg: config::HubConfig, username: &str) -> Result<()
     let mut pw = String::new();
     std::io::stdin().read_line(&mut pw)?;
     let pw = pw.trim_end_matches('\n');
-    anyhow::ensure!(pw.len() >= 8, "password must be at least 8 characters");
     kahawai_hub::auth::reset_password(&db, username, pw).await?;
     println!("password updated; existing sessions revoked");
     Ok(())
@@ -586,7 +585,7 @@ mod tests {
         }
 
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let body = r#"{"username":"browser","password":"hunter22222"}"#;
+        let body = r#"{"username":"browser","password":"hunter222222"}"#;
         let mut local = tokio::net::TcpStream::connect(setup_addr).await.unwrap();
         local
             .write_all(
@@ -652,7 +651,7 @@ mod tests {
         let task = tokio::spawn(serve_bootstrap_socket(listener, path.clone(), auth));
         let mut stream = tokio::net::UnixStream::connect(&path).await.unwrap();
         stream
-            .write_all(b"{\"username\":\"local\",\"password\":\"hunter22222\"}\n")
+            .write_all(b"{\"username\":\"local\",\"password\":\"hunter222222\"}\n")
             .await
             .unwrap();
         let mut response = String::new();

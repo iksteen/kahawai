@@ -296,10 +296,11 @@ function UsersSection({
         <input
           type="password"
           // Says so before you press Create, not after.
-          className={pass && pass.length < 8 ? 'invalid' : ''}
-          placeholder="password (8+ characters)"
+          className={pass && Array.from(pass).length < 12 ? 'invalid' : ''}
+          placeholder="At least 12 characters"
           value={pass}
           onChange={(e) => setPass(e.target.value)}
+          minLength={12}
         />
         <button
           type="button"
@@ -309,7 +310,7 @@ function UsersSection({
         >
           admin
         </button>
-        <button className="btn small" disabled={!name.trim() || pass.length < 8}>
+        <button className="btn small" disabled={!name.trim() || Array.from(pass).length < 12}>
           Create
         </button>
       </form>

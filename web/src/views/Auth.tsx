@@ -124,9 +124,14 @@ export default function Auth({
           value={password}
           onChange={(e) => setPassword(e.target.value)}
           autoComplete={mode === 'setup' ? 'new-password' : 'current-password'}
+          minLength={mode === 'setup' ? 12 : undefined}
         />
+        {mode === 'setup' && <p className="auth-hint">At least 12 characters.</p>}
         {error && <div className="error">{error}</div>}
-        <button className="btn" disabled={busy}>
+        <button
+          className="btn"
+          disabled={busy || (mode === 'setup' && Array.from(password).length < 12)}
+        >
           {mode === 'setup' ? 'Create admin account' : 'Sign in'}
         </button>
       </form>

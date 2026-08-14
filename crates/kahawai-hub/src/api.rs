@@ -1488,7 +1488,7 @@ async fn setup(
         .complete_setup(&body.username, &body.password)
         .await
         .map_err(|e| match e {
-            error @ CompleteSetupError::InvalidInput => {
+            error @ CompleteSetupError::InvalidInput(_) => {
                 (StatusCode::BAD_REQUEST, error.to_string())
             }
             error @ CompleteSetupError::AlreadyCompleted => {

@@ -62,11 +62,71 @@ async fn setup_maps_validation_and_storage_failures_separately() {
 
     db.close().await;
     let unavailable = local
-        .oneshot(request("admin", "hunter22222"))
+        .oneshot(request("admin", "hunter222222"))
         .await
         .unwrap();
     assert_eq!(unavailable.status(), StatusCode::INTERNAL_SERVER_ERROR);
     assert!(auth.setup_required());
+}
+
+#[tokio::test]
+async fn password_establishment_uses_twelve_unicode_scalars_and_preserves_legacy_hashes() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    let auth = Auth::new(db.clone(), dir.path()).await.unwrap();
+
+    assert_eq!(
+        auth.complete_setup("", "............")
+            .await
+            .unwrap_err()
+            .to_string(),
+        "username required"
+    );
+    assert_eq!(
+        auth.complete_setup("root", &"🙂".repeat(11))
+            .await
+            .unwrap_err()
+            .to_string(),
+        "password must be at least 12 characters"
+    );
+    auth.complete_setup("root", "............").await.unwrap();
+
+    assert_eq!(
+        auth.create_user("short", &"🙂".repeat(11), false)
+            .await
+            .unwrap_err()
+            .to_string(),
+        "password must be at least 12 characters"
+    );
+    auth.create_user("symbols", "!!!!!!!!!!!!", false)
+        .await
+        .unwrap();
+    auth.create_user("passphrase", &"x".repeat(64), false)
+        .await
+        .unwrap();
+    assert_eq!(
+        kahawai_hub::auth::reset_password(&db, "symbols", "eleven-chrs")
+            .await
+            .unwrap_err()
+            .to_string(),
+        "password must be at least 12 characters"
+    );
+    let unicode_password = "🙂".repeat(12);
+    kahawai_hub::auth::reset_password(&db, "symbols", &unicode_password)
+        .await
+        .unwrap();
+    auth.login("symbols", &unicode_password).await.unwrap();
+
+    let legacy_hash = kahawai_hub::auth::hash_password("short").unwrap();
+    sqlx::query(
+        "INSERT INTO users (id, username, password_hash, is_admin)
+         VALUES ('legacy', 'legacy', ?, 0)",
+    )
+    .bind(legacy_hash)
+    .execute(&db)
+    .await
+    .unwrap();
+    auth.login("legacy", "short").await.unwrap();
 }
 
 #[tokio::test]
@@ -108,7 +168,7 @@ async fn setup_then_auth_flow() {
         .clone()
         .oneshot(post(
             "/api/v1/setup",
-            serde_json::json!({"username": "attacker", "password": "hunter22222"}),
+            serde_json::json!({"username": "attacker", "password": "hunter222222"}),
         ))
         .await
         .unwrap();
@@ -125,7 +185,7 @@ async fn setup_then_auth_flow() {
                 .header("origin", "https://attacker.example")
                 .header("content-type", "application/json")
                 .body(Body::from(
-                    serde_json::json!({"username": "attacker", "password": "hunter22222"})
+                    serde_json::json!({"username": "attacker", "password": "hunter222222"})
                         .to_string(),
                 ))
                 .unwrap(),
@@ -145,7 +205,7 @@ async fn setup_then_auth_flow() {
                 .header("origin", "http://localhost:8422")
                 .header("content-type", "application/json")
                 .body(Body::from(
-                    serde_json::json!({"username": "ingmar", "password": "hunter22222"})
+                    serde_json::json!({"username": "ingmar", "password": "hunter222222"})
                         .to_string(),
                 ))
                 .unwrap(),
@@ -164,7 +224,7 @@ async fn setup_then_auth_flow() {
         api.clone()
             .oneshot(post(
                 "/api/v1/auth/token",
-                serde_json::json!({"username": "ingmar", "password": "hunter22222"}),
+                serde_json::json!({"username": "ingmar", "password": "hunter222222"}),
             ))
             .await
             .unwrap(),
@@ -218,7 +278,7 @@ async fn setup_then_auth_flow() {
         .clone()
         .oneshot(post(
             "/api/v1/auth/token",
-            serde_json::json!({"username": "ingmar", "password": "hunter22222"}),
+            serde_json::json!({"username": "ingmar", "password": "hunter222222"}),
         ))
         .await
         .unwrap();
@@ -268,7 +328,7 @@ async fn setup_then_auth_flow() {
     kahawai_hub::auth::reset_password(&db, "ingmar", "new-password-9")
         .await
         .unwrap();
-    assert!(auth.login("ingmar", "hunter22222").await.is_err());
+    assert!(auth.login("ingmar", "hunter222222").await.is_err());
     let after_reset = auth.login("ingmar", "new-password-9").await.unwrap();
     assert!(
         auth.authenticate(&access).await.is_err(),
@@ -439,8 +499,8 @@ async fn concurrent_local_setup_has_exactly_one_winner() {
     let db = kahawai_hub::db::open(dir.path()).await.unwrap();
     let auth = Arc::new(Auth::new(db.clone(), dir.path()).await.unwrap());
     let (a, b) = tokio::join!(
-        auth.complete_setup("browser", "hunter22222"),
-        auth.complete_setup("cli", "hunter22222")
+        auth.complete_setup("browser", "hunter222222"),
+        auth.complete_setup("cli", "hunter222222")
     );
     assert_ne!(a.is_ok(), b.is_ok(), "two local setup transports won");
     assert_eq!(
@@ -478,9 +538,9 @@ async fn items_filter_by_library() {
             tempfile::tempdir().unwrap().keep(),
         )),
     );
-    auth.complete_setup("ingmar", "hunter22222").await.unwrap();
+    auth.complete_setup("ingmar", "hunter222222").await.unwrap();
     let token = auth
-        .login("ingmar", "hunter22222")
+        .login("ingmar", "hunter222222")
         .await
         .unwrap()
         .access_token;
@@ -621,9 +681,9 @@ async fn admin_creates_users() {
     let db = kahawai_hub::db::open(dir.path()).await.unwrap();
     let registry = Arc::new(Registry::new(db.clone(), Default::default()));
     let auth = Arc::new(Auth::new(db.clone(), dir.path()).await.unwrap());
-    auth.complete_setup("root", "hunter22222").await.unwrap();
+    auth.complete_setup("root", "hunter222222").await.unwrap();
     let admin_token = auth
-        .login("root", "hunter22222")
+        .login("root", "hunter222222")
         .await
         .unwrap()
         .access_token;
@@ -699,7 +759,7 @@ async fn login_throttles_after_repeated_failures() {
     let db = kahawai_hub::db::open(dir.path()).await.unwrap();
     let registry = Arc::new(Registry::new(db.clone(), Default::default()));
     let auth = Arc::new(Auth::new(db.clone(), dir.path()).await.unwrap());
-    auth.complete_setup("ingmar", "hunter22222").await.unwrap();
+    auth.complete_setup("ingmar", "hunter222222").await.unwrap();
     let api = test_router(
         registry,
         auth.clone(),
@@ -734,7 +794,7 @@ async fn login_throttles_after_repeated_failures() {
         .clone()
         .oneshot(post(
             "/api/v1/auth/token",
-            serde_json::json!({"username": "ingmar", "password": "hunter22222"}),
+            serde_json::json!({"username": "ingmar", "password": "hunter222222"}),
         ))
         .await
         .unwrap();
@@ -784,7 +844,7 @@ async fn bootstrap_states_setup_and_auth_without_a_token() {
     assert_eq!(v["setup_url"], "http://127.0.0.1:8422");
     assert_eq!(v["authenticated"], false);
 
-    auth.complete_setup("ingmar", "hunter22222").await.unwrap();
+    auth.complete_setup("ingmar", "hunter222222").await.unwrap();
 
     // Setup done, no token presented: the login screen, said plainly.
     let v = body_json(api.clone().oneshot(probe()).await.unwrap()).await;
@@ -803,7 +863,7 @@ async fn bootstrap_states_setup_and_auth_without_a_token() {
         api.clone()
             .oneshot(post(
                 "/api/v1/auth/token",
-                serde_json::json!({"username": "ingmar", "password": "hunter22222"}),
+                serde_json::json!({"username": "ingmar", "password": "hunter222222"}),
             ))
             .await
             .unwrap(),
@@ -1327,9 +1387,9 @@ async fn admin_deletes_users() {
     let db = kahawai_hub::db::open(dir.path()).await.unwrap();
     let registry = Arc::new(Registry::new(db.clone(), Default::default()));
     let auth = Arc::new(Auth::new(db.clone(), dir.path()).await.unwrap());
-    auth.complete_setup("root", "hunter22222").await.unwrap();
+    auth.complete_setup("root", "hunter222222").await.unwrap();
     let admin_token = auth
-        .login("root", "hunter22222")
+        .login("root", "hunter222222")
         .await
         .unwrap()
         .access_token;
@@ -1345,10 +1405,17 @@ async fn admin_deletes_users() {
         .await
         .unwrap();
 
-    let victim = auth.create_user("bob", "hunter22222", false).await.unwrap();
+    let victim = auth
+        .create_user("bob", "hunter222222", false)
+        .await
+        .unwrap();
     // Everything a user owns: a live token, watch state, a preference,
     // and an archived row that has no foreign key to hold it down.
-    let bob = auth.login("bob", "hunter22222").await.unwrap().access_token;
+    let bob = auth
+        .login("bob", "hunter222222")
+        .await
+        .unwrap()
+        .access_token;
     sqlx::query(
         "INSERT INTO satellites(module_id,module_type,name,cert_fingerprint)
                  VALUES('fixture','mediahost','fixture','fp')",
@@ -1425,7 +1492,11 @@ async fn admin_deletes_users() {
     // A token minted while bob was an admin dies with the demotion's durable
     // generation bump. It cannot use a stale role to reach any admin action.
     auth.set_admin(&victim, true).await.unwrap();
-    let bob_admin_token = auth.login("bob", "hunter22222").await.unwrap().access_token;
+    let bob_admin_token = auth
+        .login("bob", "hunter222222")
+        .await
+        .unwrap()
+        .access_token;
     auth.set_admin(&victim, false).await.unwrap();
     assert_eq!(
         del(bob_admin_token, admin_id.clone()).await.status(),
@@ -1502,7 +1573,7 @@ async fn admin_deletes_users() {
     // And the last admin is refused, so a hub cannot be orphaned: an
     // emptied one does not fall back into setup mode until it restarts.
     let second = auth
-        .create_user("root2", "hunter22222", true)
+        .create_user("root2", "hunter222222", true)
         .await
         .unwrap();
     assert_eq!(
