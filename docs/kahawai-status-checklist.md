@@ -651,7 +651,8 @@ How something works and why it was built that way belong in
 - [x] NFR-8 Codec support delegated to system GStreamer; MIT throughout —
       the OCR tier links leptess/Tesseract (MIT/Apache-2.0), not
       subtile-ocr, so no GPL combined-work consequence exists;
-      --no-default-features additionally drops the Tesseract linkage
+      --no-default-features additionally drops the Tesseract linkage;
+      hosted CI run 31788811563 built the complete feature-off workspace
 
 ## v1 acceptance criteria
 
