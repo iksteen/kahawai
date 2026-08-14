@@ -1,213 +1,262 @@
 # Kahawai
 
-**Kahawai** (*kah-hah-why*) is Hawaiian for *stream* — the channel a river carves through the land — which is exactly what this is: a self-hosted media streaming server for the series, movies, music, and anime you've backed up from your own media. It's also, happily, the Māori name of a strong, fast-schooling New Zealand fish ("strong water"), which we're keeping as the unofficial mascot.
+*Kahawai* (*kah-hah-why*) is Hawaiian for **stream**. In te reo Māori, kahawai
+is also the name of *Arripis trutta*, from *kaha* (strong) and *wai* (water).
 
-## What it is
+## What Kahawai is
 
-A Rust backend built on GStreamer, shipped two ways from one codebase:
+Kahawai is a self-hosted server for streaming movies, series, anime, and music
+from your own media. It is written in Rust, uses GStreamer for media processing,
+and includes its web interface in the server binary.
 
-- **All-in-one** — a single binary for a NAS or home server.
-- **Modular** — a **hub** (the only thing clients talk to), one or more **mediahosts** (announce collections of media from their disks), and optional **transcoders** (handle playback for clients that can't play the source as-is). Satellites dial out to the hub and enroll via a console-code certificate flow — the hub is its own CA.
+Every deployment has three roles:
 
-## What makes it different
+- **Hub:** serves the web interface and API, owns users and library state, and is
+  the only role clients contact.
+- **Mediahost:** indexes read-only media roots and serves source bytes to the hub.
+- **Transcoder:** re-encodes streams a client cannot play directly.
 
-- **Plays the cheapest sufficient path, always.** Direct play when possible; container remuxing happens *in the hub* with no transcoder needed; re-encoding is a last resort, per-stream, hardware-accelerated, and scheduled across however many transcoder machines you attach.
-- **Anime as a first-class citizen.** AniDB exact-file matching via ED2K hashes, AniList relations and watch orders, fansub filename conventions, and ASS subtitles rendered faithfully — client-side with real fonts where the player can, burn-in or opt-in flattening where it can't.
-- **Honest capability negotiation.** Clients report what they can actually decode; the server explains every playback decision ("why is this transcoding?") right in the UI.
-- **Batteries included.** Embedded web app for admin and playback, metadata from TheTVDB/TMDB/MusicBrainz, user-initiated subtitle downloads via OpenSubtitles, multi-user watch state — all in the binary, no external services.
+The hub chooses the cheapest complete playback path: direct play, remux in the
+hub, or transcode only the incompatible streams. An **all-in-one** process runs
+the hub, a mediahost, and an optional transcoder on one machine. Satellites use
+mTLS, dial the hub, and never accept inbound application traffic.
 
-## Status
-
-Running daily. Working today: direct play, in-hub remuxing to HLS,
-hardware-accelerated transcoding dispatched across a fleet (NVENC, VA-API,
-VideoToolbox verified) with self-healing and seek-anywhere; movies, series,
-anime, and music resolution (including multi-CD rips and absolute-numbered
-fansub releases); libraries; embedded and sidecar subtitles served as WebVTT;
-audio/video track switching; TMDB metadata with TheTVDB fallback, posters,
-and an in-place match-review flow; incremental rescans with filesystem
-watching; multi-user watch state — all driven from the embedded web app.
-
-Still ahead: episode-level metadata, subtitle downloads (OpenSubtitles),
-faithful ASS rendering with fonts, AniDB/AniList, MusicBrainz, quality
-ladders, and the hardening pass. Design documents:
+Kahawai stores its state in SQLite and requires no external database. The web
+interface provides playback, libraries, users, metadata, match review, watch
+state, and administration.
 
 - [Technical requirements](./docs/kahawai-technical-requirements.md)
-- [Implementation design](./docs/kahawai-implementation.md)
-- [Release process](./docs/kahawai-releasing.md)
+- [Implementation](./docs/kahawai-implementation.md)
+- [Deployment details](./docs/kahawai-deployment.md)
 
-## Running it
+## Install all-in-one
 
-> **The container image is the recommended way to run kahawai.** It builds
-> GStreamer with the fixes in [`patches/`](./patches), which are not in a
-> release yet. On a stock install, files that those patches address will fail
-> to play — usually looking like corrupt media rather than a missing fix.
->
-> ```sh
-> docker build -t kahawai .
-> docker run --rm --gpus all kahawai doctor                   # NVIDIA
-> docker run --rm --device=/dev/dri:/dev/dri kahawai doctor   # Intel/AMD
-> ```
->
-> Building from source works and is what development uses — the notes below
-> cover it. Each patch carries a report and a reproducer that needs no media,
-> so you can check whether your own GStreamer is affected.
+The supported installation is the container image. It includes the required
+GStreamer stack and Kahawai's media fixes.
 
-### Prerequisites
-
-- **Rust** (edition 2024 toolchain) and **protoc** (protobuf compiler) to build.
-- **GStreamer 1.24+** with the plugin sets: base, good, bad, ugly, libav, and
-  [gst-plugins-rs](https://gitlab.freedesktop.org/gstreamer/gst-plugins-rs)
-  **1.28.6 or newer** (for `hlssink3`). Hardware encoders come from your
-  platform: `gst-plugin-va` (VA-API/Quick Sync), the NVIDIA plugin set
-  (NVENC), or macOS VideoToolbox.
-
-  1.28.6 is the first release carrying two hlssink3 fixes that matter here:
-  a fragment whose first buffer has no PTS, and a running time unwrapped when
-  a segment is added. Both panic inside an FFI callback, so they abort the
-  whole process instead of failing one session — an older gst-plugins-rs
-  takes the server down on ordinary files.
-
-  Note that these plugins report their *crate* version, not the release, so
-  `gst-inspect-1.0 hlssink3` shows the same number either way; only the git
-  hash it appends distinguishes them. To settle it, run the reproducer in
-  [`patches/gst-plugins-rs/`](./patches/gst-plugins-rs) — it aborts the
-  process on an affected build and exits cleanly on a fixed one.
-- Node is **not** required to run — the web app ships prebuilt in the binary,
-  and a build without npm embeds that checked-in bundle. With npm installed,
-  `cargo build` rebuilds it from `web/` whenever the sources change, so the
-  binary cannot ship an app older than the tree it was built from.
+### Build the image
 
 ```sh
-cargo build --release
-./target/release/kahawai doctor   # names every capability your GStreamer install provides or lacks
+git clone https://github.com/iksteen/kahawai.git
+cd kahawai
+docker build -t kahawai .
 ```
 
-`doctor` is the source of truth: each missing element is listed with exactly
-what it costs you (e.g. "E-AC-3 audio cannot be transcoded — install
-gst-libav"). Essential gaps abort startup; everything else degrades.
-
-### First run (all-in-one)
+Use `--device=/dev/dri:/dev/dri` for Intel or AMD hardware acceleration. Use
+`--gpus all` with the NVIDIA Container Toolkit for NVIDIA hardware.
 
 ```sh
-./target/release/kahawai hub &
-./target/release/kahawai mediahost
+docker run --rm --device=/dev/dri:/dev/dri kahawai doctor
+docker run --rm --gpus all kahawai doctor
 ```
 
-The public API remains locked on first run. Create the administrator through
-the trusted-local control plane: open http://localhost:8422 on the hub (or
-forward that loopback port over SSH), or run `kahawai hub init-admin` in a
-second terminal. For the container image, run it inside the already-running
-hub container with a TTY (the password prompt deliberately reads the terminal):
+`doctor` lists the available decode, encode, remux, and tone-mapping paths.
+
+### Configure the server
+
+Create persistent directories and a configuration file:
 
 ```sh
-docker exec -it <container-name> kahawai hub init-admin
+mkdir -p runtime/config/kahawai runtime/data runtime/cache
 ```
 
-The local browser listener and private Unix socket disappear after the first
-account commits. The mediahost (and any transcoder) prints an
-**enrollment code** on first connect; approve it on the admin page. Satellites
-receive certificates from the hub (it is its own CA) and reconnect on their
-own ever after.
-
-Add machines by running `kahawai mediahost` or `kahawai transcoder` anywhere
-that can reach the hub's satellite port, with `[mediahost] hub =` /
-`[transcoder] hub =` pointed at it — same enrollment flow.
-
-### Configuration
-
-One TOML file for every role; each binary reads only its section. Location:
-`$XDG_CONFIG_HOME/kahawai/kahawai.toml` (usually `~/.config/kahawai/`), or
-`./kahawai.toml`, or `--config <path>`. Any key can be overridden with an
-environment variable shaped `KAHAWAI_<SECTION>__<KEY>`, e.g.
-`KAHAWAI_HUB__DATA_DIR=/srv/kahawai`.
+`runtime/config/kahawai/kahawai.toml`:
 
 ```toml
 [all_in_one]
-transcoder = true               # set false (then restart) to keep encoding off this machine;
-                                # external transcoders can still enroll and remux stays local
+transcoder = true
 
 [hub]
-bind = "127.0.0.1:8420"          # client API + web app; put a reverse proxy in front for TLS
-# public_url = "https://kahawai.example.com" # enables strict browser Origin checks; HTTPS sets Secure cookies
-setup_bind = "127.0.0.1:8422"    # first-run browser only; loopback and a distinct listener port
-satellite_bind = "0.0.0.0:8421"  # enrollment + mTLS link for satellites
-data_dir = "~/.local/share/kahawai"  # db, PKI, caches (default shown for user installs)
-hostnames = ["localhost"]        # names/IPs baked into the hub's certificate SANs —
-                                 # add the LAN address remote satellites will dial
-satellite_cert_days = 90
-enrollment_ttl_minutes = 15
-max_sessions_per_user = 4        # concurrent playback sessions ONE account may hold;
-                                 # raise for a shared or kiosk account (restart to apply)
+bind = "0.0.0.0:8420"
+satellite_bind = "0.0.0.0:8421"
 
 [mediahost]
-hub = "localhost:8421"
-name = "nas"                     # shown in the admin UI
-rescan_minutes = 60              # backup sweep; the fs watcher reacts immediately where
-                                 # the filesystem supports it (inotify never fires on
-                                 # network mounts like sshfs — the sweep covers those). 0 = off
+name = "local"
 
 [[mediahost.collections]]
-name = "movies"                  # stable id — renaming makes it a new collection
-media_type = "movies"            # movies | series | anime | music
-roots = ["/mnt/media/movies"]  # absolute paths; each gets a deterministic identity
+name = "movies"
+media_type = "movies"
+roots = ["/media/movies"]
 
 [[mediahost.collections]]
 name = "series"
 media_type = "series"
-roots = ["/mnt/media/series"]
-
-[transcoder]
-hub = "localhost:8421"
-name = "gpu-box"
-max_sessions = 2                 # concurrent encodes this machine offers
+roots = ["/media/series"]
 ```
 
-`hub.public_url` is optional. When set, it must be the exact browser-facing
-HTTP(S) origin; browser login, refresh and logout then require that Origin
-exactly. HTTPS adds `Secure` to the server-managed browser cookies; configured
-HTTP is allowed but logs that authentication cookies and tokens cross the
-network in cleartext. When `public_url` is unset, Kahawai does not validate
-browser Origin headers. Trusted `X-Forwarded-Proto` and `X-Forwarded-Host`
-values may still mark cookies `Secure`.
+Collection roots are read-only. Their paths are the paths inside the container.
 
-The live OpenAPI 3.2 document is served at `/api-docs/openapi.json`; browse and
-exercise it through the embedded Swagger UI at `/swagger-ui`.
+### Run all-in-one
 
-Metadata providers (TMDB key, TheTVDB key/PIN) are configured in the admin
-web UI, not the config file. Mediahost roots are treated as strictly read-only —
-Kahawai never writes next to your media. Root list order has no identity meaning:
-every source is bound to the deterministic token of its absolute, lexically
-normalized configured root path, so equal relative filenames in separate roots
-remain distinct. Exact-root identity is satellite protocol 3; protocol 2
-mediahosts and transcoders must be upgraded before they reconnect. This wire
-break does not rescan or rematch the catalogue.
+```sh
+docker run -d \
+  --name kahawai \
+  --restart unless-stopped \
+  --device=/dev/dri:/dev/dri \
+  -p 127.0.0.1:8420:8420 \
+  -p 8421:8421 \
+  -v "$PWD/runtime/config:/config" \
+  -v "$PWD/runtime/data:/data" \
+  -v "$PWD/runtime/cache:/cache" \
+  -v /srv/media:/media:ro \
+  kahawai
+```
+
+Replace `--device=/dev/dri:/dev/dri` with `--gpus all` for NVIDIA, or omit it
+for software-only operation.
+
+Create the first administrator through the private control socket:
+
+```sh
+docker exec -it kahawai kahawai hub init-admin
+```
+
+Open <http://localhost:8420>. Put a TLS reverse proxy in front before exposing
+the hub outside the machine.
+
+Kahawai reads `$XDG_CONFIG_HOME/kahawai/kahawai.toml`, `./kahawai.toml`, or the
+path passed with `--config`. Environment overrides use
+`KAHAWAI_<SECTION>__<KEY>`, such as `KAHAWAI_HUB__DATA_DIR=/srv/kahawai`.
+
+## Satellites and standalone hub
+
+Expose the hub's satellite listener directly as TCP. Do not send it through the
+HTTP reverse proxy. The hub certificate must contain the name or address that
+satellites use:
+
+```toml
+[hub]
+satellite_bind = "0.0.0.0:8421"
+hostnames = ["kahawai.example.lan"]
+```
+
+A mediahost needs its own persistent state directory and read-only media roots:
+
+```toml
+[mediahost]
+hub = "kahawai.example.lan:8421"
+name = "nas"
+state_dir = "/data/kahawai-mediahost"
+
+[[mediahost.collections]]
+name = "anime"
+media_type = "anime"
+roots = ["/media/anime"]
+```
+
+Run it with:
+
+```sh
+kahawai mediahost
+```
+
+A transcoder needs persistent state and access to its GPU:
+
+```toml
+[transcoder]
+hub = "kahawai.example.lan:8421"
+name = "gpu-box"
+state_dir = "/data/kahawai-transcoder"
+max_sessions = 2
+```
+
+Run it with:
+
+```sh
+kahawai transcoder
+```
+
+The same container image runs either role by appending `mediahost` or
+`transcoder` to `docker run`. On first connection, the satellite prints an
+enrollment code. Approve that code in the hub's administration page. The hub
+issues the satellite certificate and the satellite reconnects with mTLS.
+
+When every collection lives on satellite mediahosts, the all-in-one process can
+be replaced with `kahawai hub`. Stop all-in-one, keep the same hub configuration
+and data directory, and start:
+
+```sh
+kahawai hub
+```
+
+The standalone hub retains users, libraries, certificates, and watch state. It
+continues to direct-play and remux. Full video encoding requires an enrolled
+transcoder.
+
+## Harden a public hub
+
+Terminate TLS at an HTTP reverse proxy and keep the hub's HTTP listener
+unreachable from the internet. For a native hub and proxy on the same host:
+
+```toml
+[hub]
+bind = "127.0.0.1:8420"
+public_url = "https://kahawai.example.com"
+trusted_proxies = ["127.0.0.1"]
+```
+
+For the container installation, keep `bind = "0.0.0.0:8420"` inside the
+container and keep the host-side `127.0.0.1:8420:8420` port mapping.
+`trusted_proxies` must contain the proxy peer address as Kahawai sees it inside
+the container, not necessarily the proxy's host address.
+
+- `public_url` enables strict Origin checking for browser login, refresh, and
+  logout. The Origin must match exactly. HTTPS also marks authentication cookies
+  `Secure`. Without `public_url`, Kahawai does not validate browser Origins.
+- `trusted_proxies` lists the socket peers allowed to supply forwarded request
+  metadata. Trust only proxy addresses; never trust a network that clients can
+  occupy.
+- `X-Forwarded-For` supplies the client address used by login throttling. Kahawai
+  resolves the chain from right to left and selects the first untrusted address.
+- `X-Forwarded-Proto` and `X-Forwarded-Host` identify the browser-facing scheme
+  and host for cookie security when `public_url` is absent and they come from a
+  trusted proxy.
+
+Minimal nginx configuration:
+
+```nginx
+location / {
+    proxy_pass http://127.0.0.1:8420;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Forwarded-Host $http_host;
+    proxy_http_version 1.1;
+}
+```
+
+The API uses the HTTP `QUERY` method for `/api/v1/items/{id}`. Proxies that
+restrict methods must allow `QUERY`. Do not buffer `/api/v1/events`; it is a
+Server-Sent Events stream. Keep the first-run setup listener private and expose
+port 8421 only to satellite networks.
+
+## OpenAPI
+
+The hub publishes its complete OpenAPI 3.2 contract at:
+
+```text
+/api-docs/openapi.json
+```
+
+The embedded Swagger UI is available at:
+
+```text
+/swagger-ui
+```
+
+The document covers the public and administrative APIs, authentication modes,
+request and response schemas, errors, and the `QUERY` item operation. API
+clients use bearer-mode login and refresh tokens; browser-cookie authentication
+is for the embedded same-origin web interface.
 
 ## License
 
 Kahawai is [MIT licensed](./LICENSE).
 
-Media plumbing is provided by [GStreamer](https://gstreamer.freedesktop.org/),
-which kahawai links dynamically as system libraries (LGPL-2.1+) — install it
-through your distribution. Some optional GStreamer plugins kahawai can take
-advantage of (for example `x264enc` from gst-plugins-ugly, or `a52dec`) are
-GPL-licensed; they are loaded at runtime from your system when present, and
-kahawai's preference-ordered element lists fall back gracefully when they are
-not. If you redistribute kahawai *bundled together with* GStreamer and its
-plugins (e.g. a container image), the LGPL/GPL terms of those components apply
-to that bundle — for this open-source project that amounts to shipping the
-license notices and pointing at the (already public) sources, or simply
-excluding the GPL plugin set.
+Kahawai dynamically links to system or container-provided
+[GStreamer](https://gstreamer.freedesktop.org/) libraries, which are
+LGPL-2.1-or-later. Some runtime plugins, including plugins from
+`gst-plugins-ugly`, are GPL-licensed. Distributors must follow the licenses of
+the GStreamer libraries and plugins included with their bundle.
 
-The OCR subtitle tier (turning PGS/VobSub image subtitles into text) links
-Tesseract via [`leptess`](https://lib.rs/crates/leptess) (MIT; Tesseract and
-Leptonica are Apache-2.0/BSD-style), so it carries no copyleft consequence.
-Building with `--no-default-features` drops the Tesseract linkage entirely
-for minimal deployments.
-
-Metadata courtesy of [TMDB](https://www.themoviedb.org/) and
-[TheTVDB](https://thetvdb.com/) when configured; both require the in-app
-attribution kahawai displays alongside their data.
-
-## Name
-
-*Kahawai* is Hawaiian for **stream**. The same word in te reo Māori names the kahawai fish (*Arripis trutta*), from *kaha* (strong) + *wai* (water). A streaming server could hardly ask for a better pair of meanings, and we use the word with respect for both origins.
+Metadata from [TMDB](https://www.themoviedb.org/) and
+[TheTVDB](https://thetvdb.com/) requires the attribution displayed by Kahawai.
