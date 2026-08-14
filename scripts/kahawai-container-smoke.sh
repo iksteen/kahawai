@@ -66,12 +66,6 @@ fi
 
 mkdir -p "$work/media/movies" "$work/state"
 cat > "$work/kahawai.toml" <<'TOML'
-[hub]
-bind = "0.0.0.0:8420"
-satellite_bind = "0.0.0.0:8421"
-data_dir = "/data/state"
-hostnames = ["localhost"]
-
 [mediahost]
 hub = "localhost:8421"
 name = "smoke"
@@ -81,6 +75,12 @@ rescan_minutes = 0
 name = "movies"
 media_type = "movies"
 roots = ["/data/media/movies"]
+
+[hub]
+bind = "0.0.0.0:8420"
+satellite_bind = "0.0.0.0:8421"
+data_dir = "/data/state"
+hostnames = ["localhost"]
 TOML
 
 # The clip comes out of the image's own GStreamer, so this needs nothing
@@ -96,13 +96,41 @@ docker run --rm --user "$user" -v "$work:/data" --entrypoint sh "$TAG" -c \
 [ -s "$work/media/movies/Smoke.Test.2026.mkv" ] || fail "the image could not mux a test clip"
 
 echo "==> starting all-in-one from $TAG" >&2
-docker run -d --name "$name" --user "$user" -p 0:8420 -v "$work:/data" \
-    "$TAG" all-in-one --config /data/kahawai.toml >/dev/null 2>&1 \
+# Docker may assign a different ephemeral host port on `docker restart`.
+# Reserve one explicitly so the canonical Origin remains true across both
+# exact-container restarts exercised below.
+host_port=$(python3 -c \
+    'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')
+docker run -d --name "$name" --user "$user" -p "127.0.0.1:$host_port:8420" \
+    -v "$work:/data" "$TAG" all-in-one --config /data/kahawai.toml >/dev/null 2>&1 \
     || fail "docker run"
 api=$(docker port "$name" 8420/tcp | head -1)
 api="localhost:${api##*:}"
 
 logs() { docker logs "$name" 2>&1 | sed 's/\x1b\[[0-9;]*m//g'; }
+
+# Discover the random published port before choosing the canonical browser
+# origin, then restart this exact container so the bind-mounted config is read.
+printf 'public_url = "http://localhost:%s"\n' "${api##*:}" >> "$work/kahawai.toml"
+container_id=$(docker inspect -f '{{.Id}}' "$name")
+before_pid=$(docker inspect -f '{{.State.Pid}}' "$name")
+docker restart "$name" >/dev/null || fail "first exact-container restart"
+[ "$(docker inspect -f '{{.Id}}' "$name")" = "$container_id" ] \
+    || fail "first restart replaced the container"
+[ "$(docker inspect -f '{{.State.Pid}}' "$name")" != "$before_pid" ] \
+    || fail "first restart did not replace the hub process"
+for _ in $(seq 30); do
+    logs 2>/dev/null | grep -q \
+        'browser authentication cookies and tokens cross the network in cleartext' && break
+    sleep 0.2
+done
+logs | grep -q 'browser authentication cookies and tokens cross the network in cleartext' \
+    || fail "configured HTTP public_url warning was not logged"
+for _ in $(seq 60); do
+    curl -sf "http://$api/health" >/dev/null && break
+    sleep 0.5
+done
+curl -sf "http://$api/health" >/dev/null || fail "public API did not return after first restart"
 # `d` is the parsed body; the expression prints what it wants from it.
 # Errors are NOT silenced: a response that changed shape should say so
 # rather than read as "not ready yet" until the loop times out.
@@ -202,9 +230,20 @@ done
 docker exec "$name" sh -c 'test ! -e "$KAHAWAI_HUB__DATA_DIR/control"' \
     >/dev/null 2>&1 || fail "setup control directory remained after init-admin"
 auth=$(curl -sf -X POST "http://$api/api/v1/auth/token" -H content-type:application/json \
-    -d '{"username":"smoke","password":"smoke-password-1"}' \
+    -d '{"client":"api","username":"smoke","password":"smoke-password-1"}' \
     | py 'print(d["access_token"])')
 [ -n "$auth" ] || fail "login after setup did not return a token"
+
+echo "==> exercising API and browser authentication" >&2
+"$repo/scripts/kahawai-auth-cycle.sh" -a "$api" smoke smoke-password-1 \
+    || fail "expanded authentication cycle"
+browser_jar="$work/browser.cookies"
+browser_login=$(curl -sf -c "$browser_jar" -X POST \
+    "http://$api/api/v1/auth/token" -H content-type:application/json \
+    -d '{"client":"browser","username":"smoke","password":"smoke-password-1"}')
+printf '%s' "$browser_login" \
+    | py 'assert set(d) == {"access_token", "expires_in"}; print(d["access_token"])' \
+    >/dev/null || fail "browser login exposed the wrong response shape"
 
 echo "==> waiting for the scan" >&2
 for _ in $(seq 30); do
@@ -226,7 +265,7 @@ url=$(printf '%s' "$session" | py 'print(d["stream_url"])')
 # The point of the whole script: segments, produced by a worker the hub
 # actually managed to spawn.
 for _ in $(seq 30); do
-    playlist=$(curl -sf -H "Authorization: Bearer $auth" "http://$api$url")
+    playlist=$(curl -sf -b "$browser_jar" "http://$api$url")
     segs=$(printf '%s\n' "$playlist" | grep -cE '\.(ts|m4s)$')
     [ "${segs:-0}" -ge 2 ] && break
     sleep 2
@@ -237,8 +276,58 @@ if [ "${segs:-0}" -lt 2 ]; then
 fi
 
 first=$(printf '%s\n' "$playlist" | grep -m1 -E '\.(ts|m4s)$')
-bytes=$(curl -sf -H "Authorization: Bearer $auth" "http://$api${url%/*}/$first" | wc -c)
+bytes=$(curl -sf -b "$browser_jar" "http://$api${url%/*}/$first" | wc -c)
 [ "${bytes:-0}" -gt 10000 ] || fail "first segment served $bytes bytes"
+
+# The refresh family and its HttpOnly cookie survive a real hub restart.
+before_pid=$(docker inspect -f '{{.State.Pid}}' "$name")
+docker restart "$name" >/dev/null || fail "second exact-container restart"
+[ "$(docker inspect -f '{{.Id}}' "$name")" = "$container_id" ] \
+    || fail "second restart replaced the container"
+[ "$(docker inspect -f '{{.State.Pid}}' "$name")" != "$before_pid" ] \
+    || fail "second restart did not replace the hub process"
+for _ in $(seq 30); do
+    curl -sf "http://$api/health" >/dev/null && break
+    sleep 0.5
+done
+curl -sf "http://$api/health" >/dev/null || fail "hub did not return after second restart"
+browser_refresh=$(curl -sf -b "$browser_jar" -c "$browser_jar" -X POST \
+    "http://$api/api/v1/auth/refresh" \
+    -H content-type:application/json -H "Origin: http://$api" \
+    -d '{"client":"browser"}') || fail "browser refresh cookie did not survive restart"
+printf '%s' "$browser_refresh" \
+    | py 'assert set(d) == {"access_token", "expires_in"}; print(d["access_token"])' \
+    >/dev/null || fail "post-restart browser refresh returned the wrong shape"
+
+python3 - "$work/kahawai/hub.db" "$repo/crates/kahawai-hub/migrations" <<'PYDB' \
+    || fail "live authentication database postconditions"
+import pathlib
+import sqlite3
+import sys
+
+db_path, migrations = sys.argv[1:3]
+db = sqlite3.connect(db_path)
+applied = db.execute(
+    "SELECT max(version) FROM _sqlx_migrations WHERE success = 1"
+).fetchone()[0]
+expected = max(int(path.name.split("_", 1)[0]) for path in pathlib.Path(migrations).glob("*.sql"))
+assert applied == expected, (applied, expected)
+families, active, revoked = db.execute(
+    "SELECT count(*), count(*) FILTER (WHERE revoked_at IS NULL), "
+    "count(*) FILTER (WHERE revoked_at IS NOT NULL) FROM refresh_families"
+).fetchone()
+assert (families, active, revoked) == (6, 2, 4), (families, active, revoked)
+assert db.execute(
+    "SELECT count(*) FROM users WHERE password_hash NOT LIKE '$argon2%'"
+).fetchone()[0] == 0
+assert db.execute(
+    "SELECT count(*) FROM refresh_families "
+    "WHERE length(current_token_hash) != 64 "
+    "OR current_token_hash GLOB '*[^0-9a-f]*' "
+    "OR current_token_hash LIKE 'v1.%'"
+).fetchone()[0] == 0
+print("live auth database is current, bounded and hashed")
+PYDB
 
 if logs | grep -q 'supervisor already gone'; then
     fail "the worker guard refused to start inside the container"
