@@ -107,6 +107,8 @@ pub struct HubConfig {
     /// Client API listener. Defaults to loopback until authentication
     /// (HUB-10/11) lands — override deliberately if you must.
     pub bind: SocketAddr,
+    /// Canonical browser origin. Unset preserves direct loopback operation.
+    pub public_url: Option<String>,
     /// Trusted-local first-run browser listener. It exists only until the
     /// initial administrator is committed and must remain loopback-only.
     pub setup_bind: SocketAddr,
@@ -164,6 +166,7 @@ impl Default for HubConfig {
     fn default() -> Self {
         Self {
             bind: "127.0.0.1:8420".parse().unwrap(),
+            public_url: None,
             setup_bind: "127.0.0.1:8422".parse().unwrap(),
             satellite_bind: "0.0.0.0:8421".parse().unwrap(),
             data_dir: default_hub_data_dir(),
@@ -437,6 +440,7 @@ mod tests {
             assert_eq!(cfg.hub.bind, "127.0.0.1:8420".parse().unwrap());
             assert_eq!(cfg.hub.setup_bind, "127.0.0.1:8422".parse().unwrap());
             assert_eq!(cfg.hub.satellite_bind, "0.0.0.0:8421".parse().unwrap());
+            assert!(cfg.hub.public_url.is_none());
             assert_eq!(
                 cfg.hub.data_dir,
                 PathBuf::from("/home/test/.local/share/kahawai")
@@ -457,6 +461,21 @@ mod tests {
             jail.create_file("kahawai.toml", "[all_in_one]\ntranscoder = false\n")?;
             let (cfg, _) = load(Some(Path::new("kahawai.toml"))).unwrap();
             assert!(!cfg.all_in_one.transcoder);
+            Ok(())
+        });
+    }
+    #[test]
+    fn public_url_is_optional_raw_hub_config() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file(
+                "kahawai.toml",
+                "[hub]\npublic_url = \"https://Kahawai.EXAMPLE:443\"",
+            )?;
+            let (cfg, _) = load(Some(Path::new("kahawai.toml"))).unwrap();
+            assert_eq!(
+                cfg.hub.public_url.as_deref(),
+                Some("https://Kahawai.EXAMPLE:443")
+            );
             Ok(())
         });
     }

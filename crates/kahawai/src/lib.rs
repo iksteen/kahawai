@@ -257,6 +257,20 @@ async fn run_hub_inner(
     config_path: Option<PathBuf>,
 ) -> Result<()> {
     config::validate_hub_binds(&cfg)?;
+    let public_origin = cfg
+        .public_url
+        .as_deref()
+        .map(kahawai_hub::api::PublicOrigin::parse)
+        .transpose()
+        .context("hub.public_url")?;
+    if public_origin
+        .as_ref()
+        .is_some_and(|origin| !origin.secure())
+    {
+        tracing::warn!(
+            "hub.public_url uses HTTP; browser authentication cookies and tokens cross the network in cleartext"
+        );
+    }
     let ca = Arc::new(kahawai_hub::pki::HubCa::load_or_create(
         &kahawai_hub::pki::pki_dir(&cfg.data_dir),
     )?);
@@ -438,6 +452,7 @@ async fn run_hub_inner(
         cors_origins: cfg.cors_origins.clone(),
         metrics_token: cfg.metrics_token.clone().filter(|t| !t.is_empty()),
         setup_url: Some(setup_url),
+        public_origin,
     };
     match cfg.metrics_token.as_deref() {
         Some(t) if !t.is_empty() => tracing::info!("/metrics enabled (hub.metrics_token)"),

@@ -17,6 +17,39 @@ use sqlx::Row;
 
 use crate::auth::{Auth, CompleteSetupError};
 use crate::registry::Registry;
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PublicOrigin {
+    value: String,
+    secure: bool,
+}
+
+impl PublicOrigin {
+    pub fn parse(value: &str) -> anyhow::Result<Self> {
+        let url = url::Url::parse(value)?;
+        anyhow::ensure!(
+            matches!(url.scheme(), "http" | "https")
+                && url.host().is_some()
+                && url.username().is_empty()
+                && url.password().is_none()
+                && url.path() == "/"
+                && url.query().is_none()
+                && url.fragment().is_none(),
+            "must be an absolute HTTP(S) origin without credentials, path, query, or fragment"
+        );
+        Ok(Self {
+            value: url.origin().ascii_serialization(),
+            secure: url.scheme() == "https",
+        })
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.value
+    }
+
+    pub fn secure(&self) -> bool {
+        self.secure
+    }
+}
 
 #[derive(Clone)]
 pub struct AppState {
@@ -30,6 +63,7 @@ pub struct AppState {
     pub proxy_trust: Arc<crate::proxy::ProxyTrust>,
     pub metrics_token: Arc<Option<String>>,
     pub setup_url: Arc<Option<String>>,
+    pub public_origin: Option<PublicOrigin>,
 }
 
 /// OPS-8 knobs, both defaulting to "off" (same-origin, no proxies).
@@ -45,6 +79,8 @@ pub struct NetOptions {
     pub metrics_token: Option<String>,
     /// Trusted-local first-run URL advertised while the public API is locked.
     pub setup_url: Option<String>,
+    /// Configured canonical browser origin; request-derived when absent.
+    pub public_origin: Option<PublicOrigin>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -70,6 +106,7 @@ pub fn router(
         proxy_trust: net.proxy_trust,
         metrics_token: Arc::new(net.metrics_token),
         setup_url: Arc::new(net.setup_url),
+        public_origin: net.public_origin,
     };
     // HUB-10: everything keyed by an item id, behind ONE grant check.
     // Their own group so `require_item_access` is stated once — a check
@@ -3579,7 +3616,7 @@ async fn session_file(
 
 #[cfg(test)]
 mod tests {
-    use super::parse_range;
+    use super::{PublicOrigin, parse_range};
 
     #[test]
     fn range_forms() {
@@ -3602,5 +3639,33 @@ mod tests {
         assert!(parse_range(Some("bytes=0-1,5-9"), size).is_err());
         assert!(parse_range(Some("chunks=0-1"), size).is_err());
         assert!(parse_range(Some("bytes=-0"), size).is_err());
+    }
+
+    #[test]
+    fn public_origin_normalizes_and_rejects_non_origins() {
+        assert_eq!(
+            PublicOrigin::parse("HTTPS://Example.COM:443")
+                .unwrap()
+                .as_str(),
+            "https://example.com"
+        );
+        assert_eq!(
+            PublicOrigin::parse("http://Example.COM:8420/")
+                .unwrap()
+                .as_str(),
+            "http://example.com:8420"
+        );
+        assert!(PublicOrigin::parse("https://example.com").unwrap().secure());
+        assert!(!PublicOrigin::parse("http://example.com").unwrap().secure());
+        for invalid in [
+            "example.com",
+            "ftp://example.com",
+            "https://user@example.com",
+            "https://example.com/app",
+            "https://example.com/?q=1",
+            "https://example.com/#fragment",
+        ] {
+            assert!(PublicOrigin::parse(invalid).is_err(), "{invalid}");
+        }
     }
 }

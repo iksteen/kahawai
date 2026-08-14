@@ -2050,6 +2050,7 @@ dependencies = [
  "tracing-subscriber",
  "ulid",
  "unicode-normalization",
+ "url",
  "x509-parser",
  "xxhash-rust",
 ]

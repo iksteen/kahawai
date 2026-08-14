@@ -49,6 +49,29 @@ impl ProxyTrust {
     pub fn trusts(&self, ip: IpAddr) -> bool {
         self.nets.read().unwrap().iter().any(|n| n.contains(&ip))
     }
+    /// Canonical scheme/authority supplied by a trusted reverse proxy.
+    /// Both headers must be valid; otherwise the caller falls back to Host.
+    pub fn forwarded_origin(
+        &self,
+        peer: Option<IpAddr>,
+        proto: Option<&str>,
+        host: Option<&str>,
+    ) -> Option<String> {
+        let peer = peer?;
+        if !self.trusts(peer) {
+            return None;
+        }
+        let proto = proto?.rsplit(',').next()?.trim().to_ascii_lowercase();
+        if !matches!(proto.as_str(), "http" | "https") {
+            return None;
+        }
+        let host = host?.rsplit(',').next()?.trim();
+        if host.contains('@') {
+            return None;
+        }
+        let authority = axum::http::uri::Authority::from_str(host).ok()?;
+        Some(format!("{proto}://{authority}"))
+    }
 
     /// The real client address: the TCP peer, unless the peer is a
     /// trusted proxy — then walk X-Forwarded-For right to left and take
@@ -150,6 +173,44 @@ mod tests {
         assert_eq!(
             t.client_ip(Some(ip("172.18.0.2")), None),
             Some(ip("172.18.0.2"))
+        );
+    }
+
+    #[test]
+    fn forwarded_origin_uses_only_trusted_rightmost_values() {
+        let t = ProxyTrust::parse(&["127.0.0.1".into()]).unwrap();
+        assert_eq!(
+            t.forwarded_origin(
+                Some(ip("127.0.0.1")),
+                Some("http, https"),
+                Some("spoofed.example, Public.EXAMPLE:443"),
+            )
+            .as_deref(),
+            Some("https://Public.EXAMPLE:443")
+        );
+        assert_eq!(
+            t.forwarded_origin(
+                Some(ip("203.0.113.9")),
+                Some("https"),
+                Some("public.example"),
+            ),
+            None
+        );
+        assert_eq!(
+            t.forwarded_origin(
+                Some(ip("127.0.0.1")),
+                Some("javascript"),
+                Some("example.com")
+            ),
+            None
+        );
+        assert_eq!(
+            t.forwarded_origin(Some(ip("127.0.0.1")), Some("https"), Some("bad host")),
+            None
+        );
+        assert_eq!(
+            t.forwarded_origin(None, Some("https"), Some("public.example")),
+            None
         );
     }
 
