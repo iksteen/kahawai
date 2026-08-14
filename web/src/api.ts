@@ -1,6 +1,5 @@
-// Same-origin client for the kahawai API. Access tokens ride the
-// Authorization header for fetches and a cookie for <video>/HLS requests
-// (media elements cannot set headers). 401s trigger one refresh + retry.
+// Same-origin client for the Kahawai API. Browser refresh/media credentials
+// are HttpOnly cookies; the short-lived access token exists only in memory.
 
 import { buildProfile } from './capabilities.ts'
 
@@ -8,188 +7,59 @@ import { notify } from './toast.ts'
 import { SerialQueue } from './serial.ts'
 import { REFRESH_RETRY_MS, refreshDelayMs } from './token.ts'
 
-const LS_ACCESS = 'kahawai.access'
-const LS_REFRESH = 'kahawai.refresh'
+export type BrowserSession = { access_token: string; expires_in: number }
+export type RestoreResult = 'authenticated' | 'anonymous'
 
-export type Tokens = { access_token: string; refresh_token: string }
+let access: string | null = null
+let generation = 0
+let refreshTimer: number | undefined
+let refreshInFlight: Promise<boolean> | null = null
+let onCleared: ((deliberate: boolean) => void) | null = null
 
-function syncCookie(token: string | null) {
-  document.cookie = token
-    ? `kahawai_token=${token}; path=/; SameSite=Lax`
-    : 'kahawai_token=; path=/; Max-Age=0'
+const REFRESH_TIMEOUT_MS = 15_000
+const LOCK_WAIT_MS = 20_000
+
+export function scrubLegacyCredentials() {
+  localStorage.removeItem('kahawai.access')
+  localStorage.removeItem('kahawai.refresh')
+  document.cookie = 'kahawai_token=; Path=/; Max-Age=0; SameSite=Lax'
 }
 
-/// Called when the tokens are cleared — a refresh definitively rejected, or
-/// an explicit sign-out.
-///
-/// Which screen you are on is decided once, from `/bootstrap`, at startup.
-/// Nothing revisited it, so a session that died an hour in left the shell up
-/// with every panel showing its own 401 and a Try again that could never
-/// work. The useful error is "sign in again", and only the shell can say it.
-let onCleared: ((deliberate: boolean) => void) | null = null
 export function onTokensCleared(cb: ((deliberate: boolean) => void) | null) {
   onCleared = cb
 }
 
-export function storeTokens(t: Tokens | null, deliberate = false) {
-  if (t) {
-    localStorage.setItem(LS_ACCESS, t.access_token)
-    localStorage.setItem(LS_REFRESH, t.refresh_token)
-    syncCookie(t.access_token)
-    // Every path that lands a token — login, refresh — re-arms the
-    // timer from the new expiry, so the schedule is never stale.
-    keepTokenFresh()
-  } else {
-    // A refresh already out there must not land on top of this. It checks the
-    // slot before storing, and removing the token is what tells it to stop —
-    // which works across tabs too, where module state would not.
-    refreshInFlight = null
-    const had = localStorage.getItem(LS_ACCESS) !== null
-    localStorage.removeItem(LS_ACCESS)
-    localStorage.removeItem(LS_REFRESH)
-    syncCookie(null)
-    clearTimeout(refreshTimer)
-    // Only when something was actually lost: clearing an already-empty slot
-    // happens on the sign-in screen itself, and bouncing it back to sign-in
-    // would be a loop.
-    if (had) onCleared?.(deliberate)
-  }
+function installAccess(token: string, expected = generation): boolean {
+  if (generation !== expected) return false
+  access = token
+  keepTokenFresh()
+  return true
 }
 
-/// Revoke the refresh family on the hub, from a pair captured before the
-/// browser's copies were dropped.
-///
-/// It deliberately touches storage at neither end. It cannot read the tokens,
-/// because sign-out has already forgotten them — that is the point: the screen
-/// changes at once, and a hub that accepts the call and then stalls cannot hold
-/// it up. And it must not write them, because by the time it answers somebody
-/// may have signed in on the screen it left behind.
-///
-/// `/auth/logout` sits behind the hub's auth layer, so a stale access token is
-/// answered 401. The repair happens here rather than in `api()` because the hub
-/// matches the family on the hash of the refresh token it is HANDED, and
-/// repairing a 401 ROTATES that token: `api()` would retry with the body built
-/// from the pre-rotation token, revoke nothing, and be answered 204 all the
-/// same. The family would outlive the sign-out by its full 30 days, which is
-/// the one thing this call exists to prevent, and nothing in the response says
-/// so.
-async function revoke(access: string, refresh: string): Promise<void> {
-  const post = (a: string, r: string) =>
-    fetch('/api/v1/auth/logout', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', Authorization: `Bearer ${a}` },
-      body: JSON.stringify({ refresh_token: r }),
-    })
-  // Only 401 is repairable here. A 2xx is necessary but not sufficient — the
-  // hub's logout is deliberately non-oracular and answers 204 for a token it
-  // did nothing with — so this can only report that the call did not LAND, not
-  // that a family was revoked. That is still worth reporting: returning on
-  // every non-401 counted a 500, a 502 from a proxy in front of a restarting
-  // hub, or a 403 as a completed sign-out, and `signOut` swallowed it, so the
-  // family lived its full thirty days with nobody told. On a shared machine
-  // that is the whole point of the button.
-  const first = await post(access, refresh)
-  if (first.ok) return
-  if (first.status !== 401) throw new Error(`the hub did not end the session (${first.status})`)
-  // Inside the lock, like every other rotation. Signing out while the scheduled
-  // refresh is in flight posted the same token twice, and the hub reads a
-  // replay as theft: the family died — which is what sign-out wanted — but this
-  // call was answered 401 and told the viewer the opposite.
-  const again = await alone(() =>
-    fetch('/api/v1/auth/refresh', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ refresh_token: refresh }),
-    }),
-  )
-  if (!again.ok) throw new Error(`the hub did not end the session (${again.status})`)
-  const fresh: Tokens = await again.json()
-  const second = await post(fresh.access_token, fresh.refresh_token)
-  if (!second.ok) throw new Error(`the hub did not end the session (${second.status})`)
-}
-
-/// Sign out: drop the browser's copies now, tell the hub afterwards.
-///
-/// Dropping them only ended the session in this browser — the refresh token
-/// stayed usable on the hub for the rest of its life. Telling the hub needs
-/// credentials the clear has just destroyed, so the pair is captured first and
-/// handed over explicitly.
-///
-/// One revoked family, not every session the account has: other devices stay
-/// signed in, which is what you want. The access token and the cookie are not
-/// invalidated by it either — they are good for their remaining life, and
-/// dropping this browser's copies is the whole of what makes them unreachable.
-export async function signOut(): Promise<void> {
-  const access = localStorage.getItem(LS_ACCESS)
-  const refresh = localStorage.getItem(LS_REFRESH)
-  storeTokens(null, true)
-  // Said out loud rather than swallowed: the screen has already changed, so
-  // this is the only place the viewer can learn that the session they just
-  // ended is still usable somewhere else.
-  if (access && refresh) {
-    await revoke(access, refresh).catch((e: unknown) => {
-      notify(`Signed out here, but ${e}. The session may still work on other devices.`)
-    })
-  }
+function clearAccess(deliberate = false, expected?: number): boolean {
+  if (expected !== undefined && generation !== expected) return false
+  const had = access !== null
+  generation++
+  access = null
+  refreshInFlight = null
+  clearTimeout(refreshTimer)
+  if (had) onCleared?.(deliberate)
+  return true
 }
 
 export function accessToken(): string | null {
-  return localStorage.getItem(LS_ACCESS)
-}
-
-/// Put the stored token back on the cookie the media elements read.
-///
-/// The cookie is a SESSION cookie and the token outlives the session it was
-/// written in, so a browser reopened on a still-valid token came back with the
-/// header credential and without the cookie one. `syncCookie` had exactly one
-/// caller — `storeTokens` — and nothing on the boot path stores anything: the
-/// shell renders signed in from `/bootstrap`, which is a Bearer request, and
-/// then every poster, the event stream and hls.js's own XHR 401, because none
-/// of them can set a header. It repaired itself when the scheduled refresh
-/// landed — at most fourteen minutes of a signed-in app with no artwork, since
-/// the access token lives fifteen (`auth.rs` ACCESS_TTL_SECS) and the refresh
-/// is scheduled a minute ahead of expiry (`token.ts` REFRESH_LEAD_MS). Narrow,
-/// and every second of it is a home screen of empty frames.
-///
-/// Called from `main.tsx` before the first render rather than run on import:
-/// an effect is too late (the browser has already requested what it painted),
-/// and an import-time side effect made `api.ts` unimportable under `node
-/// --test`, where there is no localStorage — which is how the pure modules
-/// that import from it are tested.
-///
-/// Still a session cookie, because no `Max-Age` can state the truth: the value
-/// is a fifteen-minute token, so any persistent expiry either outlives what it
-/// carries or has to be rewritten on every refresh — which is the session
-/// cookie again, with one more thing to get wrong.
-export function restoreCookie() {
-  syncCookie(accessToken())
+  return access
 }
 
 function claims(): { username?: string; admin?: boolean; exp?: number } {
-  const t = accessToken()
-  if (!t) return {}
+  if (!access) return {}
   try {
-    return JSON.parse(atob(t.split('.')[1]))
+    return JSON.parse(atob(access.split('.')[1]))
   } catch {
     return {}
   }
 }
 
-let refreshTimer: ReturnType<typeof setTimeout> | undefined
-
-/// Keep the access token valid ahead of time, rather than repairing it
-/// after something fails.
-///
-/// `api()` refreshes on a 401 and retries, but it is not the only thing
-/// carrying this token: the SAME token rides the kahawai_token cookie
-/// for <video>, <img> and EventSource, and hls.js puts it in a Bearer
-/// header from its own XHR. None of those pass through api(), so none
-/// of them can repair themselves — an expired token simply fails the
-/// media request, hls.js stops loading, and the session it was reading
-/// goes idle and is reaped. Observed 2026-08-07: a paused film died
-/// this way, and because the expired token makes the hub answer 401
-/// where it would have answered 404, session recovery could not see
-/// its own trigger either.
 export function keepTokenFresh() {
   clearTimeout(refreshTimer)
   const exp = claims().exp
@@ -197,7 +67,6 @@ export function keepTokenFresh() {
   refreshTimer = setTimeout(
     () => {
       void refreshTokens().then((ok) => {
-        // On success storeTokens() reschedules from the NEW expiry.
         if (!ok && accessToken()) refreshTimer = setTimeout(keepTokenFresh, REFRESH_RETRY_MS)
       })
     },
@@ -213,115 +82,110 @@ export function isAdmin(): boolean {
   return claims().admin === true
 }
 
-/// Is the credential slot still the one this refresh was started for?
-///
-/// A refresh is out for as long as a round trip, and anything can happen in
-/// that window: a sign-out, another tab's refresh rotating the token, or a
-/// different account signing in on this screen. Storing the answer then would
-/// resurrect a session that had ended — sign-in screen on top of a live cookie
-/// that `/bootstrap` accepts, so the next reload signs you back in as the
-/// account that just left.
-///
-/// The token we sent, still in the slot, is the test. It beats a module-scoped
-/// generation counter on two counts: a clear in ANOTHER TAB is visible to it,
-/// and a fresh sign-in — which bumps no counter — is too.
-function mine(rt: string): boolean {
-  return localStorage.getItem(LS_REFRESH) === rt
+async function alone<T>(run: () => Promise<T>): Promise<T> {
+  const locks = typeof navigator === 'undefined' ? undefined : navigator.locks
+  if (!locks) return run()
+  return locks.request('kahawai.auth', { signal: AbortSignal.timeout(LOCK_WAIT_MS) }, run)
 }
 
-// Single-flight: refresh tokens rotate server-side, so concurrent 401s
-// must share ONE refresh — the losers of the race would otherwise send
-// the already-rotated token, fail, and wipe the fresh session.
-let refreshInFlight: Promise<boolean> | null = null
-
-/// A refresh that never answers must not hold the rest of the app behind it.
-/// `refreshInFlight` is shared by design, so a fetch with no deadline poisons
-/// every later 401 too, and the caller waiting on it has no way out: nothing
-/// times out a `fetch` on its own.
-const REFRESH_TIMEOUT_MS = 15000
-
-/// How long to queue for the cross-tab refresh lock before giving up and
-/// letting the caller's own 401 handling deal with it. Longer than the request
-/// it is serialising, so a tab that is genuinely first is never cut off.
-const LOCK_WAIT_MS = 20000
-
-/// One refresh at a time across the whole ORIGIN, not just this tab.
-///
-/// `refreshInFlight` is module state, so it cannot see another tab, and the
-/// deadline every tab computes is the same instant — `exp` comes from the same
-/// stored token. Two tabs open, or one laptop resumed past that instant, and
-/// both post the same refresh token. The hub rotates exactly once and treats
-/// the replay as theft: it revokes the whole family (`auth.rs`, "Replaying a
-/// consumed token revokes its family"), and which of the two symptoms you get
-/// is decided by which response lands first — an app left signed in on a
-/// revoked family, or both tabs bounced to the sign-in screen while holding a
-/// perfectly good access token.
-///
-/// The Web Locks API is exactly this problem, and it is in every browser this
-/// app supports. Where it is missing the behaviour is what it was before: one
-/// lock per tab, and the loser repairs itself on the next 401.
-async function alone<T>(run: () => Promise<T>): Promise<T> {
-  const locks = navigator.locks
-  if (!locks) return run()
-  // Bounded like everything else on this path. `AbortSignal.timeout` inside the
-  // callback covers the fetch, not the wait for the lock, and a waiter that
-  // never acquires it leaves the single-flight promise pending for ever.
-  return locks.request('kahawai.refresh', { signal: AbortSignal.timeout(LOCK_WAIT_MS) }, run)
+async function rotate(started: number, throwTransient: boolean): Promise<boolean> {
+  if (generation !== started) return false
+  let response: Response
+  try {
+    response = await fetch('/api/v1/auth/refresh', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ client: 'browser' }),
+      signal: AbortSignal.timeout(REFRESH_TIMEOUT_MS),
+    })
+  } catch {
+    if (throwTransient) throw new Offline()
+    return false
+  }
+  if (response.status === 401 || response.status === 403) {
+    clearAccess(false, started)
+    return false
+  }
+  if (!response.ok) {
+    if (throwTransient)
+      throw new ApiError(response.status, (await response.text()) || `${response.status}`)
+    return false
+  }
+  const fresh = (await response.json()) as BrowserSession
+  return installAccess(fresh.access_token, started)
 }
 
 export function refreshTokens(): Promise<boolean> {
-  // The clear is HERE as well as in the callback's `finally`, because the
-  // callback is not guaranteed to run: `locks.request` rejects on its own for a
-  // document that is not fully active, for an opaque origin, and now for the
-  // wait timing out. A rejection left `refreshInFlight` holding it for the life
-  // of the page, and `api()` awaits that promise on every 401 — so one failure
-  // to take the lock turned every later 401 in the tab into a DOMException out
-  // of `api()`, with no path back.
-  // Captured SYNCHRONOUSLY, before any queueing: this call is about the session
-  // that was live when it was made. Signing in again while it waits produces a
-  // different session, and a refresh that then acted on that one could sign out
-  // an account it was never asked about.
-  const started = localStorage.getItem(LS_REFRESH)
-  if (!started) return Promise.resolve(false)
-  refreshInFlight ??= alone(async () => {
-    try {
-      // And re-read inside the lock, because the tab that went first has
-      // rotated it. Asking with the token we queued on is precisely the replay
-      // the lock exists to prevent, and asking with THEIRS would make this call
-      // about a session it was not started for — so a rotation that happened
-      // while we waited simply ends this attempt. The caller's next 401 asks
-      // again, with whatever is current by then.
-      const rt = localStorage.getItem(LS_REFRESH)
-      if (!rt || rt !== started) return false
-      const r = await fetch('/api/v1/auth/refresh', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ refresh_token: rt }),
-        signal: AbortSignal.timeout(REFRESH_TIMEOUT_MS),
-      })
-      if (!r.ok) {
-        // Only a definitive rejection means the session is dead; transient
-        // failures keep the tokens for a later retry. And only if it is still
-        // the session we asked about — see `mine()` — or a 401 about a token
-        // nobody holds any more would take a live one down with it.
-        if ((r.status === 401 || r.status === 403) && mine(rt)) storeTokens(null)
-        return false
-      }
-      const fresh = await r.json()
-      if (!mine(rt)) return false
-      storeTokens(fresh)
-      return true
-    } catch {
-      return false
-    } finally {
-      refreshInFlight = null
-    }
-  })
+  if (!access) return Promise.resolve(false)
+  const started = generation
+  refreshInFlight ??= alone(() => rotate(started, false))
     .catch(() => false)
     .finally(() => {
       refreshInFlight = null
     })
   return refreshInFlight
+}
+
+export async function restoreSession(): Promise<RestoreResult> {
+  const started = generation
+  return (await alone(() => rotate(started, true))) ? 'authenticated' : 'anonymous'
+}
+
+export async function browserLogin(username: string, password: string): Promise<void> {
+  const started = ++generation
+  await alone(async () => {
+    let response: Response
+    try {
+      response = await fetch('/api/v1/auth/token', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ client: 'browser', username, password }),
+      })
+    } catch {
+      throw new Offline()
+    }
+    if (!response.ok)
+      throw new ApiError(response.status, (await response.text()) || `${response.status}`)
+    const session = (await response.json()) as BrowserSession
+    installAccess(session.access_token, started)
+  })
+}
+
+async function revoke(capturedAccess: string): Promise<void> {
+  await alone(async () => {
+    const post = (bearer: string) =>
+      fetch('/api/v1/auth/logout', {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          Authorization: `Bearer ${bearer}`,
+        },
+        body: JSON.stringify({ client: 'browser' }),
+      })
+    let response = await post(capturedAccess)
+    if (response.status === 401) {
+      const refreshed = await fetch('/api/v1/auth/refresh', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ client: 'browser' }),
+        signal: AbortSignal.timeout(REFRESH_TIMEOUT_MS),
+      })
+      if (!refreshed.ok) throw new Error(`the hub did not end the session (${refreshed.status})`)
+      const session = (await refreshed.json()) as BrowserSession
+      response = await post(session.access_token)
+    }
+    if (!response.ok) throw new Error(`the hub did not end the session (${response.status})`)
+  })
+}
+
+export async function signOut(): Promise<void> {
+  const capturedAccess = access
+  clearAccess(true)
+  if (capturedAccess) {
+    await revoke(capturedAccess).catch((error: unknown) => {
+      notify(`Signed out here, but ${error}. The session may still work on other devices.`)
+    })
+  }
 }
 
 /// The hub could not be reached at all: no response, rather than a bad one.
@@ -1020,8 +884,8 @@ export function pickSubtitle(wishlist: string[], subs: Subtitle[]): Subtitle | n
 export const fetchPrefs = () => json<{ prefs: Pref[] }>('/api/v1/prefs')
 
 /// HUB-11 event channel: invalidation hints ({kind, ...}). Authenticates
-/// via the kahawai_token cookie (EventSource cannot set headers). The
-/// browser auto-reconnects; callers just react to hints.
+/// via the HttpOnly `kahawai_media` cookie (EventSource cannot set headers).
+/// The browser auto-reconnects; callers just react to hints.
 export function openEvents(onEvent: (e: { kind: string } & Record<string, unknown>) => void) {
   const es = new EventSource('/api/v1/events')
   es.onmessage = (m) => {
@@ -1116,16 +980,19 @@ export function endSession(sessionId: string, keepalive = false) {
 
 // ---- admin ----
 
-/// OPS-10: URLs for the session/item diagnostic bundles. Plain hrefs on
-/// purpose — `storeTokens` mirrors the access token into the
-/// `kahawai_token` cookie, which is how <video>/<img>/EventSource
-/// already authenticate, so an <a download> needs no blob plumbing.
-export function sessionLogUrl(sessionId: string): string {
-  return `/admin/v1/sessions/${encodeURIComponent(sessionId)}/log`
-}
-
-export function itemLogUrl(itemId: string): string {
-  return `/admin/v1/items/${encodeURIComponent(itemId)}/log`
+export async function downloadWithAuth(path: string): Promise<void> {
+  const response = await api(path)
+  if (!response.ok)
+    throw new ApiError(response.status, (await response.text()) || `${response.status}`)
+  const url = URL.createObjectURL(await response.blob())
+  const link = document.createElement('a')
+  link.href = url
+  link.download = ''
+  try {
+    link.click()
+  } finally {
+    URL.revokeObjectURL(url)
+  }
 }
 
 export type PendingEnrollment = {

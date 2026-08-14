@@ -19,10 +19,11 @@ import {
   type ItemDetail,
   type Session,
   isAdmin,
-  sessionLogUrl,
+  downloadWithAuth,
 } from '../api'
 import { loadMask, maskSummary } from '../capabilities'
 import { keepSessionAlive } from '../keepalive'
+import { notify } from '../toast'
 import {
   SESSION_GONE,
   forgetRecoveries,
@@ -1546,9 +1547,16 @@ export default function Player({
             {/* OPS-10, where the problem is visible: the diagnostics for
                 THIS session, beside the verdict that describes it. */}
             {isAdmin() && (
-              <a className="info-log" href={sessionLogUrl(session.session_id)} download>
+              <button
+                className="info-log"
+                onClick={() =>
+                  downloadWithAuth(
+                    `/admin/v1/sessions/${encodeURIComponent(session.session_id)}/log`,
+                  ).catch((e: unknown) => notify(`Could not download the session log: ${e}`))
+                }
+              >
                 download session log
-              </a>
+              </button>
             )}
           </div>
         )}

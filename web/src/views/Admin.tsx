@@ -34,7 +34,7 @@ import {
   adminSetUserAdmin,
   refreshTokens,
   username,
-  sessionLogUrl,
+  downloadWithAuth,
   adminSessions,
   type AdminSession,
   type AdminUser,
@@ -1215,10 +1215,16 @@ export default function Admin() {
                     <span className="mono dim">idle {s.idle_secs}s</span>
                   </span>
                   <span>
-                    {/* OPS-10: plain anchor — the media cookie authenticates it. */}
-                    <a className="btn ghost small" href={sessionLogUrl(s.session_id)} download>
+                    <button
+                      className="btn ghost small"
+                      onClick={() =>
+                        downloadWithAuth(
+                          `/admin/v1/sessions/${encodeURIComponent(s.session_id)}/log`,
+                        ).catch((err: unknown) => setError(String(err)))
+                      }
+                    >
                       Log
-                    </a>
+                    </button>
                     <button
                       className="btn ghost small"
                       onClick={() =>

@@ -1309,6 +1309,10 @@ h2 {
   pointer-events: auto;
   align-self: flex-start;
   margin-top: 4px;
+  padding: 0;
+  background: none;
+  border: 0;
+  cursor: pointer;
   color: var(--dim);
   text-decoration: none;
   border-bottom: 1px dotted var(--teal-dim);

@@ -6,6 +6,7 @@ import {
   isAdmin,
   keepTokenFresh,
   onTokensCleared,
+  restoreSession,
   signOut,
   username,
   type Item,
@@ -342,8 +343,11 @@ export default function App() {
         setBootError('')
         setSetupAvailable(s.setup_available)
         setSetupUrl(s.setup_url)
-        if (s.setup_required) setPhase('setup')
-        else setPhase(s.authenticated ? 'app' : 'login')
+        if (s.setup_required) {
+          setPhase('setup')
+          return
+        }
+        setPhase((await restoreSession()) === 'authenticated' ? 'app' : 'login')
       } catch (e) {
         // NOT the sign-in screen. Conflating "the hub did not answer" with
         // "you are not signed in" sent a signed-in viewer to a password box
@@ -424,25 +428,10 @@ export default function App() {
     // /library/x/item/y restores the previous account's page. (The queue is
     // dropped for both, in the cleared handler above.)
     navigate({ view: 'libraries' }, { replace: true })
-    // Release before the tokens go, not as a consequence of the route change
-    // below: this effect is declared above the one that watches `playing`, so
-    // it runs first, and `signOut` clears the access token, the refresh token
-    // and the media cookie synchronously. By the time the route change was
-    // observed there was nothing left to authenticate the DELETE with — it
-    // 401'd, found no refresh token to repair itself with, and the error was
-    // swallowed. Measured: sign out mid-film and the session was still on the
-    // hub, holding its transcoder slot until the reaper took it.
-    //
-    // Clearing the ref stops the route change from sending a second one.
-    if (playedRef.current) {
-      void endSession(playedRef.current, true)
-      playedRef.current = null
-    }
-    // Tokens dropped at once and the hub told afterwards from a captured copy,
-    // which is `signOut`'s whole design: awaiting the network first left a
-    // window in which a fast sign-in — autofill and Enter — was wiped by the
-    // late answer to the sign-out before it, unexplained, with ITS family left
-    // live on the hub.
+    // Release while the in-memory bearer is still live. `signOut` then clears
+    // it synchronously and, under the shared auth lock, asks the hub to revoke
+    // and clear the HttpOnly cookie family. This preserves final progress and
+    // session DELETE ordering without letting a queued login overtake logout.
     void signOut()
   }, [signingOut])
 

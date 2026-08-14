@@ -4,21 +4,17 @@
 /// because the decision is worth stating on its own: the token is
 /// refreshed BEFORE it expires, not repaired after something fails.
 ///
-/// api() retries a 401 with a fresh token, but it is not the only thing
-/// carrying this token. The same token rides the kahawai_token cookie
-/// for <video>, <img> and EventSource, and hls.js sends it as a Bearer
-/// header from its own XHR. None of those pass through api(), so an
-/// expired token just fails the media request — and worse, makes the
-/// hub answer 401 where it would have answered 404, so session recovery
-/// cannot see its trigger either (observed 2026-08-07: a paused film
-/// died this way and had to be restarted by hand).
+/// `api()` retries a 401 with a fresh access token. Native media, images and
+/// EventSource instead use the server-managed `kahawai_media` cookie; hls.js
+/// reads the current in-memory access token for each XHR. Refreshing ahead of
+/// expiry rotates both credentials before either kind of request fails.
 
 /// Refresh this long before expiry. The access token lives 15 minutes
 /// (auth.rs ACCESS_TTL_SECS), so this costs a request per ~14 minutes.
 export const REFRESH_LEAD_MS = 60_000
 
 /// A refresh that failed transiently — hub restarting, link down — is
-/// worth retrying. A definitive rejection clears the tokens instead,
+/// worth retrying. A definitive rejection clears the in-memory access token,
 /// and then there is nothing left to schedule.
 export const REFRESH_RETRY_MS = 30_000
 

@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { storeTokens, type Tokens } from '../api'
+import { browserLogin } from '../api'
 
 export default function Auth({
   mode,
@@ -27,21 +27,23 @@ export default function Auth({
     e.preventDefault()
     setBusy(true)
     setError('')
-    const [url, body] =
-      mode === 'setup'
-        ? ['/api/v1/setup', { username: user, password }]
-        : ['/api/v1/auth/token', { username: user, password }]
-    // Raw `fetch`, because there is no token yet and `api()` exists to
-    // attach one — but that also means nothing here turns an unreachable hub
-    // into a sentence. Unhandled, the rejection skipped `setBusy(false)` and
-    // left the only button on the screen greyed out with nothing said: one
-    // wifi blip and signing in needed a reload.
+    if (mode === 'login') {
+      try {
+        await browserLogin(user, password)
+        onDone()
+      } catch (e) {
+        setError(String(e))
+      } finally {
+        setBusy(false)
+      }
+      return
+    }
     let r: Response
     try {
-      r = await fetch(url as string, {
+      r = await fetch('/api/v1/setup', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify(body),
+        body: JSON.stringify({ username: user, password }),
       })
     } catch {
       setBusy(false)
@@ -53,15 +55,7 @@ export default function Auth({
       setError((await r.text()) || 'Something went wrong')
       return
     }
-    if (mode === 'setup') {
-      // The trusted-local listener closes after this response. Its origin is
-      // deliberately not the normal hub origin, so its tokens would not be
-      // useful there; tell the operator to return to the address they use.
-      setSetupDone(true)
-      return
-    }
-    storeTokens((await r.json()) as Tokens)
-    onDone()
+    setSetupDone(true)
   }
 
   if (mode === 'setup' && !setupAvailable) {

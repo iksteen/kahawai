@@ -22,7 +22,7 @@ import {
   type ItemDetail,
   type Source,
   isAdmin,
-  itemLogUrl,
+  downloadWithAuth,
   setWatched,
 } from '../api'
 import CapabilityDebug from './CapabilityDebug'
@@ -953,9 +953,16 @@ export default function Detail({
                   it — the point is debugging a report from someone else,
                   after they have closed the player. */}
               {isAdmin() && (
-                <a className="btn ghost small log-link" href={itemLogUrl(id)} download>
+                <button
+                  className="btn ghost small log-link"
+                  onClick={() =>
+                    downloadWithAuth(`/admin/v1/items/${encodeURIComponent(id)}/log`).catch(
+                      (e: unknown) => notify(`Could not download the session log: ${e}`),
+                    )
+                  }
+                >
                   Last session log
-                </a>
+                </button>
               )}
             </div>
             {/* Re-ASK, don't just re-badge. The negotiated half of this
