@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, type ComponentType, type CSSProperties } from 'react'
+import { fetchItem } from '../item-query'
 import {
   endSession,
-  fetchItem,
   fetchLibraries,
   prefsOrNone,
   resolveTracks,

@@ -1,12 +1,12 @@
 import { useEffect, useReducer, useRef, useState } from 'react'
 import Hls from 'hls.js'
+import { fetchItem } from '../item-query'
 import {
   fetchChildren,
   artworkUrl,
   accessToken,
   api,
   endSession,
-  fetchItem,
   fetchLibraries,
   prefsOrNone,
   postProgress,

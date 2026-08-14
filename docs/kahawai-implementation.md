@@ -348,8 +348,27 @@ security schemes and nullable/omitted schema boundaries.
 `admin_api::admin_flow_enrollments_satellites_archive_restore` then fetches the
 served document and proves every documented protected method/path reaches a
 mounted authentication boundary rather than the SPA fallback. The vendored
-Swagger assets keep builds and rendering independent of a CDN. TypeScript
-generation and a post-1.0 compatibility baseline remain ENG-2/6 work.
+Swagger assets keep builds and rendering independent of a CDN.
+
+`web/openapi.json` is the one checked-in generated contract. `npm run
+api:export` runs the `kahawai-hub` `export_openapi` example with web building
+disabled, stamps its temporary output with a SHA-256 of the Rust contract
+inputs, and asks Orval 8.24.0 to parse it before atomically replacing the
+committed file. No running hub is required. A working-tree fingerprint check
+runs before development, tests, typechecking and every web build; the
+repository's pre-commit hook checks the staged blobs instead, so partial commits
+cannot pair sources with the wrong document. Install that hook with `git config
+core.hooksPath .githooks`. The Rust
+`checked_in_openapi_matches_generated_document` test is the definitive semantic
+comparison and catches an incomplete fingerprint manifest.
+
+Orval regenerates the ignored fetch client and models under
+`web/src/generated` from the committed JSON during `npm install` and before
+each web entry point. The custom fetch mutator retains the web client's bearer
+refresh and `ApiError` behaviour. `QUERY /api/v1/items/{id}` is the first
+generated binding used by the UI; the other routes remain on the existing
+wrapper until migrated. The post-1.0 compatibility baseline remains ENG-6
+work.
 
 *This breaks v1 in place, against NFR-7* ("breaking changes only in a new major API version"). Deliberate, with the maintainer's sanction: there are no external clients yet, and carrying a `/api/v2` for a pre-release keyspace costs more than it protects. NFR-7 governs from the first outside consumer.
 

@@ -195,7 +195,8 @@ impl Modify for BearerSecurity {
     }
 }
 
-fn openapi_document() -> utoipa::openapi::OpenApi {
+/// Build the exact OpenAPI document served by the hub.
+pub fn openapi_document() -> utoipa::openapi::OpenApi {
     let mut openapi = ApiDoc::openapi();
     let item = openapi
         .paths
@@ -1589,6 +1590,7 @@ async fn admin_enrich_run(
 }
 
 #[derive(serde::Deserialize, Default, ToSchema, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 struct RefreshQuery {
     deep: Option<bool>,
 }
@@ -3399,6 +3401,7 @@ async fn list_collections(
 /// `?size=` names one of `artwork::SIZES`; anything else, including
 /// nothing, serves the original.
 #[derive(serde::Deserialize, Default, ToSchema, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 struct ArtworkQuery {
     size: Option<String>,
     /// The client's cache-buster. Load-bearing rather than merely accepted: its
@@ -3488,6 +3491,7 @@ async fn item_artwork(
 }
 
 #[derive(Deserialize, ToSchema, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 struct VttQuery {
     /// f64 so a client that computed a fractional shift still works.
     #[serde(default)]
@@ -3737,6 +3741,7 @@ async fn list_libraries(
 }
 
 #[derive(Deserialize, ToSchema, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 struct ItemsQuery {
     library: Option<String>,
     /// HUB-12 server-side search: a substring of the title, folded the
@@ -5308,6 +5313,23 @@ mod tests {
     }
 
     #[test]
+    fn checked_in_openapi_matches_generated_document() {
+        let mut committed: serde_json::Value =
+            serde_json::from_str(include_str!("../../../web/openapi.json")).unwrap();
+        let fingerprint = committed
+            .as_object_mut()
+            .unwrap()
+            .remove("x-kahawai-source-sha256")
+            .expect("openapi.json has a source fingerprint");
+        assert_eq!(fingerprint.as_str().map(str::len), Some(64));
+        assert_eq!(
+            committed,
+            serde_json::to_value(openapi_document()).unwrap(),
+            "web/openapi.json is stale; run `npm --prefix web run api:export`"
+        );
+    }
+
+    #[test]
     fn openapi_covers_exact_application_surface_with_typed_bodies() {
         use std::collections::BTreeSet;
 
@@ -5417,6 +5439,28 @@ mod tests {
                 ["schema"]["$ref"],
             "#/components/schemas/ItemQueryResponse"
         );
+        for (path, method, name) in [
+            ("/admin/v1/libraries/{id}/refresh", "post", "deep"),
+            ("/api/v1/items", "get", "library"),
+            ("/api/v1/items", "get", "q"),
+            ("/api/v1/items", "get", "sort"),
+            ("/api/v1/items", "get", "in_progress"),
+            ("/api/v1/items", "get", "limit"),
+            ("/api/v1/items", "get", "offset"),
+            ("/api/v1/items/{id}/artwork", "get", "size"),
+            ("/api/v1/items/{id}/artwork", "get", "v"),
+            ("/api/v1/items/{id}/subtitles/{file}", "get", "shift_ms"),
+        ] {
+            let parameter = document["paths"][path][method]["parameters"]
+                .as_array()
+                .and_then(|parameters| {
+                    parameters
+                        .iter()
+                        .find(|parameter| parameter["name"] == name)
+                })
+                .unwrap_or_else(|| panic!("{method} {path} has no {name} parameter"));
+            assert_eq!(parameter["in"], "query", "{method} {path} {name}");
+        }
         assert_eq!(
             document["paths"]["/api/v1/items"]["get"]["responses"]["200"]["content"]["application/json"]
                 ["schema"]["$ref"],

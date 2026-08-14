@@ -14,6 +14,7 @@ fn main() {
 
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=KAHAWAI_REQUIRE_WEB");
+    println!("cargo:rerun-if-env-changed=KAHAWAI_SKIP_WEB_BUILD");
 
     // web/dist is output, so watch the bundle's inputs rather than arming the
     // build script with its own writes.
@@ -35,7 +36,7 @@ fn main() {
     }
 
     let modules = web.join("node_modules");
-    if modules.exists() {
+    if modules.exists() && std::env::var_os("KAHAWAI_SKIP_WEB_BUILD").is_none() {
         // A changed lockfile with an old install should repair itself before
         // TypeScript sees an incomplete dependency tree.
         let installed_lock = modules.join(".package-lock.json");

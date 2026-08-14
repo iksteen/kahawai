@@ -600,30 +600,6 @@ export type Negotiated = {
   subtitles: Subtitle[]
 }
 
-/// Ask what we would be served, not merely what was discovered
-/// (RFC 10008 QUERY). One round trip: the answer carries the announced
-/// streams AND the negotiated verdict.
-///
-/// The profile sent here is the UNREFINED probe. `refineForSources`
-/// needs the announced streams this call returns, and it can only ever
-/// ADD precise caps beside the family floor — which `cap_admits`
-/// already treats as unknown-permissive — so the only thing lost is a
-/// slightly pessimistic preview on a device whose generic high-end
-/// probe fails but whose per-stream one passes. `startPlaybackSession`
-/// still refines, and by then the streams are in hand.
-export async function fetchItem(id: string): Promise<ItemDetail> {
-  const raw = await json<Item & { sources: Source[] | number; negotiated?: Negotiated }>(
-    `/api/v1/items/${id}`,
-    {
-      method: 'QUERY',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ profile: buildProfile() }),
-    },
-  )
-  const sources = Array.isArray(raw.sources) ? raw.sources : []
-  return { ...(raw as Item), sources: sources.length, sources_detail: sources }
-}
-
 export type SubtitleVerdict = {
   index: number
   track_id?: number | null

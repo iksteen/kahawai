@@ -1,10 +1,10 @@
 import { useEffect, useState } from 'react'
 import Failed from '../Failed'
+import { fetchItem } from '../item-query'
 import {
   artworkSrcSet,
   artworkUrl,
   fetchChildren,
-  fetchItem,
   prefsOrNone,
   setWatched,
   type Item,

@@ -592,10 +592,15 @@ marked in that document.
 - [~] ENG-2 The same DTOs generate a complete OpenAPI 3.2 document for the
       exact 62-operation application surface and vendored Swagger UI.
       Generation fails closed on operation membership, typed JSON schemas,
-      security declarations, QUERY placement and null-versus-omitted fields;
-      the mounted-route integration check proves documented protected
-      operations reach authentication instead of the SPA fallback. TypeScript
-      generation and the post-1.0 compatibility baseline remain
+      security declarations, QUERY placement, query-parameter location and
+      null-versus-omitted fields. `web/openapi.json` is committed, source-
+      fingerprinted and checked for exact semantic equality with the Rust
+      document. Working-tree build gates and a staged pre-commit gate reject a
+      stale snapshot. Orval 8.24.0 regenerates the ignored fetch bindings for
+      every operation during installation and before each web entry point,
+      without a running hub; the UI uses the generated item QUERY binding
+      through its existing authenticated transport. The remaining web routes
+      and post-1.0 compatibility baseline remain open
 - [ ] ENG-3 After characterization tests cover the existing wire behaviour,
       define API ownership boundaries that prevent auth, library, playback,
       admin, provider and observability changes from sharing one implementation
