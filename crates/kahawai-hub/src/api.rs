@@ -108,73 +108,93 @@ pub fn router(
         setup_url: Arc::new(net.setup_url),
         public_origin: net.public_origin,
     };
-    // HUB-10: everything keyed by an item id, behind ONE grant check.
-    // Their own group so `require_item_access` is stated once — a check
-    // per handler is a check nobody adds to the ninth.
-    let items = Router::new()
+    // Method/path membership is the cookie authority. Item/session ownership
+    // remains inside authentication for both transport groups.
+    let bearer_items = Router::new()
         .route("/api/v1/items/{id}", get(item_detail).fallback(item_query))
         .route("/api/v1/items/{id}/children", get(item_children))
         .route(
             "/api/v1/items/{id}/watched",
             axum::routing::put(item_set_watched),
         )
-        .route("/api/v1/items/{id}/artwork", get(item_artwork))
         .route("/api/v1/items/{id}/subtitles/search", post(subtitle_search))
         .route(
             "/api/v1/items/{id}/subtitles/download",
             post(subtitle_download),
         )
+        .route("/api/v1/items/{id}/fonts", get(item_fonts))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            require_item_access,
+        ))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            require_bearer,
+        ));
+    let media_items = Router::new()
+        .route("/api/v1/items/{id}/artwork", get(item_artwork))
         .route(
             "/api/v1/items/{id}/subtitles/{file}",
             get(item_subtitle_file),
         )
-        .route("/api/v1/items/{id}/fonts", get(item_fonts))
         .route("/api/v1/items/{id}/fonts/{n}", get(item_font))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             require_item_access,
+        ))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            require_bearer_or_media,
         ));
-    // AUTH-11: every user-facing resource below a session id crosses one
-    // ownership boundary. Keeping the routes together means a new playlist,
-    // segment, subtitle or control endpoint cannot accidentally rely on the
-    // session id as a bearer capability. Administrative routes are separate.
-    let session_resources = Router::new()
+    let bearer_sessions = Router::new()
         .route(
             "/api/v1/playback/sessions/{id}",
             axum::routing::delete(end_session),
         )
-        .route("/api/v1/playback/sessions/{id}/stream", get(stream_session))
         .route(
             "/api/v1/playback/sessions/{id}/progress",
             post(post_progress),
         )
         .route("/api/v1/playback/sessions/{id}/seek", post(seek_session))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            require_session_owner,
+        ))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            require_bearer,
+        ));
+    let media_sessions = Router::new()
+        .route("/api/v1/playback/sessions/{id}/stream", get(stream_session))
         .route("/api/v1/playback/sessions/{id}/{file}", get(session_file))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             require_session_owner,
+        ))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            require_bearer_or_media,
         ));
-    let protected = Router::new()
+    let bearer = Router::new()
         .route("/api/v1/collections", get(list_collections))
         .route("/api/v1/libraries", get(list_libraries))
         .route("/api/v1/items", get(list_items))
         .route("/api/v1/auth/logout", post(logout))
-        // Not in the `items` group: keyed by a TRACK id, and already
-        // gated on being that track's downloader or an admin.
         .route(
             "/api/v1/subtitles/{track_id}",
             axum::routing::delete(subtitle_delete),
         )
         .route("/api/v1/prefs", get(get_prefs).put(put_pref))
-        .route("/api/v1/events", get(events))
         .route("/api/v1/playback/sessions", post(start_session))
-        // Merged BEFORE this layer, so `require_auth` wraps both inner
-        // authorization groups and installs Claims before either runs.
-        .merge(session_resources)
-        .merge(items)
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
-            require_auth,
+            require_bearer,
+        ));
+    let media = Router::new()
+        .route("/api/v1/events", get(events))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            require_bearer_or_media,
         ));
     let admin = Router::new()
         .route("/admin/v1/enrollments", get(admin_enrollments))
@@ -250,24 +270,27 @@ pub fn router(
         .route_layer(axum::middleware::from_fn(require_admin))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
-            require_auth,
+            require_bearer,
         ));
     let mut app = Router::new()
         .merge(admin)
+        .merge(bearer)
+        .merge(media)
+        .merge(bearer_items)
+        .merge(media_items)
+        .merge(bearer_sessions)
+        .merge(media_sessions)
         // NFR-6: public on purpose. It names modules and their state and
         // nothing else — a load balancer or uptime check must be able to
         // ask without holding a credential, and there is nothing here
         // that a failed login does not already reveal.
         .route("/health", get(health))
-        // NFR-6: its own static credential, not a login token — see
-        // `metrics`. Outside the admin group on purpose.
         .route("/metrics", get(metrics))
         .route("/api/v1/bootstrap", get(bootstrap))
         // Initial-admin creation deliberately does not exist on this public
         // router. It lives on the dedicated loopback setup listener.
         .route("/api/v1/auth/token", post(login))
         .route("/api/v1/auth/refresh", post(refresh))
-        .merge(protected)
         .with_state(state);
     if let Some(cors) = cors {
         app = app.layer(cors);
@@ -330,28 +353,33 @@ fn session_gone() -> ApiError {
     hidden("session")
 }
 
-/// The token as a client presents it: Authorization header first, the
-/// kahawai_token cookie as the fallback for <video>/HLS requests, which
-/// cannot set headers (HUB-27). Shared with `bootstrap`, so what counts
-/// as "signed in" cannot drift between the gate and what the gate says.
-fn presented_token(req: &Request) -> Option<String> {
-    let header = req
-        .headers()
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .map(str::to_string);
-    header.or_else(|| {
-        req.headers()
-            .get(axum::http::header::COOKIE)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|c| {
-                c.split(';')
-                    .filter_map(|kv| kv.trim().split_once('='))
-                    .find(|(k, _)| *k == "kahawai_token")
-                    .map(|(_, v)| v.to_string())
-            })
-    })
+fn cookie<'a>(headers: &'a axum::http::HeaderMap, name: &str) -> Option<&'a str> {
+    headers
+        .get(axum::http::header::COOKIE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|cookies| {
+            cookies
+                .split(';')
+                .filter_map(|entry| entry.trim().split_once('='))
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| value)
+        })
+}
+
+/// An Authorization header always wins, including when malformed or invalid.
+fn request_token(req: &Request, allow_media_cookie: bool) -> Result<Option<&str>, ()> {
+    if let Some(value) = req.headers().get(axum::http::header::AUTHORIZATION) {
+        return value
+            .to_str()
+            .ok()
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .filter(|token| !token.is_empty())
+            .map(Some)
+            .ok_or(());
+    }
+    Ok(allow_media_cookie
+        .then(|| cookie(req.headers(), "kahawai_media"))
+        .flatten())
 }
 
 /// Which screen the client should open on, stated rather than inferred.
@@ -422,10 +450,11 @@ async fn bootstrap(State(state): State<AppState>, req: Request) -> Json<Value> {
     let setup_required = state.auth.setup_required();
     let authenticated = if setup_required {
         false
-    } else if let Some(token) = presented_token(&req) {
-        state.auth.authenticate(&token).await.is_ok()
     } else {
-        false
+        match request_token(&req, true) {
+            Ok(Some(token)) => state.auth.authenticate(token).await.is_ok(),
+            Ok(None) | Err(()) => false,
+        }
     };
     Json(json!({
         "setup_required": setup_required,
@@ -435,25 +464,40 @@ async fn bootstrap(State(state): State<AppState>, req: Request) -> Json<Value> {
     }))
 }
 
-async fn require_auth(
+async fn require_bearer(
     State(state): State<AppState>,
-    mut req: Request,
+    req: Request,
     next: Next,
 ) -> Result<Response, ApiError> {
+    require_auth(state, req, next, false).await
+}
+
+async fn require_bearer_or_media(
+    State(state): State<AppState>,
+    req: Request,
+    next: Next,
+) -> Result<Response, ApiError> {
+    require_auth(state, req, next, true).await
+}
+
+async fn require_auth(
+    state: AppState,
+    mut req: Request,
+    next: Next,
+    allow_media_cookie: bool,
+) -> Result<Response, ApiError> {
     if state.auth.setup_required() {
-        // OPS-1: nothing else is reachable until setup completes.
         tracing::warn!(path = %req.uri(), "503: setup_required returned true");
         return Err((StatusCode::SERVICE_UNAVAILABLE, "setup required".into()));
     }
-    let token = presented_token(&req).ok_or((
-        StatusCode::UNAUTHORIZED,
-        "invalid or missing token".to_string(),
-    ))?;
-    // Signature and expiry are necessary, but mutable account state comes from
-    // the indexed users row on every request. Its durable generation makes a
-    // deletion, role change or CLI password reset effective across processes
-    // and restarts rather than only in this Auth instance.
-    let claims = state.auth.authenticate(&token).await.map_err(|_| {
+    let token = request_token(&req, allow_media_cookie)
+        .ok()
+        .flatten()
+        .ok_or((
+            StatusCode::UNAUTHORIZED,
+            "invalid or missing token".to_string(),
+        ))?;
+    let claims = state.auth.authenticate(token).await.map_err(|_| {
         (
             StatusCode::UNAUTHORIZED,
             "invalid or missing token".to_string(),
@@ -1542,10 +1586,32 @@ async fn setup(
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[derive(Clone, Copy, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
+enum AuthClient {
+    Browser,
+    Api,
+}
+
 #[derive(Deserialize)]
 struct LoginRequest {
+    client: AuthClient,
     username: String,
     password: String,
+}
+
+#[derive(Deserialize)]
+struct RefreshRequest {
+    client: AuthClient,
+    #[serde(default)]
+    refresh_token: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct LogoutRequest {
+    client: AuthClient,
+    #[serde(default)]
+    refresh_token: Option<String>,
 }
 
 /// Source address for OPS-2 throttling: the socket peer (None in
@@ -1571,6 +1637,129 @@ impl axum::extract::FromRequestParts<AppState> for ClientIp {
     }
 }
 
+struct AuthRequestMeta {
+    headers: axum::http::HeaderMap,
+    peer: Option<std::net::IpAddr>,
+}
+
+impl axum::extract::FromRequestParts<AppState> for AuthRequestMeta {
+    type Rejection = std::convert::Infallible;
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        Ok(Self {
+            headers: parts.headers.clone(),
+            peer: parts
+                .extensions
+                .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+                .map(|c| c.0.ip()),
+        })
+    }
+}
+
+fn browser_origin(state: &AppState, meta: &AuthRequestMeta) -> Option<PublicOrigin> {
+    if let Some(origin) = &state.public_origin {
+        return Some(origin.clone());
+    }
+    let header = |name| meta.headers.get(name).and_then(|value| value.to_str().ok());
+    state
+        .proxy_trust
+        .forwarded_origin(
+            meta.peer,
+            header("x-forwarded-proto"),
+            header("x-forwarded-host"),
+        )
+        .and_then(|origin| PublicOrigin::parse(&origin).ok())
+        .or_else(|| {
+            header("host").and_then(|host| PublicOrigin::parse(&format!("http://{host}")).ok())
+        })
+}
+
+fn validate_browser_origin(
+    state: &AppState,
+    meta: &AuthRequestMeta,
+) -> Result<PublicOrigin, ApiError> {
+    let forbidden = || {
+        (
+            StatusCode::FORBIDDEN,
+            "browser authentication requires the canonical Origin".into(),
+        )
+    };
+    let expected = browser_origin(state, meta).ok_or_else(forbidden)?;
+    let presented = meta
+        .headers
+        .get(axum::http::header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| PublicOrigin::parse(value).ok())
+        .ok_or_else(forbidden)?;
+    if presented != expected {
+        return Err(forbidden());
+    }
+    Ok(expected)
+}
+
+fn auth_cookie(
+    name: &str,
+    value: &str,
+    path: &str,
+    max_age: i64,
+    secure: bool,
+) -> axum::http::HeaderValue {
+    let secure = if secure { "; Secure" } else { "" };
+    format!("{name}={value}; Path={path}; Max-Age={max_age}; HttpOnly; SameSite=Strict{secure}")
+        .parse()
+        .expect("generated auth token is a valid cookie value")
+}
+
+fn append_auth_cookies(response: &mut Response, tokens: &crate::auth::TokenPair, secure: bool) {
+    response.headers_mut().append(
+        axum::http::header::SET_COOKIE,
+        auth_cookie(
+            "kahawai_refresh",
+            &tokens.refresh_token,
+            "/api/v1/auth",
+            crate::auth::REFRESH_TTL_SECS,
+            secure,
+        ),
+    );
+    response.headers_mut().append(
+        axum::http::header::SET_COOKIE,
+        auth_cookie(
+            "kahawai_media",
+            &tokens.access_token,
+            "/api/v1",
+            crate::auth::ACCESS_TTL_SECS,
+            secure,
+        ),
+    );
+}
+
+fn clear_auth_cookies(response: &mut Response, secure: bool) {
+    for (name, path) in [
+        ("kahawai_refresh", "/api/v1/auth"),
+        ("kahawai_media", "/api/v1"),
+    ] {
+        response.headers_mut().append(
+            axum::http::header::SET_COOKIE,
+            auth_cookie(name, "", path, 0, secure),
+        );
+    }
+}
+
+fn token_response(tokens: crate::auth::TokenPair, client: AuthClient, secure: bool) -> Response {
+    if client == AuthClient::Api {
+        return Json(json!(tokens)).into_response();
+    }
+    let mut response = Json(json!({
+        "access_token": tokens.access_token,
+        "expires_in": tokens.expires_in,
+    }))
+    .into_response();
+    append_auth_cookies(&mut response, &tokens, secure);
+    response
+}
+
 /// OPS-2 thresholds: consecutive failures before lockout. The per-IP
 /// bar is higher so one shared NAT doesn't lock a household out.
 const THROTTLE_USER_AFTER: u32 = 5;
@@ -1579,8 +1768,10 @@ const THROTTLE_IP_AFTER: u32 = 20;
 async fn login(
     State(state): State<AppState>,
     ClientIp(ip): ClientIp,
-    Json(body): Json<LoginRequest>,
-) -> Result<Json<Value>, ApiError> {
+    meta: AuthRequestMeta,
+    body: Result<Json<LoginRequest>, axum::extract::rejection::JsonRejection>,
+) -> Result<Response, ApiError> {
+    let Json(body) = body.map_err(|error| (StatusCode::BAD_REQUEST, error.body_text()))?;
     if state.auth.setup_required() {
         return Err((StatusCode::SERVICE_UNAVAILABLE, "setup required".into()));
     }
@@ -1589,7 +1780,7 @@ async fn login(
     let locked = state.auth.throttle.locked(&user_key).or_else(|| {
         ip_key
             .as_deref()
-            .and_then(|k| state.auth.throttle.locked(k))
+            .and_then(|key| state.auth.throttle.locked(key))
     });
     if let Some(wait) = locked {
         tracing::warn!(username = %body.username, ip = ?ip, "login throttled");
@@ -1601,56 +1792,111 @@ async fn login(
     match state.auth.login(&body.username, &body.password).await {
         Ok(tokens) => {
             state.auth.throttle.clear(&user_key);
-            if let Some(k) = &ip_key {
-                state.auth.throttle.clear(k);
+            if let Some(key) = &ip_key {
+                state.auth.throttle.clear(key);
             }
-            Ok(Json(json!(tokens)))
+            let secure = body.client == AuthClient::Browser
+                && browser_origin(&state, &meta).is_some_and(|origin| origin.secure());
+            Ok(token_response(tokens, body.client, secure))
         }
         Err(_) => {
             let lock = state.auth.throttle.fail(&user_key, THROTTLE_USER_AFTER);
-            if let Some(k) = &ip_key {
-                state.auth.throttle.fail(k, THROTTLE_IP_AFTER);
+            if let Some(key) = &ip_key {
+                state.auth.throttle.fail(key, THROTTLE_IP_AFTER);
             }
             tracing::warn!(username = %body.username, ip = ?ip, locked = ?lock, "login failed");
-            Err((StatusCode::UNAUTHORIZED, "invalid credentials".to_string()))
+            Err((StatusCode::UNAUTHORIZED, "invalid credentials".into()))
         }
     }
 }
 
-#[derive(Deserialize)]
-struct RefreshRequest {
-    refresh_token: String,
-}
-
 async fn refresh(
     State(state): State<AppState>,
-    Json(body): Json<RefreshRequest>,
-) -> Result<Json<Value>, ApiError> {
-    let tokens = state
-        .auth
-        .refresh(&body.refresh_token)
-        .await
-        .map_err(|e| match e {
-            crate::auth::RefreshError::Invalid => (
-                StatusCode::UNAUTHORIZED,
-                "invalid refresh token".to_string(),
-            ),
-            crate::auth::RefreshError::Internal(e) => internal(e),
-        })?;
-    Ok(Json(json!(tokens)))
+    meta: AuthRequestMeta,
+    body: Result<Json<RefreshRequest>, axum::extract::rejection::JsonRejection>,
+) -> Result<Response, ApiError> {
+    let Json(body) = body.map_err(|error| (StatusCode::BAD_REQUEST, error.body_text()))?;
+    let (token, origin) = match body.client {
+        AuthClient::Api => (
+            body.refresh_token
+                .as_deref()
+                .filter(|token| !token.is_empty())
+                .ok_or((StatusCode::BAD_REQUEST, "refresh_token required".into()))?,
+            None,
+        ),
+        AuthClient::Browser => {
+            if body.refresh_token.is_some() {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "browser refresh_token must be omitted".into(),
+                ));
+            }
+            let origin = validate_browser_origin(&state, &meta)?;
+            let Some(token) = cookie(&meta.headers, "kahawai_refresh") else {
+                let mut response =
+                    (StatusCode::UNAUTHORIZED, "invalid refresh token").into_response();
+                clear_auth_cookies(&mut response, origin.secure());
+                return Ok(response);
+            };
+            (token, Some(origin))
+        }
+    };
+    match state.auth.refresh(token).await {
+        Ok(tokens) => Ok(token_response(
+            tokens,
+            body.client,
+            origin.is_some_and(|origin| origin.secure()),
+        )),
+        Err(crate::auth::RefreshError::Invalid) if body.client == AuthClient::Browser => {
+            let mut response = (StatusCode::UNAUTHORIZED, "invalid refresh token").into_response();
+            clear_auth_cookies(&mut response, origin.is_some_and(|origin| origin.secure()));
+            Ok(response)
+        }
+        Err(crate::auth::RefreshError::Invalid) => {
+            Err((StatusCode::UNAUTHORIZED, "invalid refresh token".into()))
+        }
+        Err(crate::auth::RefreshError::Internal(error)) => Err(internal(error)),
+    }
 }
 
 async fn logout(
     State(state): State<AppState>,
     axum::Extension(claims): axum::Extension<crate::auth::Claims>,
-    Json(body): Json<RefreshRequest>,
-) -> Result<StatusCode, ApiError> {
+    meta: AuthRequestMeta,
+    body: Result<Json<LogoutRequest>, axum::extract::rejection::JsonRejection>,
+) -> Result<Response, ApiError> {
+    let Json(body) = body.map_err(|error| (StatusCode::BAD_REQUEST, error.body_text()))?;
+    let (token, origin) = match body.client {
+        AuthClient::Api => (
+            body.refresh_token
+                .as_deref()
+                .filter(|token| !token.is_empty())
+                .ok_or((StatusCode::BAD_REQUEST, "refresh_token required".into()))?,
+            None,
+        ),
+        AuthClient::Browser => {
+            if body.refresh_token.is_some() {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "browser refresh_token must be omitted".into(),
+                ));
+            }
+            let origin = validate_browser_origin(&state, &meta)?;
+            let token = cookie(&meta.headers, "kahawai_refresh")
+                .ok_or((StatusCode::UNAUTHORIZED, "refresh cookie required".into()))?;
+            (token, Some(origin))
+        }
+    };
     state
         .auth
-        .logout(&claims.sub, &body.refresh_token)
+        .logout(&claims.sub, token)
         .await
         .map_err(internal)?;
-    Ok(StatusCode::NO_CONTENT)
+    let mut response = StatusCode::NO_CONTENT.into_response();
+    if let Some(origin) = origin {
+        clear_auth_cookies(&mut response, origin.secure());
+    }
+    Ok(response)
 }
 
 #[derive(Deserialize)]
@@ -1681,8 +1927,8 @@ struct StartSessionRequest {
 }
 
 /// HUB-11 event channel: server-sent invalidation hints ({kind, ...}).
-/// EventSource authenticates via the kahawai_token cookie (it cannot
-/// set headers), same as <video>/HLS requests. Hints, not state —
+/// EventSource authenticates via the `kahawai_media` cookie (it cannot
+/// set headers), like the other browser media resources. Hints, not state —
 /// clients refetch whatever a hint names.
 async fn events(State(state): State<AppState>) -> impl axum::response::IntoResponse {
     use axum::response::sse::{Event, KeepAlive, Sse};

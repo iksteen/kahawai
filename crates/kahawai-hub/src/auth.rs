@@ -53,8 +53,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{Row, SqlitePool};
 
-const ACCESS_TTL_SECS: i64 = 15 * 60;
-const REFRESH_TTL_SECS: i64 = 30 * 24 * 3600;
+pub const ACCESS_TTL_SECS: i64 = 15 * 60;
+pub const REFRESH_TTL_SECS: i64 = 30 * 24 * 3600;
 pub const MIN_PASSWORD_CHARS: usize = 12;
 
 /// JWT issuer: the authority that minted the credential. The per-hub signing
