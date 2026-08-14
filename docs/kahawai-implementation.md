@@ -485,7 +485,7 @@ A validated announcement inserts `collection_roots`. One configured root proves 
 
 ## 6. Transcoder internals
 
-**Capability probing at startup.** Enumerate `gst::ElementFactory` list, rank encoders: `vaapih264enc/vah264enc`, `nvh264enc`, `qsvh264enc`, `x264enc` (and HEVC/AV1 equivalents); verify by dry-running a 1-frame pipeline per encoder so a broken driver is discovered at registration, not mid-session (TC-1, TC-6 fallback list retained).
+**Capability probing at startup.** Enumerate the `gst::ElementFactory` list and rank encoders: `vah264enc`/`vaapih264enc`, `nvh264enc`, `qsvh264enc`, VideoToolbox, then software (and the HEVC/AV1 equivalents). Presence is insufficient: each candidate encodes five test frames before it can be declared (TC-1), and failures retain the full GStreamer error before the preference list falls through (TC-6). The test dimensions are fixed to the nearest ordinary 640×480 size allowed by that encoder's own system-memory sink caps, rather than one universal size: Mesa's gfx1200 `vah265enc`, for example, accepts widths from 384 while the old 320×240 probe falsely classified working AMD HEVC hardware as broken. A session whose demuxed caps state exact dimensions applies the same sink-cap check before selecting its encoder; an incompatible candidate falls through instead of failing during pipeline negotiation.
 
 **Pipeline construction per `TranscodeSpec`.** Source is a custom `appsrc`-backed element fed from the hub byte plane (or direct file in all-in-one), pushed into:
 

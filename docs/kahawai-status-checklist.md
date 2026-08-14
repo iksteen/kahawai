@@ -538,8 +538,11 @@ How something works and why it was built that way belong in
       `worker_threads`, which each pipeline worker applies to itself
       (both default to 0 = today's behaviour; on all-in-one they govern
       the hub's own remux workers too). Runtime degradation to software
-      comes free from the per-session worker process dry-running its
-      preference list, and the session log now names the encoder it got.
+      comes from the per-session worker probing its preference list and
+      rejecting candidates whose sink caps exclude the session dimensions;
+      the session log names the encoder it got. Startup probes likewise choose
+      dimensions from each encoder's own caps, avoiding false hardware
+      failures from a one-size test frame.
       Struck by the amendment, with reasons and measurements there:
       scratch eviction (unreachable without giving up the EVENT playlist
       players seek in; a run costs 3.0–5.4 GB per content-hour and is

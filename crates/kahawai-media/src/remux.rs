@@ -249,21 +249,64 @@ pub const SW_VIDEO_ENCODERS: &[&str] = &[
     "av1enc",
 ];
 
+/// Best available video encoder for this box, with an optional exact output
+/// size. The startup capability path has no size and picks the first encoder
+/// that survives its own caps-sized probe. A session whose demuxed caps carry
+/// dimensions additionally skips candidates that reject that picture size.
+fn verified_video_encoder(
+    list: &[&'static str],
+    dimensions: Option<(i32, i32)>,
+) -> Option<&'static str> {
+    static VERIFIED: std::sync::LazyLock<
+        std::sync::Mutex<std::collections::HashMap<&'static str, bool>>,
+    > = std::sync::LazyLock::new(Default::default);
+    let verified = &*VERIFIED;
+    let _ = crate::init();
+    list.iter().copied().find(|name| {
+        if gst::ElementFactory::find(name).is_none() {
+            return false;
+        }
+        if let Some((width, height)) = dimensions
+            && !video_encoder_accepts_dimensions(name, width, height)
+        {
+            tracing::warn!(
+                encoder = name,
+                width,
+                height,
+                "encoder rejects session dimensions; trying next"
+            );
+            return false;
+        }
+        if let Some(ok) = verified.lock().unwrap().get(name).copied() {
+            return ok;
+        }
+        let ok = dry_run_video_encoder(name);
+        verified.lock().unwrap().insert(name, ok);
+        if !ok {
+            tracing::warn!(encoder = name, "encoder failed dry-run; trying next");
+        }
+        ok
+    })
+}
+
 /// Best available H.264 encoder, dry-run-verified once. None → this box
 /// cannot transcode video.
 pub fn h264_encoder() -> Option<&'static str> {
-    static VERIFIED: std::sync::OnceLock<Option<&'static str>> = std::sync::OnceLock::new();
-    *VERIFIED.get_or_init(|| verified_encoder(H264_ENCODERS, dry_run_video_encoder))
+    static VERIFIED: std::sync::LazyLock<Option<&'static str>> =
+        std::sync::LazyLock::new(|| verified_video_encoder(H264_ENCODERS, None));
+    *VERIFIED
 }
 
 pub fn hevc_encoder() -> Option<&'static str> {
-    static VERIFIED: std::sync::OnceLock<Option<&'static str>> = std::sync::OnceLock::new();
-    *VERIFIED.get_or_init(|| verified_encoder(HEVC_ENCODERS, dry_run_video_encoder))
+    static VERIFIED: std::sync::LazyLock<Option<&'static str>> =
+        std::sync::LazyLock::new(|| verified_video_encoder(HEVC_ENCODERS, None));
+    *VERIFIED
 }
 
 pub fn av1_encoder() -> Option<&'static str> {
-    static VERIFIED: std::sync::OnceLock<Option<&'static str>> = std::sync::OnceLock::new();
-    *VERIFIED.get_or_init(|| verified_encoder(AV1_ENCODERS, dry_run_video_encoder))
+    static VERIFIED: std::sync::LazyLock<Option<&'static str>> =
+        std::sync::LazyLock::new(|| verified_video_encoder(AV1_ENCODERS, None));
+    *VERIFIED
 }
 
 /// TC-6 CPU share: the thread ceiling a worker was configured with, or
@@ -369,13 +412,92 @@ pub fn encoder_capabilities() -> Vec<(&'static str, &'static str, bool)> {
     caps
 }
 
+const VIDEO_PROBE_WIDTH: i32 = 640;
+const VIDEO_PROBE_HEIGHT: i32 = 480;
+
+/// System-memory raw-video caps an encoder accepts. The real chain reaches
+/// every non-NV encoder through `videoconvert`; NV additionally has its CUDA
+/// converter path, but also advertises this fallback. A device-specific VA
+/// factory carries the active driver's limits here — including radeonsi's
+/// 384-pixel minimum for HEVC on gfx1200.
+fn video_encoder_sink_caps(name: &str) -> Option<gst::Caps> {
+    let factory = gst::ElementFactory::find(name)?;
+    let raw = gst::Caps::builder("video/x-raw").build();
+    let mut accepted = gst::Caps::new_empty();
+    for template in factory
+        .static_pad_templates()
+        .into_iter()
+        .filter(|template| template.direction() == gst::PadDirection::Sink)
+    {
+        accepted.merge(template.caps().intersect(&raw));
+    }
+    (!accepted.is_empty()).then_some(accepted)
+}
+
+/// A cheap, ordinary probe size inside one encoder's advertised limits.
+/// 640x480 keeps the five-buffer startup probe small; fixation moves either
+/// axis to the nearest supported value when a driver requires something else.
+fn video_probe_dimensions_from_caps(caps: &gst::Caps) -> Option<(i32, i32)> {
+    let mut fixed = caps.copy();
+    fixed.truncate();
+    let structure = fixed.get_mut()?.structure_mut(0)?;
+    for (field, preferred) in [("width", VIDEO_PROBE_WIDTH), ("height", VIDEO_PROBE_HEIGHT)] {
+        if structure.has_field(field) {
+            structure.fixate_field_nearest_int(field, preferred);
+        } else {
+            structure.set(field, preferred);
+        }
+    }
+    let width = structure.get::<i32>("width").ok()?;
+    let height = structure.get::<i32>("height").ok()?;
+    (width > 0 && height > 0).then_some((width, height))
+}
+
+fn video_caps_accept_dimensions(caps: &gst::Caps, width: i32, height: i32) -> bool {
+    let dimensions = gst::Caps::builder("video/x-raw")
+        .field("width", width)
+        .field("height", height)
+        .build();
+    caps.can_intersect(&dimensions)
+}
+
+fn video_encoder_accepts_dimensions(name: &str, width: i32, height: i32) -> bool {
+    video_encoder_sink_caps(name)
+        .is_some_and(|caps| video_caps_accept_dimensions(&caps, width, height))
+}
+
 fn dry_run_video_encoder(name: &str) -> bool {
+    let Some(caps) = video_encoder_sink_caps(name) else {
+        tracing::warn!(
+            encoder = name,
+            "encoder has no system-memory raw-video sink caps"
+        );
+        return false;
+    };
+    let Some((width, height)) = video_probe_dimensions_from_caps(&caps) else {
+        tracing::warn!(encoder = name, "encoder has no usable video dimensions");
+        return false;
+    };
     // No forced pixel format: encoders differ (x264enc takes I420,
     // nvh264enc only NV12/RGBA-family) — videoconvert lets negotiation
     // pick whatever the encoder accepts, exactly like the real pipeline.
-    dry_run(&format!(
-        "videotestsrc num-buffers=5 ! video/x-raw,width=320,height=240 ! videoconvert ! {name} ! fakesink"
-    ))
+    let launch = format!(
+        "videotestsrc num-buffers=5 ! video/x-raw,width={width},height={height} \
+         ! videoconvert ! {name} ! fakesink"
+    );
+    match dry_run_result(&launch) {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::warn!(
+                encoder = name,
+                width,
+                height,
+                error = format!("{error:#}"),
+                "video encoder dry-run failed"
+            );
+            false
+        }
+    }
 }
 
 fn dry_run_encoder(name: &str) -> bool {
@@ -385,23 +507,38 @@ fn dry_run_encoder(name: &str) -> bool {
 }
 
 fn dry_run(launch: &str) -> bool {
-    let Ok(p) = gst::parse::launch(launch) else {
-        return false;
-    };
-    if p.set_state(gst::State::Playing).is_err() {
-        return false;
+    dry_run_result(launch).is_ok()
+}
+
+fn dry_run_result(launch: &str) -> Result<()> {
+    let p = gst::parse::launch(launch).context("parsing dry-run pipeline")?;
+    if let Err(error) = p.set_state(gst::State::Playing) {
+        let _ = p.set_state(gst::State::Null);
+        anyhow::bail!("starting dry-run pipeline: {error}");
     }
-    let ok = p
-        .bus()
-        .and_then(|bus| {
-            bus.timed_pop_filtered(
-                gst::ClockTime::from_seconds(5),
-                &[gst::MessageType::Eos, gst::MessageType::Error],
-            )
-        })
-        .is_some_and(|msg| msg.type_() == gst::MessageType::Eos);
+    let result = match p.bus().and_then(|bus| {
+        bus.timed_pop_filtered(
+            gst::ClockTime::from_seconds(5),
+            &[gst::MessageType::Eos, gst::MessageType::Error],
+        )
+    }) {
+        Some(message) => match message.view() {
+            gst::MessageView::Eos(_) => Ok(()),
+            gst::MessageView::Error(error) => Err(anyhow::anyhow!(
+                "{}: {} ({:?})",
+                error
+                    .src()
+                    .map(|source| source.name().to_string())
+                    .unwrap_or_else(|| "unknown".into()),
+                error.error(),
+                error.debug()
+            )),
+            _ => unreachable!("filtered for EOS and error"),
+        },
+        None => Err(anyhow::anyhow!("dry-run pipeline timed out")),
+    };
     let _ = p.set_state(gst::State::Null);
-    ok
+    result
 }
 
 /// Source caps names of one kind, for decode-fit placement.
@@ -1356,6 +1493,11 @@ fn route_stream(
         .structure(0)
         .map(|s| s.name().to_string())
         .unwrap_or_default();
+    let source_dimensions = caps.structure(0).and_then(|structure| {
+        let width = structure.get::<i32>("width").ok()?;
+        let height = structure.get::<i32>("height").ok()?;
+        (width > 0 && height > 0).then_some((width, height))
+    });
     let mode = mode_for(&caps_name, &plan);
     // Encode: claim the kind's muxer pad for the decode→re-encode branch.
     if mode == StreamMode::Encode && can_decode(&caps_name) {
@@ -1375,6 +1517,7 @@ fn route_stream(
                     plan.video_codec,
                     plan.video_kbps,
                     plan.max_height,
+                    source_dimensions,
                     plan.tone_map,
                     plan.deinterlace,
                     burn.clone(),
@@ -2265,6 +2408,7 @@ fn build_video_encode_chain(
     target: VideoTarget,
     video_kbps: Option<u32>,
     max_height: Option<u32>,
+    source_dimensions: Option<(i32, i32)>,
     tone_map: bool,
     deinterlace: bool,
     burn: Option<std::sync::Arc<crate::burnin::Timeline>>,
@@ -2272,10 +2416,22 @@ fn build_video_encode_chain(
     // built here and its text pad published for the subtitle branch.
     ass_burn: Option<Arc<Mutex<AssBurnLink>>>,
 ) {
+    // A height ceiling changes the picture after this point. Its exact width
+    // is fixed by videoscale from the source's display aspect, so demuxed
+    // dimensions are authoritative only when no scaling will occur.
+    let dimensions = source_dimensions.filter(|(_, height)| {
+        max_height.is_none_or(|max| u32::try_from(*height).is_ok_and(|height| height <= max))
+    });
     let (encoder, parser) = match target {
-        VideoTarget::H264 => (h264_encoder(), "h264parse"),
-        VideoTarget::Hevc => (hevc_encoder(), "h265parse"),
-        VideoTarget::Av1 => (av1_encoder(), "av1parse"),
+        VideoTarget::H264 => (
+            verified_video_encoder(H264_ENCODERS, dimensions),
+            "h264parse",
+        ),
+        VideoTarget::Hevc => (
+            verified_video_encoder(HEVC_ENCODERS, dimensions),
+            "h265parse",
+        ),
+        VideoTarget::Av1 => (verified_video_encoder(AV1_ENCODERS, dimensions), "av1parse"),
     };
     let Some(enc_name) = encoder else {
         tracing::error!(
@@ -4849,6 +5005,28 @@ mod concat_spike {
 
 #[cfg(test)]
 mod tests {
+    /// A gfx1200 radeonsi HEVC encoder advertises width >= 384. The old
+    /// universal 320x240 probe therefore rejected working hardware before a
+    /// session could use it. Probe dimensions come from the encoder's own caps:
+    /// the chosen size must be ordinary, accepted, and not the rejected 320px.
+    #[test]
+    fn video_probe_respects_driver_dimension_limits() {
+        crate::init().unwrap();
+        let amd_hevc = gst::Caps::builder("video/x-raw")
+            .field("width", gst::IntRange::new(384i32, 8192))
+            .field("height", gst::IntRange::new(128i32, 4352))
+            .build();
+        assert!(!super::video_caps_accept_dimensions(&amd_hevc, 320, 240));
+        let dimensions =
+            super::video_probe_dimensions_from_caps(&amd_hevc).expect("usable HEVC dimensions");
+        assert_eq!(dimensions, (640, 480));
+        assert!(super::video_caps_accept_dimensions(
+            &amd_hevc,
+            dimensions.0,
+            dimensions.1
+        ));
+    }
+
     /// TC-6: the thread ceiling has to LAND, on every software encoder
     /// this box actually has.
     ///
