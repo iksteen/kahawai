@@ -135,7 +135,15 @@ async fn serve_bootstrap_socket(
                         let response = match result {
                             Ok((username, password)) => match auth.complete_setup(&username, &password).await {
                                 Ok(_) => serde_json::json!({"ok": true}),
-                                Err(e) => serde_json::json!({"ok": false, "error": e.to_string()}),
+                                Err(e) => {
+                                    if let kahawai_hub::auth::CompleteSetupError::Internal(source) = &e {
+                                        tracing::error!(
+                                            error = format!("{source:#}"),
+                                            "initial-admin setup failed"
+                                        );
+                                    }
+                                    serde_json::json!({"ok": false, "error": e.to_string()})
+                                }
                             },
                             Err(e) => serde_json::json!({"ok": false, "error": e.to_string()}),
                         };

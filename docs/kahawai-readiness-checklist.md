@@ -151,7 +151,8 @@ marked in that document.
       exposes only a dedicated loopback browser listener with strict same-origin
       validation and a mode-0600 Unix socket inside an atomically private
       mode-0700 control directory for the interactive CLI; both call
-      one `BEGIN IMMEDIATE` create-if-empty operation, close after the sole
+      one `BEGIN IMMEDIATE` create-if-empty operation whose typed outcomes
+      preserve 400/409/500 semantics, close after the sole
       winner commits, and are absent on later starts. No setup bearer secret is
       generated, logged, copied, accepted remotely, or left to brute-force
 - [~] AUTH-13 Retain existing Argon2id hashes and adopt a documented password

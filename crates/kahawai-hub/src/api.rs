@@ -15,7 +15,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use sqlx::Row;
 
-use crate::auth::Auth;
+use crate::auth::{Auth, CompleteSetupError};
 use crate::registry::Registry;
 
 #[derive(Clone)]
@@ -1491,13 +1491,20 @@ async fn setup(
         .auth
         .complete_setup(&body.username, &body.password)
         .await
-        .map_err(|e| {
-            let status = if state.auth.setup_required() {
-                StatusCode::BAD_REQUEST
-            } else {
-                StatusCode::CONFLICT
-            };
-            (status, e.to_string())
+        .map_err(|e| match e {
+            error @ CompleteSetupError::InvalidInput => {
+                (StatusCode::BAD_REQUEST, error.to_string())
+            }
+            error @ CompleteSetupError::AlreadyCompleted => {
+                (StatusCode::CONFLICT, error.to_string())
+            }
+            CompleteSetupError::Internal(source) => {
+                tracing::error!(error = format!("{source:#}"), "initial-admin setup failed");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "initial-admin setup failed".into(),
+                )
+            }
         })?;
     Ok(StatusCode::NO_CONTENT)
 }

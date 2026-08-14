@@ -40,6 +40,36 @@ fn post_authed(uri: &str, token: &str, body: serde_json::Value) -> Request<Body>
 }
 
 #[tokio::test]
+async fn setup_maps_validation_and_storage_failures_separately() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    let auth = Arc::new(Auth::new(db.clone(), dir.path()).await.unwrap());
+    let local = kahawai_hub::api::setup_router(auth.clone(), "127.0.0.1:8422".parse().unwrap());
+    let request = |username: &str, password: &str| {
+        Request::post("/api/v1/setup")
+            .header("host", "localhost:8422")
+            .header("origin", "http://localhost:8422")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({"username": username, "password": password}).to_string(),
+            ))
+            .unwrap()
+    };
+
+    let invalid = local.clone().oneshot(request("", "short")).await.unwrap();
+    assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+    assert!(auth.setup_required());
+
+    db.close().await;
+    let unavailable = local
+        .oneshot(request("admin", "hunter22222"))
+        .await
+        .unwrap();
+    assert_eq!(unavailable.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(auth.setup_required());
+}
+
+#[tokio::test]
 async fn setup_then_auth_flow() {
     let dir = tempfile::tempdir().unwrap();
     let db = kahawai_hub::db::open(dir.path()).await.unwrap();

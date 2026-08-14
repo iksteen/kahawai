@@ -117,6 +117,17 @@ pub enum RefreshError {
     Internal(#[from] anyhow::Error),
 }
 
+/// Why the one-time trusted-local setup transition did not commit.
+#[derive(Debug, thiserror::Error)]
+pub enum CompleteSetupError {
+    #[error("username required and password must be at least 8 characters")]
+    InvalidInput,
+    #[error("setup already completed")]
+    AlreadyCompleted,
+    #[error(transparent)]
+    Internal(#[from] anyhow::Error),
+}
+
 pub struct Auth {
     db: SqlitePool,
     enc: EncodingKey,
@@ -312,22 +323,33 @@ impl Auth {
     /// The one operation behind both trusted-local setup transports. The
     /// immediate transaction makes concurrent browser/CLI claims serialize;
     /// exactly one can observe an empty user table and commit the first admin.
-    pub async fn complete_setup(&self, username: &str, password: &str) -> Result<()> {
+    pub async fn complete_setup(
+        &self,
+        username: &str,
+        password: &str,
+    ) -> std::result::Result<(), CompleteSetupError> {
         let username = username.trim();
         if username.is_empty() || password.len() < 8 {
-            bail!("username required and password must be at least 8 characters");
+            return Err(CompleteSetupError::InvalidInput);
         }
         // Deliberately outside SQLite's write lock: Argon2 is expensive, but
         // the transaction below is still the authority on who won the race.
         let hash = hash_password(password)?;
         let id = ulid::Ulid::generate().to_string();
-        let mut tx = self.db.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx = self
+            .db
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .context("beginning initial-admin setup")?;
         let users: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
             .fetch_one(&mut *tx)
-            .await?;
+            .await
+            .context("checking whether initial-admin setup already completed")?;
         if users != 0 {
-            tx.rollback().await?;
-            bail!("setup already completed");
+            tx.rollback()
+                .await
+                .context("rolling back completed initial-admin setup")?;
+            return Err(CompleteSetupError::AlreadyCompleted);
         }
         sqlx::query(
             "INSERT INTO users (id, username, password_hash, is_admin) VALUES (?, ?, ?, 1)",
@@ -336,8 +358,11 @@ impl Auth {
         .bind(username)
         .bind(&hash)
         .execute(&mut *tx)
-        .await?;
-        tx.commit().await?;
+        .await
+        .context("inserting initial administrator")?;
+        tx.commit()
+            .await
+            .context("committing initial administrator")?;
         self.setup_required.store(false, Ordering::Release);
         self.setup_done.notify_waiters();
         tracing::info!(username, "initial admin created; setup complete");
