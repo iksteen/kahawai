@@ -309,17 +309,13 @@ marked in that document.
 - [ ] GST-7 Make pipeline assembly transactional: element creation, required
       properties, request pads and statically knowable links are validated
       before PLAYING; dynamic callback failures post one structured pipeline
-      API clients use explicit bearer mode. Browser mode keeps its access JWT
-      only in memory and uses host-only HttpOnly refresh/media cookies; reload
-      rotates the refresh family, and logout clears both cookies. The media
-      cookie is accepted only by the explicit read allowlist, while mutations
-      remain bearer-only. Browser refresh/logout require the canonical Origin
-      derived from `hub.public_url` or trusted request metadata. Access JWTs
-      retain the explicit HS256-only allowlist, fixed issuer, API audience and
-      signed `access` credential type; mutable account state and `auth_version`
-      come from the database on every request. Refresh families remain hashed,
-      single-row and single-winner, with replay, logout and password-reset
-      revocation
+      error and cannot leave a claimed mux pad waiting for a generic startup
+      timeout. A dedicated `PipelineAssembler` is one implementation option
+- [ ] GST-8 Remove panic-based control flow from Rust functions invoked by C.
+      Wrap every pad probe, appsink/appsrc callback and dynamic signal handler
+      in a common no-unwind boundary; eliminate production `unwrap` calls on
+      element, pad, link, state and shared callback state operations
+- [ ] GST-9 Represent required transforms as hard invariants. A requested tone
       map, deinterlace, image/ASS burn, channel layout or encoder path either
       reaches the negotiated output and is reported in `PipelineActual`, or the
       worker fails before readiness so the hub can choose an explicit fallback
