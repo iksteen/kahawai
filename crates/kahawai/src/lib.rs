@@ -292,7 +292,7 @@ async fn run_hub_inner(
         let setup_listener = tokio::net::TcpListener::bind(cfg.setup_bind)
             .await
             .with_context(|| format!("binding local setup UI on {}", cfg.setup_bind))?;
-        let setup_api = kahawai_hub::api::setup_router(auth.clone(), cfg.setup_bind);
+        let setup_api = kahawai_hub::api::setup_router(auth.clone());
         let setup_done = auth.clone();
         tokio::spawn(async move {
             if let Err(e) = axum::serve(setup_listener, setup_api)

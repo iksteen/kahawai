@@ -246,11 +246,7 @@ struct SetupState {
 /// First-admin browser flow on a dedicated loopback listener. Keeping this a
 /// separate router makes accidental publication impossible: the public router
 /// has no setup mutation to protect with a header or source-address check.
-pub fn setup_router(auth: Arc<Auth>, addr: std::net::SocketAddr) -> Router {
-    assert!(
-        addr.ip().is_loopback(),
-        "setup router must bind to loopback"
-    );
+pub fn setup_router(auth: Arc<Auth>) -> Router {
     let state = SetupState { auth };
     Router::new()
         .route("/api/v1/bootstrap", get(setup_bootstrap))
