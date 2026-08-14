@@ -996,7 +996,8 @@ export async function downloadWithAuth(path: string): Promise<void> {
   const url = URL.createObjectURL(await response.blob())
   const link = document.createElement('a')
   link.href = url
-  link.download = ''
+  link.download =
+    response.headers.get('content-disposition')?.match(/filename="([^"]+)"/i)?.[1] ?? ''
   try {
     link.click()
   } finally {

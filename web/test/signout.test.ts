@@ -118,7 +118,18 @@ Object.defineProperty(globalThis, 'sessionStorage', {
 })
 
 const cookieWrites: string[] = []
-const documentStub = {}
+const downloaded: Array<{ href: string; filename: string }> = []
+const documentStub = {
+  createElement: (tag: string) => {
+    assert.equal(tag, 'a')
+    const link = {
+      href: '',
+      download: '',
+      click: () => downloaded.push({ href: link.href, filename: link.download }),
+    }
+    return link
+  },
+}
 Object.defineProperty(documentStub, 'cookie', {
   get: () => {
     throw new Error('document.cookie was read')
@@ -132,6 +143,7 @@ Object.defineProperty(globalThis, 'document', { configurable: true, value: docum
 const {
   accessToken,
   browserLogin,
+  downloadWithAuth,
   refreshTokens,
   restoreSession,
   scrubLegacyCredentials,
@@ -177,6 +189,7 @@ beforeEach(async () => {
   calls = []
   storageOps.length = 0
   cookieWrites.length = 0
+  downloaded.length = 0
   locks.reset()
 })
 
@@ -197,6 +210,23 @@ test('sign-out clears access tokens in every open tab', async () => {
   await browserLogin('root', 'password-123')
   await signOut()
   assert.deepEqual(channel?.messages, ['sign-out'], 'local sign-out notifies peer tabs')
+})
+
+test('authenticated download uses the server attachment filename', async () => {
+  setHub(
+    () =>
+      new Response('diagnostics', {
+        headers: {
+          'content-disposition': 'attachment; filename="kahawai-session-01ABC.log"',
+          'content-type': 'text/plain; charset=utf-8',
+        },
+      }),
+  )
+
+  await downloadWithAuth('/admin/v1/sessions/01ABC/log')
+
+  assert.equal(downloaded.length, 1)
+  assert.equal(downloaded[0]?.filename, 'kahawai-session-01ABC.log')
 })
 
 test('concurrent 401 repair shares one same-tab refresh', async () => {
