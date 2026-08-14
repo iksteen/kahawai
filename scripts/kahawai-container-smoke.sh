@@ -114,11 +114,17 @@ items='it = d if isinstance(d, list) else d["items"];'
 # to the container's bridge address and cannot reach a listener on its own
 # 127.0.0.1, so make this request from inside the network namespace. The
 # runtime image has bash; /dev/tcp avoids adding curl solely for this check.
+setup_ready=""
 for _ in $(seq 30); do
-    [ -S "$work/state/bootstrap.sock" ] && break
+    setup_probe=$(docker exec "$name" bash -c '
+        exec 3<>/dev/tcp/127.0.0.1/8422
+        printf "GET /api/v1/bootstrap HTTP/1.1\r\nHost: localhost:8422\r\nConnection: close\r\n\r\n" >&3
+        cat <&3
+    ' 2>/dev/null || true)
+    case "$setup_probe" in HTTP/1.1\ 200*) setup_ready=1; break ;; esac
     sleep 2
 done
-[ -S "$work/state/bootstrap.sock" ] \
+[ -n "$setup_ready" ] \
     || { logs | tail -20 >&2; fail "the local setup control plane never opened"; }
 setup_body='{"username":"smoke","password":"smoke-password-1"}'
 setup_response=$(docker exec "$name" bash -c '
