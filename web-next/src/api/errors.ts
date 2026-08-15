@@ -6,10 +6,13 @@
 /// `message` is written for a person and its wording is not contractual, so
 /// nothing here may branch on it.
 
-/// The hub could not be reached at all: no response, rather than a bad one.
+/// No answer, rather than a bad one: the hub could not be reached, or was
+/// reached and never replied. One class, because the two are the same thing to
+/// everything downstream — nothing was learned, and asking again may work —
+/// and because the difference is worth saying only in the sentence on screen.
 export class Offline extends Error {
-  constructor() {
-    super('Could not reach the hub.')
+  constructor(message = 'Could not reach the hub.') {
+    super(message)
     this.name = 'Offline'
   }
   override toString() {

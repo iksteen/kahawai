@@ -15,10 +15,10 @@ import type { AuthWire } from './session.ts'
 import { login, logout, refresh } from './generated/kahawai.ts'
 
 export const authWire: AuthWire = {
-  login: (username, password) =>
+  login: (username, password, signal) =>
     login(
       { client: 'browser', username, password },
-      { skipAuthRefresh: true, skipAuthorization: true },
+      { skipAuthRefresh: true, skipAuthorization: true, signal },
     ),
   refresh: () => refresh({ client: 'browser' }, { skipAuthRefresh: true, skipAuthorization: true }),
   logout: async (bearer) => {

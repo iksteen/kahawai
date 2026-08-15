@@ -95,6 +95,115 @@ afterEach(() => {
 })
 
 describe('refresh timing', () => {
+  test('the deadline is there when nobody supplies one', async () => {
+    // UI-24 lives on the DEFAULT parameter: `Auth.vue` passes no signal, so a
+    // test that supplies its own leaves the only deadline production has
+    // unexercised. Replacing it with a signal that never fires passed the
+    // whole suite.
+    //
+    // Asserting `toHaveBeenCalledWith(20_000)` did not work either, and the
+    // reason is worth keeping: the auth LOCK asks for a 20-second timeout too,
+    // so the spy saw that call and passed while the login had no deadline at
+    // all. What distinguishes them is which signal reaches the wire.
+    const deadline = AbortSignal.timeout(60_000)
+    const timeout = vi.spyOn(AbortSignal, 'timeout').mockReturnValue(deadline)
+
+    let handed: AbortSignal | undefined
+    startAuthSession(
+      hub({
+        login: async (_user, _password, signal) => {
+          handed = signal
+          return { access_token: 'access-1', expires_in: 900 }
+        },
+      }),
+    )
+    await browserLogin('root', 'password-123')
+    expect(handed).toBe(deadline)
+    timeout.mockRestore()
+  })
+
+  test('and letting go only drops the handler that is still listening', async () => {
+    // A remount can register before the previous owner tears down — which is
+    // what a hot reload does. Clearing the slot unconditionally wiped the
+    // successor, and an expired session then silently stopped dropping anyone
+    // to the sign-in screen.
+    startAuthSession(hub())
+    const heard: string[] = []
+    const dropFirst = onTokensCleared(() => heard.push('first'))
+    onTokensCleared(() => heard.push('second'))
+    dropFirst()
+
+    await browserLogin('root', 'password-123')
+    await signOut()
+    expect(heard).toEqual(['second'])
+  })
+
+  test('a login that was superseded is not a signed-in app', async () => {
+    // `installAccess` returns false when the generation moved under it — a
+    // peer tab signed out while this login was in flight. Nobody read it: the
+    // login resolved, the caller took that for success, and the app rendered
+    // signed in with no bearer. Every request 401'd, the refresh had nothing
+    // to refresh, and no clearing event ever came.
+    const held = deferred()
+    startAuthSession(
+      hub({
+        login: async () => {
+          await held.promise
+          return { access_token: 'access-1', expires_in: 900 }
+        },
+      }),
+    )
+
+    const login = browserLogin('root', 'password-123')
+    await Promise.resolve()
+    // The peer tab, arriving mid-flight. `signOut` here rather than the
+    // BroadcastChannel: the channel is asynchronous and the point is that the
+    // generation moves BEFORE the hub answers.
+    void signOut()
+    held.release()
+
+    await expect(login).rejects.toThrow()
+    expect(accessToken()).toBeNull()
+  })
+
+  test('a login carries a deadline the hub cannot outwait', async () => {
+    // UI-24. The form is disabled while the request is out, and the request
+    // had no deadline: a hub that accepted the connection and never answered
+    // left a dead form on the one screen with nothing else to navigate to.
+    //
+    // A real signal rather than a raced timer. A lost race leaves the request
+    // running, so a login that lands after the person was told it failed would
+    // install a session they were never offered.
+    let handed: AbortSignal | undefined
+    startAuthSession(
+      hub({
+        login: async (_user, _password, signal) => {
+          handed = signal
+          return new Promise((_resolve, reject) => {
+            signal.addEventListener('abort', () => reject(signal.reason))
+          })
+        },
+      }),
+    )
+
+    // The deadline, driven by hand: `AbortSignal.timeout`'s own timer is the
+    // platform's and fake timers do not reach it. What is being checked here
+    // is that the signal is threaded through and that an abort installs
+    // nothing — the default deadline is one call to `AbortSignal.timeout`.
+    const deadline = new AbortController()
+    const login = browserLogin('root', 'password-123', deadline.signal)
+    // The lock is taken first, so the call itself is a microtask away.
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(handed).toBe(deadline.signal)
+    expect(handed!.aborted).toBe(false)
+
+    deadline.abort(new Error('the hub did not answer in time'))
+    await expect(login).rejects.toThrow('did not answer in time')
+    // And nothing was installed by a request that was given up on.
+    expect(accessToken()).toBeNull()
+  })
+
   test('the server lifetime refreshes an opaque token before expiry', async () => {
     startAuthSession(hub())
     await browserLogin('root', 'password-123')

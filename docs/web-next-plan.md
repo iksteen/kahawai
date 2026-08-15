@@ -389,7 +389,7 @@ composables → components → view → review → commit.
 | # | Page | Notes |
 | --- | --- | --- |
 | 4 | Shell, header, menus, routing — **DONE** | the two menus, the search box's two meanings, keyboard and ARIA |
-| 5 | Auth / setup | including UI-24: a hub that never answers must not leave a dead form |
+| 5 | Auth / setup — **DONE** | including UI-24: a hub that never answers must not leave a dead form |
 | 6 | Home (libraries, shelves, continue watching) | inline retries per shelf, the three loading states of UI-22 |
 | 7 | Search panel | on B3; combobox pattern, `aria-activedescendant`, every key driven |
 | 8 | Library grid | virtualised, fixed cell height (UI-11), `srcset` at both densities (UI-16) |
@@ -427,6 +427,45 @@ Three things came out of it that are worth carrying forward:
   to conclude that a second `clearTimeout` was dead code. The conclusion
   survived re-measurement with `flush: 'sync'`; the instrument that produced
   it did not.
+
+### What phase 5 landed
+
+The four states before there is an app — nothing, a hub that did not start, a
+way in, the app — plus the first-run setup form and the sign-in form.
+
+- **UI-24 is closed for this UI.** `browserLogin` now carries a real
+  `AbortSignal` rather than racing a timer: a lost race leaves the request
+  running, and a login that lands after the person was told it failed installs
+  a session they were never offered. The form re-enables in a `finally`, which
+  is the other half. **`web/` still has the bug** — the fix is in
+  `web-next/src/api/session.ts` and the old client has its own copy of that
+  code, so UI-24 stays open in the checklist until cutover.
+- **A timed-out request now says so.** `Offline` covers both "not reached" and
+  "reached and never answered", because nothing downstream can act on the
+  difference — but on the sign-in screen the sentence is the only thing the
+  person has to go on, so the two no longer read the same.
+- **The sign-out ordering was reintroduced and then caught in review.** The old
+  `App.tsx` signs out in two steps and says why: navigating first unmounts the
+  player while its bearer still works, so its final progress report lands. The
+  first draft here cleared the tokens first. There is now a test that fails on
+  that order, which is what the comment should have had all along.
+- **Labels.** The old form named its fields with placeholders alone, so the
+  name vanished as soon as anything was typed. Real `<label>` elements now, and
+  the password rule is `aria-describedby` rather than a loose paragraph.
+- **A login that was superseded is no longer a success.** `installAccess`
+  returns false when a peer tab signed out mid-flight; nobody read it, so the
+  app rendered signed in with no bearer and only a reload recovered. Inherited
+  from the old client, which still has it.
+- **Two measurement traps, both recorded in the tests that hit them.** A spy
+  asserting `AbortSignal.timeout(20_000)` passed with the login deadline
+  removed, because the auth lock asks for 20 seconds too. And the form's
+  `@submit.prevent` could be deleted without failing anything — a form with no
+  method then does a native GET, putting the password in the address bar.
+
+**For phase 12:** the old cleared-tokens handler also does `setQueue(null)` —
+the next account must not inherit tracks it cannot read, and `AlbumPlayer`
+retries a 403 for ever. There is no queue yet, so there is nowhere to put it;
+it belongs in that handler when there is.
 
 ### The player
 

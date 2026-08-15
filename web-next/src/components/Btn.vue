@@ -2,7 +2,13 @@
 /// The one button. Teal by default; `ghost` is the secondary offer beside it,
 /// which is outlined rather than filled so the pair reads as one choice and
 /// one alternative.
-withDefaults(defineProps<{ ghost?: boolean; small?: boolean; disabled?: boolean }>(), {})
+/// `submit` because the type is set here rather than passed through: a
+/// fallthrough `type` and the template's own would be two answers, and which
+/// wins is a rule nobody should have to remember at each call site.
+withDefaults(
+  defineProps<{ ghost?: boolean; small?: boolean; disabled?: boolean; submit?: boolean }>(),
+  {},
+)
 </script>
 
 <template>
@@ -15,7 +21,7 @@ withDefaults(defineProps<{ ghost?: boolean; small?: boolean; disabled?: boolean 
       small ? 'px-3 py-1 text-[13px]' : 'px-[18px] py-2',
     ]"
     :disabled="disabled"
-    type="button"
+    :type="submit ? 'submit' : 'button'"
   >
     <slot />
   </button>

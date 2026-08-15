@@ -263,6 +263,10 @@ followed, and those cases are listed too.
       dead form and no way to cancel — the one screen with nothing else to
       navigate to. Pre-existing, and not adjacent to anything the redesign
       touched, so it is recorded rather than folded into that branch.
+      Fixed in the rebuild (`web-next`, phase 5): the login carries an
+      `AbortSignal` and the form re-enables in a `finally`. Still open here,
+      because `web/` is what ships until cutover and has its own copy of that
+      code.
 
 - [x] UI-25 **The whole-libraries grant can lose an update.** Admin sends the
       complete set of libraries for a user rather than a delta, so two admins

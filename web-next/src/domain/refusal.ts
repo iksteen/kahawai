@@ -68,3 +68,15 @@ export type Report = 'notice' | 'inline'
 export function reportFor(cause: 'action' | 'content'): Report {
   return cause === 'action' ? 'notice' : 'inline'
 }
+
+/// The sentence to show, when there is nowhere better to get one.
+///
+/// `Offline` and `ApiError` both render as their message, which is either the
+/// hub's own words or this client's about not reaching it. Anything else is a
+/// bug rather than a condition, and `String(x)` on a thrown non-Error gives
+/// "[object Object]" — which tells whoever is looking at it nothing, so it is
+/// replaced with a sentence that at least says what happened.
+export function sentence(e: unknown): string {
+  if (e instanceof Error) return e.message || String(e)
+  return 'Something went wrong.'
+}

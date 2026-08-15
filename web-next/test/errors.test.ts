@@ -5,10 +5,12 @@
 /// split, because getting it wrong is invisible until a proxy or an outage
 /// makes it visible.
 
-import { describe, expect, test } from 'vitest'
+import { afterEach, describe, expect, test, vi } from 'vitest'
 
 import { ApiError, Offline, retry, retryAfter } from '../src/api/errors.ts'
-import { apiFailure } from '../src/api/transport.ts'
+import { api, apiFailure } from '../src/api/transport.ts'
+
+afterEach(() => vi.restoreAllMocks())
 
 const respond = (status: number, body: string, headers: Record<string, string> = {}) =>
   new Response(body, { status, headers: { 'content-type': 'application/json', ...headers } })
@@ -74,5 +76,38 @@ describe('whether asking again could work', () => {
     expect(retry(refusal(503))).toBe(true)
     expect(retry(refusal(503, 'setup_required'))).toBe(false)
     expect(retry(refusal(503, 'provider_unconfigured'))).toBe(false)
+  })
+})
+
+describe('a request that gets no answer', () => {
+  test('says the hub was not reached when it was not', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new TypeError('Failed to fetch')))
+    await expect(api('/api/v1/items')).rejects.toThrow('Could not reach the hub.')
+  })
+
+  test('and says it did not answer when the deadline expired', async () => {
+    // Both are `Offline` — nothing was learned either way, and asking again
+    // may work. The sentence is the part that differs, and on the sign-in
+    // screen it is the only thing the person has to go on: a hub that
+    // accepted the connection and went quiet is not one that is unreachable.
+    const signal = AbortSignal.timeout(0)
+    await new Promise((resolve) => signal.addEventListener('abort', resolve))
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(signal.reason))
+
+    await expect(api('/api/v1/items', { signal })).rejects.toThrow('did not answer in time')
+    await expect(api('/api/v1/items', { signal })).rejects.toBeInstanceOf(Offline)
+  })
+
+  test('and a deliberate cancellation is handed back untouched', async () => {
+    // Somebody pressing cancel does not need to be told their request failed
+    // — and the reason they cancelled WITH is what the caller is waiting for.
+    // Read off the error's name instead of the signal, a cancel carrying a
+    // plain Error matched neither branch and became "Could not reach the hub."
+    const cancelled = new AbortController()
+    const why = new Error('cancelled')
+    cancelled.abort(why)
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(why))
+
+    await expect(api('/api/v1/items', { signal: cancelled.signal })).rejects.toBe(why)
   })
 })

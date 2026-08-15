@@ -18,6 +18,7 @@
 /// module side effects, which is why testing them needed a dynamic import
 /// after stubbing globals.
 
+import { Offline } from './errors.ts'
 import { configureApiClient } from './transport.ts'
 import { REFRESH_RETRY_MS, refreshDelayMs } from '../domain/token.ts'
 
@@ -27,6 +28,10 @@ const REFRESH_TIMEOUT_MS = 15_000
 /// Long enough that a peer tab's slow refresh is waited for, short enough that
 /// a wedged one does not freeze this tab's boot.
 const LOCK_WAIT_MS = 20_000
+/// Longer than a refresh, because a login costs a password hash on the hub —
+/// argon2 by design, and deliberately not fast. Short enough that somebody
+/// watching a spinner gets their form back.
+const LOGIN_TIMEOUT_MS = 20_000
 
 export type RestoreResult = 'authenticated' | 'anonymous'
 
@@ -37,6 +42,7 @@ export type AuthWire = {
   login: (
     username: string,
     password: string,
+    signal: AbortSignal,
   ) => Promise<{ access_token: string; expires_in: number }>
   refresh: () => Promise<{ access_token: string; expires_in: number }>
   logout: (bearer: string) => Promise<void>
@@ -58,8 +64,17 @@ export function accessToken(): string | null {
 }
 
 /// Told when the session ends, with whether the person asked for it.
-export function onTokensCleared(callback: ((deliberate: boolean) => void) | null) {
+///
+/// Returns the way to stop listening, and it only clears the slot if this
+/// callback is still in it. Clearing unconditionally wipes a successor that
+/// registered before the previous owner tore down — which is exactly what a
+/// hot reload does — and an expired session then silently stops dropping
+/// anyone to the sign-in screen.
+export function onTokensCleared(callback: ((deliberate: boolean) => void) | null): () => void {
   cleared = callback
+  return () => {
+    if (cleared === callback) cleared = null
+  }
 }
 
 function installAccess(token: string, expiresInSecs: number, expected: number): boolean {
@@ -100,7 +115,18 @@ function scheduleRefresh(delayMs: number) {
 async function alone<T>(run: () => Promise<T>): Promise<T> {
   const locks = typeof navigator === 'undefined' ? undefined : navigator.locks
   if (!locks) return run()
-  return locks.request('kahawai.auth', { signal: AbortSignal.timeout(LOCK_WAIT_MS) }, run)
+  try {
+    return await locks.request('kahawai.auth', { signal: AbortSignal.timeout(LOCK_WAIT_MS) }, run)
+  } catch (error) {
+    // The WAIT expired, not the request. Nothing here touches the transport,
+    // so without this the sentence that reaches the sign-in screen is the
+    // platform's own — "signal timed out" — for a condition that is about
+    // another tab and is fixed by trying again.
+    if (error instanceof DOMException && error.name === 'TimeoutError') {
+      throw new Offline('Another tab is still busy signing in. Try again.')
+    }
+    throw error
+  }
 }
 
 async function rotate(started: number, throwTransient: boolean): Promise<boolean> {
@@ -156,11 +182,34 @@ export async function restoreSession(): Promise<RestoreResult> {
   return (await alone(() => rotate(started, true))) ? 'authenticated' : 'anonymous'
 }
 
-export async function browserLogin(username: string, password: string): Promise<void> {
+/// UI-24. A hub that accepts the connection and never answers left the sign-in
+/// form disabled for ever, on the one screen with nothing else to navigate to.
+///
+/// A real `AbortSignal` rather than racing a timer: a lost race leaves the
+/// request running, and a login that lands after the person was told it failed
+/// installs a session they were not offered. This one is cancelled.
+/// Rejects when the session it belongs to no longer exists.
+///
+/// `installAccess` returns false for exactly that — a peer tab signed out
+/// while this login was in flight, so the generation moved — and nobody read
+/// it. The login resolved, the caller took that for success, and the app
+/// rendered as signed in with no bearer: every request 401'd, the refresh had
+/// nothing to refresh, and no clearing event ever came. Only a reload
+/// recovered it.
+export async function browserLogin(
+  username: string,
+  password: string,
+  /// The caller's own, when it has one — a cancel button, or a test driving
+  /// the deadline, which `AbortSignal.timeout` cannot be made to do: fake
+  /// timers do not reach the platform's internal one.
+  signal: AbortSignal = AbortSignal.timeout(LOGIN_TIMEOUT_MS),
+): Promise<void> {
   const started = ++generation
   await alone(async () => {
-    const session = await wire!.login(username, password)
-    installAccess(session.access_token, session.expires_in, started)
+    const session = await wire!.login(username, password, signal)
+    if (!installAccess(session.access_token, session.expires_in, started)) {
+      throw new Offline('Signed out in another tab while signing in here.')
+    }
   })
 }
 

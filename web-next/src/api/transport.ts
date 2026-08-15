@@ -75,7 +75,22 @@ export async function api(path: string, init: ApiRequestInit = {}): Promise<Resp
     }
     try {
       return await fetch(path, { ...request, headers })
-    } catch {
+    } catch (error) {
+      // Asked of the SIGNAL, not of the error. A caller that aborts with a
+      // reason — `controller.abort(new Error('cancelled'))` — rejects with
+      // that reason, which is an ordinary Error and matches no DOMException
+      // name: reading the name alone reported a cancel the user performed as
+      // "Could not reach the hub."
+      if (init.signal?.aborted) {
+        // The caller's own deadline, expired. Everything else here is a
+        // deliberate cancellation, which is not a failure to report — it goes
+        // back untouched, for the caller that asked for it.
+        const reason: unknown = init.signal.reason
+        if (reason instanceof DOMException && reason.name === 'TimeoutError') {
+          throw new Offline('The hub did not answer in time.')
+        }
+        throw error
+      }
       throw new Offline()
     }
   }
