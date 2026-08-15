@@ -388,7 +388,7 @@ composables → components → view → review → commit.
 
 | # | Page | Notes |
 | --- | --- | --- |
-| 4 | Shell, header, menus, routing | the two menus, the search box's two meanings, keyboard and ARIA |
+| 4 | Shell, header, menus, routing — **DONE** | the two menus, the search box's two meanings, keyboard and ARIA |
 | 5 | Auth / setup | including UI-24: a hub that never answers must not leave a dead form |
 | 6 | Home (libraries, shelves, continue watching) | inline retries per shelf, the three loading states of UI-22 |
 | 7 | Search panel | on B3; combobox pattern, `aria-activedescendant`, every key driven |
@@ -399,6 +399,34 @@ composables → components → view → review → commit.
 | 12 | Album queue | survives navigation; per-track removal (UI-2) now that it is cheap |
 | 13 | Video player | largest and last; see below |
 | 14 | Accessibility pass | UI-17: keyboard-only run and a screen reader, which has never happened |
+
+### What phase 4 landed
+
+The frame, the two menus, the one search box, the router, and the error
+boundary phase 3 said would arrive with the first screen to key on.
+
+Three things came out of it that are worth carrying forward:
+
+- **`role="menu"` is a promise.** The old header had the role and none of the
+  keyboard behind it. A menuitem puts a screen reader into focus mode, where
+  its own browse keys stop working — so the role without the arrow keys leaves
+  that user with nothing that moves. The rebuild implements the pattern:
+  focus into the menu on open, arrows with wrapping, Home/End, and focus back
+  to the trigger on close. Asked *before* the DOM updates, because the
+  watcher runs pre-flush and `activeElement` is still the row that is about to
+  be removed.
+- **A comment recording an incident is a specification.** Two of the defects
+  found in review were places where the port dropped a rule whose reason was
+  written beside it: the search box's `z-index: 16` above the menu sheet, and
+  the notice's `pointer-events: none`. Both had the incident in the comment
+  and neither had a test.
+- **A vacuous test can invent a fact.** The debounce test used a default
+  (`flush: 'pre'`) watcher, which coalesces two writes in one tick into one
+  callback — so the intermediate value it existed to forbid was unobservable,
+  and a mutation removing the `clearTimeout` passed. It had already been used
+  to conclude that a second `clearTimeout` was dead code. The conclusion
+  survived re-measurement with `flush: 'sync'`; the instrument that produced
+  it did not.
 
 ### The player
 

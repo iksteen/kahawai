@@ -1,6 +1,7 @@
 import { createApp } from 'vue'
 
 import App from './App.vue'
+import { router } from './router.ts'
 import { authWire } from './api/auth-wire.ts'
 import { scrubLegacyCredentials, startAuthSession } from './api/session.ts'
 import './theme.css'
@@ -13,4 +14,4 @@ startAuthSession(authWire)
 // it finds.
 scrubLegacyCredentials()
 
-createApp(App).mount('#app')
+createApp(App).use(router).mount('#app')
