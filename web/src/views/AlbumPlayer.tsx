@@ -203,18 +203,22 @@ export default function AlbumPlayer({
         slots.current[which].error = ''
         slots.current[which].tries = 0
         slots.current[which].triesFor = null
-        // BOTH slots. A start that succeeded is proof the account is under its
-        // cap, which is the only thing that makes a `busy` count stale — and
-        // the latched slot cannot clear its own, because a slot marked
-        // `refused` is not asked again. Left to itself it stayed at the
-        // ceiling for the rest of the album: one attempt per track advance and
-        // final immediately, where the ceiling was meant to buy five minutes.
+        // This slot always; the other one only when TWO sessions now coexist.
         //
-        // Not reset per track, which was the first cut: the cap is about the
-        // account, so a new track id says nothing about it and the ceiling was
-        // never reached at all.
-        slots.current[0].busyTries = 0
-        slots.current[1].busyTries = 0
+        // Three cuts, because the signal is narrower than it looks. Per track
+        // was wrong: the cap is about the account, so a new track id says
+        // nothing about it and the ceiling was never reached. Both slots on
+        // any success was also wrong, in the opposite direction: the active
+        // slot releases its own session before starting the next track, so
+        // under a permanent cap it succeeds on every advance and kept clearing
+        // the warm slot's count — the ceiling unreachable again, and the tab
+        // polling for the whole album.
+        //
+        // What makes a `busy` count stale is proof the account has room for a
+        // SECOND session, and only two live sessions are that.
+        slots.current[which].busyTries = 0
+        const other = which === 0 ? 1 : 0
+        if (slots.current[other].session) slots.current[other].busyTries = 0
         force((n) => n + 1)
       } catch (e) {
         if (slots.current[which].key !== track.id) return

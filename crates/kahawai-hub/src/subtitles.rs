@@ -130,6 +130,23 @@ pub(crate) fn promote_legacy_cache(
     Ok(())
 }
 
+/// The item a subtitle request named is not in the catalogue.
+///
+/// A type because the API cannot otherwise tell it from the provider being
+/// down: an `Option::context` here reached the client as 502 "the subtitle
+/// provider did not answer", so an admin searching for a typo'd id was told
+/// OpenSubtitles was having an outage it was not having.
+#[derive(Debug)]
+pub struct NoSuchItem;
+
+impl std::fmt::Display for NoSuchItem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("no such item")
+    }
+}
+
+impl std::error::Error for NoSuchItem {}
+
 pub struct Subtitles {
     dir: PathBuf,
     /// HUB-21 deployment config (kahawai.toml); wins over settings.
@@ -651,8 +668,13 @@ impl Subtitles {
         Vec<crate::opensubtitles::Candidate>,
         crate::opensubtitles::Quota,
     )> {
-        let provider = self.external_provider(registry, user_id).await?;
-        provider.refresh_quota().await;
+        // The item BEFORE the provider. Asking OpenSubtitles about an id this
+        // catalogue does not have is work nobody wanted, and resolving the
+        // provider first made the honest answer depend on deployment config:
+        // on a hub with no credentials an unknown id reported that the
+        // provider was unreachable, which was both wrong and unverifiable —
+        // the 404 could not be reached at all until someone configured an
+        // account.
         let row = sqlx::query(
             "SELECT i.kind, i.season, i.episode,
                     md.proj_season, md.proj_episode,
@@ -675,7 +697,9 @@ impl Subtitles {
         .bind(item_id)
         .fetch_optional(registry.db())
         .await?
-        .context("no such item")?;
+        .ok_or(NoSuchItem)?;
+        let provider = self.external_provider(registry, user_id).await?;
+        provider.refresh_quota().await;
 
         // The mediahost's oshash IS the OpenSubtitles moviehash (HUB-22).
         let hash: Option<i64> = sqlx::query_scalar(

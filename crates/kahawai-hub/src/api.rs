@@ -890,9 +890,17 @@ struct UpdatedResponse {
 /// viewer's download entitlement had already been spent on a fetch that
 /// worked.
 ///
-/// It is a floor, not a taxonomy: a producer with more than one refusal worth
-/// telling apart wants typed errors, the way `sessions::SessionCap` and
-/// `opensubtitles::QuotaSpent` do.
+/// It is a floor, not a taxonomy, and its premise is narrow enough to state:
+/// **the producer must express its client-visible refusals as plain `anyhow`
+/// and its faults as one of those three types.** Where that does not hold it
+/// inverts, in both directions, and it did at four sites — a producer whose
+/// only failure is `io` (so the refusal arm is unreachable and everything is a
+/// 500), a producer that says "no such item" with `Option::context` behind a
+/// code meaning "upstream is down", and two fallback arms where every
+/// remaining error is `sqlx` and the refusal they named was dead.
+///
+/// A producer with more than one refusal worth telling apart wants typed
+/// errors, the way `sessions::SessionCap` and `opensubtitles::QuotaSpent` do.
 fn refusal_or_internal(code: ErrorCode, message: &'static str, e: anyhow::Error) -> ApiError {
     let ours = e.downcast_ref::<sqlx::Error>().is_some()
         || e.downcast_ref::<std::io::Error>().is_some()
@@ -927,6 +935,13 @@ pub fn is_unique_violation(e: &anyhow::Error) -> bool {
 /// a day — so it gets a code and keeps the sentence the provider module wrote,
 /// which names the way out. Everything else is upstream being upstream.
 fn subtitle_provider_refusal(e: anyhow::Error) -> ApiError {
+    if e.downcast_ref::<crate::subtitles::NoSuchItem>().is_some() {
+        // Before the provider is blamed for it. An unknown id arrived as 502
+        // "the subtitle provider did not answer", so a typo reported an outage
+        // that was not happening — and this route's own 404 was unreachable
+        // for an admin, whose grant check always passes.
+        return ApiError::new(ErrorCode::NotFound, "no such item");
+    }
     match e.downcast_ref::<crate::opensubtitles::QuotaSpent>() {
         Some(spent) => ApiError::new(ErrorCode::SubtitleQuotaSpent, spent.to_string()),
         // `refusal_or_internal`, not `log`: a SQLITE_BUSY inside the search
@@ -2403,6 +2418,12 @@ async fn admin_delete_satellite(
         .registry
         .delete_satellite(&id)
         .await
+        // The pre-check above is load-bearing, not belt and braces: the
+        // registry ALSO refuses the in-process mediahost, with a plain
+        // `ensure!` that `refusal_or_internal` would read as "no such
+        // satellite" — a 404 for a box that is plainly there. Typing it in the
+        // registry would be the durable fix; until then the two must not
+        // diverge.
         .map_err(|e| refusal_or_internal(ErrorCode::NotFound, "no such satellite", e))?;
     let removed_payloads = state
         .subtitles
@@ -2603,11 +2624,10 @@ async fn admin_attach_collection(
                 Some(mismatch @ crate::registry::AttachRefused::TypeMismatch { .. }) => {
                     ApiError::new(ErrorCode::Conflict, mismatch.to_string())
                 }
-                None => refusal_or_internal(
-                    ErrorCode::Conflict,
-                    "that collection could not be attached",
-                    e,
-                ),
+                // Every refusal this route has is an `AttachRefused` above,
+                // so what reaches here is the database. A `Conflict` fallback
+                // was unreachable and documented a 409 nothing could return.
+                None => internal(e),
             }
         })?;
     Ok(StatusCode::NO_CONTENT)
@@ -4060,16 +4080,21 @@ async fn item_subtitle_file(
         let bytes = tokio::fs::read(state.subtitles.raster_path(track.id))
             .await
             .map_err(|e| {
-                // `refusal_or_internal`, not a flat NotFound: an EACCES or an
-                // EIO on the subtitle cache is the hub's, and reporting it as
-                // "no body on disk" tells a client the track is absent while
-                // keeping the fault out of an operator's 5xx alerting. This is
-                // the exact misfiling that helper's doc cites.
-                refusal_or_internal(
-                    ErrorCode::NotFound,
-                    "that rasterised track has no body on disk",
-                    anyhow::anyhow!(e),
-                )
+                // `tokio::fs::read` fails ONLY with an io error, and
+                // `refusal_or_internal` reads any io error as ours — so its
+                // refusal arm could never be reached here: every failure was a
+                // 500 and this route's declared 404 was dead. The row is
+                // INSERTed before the payload is written, so a missing file is
+                // an ordinary orphan and the client's business; anything else
+                // is the disk, and ours.
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    ApiError::new(
+                        ErrorCode::NotFound,
+                        "that rasterised track has no body on disk",
+                    )
+                } else {
+                    internal(e)
+                }
             })?;
         return Ok((
             [(
@@ -5305,7 +5330,6 @@ struct ItemQuery {
         (status = 200, description = "Item details and current playback negotiation", body = ItemQueryResponse, headers(("accept-query" = String))),
         (status = 401, description = "Missing or invalid bearer token", body = ApiErrorBody),
         (status = 404, description = "Item does not exist or is outside the account's libraries", body = ApiErrorBody),
-        (status = 409, description = "Playback capabilities cannot be negotiated", body = ApiErrorBody),
         (status = 400, description = "The QUERY body is not the JSON this route takes", body = ApiErrorBody),
         (status = 405, description = "Answered for any other verb on this path — POST, PUT, DELETE. Declared here because the document has no operation for those: QUERY is registered as this path's method-router fallback", body = ApiErrorBody, headers(("allow" = String), ("accept-query" = String))),
         (status = 415, description = "QUERY requires an application/json body", body = ApiErrorBody),
@@ -5372,11 +5396,9 @@ async fn item_query(
         // unplayable.
         match e.downcast_ref::<crate::sessions::NoSuchTrack>() {
             Some(missing) => ApiError::new(ErrorCode::BadRequest, missing.to_string()),
-            None => refusal_or_internal(
-                ErrorCode::Conflict,
-                "this item's playback could not be negotiated",
-                e,
-            ),
+            // As above: this route's refusals are typed, and what is left is
+            // the database.
+            None => internal(e),
         }
     })?;
     // Nothing to negotiate is an ANSWER, not a failure: a show or an

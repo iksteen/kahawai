@@ -132,7 +132,17 @@ async fn serve(State(dir): State<WebDir>, uri: Uri) -> Response {
         // A name this cannot serve answers exactly as a miss does: a refusal
         // and an absence are the same thing to a client, and telling them
         // apart would only report what is on disk.
-        None => shell_or_404(&dir, raw).await,
+        //
+        // The DECODED prefix decides the `assets/` rule, not the raw one.
+        // `/app/assets%2f..%2fmain.js` is refused above, and on the raw
+        // spelling `starts_with("assets/")` is false — so it fell through to
+        // the shell with a 200, handing a browser HTML where a module was
+        // promised. That is the failure the `assets/` branch exists for, and
+        // the refusal path was the one way back into it.
+        None => {
+            let decoded = percent_decode(raw).unwrap_or_else(|| raw.to_string());
+            shell_or_404(&dir, &decoded).await
+        }
     }
 }
 

@@ -349,7 +349,7 @@ present-but-unknown are genuinely different answers.
 `kahawai hub --web-dir web-next/dist` — the shell, its hashed assets and a
 client-side route all served by the hub, which is the loop phase 0 exists for.
 
-## Phase 3 — foundations
+## Phase 3 — foundations — DONE
 
 Written before any page, because every page depends on them and because these
 are the three places the instruction warns will hurt if backfilled.
@@ -370,7 +370,16 @@ are the three places the instruction warns will hurt if backfilled.
   call site.
 - **Notice host and boundaries.** One toast host; error boundaries keyed on
   the screen rather than the address, which is what keeps an autoplay handover
-  from remounting the player.
+  from remounting the player. The host is here (`composables/notices.ts`); the
+  boundaries land with the shell in phase 4, which is the first thing that has
+  a screen to key on.
+
+What the session gained over the port: starting is explicit. The channel and
+the transport wiring used to be module side effects, which is why testing them
+needed globals stubbed before a dynamic import in the right order. The three
+guards that matter — the generation check, clearing memory before the lock,
+and the shared in-flight refresh — were each removed in turn to confirm the
+tests go red; all three do.
 
 ## Phase 4 onward — page by page
 

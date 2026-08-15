@@ -186,10 +186,6 @@ async fn a_symlink_out_of_the_directory_does_not_escape_it() {
     std::fs::remove_file(outside).unwrap();
 }
 
-/// A wrong `--web-dir` is refused at startup, where the mistake was made.
-/// Serving it and answering "the web UI was not embedded in this build" is
-/// what this replaces: a 200, no log line, and the diagnosis pointed at the
-/// binary instead of the flag.
 /// A project root is not a build, and it has an `index.html` too.
 ///
 /// `--web-dir web` is `web/dist` with the last segment dropped — one slip from
@@ -217,6 +213,10 @@ fn a_project_root_is_refused_even_though_it_has_an_index() {
     assert!(kahawai_hub::web::resolve_dir(dir.path()).is_ok());
 }
 
+/// A wrong `--web-dir` is refused at startup, where the mistake was made.
+/// Serving it and answering "the web UI was not embedded in this build" is
+/// what this replaces: a 200, no log line, and the diagnosis pointed at the
+/// binary instead of the flag.
 #[test]
 fn a_web_dir_that_is_not_a_directory_is_refused() {
     let dir = bundle();

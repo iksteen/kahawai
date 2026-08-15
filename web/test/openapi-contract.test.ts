@@ -140,7 +140,7 @@ test('and its 503 names that refusal, not only the domain one', () => {
 test('a route that is not behind it does not claim that refusal', () => {
   const spurious = operations
     .filter((entry) => !behindRequireAuth(entry))
-    .filter(([, op]) => op.responses['503']?.description?.includes('administrator'))
+    .filter(([, op]) => op.responses['503']?.description?.includes('setup_required'))
     .map(([label]) => label)
   assert.deepEqual(spurious, [])
 })

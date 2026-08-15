@@ -55,7 +55,7 @@ export class ApiError extends Error {
 /// when an operator acts. A 503 with no code at all is an intermediary's —
 /// HAProxy and ingress-nginx answer it for a backend that is down — and that
 /// is the ordinary hub restart, which does clear.
-const OPERATOR_CLEARS = ['setup_required', 'provider_unconfigured']
+export const OPERATOR_CLEARS = ['setup_required', 'provider_unconfigured']
 
 export function retry(e: unknown): boolean {
   if (e instanceof Offline) return true
