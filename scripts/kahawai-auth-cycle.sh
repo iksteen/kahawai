@@ -198,28 +198,25 @@ browser_body, browser_cookies = expect(
         "POST",
         "/api/v1/auth/token",
         {"client": "browser", "username": username, "password": password},
+        origin=base,
         opener=browser,
     ),
     "browser login",
 )
 assert_browser_response(browser_body, browser_cookies, "browser login")
 
-bootstrap, _ = expect(200, call("GET", "/api/v1/bootstrap", opener=browser), "cookie bootstrap")
-if bootstrap.get("authenticated") is not True:
-    raise SystemExit("media-cookie bootstrap did not authenticate")
+expect(200, call("HEAD", "/api/v1/events", opener=browser), "media-cookie event stream")
 expect(401, call("GET", "/api/v1/items", opener=browser), "cookie catalogue rejection")
 expect(
     401,
     call("POST", "/api/v1/playback/sessions", {}, opener=browser),
     "cookie mutation rejection",
 )
-invalid_bootstrap, _ = expect(
-    200,
-    call("GET", "/api/v1/bootstrap", bearer="invalid", opener=browser),
+expect(
+    401,
+    call("HEAD", "/api/v1/events", bearer="invalid", opener=browser),
     "invalid bearer precedence",
 )
-if invalid_bootstrap.get("authenticated") is not False:
-    raise SystemExit("bootstrap fell back to a valid cookie after an invalid bearer")
 
 for bad_origin, label in [
     (None, "absent Origin"),

@@ -240,6 +240,7 @@ echo "==> exercising API and browser authentication" >&2
 browser_jar="$work/browser.cookies"
 browser_login=$(curl -sf -c "$browser_jar" -X POST \
     "http://$api/api/v1/auth/token" -H content-type:application/json \
+    -H "Origin: http://$api" \
     -d '{"client":"browser","username":"smoke","password":"smoke-password-1"}')
 printf '%s' "$browser_login" \
     | py 'assert set(d) == {"access_token", "expires_in"}; print(d["access_token"])' \
