@@ -384,22 +384,37 @@ async fn run_hub_inner(
     );
 
     // SEC-3 CLI approval: type a satellite's console code + Enter.
+    //
+    // Only with a terminal to type at. `tokio::io::stdin` reads on a blocking
+    // thread that nothing here can cancel, and it outlives the task that
+    // spawned it: a hub under systemd or in a container consumed a stdin
+    // nobody was typing into, and a `#[tokio::test]` that started an
+    // all-in-one hung on runtime shutdown for ever — the test itself passed,
+    // the binary never exited, and cargo waited. Measured from /proc: one
+    // thread in `unix_stream_read_generic`, two more waiting on it.
+    //
+    // A service without a console approves through the admin API, which is
+    // where an operator does it anyway.
     let approver = svc.clone();
-    tokio::spawn(async move {
-        use tokio::io::AsyncBufReadExt;
-        let mut lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();
-        eprintln!("Type an enrollment code + Enter to approve a satellite.");
-        while let Ok(Some(line)) = lines.next_line().await {
-            let code = line.trim();
-            if code.is_empty() {
-                continue;
+    if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        tokio::spawn(async move {
+            use tokio::io::AsyncBufReadExt;
+            let mut lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();
+            eprintln!("Type an enrollment code + Enter to approve a satellite.");
+            while let Ok(Some(line)) = lines.next_line().await {
+                let code = line.trim();
+                if code.is_empty() {
+                    continue;
+                }
+                match approver.approve(code).await {
+                    Ok(summary) => eprintln!("approved: {summary}"),
+                    Err(e) => eprintln!("rejected: {e}"),
+                }
             }
-            match approver.approve(code).await {
-                Ok(summary) => eprintln!("approved: {summary}"),
-                Err(e) => eprintln!("rejected: {e}"),
-            }
-        }
-    });
+        });
+    } else {
+        tracing::info!("no terminal on stdin; approve satellites through the admin API");
+    }
 
     // Client API (browse). No auth yet — keep it on loopback (see config).
     let api_listener = tokio::net::TcpListener::bind(cfg.bind)
