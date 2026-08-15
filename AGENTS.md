@@ -102,6 +102,12 @@ cd web && npm run dev      # Vite on :5173, /api and /admin proxied to :8420
 kahawai hub --web-dir web/dist   # serve a built bundle from disk
 ```
 
+`web-next/` is the rebuild (`docs/web-next-plan.md`) and runs the same two
+ways. It generates its client from `web/openapi.json` rather than a copy, so
+there is one document and one fingerprint; at cutover it takes `web/`'s name.
+It pins TypeScript 5 because `vue-tsc` cannot run against 7 — the reason is in
+the plan, with the error.
+
 `npm run dev` is the editing loop — HMR, no Rust in it at all. `--web-dir` is
 for trying a bundle a binary does not carry (a second UI, a release hub, a
 colleague's build). The embedded bundle stays the default and is the only

@@ -190,6 +190,33 @@ async fn a_symlink_out_of_the_directory_does_not_escape_it() {
 /// Serving it and answering "the web UI was not embedded in this build" is
 /// what this replaces: a 200, no log line, and the diagnosis pointed at the
 /// binary instead of the flag.
+/// A project root is not a build, and it has an `index.html` too.
+///
+/// `--web-dir web` is `web/dist` with the last segment dropped — one slip from
+/// what `AGENTS.md` documents — and the first cut of the guard accepted it.
+/// Everything readable under the root is served, on an unauthenticated route,
+/// on a bind that is usually 0.0.0.0: that is `package.json`, `src/`, any
+/// `.env`, and `node_modules` entire.
+#[test]
+fn a_project_root_is_refused_even_though_it_has_an_index() {
+    let dir = bundle();
+    // Exactly what a Vite project has beside its index.
+    std::fs::write(dir.path().join("package.json"), "{}").unwrap();
+    let refused = kahawai_hub::web::resolve_dir(dir.path()).unwrap_err();
+    assert!(
+        format!("{refused:#}").contains("project rather than a build"),
+        "{refused:#}"
+    );
+
+    std::fs::remove_file(dir.path().join("package.json")).unwrap();
+    std::fs::create_dir(dir.path().join("node_modules")).unwrap();
+    assert!(kahawai_hub::web::resolve_dir(dir.path()).is_err());
+
+    // And the build output it was pointed at by mistake still works.
+    std::fs::remove_dir(dir.path().join("node_modules")).unwrap();
+    assert!(kahawai_hub::web::resolve_dir(dir.path()).is_ok());
+}
+
 #[test]
 fn a_web_dir_that_is_not_a_directory_is_refused() {
     let dir = bundle();

@@ -1,4 +1,5 @@
 /target
 /web/node_modules
+/web-next/node_modules
 __pycache__/
 /web-mockup

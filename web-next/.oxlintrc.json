@@ -1,0 +1,8 @@
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "ignorePatterns": ["dist", "src/generated"],
+  "plugins": ["typescript", "oxc", "import"],
+  "rules": {
+    "import/no-cycle": "error"
+  }
+}

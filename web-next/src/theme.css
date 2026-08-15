@@ -1,0 +1,53 @@
+/* kahawai — deep-water dark. The palette is the one `web/src/styles.css`
+   opens with, ported name for name rather than re-chosen: the design is
+   frozen for this rebuild, so a colour that drifts here is a regression
+   nobody asked for.
+
+   Tailwind v4 reads `@theme`, which emits the same custom properties the old
+   stylesheet declared by hand AND generates the utilities — so `--color-bg` is
+   both `var(--color-bg)` and `bg-bg`. One definition, two ways to reach it. */
+@import 'tailwindcss';
+
+@theme {
+  --color-bg: #0b1416;
+  --color-surface: #111d20;
+  --color-line: #22383c;
+  --color-text: #d9e6e6;
+  --color-dim: #7d979a;
+  --color-teal: #5fc8b7;
+  --color-teal-dim: #2e5f58;
+  --color-sand: #dcb877;
+  --color-warn: #d98d7a;
+
+  /* Four more steps the design uses often enough to name. `hairline` is a
+     separator INSIDE a card, one notch softer than the card's own `line`.
+     `prose` is body copy: a shade under `text`, so an overview does not
+     compete with the heading above it. `dimmer` is tertiary only —
+     placeholder numerals and disabled marks — never a label: labels were
+     deliberately raised off it for contrast. */
+  --color-hairline: #1a2c30;
+  --color-hover: #16262a;
+  --color-prose: #cdd8da;
+  --color-dimmer: #3d5559;
+
+  --font-mono: ui-monospace, 'JetBrains Mono', Menlo, Consolas, monospace;
+  --font-sans: system-ui, -apple-system, 'Segoe UI', sans-serif;
+}
+
+/* Native controls are dark too. Without this a <select>'s own dropdown, every
+   checkbox and the scrollbars all render light on a page that is not, and the
+   sort control looks like something from another application. Cheaper and more
+   consistent than restyling each one, and it is the only way to reach the
+   popup list at all. */
+:root {
+  color-scheme: dark;
+}
+
+body {
+  background: radial-gradient(120% 90% at 75% -10%, #12262b 0%, var(--color-bg) 55%) fixed;
+  color: var(--color-text);
+  font-family: var(--font-sans);
+  font-size: 15px;
+  line-height: 1.55;
+  margin: 0;
+}

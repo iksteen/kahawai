@@ -318,7 +318,7 @@ read — needs somewhere to store them first).
 
 Each gap lands as its own commit with hub tests, before any Vue is written.
 
-## Phase 2 — clean room
+## Phase 2 — clean room — DONE
 
 `web-next/`, beside `web/` (owner decision: the old UI stays readable and
 runnable for the whole rebuild, because its comments are the specification),
@@ -327,8 +327,27 @@ oxlint, oxfmt, Vitest, Orval pointed at the
 same `openapi.json` and the same fingerprint check. Nothing but a shell that
 boots and a green test run.
 
-Tailwind's theme is extracted from the custom properties already at the top of
-`styles.css`, so the palette has one definition, as it does now.
+Tailwind's theme is the custom properties already at the top of `styles.css`,
+ported name for name into an `@theme` block — which emits the same properties
+AND generates the utilities, so `--color-bg` is both `var(--color-bg)` and
+`bg-bg`. One definition, two ways to reach it.
+
+**TypeScript 5, not 7, and only here.** `vue-tsc` patches `typescript/lib/tsc`,
+and TypeScript 7 — the native port `web/` uses — does not export it, so
+`vue-tsc` cannot run at all: measured, `ERR_PACKAGE_PATH_NOT_EXPORTED`. The
+alternative was `tsc` plus a `declare module '*.vue'` shim, which typechecks
+the TypeScript and gives up every prop and every template expression — the
+half this stack was chosen for. Two independent npm projects may hold two
+compilers; at cutover this one is the one that survives. Revisit when
+`vue-tsc` supports 7.
+
+The strict settings earn themselves immediately: `exactOptionalPropertyTypes`
+caught `retryAfterSecs = undefined` on the first file written, where absent and
+present-but-unknown are genuinely different answers.
+
+**Check:** `npm run build` in `web-next/`, then
+`kahawai hub --web-dir web-next/dist` — the shell, its hashed assets and a
+client-side route all served by the hub, which is the loop phase 0 exists for.
 
 ## Phase 3 — foundations
 

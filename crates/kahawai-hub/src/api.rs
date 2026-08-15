@@ -3632,7 +3632,7 @@ struct SeekRequest {
         (status = 401, body = ApiErrorBody),
         (status = 409, body = ApiErrorBody),
         (status = 404, body = ApiErrorBody),
-        (status = 503, body = ApiErrorBody, description = "The hub has no administrator yet: `setup_required`"),
+        (status = 503, body = ApiErrorBody, description = "The mediahost holding the bytes went away while the lease was re-opened (`source_offline`), or the hub has no administrator yet (`setup_required`)"),
         (status = 415, description = "The body needs Content-Type: application/json", body = ApiErrorBody),
         (status = 413, description = "The body is past the hub's buffer limit", body = ApiErrorBody)
     )
@@ -4060,7 +4060,12 @@ async fn item_subtitle_file(
         let bytes = tokio::fs::read(state.subtitles.raster_path(track.id))
             .await
             .map_err(|e| {
-                ApiError::log(
+                // `refusal_or_internal`, not a flat NotFound: an EACCES or an
+                // EIO on the subtitle cache is the hub's, and reporting it as
+                // "no body on disk" tells a client the track is absent while
+                // keeping the fault out of an operator's 5xx alerting. This is
+                // the exact misfiling that helper's doc cites.
+                refusal_or_internal(
                     ErrorCode::NotFound,
                     "that rasterised track has no body on disk",
                     anyhow::anyhow!(e),

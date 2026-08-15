@@ -9,7 +9,7 @@
     },
     "version": "0.0.0-dev"
   },
-  "x-kahawai-source-sha256": "17a5aa802068de771c7573d3ff37dd37c0c10673790e2aaa1c46a0a52c94f756",
+  "x-kahawai-source-sha256": "8c20affcc4521f28e76c68d34af9bf644f931ca91e1f4ee1e726921dc42e2a72",
   "paths": {
     "/admin/v1/collections": {
       "get": {
@@ -5062,7 +5062,7 @@
             }
           },
           "503": {
-            "description": "The hub has no administrator yet: `setup_required`",
+            "description": "The mediahost holding the bytes went away while the lease was re-opened (`source_offline`), or the hub has no administrator yet (`setup_required`)",
             "content": {
               "application/json": {
                 "schema": {

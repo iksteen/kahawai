@@ -60,6 +60,28 @@ pub fn resolve_dir(dir: &Path) -> Result<PathBuf> {
             resolved.display()
         );
     }
+    // An `index.html` is not enough on its own, which the first cut of this
+    // missed: a Vite PROJECT ROOT has one too, so `--web-dir web` — the
+    // documented `web/dist` with the last segment dropped, one plausible
+    // slip — passed the check meant to catch exactly that. Everything
+    // readable under the root is served, deliberately, and `/app/*` is
+    // unauthenticated on a bind that is usually 0.0.0.0: that hands out
+    // `package.json`, `src/`, any `.env` and the whole of `node_modules`.
+    //
+    // A build output has no manifest and no dependencies. Testing for those
+    // rather than for a `dist/` name or an `assets/` directory, because the
+    // name is a convention and `assets/` can be absent when a small build
+    // inlines everything — but a bundle that ships its own `package.json` is
+    // not a bundle.
+    for marker in ["package.json", "node_modules"] {
+        if resolved.join(marker).exists() {
+            bail!(
+                "--web-dir {} contains {marker}, so it is a project rather than a build; \
+                 point it at the output directory (a Vite `dist`)",
+                resolved.display()
+            );
+        }
+    }
     Ok(resolved)
 }
 
