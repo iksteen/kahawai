@@ -10,9 +10,10 @@ bundle GStreamer or its plugins and are not a supported native installation.
    workspace Cargo version is the permanent `0.0.0-dev` placeholder. Put the
    release title in the annotation subject and the notes in its body.
 2. Push the tag. The release workflow creates a same-named branch containing
-   one additional `release: <tag>` commit. That commit changes only
-   `Cargo.toml` and `Cargo.lock` and stamps every workspace package with the
-   tag's version.
+   one additional `release: <tag>` commit. That commit stamps every workspace
+   package in `Cargo.toml` and `Cargo.lock`, then updates only the
+   `x-kahawai-source-sha256` value in `web/openapi.json` to bind the unchanged
+   API document to those stamped sources.
 3. CI builds from the fully qualified branch ref, never the original tag. It
    runs source checks, builds and tests the pinned media stack natively on
    Linux amd64 and arm64, and smoke-tests each exact pushed image digest.
@@ -33,9 +34,10 @@ candidates publish only their exact `X.Y.Z-rc.N` tag.
 ## Failure and retry
 
 The workflow never force-updates the stamped branch. A retry reuses it only
-when it is exactly one commit above the annotated tag, changes only the two
-Cargo files, and contains the expected version. Any conflict stops the run for
-manual inspection.
+when it is exactly one commit above the annotated tag, contains the expected
+version and OpenAPI source fingerprint, and changes only the two Cargo files
+plus that fingerprint. Any other OpenAPI change or branch conflict stops the
+run for manual inspection.
 
 A failed release may leave a stamped branch, a draft GitHub Release, workflow
 artifacts, and untagged Docker Hub digests. Rerunning the workflow reuses valid

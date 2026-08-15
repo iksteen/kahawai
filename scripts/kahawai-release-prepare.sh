@@ -6,7 +6,7 @@
 #
 # The tag is the maintainer's release request and carries the release notes.
 # The same-named branch contains one additional commit changing only the Cargo
-# workspace version and lockfile; release artifacts are built from that commit.
+# workspace version, lockfile and OpenAPI source fingerprint.
 set -euo pipefail
 
 die() { echo "error: $*" >&2; exit 1; }
@@ -50,6 +50,21 @@ print(" ".join(bad))
     [ -z "$bad" ] || die "workspace version mismatch: $bad"
 }
 
+verify_openapi_restamp() {
+    node web/scripts/openapi-fingerprint.mjs --check
+    if ! git show "$tag_commit:web/openapi.json" | python3 -c '
+import json, sys
+tag_document = json.load(sys.stdin)
+with open("web/openapi.json") as source:
+    release_document = json.load(source)
+for document in (tag_document, release_document):
+    document.pop("x-kahawai-source-sha256", None)
+sys.exit(tag_document != release_document)
+'; then
+        die "web/openapi.json changed beyond its source fingerprint"
+    fi
+}
+
 verify_branch() {
     local ref="$1" head parent count changed
     head="$(git rev-parse "$ref^{commit}")"
@@ -58,10 +73,11 @@ verify_branch() {
     count="$(git rev-list --count "$tag_commit..$head")"
     [ "$count" = 1 ] || die "$ref contains $count commits beyond the tag"
     changed="$(git diff --name-only "$tag_commit" "$head" | sort)"
-    [ "$changed" = $'Cargo.lock\nCargo.toml' ] \
-        || die "$ref changes files other than Cargo.toml and Cargo.lock: $changed"
+    [ "$changed" = $'Cargo.lock\nCargo.toml\nweb/openapi.json' ] \
+        || die "$ref changes files other than the release stamps: $changed"
     git switch --detach "$head" >/dev/null
     verify_versions
+    verify_openapi_restamp
     release_commit="$head"
 }
 
@@ -81,11 +97,13 @@ print(next(iter(versions)) if len(versions) == 1 else ",".join(sorted(versions))
         || die "tag source must use the committed 0.0.0-dev placeholder, found $current"
     git switch -c "$tag" >/dev/null
     cargo set-version --workspace "$version"
+    node web/scripts/openapi-fingerprint.mjs --write openapi.json
     verify_versions
+    verify_openapi_restamp
     changed="$(git diff --name-only | sort)"
-    [ "$changed" = $'Cargo.lock\nCargo.toml' ] \
+    [ "$changed" = $'Cargo.lock\nCargo.toml\nweb/openapi.json' ] \
         || die "version stamping changed unexpected files: $changed"
-    git add Cargo.toml Cargo.lock
+    git add Cargo.toml Cargo.lock web/openapi.json
     git -c user.name='github-actions[bot]' \
         -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
         commit -m "release: $tag" >/dev/null
