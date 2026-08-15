@@ -6,7 +6,7 @@
 #
 # The tag is the maintainer's release request and carries the release notes.
 # The same-named branch contains one additional commit changing only the Cargo
-# workspace version, lockfile and OpenAPI source fingerprint.
+# workspace version and lockfile plus the OpenAPI version and source fingerprint.
 set -euo pipefail
 
 die() { echo "error: $*" >&2; exit 1; }
@@ -57,11 +57,14 @@ import json, sys
 tag_document = json.load(sys.stdin)
 with open("web/openapi.json") as source:
     release_document = json.load(source)
+if release_document["info"]["version"] != sys.argv[1]:
+    raise SystemExit
+release_document["info"]["version"] = tag_document["info"]["version"]
 for document in (tag_document, release_document):
     document.pop("x-kahawai-source-sha256", None)
 sys.exit(tag_document != release_document)
-'; then
-        die "web/openapi.json changed beyond its source fingerprint"
+' "$version"; then
+        die "web/openapi.json changed beyond its release version and source fingerprint"
     fi
 }
 
@@ -97,6 +100,13 @@ print(next(iter(versions)) if len(versions) == 1 else ",".join(sorted(versions))
         || die "tag source must use the committed 0.0.0-dev placeholder, found $current"
     git switch -c "$tag" >/dev/null
     cargo set-version --workspace "$version"
+    python3 -c '
+import json, pathlib, sys
+path = pathlib.Path("web/openapi.json")
+document = json.loads(path.read_text())
+document["info"]["version"] = sys.argv[1]
+path.write_text(json.dumps(document, indent=2) + "\n")
+' "$version"
     node web/scripts/openapi-fingerprint.mjs --write openapi.json
     verify_versions
     verify_openapi_restamp
