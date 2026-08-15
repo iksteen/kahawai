@@ -66,8 +66,16 @@ followed, and those cases are listed too.
       re-fetches the AniDB title dump on request. Needs plumbing before UI.
 
 - [ ] UI-4 **Album tracks show no duration.** The prototype prints a running
-      time per track. A track's children carry watch state, not file duration,
-      so the number is not in the response the track list is built from.
+      time per track. A track's children carried watch state, not file
+      duration, so the number was not in the response the track list is built
+      from — and watch state is exactly what a track nobody has played does not
+      have.
+      **The API half is done**: `duration_ms` is on children and on a detail,
+      from the files' own probes, summed across a source's parts and minimised
+      across the sources that could actually play. The track list still prints
+      no times, because nothing client-side reads it — `Item` in
+      `web/src/api.ts` does not declare the field. Open until it is on screen;
+      the rebuild's album page (phase 12) is where that lands.
 
 ## No data behind it
 
@@ -256,14 +264,15 @@ followed, and those cases are listed too.
       navigate to. Pre-existing, and not adjacent to anything the redesign
       touched, so it is recorded rather than folded into that branch.
 
-- [ ] UI-25 **The whole-libraries grant can lose an update.** Admin sends the
+- [x] UI-25 **The whole-libraries grant can lose an update.** Admin sends the
       complete set of libraries for a user rather than a delta, so two admins
-      editing the same user's grants concurrently give the second write the
-      whole answer — the first one's change is gone with nothing said. The
-      shape is the same as the Settings revert that was fixed, but the fix is
-      not: the server would need to take a delta, or the request would need a
-      version to check. That is an API change, and the API is the backend
-      team's.
+      editing the same user's grants concurrently gave the second write the
+      whole answer — the first one's change gone with nothing said. The request
+      carries a version now: `users.grants_version`, returned with every read
+      and required on the write, checked and bumped in the same statement so
+      two writers cannot both pass. The loser gets 409 `stale_write` and is
+      told to reload; an account deleted under them still gets 404, because
+      "reload and try again" is advice that would never come true.
 
 - [ ] UI-26 **Twenty-five suppressed `react-hooks/exhaustive-deps` warnings.**
       Deleting the inline disables and running the project's own config
@@ -297,11 +306,18 @@ followed, and those cases are listed too.
       that means nothing and cannot tell "one film, seven files" from "seven
       encodes, pick one", which is exactly what the detail page's "7 sources"
       reads as.
-      Nothing is broken for a viewer who presses play. What is missing is the
+      Nothing was broken for a viewer who pressed play. What was missing is the
       client's ability to say what it is looking at, and no amount of UI work
-      fixes it from here: the field is not in the response. Asked for on the
-      hub side in `docs/kahawai-hub-review-findings.md`; this entry is the UI
-      half, and it stays open until the part number arrives.
+      fixes that from here.
+      **The API half is done**: each source row carries `source_id`, `part` and
+      `parts`, so rows sharing an id are parts of one work in part order and
+      rows with different ones are alternatives. The order was wrong as well as
+      unlabelled — it ranked individual FILES by size while claiming to be "the
+      order playback picks in", so a two-CD film listed cd2 first. It is
+      playback's own ordering now.
+      The detail page still reads "7 sources": `Source` in `web/src/api.ts`
+      declares none of the three fields and nothing groups on them. Open until
+      it does; the rebuild's detail page (phase 9) is where that lands.
 
 - [ ] UI-17 **No accessibility pass.** Keyboard reachability was kept in mind
       where a pointer gesture was added (click-to-promote beside pill dragging,

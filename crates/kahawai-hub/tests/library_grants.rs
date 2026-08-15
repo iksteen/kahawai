@@ -187,9 +187,14 @@ async fn harness() -> Hub {
         .await
         .unwrap();
     assert!(
-        kahawai_hub::grants::set_access(&db, &kid_id, false, &["L1".to_string()])
-            .await
-            .unwrap(),
+        matches!(
+            // Version 0: a freshly created account has never had its grants
+            // written, which is what the guard's starting point means.
+            kahawai_hub::grants::set_access(&db, &kid_id, 0, false, &["L1".to_string()])
+                .await
+                .unwrap(),
+            kahawai_hub::grants::SetAccess::Applied { .. }
+        ),
         "the account we just made must exist"
     );
     let kid = auth
@@ -404,16 +409,39 @@ async fn collections_stop_at_the_granted_libraries() {
 #[tokio::test]
 async fn no_grants_and_no_flag_is_no_access() {
     let h = harness().await;
-    assert!(
-        kahawai_hub::grants::set_access(&h.db, &h.kid_id, false, &[])
+    let current = kahawai_hub::grants::users_with_access(&h.db)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|u| u.id == h.kid_id)
+        .expect("the harness account")
+        .grants_version;
+    // The stored set comes back from inside the write's own transaction, so
+    // it cannot be another admin's answer paired with this one's version.
+    assert_eq!(
+        kahawai_hub::grants::set_access(&h.db, &h.kid_id, current, false, &[])
             .await
-            .unwrap()
+            .unwrap(),
+        kahawai_hub::grants::SetAccess::Applied {
+            grants_version: current + 1,
+            libraries: Vec::new(),
+        }
     );
-    // No such account: a return value, not an error to read prose out of.
-    assert!(
-        !kahawai_hub::grants::set_access(&h.db, "01NOSUCHUSER", false, &[])
+    // No such account, and a write that lost a race: return values, not errors
+    // to read prose out of, and never the same one — an admin looking at a
+    // user somebody deleted under them must not be told to reload and retry.
+    assert_eq!(
+        kahawai_hub::grants::set_access(&h.db, "01NOSUCHUSER", 0, false, &[])
             .await
-            .unwrap()
+            .unwrap(),
+        kahawai_hub::grants::SetAccess::NoSuchUser
+    );
+    assert_eq!(
+        kahawai_hub::grants::set_access(&h.db, &h.kid_id, current, false, &[])
+            .await
+            .unwrap(),
+        kahawai_hub::grants::SetAccess::Stale,
+        "the version this write already consumed must not work twice"
     );
 
     let (_, v) = get(&h.api, &h.kid, "/api/v1/libraries").await;
@@ -444,17 +472,51 @@ async fn the_admin_api_round_trips_access() {
 
     // Grant L2 as well — and hand in a library id that no longer exists,
     // which must be dropped rather than fail the call.
+    let version = kid["grants_version"].as_i64().expect("grants_version");
     let uri = format!("/admin/v1/users/{}/libraries", h.kid_id);
     let (status, body) = call(
         &h.api,
         &h.boss,
         "PUT",
         &uri,
-        Some(json!({ "all_libraries": false, "libraries": ["L1", "L2", "gone"] })),
+        Some(
+            json!({ "all_libraries": false, "libraries": ["L1", "L2", "gone"], "grants_version": version }),
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
     let stored: Value = serde_json::from_str(&body).unwrap();
+
+    // UI-25: the version this admin held is spent. A second admin who read at
+    // the same time and submits now is refused rather than quietly replacing
+    // the change that just landed — the panel sends the COMPLETE set, so a
+    // merge is not what would have happened.
+    let (status, body) = call(
+        &h.api,
+        &h.boss,
+        "PUT",
+        &uri,
+        Some(json!({ "all_libraries": true, "libraries": [], "grants_version": version })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    let refusal: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(refusal["code"], "stale_write");
+    // And the first write is still what the hub holds.
+    let (_, after) = call(&h.api, &h.boss, "GET", "/admin/v1/users", None).await;
+    let after: Value = serde_json::from_str(&after).unwrap();
+    let kid_after = after["users"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|u| u["username"] == "kid")
+        .unwrap();
+    assert_eq!(kid_after["all_libraries"], false, "the loser overwrote it");
+    assert_eq!(
+        kid_after["grants_version"].as_i64().unwrap(),
+        version + 1,
+        "a refused write must not consume a version"
+    );
     let mut got: Vec<&str> = stored["libraries"]
         .as_array()
         .unwrap()
@@ -477,9 +539,11 @@ async fn the_admin_api_round_trips_access() {
         &h.boss,
         "PUT",
         "/admin/v1/users/01NOSUCHUSER/libraries",
-        Some(json!({ "all_libraries": true })),
+        Some(json!({ "all_libraries": true, "grants_version": 0 })),
     )
     .await;
+    // Absent, not stale: the guard must not turn a deleted account into
+    // "reload and try again", which is advice that never comes true.
     assert_eq!(status, StatusCode::NOT_FOUND);
 
     // A non-admin cannot read or write any of it.

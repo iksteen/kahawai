@@ -128,6 +128,13 @@ function UsersSection({
         inflight: number
         savedSeq: number
         saved: { all_libraries: boolean; libraries: string[] } | null
+        /// The `grants_version` the next write must carry (UI-25).
+        ///
+        /// Not read from `u` at send time: the queue below serialises writes
+        /// per user, so a second click goes out before any repaint, and the
+        /// row still holds the version the FIRST one consumed. Each answer
+        /// carries the version it produced, which is what the next one needs.
+        version: number
         queue: SerialQueue
       }
     >(),
@@ -191,11 +198,21 @@ function UsersSection({
       inflight: 0,
       savedSeq: 0,
       saved: null,
+      version: u.grants_version,
       queue: new SerialQueue(),
     }
     writes.current.set(u.id, w)
     // Nothing outstanding means the chips on screen are what the hub has.
-    if (w.inflight === 0) w.saved = { all_libraries: u.all_libraries, libraries: u.libraries }
+    if (w.inflight === 0) {
+      w.saved = { all_libraries: u.all_libraries, libraries: u.libraries }
+      // Nothing outstanding means the row is the hub's answer — but only if
+      // that answer is not older than what we already know. A `refresh` that
+      // started BEFORE a write and lands after it settles carries the
+      // pre-write snapshot, and taking its version back would send a spent one
+      // and be told "somebody else changed this" when nobody had. Versions
+      // only ever climb, so the newer number is the true one.
+      w.version = Math.max(w.version, u.grants_version)
+    }
     const mine = ++w.seq
     w.inflight++
     const apply = (v: { all_libraries: boolean; libraries: string[] }) =>
@@ -205,8 +222,17 @@ function UsersSection({
     // replies did not order SQLite writes, so request A could commit after B
     // and leave the hub holding A while the panel continued to show B.
     return w.queue
-      .run(() => adminSetUserLibraries(u.id, all, libs))
+      .run(() => adminSetUserLibraries(u.id, all, libs, w.version))
       .then((r) => {
+        // Whatever else this answer is, it moved the version on. The queue
+        // means the next write is not sent until this lands.
+        // Onto the ROW as well as the write state. `w.version` is reset from
+        // the row whenever nothing is outstanding, so leaving the row holding
+        // the version this write just consumed made every second edit — one
+        // click, let it land, click again — send a spent version and come back
+        // `stale_write`, telling an operator somebody else had changed it when
+        // nobody had. It stayed wrong until the next poll.
+        w.version = r.grants_version
         // The revert target moves on ANY success, newest-first: an older write
         // succeeding while a newer one is out still tells us something the hub
         // has accepted, and reverting past it would undo it.
@@ -214,6 +240,13 @@ function UsersSection({
           w.savedSeq = mine
           w.saved = { all_libraries: r.all_libraries, libraries: r.libraries }
         }
+        // The version onto the ROW, from any answer and unconditionally: the
+        // queue serialises these, so the one that just landed carries the
+        // newest the hub has. The CHIPS are a different question — see below —
+        // and this must not paint them.
+        setUsers((us) =>
+          us.map((x) => (x.id === u.id ? { ...x, grants_version: r.grants_version } : x)),
+        )
         // The CHIPS, though, only ever come from the newest write. This is a
         // whole-set write and the next click computes its payload from what is
         // on screen, so painting an older answer does not merely look stale:
@@ -234,6 +267,15 @@ function UsersSection({
         if (mine !== w.seq) return
         if (w.saved) apply(w.saved)
         onError(String(e))
+        // A refused write leaves this panel holding a version the hub has
+        // moved past, and nothing else here would go and look: `refresh` runs
+        // on mount and on an SSE hint, and granting libraries emits none. So
+        // every further click sent the same spent version and was refused
+        // again — on an idle hub, for ever, with a message blaming an admin
+        // who was not there. Reading once is what the message asks the
+        // operator to do; doing it for them is the whole difference between a
+        // refusal and a dead panel.
+        if ((e as { code?: string }).code === 'stale_write') void refresh()
       })
       .finally(() => {
         w.inflight--

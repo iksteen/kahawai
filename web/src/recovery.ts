@@ -34,11 +34,23 @@ export const SOURCE_OFFLINE = 503
 /// should do, so it is `busy` rather than `wait` — see `StartRetry`.
 export const SESSION_CAP = 429
 
+/// The 503s that a person has to act on, so no amount of waiting helps.
+///
+/// Everything else answering 503 — the hub's own `source_offline`, and an
+/// intermediary answering for a backend that is down — comes back on its own.
+const OPERATOR_CLEARS = ['setup_required', 'provider_unconfigured']
+
 /// True when a thrown request failure says the source's host is away. Takes
 /// `unknown` because it sits in a `catch`, and anything that is not an
 /// `ApiError` with this status is some other problem.
 export function isSourceOffline(e: unknown): boolean {
-  return typeof e === 'object' && e !== null && (e as { status?: number }).status === SOURCE_OFFLINE
+  if (typeof e !== 'object' || e === null) return false
+  const { status, code } = e as { status?: number; code?: string }
+  // The same test `startRetry` makes, for the same reason: this decides
+  // whether to print "the machine holding this file is not answering", and a
+  // hub restarted onto an empty database answers 503 `setup_required` — a
+  // sentence about a mediahost for a hub that needs a first admin.
+  return status === SOURCE_OFFLINE && !OPERATOR_CLEARS.includes(code ?? '')
 }
 
 /// True when a response says the session is gone. Takes `undefined`
@@ -59,9 +71,11 @@ export function isSessionDead(e: unknown): boolean {
 /// What to do about a session START that failed.
 ///
 /// `wait` — nothing is wrong with the item and the condition clears itself:
-/// 503 (the mediahost is away), no answer at all (connection refused, DNS, an
-/// aborted timeout — everything `api()` wraps as `Offline`), or a 5xx from the
-/// hub or from a proxy in front of it. That last one is the case a narrower
+/// 503 (the mediahost is away, or an intermediary answering for a hub that is
+/// restarting), no answer at all (connection refused, DNS, an aborted timeout
+/// — everything `api()` wraps as `Offline`), or 502/504 from a proxy in front
+/// of it. The two 503s that need an operator are named in `OPERATOR_CLEARS`
+/// and are not this. That last one is the case a narrower
 /// rule got wrong: most deployments put a reverse proxy in front, so an
 /// ordinary hub restart is a 502 with an HTML body rather than a dropped
 /// connection, and treating it as final stopped an album for good.
@@ -95,13 +109,19 @@ export function startRetry(e: unknown): StartRetry {
   // side without a status — a malformed body, a bug here — is not weather
   // either.
   const code = typeof e === 'object' && e !== null ? (e as { code?: string }).code : undefined
-  // Not every 503 is weather. Two of them — the hub having no administrator
-  // yet, and a provider with no credentials — clear only when an OPERATOR
-  // acts, and the player's stand-by dialog says the machine holding the file
-  // has stopped answering and offers one button. A hub restarted onto an empty
-  // database would have left a tab standing by for ever with the real answer
-  // sitting unread in `code`.
-  if (status === SOURCE_OFFLINE) return code === 'source_offline' ? 'wait' : 'maybe'
+  // Not every 503 is weather. Two of the hub's — no administrator yet, and a
+  // provider with no credentials — clear only when an OPERATOR acts, and the
+  // player's stand-by dialog says the machine holding the file has stopped
+  // answering and offers one button. A hub restarted onto an empty database
+  // would leave a tab standing by for ever with the real answer in `code`.
+  //
+  // Named, not inferred from the ABSENCE of `source_offline`. A 503 with no
+  // code at all is an intermediary's — HAProxy, ingress-nginx with no
+  // endpoints and Cloudflare all answer 503 for a backend that is down, not
+  // 502 — and that is the ordinary hub restart the line below exists for.
+  // Requiring `source_offline` to wait made every one of those final, which
+  // is the regression this whole branch was written to prevent.
+  if (status === SOURCE_OFFLINE) return OPERATOR_CLEARS.includes(code ?? '') ? 'maybe' : 'wait'
   if (status === 502 || status === 504) return 'wait'
   // The account's own cap, which is neither weather nor a verdict about the
   // item. Its own answer for the reason `StartRetry` gives.

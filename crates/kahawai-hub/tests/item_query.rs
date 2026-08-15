@@ -118,6 +118,7 @@ fn test_router(
 /// `db` and `subs_dir` come back so a test can look for the artefacts
 /// QUERY must NOT have produced.
 struct Fx {
+    reg: Arc<Registry>,
     // Keep this bound for the whole test. Dropping it unlinks hub.db while
     // the router's lazy SQLite pool is still using the directory.
     _dir: tempfile::TempDir,
@@ -130,6 +131,85 @@ struct Fx {
 
 async fn fixture() -> Fx {
     fixture_with(rec("Heat (1995).mkv", 100)).await
+}
+
+/// UI-27: one film in several parts must be tellable from several encodes.
+///
+/// The list is one row per FILE, ordered by what playback would pick, so both
+/// cases read as "N sources" in an order that means nothing. The grouping was
+/// in the database — `playable_sources` collects a family and states how many
+/// parts it expects — and simply was not in the response, so no client could
+/// say what it was looking at.
+#[tokio::test]
+async fn a_multi_part_film_is_tellable_from_alternative_encodes() {
+    // Two CDs of one film, and a second encode of the same film beside them.
+    let fx = fixture_with(rec("Heat (1995)/Heat (1995) cd1.mkv", 100)).await;
+    fx.reg
+        .upsert_files(
+            "01H",
+            "movies",
+            vec![
+                rec("Heat (1995)/Heat (1995) cd1.mkv", 100),
+                rec("Heat (1995)/Heat (1995) cd2.mkv", 110),
+                rec("Heat (1995)/Heat (1995) REPACK.mkv", 400),
+            ],
+        )
+        .await
+        .unwrap();
+
+    let response = fx
+        .api
+        .clone()
+        .oneshot(
+            axum::http::Request::get(format!("/api/v1/items/{}", fx.id))
+                .header("authorization", &fx.bearer)
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let item: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    // `ItemRow<S>`'s generic field: a count when browsing, the rows themselves
+    // on a detail.
+    let sources = item["sources"].as_array().expect("sources on the detail");
+
+    // Group the way a client would have to, on the fields the response now
+    // carries and did not before.
+    let mut by_source: std::collections::BTreeMap<i64, Vec<i64>> = Default::default();
+    let mut expected: std::collections::BTreeMap<i64, i64> = Default::default();
+    for s in sources {
+        let id = s["source_id"].as_i64().expect("source_id on every source");
+        by_source
+            .entry(id)
+            .or_default()
+            .push(s["part"].as_i64().expect("part on every source"));
+        expected.insert(id, s["parts"].as_i64().expect("parts on every source"));
+    }
+
+    let multi: Vec<_> = by_source.values().filter(|p| p.len() > 1).collect();
+    assert_eq!(
+        multi.len(),
+        1,
+        "expected exactly one multi-part source in {by_source:?}"
+    );
+    assert_eq!(*multi[0], vec![1, 2], "parts are not numbered in order");
+    assert!(
+        by_source.len() > 1,
+        "the alternative encode did not come back as its own source: {by_source:?}"
+    );
+    for (id, parts) in &by_source {
+        assert_eq!(
+            expected[id],
+            parts.len() as i64,
+            "source {id} reports {} parts and returned {}",
+            expected[id],
+            parts.len()
+        );
+    }
 }
 
 async fn fixture_with(file: FileUpsertRecord) -> Fx {
@@ -159,7 +239,7 @@ async fn fixture_with(file: FileUpsertRecord) -> Fx {
         .unwrap();
     let subs_dir = tempfile::tempdir().unwrap().keep();
     let api = test_router(
-        reg,
+        reg.clone(),
         auth,
         Arc::new(kahawai_hub::sessions::Sessions::new(
             tempfile::tempdir().unwrap().keep(),
@@ -167,6 +247,7 @@ async fn fixture_with(file: FileUpsertRecord) -> Fx {
         subs_dir.clone(),
     );
     Fx {
+        reg,
         _dir: dir,
         api,
         bearer,

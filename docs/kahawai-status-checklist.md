@@ -429,6 +429,10 @@ How something works and why it was built that way belong in
       status carries transience (429/503 clear, other 4xx are final), so a
       third-party client needs no table of kahawai's codes
       (`tests/error_bodies.rs`, `web/test/api-failure.test.ts`)
+      Library grants take a `grants_version`, so two admins editing one account
+      cannot silently discard each other (UI-25). Two more gaps are closed on
+      the wire and not yet on screen, so they stay open in the UI ledger:
+      `duration_ms` (UI-4) and `source_id`/`part`/`parts` (UI-27)
 
 ## Hub — anime (HUB-29..33)
 

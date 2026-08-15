@@ -1070,6 +1070,10 @@ export type AdminUser = {
   all_libraries: boolean
   libraries: string[]
   created_at: number
+  /// UI-25: what this account's grants were when they were read. A write
+  /// carries it back so two admins editing one account cannot silently
+  /// discard each other — the panel sends the complete set, not a delta.
+  grants_version: number
 }
 
 export const adminUsers = () => generatedAdminUsers()
@@ -1091,5 +1095,14 @@ export const adminDeleteUser = (id: string) => generatedAdminDeleteUser(id)
 /// Whole state, not a toggle: the panel holds every box, and sending all
 /// of them is what keeps two admins from interleaving into a set neither
 /// picked.
-export const adminSetUserLibraries = (id: string, allLibraries: boolean, libraries: string[]) =>
-  generatedAdminSetUserLibraries(id, { all_libraries: allLibraries, libraries })
+export const adminSetUserLibraries = (
+  id: string,
+  allLibraries: boolean,
+  libraries: string[],
+  grantsVersion: number,
+) =>
+  generatedAdminSetUserLibraries(id, {
+    all_libraries: allLibraries,
+    libraries,
+    grants_version: grantsVersion,
+  })

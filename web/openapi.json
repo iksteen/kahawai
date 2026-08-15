@@ -9,7 +9,7 @@
     },
     "version": "0.0.0-dev"
   },
-  "x-kahawai-source-sha256": "1faa5be9fe0a7f21aedb7635cd3bd13e852200b72c0b0c3232b54576c6dddc6c",
+  "x-kahawai-source-sha256": "17a5aa802068de771c7573d3ff37dd37c0c10673790e2aaa1c46a0a52c94f756",
   "paths": {
     "/admin/v1/collections": {
       "get": {
@@ -2792,6 +2792,16 @@
             }
           },
           "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Somebody else changed these grants since they were read: `stale_write`",
             "content": {
               "application/json": {
                 "schema": {
@@ -6679,6 +6689,7 @@
           "not_found",
           "conflict",
           "last_admin",
+          "stale_write",
           "self_target",
           "setup_required",
           "setup_complete",
@@ -7030,6 +7041,7 @@
           "replay_gain",
           "resume_position_ms",
           "resume_duration_ms",
+          "duration_ms",
           "played",
           "play_count"
         ],
@@ -7046,6 +7058,14 @@
               "string",
               "null"
             ]
+          },
+          "duration_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "UI-4: the running time the FILES state, as opposed to\n`resume_duration_ms`, which is what a player last reported while\nwatching. An album track list had neither, so it printed no times at\nall: a track nobody has played has no watch state to borrow one from.\n\nSummed across a source's parts and minimised across alternatives, over\nthe sources that could actually play — an incomplete one undercounts,\nand the minimum would otherwise prefer exactly that.\n\nOn a detail and on children. **Null on a browse page**, which does not\nreach `files`: a card shows a title and a poster, and resolving a\nrunning time for every row of a page is a cost that buys nothing there."
           },
           "episode": {
             "type": [
@@ -7178,7 +7198,10 @@
                 "path_rel",
                 "size",
                 "available",
-                "revision"
+                "revision",
+                "source_id",
+                "part",
+                "parts"
               ],
               "properties": {
                 "available": {
@@ -7190,6 +7213,14 @@
                 "module_id": {
                   "type": "string"
                 },
+                "part": {
+                  "type": "integer",
+                  "format": "int64"
+                },
+                "parts": {
+                  "type": "integer",
+                  "format": "int64"
+                },
                 "path_rel": {
                   "type": "string"
                 },
@@ -7200,6 +7231,11 @@
                 "size": {
                   "type": "integer",
                   "format": "int64"
+                },
+                "source_id": {
+                  "type": "integer",
+                  "format": "int64",
+                  "description": "UI-27. Which playable source this file belongs to, which part of it\nthis is, and how many parts that source has.\n\nThe list is one row per FILE, ordered by what playback would pick. That\nmade one film split across seven numbered parts indistinguishable from\nseven alternative encodes — both are \"7 sources\" in an order that means\nnothing to a reader, and no amount of UI work fixes it from the client\nside because the grouping was not in the response.\n\n`source_id` is opaque and only stable within one response; it exists to\nbe grouped on, not stored. Rows sharing it are parts of one work, in\n`part` order; rows with different ones are alternatives to choose\nbetween."
                 },
                 "streams": {
                   "oneOf": [
@@ -7253,6 +7289,7 @@
           "replay_gain",
           "resume_position_ms",
           "resume_duration_ms",
+          "duration_ms",
           "played",
           "play_count"
         ],
@@ -7269,6 +7306,14 @@
               "string",
               "null"
             ]
+          },
+          "duration_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "UI-4: the running time the FILES state, as opposed to\n`resume_duration_ms`, which is what a player last reported while\nwatching. An album track list had neither, so it printed no times at\nall: a track nobody has played has no watch state to borrow one from.\n\nSummed across a source's parts and minimised across alternatives, over\nthe sources that could actually play — an incomplete one undercounts,\nand the minimum would otherwise prefer exactly that.\n\nOn a detail and on children. **Null on a browse page**, which does not\nreach `files`: a card shows a title and a poster, and resolving a\nrunning time for every row of a page is a cost that buys nothing there."
           },
           "episode": {
             "type": [
@@ -8548,12 +8593,18 @@
       "SetAccess": {
         "type": "object",
         "required": [
-          "all_libraries"
+          "all_libraries",
+          "grants_version"
         ],
         "properties": {
           "all_libraries": {
             "type": "boolean",
             "description": "Everything, including libraries made later. When true the list is\nstored but not consulted — see the `grants` module doc."
+          },
+          "grants_version": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The `grants_version` this admin was shown (UI-25).\n\nRequired, and not defaulted, because a guard a client can omit is not\none. The panel sends the COMPLETE set rather than a delta, so without\nit two admins editing the same account do not merge — the second write\nreplaces the first and the first admin's change is gone with nothing\nsaid."
           },
           "libraries": {
             "type": "array",
@@ -9191,7 +9242,8 @@
           "is_admin",
           "all_libraries",
           "created_at",
-          "libraries"
+          "libraries",
+          "grants_version"
         ],
         "properties": {
           "all_libraries": {
@@ -9200,6 +9252,11 @@
           "created_at": {
             "type": "integer",
             "format": "int64"
+          },
+          "grants_version": {
+            "type": "integer",
+            "format": "int64",
+            "description": "What this account's grants were when they were read, for the write\nthat follows. See [`set_access`]."
           },
           "id": {
             "type": "string"
@@ -9223,11 +9280,17 @@
         "required": [
           "id",
           "all_libraries",
-          "libraries"
+          "libraries",
+          "grants_version"
         ],
         "properties": {
           "all_libraries": {
             "type": "boolean"
+          },
+          "grants_version": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The version this write produced, so a panel that edits twice without\nreloading sends the right one the second time."
           },
           "id": {
             "type": "string"

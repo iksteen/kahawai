@@ -112,10 +112,16 @@ const offline = () => {
 test('a start is worth asking about again unless the item itself was refused', () => {
   // 503 and "no answer at all" are the two the album queue already waited out.
   assert.equal(startRetry({ status: SOURCE_OFFLINE, code: 'source_offline' }), 'wait')
-  // The other two 503s clear only when an operator acts, and standing by on
-  // them names an unreachable machine that is answering perfectly well.
+  // Two 503s clear only when an operator acts, and standing by on them names
+  // an unreachable machine that is answering perfectly well.
   assert.equal(startRetry({ status: SOURCE_OFFLINE, code: 'setup_required' }), 'maybe')
   assert.equal(startRetry({ status: SOURCE_OFFLINE, code: 'provider_unconfigured' }), 'maybe')
+  // A 503 with no code is an intermediary's — HAProxy and ingress-nginx answer
+  // it for a backend that is down — which is the ordinary hub restart this
+  // branch exists to wait out. Requiring the hub's own code made those final.
+  assert.equal(startRetry({ status: SOURCE_OFFLINE }), 'wait')
+  assert.equal(isSourceOffline({ status: SOURCE_OFFLINE }), true)
+  assert.equal(isSourceOffline({ status: SOURCE_OFFLINE, code: 'setup_required' }), false)
   assert.equal(startRetry(offline()), 'wait')
   // A statusless throw that is NOT the network — a malformed body, a bug on
   // this side — is not weather to wait out.

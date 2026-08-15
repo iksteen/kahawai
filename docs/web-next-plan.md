@@ -112,7 +112,13 @@ embedded assets cannot contain, keeps the `assets/` 404 rule, and refuses
 every traversal spelling. That last one is the reason the test exists: a URI
 path is the only untrusted string in the hub that reaches a filesystem.
 
-## Phase 1 — backend gaps
+## Phase 1 — backend gaps — DONE (on the wire)
+
+Every gap below is closed in the hub. Two of them — UI-4 and UI-27 — are only
+half of a UI-checklist entry: the field exists and nothing renders it yet, so
+those entries stay open until the page that reads them is rebuilt. Marking
+them done because the API moved would be marking a requirement done by
+redefining it.
 
 Ranked by whether the UI can be written correctly without them.
 
@@ -245,29 +251,65 @@ Recorded while doing it: six routes documented **410** for a gone session and
 the hub returns 404 — the one status the client's recovery machine keys on. The
 document was wrong; it says 404 now.
 
-### B3. Grouped cross-library search
+### B3. Grouped cross-library search — WITHDRAWN, measured
 
-`SearchOverlay` fires one request per library because "at most five each is
-not something a single LIMIT can express". One endpoint returning grouped
-hits removes the fan-out, the per-library partial-failure state, and the
-`Promise.all([])`-answers-immediately trap the comment there warns about.
+`SearchOverlay` fires one request per library for two stated reasons: "the
+items endpoint does not say which library a row came from" and "at most five
+each is not something a single LIMIT can express".
 
-### B4. Part numbers on source rows
+The first stopped being true when `library_id` was added to browse rows. The
+second is a window function, and it was built — `per_library` on the same
+endpoint, its own arm so the measured queries stayed byte for byte what they
+were — and then measured against the benchmark's adversarial needle, which
+matches the whole catalogue:
 
-UI-27 / finding 11. Seven part files of one film are published as a flat
-array ordered by size, so no client can tell "one film, seven parts" from
-"seven encodes, pick one". A `part` field; the detail page reads it.
+| shape | 50k | 250k (worst of 3) |
+| --- | --- | --- |
+| dense search, one library (today) | 20.2 ms | 69.9 ms |
+| `per_library`, correlated subquery in `PARTITION BY` | 84.3 ms | 840.8 ms |
+| `per_library`, joining `library_collections` | 59.9 ms | 364.6 ms |
 
-### B5. Lost-update guard on user library grants
+The first shape is the 912 ms failure mode `item_page_sql` exists to avoid,
+reproduced exactly: the library lookup ran for every LIKE candidate rather
+than for a page. Joining the mapping table instead is 2.3× better and still
+misses the 200 ms NFR-1 target at 250k, because ranking WITHIN each library
+cannot stop early the way `ORDER BY … LIMIT` on an index can — the window has
+to see every match before it knows which five are the top five.
 
-UI-25. Two admins editing one user's grants silently discard the first write.
-Needs a version on the request or a delta. Being fixed here rather than
-carried because Admin is a page this rebuild writes from scratch, and because
-"changes revert to what the server holds" is a stated requirement of it.
+So it is withdrawn rather than shipped slow. The client's fan-out is N
+CONCURRENT requests, so its wall clock is one query and not N — it was never
+the slower option, and the complexity it costs a client is now much smaller
+than when the comment was written: `library_id` identifies each hit, and
+TanStack Query owns the fan-out and the partial-failure states that the
+hand-rolled panel had to track itself.
 
-### B6. Track durations on album children
+Reopening this wants a different shape, not a faster version of this one — a
+per-library UNION of indexed top-N stops early on a dense needle but pays N
+full scans on a rare one, which is the trade to measure next time.
 
-UI-4. One field; the album track list wants it.
+### B4. Part numbers on source rows — DONE
+
+UI-27 / finding 11. Seven part files of one film were published as a flat
+array ordered by size, so no client could tell "one film, seven parts" from
+"seven encodes, pick one". `source_id`, `part` and `parts` on each row.
+
+The ordering was wrong too, and its comment said otherwise: it ranked
+individual FILES by size while claiming to be "the same order playback picks
+in", so a two-CD film came back cd2 first. It is playback's own clause now.
+
+### B5. Lost-update guard on user library grants — DONE
+
+UI-25. Two admins editing one user's grants silently discarded the first
+write. `users.grants_version`, returned with every read and required on the
+write; the check and the bump are one statement, so two writers cannot both
+pass it. The loser gets 409 `stale_write`. Required rather than optional,
+because a guard a client may omit is not one.
+
+### B6. Track durations on album children — DONE
+
+UI-4. `duration_ms` from the file's own probe, on every item row — distinct
+from `resume_duration_ms`, which is what a player last reported and is exactly
+what a track nobody has played does not have.
 
 **Deferred, with reasons:** UI-1 (artist entity — a migration and an
 enrichment path, and the owner already decided albums), UI-3 (AniDB title

@@ -89,35 +89,101 @@ async fn index(State(dir): State<WebDir>) -> Response {
 }
 
 async fn serve(State(dir): State<WebDir>, uri: Uri) -> Response {
-    let path = uri.path().trim_start_matches("/app/");
-    spa_response(&dir, path).await
+    let raw = uri.path().trim_start_matches("/app/");
+    // ONE decode, at the edge, and everything below reads the result: the
+    // lookup, the MIME type, the cache policy and the `assets/` rule. They
+    // have to agree about what was asked for, and they cannot if some of them
+    // read the encoded spelling — `/app/assets%2Fmain-abc123.js` found the
+    // file and then called it a client-side route, so a MISS on that spelling
+    // answered `index.html` with a 200, which is the upgrade-breaks-open-tabs
+    // failure the `assets/` branch exists to prevent.
+    //
+    // Decoding for BOTH sources, not just the directory. An earlier cut did it
+    // inside the directory branch alone and so moved the divergence rather
+    // than closing it: the same bundle served a percent-encoded name from
+    // `--web-dir` and 404'd it from the embedded copy.
+    match safe_rel(raw) {
+        Some(path) => spa_response(&dir, &path).await,
+        // Not a name this serves. The RAW spelling still decides the
+        // `assets/` rule, so a refused build-artefact path is a 404 rather
+        // than the shell.
+        // A name this cannot serve answers exactly as a miss does: a refusal
+        // and an absence are the same thing to a client, and telling them
+        // apart would only report what is on disk.
+        None => shell_or_404(&dir, raw).await,
+    }
 }
 
 /// First half of the containment check: the spelling.
 ///
-/// Only plain descending names are joined — no `..`, no empty or absolute
-/// segment, and no `%`, so there is no encoding left to decode a traversal out
-/// of afterwards. Vite emits content-hashed ASCII names, so refusing
-/// everything else costs nothing.
+/// Percent-decoded first, then checked — no `..`, no empty or absolute
+/// segment. Refusing `%` outright was the first cut and it was wrong in a way
+/// only a real bundle shows: Vite's default `assetFileNames` keeps the source
+/// basename, so an imported `café.png` becomes `assets/café-a1b2c3.png` and
+/// arrives percent-encoded. `rust_embed` applies no such filter, so the two
+/// modes disagreed about which builds they could serve — the same hub, the
+/// same bundle, a 404 from one and a 200 from the other.
+///
+/// Decoding is safe here because it happens BEFORE the checks rather than
+/// after: there is no second encoding left for a `..` to hide in, and the
+/// resolved-path comparison in `load` is what actually holds the directory.
 ///
 /// This is a filter on the STRING and not a list of expected artefacts: every
 /// readable file under the directory is served, which is what pointing the hub
 /// at a directory means. It is also why the second half exists — a string
 /// filter cannot see a symlink.
-fn safe_rel(path: &str) -> Option<&str> {
-    let plain = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/');
-    if !path.chars().all(plain) {
-        return None;
-    }
-    if path
+fn safe_rel(path: &str) -> Option<String> {
+    let decoded = percent_decode(path)?;
+    if decoded
         .split('/')
-        .any(|segment| segment.is_empty() || segment == "..")
+        .any(|segment| segment.is_empty() || segment == "." || segment == "..")
     {
         return None;
     }
-    Some(path)
+    // A NUL cannot be in a path at all, and a backslash is a separator on some
+    // platforms and an ordinary filename character here — a name that means
+    // two different things on two systems is not one to serve.
+    //
+    // `%2f` needs no case of its own: it decodes to `/` BEFORE the split
+    // above, so it arrives as the separator it is and its segments are checked
+    // like any other. That is the whole reason decoding comes first.
+    if decoded.contains('\0') || decoded.contains('\\') {
+        return None;
+    }
+    Some(decoded)
 }
 
+/// `%XX` only, and only for bytes that make valid UTF-8. Anything malformed is
+/// not a path this serves.
+fn percent_decode(path: &str) -> Option<String> {
+    if !path.contains('%') {
+        return Some(path.to_string());
+    }
+    let bytes = path.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hex = path.get(i + 1..i + 3)?;
+            // Two HEXDIG, as RFC 3986 says, and checked rather than left to
+            // the parser: `from_str_radix` accepts a sign, so `%+A` decoded to
+            // a newline and `%-0` to a NUL. Harmless downstream — everything
+            // is vetted after — but two spellings resolving to one file is not
+            // something a path should allow.
+            if !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return None;
+            }
+            out.push(u8::from_str_radix(hex, 16).ok()?);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+/// The path is already decoded and already vetted by [`safe_rel`].
 async fn load(dir: &WebDir, path: &str) -> Option<Vec<u8>> {
     let Some(root) = dir.as_ref() else {
         return Assets::get(path).map(|asset| asset.data.into_owned());
@@ -131,9 +197,7 @@ async fn load(dir: &WebDir, path: &str) -> Option<Vec<u8>> {
     //
     // Both sides resolved and then compared. This is the check that holds the
     // directory; the string filter only keeps the obvious spellings out.
-    let resolved = tokio::fs::canonicalize(root.join(safe_rel(path)?))
-        .await
-        .ok()?;
+    let resolved = tokio::fs::canonicalize(root.join(path)).await.ok()?;
     if !resolved.starts_with(root) {
         return None;
     }
@@ -141,38 +205,61 @@ async fn load(dir: &WebDir, path: &str) -> Option<Vec<u8>> {
 }
 
 async fn spa_response(dir: &WebDir, path: &str) -> Response {
-    let (data, path) = match load(dir, path).await {
-        Some(data) => (data, path),
-        // A missing BUILD ARTEFACT is a 404, not the shell. The fallback
-        // exists for client-side routes, and `assets/…` is never one: those
-        // paths are content-hashed and only ever produced by the build.
-        //
-        // Answering them with `index.html` and a 200 is what made a hub
-        // upgrade break every tab that was already open. The app code-splits
-        // the player, so pressing Play fetches a hash that the new binary no
-        // longer embeds; the browser got HTML where a module was promised,
-        // rejected it on the MIME type, and `React.lazy` caches that rejected
-        // promise for the life of the page — so the error boundary's Try again
-        // could never work and only a reload helped. A 404 lets the client
-        // tell "this build is gone" from "this route is yours to handle".
-        None if path.starts_with("assets/") => {
-            return (StatusCode::NOT_FOUND, "no such asset in this build").into_response();
-        }
-        // Client-side routes fall back to the SPA shell.
-        None => match load(dir, "index.html").await {
-            Some(data) => (data, "index.html"),
-            None => {
-                return (
-                    [
-                        (header::CONTENT_TYPE, "text/html; charset=utf-8"),
-                        (header::CACHE_CONTROL, "no-cache"),
-                    ],
-                    NO_WEB_UI,
-                )
-                    .into_response();
-            }
-        },
+    let Some(data) = load(dir, path).await else {
+        return shell_or_404(dir, path).await;
     };
+    served(data, path)
+}
+
+/// The fallback half: a build artefact is a 404, anything else is the shell.
+async fn shell_or_404(dir: &WebDir, path: &str) -> Response {
+    // A missing BUILD ARTEFACT is a 404, not the shell. The fallback
+    // exists for client-side routes, and `assets/…` is never one: those
+    // paths are content-hashed and only ever produced by the build.
+    //
+    // Answering them with `index.html` and a 200 is what made a hub
+    // upgrade break every tab that was already open. The app code-splits
+    // the player, so pressing Play fetches a hash that the new binary no
+    // longer embeds; the browser got HTML where a module was promised,
+    // rejected it on the MIME type, and `React.lazy` caches that rejected
+    // promise for the life of the page — so the error boundary's Try again
+    // could never work and only a reload helped. A 404 lets the client
+    // tell "this build is gone" from "this route is yours to handle".
+    if path.starts_with("assets/") {
+        return (StatusCode::NOT_FOUND, "no such asset in this build").into_response();
+    }
+    // Client-side routes fall back to the SPA shell.
+    match load(dir, "index.html").await {
+        Some(data) => served(data, "index.html"),
+        // With a directory, a missing shell is not a build without a UI —
+        // `resolve_dir` refused that at startup. It is a bundle being
+        // rebuilt underneath a running hub, which is the whole point of
+        // the flag: `vite build` clears `dist` and writes it again. Saying
+        // "not embedded in this build" there blames the binary for a state
+        // that lasts a second, so this says the true thing and says it
+        // with a status a client will retry.
+        None if dir.is_some() => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [
+                (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
+                (header::CACHE_CONTROL, "no-store"),
+            ],
+            "the web bundle is being rebuilt",
+        )
+            .into_response(),
+        None => (
+            [
+                (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+                (header::CACHE_CONTROL, "no-cache"),
+            ],
+            NO_WEB_UI,
+        )
+            .into_response(),
+    }
+}
+
+/// One body, with the type and the cache policy its NAME implies.
+fn served(data: Vec<u8>, path: &str) -> Response {
     let mime = match path.rsplit_once('.').map(|(_, e)| e) {
         Some("html") => "text/html; charset=utf-8",
         Some("js") => "text/javascript",

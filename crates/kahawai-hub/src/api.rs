@@ -681,6 +681,9 @@ struct UserAccessResponse {
     id: String,
     all_libraries: bool,
     libraries: Vec<String>,
+    /// The version this write produced, so a panel that edits twice without
+    /// reloading sends the right one the second time.
+    grants_version: i64,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -2093,6 +2096,14 @@ struct SetAccess {
     all_libraries: bool,
     #[serde(default)]
     libraries: Vec<String>,
+    /// The `grants_version` this admin was shown (UI-25).
+    ///
+    /// Required, and not defaulted, because a guard a client can omit is not
+    /// one. The panel sends the COMPLETE set rather than a delta, so without
+    /// it two admins editing the same account do not merge — the second write
+    /// replaces the first and the first admin's change is gone with nothing
+    /// said.
+    grants_version: i64,
 }
 
 /// HUB-10: replace an account's library access.
@@ -2120,7 +2131,8 @@ struct SetAccess {
         (status = 500, body = ApiErrorBody),
         (status = 415, description = "The body needs Content-Type: application/json", body = ApiErrorBody),
         (status = 413, description = "The body is past the hub's buffer limit", body = ApiErrorBody),
-        (status = 503, description = "The hub has no administrator yet: `setup_required`", body = ApiErrorBody)
+        (status = 503, description = "The hub has no administrator yet: `setup_required`", body = ApiErrorBody),
+        (status = 409, description = "Somebody else changed these grants since they were read: `stale_write`", body = ApiErrorBody)
     )
 )]
 async fn admin_set_user_libraries(
@@ -2129,22 +2141,33 @@ async fn admin_set_user_libraries(
     ApiJson(body): ApiJson<SetAccess>,
 ) -> Result<Json<UserAccessResponse>, ApiError> {
     let db = state.registry.db();
-    let existed = crate::grants::set_access(db, &id, body.all_libraries, &body.libraries)
-        .await
-        .map_err(internal)?;
-    if !existed {
-        return Err(hidden("user"));
-    }
-    let stored: Vec<String> =
-        sqlx::query_scalar("SELECT library_id FROM user_libraries WHERE user_id = ?")
-            .bind(&id)
-            .fetch_all(db)
-            .await
-            .map_err(internal)?;
+    let applied = crate::grants::set_access(
+        db,
+        &id,
+        body.grants_version,
+        body.all_libraries,
+        &body.libraries,
+    )
+    .await
+    .map_err(internal)?;
+    let (grants_version, stored) = match applied {
+        crate::grants::SetAccess::Applied {
+            grants_version,
+            libraries,
+        } => (grants_version, libraries),
+        crate::grants::SetAccess::Stale => {
+            return Err(ApiError::new(
+                ErrorCode::StaleWrite,
+                "somebody else changed this account's libraries; reload and try again",
+            ));
+        }
+        crate::grants::SetAccess::NoSuchUser => return Err(hidden("user")),
+    };
     Ok(Json(UserAccessResponse {
         id,
         all_libraries: body.all_libraries,
         libraries: stored,
+        grants_version,
     }))
 }
 
@@ -4756,6 +4779,20 @@ struct ItemRow<S> {
     resume_position_ms: Option<i64>,
     #[schema(required)]
     resume_duration_ms: Option<i64>,
+    /// UI-4: the running time the FILES state, as opposed to
+    /// `resume_duration_ms`, which is what a player last reported while
+    /// watching. An album track list had neither, so it printed no times at
+    /// all: a track nobody has played has no watch state to borrow one from.
+    ///
+    /// Summed across a source's parts and minimised across alternatives, over
+    /// the sources that could actually play — an incomplete one undercounts,
+    /// and the minimum would otherwise prefer exactly that.
+    ///
+    /// On a detail and on children. **Null on a browse page**, which does not
+    /// reach `files`: a card shows a title and a poster, and resolving a
+    /// running time for every row of a page is a cost that buys nothing there.
+    #[schema(required)]
+    duration_ms: Option<i64>,
     played: bool,
     play_count: i64,
 }
@@ -4790,6 +4827,9 @@ fn item_row<S>(r: &sqlx::sqlite::SqliteRow, sources: S) -> ItemRow<S> {
             .ok()
             .flatten()
             .and_then(|value| serde_json::from_str(&value).ok()),
+        // `try_get`, because the browse queries do not select it — only the
+        // ones that reach `files`, which is where a running time lives.
+        duration_ms: r.try_get("file_duration_ms").ok().flatten(),
         resume_position_ms: r.get("position_ms"),
         resume_duration_ms: r.try_get("duration_ms").ok().flatten(),
         played: r.get::<Option<i64>, _>("played").unwrap_or(0) != 0,
@@ -4830,6 +4870,38 @@ async fn item_children(
                 -- copies of one track carry the same measurement, and
                 -- where they disagree the difference is under a dB.
                 MIN(json_extract(f.streams_json, '$.replay_gain')) AS replay_gain,
+                -- UI-4. SUM within a source, MIN across them. The join is one
+                -- row per FILE, so a bare MIN is taken over parts as well as
+                -- alternatives: a two-part episode of 45 minutes a side
+                -- reported 45, and so did a 90-minute single-file encode
+                -- sitting beside it. Which of the two is longer is not the
+                -- question — how long the work is, is.
+                (SELECT MIN(d) FROM (
+                   SELECT SUM(json_extract(f2.streams_json, '$.duration_ms')) AS d
+                     FROM playable_sources ps2
+                     JOIN playable_source_parts psp2 ON psp2.playable_source_id = ps2.id
+                     JOIN files f2 ON f2.id = psp2.file_id
+                    WHERE ps2.item_id = i.id
+                    GROUP BY ps2.id
+                    -- Only sources that could actually play, which is the
+                    -- same completeness `sessions::source_parts` requires:
+                    -- the ordinals are exactly 1..=expected, and every part
+                    -- has a running time. Without it a half-scanned two-CD
+                    -- source undercounts — SQLite's SUM skips NULLs — and
+                    -- the MIN outside prefers exactly that undercount, so a
+                    -- 90-minute film beside it reported 45.
+                    --
+                    -- DISTINCT and MAX rather than a plain COUNT: the primary
+                    -- key is (source, file), not (source, ordinal), so two
+                    -- files both numbered 1 satisfy a count and are refused by
+                    -- playback. With `ordinal > 0` checked by the schema, a
+                    -- distinct count and a maximum that both equal the
+                    -- expected number can only be 1..=expected.
+                   HAVING COUNT(DISTINCT psp2.ordinal) = ps2.expected_parts
+                      AND MAX(psp2.ordinal) = ps2.expected_parts
+                      AND COUNT(json_extract(f2.streams_json, '$.duration_ms'))
+                          = ps2.expected_parts
+                 )) AS file_duration_ms,
                 w.position_ms, w.duration_ms, w.played, w.play_count
          FROM items i
          LEFT JOIN playable_sources ps ON ps.item_id=i.id
@@ -4859,6 +4931,22 @@ struct ItemSource {
     size: i64,
     available: bool,
     revision: i64,
+    /// UI-27. Which playable source this file belongs to, which part of it
+    /// this is, and how many parts that source has.
+    ///
+    /// The list is one row per FILE, ordered by what playback would pick. That
+    /// made one film split across seven numbered parts indistinguishable from
+    /// seven alternative encodes — both are "7 sources" in an order that means
+    /// nothing to a reader, and no amount of UI work fixes it from the client
+    /// side because the grouping was not in the response.
+    ///
+    /// `source_id` is opaque and only stable within one response; it exists to
+    /// be grouped on, not stored. Rows sharing it are parts of one work, in
+    /// `part` order; rows with different ones are alternatives to choose
+    /// between.
+    source_id: i64,
+    part: i64,
+    parts: i64,
     /// Outer `None` omits streams from GET; inner `None` preserves a
     /// malformed legacy stream record as JSON null on QUERY.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -5007,6 +5095,21 @@ async fn item_body(
                 md.updated_at AS art_version,
                 COALESCE(pmd.title, p.title) AS show_title,
                 (SELECT COUNT(*) FROM playable_sources ps WHERE ps.item_id=i.id) AS sources,
+                -- UI-4, the same shape as `item_children`: the running time
+                -- the FILES state, once per item, from the sources that could
+                -- actually play. One correlated subquery for one row.
+                (SELECT MIN(d) FROM (
+                   SELECT SUM(json_extract(f2.streams_json, '$.duration_ms')) AS d
+                     FROM playable_sources ps2
+                     JOIN playable_source_parts psp2 ON psp2.playable_source_id = ps2.id
+                     JOIN files f2 ON f2.id = psp2.file_id
+                    WHERE ps2.item_id = i.id
+                    GROUP BY ps2.id
+                   HAVING COUNT(DISTINCT psp2.ordinal) = ps2.expected_parts
+                      AND MAX(psp2.ordinal) = ps2.expected_parts
+                      AND COUNT(json_extract(f2.streams_json, '$.duration_ms'))
+                          = ps2.expected_parts
+                 )) AS file_duration_ms,
                 w.position_ms, w.duration_ms, w.played, w.play_count
          FROM items i
          LEFT JOIN items p ON p.id = i.parent_id
@@ -5024,16 +5127,33 @@ async fn item_body(
 
     let sources = sqlx::query(
         "SELECT f.module_id,f.collection_id,f.path_rel AS source_path,f.size,f.streams_json,
-                COALESCE(f.revision,1) AS revision
+                COALESCE(f.revision,1) AS revision,
+                ps.id AS source_id, p.ordinal AS part, ps.expected_parts AS parts
          FROM playable_sources ps
          JOIN playable_source_parts p ON p.playable_source_id=ps.id
          JOIN files f ON f.id=p.file_id
          WHERE ps.item_id=?
-         -- Same order playback picks in (sessions::source_parts), so the
-         -- list a user reads is the preference the player acts on.
-         ORDER BY COALESCE(json_extract(f.streams_json, '$.video[0].height'), 0) DESC,
-                  COALESCE(f.revision, 1) DESC,
-                  f.size DESC",
+         -- Playback's own order, from `sessions::playable_rows`, which this
+         -- claimed to match and did not: that one ranks whole SOURCES by their
+         -- weakest part and then lists a source's parts in sequence, and this
+         -- ranked individual FILES by size. On a two-CD film the list came
+         -- back cd2, cd1 — the preference the player acts on, described
+         -- wrongly, on the endpoint whose job is to describe it.
+         --
+         -- Kept as a copy rather than shared: the two select different
+         -- columns and this one has no root join, and a query that is the same
+         -- shape is easier to compare than an abstraction over both.
+         ORDER BY ps.expected_parts>1,
+                  (SELECT MIN(COALESCE(json_extract(f2.streams_json,'$.video[0].height'),0))
+                     FROM playable_source_parts p2 JOIN files f2 ON f2.id=p2.file_id
+                    WHERE p2.playable_source_id=ps.id) DESC,
+                  (SELECT MIN(COALESCE(f2.revision,1))
+                     FROM playable_source_parts p2 JOIN files f2 ON f2.id=p2.file_id
+                    WHERE p2.playable_source_id=ps.id) DESC,
+                  (SELECT SUM(f2.size) FROM playable_source_parts p2
+                     JOIN files f2 ON f2.id=p2.file_id
+                    WHERE p2.playable_source_id=ps.id) DESC,
+                  ps.id,p.ordinal,f.id",
     )
     .bind(id)
     .fetch_all(state.registry.db())
@@ -5051,6 +5171,9 @@ async fn item_body(
                 path_rel: r.get("source_path"),
                 size: r.get("size"),
                 revision: r.get("revision"),
+                source_id: r.get("source_id"),
+                part: r.get("part"),
+                parts: r.get("parts"),
                 streams: with_streams.then(|| {
                     serde_json::from_str(r.get::<String, _>("streams_json").as_str()).ok()
                 }),

@@ -4,14 +4,21 @@
 //!
 //! ## What is stored
 //!
-//! `users.all_libraries`, a flag defaulting to 1, and `user_libraries`, a
-//! plain (user, library) list:
+//! `users.all_libraries`, a flag defaulting to 1; `user_libraries`, a plain
+//! (user, library) list; and `users.grants_version`, a counter bumped by every
+//! write to either of them:
 //!
 //! | `all_libraries` | rows in `user_libraries` | the account sees |
 //! |-----------------|--------------------------|------------------|
 //! | 1               | ignored                  | every library, including ones created later |
 //! | 0               | some                     | exactly those |
 //! | 0               | none                     | nothing |
+//!
+//! `grants_version` is what makes a wholesale write safe to make concurrently
+//! (UI-25). A reader is told the version it read at; a writer sends it back
+//! and the `UPDATE` matches only while it still holds, so of two admins who
+//! read the same state and both submit, the second is refused rather than
+//! silently replacing the first. See [`set_access`].
 //!
 //! The flag is there so that "nothing" is expressible. A list on its own
 //! cannot say it: with no rows meaning "everything" you can never revoke
@@ -163,6 +170,9 @@ pub struct UserAccess {
     pub all_libraries: bool,
     pub created_at: i64,
     pub libraries: Vec<String>,
+    /// What this account's grants were when they were read, for the write
+    /// that follows. See [`set_access`].
+    pub grants_version: i64,
 }
 
 /// Every account with its access, for the admin panel. Sorted by name,
@@ -170,7 +180,7 @@ pub struct UserAccess {
 /// stays readable.
 pub async fn users_with_access(db: &SqlitePool) -> Result<Vec<UserAccess>> {
     let rows = sqlx::query(
-        "SELECT u.id, u.username, u.is_admin, u.all_libraries, u.created_at,
+        "SELECT u.id, u.username, u.is_admin, u.all_libraries, u.created_at, u.grants_version,
                 (SELECT json_group_array(ul.library_id)
                    FROM user_libraries ul WHERE ul.user_id = u.id) AS libraries
            FROM users u ORDER BY u.username",
@@ -185,40 +195,83 @@ pub async fn users_with_access(db: &SqlitePool) -> Result<Vec<UserAccess>> {
             is_admin: r.get::<i64, _>("is_admin") != 0,
             all_libraries: r.get::<i64, _>("all_libraries") != 0,
             created_at: r.get("created_at"),
+            grants_version: r.get("grants_version"),
             libraries: serde_json::from_str(&r.get::<String, _>("libraries")).unwrap_or_default(),
         })
         .collect())
 }
 
-/// Replace an account's access wholesale, in one transaction.
+/// What a write to an account's grants did. Each is something a caller can
+/// act on, so they are return values rather than errors to read prose out of;
+/// an `Err` from [`set_access`] is the database being unavailable.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SetAccess {
+    Applied {
+        grants_version: i64,
+        /// What was stored, read inside the same transaction that wrote it.
+        ///
+        /// The caller used to read it back afterwards, which left a window: a
+        /// second admin's write landing in between paired THIS write's version
+        /// with THEIR library set, and the panel painted their chips as ours.
+        /// It self-healed on the next click — a spent version is refused — but
+        /// a feature whose whole purpose is that the two agree should not have
+        /// a moment where they do not.
+        libraries: Vec<String>,
+    },
+    /// Somebody else wrote since this admin read. UI-25: the panel sends the
+    /// COMPLETE set rather than a delta, so a second write does not merge with
+    /// the first — it replaces it, and the first admin's change is gone with
+    /// nothing said. A version turns that into a refusal they can see.
+    Stale,
+    NoSuchUser,
+}
+
+/// Replace an account's access wholesale, in one transaction, if nobody else
+/// has written since it was read.
 ///
 /// Wholesale rather than add/remove because that is what a panel of
-/// checkboxes has in hand, and because two clients toggling different
-/// boxes should not be able to interleave into a set neither asked for.
+/// checkboxes has in hand, and because two clients toggling different boxes
+/// should not be able to interleave into a set neither asked for. That is also
+/// why it needs a version: a wholesale write does not merge, so without one
+/// the second writer silently replaces the first (UI-25).
 ///
-/// `Ok(false)` means there is no such account — the one failure a caller
-/// can do anything about, so it is a return value rather than an error.
-/// An `Err` here is the database being unavailable, and no caller should
-/// have to read prose to tell those apart.
+/// `expected` is the `grants_version` the caller was shown. The check and the
+/// write are one statement, so two admins racing cannot both pass it: the
+/// loser's `UPDATE` matches no row and is told so.
 ///
-/// Library ids that do not exist are dropped rather than refused — the
-/// insert selects from `libraries`, so a stale id from a client holding
-/// an old list cannot fail the whole call. The caller reads the stored
-/// set back and can see what landed.
+/// Library ids that do not exist are dropped rather than refused — the insert
+/// selects from `libraries`, so a stale id from a client holding an old list
+/// cannot fail the whole call. The caller reads the stored set back and can
+/// see what landed.
 pub async fn set_access(
     db: &SqlitePool,
     user_id: &str,
+    expected: i64,
     all_libraries: bool,
     libraries: &[String],
-) -> Result<bool> {
+) -> Result<SetAccess> {
     let mut tx = db.begin().await?;
-    let res = sqlx::query("UPDATE users SET all_libraries = ? WHERE id = ?")
-        .bind(all_libraries)
-        .bind(user_id)
-        .execute(&mut *tx)
-        .await?;
+    let res = sqlx::query(
+        "UPDATE users SET all_libraries = ?, grants_version = grants_version + 1
+          WHERE id = ? AND grants_version = ?",
+    )
+    .bind(all_libraries)
+    .bind(user_id)
+    .bind(expected)
+    .execute(&mut *tx)
+    .await?;
     if res.rows_affected() == 0 {
-        return Ok(false);
+        // Absent, or written since. Tell them apart so an admin looking at a
+        // user who was deleted under them does not read "try again".
+        let exists: Option<i64> = sqlx::query_scalar("SELECT 1 FROM users WHERE id = ?")
+            .bind(user_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+        return Ok(if exists.is_some() {
+            SetAccess::Stale
+        } else {
+            SetAccess::NoSuchUser
+        });
     }
     sqlx::query("DELETE FROM user_libraries WHERE user_id = ?")
         .bind(user_id)
@@ -234,12 +287,25 @@ pub async fn set_access(
         .execute(&mut *tx)
         .await?;
     }
+    let grants_version: i64 = sqlx::query_scalar("SELECT grants_version FROM users WHERE id = ?")
+        .bind(user_id)
+        .fetch_one(&mut *tx)
+        .await?;
+    let stored: Vec<String> =
+        sqlx::query_scalar("SELECT library_id FROM user_libraries WHERE user_id = ?")
+            .bind(user_id)
+            .fetch_all(&mut *tx)
+            .await?;
     tx.commit().await?;
     tracing::info!(
         user_id,
         all_libraries,
         granted = libraries.len(),
+        grants_version,
         "library access set"
     );
-    Ok(true)
+    Ok(SetAccess::Applied {
+        grants_version,
+        libraries: stored,
+    })
 }

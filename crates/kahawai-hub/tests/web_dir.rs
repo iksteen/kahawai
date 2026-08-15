@@ -41,6 +41,10 @@ fn bundle() -> tempfile::TempDir {
     // which would invite pointing `--web-dir` at `web/` instead of `web/dist`
     // and publishing `.env` and `src/` on an unauthenticated route.
     std::fs::write(dir.path().join("plain.txt"), "served").unwrap();
+    // Vite keeps a source basename, so a bundle importing `café.png` ships one
+    // — and it arrives percent-encoded. Refusing `%` outright made the two
+    // serving modes disagree about which builds they could serve.
+    std::fs::write(dir.path().join("assets/café-a1b2c3.png"), "not ascii").unwrap();
     dir
 }
 
@@ -78,11 +82,29 @@ async fn a_request_path_cannot_climb_out_of_the_directory() {
     // reaches the filesystem, so a refusal is indistinguishable from a miss:
     // these answer the SPA shell, or the `assets/` 404 for the one that is
     // spelled like a build artefact. Never a file.
+    // Percent-encoding is DECODED before the check now, so the encoded
+    // spellings are the ones that matter: each of these is a traversal only a
+    // decoder can see, and refusing `%` wholesale is no longer what stops
+    // them.
     for path in [
         "/app/../outside.txt",
         "/app/assets/../../outside.txt",
         "/app/%2e%2e/outside.txt",
+        "/app/%2E%2E%2Foutside.txt",
+        "/app/assets/%2e%2e/%2e%2e/outside.txt",
+        // A separator hidden as %2F, which the segment split would not see.
+        "/app/assets%2f..%2foutside.txt",
         "/app/secret.txt%00.js",
+        "/app/%00",
+        // Malformed encoding is not a path this serves. `%+A` and `%-0` are
+        // here because `from_str_radix` accepts a sign, so they decoded to a
+        // newline and a NUL instead of being refused — two spellings of one
+        // path is not something a path should allow.
+        "/app/%zz",
+        "/app/%2",
+        "/app/%+A",
+        "/app/%-0",
+        "/app/assets/%+A.js",
         "/app//etc/hostname",
     ] {
         let (status, body) = get(dir.path(), path).await;
@@ -103,6 +125,44 @@ async fn every_readable_file_under_the_directory_is_served() {
         get(dir.path(), "/app/plain.txt").await,
         (StatusCode::OK, "served".into())
     );
+    // Percent-encoded, as a browser sends it. `rust_embed` applies no name
+    // filter, so refusing this made the same bundle serve from one mode and
+    // 404 from the other.
+    assert_eq!(
+        get(dir.path(), "/app/assets/caf%C3%A9-a1b2c3.png").await,
+        (StatusCode::OK, "not ascii".into())
+    );
+}
+
+/// A bundle being rebuilt under a running hub is not a build without a UI.
+///
+/// `--web-dir` exists so the bundle can be rebuilt while the hub runs, and
+/// `vite build` clears `dist` before writing it. Answering 200 "the web UI was
+/// not embedded in this build" there blames the binary for a state that lasts
+/// a second — the same false diagnosis `resolve_dir` was written to stop, one
+/// layer down.
+#[tokio::test]
+async fn a_bundle_mid_rebuild_says_so_rather_than_blaming_the_build() {
+    let dir = bundle();
+    // Resolved while the bundle is whole and held, exactly as the hub does it:
+    // `resolve_dir` runs once at startup and the router keeps the path. The
+    // rebuild happens underneath a router that already exists — resolving
+    // after the delete would test the startup check instead, which is a
+    // different guard with its own test below.
+    let router = kahawai_hub::web::router(Some(kahawai_hub::web::resolve_dir(dir.path()).unwrap()));
+    std::fs::remove_file(dir.path().join("index.html")).unwrap();
+
+    let response = router
+        .oneshot(Request::builder().uri("/app/").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let body = String::from_utf8_lossy(&body);
+    assert!(body.contains("rebuilt"), "{body}");
+    assert!(!body.contains("not embedded"), "{body}");
 }
 
 /// The case a string filter cannot see. `safe_rel` refuses a `..` in the

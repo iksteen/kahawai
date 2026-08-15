@@ -97,6 +97,11 @@ pub enum ErrorCode {
     /// It would leave the hub with no administrator. HUB-10 refuses both the
     /// demotion and the deletion, so nothing can lock an operator out.
     LastAdmin,
+    /// Somebody else wrote to this since it was read (UI-25). The request was
+    /// well formed and would have silently discarded their change; reading the
+    /// current state and deciding again is the way out, which is why it is not
+    /// a plain `Conflict` — a client can act on this one on its own.
+    StaleWrite,
     /// You cannot do this to your own account. Deliberately not `Forbidden`,
     /// which is what an unprivileged token gets: the way out of this one is a
     /// different target, not a different session.
@@ -154,9 +159,8 @@ impl ErrorCode {
             LoginThrottled | SessionCap => StatusCode::TOO_MANY_REQUESTS,
             Forbidden | AdminRequired => StatusCode::FORBIDDEN,
             NotFound => StatusCode::NOT_FOUND,
-            Conflict | SetupComplete | Unplayable | LastAdmin | SelfTarget | SubtitleQuotaSpent => {
-                StatusCode::CONFLICT
-            }
+            Conflict | SetupComplete | Unplayable | LastAdmin | SelfTarget | StaleWrite
+            | SubtitleQuotaSpent => StatusCode::CONFLICT,
             SetupRequired | SourceOffline | SatelliteUnreachable | ProviderUnconfigured => {
                 StatusCode::SERVICE_UNAVAILABLE
             }
