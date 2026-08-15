@@ -74,7 +74,7 @@ async fn setup_maps_validation_and_storage_failures_separately() {
     let dir = tempfile::tempdir().unwrap();
     let db = kahawai_hub::db::open(dir.path()).await.unwrap();
     let auth = Arc::new(Auth::new(db.clone(), dir.path()).await.unwrap());
-    let local = kahawai_hub::api::setup_router(auth.clone());
+    let local = kahawai_hub::api::setup_router(auth.clone(), None);
     let request = |username: &str, password: &str| {
         Request::post("/api/v1/setup")
             .header("host", "localhost:8422")
@@ -165,7 +165,7 @@ async fn setup_then_auth_flow() {
     let registry = Arc::new(Registry::new(db.clone(), Default::default()));
     let auth = Arc::new(Auth::new(db.clone(), dir.path()).await.unwrap());
     assert!(auth.setup_required());
-    let local = kahawai_hub::api::setup_router(auth.clone());
+    let local = kahawai_hub::api::setup_router(auth.clone(), None);
     let api = test_router(
         registry,
         auth.clone(),
@@ -1347,7 +1347,7 @@ async fn bootstrap_states_setup_without_authentication() {
     let db = kahawai_hub::db::open(dir.path()).await.unwrap();
     let registry = Arc::new(Registry::new(db.clone(), Default::default()));
     let auth = Arc::new(Auth::new(db.clone(), dir.path()).await.unwrap());
-    let local = kahawai_hub::api::setup_router(auth.clone());
+    let local = kahawai_hub::api::setup_router(auth.clone(), None);
     let api = test_router(
         registry,
         auth.clone(),

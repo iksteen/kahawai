@@ -37,6 +37,11 @@ struct Cli {
     #[arg(short, long, global = true)]
     config: Option<PathBuf>,
 
+    /// Serve /app/ from this directory instead of the embedded bundle
+    /// (see the kahawai binary's help).
+    #[arg(long, value_name = "DIR")]
+    web_dir: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Option<Cmd>,
 }
@@ -94,7 +99,7 @@ async fn main() -> Result<()> {
     match cli.command {
         None => {
             kahawai_runtime::startup_checks(&cfg, ROLES, ocr_rows())?;
-            kahawai::run_hub(cfg.hub, config_used).await
+            kahawai::run_hub(cfg.hub, config_used, cli.web_dir).await
         }
         Some(Cmd::Doctor {
             json,

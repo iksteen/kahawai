@@ -82,6 +82,9 @@ pub struct NetOptions {
     pub setup_url: Option<String>,
     /// Configured canonical browser origin; absent disables Origin validation.
     pub public_origin: Option<PublicOrigin>,
+    /// `--web-dir`: serve `/app/` from this directory instead of the bundle
+    /// embedded at build time. None = embedded, which is what a release ships.
+    pub web_dir: Option<std::path::PathBuf>,
 }
 #[derive(OpenApi)]
 #[openapi(
@@ -222,6 +225,7 @@ pub fn router(
     net: NetOptions,
 ) -> Router {
     let cors = cors_layer(&net.cors_origins);
+    let web_dir = net.web_dir;
     let state = AppState {
         registry,
         auth,
@@ -425,7 +429,7 @@ pub fn router(
     app.merge(Router::from(
         SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", openapi_document()),
     ))
-    .merge(crate::web::router())
+    .merge(crate::web::router(web_dir))
 }
 
 #[derive(Clone)]
@@ -436,13 +440,13 @@ struct SetupState {
 /// First-admin browser flow on a dedicated loopback listener. Keeping this a
 /// separate router makes accidental publication impossible: the public router
 /// has no setup mutation to protect with a header or source-address check.
-pub fn setup_router(auth: Arc<Auth>) -> Router {
+pub fn setup_router(auth: Arc<Auth>, web_dir: Option<std::path::PathBuf>) -> Router {
     let state = SetupState { auth };
     Router::new()
         .route("/api/v1/bootstrap", get(setup_bootstrap))
         .route("/api/v1/setup", post(setup))
         .with_state(state)
-        .merge(crate::web::router())
+        .merge(crate::web::router(web_dir))
 }
 
 /// OPS-8 CORS: absent config = no CORS headers (same-origin only, the

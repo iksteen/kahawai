@@ -64,9 +64,19 @@ struct Cli {
 #[allow(clippy::large_enum_variant)] // one value per process; size is noise
 enum Cmd {
     /// Run hub, mediahost, and transcoder in a single process.
-    AllInOne,
+    AllInOne {
+        /// As `hub --web-dir`.
+        #[arg(long, value_name = "DIR")]
+        web_dir: Option<PathBuf>,
+    },
     /// Run the hub (the module clients talk to).
     Hub {
+        /// Serve /app/ from this directory instead of the bundle embedded at
+        /// build time — a web UI can then be rebuilt without rebuilding
+        /// Kahawai. Point it at a Vite `dist`; live editing is Vite's own dev
+        /// server with `/api` proxied here.
+        #[arg(long, value_name = "DIR")]
+        web_dir: Option<PathBuf>,
         #[command(subcommand)]
         cmd: Option<HubCmd>,
     },
@@ -135,7 +145,7 @@ async fn main() -> Result<()> {
     let (cfg, config_used) = kahawai_runtime::load_config(cli.config.as_deref())?;
 
     match &cli.command {
-        Cmd::AllInOne => {
+        Cmd::AllInOne { .. } => {
             let transcoder = cfg.all_in_one.transcoder;
             kahawai_runtime::startup_checks(
                 &cfg,
@@ -147,21 +157,33 @@ async fn main() -> Result<()> {
                 ocr_rows(),
             )?
         }
-        Cmd::Hub { cmd: None } => kahawai_runtime::startup_checks(&cfg, HUB_ROLES, ocr_rows())?,
+        Cmd::Hub { cmd: None, .. } => kahawai_runtime::startup_checks(&cfg, HUB_ROLES, ocr_rows())?,
         Cmd::Mediahost => kahawai_runtime::startup_checks(&cfg, MEDIAHOST_ROLES, Vec::new())?,
         Cmd::Transcoder => kahawai_runtime::startup_checks(&cfg, TRANSCODER_ROLES, Vec::new())?,
         _ => {}
     }
+    // clap parses `--web-dir` for every `hub` invocation and only the one that
+    // RUNS the hub can act on it. Saying so beats discarding it in silence.
+    if let Cmd::Hub {
+        cmd: Some(_),
+        web_dir: Some(_),
+    } = &cli.command
+    {
+        anyhow::bail!("--web-dir applies to `kahawai hub`, not to its subcommands");
+    }
     match cli.command {
-        Cmd::Hub { cmd: None } => kahawai::run_hub(cfg.hub, config_used).await,
+        Cmd::Hub { cmd: None, web_dir } => kahawai::run_hub(cfg.hub, config_used, web_dir).await,
         Cmd::Hub {
             cmd: Some(HubCmd::InitAdmin),
+            ..
         } => kahawai::init_admin(cfg.hub).await,
         Cmd::Hub {
             cmd: Some(HubCmd::ResetPassword { username }),
+            ..
         } => kahawai::reset_password(cfg.hub, &username).await,
         Cmd::Hub {
             cmd: Some(HubCmd::Backup { dest }),
+            ..
         } => {
             let m = kahawai_hub::backup::backup(&cfg.hub.data_dir, config_used.as_deref(), &dest)
                 .await?;
@@ -178,6 +200,7 @@ async fn main() -> Result<()> {
         }
         Cmd::Hub {
             cmd: Some(HubCmd::Restore { src, force }),
+            ..
         } => {
             let m = kahawai_hub::backup::restore(&src, &cfg.hub.data_dir, force)?;
             println!(
@@ -209,6 +232,6 @@ async fn main() -> Result<()> {
             tonemap,
         } => kahawai_runtime::run_benchmark(&cfg, cache, only, tonemap),
         Cmd::Transcoder => kahawai_transcoderd::run_transcoder(&cfg).await,
-        Cmd::AllInOne => kahawai::run_all_in_one(cfg, config_used).await,
+        Cmd::AllInOne { web_dir } => kahawai::run_all_in_one(cfg, config_used, web_dir).await,
     }
 }

@@ -176,7 +176,7 @@ async fn admin_flow_enrollments_satellites_archive_restore() {
             "{path} is not mounted"
         );
     }
-    let setup_api = kahawai_hub::api::setup_router(auth.clone());
+    let setup_api = kahawai_hub::api::setup_router(auth.clone(), None);
     assert_eq!(
         setup_api
             .oneshot(

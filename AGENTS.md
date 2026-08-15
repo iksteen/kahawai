@@ -91,6 +91,22 @@ unsafe forms.
 Then verify: `_sqlx_migrations` version, process up, log tail. Migrations
 apply only at hub startup, so an un-restarted hub is a schema behind.
 
+### Working on the web UI without rebuilding the hub
+
+`build.rs` runs `npm run build` and `rust_embed` bakes the result in, so a
+one-character CSS change otherwise costs a Cargo rebuild and a restart. Two
+ways out, and neither is how a release is built:
+
+```sh
+cd web && npm run dev      # Vite on :5173, /api and /admin proxied to :8420
+kahawai hub --web-dir web/dist   # serve a built bundle from disk
+```
+
+`npm run dev` is the editing loop — HMR, no Rust in it at all. `--web-dir` is
+for trying a bundle a binary does not carry (a second UI, a release hub, a
+colleague's build). The embedded bundle stays the default and is the only
+thing a release ships.
+
 Deployment topology, cross-compilation and the NAS/macOS satellites:
 `docs/kahawai-deployment.md`.
 

@@ -177,15 +177,23 @@ pub async fn reset_password(cfg: config::HubConfig, username: &str) -> Result<()
     Ok(())
 }
 
-pub async fn run_hub(cfg: config::HubConfig, config_path: Option<PathBuf>) -> Result<()> {
-    run_hub_inner(cfg, None, false, config_path).await
+pub async fn run_hub(
+    cfg: config::HubConfig,
+    config_path: Option<PathBuf>,
+    web_dir: Option<PathBuf>,
+) -> Result<()> {
+    run_hub_inner(cfg, None, false, config_path, web_dir).await
 }
 
 /// AR-5 all-in-one: the hub plus an IN-PROCESS mediahost — module logic
 /// unchanged, transport replaced by channels, byte plane replaced by
 /// direct file reads. The satellite listener stays up: external
 /// mediahosts/transcoders enroll and dial in exactly as in modular mode.
-pub async fn run_all_in_one(cfg: config::Config, config_path: Option<PathBuf>) -> Result<()> {
+pub async fn run_all_in_one(
+    cfg: config::Config,
+    config_path: Option<PathBuf>,
+    web_dir: Option<PathBuf>,
+) -> Result<()> {
     // An empty in-process mediahost is useful when this process supplies
     // the hub (and optionally local transcoding) while collections live on
     // external mediahosts. The empty engine stays connected and idle.
@@ -194,6 +202,7 @@ pub async fn run_all_in_one(cfg: config::Config, config_path: Option<PathBuf>) -
         Some(cfg.mediahost),
         cfg.all_in_one.transcoder,
         config_path,
+        web_dir,
     )
     .await
 }
@@ -255,8 +264,20 @@ async fn run_hub_inner(
     local_transcoder: bool,
     // The file SIGHUP re-reads (NFR-6). None when defaults were used.
     config_path: Option<PathBuf>,
+    // `--web-dir`: serve /app/ from disk rather than the embedded bundle.
+    web_dir: Option<PathBuf>,
 ) -> Result<()> {
     config::validate_hub_binds(&cfg)?;
+    // Beside the bind check, and for the same reason: a flag that is wrong is
+    // wrong before anything is listening, and this one otherwise fails as a
+    // 200 that blames the binary.
+    let web_dir = web_dir
+        .as_deref()
+        .map(kahawai_hub::web::resolve_dir)
+        .transpose()?;
+    if let Some(dir) = &web_dir {
+        tracing::info!(dir = %dir.display(), "serving /app/ from disk, not the embedded bundle");
+    }
     let public_origin = cfg
         .public_url
         .as_deref()
@@ -305,7 +326,7 @@ async fn run_hub_inner(
         let setup_listener = tokio::net::TcpListener::bind(cfg.setup_bind)
             .await
             .with_context(|| format!("binding local setup UI on {}", cfg.setup_bind))?;
-        let setup_api = kahawai_hub::api::setup_router(auth.clone());
+        let setup_api = kahawai_hub::api::setup_router(auth.clone(), web_dir.clone());
         let setup_done = auth.clone();
         tokio::spawn(async move {
             if let Err(e) = axum::serve(setup_listener, setup_api)
@@ -453,6 +474,7 @@ async fn run_hub_inner(
         metrics_token: cfg.metrics_token.clone().filter(|t| !t.is_empty()),
         setup_url: Some(setup_url),
         public_origin,
+        web_dir,
     };
     match cfg.metrics_token.as_deref() {
         Some(t) if !t.is_empty() => tracing::info!("/metrics enabled (hub.metrics_token)"),
@@ -564,7 +586,7 @@ mod tests {
         let port = unused_loopback_addr().port();
         cfg.hub.bind = format!("0.0.0.0:{port}").parse().unwrap();
         cfg.hub.setup_bind = format!("127.0.0.1:{port}").parse().unwrap();
-        let error = run_all_in_one(cfg, None).await.unwrap_err();
+        let error = run_all_in_one(cfg, None, None).await.unwrap_err();
         assert!(error.to_string().contains("different port"), "{error:#}");
     }
 
@@ -582,7 +604,7 @@ mod tests {
 
         let api_addr = cfg.hub.bind;
         let setup_addr = cfg.hub.setup_bind;
-        let server = tokio::spawn(run_all_in_one(cfg, None));
+        let server = tokio::spawn(run_all_in_one(cfg, None, None));
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         loop {
             if server.is_finished() {
