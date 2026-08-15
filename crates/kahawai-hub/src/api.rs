@@ -1010,17 +1010,6 @@ fn request_token(req: &Request, allow_media_cookie: bool) -> Result<Option<&str>
         .flatten())
 }
 
-/// Which screen the client should open on, stated rather than inferred.
-///
-/// Public by necessity, and deliberately so: every route behind
-/// `require_auth` answers 503 before setup and 401 without a token, so a
-/// client reading those is guessing its own state off an error path — and
-/// pays whatever the endpoint it picked costs. The web UI probed
-/// `/api/v1/items` and pulled the entire catalogue (1.4 MB, 578 ms here)
-/// to read a status line it then threw away.
-///
-/// Says nothing a caller could not learn by trying to log in:
-/// `setup_required` is already printed on the console at startup.
 /// NFR-6: Prometheus text exposition, behind its own static token.
 ///
 /// NOT a login token. Access tokens live 15 minutes and no scraper
@@ -1102,6 +1091,17 @@ async fn health(
     Ok(Json(crate::metrics::health(&snap)))
 }
 
+/// Which screen the client should open on, stated rather than inferred.
+///
+/// Public by necessity, and deliberately so: every route behind
+/// `require_auth` answers 503 before setup and 401 without a token, so a
+/// client reading those is guessing its own state off an error path — and
+/// pays whatever the endpoint it picked costs. The web UI probed
+/// `/api/v1/items` and pulled the entire catalogue (1.4 MB, 578 ms here)
+/// to read a status line it then threw away.
+///
+/// Says nothing a caller could not learn by trying to log in:
+/// `setup_required` is already printed on the console at startup.
 #[utoipa::path(
     get,
     path = "/api/v1/bootstrap",

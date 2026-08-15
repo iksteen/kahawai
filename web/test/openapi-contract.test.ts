@@ -19,6 +19,8 @@ type Response = {
   content?: Record<string, { schema?: { $ref?: string } }>
 }
 type Operation = {
+  summary?: string
+  description?: string
   parameters?: unknown[]
   requestBody?: unknown
   security?: Record<string, unknown>[]
@@ -45,6 +47,74 @@ const refusals = (op: Operation) =>
 
 test('the document has operations to check', () => {
   assert.ok(operations.length > 30, `only ${operations.length} operations`)
+})
+
+/// A doc comment sits above one `#[utoipa::path]`, and nothing says which.
+/// `/api/v1/bootstrap`'s explanation was glued onto the block above `metrics`,
+/// so the published document described the Prometheus endpoint as "which
+/// screen the client should open on" and said nothing at all about bootstrap.
+/// Both still compiled, still served, and still generated a client.
+///
+/// A ratchet rather than a clean assertion: 33 operations were already
+/// undocumented when this was written, and turning that into a red suite would
+/// have made the check something to switch off. New ones are refused; delete a
+/// name from the list as its handler gets a doc comment. Documenting the rest
+/// is its own piece of work — a published contract a third-party client is
+/// meant to work from should not be half silent.
+const UNDOCUMENTED = new Set([
+  'GET /admin/v1/collections',
+  'GET /admin/v1/enrich',
+  'POST /admin/v1/enrich',
+  'POST /admin/v1/enrich/search',
+  'GET /admin/v1/enrollments',
+  'POST /admin/v1/enrollments/approve',
+  'POST /admin/v1/items/{id}/match',
+  'POST /admin/v1/libraries',
+  'DELETE /admin/v1/libraries/{id}',
+  'POST /admin/v1/libraries/{id}/collections',
+  'DELETE /admin/v1/libraries/{id}/collections/{module_id}/{collection_id}',
+  'GET /admin/v1/providers',
+  'POST /admin/v1/providers/tmdb',
+  'POST /admin/v1/providers/tvdb',
+  'GET /admin/v1/satellites',
+  'POST /admin/v1/satellites/{id}/disabled',
+  'GET /admin/v1/sessions',
+  'DELETE /admin/v1/sessions/{id}',
+  'POST /admin/v1/users',
+  'POST /api/v1/auth/logout',
+  'POST /api/v1/auth/refresh',
+  'POST /api/v1/auth/token',
+  'GET /api/v1/collections',
+  'GET /api/v1/items',
+  'GET /api/v1/items/{id}',
+  'GET /api/v1/items/{id}/artwork',
+  'GET /api/v1/items/{id}/fonts',
+  'GET /api/v1/items/{id}/fonts/{n}',
+  'POST /api/v1/playback/sessions',
+  'DELETE /api/v1/playback/sessions/{id}',
+  'GET /api/v1/playback/sessions/{id}/stream',
+  'PUT /api/v1/prefs',
+  'POST /api/v1/setup',
+])
+
+const silent = (op: Operation) => !op.summary?.trim() && !op.description?.trim()
+
+test('a newly published operation says what it is', () => {
+  const mute = operations
+    .filter(([, op]) => silent(op))
+    .map(([label]) => label)
+    .filter((label) => !UNDOCUMENTED.has(label))
+  assert.deepEqual(mute, [])
+})
+
+/// A name left behind after its handler is documented would quietly re-open
+/// the hole for whatever path gets renamed onto it.
+test('the list of known-silent operations has no stale names', () => {
+  const still = new Set<string>(operations.filter(([, op]) => silent(op)).map(([label]) => label))
+  assert.deepEqual(
+    [...UNDOCUMENTED].filter((label) => !still.has(label)),
+    [],
+  )
 })
 
 test('every refusal carries an ApiErrorBody, or no body at all', () => {

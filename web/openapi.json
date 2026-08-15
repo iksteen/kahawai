@@ -9,7 +9,7 @@
     },
     "version": "0.0.0-dev"
   },
-  "x-kahawai-source-sha256": "da79023b09459bd25290ad424dd946b663d378f6240a0407ae53e97f08ab1e32",
+  "x-kahawai-source-sha256": "a3e615b46c0525ce8e91c070c20ac4a381c95aab47e5f664e2c84d1792cb1790",
   "paths": {
     "/admin/v1/collections": {
       "get": {
@@ -3209,6 +3209,8 @@
         "tags": [
           "Authentication"
         ],
+        "summary": "Which screen the client should open on, stated rather than inferred.",
+        "description": "Public by necessity, and deliberately so: every route behind\n`require_auth` answers 503 before setup and 401 without a token, so a\nclient reading those is guessing its own state off an error path — and\npays whatever the endpoint it picked costs. The web UI probed\n`/api/v1/items` and pulled the entire catalogue (1.4 MB, 578 ms here)\nto read a status line it then threw away.\n\nSays nothing a caller could not learn by trying to log in:\n`setup_required` is already printed on the console at startup.",
         "operationId": "bootstrap",
         "responses": {
           "200": {
@@ -5705,8 +5707,8 @@
         "tags": [
           "Observability"
         ],
-        "summary": "Which screen the client should open on, stated rather than inferred.",
-        "description": "Public by necessity, and deliberately so: every route behind\n`require_auth` answers 503 before setup and 401 without a token, so a\nclient reading those is guessing its own state off an error path — and\npays whatever the endpoint it picked costs. The web UI probed\n`/api/v1/items` and pulled the entire catalogue (1.4 MB, 578 ms here)\nto read a status line it then threw away.\n\nSays nothing a caller could not learn by trying to log in:\n`setup_required` is already printed on the console at startup.\nNFR-6: Prometheus text exposition, behind its own static token.\n\nNOT a login token. Access tokens live 15 minutes and no scraper\nrefreshes them, so an admin-token endpoint would serve one scrape and\nthen 401 forever. `hub.metrics_token` is a static credential scoped to\nthis one read-only route — no user, no session, no refresh.\n\nUnset means NOT SERVED: 404, so a hub that was never configured for\nscraping does not advertise an endpoint reporting its library size.\nA configured-but-wrong token is 401, so an operator can tell \"off\nhere\" from \"wrong secret\".",
+        "summary": "NFR-6: Prometheus text exposition, behind its own static token.",
+        "description": "NOT a login token. Access tokens live 15 minutes and no scraper\nrefreshes them, so an admin-token endpoint would serve one scrape and\nthen 401 forever. `hub.metrics_token` is a static credential scoped to\nthis one read-only route — no user, no session, no refresh.\n\nUnset means NOT SERVED: 404, so a hub that was never configured for\nscraping does not advertise an endpoint reporting its library size.\nA configured-but-wrong token is 401, so an operator can tell \"off\nhere\" from \"wrong secret\".",
         "operationId": "metrics",
         "responses": {
           "200": {
