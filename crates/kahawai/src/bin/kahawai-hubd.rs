@@ -96,6 +96,11 @@ async fn main() -> Result<()> {
     kahawai_runtime::init_tracing();
     let cli = Cli::parse();
     let (cfg, config_used) = kahawai_runtime::load_config(cli.config.as_deref())?;
+    // As `kahawai hub`: the flag only means something to the arm that runs the
+    // hub, and discarding it in silence is how somebody spends an afternoon.
+    if cli.command.is_some() && cli.web_dir.is_some() {
+        anyhow::bail!("--web-dir applies to running the hub, not to its subcommands");
+    }
     match cli.command {
         None => {
             kahawai_runtime::startup_checks(&cfg, ROLES, ocr_rows())?;

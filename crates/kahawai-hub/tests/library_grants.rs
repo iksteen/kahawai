@@ -325,12 +325,17 @@ async fn a_grant_bounds_browse_search_and_detail() {
         assert_eq!(status, StatusCode::OK, "{uri} is granted");
     }
 
-    // Artwork answers 404 either way — there is none — so the STATUS
-    // cannot tell the two apart and the body has to.
+    // Artwork answers 404 either way — there is none — so the STATUS cannot
+    // tell the two apart, and neither can the CODE: both are `not_found`, on
+    // purpose. A distinct code for the refusal would answer "that item exists,
+    // you just may not have it" on the one route whose denials are supposed to
+    // be indistinguishable from absence. Only the message differs, and no
+    // client is meant to read it — this test does, because it is the only
+    // handle on the two paths from outside.
     let (_, denied) = call(&h.api, &h.kid, "GET", "/api/v1/items/s1/artwork", None).await;
     let (_, granted) = call(&h.api, &h.kid, "GET", "/api/v1/items/m1/artwork", None).await;
-    assert_eq!(denied, "no such item");
-    assert_eq!(granted, "no artwork");
+    assert_eq!(denied, r#"{"code":"not_found","message":"no such item"}"#);
+    assert_eq!(granted, r#"{"code":"not_found","message":"no artwork"}"#);
 
     // QUERY — the negotiation endpoint, and the one route in the group
     // that is a METHOD-ROUTER FALLBACK rather than a method. Worth its

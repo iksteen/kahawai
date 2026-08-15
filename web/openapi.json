@@ -9,7 +9,7 @@
     },
     "version": "0.0.0-dev"
   },
-  "x-kahawai-source-sha256": "b6b2612c1d408157d477f541fcca7527e7d8f3bb1f6ae47a43ed0a62876a576e",
+  "x-kahawai-source-sha256": "1faa5be9fe0a7f21aedb7635cd3bd13e852200b72c0b0c3232b54576c6dddc6c",
   "paths": {
     "/admin/v1/collections": {
       "get": {
@@ -29,27 +29,37 @@
           },
           "401": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "403": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "500": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The hub has no administrator yet: `setup_required`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
@@ -80,18 +90,28 @@
           },
           "401": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "403": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The hub has no administrator yet: `setup_required`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
@@ -120,18 +140,28 @@
           },
           "401": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "403": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The hub has no administrator yet: `setup_required`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
@@ -163,27 +193,37 @@
           },
           "401": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "403": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "500": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The hub has no administrator yet: `setup_required`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
@@ -222,29 +262,69 @@
               }
             }
           },
+          "400": {
+            "description": "The request body is not the JSON this route takes",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
           "401": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "403": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "The body is past the hub's buffer limit",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "The body needs Content-Type: application/json",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "500": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The hub has no administrator yet: `setup_required`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
@@ -275,18 +355,28 @@
           },
           "401": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "403": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The hub has no administrator yet: `setup_required`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
@@ -325,20 +415,81 @@
               }
             }
           },
+          "400": {
+            "description": "The request body is not the JSON this route takes",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
           "401": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "403": {
+            "description": "Not an admin (require_admin); the handler itself no longer answers this",
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No pending enrollment matches that code",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "The body is past the hub's buffer limit",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "The body needs Content-Type: application/json",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Signing the certificate or recording the satellite failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The hub has no administrator yet: `setup_required`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
@@ -385,38 +536,58 @@
               }
             }
           },
+          "400": {
+            "description": "A path segment or query parameter is not the shape this route takes",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
           "401": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "403": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "404": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "500": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The hub has no administrator yet: `setup_required`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
@@ -467,36 +638,66 @@
           },
           "400": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "401": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "403": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "The body is past the hub's buffer limit",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "The body needs Content-Type: application/json",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "500": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The hub has no administrator yet: `setup_required`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
@@ -528,27 +729,37 @@
           },
           "401": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "403": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "500": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The hub has no administrator yet: `setup_required`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
@@ -587,36 +798,76 @@
           },
           "400": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "401": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "403": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "409": {
+            "description": "A library with that name already exists",
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "The body is past the hub's buffer limit",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "The body needs Content-Type: application/json",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The hub has no administrator yet: `setup_required`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
@@ -649,38 +900,58 @@
           "204": {
             "description": "Library deleted"
           },
+          "400": {
+            "description": "A path segment or query parameter is not the shape this route takes",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
           "401": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "403": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "404": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "500": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The hub has no administrator yet: `setup_required`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
@@ -723,29 +994,88 @@
           "204": {
             "description": "Collection attached"
           },
+          "400": {
+            "description": "The request body is not the JSON this route takes",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
           "401": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "403": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such library, or no such collection",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "409": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "The body is past the hub's buffer limit",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "The body needs Content-Type: application/json",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The hub has no administrator yet: `setup_required`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
@@ -794,38 +1124,58 @@
           "204": {
             "description": "Collection detached"
           },
+          "400": {
+            "description": "A path segment or query parameter is not the shape this route takes",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
           "401": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "403": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "404": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "500": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The hub has no administrator yet: `setup_required`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
@@ -873,29 +1223,59 @@
               }
             }
           },
+          "400": {
+            "description": "A path segment or query parameter is not the shape this route takes",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
           "401": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "403": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such library, or it has no collections attached",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "500": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The hub has no administrator yet: `setup_required`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
@@ -926,27 +1306,37 @@
           },
           "401": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "403": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "500": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The hub has no administrator yet: `setup_required`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
@@ -988,36 +1378,66 @@
           },
           "400": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "401": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "403": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "The body is past the hub's buffer limit",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "The body needs Content-Type: application/json",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "500": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The hub has no administrator yet: `setup_required`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
@@ -1047,38 +1467,39 @@
               }
             }
           },
-          "400": {
-            "content": {
-              "text/plain": {
-                "schema": {
-                  "type": "string"
-                }
-              }
-            }
-          },
           "401": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "403": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "500": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "No AniDB credentials on this deployment (`provider_unconfigured`), or the hub has no administrator yet (`setup_required`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
@@ -1130,27 +1551,66 @@
           },
           "400": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "401": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "403": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "The body is past the hub's buffer limit",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "The body needs Content-Type: application/json",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The hub has no administrator yet: `setup_required`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
@@ -1191,36 +1651,66 @@
           },
           "400": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "401": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "403": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "The body is past the hub's buffer limit",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "The body needs Content-Type: application/json",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "500": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The hub has no administrator yet: `setup_required`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
@@ -1261,36 +1751,66 @@
           },
           "400": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "401": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "403": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "The body is past the hub's buffer limit",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "The body needs Content-Type: application/json",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "500": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The hub has no administrator yet: `setup_required`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
@@ -1321,27 +1841,37 @@
           },
           "401": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "403": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "500": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The hub has no administrator yet: `setup_required`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
@@ -1381,47 +1911,67 @@
               }
             }
           },
+          "400": {
+            "description": "A path segment or query parameter is not the shape this route takes",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
           "401": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "403": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "404": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "409": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "500": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The hub has no administrator yet: `setup_required`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
@@ -1464,29 +2014,69 @@
           "204": {
             "description": "Placement state updated"
           },
+          "400": {
+            "description": "The request body is not the JSON this route takes",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
           "401": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "403": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "The body is past the hub's buffer limit",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "The body needs Content-Type: application/json",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "500": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The hub has no administrator yet: `setup_required`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
@@ -1517,27 +2107,37 @@
           },
           "401": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "403": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "500": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The hub has no administrator yet: `setup_required`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
@@ -1570,29 +2170,49 @@
           "204": {
             "description": "Session ended"
           },
+          "400": {
+            "description": "A path segment or query parameter is not the shape this route takes",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
           "401": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "403": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
-          "410": {
+          "404": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The hub has no administrator yet: `setup_required`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
@@ -1639,29 +2259,58 @@
               }
             }
           },
+          "400": {
+            "description": "A path segment or query parameter is not the shape this route takes",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
           "401": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "403": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "404": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The transcoder running this session is not answering, or the hub has no administrator yet (`setup_required`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
@@ -1693,27 +2342,37 @@
           },
           "401": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "403": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "500": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The hub has no administrator yet: `setup_required`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
@@ -1752,27 +2411,76 @@
           },
           "400": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "401": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "403": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "That username is already taken",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "The body is past the hub's buffer limit",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "The body needs Content-Type: application/json",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The hub has no administrator yet: `setup_required`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
@@ -1813,47 +2521,67 @@
               }
             }
           },
+          "400": {
+            "description": "A path segment or query parameter is not the shape this route takes",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
           "401": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "403": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "404": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "409": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "500": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The hub has no administrator yet: `setup_required`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
@@ -1904,47 +2632,87 @@
               }
             }
           },
+          "400": {
+            "description": "The request body is not the JSON this route takes",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
           "401": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "403": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "404": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "409": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "The body is past the hub's buffer limit",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "The body needs Content-Type: application/json",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "500": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The hub has no administrator yet: `setup_required`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
@@ -1995,38 +2763,78 @@
               }
             }
           },
+          "400": {
+            "description": "The request body is not the JSON this route takes",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
           "401": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "403": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "404": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "The body is past the hub's buffer limit",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "The body needs Content-Type: application/json",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "500": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The hub has no administrator yet: `setup_required`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
@@ -2083,36 +2891,66 @@
           },
           "400": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "401": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "403": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "The body is past the hub's buffer limit",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "The body needs Content-Type: application/json",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "500": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The hub has no administrator yet: `setup_required`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
@@ -2175,36 +3013,56 @@
           },
           "400": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "401": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "403": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "The body is past the hub's buffer limit",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "The body needs Content-Type: application/json",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "500": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
@@ -2262,45 +3120,73 @@
           },
           "400": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "401": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "403": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "The body is past the hub's buffer limit",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "The body needs Content-Type: application/json",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "429": {
-            "content": {
-              "text/plain": {
+            "headers": {
+              "retry-after": {
                 "schema": {
                   "type": "string"
+                },
+                "description": "Seconds until the lockout clears"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "503": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
@@ -2346,18 +3232,28 @@
           },
           "401": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "500": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The hub has no administrator yet: `setup_required`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
@@ -2396,9 +3292,19 @@
           },
           "401": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The hub has no administrator yet: `setup_required`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
@@ -2488,29 +3394,49 @@
               }
             }
           },
+          "400": {
+            "description": "A path segment or query parameter is not the shape this route takes",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
           "401": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "404": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "500": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The hub has no administrator yet: `setup_required`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
@@ -2549,29 +3475,49 @@
               }
             }
           },
+          "400": {
+            "description": "A path segment or query parameter is not the shape this route takes",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
           "401": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "404": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "500": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The hub has no administrator yet: `setup_required`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
@@ -2635,12 +3581,22 @@
               }
             }
           },
+          "400": {
+            "description": "The QUERY body is not the JSON this route takes",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
           "401": {
             "description": "Missing or invalid bearer token",
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
@@ -2648,9 +3604,31 @@
           "404": {
             "description": "Item does not exist or is outside the account's libraries",
             "content": {
-              "text/plain": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "405": {
+            "description": "Answered for any other verb on this path — POST, PUT, DELETE. Declared here because the document has no operation for those: QUERY is registered as this path's method-router fallback",
+            "headers": {
+              "accept-query": {
                 "schema": {
                   "type": "string"
+                }
+              },
+              "allow": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
@@ -2658,9 +3636,19 @@
           "409": {
             "description": "Playback capabilities cannot be negotiated",
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "The body is past the hub's buffer limit",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
@@ -2668,18 +3656,28 @@
           "415": {
             "description": "QUERY requires an application/json body",
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "500": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The hub has no administrator yet: `setup_required`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
@@ -2767,11 +3765,21 @@
               }
             }
           },
+          "400": {
+            "description": "A path segment or query parameter is not the shape this route takes",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
           "401": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
@@ -2785,18 +3793,28 @@
               }
             },
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "500": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The hub has no administrator yet: `setup_required`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
@@ -2839,29 +3857,49 @@
               }
             }
           },
+          "400": {
+            "description": "A path segment or query parameter is not the shape this route takes",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
           "401": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "404": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "500": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The hub has no administrator yet: `setup_required`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
@@ -2900,29 +3938,49 @@
               }
             }
           },
+          "400": {
+            "description": "A path segment or query parameter is not the shape this route takes",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
           "401": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "404": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "500": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The hub has no administrator yet: `setup_required`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
@@ -2982,29 +4040,49 @@
               }
             }
           },
+          "400": {
+            "description": "A path segment or query parameter is not the shape this route takes",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
           "401": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "404": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "500": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The hub has no administrator yet: `setup_required`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
@@ -3057,29 +4135,88 @@
               }
             }
           },
+          "400": {
+            "description": "The request body is not the JSON this route takes",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
           "401": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "404": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The download entitlement is spent: `subtitle_quota_spent`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "The body is past the hub's buffer limit",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "The body needs Content-Type: application/json",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "502": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The hub has no administrator yet: `setup_required`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
@@ -3129,29 +4266,88 @@
               }
             }
           },
+          "400": {
+            "description": "The request body is not the JSON this route takes",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
           "401": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "404": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The download entitlement is spent: `subtitle_quota_spent`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "The body is past the hub's buffer limit",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "The body needs Content-Type: application/json",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "502": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The hub has no administrator yet: `setup_required`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
@@ -3233,45 +4429,55 @@
           },
           "400": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "401": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "404": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "422": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "500": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The hub has no administrator yet: `setup_required`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
@@ -3327,36 +4533,66 @@
           },
           "400": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "401": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "404": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "The body is past the hub's buffer limit",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "The body needs Content-Type: application/json",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "500": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The hub has no administrator yet: `setup_required`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
@@ -3388,18 +4624,28 @@
           },
           "401": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "500": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The hub has no administrator yet: `setup_required`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
@@ -3438,47 +4684,89 @@
               }
             }
           },
+          "400": {
+            "description": "The request body is not the JSON this route takes",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
           "401": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "404": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "409": {
+            "description": "Refused about the ITEM, and forever: `unplayable`",
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "The body is past the hub's buffer limit",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "The body needs Content-Type: application/json",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "This account is at its stream cap; clears when one ends: `session_cap`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "500": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "503": {
+            "description": "The mediahost holding the bytes is away: `source_offline`, or the hub has no administrator yet (`setup_required`)",
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
@@ -3511,20 +4799,40 @@
           "204": {
             "description": "Session ended"
           },
-          "401": {
+          "400": {
+            "description": "A path segment or query parameter is not the shape this route takes",
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
-          "410": {
+          "401": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The hub has no administrator yet: `setup_required`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
@@ -3574,29 +4882,69 @@
               }
             }
           },
-          "401": {
+          "400": {
+            "description": "The request body is not the JSON this route takes",
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
-          "410": {
+          "401": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "The body is past the hub's buffer limit",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "The body needs Content-Type: application/json",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "500": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The hub has no administrator yet: `setup_required`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
@@ -3646,38 +4994,69 @@
               }
             }
           },
+          "400": {
+            "description": "The request body is not the JSON this route takes",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
           "401": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "409": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
-          "410": {
+          "413": {
+            "description": "The body is past the hub's buffer limit",
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "The body needs Content-Type: application/json",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "503": {
+            "description": "The hub has no administrator yet: `setup_required`",
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
@@ -3779,29 +5158,39 @@
               }
             }
           },
+          "400": {
+            "description": "A path segment or query parameter is not the shape this route takes",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
           "401": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "409": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
-                }
-              }
-            }
-          },
-          "410": {
-            "content": {
-              "text/plain": {
-                "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
@@ -3812,6 +5201,16 @@
               "content-range": {
                 "schema": {
                   "type": "string"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The hub has no administrator yet: `setup_required`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
@@ -3919,45 +5318,46 @@
           },
           "400": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "401": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "404": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
-                }
-              }
-            }
-          },
-          "410": {
-            "content": {
-              "text/plain": {
-                "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "500": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The hub has no administrator yet: `setup_required`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
@@ -3992,18 +5392,28 @@
           },
           "401": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "500": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The hub has no administrator yet: `setup_required`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
@@ -4042,27 +5452,57 @@
           },
           "400": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "401": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "The body is past the hub's buffer limit",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "The body needs Content-Type: application/json",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "500": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The hub has no administrator yet: `setup_required`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
@@ -4097,36 +5537,56 @@
           },
           "400": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "403": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "409": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "The body is past the hub's buffer limit",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "The body needs Content-Type: application/json",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "500": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
@@ -4162,20 +5622,40 @@
               }
             }
           },
+          "400": {
+            "description": "A path segment or query parameter is not the shape this route takes",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
           "401": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
           },
           "500": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The hub has no administrator yet: `setup_required`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
@@ -4210,9 +5690,9 @@
           "500": {
             "description": "Snapshot failed",
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
@@ -4242,9 +5722,9 @@
           "401": {
             "description": "Wrong metrics token",
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
@@ -4252,9 +5732,9 @@
           "404": {
             "description": "Metrics are not enabled",
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
@@ -4262,9 +5742,9 @@
           "500": {
             "description": "Snapshot failed",
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
@@ -4436,6 +5916,23 @@
               "null"
             ],
             "format": "double"
+          }
+        }
+      },
+      "ApiErrorBody": {
+        "type": "object",
+        "description": "The body every 4xx and 5xx carries. Named for the schema: this is what a\nclient parses, and `ApiError` is what the hub throws around internally.",
+        "required": [
+          "code",
+          "message"
+        ],
+        "properties": {
+          "code": {
+            "$ref": "#/components/schemas/ErrorCode"
+          },
+          "message": {
+            "type": "string",
+            "description": "For a person. Never a chain, never a path, never a subprocess's stderr."
           }
         }
       },
@@ -5163,6 +6660,37 @@
           }
         }
       },
+      "ErrorCode": {
+        "type": "string",
+        "description": "What went wrong, as something a client can branch on.\n\nAdding a variant is how a new refusal becomes visible to clients; reusing\na near-enough one is how it stays invisible. Prefer a new variant.\n`Deserialize` for one reader: the test that walks the published document\nand checks each declared status against the code its description names. A\ndeclaration drifting from `status()` is the one class of untruth the\nTypeScript contract test cannot see, and it happened.",
+        "enum": [
+          "internal",
+          "bad_request",
+          "unsupported_media_type",
+          "method_not_allowed",
+          "payload_too_large",
+          "unsupported_track",
+          "unauthenticated",
+          "invalid_credentials",
+          "invalid_refresh",
+          "login_throttled",
+          "forbidden",
+          "admin_required",
+          "not_found",
+          "conflict",
+          "last_admin",
+          "self_target",
+          "setup_required",
+          "setup_complete",
+          "provider_unconfigured",
+          "provider_error",
+          "subtitle_quota_spent",
+          "unplayable",
+          "satellite_unreachable",
+          "source_offline",
+          "session_cap"
+        ]
+      },
       "FontsResponse": {
         "type": "object",
         "required": [
@@ -5464,9 +6992,14 @@
             ]
           },
           "unavailable": {
-            "type": [
-              "string",
-              "null"
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ApiErrorBody",
+                "description": "Why the converged half is null. Not an error — the item loaded, and\nits page must render — but the same distinction as an error carries,\nin the same shape: `source_offline` comes back once the host does,\n`unplayable` does not. It used to be a bare string holding\n`format!(\"{e:#}\")`, so the detail page had a pipeline's chain to\nprint and no way to tell a wait from a dead end."
+              },
+              {
+                "type": "null"
+              }
             ]
           }
         }

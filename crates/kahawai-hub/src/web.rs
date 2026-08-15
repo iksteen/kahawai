@@ -47,6 +47,19 @@ pub fn resolve_dir(dir: &Path) -> Result<PathBuf> {
     if !resolved.is_dir() {
         bail!("--web-dir {} is not a directory", resolved.display());
     }
+    // And that it is the bundle rather than the directory ABOVE it. A
+    // directory exists, canonicalises and is a directory whether or not
+    // anything was ever built into it, so `--web-dir /srv/kahawai` when the
+    // bundle is in `/srv/kahawai/dist` started the hub, logged that it was
+    // serving from disk, and answered every request with a 200 saying the UI
+    // was not embedded in this build — the exact outcome this function was
+    // written to stop, one directory up.
+    if !resolved.join("index.html").is_file() {
+        bail!(
+            "--web-dir {} has no index.html; point it at a built bundle (a Vite `dist`)",
+            resolved.display()
+        );
+    }
     Ok(resolved)
 }
 

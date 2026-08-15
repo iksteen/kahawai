@@ -50,6 +50,71 @@ impl std::fmt::Display for SourceOffline {
 
 impl std::error::Error for SourceOffline {}
 
+/// This account already holds as many playback sessions as it may.
+///
+/// A type rather than a `bail!` sentence because it is the one refusal from
+/// this layer that clears on its own — as soon as any of them ends. Every
+/// other one is about the item and will refuse again forever. They arrived at
+/// the API as the same 409 with the difference only in the prose, which no
+/// client may read: a client playing a LIST rather than one item has to tell
+/// "wait" from "give up", and the album queue holds two sessions, so a film
+/// playing beside it is enough to reach the limit.
+#[derive(Debug)]
+pub struct SessionCap {
+    pub held: usize,
+}
+
+impl std::fmt::Display for SessionCap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "too many concurrent streams ({}); close one first",
+            self.held
+        )
+    }
+}
+
+impl std::error::Error for SessionCap {}
+
+/// A satellite that should have answered did not — not connected, or
+/// connected and silent past a deadline.
+///
+/// A type because the API cannot otherwise tell it from absence: collecting a
+/// session's logs from a wedged transcoder was answering "no logs for that
+/// session", on the one route an operator reaches for when a session is
+/// misbehaving.
+#[derive(Debug)]
+pub struct SatelliteSilent(pub String);
+
+impl std::fmt::Display for SatelliteSilent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for SatelliteSilent {}
+
+/// The subtitle track a REQUEST named is not on that item.
+///
+/// A type because this is the caller's input reaching a layer whose every
+/// other failure is about the item. Folded in with those it arrived as 409
+/// "this item's playback could not be negotiated" — which under the API's
+/// contract means final, so a client asking for track 999 on a perfectly
+/// playable film concluded the film was dead.
+#[derive(Debug)]
+pub struct NoSuchTrack {
+    pub item: String,
+    pub track: i64,
+}
+
+impl std::fmt::Display for NoSuchTrack {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "no subtitle track {} on item {}", self.track, self.item)
+    }
+}
+
+impl std::error::Error for NoSuchTrack {}
+
 /// How a remux/transcode pipeline runs. The hub always spawns the
 /// supervised worker (§1.1: a GStreamer crash kills one session, not the
 /// process — observed twice on a real library via hlssink3 panics).
@@ -326,7 +391,10 @@ impl<'a> Negotiation<'a> {
             Some(tid) => {
                 let t = crate::tracks::get_for_item(registry.db(), item_id, tid)
                     .await?
-                    .with_context(|| format!("no subtitle track {tid} for item {item_id}"))?;
+                    .ok_or_else(|| NoSuchTrack {
+                        item: item_id.to_string(),
+                        track: tid,
+                    })?;
                 Some(t)
             }
             None => None,
@@ -1071,14 +1139,28 @@ impl Sessions {
                     // The box is gone; a stored bundle may still exist.
                     return match crate::sessionlog::for_session(&data_dir, id) {
                         Some(p) => Ok(std::fs::read_to_string(p)?),
-                        None => Err(e),
+                        // Typed, like the timeout below: "the transcoder is
+                        // not reachable" and "this session kept no logs" are
+                        // different answers and the API cannot tell them apart
+                        // from a sentence.
+                        // The transport failure is the SOURCE and the typed
+                        // refusal is the context, not the other way round.
+                        // Flattening the chain into the outermost layer is the
+                        // exact shape `error.rs` names as a leak vector: it is
+                        // harmless only while nothing reads this error's own
+                        // `Display`, and it reads backwards in the log.
+                        None => Err(e.context(SatelliteSilent(
+                            "the transcoder running this session is not reachable".into(),
+                        ))),
                     };
                 }
                 match tokio::time::timeout(Duration::from_secs(10), rx).await {
                     Ok(Ok(body)) => Ok(body),
                     _ => {
                         self.pending_logs.lock().unwrap().remove(id);
-                        bail!("transcoder did not answer with logs in time")
+                        bail!(SatelliteSilent(
+                            "the transcoder running this session did not answer in time".into()
+                        ))
                     }
                 }
             }
@@ -1161,7 +1243,7 @@ impl Sessions {
                 .filter(|s| s.user_id == user_id && !reserved.contains_key(&s.id))
                 .count();
         if held >= self.max_per_user {
-            bail!("too many concurrent streams ({held}); close one first");
+            bail!(SessionCap { held });
         }
         reserved.insert(id.to_string(), user_id.to_string());
         Ok(())
@@ -2643,9 +2725,18 @@ impl Sessions {
                 replan_subs = true;
             }
         } else if let Some(tid) = subtitle_track {
+            // Typed, as in `Negotiation::new`. This is the path a LIVE viewer
+            // takes when they change subtitles, and a stale id — a track
+            // deleted from another tab, or one from before a rescan — arrived
+            // through `session_refusal` as 409 "this item cannot be played".
+            // The player's `switchBurn` then gave up on a film that was
+            // playing perfectly well a second earlier.
             let track = crate::tracks::get_for_item(registry.db(), &session.item_id, tid)
                 .await?
-                .with_context(|| format!("no subtitle track {tid} for item {}", session.item_id))?;
+                .ok_or_else(|| NoSuchTrack {
+                    item: session.item_id.clone(),
+                    track: tid,
+                })?;
             let part = session.parts.first().context("session has no parts")?;
             let is_image = crate::tracks::is_image_format(&track.format);
             // HUB-32a: an ASS pick has to reach negotiation too, but

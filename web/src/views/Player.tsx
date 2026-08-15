@@ -553,6 +553,12 @@ export default function Player({
       // An unreachable hub is not an answer, it is the weather the stand-by
       // dialog exists for — and the retry loop below already reads it that way.
       // This branch turning it into "Playback stopped" was the disagreement.
+      //
+      // `busy` — the account's stream cap — deliberately does NOT come here,
+      // even though it clears by itself. Standing by would tell somebody the
+      // machine holding their file has stopped answering, which is false, and
+      // offer them only Go home for a condition they can fix by closing
+      // something. The stopped path shows the hub's own sentence instead.
       if (startRetry(e) === 'wait') {
         // Stop the picture. There is still a buffer, and left alone it plays
         // on behind the dialog — sound coming out of a screen that says the
@@ -656,6 +662,22 @@ export default function Player({
         // fetch-level failure, and an unhealthy network is exactly the
         // weather this dialog exists for; one DNS hiccup used to replace the
         // wait, and the position it was holding, with "Playback stopped".
+        //
+        // `=== 'wait'`, the same test the entry branch makes, and deliberately
+        // NOT `retryable`. Both were tried.
+        //
+        // `busy` clears by itself, so retrying it looks right — but this
+        // dialog says one specific thing ("the machine holding this file has
+        // stopped answering") and offers one button (Go home). A viewer whose
+        // host came back and who is now merely at the stream cap — another
+        // tab, or the album player's two slots — would sit in front of a false
+        // cause for ever, with no way out and nothing to press. Leaving takes
+        // them to the stopped screen and the hub's own sentence, which names
+        // the thing that clears it: close one first.
+        //
+        // The position is not what is lost by leaving. Progress is reported to
+        // the hub as it plays, so coming back resumes; a permanent dialog
+        // about the wrong machine is not recoverable at all.
         if (!stop && startRetry(e) !== 'wait') {
           send({ type: 'stopped', why: String(e) })
         }

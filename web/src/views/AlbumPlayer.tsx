@@ -22,13 +22,36 @@ import Icon from '../icons'
 const RETRY_MS = 5000
 
 /// How many times to ask again about a refusal that MIGHT clear — see
-/// `startRetry`. The hub says 409 both for "this item has no sources" and for
-/// "too many concurrent streams; close one first", so the client cannot tell a
-/// permanent refusal from a queue holding two sessions while a film holds
-/// another. Three attempts spans two retry intervals — ten seconds, since the
-/// first is immediate — which is long enough for a film to end and free a slot,
-/// and short enough that an unplayable track stops asking.
+/// `startRetry`.
+///
+/// This used to carry the stream cap: the hub said 409 both for "this item has
+/// no sources" and for "too many concurrent streams", so the client could not
+/// tell a permanent refusal from a queue holding two sessions while a film
+/// holds another, and three attempts was a guess standing in for an answer the
+/// hub could give. It gives it now — the cap is a 429, `startRetry` calls it
+/// `busy`, and this player waits it out under a much larger ceiling of its
+/// own (`BUSY_TRIES`).
+///
+/// What is left is a backstop for a 409 whose cause this client does not
+/// enumerate. Three attempts spans two retry intervals, which costs ten
+/// seconds before an unplayable track stops asking.
 const REFUSAL_TRIES = 3
+
+/// How many times to ask again about the account's STREAM CAP, which clears
+/// by itself — but not always by itself here.
+///
+/// This player holds two sessions, so with `max_sessions_per_user` set low
+/// enough the warm slot is refused by the album's own active one and the
+/// condition can never clear: unbounded, that tab re-POSTs a session every
+/// five seconds for as long as it is open. Before the cap became its own
+/// status it was bounded at three, by accident, because it was
+/// indistinguishable from a dead track.
+///
+/// Five minutes rather than ten seconds, because the ordinary case — a film
+/// playing elsewhere — really does clear, and giving up on it in ten seconds
+/// is what this whole split was meant to stop. It is a backstop against
+/// polling for ever, not a guess at how long a film is.
+const BUSY_TRIES = 60
 
 /// How long a session start may take before it counts as failed.
 ///
@@ -82,6 +105,15 @@ type Slot = {
   /// apply to the next one.
   tries: number
   triesFor: string | null
+  /// Consecutive stream-cap refusals, NOT tied to a track.
+  ///
+  /// The cap is about the ACCOUNT, so counting it against `triesFor` meant it
+  /// never counted: the warm slot takes a new track id on every advance, which
+  /// zeroed the count long before any ceiling. With three-minute tracks a cap
+  /// that never clears reached about 36 of 60 and then started over, so the
+  /// tab asked every five seconds for the whole album — twelve times the rate
+  /// it had before the cap was given a status of its own.
+  busyTries: number
 }
 
 export default function AlbumPlayer({
@@ -113,8 +145,8 @@ export default function AlbumPlayer({
   // is playing, the other is the one being warmed.
   const els = [useRef<HTMLAudioElement>(null), useRef<HTMLAudioElement>(null)]
   const slots = useRef<[Slot, Slot]>([
-    { session: null, key: null, trouble: null, error: '', tries: 0, triesFor: null },
-    { session: null, key: null, trouble: null, error: '', tries: 0, triesFor: null },
+    { session: null, key: null, trouble: null, error: '', tries: 0, triesFor: null, busyTries: 0 },
+    { session: null, key: null, trouble: null, error: '', tries: 0, triesFor: null, busyTries: 0 },
   ])
   /// Bumped on every prepare, won or lost. The value is read only as an
   /// effect dependency: a retry that fails again has to re-arm the timer, and
@@ -171,6 +203,18 @@ export default function AlbumPlayer({
         slots.current[which].error = ''
         slots.current[which].tries = 0
         slots.current[which].triesFor = null
+        // BOTH slots. A start that succeeded is proof the account is under its
+        // cap, which is the only thing that makes a `busy` count stale — and
+        // the latched slot cannot clear its own, because a slot marked
+        // `refused` is not asked again. Left to itself it stayed at the
+        // ceiling for the rest of the album: one attempt per track advance and
+        // final immediately, where the ceiling was meant to buy five minutes.
+        //
+        // Not reset per track, which was the first cut: the cap is about the
+        // account, so a new track id says nothing about it and the ceiling was
+        // never reached at all.
+        slots.current[0].busyTries = 0
+        slots.current[1].busyTries = 0
         force((n) => n + 1)
       } catch (e) {
         if (slots.current[which].key !== track.id) return
@@ -187,19 +231,43 @@ export default function AlbumPlayer({
         // never advancing and never giving up. `startRetry` is where that line
         // lives now, for the film as well as the track — they used to disagree
         // about what counts as "come back later".
+        // Nothing here is on screen to read a sentence, so `wait` and `busy`
+        // both mean "ask again" — but they are counted apart, because only
+        // `wait` is certain to be somebody else's to clear. A player in front
+        // of a person tells them apart differently; see `StartRetry`.
         const verdict = startRetry(e)
         const slot_ = slots.current[which]
         // A condition that clears itself starts the count over, so a host that
-        // flaps for an hour is still waited out. Only a refusal that might be
-        // about the item counts against the ceiling, and only against the
-        // track it was about.
+        // flaps for an hour is still waited out.
+        //
+        // Two counters, because the two refusals are about different things. A
+        // 409 is about the TRACK, so it is counted against the track and does
+        // not apply to the next one. The cap is about the ACCOUNT, so it is
+        // counted on the slot and survives an advance — counted per track it
+        // never reached its ceiling at all, which is the whole reason it has
+        // one.
         if (slot_.triesFor !== track.id) {
           slot_.triesFor = track.id
           slot_.tries = 0
         }
-        slot_.tries = verdict === 'wait' ? 0 : slot_.tries + 1
-        slots.current[which].trouble =
-          verdict === 'wait' || slots.current[which].tries < REFUSAL_TRIES ? 'failed' : 'refused'
+        // Only `wait` clears them, and it clears both: it is the one verdict
+        // that says nothing is wrong with either the track or the account.
+        // Zeroing each on the OTHER's verdict was a way to poll for ever — a
+        // cap that flickers while a track is genuinely unplayable alternates
+        // 429 and 409, and each answer reset the other's count, so neither
+        // ceiling was ever reached.
+        if (verdict === 'wait') {
+          slot_.busyTries = 0
+          slot_.tries = 0
+        } else if (verdict === 'busy') {
+          slot_.busyTries += 1
+        } else {
+          slot_.tries += 1
+        }
+        const asking =
+          verdict === 'wait' ||
+          (verdict === 'busy' ? slot_.busyTries < BUSY_TRIES : slot_.tries < REFUSAL_TRIES)
+        slots.current[which].trouble = asking ? 'failed' : 'refused'
         // A timeout arrives as `Offline` like any other unanswered request:
         // api() wraps every fetch rejection, abort included.
         slots.current[which].error = String(e)

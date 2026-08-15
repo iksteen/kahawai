@@ -255,14 +255,24 @@ async fn progress_resume_played_caps_and_idle() {
     assert_eq!(v["resume_position_ms"], 97_000);
 
     // Per-user cap: second session fine, third refused (limit 2).
+    //
+    // 429 and `session_cap`, not the 409 every other refusal from this
+    // endpoint carries. The cap clears the moment a session ends and the
+    // item's own refusals never do; both used to arrive as 409 with the
+    // difference in the prose, so a client playing a queue had to guess.
     let resp = start_session().await.unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);
     let resp = start_session().await.unwrap();
     assert_eq!(
         resp.status(),
-        StatusCode::CONFLICT,
+        StatusCode::TOO_MANY_REQUESTS,
         "cap of 2 sessions per user"
     );
+    let body = axum::body::to_bytes(resp.into_body(), 1 << 16)
+        .await
+        .unwrap();
+    let refusal: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(refusal["code"], "session_cap");
 
     // A live session still answers 404 for a sub-resource that does not
     // exist. AUTH-11 deliberately spends that distinction: session absence

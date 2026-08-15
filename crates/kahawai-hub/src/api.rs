@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Path, Query, Request, State};
+use axum::extract::{Request, State};
 use axum::http::StatusCode;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
@@ -403,7 +403,7 @@ pub fn router(
             state.clone(),
             require_bearer,
         ));
-    let mut app = Router::new()
+    let app = Router::new()
         .merge(admin)
         .merge(bearer)
         .merge(media)
@@ -423,13 +423,60 @@ pub fn router(
         .route("/api/v1/auth/token", post(login))
         .route("/api/v1/auth/refresh", post(refresh))
         .with_state(state);
+    // Merge, then fall back, then layer. All three orderings matter and two of
+    // them were wrong first:
+    //
+    // - AFTER the merges, because `method_not_allowed_fallback` walks the
+    //   routes registered at the time it is called. Set before, `POST /app/`
+    //   still answered axum's bare 405 while every other path answered JSON.
+    // - BEFORE the CORS layer, because `layer` wraps each route AND each
+    //   method router's default fallback. Set after, these replaced the
+    //   wrapped ones with bare handlers — and since no route registers
+    //   `options`, a browser preflight lands on exactly that fallback. Every
+    //   cross-origin POST/PUT/DELETE then preflighted, got a 405 with no
+    //   `Access-Control-Allow-Origin`, and was blocked.
+    //
+    // `tests/error_bodies.rs` pins both ends: the preflight is answered, and
+    // the fallbacks still speak JSON through the layer.
+    //
+    // One consequence worth stating rather than rediscovering: a 405 is no
+    // longer behind `require_bearer`. The sub-routers attach that with
+    // `Router::route_layer`, which goes through `Endpoint::layer` and so wraps
+    // a method router's DEFAULT 405 fallback while leaving it the `Default`
+    // variant — and `method_not_allowed_fallback` replaces exactly that
+    // variant. (Not `MethodRouter::route_layer`, which does leave the fallback
+    // alone; two readings of axum disagreed about this and the answer is
+    // measured, not read: with the call removed, `POST /admin/v1/users/abc`
+    // with no credentials answers 401; with it, 405.)
+    //
+    // So an unauthenticated caller can tell an admin path that exists from one
+    // that does not. That is not new information — `/api-docs/openapi.json` is
+    // served unauthenticated and lists all 29 of them, also measured — so it
+    // is accepted rather than worked around. Putting the fallback behind auth
+    // would mean giving up the JSON body on every 405, which is the thing this
+    // is for.
+    let mut app = app
+        .merge(Router::from(
+            SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", openapi_document()),
+        ))
+        .merge(crate::web::router(web_dir))
+        .fallback(unknown_route)
+        .method_not_allowed_fallback(wrong_method);
     if let Some(cors) = cors {
         app = app.layer(cors);
     }
-    app.merge(Router::from(
-        SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", openapi_document()),
-    ))
-    .merge(crate::web::router(web_dir))
+    app
+}
+
+async fn unknown_route() -> ApiError {
+    ApiError::new(ErrorCode::NotFound, "no such route")
+}
+
+async fn wrong_method() -> ApiError {
+    ApiError::new(
+        ErrorCode::MethodNotAllowed,
+        "that method is not allowed here",
+    )
 }
 
 #[derive(Clone)]
@@ -447,6 +494,8 @@ pub fn setup_router(auth: Arc<Auth>, web_dir: Option<std::path::PathBuf>) -> Rou
         .route("/api/v1/setup", post(setup))
         .with_state(state)
         .merge(crate::web::router(web_dir))
+        .fallback(unknown_route)
+        .method_not_allowed_fallback(wrong_method)
 }
 
 /// OPS-8 CORS: absent config = no CORS headers (same-origin only, the
@@ -474,7 +523,7 @@ fn cors_layer(origins: &[String]) -> Option<tower_http::cors::CorsLayer> {
     )
 }
 
-type ApiError = (StatusCode, String);
+use crate::error::{ApiError, ApiErrorBody, ApiJson, ApiPath, ApiQuery, ErrorCode};
 
 #[derive(Serialize, ToSchema)]
 struct BootstrapResponse {
@@ -821,8 +870,90 @@ struct UpdatedResponse {
     updated: Vec<WatchUpdate>,
 }
 
+/// A refusal, unless the cause is the database — in which case it is ours.
+///
+/// These call sites map a whole `anyhow::Error` onto one client code, and the
+/// producers mix "you asked for something that is not there" with "the write
+/// failed". Answering `not_found` to an admin whose delete hit a locked
+/// database tells them to stop asking about a satellite that is still there.
+/// Both halves are the hub's fault and both are 500s.
+///
+/// Three causes are tested for, and the last two were added because leaving
+/// them out misfiled a real failure. `sqlx::Error` covers the database.
+/// `std::io::Error` and `serde_json::Error` cover the producers that WRITE:
+/// the subtitle download finishes by creating its cache directory,
+/// serialising the record and writing the file, so a full or unwritable disk
+/// answered "the subtitle provider did not answer" on a 502 — after the
+/// viewer's download entitlement had already been spent on a fetch that
+/// worked.
+///
+/// It is a floor, not a taxonomy: a producer with more than one refusal worth
+/// telling apart wants typed errors, the way `sessions::SessionCap` and
+/// `opensubtitles::QuotaSpent` do.
+fn refusal_or_internal(code: ErrorCode, message: &'static str, e: anyhow::Error) -> ApiError {
+    let ours = e.downcast_ref::<sqlx::Error>().is_some()
+        || e.downcast_ref::<std::io::Error>().is_some()
+        || e.downcast_ref::<serde_json::Error>().is_some();
+    if ours {
+        return internal(e);
+    }
+    ApiError::log(code, message, e)
+}
+
+/// Whether a failure is a UNIQUE constraint firing.
+///
+/// The one database error that is about the REQUEST rather than the hub's
+/// health — nothing is unwell, two rows just cannot both have that name. It
+/// matters because `refusal_or_internal`'s premise is the opposite one, and a
+/// producer that expresses "already taken" by letting a constraint fire
+/// inverts it: the first cut of that helper turned a duplicate library name
+/// into a 500 with nothing an admin could act on.
+///
+/// `is_unique_violation`, not a string match on the message. The driver
+/// already knows, and a client-visible decision made by reading English is
+/// exactly what this module replaces.
+pub fn is_unique_violation(e: &anyhow::Error) -> bool {
+    matches!(
+        e.downcast_ref::<sqlx::Error>(),
+        Some(sqlx::Error::Database(db)) if db.is_unique_violation()
+    )
+}
+
+/// The subtitle provider refused. Its entitlement running out is not an
+/// outage, and it is the common case — the anonymous budget is five downloads
+/// a day — so it gets a code and keeps the sentence the provider module wrote,
+/// which names the way out. Everything else is upstream being upstream.
+fn subtitle_provider_refusal(e: anyhow::Error) -> ApiError {
+    match e.downcast_ref::<crate::opensubtitles::QuotaSpent>() {
+        Some(spent) => ApiError::new(ErrorCode::SubtitleQuotaSpent, spent.to_string()),
+        // `refusal_or_internal`, not `log`: a SQLITE_BUSY inside the search
+        // is the hub's, and answering "the provider did not answer" on a 502
+        // sends a viewer to blame OpenSubtitles while an operator's alerting
+        // files our fault as an upstream one.
+        None => refusal_or_internal(
+            ErrorCode::ProviderError,
+            "the subtitle provider did not answer",
+            e,
+        ),
+    }
+}
+
+/// A failure that is OURS. The detail goes to the log and a fixed sentence
+/// goes to the client: a 500's cause is by definition something the caller
+/// cannot act on, and it is the one that carries scratch paths, worker argv
+/// and a subprocess's stderr. `item_artwork` has answered this way since
+/// SEC-WEB-7; this makes it the rule.
 fn internal(e: impl std::fmt::Display) -> ApiError {
-    (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+    // `{e:#}` and not `{e}`: with the client getting a fixed sentence, this
+    // line is the only place the cause exists at all, and `Display` on an
+    // anyhow error prints one layer. The context somebody attached upstream —
+    // `no subtitle {key} on this item` over a sqlx error — was being dropped
+    // from the only record of it.
+    tracing::error!(error = format!("{e:#}"), "request failed");
+    ApiError::new(
+        ErrorCode::Internal,
+        "the hub could not complete this request",
+    )
 }
 
 /// Session absence is deliberately indistinguishable from denied ownership.
@@ -890,9 +1021,9 @@ fn request_token(req: &Request, allow_media_cookie: bool) -> Result<Option<&str>
     security(("metrics_token" = [])),
     responses(
         (status = 200, description = "Prometheus exposition", body = String, content_type = "text/plain; version=0.0.4; charset=utf-8"),
-        (status = 401, description = "Wrong metrics token", body = String, content_type = "text/plain"),
-        (status = 404, description = "Metrics are not enabled", body = String, content_type = "text/plain"),
-        (status = 500, description = "Snapshot failed", body = String, content_type = "text/plain")
+        (status = 401, description = "Wrong metrics token", body = ApiErrorBody),
+        (status = 404, description = "Metrics are not enabled", body = ApiErrorBody),
+        (status = 500, description = "Snapshot failed", body = ApiErrorBody)
     )
 )]
 async fn metrics(
@@ -900,7 +1031,10 @@ async fn metrics(
     headers: axum::http::HeaderMap,
 ) -> Result<Response, ApiError> {
     let Some(expected) = state.metrics_token.as_deref() else {
-        return Err((StatusCode::NOT_FOUND, "metrics are not enabled".into()));
+        return Err(ApiError::new(
+            ErrorCode::NotFound,
+            "metrics are not enabled",
+        ));
     };
     let presented = headers
         .get(axum::http::header::AUTHORIZATION)
@@ -908,7 +1042,10 @@ async fn metrics(
         .and_then(|v| v.strip_prefix("Bearer "))
         .unwrap_or_default();
     if !ct_eq(presented.as_bytes(), expected.as_bytes()) {
-        return Err((StatusCode::UNAUTHORIZED, "bad metrics token".into()));
+        return Err(ApiError::new(
+            ErrorCode::Unauthenticated,
+            "bad metrics token",
+        ));
     }
     let snap = crate::metrics::gather(&state.registry, &state.sessions, state.enricher.data_dir())
         .await
@@ -935,7 +1072,7 @@ async fn metrics(
     tag = "Observability",
     responses(
         (status = 200, description = "Hub and satellite health", body = crate::metrics::HealthResponse),
-        (status = 500, description = "Snapshot failed", body = String, content_type = "text/plain")
+        (status = 500, description = "Snapshot failed", body = ApiErrorBody)
     )
 )]
 async fn health(
@@ -990,18 +1127,18 @@ async fn require_auth(
 ) -> Result<Response, ApiError> {
     if state.auth.setup_required() {
         tracing::warn!(path = %req.uri(), "503: setup_required returned true");
-        return Err((StatusCode::SERVICE_UNAVAILABLE, "setup required".into()));
+        return Err(ApiError::new(ErrorCode::SetupRequired, "setup required"));
     }
     let token = request_token(&req, allow_media_cookie)
         .ok()
         .flatten()
-        .ok_or((
-            StatusCode::UNAUTHORIZED,
-            "invalid or missing token".to_string(),
+        .ok_or(ApiError::new(
+            ErrorCode::Unauthenticated,
+            "invalid or missing token",
         ))?;
     let claims = state.auth.authenticate(token).await.map_err(|_| {
-        (
-            StatusCode::UNAUTHORIZED,
+        ApiError::new(
+            ErrorCode::Unauthenticated,
             "invalid or missing token".to_string(),
         )
     })?;
@@ -1043,7 +1180,7 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 /// HUB-10: a denial the caller cannot tell from absence. See the
 /// `grants` module doc for why this is never 403.
 fn hidden(what: &str) -> ApiError {
-    (StatusCode::NOT_FOUND, format!("no such {what}"))
+    ApiError::new(ErrorCode::NotFound, format!("no such {what}"))
 }
 
 /// HUB-10: the grant gate for every route keyed by an item id.
@@ -1077,7 +1214,7 @@ async fn require_admin(req: Request, next: Next) -> Result<Response, ApiError> {
         .get::<crate::auth::Claims>()
         .is_some_and(|c| c.admin);
     if !is_admin {
-        return Err((StatusCode::FORBIDDEN, "admin only".into()));
+        return Err(ApiError::new(ErrorCode::AdminRequired, "admin only"));
     }
     Ok(next.run(req).await)
 }
@@ -1087,8 +1224,9 @@ async fn require_admin(req: Request, next: Next) -> Result<Response, ApiError> {
     security(("bearer_auth" = [])),
     responses(
         (status = 200, body = EnrollmentsResponse),
-        (status = 401, body = String, content_type = "text/plain"),
-        (status = 403, body = String, content_type = "text/plain")
+        (status = 401, body = ApiErrorBody),
+        (status = 403, body = ApiErrorBody),
+        (status = 503, description = "The hub has no administrator yet: `setup_required`", body = ApiErrorBody)
     )
 )]
 async fn admin_enrollments(State(state): State<AppState>) -> Json<EnrollmentsResponse> {
@@ -1117,19 +1255,36 @@ struct ApproveRequest {
     request_body = ApproveRequest,
     responses(
         (status = 200, body = ApprovedResponse),
-        (status = 401, body = String, content_type = "text/plain"),
-        (status = 403, body = String, content_type = "text/plain")
+        (status = 400, description = "The request body is not the JSON this route takes", body = ApiErrorBody),
+        (status = 401, body = ApiErrorBody),
+        (status = 403, description = "Not an admin (require_admin); the handler itself no longer answers this", body = ApiErrorBody),
+        (status = 404, description = "No pending enrollment matches that code", body = ApiErrorBody),
+        (status = 500, description = "Signing the certificate or recording the satellite failed", body = ApiErrorBody),
+        (status = 415, description = "The body needs Content-Type: application/json", body = ApiErrorBody),
+        (status = 413, description = "The body is past the hub's buffer limit", body = ApiErrorBody),
+        (status = 503, description = "The hub has no administrator yet: `setup_required`", body = ApiErrorBody)
     )
 )]
 async fn admin_approve(
     State(state): State<AppState>,
-    Json(body): Json<ApproveRequest>,
+    ApiJson(body): ApiJson<ApproveRequest>,
 ) -> Result<Json<ApprovedResponse>, ApiError> {
-    let summary = state
-        .enrollments
-        .approve(&body.code)
-        .await
-        .map_err(|e| (StatusCode::FORBIDDEN, format!("{e:#}")))?;
+    let summary = state.enrollments.approve(&body.code).await.map_err(|e| {
+        match e.downcast_ref::<crate::enrollment::EnrollError>() {
+            // The only failure here that is about the REQUEST. Signing the CSR
+            // and recording the satellite are the hub's own work, and
+            // answering FORBIDDEN for those told an admin whose CA failed to
+            // sign that they were not allowed to approve — the one code that
+            // means "a different account might".
+            Some(crate::enrollment::EnrollError::NoMatch) => ApiError::new(
+                ErrorCode::NotFound,
+                "no pending enrollment matches that code; if only one was \
+                 waiting it has been dropped as a possible substitution (§7.2) \
+                 and the satellite must enroll again",
+            ),
+            _ => internal(e),
+        }
+    })?;
     Ok(Json(ApprovedResponse { approved: summary }))
 }
 
@@ -1138,9 +1293,10 @@ async fn admin_approve(
     security(("bearer_auth" = [])),
     responses(
         (status = 200, body = ProvidersResponse),
-        (status = 401, body = String, content_type = "text/plain"),
-        (status = 403, body = String, content_type = "text/plain"),
-        (status = 500, body = String, content_type = "text/plain")
+        (status = 401, body = ApiErrorBody),
+        (status = 403, body = ApiErrorBody),
+        (status = 500, body = ApiErrorBody),
+        (status = 503, description = "The hub has no administrator yet: `setup_required`", body = ApiErrorBody)
     )
 )]
 async fn admin_providers(
@@ -1201,19 +1357,31 @@ struct SetChain {
     request_body = SetChain,
     responses(
         (status = 200, body = OkResponse),
-        (status = 400, body = String, content_type = "text/plain"),
-        (status = 401, body = String, content_type = "text/plain"),
-        (status = 403, body = String, content_type = "text/plain")
+        (status = 400, body = ApiErrorBody),
+        (status = 401, body = ApiErrorBody),
+        (status = 403, body = ApiErrorBody),
+        (status = 500, body = ApiErrorBody),
+        (status = 415, description = "The body needs Content-Type: application/json", body = ApiErrorBody),
+        (status = 413, description = "The body is past the hub's buffer limit", body = ApiErrorBody),
+        (status = 503, description = "The hub has no administrator yet: `setup_required`", body = ApiErrorBody)
     )
 )]
 async fn admin_set_chain(
     State(state): State<AppState>,
-    Path(media_type): Path<String>,
-    Json(body): Json<SetChain>,
+    ApiPath(media_type): ApiPath<String>,
+    ApiJson(body): ApiJson<SetChain>,
 ) -> Result<Json<OkResponse>, ApiError> {
     crate::providers::set_chain(state.registry.db(), &media_type, &body.order)
         .await
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+        .map_err(
+            |e| match e.downcast_ref::<crate::providers::NotAPermutation>() {
+                // Its own sentence, because it is the only thing that names a
+                // valid order — an admin who dropped one provider otherwise got a
+                // 400 with nothing to correct against.
+                Some(wrong) => ApiError::new(ErrorCode::BadRequest, wrong.to_string()),
+                None => internal(e),
+            },
+        )?;
     state
         .registry
         .emit(crate::registry::RegistryEvent::EnrichChain {
@@ -1238,22 +1406,28 @@ struct SubtitleSearchRequest {
     request_body = SubtitleSearchRequest,
     responses(
         (status = 200, body = SubtitleSearchResponse),
-        (status = 401, body = String, content_type = "text/plain"),
-        (status = 404, body = String, content_type = "text/plain"),
-        (status = 502, body = String, content_type = "text/plain")
+        (status = 400, description = "The request body is not the JSON this route takes", body = ApiErrorBody),
+        (status = 401, body = ApiErrorBody),
+        (status = 404, body = ApiErrorBody),
+        (status = 409, description = "The download entitlement is spent: `subtitle_quota_spent`", body = ApiErrorBody),
+        (status = 502, body = ApiErrorBody),
+        (status = 415, description = "The body needs Content-Type: application/json", body = ApiErrorBody),
+        (status = 413, description = "The body is past the hub's buffer limit", body = ApiErrorBody),
+        (status = 500, body = ApiErrorBody),
+        (status = 503, description = "The hub has no administrator yet: `setup_required`", body = ApiErrorBody)
     )
 )]
 async fn subtitle_search(
     State(state): State<AppState>,
-    Path(id): Path<String>,
+    ApiPath(id): ApiPath<String>,
     axum::Extension(claims): axum::Extension<crate::auth::Claims>,
-    Json(body): Json<SubtitleSearchRequest>,
+    ApiJson(body): ApiJson<SubtitleSearchRequest>,
 ) -> Result<Json<SubtitleSearchResponse>, ApiError> {
     let (candidates, quota) = state
         .subtitles
         .search_external(&state.registry, &id, body.languages, &claims.sub)
         .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("{e:#}")))?;
+        .map_err(subtitle_provider_refusal)?;
     Ok(Json(SubtitleSearchResponse { candidates, quota }))
 }
 
@@ -1273,16 +1447,22 @@ struct SubtitleDownloadRequest {
     request_body = SubtitleDownloadRequest,
     responses(
         (status = 200, body = SubtitleDownloadResponse),
-        (status = 401, body = String, content_type = "text/plain"),
-        (status = 404, body = String, content_type = "text/plain"),
-        (status = 502, body = String, content_type = "text/plain")
+        (status = 400, description = "The request body is not the JSON this route takes", body = ApiErrorBody),
+        (status = 401, body = ApiErrorBody),
+        (status = 404, body = ApiErrorBody),
+        (status = 409, description = "The download entitlement is spent: `subtitle_quota_spent`", body = ApiErrorBody),
+        (status = 502, body = ApiErrorBody),
+        (status = 415, description = "The body needs Content-Type: application/json", body = ApiErrorBody),
+        (status = 413, description = "The body is past the hub's buffer limit", body = ApiErrorBody),
+        (status = 500, body = ApiErrorBody),
+        (status = 503, description = "The hub has no administrator yet: `setup_required`", body = ApiErrorBody)
     )
 )]
 async fn subtitle_download(
     State(state): State<AppState>,
-    Path(id): Path<String>,
+    ApiPath(id): ApiPath<String>,
     axum::Extension(claims): axum::Extension<crate::auth::Claims>,
-    Json(body): Json<SubtitleDownloadRequest>,
+    ApiJson(body): ApiJson<SubtitleDownloadRequest>,
 ) -> Result<Json<SubtitleDownloadResponse>, ApiError> {
     let (track_id, quota) = state
         .subtitles
@@ -1294,7 +1474,7 @@ async fn subtitle_download(
             &claims.sub,
         )
         .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("{e:#}")))?;
+        .map_err(subtitle_provider_refusal)?;
     Ok(Json(SubtitleDownloadResponse { track_id, quota }))
 }
 
@@ -1312,14 +1492,16 @@ async fn subtitle_download(
     params(("track_id" = i64, Path)),
     responses(
         (status = 200, body = RemovedResponse),
-        (status = 401, body = String, content_type = "text/plain"),
-        (status = 500, body = String, content_type = "text/plain")
+        (status = 401, body = ApiErrorBody),
+        (status = 500, body = ApiErrorBody),
+        (status = 400, description = "A path segment or query parameter is not the shape this route takes", body = ApiErrorBody),
+        (status = 503, description = "The hub has no administrator yet: `setup_required`", body = ApiErrorBody)
     )
 )]
 async fn subtitle_delete(
     State(state): State<AppState>,
     axum::Extension(claims): axum::Extension<crate::auth::Claims>,
-    Path(track_id): Path<i64>,
+    ApiPath(track_id): ApiPath<i64>,
 ) -> Result<Json<RemovedResponse>, ApiError> {
     let removed = state
         .subtitles
@@ -1335,10 +1517,15 @@ async fn subtitle_delete(
     security(("bearer_auth" = [])),
     responses(
         (status = 200, body = VerificationResponse),
-        (status = 400, body = String, content_type = "text/plain"),
-        (status = 401, body = String, content_type = "text/plain"),
-        (status = 403, body = String, content_type = "text/plain"),
-        (status = 500, body = String, content_type = "text/plain")
+        (status = 401, body = ApiErrorBody),
+        (status = 403, body = ApiErrorBody),
+        (status = 500, body = ApiErrorBody),
+        // Both codes, in one entry. OpenAPI has one response per status and
+        // utoipa keeps the LAST of two — so declaring them separately did not
+        // document both, it silently dropped the one this route actually
+        // returns, leaving a client to read "the hub has no administrator yet"
+        // for a missing AniDB account.
+        (status = 503, description = "No AniDB credentials on this deployment (`provider_unconfigured`), or the hub has no administrator yet (`setup_required`)", body = ApiErrorBody)
     )
 )]
 async fn admin_verify_anidb(
@@ -1361,9 +1548,9 @@ async fn admin_verify_anidb(
         .map_err(internal)?
         .filter(|k| !k.is_empty());
     let (Some(user), Some(pass)) = (user, pass) else {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "no AniDB account configured".into(),
+        return Err(ApiError::new(
+            ErrorCode::ProviderUnconfigured,
+            "no AniDB account configured",
         ));
     };
     match crate::anidb::Anidb::login(state.enricher.data_dir(), &user, &pass, key.as_deref()).await
@@ -1375,6 +1562,12 @@ async fn admin_verify_anidb(
                 error: None,
             }))
         }
+        // The chain, deliberately, and the one place it still goes out. This
+        // route exists to tell an admin why a credential they just typed did
+        // not work, and the chain IS that answer — it is a log line delivered
+        // to the person who would otherwise have to go and read the log. It
+        // is admin-only, it is a 200 rather than a refusal, and the account it
+        // describes is the one they are holding.
         Err(error) => Ok(Json(VerificationResponse {
             verified: false,
             error: Some(format!("{error:#}")),
@@ -1399,21 +1592,24 @@ struct SetAnidb {
     request_body = SetAnidb,
     responses(
         (status = 200, body = SavedVerificationResponse),
-        (status = 400, body = String, content_type = "text/plain"),
-        (status = 401, body = String, content_type = "text/plain"),
-        (status = 403, body = String, content_type = "text/plain"),
-        (status = 500, body = String, content_type = "text/plain")
+        (status = 400, body = ApiErrorBody),
+        (status = 401, body = ApiErrorBody),
+        (status = 403, body = ApiErrorBody),
+        (status = 500, body = ApiErrorBody),
+        (status = 415, description = "The body needs Content-Type: application/json", body = ApiErrorBody),
+        (status = 413, description = "The body is past the hub's buffer limit", body = ApiErrorBody),
+        (status = 503, description = "The hub has no administrator yet: `setup_required`", body = ApiErrorBody)
     )
 )]
 async fn admin_set_anidb(
     State(state): State<AppState>,
-    Json(body): Json<SetAnidb>,
+    ApiJson(body): ApiJson<SetAnidb>,
 ) -> Result<Json<SavedVerificationResponse>, ApiError> {
     let (user, pass) = (body.username.trim(), body.password.trim());
     if user.is_empty() || pass.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "username and password required".into(),
+        return Err(ApiError::new(
+            ErrorCode::BadRequest,
+            "username and password required",
         ));
     }
     state
@@ -1460,6 +1656,8 @@ async fn admin_set_anidb(
                 error: None,
             }))
         }
+        // The chain, deliberately — see `admin_verify_anidb` above for why
+        // this route and no other.
         Err(error) => Ok(Json(SavedVerificationResponse {
             saved: true,
             verified: false,
@@ -1481,19 +1679,28 @@ struct SetTvdb {
     request_body = SetTvdb,
     responses(
         (status = 200, body = SavedResponse),
-        (status = 400, body = String, content_type = "text/plain"),
-        (status = 401, body = String, content_type = "text/plain"),
-        (status = 403, body = String, content_type = "text/plain"),
-        (status = 500, body = String, content_type = "text/plain")
+        (status = 400, body = ApiErrorBody),
+        (status = 401, body = ApiErrorBody),
+        (status = 403, body = ApiErrorBody),
+        (status = 500, body = ApiErrorBody),
+        (status = 415, description = "The body needs Content-Type: application/json", body = ApiErrorBody),
+        (status = 413, description = "The body is past the hub's buffer limit", body = ApiErrorBody),
+        (status = 503, description = "The hub has no administrator yet: `setup_required`", body = ApiErrorBody)
     )
 )]
 async fn admin_set_tvdb(
     State(state): State<AppState>,
-    Json(body): Json<SetTvdb>,
+    ApiJson(body): ApiJson<SetTvdb>,
 ) -> Result<Json<SavedResponse>, ApiError> {
     let key = body.api_key.trim();
     if key.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "api_key required".into()));
+        return Err(ApiError::new(
+            // Not ProviderUnconfigured: that says the DEPLOYMENT has no
+            // credentials, and this is a blank field in the form setting them.
+            // A client configuring a provider has to tell those apart.
+            ErrorCode::BadRequest,
+            "api_key required",
+        ));
     }
     state
         .registry
@@ -1528,19 +1735,28 @@ struct SetTmdb {
     request_body = SetTmdb,
     responses(
         (status = 200, body = SavedResponse),
-        (status = 400, body = String, content_type = "text/plain"),
-        (status = 401, body = String, content_type = "text/plain"),
-        (status = 403, body = String, content_type = "text/plain"),
-        (status = 500, body = String, content_type = "text/plain")
+        (status = 400, body = ApiErrorBody),
+        (status = 401, body = ApiErrorBody),
+        (status = 403, body = ApiErrorBody),
+        (status = 500, body = ApiErrorBody),
+        (status = 415, description = "The body needs Content-Type: application/json", body = ApiErrorBody),
+        (status = 413, description = "The body is past the hub's buffer limit", body = ApiErrorBody),
+        (status = 503, description = "The hub has no administrator yet: `setup_required`", body = ApiErrorBody)
     )
 )]
 async fn admin_set_tmdb(
     State(state): State<AppState>,
-    Json(body): Json<SetTmdb>,
+    ApiJson(body): ApiJson<SetTmdb>,
 ) -> Result<Json<SavedResponse>, ApiError> {
     let key = body.api_key.trim();
     if key.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "api_key required".into()));
+        return Err(ApiError::new(
+            // Not ProviderUnconfigured: that says the DEPLOYMENT has no
+            // credentials, and this is a blank field in the form setting them.
+            // A client configuring a provider has to tell those apart.
+            ErrorCode::BadRequest,
+            "api_key required",
+        ));
     }
     state
         .registry
@@ -1563,8 +1779,9 @@ async fn admin_set_tmdb(
     security(("bearer_auth" = [])),
     responses(
         (status = 200, body = crate::enrich::EnrichStatus),
-        (status = 401, body = String, content_type = "text/plain"),
-        (status = 403, body = String, content_type = "text/plain")
+        (status = 401, body = ApiErrorBody),
+        (status = 403, body = ApiErrorBody),
+        (status = 503, description = "The hub has no administrator yet: `setup_required`", body = ApiErrorBody)
     )
 )]
 async fn admin_enrich_status(State(state): State<AppState>) -> Json<crate::enrich::EnrichStatus> {
@@ -1576,8 +1793,9 @@ async fn admin_enrich_status(State(state): State<AppState>) -> Json<crate::enric
     security(("bearer_auth" = [])),
     responses(
         (status = 200, body = StartedResponse),
-        (status = 401, body = String, content_type = "text/plain"),
-        (status = 403, body = String, content_type = "text/plain")
+        (status = 401, body = ApiErrorBody),
+        (status = 403, body = ApiErrorBody),
+        (status = 503, description = "The hub has no administrator yet: `setup_required`", body = ApiErrorBody)
     )
 )]
 async fn admin_enrich_run(
@@ -1608,15 +1826,18 @@ struct RefreshQuery {
     params(("id" = String, Path), RefreshQuery),
     responses(
         (status = 200, body = RefreshResponse),
-        (status = 401, body = String, content_type = "text/plain"),
-        (status = 403, body = String, content_type = "text/plain"),
-        (status = 500, body = String, content_type = "text/plain")
+        (status = 401, body = ApiErrorBody),
+        (status = 403, body = ApiErrorBody),
+        (status = 404, description = "No such library, or it has no collections attached", body = ApiErrorBody),
+        (status = 500, body = ApiErrorBody),
+        (status = 400, description = "A path segment or query parameter is not the shape this route takes", body = ApiErrorBody),
+        (status = 503, description = "The hub has no administrator yet: `setup_required`", body = ApiErrorBody)
     )
 )]
 async fn admin_refresh_library(
     State(state): State<AppState>,
-    Path(id): Path<String>,
-    Query(q): Query<RefreshQuery>,
+    ApiPath(id): ApiPath<String>,
+    ApiQuery(q): ApiQuery<RefreshQuery>,
 ) -> Result<Json<RefreshResponse>, ApiError> {
     let members: Vec<(String, String)> = sqlx::query_as(
         "SELECT module_id, collection_id FROM library_collections WHERE library_id = ?",
@@ -1626,7 +1847,10 @@ async fn admin_refresh_library(
     .await
     .map_err(internal)?;
     if members.is_empty() {
-        return Err((StatusCode::NOT_FOUND, "library has no collections".into()));
+        return Err(ApiError::new(
+            ErrorCode::NotFound,
+            "library has no collections",
+        ));
     }
     let (mut asked, mut offline) = (0usize, 0usize);
     for (module_id, collection_id) in members {
@@ -1668,9 +1892,10 @@ async fn request_scan(state: &AppState, module_id: &str, collection_id: &str) ->
     security(("bearer_auth" = [])),
     responses(
         (status = 200, body = ReviewEntriesResponse),
-        (status = 401, body = String, content_type = "text/plain"),
-        (status = 403, body = String, content_type = "text/plain"),
-        (status = 500, body = String, content_type = "text/plain")
+        (status = 401, body = ApiErrorBody),
+        (status = 403, body = ApiErrorBody),
+        (status = 500, body = ApiErrorBody),
+        (status = 503, description = "The hub has no administrator yet: `setup_required`", body = ApiErrorBody)
     )
 )]
 async fn admin_review_list(
@@ -1725,14 +1950,18 @@ struct ReviewSearch {
     request_body = ReviewSearch,
     responses(
         (status = 200, body = ReviewCandidatesResponse),
-        (status = 401, body = String, content_type = "text/plain"),
-        (status = 403, body = String, content_type = "text/plain"),
-        (status = 500, body = String, content_type = "text/plain")
+        (status = 400, description = "The request body is not the JSON this route takes", body = ApiErrorBody),
+        (status = 401, body = ApiErrorBody),
+        (status = 403, body = ApiErrorBody),
+        (status = 500, body = ApiErrorBody),
+        (status = 415, description = "The body needs Content-Type: application/json", body = ApiErrorBody),
+        (status = 413, description = "The body is past the hub's buffer limit", body = ApiErrorBody),
+        (status = 503, description = "The hub has no administrator yet: `setup_required`", body = ApiErrorBody)
     )
 )]
 async fn admin_review_search(
     State(state): State<AppState>,
-    Json(body): Json<ReviewSearch>,
+    ApiJson(body): ApiJson<ReviewSearch>,
 ) -> Result<Json<ReviewCandidatesResponse>, ApiError> {
     let candidates = state
         .enricher
@@ -1765,16 +1994,19 @@ struct ApplyMatch {
     request_body = ApplyMatch,
     responses(
         (status = 200, body = OkResponse),
-        (status = 400, body = String, content_type = "text/plain"),
-        (status = 401, body = String, content_type = "text/plain"),
-        (status = 403, body = String, content_type = "text/plain"),
-        (status = 500, body = String, content_type = "text/plain")
+        (status = 400, body = ApiErrorBody),
+        (status = 401, body = ApiErrorBody),
+        (status = 403, body = ApiErrorBody),
+        (status = 500, body = ApiErrorBody),
+        (status = 415, description = "The body needs Content-Type: application/json", body = ApiErrorBody),
+        (status = 413, description = "The body is past the hub's buffer limit", body = ApiErrorBody),
+        (status = 503, description = "The hub has no administrator yet: `setup_required`", body = ApiErrorBody)
     )
 )]
 async fn admin_apply_match(
     State(state): State<AppState>,
-    Path(id): Path<String>,
-    Json(body): Json<ApplyMatch>,
+    ApiPath(id): ApiPath<String>,
+    ApiJson(body): ApiJson<ApplyMatch>,
 ) -> Result<Json<OkResponse>, ApiError> {
     let db = state.registry.db();
     match body.action.as_str() {
@@ -1798,13 +2030,14 @@ async fn admin_apply_match(
         "pick" => {
             let candidate = body
                 .candidate
-                .ok_or((StatusCode::BAD_REQUEST, "candidate required".into()))?;
+                .ok_or(ApiError::new(ErrorCode::BadRequest, "candidate required"))?;
             let provider = body
                 .provider
-                .ok_or((StatusCode::BAD_REQUEST, "provider required".into()))?;
-            let provider_id = candidate
-                .id
-                .ok_or((StatusCode::BAD_REQUEST, "candidate.id required".into()))?;
+                .ok_or(ApiError::new(ErrorCode::BadRequest, "provider required"))?;
+            let provider_id = candidate.id.ok_or(ApiError::new(
+                ErrorCode::BadRequest,
+                "candidate.id required",
+            ))?;
             // A human's choice: stored as that provider's answer and pinned,
             // so automatic re-picking leaves it alone whatever lands later.
             crate::providers::assign_manual(
@@ -1824,7 +2057,12 @@ async fn admin_apply_match(
             .await
             .map_err(internal)?;
         }
-        other => return Err((StatusCode::BAD_REQUEST, format!("unknown action {other}"))),
+        other => {
+            return Err(ApiError::new(
+                ErrorCode::BadRequest,
+                format!("unknown action {other}"),
+            ));
+        }
     }
     Ok(Json(OkResponse { ok: true }))
 }
@@ -1835,9 +2073,10 @@ async fn admin_apply_match(
     security(("bearer_auth" = [])),
     responses(
         (status = 200, body = UsersResponse),
-        (status = 401, body = String, content_type = "text/plain"),
-        (status = 403, body = String, content_type = "text/plain"),
-        (status = 500, body = String, content_type = "text/plain")
+        (status = 401, body = ApiErrorBody),
+        (status = 403, body = ApiErrorBody),
+        (status = 500, body = ApiErrorBody),
+        (status = 503, description = "The hub has no administrator yet: `setup_required`", body = ApiErrorBody)
     )
 )]
 async fn admin_users(State(state): State<AppState>) -> Result<Json<UsersResponse>, ApiError> {
@@ -1874,16 +2113,20 @@ struct SetAccess {
     request_body = SetAccess,
     responses(
         (status = 200, body = UserAccessResponse),
-        (status = 401, body = String, content_type = "text/plain"),
-        (status = 403, body = String, content_type = "text/plain"),
-        (status = 404, body = String, content_type = "text/plain"),
-        (status = 500, body = String, content_type = "text/plain")
+        (status = 400, description = "The request body is not the JSON this route takes", body = ApiErrorBody),
+        (status = 401, body = ApiErrorBody),
+        (status = 403, body = ApiErrorBody),
+        (status = 404, body = ApiErrorBody),
+        (status = 500, body = ApiErrorBody),
+        (status = 415, description = "The body needs Content-Type: application/json", body = ApiErrorBody),
+        (status = 413, description = "The body is past the hub's buffer limit", body = ApiErrorBody),
+        (status = 503, description = "The hub has no administrator yet: `setup_required`", body = ApiErrorBody)
     )
 )]
 async fn admin_set_user_libraries(
     State(state): State<AppState>,
-    Path(id): Path<String>,
-    Json(body): Json<SetAccess>,
+    ApiPath(id): ApiPath<String>,
+    ApiJson(body): ApiJson<SetAccess>,
 ) -> Result<Json<UserAccessResponse>, ApiError> {
     let db = state.registry.db();
     let existed = crate::grants::set_access(db, &id, body.all_libraries, &body.libraries)
@@ -1924,17 +2167,21 @@ struct SetAdminBody {
     request_body = SetAdminBody,
     responses(
         (status = 200, body = UserAdminResponse),
-        (status = 401, body = String, content_type = "text/plain"),
-        (status = 403, body = String, content_type = "text/plain"),
-        (status = 404, body = String, content_type = "text/plain"),
-        (status = 409, body = String, content_type = "text/plain"),
-        (status = 500, body = String, content_type = "text/plain")
+        (status = 400, description = "The request body is not the JSON this route takes", body = ApiErrorBody),
+        (status = 401, body = ApiErrorBody),
+        (status = 403, body = ApiErrorBody),
+        (status = 404, body = ApiErrorBody),
+        (status = 409, body = ApiErrorBody),
+        (status = 500, body = ApiErrorBody),
+        (status = 415, description = "The body needs Content-Type: application/json", body = ApiErrorBody),
+        (status = 413, description = "The body is past the hub's buffer limit", body = ApiErrorBody),
+        (status = 503, description = "The hub has no administrator yet: `setup_required`", body = ApiErrorBody)
     )
 )]
 async fn admin_set_user_admin(
     State(state): State<AppState>,
-    Path(id): Path<String>,
-    Json(body): Json<SetAdminBody>,
+    ApiPath(id): ApiPath<String>,
+    ApiJson(body): ApiJson<SetAdminBody>,
 ) -> Result<Json<UserAdminResponse>, ApiError> {
     match state
         .auth
@@ -1943,14 +2190,13 @@ async fn admin_set_user_admin(
         .map_err(internal)?
     {
         crate::auth::SetAdmin::NoSuchUser => Err(hidden("user")),
-        crate::auth::SetAdmin::LastAdmin => Err((
-            // Not FORBIDDEN: `require_admin` above already answers that for
-            // "your token is not an admin", and a client cannot tell
-            // re-authenticate from pick-another-account without reading the
-            // prose. CONFLICT is what the self-guard uses, and this is the
-            // same class — the request is well formed and the state says no.
-            StatusCode::CONFLICT,
-            "refusing to demote the last admin".into(),
+        crate::auth::SetAdmin::LastAdmin => Err(ApiError::new(
+            // Its own code, not FORBIDDEN and not a bare CONFLICT.
+            // `require_admin` above already answers FORBIDDEN for "your token
+            // is not an admin", and a client could not tell re-authenticate
+            // from pick-another-account without reading the prose. It can now.
+            ErrorCode::LastAdmin,
+            "refusing to demote the last admin",
         )),
         _ => Ok(Json(UserAdminResponse {
             id,
@@ -1973,20 +2219,45 @@ struct CreateUser {
     request_body = CreateUser,
     responses(
         (status = 200, body = CreatedUserResponse),
-        (status = 400, body = String, content_type = "text/plain"),
-        (status = 401, body = String, content_type = "text/plain"),
-        (status = 403, body = String, content_type = "text/plain")
+        (status = 400, body = ApiErrorBody),
+        (status = 401, body = ApiErrorBody),
+        (status = 403, body = ApiErrorBody),
+        (status = 500, body = ApiErrorBody),
+        (status = 415, description = "The body needs Content-Type: application/json", body = ApiErrorBody),
+        (status = 409, description = "That username is already taken", body = ApiErrorBody),
+        (status = 413, description = "The body is past the hub's buffer limit", body = ApiErrorBody),
+        (status = 503, description = "The hub has no administrator yet: `setup_required`", body = ApiErrorBody)
     )
 )]
 async fn admin_create_user(
     State(state): State<AppState>,
-    Json(body): Json<CreateUser>,
+    ApiJson(body): ApiJson<CreateUser>,
 ) -> Result<Json<CreatedUserResponse>, ApiError> {
     let id = state
         .auth
         .create_user(&body.username, &body.password, body.admin)
         .await
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+        // `auth::create_user` turns the UNIQUE violation into a fresh
+        // `anyhow!` with no sqlx underneath, and passes every other database
+        // error through as one — so this split lands the way it reads.
+        .map_err(|e| {
+            // The taken name is its own answer, and the same one a taken
+            // library name gets — the two create routes disagreed about the
+            // code for an identical collision until this.
+            if e.downcast_ref::<crate::auth::UsernameTaken>().is_some() {
+                ApiError::new(ErrorCode::Conflict, "that username is already taken")
+            } else if let Some(policy) = e.downcast_ref::<crate::auth::CredentialPolicyError>() {
+                // The policy already says which rule was broken, and `setup`
+                // has always reported it. A blank username was being told the
+                // PASSWORD was too short, because one fixed sentence stood in
+                // for two different refusals on the same route.
+                ApiError::new(ErrorCode::BadRequest, policy.to_string())
+            } else {
+                // Not a refusal this route knows how to name — hashing failed,
+                // or the write did. Neither is the admin's to fix.
+                internal(e)
+            }
+        })?;
     Ok(Json(CreatedUserResponse {
         id,
         username: body.username,
@@ -2005,37 +2276,39 @@ async fn admin_create_user(
     params(("id" = String, Path)),
     responses(
         (status = 200, body = DeletedUserResponse),
-        (status = 401, body = String, content_type = "text/plain"),
-        (status = 403, body = String, content_type = "text/plain"),
-        (status = 404, body = String, content_type = "text/plain"),
-        (status = 409, body = String, content_type = "text/plain"),
-        (status = 500, body = String, content_type = "text/plain")
+        (status = 401, body = ApiErrorBody),
+        (status = 403, body = ApiErrorBody),
+        (status = 404, body = ApiErrorBody),
+        (status = 409, body = ApiErrorBody),
+        (status = 500, body = ApiErrorBody),
+        (status = 400, description = "A path segment or query parameter is not the shape this route takes", body = ApiErrorBody),
+        (status = 503, description = "The hub has no administrator yet: `setup_required`", body = ApiErrorBody)
     )
 )]
 async fn admin_delete_user(
     State(state): State<AppState>,
     axum::Extension(claims): axum::Extension<crate::auth::Claims>,
-    Path(id): Path<String>,
+    ApiPath(id): ApiPath<String>,
 ) -> Result<Json<DeletedUserResponse>, ApiError> {
     // Deleting yourself would revoke your own token mid-request and,
     // for the only admin, leave nobody who can undo it.
     if id == claims.sub {
-        return Err((
-            // CONFLICT, as the admin-flag route's self-guard answers. FORBIDDEN
-            // is what `require_admin` says when your token is not an admin at
-            // all, so a client could not tell "re-authenticate" from "pick a
-            // different account" without reading the prose.
-            StatusCode::CONFLICT,
-            "cannot delete the account you are signed in as".into(),
+        return Err(ApiError::new(
+            // Its own code, for the reason the admin-flag route gives:
+            // FORBIDDEN is what `require_admin` says when your token is not an
+            // admin at all, so a client could not tell "re-authenticate" from
+            // "pick a different target" without reading the prose.
+            ErrorCode::SelfTarget,
+            "cannot delete the account you are signed in as",
         ));
     }
     let username = match state.auth.delete_user(&id).await.map_err(internal)? {
         crate::auth::DeleteUser::Deleted(username) => username,
         crate::auth::DeleteUser::NoSuchUser => return Err(hidden("user")),
         crate::auth::DeleteUser::LastAdmin => {
-            return Err((
-                StatusCode::CONFLICT,
-                "refusing to delete the last admin".into(),
+            return Err(ApiError::new(
+                ErrorCode::LastAdmin,
+                "refusing to delete the last admin",
             ));
         }
     };
@@ -2055,9 +2328,10 @@ async fn admin_delete_user(
     security(("bearer_auth" = [])),
     responses(
         (status = 200, body = SatellitesResponse),
-        (status = 401, body = String, content_type = "text/plain"),
-        (status = 403, body = String, content_type = "text/plain"),
-        (status = 500, body = String, content_type = "text/plain")
+        (status = 401, body = ApiErrorBody),
+        (status = 403, body = ApiErrorBody),
+        (status = 500, body = ApiErrorBody),
+        (status = 503, description = "The hub has no administrator yet: `setup_required`", body = ApiErrorBody)
     )
 )]
 async fn admin_satellites(
@@ -2079,24 +2353,26 @@ async fn admin_satellites(
     params(("id" = String, Path)),
     responses(
         (status = 200, body = DeletedSatelliteResponse),
-        (status = 401, body = String, content_type = "text/plain"),
-        (status = 403, body = String, content_type = "text/plain"),
-        (status = 404, body = String, content_type = "text/plain"),
-        (status = 409, body = String, content_type = "text/plain"),
-        (status = 500, body = String, content_type = "text/plain")
+        (status = 401, body = ApiErrorBody),
+        (status = 403, body = ApiErrorBody),
+        (status = 404, body = ApiErrorBody),
+        (status = 409, body = ApiErrorBody),
+        (status = 500, body = ApiErrorBody),
+        (status = 400, description = "A path segment or query parameter is not the shape this route takes", body = ApiErrorBody),
+        (status = 503, description = "The hub has no administrator yet: `setup_required`", body = ApiErrorBody)
     )
 )]
 async fn admin_delete_satellite(
     State(state): State<AppState>,
-    Path(id): Path<String>,
+    ApiPath(id): ApiPath<String>,
 ) -> Result<Json<DeletedSatelliteResponse>, ApiError> {
     // Before ending anything: the hub's own mediahost is not a satellite
     // this operation can act on, and refusing after tearing its sessions
     // down would be the destructive half of an operation that then fails.
     if state.registry.is_in_process(&id).await.map_err(internal)? {
-        return Err((
-            StatusCode::CONFLICT,
-            "the in-process mediahost cannot be deleted: it is the hub itself".into(),
+        return Err(ApiError::new(
+            ErrorCode::Conflict,
+            "the in-process mediahost cannot be deleted: it is the hub itself",
         ));
     }
     let ended = state.sessions.end_for_module(&id);
@@ -2104,7 +2380,7 @@ async fn admin_delete_satellite(
         .registry
         .delete_satellite(&id)
         .await
-        .map_err(|e| (StatusCode::NOT_FOUND, format!("{e:#}")))?;
+        .map_err(|e| refusal_or_internal(ErrorCode::NotFound, "no such satellite", e))?;
     let removed_payloads = state
         .subtitles
         .clean_orphaned_payloads(&state.registry)
@@ -2130,9 +2406,10 @@ struct SetDisabled {
     security(("bearer_auth" = [])),
     responses(
         (status = 200, body = AdminLibrariesResponse),
-        (status = 401, body = String, content_type = "text/plain"),
-        (status = 403, body = String, content_type = "text/plain"),
-        (status = 500, body = String, content_type = "text/plain")
+        (status = 401, body = ApiErrorBody),
+        (status = 403, body = ApiErrorBody),
+        (status = 500, body = ApiErrorBody),
+        (status = 503, description = "The hub has no administrator yet: `setup_required`", body = ApiErrorBody)
     )
 )]
 async fn admin_libraries(
@@ -2151,9 +2428,10 @@ async fn admin_libraries(
     security(("bearer_auth" = [])),
     responses(
         (status = 200, body = AdminCollectionsResponse),
-        (status = 401, body = String, content_type = "text/plain"),
-        (status = 403, body = String, content_type = "text/plain"),
-        (status = 500, body = String, content_type = "text/plain")
+        (status = 401, body = ApiErrorBody),
+        (status = 403, body = ApiErrorBody),
+        (status = 500, body = ApiErrorBody),
+        (status = 503, description = "The hub has no administrator yet: `setup_required`", body = ApiErrorBody)
     )
 )]
 async fn admin_collections(
@@ -2179,25 +2457,52 @@ struct CreateLibraryRequest {
     request_body = CreateLibraryRequest,
     responses(
         (status = 200, body = CreatedLibraryResponse),
-        (status = 400, body = String, content_type = "text/plain"),
-        (status = 401, body = String, content_type = "text/plain"),
-        (status = 403, body = String, content_type = "text/plain"),
-        (status = 409, body = String, content_type = "text/plain")
+        (status = 400, body = ApiErrorBody),
+        (status = 401, body = ApiErrorBody),
+        (status = 403, body = ApiErrorBody),
+        (status = 409, description = "A library with that name already exists", body = ApiErrorBody),
+        (status = 500, body = ApiErrorBody),
+        (status = 415, description = "The body needs Content-Type: application/json", body = ApiErrorBody),
+        (status = 413, description = "The body is past the hub's buffer limit", body = ApiErrorBody),
+        (status = 503, description = "The hub has no administrator yet: `setup_required`", body = ApiErrorBody)
     )
 )]
 async fn admin_create_library(
     State(state): State<AppState>,
-    Json(body): Json<CreateLibraryRequest>,
+    ApiJson(body): ApiJson<CreateLibraryRequest>,
 ) -> Result<Json<CreatedLibraryResponse>, ApiError> {
     let name = body.name.trim();
     if name.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "library name required".into()));
+        return Err(ApiError::new(
+            ErrorCode::BadRequest,
+            "library name required",
+        ));
     }
     let id = state
         .registry
         .create_library(name, &body.media_type)
         .await
-        .map_err(|e| (StatusCode::CONFLICT, format!("{e:#}")))?;
+        .map_err(|e| {
+            // Three arms, because this route has two refusals and one fault
+            // and each is told apart by something different. `libraries.name`
+            // is UNIQUE and the producer lets it fire; the media type is
+            // checked with an `ensure!` before any statement runs; anything
+            // else reaching here is the database being unwell.
+            if is_unique_violation(&e) {
+                ApiError::new(
+                    ErrorCode::Conflict,
+                    "a library with that name already exists",
+                )
+            } else if let Some(unknown) = e.downcast_ref::<crate::registry::UnknownMediaType>() {
+                // Matched, not a catch-all. Written as `else` it would name
+                // the media type for whatever refusal `create_library` grows
+                // next — an empty name, a reserved one — and nothing would
+                // fail.
+                ApiError::new(ErrorCode::BadRequest, unknown.to_string())
+            } else {
+                internal(e)
+            }
+        })?;
     Ok(Json(CreatedLibraryResponse { id }))
 }
 
@@ -2207,20 +2512,22 @@ async fn admin_create_library(
     params(("id" = String, Path)),
     responses(
         (status = 204, description = "Library deleted"),
-        (status = 401, body = String, content_type = "text/plain"),
-        (status = 403, body = String, content_type = "text/plain"),
-        (status = 404, body = String, content_type = "text/plain"),
-        (status = 500, body = String, content_type = "text/plain")
+        (status = 401, body = ApiErrorBody),
+        (status = 403, body = ApiErrorBody),
+        (status = 404, body = ApiErrorBody),
+        (status = 500, body = ApiErrorBody),
+        (status = 400, description = "A path segment or query parameter is not the shape this route takes", body = ApiErrorBody),
+        (status = 503, description = "The hub has no administrator yet: `setup_required`", body = ApiErrorBody)
     )
 )]
 async fn admin_delete_library(
     State(state): State<AppState>,
-    Path(id): Path<String>,
+    ApiPath(id): ApiPath<String>,
 ) -> Result<StatusCode, ApiError> {
     if state.registry.delete_library(&id).await.map_err(internal)? {
         Ok(StatusCode::NO_CONTENT)
     } else {
-        Err((StatusCode::NOT_FOUND, "no such library".into()))
+        Err(ApiError::new(ErrorCode::NotFound, "no such library"))
     }
 }
 
@@ -2237,21 +2544,49 @@ struct AttachCollectionRequest {
     request_body = AttachCollectionRequest,
     responses(
         (status = 204, description = "Collection attached"),
-        (status = 401, body = String, content_type = "text/plain"),
-        (status = 403, body = String, content_type = "text/plain"),
-        (status = 409, body = String, content_type = "text/plain")
+        (status = 400, description = "The request body is not the JSON this route takes", body = ApiErrorBody),
+        (status = 401, body = ApiErrorBody),
+        (status = 403, body = ApiErrorBody),
+        (status = 409, body = ApiErrorBody),
+        (status = 500, body = ApiErrorBody),
+        (status = 415, description = "The body needs Content-Type: application/json", body = ApiErrorBody),
+        (status = 404, description = "No such library, or no such collection", body = ApiErrorBody),
+        (status = 413, description = "The body is past the hub's buffer limit", body = ApiErrorBody),
+        (status = 503, description = "The hub has no administrator yet: `setup_required`", body = ApiErrorBody)
     )
 )]
 async fn admin_attach_collection(
     State(state): State<AppState>,
-    Path(id): Path<String>,
-    Json(body): Json<AttachCollectionRequest>,
+    ApiPath(id): ApiPath<String>,
+    ApiJson(body): ApiJson<AttachCollectionRequest>,
 ) -> Result<StatusCode, ApiError> {
     state
         .registry
         .attach_collection(&id, &body.module_id, &body.collection_id)
         .await
-        .map_err(|e| (StatusCode::CONFLICT, format!("{e:#}")))?;
+        .map_err(|e| {
+            // Three refusals, three answers. `registry::AttachRefused` exists
+            // so this route can give them: an absent library or collection is
+            // a 404, and a media-type mismatch is the one an admin can act on
+            // without going and looking something up. They were one opaque
+            // 409 with the difference in a log line.
+            match e.downcast_ref::<crate::registry::AttachRefused>() {
+                Some(crate::registry::AttachRefused::NoLibrary) => {
+                    ApiError::new(ErrorCode::NotFound, "no such library")
+                }
+                Some(crate::registry::AttachRefused::NoCollection) => {
+                    ApiError::new(ErrorCode::NotFound, "no such collection")
+                }
+                Some(mismatch @ crate::registry::AttachRefused::TypeMismatch { .. }) => {
+                    ApiError::new(ErrorCode::Conflict, mismatch.to_string())
+                }
+                None => refusal_or_internal(
+                    ErrorCode::Conflict,
+                    "that collection could not be attached",
+                    e,
+                ),
+            }
+        })?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -2265,15 +2600,17 @@ async fn admin_attach_collection(
     ),
     responses(
         (status = 204, description = "Collection detached"),
-        (status = 401, body = String, content_type = "text/plain"),
-        (status = 403, body = String, content_type = "text/plain"),
-        (status = 404, body = String, content_type = "text/plain"),
-        (status = 500, body = String, content_type = "text/plain")
+        (status = 401, body = ApiErrorBody),
+        (status = 403, body = ApiErrorBody),
+        (status = 404, body = ApiErrorBody),
+        (status = 500, body = ApiErrorBody),
+        (status = 400, description = "A path segment or query parameter is not the shape this route takes", body = ApiErrorBody),
+        (status = 503, description = "The hub has no administrator yet: `setup_required`", body = ApiErrorBody)
     )
 )]
 async fn admin_detach_collection(
     State(state): State<AppState>,
-    Path((id, module_id, collection_id)): Path<(String, String, String)>,
+    ApiPath((id, module_id, collection_id)): ApiPath<(String, String, String)>,
 ) -> Result<StatusCode, ApiError> {
     if state
         .registry
@@ -2283,7 +2620,7 @@ async fn admin_detach_collection(
     {
         Ok(StatusCode::NO_CONTENT)
     } else {
-        Err((StatusCode::NOT_FOUND, "not attached".into()))
+        Err(ApiError::new(ErrorCode::NotFound, "not attached"))
     }
 }
 
@@ -2294,15 +2631,19 @@ async fn admin_detach_collection(
     request_body = SetDisabled,
     responses(
         (status = 204, description = "Placement state updated"),
-        (status = 401, body = String, content_type = "text/plain"),
-        (status = 403, body = String, content_type = "text/plain"),
-        (status = 500, body = String, content_type = "text/plain")
+        (status = 400, description = "The request body is not the JSON this route takes", body = ApiErrorBody),
+        (status = 401, body = ApiErrorBody),
+        (status = 403, body = ApiErrorBody),
+        (status = 500, body = ApiErrorBody),
+        (status = 415, description = "The body needs Content-Type: application/json", body = ApiErrorBody),
+        (status = 413, description = "The body is past the hub's buffer limit", body = ApiErrorBody),
+        (status = 503, description = "The hub has no administrator yet: `setup_required`", body = ApiErrorBody)
     )
 )]
 async fn admin_set_disabled(
     State(state): State<AppState>,
-    Path(id): Path<String>,
-    Json(body): Json<SetDisabled>,
+    ApiPath(id): ApiPath<String>,
+    ApiJson(body): ApiJson<SetDisabled>,
 ) -> Result<StatusCode, ApiError> {
     state
         .registry
@@ -2318,9 +2659,10 @@ async fn admin_set_disabled(
     security(("bearer_auth" = [])),
     responses(
         (status = 200, body = AdminSessionsResponse),
-        (status = 401, body = String, content_type = "text/plain"),
-        (status = 403, body = String, content_type = "text/plain"),
-        (status = 500, body = String, content_type = "text/plain")
+        (status = 401, body = ApiErrorBody),
+        (status = 403, body = ApiErrorBody),
+        (status = 500, body = ApiErrorBody),
+        (status = 503, description = "The hub has no administrator yet: `setup_required`", body = ApiErrorBody)
     )
 )]
 async fn admin_sessions(
@@ -2376,20 +2718,38 @@ async fn admin_sessions(
     responses(
         (status = 200, body = String, content_type = "text/plain; charset=utf-8",
             headers(("content-disposition" = String))),
-        (status = 401, body = String, content_type = "text/plain"),
-        (status = 403, body = String, content_type = "text/plain"),
-        (status = 404, body = String, content_type = "text/plain")
+        (status = 401, body = ApiErrorBody),
+        (status = 403, body = ApiErrorBody),
+        (status = 404, body = ApiErrorBody),
+        (status = 400, description = "A path segment or query parameter is not the shape this route takes", body = ApiErrorBody),
+        (status = 500, body = ApiErrorBody),
+        (status = 503, description = "The transcoder running this session is not answering, or the hub has no administrator yet (`setup_required`)", body = ApiErrorBody)
     )
 )]
 async fn admin_session_log(
     State(state): State<AppState>,
-    Path(id): Path<String>,
+    ApiPath(id): ApiPath<String>,
 ) -> Result<Response, ApiError> {
     let body = state
         .sessions
         .collect_logs(&state.registry, &id)
         .await
-        .map_err(|e| (StatusCode::NOT_FOUND, format!("{e:#}")))?;
+        .map_err(
+            |e| match e.downcast_ref::<crate::sessions::SatelliteSilent>() {
+                // A wedged transcoder is not an absent log. This is the route an
+                // operator reaches for when a session is misbehaving, and telling
+                // them the logs do not exist — when the box holding them simply
+                // is not answering — sends them to look somewhere else.
+                // `log`, so the transport chain the producer attached is kept —
+                // the sentence is the type's own and says nothing about which
+                // link failed, which is the next thing an operator asks.
+                Some(silent) => {
+                    let message = silent.to_string();
+                    ApiError::log(ErrorCode::SatelliteUnreachable, message, e)
+                }
+                None => refusal_or_internal(ErrorCode::NotFound, "no logs for that session", e),
+            },
+        )?;
     Ok(log_attachment(format!("kahawai-session-{id}.log"), body))
 }
 
@@ -2401,26 +2761,24 @@ async fn admin_session_log(
     responses(
         (status = 200, body = String, content_type = "text/plain; charset=utf-8",
             headers(("content-disposition" = String))),
-        (status = 401, body = String, content_type = "text/plain"),
-        (status = 403, body = String, content_type = "text/plain"),
-        (status = 404, body = String, content_type = "text/plain"),
-        (status = 500, body = String, content_type = "text/plain")
+        (status = 401, body = ApiErrorBody),
+        (status = 403, body = ApiErrorBody),
+        (status = 404, body = ApiErrorBody),
+        (status = 500, body = ApiErrorBody),
+        (status = 400, description = "A path segment or query parameter is not the shape this route takes", body = ApiErrorBody),
+        (status = 503, description = "The hub has no administrator yet: `setup_required`", body = ApiErrorBody)
     )
 )]
 async fn admin_item_log(
     State(state): State<AppState>,
-    Path(id): Path<String>,
+    ApiPath(id): ApiPath<String>,
 ) -> Result<Response, ApiError> {
     let data_dir = state
         .sessions
         .data_dir()
-        .ok_or_else(|| (StatusCode::NOT_FOUND, "no data dir".to_string()))?;
-    let path = crate::sessionlog::newest_for_item(data_dir, &id).ok_or_else(|| {
-        (
-            StatusCode::NOT_FOUND,
-            "no session logs for this item".to_string(),
-        )
-    })?;
+        .ok_or_else(|| ApiError::new(ErrorCode::NotFound, "no data dir"))?;
+    let path = crate::sessionlog::newest_for_item(data_dir, &id)
+        .ok_or_else(|| ApiError::new(ErrorCode::NotFound, "no session logs for this item"))?;
     let body = std::fs::read_to_string(&path).map_err(internal)?;
     Ok(log_attachment(format!("kahawai-item-{id}.log"), body))
 }
@@ -2448,14 +2806,16 @@ fn log_attachment(filename: String, body: String) -> Response {
     params(("id" = String, Path)),
     responses(
         (status = 204, description = "Session ended"),
-        (status = 401, body = String, content_type = "text/plain"),
-        (status = 403, body = String, content_type = "text/plain"),
-        (status = 410, body = String, content_type = "text/plain")
+        (status = 401, body = ApiErrorBody),
+        (status = 403, body = ApiErrorBody),
+        (status = 404, body = ApiErrorBody),
+        (status = 400, description = "A path segment or query parameter is not the shape this route takes", body = ApiErrorBody),
+        (status = 503, description = "The hub has no administrator yet: `setup_required`", body = ApiErrorBody)
     )
 )]
 async fn admin_end_session(
     State(state): State<AppState>,
-    Path(id): Path<String>,
+    ApiPath(id): ApiPath<String>,
 ) -> Result<StatusCode, ApiError> {
     if state.sessions.end(&id) {
         Ok(StatusCode::NO_CONTENT)
@@ -2483,16 +2843,18 @@ async fn setup_bootstrap(State(state): State<SetupState>) -> Json<BootstrapRespo
     request_body = SetupRequest,
     responses(
         (status = 204, description = "Initial admin created"),
-        (status = 400, body = String, content_type = "text/plain"),
-        (status = 403, body = String, content_type = "text/plain"),
-        (status = 409, body = String, content_type = "text/plain"),
-        (status = 500, body = String, content_type = "text/plain")
+        (status = 400, body = ApiErrorBody),
+        (status = 403, body = ApiErrorBody),
+        (status = 409, body = ApiErrorBody),
+        (status = 500, body = ApiErrorBody),
+        (status = 415, description = "The body needs Content-Type: application/json", body = ApiErrorBody),
+        (status = 413, description = "The body is past the hub's buffer limit", body = ApiErrorBody)
     )
 )]
 async fn setup(
     State(state): State<SetupState>,
     headers: axum::http::HeaderMap,
-    Json(body): Json<SetupRequest>,
+    ApiJson(body): ApiJson<SetupRequest>,
 ) -> Result<StatusCode, ApiError> {
     let host = headers
         .get(axum::http::header::HOST)
@@ -2512,13 +2874,16 @@ async fn setup(
                 .is_ok_and(|ip| ip.is_loopback())
     };
     if !matches!((&host, &origin), (Some(h), Some(o)) if h == o && local_host(h)) {
-        return Err((
-            StatusCode::FORBIDDEN,
-            "setup requires its local same-origin page".into(),
+        return Err(ApiError::new(
+            ErrorCode::Forbidden,
+            "setup requires its local same-origin page",
         ));
     }
     if !state.auth.setup_required() {
-        return Err((StatusCode::CONFLICT, "setup already completed".into()));
+        return Err(ApiError::new(
+            ErrorCode::SetupComplete,
+            "setup already completed",
+        ));
     }
     state
         .auth
@@ -2526,17 +2891,18 @@ async fn setup(
         .await
         .map_err(|e| match e {
             error @ CompleteSetupError::InvalidInput(_) => {
-                (StatusCode::BAD_REQUEST, error.to_string())
+                ApiError::new(ErrorCode::BadRequest, error.to_string())
             }
             error @ CompleteSetupError::AlreadyCompleted => {
-                (StatusCode::CONFLICT, error.to_string())
+                // The same condition as the pre-check above, so the same
+                // code: this is the arm two concurrent setups race into, and a
+                // client branching on `setup_complete` must not depend on
+                // which one it was.
+                ApiError::new(ErrorCode::SetupComplete, error.to_string())
             }
             CompleteSetupError::Internal(source) => {
                 tracing::error!(error = format!("{source:#}"), "initial-admin setup failed");
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "initial-admin setup failed".into(),
-                )
+                ApiError::new(ErrorCode::Internal, "initial-admin setup failed")
             }
         })?;
     Ok(StatusCode::NO_CONTENT)
@@ -2634,9 +3000,9 @@ fn browser_cookie_secure(state: &AppState, meta: &AuthRequestMeta) -> Result<boo
         return Ok(request_browser_origin(state, meta).is_some_and(|origin| origin.secure()));
     };
     let forbidden = || {
-        (
-            StatusCode::FORBIDDEN,
-            "browser authentication requires the canonical Origin".into(),
+        ApiError::new(
+            ErrorCode::Forbidden,
+            "browser authentication requires the canonical Origin",
         )
     };
     let presented = meta
@@ -2723,22 +3089,23 @@ const THROTTLE_IP_AFTER: u32 = 20;
     params(("Origin" = Option<String>, Header, description = "Required for browser mode when hub.public_url is configured; must match it exactly")),
     responses(
         (status = 200, body = AuthSuccessResponse, headers(("set-cookie" = String, description = "Browser clients receive refresh and media cookies"))),
-        (status = 400, body = String, content_type = "text/plain"),
-        (status = 401, body = String, content_type = "text/plain"),
-        (status = 403, body = String, content_type = "text/plain"),
-        (status = 429, body = String, content_type = "text/plain"),
-        (status = 503, body = String, content_type = "text/plain")
+        (status = 400, body = ApiErrorBody),
+        (status = 401, body = ApiErrorBody),
+        (status = 403, body = ApiErrorBody),
+        (status = 429, body = ApiErrorBody, headers(("retry-after" = String, description = "Seconds until the lockout clears"))),
+        (status = 503, body = ApiErrorBody),
+        (status = 415, description = "The body needs Content-Type: application/json", body = ApiErrorBody),
+        (status = 413, description = "The body is past the hub's buffer limit", body = ApiErrorBody)
     )
 )]
 async fn login(
     State(state): State<AppState>,
     ClientIp(ip): ClientIp,
     meta: AuthRequestMeta,
-    body: Result<Json<LoginRequest>, axum::extract::rejection::JsonRejection>,
+    ApiJson(body): ApiJson<LoginRequest>,
 ) -> Result<Response, ApiError> {
-    let Json(body) = body.map_err(|error| (StatusCode::BAD_REQUEST, error.body_text()))?;
     if state.auth.setup_required() {
-        return Err((StatusCode::SERVICE_UNAVAILABLE, "setup required".into()));
+        return Err(ApiError::new(ErrorCode::SetupRequired, "setup required"));
     }
     let secure = match body.client {
         AuthClient::Browser => browser_cookie_secure(&state, &meta)?,
@@ -2753,10 +3120,14 @@ async fn login(
     });
     if let Some(wait) = locked {
         tracing::warn!(username = %body.username, ip = ?ip, "login throttled");
-        return Err((
-            StatusCode::TOO_MANY_REQUESTS,
+        // `Retry-After` as well as the sentence: a lockout runs from 30 s to
+        // fifteen minutes, and until this the only statement of which was in
+        // `message` — prose the contract tells clients not to read.
+        return Err(ApiError::new(
+            ErrorCode::LoginThrottled,
             format!("too many attempts; retry in {}s", wait.as_secs().max(1)),
-        ));
+        )
+        .retry_after(wait.as_secs().max(1)));
     }
     match state.auth.login(&body.username, &body.password).await {
         Ok(tokens) => {
@@ -2772,7 +3143,10 @@ async fn login(
                 state.auth.throttle.fail(key, THROTTLE_IP_AFTER);
             }
             tracing::warn!(username = %body.username, ip = ?ip, locked = ?lock, "login failed");
-            Err((StatusCode::UNAUTHORIZED, "invalid credentials".into()))
+            Err(ApiError::new(
+                ErrorCode::InvalidCredentials,
+                "invalid credentials",
+            ))
         }
     }
 }
@@ -2783,37 +3157,42 @@ async fn login(
     params(("Origin" = Option<String>, Header, description = "Required for browser mode when hub.public_url is configured; must match it exactly")),
     responses(
         (status = 200, body = AuthSuccessResponse, headers(("set-cookie" = String, description = "Rotated browser cookies"))),
-        (status = 400, body = String, content_type = "text/plain"),
-        (status = 401, body = String, content_type = "text/plain"),
-        (status = 403, body = String, content_type = "text/plain"),
-        (status = 500, body = String, content_type = "text/plain")
+        (status = 400, body = ApiErrorBody),
+        (status = 401, body = ApiErrorBody),
+        (status = 403, body = ApiErrorBody),
+        (status = 500, body = ApiErrorBody),
+        (status = 415, description = "The body needs Content-Type: application/json", body = ApiErrorBody),
+        (status = 413, description = "The body is past the hub's buffer limit", body = ApiErrorBody)
     )
 )]
 async fn refresh(
     State(state): State<AppState>,
     meta: AuthRequestMeta,
-    body: Result<Json<RefreshRequest>, axum::extract::rejection::JsonRejection>,
+    ApiJson(body): ApiJson<RefreshRequest>,
 ) -> Result<Response, ApiError> {
-    let Json(body) = body.map_err(|error| (StatusCode::BAD_REQUEST, error.body_text()))?;
     let (token, secure) = match body.client {
         AuthClient::Api => (
             body.refresh_token
                 .as_deref()
                 .filter(|token| !token.is_empty())
-                .ok_or((StatusCode::BAD_REQUEST, "refresh_token required".into()))?,
+                .ok_or(ApiError::new(
+                    ErrorCode::BadRequest,
+                    "refresh_token required",
+                ))?,
             None,
         ),
         AuthClient::Browser => {
             if body.refresh_token.is_some() {
-                return Err((
-                    StatusCode::BAD_REQUEST,
-                    "browser refresh_token must be omitted".into(),
+                return Err(ApiError::new(
+                    ErrorCode::BadRequest,
+                    "browser refresh_token must be omitted",
                 ));
             }
             let secure = browser_cookie_secure(&state, &meta)?;
             let Some(token) = cookie(&meta.headers, "kahawai_refresh") else {
                 let mut response =
-                    (StatusCode::UNAUTHORIZED, "invalid refresh token").into_response();
+                    ApiError::new(ErrorCode::InvalidRefresh, "invalid refresh token")
+                        .into_response();
                 clear_auth_cookies(&mut response, secure);
                 return Ok(response);
             };
@@ -2823,13 +3202,15 @@ async fn refresh(
     match state.auth.refresh(token).await {
         Ok(tokens) => Ok(token_response(tokens, body.client, secure.unwrap_or(false))),
         Err(crate::auth::RefreshError::Invalid) if body.client == AuthClient::Browser => {
-            let mut response = (StatusCode::UNAUTHORIZED, "invalid refresh token").into_response();
+            let mut response =
+                ApiError::new(ErrorCode::InvalidRefresh, "invalid refresh token").into_response();
             clear_auth_cookies(&mut response, secure.unwrap_or(false));
             Ok(response)
         }
-        Err(crate::auth::RefreshError::Invalid) => {
-            Err((StatusCode::UNAUTHORIZED, "invalid refresh token".into()))
-        }
+        Err(crate::auth::RefreshError::Invalid) => Err(ApiError::new(
+            ErrorCode::InvalidRefresh,
+            "invalid refresh token",
+        )),
         Err(crate::auth::RefreshError::Internal(error)) => Err(internal(error)),
     }
 }
@@ -2841,37 +3222,44 @@ async fn refresh(
     params(("Origin" = Option<String>, Header, description = "Required for browser mode when hub.public_url is configured; must match it exactly")),
     responses(
         (status = 204, description = "Refresh token revoked", headers(("set-cookie" = String, description = "Browser cookies cleared"))),
-        (status = 400, body = String, content_type = "text/plain"),
-        (status = 401, body = String, content_type = "text/plain"),
-        (status = 403, body = String, content_type = "text/plain"),
-        (status = 500, body = String, content_type = "text/plain")
+        (status = 400, body = ApiErrorBody),
+        (status = 401, body = ApiErrorBody),
+        (status = 403, body = ApiErrorBody),
+        (status = 500, body = ApiErrorBody),
+        (status = 415, description = "The body needs Content-Type: application/json", body = ApiErrorBody),
+        (status = 413, description = "The body is past the hub's buffer limit", body = ApiErrorBody),
+        (status = 503, description = "The hub has no administrator yet: `setup_required`", body = ApiErrorBody)
     )
 )]
 async fn logout(
     State(state): State<AppState>,
     axum::Extension(claims): axum::Extension<crate::auth::Claims>,
     meta: AuthRequestMeta,
-    body: Result<Json<LogoutRequest>, axum::extract::rejection::JsonRejection>,
+    ApiJson(body): ApiJson<LogoutRequest>,
 ) -> Result<Response, ApiError> {
-    let Json(body) = body.map_err(|error| (StatusCode::BAD_REQUEST, error.body_text()))?;
     let (token, secure) = match body.client {
         AuthClient::Api => (
             body.refresh_token
                 .as_deref()
                 .filter(|token| !token.is_empty())
-                .ok_or((StatusCode::BAD_REQUEST, "refresh_token required".into()))?,
+                .ok_or(ApiError::new(
+                    ErrorCode::BadRequest,
+                    "refresh_token required",
+                ))?,
             None,
         ),
         AuthClient::Browser => {
             if body.refresh_token.is_some() {
-                return Err((
-                    StatusCode::BAD_REQUEST,
-                    "browser refresh_token must be omitted".into(),
+                return Err(ApiError::new(
+                    ErrorCode::BadRequest,
+                    "browser refresh_token must be omitted",
                 ));
             }
             let secure = browser_cookie_secure(&state, &meta)?;
-            let token = cookie(&meta.headers, "kahawai_refresh")
-                .ok_or((StatusCode::UNAUTHORIZED, "refresh cookie required".into()))?;
+            let token = cookie(&meta.headers, "kahawai_refresh").ok_or(ApiError::new(
+                ErrorCode::Unauthenticated,
+                "refresh cookie required",
+            ))?;
             (token, Some(secure))
         }
     };
@@ -2923,7 +3311,8 @@ struct StartSessionRequest {
     security(("bearer_auth" = []), ("media_token" = [])),
     responses(
         (status = 200, body = String, content_type = "text/event-stream", headers(("x-accel-buffering" = String))),
-        (status = 401, body = String, content_type = "text/plain")
+        (status = 401, body = ApiErrorBody),
+        (status = 503, description = "The hub has no administrator yet: `setup_required`", body = ApiErrorBody)
     )
 )]
 async fn events(State(state): State<AppState>) -> impl axum::response::IntoResponse {
@@ -2951,8 +3340,9 @@ async fn events(State(state): State<AppState>) -> impl axum::response::IntoRespo
     security(("bearer_auth" = [])),
     responses(
         (status = 200, body = PreferencesResponse),
-        (status = 401, body = String, content_type = "text/plain"),
-        (status = 500, body = String, content_type = "text/plain")
+        (status = 401, body = ApiErrorBody),
+        (status = 500, body = ApiErrorBody),
+        (status = 503, description = "The hub has no administrator yet: `setup_required`", body = ApiErrorBody)
     )
 )]
 async fn get_prefs(
@@ -2990,18 +3380,21 @@ struct PutPrefRequest {
     request_body = PutPrefRequest,
     responses(
         (status = 200, body = OkResponse),
-        (status = 400, body = String, content_type = "text/plain"),
-        (status = 401, body = String, content_type = "text/plain"),
-        (status = 500, body = String, content_type = "text/plain")
+        (status = 400, body = ApiErrorBody),
+        (status = 401, body = ApiErrorBody),
+        (status = 500, body = ApiErrorBody),
+        (status = 415, description = "The body needs Content-Type: application/json", body = ApiErrorBody),
+        (status = 413, description = "The body is past the hub's buffer limit", body = ApiErrorBody),
+        (status = 503, description = "The hub has no administrator yet: `setup_required`", body = ApiErrorBody)
     )
 )]
 async fn put_pref(
     State(state): State<AppState>,
     axum::Extension(claims): axum::Extension<crate::auth::Claims>,
-    Json(body): Json<PutPrefRequest>,
+    ApiJson(body): ApiJson<PutPrefRequest>,
 ) -> Result<Json<OkResponse>, ApiError> {
     if body.key.len() > 64 || body.value.len() > 256 || body.scope.len() > 64 {
-        return Err((StatusCode::BAD_REQUEST, "preference too long".into()));
+        return Err(ApiError::new(ErrorCode::BadRequest, "preference too long"));
     }
     if body.value.is_empty() {
         sqlx::query("DELETE FROM user_prefs WHERE user_id = ? AND scope = ? AND key = ?")
@@ -3032,12 +3425,68 @@ async fn put_pref(
 /// forever; an absent mediahost is about the moment, and a client is meant
 /// to stand by and retry rather than give up.
 fn session_refusal(e: anyhow::Error) -> ApiError {
-    let status = if e.downcast_ref::<crate::sessions::SourceOffline>().is_some() {
-        StatusCode::SERVICE_UNAVAILABLE
+    // The caller's own input, before anything about the item is considered: a
+    // seek that names a subtitle track this item does not have. Everything
+    // else here is a verdict on the item, and folding this in with them told a
+    // viewer changing subtitles that a film which was playing a second earlier
+    // could not be played.
+    if let Some(missing) = e.downcast_ref::<crate::sessions::NoSuchTrack>() {
+        return ApiError::new(ErrorCode::BadRequest, missing.to_string());
+    }
+    let code = if e.downcast_ref::<crate::sessions::SourceOffline>().is_some() {
+        ErrorCode::SourceOffline
+    } else if e.downcast_ref::<crate::sessions::SessionCap>().is_some() {
+        // Not `Unplayable`, which is what every other refusal here means and
+        // what this used to arrive as. The cap clears the moment a session
+        // ends, and a client playing a queue — the album player holds two
+        // sessions, so a film beside it is enough to reach the limit — has to
+        // be able to tell "wait" from "never". Both were 409 with the
+        // difference in the prose, and ours guessed at three more tries.
+        ErrorCode::SessionCap
     } else {
-        StatusCode::CONFLICT
+        ErrorCode::Unplayable
     };
-    (status, format!("{e:#}"))
+    // The sentence comes from the CODE, not from the error, and this is the
+    // route that decides it: `Sessions::start` fails with the hub's scratch
+    // layout, the worker's executable path and four lines of GStreamer stderr
+    // baked into its outermost layer. All of that goes to the log.
+    //
+    // `SourceOffline` and `SessionCap` are types with sentences of their own,
+    // but they are not read from here either — an `anyhow` chain can carry
+    // them at any depth, and one of them is already wrapped with the transport
+    // prose above it. Reading the code and writing the sentence is the only
+    // spelling that cannot be undone from a distance.
+    let message = match code {
+        ErrorCode::SourceOffline => "the machine holding this file is not connected right now",
+        // It has to name the action, because the screen it lands on offers
+        // none: the player prints this sentence and a way home, and standing
+        // by instead would claim the machine holding the file is unreachable.
+        ErrorCode::SessionCap => {
+            "this account is already watching as much as it may at once; close one first"
+        }
+        _ => "this item cannot be played",
+    };
+    // `new` for the two that are EXPECTED and polled — a player standing by
+    // and an album queue both re-ask every five seconds for as long as the
+    // condition lasts, so one waiting viewer would write around 720 chained
+    // warn lines an hour into the log this change exists to make useful. Both
+    // are self-clearing states with authored messages and nothing to diagnose.
+    // `Unplayable` keeps its chain: it is asked once, and its cause is the
+    // whole reason anybody reads this log.
+    match code {
+        ErrorCode::Unplayable => ApiError::log(code, message, e),
+        // `debug`. A polled outage would write around 720 warn lines an hour,
+        // and dropping the cause entirely left a refused seek recorded with
+        // its position and no reason at all. Below the default filter, so the
+        // standing record of a host going away is the registry's own
+        // `satellite disconnected` at info; this is the per-request detail for
+        // somebody who has turned debug on. The seek's own warn carries the
+        // CODE either way.
+        _ => {
+            tracing::debug!(code = ?code, error = format!("{e:#}"), "playback refused");
+            ApiError::new(code, message)
+        }
+    }
 }
 
 #[utoipa::path(
@@ -3046,17 +3495,21 @@ fn session_refusal(e: anyhow::Error) -> ApiError {
     request_body = StartSessionRequest,
     responses(
         (status = 201, body = StartSessionResponse),
-        (status = 401, body = String, content_type = "text/plain"),
-        (status = 404, body = String, content_type = "text/plain"),
-        (status = 409, body = String, content_type = "text/plain"),
-        (status = 500, body = String, content_type = "text/plain"),
-        (status = 503, body = String, content_type = "text/plain")
+        (status = 400, description = "The request body is not the JSON this route takes", body = ApiErrorBody),
+        (status = 401, body = ApiErrorBody),
+        (status = 404, body = ApiErrorBody),
+        (status = 409, description = "Refused about the ITEM, and forever: `unplayable`", body = ApiErrorBody),
+        (status = 429, description = "This account is at its stream cap; clears when one ends: `session_cap`", body = ApiErrorBody),
+        (status = 500, body = ApiErrorBody),
+        (status = 503, description = "The mediahost holding the bytes is away: `source_offline`, or the hub has no administrator yet (`setup_required`)", body = ApiErrorBody),
+        (status = 415, description = "The body needs Content-Type: application/json", body = ApiErrorBody),
+        (status = 413, description = "The body is past the hub's buffer limit", body = ApiErrorBody)
     )
 )]
 async fn start_session(
     State(state): State<AppState>,
     axum::Extension(claims): axum::Extension<crate::auth::Claims>,
-    Json(body): Json<StartSessionRequest>,
+    ApiJson(body): ApiJson<StartSessionRequest>,
 ) -> Result<(StatusCode, Json<StartSessionResponse>), ApiError> {
     // HUB-10. Here rather than inside `Sessions::start`: authorization is
     // the API edge's job, and the session-scoped routes that follow are
@@ -3152,16 +3605,19 @@ struct SeekRequest {
     request_body = SeekRequest,
     responses(
         (status = 200, body = SeekResponse),
-        (status = 401, body = String, content_type = "text/plain"),
-        (status = 409, body = String, content_type = "text/plain"),
-        (status = 410, body = String, content_type = "text/plain"),
-        (status = 503, body = String, content_type = "text/plain")
+        (status = 400, description = "The request body is not the JSON this route takes", body = ApiErrorBody),
+        (status = 401, body = ApiErrorBody),
+        (status = 409, body = ApiErrorBody),
+        (status = 404, body = ApiErrorBody),
+        (status = 503, body = ApiErrorBody, description = "The hub has no administrator yet: `setup_required`"),
+        (status = 415, description = "The body needs Content-Type: application/json", body = ApiErrorBody),
+        (status = 413, description = "The body is past the hub's buffer limit", body = ApiErrorBody)
     )
 )]
 async fn seek_session(
     State(state): State<AppState>,
-    Path(id): Path<String>,
-    Json(body): Json<SeekRequest>,
+    ApiPath(id): ApiPath<String>,
+    ApiJson(body): ApiJson<SeekRequest>,
 ) -> Result<Json<SeekResponse>, ApiError> {
     // Before the seek, not inside it: `Sessions::seek` reports a missing
     // session as an ordinary error, which lands as the same 409 a real
@@ -3183,12 +3639,20 @@ async fn seek_session(
         )
         .await
         .map_err(|e| {
-            // Every failed seek tells its story here, not just the ones
-            // the fallback retried — a 409 must never be untraceable.
+            // Every failed seek tells its story here, not just the ones the
+            // fallback retried — a refusal must never be untraceable. This
+            // line carries what only the request knows; the chain is
+            // `session_refusal`'s, at warn for a dead item and at debug for
+            // the two self-clearing states, whose causes are polled. Logging
+            // `{e:#}` here as well wrote every failed seek out twice.
+            // The CODE at warn, the chain at debug (inside `session_refusal`).
+            // Without it a refused seek logged a position and nothing else,
+            // which is the untraceable refusal this comment forbids.
+            let refusal = session_refusal(e);
             tracing::warn!(session = %id, position_ms = body.position_ms,
                 audio_track = ?body.audio_track, video_track = ?body.video_track,
-                error = format!("{e:#}"), "seek failed");
-            session_refusal(e)
+                code = ?refusal.code(), "seek failed");
+            refusal
         })?;
     // A track switch re-planned: hand back the verdicts of what plays
     // NOW so the overlay never lies about the current streams.
@@ -3218,13 +3682,15 @@ async fn seek_session(
     params(("id" = String, Path)),
     responses(
         (status = 204, description = "Session ended"),
-        (status = 401, body = String, content_type = "text/plain"),
-        (status = 410, body = String, content_type = "text/plain")
+        (status = 401, body = ApiErrorBody),
+        (status = 404, body = ApiErrorBody),
+        (status = 400, description = "A path segment or query parameter is not the shape this route takes", body = ApiErrorBody),
+        (status = 503, description = "The hub has no administrator yet: `setup_required`", body = ApiErrorBody)
     )
 )]
 async fn end_session(
     State(state): State<AppState>,
-    Path(id): Path<String>,
+    ApiPath(id): ApiPath<String>,
 ) -> Result<StatusCode, ApiError> {
     if state.sessions.end(&id) {
         Ok(StatusCode::NO_CONTENT)
@@ -3298,21 +3764,26 @@ fn parse_range(header: Option<&str>, size: u64) -> Result<Option<(u64, u64)>, ()
     responses(
         (status = 200, body = Vec<u8>, content_type = "application/octet-stream", headers(("accept-ranges" = String), ("content-length" = u64))),
         (status = 206, body = Vec<u8>, content_type = "application/octet-stream", headers(("accept-ranges" = String), ("content-length" = u64), ("content-range" = String))),
-        (status = 401, body = String, content_type = "text/plain"),
-        (status = 409, body = String, content_type = "text/plain"),
-        (status = 410, body = String, content_type = "text/plain"),
-        (status = 416, description = "Invalid or unsatisfiable byte range", headers(("content-range" = String)))
+        (status = 401, body = ApiErrorBody),
+        (status = 409, body = ApiErrorBody),
+        (status = 404, body = ApiErrorBody),
+        (status = 416, description = "Invalid or unsatisfiable byte range", headers(("content-range" = String))),
+        (status = 400, description = "A path segment or query parameter is not the shape this route takes", body = ApiErrorBody),
+        (status = 503, description = "The hub has no administrator yet: `setup_required`", body = ApiErrorBody)
     )
 )]
 async fn stream_session(
     State(state): State<AppState>,
-    Path(id): Path<String>,
+    ApiPath(id): ApiPath<String>,
     headers: axum::http::HeaderMap,
 ) -> Result<Response, ApiError> {
     let session = state.sessions.get(&id).ok_or_else(session_gone)?;
     session.touch();
     let crate::sessions::Mode::Direct { lease } = &session.mode else {
-        return Err((StatusCode::CONFLICT, "not a direct-play session".into()));
+        return Err(ApiError::new(
+            ErrorCode::Conflict,
+            "not a direct-play session",
+        ));
     };
     let range = headers
         .get(axum::http::header::RANGE)
@@ -3358,8 +3829,9 @@ async fn stream_session(
     security(("bearer_auth" = [])),
     responses(
         (status = 200, body = CollectionsResponse),
-        (status = 401, body = String, content_type = "text/plain"),
-        (status = 500, body = String, content_type = "text/plain")
+        (status = 401, body = ApiErrorBody),
+        (status = 500, body = ApiErrorBody),
+        (status = 503, description = "The hub has no administrator yet: `setup_required`", body = ApiErrorBody)
     )
 )]
 async fn list_collections(
@@ -3414,15 +3886,20 @@ struct ArtworkQuery {
     params(("id" = String, Path), ArtworkQuery),
     responses(
         (status = 200, content((Vec<u8> = "image/jpeg"), (Vec<u8> = "image/png"), (Vec<u8> = "image/webp")), headers(("cache-control" = String))),
-        (status = 401, body = String, content_type = "text/plain"),
-        (status = 404, body = String, content_type = "text/plain", headers(("cache-control" = String))),
-        (status = 500, body = String, content_type = "text/plain")
+        (status = 401, body = ApiErrorBody),
+        // Cacheable, unlike every other refusal — see the handler. The body is
+        // an ApiErrorBody like the rest, including the grant gate's 404 on this
+        // same operation, which a client would otherwise have to guess at.
+        (status = 404, body = ApiErrorBody, headers(("cache-control" = String))),
+        (status = 500, body = ApiErrorBody),
+        (status = 400, description = "A path segment or query parameter is not the shape this route takes", body = ApiErrorBody),
+        (status = 503, description = "The hub has no administrator yet: `setup_required`", body = ApiErrorBody)
     )
 )]
 async fn item_artwork(
     State(state): State<AppState>,
-    Path(id): Path<String>,
-    Query(q): Query<ArtworkQuery>,
+    ApiPath(id): ApiPath<String>,
+    ApiQuery(q): ApiQuery<ArtworkQuery>,
 ) -> Result<Response, ApiError> {
     // The detail goes to the log, not to the caller: what fails here is
     // usually a fetch from a metadata provider, and its error names the
@@ -3436,10 +3913,7 @@ async fn item_artwork(
         Ok(found) => found,
         Err(e) => {
             tracing::warn!(item = %id, error = %e, "artwork could not be served");
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "artwork unavailable".into(),
-            ));
+            return Err(ApiError::new(ErrorCode::Internal, "artwork unavailable"));
         }
     };
     match found {
@@ -3482,7 +3956,10 @@ async fn item_artwork(
             } else {
                 [(axum::http::header::CACHE_CONTROL, "private, max-age=30")]
             },
-            "no artwork",
+            axum::Json(ApiErrorBody {
+                code: ErrorCode::NotFound,
+                message: "no artwork".into(),
+            }),
         )
             .into_response()),
     }
@@ -3508,17 +3985,18 @@ struct VttQuery {
     ),
     responses(
         (status = 200, content((String = "text/vtt; charset=utf-8"), (String = "text/x-ssa; charset=utf-8"), (Vec<u8> = "application/x-ndjson; charset=utf-8")), headers(("cache-control" = String))),
-        (status = 400, body = String, content_type = "text/plain"),
-        (status = 401, body = String, content_type = "text/plain"),
-        (status = 404, body = String, content_type = "text/plain"),
-        (status = 422, body = String, content_type = "text/plain"),
-        (status = 500, body = String, content_type = "text/plain")
+        (status = 400, body = ApiErrorBody),
+        (status = 401, body = ApiErrorBody),
+        (status = 404, body = ApiErrorBody),
+        (status = 422, body = ApiErrorBody),
+        (status = 500, body = ApiErrorBody),
+        (status = 503, description = "The hub has no administrator yet: `setup_required`", body = ApiErrorBody)
     )
 )]
 async fn item_subtitle_file(
     State(state): State<AppState>,
-    Path((id, file)): Path<(String, String)>,
-    Query(q): Query<VttQuery>,
+    ApiPath((id, file)): ApiPath<(String, String)>,
+    ApiQuery(q): ApiQuery<VttQuery>,
 ) -> Result<Response, ApiError> {
     // The public keyspace is TRACK IDS ({id}.vtt / {id}.ass); the
     // resolver maps them onto the internal cache/pipeline notation.
@@ -3531,13 +4009,13 @@ async fn item_subtitle_file(
     // Firefox + a burn track's phantom .vtt request).
     let refuse_image = |track: &crate::tracks::Track| -> Result<(), ApiError> {
         if crate::tracks::is_image_format(&track.format) {
-            return Err(ApiError::from((
-                StatusCode::UNPROCESSABLE_ENTITY,
+            return Err(ApiError::new(
+                ErrorCode::UnsupportedTrack,
                 format!(
                     "track {} is {} (image): no text form — use overlay or burn delivery",
                     track.id, track.format
                 ),
-            )));
+            ));
         }
         Ok(())
     };
@@ -3546,19 +4024,25 @@ async fn item_subtitle_file(
     // complete before the first byte goes out, so it needs no session
     // and no tail-following — the client fetches it once, like a .vtt.
     if let Some(raw) = file.strip_suffix(".jsonl") {
-        let track_id = resolve(raw)
-            .ok_or_else(|| ApiError::from((StatusCode::BAD_REQUEST, "bad track id".to_string())))?;
+        let track_id =
+            resolve(raw).ok_or_else(|| ApiError::new(ErrorCode::BadRequest, "bad track id"))?;
         let track = crate::tracks::get_for_item(state.registry.db(), &id, track_id)
             .await
             .map_err(internal)?
             .filter(|t| t.origin == "raster")
-            .ok_or((
-                StatusCode::NOT_FOUND,
-                "no such rasterised track".to_string(),
+            .ok_or(ApiError::new(
+                ErrorCode::NotFound,
+                "no such rasterised track",
             ))?;
         let bytes = tokio::fs::read(state.subtitles.raster_path(track.id))
             .await
-            .map_err(|e| (StatusCode::NOT_FOUND, format!("raster body missing: {e}")))?;
+            .map_err(|e| {
+                ApiError::log(
+                    ErrorCode::NotFound,
+                    "that rasterised track has no body on disk",
+                    anyhow::anyhow!(e),
+                )
+            })?;
         return Ok((
             [(
                 axum::http::header::CONTENT_TYPE,
@@ -3569,13 +4053,13 @@ async fn item_subtitle_file(
             .into_response());
     }
     if let Some(raw) = file.strip_suffix(".ass") {
-        let track_id = resolve(raw)
-            .ok_or_else(|| ApiError::from((StatusCode::BAD_REQUEST, "bad track id".to_string())))?;
+        let track_id =
+            resolve(raw).ok_or_else(|| ApiError::new(ErrorCode::BadRequest, "bad track id"))?;
         let track = state
             .subtitles
             .internal_key(&state.registry, &id, track_id)
             .await
-            .map_err(|e| (StatusCode::NOT_FOUND, format!("{e:#}")))?;
+            .map_err(|e| refusal_or_internal(ErrorCode::NotFound, "no such subtitle track", e))?;
         refuse_image(&track)?;
         let key = track.internal_key();
         let body = state
@@ -3602,13 +4086,13 @@ async fn item_subtitle_file(
         });
     }
     let raw = file.strip_suffix(".vtt").unwrap_or(&file);
-    let track_id = resolve(raw)
-        .ok_or_else(|| ApiError::from((StatusCode::BAD_REQUEST, "bad track id".to_string())))?;
+    let track_id =
+        resolve(raw).ok_or_else(|| ApiError::new(ErrorCode::BadRequest, "bad track id"))?;
     let track = state
         .subtitles
         .internal_key(&state.registry, &id, track_id)
         .await
-        .map_err(|e| (StatusCode::NOT_FOUND, format!("{e:#}")))?;
+        .map_err(|e| refusal_or_internal(ErrorCode::NotFound, "no such subtitle track", e))?;
     refuse_image(&track)?;
     let vtt = state
         .subtitles
@@ -3637,14 +4121,16 @@ async fn item_subtitle_file(
     params(("id" = String, Path)),
     responses(
         (status = 200, body = FontsResponse),
-        (status = 401, body = String, content_type = "text/plain"),
-        (status = 404, body = String, content_type = "text/plain"),
-        (status = 500, body = String, content_type = "text/plain")
+        (status = 401, body = ApiErrorBody),
+        (status = 404, body = ApiErrorBody),
+        (status = 500, body = ApiErrorBody),
+        (status = 400, description = "A path segment or query parameter is not the shape this route takes", body = ApiErrorBody),
+        (status = 503, description = "The hub has no administrator yet: `setup_required`", body = ApiErrorBody)
     )
 )]
 async fn item_fonts(
     State(state): State<AppState>,
-    Path(id): Path<String>,
+    ApiPath(id): ApiPath<String>,
 ) -> Result<Json<FontsResponse>, ApiError> {
     let fonts = state
         .subtitles
@@ -3666,14 +4152,16 @@ async fn item_fonts(
     ),
     responses(
         (status = 200, body = Vec<u8>, content_type = "font/ttf", headers(("cache-control" = String))),
-        (status = 401, body = String, content_type = "text/plain"),
-        (status = 404, body = String, content_type = "text/plain"),
-        (status = 500, body = String, content_type = "text/plain")
+        (status = 401, body = ApiErrorBody),
+        (status = 404, body = ApiErrorBody),
+        (status = 500, body = ApiErrorBody),
+        (status = 400, description = "A path segment or query parameter is not the shape this route takes", body = ApiErrorBody),
+        (status = 503, description = "The hub has no administrator yet: `setup_required`", body = ApiErrorBody)
     )
 )]
 async fn item_font(
     State(state): State<AppState>,
-    Path((id, n)): Path<(String, usize)>,
+    ApiPath((id, n)): ApiPath<(String, usize)>,
 ) -> Result<Response, ApiError> {
     let fonts = state
         .subtitles
@@ -3683,7 +4171,7 @@ async fn item_font(
     let (_, bytes) = fonts
         .into_iter()
         .nth(n)
-        .ok_or((StatusCode::NOT_FOUND, "no such font".into()))?;
+        .ok_or(ApiError::new(ErrorCode::NotFound, "no such font"))?;
     Ok((
         [
             (axum::http::header::CONTENT_TYPE, "font/ttf"),
@@ -3702,8 +4190,9 @@ async fn item_font(
     security(("bearer_auth" = [])),
     responses(
         (status = 200, body = LibrariesResponse),
-        (status = 401, body = String, content_type = "text/plain"),
-        (status = 500, body = String, content_type = "text/plain")
+        (status = 401, body = ApiErrorBody),
+        (status = 500, body = ApiErrorBody),
+        (status = 503, description = "The hub has no administrator yet: `setup_required`", body = ApiErrorBody)
     )
 )]
 async fn list_libraries(
@@ -3928,14 +4417,16 @@ fn item_page_sql(inner: &str, order_out: &str, restricted: bool, scoped: bool) -
     params(ItemsQuery),
     responses(
         (status = 200, body = ItemsResponse),
-        (status = 401, body = String, content_type = "text/plain"),
-        (status = 404, body = String, content_type = "text/plain"),
-        (status = 500, body = String, content_type = "text/plain")
+        (status = 401, body = ApiErrorBody),
+        (status = 404, body = ApiErrorBody),
+        (status = 500, body = ApiErrorBody),
+        (status = 400, description = "A path segment or query parameter is not the shape this route takes", body = ApiErrorBody),
+        (status = 503, description = "The hub has no administrator yet: `setup_required`", body = ApiErrorBody)
     )
 )]
 async fn list_items(
     State(state): State<AppState>,
-    Query(q): Query<ItemsQuery>,
+    ApiQuery(q): ApiQuery<ItemsQuery>,
     axum::Extension(claims): axum::Extension<crate::auth::Claims>,
 ) -> Result<Json<ItemsResponse>, ApiError> {
     let limit = q.limit.unwrap_or(ITEMS_PAGE_DEFAULT).min(ITEMS_PAGE_MAX);
@@ -4314,14 +4805,16 @@ fn item_row<S>(r: &sqlx::sqlite::SqliteRow, sources: S) -> ItemRow<S> {
     params(("id" = String, Path)),
     responses(
         (status = 200, body = ChildrenResponse),
-        (status = 401, body = String, content_type = "text/plain"),
-        (status = 404, body = String, content_type = "text/plain"),
-        (status = 500, body = String, content_type = "text/plain")
+        (status = 401, body = ApiErrorBody),
+        (status = 404, body = ApiErrorBody),
+        (status = 500, body = ApiErrorBody),
+        (status = 400, description = "A path segment or query parameter is not the shape this route takes", body = ApiErrorBody),
+        (status = 503, description = "The hub has no administrator yet: `setup_required`", body = ApiErrorBody)
     )
 )]
 async fn item_children(
     State(state): State<AppState>,
-    Path(id): Path<String>,
+    ApiPath(id): ApiPath<String>,
     axum::Extension(claims): axum::Extension<crate::auth::Claims>,
 ) -> Result<Json<ChildrenResponse>, ApiError> {
     let rows = sqlx::query(
@@ -4431,8 +4924,14 @@ struct ItemQueryResponse {
 struct ItemQueryResult {
     #[schema(required)]
     negotiated: Option<NegotiatedItem>,
+    /// Why the converged half is null. Not an error — the item loaded, and
+    /// its page must render — but the same distinction as an error carries,
+    /// in the same shape: `source_offline` comes back once the host does,
+    /// `unplayable` does not. It used to be a bare string holding
+    /// `format!("{e:#}")`, so the detail page had a pipeline's chain to
+    /// print and no way to tell a wait from a dead end.
     #[serde(skip_serializing_if = "Option::is_none")]
-    unavailable: Option<String>,
+    unavailable: Option<ApiErrorBody>,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -4472,14 +4971,16 @@ struct NegotiatedStreams {
     params(("id" = String, Path)),
     responses(
         (status = 200, body = ItemDetailResponse),
-        (status = 401, body = String, content_type = "text/plain"),
-        (status = 404, body = String, content_type = "text/plain"),
-        (status = 500, body = String, content_type = "text/plain")
+        (status = 401, body = ApiErrorBody),
+        (status = 404, body = ApiErrorBody),
+        (status = 500, body = ApiErrorBody),
+        (status = 400, description = "A path segment or query parameter is not the shape this route takes", body = ApiErrorBody),
+        (status = 503, description = "The hub has no administrator yet: `setup_required`", body = ApiErrorBody)
     )
 )]
 async fn item_detail(
     State(state): State<AppState>,
-    Path(id): Path<String>,
+    ApiPath(id): ApiPath<String>,
     axum::Extension(claims): axum::Extension<crate::auth::Claims>,
 ) -> Result<Json<ItemDetailResponse>, ApiError> {
     Ok(Json(item_body(&state, &id, &claims.sub, false).await?))
@@ -4519,7 +5020,7 @@ async fn item_body(
     .fetch_optional(state.registry.db())
     .await
     .map_err(internal)?
-    .ok_or((StatusCode::NOT_FOUND, "no such item".to_string()))?;
+    .ok_or(ApiError::new(ErrorCode::NotFound, "no such item"))?;
 
     let sources = sqlx::query(
         "SELECT f.module_id,f.collection_id,f.path_rel AS source_path,f.size,f.streams_json,
@@ -4674,19 +5175,23 @@ struct ItemQuery {
     request_body = Option<ItemQuery>,
     responses(
         (status = 200, description = "Item details and current playback negotiation", body = ItemQueryResponse, headers(("accept-query" = String))),
-        (status = 401, description = "Missing or invalid bearer token", body = String, content_type = "text/plain"),
-        (status = 404, description = "Item does not exist or is outside the account's libraries", body = String, content_type = "text/plain"),
-        (status = 409, description = "Playback capabilities cannot be negotiated", body = String, content_type = "text/plain"),
-        (status = 415, description = "QUERY requires an application/json body", body = String, content_type = "text/plain"),
-        (status = 500, body = String, content_type = "text/plain")
+        (status = 401, description = "Missing or invalid bearer token", body = ApiErrorBody),
+        (status = 404, description = "Item does not exist or is outside the account's libraries", body = ApiErrorBody),
+        (status = 409, description = "Playback capabilities cannot be negotiated", body = ApiErrorBody),
+        (status = 400, description = "The QUERY body is not the JSON this route takes", body = ApiErrorBody),
+        (status = 405, description = "Answered for any other verb on this path — POST, PUT, DELETE. Declared here because the document has no operation for those: QUERY is registered as this path's method-router fallback", body = ApiErrorBody, headers(("allow" = String), ("accept-query" = String))),
+        (status = 415, description = "QUERY requires an application/json body", body = ApiErrorBody),
+        (status = 500, body = ApiErrorBody),
+        (status = 413, description = "The body is past the hub's buffer limit", body = ApiErrorBody),
+        (status = 503, description = "The hub has no administrator yet: `setup_required`", body = ApiErrorBody)
     )
 )]
 async fn item_query(
     State(state): State<AppState>,
     axum::Extension(claims): axum::Extension<crate::auth::Claims>,
-    Path(id): Path<String>,
+    ApiPath(id): ApiPath<String>,
     method: axum::http::Method,
-    body: Option<Json<ItemQuery>>,
+    body: Option<ApiJson<ItemQuery>>,
 ) -> Result<Response, ApiError> {
     if method.as_str() != "QUERY" {
         return Ok((
@@ -4698,7 +5203,13 @@ async fn item_query(
                     "application/json",
                 ),
             ],
-            "",
+            // An error body like every other refusal. It was empty, which on
+            // the one route that answers 405 by hand made it the exception to
+            // a contract the document states without qualification.
+            axum::Json(ApiErrorBody {
+                code: ErrorCode::MethodNotAllowed,
+                message: "use GET or QUERY on an item".into(),
+            }),
         )
             .into_response());
     }
@@ -4707,9 +5218,9 @@ async fn item_query(
     // content." `Json`'s own extractor rejection is that check — it
     // 415s on a missing or wrong type — so a body that failed to
     // extract is a refusal, not an empty query.
-    let Json(q) = body.ok_or((
-        StatusCode::UNSUPPORTED_MEDIA_TYPE,
-        "QUERY needs a body with Content-Type: application/json".to_string(),
+    let ApiJson(q) = body.ok_or(ApiError::new(
+        ErrorCode::UnsupportedMediaType,
+        "QUERY needs a body with Content-Type: application/json",
     ))?;
 
     let out = item_body(&state, &id, &claims.sub, true).await?;
@@ -4724,7 +5235,22 @@ async fn item_query(
         q.subtitle_track,
     )
     .await
-    .map_err(|e| (StatusCode::CONFLICT, format!("{e:#}")))?;
+    .map_err(|e| {
+        // Three answers, because three different things fail here. A track id
+        // the REQUEST named is the caller's; a storage failure is the hub's;
+        // what is left is about the item. As one 409 they were all final under
+        // this contract — the SPA's `startRetry` maps it to `maybe` and stops
+        // asking — so a client that asked for track 999 was told the film was
+        // unplayable.
+        match e.downcast_ref::<crate::sessions::NoSuchTrack>() {
+            Some(missing) => ApiError::new(ErrorCode::BadRequest, missing.to_string()),
+            None => refusal_or_internal(
+                ErrorCode::Conflict,
+                "this item's playback could not be negotiated",
+                e,
+            ),
+        }
+    })?;
     // Nothing to negotiate is an ANSWER, not a failure: a show or an
     // album has no sources of its own, and a movie whose mediahost is
     // offline has none right now. Both are ordinary items whose detail
@@ -4734,9 +5260,29 @@ async fn item_query(
         Ok(v) => v,
         Err(e) => {
             let unavailable = if out.item.sources.is_empty() {
-                "this item has no media of its own".to_string()
+                ApiErrorBody {
+                    code: ErrorCode::Unplayable,
+                    message: "this item has no media of its own".to_string(),
+                }
             } else {
-                format!("{e:#}")
+                let code = if e.downcast_ref::<crate::sessions::SourceOffline>().is_some() {
+                    ErrorCode::SourceOffline
+                } else {
+                    ErrorCode::Unplayable
+                };
+                tracing::warn!(item = %id, code = ?code, error = format!("{e:#}"), "item has nothing to negotiate");
+                // Authored, for the reason `session_refusal` gives: the error
+                // reaching here is the same one, and its outermost layer is
+                // the pipeline's, not a sentence.
+                ApiErrorBody {
+                    code,
+                    message: match code {
+                        ErrorCode::SourceOffline => {
+                            "the machine holding this file is not connected right now".into()
+                        }
+                        _ => "this item cannot be played".into(),
+                    },
+                }
             };
             let out = ItemQueryResponse {
                 item: out,
@@ -4837,16 +5383,20 @@ struct ProgressRequest {
     request_body = ProgressRequest,
     responses(
         (status = 200, body = ProgressResponse),
-        (status = 401, body = String, content_type = "text/plain"),
-        (status = 410, body = String, content_type = "text/plain"),
-        (status = 500, body = String, content_type = "text/plain")
+        (status = 400, description = "The request body is not the JSON this route takes", body = ApiErrorBody),
+        (status = 401, body = ApiErrorBody),
+        (status = 404, body = ApiErrorBody),
+        (status = 500, body = ApiErrorBody),
+        (status = 415, description = "The body needs Content-Type: application/json", body = ApiErrorBody),
+        (status = 413, description = "The body is past the hub's buffer limit", body = ApiErrorBody),
+        (status = 503, description = "The hub has no administrator yet: `setup_required`", body = ApiErrorBody)
     )
 )]
 async fn post_progress(
     State(state): State<AppState>,
-    Path(id): Path<String>,
+    ApiPath(id): ApiPath<String>,
     axum::Extension(claims): axum::Extension<crate::auth::Claims>,
-    Json(body): Json<ProgressRequest>,
+    ApiJson(body): ApiJson<ProgressRequest>,
 ) -> Result<Json<ProgressResponse>, ApiError> {
     let session = state.sessions.get(&id).ok_or_else(session_gone)?;
     session.touch();
@@ -4947,25 +5497,28 @@ struct WatchedRequest {
     request_body = WatchedRequest,
     responses(
         (status = 200, body = UpdatedResponse),
-        (status = 400, body = String, content_type = "text/plain"),
-        (status = 401, body = String, content_type = "text/plain"),
-        (status = 404, body = String, content_type = "text/plain"),
-        (status = 500, body = String, content_type = "text/plain")
+        (status = 400, body = ApiErrorBody),
+        (status = 401, body = ApiErrorBody),
+        (status = 404, body = ApiErrorBody),
+        (status = 500, body = ApiErrorBody),
+        (status = 415, description = "The body needs Content-Type: application/json", body = ApiErrorBody),
+        (status = 413, description = "The body is past the hub's buffer limit", body = ApiErrorBody),
+        (status = 503, description = "The hub has no administrator yet: `setup_required`", body = ApiErrorBody)
     )
 )]
 async fn item_set_watched(
     State(state): State<AppState>,
-    Path(id): Path<String>,
+    ApiPath(id): ApiPath<String>,
     axum::Extension(claims): axum::Extension<crate::auth::Claims>,
-    Json(body): Json<WatchedRequest>,
+    ApiJson(body): ApiJson<WatchedRequest>,
 ) -> Result<Json<UpdatedResponse>, ApiError> {
     let ids = body.items.unwrap_or_else(|| vec![id.clone()]);
     if ids.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "no items to mark".into()));
+        return Err(ApiError::new(ErrorCode::BadRequest, "no items to mark"));
     }
     if ids.len() > WATCHED_BATCH_MAX {
-        return Err((
-            StatusCode::BAD_REQUEST,
+        return Err(ApiError::new(
+            ErrorCode::BadRequest,
             format!("at most {WATCHED_BATCH_MAX} items per mark"),
         ));
     }
@@ -5037,13 +5590,23 @@ async fn transcode_file(
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
     if !valid {
-        return Err((StatusCode::BAD_REQUEST, "invalid file name".into()));
+        return Err(ApiError::new(ErrorCode::BadRequest, "invalid file name"));
     }
     let bytes = state
         .sessions
         .fetch_artifact(&state.registry, session, file)
         .await
-        .map_err(|e| (StatusCode::NOT_FOUND, format!("{e:#}")))?;
+        // `debug`, because this path is POLLED: the player asks for
+        // `start.pos` up to three times per seek precisely because it is often
+        // not written yet, and hls.js probes segments the same way. At the
+        // default filter (`info`) these lines are not emitted at all, and that
+        // is the trade — a dropped link is already `satellite disconnected` at
+        // info from the registry, so an operator is not left guessing; this
+        // adds which request noticed, for somebody who has turned debug on.
+        .map_err(|e| {
+            tracing::debug!(session = %session.id, file = %file, error = format!("{e:#}"), "artifact not served");
+            ApiError::new(ErrorCode::NotFound, "no such file in this session")
+        })?;
     let bytes = if file.ends_with(".m3u8") {
         declare_target_duration(bytes, session.target_duration_secs)
     } else {
@@ -5110,16 +5673,16 @@ fn declare_target_duration(bytes: Vec<u8>, secs: u32) -> Vec<u8> {
     ),
     responses(
         (status = 200, content((Vec<u8> = "application/vnd.apple.mpegurl"), (Vec<u8> = "video/mp4"), (Vec<u8> = "video/mp2t"), (Vec<u8> = "text/plain"), (Vec<u8> = "text/x-ssa"), (Vec<u8> = "application/x-ndjson"))),
-        (status = 400, body = String, content_type = "text/plain"),
-        (status = 401, body = String, content_type = "text/plain"),
-        (status = 404, body = String, content_type = "text/plain"),
-        (status = 410, body = String, content_type = "text/plain"),
-        (status = 500, body = String, content_type = "text/plain")
+        (status = 400, body = ApiErrorBody),
+        (status = 401, body = ApiErrorBody),
+        (status = 404, body = ApiErrorBody),
+        (status = 500, body = ApiErrorBody),
+        (status = 503, description = "The hub has no administrator yet: `setup_required`", body = ApiErrorBody)
     )
 )]
 async fn session_file(
     State(state): State<AppState>,
-    Path((id, file)): Path<(String, String)>,
+    ApiPath((id, file)): ApiPath<(String, String)>,
 ) -> Result<Response, ApiError> {
     let session = state.sessions.get(&id).ok_or_else(session_gone)?;
     session.touch();
@@ -5133,7 +5696,7 @@ async fn session_file(
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '.');
         if !valid {
-            return Err((StatusCode::BAD_REQUEST, "invalid file name".into()));
+            return Err(ApiError::new(ErrorCode::BadRequest, "invalid file name"));
         }
         // The public keyspace is the track id; the pipeline writes
         // internal stream-index names (subs-e{n}.*). Translate here —
@@ -5148,7 +5711,7 @@ async fn session_file(
                 .await
                 .map_err(internal)?
                 .filter(|t| t.origin == "embedded")
-                .ok_or((StatusCode::NOT_FOUND, "no such embedded track".to_string()))?;
+                .ok_or(ApiError::new(ErrorCode::NotFound, "no such embedded track"))?;
                 format!("subs-{}.{ext}", track.internal_key())
             }
             _ => file.clone(),
@@ -5214,7 +5777,7 @@ async fn session_file(
             return transcode_file(&state, &session, &file).await;
         }
         crate::sessions::Mode::Direct { .. } => {
-            return Err((StatusCode::NOT_FOUND, "not a remux session".into()));
+            return Err(ApiError::new(ErrorCode::NotFound, "not a remux session"));
         }
     };
     let dir = &dir;
@@ -5223,7 +5786,7 @@ async fn session_file(
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
     if !valid {
-        return Err((StatusCode::BAD_REQUEST, "invalid file name".into()));
+        return Err(ApiError::new(ErrorCode::BadRequest, "invalid file name"));
     }
     let ctype = if file.ends_with(".m3u8") {
         "application/vnd.apple.mpegurl"
@@ -5237,11 +5800,11 @@ async fn session_file(
         // align subtitles and the seekbar to it.
         "text/plain"
     } else {
-        return Err((StatusCode::NOT_FOUND, "unknown file type".into()));
+        return Err(ApiError::new(ErrorCode::NotFound, "unknown file type"));
     };
     let bytes = tokio::fs::read(dir.join(&file))
         .await
-        .map_err(|_| (StatusCode::NOT_FOUND, "no such file".to_string()))?;
+        .map_err(|_| ApiError::new(ErrorCode::NotFound, "no such file"))?;
     let bytes = if file.ends_with(".m3u8") {
         declare_target_duration(bytes, session.target_duration_secs)
     } else {

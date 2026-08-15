@@ -30,16 +30,55 @@ export class Offline extends Error {
 }
 
 /// A failed request, with the status still attached.
+///
+/// `code` is the hub's machine-readable reason (`ErrorCode` in the generated
+/// model). Undefined when the body was not the hub's — a proxy's 502 page, a
+/// truncated response — which is itself worth being able to tell apart.
+///
+/// Branch on the STATUS for whether to retry and on the CODE for what to say.
+/// That split is the hub's contract — 429 and 503 clear on their own, every
+/// other 4xx is final — and it needs no table of codes here.
+///
+/// It stops short of a policy, deliberately: THIS app's is `startRetry` in
+/// `recovery.ts`, which is narrower about 5xx than the contract allows. A 500
+/// is the hub answering that it failed, which for one item does not clear on
+/// its own, and standing by on it names a cause that is not the cause. 502 and
+/// 504 are a different animal — a hub restarting behind a reverse proxy — and
+/// those do wait.
 export class ApiError extends Error {
   status: number
-  constructor(status: number, message: string) {
+  code?: string
+  constructor(status: number, message: string, code?: string) {
     super(message)
     this.name = 'ApiError'
     this.status = status
+    this.code = code
   }
   override toString() {
     return this.message
   }
+}
+
+/// The hub answers every 4xx and 5xx with `{code, message}`. A body that is
+/// not that shape is still shown: a reverse proxy in front of the hub answers
+/// its own failures, and "502 Bad Gateway" as HTML is more use on screen than
+/// a bare status number.
+export async function apiFailure(response: Response): Promise<ApiError> {
+  const text = await response.text().catch(() => '')
+  try {
+    const body: unknown = JSON.parse(text)
+    if (
+      typeof body === 'object' &&
+      body !== null &&
+      typeof (body as { message?: unknown }).message === 'string'
+    ) {
+      const { code, message } = body as { code?: unknown; message: string }
+      return new ApiError(response.status, message, typeof code === 'string' ? code : undefined)
+    }
+  } catch {
+    // not JSON: fall through to the raw text
+  }
+  return new ApiError(response.status, text || `${response.status}`)
 }
 
 export async function api(path: string, init: ApiRequestInit = {}): Promise<Response> {
@@ -72,8 +111,7 @@ export async function api(path: string, init: ApiRequestInit = {}): Promise<Resp
 export async function apiClient<T>(url: string, options: ApiRequestInit = {}): Promise<T> {
   const response = await api(url, options)
   if (options.rawResponse) return response as T
-  if (!response.ok)
-    throw new ApiError(response.status, (await response.text()) || `${response.status}`)
+  if (!response.ok) throw await apiFailure(response)
   if (
     response.status === 204 ||
     response.status === 205 ||

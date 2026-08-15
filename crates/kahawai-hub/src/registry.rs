@@ -19,6 +19,32 @@ use sha2::{Digest, Sha256};
 use sqlx::{Row, SqlitePool};
 use utoipa::ToSchema;
 
+/// A media type this hub has no meaning for.
+///
+/// A type so the API can name the field without a catch-all arm standing in
+/// for "whatever else `create_library` refuses" — see `AttachRefused` for the
+/// same reasoning at more length.
+#[derive(Debug, thiserror::Error)]
+#[error("media type must be one of movies, series, anime, music, not {0:?}")]
+pub struct UnknownMediaType(pub String);
+
+/// Why an attach was refused, as three answers rather than one sentence.
+///
+/// All three are the admin's to act on and they want different actions —
+/// pick another library, pick another collection, or accept that a music
+/// collection does not go in a film library. Collapsed into one `anyhow`
+/// they reached the API as one opaque 409 with the difference only in a log
+/// line, which is what `error.rs` exists to stop.
+#[derive(Debug, thiserror::Error)]
+pub enum AttachRefused {
+    #[error("no such library")]
+    NoLibrary,
+    #[error("no such collection")]
+    NoCollection,
+    #[error("type mismatch: library is {library}, collection is {collection}")]
+    TypeMismatch { library: String, collection: String },
+}
+
 #[derive(Debug, Clone)]
 pub struct SatelliteState {
     pub module_type: String,
@@ -1538,10 +1564,9 @@ impl Registry {
     }
 
     pub async fn create_library(&self, name: &str, media_type: &str) -> Result<String> {
-        anyhow::ensure!(
-            matches!(media_type, "movies" | "series" | "anime" | "music"),
-            "unknown media type {media_type:?}"
-        );
+        if !matches!(media_type, "movies" | "series" | "anime" | "music") {
+            return Err(UnknownMediaType(media_type.to_string()).into());
+        }
         let id = ulid::Ulid::generate().to_string();
         sqlx::query("INSERT INTO libraries (id, name, media_type) VALUES (?, ?, ?)")
             .bind(&id)
@@ -1576,7 +1601,7 @@ impl Registry {
                 .bind(library_id)
                 .fetch_optional(&self.db)
                 .await?;
-        let lib_type = lib_type.context("no such library")?;
+        let lib_type = lib_type.ok_or(AttachRefused::NoLibrary)?;
         let col_type: Option<String> = sqlx::query_scalar(
             "SELECT media_type FROM collections WHERE module_id = ? AND collection_id = ?",
         )
@@ -1584,11 +1609,14 @@ impl Registry {
         .bind(collection_id)
         .fetch_optional(&self.db)
         .await?;
-        let col_type = col_type.context("no such collection")?;
-        anyhow::ensure!(
-            lib_type == col_type,
-            "type mismatch: library is {lib_type}, collection is {col_type}"
-        );
+        let col_type = col_type.ok_or(AttachRefused::NoCollection)?;
+        if lib_type != col_type {
+            return Err(AttachRefused::TypeMismatch {
+                library: lib_type,
+                collection: col_type,
+            }
+            .into());
+        }
         sqlx::query(
             "INSERT OR IGNORE INTO library_collections (library_id, module_id, collection_id)
              VALUES (?, ?, ?)",

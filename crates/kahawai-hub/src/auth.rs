@@ -136,6 +136,11 @@ pub enum CompleteSetupError {
     Internal(#[from] anyhow::Error),
 }
 
+/// That username is already in use. HUB-10.
+#[derive(Debug, thiserror::Error)]
+#[error("that username is already taken")]
+pub struct UsernameTaken;
+
 pub struct Auth {
     db: SqlitePool,
     enc: EncodingKey,
@@ -525,8 +530,15 @@ impl Auth {
         .execute(&self.db)
         .await
         .map_err(|e| match e {
+            // A type, not a sentence. The API answers 409 for a library name
+            // that is taken and was answering 400 "check the name is free and
+            // the password long enough" for a username that is — the same
+            // collision, two codes, and an admin unable to tell it from a
+            // password that was too short. `is_unique_violation` cannot see
+            // this one, because rewriting it as a plain `anyhow!` is what
+            // takes the sqlx error out of the chain.
             sqlx::Error::Database(ref db) if db.is_unique_violation() => {
-                anyhow::anyhow!("username already exists")
+                anyhow::Error::new(UsernameTaken)
             }
             e => e.into(),
         })?;

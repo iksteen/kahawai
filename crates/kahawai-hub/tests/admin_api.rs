@@ -294,7 +294,16 @@ async fn admin_flow_enrollments_satellites_archive_restore() {
         )
         .await
         .unwrap();
-    assert_eq!(wrong.status(), StatusCode::FORBIDDEN);
+    // 404, not the 403 this was: the admin IS allowed to approve, and the code
+    // simply matches nothing. FORBIDDEN is the one answer that means "a
+    // different account might", and it also covered a CA that failed to sign —
+    // so an admin whose hub was broken was told to go and be someone else.
+    assert_eq!(wrong.status(), StatusCode::NOT_FOUND);
+    let body = axum::body::to_bytes(wrong.into_body(), 1 << 16)
+        .await
+        .unwrap();
+    let refusal: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(refusal["code"], "not_found");
 
     // Resubmit (wrong code rejected the sole pending CSR per §7.2).
     enrollments

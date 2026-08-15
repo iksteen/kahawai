@@ -424,7 +424,11 @@ How something works and why it was built that way belong in
       audio/video/subtitle track selection, resume, watch state
 - [x] HUB-28 Web UI is a pure client of the public API — including session
       recovery, which is driven by the owner-scoped 404 contract rather than by
-      any client-side copy of the hub's idle timeout
+      any client-side copy of the hub's idle timeout. Every 4xx/5xx is
+      `{code, message}` with `code` enumerated in the OpenAPI document; the
+      status carries transience (429/503 clear, other 4xx are final), so a
+      third-party client needs no table of kahawai's codes
+      (`tests/error_bodies.rs`, `web/test/api-failure.test.ts`)
 
 ## Hub — anime (HUB-29..33)
 

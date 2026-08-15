@@ -17,6 +17,7 @@ const inputs = [
   'crates/kahawai-hub/src/api.rs',
   'crates/kahawai-hub/src/auth.rs',
   'crates/kahawai-hub/src/enrich.rs',
+  'crates/kahawai-hub/src/error.rs',
   'crates/kahawai-hub/src/grants.rs',
   'crates/kahawai-hub/src/metrics.rs',
   'crates/kahawai-hub/src/opensubtitles.rs',

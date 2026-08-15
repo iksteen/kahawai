@@ -41,6 +41,29 @@ pub fn default_api_key() -> &'static str {
 pub const USER_PREF_USERNAME: &str = "opensubtitles.username";
 pub const USER_PREF_PASSWORD: &str = "opensubtitles.password";
 
+/// The download entitlement is spent — this account's, or the server's shared
+/// anonymous one.
+///
+/// A type rather than a sentence so the API can give it a code of its own. It
+/// is not an upstream fault and it is not a network problem: telling somebody
+/// the provider did not answer when they have simply used their five downloads
+/// sends them to retry instead of to add an account. The anonymous budget is
+/// five per 24 h, so this is an ordinary Tuesday, not an incident.
+///
+/// The message travels with it because it is authored for a reader and names
+/// the way out. That is what makes it safe to put on the wire, and why the
+/// API reads THIS type's `Display` rather than the anyhow chain around it.
+#[derive(Debug)]
+pub struct QuotaSpent(pub String);
+
+impl std::fmt::Display for QuotaSpent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for QuotaSpent {}
+
 /// Deployment-level provider config (kahawai.toml): just the
 /// application key, and only when a deployment wants its own. Empty =
 /// the admin setting, then the built-in key. Account credentials live
@@ -446,7 +469,7 @@ impl SubtitleProvider for OpenSubtitles {
             bail!("OpenSubtitles rejected the download token — retry");
         }
         if matches!(resp.status().as_u16(), 402 | 406 | 407) {
-            bail!(
+            bail!(QuotaSpent(format!(
                 "OpenSubtitles download quota exhausted{} — it resets 24 h after your first \
                  download today",
                 if token.is_some() {
@@ -454,7 +477,7 @@ impl SubtitleProvider for OpenSubtitles {
                 } else {
                     " (anonymous: 5 per 24 h; add an account for more)"
                 }
-            );
+            )));
         }
         let dl: DlResp = resp
             .error_for_status()

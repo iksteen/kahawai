@@ -189,6 +189,18 @@ pub fn media_type_key(media_type: &str) -> &'static str {
         .unwrap_or("movies")
 }
 
+/// The order sent is not a rearrangement of this media type's providers.
+///
+/// A type, because its message is the only thing that names a valid order and
+/// it is the admin's to act on — the same reason `opensubtitles::QuotaSpent`
+/// is one. Collapsed into a generic "that provider order was refused", the
+/// answer was only in the hub log.
+#[derive(Debug, thiserror::Error)]
+#[error("provider order must be a permutation of {known:?}")]
+pub struct NotAPermutation {
+    pub known: Vec<String>,
+}
+
 /// The normative provider order for a media type — the default, and the
 /// permutation whitelist a stored order must stay within.
 pub fn chain_for(media_type: &str) -> &'static [&'static str] {
@@ -243,10 +255,12 @@ pub async fn chain_in_force(db: &SqlitePool, media_type: &str) -> Vec<String> {
 pub async fn set_chain(db: &SqlitePool, media_type: &str, order: &[String]) -> Result<()> {
     let media_type = media_type_key(media_type);
     let known = chain_for(media_type);
-    anyhow::ensure!(
-        order.len() == known.len() && known.iter().all(|k| order.iter().any(|s| s == k)),
-        "provider order must be a permutation of {known:?}"
-    );
+    if order.len() != known.len() || !known.iter().all(|k| order.iter().any(|s| s == k)) {
+        return Err(NotAPermutation {
+            known: known.iter().map(|k| k.to_string()).collect(),
+        }
+        .into());
+    }
     // ONE statement, and only for the positions that actually moved.
     // Delete-then-reinsert would have written every row twice and left a
     // window in between where the media type had no ranks at all — and

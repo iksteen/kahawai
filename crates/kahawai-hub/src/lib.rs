@@ -8,6 +8,7 @@ pub mod db;
 pub mod enrich;
 pub mod enrollment;
 pub mod enrollment_service;
+pub mod error;
 pub mod gate;
 pub mod grants;
 pub mod leases;

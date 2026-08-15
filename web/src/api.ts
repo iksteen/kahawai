@@ -58,7 +58,7 @@ import {
   subtitleSearch as generatedSubtitleSearch,
 } from './generated/kahawai.ts'
 import type { ProviderCandidate } from './generated/model/index.ts'
-import { ApiError, Offline, api, configureApiClient } from './api-client.ts'
+import { ApiError, Offline, api, apiFailure, configureApiClient } from './api-client.ts'
 import { notify } from './toast.ts'
 import { SerialQueue } from './serial.ts'
 import { REFRESH_RETRY_MS, refreshDelayMs } from './token.ts'
@@ -71,7 +71,11 @@ export type RestoreResult = 'authenticated' | 'anonymous'
 
 let access: string | null = null
 let generation = 0
-let refreshTimer: number | undefined
+/// `ReturnType<typeof setTimeout>` rather than `number`, which is what the
+/// DOM's `setTimeout` returns and what this said. The two disagree under
+/// node's types, and the test project needs those — so the narrower spelling
+/// was the reason 153 tests could not be typechecked at all.
+let refreshTimer: ReturnType<typeof setTimeout> | undefined
 let refreshInFlight: Promise<boolean> | null = null
 let onCleared: ((deliberate: boolean) => void) | null = null
 
@@ -894,8 +898,7 @@ export function endSession(sessionId: string, keepalive = false) {
 
 export async function downloadWithAuth(path: string): Promise<void> {
   const response = await api(path)
-  if (!response.ok)
-    throw new ApiError(response.status, (await response.text()) || `${response.status}`)
+  if (!response.ok) throw await apiFailure(response)
   const url = URL.createObjectURL(await response.blob())
   const link = document.createElement('a')
   link.href = url

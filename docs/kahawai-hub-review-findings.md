@@ -38,7 +38,7 @@ setup mode, before or after restart.
 
 ---
 
-## 2. A refused session start hands the client the error chain
+## 2. A refused session start hands the client the error chain — FIXED
 
 `crates/kahawai-hub/src/api.rs`, `session_refusal`
 
@@ -54,6 +54,11 @@ renders it, and stand-by shows it when a retry gives up).
 Every other public shape here is deliberate about this. Suggest keeping the
 chain in the log and returning the outermost context only, or a fixed string
 per status.
+
+**Fixed.** `crates/kahawai-hub/src/error.rs`: every 4xx and 5xx is now
+`{"code", "message"}`, the chain goes to the log, and a 500 returns a fixed
+sentence. `session_refusal` downcasts rather than formats. See finding 16 for
+the half of this that was about statuses.
 
 ---
 
@@ -164,7 +169,7 @@ there says as much. Not fixed here.
 
 ---
 
-## 6. The anyhow chain reaches clients from three more routes
+## 6. The anyhow chain reaches clients from three more routes — FIXED
 
 Finding 2 above covers `session_refusal`, which both `start_session` and
 `seek_session` go through — so seek is already counted there, and an earlier
@@ -194,6 +199,13 @@ they are usually the only clue anyone gets — so the fix belongs at the source.
 
 The pattern to copy is already here: `item_artwork` logs the error and returns
 a fixed `"artwork unavailable"`, citing SEC-WEB-7.
+
+**Fixed**, and made structural rather than per-route: `ApiError` is a type with
+constructors instead of `(StatusCode, String)`, so there is no longer a tuple a
+chain can be dropped into. `ApiError::log` takes the chain, logs `{e:#}` and
+returns `{e}`; `internal` logs and returns a fixed sentence. `item_query`'s
+`unavailable` field went the same way — it is an error body now, so a detail
+page can tell an absent mediahost from an unplayable item.
 
 ## 7. `seek` and `end` take a session id and no owner — resolved
 
@@ -391,7 +403,7 @@ Not urgent, and nothing is broken without it — a resize on the first frame of
 playback is cosmetic. Recorded because the shape is knowable at probe time and
 is not knowable anywhere else until the media is decoding.
 
-## 16. One status for a refusal that is forever and one that clears in a minute
+## 16. One status for a refusal that is forever and one that clears in a minute — FIXED
 
 `session_refusal` maps every failure that is not `SourceOffline` to 409:
 
@@ -419,6 +431,22 @@ giving up, which is a guess standing in for an answer the hub could give.
 A distinct status would settle it — 429 for the cap, keeping 409 for the item
 itself — or a machine-readable reason on the body. Either lets a client wait out
 the one and give up on the other, without reading English.
+
+**Fixed, both ways.** `sessions::SessionCap` is a type rather than a `bail!`
+sentence, so `session_refusal` downcasts it to 429 `session_cap` and leaves 409
+`unplayable` for the item. Our guess is gone with it. `startRetry` calls a 429
+carrying `session_cap` a `busy` — the queue waits it out under a ceiling of its
+own (`BUSY_TRIES`, five minutes), and the player does not wait at all: its
+stand-by dialog names an unreachable machine and offers one button, so a viewer
+at the cap gets the hub's own "close one first" instead. `REFUSAL_TRIES` is now
+a backstop for 409s this client does not enumerate rather than a number
+standing in for your answer.
+
+Recorded while fixing it: six routes documented **410** for a gone session —
+`admin_end_session`, `seek`, `end`, `stream`, `progress` and `session_file` —
+and the hub returns 404 through `session_gone`, which is what a client's
+recovery keys on. The document was wrong about the one status a recovery
+machine reads. Corrected to 404.
 
 ---
 

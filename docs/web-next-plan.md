@@ -116,7 +116,7 @@ path is the only untrusted string in the hub that reaches a filesystem.
 
 Ranked by whether the UI can be written correctly without them.
 
-### B1. Machine-readable error reasons — blocking
+### B1. Machine-readable error reasons — blocking — DONE
 
 Findings 2, 6 and 16 in `kahawai-hub-review-findings.md`. Today the hub
 returns `format!("{e:#}")` — the whole anyhow chain, including scratch paths,
@@ -141,13 +141,84 @@ content-type: application/json
 
 One shape for every 4xx and 5xx. `code` is an enumerated, stable identifier
 published in the OpenAPI schema; `message` is for a human and its wording is
-not contractual. The anyhow chain stays in the log. `ApiError` stops being
-`(StatusCode, String)` and becomes a type with constructors, so a bare tuple
-can no longer smuggle a chain out — 62 construction sites and 209 declared
-`text/plain` responses, all converted, and the OpenAPI document re-stamped.
+not contractual. The anyhow chain stays in the log. `ApiError` stopped being
+`(StatusCode, String)` and became a type with constructors, so there is no
+longer a tuple a chain can be dropped into.
+
+The contract is checked rather than described: `web/test/openapi-contract.test.ts`
+reads the generated document and asserts that every 4xx and 5xx body is
+`application/json`; that every route taking a body declares the 400, 413 and
+415 a bad one produces; that every route with a path or query parameter
+declares its 400; that no bodyless route declares a 413 or 415; and that every
+published code is snake case.
+
+It exists because the prose version was wrong four times. Counts recited in
+this file went stale three times on their own — which is the argument against
+reciting them at all, and for a test that fails on the change instead of on
+the next reviewer.
+
+One response sits outside deliberately: `stream_session`'s 416 has no body,
+which is what RFC 9110 asks for. Item artwork's 404 carries the same body as
+every other refusal and is merely cacheable.
+
+Seven rounds of review went into this, and rounds two through seven mostly
+found defects in the previous round's FIXES — 3, 8, 6, 4, 7, 5 findings. Most
+were one mistake wearing different clothes: assuming a boundary held rather
+than making it hold. The ones worth carrying forward:
+
+- `ApiError::log` first returned `error.to_string()`, the outermost anyhow
+  layer, on the theory that the outermost layer is a sentence. It is not: the
+  session layer bails with the worker's stderr *inside* that layer, and the
+  fallback-sink path flattens a whole chain into it with
+  `with_context(|| format!("{first:#}"))`. The message is a parameter now, so
+  no error's text crosses the boundary at all and `ApiErrorBody`'s promise is a
+  property of the signature.
+- Item artwork's 404 is JSON too. The grant gate answers that same operation
+  with an error body, so documenting the miss as `text/plain` left one of two
+  shapes undocumented. Both are `not_found` with only the message differing,
+  which is correct: a distinct code would leak existence on the one route whose
+  denials are meant to look like absence.
+- `ApiJson`, `ApiQuery` and `ApiPath` replace every bare axum extractor. Their
+  rejections are `text/plain` with no code, so a malformed body — and then,
+  once that was fixed, `?limit=abc` and a non-numeric id in a path — were the
+  refusals that did not carry one, on routes that mostly declared no 400 at
+  all. Fixing the body half and leaving the other two would have made the
+  contract true of most refusals, which is not what the document says.
+- A wrong `Content-Type` is 415 and a body that will not parse is 400. An
+  earlier cut collapsed both into 400 on the grounds that what you sent is
+  wrong either way — which quietly changed the status QUERY had been
+  answering, and its own test said so. Throwing away a distinction axum
+  already makes is against the grain of the whole change.
+- Collapsing producers' messages went too far in the other direction. A spent
+  OpenSubtitles budget — five downloads into an anonymous day, so an ordinary
+  Tuesday — arrived as "the provider did not answer", which sends somebody to
+  retry an outage that is not happening instead of adding an account. Its
+  sentence is authored, names the way out and leaks nothing. It is a typed
+  error with a code of its own now, and the API reads THAT type's `Display`
+  rather than the chain around it. Same shape for enrollment approval, where
+  a CA that failed to sign was reported as `forbidden` — the one code that
+  means "a different account might".
+- The opposite error, three times: one code standing in for several refusals.
+  A duplicate username was a 400 saying the password might be too short while
+  a duplicate library name was a 409; a blank username was told the password
+  was too short; and attaching a collection answered one opaque 409 for "no
+  such library", "no such collection" and a media-type mismatch. Typed errors
+  in `auth` and `registry` are what let the API tell them apart.
+- The player's stand-by dialog is entered and left on `wait` alone. Round four
+  said the exit should also cover `busy` — the account at its stream cap —
+  because it clears by itself; round six showed what that costs. The dialog
+  says the machine holding the file has stopped answering and offers one
+  button, so a viewer whose host came back and who is merely at the cap sits
+  in front of a false cause for ever. Leaving takes them to the hub's own
+  sentence, which names the thing that clears it.
+
+Every `format!("{e:#}")` reaching a client is gone from the refusal paths. Two
+remain on purpose, on `admin_verify_anidb` and `admin_set_anidb` — admin-only
+200s whose entire job is telling the admin why the credential they just typed
+did not work. The OpenAPI document is re-stamped.
 
 **The status says whether to retry; the code says what happened.** 429 and
-503 clear on their own, 5xx retries with backoff, every other 4xx is final.
+503 clear on their own, 5xx is worth a backoff, every other 4xx is final.
 That split is HTTP's own and needs no kahawai-specific knowledge, which is
 the point: a third-party client gets the retry decision right without a
 table of our codes in it. `retryable` is deliberately *not* a field — it
@@ -163,12 +234,16 @@ additive and breaks nothing, and that is its problem — the code is out of
 band, easy to not send, and easy to not read, so the prose would have stayed
 the real answer.
 
-### B2. The per-user session cap gets its own status — blocking
+### B2. The per-user session cap gets its own status — blocking — DONE
 
-`too many concurrent streams` is a 409 today, indistinguishable from "this
-item is unplayable, forever". 429 (or a `code` from B1) lets the album queue
-wait it out instead of guessing at three retries. Falls out of B1; listed
-separately because the status matters as much as the body.
+`too many concurrent streams` was a 409, indistinguishable from "this item is
+unplayable, forever". It is 429 `session_cap` now, from a `sessions::SessionCap`
+type rather than a `bail!` sentence, and the album queue waits it out instead of
+guessing at three retries.
+
+Recorded while doing it: six routes documented **410** for a gone session and
+the hub returns 404 — the one status the client's recovery machine keys on. The
+document was wrong; it says 404 now.
 
 ### B3. Grouped cross-library search
 
@@ -205,7 +280,8 @@ Each gap lands as its own commit with hub tests, before any Vue is written.
 
 `web-next/`, beside `web/` (owner decision: the old UI stays readable and
 runnable for the whole rebuild, because its comments are the specification),
-running against the dev hub through Phase 0's proxy. Vite, Vue 3, Tailwind, oxlint, oxfmt, Vitest, Orval pointed at the
+running against the dev hub through Phase 0's proxy. Vite, Vue 3, Tailwind,
+oxlint, oxfmt, Vitest, Orval pointed at the
 same `openapi.json` and the same fingerprint check. Nothing but a shell that
 boots and a green test run.
 

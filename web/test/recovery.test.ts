@@ -8,6 +8,7 @@ import {
   mayRecover,
   SESSION_GONE,
   SOURCE_OFFLINE,
+  SESSION_CAP,
   startRetry,
 } from '../src/recovery.ts'
 
@@ -110,7 +111,11 @@ const offline = () => {
 
 test('a start is worth asking about again unless the item itself was refused', () => {
   // 503 and "no answer at all" are the two the album queue already waited out.
-  assert.equal(startRetry({ status: SOURCE_OFFLINE }), 'wait')
+  assert.equal(startRetry({ status: SOURCE_OFFLINE, code: 'source_offline' }), 'wait')
+  // The other two 503s clear only when an operator acts, and standing by on
+  // them names an unreachable machine that is answering perfectly well.
+  assert.equal(startRetry({ status: SOURCE_OFFLINE, code: 'setup_required' }), 'maybe')
+  assert.equal(startRetry({ status: SOURCE_OFFLINE, code: 'provider_unconfigured' }), 'maybe')
   assert.equal(startRetry(offline()), 'wait')
   // A statusless throw that is NOT the network — a malformed body, a bug on
   // this side — is not weather to wait out.
@@ -123,8 +128,41 @@ test('a start is worth asking about again unless the item itself was refused', (
   // 500 is the hub answering that it failed, which for one item does not clear
   // on its own — and the stand-by dialog it would select has no way out.
   assert.equal(startRetry({ status: 500 }), 'maybe')
-  // 409 covers both "no sources, ever" and "too many streams, close one" —
-  // bounded rather than endless, because the client cannot tell them apart.
+  // The pair this split exists for. The per-account session cap clears the
+  // moment a session ends; 409 is about the item and will refuse again
+  // forever. They used to be the same status with the difference in the prose,
+  // and the queue guessed at three tries.
+  assert.equal(startRetry({ status: SESSION_CAP, code: 'session_cap' }), 'busy')
+  // A 429 that is not the hub's — a reverse proxy or WAF rate-limiting the
+  // tab, with an HTML body and so no code — must not buy `BUSY_TRIES` worth
+  // of asking at a rate limiter.
+  assert.equal(startRetry({ status: SESSION_CAP }), 'maybe')
+  assert.equal(startRetry({ status: SESSION_CAP, code: 'login_throttled' }), 'maybe')
   assert.equal(startRetry({ status: 409 }), 'maybe')
   assert.equal(startRetry({ status: 404 }), 'maybe')
+})
+
+/// `busy` is not `wait`, and the difference is what is on screen.
+///
+/// A background queue asks again for both. A player stands by only for `wait`:
+/// the standby dialog says the machine holding the file has stopped answering
+/// and offers one button, which for a stream cap is a false cause and the
+/// wrong single option — the viewer can fix that one by closing something, and
+/// the hub's own message says so.
+test('both self-clearing verdicts retry, and only one of them stands by', () => {
+  const asksAgain = (e: unknown) => startRetry(e) !== 'maybe'
+  assert.equal(asksAgain({ status: SOURCE_OFFLINE, code: 'source_offline' }), true)
+  assert.equal(asksAgain({ status: SESSION_CAP, code: 'session_cap' }), true)
+  assert.equal(asksAgain({ status: 409 }), false)
+  assert.equal(asksAgain({ status: 500 }), false)
+
+  // The player's stand-by dialog, entering AND leaving, is `wait` alone. It
+  // says the machine holding the file has stopped answering and offers one
+  // button; a viewer at the stream cap would sit in front of a false cause
+  // with nothing to press, so `busy` neither enters it nor keeps them in it.
+  // The album queue, which has no dialog and nobody reading it, retries both.
+  const standsBy = (e: unknown) => startRetry(e) === 'wait'
+  assert.equal(standsBy({ status: SOURCE_OFFLINE, code: 'source_offline' }), true)
+  assert.equal(standsBy({ status: SESSION_CAP, code: 'session_cap' }), false)
+  assert.equal(asksAgain({ status: SESSION_CAP, code: 'session_cap' }), true)
 })

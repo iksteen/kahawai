@@ -602,6 +602,39 @@ values, impose no composition rules, and retain login throttling. Existing
 shorter Argon2id hashes remain valid at login; the minimum applies only before
 a new hash is written.
 
+#### Refusals
+
+Every 4xx and 5xx is `application/json` — `{"code": …, "message": …}`. `code`
+is drawn from the `ErrorCode` enumeration published in the OpenAPI document
+and is stable; `message` is written for a person and its wording is not
+contractual.
+
+Two responses sit outside that. Item artwork's 404 carries the same body but
+is CACHEABLE, because a shelf of coverless cards was otherwise one live
+request per card on every render; and `stream_session`'s 416 has no body at
+all, which is what RFC 9110 asks for — the answer is in `Content-Range`, and
+a code would add nothing.
+
+**The status says whether to retry; the code says what happened.** 429 and 503
+clear on their own, 5xx is worth a backoff, every other 4xx is final. That
+split is HTTP's, so a third-party client (HUB-28) gets the retry decision right
+without a table of kahawai's codes in it. There is no `retryable` field: it
+would be the same decision computed in two places, free to disagree.
+
+Two consequences of that rule are behaviour changes, not restatements. The
+per-account session cap is 429 `session_cap` rather than the 409 it shared with
+"this item has no playable source" — one clears the moment a session ends and
+the other never does, and a client playing a queue has to tell them apart.
+And an internal failure returns a fixed sentence: the anyhow chain, which
+carried the hub's scratch layout, the pipeline worker's argv and GStreamer's
+stderr, goes to the log. `item_artwork` had answered this way since SEC-WEB-7;
+it is the rule now.
+
+`GET`/`QUERY` on an item reports the same distinction in a success body:
+`query.unavailable` is an error body rather than a string, so a detail page can
+tell a mediahost that is away (`source_offline`, comes back) from an item with
+nothing to play (`unplayable`).
+
 ## 8. Configuration example
 
 ```toml
