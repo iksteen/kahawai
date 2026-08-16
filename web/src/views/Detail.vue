@@ -64,7 +64,6 @@ const item = computed(() => query.data.value)
 /// IS the screen — left waiting for a name that is never coming, the tab strip
 /// keeps the bare site name and the announcement never happens at all.
 useScreenName(
-  'detail',
   computed(() => {
     if (item.value) return itemName(item.value)
     return query.isError.value ? 'Could not load this item' : null

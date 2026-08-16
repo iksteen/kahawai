@@ -13,7 +13,7 @@ import Auth from './views/Auth.vue'
 import Boundary from './components/Boundary.vue'
 import Failed from './components/Failed.vue'
 import QueueBar from './components/QueueBar.vue'
-import { awayFrom, boundaryKey, type RouteName } from './domain/routes.ts'
+import { addressOf, awayFrom, type RouteName } from './domain/routes.ts'
 import { notify } from './composables/notices.ts'
 import { signOut, whoAmI } from './api/session.ts'
 import { useBoot } from './composables/boot.ts'
@@ -43,6 +43,10 @@ const me = computed(() => (phase.value === 'app' ? whoAmI() : { username: '', ad
 
 const name = computed(() => (route.name ?? 'libraries') as RouteName)
 
+/// Which SCREEN the boundary is guarding, which is not the same as the
+/// address: an autoplay handover changes the URL and must not remount.
+const screen = computed(() => addressOf(route))
+
 /// UI-17: the tab strip, the bookmark, and the one thing that tells a screen
 /// reader the screen changed at all. The route knows which screen; what is ON
 /// it arrives a round trip later, so the title is set twice and announced once.
@@ -57,23 +61,18 @@ const shown = computed<Screen>(() => {
   if (bootError.value) return 'failed'
   return phase.value === 'app' ? name.value : phase.value
 })
-useDocumentTitle(shown)
+/// Announced on ARRIVAL, and the boundary's key is what an arrival is: the
+/// route name alone says an item and the next item are the same screen, so
+/// pressing an episode said nothing at all. The same key, for the same reason
+/// the boundary uses it — the player's autoplay handover changes the URL and
+/// is not somewhere the viewer went.
+useDocumentTitle(shown, screen)
 
 /// The queue lives above the router, because it survives navigation — that is
 /// the whole point of a queue. It is inside the SHELL, though: signing out has
 /// to unmount it while the bearer still works, so its sessions are ended rather
 /// than left for the reaper.
 const queue = useQueue()
-
-/// Which SCREEN the boundary is guarding, which is not the same as the
-/// address: an autoplay handover changes the URL and must not remount.
-const screen = computed(() =>
-  boundaryKey(
-    name.value,
-    route.path,
-    typeof route.params.library === 'string' ? route.params.library : undefined,
-  ),
-)
 
 /// Signed in. The note goes with the screen that explained it.
 function entered() {

@@ -616,10 +616,18 @@ event — a listener counted zero), and two tabs cannot race a refresh, because
 `session.ts:alone` holds an origin-wide Web Lock. Raw `fetch` calls bypassed it
 and revoked the family, which measured the hub rather than the app.
 
-**Known and not fixed:** navigating between two addresses of the SAME screen —
-item to related item, season 1 to season 2, one `/play` entry to another — is
-not announced, because the announcement is armed by the route NAME changing.
-The titles are correct throughout.
+- **An arrival is an address, not a route name.** Armed on the name alone, the
+  navigation a viewer does most — pressing an episode on a series page, a
+  related film, the next season — was silent, because an item and the next item
+  are one screen. It arms on the error boundary's key instead, which already
+  draws exactly this line and for the same reason: the player's autoplay
+  handover changes the URL and is not somewhere the viewer went. That made the
+  publication's tag the address too, which is what it should always have been —
+  and deleted four hand-typed screen literals, the thing most likely to rot.
+
+**Known and not fixed:** back and forward between two `/play` addresses in one
+library is not announced, because the player's key deliberately holds still
+across a handover and cannot tell the two apart. The title is right.
 
 ### What phase 13 landed
 

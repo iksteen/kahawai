@@ -66,7 +66,6 @@ const projected = computed(() => projecting('seasons', children.data.value ?? []
 /// of working episodes, and calling that "could not load this season" tells
 /// both the tab strip and the screen reader something the screen contradicts.
 useScreenName(
-  'season',
   computed(() => {
     if (children.isError.value && !children.data.value) return 'Could not load this season'
     const label = seasonLabel(season.value, projected.value)

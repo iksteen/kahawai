@@ -105,13 +105,15 @@ async function screen(view: unknown, at: string) {
 /// the same door the views use, and each screen is then asked for its OWN name
 /// rather than for any name at all.
 const forgetScreenName = () => {
+  const router = createRouter({ history: createMemoryHistory(), routes })
   const wrapper = mount(
     defineComponent({
       setup() {
-        useScreenName('libraries', ref(null))
+        useScreenName(ref(null))
         return () => h('div')
       },
     }),
+    { global: { plugins: [router] } },
   )
   live.push(wrapper)
   return wrapper
@@ -203,15 +205,22 @@ describe('every screen says what it is showing', () => {
   // did. The tab strip, the bookmark and the screen reader all got the bare
   // word "kahawai" — the exact failure the module was written to fix.
   const screens: [string, unknown, string, Showing][] = [
-    ['a library', Library, '/library/films', { screen: 'library', name: 'Films' }],
-    ['an item', Detail, '/library/films/item/heat', { screen: 'detail', name: 'Heat' }],
+    ['a library', Library, '/library/films', { at: '/library/films', name: 'Films' }],
+    [
+      'an item',
+      Detail,
+      '/library/films/item/heat',
+      { at: '/library/films/item/heat', name: 'Heat' },
+    ],
     [
       'a season',
       Season,
       '/library/films/item/show/season/1',
-      { screen: 'season', name: 'Heat · Season 1' },
+      { at: '/library/films/item/show/season/1', name: 'Heat · Season 1' },
     ],
-    ['the player', Player, '/library/films/item/heat/play', { screen: 'player', name: 'Heat' }],
+    // The player's tag drops the item on purpose: an autoplay handover changes
+    // the URL and must not remount the frame. See `boundaryKey`.
+    ['the player', Player, '/library/films/item/heat/play', { at: 'player:films', name: 'Heat' }],
   ]
 
   for (const [what, view, at, expected] of screens) {
@@ -223,10 +232,9 @@ describe('every screen says what it is showing', () => {
       expect(screenShowing.value).toBe(null)
       await screen(view, at)
       await flushPromises()
-      // The TAG as well as the name. It is a hand-typed literal in each view,
-      // and a screen publishing under another screen's tag never titles itself
-      // and is never announced — while an assertion about the name alone goes
-      // on passing.
+      // The TAG as well as the name: a name published against another address
+      // never reaches the title and is never announced, while an assertion
+      // about the name alone goes on passing.
       expect(screenShowing.value).toEqual(expected)
     })
   }
@@ -240,7 +248,10 @@ describe('every screen says what it is showing', () => {
     forgetScreenName()
     await screen(Detail, '/library/films/item/ep')
     await flushPromises()
-    expect(screenShowing.value).toEqual({ screen: 'detail', name: 'Blue Exorcist · Episode 1' })
+    expect(screenShowing.value).toEqual({
+      at: '/library/films/item/ep',
+      name: 'Blue Exorcist · Episode 1',
+    })
   })
 
   test('and a player still waiting publishes nothing', async () => {

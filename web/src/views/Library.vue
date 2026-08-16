@@ -88,10 +88,7 @@ const name = computed(() => self.value?.name ?? 'Library')
 /// announcement on the word the announcement exists to replace. But a details
 /// request that FAILED is never going to produce one, and a screen you are
 /// standing on has to answer "where am I" — so the placeholder, then.
-useScreenName(
-  'library',
-  computed(() => self.value?.name ?? (details.isError.value ? name.value : null)),
-)
+useScreenName(computed(() => self.value?.name ?? (details.isError.value ? name.value : null)))
 
 /// Measured, never assumed: the card art's aspect ratio is applied to a fluid
 /// grid column, so a row's height is a function of the window width.

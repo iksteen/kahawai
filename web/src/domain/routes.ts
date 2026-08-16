@@ -36,6 +36,21 @@ export function boundaryKey(name: RouteName, path: string, library?: string): st
   return name === 'player' ? `player:${library ?? ''}` : path
 }
 
+/// The same key, off a route object. Two callers need to agree on it exactly —
+/// the boundary that remounts on it and the announcement that fires on it —
+/// and they were computing it from the same three pieces in two places.
+export function addressOf(route: {
+  name?: unknown
+  path: string
+  params: Record<string, unknown>
+}): string {
+  return boundaryKey(
+    (route.name ?? 'libraries') as RouteName,
+    route.path,
+    typeof route.params.library === 'string' ? route.params.library : undefined,
+  )
+}
+
 /// Whether this screen has a results panel under the search box.
 ///
 /// Only the home screen. On a library page the same box filters that library

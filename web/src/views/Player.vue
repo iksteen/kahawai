@@ -65,7 +65,6 @@ const heading = computed(() => {
 /// it would spend this screen's one announcement before there is anything to
 /// announce. A failure is not a state it grows out of, so that one is published.
 useScreenName(
-  'player',
   computed(() => {
     if (naming.value) return itemName(naming.value)
     return failure.value ? 'Could not start playback' : null
