@@ -4,9 +4,8 @@
 /// grid and on its show's page, and a viewer who sees "E11" in one place and
 /// "S?E11" in another has to work out whether they are the same thing.
 ///
-/// The season-projection helpers and the resume rule live with the screens
-/// that need them (phases 9 and 13); porting them here now would be untested
-/// code waiting to drift from the old client it was copied from.
+/// The season-projection helpers arrived with the item pages that need them
+/// (phase 9). The player's own timing helpers are still to come.
 
 import type { ItemRowI64 } from '../api/generated/model/itemRowI64.ts'
 
@@ -68,4 +67,54 @@ export function watchedPct(
 ): number | null {
   if (!i.resume_position_ms || !i.resume_duration_ms) return null
   return Math.min(100, (i.resume_position_ms / i.resume_duration_ms) * 100)
+}
+
+/// HUB-31: absolute-numbered (anime) episodes carry a TVDB-style projection
+/// onto seasons. Whether to use it is a user preference, but the answer has to
+/// be the same on the show page and the season page — a viewer who opens
+/// "Season 2" must not land on a different set of episodes than the list they
+/// clicked it from.
+export function projecting(
+  animeView: 'seasons' | 'native',
+  episodes: { proj_season: number | null }[],
+): boolean {
+  return animeView === 'seasons' && episodes.some((e) => e.proj_season != null)
+}
+
+export function seasonOf(
+  episode: { season: number | null; proj_season: number | null },
+  projected: boolean,
+): number | null {
+  return projected ? (episode.proj_season ?? null) : episode.season
+}
+
+export function episodeOf(
+  episode: { episode: number | null; proj_episode: number | null },
+  projected: boolean,
+): number | null {
+  return projected ? (episode.proj_episode ?? episode.episode) : episode.episode
+}
+
+/// A null season means absolute numbering, which is a different thing from
+/// Specials (season 0) and from a season nobody named.
+export function seasonLabel(season: number | null, projected: boolean): string {
+  if (season === null) return projected ? 'Other' : 'Episodes'
+  return season === 0 ? 'Specials' : `Season ${season}`
+}
+
+/// Where pressing Play should start: the stored position, or 0 once it is
+/// close enough to the end that resuming would mean watching the credits.
+///
+/// Off `resume_duration_ms`, which is the hub's own figure for the WHOLE item.
+/// Computing it from the largest single file instead silently loses the resume
+/// on every multi-part film: forty minutes into a seven-part feature is past
+/// 90% of part one, so Play restarted from zero.
+export function resumeMs(item: {
+  resume_position_ms: number | null
+  resume_duration_ms: number | null
+}): number {
+  const at = item.resume_position_ms
+  const total = item.resume_duration_ms
+  if (!at || !total) return 0
+  return at < total * 0.9 ? at : 0
 }

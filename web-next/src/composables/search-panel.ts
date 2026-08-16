@@ -66,16 +66,45 @@ export function useSearchPanel(libraries: Ref<LibrarySummary[]>, query: Ref<stri
       ),
   })
 
-  const hits = computed<LibraryHits[]>(() => search.data.value ?? [])
+  /// The query the rows on screen belong to, and '' when there are none.
+  ///
+  /// `keepPreviousData` hands the last result set to the NEXT key, which is
+  /// what keeps rows actionable between two keystrokes — and what made an
+  /// emptied box remember. Cleared the moment nothing is being asked, so
+  /// typing again starts from nothing rather than from the search somebody
+  /// cancelled: the panel was labelled "Results for zzz" over the hits for
+  /// "heat", and two arrow presses and Enter opened a film out of them.
+  const shownQuery = ref('')
+  watch(
+    [asking, () => search.isPlaceholderData.value, () => search.data.value],
+    () => {
+      if (!asking.value) shownQuery.value = ''
+      else if (!search.isPlaceholderData.value && search.data.value) shownQuery.value = query.value
+    },
+    { immediate: true },
+  )
+
+  const hits = computed<LibraryHits[]>(() =>
+    shownQuery.value === '' ? [] : (search.data.value ?? []),
+  )
   const rows = computed(() => searchRows(hits.value))
+
+  /// Asking, with the previous query's rows still on screen.
+  ///
+  /// No `asking &&` guard: a query that has been disabled mid-flight stops
+  /// reporting itself as fetching, so the guard was a second answer to a
+  /// question that already had one, and no test could tell it apart.
+  const searching = computed(() => search.isFetching.value)
+
+  /// Cleared before asking, so a failure does not paint over the next
+  /// keystroke's results for a round trip — the banner named a library the
+  /// current search had not asked yet.
   const failed = computed(() =>
-    hits.value.filter((h) => h.failure !== '').map((h) => h.library.name),
+    searching.value ? [] : hits.value.filter((h) => h.failure !== '').map((h) => h.library.name),
   )
   const allFailed = computed(
-    () => hits.value.length > 0 && failed.value.length === hits.value.length,
+    () => failed.value.length > 0 && failed.value.length === hits.value.length,
   )
-  /// Asking, with the previous query's rows still on screen.
-  const searching = computed(() => asking.value && search.isFetching.value)
 
   /// Whether there is a panel ON SCREEN — which is what the input's
   /// `aria-expanded` has to mean.
@@ -85,7 +114,7 @@ export function useSearchPanel(libraries: Ref<LibrarySummary[]>, query: Ref<stri
   /// from the row count told a screen reader the combobox was collapsed while
   /// "No matches" or the retry button was showing — the exact two states
   /// somebody would most need read out.
-  const drawn = computed(() => asking.value && search.data.value !== undefined)
+  const drawn = computed(() => asking.value && shownQuery.value !== '')
 
   /// The lit row, `-1` for none. Not carried across a query: a position kept
   /// in a list that has been replaced points at a different film, and Enter
@@ -93,17 +122,20 @@ export function useSearchPanel(libraries: Ref<LibrarySummary[]>, query: Ref<stri
   const highlight = ref(-1)
   watch(rows, () => (highlight.value = -1))
 
-  /// One notice per settled search. Reported here rather than per library
-  /// because notices are latest-wins: one each would name whichever failed
-  /// last and imply the rest were fine.
-  let told = ''
-  watch([searching, hits], () => {
-    if (searching.value || !asking.value) return
-    const trouble = searchTrouble(hits.value)
-    const said = query.value + trouble
-    if (trouble === '' || told === said) return
-    told = said
-    notify(trouble)
+  /// One notice per SETTLED ATTEMPT — the moment a search stops being in
+  /// flight, and every time. Reported here rather than per library because
+  /// notices are latest-wins: one each would name whichever failed last and
+  /// imply the rest were fine.
+  ///
+  /// An earlier version remembered the sentence it had said and refused to
+  /// repeat it. Notices clear after five seconds, so there was nothing on
+  /// screen to duplicate: pressing Try again against a hub that was still down
+  /// then said nothing at all — on the one channel the panel deliberately does
+  /// not leave to a live region.
+  watch(searching, (now, before) => {
+    if (now || !before || !asking.value) return
+    const trouble = searchTrouble(search.data.value ?? [])
+    if (trouble !== '') notify(trouble)
   })
 
   return {
@@ -113,6 +145,9 @@ export function useSearchPanel(libraries: Ref<LibrarySummary[]>, query: Ref<stri
     searching,
     drawn,
     highlight,
+    /// What the rows on screen are results FOR, which is not always what is in
+    /// the box: the label has to stay honest while a replacement is in flight.
+    shownQuery,
     retry: () => void search.refetch(),
   }
 }

@@ -391,11 +391,11 @@ composables → components → view → review → commit.
 | 4 | Shell, header, menus, routing — **DONE** | the two menus, the search box's two meanings, keyboard and ARIA |
 | 5 | Auth / setup — **DONE** | including UI-24: a hub that never answers must not leave a dead form |
 | 6 | Home (libraries, shelves, continue watching) — **DONE** | inline retries per shelf, the three loading states of UI-22 |
-| 7 | Search panel | on B3; combobox pattern, `aria-activedescendant`, every key driven |
-| 8 | Library grid | virtualised, fixed cell height (UI-11), `srcset` at both densities (UI-16) |
+| 7 | Search panel — **DONE** | on B3; combobox pattern, `aria-activedescendant`, every key driven |
+| 8 | Library grid — **DONE** | virtualised, fixed cell height (UI-11), `srcset` at both densities (UI-16) |
 | 9 | Detail + Season | error split: a refused Play is not a failed item load (UI-13) |
 | 10 | Settings | drag ordering with keyboard equivalents (UI-12), per-key write queue |
-| 11 | Admin | optimistic writes with rollback throughout; B5 |
+| 11 | Admin | optimistic writes with rollback throughout; B5; **and the match button**, which is a library-grid control but the only surface that reads `match_confidence` — see below |
 | 12 | Album queue | survives navigation; per-track removal (UI-2) now that it is cheap |
 | 13 | Video player | largest and last; see below |
 | 14 | Accessibility pass | UI-17: keyboard-only run and a screen reader, which has never happened |
@@ -498,6 +498,43 @@ and the claims reader behind the header's name.
   was back under every shelf, and the lane arrows were `display: none` until
   hover — which takes them out of the tab order, leaving no keyboard path to
   the arrow that pages the shelf.
+
+### What phases 7 and 8 landed
+
+The cross-library search panel and the virtualised library grid.
+
+- **A panel labelled for one query, showing another's hits.** `keepPreviousData`
+  is what keeps rows actionable between two keystrokes, and it hands the last
+  result set to the next key — including across an emptied box. The panel read
+  "Results for zzz" over the hits for "heat", and two arrow presses and Enter
+  opened a film out of them. It now tracks which query the rows belong to, and
+  that is also what the label reads.
+- **Two reproduced defects in the grid.** Re-sorting left ten cards inside a
+  full-height container — scrolling to the top when already there fires no
+  scroll event, and a re-sort changes neither the total nor the metric, so
+  every path that would have recomputed was watching something that had not
+  moved. And clicking a card that had not arrived threw, because the click
+  handler was on the cell rather than on the card and the placeholder is not a
+  card.
+- **The cell height invariant had quietly broken.** `metaLine` is empty for a
+  film with no year, an empty span takes no line box, and one short cell makes
+  its whole grid row short — while `reservedHeight` multiplies ONE measured
+  row pitch by every row. The dash is back, and so is the two-line clamp.
+- **Where the measurements come from.** The grid measures its own columns and
+  cell height, which a test environment cannot produce — so the arithmetic
+  lives in `domain/virtual.ts` and the mounted tests stub the two numbers.
+  Before that stub, six behaviours could be deleted without failing anything,
+  including the scroll listener and the measurement itself.
+- **A blind spot worth stating:** happy-dom drops an `aspect-ratio` whose value
+  is a `var()`, however it is written, so "the placeholder is the same height
+  as the card" is checked by its class and by eye, not by its value.
+
+**Deferred, not lost:** the admin match button. It is a library-grid control,
+but it is the only surface anywhere that reads `match_confidence` — a library
+without it is a library where nothing looks wrong — so it goes with the rest of
+the admin surfaces in phase 11. Whoever ports it needs two things the new code
+does not show: the cell needs `position: relative`, and the button's offset is
+17px rather than 16, because 16 misses its two sibling badges by a pixel.
 
 ### The player
 

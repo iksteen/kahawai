@@ -3,8 +3,9 @@
 /// dismissing click went through to the page behind it, and a filter that
 /// followed you home.
 
+import { QueryClient, VueQueryPlugin } from '@tanstack/vue-query'
 import { flushPromises, mount } from '@vue/test-utils'
-import { describe, expect, test } from 'vitest'
+import { describe, expect, test, vi } from 'vitest'
 import { nextTick } from 'vue'
 import { createMemoryHistory, createRouter } from 'vue-router'
 
@@ -12,7 +13,24 @@ import AppShell from '../src/components/AppShell.vue'
 import MenuPopover from '../src/components/MenuPopover.vue'
 import SearchBox from '../src/components/SearchBox.vue'
 
+vi.mock('../src/api/generated/kahawai.ts', () => ({
+  listItems: vi.fn(async () => ({ items: [], total: 0, limit: 5, offset: 0 })),
+  getItemArtworkUrl: (id: string) => `/api/v1/items/${id}/artwork`,
+}))
+
 const Blank = { template: '<div />' }
+
+/// No retries: one refused request must not become three in a test that is
+/// about a menu.
+const withQuery = () =>
+  [
+    VueQueryPlugin,
+    {
+      queryClient: new QueryClient({
+        defaultOptions: { queries: { retry: false } },
+      }),
+    },
+  ] as [typeof VueQueryPlugin, { queryClient: QueryClient }]
 
 function testRouter(start = '/') {
   const router = createRouter({
@@ -45,7 +63,7 @@ async function shell(start = '/', props: Record<string, unknown> = {}) {
       admin: false,
       ...props,
     },
-    global: { plugins: [router] },
+    global: { plugins: [router, withQuery()] },
   })
   return { wrapper, router }
 }
@@ -78,6 +96,7 @@ describe('the search box', () => {
         panel: true,
         shown: false,
         highlight: -1,
+        count: 0,
         listId: 'results',
         optionId: (i: number) => `option-${i}`,
       },
@@ -96,6 +115,7 @@ describe('the search box', () => {
         panel: true,
         shown: true,
         highlight: 2,
+        count: 0,
         listId: 'results',
         optionId: (i: number) => `option-${i}`,
       },
@@ -113,6 +133,7 @@ describe('the search box', () => {
       panel: true,
       shown: false,
       highlight: -1,
+      count: 0,
       listId: 'r',
       optionId: (i: number) => `o-${i}`,
     }
@@ -132,6 +153,7 @@ describe('the search box', () => {
       panel: true,
       shown: false,
       highlight: -1,
+      count: 0,
       listId: 'r',
       optionId: (i: number) => `o-${i}`,
     }
@@ -154,6 +176,7 @@ describe('the search box', () => {
         panel: true,
         shown: false,
         highlight: -1,
+        count: 0,
         listId: 'r',
         optionId: (i: number) => `o-${i}`,
       },
@@ -227,7 +250,7 @@ describe('the menus', () => {
         username: 'claude',
         admin: false,
       },
-      global: { plugins: [wrapper.vm.$router] },
+      global: { plugins: [wrapper.vm.$router, withQuery()] },
       attachTo: document.body,
     })
     await attached.findAll('button')[0]!.trigger('click')
@@ -260,7 +283,7 @@ describe('the menus', () => {
     await router.isReady()
     const wrapper = mount(AppShell, {
       props: { libraries: [], username: 'claude', admin: false },
-      global: { plugins: [router] },
+      global: { plugins: [router, withQuery()] },
       attachTo: document.body,
     })
     const trigger = wrapper.findAll('button')[0]!.element as HTMLElement

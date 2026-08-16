@@ -9,6 +9,7 @@ import { createRouter, createWebHistory } from 'vue-router'
 
 const Placeholder = () => import('./views/Placeholder.vue')
 const Home = () => import('./views/Home.vue')
+const Library = () => import('./views/Library.vue')
 
 export const router = createRouter({
   // The hub serves the app under /app/ and falls back to the shell for any
@@ -18,7 +19,7 @@ export const router = createRouter({
     { path: '/', name: 'libraries', component: Home },
     { path: '/admin', name: 'admin', component: Placeholder },
     { path: '/settings', name: 'settings', component: Placeholder },
-    { path: '/library/:library', name: 'library', component: Placeholder },
+    { path: '/library/:library', name: 'library', component: Library },
     {
       path: '/library/:library/item/:id',
       name: 'detail',

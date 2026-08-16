@@ -110,6 +110,77 @@ describe('a library that could not be asked', () => {
     expect(notice.value).toBe('Could not search Music.')
   })
 
+  test('and a failure that repeats is reported every time', async () => {
+    // The de-dup remembered the sentence it had said and refused to repeat it.
+    // Notices clear after five seconds, so there was nothing on screen to
+    // duplicate: pressing Try again against a hub that was still down said
+    // nothing at all.
+    answers({ films: 'fails', music: 'fails' })
+    const { api } = panel()
+    await flushPromises()
+    expect(notice.value).not.toBe('')
+
+    clearNotices()
+    api().retry()
+    await flushPromises()
+    expect(notice.value).not.toBe('')
+  })
+
+  test('and a banner from the last query does not sit over the next one', async () => {
+    // The sentence named a library the current search had not asked yet.
+    answers({ films: [item('a')], music: 'fails' })
+    const query = ref('heat')
+    const { api } = panel(query)
+    await flushPromises()
+    expect(api().failed.value).toEqual(['Music'])
+
+    let answer = () => {}
+    vi.mocked(listItems).mockReturnValue(
+      new Promise((resolve) => (answer = () => resolve(page([])))),
+    )
+    query.value = 'other'
+    await flushPromises()
+    expect(api().searching.value).toBe(true)
+    expect(api().failed.value).toEqual([])
+
+    answer()
+    await flushPromises()
+  })
+
+  test('one library being away is not the hub being away', async () => {
+    // The two sentences say different things, and only one of them is true.
+    answers({ films: [item('a')], music: 'fails' })
+    const { api } = panel()
+    await flushPromises()
+    expect(api().allFailed.value).toBe(false)
+
+    answers({ films: 'fails', music: 'fails' })
+    api().retry()
+    await flushPromises()
+    expect(api().allFailed.value).toBe(true)
+  })
+
+  test('emptying the box stops the search, even mid-flight', async () => {
+    // Otherwise the panel is "still searching" for a query nobody typed, and
+    // the failure banner it is holding back never comes back.
+    let answer = () => {}
+    vi.mocked(listItems).mockReturnValue(
+      new Promise((resolve) => (answer = () => resolve(page([])))),
+    )
+    const query = ref('heat')
+    const { api } = panel(query)
+    await flushPromises()
+    expect(api().searching.value).toBe(true)
+
+    query.value = ''
+    await flushPromises()
+    expect(api().searching.value).toBe(false)
+    expect(api().drawn.value).toBe(false)
+
+    answer()
+    await flushPromises()
+  })
+
   test('and asking again is offered', async () => {
     answers({ films: 'fails', music: 'fails' })
     const { api } = panel()

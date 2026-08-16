@@ -15,7 +15,7 @@
 /// `type="text"`, not `type="search"`. A search input brings the UA's own
 /// clear button, which would sit on top of this one, and in some browsers
 /// Escape reverts the field — losing the query is not what Escape is for here.
-import { computed, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
 
 import Icon from './Icon.vue'
 
@@ -29,6 +29,10 @@ const props = defineProps<{
   /// take the caret out of the field somebody is still typing in.
   shown: boolean
   highlight: number
+  /// How many rows the panel drew. A panel showing "No matches" is on screen
+  /// with nothing to walk, and taking the arrows there kills the caret
+  /// movement in a box whose query matched nothing.
+  count: number
   listId: string
   optionId: (index: number) => string
 }>()
@@ -37,7 +41,83 @@ const emit = defineEmits<{
   'update:modelValue': [string]
   reopen: []
   clear: []
+  /// Walking the panel. Reported rather than handled here: the panel owns the
+  /// rows, so it is the only thing that knows how far the list goes.
+  walk: [delta: number]
+  take: []
+  dismiss: []
 }>()
+
+/// The keyboard, scoped to the search AREA rather than the window: the panel
+/// is only reachable through the field it belongs to, so there is no priority
+/// question against the menus, the dialogs or the player's own Escape. And
+/// only while there is a panel, so a closed box keeps its own keys.
+///
+/// The area rather than the input alone because focus can legitimately be on
+/// the ✕ or on Try again with the panel still up, and Escape has to work from
+/// there too.
+function onKey(event: KeyboardEvent) {
+  // Only while there is a panel. A closed box keeps its own keys exactly as
+  // they were — Escape in a library's filter box is the browser's, and taking
+  // it dropped the caret out of the field for nothing.
+  if (!props.shown) return
+  // A composition owns these keys first. Typing Japanese, the arrows walk the
+  // IME's candidate list and Enter commits the word — take them and choosing a
+  // character navigates into a library instead.
+  if (event.isComposing) return
+  if (event.key === 'Escape') {
+    // Out of the field as well as out of the panel: a dropdown dismissed while
+    // the caret is still blinking in the box that opened it reads as a box
+    // that stopped working. `preventDefault` because Escape in a search field
+    // reverts its value in some browsers, and losing the query was not what
+    // was asked for.
+    event.preventDefault()
+    emit('dismiss')
+    ;(document.activeElement as HTMLElement | null)?.blur()
+    return
+  }
+  // Walking and opening belong to the field. Anywhere else in here — the ✕,
+  // Try again — the keys are that control's own, and Enter must press the
+  // button rather than open a library.
+  if (event.target !== input.value || props.count === 0) return
+  if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+    // Or the caret jumps to one end of the query while the highlight moves.
+    event.preventDefault()
+    emit('walk', event.key === 'ArrowDown' ? 1 : -1)
+    return
+  }
+  if (event.key === 'Enter') {
+    event.preventDefault()
+    emit('take')
+  }
+}
+
+/// Tab out of the area and the panel goes with you. This replaces closing on
+/// the Tab key itself, which could not tell "leaving" from "reaching for the
+/// retry button inside the panel" and so made that button mouse-only.
+///
+/// Only when focus actually landed on something outside: a `relatedTarget` of
+/// null means focus went nowhere, which is also what a mousedown on a row
+/// looks like in browsers that do not focus buttons on click — closing there
+/// would unmount the row before its click could fire.
+function onFocusOut(event: FocusEvent) {
+  const to = event.relatedTarget as Node | null
+  if (to && !area.value?.contains(to)) emit('dismiss')
+}
+
+const area = ref<HTMLElement | null>(null)
+
+/// The panel scrolls at 70vh, so the highlight can walk out of sight.
+/// `nearest` rather than `center`: it moves things only as far as it must,
+/// which on a long panel whose bottom is past the fold means the page comes
+/// along — the alternative is a lit row nobody can see.
+watch(
+  () => props.highlight,
+  (at) => {
+    if (at < 0) return
+    document.getElementById(props.optionId(at))?.scrollIntoView({ block: 'nearest' })
+  },
+)
 
 const input = ref<HTMLInputElement | null>(null)
 defineExpose({ focus: () => input.value?.focus() })
@@ -62,7 +142,12 @@ const combobox = computed(() =>
        which pushed the header off a 375px screen sideways. It stops growing at
        420 for the opposite reason: a search box the width of the page is a
        banner. -->
-  <div class="relative min-w-[150px] max-w-[420px] flex-[1_1_200px]">
+  <div
+    ref="area"
+    class="relative min-w-[150px] max-w-[420px] flex-[1_1_200px]"
+    @keydown="onKey"
+    @focusout="onFocusOut"
+  >
     <span class="pointer-events-none absolute top-1/2 left-2.5 flex -translate-y-1/2 text-dimmer">
       <Icon name="search" />
     </span>

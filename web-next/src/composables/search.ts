@@ -108,3 +108,10 @@ const SEARCH = Symbol('search') as InjectionKey<Search>
 export function useSearchQuery() {
   return inject(SEARCH, undefined)?.query ?? readonly(ref(''))
 }
+
+/// The box itself, for a view that can clear it — the library heading drops
+/// the filter, which is the other half of the ✕. `undefined` outside the
+/// shell, where there is no box to clear.
+export function useSearchBox(): Search | undefined {
+  return inject(SEARCH, undefined)
+}

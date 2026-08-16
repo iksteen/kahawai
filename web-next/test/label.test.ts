@@ -4,7 +4,18 @@
 
 import { describe, expect, test } from 'vitest'
 
-import { type Labelled, metaLine, seLabel, targetOf, watchedPct } from '../src/domain/label.ts'
+import {
+  episodeOf,
+  type Labelled,
+  metaLine,
+  projecting,
+  resumeMs,
+  seasonLabel,
+  seasonOf,
+  seLabel,
+  targetOf,
+  watchedPct,
+} from '../src/domain/label.ts'
 
 const row = (over: Partial<Labelled>): Labelled => ({
   id: 'i1',
@@ -110,5 +121,74 @@ describe('how far through', () => {
     // A position past the reported duration is ordinary: the hub's figure is
     // the container's and a player can report a little beyond it.
     expect(watchedPct(row({ resume_position_ms: 1300, resume_duration_ms: 1200 }))).toBe(100)
+  })
+})
+
+describe('anime numbered straight through', () => {
+  const absolute = [
+    { season: null, proj_season: 1, episode: 1, proj_episode: 1 },
+    { season: null, proj_season: 2, episode: 26, proj_episode: 1 },
+  ]
+
+  test('is projected onto seasons only when asked and only when it can be', () => {
+    // The answer has to be the same on the show page and the season page: a
+    // viewer who opens "Season 2" must not land on a different set of
+    // episodes than the list they clicked it from.
+    expect(projecting('seasons', absolute)).toBe(true)
+    expect(projecting('native', absolute)).toBe(false)
+    // Nothing to project onto.
+    expect(projecting('seasons', [{ proj_season: null }])).toBe(false)
+  })
+
+  test('and then the projected numbers are the ones used', () => {
+    expect(seasonOf(absolute[1]!, true)).toBe(2)
+    expect(episodeOf(absolute[1]!, true)).toBe(1)
+    expect(seasonOf(absolute[1]!, false)).toBeNull()
+    expect(episodeOf(absolute[1]!, false)).toBe(26)
+  })
+
+  test('an episode with no projection keeps its own number', () => {
+    // Projecting a show where only some episodes carry one must not renumber
+    // the rest to nothing.
+    const partial = { season: 1, proj_season: null, episode: 7, proj_episode: null }
+    expect(episodeOf(partial, true)).toBe(7)
+  })
+})
+
+describe('naming a season', () => {
+  test('zero is Specials, not season zero', () => {
+    expect(seasonLabel(0, false)).toBe('Specials')
+  })
+
+  test('and null is absolute numbering, which is not a missing season', () => {
+    expect(seasonLabel(null, false)).toBe('Episodes')
+    // Under a projection there ARE seasons, so the leftovers are Other.
+    expect(seasonLabel(null, true)).toBe('Other')
+  })
+
+  test('anything else says which', () => {
+    expect(seasonLabel(2, false)).toBe('Season 2')
+  })
+})
+
+describe('where Play starts', () => {
+  test('from where you got to', () => {
+    expect(resumeMs({ resume_position_ms: 300, resume_duration_ms: 1200 })).toBe(300)
+  })
+
+  test('and from the beginning once that is the credits', () => {
+    expect(resumeMs({ resume_position_ms: 1100, resume_duration_ms: 1200 })).toBe(0)
+  })
+
+  test('measured against the WHOLE item, not its largest file', () => {
+    // Forty minutes into a seven-part feature is past 90% of part one, so
+    // computing this per file restarted every multi-part film from zero.
+    const sevenParts = { resume_position_ms: 40 * 60_000, resume_duration_ms: 210 * 60_000 }
+    expect(resumeMs(sevenParts)).toBe(40 * 60_000)
+  })
+
+  test('and from the beginning when there is nothing to resume', () => {
+    expect(resumeMs({ resume_position_ms: null, resume_duration_ms: 1200 })).toBe(0)
+    expect(resumeMs({ resume_position_ms: 300, resume_duration_ms: null })).toBe(0)
   })
 })

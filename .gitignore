@@ -1,5 +1,8 @@
 /target
 /web/node_modules
 /web-next/node_modules
+# Vitest writes its cache to the nearest node_modules, which is the repo root
+# when a run is started from here rather than from web-next/.
+/node_modules
 __pycache__/
 /web-mockup

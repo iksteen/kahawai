@@ -12,9 +12,13 @@ import Icon, { type IconName } from './Icon.vue'
 import MenuItem from './MenuItem.vue'
 import MenuPopover from './MenuPopover.vue'
 import SearchBox from './SearchBox.vue'
+import SearchPanel from './SearchPanel.vue'
 import { hasSearchBox, hasSearchPanel, type RouteName } from '../domain/routes.ts'
+import { targetOf } from '../domain/label.ts'
 import { notice } from '../composables/notices.ts'
+import { moveHighlight, SEARCH_LIST_ID, searchOptionId } from '../domain/search-nav.ts'
 import { useSearch } from '../composables/search.ts'
+import { useSearchPanel } from '../composables/search-panel.ts'
 
 const props = defineProps<{
   libraries: { id: string; name: string; media_type: string }[]
@@ -28,17 +32,79 @@ const router = useRouter()
 // Destructured, because a template only auto-unwraps refs that are top-level
 // setup bindings — `search.text` inside an object is not one, and reaching for
 // `.value` in a template is the mistake that spelling invites.
-const { text, query, typed, reopen, dismiss, clear } = useSearch()
+const { text, query, open, typed, reopen, dismiss, clear, taken } = useSearch()
 
 const name = computed(() => (route.name ?? 'libraries') as RouteName)
 const panel = computed(() => hasSearchPanel(name.value))
-const box = computed(() => hasSearchBox(name.value))
+const hasBox = computed(() => hasSearchBox(name.value))
+/// The field itself, so the panel's retry can put focus back in it.
+const box = ref<{ focus: () => void } | null>(null)
 
-/// Any navigation puts the panel away — not only the two that go through
-/// `go()`. Back and forward, a result opening its item, a view pushing a route
-/// of its own: none of them pass through this component, and the flag
-/// outliving the route is how the home screen once mounted with a results
-/// panel already open over a page nobody had searched.
+/// The panel searches whatever the header holds, on the screens that have one.
+/// It is asked for even while closed, so dismissing keeps the results it
+/// already has — unmounting threw them away, and focusing the box again re-ran
+/// every library's search and showed nothing for a round trip.
+const libraryList = computed(() => props.libraries)
+const panelQuery = computed(() => (panel.value ? query.value : ''))
+const results = useSearchPanel(libraryList, panelQuery)
+
+/// On screen: the panel has drawn something AND the box has not been
+/// dismissed. Both, because they are different questions — one is "is there
+/// anything to show", the other is "does the viewer want it".
+const showing = computed(() => open.value && results.drawn.value)
+
+/// Dismissing abandons the walk. Here rather than in the Escape handler
+/// because there are four ways out — Escape, focus leaving the search area, a
+/// click on the sheet, and opening something — and only this covers them all.
+/// Without it the panel came back with the old row still lit: dismissed at the
+/// eighth hit, refocused, and Enter opened that hit instead of the first
+/// library, which is what "nothing highlighted" is supposed to mean.
+watch(showing, (on) => {
+  if (!on) results.highlight.value = -1
+})
+
+/// Focus first, then ask. Pressing Try again clears the failure, which
+/// unmounts the button it was pressed with — focus would land on the document
+/// body with the panel still open and every one of its keys dead, because they
+/// are scoped to the search area.
+function askAgain() {
+  box.value?.focus()
+  results.retry()
+}
+
+function walk(delta: number) {
+  results.highlight.value = moveHighlight(results.rows.value.length, results.highlight.value, delta)
+}
+
+/// Enter with nothing highlighted falls to the first row, which `searchRows`
+/// guarantees is a library heading — so Enter straight after typing shows
+/// everything the first library matched, rather than guessing at one film.
+function take() {
+  const row = results.rows.value[results.highlight.value] ?? results.rows.value[0]
+  if (!row) return
+  if (row.kind === 'library') openFromPanel(row.library.id)
+  else openItemFromPanel(targetOf(row.item), row.library.id)
+}
+
+/// A library keeps the text, where it becomes that library's filter. An item
+/// does not: you asked for this one thing and got it.
+function openFromPanel(library: string) {
+  dismiss()
+  void router.push({ name: 'library', params: { library } })
+}
+function openItemFromPanel(id: string, library: string) {
+  taken()
+  void router.push({ name: 'detail', params: { library, id } })
+}
+
+/// Any navigation puts the panel away.
+///
+/// Belt and braces: today every way out is explicit — Escape, the sheet, a
+/// library row, a hit — and only the home screen has a panel at all, so no
+/// test can tell this line from the four that already do the job. It stays
+/// because the flag outliving the route is how the home screen once mounted
+/// with a results panel already open over a page nobody had searched, and the
+/// second screen to grow a panel will not come with that memory attached.
 watch(
   () => route.fullPath,
   () => dismiss(),
@@ -128,17 +194,36 @@ function go(to: Parameters<typeof router.push>[0], fresh: boolean) {
       </div>
 
       <SearchBox
-        v-if="box"
+        v-if="hasBox"
+        ref="box"
         :model-value="text"
         :panel="panel"
-        :shown="false"
-        :highlight="-1"
-        list-id="search-results"
-        :option-id="(i: number) => `search-option-${i}`"
+        :shown="showing"
+        :highlight="results.highlight.value"
+        :count="results.rows.value.length"
+        :list-id="SEARCH_LIST_ID"
+        :option-id="searchOptionId"
         @update:model-value="typed($event, panel)"
         @reopen="reopen(panel)"
         @clear="clear()"
-      />
+        @walk="walk"
+        @take="take"
+        @dismiss="dismiss()"
+      >
+        <SearchPanel
+          v-if="showing"
+          :query="results.shownQuery.value"
+          :rows="results.rows.value"
+          :failed="results.failed.value"
+          :all-failed="results.allFailed.value"
+          :searching="results.searching.value"
+          :highlight="results.highlight.value"
+          @close="dismiss()"
+          @retry="askAgain"
+          @open-library="openFromPanel"
+          @open-item="openItemFromPanel"
+        />
+      </SearchBox>
       <div v-else class="flex-1" />
 
       <!-- `ml-auto` once the header has wrapped, so the profile button stays
