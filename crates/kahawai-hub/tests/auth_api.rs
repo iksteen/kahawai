@@ -320,6 +320,23 @@ async fn setup_then_auth_flow() {
     let rotated = body_json(resp).await;
     assert!(rotated["access_token"].as_str().is_some());
     let rotated_refresh = rotated["refresh_token"].as_str().unwrap().to_string();
+    // One generation behind is an honest client whose response was lost, or a
+    // second tab that rotated first — not a thief. It rotates again.
+    let resp = api
+        .clone()
+        .oneshot(post(
+            "/api/v1/auth/refresh",
+            serde_json::json!({"client": "api", "refresh_token": refresh.clone()}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "the previous generation must still rotate"
+    );
+    // That leaves `refresh` two generations back, which means somebody else
+    // spent one in between. Still replay, still revokes the family.
     let resp = api
         .clone()
         .oneshot(post(
@@ -331,7 +348,7 @@ async fn setup_then_auth_flow() {
     assert_eq!(
         resp.status(),
         StatusCode::UNAUTHORIZED,
-        "refresh tokens are single-use"
+        "two generations back is replay"
     );
     let resp = api
         .clone()
@@ -1710,46 +1727,132 @@ async fn auth_version_migration_invalidates_existing_access_and_refresh() {
     assert_eq!(row, (1, true));
 }
 
-/// AUTH-4/5: one concurrent rotation wins. The loser is a presentation of
-/// the now-consumed token, so it also revokes the winner's family.
+/// AUTH-4/5: two browser tabs refreshing at the same instant both survive.
+///
+/// This is the case the browser cannot prevent for us. `navigator.locks`
+/// serialises tabs, but only per ORIGIN — cookies ignore the port, so :8420
+/// and :5173 share a jar and hold two independent locks, and the LAN address
+/// over plain HTTP is not a secure context and has no locks at all. Before
+/// leniency, whichever request landed second killed the family and logged
+/// both tabs out.
 #[tokio::test]
-async fn concurrent_refresh_has_one_winner_and_revokes_replay_family() {
+async fn two_tabs_refreshing_at_the_same_instant_both_survive() {
     let (_dir, db, auth, _api, _setup) = auth_harness().await;
-    let contested = auth
-        .login("root", "hunter22222hunter")
-        .await
-        .unwrap()
-        .refresh_token;
     let separate = auth
         .login("root", "hunter22222hunter")
         .await
         .unwrap()
         .refresh_token;
+    let held = auth
+        .login("root", "hunter22222hunter")
+        .await
+        .unwrap()
+        .refresh_token;
+
     let barrier = Arc::new(tokio::sync::Barrier::new(3));
-    let run = |auth: Arc<Auth>, barrier: Arc<tokio::sync::Barrier>, token: String| {
+    let tab = |auth: Arc<Auth>, barrier: Arc<tokio::sync::Barrier>, token: String| {
         tokio::spawn(async move {
             barrier.wait().await;
             auth.refresh(&token).await
         })
     };
-    let first = run(auth.clone(), barrier.clone(), contested.clone());
-    let second = run(auth.clone(), barrier.clone(), contested);
+    let a = tab(auth.clone(), barrier.clone(), held.clone());
+    let b = tab(auth.clone(), barrier.clone(), held);
     barrier.wait().await;
-    let first = first.await.unwrap();
-    let second = second.await.unwrap();
-    assert_eq!(
-        usize::from(first.is_ok()) + usize::from(second.is_ok()),
-        1,
-        "concurrent refresh did not have exactly one winner"
-    );
-    let winner = first.or(second).unwrap();
-    assert!(matches!(
-        auth.refresh(&winner.refresh_token).await,
-        Err(kahawai_hub::auth::RefreshError::Invalid)
-    ));
+    assert!(a.await.unwrap().is_ok(), "the first tab was refused");
+    assert!(b.await.unwrap().is_ok(), "the second tab was refused");
+
     assert!(
         auth.refresh(&separate).await.is_ok(),
-        "replay revoked a separate login family"
+        "a separate login family was caught in it"
+    );
+    let revoked: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM refresh_families WHERE revoked_at IS NOT NULL")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    assert_eq!(revoked, 0, "nothing here is a breach");
+}
+
+/// And they keep working, round after round.
+///
+/// The token is a COOKIE, so the tabs hold no private copies that drift: both
+/// send whatever is in the jar, and each response writes it back. The jar ends
+/// up on the answer that ARRIVES last, which is normally the rotation that
+/// committed last — and that is `current`, so the next overlap has a current
+/// and a previous to hand out and both tabs are served.
+#[tokio::test]
+async fn a_jar_left_on_the_later_answer_stays_healthy() {
+    let (_dir, db, auth, _api, _setup) = auth_harness().await;
+    let mut jar = auth
+        .login("root", "hunter22222hunter")
+        .await
+        .unwrap()
+        .refresh_token;
+
+    for round in 0..10 {
+        let held = jar.clone();
+        // Two requests carrying the same cookie: the second is the one that
+        // would have been in flight when the first rotated.
+        let first = auth.refresh(&held).await;
+        let second = auth.refresh(&held).await;
+        assert!(
+            first.is_ok() && second.is_ok(),
+            "a tab was refused in round {round}"
+        );
+        jar = second.unwrap().refresh_token;
+    }
+
+    assert!(
+        auth.refresh(&jar).await.is_ok(),
+        "the jar's token stopped working"
+    );
+    let revoked: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM refresh_families WHERE revoked_at IS NOT NULL")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    assert_eq!(revoked, 0);
+}
+
+/// KNOWN GAP, pinned deliberately: a jar left on the EARLIER answer.
+///
+/// Two responses race back and the later arrival is not always the later
+/// commit, so the jar can keep the token that is already `previous`. One more
+/// overlap and the first request evicts it — `previous` becomes the outgoing
+/// `current` — leaving the second request holding something two generations
+/// back, which is replay.
+///
+/// It needs two overlaps in a row with unlucky ordering, where today ONE
+/// overlap is enough, so this is strictly better than what it replaces. A
+/// third generation would close it: the shifted set would still contain the
+/// jar's token. Stopped at two because each extra generation is another
+/// rotation a stolen token stays good for (owner decision, 2026-08-16).
+///
+/// If someone implements the third generation, this test is what will fail.
+#[tokio::test]
+async fn a_jar_left_on_the_earlier_answer_is_the_one_case_still_lost() {
+    let (_dir, db, auth, _api, _setup) = auth_harness().await;
+    let held = auth
+        .login("root", "hunter22222hunter")
+        .await
+        .unwrap()
+        .refresh_token;
+
+    let earlier = auth.refresh(&held).await.unwrap().refresh_token;
+    let _later = auth.refresh(&held).await.unwrap().refresh_token;
+
+    // The jar kept `earlier`, which is now `previous`. One more overlap:
+    assert!(
+        auth.refresh(&earlier).await.is_ok(),
+        "the first of the pair should still be served"
+    );
+    assert!(
+        matches!(
+            auth.refresh(&earlier).await,
+            Err(kahawai_hub::auth::RefreshError::Invalid)
+        ),
+        "a third generation would serve this one too"
     );
     let revoked: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM refresh_families WHERE revoked_at IS NOT NULL")
@@ -1757,6 +1860,65 @@ async fn concurrent_refresh_has_one_winner_and_revokes_replay_family() {
             .await
             .unwrap();
     assert_eq!(revoked, 1);
+}
+
+/// The other half: a token further back than one generation is somebody
+/// else's spend, and the family goes.
+#[tokio::test]
+async fn a_token_two_generations_back_still_revokes() {
+    let (_dir, db, auth, _api, _setup) = auth_harness().await;
+    let stolen = auth
+        .login("root", "hunter22222hunter")
+        .await
+        .unwrap()
+        .refresh_token;
+
+    let second = auth.refresh(&stolen).await.unwrap().refresh_token;
+    let third = auth.refresh(&second).await.unwrap().refresh_token;
+
+    assert!(
+        matches!(
+            auth.refresh(&stolen).await,
+            Err(kahawai_hub::auth::RefreshError::Invalid)
+        ),
+        "two generations back was accepted"
+    );
+    assert!(
+        matches!(
+            auth.refresh(&third).await,
+            Err(kahawai_hub::auth::RefreshError::Invalid)
+        ),
+        "the family survived a replay"
+    );
+    let revoked: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM refresh_families WHERE revoked_at IS NOT NULL")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    assert_eq!(revoked, 1);
+}
+
+/// The lost-response case, which no client-side lock can prevent: the hub
+/// rotated, the answer never arrived, and the client's only token is the one
+/// it already sent.
+#[tokio::test]
+async fn a_lost_response_does_not_cost_the_session() {
+    let (_dir, _db, auth, _api, _setup) = auth_harness().await;
+    let held = auth
+        .login("root", "hunter22222hunter")
+        .await
+        .unwrap()
+        .refresh_token;
+
+    // The hub rotates and the client never sees the answer.
+    let _lost = auth.refresh(&held).await.expect("first rotation");
+
+    // Thirty seconds later it retries with the only token it has.
+    let recovered = auth
+        .refresh(&held)
+        .await
+        .expect("a lost response cost the session");
+    assert!(auth.refresh(&recovered.refresh_token).await.is_ok());
 }
 
 /// API logout is authenticated, family-scoped, idempotent and deliberately

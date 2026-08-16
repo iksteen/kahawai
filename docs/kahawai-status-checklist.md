@@ -308,6 +308,16 @@ How something works and why it was built that way belong in
       only in memory, schedules rotation from the returned `expires_in` rather
       than decoding the bearer, and uses host-only HttpOnly refresh/media
       cookies; reload rotates the refresh family, and logout clears both cookies.
+      Rotation accepts the PREVIOUS generation as well as the current one: an
+      honest client holds a retired token whenever its response was lost, or
+      when a second tab rotated first — `navigator.locks` serialises tabs only
+      per ORIGIN, while cookies ignore the port, and the LAN address over plain
+      HTTP is not a secure context and has no locks at all. Anything older is
+      still replay and still revokes the family. Known gap, pinned by
+      `a_jar_left_on_the_earlier_answer_is_the_one_case_still_lost`: two
+      overlapping refreshes in a row, where the jar keeps the earlier of two
+      racing answers, still lose the session — a third generation would close
+      it at the cost of another rotation's life for a stolen token.
       The media cookie is accepted only by the explicit read allowlist, while mutations
       remain bearer-only. When `hub.public_url` is configured, browser login,
       refresh and logout require that exact canonical Origin; when absent,

@@ -574,7 +574,23 @@ impl Auth {
         .await
     }
 
-    /// Rotate exactly once. Replaying a consumed token revokes its family.
+    /// Rotate, accepting the previous generation as well as the current one.
+    ///
+    /// An honest client can be exactly ONE generation behind and no more,
+    /// because it never learned the newer token: its response was lost, or a
+    /// second tab of the same browser rotated first. (`navigator.locks`
+    /// serialises tabs, but only per ORIGIN — cookies ignore the port, so
+    /// :8420 and :5173 share a token and hold two separate locks, and the LAN
+    /// address over plain HTTP is not a secure context and has no locks at
+    /// all.) Two tabs then leapfrog, each one generation back, and both stay
+    /// alive; before this, whichever refreshed second killed the family and
+    /// logged both of them out.
+    ///
+    /// Anything older than the previous generation is still replay and still
+    /// revokes: being two behind means somebody else spent one in between.
+    /// The cost is that a stolen token is good for two rotations rather than
+    /// one, and spending it no longer trips detection on the next legitimate
+    /// refresh — that client is one behind, which is now allowed.
     pub async fn refresh(
         &self,
         refresh_token: &str,
@@ -589,16 +605,22 @@ impl Auth {
             .begin_with("BEGIN IMMEDIATE")
             .await
             .context("beginning refresh rotation")?;
+        // `previous_token_hash = current_token_hash` reads the row as it was
+        // before this statement, so every rotation hands the outgoing token
+        // down a generation — whichever of the two was presented.
         let changed = sqlx::query(
             "UPDATE refresh_families
-                SET current_token_hash = ?, expires_at = ?, rotated_at = ?
-              WHERE id = ? AND current_token_hash = ?
+                SET previous_token_hash = current_token_hash,
+                    current_token_hash = ?, expires_at = ?, rotated_at = ?
+              WHERE id = ?
+                AND (current_token_hash = ? OR previous_token_hash = ?)
                 AND revoked_at IS NULL AND expires_at >= ?",
         )
         .bind(&next_hash)
         .bind(now + REFRESH_TTL_SECS)
         .bind(now)
         .bind(family_id)
+        .bind(&presented_hash)
         .bind(&presented_hash)
         .bind(now)
         .execute(&mut *tx)
@@ -608,7 +630,7 @@ impl Auth {
 
         if changed == 0 {
             let family = sqlx::query(
-                "SELECT current_token_hash, expires_at, revoked_at
+                "SELECT current_token_hash, previous_token_hash, expires_at, revoked_at
                    FROM refresh_families WHERE id = ?",
             )
             .bind(family_id)
@@ -619,6 +641,10 @@ impl Auth {
                 && family.get::<Option<i64>, _>("revoked_at").is_none()
                 && family.get::<i64, _>("expires_at") >= now
                 && family.get::<String, _>("current_token_hash") != presented_hash
+                && family
+                    .get::<Option<String>, _>("previous_token_hash")
+                    .as_deref()
+                    != Some(presented_hash.as_str())
             {
                 sqlx::query(
                     "UPDATE refresh_families SET revoked_at = ?

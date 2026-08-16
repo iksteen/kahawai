@@ -1,0 +1,28 @@
+-- Generational leniency on refresh rotation.
+--
+-- Rotation revoked the whole family the moment a consumed token came back,
+-- which is right for a stolen one and wrong for the two ways an honest client
+-- ends up holding a token the hub has already retired:
+--
+--   * The response was lost. The hub rotated, the answer never arrived — a
+--     dropped link, a tab closed mid-flight, a laptop that slept — and the
+--     client's only token is the one it sent.
+--   * Two of its tabs refreshed at once. `navigator.locks` serialises them,
+--     but only per ORIGIN: cookies ignore the port, so :8420 and :5173 share
+--     one token and hold two independent locks, and the LAN address over plain
+--     HTTP is not a secure context and has no locks at all.
+--
+-- Both leave a client exactly ONE generation behind, never more, because it
+-- never learned the newer token. So a family accepts its previous token as
+-- well as its current one, and every rotation moves the outgoing current here.
+-- Presenting anything older is still replay and still revokes.
+--
+-- The cost, stated plainly: a stolen token stays usable for two rotations
+-- (~28 min at a 15-minute access token) rather than one, and spending it no
+-- longer trips detection on the legitimate client's next refresh — that client
+-- is one generation behind and is accepted. Detection now fires on tokens
+-- three or more generations old.
+--
+-- NULL for every existing family: they have no previous generation, and the
+-- first rotation after this gives them one.
+ALTER TABLE refresh_families ADD COLUMN previous_token_hash TEXT;
