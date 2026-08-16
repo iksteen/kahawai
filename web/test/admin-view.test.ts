@@ -519,13 +519,16 @@ describe('the two kinds of failure', () => {
 
 describe('the tabs', () => {
   test('are tabs, and the arrow keys move between them', async () => {
+    // A COLUMN of tabs, so Down and Up. `aria-orientation` is a promise about
+    // which keys work, and Left/Right on a column is the wrong one.
     const wrapper = await open()
     const tabs = wrapper.findAll('[role="tab"]')
     expect(tabs.length).toBe(5)
+    expect(wrapper.get('[role="tablist"]').attributes('aria-orientation')).toBe('vertical')
     expect(tabs[0]!.attributes('aria-selected')).toBe('true')
     expect(tabs[1]!.attributes('tabindex')).toBe('-1')
 
-    await tabs[0]!.trigger('keydown', { key: 'ArrowRight' })
+    await tabs[0]!.trigger('keydown', { key: 'ArrowDown' })
     await flushPromises()
     expect(wrapper.findAll('[role="tab"]')[1]!.attributes('aria-selected')).toBe('true')
     expect(wrapper.find('[role="tabpanel"]').attributes('aria-labelledby')).toBe('tab-libraries')
@@ -536,18 +539,34 @@ describe('the tabs', () => {
     // leave the focus behind puts the keyboard user on a control that is no
     // longer in the tab order.
     const wrapper = await open()
-    await wrapper.findAll('[role="tab"]')[0]!.trigger('keydown', { key: 'ArrowRight' })
+    await wrapper.findAll('[role="tab"]')[0]!.trigger('keydown', { key: 'ArrowDown' })
     await flushPromises()
     expect(document.activeElement).toBe(wrapper.findAll('[role="tab"]')[1]!.element)
   })
 
-  test('and ArrowLeft goes back', async () => {
+  test('and ArrowUp goes back', async () => {
+    const wrapper = await open()
+    await wrapper.findAll('[role="tab"]')[0]!.trigger('keydown', { key: 'ArrowDown' })
+    await flushPromises()
+    await wrapper.findAll('[role="tab"]')[1]!.trigger('keydown', { key: 'ArrowUp' })
+    await flushPromises()
+    expect(wrapper.findAll('[role="tab"]')[0]!.attributes('aria-selected')).toBe('true')
+  })
+
+  test('and the horizontal keys are left alone', async () => {
+    // Not merely unbound: Left/Right belong to whatever the panel holds, and a
+    // tablist that swallowed them would take them off a text field in a form.
     const wrapper = await open()
     await wrapper.findAll('[role="tab"]')[0]!.trigger('keydown', { key: 'ArrowRight' })
     await flushPromises()
-    await wrapper.findAll('[role="tab"]')[1]!.trigger('keydown', { key: 'ArrowLeft' })
-    await flushPromises()
     expect(wrapper.findAll('[role="tab"]')[0]!.attributes('aria-selected')).toBe('true')
+  })
+
+  test('and the nav sticks, because the lists below it are unbounded', async () => {
+    // On a busy fleet a strip along the top means scrolling back up past the
+    // whole of Libraries to change section.
+    const wrapper = await open()
+    expect(wrapper.get('[role="tablist"]').classes()).toContain('sticky')
   })
 
   test('and Home goes to the first', async () => {

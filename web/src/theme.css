@@ -48,6 +48,21 @@
   --animate-rise-note: rise 200ms ease-out;
   --animate-rise-pop: rise 160ms ease-out;
 
+  /* A satellite waiting to be let in is the one thing in the admin panel that
+     needs somebody NOW, so its count pulses until they go and look. The
+     reduced-motion block below stops it, like everything else here. */
+  --animate-urgent: urgent 1.4s ease-in-out infinite;
+
+  @keyframes urgent {
+    0%,
+    100% {
+      opacity: 1;
+    }
+    50% {
+      opacity: 0.35;
+    }
+  }
+
   @keyframes rise {
     from {
       opacity: 0;

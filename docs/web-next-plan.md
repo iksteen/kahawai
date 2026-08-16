@@ -663,6 +663,14 @@ every one of them is a rule the port dropped or transcribed wrong.
   uppercase; the card heads in Settings and Providers are NOT that heading, they
   are `.card-name` at 14/600/capitalize in full-strength text. Getting the first
   one right by making the second one wrong is how the review caught it.
+- **Admin's sticky sidebar became a strip along the top.** No reason for the
+  move was ever recorded, and the reference's own comment gives the reason
+  against it: the satellite and session lists are unbounded, so a nav at the
+  top means scrolling back up past the whole of Libraries to change section.
+  The tab SEMANTICS the rebuild added are worth keeping and were never in
+  tension with it — a tablist is orientation-agnostic, so it is
+  `aria-orientation="vertical"` with Down and Up, and Left/Right are left to
+  whatever the panel holds.
 
 **Known and not fixed:** the entry animation replays on every navigation that
 changes the view component, and not on one that reuses it — library to library

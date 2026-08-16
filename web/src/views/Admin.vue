@@ -96,7 +96,9 @@ async function go(id: SectionId) {
 }
 
 function key(event: KeyboardEvent, at: number) {
-  const by = event.key === 'ArrowRight' ? 1 : event.key === 'ArrowLeft' ? -1 : 0
+  // Down and Up, because the tablist is vertical — `aria-orientation` is a
+  // promise about which keys work, and Left/Right on a column is the wrong one.
+  const by = event.key === 'ArrowDown' ? 1 : event.key === 'ArrowUp' ? -1 : 0
   const to =
     event.key === 'Home' ? 0 : event.key === 'End' ? SECTIONS.length - 1 : by ? at + by : -1
   if (to < 0 || to >= SECTIONS.length) return
@@ -112,17 +114,28 @@ function key(event: KeyboardEvent, at: number) {
 </script>
 
 <template>
-  <main>
-    <h1 class="mb-1 text-[22px] font-[650] tracking-[0.01em]">Admin · {{ here.label }}</h1>
-
-    <div class="mt-4 mb-3 flex flex-wrap gap-1" role="tablist" aria-label="Admin sections">
+  <!-- Five jobs, a nav instead of one long scroll — and the nav STICKS,
+       because the satellite and session lists are unbounded: on a busy fleet a
+       strip along the top means scrolling back up past the whole of Libraries
+       to change section. -->
+  <main class="flex flex-wrap items-start gap-7">
+    <nav
+      class="sticky top-4 flex w-[min(190px,100%)] flex-none flex-col gap-0.5"
+      role="tablist"
+      aria-label="Admin sections"
+      aria-orientation="vertical"
+    >
       <button
         v-for="(section, at) in SECTIONS"
         :id="`tab-${section.id}`"
         :key="section.id"
         ref="tabs"
-        class="flex cursor-pointer items-center gap-1.5 rounded-t border border-b-0 border-line px-3 py-1.5"
-        :class="tab === section.id ? 'bg-surface text-teal' : 'text-dim hover:text-text'"
+        class="flex cursor-pointer items-center gap-2 rounded-r border-l-2 px-3 py-2 text-left text-[13.5px]"
+        :class="
+          tab === section.id
+            ? 'border-l-teal bg-surface text-text'
+            : 'border-l-transparent text-dim hover:bg-hover hover:text-text'
+        "
         type="button"
         role="tab"
         :aria-selected="tab === section.id"
@@ -133,90 +146,93 @@ function key(event: KeyboardEvent, at: number) {
       >
         {{ section.label }}
         <!-- A satellite waiting to be let in is the one thing here that needs
-             you now, so its count is coloured until you go and look. -->
+             you now, so its count pulses until you go and look. -->
         <span
           v-if="badge(section.id) > 0"
-          class="rounded-full px-1.5 font-mono text-[11px]"
-          :class="
-            section.id === 'satellites' && tab !== 'satellites'
-              ? 'bg-warn/20 text-warn'
-              : 'bg-line text-dim'
-          "
+          class="ml-auto rounded-lg bg-teal-dim px-[7px] font-mono text-[11px] text-teal"
+          :class="section.id === 'satellites' && tab !== 'satellites' && 'animate-urgent'"
         >
           {{ badge(section.id) }}
         </span>
       </button>
-    </div>
-    <p class="mb-4 max-w-[80ch] text-dim">{{ here.intro }}</p>
+    </nav>
 
-    <!-- Both live regions exist from the first render and only their TEXT
+    <div class="min-w-[min(420px,100%)] flex-1">
+      <!-- The section, not "Admin · the section": the nav beside it says
+           where you are, and the tab strip says it a third time. The document
+           TITLE still carries "Admin", because a browser tab has no nav. -->
+      <h1 class="mb-1 text-[22px] font-[650] tracking-[0.01em]">{{ here.label }}</h1>
+      <p class="mb-3.5 max-w-[640px] text-[13px] text-dim">{{ here.intro }}</p>
+
+      <!-- Both live regions exist from the first render and only their TEXT
          changes. A node inserted with its content already in it is not
          reliably announced, and this is the only channel that reports a
          refused delete.
          The read line goes quiet when NOTHING could be read: the Failed block
          below says the same thing with a Try again on it, and one outage
          described twice on one screen reads as two. -->
-    <p class="mb-3 min-h-0 text-warn empty:mb-0" role="status">
-      {{ admin.loaded.value ? admin.readError.value : '' }}
-    </p>
-    <p class="mb-3 min-h-0 text-warn empty:mb-0" role="alert">{{ admin.actionError.value }}</p>
+      <p class="mb-3 min-h-0 text-warn empty:mb-0" role="status">
+        {{ admin.loaded.value ? admin.readError.value : '' }}
+      </p>
+      <p class="mb-3 min-h-0 text-warn empty:mb-0" role="alert">{{ admin.actionError.value }}</p>
 
-    <div
-      v-if="admin.loaded.value || !admin.readError.value"
-      :id="`panel-${tab}`"
-      role="tabpanel"
-      :aria-labelledby="`tab-${tab}`"
-      class="outline-none"
-      tabindex="-1"
-    >
-      <AdminSatellites
-        v-if="tab === 'satellites'"
-        :pending="admin.enrollments.value"
-        :satellites="admin.satellites.value"
-        :collections="admin.collections.value"
-        :broken="admin.broken.value"
-        :act="admin.act"
-      />
+      <div
+        v-if="admin.loaded.value || !admin.readError.value"
+        :id="`panel-${tab}`"
+        role="tabpanel"
+        :aria-labelledby="`tab-${tab}`"
+        class="outline-none"
+        tabindex="-1"
+      >
+        <AdminSatellites
+          v-if="tab === 'satellites'"
+          :pending="admin.enrollments.value"
+          :satellites="admin.satellites.value"
+          :collections="admin.collections.value"
+          :broken="admin.broken.value"
+          :act="admin.act"
+        />
 
-      <AdminLibraries
-        v-else-if="tab === 'libraries'"
-        :libraries="admin.libraries.value"
-        :collections="admin.collections.value"
-        :broken="admin.broken.value"
-        :act="admin.act"
-      />
+        <AdminLibraries
+          v-else-if="tab === 'libraries'"
+          :libraries="admin.libraries.value"
+          :collections="admin.collections.value"
+          :broken="admin.broken.value"
+          :act="admin.act"
+        />
 
-      <AdminProviders
-        v-else-if="tab === 'providers'"
-        :act="admin.act"
-        :refused="(why: string) => (admin.actionError.value = why)"
-      />
+        <AdminProviders
+          v-else-if="tab === 'providers'"
+          :act="admin.act"
+          :refused="(why: string) => (admin.actionError.value = why)"
+        />
 
-      <AdminUsers
-        v-else-if="tab === 'users'"
-        :users="admin.users.value"
-        :libraries="admin.libraries.value"
-        :broken="admin.broken.value"
-        :act="admin.act"
-        :reread="() => admin.reload('users')"
-        :refused="(why: string) => (admin.actionError.value = why)"
-      />
+        <AdminUsers
+          v-else-if="tab === 'users'"
+          :users="admin.users.value"
+          :libraries="admin.libraries.value"
+          :broken="admin.broken.value"
+          :act="admin.act"
+          :reread="() => admin.reload('users')"
+          :refused="(why: string) => (admin.actionError.value = why)"
+        />
 
-      <AdminSessions
-        v-else
-        :sessions="admin.sessions.value"
-        :broken="admin.broken.value"
-        :act="admin.act"
+        <AdminSessions
+          v-else
+          :sessions="admin.sessions.value"
+          :broken="admin.broken.value"
+          :act="admin.act"
+        />
+      </div>
+
+      <!-- Nothing has ever been read AND something is failing: the panel is
+           not empty, it is unavailable. -->
+      <Failed
+        v-if="!admin.loaded.value && admin.readError.value"
+        what="Could not read the hub."
+        :message="admin.readError.value"
+        @retry="admin.reload()"
       />
     </div>
-
-    <!-- Nothing has ever been read AND something is failing: the panel is not
-         empty, it is unavailable. -->
-    <Failed
-      v-if="!admin.loaded.value && admin.readError.value"
-      what="Could not read the hub."
-      :message="admin.readError.value"
-      @retry="admin.reload()"
-    />
   </main>
 </template>
