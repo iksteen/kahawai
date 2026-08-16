@@ -154,8 +154,15 @@ def assert_browser_response(body, cookies, what):
 # API bearer families: replay, logout isolation and concurrency.
 first = api_login()
 rotated, _ = expect(200, api_refresh(first["refresh_token"]), "initial rotation")
-expect(401, api_refresh(first["refresh_token"]), "consumed-token replay")
-expect(401, api_refresh(rotated["refresh_token"]), "replayed family remains revoked")
+# ONE generation behind is honoured: a client whose refresh response was lost,
+# or whose other tab rotated first, holds the token it sent and nothing newer,
+# and must not be signed out for it.
+regenerated, _ = expect(
+    200, api_refresh(first["refresh_token"]), "previous-generation token accepted"
+)
+# TWO generations behind is replay, and still costs the whole family.
+expect(401, api_refresh(first["refresh_token"]), "two-generation replay refused")
+expect(401, api_refresh(regenerated["refresh_token"]), "replayed family remains revoked")
 
 logout_pair = api_login()
 _body, cookies = expect(
@@ -183,11 +190,19 @@ def race():
 
 with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
     results = list(executor.map(lambda _: race(), range(2)))
-if sorted(result[0] for result in results) != [200, 401]:
-    raise SystemExit("concurrent refresh: expected one HTTP 200 and one 401, got %r"
+# BOTH survive, which is the whole point: two tabs sharing one cookie refresh
+# at the same instant, the loser's token is the winner's previous generation,
+# and neither is signed out. One 401 here would be the bug.
+if sorted(result[0] for result in results) != [200, 200]:
+    raise SystemExit("concurrent refresh: expected both to succeed, got %r"
                      % [result[0] for result in results])
-winner = next(body for status, body, _cookies in results if status == 200)
-expect(401, api_refresh(winner["refresh_token"]), "concurrent replay family revocation")
+# The contested token is now two generations back, so it is replay and takes
+# the family with it. Which racer won is unknowable from here and does not
+# matter: once revoked, BOTH answers are dead.
+expect(401, api_refresh(contested["refresh_token"]), "contested token is replay")
+for index, (_status, body, _cookies) in enumerate(results):
+    expect(401, api_refresh(body["refresh_token"]),
+           "concurrent replay family revocation (racer %d)" % index)
 
 # Browser mode: server-only cookies, canonical Origin and narrow cookie reads.
 jar = http.cookiejar.CookieJar()
