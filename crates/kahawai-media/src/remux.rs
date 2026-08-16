@@ -2007,50 +2007,138 @@ fn attach_peak_probe(upload: &gst::Element, shader: &gst::Element) {
 /// nothing else — needs to be linkable at all.
 pub(crate) const TONEMAP_OUT_FORMATS: [&str; 2] = ["NV12", "I420"];
 
-/// Hold encoded video back until the first KEYFRAME, asking the encoder
-/// for one as soon as data actually flows.
-///
-/// Installed only on a seeked start. The first fragment a player gets
-/// must stand alone — there are no earlier parameter sets to fall back
-/// on — and an encoder resuming mid-stream does not reliably lead with
-/// an IDR.
-///
-/// The request is sent from INSIDE the probe, on the first buffer we
-/// drop, and that timing is the point: sent while building the pipeline
-/// it reaches an encoder that is not playing yet and does nothing
-/// (measured — the first attempt at this fix changed exactly nothing).
-/// By the time a buffer arrives here the chain is running, so the event
-/// lands. `hlssink3`'s own fragment-boundary requests prove the encoder
-/// honours them; this just needs one earlier.
+/// The first buffer of whatever is about to be pushed.
 ///
 /// BUFFER **and** BUFFER_LIST: a parser is free to push lists, and a
-/// BUFFER-only probe never sees those — the other half of why the first
-/// attempt was a no-op.
+/// BUFFER-only probe never sees those — half of why the first attempt at
+/// the seeked-start fix below was a no-op. What matters about a list is
+/// its FIRST buffer: that is what the muxer sees at the head of the
+/// fragment.
+fn head_buffer<'a>(data: &'a Option<gst::PadProbeData<'a>>) -> Option<&'a gst::BufferRef> {
+    match data {
+        Some(gst::PadProbeData::Buffer(b)) => Some(b),
+        Some(gst::PadProbeData::BufferList(l)) => l.get(0),
+        _ => None,
+    }
+}
+
+fn is_keyframe(b: &gst::BufferRef) -> bool {
+    !b.flags().contains(gst::BufferFlags::DELTA_UNIT)
+}
+
+/// Whether the muxer will KEEP this buffer, or discard it as lying
+/// outside the segment it was told to play.
+///
+/// A buffer whose running time is negative is wholly before the segment
+/// start and does not survive the muxer. That is not an error — it is
+/// what an edit list means — but a keyframe that gets discarded cannot
+/// open a fragment, and a gate that accepted one would let the frames
+/// after it through with nothing to decode them against.
+fn survives_the_segment(pad: &gst::Pad, b: &gst::BufferRef) -> bool {
+    let Some(pts) = b.pts() else { return true };
+    let Some(seg) = pad
+        .sticky_event::<gst::event::Segment>(0)
+        .and_then(|e| e.segment().downcast_ref::<gst::ClockTime>().cloned())
+    else {
+        return true; // no segment yet: nothing to be outside of
+    };
+    !matches!(
+        seg.to_running_time_full(pts),
+        Some(gst::format::Signed::Negative(_))
+    )
+}
+
+/// Hold video out of the muxer until a keyframe it will actually keep.
+///
+/// Installed on the muxer's video pad for EVERY session. The first
+/// fragment a player gets has no earlier parameter sets to fall back on,
+/// so it must open on an IDR; a fragment of slices referencing pictures
+/// the decoder was never given is invalid HLS, and every player is
+/// entitled to reject it. hls.js 1.7 does, fatally — playback never
+/// leaves 0:00 — and 1.6 retried the segment a few times before starting
+/// late with the un-referenced frames jittering alongside the real ones.
+///
+/// BOTH conditions, because either alone lets that fragment through:
+///
+///   * A source may open on frames that precede its first keyframe.
+///   * A source may open on a keyframe the MUXER then discards.
+///
+/// The second is the one that took the diagnosis twice.
+/// `Alita Battle Angel (2019)_SBS.mp4` leads with SPS, PPS and an IDR —
+/// the bitstream is exactly right — but its edit list puts that IDR
+/// 83 ms before the segment start, so it is clipped as out-of-range
+/// while the 27 delta frames behind it, the first of which ends exactly
+/// on the boundary, are kept. `segment00000.ts` came out as 27 slices,
+/// 0 SPS, 0 PPS, 0 IDR. Nothing about the file is malformed and nothing
+/// upstream is misconfigured; the parameter sets are simply on the one
+/// access unit the segment excludes. Reading the keyframe FLAG alone
+/// says "opened at a keyframe, dropped 0" and changes nothing.
+///
+/// ffprobe agrees with the muxer and reports that IDR as `key_frame=0`,
+/// because it applies the edit list too. That is what first suggested a
+/// source with no leading keyframe, which it is not.
+///
+/// The cost is the trimmed frames plus everything up to the next IDR —
+/// 1.126 s on that file, which is 1.126 s that currently cannot be
+/// decoded at all. Keeping them instead means shifting BOTH pads'
+/// segments so nothing is clipped; the sync would hold, since they move
+/// together, and it is a bigger change than this one.
+///
+/// The muxer's own pad is the one place that covers this once. It is
+/// requested a single time per session, and on a multi-part source it is
+/// `concat`'s downstream end, so every part passes through it — while the
+/// branches upstream are per-part and per-mode, and gating them would be
+/// several installs enforcing one invariant.
 fn open_on_keyframe(pad: &gst::Pad) {
-    let asked = std::sync::atomic::AtomicBool::new(false);
     let dropped = std::sync::atomic::AtomicUsize::new(0);
     pad.add_probe(
         gst::PadProbeType::BUFFER | gst::PadProbeType::BUFFER_LIST,
         move |pad, info| {
-            let leads_with_keyframe = match &info.data {
-                Some(gst::PadProbeData::Buffer(b)) => {
-                    !b.flags().contains(gst::BufferFlags::DELTA_UNIT)
-                }
-                // A list is keyframe-led if its FIRST buffer is: that is
-                // what the muxer will see at the head of the fragment.
-                Some(gst::PadProbeData::BufferList(l)) => l
-                    .get(0)
-                    .is_some_and(|b| !b.flags().contains(gst::BufferFlags::DELTA_UNIT)),
-                _ => return gst::PadProbeReturn::Ok,
+            let Some(b) = head_buffer(&info.data) else {
+                return gst::PadProbeReturn::Ok;
             };
-            if leads_with_keyframe {
-                tracing::info!(
-                    dropped = dropped.load(std::sync::atomic::Ordering::SeqCst),
-                    "seeked start: keyframe reached, video opened"
-                );
+            if is_keyframe(b) && survives_the_segment(pad, b) {
+                let n = dropped.load(std::sync::atomic::Ordering::SeqCst);
+                if n > 0 {
+                    tracing::info!(dropped = n, "video opened at the first usable keyframe");
+                }
                 return gst::PadProbeReturn::Remove;
             }
-            if !asked.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            dropped.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            gst::PadProbeReturn::Drop
+        },
+    );
+}
+
+/// Ask the encoder for a keyframe as soon as data actually flows.
+///
+/// Installed only on a seeked start: an encoder resuming mid-stream does
+/// not reliably lead with an IDR, and without this the wait for its next
+/// natural one is the wait for the picture to appear. Measured on
+/// VideoToolbox: start_ms=0 gives an IDR and parameter sets immediately,
+/// start_ms=300000 gives 48 slices and none of the three. NVENC leads
+/// with an IDR and never showed it, which is why every local test passed.
+///
+/// The request is sent from INSIDE the probe, on the first buffer, and
+/// that timing is the point: sent while building the pipeline it reaches
+/// an encoder that is not playing yet and does nothing (measured — the
+/// first attempt at this fix changed exactly nothing). By the time a
+/// buffer arrives here the chain is running, so the event lands.
+/// `hlssink3`'s own fragment-boundary requests prove the encoder honours
+/// them; this just needs one earlier.
+///
+/// Nothing is dropped here. [`open_on_keyframe`] on the muxer's pad is
+/// what keeps the pre-IDR frames out of the first segment, for this path
+/// and every other.
+fn ask_encoder_for_a_keyframe(pad: &gst::Pad) {
+    pad.add_probe(
+        gst::PadProbeType::BUFFER | gst::PadProbeType::BUFFER_LIST,
+        move |pad, info| {
+            let Some(b) = head_buffer(&info.data) else {
+                return gst::PadProbeReturn::Ok;
+            };
+            // Already an IDR — the resume needs nothing.
+            if !is_keyframe(b) {
                 let sent = pad.send_event(
                     gst_video::UpstreamForceKeyUnitEvent::builder()
                         .all_headers(true)
@@ -2058,8 +2146,7 @@ fn open_on_keyframe(pad: &gst::Pad) {
                 );
                 tracing::info!(sent, "seeked start: asked the encoder for a keyframe");
             }
-            dropped.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            gst::PadProbeReturn::Drop
+            gst::PadProbeReturn::Remove
         },
     );
 }
@@ -2657,14 +2744,7 @@ fn build_video_encode_chain(
     let out = parse.static_pad("src").unwrap();
     guard_pts(&out);
     if let Some(g) = gate {
-        // A SEEKED start must still hand the muxer a keyframe FIRST.
-        // Measured on VideoToolbox: start_ms=0 gives segment00000 its
-        // IDR and parameter sets, start_ms=300000 gives 48 slices and
-        // none of the three — undecodable, so the player wedges at the
-        // resume point while the worker produces minutes of good
-        // segments behind it. NVENC leads with an IDR and never showed
-        // it, which is why every local test passed.
-        open_on_keyframe(&out);
+        ask_encoder_for_a_keyframe(&out);
         g.install(&out);
     }
     if let Err(e) = out.link(&sinkpad) {
@@ -4008,6 +4088,11 @@ pub fn start_parts(
             SegSink::Fmp4(mux) => mux.request_pad_simple("sink_%u"),
         }
         .with_context(|| format!("requesting {kind} pad"))?;
+        // BEFORE the pace probe, which must not meter a buffer that never
+        // reaches the muxer: probe iteration stops at the first DROP.
+        if kind == "video" {
+            open_on_keyframe(&pad);
+        }
         if let Some(cfg) = &pace {
             // HUB-36: meter the first pad only — video when the plan has
             // it (loop order), which is the stream whose production rate
@@ -4601,6 +4686,99 @@ mod concat_spike {
         // Walk the TS payload for H.264 start codes. Parameter sets and
         // an IDR must BOTH be present, or the segment cannot stand on
         // its own — which is all a player gets at session start.
+        let mut kinds = std::collections::HashSet::new();
+        for w in bytes.windows(4) {
+            if w[0] == 0 && w[1] == 0 && w[2] == 1 {
+                kinds.insert(w[3] & 0x1f);
+            }
+        }
+        assert!(kinds.contains(&7), "segment00000 has no SPS: {kinds:?}");
+        assert!(kinds.contains(&8), "segment00000 has no PPS: {kinds:?}");
+        assert!(kinds.contains(&5), "segment00000 has no IDR: {kinds:?}");
+    }
+
+    /// The case the test above admits it cannot reach: a source that OPENS
+    /// on frames preceding its first keyframe.
+    ///
+    /// Real and not rare — `Alita Battle Angel (2019)_SBS.mp4` spends 27
+    /// B/P frames before its first IDR at 1.126 s. The sink cuts a new
+    /// segment at that IDR, so those frames became the whole of
+    /// `segment00000.ts`: 27 slices, no SPS, no PPS, no IDR. hls.js 1.7
+    /// raises a fatal `bufferAppendError` on it and playback never leaves
+    /// 0:00.
+    ///
+    /// x264enc will not produce that shape on its own, so the probe below
+    /// makes it: drop the leading IDR and the stream opens on the rest of
+    /// GOP 0, delta frames referencing a picture that is no longer there.
+    /// Exactly the reference file's shape, and with the fix removed this
+    /// test fails on the first assertion (verified — the segment's NAL
+    /// types are {1, 9}: slices and access-unit delimiters, nothing a
+    /// decoder can start from).
+    #[test]
+    fn a_source_that_opens_before_its_first_keyframe_still_decodes() {
+        crate::init().unwrap();
+        if !crate::testutil::require_elements(&["hlssink3", "x264enc"]) {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("hls");
+        std::fs::create_dir_all(&out).unwrap();
+        let (sink, _) = make_hls_sink(&out, Some("hlssink3")).unwrap();
+        let pipeline = gst::Pipeline::new();
+        let src = gst::ElementFactory::make("videotestsrc")
+            .property("num-buffers", 240i32)
+            .build()
+            .unwrap();
+        let caps = gst::ElementFactory::make("capsfilter")
+            .property(
+                "caps",
+                gst::Caps::builder("video/x-raw")
+                    .field("framerate", gst::Fraction::new(24000, 1001))
+                    .field("width", 320i32)
+                    .field("height", 180i32)
+                    .build(),
+            )
+            .build()
+            .unwrap();
+        // Two GOPs, so there IS a later keyframe to open on.
+        let enc = gst::ElementFactory::make("x264enc")
+            .property("key-int-max", 48u32)
+            .build()
+            .unwrap();
+        let parse = gst::ElementFactory::make("h264parse")
+            .property("config-interval", -1i32)
+            .build()
+            .unwrap();
+        pipeline
+            .add_many([&src, &caps, &enc, &parse, &sink])
+            .unwrap();
+        gst::Element::link_many([&src, &caps, &enc, &parse]).unwrap();
+
+        let tail = parse.static_pad("src").unwrap();
+        let seen = std::sync::atomic::AtomicUsize::new(0);
+        tail.add_probe(
+            gst::PadProbeType::BUFFER | gst::PadProbeType::BUFFER_LIST,
+            move |_, info| {
+                let first = seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
+                if first && head_buffer(&info.data).is_some_and(is_keyframe) {
+                    return gst::PadProbeReturn::Drop;
+                }
+                gst::PadProbeReturn::Ok
+            },
+        );
+
+        let pad = sink.request_pad_simple("video").unwrap();
+        // What production installs on this pad, and the whole subject.
+        open_on_keyframe(&pad);
+        tail.link(&pad).unwrap();
+
+        let msg = run_to_eos(&pipeline, 60);
+        assert!(
+            matches!(msg.map(|m| m.type_()), Some(gst::MessageType::Eos)),
+            "pipeline did not reach EOS"
+        );
+
+        let bytes = std::fs::read(out.join("segment00000.ts")).expect("no first segment");
         let mut kinds = std::collections::HashSet::new();
         for w in bytes.windows(4) {
             if w[0] == 0 && w[1] == 0 && w[2] == 1 {
