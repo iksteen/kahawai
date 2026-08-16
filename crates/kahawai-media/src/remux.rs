@@ -2110,7 +2110,8 @@ fn open_on_keyframe(pad: &gst::Pad) {
     );
 }
 
-/// Ask the encoder for a keyframe as soon as data actually flows.
+/// Hold the ENCODER's output back until its first keyframe, asking it for
+/// one as soon as data actually flows.
 ///
 /// Installed only on a seeked start: an encoder resuming mid-stream does
 /// not reliably lead with an IDR, and without this the wait for its next
@@ -2119,26 +2120,35 @@ fn open_on_keyframe(pad: &gst::Pad) {
 /// start_ms=300000 gives 48 slices and none of the three. NVENC leads
 /// with an IDR and never showed it, which is why every local test passed.
 ///
-/// The request is sent from INSIDE the probe, on the first buffer, and
-/// that timing is the point: sent while building the pipeline it reaches
-/// an encoder that is not playing yet and does nothing (measured — the
-/// first attempt at this fix changed exactly nothing). By the time a
+/// The request is sent from INSIDE the probe, on the first buffer we drop,
+/// and that timing is the point: sent while building the pipeline it
+/// reaches an encoder that is not playing yet and does nothing (measured —
+/// the first attempt at this fix changed exactly nothing). By the time a
 /// buffer arrives here the chain is running, so the event lands.
 /// `hlssink3`'s own fragment-boundary requests prove the encoder honours
 /// them; this just needs one earlier.
 ///
-/// Nothing is dropped here. [`open_on_keyframe`] on the muxer's pad is
-/// what keeps the pre-IDR frames out of the first segment, for this path
-/// and every other.
-fn ask_encoder_for_a_keyframe(pad: &gst::Pad) {
+/// WHY THIS DROPS TOO, when [`open_on_keyframe`] on the muxer's pad would
+/// keep the same frames out of the same segment: this pad is also where
+/// [`SeekGate::open_reporting`] reads the playlist origin, from the first
+/// buffer to carry a PTS. Let the pre-IDR frames past here and `start.pos`
+/// names one of them — a position the muxer then discards, so the seekbar
+/// and every subtitle hang off a frame the player never receives. On the
+/// VideoToolbox measurement above that is 48 frames of error, about two
+/// seconds. Dropping at the muxer alone is correct for the SEGMENT and
+/// wrong for the ORIGIN.
+fn open_encoder_on_keyframe(pad: &gst::Pad) {
+    let asked = std::sync::atomic::AtomicBool::new(false);
     pad.add_probe(
         gst::PadProbeType::BUFFER | gst::PadProbeType::BUFFER_LIST,
         move |pad, info| {
             let Some(b) = head_buffer(&info.data) else {
                 return gst::PadProbeReturn::Ok;
             };
-            // Already an IDR — the resume needs nothing.
-            if !is_keyframe(b) {
+            if is_keyframe(b) {
+                return gst::PadProbeReturn::Remove;
+            }
+            if !asked.swap(true, std::sync::atomic::Ordering::SeqCst) {
                 let sent = pad.send_event(
                     gst_video::UpstreamForceKeyUnitEvent::builder()
                         .all_headers(true)
@@ -2146,7 +2156,7 @@ fn ask_encoder_for_a_keyframe(pad: &gst::Pad) {
                 );
                 tracing::info!(sent, "seeked start: asked the encoder for a keyframe");
             }
-            gst::PadProbeReturn::Remove
+            gst::PadProbeReturn::Drop
         },
     );
 }
@@ -2744,7 +2754,7 @@ fn build_video_encode_chain(
     let out = parse.static_pad("src").unwrap();
     guard_pts(&out);
     if let Some(g) = gate {
-        ask_encoder_for_a_keyframe(&out);
+        open_encoder_on_keyframe(&out);
         g.install(&out);
     }
     if let Err(e) = out.link(&sinkpad) {
