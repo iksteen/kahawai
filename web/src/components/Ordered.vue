@@ -10,6 +10,12 @@
 /// The keyboard version moves one place at a time with the arrow keys while a
 /// row is focused. It takes more presses than a drag takes seconds, and it is
 /// the difference between fiddly and impossible.
+///
+/// TWO shapes, because the design has two and they are not interchangeable. A
+/// language is a word: a dozen of them belong in a row, as pills, beside the
+/// label that names them. A fallback rung is a sentence: those belong in
+/// stacked rows. Rendering both as full-width rows put one language per line
+/// under a heading of its own — a column of mostly empty boxes.
 import { nextTick, ref } from 'vue'
 
 import Icon from './Icon.vue'
@@ -23,9 +29,25 @@ const props = defineProps<{
   pinned?: string[]
   /// What to show for an entry, when the stored token is not the word.
   display?: (item: string) => string
+  /// Pills in a row rather than stacked rows.
+  chips?: boolean
+  /// What each entry means, shown beside it. Rows with a note are laid out as
+  /// one grid across the whole list — subgrid, so every explanation starts at
+  /// the same place. As independent rows the notes began wherever each name
+  /// happened to end, and "burnt into the picture" is a lot wider than
+  /// "plain text".
+  note?: (item: string) => string
+  /// Nothing here can be removed at all. The fallback ladder is the case: the
+  /// order expresses priority, never removal, so every rung is always present
+  /// and a ✕ on each one offered something that does not exist.
+  fixed?: boolean
 }>()
 
-const emit = defineEmits<{ move: [from: number, to: number]; remove: [at: number] }>()
+const emit = defineEmits<{
+  move: [from: number, to: number]
+  remove: [at: number]
+  promote: [at: number]
+}>()
 
 /// The source of the gesture in progress. Read by the drop in the same gesture
 /// that set it, before any state has committed — so it is a plain variable,
@@ -69,20 +91,47 @@ async function key(at: number, event: KeyboardEvent) {
   await nextTick()
   rows.value[to]?.focus()
 }
+
+const shown = (item: string) => props.display?.(item) ?? item
+
+/// Ids for the notes, so a row can point at its own with `aria-describedby`.
+/// The row's `aria-label` REPLACES its content for a screen reader, so a note
+/// rendered inside it would otherwise be read by nobody.
+const uid = Math.random().toString(36).slice(2, 8)
+const noteId = (at: number) => `ord-${uid}-${at}`
 </script>
 
 <template>
-  <ul class="flex flex-col gap-1" role="list" :aria-label="props.label">
+  <ul
+    :class="
+      chips
+        ? 'flex flex-wrap items-center gap-1.5'
+        : note
+          ? 'grid grid-cols-[auto_auto_1fr] gap-x-[9px] gap-y-1'
+          : 'flex flex-col gap-1'
+    "
+    role="list"
+    :aria-label="props.label"
+  >
     <li
       v-for="(item, at) in props.items"
       :key="item"
       ref="rows"
-      class="flex cursor-grab items-center gap-2 rounded border border-line bg-surface px-2 py-1"
-      :class="[lifting === at && 'opacity-40', over === at && 'border-teal-dim']"
+      class="cursor-grab items-center"
+      :class="[
+        chips
+          ? 'flex min-h-7 gap-[3px] rounded border border-teal-dim py-[3px] pr-1 pl-1.5 text-[12px]'
+          : note
+            ? 'col-span-full grid grid-cols-subgrid rounded border border-hairline px-2 py-[5px]'
+            : 'flex gap-2 rounded border border-line bg-surface px-2 py-1',
+        lifting === at && 'opacity-40',
+        over === at && 'border-teal bg-teal/8',
+      ]"
       draggable="true"
       tabindex="0"
       role="listitem"
-      :aria-label="`${props.display?.(item) ?? item}, ${at + 1} of ${props.items.length}. Use the arrow keys to move it.`"
+      :aria-label="`${shown(item)}, ${at + 1} of ${props.items.length}. Use the arrow keys to move it.`"
+      :aria-describedby="note ? noteId(at) : undefined"
       @dragstart="start(at, $event)"
       @dragenter="over = at"
       @dragover.prevent
@@ -90,16 +139,43 @@ async function key(at: number, event: KeyboardEvent) {
       @dragend="clear"
       @keydown="key(at, $event)"
     >
-      <span class="flex text-dimmer" aria-hidden="true"><Icon name="grip" /></span>
-      <span class="flex-1">{{ props.display?.(item) ?? item }}</span>
-      <!-- A pinned entry may be moved but not removed: it is what makes the
-           list total, and a list without it answers nothing for a file in a
-           language nobody named. -->
+      <span class="flex text-dimmer" aria-hidden="true"
+        ><Icon name="grip" :size="chips ? 10 : 14"
+      /></span>
+
+      <!-- A pill's name promotes on click. A drag is a pointer gesture, and
+           the same outcome has to be reachable without one — the arrow keys
+           are the other half, and this is the one-press version. -->
       <button
-        v-if="!props.pinned?.includes(item)"
-        class="cursor-pointer px-1 text-dim hover:text-warn"
+        v-if="chips"
+        class="cursor-pointer border-0 bg-transparent p-0 font-mono text-[12px] text-teal"
         type="button"
-        :aria-label="`Remove ${props.display?.(item) ?? item}`"
+        :title="at === 0 ? 'first choice' : 'make it the first choice'"
+        :aria-label="
+          at === 0 ? `${shown(item)}, first choice` : `Make ${shown(item)} the first choice`
+        "
+        @click="at > 0 && emit('promote', at)"
+      >
+        {{ shown(item) }}
+      </button>
+      <span v-else :class="note ? '' : 'flex-1'">{{ shown(item) }}</span>
+      <span v-if="note" :id="noteId(at)" class="text-[12px] text-dim">{{ note(item) }}</span>
+
+      <!-- The lock and the ✕ share one box: an icon has no line box and a
+           glyph has a tall one, so without this a pinned pill stood taller
+           than the rest. -->
+      <span
+        v-if="props.pinned?.includes(item)"
+        class="flex h-[15px] w-[15px] shrink-0 items-center justify-center text-dimmer"
+        title="always the final fallback"
+      >
+        <Icon name="lock" :size="10" />
+      </span>
+      <button
+        v-else-if="!fixed"
+        class="flex h-[15px] w-[15px] shrink-0 cursor-pointer items-center justify-center text-[12px] leading-none text-dim hover:text-warn"
+        type="button"
+        :aria-label="`Remove ${shown(item)}`"
         @click="emit('remove', at)"
       >
         ✕

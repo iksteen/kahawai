@@ -4,6 +4,7 @@
 /// see `useOptimistic`, which is where the hard part is.
 import { computed, ref, watch } from 'vue'
 
+import Btn from '../components/Btn.vue'
 import Failed from '../components/Failed.vue'
 import Icon from '../components/Icon.vue'
 import Ordered from '../components/Ordered.vue'
@@ -13,6 +14,7 @@ import {
   bandwidthValue,
   ORIGINAL,
   stored,
+  suggestions,
   validToken,
   wishlist,
 } from '../domain/prefs.ts'
@@ -139,8 +141,76 @@ function moveRung(from: number, to: number) {
   if (next) void save('subs.ass', stored(next))
 }
 
+/// HUB-31: which numbering an absolute-numbered series is shown in. The two
+/// sides of one control — the title on each says what the word means, because
+/// "native" does not say it on its own.
+const ANIME_VIEWS = [
+  { value: 'seasons', title: 'TVDB-style seasons (projected)' },
+  { value: 'native', title: 'flat absolute numbering (AniDB-native)' },
+] as const
 /// HUB-31: which numbering an absolute-numbered series is shown in.
 const animeView = computed(() => (values.value['anime_view'] === 'native' ? 'native' : 'seasons'))
+
+/// Clicking a language makes it the first choice — the one-press version of a
+/// drag, and the reason the name is a button.
+function promote(kind: 'audio' | 'subs', mediaType: string, at: number) {
+  const items = listFor(kind, mediaType)
+  const picked = items[at]
+  if (!picked) return
+  saveList(kind, mediaType, [picked, ...items.filter((_, n) => n !== at)])
+}
+
+/// HUB-21. Subtitle search works without an account, on a download budget the
+/// whole server shares; attaching your own spends your own instead.
+///
+/// The two writes are settled independently. Reporting one flat failure for a
+/// half-save left the hub holding the new username while the card still showed
+/// the old one — and the badge still reading "shared budget" for an account
+/// that was half attached.
+const osUser = ref('')
+const osPass = ref('')
+const osBusy = ref(false)
+watch(
+  () => values.value['opensubtitles.username'],
+  (name) => (osUser.value = name ?? ''),
+  { immediate: true },
+)
+const osAttached = computed(
+  () => !!values.value['opensubtitles.username'] || !!values.value['opensubtitles.password'],
+)
+
+/// Its own function, not two statements in the template: a multi-statement
+/// inline handler parses nowhere except by accident.
+function disconnect() {
+  osUser.value = ''
+  void saveAccount('', '')
+}
+
+async function saveAccount(user: string, pass: string) {
+  osBusy.value = true
+  try {
+    const [name, secret] = await Promise.allSettled([
+      putPref('', 'opensubtitles.username', user),
+      putPref('', 'opensubtitles.password', pass),
+    ])
+    osPass.value = ''
+    // Whatever landed is what the hub has, so the card must show that.
+    values.value = {
+      ...values.value,
+      'opensubtitles.username':
+        name.status === 'fulfilled' ? user : (values.value['opensubtitles.username'] ?? ''),
+      'opensubtitles.password': secret.status === 'fulfilled' ? pass : '',
+    }
+    const failed = [
+      name.status === 'rejected' ? 'username' : null,
+      secret.status === 'rejected' ? 'password' : null,
+    ].filter(Boolean)
+    if (failed.length === 0) flash()
+    else notify(`Could not save the ${failed.join(' or ')}.`)
+  } finally {
+    osBusy.value = false
+  }
+}
 </script>
 
 <template>
@@ -168,115 +238,234 @@ const animeView = computed(() => (values.value['anime_view'] === 'native' ? 'nat
         saved
       </span>
     </div>
-    <p class="mb-6 text-dim">Everything here saves the moment you change it.</p>
+    <p class="mb-3 text-dim">Everything here saves the moment you change it.</p>
 
-    <section class="mb-6 rounded-md border border-line bg-surface p-4">
-      <h2 class="mb-2 flex items-center gap-2 text-[14px] leading-none font-[600] capitalize">
-        <Icon name="play" :size="15" />
-        Playback
-      </h2>
-      <p class="mb-3 text-dim">Applies wherever you play, on this account.</p>
+    <!-- One column, one measure. Cards 12px apart rather than 24, so the page
+         reads as a stack of related settings and not as separate screens. -->
+    <div class="flex max-w-[660px] flex-col gap-3">
+      <!-- HUB-21. Works without an account; attaching one spends your own
+           download budget instead of the server's shared one. -->
+      <section class="flex flex-col gap-3 rounded-md border border-line bg-surface px-4 py-3.5">
+        <div class="flex items-center gap-2">
+          <span class="flex text-teal"><Icon name="download" :size="15" /></span>
+          <span class="text-[14px] leading-none font-[600] capitalize">OpenSubtitles</span>
+        </div>
+        <p class="m-0 max-w-[560px] text-[12.5px] text-dim">
+          Subtitle search works without an account, on a small download budget shared by everyone on
+          this server. Attach your own opensubtitles.com account to spend your own budget instead.
+          Subtitles you download are shared with everyone here.
+        </p>
+        <div class="flex flex-wrap items-center gap-x-2.5 gap-y-2">
+          <label class="w-[76px] shrink-0 font-mono text-[12px] text-dim" for="os-user">
+            account
+          </label>
+          <input
+            id="os-user"
+            v-model="osUser"
+            class="min-w-[150px] flex-[1_1_170px] rounded border border-line bg-bg px-2 py-1"
+            placeholder="opensubtitles.com username"
+          />
+          <label class="sr-only" for="os-pass">opensubtitles.com password</label>
+          <input
+            id="os-pass"
+            v-model="osPass"
+            class="min-w-[150px] flex-[1_1_170px] rounded border border-line bg-bg px-2 py-1"
+            type="password"
+            :placeholder="
+              values['opensubtitles.password'] ? 'password saved — enter to replace' : 'password'
+            "
+          />
+          <Btn
+            small
+            :disabled="osBusy || !osUser.trim() || !osPass.trim()"
+            @click="saveAccount(osUser.trim(), osPass)"
+          >
+            Save
+          </Btn>
+          <Btn v-if="osAttached" ghost small :disabled="osBusy" @click="disconnect">
+            Disconnect
+          </Btn>
+        </div>
+      </section>
 
-      <label class="flex flex-wrap items-center gap-3">
-        <span class="w-32 font-mono text-[13px] text-dim">bandwidth</span>
-        <input
-          v-model="bandwidth"
-          class="w-48 rounded border border-line bg-bg px-2 py-1 font-mono"
-          type="number"
-          min="0"
-          placeholder="kbit/s cap (0 = none)"
-          @blur="saveBandwidth(($event.target as HTMLInputElement).value)"
-        />
-      </label>
-      <p class="mt-2 max-w-[70ch] text-[13px] text-dim">
-        A ceiling for how much data playback may use — worth setting on a metered or slow
-        connection. Anything above it is re-encoded smaller; a file that cannot be re-encoded will
-        refuse to play rather than stall. Leave it empty for no limit.
-      </p>
-    </section>
+      <section class="flex flex-col gap-3 rounded-md border border-line bg-surface px-4 py-3.5">
+        <div class="flex items-center gap-2">
+          <span class="flex text-teal"><Icon name="play" :size="15" /></span>
+          <span class="text-[14px] leading-none font-[600] capitalize">Playback</span>
+        </div>
+        <p class="m-0 max-w-[560px] text-[12.5px] text-dim">
+          Applies wherever you play, on this account.
+        </p>
 
-    <section class="mb-6 rounded-md border border-line bg-surface p-4">
-      <h2 class="mb-2 text-[14px] leading-none font-[600] capitalize">Styled subtitles</h2>
-      <p class="mb-3 max-w-[70ch] text-dim">
-        How styled subtitles reach a player that cannot draw them itself, in the order to try. The
-        server takes the first rung this client and this server can actually serve.
-      </p>
-      <Ordered
-        :items="ladder"
-        label="Styled subtitle fallbacks, in order"
-        :display="(rung) => ASS_RUNGS[rung as keyof typeof ASS_RUNGS].name"
-        @move="moveRung"
-      />
-      <ul class="mt-2 flex flex-col gap-1 text-[13px] text-dim">
-        <li v-for="rung in ladder" :key="rung">
-          <span class="text-prose">{{ ASS_RUNGS[rung].name }}</span> —
-          {{ ASS_RUNGS[rung].note }}
-        </li>
-      </ul>
-    </section>
+        <div class="flex flex-wrap items-center gap-x-2.5 gap-y-2">
+          <label class="w-[76px] shrink-0 font-mono text-[12px] text-dim" for="bandwidth">
+            bandwidth
+          </label>
+          <!-- Shares the line rather than taking one: a fixed width here left
+               the field two thirds empty beside a placeholder it could not
+               show. -->
+          <input
+            id="bandwidth"
+            v-model="bandwidth"
+            class="min-w-[150px] flex-[1_1_170px] rounded border border-line bg-bg px-2 py-1 font-mono"
+            type="number"
+            min="0"
+            placeholder="kbit/s cap (0 = none)"
+            @blur="saveBandwidth(($event.target as HTMLInputElement).value)"
+          />
+        </div>
+        <!-- An explanation belongs under the control it explains, lined up
+             with it: 76px of label plus the 10px gap. -->
+        <p class="mt-[-2px] ml-[86px] max-w-[480px] text-[12px] text-dim">
+          A ceiling for how much data playback may use — worth setting on a metered or slow
+          connection. Anything above it is re-encoded smaller; a file that cannot be re-encoded will
+          refuse to play rather than stall. Leave it empty for no limit.
+        </p>
+      </section>
 
-    <section
-      v-for="mediaType in MEDIA_TYPES"
-      :key="mediaType"
-      class="mb-6 rounded-md border border-line bg-surface p-4"
-    >
-      <h2 class="mb-3 text-[14px] leading-none font-[600] capitalize">{{ mediaType }}</h2>
-
-      <div v-for="kind in ['audio', 'subs'] as const" :key="kind" class="mb-4">
-        <h3 class="mb-2 font-mono text-[13px] text-dim">
-          {{ kind === 'audio' ? 'audio languages' : 'subtitle languages' }}
-        </h3>
+      <section class="flex flex-col gap-3 rounded-md border border-line bg-surface px-4 py-3.5">
+        <!-- Not a card NAME: those are capitalised because they are proper
+             nouns and media types. This is a sentence, and `capitalize` was
+             rendering it "Styled Subtitles". -->
+        <span class="text-[12.5px] font-[600]">Styled subtitles</span>
+        <p class="m-0 max-w-[560px] text-[12.5px] text-dim">
+          How styled subtitles reach a player that cannot draw them itself, in the order to try. The
+          server takes the first rung this client and this server can actually serve.
+        </p>
+        <!-- `fixed`: the order expresses priority, never removal. Every rung is
+             always present, so a ✕ on each one offered something that does not
+             exist (owner decision, 2026-08-03). -->
         <Ordered
-          :items="listFor(kind, mediaType)"
-          :label="`${kind === 'audio' ? 'Audio' : 'Subtitle'} languages for ${mediaType}, in order`"
-          :pinned="kind === 'audio' ? [ORIGINAL] : []"
-          @move="(from, to) => move(kind, mediaType, from, to)"
-          @remove="(at) => remove(kind, mediaType, at)"
+          :items="ladder"
+          fixed
+          label="Styled subtitle fallbacks, in order"
+          :display="(rung) => ASS_RUNGS[rung as keyof typeof ASS_RUNGS].name"
+          :note="(rung) => ASS_RUNGS[rung as keyof typeof ASS_RUNGS].note"
+          @move="moveRung"
         />
-        <div class="mt-2 flex items-center gap-2">
+      </section>
+
+      <!-- Which tracks to start with, per media type: what you want from a
+           film is not what you want from anime (HUB-33). -->
+      <div class="mt-1">
+        <span class="text-[12.5px] font-[600]">Which tracks to start with</span>
+        <p class="m-0 mt-2 max-w-[560px] text-[12.5px] text-dim">
+          When you open something, the first language in each list that the file actually has is the
+          one that plays. Drag a language to move it, or click it to make it your first choice.
+          <span class="font-mono text-teal">original</span> means whatever language the title was
+          made in. Picking a different track while watching only affects that title, and it wins
+          over these.
+        </p>
+      </div>
+
+      <section
+        v-for="mediaType in MEDIA_TYPES"
+        :key="mediaType"
+        class="flex flex-col gap-3 rounded-md border border-line bg-surface px-4 py-3.5"
+      >
+        <div class="flex items-center gap-2">
+          <span class="flex text-teal">
+            <Icon :name="mediaType === 'movies' ? 'movie' : 'show'" :size="15" />
+          </span>
+          <span class="text-[14px] leading-none font-[600] capitalize">{{ mediaType }}</span>
+        </div>
+
+        <!-- Anime's presentation first: it decides how the episode lists on
+             every other screen are numbered, which is a bigger difference than
+             a track order. -->
+        <template v-if="mediaType === 'anime'">
+          <div class="flex flex-wrap items-center gap-x-2.5 gap-y-2">
+            <span id="anime-view" class="w-[76px] shrink-0 font-mono text-[12px] text-dim">
+              view
+            </span>
+            <!-- A two-state choice reads as one control, not two chips. The
+                 unpicked side keeps full-strength text: dimming it is how a
+                 disabled control looks, and it is not disabled — it is the
+                 other half of the choice. -->
+            <span class="flex flex-wrap gap-1.5" role="group" aria-labelledby="anime-view">
+              <button
+                v-for="option in ANIME_VIEWS"
+                :key="option.value"
+                class="inline-flex min-h-7 cursor-pointer items-center rounded border px-[11px] py-1 font-mono text-[12px] tracking-[0.02em]"
+                :class="
+                  animeView === option.value
+                    ? 'border-teal bg-teal font-[600] text-bg'
+                    : 'border-dim bg-surface text-text hover:border-prose hover:bg-hover'
+                "
+                type="button"
+                :aria-pressed="animeView === option.value"
+                :title="option.title"
+                @click="save('anime_view', option.value)"
+              >
+                {{ option.value }}
+              </button>
+            </span>
+          </div>
+          <p class="mt-[-2px] ml-[86px] max-w-[480px] text-[12px] text-dim">
+            {{
+              animeView === 'seasons'
+                ? 'Numbered in seasons, the way most people know these shows.'
+                : 'Numbered straight through, the way they were broadcast.'
+            }}
+          </p>
+        </template>
+
+        <!-- Label, pills and the way to add one, all on the same line — a
+             language is a word, and a dozen of them belong in a row. -->
+        <div
+          v-for="kind in ['audio', 'subs'] as const"
+          :key="kind"
+          class="flex flex-wrap items-center gap-x-2.5 gap-y-2"
+        >
+          <span class="w-[76px] shrink-0 font-mono text-[12px] text-dim">
+            {{ kind === 'audio' ? 'audio' : 'subtitles' }}
+          </span>
+          <span
+            v-if="listFor(kind, mediaType).length === 0"
+            class="flex min-h-[1.6rem] flex-[1_1_240px] items-center text-[12px] text-dimmer"
+          >
+            no subtitles
+          </span>
+          <!-- The pills take the slack, which is what puts the add box against
+               the right edge of the row rather than against the last pill. -->
+          <Ordered
+            v-else
+            chips
+            class="min-h-[1.6rem] flex-[1_1_240px]"
+            :items="listFor(kind, mediaType)"
+            :label="`${kind === 'audio' ? 'Audio' : 'Subtitle'} languages for ${mediaType}, in order`"
+            :pinned="kind === 'audio' ? [ORIGINAL] : []"
+            @move="(from, to) => move(kind, mediaType, from, to)"
+            @remove="(at) => remove(kind, mediaType, at)"
+            @promote="(at) => promote(kind, mediaType, at)"
+          />
           <label class="sr-only" :for="`${kind}-${mediaType}`">
             Add a language for {{ mediaType }}
           </label>
+          <!-- Dashed, because it is an opening rather than a value. -->
           <input
             :id="`${kind}-${mediaType}`"
             v-model="typing[`${kind}.${mediaType}`]"
-            class="w-32 rounded border border-line bg-bg px-2 py-1 font-mono"
-            :class="rejected[`${kind}.${mediaType}`] && 'border-warn'"
+            class="w-[70px] flex-none rounded border border-dashed bg-bg px-2 py-1 font-mono text-[12px]"
+            :class="rejected[`${kind}.${mediaType}`] ? 'border-warn' : 'border-line'"
             :aria-invalid="rejected[`${kind}.${mediaType}`] || undefined"
-            placeholder="en"
+            :list="`langs-${kind}-${mediaType}`"
+            placeholder="add…"
             @keydown.enter.prevent="add(kind, mediaType)"
+            @blur="typing[`${kind}.${mediaType}`]?.trim() && add(kind, mediaType)"
           />
-          <button
-            class="cursor-pointer rounded border border-line px-2 py-1 hover:border-dim"
-            type="button"
-            @click="add(kind, mediaType)"
-          >
-            Add
-          </button>
-          <span v-if="rejected[`${kind}.${mediaType}`]" class="text-[13px] text-warn" role="alert">
+          <datalist :id="`langs-${kind}-${mediaType}`">
+            <option
+              v-for="token in suggestions(listFor(kind, mediaType), kind)"
+              :key="token"
+              :value="token"
+            />
+          </datalist>
+          <span v-if="rejected[`${kind}.${mediaType}`]" class="text-[12px] text-warn" role="alert">
             Two or three letters, like “en” or “nld”.
           </span>
         </div>
-      </div>
-    </section>
-
-    <section class="mb-6 rounded-md border border-line bg-surface p-4">
-      <h2 class="mb-2 text-[14px] leading-none font-[600] capitalize">Anime numbering</h2>
-      <p class="mb-3 max-w-[70ch] text-dim">
-        Series numbered straight through can be shown either way. This decides which numbering the
-        show page and the season pages use — both, always the same one.
-      </p>
-      <label class="flex items-center gap-3">
-        <span class="w-32 font-mono text-[13px] text-dim">show as</span>
-        <select
-          class="rounded border border-line bg-bg px-2 py-1"
-          :value="animeView"
-          @change="save('anime_view', ($event.target as HTMLSelectElement).value)"
-        >
-          <option value="seasons">seasons</option>
-          <option value="native">as numbered in the files</option>
-        </select>
-      </label>
-    </section>
+      </section>
+    </div>
   </main>
 </template>

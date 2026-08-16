@@ -17,6 +17,37 @@ export function validToken(token: string): boolean {
 /// reorderable, because another language may be preferred above it.
 export const ORIGINAL = 'original'
 
+/// What the add box offers. Not a language database: the point is that the
+/// common ones are one keystroke rather than a spelling test, and anything
+/// else is still typeable.
+const SUGGEST = [
+  ORIGINAL,
+  'en',
+  'nl',
+  'ja',
+  'de',
+  'fr',
+  'es',
+  'it',
+  'pt',
+  'sv',
+  'da',
+  'no',
+  'fi',
+  'pl',
+  'ru',
+  'zh',
+  'ko',
+]
+
+/// The ones worth offering here: not already chosen, and never the audio
+/// backstop on a subtitle list — there is no "original" subtitle track.
+export function suggestions(chosen: string[], kind: 'audio' | 'subs'): string[] {
+  return SUGGEST.filter(
+    (token) => !chosen.includes(token) && !(kind === 'subs' && token === ORIGINAL),
+  )
+}
+
 /// A stored wishlist, as a list. Audio always ends up with the backstop in it,
 /// wherever the viewer has put it.
 export function wishlist(stored: string, kind: 'audio' | 'subs'): string[] {
