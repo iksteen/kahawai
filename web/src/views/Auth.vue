@@ -87,9 +87,16 @@ async function submit() {
 </script>
 
 <template>
-  <div class="grid min-h-screen place-items-center px-5">
-    <div class="w-full max-w-[360px]">
-      <h1 class="mb-4 text-center text-[28px] font-[650] tracking-[0.04em]">
+  <div class="grid min-h-screen place-items-center p-6">
+    <!-- A card, because this is the one screen with nothing else on it: the
+         panel is what says the form is a thing to fill in rather than text
+         that happens to have boxes. Not a flat 340px — on a narrow phone that
+         overflows the padding it is centred in, and the first screen everybody
+         meets is the wrong one to have a horizontal scrollbar. -->
+    <div
+      class="animate-rise flex w-[min(340px,100%)] flex-col gap-3 rounded-lg border border-line bg-surface px-7 pt-8 pb-7"
+    >
+      <h1 class="text-[28px] font-[650] tracking-[0.04em]">
         kahawai<span class="text-teal">~</span>
       </h1>
 
@@ -102,7 +109,7 @@ async function submit() {
            the document. -->
       <p
         v-if="mode === 'setup' && !setupAvailable"
-        class="text-center text-prose"
+        class="text-[13.5px] text-dim"
         role="status"
         tabindex="-1"
       >
@@ -114,12 +121,12 @@ async function submit() {
         <code class="font-mono text-teal">kahawai hub init-admin</code>.
       </p>
 
-      <p v-else-if="created" ref="done" class="text-center text-prose" role="status" tabindex="-1">
+      <p v-else-if="created" ref="done" class="text-[13.5px] text-dim" role="status" tabindex="-1">
         Administrator created. Return to your normal kahawai address and sign in.
       </p>
 
       <form v-else class="flex flex-col gap-3" :aria-busy="busy" @submit.prevent="submit">
-        <p class="text-center text-prose">
+        <p class="mb-1.5 text-[13.5px] text-dim">
           {{
             mode === 'setup'
               ? 'First run. Create the initial administrator from this local-only page.'
@@ -132,7 +139,7 @@ async function submit() {
           :id="userField"
           ref="first"
           v-model="username"
-          class="rounded-md border border-line bg-surface px-3 py-2 text-text"
+          class="rounded border border-line bg-bg px-3 py-[9px] text-text"
           :aria-invalid="failure !== '' || undefined"
           :aria-describedby="failure ? alertId : undefined"
           autocomplete="username"
@@ -144,7 +151,7 @@ async function submit() {
         <input
           :id="passwordField"
           v-model="password"
-          class="rounded-md border border-line bg-surface px-3 py-2 text-text"
+          class="rounded border border-line bg-bg px-3 py-[9px] text-text"
           :autocomplete="mode === 'setup' ? 'new-password' : 'current-password'"
           :aria-invalid="failure !== '' || undefined"
           :aria-describedby="
@@ -156,7 +163,11 @@ async function submit() {
           type="password"
           required
         />
-        <p v-if="mode === 'setup'" :id="`${passwordField}-rule`" class="text-[12px] text-dim">
+        <p
+          v-if="mode === 'setup'"
+          :id="`${passwordField}-rule`"
+          class="mb-1.5 text-[13.5px] text-dim"
+        >
           At least {{ MIN_PASSWORD }} characters.
         </p>
 

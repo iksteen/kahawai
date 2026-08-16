@@ -279,10 +279,17 @@ function go(to: Parameters<typeof router.push>[0], fresh: boolean) {
       </SearchBox>
       <div v-else class="flex-1" />
 
-      <!-- `ml-auto` once the header has wrapped, so the profile button stays
-           at the right edge. Without it the menu anchored to it computed a
-           negative x on a phone and clipped its own labels to "…ttings". -->
-      <div class="relative ml-auto">
+      <!-- `ml-auto` once the header has WRAPPED, so the profile button stays at
+           the right edge of a line it is alone on: its menu is anchored to its
+           right, and against a button at the left edge that computed a negative
+           x on a phone and clipped its own labels to "…ttings".
+           Only there, though. An auto margin absorbs free space before
+           `justify-between` gets to divide it, so on a header that fits, this
+           collected the whole surplus on one side and packed the search box
+           against the wordmark instead of leaving it centred between the two.
+           Below the wrap the search box has already shrunk to its floor, so
+           there is no surplus for this to take. -->
+      <div class="relative max-sm:ml-auto">
         <button
           class="flex cursor-pointer items-center gap-2 rounded-full border border-line py-[3px] pr-2.5 pl-1 hover:border-dim"
           :title="props.username"
@@ -349,7 +356,7 @@ function go(to: Parameters<typeof router.push>[0], fresh: boolean) {
     >
       <div
         v-if="notice !== ''"
-        class="rounded-md border border-line bg-surface px-4 py-2 shadow-lg"
+        class="animate-rise-note rounded-md border border-line bg-surface px-4 py-2 shadow-lg"
       >
         {{ notice }}
       </div>

@@ -110,20 +110,28 @@ const marooned = (user: UserAccess) =>
 
 <template>
   <section aria-labelledby="new-account">
-    <h2 id="new-account" class="mt-4 mb-2 text-[15px] font-[650]">New account</h2>
+    <h2 id="new-account" class="mb-3 text-[14px] font-[650] tracking-[0.08em] text-dim uppercase">
+      New account
+    </h2>
     <form class="mb-4 flex flex-wrap items-center gap-2" @submit.prevent="create">
+      <!-- The two fields share whatever is left after the toggle and Create,
+           which take only what they need. A basis rather than a width, so they
+           stay equal as the column narrows, and `min-w-0` so they can shrink
+           below their placeholder text instead of pushing the buttons off the
+           end — at an intrinsic width the row stopped short of the panel and
+           read as something half-drawn. -->
       <label class="sr-only" for="new-user">New username</label>
       <input
         id="new-user"
         v-model="newUser.username"
-        class="rounded border border-line bg-bg px-2 py-1"
+        class="min-w-0 flex-[1_1_120px] rounded border border-line bg-bg px-2 py-1"
         placeholder="new username"
       />
       <label class="sr-only" for="new-pass">Password</label>
       <input
         id="new-pass"
         v-model="newUser.password"
-        class="rounded border bg-bg px-2 py-1"
+        class="min-w-0 flex-[1_1_120px] rounded border bg-bg px-2 py-1"
         :class="tooShort ? 'border-warn' : 'border-line'"
         type="password"
         autocomplete="new-password"
@@ -158,7 +166,12 @@ const marooned = (user: UserAccess) =>
   </section>
 
   <section aria-labelledby="accounts">
-    <h2 id="accounts" class="mt-6 mb-2 text-[15px] font-[650]">Accounts</h2>
+    <h2
+      id="accounts"
+      class="mt-[22px] mb-3 text-[14px] font-[650] tracking-[0.08em] text-dim uppercase"
+    >
+      Accounts
+    </h2>
     <p v-if="props.broken.includes('users')" class="text-warn">
       The accounts could not be read, so this is not saying there are none.
     </p>

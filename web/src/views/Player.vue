@@ -244,7 +244,7 @@ function advanced(nextItem: ItemQueryResponse, fresh: StartSessionResponse) {
        on the session id, so every restart and every next episode destroys the
        element the focus was on and drops it to `<body>`. -->
   <main v-else :class="mode === 'theater' ? 'theater' : ''" tabindex="-1">
-    <Btn v-if="mode === 'window'" ghost small class="mb-3" @click="leave">← Back</Btn>
+    <Btn v-if="mode === 'window'" ghost small class="mb-[18px]" @click="leave">← Back</Btn>
 
     <!-- The item's own geometry, not 16:9: the box that appears while the
          session is being started is usually the shape the picture will be, and

@@ -171,7 +171,7 @@ const animeView = computed(() => (values.value['anime_view'] === 'native' ? 'nat
     <p class="mb-6 text-dim">Everything here saves the moment you change it.</p>
 
     <section class="mb-6 rounded-md border border-line bg-surface p-4">
-      <h2 class="mb-2 flex items-center gap-2 text-[15px] font-[650]">
+      <h2 class="mb-2 flex items-center gap-2 text-[14px] leading-none font-[600] capitalize">
         <Icon name="play" :size="15" />
         Playback
       </h2>
@@ -196,7 +196,7 @@ const animeView = computed(() => (values.value['anime_view'] === 'native' ? 'nat
     </section>
 
     <section class="mb-6 rounded-md border border-line bg-surface p-4">
-      <h2 class="mb-2 text-[15px] font-[650]">Styled subtitles</h2>
+      <h2 class="mb-2 text-[14px] leading-none font-[600] capitalize">Styled subtitles</h2>
       <p class="mb-3 max-w-[70ch] text-dim">
         How styled subtitles reach a player that cannot draw them itself, in the order to try. The
         server takes the first rung this client and this server can actually serve.
@@ -220,7 +220,7 @@ const animeView = computed(() => (values.value['anime_view'] === 'native' ? 'nat
       :key="mediaType"
       class="mb-6 rounded-md border border-line bg-surface p-4"
     >
-      <h2 class="mb-3 text-[15px] font-[650] capitalize">{{ mediaType }}</h2>
+      <h2 class="mb-3 text-[14px] leading-none font-[600] capitalize">{{ mediaType }}</h2>
 
       <div v-for="kind in ['audio', 'subs'] as const" :key="kind" class="mb-4">
         <h3 class="mb-2 font-mono text-[13px] text-dim">
@@ -261,7 +261,7 @@ const animeView = computed(() => (values.value['anime_view'] === 'native' ? 'nat
     </section>
 
     <section class="mb-6 rounded-md border border-line bg-surface p-4">
-      <h2 class="mb-2 text-[15px] font-[650]">Anime numbering</h2>
+      <h2 class="mb-2 text-[14px] leading-none font-[600] capitalize">Anime numbering</h2>
       <p class="mb-3 max-w-[70ch] text-dim">
         Series numbered straight through can be shown either way. This decides which numbering the
         show page and the season pages use — both, always the same one.

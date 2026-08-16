@@ -118,10 +118,13 @@ const failed = computed(() => props.broken.includes('libraries'))
   <section aria-label="Libraries">
     <form class="mb-4 flex flex-wrap items-center gap-2" @submit.prevent="create">
       <label class="sr-only" for="new-library">New library name</label>
+      <!-- Grows into the row, the way the account form beside it does. At an
+           intrinsic width the field stopped a third of the way across the panel
+           and the row read as something half-drawn. -->
       <input
         id="new-library"
         v-model="newLibrary.name"
-        class="rounded border border-line bg-bg px-2 py-1"
+        class="min-w-0 flex-[1_1_120px] rounded border border-line bg-bg px-2 py-1"
         placeholder="new library"
       />
       <label class="sr-only" for="new-library-type">Media type</label>
@@ -222,8 +225,11 @@ const failed = computed(() => props.broken.includes('libraries'))
         >
           Refresh
         </Btn>
+        <!-- Filled in the warning colour once it is armed, so the second press
+             does not look like the first. -->
         <Btn
-          ghost
+          :ghost="confirming !== library.id"
+          :danger="confirming === library.id"
           small
           title="Removes the library, its collection attachments and every grant to it"
           @click="remove(library)"

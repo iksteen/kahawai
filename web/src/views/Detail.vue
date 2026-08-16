@@ -266,7 +266,10 @@ function markSeason(season: number | null, played: boolean) {
   />
 
   <main v-else-if="item">
-    <Btn ghost small class="mb-4" @click="goUp">{{ up.label }}</Btn>
+    <!-- No margin of its own: the gap under it belongs to the head below,
+         which carries `.detail-head`'s 22px. This button is the one back
+         button in the app that is not `.back`. -->
+    <Btn ghost small @click="goUp">{{ up.label }}</Btn>
 
     <DetailHead :item="item" :subline="subline" :progress="item.kind === 'show' ? null : undefined">
       <template v-if="item.kind === 'show'">
@@ -316,6 +319,7 @@ function markSeason(season: number | null, played: boolean) {
         <Btn
           ghost
           small
+          :on="item.played"
           :disabled="busy.has(item.id)"
           :title="item.played ? 'Mark as unwatched' : 'Mark as watched without playing it'"
           @click="mark(item.id, !item.played)"
@@ -498,9 +502,15 @@ function markSeason(season: number | null, played: boolean) {
 
     <!-- A film or an episode -->
     <template v-else>
-      <section v-if="item.metadata?.cast?.length" class="mt-8">
-        <h2 class="mb-2 text-[14px] font-[650] tracking-[0.08em] text-dim uppercase">Cast</h2>
-        <ul class="flex flex-wrap gap-x-6 gap-y-1">
+      <!-- Columns, not a wrap. Names are short and characters are not, so a
+           flex wrap packs a ragged line of them across the whole page and the
+           eye has nothing to run down. A grid of 15rem columns inside a 46rem
+           measure gives two or three of them, aligned. -->
+      <section v-if="item.metadata?.cast?.length" class="mt-9 max-w-[46rem]">
+        <h2 class="mb-3 text-[14px] font-[650] tracking-[0.08em] text-dim uppercase">Cast</h2>
+        <ul
+          class="grid grid-cols-[repeat(auto-fill,minmax(15rem,1fr))] gap-x-6 gap-y-[0.15rem] text-[0.85rem] leading-[1.5]"
+        >
           <li v-for="person in item.metadata.cast" :key="person.name">
             {{ person.name }}
             <span v-if="person.character" class="text-dim">as {{ person.character }}</span>
@@ -565,7 +575,7 @@ function markSeason(season: number | null, played: boolean) {
                effect on the NEXT session, so it has to be settable before Play
                is pressed. -->
           <div class="mt-2 flex flex-wrap items-center gap-2 border-t border-hairline pt-2">
-            <Btn ghost small :aria-pressed="showCaps" @click="showCaps = !showCaps">
+            <Btn ghost small mono :aria-pressed="showCaps" @click="showCaps = !showCaps">
               client capabilities
             </Btn>
             <!-- OPS-10, and only for an admin: what the hub recorded about the

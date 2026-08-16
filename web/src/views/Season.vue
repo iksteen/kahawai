@@ -154,7 +154,9 @@ function play(id: string, fromStart = false) {
   />
 
   <main v-else>
-    <Btn ghost small class="mb-4" @click="goUp">← {{ show.data.value?.title ?? 'Series' }}</Btn>
+    <Btn ghost small class="mb-[18px]" @click="goUp"
+      >← {{ show.data.value?.title ?? 'Series' }}</Btn
+    >
 
     <div class="mb-4 flex flex-wrap items-baseline gap-3">
       <h1 class="text-[22px] font-[650] tracking-[0.01em]">
@@ -169,6 +171,7 @@ function play(id: string, fromStart = false) {
       <Btn
         ghost
         small
+        :on="allSeen"
         :disabled="busy.has(showId) || !mine?.length"
         :title="
           mine === undefined
@@ -247,7 +250,9 @@ function play(id: string, fromStart = false) {
         <p v-if="picked.data.value.metadata?.overview" class="mt-2 max-w-[70ch] text-prose">
           {{ picked.data.value.metadata.overview }}
         </p>
-        <div class="mt-3 flex flex-wrap items-center gap-3">
+        <div
+          class="mt-5 mb-1 flex flex-wrap items-center gap-3 [&>button]:flex-none [&>button]:whitespace-nowrap"
+        >
           <Btn
             :disabled="busy.has(picked.data.value.id) || !pickedPlayable"
             :title="pickedPlayable ? undefined : 'The machine holding this file is not answering'"
@@ -266,6 +271,7 @@ function play(id: string, fromStart = false) {
           <Btn
             ghost
             small
+            :on="picked.data.value.played"
             :disabled="busy.has(picked.data.value.id)"
             @click="mark(picked.data.value.id, !picked.data.value.played)"
           >

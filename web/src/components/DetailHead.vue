@@ -51,7 +51,7 @@ const runtime = computed(() => duration(props.item.duration_ms))
 </script>
 
 <template>
-  <div class="mt-6 mb-2 flex flex-wrap items-start gap-6">
+  <div class="mt-[22px] mb-1.5 flex flex-wrap items-start gap-6">
     <span
       class="art-box shrink-0 rounded-md border border-line"
       :style="{ width: `min(${shape.width}, 46vw)` }"
@@ -104,7 +104,17 @@ const runtime = computed(() => duration(props.item.duration_ms))
         </span>
       </div>
 
-      <div class="mt-4 flex flex-wrap items-center gap-3"><slot /></div>
+      <!-- The BUTTONS do not shrink and their labels do not break: this column
+           is narrow on a phone and beside a poster, and a shrinking flex item
+           let "Play from start" fold onto two lines mid-word while there was
+           still a whole row of space beside it. Buttons only — the slot also
+           carries the next episode's title, which is prose and has to be free
+           to wrap. -->
+      <div
+        class="mt-5 mb-1 flex flex-wrap items-center gap-3 [&>button]:flex-none [&>button]:whitespace-nowrap"
+      >
+        <slot />
+      </div>
     </div>
   </div>
 </template>

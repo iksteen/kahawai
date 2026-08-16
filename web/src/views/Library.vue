@@ -221,7 +221,7 @@ function open(item: Parameters<typeof targetOf>[0]) {
   <main>
     <!-- The wordmark opens the jump menu now, so home needs saying
          somewhere. -->
-    <Btn ghost small class="mb-4" @click="router.push({ name: 'libraries' })">← Home</Btn>
+    <Btn ghost small class="mb-[18px]" @click="router.push({ name: 'libraries' })">← Home</Btn>
     <div class="mb-4 flex items-baseline gap-3">
       <!-- Pressable when there is a filter to drop, and inert when there is
            not: a heading that looks clickable and does nothing is worse than

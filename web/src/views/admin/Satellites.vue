@@ -136,7 +136,9 @@ function some(satellite: SatelliteOverview) {
 
 <template>
   <section aria-labelledby="waiting">
-    <h2 id="waiting" class="mt-4 mb-2 text-[15px] font-[650]">Waiting to be let in</h2>
+    <h2 id="waiting" class="mb-3 text-[14px] font-[650] tracking-[0.08em] text-dim uppercase">
+      Waiting to be let in
+    </h2>
     <p v-if="props.broken.includes('enrolments')" class="text-warn">
       This list could not be read, so it is not saying there is nothing.
     </p>
@@ -168,12 +170,17 @@ function some(satellite: SatelliteOverview) {
     <!-- Approved by the code the satellite prints, not by pressing a row: the
          code is what proves whoever is at this panel can also see that
          machine. -->
-    <form class="flex flex-wrap items-center gap-2" @submit.prevent="approve">
+    <!-- A short row on purpose: two controls and a code that is eight
+         characters, so it is capped rather than stretched across the panel. -->
+    <form
+      class="mt-2.5 flex max-w-[420px] flex-wrap items-center gap-2.5"
+      @submit.prevent="approve"
+    >
       <label class="sr-only" for="enrol-code">Enrolment code</label>
       <input
         id="enrol-code"
         v-model="code"
-        class="rounded border border-line bg-bg px-2 py-1 font-mono"
+        class="min-w-0 flex-1 rounded border border-line bg-bg px-2 py-1 font-mono"
         placeholder="Enrolment code (XXXX-XXXX)"
       />
       <Btn submit small :disabled="!code.trim()">Approve</Btn>
@@ -181,7 +188,12 @@ function some(satellite: SatelliteOverview) {
   </section>
 
   <section aria-labelledby="enrolled">
-    <h2 id="enrolled" class="mt-6 mb-2 text-[15px] font-[650]">Enrolled</h2>
+    <h2
+      id="enrolled"
+      class="mt-[22px] mb-3 text-[14px] font-[650] tracking-[0.08em] text-dim uppercase"
+    >
+      Enrolled
+    </h2>
     <p v-if="props.broken.includes('satellites')" class="text-warn">
       The fleet could not be read, so this is not saying there is nothing enrolled.
     </p>
@@ -230,8 +242,11 @@ function some(satellite: SatelliteOverview) {
           >
             {{ drained(satellite) ? 'Disabled — enable' : 'Disable' }}
           </Btn>
+          <!-- Filled in the warning colour once it is armed, so the second
+               press does not look like the first. -->
           <Btn
-            ghost
+            :ghost="confirming !== satellite.module_id"
+            :danger="confirming === satellite.module_id"
             small
             :class="satellite.module_type === 'transcoder' ? '' : 'ml-auto'"
             title="Revokes its certificate: it is refused at the TLS layer and cannot come back on its own"

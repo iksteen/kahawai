@@ -1296,7 +1296,7 @@ const remember = (scope: string, key: string, value: string) =>
          enough to discover an overlay you were not told about. -->
     <div
       v-if="upNextOn && next"
-      class="absolute right-4 z-8 flex w-[320px] flex-col gap-2 rounded-md border border-line bg-bg/95 p-3"
+      class="animate-rise absolute right-4 z-8 flex w-[320px] flex-col gap-2 rounded-md border border-line bg-bg/95 p-3"
       :class="barShown || playing.paused ? 'bottom-24' : 'bottom-8'"
       role="region"
       aria-label="Up next"

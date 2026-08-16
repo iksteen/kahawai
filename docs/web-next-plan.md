@@ -629,6 +629,50 @@ and revoked the family, which measured the hub rather than the app.
 library is not announced, because the player's key deliberately holds still
 across a handover and cannot tell the two apart. The title is right.
 
+#### The design was frozen; the port had drifted anyway
+
+Reported from use, one screen at a time, and then swept against the reference
+stylesheet — which is still readable at `2ab6db3^`. Nothing here is a decision;
+every one of them is a rule the port dropped or transcribed wrong.
+
+- **A rule ported by eye is a rule ported wrong.** The login card came back with
+  the right border and the wrong hint colour, the wrong input radius and every
+  ghost button a weight light, because those live in neighbouring rules that
+  were not being read at the time. The fix for the next one is to read the whole
+  rule, not the line the symptom points at.
+- **One bug wore three faces.** Tailwind's preflight lays every `svg` out as a
+  block, so an icon beside a label split a button across two lines — reported as
+  the watched tick, true of four buttons. It belonged on the shared `Btn`, not
+  at the call site. Same shape for the admin forms: the reference leans on a
+  global `input { width: 100% }` the rebuild does not have, so THREE rows stop
+  short, of which one was reported.
+- **An auto margin absorbs free space before `justify-content` divides it.**
+  That is why the search box sat against the wordmark. The margin was guarding a
+  real case — a wrapped header, where the profile menu is anchored right and
+  computed a negative x — so it is scoped to the widths that wrap rather than
+  removed.
+- **`Btn` grew the three variants the reference already had**: `on` (a tick that
+  is already ticked reads as state, not an offer), `danger` (the second press of
+  a delete), `mono`. Each is a variant rather than a class at the call site
+  because a passed class fights the one below it on stylesheet order, which is
+  not something a call site should have to reason about.
+- **Everything that arrives was arriving without moving.** `@keyframes rise` and
+  its six users — every screen, both menus, the toast, the sign-in card, the
+  results panel, up-next — had not been ported at all.
+- **Headings.** Admin's were plain 15px where the global `h2` is 14px dim
+  uppercase; the card heads in Settings and Providers are NOT that heading, they
+  are `.card-name` at 14/600/capitalize in full-strength text. Getting the first
+  one right by making the second one wrong is how the review caught it.
+
+**Known and not fixed:** the entry animation replays on every navigation that
+changes the view component, and not on one that reuses it — library to library
+through the jump menu, season to season, item to a related item that is already
+cached. The reference remounted the whole screen on a keyed boundary; this
+boundary takes the screen as a PROP so that a throw is cleared without throwing
+away the page, and remounting every view to replay a 240ms fade is not a trade
+worth making. The titles, the focus move and the announcement all still fire on
+those navigations.
+
 ### What phase 13 landed
 
 The player: the route that owns a session, the picture that plays one, the

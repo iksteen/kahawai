@@ -96,7 +96,7 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
     <div class="fixed inset-0 z-14" data-testid="menu-sheet" @click="emit('close')" />
     <div
       ref="menu"
-      class="absolute top-full z-20 mt-1 min-w-48 rounded-md border border-line bg-surface py-1 shadow-lg"
+      class="animate-rise-pop absolute top-full z-20 mt-1 min-w-48 rounded-md border border-line bg-surface py-1 shadow-lg"
       :class="align === 'right' ? 'right-0' : 'left-0'"
       role="menu"
     >

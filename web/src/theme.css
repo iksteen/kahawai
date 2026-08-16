@@ -37,6 +37,31 @@
 
   --font-mono: ui-monospace, 'JetBrains Mono', Menlo, Consolas, monospace;
   --font-sans: system-ui, -apple-system, 'Segoe UI', sans-serif;
+
+  /* Four pixels and a fade, on everything that ARRIVES: a screen, a menu, a
+     notice, the sign-in card, the results panel. Nothing moves on the way out
+     and nothing moves that was already there — the point is only that a thing
+     which was not on the page a moment ago is seen to appear, rather than
+     being found already present. Three durations because the reference has
+     three: the further a thing travels into view, the longer it takes. */
+  --animate-rise: rise 240ms ease-out;
+  --animate-rise-note: rise 200ms ease-out;
+  --animate-rise-pop: rise 160ms ease-out;
+
+  @keyframes rise {
+    from {
+      opacity: 0;
+      transform: translateY(4px);
+    }
+  }
+}
+
+/* Every screen, without each view having to remember. `main` is what a view
+   renders, and it is what the reference animated. */
+@layer base {
+  main {
+    animation: var(--animate-rise);
+  }
 }
 
 /* The tones a `tone` field can name, generated on purpose.

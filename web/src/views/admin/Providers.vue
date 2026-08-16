@@ -188,7 +188,10 @@ async function run() {
 
   <div class="flex flex-col gap-4">
     <section class="rounded border border-line bg-surface p-3" aria-labelledby="providers-movies">
-      <h2 id="providers-movies" class="mb-2 flex items-center gap-2 text-[15px] font-[650]">
+      <h2
+        id="providers-movies"
+        class="mb-3 flex items-center gap-2 text-[14px] leading-none font-[600] capitalize"
+      >
         <Icon name="movie" />
         Movies &amp; series
       </h2>
@@ -232,7 +235,10 @@ async function run() {
     </section>
 
     <section class="rounded border border-line bg-surface p-3" aria-labelledby="providers-anime">
-      <h2 id="providers-anime" class="mb-2 flex items-center gap-2 text-[15px] font-[650]">
+      <h2
+        id="providers-anime"
+        class="mb-3 flex items-center gap-2 text-[14px] leading-none font-[600] capitalize"
+      >
         <Icon name="show" />
         Anime
         <span
@@ -290,7 +296,10 @@ async function run() {
       class="rounded border border-line bg-surface p-3"
       aria-labelledby="providers-order"
     >
-      <h2 id="providers-order" class="mb-2 flex items-center gap-2 text-[15px] font-[650]">
+      <h2
+        id="providers-order"
+        class="mb-3 flex items-center gap-2 text-[14px] leading-none font-[600] capitalize"
+      >
         <Icon name="grip" />
         Matching order
       </h2>

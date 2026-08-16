@@ -45,7 +45,7 @@ const emit = defineEmits<{
        floor wider than that box wins against `left`/`right` — the panel grew
        54px off the right edge, taking every count and arrow with it. -->
   <div
-    class="absolute top-[calc(100%+8px)] right-0 left-0 z-20 max-h-[70vh] min-w-[min(280px,100%)] overflow-y-auto rounded-lg border border-line bg-surface p-1.5 shadow-[0_12px_34px_rgba(0,0,0,0.55)]"
+    class="animate-rise-pop absolute top-[calc(100%+8px)] right-0 left-0 z-20 max-h-[70vh] min-w-[min(280px,100%)] overflow-y-auto rounded-lg border border-line bg-surface p-1.5 shadow-[0_12px_34px_rgba(0,0,0,0.55)]"
   >
     <!-- Out of flow and pinned: in the flow it pushed the whole list down 17px
          on every debounced keystroke and back up when it settled. -->
