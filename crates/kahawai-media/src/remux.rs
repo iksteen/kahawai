@@ -2078,11 +2078,25 @@ fn survives_the_segment(pad: &gst::Pad, b: &gst::BufferRef) -> bool {
 /// because it applies the edit list too. That is what first suggested a
 /// source with no leading keyframe, which it is not.
 ///
-/// The cost is the trimmed frames plus everything up to the next IDR —
-/// 1.126 s on that file, which is 1.126 s that currently cannot be
-/// decoded at all. Keeping them instead means shifting BOTH pads'
-/// segments so nothing is clipped; the sync would hold, since they move
-/// together, and it is a bigger change than this one.
+/// The cost is the trimmed frames plus everything up to the next IDR,
+/// and it is paid in silence too: the audio for that span IS muxed, but
+/// a media element's buffered range is the INTERSECTION of its tracks,
+/// so with no video before the first IDR playback cannot begin there and
+/// the sound goes unheard. 1.126 s on that file — 1.126 s that before
+/// this could not be decoded at all.
+///
+/// Keeping it instead means shifting BOTH pads' segments so nothing is
+/// clipped; sync would hold, since they move together. WEIGHED AND
+/// DECLINED, 2026-08-16: across 2,176 files in the movies, anime,
+/// animore and 3d collections, exactly TWO lose anything —
+/// `The Heroes of Telemark (1965).mp4` at 7.382 s (179 buffers dropped)
+/// and this one at 1.126 s (29). Both `.mp4` with a trimmed opening IDR.
+/// 8.5 s of library, against rewriting segment timestamps for every
+/// session in the element whose documented failure mode is a
+/// "Timestamps going backwards" panic, is not a trade worth taking.
+/// Revisit if the count grows: the scan is one head-read per file, and
+/// ffprobe's first keyframe agreed with this gate to the millisecond on
+/// both.
 ///
 /// The muxer's own pad is the one place that covers this once. It is
 /// requested a single time per session, and on a multi-part source it is
