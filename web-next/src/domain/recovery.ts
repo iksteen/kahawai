@@ -21,6 +21,18 @@ import { ApiError, retry } from '../api/errors.ts'
 
 export const SESSION_GONE = 404
 
+/// **503 `source_offline`**: the item's bytes are on a mediahost that is not
+/// connected. Nothing is wrong with the item and nothing is wrong with the
+/// request — the same call may succeed once the host is back.
+///
+/// Narrower than "worth asking again", and the difference matters wherever the
+/// answer is put into words: a request that got no answer at all and a gateway
+/// status are both worth retrying, and neither of them is a statement about the
+/// machine holding the file.
+export function isSourceOffline(cause: unknown): boolean {
+  return cause instanceof ApiError && cause.status === 503 && cause.code !== 'setup_required'
+}
+
 /// How many times a caller that asks on a TIMER may ask again.
 ///
 /// `retry` says whether the answer could change; this says how long to keep

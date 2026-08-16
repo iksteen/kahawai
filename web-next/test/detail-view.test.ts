@@ -16,6 +16,12 @@ vi.mock('../src/api/generated/kahawai.ts', () => ({
   itemChildren: vi.fn(),
   itemSetWatched: vi.fn(),
   adminItemLog: vi.fn(),
+  listLibraries: vi.fn(),
+  getPrefs: vi.fn(),
+  putPref: vi.fn(),
+  subtitleSearch: vi.fn(),
+  subtitleDownload: vi.fn(),
+  subtitleDelete: vi.fn(),
   getItemArtworkUrl: (id: string) => `/api/v1/items/${id}/artwork`,
 }))
 const admin = { value: false }
@@ -25,8 +31,16 @@ vi.mock('../src/api/capabilities.ts', () => ({
   loadMask: vi.fn(() => ({})),
 }))
 
-const { adminItemLog, itemChildren, itemQuery, itemSetWatched } =
-  await import('../src/api/generated/kahawai.ts')
+const {
+  adminItemLog,
+  getPrefs,
+  itemChildren,
+  itemQuery,
+  itemSetWatched,
+  listLibraries,
+  subtitleDelete,
+  subtitleSearch,
+} = await import('../src/api/generated/kahawai.ts')
 const { loadMask } = await import('../src/api/capabilities.ts')
 const { notice, clearNotices } = await import('../src/composables/notices.ts')
 const { clearQueue, useQueue } = await import('../src/composables/queue.ts')
@@ -127,6 +141,15 @@ beforeEach(() => {
   vi.mocked(itemChildren).mockResolvedValue({ children: [] } as never)
   vi.mocked(itemSetWatched).mockResolvedValue({ updated: 1 } as never)
   vi.mocked(loadMask).mockReturnValue({})
+  vi.mocked(listLibraries).mockResolvedValue({
+    libraries: [{ id: 'films', name: 'Films', media_type: 'movies' }],
+  } as never)
+  vi.mocked(getPrefs).mockResolvedValue({ prefs: [] } as never)
+  vi.mocked(subtitleSearch).mockResolvedValue({
+    candidates: [],
+    quota: { remaining: null, total: null, resets_in_secs: null, per_account: false },
+  } as never)
+  vi.mocked(subtitleDelete).mockResolvedValue({ removed: true } as never)
   clearNotices()
   clearQueue()
 })
@@ -1070,5 +1093,99 @@ describe('the last session for this item (OPS-10)', () => {
       .trigger('click')
     await flushPromises()
     expect(notice.value).toContain('no session for that item')
+  })
+})
+
+describe('the subtitles section (HUB-24)', () => {
+  const withSubs = (subtitles: Record<string, unknown>[]) =>
+    film({
+      negotiated: {
+        cost: 'copy',
+        mode: 'remux',
+        source: null,
+        streams: { video: 'copy', audio: 'copy' },
+        subtitles,
+        target_duration_secs: 6,
+      },
+    })
+
+  test('says what is in the file, and lists what the hub is storing', async () => {
+    vi.mocked(itemQuery).mockResolvedValue(
+      withSubs([
+        {
+          id: 1,
+          origin: 'embedded',
+          format: 'srt',
+          language: 'eng',
+          delivery: 'text',
+          note: '',
+          deletable: false,
+        },
+        {
+          id: 2,
+          origin: 'downloaded',
+          format: 'srt',
+          language: 'fra',
+          delivery: 'text',
+          note: '',
+          deletable: true,
+        },
+      ]) as never,
+    )
+    const { wrapper } = await open(Detail, '/library/films/item/heat')
+    expect(wrapper.text()).toContain('1 in the file: eng')
+    expect(wrapper.text()).toContain('downloaded')
+  })
+
+  test('and the search is filtered by the media type’s preference', async () => {
+    // The wiring, not the panel: the media type comes from the library and the
+    // wishlist from the account's preferences, and neither is on the item.
+    vi.mocked(getPrefs).mockResolvedValue({
+      prefs: [{ scope: '', key: 'subs.movies', value: 'eng, fra' }],
+    } as never)
+    vi.mocked(itemQuery).mockResolvedValue(withSubs([]) as never)
+    const { wrapper } = await open(Detail, '/library/films/item/heat')
+    await wrapper
+      .findAll('button')
+      .find((b) => b.text().startsWith('Find subtitles'))!
+      .trigger('click')
+    await flushPromises()
+    expect(subtitleSearch).toHaveBeenCalledWith('heat', { languages: ['eng', 'fra'] })
+  })
+
+  test('and a standing choice for this title is shown, scoped to the series', async () => {
+    vi.mocked(getPrefs).mockResolvedValue({
+      prefs: [{ scope: 'show', key: 'subs', value: 'fra' }],
+    } as never)
+    vi.mocked(itemQuery).mockResolvedValue(
+      film({ kind: 'episode', parent_id: 'show', negotiated: null }) as never,
+    )
+    const { wrapper } = await open(Detail, '/library/films/item/heat')
+    expect(wrapper.text()).toContain('fra for this title')
+  })
+
+  test('and removing a track re-reads the item', async () => {
+    vi.mocked(itemQuery).mockResolvedValue(
+      withSubs([
+        {
+          id: 2,
+          origin: 'downloaded',
+          format: 'srt',
+          language: 'fra',
+          delivery: 'text',
+          note: '',
+          deletable: true,
+        },
+      ]) as never,
+    )
+    const { wrapper } = await open(Detail, '/library/films/item/heat')
+    const reads = vi.mocked(itemQuery).mock.calls.length
+    await wrapper
+      .findAll('button')
+      .find((b) => b.text() === 'Remove')!
+      .trigger('click')
+    await flushPromises()
+    expect(subtitleDelete).toHaveBeenCalledWith(2)
+    expect(vi.mocked(itemQuery).mock.calls.length).toBeGreaterThan(reads)
   })
 })

@@ -219,12 +219,23 @@ function open(item: Parameters<typeof targetOf>[0]) {
       <!-- Pressable when there is a filter to drop, and inert when there is
            not: a heading that looks clickable and does nothing is worse than
            one that does not. -->
-      <h1
-        class="text-[22px] font-[650] tracking-[0.01em]"
-        :class="query !== '' && 'cursor-pointer hover:text-teal'"
-        @click="query !== '' && clearFilter()"
-      >
-        {{ name }}
+      <!-- Pressable when there is a filter to drop, and inert when there is
+           not: a heading that looks clickable and does nothing is worse than
+           one that does not. A BUTTON when it is pressable, because a heading
+           with a click handler is unreachable from the keyboard — the ✕ in the
+           search box is the other half of the same gesture and always was
+           reachable, so this was a mouse-only shortcut. -->
+      <h1 class="text-[22px] font-[650] tracking-[0.01em]">
+        <button
+          v-if="query !== ''"
+          class="cursor-pointer hover:text-teal"
+          type="button"
+          :title="`Show all of ${name}`"
+          @click="clearFilter"
+        >
+          {{ name }}
+        </button>
+        <template v-else>{{ name }}</template>
       </h1>
       <select
         v-model="sort"

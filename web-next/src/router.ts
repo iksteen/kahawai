@@ -7,7 +7,9 @@
 
 import { createRouter, createWebHistory } from 'vue-router'
 
-const Placeholder = () => import('./views/Placeholder.vue')
+import { loadChunk } from './api/chunk.ts'
+import { notify } from './composables/notices.ts'
+
 const Home = () => import('./views/Home.vue')
 const Library = () => import('./views/Library.vue')
 const Detail = () => import('./views/Detail.vue')
@@ -40,7 +42,15 @@ export const router = createRouter({
       // land where pressing Play does.
       path: '/library/:library/item/:id/play',
       name: 'player',
-      component: Placeholder,
+      // Its own chunk: hls.js is a few hundred kilobytes, and a page that has
+      // not opened the player should not pay for it.
+      //
+      // Through `loadChunk`, because the hub embeds this build in its own
+      // binary: upgrading it replaces every content hash under tabs that are
+      // still open, and a tab that outlives an upgrade asks for a name the new
+      // binary does not have. Without it the Play button does nothing, for
+      // ever, silently.
+      component: () => loadChunk('player', () => import('./views/Player.vue')),
     },
     // Anything else is the home screen rather than a dead end: these paths are
     // typed and shared by people, not only produced by the app.
@@ -62,4 +72,13 @@ export const router = createRouter({
     // is what a person expects from those two buttons alone.
     return savedPosition ?? { top: 0 }
   },
+})
+
+/// A chunk that could not be fetched, after `loadChunk` has already spent its
+/// one reload on it. The router leaves the address where it was and renders
+/// nothing, so without this a press simply does nothing.
+router.onError((cause: unknown, to) => {
+  if (!/dynamically imported module|Importing a module script failed/i.test(String(cause)))
+    throw cause
+  notify(`Could not load ${String(to.name ?? 'that screen')}. Reload the page to try again.`)
 })

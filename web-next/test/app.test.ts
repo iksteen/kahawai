@@ -73,14 +73,17 @@ beforeEach(() => {
 afterEach(() => vi.clearAllMocks())
 
 describe('what is on screen', () => {
-  test('booting shows nothing at all', async () => {
+  test('booting shows nothing at all, and announces nothing either', async () => {
     // Not a spinner. One that flashes for 40 ms on every load is worse than a
     // blank moment, and a boot slow enough to notice ends in an error instead.
+    // Nothing for a screen reader either: there is no screen to have moved
+    // between yet, and "Home" over a blank page is a lie about both.
     const router = app()
     await router.isReady()
     const wrapper = mount(App, { global: { plugins: [router, VueQueryPlugin] } })
     expect(wrapper.text()).toBe('')
     expect(wrapper.find('form').exists()).toBe(false)
+    expect(wrapper.find('[role="status"]').exists()).toBe(false)
   })
 
   test('a hub that did not start is not a sign-in screen', async () => {

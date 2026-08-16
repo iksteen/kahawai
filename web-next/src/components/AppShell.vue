@@ -5,7 +5,7 @@
 /// The bottom padding is room for the music queue bar, which floats over the
 /// page rather than pushing it — without it the last row of a library sits
 /// under the bar and cannot be reached.
-import { computed, ref, watch } from 'vue'
+import { computed, nextTick, ref, useTemplateRef, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 
 import Icon, { type IconName } from './Icon.vue'
@@ -13,7 +13,7 @@ import MenuItem from './MenuItem.vue'
 import MenuPopover from './MenuPopover.vue'
 import SearchBox from './SearchBox.vue'
 import SearchPanel from './SearchPanel.vue'
-import { hasSearchBox, hasSearchPanel, type RouteName } from '../domain/routes.ts'
+import { boundaryKey, hasSearchBox, hasSearchPanel, type RouteName } from '../domain/routes.ts'
 import { targetOf } from '../domain/label.ts'
 import { notice } from '../composables/notices.ts'
 import { moveHighlight, SEARCH_LIST_ID, searchOptionId } from '../domain/search-nav.ts'
@@ -41,6 +41,29 @@ const router = useRouter()
 const { text, query, open, typed, reopen, dismiss, clear, taken } = useSearch()
 
 const name = computed(() => (route.name ?? 'libraries') as RouteName)
+
+/// UI-17: where the focus goes when the screen changes.
+///
+/// A real navigation puts the focus at the top of the new document. This one
+/// does not, so pressing a card left a screen reader user focused on a button
+/// that no longer exists — the focus falls to `<body>`, and the next Tab starts
+/// at the skip link with nothing said about where they now are.
+///
+/// Keyed on the SCREEN rather than the address, and for the same reason the
+/// error boundary is: the player's autoplay handover changes the URL and must
+/// not take the focus off whatever the viewer was reaching for.
+///
+/// Not on the FIRST render — a page that grabs the focus on load is a page that
+/// has taken it from the browser's own starting point.
+const content = useTemplateRef<HTMLElement>('content')
+const screen = computed(() =>
+  boundaryKey(
+    name.value,
+    route.path,
+    typeof route.params.library === 'string' ? route.params.library : undefined,
+  ),
+)
+watch(screen, () => void nextTick(() => content.value?.focus()))
 const panel = computed(() => hasSearchPanel(name.value))
 const hasBox = computed(() => hasSearchBox(name.value))
 /// The field itself, so the panel's retry can put focus back in it.
@@ -159,6 +182,20 @@ function go(to: Parameters<typeof router.push>[0], fresh: boolean) {
        rows at that width and grows another when it has an error to show; and
        conditional, because a page with nothing playing should not pay for a
        bar that is not there. -->
+  <!-- UI-17: the first thing Tab reaches, and it goes past the header. The
+       header carries a search box, a wordmark menu and a profile menu, and a
+       keyboard user landing on a library page had to walk all of them before
+       reaching the first card — on every navigation, because the focus returns
+       to the top each time.
+
+       Visible only when focused, which is the point: it is furniture for the
+       people who need it and invisible to everyone else. -->
+  <a
+    class="sr-only rounded bg-surface px-3 py-2 text-teal focus:not-sr-only focus:absolute focus:top-2 focus:left-2 focus:z-40"
+    href="#content"
+  >
+    Skip to the content
+  </a>
   <div
     class="mx-auto max-w-[1200px] px-[clamp(14px,4vw,32px)]"
     :class="playing ? 'pb-[170px]' : 'pb-8'"
@@ -290,7 +327,13 @@ function go(to: Parameters<typeof router.push>[0], fresh: boolean) {
       </div>
     </header>
 
-    <slot :query="query" />
+    <!-- The skip link's target, and the landmark a screen reader jumps to.
+         `tabindex="-1"` because a fragment link moves the focus only to
+         something that can hold it — without it the browser scrolls and leaves
+         the focus where it was, so the next Tab goes back into the header. -->
+    <div id="content" ref="content" tabindex="-1" class="outline-none">
+      <slot :query="query" />
+    </div>
 
     <!-- Outside every view, so a notice survives the view that raised it
          navigating away.

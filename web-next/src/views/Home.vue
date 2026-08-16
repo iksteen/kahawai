@@ -65,6 +65,11 @@ async function grow(shelf: ShelfData) {
        many skeletons to draw, and a spinner for one round trip is worse than a
        blank moment. -->
   <main v-else-if="libraries.data.value">
+    <!-- Named, and not shown: the shelves ARE the page and a banner over them
+         would be a line of furniture. But heading navigation is how a screen
+         reader user finds where they are, and a screen with no `h1` answers
+         that question with nothing. -->
+    <h1 class="sr-only">Your libraries</h1>
     <p v-if="list.length === 0" class="text-dim">{{ emptyHomeText(whoAmI().admin) }}</p>
 
     <template v-else>

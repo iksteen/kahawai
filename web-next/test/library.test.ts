@@ -427,16 +427,27 @@ describe('filtering it from the header', () => {
     expect(wrapper.text()).not.toContain('Attach a collection')
   })
 
-  test('and the heading drops it', async () => {
+  test('and the heading drops it, from the keyboard as well as the mouse', async () => {
     // The heading is where somebody looks when the page says twelve of two
-    // thousand — the other half of the ✕ in the box.
+    // thousand — the other half of the ✕ in the box. A heading with a click
+    // handler is unreachable without a pointer, so it is a button when it is
+    // pressable.
     const { wrapper } = await filtered('heat')
     vi.mocked(listItems).mockClear()
 
-    await wrapper.find('h1').trigger('click')
+    const heading = wrapper.find('h1 button')
+    expect(heading.exists()).toBe(true)
+    await heading.trigger('click')
     await new Promise((resolve) => setTimeout(resolve, DEBOUNCE_MS + 10))
     await flushPromises()
     expect(listItems).toHaveBeenCalledWith(expect.objectContaining({ q: '' }))
+  })
+
+  test('and with nothing to drop it is not a control at all', async () => {
+    // A heading that looks pressable and does nothing is worse than one that
+    // does not.
+    const { wrapper } = await grid()
+    expect(wrapper.find('h1 button').exists()).toBe(false)
   })
 })
 

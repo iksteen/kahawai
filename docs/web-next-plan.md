@@ -397,7 +397,7 @@ composables → components → view → review → commit.
 | 10 | Settings — **DONE** | drag ordering with keyboard equivalents (UI-12), per-key write queue |
 | 11 | Admin — **DONE** | optimistic writes with rollback throughout; B5; the match button, a library-grid control but the only surface that reads `match_confidence`; OPS-10's per-item and per-session logs, both authenticated downloads |
 | 12 | Album queue — **DONE** | survives navigation; per-track removal (UI-2); the album page's two actions, which are queue operations and were absent until it existed |
-| 13 | Video player | largest and last; see below. **Plus the subtitle panel** (HUB-21/24) and the capability debug panel, which both need `resolveTracks`/`pickSubtitle` from here |
+| 13 | Video player — **DONE** | largest and last; see below. Plus the capability debug panel, on the item page as well as in the player, and the subtitle panel (HUB-21/24) |
 | 14 | Accessibility pass | UI-17: keyboard-only run and a screen reader, which has never happened |
 
 ### What phase 4 landed
@@ -533,6 +533,91 @@ The cross-library search panel and the virtualised library grid.
 a library-grid control, but it is the only surface anywhere that reads
 `match_confidence` — a library without it is a library where nothing looks
 wrong — so it went with the rest of the admin surfaces.
+
+### What phase 13 landed
+
+The player: the route that owns a session, the picture that plays one, the
+three subtitle renderers, and the capability mask editor — which lands on the
+item page in the same change, because a mask only takes effect on the NEXT
+session and has to be settable before Play is pressed. Plus HUB-24's subtitle
+panel, which is the other half of the same subject: the player picks a track,
+the item page manages which tracks there are.
+
+- **Two components, and the split is the design.** The ROUTE holds the session
+  and the frame; the PICTURE is keyed on the session id and replaced by every
+  restart, stand-by resume, capability change and next episode. That is what
+  keeps the window and the way out of it from blinking while the thing behind
+  them is rebuilt — and it is why releasing a session belongs to the route:
+  the picture's teardown runs whenever Vue feels like it, and ending a session
+  is the one irreversible act in it.
+- **A `<script setup>` block is not module scope**, and the volume carried
+  across sessions found that out. The body of `<script setup>` IS the setup
+  function, so a `let` there starts over with every instance — an evening of a
+  series at 15% became an episode at 100% at every boundary, which is the exact
+  incident the reference recorded and fixed by putting the value at module
+  scope. In an SFC that needs a second, plain `<script>` block. Caught by the
+  test, not by review.
+- **One health ref, no shadow.** The reference kept a reducer AND a ref holding
+  the same value, because a React listener reads whatever the render that
+  created it captured. A Vue ref has no such problem, so the shadow is gone and
+  the comment says why it was there.
+- **`steer` is the three restart paths' shared answer.** A seek, a track switch
+  and a burn transition all POST, then write the origin, then re-attach — and
+  they used to disagree about which failures meant what. One function now
+  decides: a 404 is the recovery contract, a ceiling of `null` is weather and
+  stands by, and anything else hands the retry back rather than leaving the
+  picture frozen with the keepalive holding the session alive.
+- **What happy-dom cannot do, said out loud.** It does not fire `timeupdate`
+  when the playhead is moved, does not fire `volumechange` for a volume it
+  accepted, and has no media to start — so a `play()` that resolves has to be
+  stubbed wherever the veil is the subject. Each of those is done by hand in
+  the test that needs it, with the reason next to it. hls.js is replaced by a
+  recorder: the picture's own logic is what is under test.
+
+Reviewed in a clean context before this commit. What it found:
+
+- **A session per route-param change, released by nobody.** Back and Forward
+  across two `/play` entries reuse the component with a new id, and `start`
+  overwrote the session without ending what was there. Four of those and the
+  account is at its per-user cap. There is ONE writer now — a `watch` on the
+  session — and it is `flush: 'post'`, because the picture posts the final
+  position in its teardown and a pre-flush release beat it: the report went to
+  a session the route had just ended.
+- **The track switch stopped reverting, and remembered a track that never
+  played.** `steer` returned a boolean nobody could read, so a 404 left the
+  selector naming the new track and recovery opened its session on it —
+  Japanese audio under a selector reading English. It returns an outcome now,
+  and the revert runs BEFORE the recovery it would otherwise race.
+- **Four of the five session starts dropped the bandwidth cap.** `prefs` had a
+  default of `[]`, which is not nullish, so every recovery, every hand-pressed
+  Try again, the capability restart and the stand-by resume started uncapped —
+  on the metered link the setting exists for. Saying so is now `'read'`.
+- **The `.videobox` CSS was half-ported.** No stacking context, so a dialog at
+  `z-9` sat under the shell's menus; no `bar-up` transform, so the ASS and
+  bitmap canvases stayed under the transport; the ratio pinned to the box
+  rather than `auto var()` on the video, so a probe that disagreed with the
+  file letterboxed for the whole film; and no `max-height`, so at 1080p the
+  transport started below the fold.
+- **The player chunk did not go through `loadChunk`.** A tab that outlives a
+  hub upgrade asks for a name the new binary does not have, and the Play button
+  did nothing, silently, for ever.
+- **UI-17 findings on the one screen with no page furniture.** The seekbar was
+  a `div` with a click handler — not focusable, no value, no keys, so the only
+  transport a keyboard user had was ±10/+30 and "skip the recap" was
+  unreachable. It is an `<input type="range">` now, which is what the volume
+  control beside it already was. Both dialogs were `aria-modal` and neither was
+  modal: nothing moved the focus in, so an `alertdialog` announced nothing, and
+  six controls behind the scrim stayed in the tab order. The hidden bar was
+  still tabbable, and the two nudge buttons announced as "10" and "30".
+
+**Three guards in `Picture.vue` are unreachable and stay**: `settle(gen)`
+rather than `settle(seekGen)`, `giveUp`'s generation check, and `beginRestart`
+re-arming rather than stacking a ceiling. All three answer two restarts being
+outstanding at once, and `seekTo`, `switchTracks` and `switchBurn` all refuse
+to start while `isFrozen` — which reads the current health, where the reference
+read a React closure that could be stale. `syncOrigin`'s two checks are
+likewise redundant with each other; either alone is enough, so a mutation of
+one is masked by the other.
 
 ### What phase 12 landed
 

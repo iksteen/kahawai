@@ -8,11 +8,14 @@
 ///
 /// An album's page needs the queue that outlives it, so it lands with the
 /// queue in phase 12.
-import { computed, watch } from 'vue'
+import { computed, ref, watch } from 'vue'
+import { useQuery } from '@tanstack/vue-query'
 import { useRoute, useRouter } from 'vue-router'
 
 import Attribution from '../components/Attribution.vue'
 import Btn from '../components/Btn.vue'
+import CapabilityDebug from '../components/CapabilityDebug.vue'
+import SubtitlePanel from '../components/SubtitlePanel.vue'
 import DetailHead from '../components/DetailHead.vue'
 import Failed from '../components/Failed.vue'
 import Icon from '../components/Icon.vue'
@@ -34,7 +37,7 @@ import {
   seLabel,
   watchedPct,
 } from '../domain/label.ts'
-import { adminItemLog } from '../api/generated/kahawai.ts'
+import { adminItemLog, listLibraries } from '../api/generated/kahawai.ts'
 import { notify } from '../composables/notices.ts'
 import { loadMask } from '../api/capabilities.ts'
 import { maskSummary } from '../domain/capability-mask.ts'
@@ -43,6 +46,7 @@ import { saveAs } from '../api/download.ts'
 import { seasonSegment } from '../domain/routes.ts'
 import { whoAmI } from '../api/session.ts'
 import { useChildren, useItem, useWatched } from '../composables/item.ts'
+import { usePrefs } from '../composables/prefs.ts'
 import { useQueue } from '../composables/queue.ts'
 
 const route = useRoute()
@@ -87,8 +91,57 @@ function goUp() {
 const works = computed(() => groupSources(item.value?.sources ?? []))
 const best = computed(() => works.value[0]?.parts[0])
 
+/// HUB-24, and the two preferences the panel has to know about: the media
+/// type's subtitle wishlist, and this TITLE's own standing choice — which
+/// outranks it, is set by picking a language while watching, and would
+/// otherwise make the list above it read as a lie.
+const prefs = usePrefs()
+const libraries = useQuery({
+  queryKey: ['libraries'],
+  queryFn: () => listLibraries(),
+  select: (answer) => answer.libraries,
+})
+const mediaType = computed(
+  () => libraries.data.value?.find((l) => l.id === library.value)?.media_type ?? '',
+)
+const subLanguages = computed(() =>
+  (prefs.known.value[`subs.${mediaType.value}`] ?? '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean),
+)
+const titleScope = computed(() => item.value?.parent_id ?? item.value?.id ?? '')
+const titleChoice = computed(
+  () =>
+    prefs.query.data.value?.prefs.find((p) => p.scope === titleScope.value && p.key === 'subs')
+      ?.value ?? '',
+)
+/// The file's own frame rate, for the drift warning on a candidate.
+const fileFps = computed(() => {
+  const fps = best.value?.streams?.video?.[0]?.fps
+  return fps ? fps[0] / fps[1] : null
+})
+
+/// A download, a removal or a cleared override all change what this page shows.
+async function subtitlesChanged() {
+  await Promise.all([query.refetch(), prefs.query.refetch()])
+}
+
 /// What the stored capability mask changes, if anything.
-const masked = maskSummary(loadMask())
+/// The mask this page's verdict was computed against. Re-read rather than
+/// captured, because the panel below can change it — and a badge that still
+/// reports the mask it USED to be is worse than no badge.
+const mask = ref(loadMask())
+const masked = computed(() => maskSummary(mask.value))
+const showCaps = ref(false)
+
+/// Re-ASK, do not just re-badge. The negotiated half of this page is an answer
+/// to the capability profile, so editing the mask invalidates it: the delivery,
+/// the ASS rung and the reasons all move.
+async function maskChanged() {
+  mask.value = loadMask()
+  await query.refetch()
+}
 
 /// OPS-10: the LAST session for this item, whoever played it.
 ///
@@ -461,7 +514,9 @@ function markSeason(season: number | null, played: boolean) {
           </div>
           <!-- One row per elementary stream, because that is the grain
                negotiation decides at: a file can copy its video and re-encode
-               only its audio. -->
+               only its audio. Block-level siblings, not flex items of the
+               button row below: wrapped in it they sat inline BETWEEN the two
+               buttons and wrapped around them. -->
           <div
             v-for="row in [
               { label: 'video', verdict: item.negotiated.streams.video },
@@ -480,11 +535,18 @@ function markSeason(season: number | null, played: boolean) {
               </span>
             </span>
           </div>
-          <!-- OPS-10, and only for an admin: what the hub recorded about the
-               last session for this item, whoever played it. -->
-          <div v-if="me.admin" class="mt-2 border-t border-hairline pt-2">
-            <Btn ghost small @click="itemLog">Last session log</Btn>
+          <!-- Here, not in Settings and not only in the player: a mask takes
+               effect on the NEXT session, so it has to be settable before Play
+               is pressed. -->
+          <div class="mt-2 flex flex-wrap items-center gap-2 border-t border-hairline pt-2">
+            <Btn ghost small :aria-pressed="showCaps" @click="showCaps = !showCaps">
+              client capabilities
+            </Btn>
+            <!-- OPS-10, and only for an admin: what the hub recorded about the
+                 last session for this item, whoever played it. -->
+            <Btn v-if="me.admin" ghost small @click="itemLog">Last session log</Btn>
           </div>
+          <CapabilityDebug v-if="showCaps" class="mt-2" @change="maskChanged" />
         </div>
       </section>
 
@@ -578,6 +640,16 @@ function markSeason(season: number | null, played: boolean) {
         </ul>
       </section>
     </template>
+
+    <SubtitlePanel
+      :item="item"
+      :subs="item.negotiated?.subtitles ?? []"
+      :languages="subLanguages"
+      :title-choice="titleChoice"
+      :fps="fileFps"
+      @changed="subtitlesChanged"
+      @cleared="subtitlesChanged"
+    />
 
     <Attribution :provider="item.metadata?.provider" />
   </main>

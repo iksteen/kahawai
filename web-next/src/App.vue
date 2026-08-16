@@ -17,6 +17,7 @@ import { awayFrom, boundaryKey, type RouteName } from './domain/routes.ts'
 import { notify } from './composables/notices.ts'
 import { signOut, whoAmI } from './api/session.ts'
 import { useBoot } from './composables/boot.ts'
+import { useDocumentTitle, screenName } from './composables/title.ts'
 import { useLibraries } from './composables/home.ts'
 import { useQueue } from './composables/queue.ts'
 
@@ -40,6 +41,16 @@ const libraries = useLibraries(computed(() => phase.value === 'app'))
 const me = computed(() => (phase.value === 'app' ? whoAmI() : { username: '', admin: false }))
 
 const name = computed(() => (route.name ?? 'libraries') as RouteName)
+
+/// UI-17: the tab strip, the bookmark, and the one thing that tells a screen
+/// reader the screen changed at all. The route knows which screen; what is ON
+/// it arrives a round trip later, so the title is set twice and announced once.
+const named = computed(() => {
+  if (name.value !== 'library') return null
+  const id = route.params.library
+  return libraries.data.value?.find((l) => l.id === id)?.name ?? null
+})
+useDocumentTitle(name, named)
 
 /// The queue lives above the router, because it survives navigation — that is
 /// the whole point of a queue. It is inside the SHELL, though: signing out has
@@ -154,4 +165,13 @@ async function leave() {
       <QueueBar :paused="name === 'player'" />
     </Boundary>
   </AppShell>
+
+  <!-- Outside the chain above, because a `v-else` only pairs with the element
+       immediately before it — and in the document for the whole of the app's
+       life, because a live region inserted together with its text is commonly
+       announced by nothing. Not while booting or signing in: there is no screen
+       to have moved between, and those two say what they are themselves. -->
+  <p v-if="phase === 'app'" class="sr-only" role="status" aria-live="polite">
+    {{ screenName }}
+  </p>
 </template>
