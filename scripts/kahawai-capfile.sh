@@ -17,6 +17,10 @@
 # line of the verdict is a negotiation decision on display.
 set -euo pipefail
 
+# The torture file is rendered by the muxers we patch, so render it
+# with the patched ones.
+. "$(dirname "$0")/kahawai-gst-env.sh"
+
 OUT_DIR="${1:-$HOME}"
 NAME="Capability Torture (2026)"
 MKV="$OUT_DIR/$NAME.mkv"

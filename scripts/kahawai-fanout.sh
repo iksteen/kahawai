@@ -41,6 +41,10 @@ shift $((OPTIND - 1))
 [ $# -ge 2 ] || { echo "usage: $(basename "$0") [-n hosts] <admin-user> <admin-password>" >&2; exit 2; }
 USERNAME=$1 PASSWORD=$2
 
+# The mediahosts this stands up probe media in-process, same as the
+# service does, so they need the same plugins the service gets.
+. "$(dirname "$0")/kahawai-gst-env.sh"
+
 BIN=$(cd "$(dirname "$0")/.." && pwd)/target/release/kahawai
 [ -x "$BIN" ] || { echo "build first: cargo build --release" >&2; exit 1; }
 

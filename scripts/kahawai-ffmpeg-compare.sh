@@ -28,6 +28,9 @@ while [ $# -gt 0 ]; do
 done
 [ -n "$DIR" ] || { echo "usage: $0 <dir> [--limit N] [--jobs N] [--seed S]" >&2; exit 2; }
 
+# Our arm has to be the shipping stack, or the comparison measures
+# the system plugins against ffmpeg and calls the difference ours.
+. "$(dirname "$0")/kahawai-gst-env.sh"
 repo=$(cd "$(dirname "$0")/.." && pwd)
 SWEEP="$repo/target/release/kahawai-sweep"
 [ -x "$SWEEP" ] || (cd "$repo" && cargo build --release -q -p kahawai-media --bin kahawai-sweep)
