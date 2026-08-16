@@ -6,7 +6,9 @@
 import { describe, expect, test } from 'vitest'
 
 import {
+  deliveryPlan,
   duration,
+  groupSources,
   LOUD_DELIVERY,
   planRow,
   size,
@@ -99,6 +101,12 @@ describe('a plan row', () => {
     expect(planRow('text').tone).toBe('teal')
   })
 
+  test('and the words are matched however they are cased', () => {
+    // The hub writes them; the client must not depend on which case it used.
+    expect(planRow('COPY').tone).toBe('teal')
+    expect(planRow('Direct — from disk').tone).toBe('teal')
+  })
+
   test('and anything that costs something does not', () => {
     expect(planRow('h264 → h265 (encoded)').tone).toBe('sand')
   })
@@ -145,5 +153,73 @@ describe('the subtitle verdict', () => {
     expect(subtitleVerdict({ language: null, format: 'pgs', delivery: 'overlay' }, 1).verdict).toBe(
       '? pgs · overlay',
     )
+  })
+})
+
+describe('the plan chip', () => {
+  test('names the work, not the pipeline', () => {
+    // `mode` says whether bytes are served as they are; `cost` says whether
+    // anything is re-encoded, and a remux carrying `video_encode` does.
+    expect(deliveryPlan('direct').chip).toBe('DIRECT')
+    expect(deliveryPlan('copy').chip).toBe('REMUX')
+    expect(deliveryPlan('audio_encode').chip).toBe('TRANSCODE')
+    expect(deliveryPlan('video_encode').chip).toBe('TRANSCODE')
+  })
+
+  test('and the cheap ones read as cheap', () => {
+    expect(deliveryPlan('direct').tone).toBe('teal')
+    expect(deliveryPlan('copy').tone).toBe('teal')
+    expect(deliveryPlan('video_encode').tone).toBe('sand')
+    expect(deliveryPlan('unplayable').tone).toBe('warn')
+  })
+
+  test('only the two that a stream row cannot explain carry a note', () => {
+    // The panel lists every stream's verdict underneath, so a sentence beside
+    // the chip said the same thing twice — and worse, because one chip cannot
+    // describe two streams.
+    expect(deliveryPlan('direct').note).toBe('')
+    expect(deliveryPlan('copy').note).toBe('')
+    expect(deliveryPlan('video_encode').note).toBe('')
+    expect(deliveryPlan('audio_encode').note).toContain('picture is copied')
+    // Nothing to read off a row: there is no work, there is a refusal.
+    expect(deliveryPlan('unplayable').note).toContain('nothing here can be delivered')
+  })
+
+  test('and a cost this build has never heard of is still shown', () => {
+    // The hub may know something this client does not, and hiding it would
+    // leave a panel that says nothing about what is about to happen.
+    expect(deliveryPlan('something_new')).toEqual({
+      chip: 'SOMETHING_NEW',
+      tone: 'warn',
+      note: '',
+    })
+  })
+})
+
+describe('grouping the files an item is made of', () => {
+  const file = (source_id: number, part: number, parts: number) => ({ source_id, part, parts })
+
+  test('parts of one work are one entry, in order', () => {
+    // UI-27: a film in seven numbered parts and seven alternative encodes were
+    // both "7 sources", in an order that means nothing to a reader.
+    const grouped = groupSources([file(1, 2, 3), file(1, 1, 3), file(1, 3, 3)])
+    expect(grouped).toHaveLength(1)
+    expect(grouped[0]!.parts.map((p) => p.part)).toEqual([1, 2, 3])
+  })
+
+  test('and alternatives are separate entries', () => {
+    expect(groupSources([file(1, 1, 1), file(2, 1, 1)])).toHaveLength(2)
+  })
+
+  test('a work missing a part says so', () => {
+    // It cannot play to the end, and "7 sources" over it hides that.
+    expect(groupSources([file(1, 1, 3), file(1, 2, 3)])[0]!.whole).toBe(false)
+    expect(groupSources([file(1, 1, 2), file(1, 2, 2)])[0]!.whole).toBe(true)
+  })
+
+  test('and the order the hub sent them in is kept between works', () => {
+    // The list is ordered by what playback would pick, so the first entry is
+    // the one Play would use.
+    expect(groupSources([file(7, 1, 1), file(3, 1, 1)]).map((g) => g.id)).toEqual([7, 3])
   })
 })

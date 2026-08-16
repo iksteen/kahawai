@@ -85,3 +85,69 @@ export function subtitleVerdict(
   const tone = LOUD_DELIVERY[track.delivery]
   return tone ? { verdict: `${name}${how}`, tone } : { verdict: `${name}${how}` }
 }
+
+/// One aggregate name for the work a playback plan performs.
+///
+/// Keyed on COST, never on `mode`. On this endpoint `mode` is only ever
+/// `direct` or `remux` — it says whether bytes are served as they are, not
+/// whether anything is re-encoded — so a `remux` carrying `video_encode`
+/// re-encodes the picture, and a chip reading REMUX over it would say the
+/// opposite of what the rows underneath say.
+///
+/// No gloss goes with most of them: the panel lists every stream's verdict
+/// directly underneath, so a sentence beside the chip said the same thing
+/// twice and worse, because one chip cannot describe two streams.
+/// `unplayable` keeps its note — it is the one verdict that describes no work
+/// at all but a refusal, and there is no stream row to read it off.
+const DELIVERY = {
+  direct: { chip: 'DIRECT', tone: 'teal', note: '' },
+  copy: { chip: 'REMUX', tone: 'teal', note: '' },
+  audio_encode: {
+    chip: 'TRANSCODE',
+    tone: 'sand',
+    note: 'the audio is re-encoded; the picture is copied',
+  },
+  video_encode: { chip: 'TRANSCODE', tone: 'sand', note: '' },
+  unplayable: {
+    chip: 'UNPLAYABLE',
+    tone: 'warn',
+    note: 'nothing here can be delivered to this browser',
+  },
+} as const
+
+export function deliveryPlan(cost: string): { chip: string; tone: string; note: string } {
+  // A cost this client has never heard of is still shown, in its own words and
+  // in the tone that says "look at this" — the hub may know something this
+  // build does not.
+  return (
+    DELIVERY[cost as keyof typeof DELIVERY] ?? { chip: cost.toUpperCase(), tone: 'warn', note: '' }
+  )
+}
+
+/// UI-27: one row per FILE, grouped into the works they are parts of.
+///
+/// The flat list made one film split across seven numbered parts
+/// indistinguishable from seven alternative encodes — both are "7 sources" in
+/// an order that means nothing to a reader. `source_id` is what tells them
+/// apart: rows sharing one are parts of a single work, in `part` order; rows
+/// with different ones are alternatives to choose between.
+///
+/// Opaque and stable only within one response — it exists to be grouped on,
+/// never stored.
+export function groupSources<T extends { source_id: number; part: number; parts: number }>(
+  sources: T[],
+): { id: number; parts: T[]; whole: boolean }[] {
+  const byWork = new Map<number, T[]>()
+  for (const source of sources) {
+    const held = byWork.get(source.source_id)
+    if (held) held.push(source)
+    else byWork.set(source.source_id, [source])
+  }
+  return [...byWork.entries()].map(([id, parts]) => ({
+    id,
+    parts: [...parts].sort((a, b) => a.part - b.part),
+    // A work missing a part cannot play to the end, and saying "7 sources"
+    // over it hides that completely.
+    whole: parts.length === (parts[0]?.parts ?? 0),
+  }))
+}

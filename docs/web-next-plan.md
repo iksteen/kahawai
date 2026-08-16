@@ -393,11 +393,11 @@ composables → components → view → review → commit.
 | 6 | Home (libraries, shelves, continue watching) — **DONE** | inline retries per shelf, the three loading states of UI-22 |
 | 7 | Search panel — **DONE** | on B3; combobox pattern, `aria-activedescendant`, every key driven |
 | 8 | Library grid — **DONE** | virtualised, fixed cell height (UI-11), `srcset` at both densities (UI-16) |
-| 9 | Detail + Season | error split: a refused Play is not a failed item load (UI-13) |
-| 10 | Settings | drag ordering with keyboard equivalents (UI-12), per-key write queue |
-| 11 | Admin | optimistic writes with rollback throughout; B5; **and the match button**, which is a library-grid control but the only surface that reads `match_confidence` — see below |
-| 12 | Album queue | survives navigation; per-track removal (UI-2) now that it is cheap |
-| 13 | Video player | largest and last; see below |
+| 9 | Detail + Season — **DONE** | error split: a refused Play is not a failed item load (UI-13) |
+| 10 | Settings — **DONE** | drag ordering with keyboard equivalents (UI-12), per-key write queue |
+| 11 | Admin | optimistic writes with rollback throughout; B5; **and the match button**, which is a library-grid control but the only surface that reads `match_confidence`; **and OPS-10's per-item session log**, which needs an authenticated download |
+| 12 | Album queue | survives navigation; per-track removal (UI-2); **and the album page's two actions**, which are queue operations and are absent until it exists |
+| 13 | Video player | largest and last; see below. **Plus the subtitle panel** (HUB-21/24) and the capability debug panel, which both need `resolveTracks`/`pickSubtitle` from here |
 | 14 | Accessibility pass | UI-17: keyboard-only run and a screen reader, which has never happened |
 
 ### What phase 4 landed
@@ -535,6 +535,32 @@ without it is a library where nothing looks wrong — so it goes with the rest o
 the admin surfaces in phase 11. Whoever ports it needs two things the new code
 does not show: the cell needs `position: relative`, and the button's offset is
 17px rather than 16, because 16 misses its two sibling badges by a pixel.
+
+### What phases 9 and 10 landed
+
+The item pages — film, series, episode, season — and Settings. Plus the
+capability probe, which the item query needs to ask what THIS client would be
+served.
+
+- **Two ways to destroy a page somebody was reading.** A failed background
+  re-ask replaced the item page with "Could not load this item" — over a mark
+  that had just succeeded, since a tick invalidates that query. And the season
+  page had the fatality split backwards: the episodes ARE that page, and it
+  treated the title on the back button as the fatal load instead.
+- **The probe threw where the original did not.** It checked for
+  `MediaSource` but called `isTypeSupported` unconditionally; a browser with
+  one and not the other turned every item page into a failure, because the
+  probe runs inside the query.
+- **A capability mask is applied whether or not anything says so.**
+  `buildProfile` reads the stored mask today, so the badge saying "masked"
+  could not wait for the debug panel — a mask set in the old UI silently
+  changes what this page reports about your playback.
+- **The TMDB attribution is a term of use**, not a design choice; it was
+  dropped in the port along with the three other providers' credits.
+- **The settings' hard part is the revert target.** Two changes in flight and
+  one failing: reverting to the value the failing write started from puts the
+  list back past a change that was saved. The target is the last value the
+  server CONFIRMED, and only the newest write may use it.
 
 ### The player
 
