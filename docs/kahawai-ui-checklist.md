@@ -329,8 +329,14 @@ followed, and those cases are listed too.
       announcement, `prefers-reduced-motion`, real modal behaviour on every
       dialog (focus in, Tab trapped, Escape from anywhere, focus restored), and
       live regions that exist before they have anything to say. Every control
-      on five screens is named, there is one `h1` per screen and no skipped
-      heading levels, and `web-next/test/a11y.test.ts` keeps all of it.
+      on six screens is named, there is one `h1` per screen — including the
+      player, and including a screen whose request failed — and no skipped
+      heading levels, and `web/test/a11y.test.ts` keeps all of it.
+      The title and its announcement were re-done after the running app was
+      driven signed in: `documentTitle` was correct and no view called it with
+      a name, so three of seven screens showed and announced the bare word
+      "kahawai". The name is now published by the view that knows it, tagged
+      with its screen, and the audit asks every screen for its own.
       Still owed, and not automatable: a keyboard-only run and a screen reader.
       Whether an announcement is intelligible, whether the focus order matches
       the reading order and whether anything is legible at 200% zoom all need a

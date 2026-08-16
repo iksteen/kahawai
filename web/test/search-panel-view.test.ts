@@ -49,6 +49,15 @@ describe('the rows', () => {
     expect(wrapper.emitted('openLibrary')).toEqual([['films']])
   })
 
+  test('and says it OUT LOUD as what pressing it does', async () => {
+    // An accessible name comes from the content when there is any, and this
+    // row's content is a library's name beside a bare number: arrowing onto
+    // the first result announced "Films 2 of 9". The `title` explaining it is
+    // a tooltip and loses to content; a label wins.
+    const heading = panel().findAll('[role="option"]')[0]!
+    expect(heading.attributes('aria-label')).toBe('Show everything in Films, 2 of 9')
+  })
+
   test('a hit opens its item, under the library it was found in', async () => {
     const wrapper = panel()
     await wrapper.findAll('[role="option"]')[1]!.trigger('click')

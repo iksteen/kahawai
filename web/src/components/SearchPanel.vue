@@ -89,6 +89,11 @@ const emit = defineEmits<{
          they are not tab stops. -->
     <div :id="SEARCH_LIST_ID" role="listbox" :aria-label="`Results for ${props.query}`">
       <template v-for="(row, at) in props.rows" :key="rowKey(row)">
+        <!-- Labelled, not just titled. An accessible name comes from the
+             CONTENT when there is any, and this row's content is a library's
+             name beside a bare number — so arrowing onto the first result
+             announced "3d 1", which is neither the group it heads nor what
+             pressing it does. `title` loses to content; a label wins. -->
         <button
           v-if="row.kind === 'library'"
           :id="searchOptionId(at)"
@@ -98,6 +103,7 @@ const emit = defineEmits<{
           :aria-selected="at === props.highlight"
           tabindex="-1"
           :title="`Show everything in ${row.library.name}`"
+          :aria-label="`Show everything in ${row.library.name}, ${countLabel(row.shown, row.total)}`"
           type="button"
           @click="emit('openLibrary', row.library.id)"
         >

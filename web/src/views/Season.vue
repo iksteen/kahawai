@@ -26,6 +26,7 @@ import { parseSeason } from '../domain/routes.ts'
 import { sentence } from '../domain/refusal.ts'
 import { notify } from '../composables/notices.ts'
 import { useChildrenOf, useItem, useWatched } from '../composables/item.ts'
+import { useScreenName } from '../composables/title.ts'
 
 /// How much of the strip one press of an arrow moves: two and a bit cards, so
 /// something new is always in view and something old still is.
@@ -55,6 +56,25 @@ watch(
 )
 
 const projected = computed(() => projecting('seasons', children.data.value ?? []))
+
+/// UI-17. The show first: "Season 2" is what every one of these screens is
+/// called, and a tab strip full of them names nothing. A failure panel is
+/// still a screen, and one that never publishes is never announced.
+///
+/// The two failures are not the same failure, and the condition here is the
+/// template's — the SHOW's details going missing is a notice over a page full
+/// of working episodes, and calling that "could not load this season" tells
+/// both the tab strip and the screen reader something the screen contradicts.
+useScreenName(
+  'season',
+  computed(() => {
+    if (children.isError.value && !children.data.value) return 'Could not load this season'
+    const label = seasonLabel(season.value, projected.value)
+    const series = show.data.value?.title?.trim()
+    if (series) return `${series} · ${label}`
+    return show.isError.value ? label : null
+  }),
+)
 /// `undefined` until the children answer. An empty array meant either
 /// "loading" or "this show has no episodes", so the empty-season explanation
 /// was suppressed for the case it was written for and the page read as broken.

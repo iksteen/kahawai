@@ -18,6 +18,7 @@ import { notify } from './composables/notices.ts'
 import { signOut, whoAmI } from './api/session.ts'
 import { useBoot } from './composables/boot.ts'
 import { useDocumentTitle, screenName } from './composables/title.ts'
+import type { Screen } from './domain/titles.ts'
 import { useLibraries } from './composables/home.ts'
 import { useQueue } from './composables/queue.ts'
 
@@ -45,12 +46,18 @@ const name = computed(() => (route.name ?? 'libraries') as RouteName)
 /// UI-17: the tab strip, the bookmark, and the one thing that tells a screen
 /// reader the screen changed at all. The route knows which screen; what is ON
 /// it arrives a round trip later, so the title is set twice and announced once.
-const named = computed(() => {
-  if (name.value !== 'library') return null
-  const id = route.params.library
-  return libraries.data.value?.find((l) => l.id === id)?.name ?? null
+///
+/// The GATE outranks the route, and a boot error outranks the gate — the same
+/// order the template renders in. Until the session is up there is no router
+/// screen on display, and the route still names whichever page the last session
+/// ended on: a sign-in form under the title "Home" is the tab strip and the
+/// screen reader both saying something untrue, and so is "Starting" over a hub
+/// that has already given up.
+const shown = computed<Screen>(() => {
+  if (bootError.value) return 'failed'
+  return phase.value === 'app' ? name.value : phase.value
 })
-useDocumentTitle(name, named)
+useDocumentTitle(shown)
 
 /// The queue lives above the router, because it survives navigation — that is
 /// the whole point of a queue. It is inside the SHELL, though: signing out has

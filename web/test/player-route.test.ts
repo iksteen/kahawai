@@ -214,6 +214,25 @@ describe('a session nobody will play', () => {
     expect(api.endSession).toHaveBeenCalledWith('s1', { keepalive: true })
   })
 
+  test('and the heading is never the episode you just left', async () => {
+    // `item` is a plain ref that `start` overwrites a round trip later, so
+    // across two `/play` entries the screen kept naming the previous episode:
+    // heading, tab strip and screen reader all confidently wrong, which is a
+    // worse answer to "where am I" than no answer.
+    const { wrapper, router } = await open()
+    expect(wrapper.find('h1').text()).toBe('Heat')
+
+    const late = held(film({ id: 'other', title: 'Sleepers' }))
+    vi.mocked(api.itemQuery).mockReturnValue(late.promise as never)
+    await router.push('/library/films/item/other/play')
+    await flushPromises()
+    expect(wrapper.find('h1').text()).toBe('Starting playback')
+
+    late.settle()
+    await flushPromises()
+    expect(wrapper.find('h1').text()).toBe('Sleepers')
+  })
+
   test('and the release happens AFTER the picture has said where the viewer got to', async () => {
     // The picture posts its final position in its teardown, and a release that
     // ran first sent that report to a session the route had already ended.

@@ -31,6 +31,7 @@ import { notify } from '../composables/notices.ts'
 import { sentence } from '../domain/refusal.ts'
 import { targetOf } from '../domain/label.ts'
 import { useLibraryItems } from '../composables/library.ts'
+import { useScreenName } from '../composables/title.ts'
 import { useSearchBox, useSearchQuery } from '../composables/search.ts'
 import { whoAmI } from '../api/session.ts'
 
@@ -82,6 +83,15 @@ watch(
 )
 const self = computed(() => details.data.value?.find((l) => l.id === library.value))
 const name = computed(() => self.value?.name ?? 'Library')
+/// UI-17. The real name, not `name`: its fallback is the placeholder the title
+/// falls back to anyway, and announcing "Library" is spending this screen's one
+/// announcement on the word the announcement exists to replace. But a details
+/// request that FAILED is never going to produce one, and a screen you are
+/// standing on has to answer "where am I" — so the placeholder, then.
+useScreenName(
+  'library',
+  computed(() => self.value?.name ?? (details.isError.value ? name.value : null)),
+)
 
 /// Measured, never assumed: the card art's aspect ratio is applied to a fluid
 /// grid column, so a row's height is a function of the window width.

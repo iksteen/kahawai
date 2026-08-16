@@ -43,7 +43,9 @@ import { loadMask } from '../api/capabilities.ts'
 import { maskSummary } from '../domain/capability-mask.ts'
 import { sentence } from '../domain/refusal.ts'
 import { saveAs } from '../api/download.ts'
+import { itemName } from '../domain/titles.ts'
 import { seasonSegment } from '../domain/routes.ts'
+import { useScreenName } from '../composables/title.ts'
 import { whoAmI } from '../api/session.ts'
 import { useChildren, useItem, useWatched } from '../composables/item.ts'
 import { usePrefs } from '../composables/prefs.ts'
@@ -57,6 +59,17 @@ const library = computed(() => String(route.params.library ?? ''))
 
 const query = useItem(id)
 const item = computed(() => query.data.value)
+/// UI-17: this screen is titled by the thing on it, and nothing above it knows
+/// what that is until the query lands. When it does not land, the failure panel
+/// IS the screen — left waiting for a name that is never coming, the tab strip
+/// keeps the bare site name and the announcement never happens at all.
+useScreenName(
+  'detail',
+  computed(() => {
+    if (item.value) return itemName(item.value)
+    return query.isError.value ? 'Could not load this item' : null
+  }),
+)
 const children = useChildren(item)
 const { mark, busy } = useWatched()
 

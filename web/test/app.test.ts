@@ -99,6 +99,34 @@ describe('what is on screen', () => {
     expect(wrapper.find('input').exists()).toBe(false)
   })
 
+  test('and the gate is titled by the gate, not by the route behind it', async () => {
+    // A session that ENDS on its own leaves the route alone, so signing back in
+    // returns you to the page you were reading — which means the router still
+    // says `libraries` while a sign-in form is on screen. The tab strip read
+    // "Home · kahawai" over it, and so did the screen reader.
+    const router = app()
+    await router.isReady()
+    phase.value = 'login'
+    mount(App, { global: { plugins: [router, VueQueryPlugin] } })
+    await flushPromises()
+    expect(document.title).toBe('Sign in · kahawai')
+  })
+
+  test('and a boot error outranks the gate, the way the template does', async () => {
+    // `bootError` outranks every phase, so the phase underneath it says
+    // nothing about what is on screen: this exact state — a hub that did not
+    // answer, with the phase left at `login` — was titled "Sign in" over
+    // "Could not start."
+    const router = app()
+    await router.isReady()
+    bootError.value = 'Could not reach the hub.'
+    phase.value = 'login'
+    const wrapper = mount(App, { global: { plugins: [router, VueQueryPlugin] } })
+    await flushPromises()
+    expect(wrapper.text()).toContain('Could not start.')
+    expect(document.title).toBe('Unavailable · kahawai')
+  })
+
   test('and its retry asks again rather than reloading', async () => {
     const router = app()
     await router.isReady()

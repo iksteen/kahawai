@@ -28,6 +28,8 @@ import { notify } from '../composables/notices.ts'
 import { resolveTracks } from '../domain/tracks.ts'
 import { sentence } from '../domain/refusal.ts'
 import { isSourceOffline } from '../domain/recovery.ts'
+import { itemName } from '../domain/titles.ts'
+import { useScreenName } from '../composables/title.ts'
 import { startPlaybackSession } from '../api/playback.ts'
 
 const route = useRoute()
@@ -44,6 +46,31 @@ const session = ref<StartSessionResponse | null>(null)
 const resumeMs = ref(0)
 const failure = ref('')
 const attempt = ref(0)
+
+/// The item THIS address is for. `item` outlives a change of id — it is a
+/// plain ref that `start` overwrites a round trip later — and browser-back
+/// between two `/play` entries left the heading and the tab strip naming the
+/// episode you had just left, which is a worse answer to "where am I" than no
+/// answer at all.
+const naming = computed(() => (item.value?.id === id.value ? item.value : null))
+
+/// UI-17. What this screen is called, for the heading and for the tab strip —
+/// which is also the only thing that tells a screen reader the screen changed.
+/// Never blank: a heading is the answer to "where am I", and "" is not one.
+const heading = computed(() => {
+  if (naming.value) return itemName(naming.value)
+  return failure.value ? 'Could not start playback' : 'Starting playback'
+})
+/// Not the heading: "Starting playback" is a state, not a name, and publishing
+/// it would spend this screen's one announcement before there is anything to
+/// announce. A failure is not a state it grows out of, so that one is published.
+useScreenName(
+  'player',
+  computed(() => {
+    if (naming.value) return itemName(naming.value)
+    return failure.value ? 'Could not start playback' : null
+  }),
+)
 
 /// The frame's own state, because the frame is the thing that persists. The
 /// picture decides it and is replaced whenever the session is; this element is
@@ -193,6 +220,13 @@ function advanced(nextItem: ItemQueryResponse, fresh: StartSessionResponse) {
 </script>
 
 <template>
+  <!-- Outside the branch, because both branches are this screen. Every other
+       screen has a visible heading; this one cannot, because the only thing on
+       it is the picture. Heading navigation is how a screen reader user asks
+       where they are, and the answer here was nothing at all — and putting it
+       inside `main` took it away again the moment playback refused. -->
+  <h1 class="sr-only">{{ heading }}</h1>
+
   <Failed
     v-if="failure"
     what="Could not start playback."

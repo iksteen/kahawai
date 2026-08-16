@@ -574,6 +574,53 @@ UI-17's structural half, and a standing test that stops it coming back.
 is intelligible, whether the focus order matches the reading order, and whether
 anything is legible at 200% zoom. `test/a11y.test.ts` says so at the top.
 
+#### What driving the running app found afterwards
+
+The bullet above — "a title per screen, and one announcement" — was true of
+`documentTitle` and of nothing else. Signed in against the live hub, three of
+seven screens showed the bare word `kahawai` in the tab strip and announced it
+out loud, because no view ever called the function with a name. The pure
+function was right and thoroughly tested; nothing asked whether it was ever
+reached. A test of a function is not a test of the behaviour.
+
+- **The title is published by the view, tagged with its screen.** Only the
+  detail view learns an item's title, and it learns it a round trip after the
+  route changed. Untagged, that publication is read by a `pre`-flush watcher
+  that runs BEFORE the outgoing view is torn down — so arriving on an item
+  announced the LIBRARY's name, and the item's own title, landing a beat later,
+  was swallowed as a repeat of a screen already announced. The tag makes the
+  mismatched pair unrepresentable. Both defects were found by a review in a
+  clean context, after the first fix; the second was worse than the first.
+- **The gate is a screen.** A session that ends on its own leaves the route
+  alone, so the router still says `libraries` while a sign-in form is on
+  screen, and a boot error can land over a running app. Titled by what is
+  actually rendered, in the order the template renders it.
+- **A screen that FAILED is still a screen.** The screens with no word of their
+  own wait for the thing that titles them; when the request fails, that thing
+  is never coming, so the state with the most to explain had no title and got
+  no announcement. Each publishes what its failure panel says — except a season
+  whose show details went missing, which is a notice over a page of working
+  episodes and not a failure at all.
+- **The player had no `h1`.** The only thing on the screen is the picture, so
+  there was nothing to make a heading out of and none was written. It was also
+  the one screen missing from the audit's list, which is why the standing test
+  did not say so. Outside the branch, so a refusal keeps it.
+- **A name is not the same as a good name.** The search panel's group rows are
+  buttons whose content is a library's name beside a bare number, so the
+  accessible name was "3d 1" — named, and the audit's "every control has a
+  name" rule passes, and it still tells a screen reader nothing.
+
+Two findings from the same session were **retracted after measuring**: the
+player's controls do reveal on focus (the browser harness never dispatched the
+event — a listener counted zero), and two tabs cannot race a refresh, because
+`session.ts:alone` holds an origin-wide Web Lock. Raw `fetch` calls bypassed it
+and revoked the family, which measured the hub rather than the app.
+
+**Known and not fixed:** navigating between two addresses of the SAME screen —
+item to related item, season 1 to season 2, one `/play` entry to another — is
+not announced, because the announcement is armed by the route NAME changing.
+The titles are correct throughout.
+
 ### What phase 13 landed
 
 The player: the route that owns a session, the picture that plays one, the

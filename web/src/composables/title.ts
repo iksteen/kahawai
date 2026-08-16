@@ -10,29 +10,90 @@
 /// too — and a polite live region carries the same words, because a title
 /// change alone is announced by some screen readers and not others.
 
-import { onScopeDispose, readonly, type Ref, ref, watch } from 'vue'
+import { computed, onScopeDispose, readonly, type Ref, ref, watch } from 'vue'
 
-import { documentTitle } from '../domain/titles.ts'
-import type { RouteName } from '../domain/routes.ts'
+import { awaitsName, documentTitle, type Screen } from '../domain/titles.ts'
 
 /// What the live region is saying. Empty between screens: a region holding the
 /// same text as last time announces nothing when it is set again.
 const said = ref('')
 export const screenName = readonly(said)
 
-export function useDocumentTitle(route: Ref<RouteName>, named: Ref<string | null | undefined>) {
+/// What the current screen is showing, published by the view that knows. The
+/// route says `detail`; only the detail view ever learns the item's title, and
+/// it learns it a round trip late.
+///
+/// Tagged with WHICH screen it describes, and that tag is the whole point. The
+/// route changes before the outgoing view is torn down — a `pre`-flush watcher
+/// runs ahead of the component update that unmounts it — so for one tick the
+/// new screen is paired with the old screen's name. Untagged, that pairing is
+/// indistinguishable from the real one: arriving on an item announced the
+/// LIBRARY's name, and the item's own title, landing a beat later, was then
+/// swallowed as a repeat of a screen already announced.
+export type Showing = { screen: Screen; name: string }
+const showing = ref<Showing | null>(null)
+/// Exported WITH its tag. A name-only view of this would hide the one thing
+/// worth checking: the tag is a hand-typed literal repeated in four views, and
+/// a view that publishes under the wrong screen never titles itself and is
+/// never announced — while every assertion about "the name it published"
+/// carries on passing.
+export const screenShowing = computed<Showing | null>(() => showing.value)
+
+/// A view naming its own screen. The screen is passed rather than read from the
+/// route so that the tag is the view's own answer, not whatever the router has
+/// moved on to.
+///
+/// The clear on teardown only takes back what THIS screen put there.
+export function useScreenName(screen: Screen, source: Ref<string | null | undefined>) {
+  watch(
+    source,
+    (name) => {
+      const text = name?.trim() || null
+      showing.value = text ? { screen, name: text } : null
+    },
+    { immediate: true },
+  )
+  onScopeDispose(() => {
+    if (showing.value?.screen === screen) showing.value = null
+  })
+}
+
+/// The document's title, from the screen and whatever that screen published.
+///
+/// It reads the publication itself rather than taking a name, so there is one
+/// place where a screen and a name are paired and one place that can get it
+/// wrong.
+export function useDocumentTitle(screen: Ref<Screen>) {
   let clearing: ReturnType<typeof setTimeout> | undefined
+  /// The screen whose arrival has not been announced yet, or null once it has.
+  /// This fires twice per navigation — once for the route, once for the name —
+  /// and announcing both says the same screen twice, a beat apart, over
+  /// whatever the reader had moved on to.
+  let unannounced: Screen | null = null
 
   watch(
-    [route, named],
-    ([name, thing], previous) => {
-      const title = documentTitle(name, thing)
+    [screen, showing],
+    ([where, published], previous) => {
+      // A name belongs to the screen that published it, and to no other.
+      const thing = published?.screen === where ? published.name : null
+      const title = documentTitle(where, thing)
       document.title = title
-      // Only when the SCREEN changed. The name arrives a round trip after the
-      // route does, so this fires twice per navigation — and announcing the
-      // second one is announcing the same screen again, a beat later, over
-      // whatever the reader had moved on to.
-      if (previous && previous[0] === name) return
+      if (!previous || previous[0] !== where) {
+        unannounced = where
+        // Emptied on ARRIVAL, not only by the timer below. The next screen can
+        // be announced with the same words as this one — pressing Play on an
+        // item page is exactly that — and a region already holding them says
+        // nothing at all when they are set again. Pressing Play within a
+        // second of the item page loading announced neither screen.
+        clearTimeout(clearing)
+        said.value = ''
+      }
+      if (unannounced !== where) return
+      // Nothing worth saying yet. On a screen titled by what it is showing,
+      // announcing before the name lands announces the word "kahawai" — and
+      // then the real title arrives under the guard above and is never said.
+      if (awaitsName(where) && !thing) return
+      unannounced = null
       said.value = title
       clearTimeout(clearing)
       // Cleared, so the next visit to the same screen is announced too: a live
