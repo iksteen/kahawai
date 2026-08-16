@@ -398,7 +398,7 @@ composables → components → view → review → commit.
 | 11 | Admin — **DONE** | optimistic writes with rollback throughout; B5; the match button, a library-grid control but the only surface that reads `match_confidence`; OPS-10's per-item and per-session logs, both authenticated downloads |
 | 12 | Album queue — **DONE** | survives navigation; per-track removal (UI-2); the album page's two actions, which are queue operations and were absent until it existed |
 | 13 | Video player — **DONE** | largest and last; see below. Plus the capability debug panel, on the item page as well as in the player, and the subtitle panel (HUB-21/24) |
-| 14 | Accessibility pass | UI-17: keyboard-only run and a screen reader, which has never happened |
+| 14 | Accessibility pass — **DONE, except the part a person has to do** | UI-17: the structural half is here and under test; a keyboard-only run and a screen reader are still owed |
 
 ### What phase 4 landed
 
@@ -533,6 +533,46 @@ The cross-library search panel and the virtualised library grid.
 a library-grid control, but it is the only surface anywhere that reads
 `match_confidence` — a library without it is a library where nothing looks
 wrong — so it went with the rest of the admin surfaces.
+
+### What phase 14 landed
+
+UI-17's structural half, and a standing test that stops it coming back.
+
+- **A skip link, and something for it to skip to.** A keyboard user landing on
+  a library page walked the search box and two menus before reaching the first
+  card, on every navigation, because the focus returns to the top each time.
+  The target carries `tabindex="-1"`, or a fragment link scrolls and leaves the
+  focus where it was.
+- **Focus follows a screen change, and only a screen change.** A real
+  navigation puts the focus at the top of the new document; this one does not,
+  so pressing a card left the focus on a button that no longer existed. Keyed
+  on the same value the error boundary uses, so the player's autoplay handover
+  — which changes the URL and nothing else — does not take the focus off
+  whatever the viewer was reaching for.
+- **A title per screen, and one announcement.** The browser announces a
+  document title on a real navigation and has no idea this one happened. The
+  title is set twice per navigation — once for the screen, once for the thing
+  on it — and announced once: the second is the same screen a beat later, over
+  whatever the reader had moved on to.
+- **Every control has a name**, checked on five screens by walking the tab
+  stops. It found one: the bandwidth cap, which had a placeholder and no label.
+- **One `h1` per screen, and no skipped levels.** Heading navigation is how a
+  screen reader user finds where they are, and the home screen answered with
+  nothing.
+- **A heading that looked pressable and was not.** The library's title drops
+  the filter — a mouse-only shortcut, because a heading with a click handler is
+  unreachable. It is a button when there is something to drop, and plain text
+  when there is not.
+- **The two dialogs on the item page are modal in the way the attribute
+  claims.** Focus moves in — an `alertdialog` is announced when the focus
+  arrives, not when it is inserted — Tab stays inside, Escape works from
+  `<body>`, and the focus goes back to whatever opened it.
+- **`prefers-reduced-motion`.** Every animation here is decoration and every
+  animated element says what it is in text, so the honest answer is to stop.
+
+**What the pass still owes, and cannot be automated:** whether an announcement
+is intelligible, whether the focus order matches the reading order, and whether
+anything is legible at 200% zoom. `test/a11y.test.ts` says so at the top.
 
 ### What phase 13 landed
 

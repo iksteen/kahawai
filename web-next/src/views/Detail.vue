@@ -316,13 +316,23 @@ function markSeason(season: number | null, played: boolean) {
 
     <!-- A series -->
     <template v-if="item.kind === 'show'">
-      <div v-if="children.isError.value" class="flex items-center gap-3">
+      <!-- Always in the document, and empty most of the time: a live region
+           inserted together with its text is not reliably announced, which is
+           the case they are least good at. The button is OUTSIDE it, or its
+           label is read as part of the message every time the message changes.
+           Everything else this page has to say goes through the shell's notice
+           host, which is one permanent region for the whole app. -->
+      <div class="flex items-center gap-3 empty:hidden">
         <p class="m-0 text-warn" role="alert">
-          Could not load the episodes: {{ sentence(children.error.value) }}
+          {{
+            children.isError.value
+              ? `Could not load the episodes: ${sentence(children.error.value)}`
+              : ''
+          }}
         </p>
-        <Btn ghost small @click="children.refetch()">Try again</Btn>
+        <Btn v-if="children.isError.value" ghost small @click="children.refetch()">Try again</Btn>
       </div>
-      <p v-else-if="children.data.value && children.data.value.length === 0" class="text-dim">
+      <p v-if="!children.isError.value && children.data.value?.length === 0" class="text-dim">
         No episodes in this series yet.
       </p>
 
@@ -424,13 +434,17 @@ function markSeason(season: number | null, played: boolean) {
          on its own is the other button, and it levels by its own gain. -->
     <template v-else-if="item.kind === 'album'">
       <h2 class="mb-2 text-[14px] font-[650] tracking-[0.08em] text-dim uppercase">Tracks</h2>
-      <div v-if="children.isError.value" class="flex items-center gap-3">
+      <div class="flex items-center gap-3 empty:hidden">
         <p class="m-0 text-warn" role="alert">
-          Could not load the track list: {{ sentence(children.error.value) }}
+          {{
+            children.isError.value
+              ? `Could not load the track list: ${sentence(children.error.value)}`
+              : ''
+          }}
         </p>
-        <Btn ghost small @click="children.refetch()">Try again</Btn>
+        <Btn v-if="children.isError.value" ghost small @click="children.refetch()">Try again</Btn>
       </div>
-      <p v-else-if="children.data.value?.length === 0" class="text-dim">
+      <p v-if="!children.isError.value && children.data.value?.length === 0" class="text-dim">
         No tracks in this record.
       </p>
       <ul v-else class="flex flex-col">

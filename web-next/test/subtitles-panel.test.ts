@@ -289,3 +289,62 @@ describe('a standing choice for this title', () => {
     expect(wrapper.emitted('cleared')).toHaveLength(1)
   })
 })
+
+describe('the candidate dialog is a real one', () => {
+  test('the focus goes into it, or nothing is announced at all', async () => {
+    // `role="dialog"` is announced when the focus arrives in it, not when it is
+    // inserted.
+    const wrapper = await panel()
+    await press(wrapper, 'Find subtitles (eng)')
+    expect(wrapper.find('[role="dialog"]').element.contains(document.activeElement)).toBe(true)
+  })
+
+  test('and comes back to whatever opened it', async () => {
+    const wrapper = await panel()
+    const opener = wrapper.findAll('button').find((b) => b.text().startsWith('Find'))!
+    ;(opener.element as HTMLElement).focus()
+    await press(wrapper, 'Find subtitles (eng)')
+    await wrapper.find('[aria-label="Close"]').trigger('click')
+    await flushPromises()
+    expect(document.activeElement).toBe(opener.element)
+  })
+
+  test('and Escape leaves it, wherever the focus is', async () => {
+    // Clicking the prose in a dialog puts the focus on `<body>`, where a
+    // handler bound to the dialog's own subtree never sees the key.
+    const wrapper = await panel()
+    await press(wrapper, 'Find subtitles (eng)')
+    ;(document.activeElement as HTMLElement | null)?.blur()
+    document.body.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
+    await flushPromises()
+    expect(wrapper.find('[role="dialog"]').exists()).toBe(false)
+  })
+
+  test('and Tab stays inside it', async () => {
+    // `aria-modal` hides the background from a virtual buffer and does nothing
+    // at all to the tab order.
+    const wrapper = await panel()
+    await press(wrapper, 'Find subtitles (eng)')
+    const stops = wrapper.findAll('[role="dialog"] button, [role="dialog"] input')
+    const last = stops.at(-1)!.element as HTMLElement
+    last.focus()
+    last.dispatchEvent(new KeyboardEvent('keydown', { key: 'Tab', bubbles: true }))
+    expect(document.activeElement).toBe(stops[0]!.element)
+  })
+
+  test('and the window listener goes with it', async () => {
+    // A global listener per mount, and this component mounts on every item
+    // page. Counted rather than inferred: an orphan handler changes nothing
+    // observable on screen, which is exactly why it accumulates unnoticed.
+    const added = vi.spyOn(window, 'addEventListener')
+    const removed = vi.spyOn(window, 'removeEventListener')
+    const wrapper = await panel()
+    const on = added.mock.calls.filter((c) => c[0] === 'keydown').length
+    wrapper.unmount()
+    const off = removed.mock.calls.filter((c) => c[0] === 'keydown').length
+    expect(on).toBeGreaterThan(0)
+    expect(off).toBe(on)
+    added.mockRestore()
+    removed.mockRestore()
+  })
+})

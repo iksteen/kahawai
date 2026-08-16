@@ -323,11 +323,19 @@ followed, and those cases are listed too.
       declares none of the three fields and nothing groups on them. Open until
       it does; the rebuild's detail page (phase 9) is where that lands.
 
-- [ ] UI-17 **No accessibility pass.** Keyboard reachability was kept in mind
-      where a pointer gesture was added (click-to-promote beside pill dragging,
-      arrow keys on the fallback ladder, a disabled rather than absent lane
-      arrow), but nothing here was verified with a screen reader or a
-      keyboard-only run. UX-3 remains unaudited.
+- [ ] UI-17 **Accessibility pass: the structural half is done, the human half
+      is not.** The rebuild (`web-next`, phase 14) added a skip link and a
+      focusable content landmark, focus that follows a screen change but not an
+      autoplay handover, a per-screen document title with one polite
+      announcement, `prefers-reduced-motion`, real modal behaviour on every
+      dialog (focus in, Tab trapped, Escape from anywhere, focus restored), and
+      live regions that exist before they have anything to say. Every control
+      on five screens is named, there is one `h1` per screen and no skipped
+      heading levels, and `web-next/test/a11y.test.ts` keeps all of it.
+      Still owed, and not automatable: a keyboard-only run and a screen reader.
+      Whether an announcement is intelligible, whether the focus order matches
+      the reading order and whether anything is legible at 200% zoom all need a
+      person. UX-3 remains unaudited.
       One exception, which is not the pass: the search results panel is built to
       the combobox pattern deliberately — the box carries the role, the expanded
       state and `aria-activedescendant`, the rows are options in a listbox that

@@ -46,6 +46,25 @@
    unstyled with nothing failing. */
 @source inline("text-{teal,sand,warn}");
 
+/* UI-17. A spinner, a fade and a canvas that slides are all decoration; for
+   somebody whose vestibular system reads them as movement they are a headache,
+   and the browser has been told so. Nothing here is load-bearing — every
+   animated element still says what it is in text — so the honest answer is to
+   stop, not to slow down.
+
+   `!important` because Tailwind's own utilities set these, and a preference is
+   not something a utility class gets to overrule. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
 /* Native controls are dark too. Without this a <select>'s own dropdown, every
    checkbox and the scrollbars all render light on a page that is not, and the
    sort control looks like something from another application. Cheaper and more

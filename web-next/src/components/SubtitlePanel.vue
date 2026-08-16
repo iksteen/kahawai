@@ -4,7 +4,7 @@
 /// The PLAYER is where tracks get picked; this section is about managing
 /// downloads, so the file's own tracks are one line of prose and the hub-stored
 /// ones are the list.
-import { computed, ref } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, useTemplateRef, watch } from 'vue'
 
 import Btn from './Btn.vue'
 import type { Candidate } from '../api/generated/model/candidate.ts'
@@ -32,11 +32,51 @@ const props = defineProps<{
 const emit = defineEmits<{ changed: []; cleared: [] }>()
 
 const busy = ref(false)
+
 const note = ref('')
 const quota = ref<Quota | null>(null)
 /// `null` while the dialog is closed. An empty array is a search that found
 /// nothing, which is a different thing and has its own offer.
 const candidates = ref<Candidate[] | null>(null)
+
+/// The dialog has to be ENTERED to be announced, and Tab must not walk out of
+/// it into the page behind: `aria-modal` hides the background from a virtual
+/// buffer and does nothing to the tab order. The same shape as `MatchDialog`,
+/// which is the other dialog on this page.
+const box = useTemplateRef<HTMLElement>('box')
+let restore: HTMLElement | null = null
+
+function keys(event: KeyboardEvent) {
+  if (!candidates.value) return
+  if (event.key === 'Escape') {
+    candidates.value = null
+    return
+  }
+  if (event.key !== 'Tab' || !box.value) return
+  const stops = [
+    ...box.value.querySelectorAll<HTMLElement>('button, input, [tabindex="0"]'),
+  ].filter((el) => !el.hasAttribute('disabled'))
+  const edge = event.shiftKey ? stops[0] : stops.at(-1)
+  if (document.activeElement !== edge) return
+  event.preventDefault()
+  ;(event.shiftKey ? stops.at(-1) : stops[0])?.focus()
+}
+
+watch(candidates, async (open) => {
+  if (open) {
+    restore = document.activeElement as HTMLElement | null
+    await nextTick()
+    // The first control in it, found in the DOM: a template ref on a component
+    // is its instance, which has no `focus`.
+    box.value?.querySelector<HTMLElement>('button, input')?.focus()
+  } else {
+    restore?.focus()
+    restore = null
+  }
+})
+
+onMounted(() => window.addEventListener('keydown', keys))
+onBeforeUnmount(() => window.removeEventListener('keydown', keys))
 
 async function find(languages: string[]) {
   busy.value = true
@@ -204,9 +244,9 @@ const drifts = (candidate: Candidate) =>
       v-if="candidates"
       class="fixed inset-0 z-40 flex items-start justify-center overflow-y-auto bg-black/60 p-6"
       @click="candidates = null"
-      @keydown.esc="candidates = null"
     >
       <div
+        ref="box"
         class="w-full max-w-[900px] rounded-lg border border-line bg-surface p-4"
         role="dialog"
         aria-modal="true"
@@ -217,7 +257,16 @@ const drifts = (candidate: Candidate) =>
           <h2 id="subs-title" class="text-[17px] font-[650]">
             Subtitles for “{{ props.item.title }}”
           </h2>
-          <Btn ghost small class="ml-auto" aria-label="Close" @click="candidates = null">✕</Btn>
+          <Btn
+            ref="field"
+            ghost
+            small
+            class="ml-auto"
+            aria-label="Close"
+            @click="candidates = null"
+          >
+            ✕
+          </Btn>
         </div>
         <p class="mt-1 text-dim">
           {{

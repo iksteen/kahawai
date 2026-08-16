@@ -766,13 +766,20 @@ promoted or ticked. One is unchanged.
       navigation, focus restoration, fullscreen escape, labels for glyph-only
       controls, meaningful artwork alternatives where appropriate and
       responsive player behaviour; turn reproduced failures into named gates.
-      Unaudited. Nothing in the redesign was verified with a keyboard-only run
-      or a screen reader (`UI-17`). Keyboard reachability was preserved by
-      construction where a pointer-only gesture was introduced — clicking a
-      language pill still promotes it, the subtitle-fallback rows take the
-      arrow keys, and a lane arrow at its limit is disabled rather than removed
-      so it keeps its place in the tab order — and glyph-only controls carry
-      titles. None of that is an audit. This item is unchanged in substance
+      Partly done, and the remainder is the part a person has to do.
+      `web-next` phase 14 closed the half a machine can check (`UI-17`):
+      keyboard navigation past the header (a skip link and a focusable content
+      landmark), focus restoration on a screen change and out of every dialog,
+      fullscreen escape, `aria-label` on every glyph-only control — verified by
+      walking the tab stops of five screens rather than asserted — one `h1` per
+      screen with no skipped levels, live regions that exist before they have
+      anything to say, `prefers-reduced-motion`, and a seekbar that is a real
+      range input rather than a div with a click handler. Kept by
+      `web-next/test/a11y.test.ts`.
+      What is left is what cannot be automated: whether an announcement is
+      intelligible, whether the focus order matches the reading order, and
+      whether anything is legible at 200% zoom. No screen reader has been near
+      it. Until one has, this stays open
 - [~] UX-4 Lazy-load administration, settings, player and subtitle rendering;
       load JASSUB/WASM only for playback modes that need it.
       Done, in the shape the measurement justified rather than the shape

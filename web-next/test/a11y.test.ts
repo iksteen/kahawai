@@ -49,6 +49,7 @@ const Library = (await import('../src/views/Library.vue')).default
 const Detail = (await import('../src/views/Detail.vue')).default
 const Settings = (await import('../src/views/Settings.vue')).default
 const AppShell = (await import('../src/components/AppShell.vue')).default
+const Season = (await import('../src/views/Season.vue')).default
 
 const routes = [
   { path: '/', name: 'libraries', component: { template: '<div />' } },
@@ -145,6 +146,7 @@ describe('every control has a name', () => {
     ['home', Home, '/'],
     ['a library', Library, '/library/films'],
     ['an item', Detail, '/library/films/item/heat'],
+    ['a season', Season, '/library/films/item/show/season/1'],
     ['settings', Settings, '/settings'],
   ]
 
@@ -155,6 +157,37 @@ describe('every control has a name', () => {
       expect(anonymous.map((el) => el.outerHTML.slice(0, 120))).toEqual([])
     })
   }
+})
+
+describe('nothing announces itself by appearing', () => {
+  // A live region has to be in the accessibility tree BEFORE its content
+  // changes: a node inserted with its text already in it is not reliably
+  // announced by NVDA or VoiceOver, which is the case they are least good at.
+  //
+  // Counted across the two states rather than checked for emptiness: some of
+  // these regions exist to hold a standing value — a count line, a saved
+  // marker — and being non-empty at rest is their job. What must not happen is
+  // a region APPEARING with the failure it reports.
+  const regions = (wrapper: { element: unknown }) =>
+    (wrapper.element as Element).querySelectorAll('[role="status"], [role="alert"]').length
+
+  test('an item page has the same regions whether or not its list failed', async () => {
+    vi.mocked(api.itemQuery).mockResolvedValue(film({ id: 'show', kind: 'show' }) as never)
+    const quiet = regions(await screen(Detail, '/library/films/item/show'))
+
+    vi.mocked(api.itemChildren).mockRejectedValue(new Error('nope'))
+    const failing = await screen(Detail, '/library/films/item/show')
+    expect(failing.text()).toContain('Could not load the episodes')
+    expect(regions(failing)).toBe(quiet)
+  })
+
+  test('and a library has the same whether or not a chunk failed', async () => {
+    const quiet = regions(await screen(Library, '/library/films'))
+
+    vi.mocked(api.listItems).mockRejectedValue(new Error('nope'))
+    const failing = await screen(Library, '/library/films')
+    expect(regions(failing)).toBe(quiet)
+  })
 })
 
 describe('the shell', () => {
@@ -277,5 +310,34 @@ describe('a heading names the screen', () => {
       expect(level).toBeLessThanOrEqual(deepest + 1)
       deepest = Math.max(deepest, level)
     }
+  })
+})
+
+describe('what the browser has been told', () => {
+  test('a viewer who asked for less motion gets none', async () => {
+    // UI-17. A spinner, a fade and a sliding canvas are all decoration; for
+    // somebody whose vestibular system reads them as movement they are a
+    // headache. Nothing here is load-bearing — every animated element says
+    // what it is in text — so the honest answer is to stop, not to slow down.
+    //
+    // Read out of the built stylesheet, because a scoped `<style>` block and a
+    // Tailwind utility both end up there and only the build knows what won.
+    const { readFileSync, readdirSync } = await import('node:fs')
+    const dir = 'dist/assets'
+    let css = ''
+    try {
+      css = readdirSync(dir)
+        .filter((f) => f.endsWith('.css'))
+        .map((f) => readFileSync(`${dir}/${f}`, 'utf8'))
+        .join('\n')
+    } catch {
+      // No build in this checkout: `npm run build` is a separate gate, and a
+      // test that fails for its absence would be reporting the wrong thing.
+      return
+    }
+    expect(css).toContain('prefers-reduced-motion')
+    const block = css.slice(css.indexOf('prefers-reduced-motion'))
+    expect(block).toContain('animation-duration')
+    expect(block).toContain('transition-duration')
   })
 })
