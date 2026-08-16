@@ -30,6 +30,11 @@
   --color-prose: #cdd8da;
   --color-dimmer: #3d5559;
 
+  /* The kahawai tilde: a swell rolling through, echoed like a set of waves.
+     What is behind every poster, so one that will not load is a mark of its
+     own rather than a hole. */
+  --art-none: url('./assets/placeholder.svg') center / cover no-repeat;
+
   --font-mono: ui-monospace, 'JetBrains Mono', Menlo, Consolas, monospace;
   --font-sans: system-ui, -apple-system, 'Segoe UI', sans-serif;
 }

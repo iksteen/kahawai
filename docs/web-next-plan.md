@@ -390,7 +390,7 @@ composables → components → view → review → commit.
 | --- | --- | --- |
 | 4 | Shell, header, menus, routing — **DONE** | the two menus, the search box's two meanings, keyboard and ARIA |
 | 5 | Auth / setup — **DONE** | including UI-24: a hub that never answers must not leave a dead form |
-| 6 | Home (libraries, shelves, continue watching) | inline retries per shelf, the three loading states of UI-22 |
+| 6 | Home (libraries, shelves, continue watching) — **DONE** | inline retries per shelf, the three loading states of UI-22 |
 | 7 | Search panel | on B3; combobox pattern, `aria-activedescendant`, every key driven |
 | 8 | Library grid | virtualised, fixed cell height (UI-11), `srcset` at both densities (UI-16) |
 | 9 | Detail + Season | error split: a refused Play is not a failed item load (UI-13) |
@@ -466,6 +466,38 @@ way in, the app — plus the first-run setup form and the sign-in form.
 the next account must not inherit tracks it cannot read, and `AlbumPlayer`
 retries a 403 for ever. There is no queue yet, so there is nowhere to put it;
 it belongs in that handler when there is.
+
+### What phase 6 landed
+
+The home screen: your libraries, what you are part-way through, and one shelf
+per library. Plus the query client, the artwork component, the sideways lane,
+and the claims reader behind the header's name.
+
+- **The rule the screen exists to keep:** a library that would not load is not
+  a library with nothing in it. The empty one is dropped, the failed one keeps
+  its heading and offers the button, and neither is judged until it has
+  answered.
+- **The review found four defects and nineteen blind tests.** The defects: a
+  page still in flight when a shelf was retried spliced itself onto the fresh
+  first page (the heading then read "6 of 1" and the shelf never asked for
+  anything again); the lane never re-read its edges after cards were appended,
+  so the arrow that fetches the next page stayed disabled over a lane that had
+  just grown; a failed continue-watching row was silent, which reads as having
+  nothing on the go; and the libraries query ran before there was a session,
+  which is a guaranteed 401 on every sign-in screen.
+- **The blind tests were all in the two components that had none.** `Art.vue`
+  and `Lane.vue` could each have had six behaviours deleted without failing
+  anything, UI-16 and UI-22 among them. Both have mounted tests now, with the
+  lane's measurements stubbed onto the element — happy-dom does no layout, so
+  every `scrollWidth` it reports is zero, which is also why a lane in a test
+  always asks for a second page on mount.
+- **The CSS port had lost more than it looked like.** The card had no box, the
+  poster had no aspect ratio (so a row of stills and posters came out ragged
+  and every card grew as its picture arrived), the swell placeholder was never
+  copied across, the progress bars had gone from sand to teal, the scrollbar
+  was back under every shelf, and the lane arrows were `display: none` until
+  hover — which takes them out of the tab order, leaving no keyboard path to
+  the arrow that pages the shelf.
 
 ### The player
 

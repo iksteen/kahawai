@@ -8,13 +8,14 @@
 import { createRouter, createWebHistory } from 'vue-router'
 
 const Placeholder = () => import('./views/Placeholder.vue')
+const Home = () => import('./views/Home.vue')
 
 export const router = createRouter({
   // The hub serves the app under /app/ and falls back to the shell for any
   // path below it, so client-side routes survive a reload and a shared link.
   history: createWebHistory('/app/'),
   routes: [
-    { path: '/', name: 'libraries', component: Placeholder },
+    { path: '/', name: 'libraries', component: Home },
     { path: '/admin', name: 'admin', component: Placeholder },
     { path: '/settings', name: 'settings', component: Placeholder },
     { path: '/library/:library', name: 'library', component: Placeholder },

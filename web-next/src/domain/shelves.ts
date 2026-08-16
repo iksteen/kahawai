@@ -15,31 +15,16 @@ export type Shelf = {
   /// How many the library holds, which is not how many arrived: a shelf pages
   /// as it is scrolled and stops when it has them all.
   total: number
+  /// How many rows the hub has HANDED OVER, which is not `items.length`: a
+  /// rescan between two pages shifts what sits at an offset, so a page can
+  /// arrive holding rows this shelf already had. Both numbers are needed —
+  /// this one is where the next page starts, and `items.length` is what is on
+  /// screen.
+  served: number
   /// `pending` until it has answered. Every library gets one the moment the
   /// list of libraries is known, so the page has its shape before any content
   /// arrives — on a slow link that was several seconds of blank.
   state: 'pending' | 'ready' | 'failed'
-}
-
-export function pendingShelves(libraries: LibrarySummary[]): Shelf[] {
-  return libraries.map((library) => ({ library, items: [], total: 0, state: 'pending' }))
-}
-
-/// One shelf's answer, put back in its place. Only that shelf is touched — the
-/// others are fine, and rebuilding them would throw away pages the viewer has
-/// already scrolled into.
-export function settle(
-  shelves: Shelf[],
-  id: string,
-  answer: { items: ItemRowI64[]; total: number } | 'failed',
-): Shelf[] {
-  return shelves.map((shelf) =>
-    shelf.library.id === id
-      ? answer === 'failed'
-        ? { ...shelf, state: 'failed' as const }
-        : { ...shelf, ...answer, state: 'ready' as const }
-      : shelf,
-  )
 }
 
 /// Which shelves are drawn.
@@ -61,11 +46,12 @@ export function appendPage(have: ItemRowI64[], arrived: ItemRowI64[]): ItemRowI6
   return [...have, ...arrived.filter((i) => !seen.has(i.id))]
 }
 
-/// Whether there is more to ask for. Compared against the library's total
-/// rather than a full page having arrived: a page that came back short because
-/// of a dedupe is not the end of the library.
-export function hasMore(shelf: Pick<Shelf, 'items' | 'total'>): boolean {
-  return shelf.items.length < shelf.total
+/// Whether there is more to ask for. Compared against what the hub has SERVED
+/// rather than what is on screen: a page that came back short because of a
+/// dedupe is not the end of the library, and comparing the deduped count would
+/// ask for the same rows again for ever.
+export function hasMore(shelf: Pick<Shelf, 'served' | 'total'>): boolean {
+  return shelf.served < shelf.total
 }
 
 /// A sleeve is square and a poster is two by three.

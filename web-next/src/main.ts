@@ -1,6 +1,8 @@
 import { createApp } from 'vue'
+import { VueQueryPlugin } from '@tanstack/vue-query'
 
 import App from './App.vue'
+import { createQueryClient } from './api/query.ts'
 import { router } from './router.ts'
 import { authWire } from './api/auth-wire.ts'
 import { scrubLegacyCredentials, startAuthSession } from './api/session.ts'
@@ -14,4 +16,4 @@ startAuthSession(authWire)
 // it finds.
 scrubLegacyCredentials()
 
-createApp(App).use(router).mount('#app')
+createApp(App).use(router).use(VueQueryPlugin, { queryClient: createQueryClient() }).mount('#app')

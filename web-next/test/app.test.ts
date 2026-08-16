@@ -4,6 +4,7 @@
 import { flushPromises, mount } from '@vue/test-utils'
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 import { defineComponent, h, onUnmounted, ref } from 'vue'
+import { VueQueryPlugin } from '@tanstack/vue-query'
 import { createMemoryHistory, createRouter } from 'vue-router'
 
 import AppShell from '../src/components/AppShell.vue'
@@ -24,7 +25,16 @@ vi.mock('../src/composables/boot.ts', () => ({
     start,
   }),
 }))
-vi.mock('../src/api/session.ts', () => ({ signOut: vi.fn() }))
+vi.mock('../src/api/generated/kahawai.ts', () => ({
+  listLibraries: vi.fn(async () => ({ libraries: [] })),
+  listItems: vi.fn(async () => ({ items: [], total: 0, limit: 20, offset: 0 })),
+  getItemArtworkUrl: (id: string) => `/api/v1/items/${id}/artwork`,
+}))
+vi.mock('../src/api/session.ts', () => ({
+  signOut: vi.fn(),
+  // The header's name and whether the Admin row is offered.
+  whoAmI: () => ({ username: 'claude', admin: false }),
+}))
 
 const { signOut } = await import('../src/api/session.ts')
 const App = (await import('../src/App.vue')).default
@@ -68,7 +78,7 @@ describe('what is on screen', () => {
     // blank moment, and a boot slow enough to notice ends in an error instead.
     const router = app()
     await router.isReady()
-    const wrapper = mount(App, { global: { plugins: [router] } })
+    const wrapper = mount(App, { global: { plugins: [router, VueQueryPlugin] } })
     expect(wrapper.text()).toBe('')
     expect(wrapper.find('form').exists()).toBe(false)
   })
@@ -80,7 +90,7 @@ describe('what is on screen', () => {
     await router.isReady()
     bootError.value = 'Could not reach the hub.'
     phase.value = 'login'
-    const wrapper = mount(App, { global: { plugins: [router] } })
+    const wrapper = mount(App, { global: { plugins: [router, VueQueryPlugin] } })
     expect(wrapper.text()).toContain('Could not start.')
     expect(wrapper.text()).toContain('Could not reach the hub.')
     expect(wrapper.find('input').exists()).toBe(false)
@@ -90,10 +100,33 @@ describe('what is on screen', () => {
     const router = app()
     await router.isReady()
     bootError.value = 'Could not reach the hub.'
-    const wrapper = mount(App, { global: { plugins: [router] } })
+    const wrapper = mount(App, { global: { plugins: [router, VueQueryPlugin] } })
     start.mockClear()
     await wrapper.find('button').trigger('click')
     expect(start).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe('what is asked for before there is a session', () => {
+  test('nothing', async () => {
+    // The shell exists from the first frame and the header lists your
+    // libraries, so an ungated query fires on the boot and sign-in screens —
+    // a guaranteed 401, and two of them on first-run setup where no refresh
+    // cookie can exist to recover with.
+    const { listLibraries } = await import('../src/api/generated/kahawai.ts')
+    const router = app()
+    await router.isReady()
+    for (const at of ['boot', 'login', 'setup'] as const) {
+      phase.value = at
+      mount(App, { global: { plugins: [router, VueQueryPlugin] } })
+      await flushPromises()
+      expect(listLibraries, `asked while ${at}`).not.toHaveBeenCalled()
+    }
+
+    phase.value = 'app'
+    mount(App, { global: { plugins: [router, VueQueryPlugin] } })
+    await flushPromises()
+    expect(listLibraries).toHaveBeenCalled()
   })
 })
 
@@ -113,7 +146,7 @@ describe('signing out', () => {
     // survives navigation, so only leaving the app takes it down.
     await router.isReady()
     phase.value = 'app'
-    const wrapper = mount(App, { global: { plugins: [router] } })
+    const wrapper = mount(App, { global: { plugins: [router, VueQueryPlugin] } })
     expect(wrapper.text()).toContain('playing')
 
     let shellUp = true
@@ -144,7 +177,7 @@ describe('signing out', () => {
     const router = app('/')
     await router.isReady()
     phase.value = 'app'
-    const wrapper = mount(App, { global: { plugins: [router] } })
+    const wrapper = mount(App, { global: { plugins: [router, VueQueryPlugin] } })
 
     let shellUp = true
     vi.mocked(signOut).mockImplementation(async () => {
@@ -167,7 +200,7 @@ describe('signing out', () => {
     const router = app('/settings')
     await router.isReady()
     phase.value = 'app'
-    const wrapper = mount(App, { global: { plugins: [router] } })
+    const wrapper = mount(App, { global: { plugins: [router, VueQueryPlugin] } })
 
     await wrapper.findAll('button').at(-1)!.trigger('click')
     await wrapper
@@ -189,7 +222,7 @@ describe('signing out', () => {
     const router = app()
     await router.isReady()
     phase.value = 'app'
-    const wrapper = mount(App, { global: { plugins: [router] } })
+    const wrapper = mount(App, { global: { plugins: [router, VueQueryPlugin] } })
 
     await wrapper.findAll('button').at(-1)!.trigger('click')
     await wrapper

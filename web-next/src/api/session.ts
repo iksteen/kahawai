@@ -18,6 +18,7 @@
 /// module side effects, which is why testing them needed a dynamic import
 /// after stubbing globals.
 
+import { type Claims, claimsFrom } from '../domain/claims.ts'
 import { Offline } from './errors.ts'
 import { configureApiClient } from './transport.ts'
 import { REFRESH_RETRY_MS, refreshDelayMs } from '../domain/token.ts'
@@ -61,6 +62,13 @@ let channel: BroadcastChannel | null = null
 
 export function accessToken(): string | null {
   return access
+}
+
+/// Who the current token says you are, for labelling only — see `claims.ts`.
+/// A function rather than a value: the token is replaced on every refresh, and
+/// a copy taken at sign-in would be read for the rest of the session.
+export function whoAmI(): Claims {
+  return claimsFrom(access)
 }
 
 /// Told when the session ends, with whether the person asked for it.

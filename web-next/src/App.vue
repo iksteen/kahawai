@@ -14,8 +14,9 @@ import Boundary from './components/Boundary.vue'
 import Failed from './components/Failed.vue'
 import { awayFrom, boundaryKey, type RouteName } from './domain/routes.ts'
 import { notify } from './composables/notices.ts'
-import { signOut } from './api/session.ts'
+import { signOut, whoAmI } from './api/session.ts'
 import { useBoot } from './composables/boot.ts'
+import { useLibraries } from './composables/home.ts'
 
 const route = useRoute()
 const router = useRouter()
@@ -23,10 +24,18 @@ const router = useRouter()
 const { phase, bootError, setupAvailable, setupUrl, note, start } = useBoot()
 onMounted(() => void start())
 
-/// Phase 6 brings the libraries and who is signed in. Stated as the
-/// placeholders they are rather than faked somewhere that would look like a
-/// real source.
-const libraries: { id: string; name: string; media_type: string }[] = []
+/// The header's jump menu lists what the home screen already asked for, so
+/// this reads the same query rather than making a second request. Empty until
+/// it lands, which is a menu with Home in it.
+///
+/// Not before there is a session: this component exists from the first frame,
+/// and asking on the boot or sign-in screens is a guaranteed 401 — two of them
+/// on first-run setup, where no refresh cookie can exist to recover with.
+const libraries = useLibraries(computed(() => phase.value === 'app'))
+
+/// Who the token says you are — for the name in the header and whether to
+/// offer the Admin menu, never as an authorisation decision. See `claims.ts`.
+const me = computed(() => (phase.value === 'app' ? whoAmI() : { username: '', admin: false }))
 
 const name = computed(() => (route.name ?? 'libraries') as RouteName)
 
@@ -104,7 +113,13 @@ async function leave() {
     @done="entered"
   />
 
-  <AppShell v-else :libraries="libraries" username="…" :admin="false" @sign-out="leave">
+  <AppShell
+    v-else
+    :libraries="libraries.data.value ?? []"
+    :username="me.username"
+    :admin="me.admin"
+    @sign-out="leave"
+  >
     <Boundary :reset-key="screen" :away="awayFrom(name)" @away="router.push({ name: 'libraries' })">
       <RouterView v-slot="{ Component }">
         <component :is="Component" />
