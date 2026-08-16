@@ -1,60 +1,71 @@
-import test from 'node:test'
-import assert from 'node:assert/strict'
-import { keepSessionAlive, PING_MS, IDLE_LIMIT_MS } from '../src/keepalive.ts'
+import { describe, expect, test, vi } from 'vitest'
 
-/// Drive the interval by hand — capture the callback setInterval is
-/// handed and call it — so a half-hour bound is checked in no time.
+import { IDLE_LIMIT_MS, keepSessionAlive, PING_MS } from '../src/domain/keepalive.ts'
+
+/// Drive the interval by hand — fake timers, then advance — so a half-hour
+/// bound is checked in no time.
 function run(position: () => number, ticks: number): number[] {
-  const realSet = globalThis.setInterval
-  const realClear = globalThis.clearInterval
-  let fire = () => {}
-  globalThis.setInterval = ((fn: () => void) => {
-    fire = fn
-    return 1
-  }) as unknown as typeof setInterval
-  globalThis.clearInterval = (() => {}) as unknown as typeof clearInterval
+  vi.useFakeTimers()
   const pings: number[] = []
+  const stop = keepSessionAlive(position, (ms) => pings.push(ms))
   try {
-    keepSessionAlive(position, (ms) => pings.push(ms))
-    for (let i = 0; i < ticks; i++) fire()
+    vi.advanceTimersByTime(PING_MS * ticks)
   } finally {
-    globalThis.setInterval = realSet
-    globalThis.clearInterval = realClear
+    stop()
+    vi.useRealTimers()
   }
   return pings
 }
 
 const HELD = IDLE_LIMIT_MS / PING_MS
 
-test('a moving playhead is pinged for as long as it moves', () => {
-  let t = 0
-  const pings = run(() => (t += 1000), HELD * 3)
-  assert.equal(pings.length, HELD * 3)
-})
+describe('keeping a session alive', () => {
+  test('a moving playhead is pinged for as long as it moves', () => {
+    let t = 0
+    expect(run(() => (t += 1000), HELD * 3)).toHaveLength(HELD * 3)
+  })
 
-test('a frozen playhead is held to the bound, then let go', () => {
-  const pings = run(() => 5000, HELD + 50)
-  // Held for exactly the bound and not one tick longer: past that the
-  // viewer has gone and the session should be reaped as the orphan it
-  // is. Every ping reports the real position, not a placeholder.
-  assert.equal(pings.length, HELD)
-  assert.ok(pings.every((p) => p === 5000))
-})
+  test('a frozen playhead is held to the bound, then let go', () => {
+    const pings = run(() => 5000, HELD + 50)
+    // Held for exactly the bound and not one tick longer: past that the viewer
+    // has gone and the session should be reaped as the orphan it is. Every
+    // ping reports the real position, not a placeholder.
+    expect(pings).toHaveLength(HELD)
+    expect(pings.every((p) => p === 5000)).toBe(true)
+  })
 
-test('a preload that never advances still gets its window', () => {
-  // Position 0 forever is the gapless preload: it must survive a pause
-  // long enough to be swapped in, without a rule of its own.
-  const pings = run(() => 0, HELD + 50)
-  assert.equal(pings.length, HELD)
-  assert.ok(pings.every((p) => p === 0))
-})
+  test('a preload that never advances still gets its window', () => {
+    // Position 0 for ever is the gapless preload: it must survive long enough
+    // to be swapped in, without a rule of its own.
+    const pings = run(() => 0, HELD + 50)
+    expect(pings).toHaveLength(HELD)
+    expect(pings.every((p) => p === 0)).toBe(true)
+  })
 
-test('movement resets the bound', () => {
-  let n = 0
-  let pos = 1000
-  const pings = run(() => {
-    if (++n === HELD) pos += 1000 // a nudge just as the window closes
-    return pos
-  }, HELD * 2)
-  assert.ok(pings.length > HELD, `expected the nudge to buy a fresh window, got ${pings.length}`)
+  test('movement buys a whole fresh window, not the rest of the old one', () => {
+    let n = 0
+    let pos = 1000
+    const pings = run(() => {
+      if (++n === HELD) pos += 1000 // a nudge just as the window closes
+      return pos
+    }, HELD * 3)
+    // A nudge that only postpones the reaping by a tick is not a reset. Off by
+    // one is exactly what a weaker assertion here missed: without clearing the
+    // stall count the nudge bought ONE more ping, and `> HELD` was still true.
+    expect(pings.length).toBeGreaterThan(HELD * 1.5)
+  })
+
+  test('cancelling stops the pings', () => {
+    vi.useFakeTimers()
+    const pings: number[] = []
+    const stop = keepSessionAlive(
+      () => 0,
+      (ms) => pings.push(ms),
+    )
+    vi.advanceTimersByTime(PING_MS * 2)
+    stop()
+    vi.advanceTimersByTime(PING_MS * 10)
+    vi.useRealTimers()
+    expect(pings).toHaveLength(2)
+  })
 })

@@ -873,12 +873,28 @@ Every one of those is a state machine that is testable without a DOM, and
 none of them is tested that way today. They become domain modules with tests
 first; the SFC is what is left over.
 
-## Cutover
+## Cutover — **DONE**
 
-`web/` is deleted and `web-next/` takes its name and its build.rs wiring, in
-one commit, once every row above is done and the accessibility pass has run.
-Not before: two half-built UIs is the state this plan is designed to spend as
-little time in as possible.
+`web/` was deleted and this directory took its name, in one commit, with every
+row above done. What moved with it, because it is shared build machinery rather
+than part of either app: `openapi.json`, `scripts/openapi-fingerprint.mjs` and
+`public/favicon.svg`. What had to change: the two paths that pointed at `../web`
+(the fingerprint gate and Orval's input), the package name in `package.json` and
+its lockfile, and `api:export`, `preview` and the `scripts` directory in the
+lint and format globs — all carried over from the old `package.json`, which had
+them and the new one did not.
+
+Nothing outside the directory needed a path change. The hub's `build.rs`,
+`rust-embed`'s `#[folder]`, `api.rs`'s `include_str!`, both CI jobs and both
+release scripts address `web/` by name and by npm script, and the new tree
+answers to all of them — which is what the rename was for. `build.rs` gained
+two watched inputs it did not have: `openapi.json` and `orval.config.ts`, since
+the client is regenerated from them on every build.
+
+Requirements this closed, each updated in the same commit: UI-24 (a sign-in that
+could hang), UI-26 (twenty-five suppressed hook warnings — the rule is gone, not
+the warnings), UI-27 (a multi-part film reading as seven alternative encodes),
+and the machine half of UI-17.
 
 ## Review
 

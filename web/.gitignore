@@ -1,26 +1,26 @@
-# Logs
-logs
-*.log
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-pnpm-debug.log*
-lerna-debug.log*
-
 node_modules
 dist
 dist-ssr
 *.local
+
+# Generated from openapi.json on every install, build, test and typecheck.
+# Committing it would be a second copy of a document that already has one
+# source of truth, and a diff nobody reads.
+src/api/generated
+node_modules/.tmp
+
+# The half-written document `api:export` produces before the fingerprint is
+# stamped into it.
 openapi.json.tmp
-src/generated
+
+# Logs
+logs
+*.log
+npm-debug.log*
 
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
 .idea
 .DS_Store
-*.suo
-*.ntvs*
-*.njsproj
-*.sln
 *.sw?

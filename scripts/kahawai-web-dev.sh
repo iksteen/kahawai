@@ -44,12 +44,11 @@ if listening "$port"; then
     echo "==> vite already on :$port"
 else
     echo "==> starting vite on :$port" >&2
-    # StrictMode stays on. It double-invokes every effect here, which is the
-    # point: playback used to die on that (the player released its session in a
-    # cleanup, so the second setup inherited a disposed one and everything
-    # answered 410), and now it survives. If playback ever breaks under
-    # `npm run dev` while working from the hub, that is the same class of bug
-    # returning, and it is worth chasing rather than switching off.
+    # The app is Vue now, so there is no StrictMode double-invoking effects —
+    # the thing that used to catch a player releasing its session in a cleanup
+    # and inheriting a disposed one. What replaced it is that the session's
+    # lifetime belongs to the ROUTE rather than to the component that plays it,
+    # and `web/test/player-route.test.ts` is where that is held.
     (cd "$repo/web" && npm run dev >"$repo/web/vite-dev.log" 2>&1 &)
     for _ in $(seq 1 60); do
         listening "$port" && break

@@ -12,31 +12,36 @@
     "predev": "npm run api:prepare",
     "dev": "vite",
     "prebuild": "npm run api:prepare",
-    "build": "tsc -b && vite build",
+    "build": "vue-tsc -b && vite build",
     "lint": "oxlint --deny-warnings src test scripts orval.config.ts",
     "fmt": "oxfmt src test scripts orval.config.ts",
     "fmt:check": "oxfmt --check src test scripts orval.config.ts",
     "pretest": "npm run api:prepare",
-    "test": "node --test \"test/*.test.ts\"",
+    "test": "vitest run",
     "preview": "vite preview",
     "pretypecheck": "npm run api:prepare",
-    "typecheck": "tsc -b"
+    "typecheck": "vue-tsc -b"
   },
   "dependencies": {
-    "hls.js": "^1.6.16",
-    "jassub": "^2.5.11",
-    "react": "^19.2.7",
-    "react-dom": "^19.2.7"
+    "@tanstack/vue-query": "^5.101.4",
+    "hls.js": "^1.7.0",
+    "jassub": "^2.5.14",
+    "vue": "^3.5.41",
+    "vue-router": "^5.2.0"
   },
   "devDependencies": {
+    "@tailwindcss/vite": "^4.3.3",
     "@types/node": "^26.1.1",
-    "@types/react": "^19.2.17",
-    "@types/react-dom": "^19.2.3",
-    "@vitejs/plugin-react": "^6.0.3",
+    "@vitejs/plugin-vue": "^6.0.8",
+    "@vue/test-utils": "^2.4.11",
+    "happy-dom": "^20.11.2",
     "orval": "8.24.0",
     "oxfmt": "0.62.0",
     "oxlint": "^1.71.0",
-    "typescript": "^7.0.2",
-    "vite": "^8.1.1"
+    "tailwindcss": "^4.3.3",
+    "typescript": "^5.9.3",
+    "vite": "^8.1.1",
+    "vitest": "^4.1.10",
+    "vue-tsc": "^3.3.10"
   }
 }

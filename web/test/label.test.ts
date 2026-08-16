@@ -1,145 +1,194 @@
-/// How an item names and measures itself in a list.
-///
-/// Untested until now, which mattered: `resumeMsFor` could be replaced with
-/// `return 0` and the whole suite passed. Every item would resume from the
-/// start, and nothing would say so.
+/// How a row names itself. Every case here is one somebody would notice: a
+/// question mark where a season should be, four albums called Greatest Hits,
+/// a progress bar past the end of the bar.
 
-import assert from 'node:assert/strict'
-import test from 'node:test'
-import type { Item } from '../src/api.ts'
+import { describe, expect, test } from 'vitest'
+
 import {
   episodeOf,
+  type Labelled,
   metaLine,
   projecting,
-  resumeMsFor,
+  resumeMs,
   seasonLabel,
   seasonOf,
   seLabel,
   targetOf,
   watchedPct,
-} from '../src/label.ts'
+} from '../src/domain/label.ts'
 
-const item = (fields: Partial<Item>): Item => ({ id: 'i', kind: 'movie', ...fields }) as Item
-
-test('an episode names its season and number, padded', () => {
-  assert.equal(seLabel(1, 2), 'S01E02')
-  assert.equal(seLabel(12, 34), 'S12E34')
+const row = (over: Partial<Labelled>): Labelled => ({
+  id: 'i1',
+  kind: 'movie',
+  title: 'Heat',
+  artist: null,
+  year: null,
+  season: null,
+  episode: null,
+  episode_end: null,
+  parent_id: null,
+  parent_title: null,
+  resume_position_ms: null,
+  resume_duration_ms: null,
+  ...over,
 })
 
-test('absolute numbering prints no season rather than an unknown one', () => {
-  // Anime is numbered this way on purpose; S?E11 reads as data we lost.
-  assert.equal(seLabel(null, 11), 'E11')
+describe('episode numbering', () => {
+  test('a seasoned episode is S01E02', () => {
+    expect(seLabel(1, 2)).toBe('S01E02')
+  })
+
+  test('absolute numbering has no season, and no question mark either', () => {
+    // Anime is numbered that way on purpose. "S?E11" reads as data we failed
+    // to load, which is a different and much worse claim.
+    expect(seLabel(null, 11)).toBe('E11')
+    expect(seLabel(null, 11)).not.toContain('?')
+  })
+
+  test('specials are season zero, not absolute', () => {
+    // 0 and null are different things and `??` would collapse them.
+    expect(seLabel(0, 3)).toBe('S00E03')
+  })
+
+  test('a batch file spans its range', () => {
+    expect(seLabel(1, 1, 2)).toBe('S01E01-02')
+    expect(seLabel(null, 1, 2)).toBe('E01-02')
+  })
 })
 
-test('specials are season zero, not a missing season', () => {
-  assert.equal(seLabel(0, 1), 'S00E01')
-  assert.equal(seasonLabel(0, false), 'Specials')
+describe('the line under a card', () => {
+  test('an episode says which show it is from', () => {
+    // A row called "Pilot" is otherwise one of eight.
+    expect(
+      metaLine(
+        row({ kind: 'episode', title: 'Pilot', parent_title: 'Fringe', season: 1, episode: 1 }),
+      ),
+    ).toBe('Fringe S01E01')
+  })
+
+  test('an album is told apart by who made it and when', () => {
+    // There are four Greatest Hits by four bands and three pressings of one.
+    expect(metaLine(row({ kind: 'album', artist: 'Queen', year: 1981 }))).toBe('Queen · 1981')
+  })
+
+  test('and a missing half is left out rather than punctuated around', () => {
+    expect(metaLine(row({ kind: 'album', artist: 'Queen', year: null }))).toBe('Queen')
+    expect(metaLine(row({ kind: 'album', artist: null, year: 1981 }))).toBe('1981')
+    expect(metaLine(row({ kind: 'album' }))).toBe('')
+  })
+
+  test('a track names its artist and its album', () => {
+    expect(metaLine(row({ kind: 'track', artist: 'Queen', parent_title: 'Hot Space' }))).toBe(
+      'Queen · Hot Space',
+    )
+  })
+
+  test('and anything else is just its year', () => {
+    expect(metaLine(row({ kind: 'movie', year: 1995 }))).toBe('1995')
+    expect(metaLine(row({ kind: 'movie', year: null }))).toBe('')
+  })
 })
 
-test('a batch file spanning episodes says so', () => {
-  assert.equal(seLabel(1, 2, 3), 'S01E02-03')
+describe('where a card leads', () => {
+  test('a track opens its album, because a track has no page', () => {
+    expect(targetOf(row({ kind: 'track', id: 't1', parent_id: 'a1' }))).toBe('a1')
+  })
+
+  test('a track with no album still opens something', () => {
+    // Nothing else to offer, and a dead card is worse than a thin page.
+    expect(targetOf(row({ kind: 'track', id: 't1', parent_id: null }))).toBe('t1')
+  })
+
+  test('everything else opens itself', () => {
+    expect(targetOf(row({ kind: 'episode', id: 'e1', parent_id: 's1' }))).toBe('e1')
+  })
 })
 
-test('a null season reads differently depending on whether a projection exists', () => {
-  // With one, the unprojected leftovers are "Other"; without, absolute
-  // numbering IS the numbering, and the page is just "Episodes".
-  assert.equal(seasonLabel(null, true), 'Other')
-  assert.equal(seasonLabel(null, false), 'Episodes')
-  assert.equal(seasonLabel(2, true), 'Season 2')
+describe('how far through', () => {
+  test('is a percentage of the whole item', () => {
+    expect(watchedPct(row({ resume_position_ms: 300, resume_duration_ms: 1200 }))).toBe(25)
+  })
+
+  test('is null when there is nothing to measure against', () => {
+    // Not zero: "not started" and "at the very beginning" draw differently,
+    // and a zero-width bar on every unwatched card is noise.
+    expect(watchedPct(row({ resume_position_ms: 300, resume_duration_ms: null }))).toBeNull()
+    expect(watchedPct(row({ resume_position_ms: null, resume_duration_ms: 1200 }))).toBeNull()
+    expect(watchedPct(row({ resume_position_ms: 0, resume_duration_ms: 1200 }))).toBeNull()
+  })
+
+  test('and never runs past the end of the bar', () => {
+    // A position past the reported duration is ordinary: the hub's figure is
+    // the container's and a player can report a little beyond it.
+    expect(watchedPct(row({ resume_position_ms: 1300, resume_duration_ms: 1200 }))).toBe(100)
+  })
 })
 
-test('projecting takes both the preference and something to project', () => {
-  const withProj = [item({ proj_season: 1 })]
-  assert.equal(projecting('seasons', withProj), true)
-  assert.equal(projecting('native', withProj), false)
-  assert.equal(projecting('seasons', [item({ season: 1 })]), false)
-  assert.equal(projecting('seasons', []), false)
+describe('anime numbered straight through', () => {
+  const absolute = [
+    { season: null, proj_season: 1, episode: 1, proj_episode: 1 },
+    { season: null, proj_season: 2, episode: 26, proj_episode: 1 },
+  ]
+
+  test('is projected onto seasons only when asked and only when it can be', () => {
+    // The answer has to be the same on the show page and the season page: a
+    // viewer who opens "Season 2" must not land on a different set of
+    // episodes than the list they clicked it from.
+    expect(projecting('seasons', absolute)).toBe(true)
+    expect(projecting('native', absolute)).toBe(false)
+    // Nothing to project onto.
+    expect(projecting('seasons', [{ proj_season: null }])).toBe(false)
+  })
+
+  test('and then the projected numbers are the ones used', () => {
+    expect(seasonOf(absolute[1]!, true)).toBe(2)
+    expect(episodeOf(absolute[1]!, true)).toBe(1)
+    expect(seasonOf(absolute[1]!, false)).toBeNull()
+    expect(episodeOf(absolute[1]!, false)).toBe(26)
+  })
+
+  test('an episode with no projection keeps its own number', () => {
+    // Projecting a show where only some episodes carry one must not renumber
+    // the rest to nothing.
+    const partial = { season: 1, proj_season: null, episode: 7, proj_episode: null }
+    expect(episodeOf(partial, true)).toBe(7)
+  })
 })
 
-test('a projected episode is numbered by the projection, an unprojected one by itself', () => {
-  const e = item({ season: null, episode: 11, proj_season: 1, proj_episode: 3 })
-  assert.equal(seasonOf(e, true), 1)
-  assert.equal(episodeOf(e, true), 3)
-  assert.equal(seasonOf(e, false), null)
-  assert.equal(episodeOf(e, false), 11)
+describe('naming a season', () => {
+  test('zero is Specials, not season zero', () => {
+    expect(seasonLabel(0, false)).toBe('Specials')
+  })
+
+  test('and null is absolute numbering, which is not a missing season', () => {
+    expect(seasonLabel(null, false)).toBe('Episodes')
+    // Under a projection there ARE seasons, so the leftovers are Other.
+    expect(seasonLabel(null, true)).toBe('Other')
+  })
+
+  test('anything else says which', () => {
+    expect(seasonLabel(2, false)).toBe('Season 2')
+  })
 })
 
-test('an episode with no projected number keeps its own', () => {
-  // The season does NOT fall back the same way: null there means absolute
-  // numbering, which is an answer rather than a gap.
-  const e = item({ season: 2, episode: 11, proj_season: null, proj_episode: null })
-  assert.equal(episodeOf(e, true), 11)
-  assert.equal(seasonOf(e, true), null)
-})
+describe('where Play starts', () => {
+  test('from where you got to', () => {
+    expect(resumeMs({ resume_position_ms: 300, resume_duration_ms: 1200 })).toBe(300)
+  })
 
-test('resume keeps a position that is not yet the credits', () => {
-  assert.equal(
-    resumeMsFor(item({ resume_position_ms: 600_000, resume_duration_ms: 1_000_000 })),
-    600_000,
-  )
-})
+  test('and from the beginning once that is the credits', () => {
+    expect(resumeMs({ resume_position_ms: 1100, resume_duration_ms: 1200 })).toBe(0)
+  })
 
-test('resume gives up exactly at nine tenths, not after it', () => {
-  // The boundary in both directions: one below resumes, the boundary itself
-  // and anything past it starts over, so a viewer who finished is not put
-  // back into the last four minutes.
-  assert.equal(
-    resumeMsFor(item({ resume_position_ms: 899_999, resume_duration_ms: 1_000_000 })),
-    899_999,
-  )
-  assert.equal(resumeMsFor(item({ resume_position_ms: 900_000, resume_duration_ms: 1_000_000 })), 0)
-  assert.equal(resumeMsFor(item({ resume_position_ms: 990_000, resume_duration_ms: 1_000_000 })), 0)
-})
+  test('measured against the WHOLE item, not its largest file', () => {
+    // Forty minutes into a seven-part feature is past 90% of part one, so
+    // computing this per file restarted every multi-part film from zero.
+    const sevenParts = { resume_position_ms: 40 * 60_000, resume_duration_ms: 210 * 60_000 }
+    expect(resumeMs(sevenParts)).toBe(40 * 60_000)
+  })
 
-test('an item with nothing stored resumes from the start', () => {
-  assert.equal(resumeMsFor(item({})), 0)
-  assert.equal(resumeMsFor(item({ resume_position_ms: 5_000 })), 0)
-  assert.equal(resumeMsFor(item({ resume_duration_ms: 5_000 })), 0)
-})
-
-test('progress is a percentage of the whole item', () => {
-  assert.equal(watchedPct(item({ resume_position_ms: 250, resume_duration_ms: 1000 })), 25)
-})
-
-test('progress cannot exceed the bar it is drawn in', () => {
-  // A stored position past the duration is not impossible — a re-probe can
-  // shorten an item — and an unclamped one draws a fill wider than its track.
-  assert.equal(watchedPct(item({ resume_position_ms: 2000, resume_duration_ms: 1000 })), 100)
-})
-
-test('unstarted or unmeasured is no bar at all, which is not zero percent', () => {
-  assert.equal(watchedPct(item({})), null)
-  assert.equal(watchedPct(item({ resume_position_ms: 0, resume_duration_ms: 1000 })), null)
-  assert.equal(watchedPct(item({ resume_position_ms: 100, resume_duration_ms: 0 })), null)
-})
-
-test('an episode says which show it came from', () => {
-  const e = item({ kind: 'episode', parent_title: 'A Show', season: 1, episode: 2 })
-  assert.equal(metaLine(e), 'A Show S01E02')
-})
-
-test('every other kind is told apart by what distinguishes it', () => {
-  // A track by who played it and what it is on; an album by who made it and
-  // when, because there are several Greatest Hits and several pressings of
-  // one of them; everything else by its year alone.
-  assert.equal(
-    metaLine(item({ kind: 'track', artist: 'A Band', parent_title: 'An Album' })),
-    'A Band · An Album',
-  )
-  assert.equal(metaLine(item({ kind: 'album', artist: 'A Band', year: 1994 })), 'A Band · 1994')
-  assert.equal(metaLine(item({ kind: 'movie', year: 1994 })), '1994')
-  assert.equal(metaLine(item({ kind: 'movie' })), '')
-})
-
-test('an episode with no number still numbers itself', () => {
-  // `episode` is nullable and `metaLine` feeds it straight in, so the
-  // fallback decides what a card says rather than being unreachable.
-  assert.equal(seLabel(1, null), 'S01E00')
-  assert.equal(seLabel(null, null), 'E00')
-})
-
-test('a track opens its album, because it has no page of its own', () => {
-  assert.equal(targetOf(item({ id: 't', kind: 'track', parent_id: 'alb' })), 'alb')
-  assert.equal(targetOf(item({ id: 't', kind: 'track' })), 't')
-  assert.equal(targetOf(item({ id: 'm', kind: 'movie', parent_id: 'x' })), 'm')
+  test('and from the beginning when there is nothing to resume', () => {
+    expect(resumeMs({ resume_position_ms: null, resume_duration_ms: 1200 })).toBe(0)
+    expect(resumeMs({ resume_position_ms: 300, resume_duration_ms: null })).toBe(0)
+  })
 })

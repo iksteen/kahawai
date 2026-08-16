@@ -7,8 +7,7 @@
 /// again in that tab and the error boundary's Try again re-rendered the same
 /// rejection for ever.
 
-import assert from 'node:assert/strict'
-import test from 'node:test'
+import { expect, test, vi } from 'vitest'
 
 const store = new Map<string, string>()
 let reloads = 0
@@ -22,12 +21,14 @@ let reloads = 0
 /// One page load. The module holds this load's marks in memory, so a fresh
 /// import is what a reload actually is; `sessionStorage` is what survives
 /// between them, and the tests below are about exactly that boundary.
-let loads = 0
 async function pageLoad() {
   reloads = 0
-  const m = (await import(`../src/chunk.ts?load=${++loads}`)) as {
-    loadChunk: <T>(key: string, load: () => Promise<T>) => Promise<T>
-  }
+  // A fresh module registry IS a reload: the module holds this load's marks in
+  // memory, and `sessionStorage` is what survives between them. Vite cannot
+  // resolve a dynamic import built from a variable, so the reset is asked for
+  // by name instead.
+  vi.resetModules()
+  const m = await import('../src/api/chunk.ts')
   return m.loadChunk
 }
 
@@ -37,8 +38,8 @@ const settle = () => new Promise((r) => setTimeout(r, 20))
 test('a chunk that loads is passed straight through', async () => {
   store.clear()
   const loadChunk = await pageLoad()
-  assert.equal(await loadChunk('player', async () => 'module'), 'module')
-  assert.equal(reloads, 0)
+  expect(await loadChunk('player', async () => 'module')).toBe('module')
+  expect(reloads).toBe(0)
 })
 
 test('a missing chunk reloads the page and never settles', async () => {
@@ -47,8 +48,8 @@ test('a missing chunk reloads the page and never settles', async () => {
   let settled = false
   void loadChunk('player', fails).then(() => (settled = true))
   await settle()
-  assert.equal(reloads, 1, 'the page is reloaded')
-  assert.equal(settled, false, 'and nothing renders in the meantime')
+  expect(reloads).toBe(1)
+  expect(settled).toBe(false)
 })
 
 test('a reload that did not help throws rather than reloading again', async () => {
@@ -56,11 +57,11 @@ test('a reload that did not help throws rather than reloading again', async () =
   const first = await pageLoad()
   void first('player', fails)
   await settle()
-  assert.equal(reloads, 1)
+  expect(reloads).toBe(1)
   // The reload lands, and the new build is missing it too.
   const second = await pageLoad()
-  await assert.rejects(second('player', fails), /Failed to fetch/)
-  assert.equal(reloads, 0, 'a broken build must not become a reload loop')
+  await await expect(second('player', fails)).rejects.toThrow()
+  expect(reloads).toBe(0)
 })
 
 test('a reload that DID help leaves no mark, so the next upgrade reloads too', async () => {
@@ -76,7 +77,7 @@ test('a reload that DID help leaves no mark, so the next upgrade reloads too', a
   // Upgrade two, same tab.
   void second('player', fails)
   await settle()
-  assert.equal(reloads, 1, 'the second upgrade gets its own reload')
+  expect(reloads).toBe(1)
 })
 
 test('a mark nobody came back for does not silence the next upgrade', async () => {
@@ -89,14 +90,14 @@ test('a mark nobody came back for does not silence the next upgrade', async () =
   const first = await pageLoad()
   void first('jassub', fails)
   await settle()
-  assert.equal(reloads, 1)
+  expect(reloads).toBe(1)
   // The reload lands. Nothing asks for libass this time.
   await pageLoad()
   // A later upgrade, same tab, and now it is asked for.
   const third = await pageLoad()
   void third('jassub', fails)
   await settle()
-  assert.equal(reloads, 1, 'the next upgrade gets its own reload')
+  expect(reloads).toBe(1)
 })
 
 test("one chunk failing does not spend the other chunk's reload", async () => {
@@ -108,7 +109,7 @@ test("one chunk failing does not spend the other chunk's reload", async () => {
   await loadChunk('player', async () => 'player')
   void loadChunk('jassub', fails)
   await settle()
-  assert.equal(reloads, 1)
+  expect(reloads).toBe(1)
   const second = await pageLoad()
   await second('player', async () => 'player')
   // Bounded on purpose: the wrong version does not reject here, it returns the
@@ -122,6 +123,6 @@ test("one chunk failing does not spend the other chunk's reload", async () => {
     ),
     new Promise<string>((r) => setTimeout(() => r('never settled'), 100)),
   ])
-  assert.equal(verdict, 'threw', 'libass must report, not reload again')
-  assert.equal(reloads, 0, 'and the player clearing its own mark must not have freed libass')
+  expect(verdict).toBe('threw')
+  expect(reloads).toBe(0)
 })

@@ -639,12 +639,13 @@ promoted or ticked. One is unchanged.
 - [x] UX-1 Replace silently swallowed request and save failures with an error
       boundary plus actionable inline/toast retry states; preserve useful errors
       across login refresh and playback recovery.
-      An error boundary sits under every routed screen, keyed on the route so
-      leaving clears it: a render throw used to take the app with it and leave
-      a white page with nothing to report. It is the app's one class component,
-      because React offers no other way to catch a render throw, and its doc
+      An error boundary sits under every routed screen, keyed on the SCREEN so
+      leaving clears it and an autoplay handover does not remount: a render
+      throw used to take the app with it and leave a white page with nothing to
+      report. It is `Boundary.vue`, built on `onErrorCaptured`, and its doc
       names what it cannot catch — handler and promise rejections, which are
-      the `Failed` path's job.
+      the `Failed` path's job. The music dock has one of its own, because it
+      outlives every navigation and a throw in it was a page with no header.
       A load that fails offers Try again and somewhere to go, on the item,
       season, home and settings screens. Try again re-runs the load that
       failed rather than a second code path.
@@ -671,10 +672,12 @@ promoted or ticked. One is unchanged.
       a site that does not exist. A total nobody can re-derive is worse than no
       total, so what follows is the list by name, and the recipe: grep `web/src`
       for `catch` and read each body, which is the only method that has been
-      right.
+      right. (Counted against the React app; the rebuild kept the same rules,
+      and the names below are the Vue files they now live in.)
       **Per-item tolerance, not request failures.** A malformed JSON line in a
-      cue or overlay stream (`Player.tsx`, the live-text and overlay effects), an
-      unparseable access token (`claims`), a malformed SSE hint (`openEvents`),
+      cue or overlay stream (`composables/subtitles.ts`, the live-text and
+      overlay renderers), an unparseable access token (`claims`), a malformed
+      SSE hint (`composables/hints.ts`),
       and the two `localStorage` reads for the capability mask (`loadMask`,
       `saveMask` — these are storage, NOT codec probes, which is what an earlier
       draft of this paragraph claimed). The surrounding stream carries on and

@@ -1,6 +1,0 @@
-dist
-# Generated from web/openapi.json on every install, build, test and typecheck.
-# Committing it would be a second copy of a document that already has one
-# source of truth, and a diff nobody reads.
-src/api/generated
-node_modules/.tmp

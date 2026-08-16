@@ -1,7 +1,11 @@
-import assert from 'node:assert/strict'
-import test from 'node:test'
-import { initialHealth, isFrozen, sessionHealth, type SessionEvent } from '../src/player-session.ts'
-import { playerPhase } from '../src/player-phase.ts'
+import { expect, test } from 'vitest'
+import {
+  initialHealth,
+  isFrozen,
+  sessionHealth,
+  type SessionEvent,
+} from '../src/domain/player-session.ts'
+import { playerPhase } from '../src/domain/player-phase.ts'
 
 const run = (...events: SessionEvent[]) => events.reduce(sessionHealth, initialHealth())
 
@@ -13,8 +17,8 @@ test('a restart that answers late is ignored', () => {
     { type: 'timeline-taken', gen: 2 },
     { type: 'restart-settled', gen: 1 },
   )
-  assert.equal(s.awaitingGen, 2)
-  assert.equal(sessionHealth(s, { type: 'restart-settled', gen: 2 }).awaitingGen, 0)
+  expect(s.awaitingGen).toBe(2)
+  expect(sessionHealth(s, { type: 'restart-settled', gen: 2 }).awaitingGen).toBe(0)
 })
 
 test('giving up on a superseded restart does not kill a live one', () => {
@@ -25,35 +29,35 @@ test('giving up on a superseded restart does not kill a live one', () => {
     { type: 'timeline-taken', gen: 2 },
     { type: 'gave-up', gen: 1 },
   )
-  assert.equal(s.dead, false)
-  assert.equal(s.awaitingGen, 2)
+  expect(s.dead).toBe(false)
+  expect(s.awaitingGen).toBe(2)
 })
 
 test('giving up on the current restart marks it dead and stops waiting', () => {
   const s = run({ type: 'timeline-taken', gen: 3 }, { type: 'gave-up', gen: 3 })
-  assert.equal(s.dead, true)
-  assert.equal(s.awaitingGen, 0)
+  expect(s.dead).toBe(true)
+  expect(s.awaitingGen).toBe(0)
 })
 
 test('pressing play clears dead, so the next play can rebuild', () => {
   const dead = run({ type: 'died-while-paused' })
-  assert.equal(dead.dead, true)
-  assert.equal(sessionHealth(dead, { type: 'play-pressed' }).dead, false)
+  expect(dead.dead).toBe(true)
+  expect(sessionHealth(dead, { type: 'play-pressed' }).dead).toBe(false)
 })
 
 test('a second recovery is refused while one is running', () => {
   // Both detectors notice the same death; the second must not start its own.
   const first = run({ type: 'recovery-started' })
   const second = sessionHealth(first, { type: 'recovery-started' })
-  assert.equal(second, first, 'no new state, so nothing re-renders or re-enters')
-  assert.equal(sessionHealth(second, { type: 'recovery-ended' }).recovering, false)
+  expect(second).toBe(first)
+  expect(sessionHealth(second, { type: 'recovery-ended' }).recovering).toBe(false)
 })
 
 test('an absent host is a wait that holds its position', () => {
   const s = run({ type: 'host-away', atMs: 812_000 })
-  assert.equal(s.standby, 812_000)
-  assert.equal(s.gone, '', 'a wait is not a stop')
-  assert.equal(playerPhase({ ...s, paused: true }), 'standby')
+  expect(s.standby).toBe(812_000)
+  expect(s.gone).toBe('')
+  expect(playerPhase({ ...s, paused: true })).toBe('standby')
 })
 
 test('a real failure during the wait replaces it, rather than sitting behind it', () => {
@@ -61,21 +65,21 @@ test('a real failure during the wait replaces it, rather than sitting behind it'
   // other direction — when it IS a real failure, the wait must clear.
   const waiting = run({ type: 'host-away', atMs: 500 })
   const s = sessionHealth(waiting, { type: 'stopped', why: 'no such file' })
-  assert.equal(s.standby, null)
-  assert.equal(s.gone, 'no such file')
-  assert.equal(playerPhase({ ...s, paused: true }), 'gone')
+  expect(s.standby).toBe(null)
+  expect(s.gone).toBe('no such file')
+  expect(playerPhase({ ...s, paused: true })).toBe('gone')
 })
 
 test('try again lifts the stop and nothing else', () => {
   const stopped = run({ type: 'stopped', why: 'it broke' })
   const s = sessionHealth(stopped, { type: 'retry-by-hand' })
-  assert.equal(s.gone, '')
-  assert.equal(playerPhase({ ...s, paused: false }), 'playing')
+  expect(s.gone).toBe('')
+  expect(playerPhase({ ...s, paused: false })).toBe('playing')
   // Reachable only from the stopped dialog, so it has no business clearing a
   // wait: the retry loop owns that. Pinned because the first version of this
   // reducer cleared it and no test could tell — `stopped` had already.
   const waiting = run({ type: 'host-away', atMs: 900 })
-  assert.equal(sessionHealth(waiting, { type: 'retry-by-hand' }).standby, 900)
+  expect(sessionHealth(waiting, { type: 'retry-by-hand' }).standby).toBe(900)
 })
 
 // `restarting` here is the reducer's own caps flag. The component does not
@@ -89,29 +93,28 @@ test('a wait outranks a stop, and a stop outranks a restart', () => {
     { type: 'host-away', atMs: 1 },
     { type: 'caps-restart-started' },
   )
-  assert.equal(playerPhase({ ...both, paused: true }), 'standby')
+  expect(playerPhase({ ...both, paused: true })).toBe('standby')
 })
 
 test('the transport is frozen for exactly the three phases that outrank a pause', () => {
-  assert.equal(isFrozen(initialHealth()), false)
-  assert.equal(isFrozen(run({ type: 'host-away', atMs: 1 })), true)
-  assert.equal(isFrozen(run({ type: 'stopped', why: 'broke' })), true)
-  assert.equal(isFrozen(run({ type: 'timeline-taken', gen: 4 })), true)
+  expect(isFrozen(initialHealth())).toBe(false)
+  expect(isFrozen(run({ type: 'host-away', atMs: 1 }))).toBe(true)
+  expect(isFrozen(run({ type: 'stopped', why: 'broke' }))).toBe(true)
+  expect(isFrozen(run({ type: 'timeline-taken', gen: 4 }))).toBe(true)
   // Settled: the picture is back and the viewer has it again.
-  assert.equal(
+  expect(
     isFrozen(run({ type: 'timeline-taken', gen: 4 }, { type: 'restart-settled', gen: 4 })),
-    false,
-  )
+  ).toBe(false)
   // A capability restart is NOT one of them — it keeps its own flag and the
   // transport stays live while the new session is fetched.
-  assert.equal(isFrozen(run({ type: 'caps-restart-started' })), false)
+  expect(isFrozen(run({ type: 'caps-restart-started' }))).toBe(false)
 })
 
 test('a capability restart clears the previous reason before it tries again', () => {
   const failed = run({ type: 'caps-restart-failed', why: 'the mask left no video' })
-  assert.equal(failed.capsError, 'the mask left no video')
-  assert.equal(failed.restarting, false)
+  expect(failed.capsError).toBe('the mask left no video')
+  expect(failed.restarting).toBe(false)
   const again = sessionHealth(failed, { type: 'caps-restart-started' })
-  assert.equal(again.capsError, '', 'the old reason is not the answer to the new attempt')
-  assert.equal(again.restarting, true)
+  expect(again.capsError).toBe('')
+  expect(again.restarting).toBe(true)
 })

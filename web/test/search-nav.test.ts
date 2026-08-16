@@ -1,107 +1,109 @@
-/// The search overlay's rows, and moving through them with the arrow keys.
-///
-/// The panel itself cannot be tested here — there is no DOM renderer in this
-/// suite — so the arithmetic lives in `search-nav.ts` and this is what covers
-/// it. Everything below is a case that behaves differently under a plausible
-/// wrong implementation: wrapping instead of clamping, skipping headings,
-/// counting the limit rather than the rows returned.
+/// The search panel's rows and its highlight. All of it is about telling two
+/// things apart that look the same: no matches from could not ask, and a
+/// count of what came back from the limit that was asked for.
 
-import assert from 'node:assert/strict'
-import test from 'node:test'
-import { countLabel, moveHighlight, searchRows, type LibraryHits } from '../src/search-nav.ts'
-import type { Item, LibrarySummary } from '../src/api.ts'
+import { describe, expect, test } from 'vitest'
 
-const lib = (id: string, name: string): LibrarySummary => ({ id, name, media_type: 'movies' })
-const item = (id: string): Item => ({ id, kind: 'movie', title: id }) as Item
+import type { ItemRowI64 } from '../src/api/generated/model/itemRowI64.ts'
+import {
+  countLabel,
+  type LibraryHits,
+  moveHighlight,
+  searchOptionId,
+  searchRows,
+  searchTrouble,
+} from '../src/domain/search-nav.ts'
 
-const films = lib('L1', 'Films')
-const shows = lib('L2', 'Series')
+const films = { id: 'films', name: 'Films', media_type: 'movies' }
+const music = { id: 'music', name: 'Music', media_type: 'music' }
+const item = (id: string) => ({ id, title: id }) as ItemRowI64
+const hits = (
+  library: typeof films,
+  items: ItemRowI64[],
+  total = items.length,
+  failure = '',
+): LibraryHits => ({ library, items, total, failure })
 
-test('a library heading is followed by its own items, in library order', () => {
-  const hits: LibraryHits[] = [
-    { library: films, items: [item('a'), item('b')], total: 2 },
-    { library: shows, items: [item('c')], total: 1 },
-  ]
-  // Reading `library` on the ITEM rows too, not just the headings: that field
-  // is what navigation uses, and a version attributing every hit to the first
-  // library's name passes any assertion that only looks at item ids.
-  assert.deepEqual(
-    searchRows(hits).map((r) =>
-      r.kind === 'library' ? `[${r.library.name}]` : `${r.library.id}/${r.item.id}`,
-    ),
-    ['[Films]', 'L1/a', 'L1/b', '[Series]', 'L2/c'],
-  )
+describe('the rows', () => {
+  test('are a heading and then that library’s hits', () => {
+    const rows = searchRows([hits(films, [item('a'), item('b')])])
+    expect(rows.map((r) => r.kind)).toEqual(['library', 'item', 'item'])
+  })
+
+  test('a library with no matches contributes no heading', () => {
+    // A heading over nothing reads as "we looked and found some".
+    expect(searchRows([hits(films, []), hits(music, [item('a')])]).map((r) => r.kind)).toEqual([
+      'library',
+      'item',
+    ])
+  })
+
+  test('and the first row is always a heading, which is what Enter falls to', () => {
+    // Enter with nothing highlighted shows everything the first library
+    // matched, rather than guessing at one film out of it.
+    const rows = searchRows([hits(films, [item('a')]), hits(music, [item('b')])])
+    expect(rows[0]!.kind).toBe('library')
+  })
 })
 
-test('a library with nothing in it contributes no heading', () => {
-  // A heading over an empty group reads as "we looked and there is something
-  // here". The search already filters these out, but the row builder must not
-  // depend on that.
-  const hits: LibraryHits[] = [
-    { library: films, items: [], total: 0 },
-    { library: shows, items: [item('c')], total: 1 },
-  ]
-  assert.deepEqual(
-    searchRows(hits).map((r) => (r.kind === 'library' ? `[${r.library.name}]` : r.item.id)),
-    ['[Series]', 'c'],
-  )
+describe('the count on a heading', () => {
+  test('is the total when everything matched is showing', () => {
+    expect(countLabel(3, 3)).toBe('3')
+  })
+
+  test('and says how many of how many when it is not', () => {
+    // The gap is why you would press the heading.
+    expect(countLabel(5, 42)).toBe('5 of 42')
+  })
+
+  test('it never claims more than the library holds', () => {
+    // `shown` is the rows that came back, never the limit asked for: three
+    // matches must not read as "5 of 3".
+    expect(countLabel(3, 3)).not.toContain('of')
+  })
 })
 
-test('the heading says how much of the match it is showing', () => {
-  // `shown` is the rows actually returned, not the limit asked for: a library
-  // with three matches must not claim to be showing five of three.
-  assert.equal(countLabel(5, 12), '5 of 12')
-  assert.equal(countLabel(3, 3), '3')
-  // Showing everything there is, whatever the number happens to be.
-  assert.equal(countLabel(5, 5), '5')
-  assert.equal(countLabel(5, 6), '5 of 6')
-  // The case that pins the contract rather than today's caller: the number
-  // shown is whatever came back, not whatever was asked for. Reading the limit
-  // instead — `total > 5 ? '5 of N'` — agrees with every assertion above and
-  // lies here, claiming five rows over three.
-  assert.equal(countLabel(3, 10), '3 of 10')
+describe('walking the list', () => {
+  test('down enters it and up stays out', () => {
+    // -1 is where every query starts.
+    expect(moveHighlight(3, -1, 1)).toBe(0)
+    expect(moveHighlight(3, -1, -1)).toBe(-1)
+  })
+
+  test('and it clamps rather than wraps', () => {
+    // Wrapping a list you cannot see all of loses your place silently.
+    expect(moveHighlight(3, 2, 1)).toBe(2)
+    expect(moveHighlight(3, 0, -1)).toBe(0)
+  })
+
+  test('an empty list has nothing to land on', () => {
+    expect(moveHighlight(0, 1, 1)).toBe(-1)
+    expect(moveHighlight(0, -1, -1)).toBe(-1)
+  })
+
+  test('and each row has an id of its own for the input to point at', () => {
+    expect(searchOptionId(0)).not.toBe(searchOptionId(1))
+  })
 })
 
-test('down from nothing highlighted lands on the first row', () => {
-  assert.equal(moveHighlight(5, -1, 1), 0)
-})
+describe('libraries that would not answer', () => {
+  test('nothing is said when they all did', () => {
+    expect(searchTrouble([hits(films, [item('a')]), hits(music, [])])).toBe('')
+  })
 
-test('up from nothing highlighted stays at nothing', () => {
-  // Pressing up before pressing down must not jump to the bottom of a list you
-  // have not looked at.
-  assert.equal(moveHighlight(5, -1, -1), -1)
-})
+  test('all of them failing is reported as one thing going wrong', () => {
+    const trouble = searchTrouble([
+      hits(films, [], 0, 'Could not reach the hub.'),
+      hits(music, [], 0, 'Could not reach the hub.'),
+    ])
+    expect(trouble).toContain('Could not reach the hub.')
+  })
 
-test('the ends clamp rather than wrap', () => {
-  // Wrapping in a panel you cannot see all of loses your place silently.
-  assert.equal(moveHighlight(3, 2, 1), 2)
-  assert.equal(moveHighlight(3, 0, -1), 0)
-})
-
-test('a highlight left beyond the end is brought back into range', () => {
-  // The reachable case, and the one that tells clamping apart from "at the end,
-  // stay put": a result set can shrink under a highlight — three rows with the
-  // highlight at seven — and returning `from` would leave it off the end for
-  // good, with no row lit and Enter opening nothing.
-  assert.equal(moveHighlight(3, 7, -1), 2)
-  assert.equal(moveHighlight(3, 7, 1), 2)
-})
-
-test('a heading is a stop, not something to skip', () => {
-  // The executable statement of the design rather than a check on
-  // `moveHighlight`, which takes a count and so cannot see kinds at all: no
-  // implementation of it could skip a heading. This breaks if `searchRows` ever
-  // stops putting headings in the same list, which is the thing worth pinning.
-  const rows = searchRows([
-    { library: films, items: [item('a'), item('b')], total: 2 },
-    { library: shows, items: [item('c')], total: 1 },
-  ])
-  const at = moveHighlight(rows.length, 2, 1)
-  assert.equal(at, 3)
-  assert.equal(rows[at].kind, 'library')
-})
-
-test('an empty result set has nothing to highlight', () => {
-  assert.equal(moveHighlight(0, -1, 1), -1)
-  assert.equal(moveHighlight(0, 3, -1), -1)
+  test('and some of them failing names them', () => {
+    // Two libraries erroring beside one with no matches printed "nothing
+    // matches" over a count of one, and the only mention of the two was a
+    // notice gone in five seconds.
+    const trouble = searchTrouble([hits(films, [item('a')]), hits(music, [], 0, 'nope')])
+    expect(trouble).toBe('Could not search Music.')
+  })
 })

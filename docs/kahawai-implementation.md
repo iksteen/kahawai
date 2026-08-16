@@ -20,7 +20,7 @@
 | Logging/metrics | `tracing` + `tracing-subscriber`, `metrics` + Prometheus exporter | NFR-6 |
 | Auth / PKI | `jsonwebtoken` (client API); embedded hub CA with `rcgen` + `x509-parser`, mTLS via `rustls` custom verifiers (inter-module) | HUB-11, SEC-1..7, NFR-4 |
 | IDs | ULID (`ulid` crate) for all entities | Sortable, opaque |
-| Web UI | TypeScript + Vite + React, `hls.js` for playback; assets embedded via `rust-embed` | HUB-25..28; single-binary distribution preserved |
+| Web UI | TypeScript + Vite + Vue 3 (`<script setup>`), Tailwind, TanStack Query, `hls.js` for playback; assets embedded via `rust-embed` | HUB-25..28; single-binary distribution preserved |
 
 ### 1.1 Media framework: why GStreamer, not FFmpeg
 
@@ -67,7 +67,7 @@ kahawai/
 │   ├── kahawai-mediahostd/     # lean mediahost binary
 │   ├── kahawai-transcoderd/    # lean transcoder binary
 │   └── kahawai/                # the binary crate
-├── web/                        # TS + Vite + React SPA (admin UI + MVP player);
+├── web/                        # TS + Vite + Vue 3 SPA (browse, player, admin);
 │                               # `vite build` output embedded into kahawai-hub
 │                               # via rust-embed at compile time
 └── migrations/

@@ -257,16 +257,19 @@ followed, and those cases are listed too.
       was worth doing because it was one constant and a `srcset`; the rest is
       machinery in exchange for bytes nobody waits on.
 
-- [ ] UI-24 **Sign-in hangs when the hub cannot be reached.** `Auth` disables
+- [x] UI-24 **Sign-in hangs when the hub cannot be reached.** `Auth` disables
       the form for the duration of the request and has no timeout, so a hub
       that accepts the connection and never answers leaves the screen with a
       dead form and no way to cancel — the one screen with nothing else to
       navigate to. Pre-existing, and not adjacent to anything the redesign
       touched, so it is recorded rather than folded into that branch.
-      Fixed in the rebuild (`web-next`, phase 5): the login carries an
-      `AbortSignal` and the form re-enables in a `finally`. Still open here,
-      because `web/` is what ships until cutover and has its own copy of that
-      code.
+      Fixed in the rebuild (phase 5) and shipping since the cutover: the login
+      carries an `AbortSignal`, the form re-enables in a `finally`, and a
+      second tab signing out mid-login is reported rather than resolving as
+      success. `web/test/session.test.ts` holds the deadline by asserting the
+      wire received the signal that was spied on — an earlier version asserted
+      the timeout's VALUE and passed with the deadline removed, because the
+      lock's own wait happens to be the same number.
 
 - [x] UI-25 **The whole-libraries grant can lose an update.** Admin sends the
       complete set of libraries for a user rather than a delta, so two admins
@@ -278,29 +281,21 @@ followed, and those cases are listed too.
       told to reload; an account deleted under them still gets 404, because
       "reload and try again" is advice that would never come true.
 
-- [ ] UI-26 **Twenty-five suppressed `react-hooks/exhaustive-deps` warnings.**
-      Deleting the inline disables and running the project's own config
-      produces 23 warnings, which `--deny-warnings` would turn red; **9 of the
-      suppressions were added on this branch** (`git diff master..HEAD`), and
-      spread over four files. The FILE totals are different numbers, and an
-      earlier draft printed them as though they were the same one: `Player.tsx`
-      7 and `AlbumPlayer.tsx` 6 are totals, not additions. Either way the weight
-      is in the seek, recovery, next-episode and queue machinery, whose
-      stale-closure bugs this branch spent days fixing. Twenty-five suppressions against 23 warnings
-      because two of them no longer cover anything: worth removing, but they
-      are the cheap half of this item. Some are genuinely load-bearing (the
-      session effect's cleanup destroys the hls instance, so re-running it on
-      an unrelated render would tear playback down and rebuild it; it used to
-      end the session there too, which was worse and is now App's job); the
-      rest are unreviewed. Accepted
-      as debt with the reason stated, because CI cannot catch what it has been
-      told to ignore.
-      Counts measured 2026-08-10 by deleting every disable comment and running
-      `oxlint src`. The previous figures — 20/20/7 — were a month stale in
-      three places at once, which is the argument for measuring them in the
-      same commit as any claim about them.
+- [x] UI-26 **Twenty-five suppressed `react-hooks/exhaustive-deps` warnings.**
+      Closed by the rebuild, which removed the rule rather than the warnings:
+      `web/` is Vue now and has no hook dependency arrays, so the whole class
+      is gone. `grep -rn "eslint-disable\|oxlint-disable" web/src web/test`
+      finds exactly one suppression in the app, on `Icon.vue`'s `v-html` —
+      which renders a string table declared four lines above it and nothing
+      else.
+      What the suppressions were standing over is worth recording, because it
+      is the thing the rebuild had to keep: the seek, recovery, next-episode
+      and queue machinery, whose stale-closure bugs cost days. A Vue ref has no
+      stale closure, so the shadowing refs that existed only for that are gone
+      too — `Picture.vue`'s health is one value, and its doc says why the
+      reference needed two. Measured 2026-08-16.
 
-- [ ] UI-27 **A multi-part film is indistinguishable from a set of alternative
+- [x] UI-27 **A multi-part film is indistinguishable from a set of alternative
       files.** One film split across seven numbered part files on a single host
       is a real case in this library. The hub gets it right — `item_sources`
       holds the parts, contiguous, and playback assembles them into a single
@@ -319,9 +314,13 @@ followed, and those cases are listed too.
       unlabelled — it ranked individual FILES by size while claiming to be "the
       order playback picks in", so a two-CD film listed cd2 first. It is
       playback's own ordering now.
-      The detail page still reads "7 sources": `Source` in `web/src/api.ts`
-      declares none of the three fields and nothing groups on them. Open until
-      it does; the rebuild's detail page (phase 9) is where that lands.
+      **The client half landed with the rebuilt detail page** (phase 9) and
+      ships since the cutover: `groupSources` in `web/src/domain/source.ts`
+      groups rows by `source_id` into works in `part` order, the page says
+      "Source" or "Sources" for the works rather than the files, a work of more
+      than one part says how many, and a work missing one says so — an
+      incomplete set is the case where "seven files" and "seven encodes" have
+      genuinely different consequences.
 
 - [ ] UI-17 **Accessibility pass: the structural half is done, the human half
       is not.** The rebuild (`web-next`, phase 14) added a skip link and a

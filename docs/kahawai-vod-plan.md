@@ -15,7 +15,7 @@ hlssink3, `EXT-X-ENDLIST` lands only at EOS. Three properties follow:
 - **A seek is a server-side restart.** `Sessions::execute_seek` removes
   the output directory and re-rolls the pipeline from the keyframe at
   or before the target. The playlist's t=0 is that seek point, so the
-  client carries the mapping itself — `offsetRef` in `Player.tsx`, with
+  client carries the mapping itself — `offset` in `Picture.vue`, with
   subtitle cues shifted by `-offset` and the overlay's `timeOffset`.
 - **A start is gated on runway.** `playlist_ready` waits for 6.5–30 s
   of content, because an EVENT client discovers segments only by

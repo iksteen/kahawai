@@ -25,9 +25,14 @@ fn main() {
         "package.json",
         "package-lock.json",
         "vite.config.ts",
+        "vitest.config.ts",
         "tsconfig.json",
         "tsconfig.app.json",
         "tsconfig.node.json",
+        // The client is generated from this on every build, so a hub change
+        // that moves the API moves the bundle too.
+        "openapi.json",
+        "orval.config.ts",
     ] {
         let path = web.join(input);
         if path.exists() {

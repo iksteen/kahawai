@@ -1,12 +1,14 @@
+import tailwindcss from '@tailwindcss/vite'
+import vue from '@vitejs/plugin-vue'
 import { defineConfig } from 'vite'
-import react from '@vitejs/plugin-react'
 
 export default defineConfig({
   base: '/app/',
-  plugins: [react()],
+  plugins: [vue(), tailwindcss()],
   server: {
-    // Both prefixes, or the admin screens 404 under `npm run dev` while
-    // every other screen works — which reads as an admin bug.
+    // Both prefixes, or the admin screens 404 under `npm run dev` while every
+    // other screen works — which reads as an admin bug. Carried over from
+    // `web/`, where that was learned.
     proxy: {
       '/api': 'http://localhost:8420',
       '/admin': 'http://localhost:8420',
