@@ -13,6 +13,7 @@ const Library = () => import('./views/Library.vue')
 const Detail = () => import('./views/Detail.vue')
 const Season = () => import('./views/Season.vue')
 const Settings = () => import('./views/Settings.vue')
+const Admin = () => import('./views/Admin.vue')
 
 export const router = createRouter({
   // The hub serves the app under /app/ and falls back to the shell for any
@@ -20,7 +21,7 @@ export const router = createRouter({
   history: createWebHistory('/app/'),
   routes: [
     { path: '/', name: 'libraries', component: Home },
-    { path: '/admin', name: 'admin', component: Placeholder },
+    { path: '/admin', name: 'admin', component: Admin },
     { path: '/settings', name: 'settings', component: Settings },
     { path: '/library/:library', name: 'library', component: Library },
     {

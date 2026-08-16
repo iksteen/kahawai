@@ -12,6 +12,7 @@ import { useQuery } from '@tanstack/vue-query'
 
 import Btn from '../components/Btn.vue'
 import Card from '../components/Card.vue'
+import MatchDialog from '../components/MatchDialog.vue'
 import {
   cellsIn,
   changed,
@@ -24,12 +25,14 @@ import {
   shapeOf,
   visibleRows,
 } from '../domain/virtual.ts'
+import type { ItemRowI64 } from '../api/generated/model/itemRowI64.ts'
 import { listLibraries } from '../api/generated/kahawai.ts'
 import { notify } from '../composables/notices.ts'
 import { sentence } from '../domain/refusal.ts'
 import { targetOf } from '../domain/label.ts'
 import { useLibraryItems } from '../composables/library.ts'
 import { useSearchBox, useSearchQuery } from '../composables/search.ts'
+import { whoAmI } from '../api/session.ts'
 
 const route = useRoute()
 const router = useRouter()
@@ -39,7 +42,20 @@ const library = computed(() => String(route.params.library ?? ''))
 const query = useSearchQuery()
 const sort = ref('title')
 
-const { loaded, total, libraryTotal, failure, need, retry } = useLibraryItems(library, query, sort)
+const { loaded, total, libraryTotal, failure, need, refresh, retry } = useLibraryItems(
+  library,
+  query,
+  sort,
+)
+
+/// HUB-8 hand-matching, from the grid: an operator finds a wrong cover by
+/// LOOKING at the covers, so the affordance belongs where they are looking.
+/// Only for a work — an episode inherits its show's identity — and only for an
+/// admin, who is the only one the endpoint answers.
+const me = whoAmI()
+const matchable = (item: ItemRowI64) => me.admin && (item.kind === 'movie' || item.kind === 'show')
+
+const matching = ref<{ item: ItemRowI64; at: number } | null>(null)
 
 /// Pressing the library's name drops the filter, which is the other half of
 /// the ✕ in the box — the heading is where somebody looks when the page is
@@ -271,10 +287,22 @@ function open(item: Parameters<typeof targetOf>[0]) {
         }"
       >
         <li v-for="at in cells" :key="at" :aria-setsize="total ?? -1" :aria-posinset="at + 1">
-          <Card :item="loaded.get(at)" @open="open" />
+          <Card
+            :item="loaded.get(at)"
+            :matchable="!!loaded.get(at) && matchable(loaded.get(at)!)"
+            @open="open"
+            @match="matching = { item: loaded.get(at)!, at }"
+          />
         </li>
       </ul>
     </div>
+
+    <MatchDialog
+      v-if="matching"
+      :item="matching.item"
+      @close="matching = null"
+      @applied="refresh(matching!.at)"
+    />
   </main>
 </template>
 

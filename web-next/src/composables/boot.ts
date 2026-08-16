@@ -6,6 +6,7 @@
 
 import { onScopeDispose, readonly, ref } from 'vue'
 
+import { clearQueue } from './queue.ts'
 import { onTokensCleared, restoreSession } from '../api/session.ts'
 import { bootstrap as fetchBootstrap } from '../api/generated/kahawai.ts'
 import { endedNote, type Phase, phaseFor } from '../domain/auth.ts'
@@ -33,6 +34,12 @@ export function useBoot() {
   /// signed out would be an explanation for something that did not happen
   /// here.
   const current = (deliberate: boolean) => {
+    // Before the guard, and whichever way the session ended. An expiry is not a
+    // change of person, but nothing should still be playing to a sign-in
+    // screen — and the next account in this tab would inherit a queue whose
+    // tracks it may not read, which the player retries for ever because a track
+    // it may not see looks exactly like a mediahost that is down.
+    clearQueue()
     if (phase.value !== 'app') return
     note.value = endedNote(deliberate)
     phase.value = 'login'

@@ -17,13 +17,31 @@
 /// last ANSWER, never from the row — the queue means a second click goes out
 /// before any repaint, and the row still holds the version the first one
 /// consumed.
+///
+/// The optimistic paint lives HERE, and that is the fourth bug. It was the
+/// view's: two callbacks wrote an override into a record the view owned, and
+/// nothing ever took it out. From the first click on a row until a reload,
+/// that account's grants could never be repainted by the hub again — another
+/// admin narrowing it changed nothing on screen — and the version override
+/// starved the `stale_write` re-read of the fresher version that is the whole
+/// point of it, so every later click on that row was refused for ever. The
+/// state machine that knows when a write is outstanding is the only thing that
+/// can know when the override should go, so it owns it.
 
 import { ref } from 'vue'
 
 import { adminSetUserLibraries } from '../api/generated/kahawai.ts'
+import { sentence } from '../domain/refusal.ts'
 import { SerialQueue } from './serial.ts'
 
 export type Access = { all_libraries: boolean; libraries: string[] }
+
+export type GrantRow = {
+  id: string
+  all_libraries: boolean
+  libraries: string[]
+  grants_version: number
+}
 
 type Write = {
   /// Which write is newest.
@@ -38,37 +56,41 @@ type Write = {
 }
 
 export function useGrants(options: {
-  /// Paint an access set onto the row.
-  show: (userId: string, access: Access) => void
-  /// The version the hub has now, onto the row — a different question from
-  /// the chips, and it must not paint them.
-  version: (userId: string, version: number) => void
   /// Something the operator did, that did not work.
   refused: (why: string) => void
-  /// Read the users again. Only for the one refusal that leaves this panel
-  /// holding a version the hub has moved past.
-  reread: () => void
+  /// Read the users again, and resolve once the answer has landed. Called
+  /// after the last write on a row settles — the row underneath the optimistic
+  /// chips is whatever the last poll said, which predates the write, so
+  /// dropping the override before this lands flicks the chips back to the old
+  /// set for the rest of the polling interval.
+  reread: () => Promise<void>
 }) {
   const queue = new SerialQueue()
   /// Per user, because two users' grants are two independent writes and a
   /// shared counter would have them cancel each other.
   const writes = new Map<string, Write>()
-  const busy = ref(new Set<string>())
+  /// What to paint instead of the row, while a write is outstanding.
+  const overlay = ref<Record<string, Access>>({})
 
-  function setBusy(id: string, out: boolean) {
-    const next = new Set(busy.value)
-    if (out) next.add(id)
-    else next.delete(id)
-    busy.value = next
+  function paint(id: string, access: Access) {
+    overlay.value = { ...overlay.value, [id]: access }
+  }
+
+  function unpaint(id: string) {
+    const next = { ...overlay.value }
+    delete next[id]
+    overlay.value = next
   }
 
   return {
-    busy,
-    async set(
-      user: { id: string; all_libraries: boolean; libraries: string[]; grants_version: number },
-      all: boolean,
-      libraries: string[],
-    ): Promise<void> {
+    /// A row as the panel is showing it: the hub's answer, with anything an
+    /// outstanding write has put on top.
+    asShown<T extends GrantRow>(user: T): T {
+      const optimistic = overlay.value[user.id]
+      return optimistic ? { ...user, ...optimistic } : user
+    },
+
+    async set(user: GrantRow, all: boolean, libraries: string[]): Promise<void> {
       const write = writes.get(user.id) ?? {
         seq: 0,
         inflight: 0,
@@ -91,8 +113,7 @@ export function useGrants(options: {
 
       const mine = ++write.seq
       write.inflight++
-      setBusy(user.id, true)
-      options.show(user.id, { all_libraries: all, libraries })
+      paint(user.id, { all_libraries: all, libraries })
 
       try {
         const answer = await queue.run(user.id, () =>
@@ -103,13 +124,10 @@ export function useGrants(options: {
           }),
         )
         // Whatever else this answer is, it moved the version on — and the
-        // queue means the next write is not sent until this lands. Onto the
-        // ROW as well: leaving the row holding the version this write just
-        // consumed made every second edit send a spent one and come back
-        // `stale_write`, telling an operator somebody else had changed it when
-        // nobody had.
+        // queue means the next write is not sent until this lands. Leaving the
+        // spent version behind made every second edit come back `stale_write`,
+        // telling an operator somebody else had changed it when nobody had.
         write.version = answer.grants_version
-        options.version(user.id, answer.grants_version)
 
         // The revert target moves on ANY success, newest-first: an older write
         // succeeding while a newer one is out still tells us something the hub
@@ -124,26 +142,35 @@ export function useGrants(options: {
         // and the next click there sends [A, C] and revokes B for real.
         if (mine !== write.seq) return
         options.refused('')
-        if (write.saved) options.show(user.id, write.saved)
+        if (write.saved) paint(user.id, write.saved)
       } catch (cause) {
         // An older write failing says nothing about where the newest one is
         // going, and reverting to what was on screen two clicks ago would undo
         // a grant the operator has since made.
         if (mine === write.seq) {
-          if (write.saved) options.show(user.id, write.saved)
-          options.refused(String(cause))
+          if (write.saved) paint(user.id, write.saved)
+          options.refused(sentence(cause))
         }
-        // A refused write leaves this panel holding a version the hub has
-        // moved past, and nothing else here would go and look: granting
-        // libraries emits no hint. Every further click would send the same
-        // spent version and be refused again — on an idle hub, for ever, with
-        // a message blaming an admin who was not there. Reading once is what
-        // the message asks the operator to do; doing it for them is the whole
-        // difference between a refusal and a dead panel.
-        if ((cause as { code?: string }).code === 'stale_write') options.reread()
       } finally {
         write.inflight--
-        if (write.inflight === 0) setBusy(user.id, false)
+        if (write.inflight === 0) {
+          // Always, not only after `stale_write`. A refused write leaves this
+          // panel holding a version the hub has moved past, and nothing else
+          // here would go and look: granting libraries emits no hint. Every
+          // further click would send the same spent version and be refused
+          // again — on an idle hub, for ever, with a message blaming an admin
+          // who was not there. Reading is also what RELEASES the override
+          // below, so the two are the same act.
+          // Swallowed, deliberately. This runs in a `finally`, and a
+          // rejection here would skip the release below and leave the row
+          // frozen for ever — which is the very incident this override was
+          // rewritten to prevent, restored through the error path. It would
+          // also reject `set`, whose two callers do not await it.
+          await options.reread().catch(() => {})
+          // Asked again: a click DURING the re-read starts another write, and
+          // dropping the override then would flick that one's chips back.
+          if (write.inflight === 0) unpaint(user.id)
+        }
       }
     },
   }

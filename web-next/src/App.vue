@@ -12,11 +12,13 @@ import AppShell from './components/AppShell.vue'
 import Auth from './views/Auth.vue'
 import Boundary from './components/Boundary.vue'
 import Failed from './components/Failed.vue'
+import QueueBar from './components/QueueBar.vue'
 import { awayFrom, boundaryKey, type RouteName } from './domain/routes.ts'
 import { notify } from './composables/notices.ts'
 import { signOut, whoAmI } from './api/session.ts'
 import { useBoot } from './composables/boot.ts'
 import { useLibraries } from './composables/home.ts'
+import { useQueue } from './composables/queue.ts'
 
 const route = useRoute()
 const router = useRouter()
@@ -38,6 +40,12 @@ const libraries = useLibraries(computed(() => phase.value === 'app'))
 const me = computed(() => (phase.value === 'app' ? whoAmI() : { username: '', admin: false }))
 
 const name = computed(() => (route.name ?? 'libraries') as RouteName)
+
+/// The queue lives above the router, because it survives navigation — that is
+/// the whole point of a queue. It is inside the SHELL, though: signing out has
+/// to unmount it while the bearer still works, so its sessions are ended rather
+/// than left for the reaper.
+const queue = useQueue()
 
 /// Which SCREEN the boundary is guarding, which is not the same as the
 /// address: an autoplay handover changes the URL and must not remount.
@@ -124,6 +132,26 @@ async function leave() {
       <RouterView v-slot="{ Component }">
         <component :is="Component" />
       </RouterView>
+    </Boundary>
+
+    <!-- Its OWN boundary, not the route's. The queue survives every navigation,
+         so it has the longest life and the most state to get wrong — and
+         rendering it outside a boundary meant a throw in it was a white page
+         with no header and no way back. `away` drops the queue rather than
+         navigating: the thing that threw is the thing to put down.
+
+         Keyed on the queue's GENERATION, so a caught throw clears when a
+         different record is put on — and not on the entries, because appending
+         to the one playing must not remount it mid-track. -->
+    <Boundary
+      v-if="queue.queue.value.entries.length > 0"
+      :reset-key="`queue:${queue.generation.value}`"
+      away="Put it down"
+      @away="queue.clear()"
+    >
+      <!-- One pair of ears: the video player takes the sound while it is on
+           screen, and the queue resumes when you leave it. -->
+      <QueueBar :paused="name === 'player'" />
     </Boundary>
   </AppShell>
 </template>

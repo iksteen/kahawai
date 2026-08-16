@@ -104,6 +104,17 @@ export function useLibraryItems(library: Ref<string>, query: Ref<string>, sort: 
     for (const chunk of chunks) void load(chunk)
   }
 
+  /// One item's chunk, read again — after something changed it.
+  ///
+  /// A hand-match rewrites the title, the year and the artwork of exactly one
+  /// row, and nothing else on the page has changed: re-reading the library
+  /// would throw away every other chunk that had been scrolled through.
+  function refresh(index: number) {
+    const chunk = Math.floor(index / CHUNK)
+    asked.delete(chunk)
+    void load(chunk)
+  }
+
   /// Everything that failed, asked again — including the very first chunk,
   /// which nothing on screen would ask for, because with no `total` the grid
   /// has reserved nothing and has no visible rows to want.
@@ -140,5 +151,5 @@ export function useLibraryItems(library: Ref<string>, query: Ref<string>, sort: 
     generation += 1
   })
 
-  return { loaded, total, libraryTotal, failure, need, retry }
+  return { loaded, total, libraryTotal, failure, need, refresh, retry }
 }

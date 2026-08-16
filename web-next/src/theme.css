@@ -39,6 +39,13 @@
   --font-sans: system-ui, -apple-system, 'Segoe UI', sans-serif;
 }
 
+/* The tones a `tone` field can name, generated on purpose.
+   `text-${tone}` is a string the scanner cannot see, so these utilities exist
+   today only because some other file happens to spell each of them out — and
+   the day one of those files loses its last literal, a delivery chip goes
+   unstyled with nothing failing. */
+@source inline("text-{teal,sand,warn}");
+
 /* Native controls are dark too. Without this a <select>'s own dropdown, every
    checkbox and the scrollbars all render light on a page that is not, and the
    sort control looks like something from another application. Cheaper and more

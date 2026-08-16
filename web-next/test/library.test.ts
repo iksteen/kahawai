@@ -23,16 +23,22 @@ import { defineComponent, h } from 'vue'
 vi.mock('../src/api/generated/kahawai.ts', () => ({
   listItems: vi.fn(),
   listLibraries: vi.fn(),
+  adminApplyMatch: vi.fn(),
+  adminReviewSearch: vi.fn(),
   getItemArtworkUrl: (id: string) => `/api/v1/items/${id}/artwork`,
 }))
+const admin = { value: false }
+vi.mock('../src/api/session.ts', () => ({ whoAmI: () => ({ username: 'me', admin: admin.value }) }))
 
-const { listItems, listLibraries } = await import('../src/api/generated/kahawai.ts')
+const { adminApplyMatch, adminReviewSearch, listItems, listLibraries } =
+  await import('../src/api/generated/kahawai.ts')
 const { clearNotices, notice } = await import('../src/composables/notices.ts')
 const Library = (await import('../src/views/Library.vue')).default
 const Card = (await import('../src/components/Card.vue')).default
 const { DEBOUNCE_MS, useSearch } = await import('../src/composables/search.ts')
 
-const item = (id: string) => ({ id, title: id, kind: 'movie', played: false }) as ItemRowI64
+const item = (id: string, over: Record<string, unknown> = {}) =>
+  ({ id, title: id, kind: 'movie', played: false, ...over }) as ItemRowI64
 
 /// A card's row, with the fields the card actually reads.
 const row = (over: Record<string, unknown>) =>
@@ -54,13 +60,14 @@ const row = (over: Record<string, unknown>) =>
     ...over,
   }) as never
 
-function hub(total: number, { failing = [] as number[] } = {}) {
+function hub(total: number, over: Record<string, unknown> = {}) {
+  const { failing = [] as number[], ...fields } = over as { failing?: number[] }
   vi.mocked(listItems).mockImplementation(async (params) => {
     const offset = params?.offset ?? 0
     if (failing.includes(offset / CHUNK)) throw new ApiError(503, 'the hub is restarting')
     return {
       items: Array.from({ length: Math.max(0, Math.min(CHUNK, total - offset)) }, (_, n) =>
-        item(`i${offset + n}`),
+        item(`i${offset + n}`, fields),
       ),
       total,
       limit: CHUNK,
@@ -453,5 +460,74 @@ describe('scrolling it', () => {
     expect(wrapper.findAll('li')[0]!.attributes('aria-posinset')).not.toBe('1')
     expect(wrapper.findAll('li').length).toBeGreaterThanOrEqual(before)
     expect(vi.mocked(listItems).mock.calls.map((c) => c[0]?.offset)).toContain(200)
+  })
+})
+
+describe('hand-matching from the grid (HUB-8)', () => {
+  beforeEach(() => {
+    admin.value = true
+    vi.mocked(adminReviewSearch).mockResolvedValue({ candidates: [] } as never)
+    vi.mocked(adminApplyMatch).mockResolvedValue({ ok: true } as never)
+  })
+  afterEach(() => (admin.value = false))
+
+  test('is not offered to somebody who is not an administrator', async () => {
+    admin.value = false
+    const { wrapper } = await grid()
+    expect(wrapper.findAll('[aria-label*="match"]')).toHaveLength(0)
+  })
+
+  test('nor on an episode, which has no identity of its own', async () => {
+    // An episode inherits its show's match; the show is where you would fix it.
+    hub(1, { kind: 'episode' })
+    const { wrapper } = await grid()
+    expect(wrapper.findAll('[aria-label*="match"]')).toHaveLength(0)
+  })
+
+  test('and opens a dialog anchored on the file', async () => {
+    hub(1, { file_title: 'Heat', file_year: 1995 })
+    const { wrapper } = await grid()
+    await wrapper.find('[aria-label*="match"]').trigger('click')
+    await flushPromises()
+    expect(wrapper.find('[role="dialog"]').exists()).toBe(true)
+    expect(adminReviewSearch).toHaveBeenCalledWith(
+      expect.objectContaining({ query: 'Heat', year: 1995 }),
+    )
+  })
+
+  test('closing it without applying re-reads nothing', async () => {
+    hub(1)
+    const { wrapper } = await grid()
+    await wrapper.find('[aria-label*="match"]').trigger('click')
+    await flushPromises()
+    const reads = vi.mocked(listItems).mock.calls.length
+
+    await wrapper.find('[role="dialog"] [aria-label="Close"]').trigger('click')
+    await flushPromises()
+    expect(wrapper.find('[role="dialog"]').exists()).toBe(false)
+    expect(vi.mocked(listItems).mock.calls.length).toBe(reads)
+  })
+
+  test('and applying one re-reads that row’s chunk', async () => {
+    // A match rewrites the title, the year and the artwork of exactly one row.
+    // Re-reading the library would throw away every chunk that had been
+    // scrolled through.
+    hub(1, { match_confidence: 'weak' })
+    vi.mocked(adminReviewSearch).mockResolvedValue({ candidates: [] } as never)
+    const { wrapper } = await grid()
+    await wrapper.find('[aria-label*="match"]').trigger('click')
+    await flushPromises()
+    const reads = vi.mocked(listItems).mock.calls.length
+
+    await wrapper
+      .findAll('[role="dialog"] button')
+      .find((b) => b.text() === 'Confirm current')!
+      .trigger('click')
+    await flushPromises()
+    expect(adminApplyMatch).toHaveBeenCalledWith(
+      'i0',
+      expect.objectContaining({ action: 'confirm' }),
+    )
+    expect(vi.mocked(listItems).mock.calls.length).toBe(reads + 1)
   })
 })

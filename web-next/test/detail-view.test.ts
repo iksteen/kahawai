@@ -15,16 +15,22 @@ vi.mock('../src/api/generated/kahawai.ts', () => ({
   itemQuery: vi.fn(),
   itemChildren: vi.fn(),
   itemSetWatched: vi.fn(),
+  adminItemLog: vi.fn(),
   getItemArtworkUrl: (id: string) => `/api/v1/items/${id}/artwork`,
 }))
+const admin = { value: false }
+vi.mock('../src/api/session.ts', () => ({ whoAmI: () => ({ username: 'me', admin: admin.value }) }))
 vi.mock('../src/api/capabilities.ts', () => ({
   buildProfile: () => ({ containers: ['mp4'] }),
   loadMask: vi.fn(() => ({})),
 }))
 
-const { itemChildren, itemQuery, itemSetWatched } = await import('../src/api/generated/kahawai.ts')
+const { adminItemLog, itemChildren, itemQuery, itemSetWatched } =
+  await import('../src/api/generated/kahawai.ts')
 const { loadMask } = await import('../src/api/capabilities.ts')
 const { notice, clearNotices } = await import('../src/composables/notices.ts')
+const { clearQueue, useQueue } = await import('../src/composables/queue.ts')
+const queue = useQueue()
 const Detail = (await import('../src/views/Detail.vue')).default
 const Season = (await import('../src/views/Season.vue')).default
 
@@ -122,6 +128,7 @@ beforeEach(() => {
   vi.mocked(itemSetWatched).mockResolvedValue({ updated: 1 } as never)
   vi.mocked(loadMask).mockReturnValue({})
   clearNotices()
+  clearQueue()
 })
 afterEach(() => vi.resetAllMocks())
 
@@ -647,20 +654,134 @@ describe('what this item is connected to', () => {
 })
 
 describe('a record', () => {
-  test('lists its tracks, and offers nothing it cannot do yet', async () => {
+  const record = async (tracks = [episode(1, { kind: 'track', title: 'Staying Power' })]) => {
     vi.mocked(itemQuery).mockResolvedValue(
       film({ kind: 'album', id: 'album', title: 'Hot Space', artist: 'Queen' }) as never,
     )
-    vi.mocked(itemChildren).mockResolvedValue({
-      children: [episode(1, { kind: 'track', title: 'Staying Power' })],
-    } as never)
-    const { wrapper } = await open(Detail, '/library/music/item/album')
+    vi.mocked(itemChildren).mockResolvedValue({ children: tracks } as never)
+    return open(Detail, '/library/music/item/album')
+  }
+
+  test('lists its tracks', async () => {
+    const { wrapper } = await record()
     expect(wrapper.text()).toContain('Staying Power')
     expect(wrapper.text()).toContain('1 track')
-    // No dead Play: a disabled control with no reason is indistinguishable
-    // from a broken one.
-    expect(wrapper.findAll('button').some((b) => b.text().includes('Play'))).toBe(false)
-    expect(wrapper.text()).toContain('needs the queue')
+  })
+
+  test('and its two actions are the queue’s, which are different questions', async () => {
+    // Play replaces what is playing; Add does not disturb it.
+    const { wrapper } = await record()
+    await wrapper
+      .findAll('button')
+      .find((b) => b.text().includes('Play'))!
+      .trigger('click')
+    expect(queue.queue.value.entries.map((e) => e.track.title)).toEqual(['Staying Power'])
+
+    await wrapper
+      .findAll('button')
+      .find((b) => b.text() === 'Add to queue')!
+      .trigger('click')
+    expect(queue.queue.value.entries).toHaveLength(2)
+    expect(queue.playing.value?.track.title).toBe('Staying Power')
+  })
+
+  test('and Play REPLACES whatever was queued, which Add never does', async () => {
+    const { wrapper } = await record()
+    queue.appendTrack({ id: 'elsewhere', title: 'Elsewhere' } as never)
+    expect(queue.queue.value.entries).toHaveLength(1)
+
+    await wrapper
+      .findAll('button')
+      .find((b) => b.text().includes('Play'))!
+      .trigger('click')
+    expect(queue.queue.value.entries.map((e) => e.track.title)).toEqual(['Staying Power'])
+  })
+
+  test('neither is offered until there is a track list to act on', async () => {
+    // Both of them ARE the track list; a Play that queues nothing is a broken
+    // control with no reason to give.
+    const { wrapper } = await record([])
+    expect(
+      wrapper
+        .findAll('button')
+        .find((b) => b.text().includes('Play'))!
+        .attributes('disabled'),
+    ).toBeDefined()
+  })
+
+  test('and each reason is SAID, because they are different reasons', async () => {
+    // Absent data and an empty record are not the same thing, and neither of
+    // them is "no". In text as well as in a title: a disabled button is out of
+    // the tab order, so its tooltip is unreachable by exactly the people who
+    // need the sentence.
+    const { wrapper } = await record([])
+    expect(wrapper.text()).toContain('This record has no tracks')
+
+    vi.mocked(itemChildren).mockRejectedValue(new ApiError(500, 'nope'))
+    const failed = await open(Detail, '/library/music/item/album')
+    expect(failed.wrapper.text()).toContain('The track list could not be read')
+    expect(
+      failed.wrapper
+        .findAll('button')
+        .find((b) => b.text().includes('Play'))!
+        .attributes('title'),
+    ).toContain('could not be read')
+  })
+
+  test('and the track list is a section with a name', async () => {
+    const { wrapper } = await record()
+    expect(wrapper.findAll('h2').some((h) => h.text() === 'Tracks')).toBe(true)
+  })
+
+  test('pressing a track plays the RECORD from there', async () => {
+    // The numbered list is the record, and somebody pressing track 4 of nine
+    // means "start here" — not "play this one and stop".
+    const { wrapper } = await record([
+      episode(1, { kind: 'track', title: 'Staying Power' }),
+      episode(2, { kind: 'track', title: 'Dancer' }),
+    ])
+    await wrapper
+      .findAll('button')
+      .find((b) => b.text().includes('Dancer'))!
+      .trigger('click')
+    expect(queue.queue.value.entries).toHaveLength(2)
+    expect(queue.playing.value?.track.title).toBe('Dancer')
+  })
+
+  test('and one track can be added on its own, levelled by itself', async () => {
+    // A single track dropped into a queue wants track gain, so it does not
+    // arrive at a different loudness from its neighbours.
+    const { wrapper } = await record()
+    await wrapper.find('[aria-label^="Add Staying Power"]').trigger('click')
+    expect(queue.queue.value.entries[0]!.gain).toBe('track')
+  })
+
+  test('and nothing on this page is marked while another record is playing', async () => {
+    // By id, not by position: the queue may hold something else entirely, and
+    // reading its index into THIS record's list marks a track nobody is
+    // playing.
+    const { wrapper } = await record([
+      episode(1, { kind: 'track', title: 'Staying Power' }),
+      episode(2, { kind: 'track', title: 'Dancer' }),
+    ])
+    queue.playAlbum([{ id: 'other', title: 'Another Record' } as never])
+    await flushPromises()
+    expect(wrapper.findAll('[aria-current="true"]')).toHaveLength(0)
+  })
+
+  test('and the track playing is marked, wherever the queue got it', async () => {
+    const { wrapper } = await record([
+      episode(1, { kind: 'track', title: 'Staying Power' }),
+      episode(2, { kind: 'track', title: 'Dancer' }),
+    ])
+    await wrapper
+      .findAll('button')
+      .find((b) => b.text().includes('Dancer'))!
+      .trigger('click')
+    await flushPromises()
+    const marked = wrapper.findAll('[aria-current="true"]')
+    expect(marked).toHaveLength(1)
+    expect(marked[0]!.text()).toContain('Dancer')
   })
 
   test('and a track list that failed can be asked for again', async () => {
@@ -892,5 +1013,62 @@ describe('the mark itself', () => {
     await expect(second).resolves.toBe(false)
     settle()
     await first
+  })
+})
+
+describe('the last session for this item (OPS-10)', () => {
+  const withPlan = () =>
+    film({
+      negotiated: {
+        cost: 'copy',
+        mode: 'remux',
+        source: null,
+        streams: { video: 'copy', audio: 'copy' },
+        subtitles: [],
+        target_duration_secs: 6,
+      },
+    })
+
+  beforeEach(() => {
+    admin.value = true
+    vi.mocked(itemQuery).mockResolvedValue(withPlan() as never)
+    vi.mocked(adminItemLog).mockResolvedValue('the log' as never)
+  })
+  afterEach(() => (admin.value = false))
+
+  test('is offered to an administrator, and to nobody else', async () => {
+    // The point is debugging a report from somebody else, after they have
+    // closed the player — so it is on the item rather than on the session.
+    expect((await open(Detail, '/library/films/item/heat')).wrapper.text()).toContain(
+      'Last session log',
+    )
+    admin.value = false
+    expect((await open(Detail, '/library/films/item/heat')).wrapper.text()).not.toContain(
+      'Last session log',
+    )
+  })
+
+  test('and downloading it names the item', async () => {
+    const click = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => {})
+    const { wrapper } = await open(Detail, '/library/films/item/heat')
+    await wrapper
+      .findAll('button')
+      .find((b) => b.text() === 'Last session log')!
+      .trigger('click')
+    await flushPromises()
+    expect(adminItemLog).toHaveBeenCalledWith('heat')
+    expect(click).toHaveBeenCalled()
+    click.mockRestore()
+  })
+
+  test('and one that could not be fetched says so rather than failing silently', async () => {
+    vi.mocked(adminItemLog).mockRejectedValue(new ApiError(404, 'no session for that item'))
+    const { wrapper } = await open(Detail, '/library/films/item/heat')
+    await wrapper
+      .findAll('button')
+      .find((b) => b.text() === 'Last session log')!
+      .trigger('click')
+    await flushPromises()
+    expect(notice.value).toContain('no session for that item')
   })
 })

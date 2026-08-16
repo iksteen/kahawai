@@ -301,3 +301,50 @@ describe('the library’s own size', () => {
     expect(api().total.value).toBeNull()
   })
 })
+
+describe('one row changed underneath', () => {
+  test('re-reads only the chunk it is in', async () => {
+    // A hand-match rewrites the title, the year and the artwork of exactly one
+    // row. Re-reading the library would throw away every other chunk that had
+    // been scrolled through.
+    const { api } = driven()
+    await flushPromises()
+    api().need([1, 2])
+    await flushPromises()
+    const reads = vi.mocked(listItems).mock.calls.length
+
+    api().refresh(CHUNK + 5)
+    await flushPromises()
+    expect(vi.mocked(listItems).mock.calls.length).toBe(reads + 1)
+    expect(vi.mocked(listItems).mock.calls.at(-1)![0]).toMatchObject({ offset: CHUNK })
+  })
+
+  test('and asking again is the only thing that would', async () => {
+    // `need` deliberately declines a chunk it has already asked for, which is
+    // what stops the scroll handler re-fetching on every frame — so a refresh
+    // that only calls it changes nothing at all.
+    const { api } = driven()
+    await flushPromises()
+    const reads = vi.mocked(listItems).mock.calls.length
+    api().need([0])
+    await flushPromises()
+    expect(vi.mocked(listItems).mock.calls.length).toBe(reads)
+  })
+
+  test('and the refreshed rows replace the old ones without clearing the rest', async () => {
+    const { api } = driven()
+    await flushPromises()
+    api().need([1])
+    await flushPromises()
+    vi.mocked(listItems).mockImplementation(async (params) => ({
+      items: [item('matched')],
+      total: 1000,
+      limit: CHUNK,
+      offset: params?.offset ?? 0,
+    }))
+    api().refresh(CHUNK)
+    await flushPromises()
+    expect(api().loaded.value.get(CHUNK)?.id).toBe('matched')
+    expect(api().loaded.value.get(0)?.id).toBe('i0')
+  })
+})

@@ -395,8 +395,8 @@ composables → components → view → review → commit.
 | 8 | Library grid — **DONE** | virtualised, fixed cell height (UI-11), `srcset` at both densities (UI-16) |
 | 9 | Detail + Season — **DONE** | error split: a refused Play is not a failed item load (UI-13) |
 | 10 | Settings — **DONE** | drag ordering with keyboard equivalents (UI-12), per-key write queue |
-| 11 | Admin | optimistic writes with rollback throughout; B5; **and the match button**, which is a library-grid control but the only surface that reads `match_confidence`; **and OPS-10's per-item session log**, which needs an authenticated download |
-| 12 | Album queue | survives navigation; per-track removal (UI-2); **and the album page's two actions**, which are queue operations and are absent until it exists |
+| 11 | Admin — **DONE** | optimistic writes with rollback throughout; B5; the match button, a library-grid control but the only surface that reads `match_confidence`; OPS-10's per-item and per-session logs, both authenticated downloads |
+| 12 | Album queue — **DONE** | survives navigation; per-track removal (UI-2); the album page's two actions, which are queue operations and were absent until it existed |
 | 13 | Video player | largest and last; see below. **Plus the subtitle panel** (HUB-21/24) and the capability debug panel, which both need `resolveTracks`/`pickSubtitle` from here |
 | 14 | Accessibility pass | UI-17: keyboard-only run and a screen reader, which has never happened |
 
@@ -529,12 +529,185 @@ The cross-library search panel and the virtualised library grid.
   is a `var()`, however it is written, so "the placeholder is the same height
   as the card" is checked by its class and by eye, not by its value.
 
-**Deferred, not lost:** the admin match button. It is a library-grid control,
-but it is the only surface anywhere that reads `match_confidence` — a library
-without it is a library where nothing looks wrong — so it goes with the rest of
-the admin surfaces in phase 11. Whoever ports it needs two things the new code
-does not show: the cell needs `position: relative`, and the button's offset is
-17px rather than 16, because 16 misses its two sibling badges by a pixel.
+**Deferred, not lost — and landed in phase 11:** the admin match button. It is
+a library-grid control, but it is the only surface anywhere that reads
+`match_confidence` — a library without it is a library where nothing looks
+wrong — so it went with the rest of the admin surfaces.
+
+### What phase 12 landed
+
+The music dock: a queue that outlives every page, gapless handover between
+tracks (HUB-19), ReplayGain, per-track removal (UI-2), and the record page's
+two actions.
+
+- **Where it is mounted is the design.** Inside the shell and outside the
+  router: it survives navigation, which is the whole point of a queue, and it
+  must unmount when the session ends while the bearer still works — its
+  teardown DELETEs two sessions, and an unauthenticated one leaks a slot. It
+  has its OWN error boundary, because it has the longest life and the most
+  state to get wrong, and a throw in it outside one was a white page with no
+  header and no way back. That boundary is keyed on a GENERATION rather than on
+  the first track: putting the same record on again produces the same first
+  track, so a caught throw stayed caught and Play did nothing at all, silently.
+- **Two elements, not one.** Preparing the next track once the current one ends
+  costs a session start plus a buffer fill — audible on every boundary, worst
+  on a record mixed to run continuously. The idle element holds the next
+  track's session and buffers it; `ended` is a `play()` on something already
+  loaded.
+- **Every session is claimed by its TRACK, never by its index.** Index 5 of one
+  record counted as a match for index 5 of the next, so the dock went on
+  playing the album you had left.
+- **The refusal ladder is gone**, and this is the phase that proves the backend
+  gap was worth closing: the old queue counted attempts and gave up after
+  three, because 409 meant both "no sources, ever" and "too many streams,
+  close one". `unplayable` (409) and `session_cap` (429) are now distinct, so
+  `retry` in `api/errors.ts` decides it — a stream cap is waited out for as
+  long as it takes, and an unplayable track stops asking at once.
+- **A retry per slot, armed by the failure that needs it.** The old client
+  re-armed one shared effect through a counter, because an identical error
+  string is not a state change any dependency can see. Vue's reactivity does
+  not need the counter, and each failure scheduling its own timer is what the
+  counter was standing in for.
+- **What the tests could not otherwise tell apart.** Four mutations survived
+  the first pass and each named a real hole: counting session starts cannot
+  distinguish "handed over to a dead slot" from "restarted it", so the audible
+  ELEMENT is what is asserted; a playhead already at 42 seconds cannot show
+  that it was restored, so the element is reset first; and two of the four were
+  the harness lying — a mutation that left unbalanced braces reads as
+  "survived" unless the runner is asked whether it ran at all.
+- **The dock must be unmounted between tests.** The queue is at module scope on
+  purpose, so a dock left mounted by an earlier test goes on reacting to the
+  next test's record and starts sessions for it.
+
+Reviewed in a clean context before this commit, and it found the following.
+
+- **The ceiling on asking again came back, split by code.** Dropping the old
+  three-try ladder was right for `unplayable`, and wrong for the two conditions
+  that can be permanent: a 500 is the hub answering that it failed, and a
+  `session_cap` can be one this very queue is holding — it takes two sessions,
+  so with a low enough per-user cap the album's warm slot is refused by the
+  album's own active one and the condition can NEVER clear. Unbounded, that tab
+  posted a session start every five seconds for as long as it was open.
+  `startCeiling` in `domain/recovery.ts` is the rule: no ceiling for weather, a
+  minute for the cap, three for a 500.
+- **One keepalive clock per slot.** Rebuilding both pings whenever either
+  session changed reset the AUDIBLE slot's stall counter every time a preload
+  landed, so a paused queue with a retrying preload beside it bought itself a
+  fresh half hour indefinitely — which is the whole thing `IDLE_LIMIT_MS`
+  exists to stop.
+- **An element whose `src` attribute is REMOVED is not defined to stop.** Both
+  `<audio>` elements always exist now — that is what stops the gapless handover
+  swapping to one Vue has just created — so releasing a session takes the
+  attribute off an element that may still be playing. The media load algorithm
+  runs when `src` is set or changed, not when it goes away. `release` pauses it.
+- **A suspended AudioContext had no way back.** Both elements feed it, so while
+  it is suspended there is no sound at all; the reference retried `resume()` on
+  every render and the port retried it only when a session changed.
+- **The bottom reserve is conditional and generous again.** A flat 88px against
+  a bar that wraps to two rows at 375px, and grows another when it has an error
+  to show: the last row of a page sat under it, and its buttons hit-tested to
+  the dock.
+
+**Four guards in `QueueBar.vue` are unreachable and stay.** The loser check's
+`|| slots[which].session`, the handover's key comparison, `arm`'s
+`clearTimeout` and `onEnded`'s `release(finished)` all restate an invariant
+something else already maintains — the claim, the orphan watcher, the call
+graph. Each encodes an ordering between a watcher, an interval and a DOM event
+that the function holding it does not control, and each one being wrong costs a
+leaked session against a per-user cap of four. They are recorded here rather
+than deleted, and the mutation sweep is expected to survive them.
+
+**A blind spot worth stating:** happy-dom has no Web Audio and does not act on
+the `autoplay` attribute. The first is stubbed, so the gain node, the
+once-per-element wiring and the factor are covered; the second is not, so two
+recovery tests play the element by hand where a browser would have done it, and
+say so.
+
+### What phase 11 landed
+
+The operator's panel — the fleet, the composer, the providers, the accounts and
+the sessions — plus the two surfaces that are admin controls living elsewhere:
+hand-matching from the library grid (HUB-8) and the per-item session log
+(OPS-10).
+
+Reviewed in a clean context before this commit, which found twenty-one things.
+The ones worth keeping in writing:
+
+- **An optimistic override nobody released.** The view owned the overlay and
+  `useGrants` only ever wrote to it, so from the first grant click a row was
+  frozen until a reload: another admin narrowing that account changed nothing
+  on screen. The version override starved the `stale_write` re-read of the
+  fresher version that is the entire point of it, so every later click on that
+  row was refused for ever, on an idle hub, blaming an admin who was not there.
+  The overlay now belongs to the state machine that knows when a write is
+  outstanding, and the re-read that releases it runs BEFORE the release — the
+  row underneath predates the write, so dropping it first flicks the chips back
+  for the rest of the polling interval.
+- **A `Failed` that could not render.** `loaded` asked whether any query was
+  still pending; a query that has ERRORED is not pending either, so the panel's
+  only Try again was behind a condition that could never hold at the same time
+  as an error. `api/query.ts` justifies its three-attempt cap with "every
+  screen offers Try again"; this one did not.
+- **Empty states that lied.** Six separate reads mean one can fail while the
+  others are fine — and each accessor fell back to `[]`, so a 503 on
+  `adminSessions` rendered "Nobody is playing anything" as a statement. Each
+  section now asks whether ITS read failed.
+- **`act` waited for six requests.** Everything after a mutation — clearing the
+  form, disarming the confirmation, saying what happened — was behind a full
+  re-read, so on a slow hub the create form kept its values with Create still
+  live, one Enter from creating the account twice.
+- **A confirmation that threw focus away.** Swapping the Delete button for a
+  question destroys the focused element: focus falls to `body` and a screen
+  reader is told nothing. One button whose LABEL changes keeps both. The
+  library delete was not armed at all, and it is the most destructive of the
+  three — it cascades every grant, and re-creating the library mints a new id.
+- **Disable on a mediahost.** The hub takes the flag for any satellite and only
+  transcoder placement reads it, so draining a mediahost gave a 204, a
+  persisted flag, and a host still serving every byte.
+- **Chips disabled for the round trip.** The `SerialQueue` exists so a second
+  click is ORDERED behind the first; disabling swallowed it instead, and took
+  the just-pressed button out of the tab order with nothing announcing why.
+- **The refusal ladder is gone.** The queue used to count attempts and give up
+  after three, because the hub said 409 both for "no sources, ever" and for
+  "too many streams, close one". `unplayable` (409) and `session_cap` (429) are
+  now distinct codes, so `retry` in `api/errors.ts` answers it for every
+  request in the app and `startRetry` does not exist here. (A CEILING came back
+  in phase 12 for the two conditions that can be permanent — see below.)
+
+Reviewed a second time after the rework, which found eight more. The ones worth
+keeping in writing:
+
+- **HUB-11's hint channel was missing entirely.** The panel was polling at
+  fifteen seconds where the old one pushed at 250 ms, and nothing recorded the
+  loss. `composables/hints.ts` is the one place the plan promised: it filters on
+  the hint's KIND, because a scan emits one every five hundred files and can
+  change only two of the six reads — every one of them used to re-read the
+  accounts and the provider credentials as well.
+- **A re-read that threw froze the row for ever.** The release of the
+  optimistic override sits behind an `await` in a `finally`; a rejection there
+  skipped it, which is the same incident this phase was reworked to fix,
+  restored through the error path — and it rejected a promise neither caller
+  awaits.
+- **The attach menu kept the row that had just been refused.** It is a menu, not
+  a value: leaving the picked collection selected shows one that is not
+  attached, and the operator cannot re-pick it to try again.
+- **Two presses of Disable sent the same value twice.** The row does not move
+  until the re-read lands, so "disable — no wait, enable" was silently one
+  write. It reads a per-satellite override now, the same shape the grants use.
+- **The match dialog's search raced, and Escape stopped at the backdrop.** The
+  grid an operator clicks is the one they are looking at, and clicking it
+  applies a match; and clicking any prose in the dialog puts the focus on
+  `<body>`, where a handler bound to the dialog's subtree never sees the key.
+- **Downloading a log went through `act`.** That is for writes: it re-reads all
+  six lists and clears the last refusal on success, so a read-only download
+  wiped an error the operator had not read.
+- **Three disabled controls explained themselves only in a `title`.** A
+  disabled button is out of the tab order, so the sentence was in the one place
+  a keyboard or screen-reader user can never reach it. Two say it in text now
+  and one is `aria-disabled` and inert.
+- **The tabs pattern: focus follows the selection.** The panel is focusable but
+  NOT focused — focusing it took the focus off the tab the arrow keys had just
+  moved to, which is the opposite of what a roving tablist promises.
 
 ### What phases 9 and 10 landed
 

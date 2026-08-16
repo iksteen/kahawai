@@ -34,12 +34,16 @@ import {
   seLabel,
   watchedPct,
 } from '../domain/label.ts'
+import { adminItemLog } from '../api/generated/kahawai.ts'
 import { notify } from '../composables/notices.ts'
 import { loadMask } from '../api/capabilities.ts'
 import { maskSummary } from '../domain/capability-mask.ts'
 import { sentence } from '../domain/refusal.ts'
+import { saveAs } from '../api/download.ts'
 import { seasonSegment } from '../domain/routes.ts'
+import { whoAmI } from '../api/session.ts'
 import { useChildren, useItem, useWatched } from '../composables/item.ts'
+import { useQueue } from '../composables/queue.ts'
 
 const route = useRoute()
 const router = useRouter()
@@ -85,6 +89,40 @@ const best = computed(() => works.value[0]?.parts[0])
 
 /// What the stored capability mask changes, if anything.
 const masked = maskSummary(loadMask())
+
+/// OPS-10: the LAST session for this item, whoever played it.
+///
+/// The point is debugging a report from somebody else, after they have closed
+/// the player — so it is on the item, not on the session, and it is here
+/// rather than in the admin panel because this is the page you are on when
+/// somebody says "this one would not play".
+const me = whoAmI()
+
+/// A record's actions are the queue's. `playAlbum` replaces what is playing and
+/// `appendAlbum` does not — both are what somebody asked for, and neither is
+/// the other.
+const queue = useQueue()
+const tracks = computed(() => children.data.value ?? [])
+/// Which track of THIS record is playing, so the list can mark it. By id: the
+/// queue may hold another record entirely.
+const nowPlaying = computed(() => queue.playing.value?.track.id ?? null)
+
+/// Why the two actions cannot be pressed, or '' when they can. Said out loud
+/// as well as in a title: a disabled button is out of the tab order, so its
+/// tooltip is unreachable by exactly the people who need the sentence.
+const whyNoTracks = computed(() => {
+  if (tracks.value.length) return ''
+  if (children.isError.value) return 'The track list could not be read.'
+  if (children.isPending.value) return 'Still reading the track list…'
+  return 'This record has no tracks.'
+})
+async function itemLog() {
+  try {
+    saveAs(`item-${id.value}.log`, await adminItemLog(id.value))
+  } catch (cause) {
+    notify(`Could not download the session log: ${sentence(cause)}`)
+  }
+}
 
 /// A re-ask that failed under a page that is still standing. Not the screen:
 /// what is on it is a moment out of date, not wrong.
@@ -180,12 +218,25 @@ function markSeason(season: number | null, played: boolean) {
         </template>
       </template>
 
-      <!-- An album's actions are the queue's, and the queue arrives in phase
-           12. Nothing is offered here rather than a Play that cannot work: a
-           disabled control with no reason is indistinguishable from a broken
-           one, and this one would have no reason to give. -->
+      <!-- A record's two actions. Both are queue operations, and they are
+           different questions: Play replaces what is playing, Add does not
+           disturb it. Neither is offered while the track list is still coming,
+           because both of them ARE the track list. -->
       <template v-else-if="item.kind === 'album'">
-        <span class="text-dim">Playing a record needs the queue, which is not built yet.</span>
+        <!-- A disabled control must SAY why. Absent data and an empty record
+             are different reasons, and neither of them is "no". -->
+        <Btn :disabled="!tracks.length" :title="whyNoTracks" @click="queue.playAlbum(tracks)">
+          ▶ Play
+        </Btn>
+        <Btn
+          ghost
+          :disabled="!tracks.length"
+          :title="whyNoTracks"
+          @click="queue.appendAlbum(tracks)"
+        >
+          Add to queue
+        </Btn>
+        <span v-if="whyNoTracks" class="text-dim">{{ whyNoTracks }}</span>
       </template>
 
       <template v-else>
@@ -314,9 +365,12 @@ function markSeason(season: number | null, played: boolean) {
       </section>
     </template>
 
-    <!-- A record's track list. Read-only until the queue exists: pressing a
-         track plays the record from there, which is a queue operation. -->
+    <!-- A record's track list. Pressing a track plays the RECORD from there,
+         rather than that track alone: the numbered list is the record, and
+         somebody pressing track 4 of nine means "start here". Adding one track
+         on its own is the other button, and it levels by its own gain. -->
     <template v-else-if="item.kind === 'album'">
+      <h2 class="mb-2 text-[14px] font-[650] tracking-[0.08em] text-dim uppercase">Tracks</h2>
       <div v-if="children.isError.value" class="flex items-center gap-3">
         <p class="m-0 text-warn" role="alert">
           Could not load the track list: {{ sentence(children.error.value) }}
@@ -328,17 +382,37 @@ function markSeason(season: number | null, played: boolean) {
       </p>
       <ul v-else class="flex flex-col">
         <li
-          v-for="(track, at) in children.data.value ?? []"
+          v-for="(track, at) in tracks"
           :key="track.id"
-          class="flex items-center gap-3 border-b border-hairline py-1.5 last:border-0"
+          class="flex items-center gap-3 border-b border-hairline last:border-0"
+          :class="track.id === nowPlaying && 'text-teal'"
         >
-          <span class="w-8 shrink-0 text-right font-mono text-[12px] text-dim">
-            {{ track.episode ?? at + 1 }}
-          </span>
-          <span class="flex-1 truncate">{{ track.title }}</span>
+          <button
+            class="flex flex-1 cursor-pointer items-center gap-3 py-1.5 text-left hover:text-teal"
+            type="button"
+            :aria-current="track.id === nowPlaying ? 'true' : undefined"
+            :title="`Play this record from ${track.title}`"
+            @click="queue.playAlbum(tracks, at)"
+          >
+            <!-- The playing row is marked rather than numbered: which one it is
+                 matters more than where it sits. -->
+            <span class="w-8 shrink-0 text-right font-mono text-[12px] text-dim">
+              {{ track.id === nowPlaying ? '▶' : (track.episode ?? at + 1) }}
+            </span>
+            <span class="flex-1 truncate">{{ track.title }}</span>
+          </button>
           <span v-if="track.played" class="flex text-teal" title="played">
             <Icon name="check" :size="13" />
           </span>
+          <button
+            class="cursor-pointer px-2 py-1.5 font-mono text-[11px] text-dim hover:text-teal"
+            type="button"
+            :aria-label="`Add ${track.title} to the queue`"
+            title="Add to the queue"
+            @click="queue.appendTrack(track)"
+          >
+            +
+          </button>
         </li>
       </ul>
     </template>
@@ -405,6 +479,11 @@ function markSeason(season: number | null, played: boolean) {
                 — {{ planRow(row.verdict).why }}
               </span>
             </span>
+          </div>
+          <!-- OPS-10, and only for an admin: what the hub recorded about the
+               last session for this item, whoever played it. -->
+          <div v-if="me.admin" class="mt-2 border-t border-hairline pt-2">
+            <Btn ghost small @click="itemLog">Last session log</Btn>
           </div>
         </div>
       </section>

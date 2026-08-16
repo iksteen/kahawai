@@ -18,6 +18,7 @@ import { targetOf } from '../domain/label.ts'
 import { notice } from '../composables/notices.ts'
 import { moveHighlight, SEARCH_LIST_ID, searchOptionId } from '../domain/search-nav.ts'
 import { useSearch } from '../composables/search.ts'
+import { useQueue } from '../composables/queue.ts'
 import { useSearchPanel } from '../composables/search-panel.ts'
 
 const props = defineProps<{
@@ -26,6 +27,11 @@ const props = defineProps<{
   admin: boolean
 }>()
 const emit = defineEmits<{ signOut: [] }>()
+
+/// Whether the music dock is up, which is the only thing that covers the
+/// bottom of the page.
+const queue = useQueue()
+const playing = computed(() => queue.queue.value.entries.length > 0)
 
 const route = useRoute()
 const router = useRouter()
@@ -146,7 +152,17 @@ function go(to: Parameters<typeof router.push>[0], fresh: boolean) {
 </script>
 
 <template>
-  <div class="mx-auto max-w-[1200px] px-[clamp(14px,4vw,32px)] pb-22">
+  <!-- The bottom reserve is CONDITIONAL and generous. Measured on an album at
+       375×720, scrolled fully down: the last two tracks sat under the dock and
+       their play and add buttons hit-tested to it — four controls with no way
+       to reach them. Generous rather than exact, because the bar wraps to two
+       rows at that width and grows another when it has an error to show; and
+       conditional, because a page with nothing playing should not pay for a
+       bar that is not there. -->
+  <div
+    class="mx-auto max-w-[1200px] px-[clamp(14px,4vw,32px)]"
+    :class="playing ? 'pb-[170px]' : 'pb-8'"
+  >
     <!-- Wraps rather than crushes: on a narrow screen the search box drops to
          its own line at full width instead of shrinking to something no title
          fits in. -->
