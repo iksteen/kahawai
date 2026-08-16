@@ -117,6 +117,25 @@ const RESTART_GIVEUP_MS = 25_000
 /// retries but never stops asking, so unbounded this polls a hub that has gone
 /// away for as long as the tab is open.
 const NET_RESTART_LIMIT = 5
+/// The same, for a fatal MEDIA error. `recoverMediaError()` tears the
+/// MediaSource down and builds a new one, so a stream hls.js cannot append at
+/// all is a loop that re-attaches several times a second, for ever: no
+/// picture, no message, and a control bar that rebuilds itself under the
+/// pointer. Three is enough for the case the call is FOR — a decoder that
+/// wedged once on a bad splice — and short enough that a stream which will
+/// never append says so.
+const MEDIA_RECOVER_LIMIT = 3
+/// And the budget refills on TIME, not on a buffered segment.
+///
+/// The network budget refills on `FRAG_BUFFERED`, which is right for it: a
+/// segment arriving means the link is back. It is wrong here. A stream whose
+/// first segment can never be appended still buffers the ones after it, so
+/// every failure was followed by a success that put the budget back — three
+/// recoveries, refill, three more, for as long as the tab stayed open. What
+/// distinguishes a decoder that wedged once from one that cannot play this
+/// stream at all is not whether anything buffered, it is whether the failures
+/// keep coming.
+const MEDIA_RECOVER_WINDOW_MS = 30_000
 /// How often to ask whether the host is back.
 const STANDBY_RETRY_MS = 5000
 
@@ -191,6 +210,8 @@ let seekGen = 0
 /// How many times hls.js has been told to start loading again after a fatal
 /// network error, reset whenever a segment actually arrives.
 let netRestarts = 0
+let mediaRecoveries = 0
+let lastMediaRecovery = 0
 /// Why the last start failed, quoted if the next one fails at the same point.
 let lastFailure = ''
 /// True once this player is gone: a restart that lands after that produced a
@@ -703,6 +724,18 @@ function attach(gen = 0) {
         netRestarts += 1
         engine.startLoad()
       } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+        // Budgeted, like the network case above and for the same reason:
+        // hls.js never stops asking. A stream it cannot append — one whose
+        // first segment carries no parameter sets, say — answered every
+        // failure with a fresh MediaSource and never told anybody.
+        const now = performance.now()
+        if (now - lastMediaRecovery > MEDIA_RECOVER_WINDOW_MS) mediaRecoveries = 0
+        lastMediaRecovery = now
+        if (mediaRecoveries >= MEDIA_RECOVER_LIMIT) {
+          giveUp(`This will not play in the browser — ${data.details}.`)
+          return
+        }
+        mediaRecoveries += 1
         engine.recoverMediaError()
       } else {
         void recover()
@@ -1013,6 +1046,27 @@ watch(
   (mode) => {
     if (mode === 'full' && !document.fullscreenElement) void box.value?.requestFullscreen?.()
     if (mode !== 'full' && document.fullscreenElement) void document.exitFullscreen?.()
+  },
+)
+
+/// A player that has given up must let go of its session.
+///
+/// The keepalive pings for as long as the picture is mounted, and that ping is
+/// what holds the session: giving up paused the picture and said so, and then
+/// went on telling the hub the session was in use. Nothing was watching it and
+/// nothing ever would be — the way out is the play button, and `onPlay`
+/// answers that with `recover`, which starts a FRESH session. So four failed
+/// attempts filled a viewer's whole allowance and the fifth was refused for
+/// concurrency, with four abandoned pipelines still pacing behind it.
+///
+/// `keepalive: true` because this can also run as the tab goes.
+watch(
+  () => health.value.dead,
+  (dead) => {
+    if (!dead) return
+    stopPinging?.()
+    stopPinging = undefined
+    void endSession(props.session.session_id, { keepalive: true }).catch(() => {})
   },
 )
 

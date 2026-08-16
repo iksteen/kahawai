@@ -75,7 +75,10 @@ class FakeHls {
   startLoad() {
     this.started += 1
   }
-  recoverMediaError() {}
+  recovered = 0
+  recoverMediaError() {
+    this.recovered += 1
+  }
   destroy() {
     this.destroyed = true
   }
@@ -619,6 +622,84 @@ describe('a fatal network error', () => {
     engine.fail({ fatal: true, type: 'networkError', details: 'fragLoadError' })
     await flushPromises()
     expect(engine.started).toBe(6)
+  })
+})
+
+describe('a fatal media error', () => {
+  test('is answered by rebuilding the decoder, a few times', async () => {
+    // What the call is for: a decoder that wedged once on a bad splice.
+    const { engine } = await watching()
+    engine.fail({ fatal: true, type: 'mediaError', details: 'bufferAppendError' })
+    engine.fail({ fatal: true, type: 'mediaError', details: 'bufferAppendError' })
+    await flushPromises()
+    expect(engine.recovered).toBe(2)
+  })
+
+  test('and then says so, rather than rebuilding it for ever', async () => {
+    // `recoverMediaError()` tears the MediaSource down and builds another, so
+    // a stream hls.js cannot append AT ALL — one whose first segment carries no
+    // parameter sets — was a loop several times a second: no picture, no
+    // message, and a control bar rebuilding itself under the pointer. The
+    // network branch beside it has had a budget all along; this one had none.
+    const { wrapper, engine } = await watching()
+    for (let n = 0; n < 8; n++) {
+      engine.fail({ fatal: true, type: 'mediaError', details: 'bufferAppendError' })
+    }
+    await flushPromises()
+    expect(engine.recovered).toBe(3)
+    expect(wrapper.find('[aria-live="polite"]').text()).toContain('will not play')
+    // The reason is in the sentence: "it did not work" sends nobody anywhere.
+    expect(wrapper.find('[aria-live="polite"]').text()).toContain('bufferAppendError')
+  })
+
+  test('and a segment arriving does NOT refill the budget', async () => {
+    // The network budget refills on a buffered segment, which is right for it:
+    // a segment arriving means the link is back. Here it let the loop run for
+    // ever — a stream whose FIRST segment can never be appended still buffers
+    // the ones after it, so every failure was followed by a success that put
+    // the budget back. Measured against the live hub: 70 MediaSources in
+    // fourteen seconds, with the budget in place.
+    const { engine } = await watching()
+    for (let n = 0; n < 3; n++) {
+      engine.fail({ fatal: true, type: 'mediaError', details: 'bufferAppendError' })
+    }
+    engine.handlers.get('fragBuffered')?.('fragBuffered', {})
+    engine.fail({ fatal: true, type: 'mediaError', details: 'bufferAppendError' })
+    await flushPromises()
+    expect(engine.recovered).toBe(3)
+  })
+
+  test('and giving up lets the session go', async () => {
+    // The keepalive ping is what holds a session, and it runs for as long as
+    // the picture is mounted. Giving up paused the picture and said so, then
+    // went on telling the hub the session was in use — nothing was watching it
+    // and nothing would be, because the way out is the play button and that
+    // starts a fresh one. Four failed attempts filled a viewer's allowance.
+    const { engine } = await watching()
+    vi.mocked(api.endSession).mockClear()
+    for (let n = 0; n < 8; n++) {
+      engine.fail({ fatal: true, type: 'mediaError', details: 'bufferAppendError' })
+    }
+    await flushPromises()
+    expect(vi.mocked(api.endSession).mock.calls.map((c) => c[0])).toEqual(['s1'])
+  })
+
+  test('and time refills it, so one glitch an hour is not a budget spent', async () => {
+    const now = vi.spyOn(performance, 'now')
+    try {
+      now.mockReturnValue(0)
+      const { engine } = await watching()
+      for (let n = 0; n < 3; n++) {
+        engine.fail({ fatal: true, type: 'mediaError', details: 'bufferAppendError' })
+      }
+      // Well past the window: this is a fresh incident, not the same one.
+      now.mockReturnValue(60_000)
+      engine.fail({ fatal: true, type: 'mediaError', details: 'bufferAppendError' })
+      await flushPromises()
+      expect(engine.recovered).toBe(4)
+    } finally {
+      now.mockRestore()
+    }
   })
 })
 
