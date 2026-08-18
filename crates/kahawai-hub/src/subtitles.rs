@@ -1110,7 +1110,7 @@ impl Subtitles {
         parent_id: i64,
         user_id: &str,
         sets_wait: std::time::Duration,
-    ) -> Result<i64> {
+    ) -> Result<Option<i64>> {
         // One generation per parent at a time: the idle sweep and the
         // button race here, and losing the race means the work is
         // already done — return the winner's row instead of redoing it.
@@ -1126,7 +1126,7 @@ impl Subtitles {
         .fetch_optional(registry.db())
         .await?
         {
-            return Ok(id);
+            return Ok(Some(id));
         }
         let parent = crate::tracks::get_internal(registry.db(), parent_id)
             .await?
@@ -1160,6 +1160,26 @@ impl Subtitles {
             move || crate::ocr::ocr_sets_file(&sets, &model)
         })
         .await??;
+        if cues.is_empty() {
+            // An ANSWER, remembered: a signs-only or decorative track OCRs
+            // to nothing every time, and treating that as a failure made
+            // the idle sweep re-fetch the sets and re-run Tesseract on
+            // every hub start. CASCADE on the parent row re-asks when the
+            // source is replaced.
+            sqlx::query(
+                "INSERT INTO ocr_no_text (track_id, model, at)
+                 VALUES (?, ?, unixepoch())
+                 ON CONFLICT(track_id) DO UPDATE SET model = excluded.model,
+                                                     at = excluded.at",
+            )
+            .bind(parent_id)
+            .bind(&model)
+            .execute(registry.db())
+            .await?;
+            tracing::info!(item = %parent.item_id, parent = parent_id, %model,
+                "image subtitle OCRed to nothing; recorded so it is not asked again");
+            return Ok(None);
+        }
         let n_cues = cues.len();
         let ex = Extracted { cues, ass: None };
 
@@ -1180,7 +1200,7 @@ impl Subtitles {
         std::fs::write(self.downloaded_path(id), serde_json::to_vec(&ex)?)?;
         tracing::info!(item = %parent.item_id, parent = parent_id, track = id,
             %model, cues = n_cues, "image subtitle OCRed to text");
-        Ok(id)
+        Ok(Some(id))
     }
 
     /// HUB-32c idle sweep: OCR every image subtitle track in the library
@@ -1261,7 +1281,10 @@ impl Subtitles {
                         .ocr_generate_within(&registry, id, "idle-sweep", SETS_WAIT_IDLE)
                         .await
                     {
-                        Ok(_) => generated += 1,
+                        Ok(Some(_)) => generated += 1,
+                        // No text is an answer and it is now recorded;
+                        // the next candidates query no longer offers it.
+                        Ok(None) => {}
                         Err(e) => {
                             tracing::warn!(track = id, item = %track.item_id,
                                 error = format!("{e:#}"), "idle OCR failed; skipping this run");
@@ -1290,6 +1313,8 @@ impl Subtitles {
                AND NOT EXISTS (
                      SELECT 1 FROM subtitle_tracks d
                      WHERE d.derived_from = t.id AND d.origin = 'ocr')
+               AND NOT EXISTS (
+                     SELECT 1 FROM ocr_no_text n WHERE n.track_id = t.id)
              ORDER BY COALESCE((SELECT MIN(fb.item_id) FROM file_bindings fb
                                  WHERE fb.file_id=f.id),''), t.id",
         )
@@ -1870,6 +1895,51 @@ async fn read_all(lease: crate::leases::Lease) -> Result<Vec<u8>> {
         if got < CHUNK {
             return Ok(out);
         }
+    }
+}
+
+#[cfg(all(test, feature = "ocr"))]
+mod ocr_memory_tests {
+    use std::sync::Arc;
+
+    /// "OCR produced no text" is an answer, not weather: once recorded,
+    /// the idle sweep must stop offering the track — before this memory
+    /// existed, a signs-only track re-fetched its display sets and ran
+    /// Tesseract again on every hub start, for ever.
+    #[tokio::test]
+    async fn a_track_that_ocred_to_nothing_is_not_asked_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::open(dir.path()).await.unwrap();
+        sqlx::raw_sql(
+            "INSERT INTO collections(module_id,collection_id,media_type)
+               VALUES('m','c','series');
+             INSERT INTO items(id,kind,title,norm_title,sort_title,module_id,collection_id)
+               VALUES('e1','episode','One','one','one','m','c');
+             INSERT INTO files(module_id,collection_id,path_rel,size,mtime_unix,
+                               head_xxh3,tail_xxh3,oshash,streams_json)
+               VALUES('m','c','e1.mkv',10,1,0,0,0,'{}');
+             -- Embedded tracks carry ONLY source_id (migration 54).
+             INSERT INTO subtitle_tracks(source_id,origin,format,language,stream_index)
+               SELECT id,'embedded','pgs','en',0 FROM files;",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        let registry = Arc::new(crate::registry::Registry::new(db, Default::default()));
+        let subs = super::Subtitles::new(tempfile::tempdir().unwrap().keep());
+
+        let offered = subs.ocr_candidates(&registry).await;
+        assert_eq!(offered.len(), 1, "the image track is the sweep's work");
+
+        sqlx::query("INSERT INTO ocr_no_text (track_id, model, at) VALUES (?, 'eng', unixepoch())")
+            .bind(offered[0])
+            .execute(registry.db())
+            .await
+            .unwrap();
+        assert!(
+            subs.ocr_candidates(&registry).await.is_empty(),
+            "a remembered empty answer is not re-asked"
+        );
     }
 }
 

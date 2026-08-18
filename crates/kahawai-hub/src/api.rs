@@ -1562,11 +1562,6 @@ async fn subtitle_download(
     Ok(Json(SubtitleDownloadResponse { track_id, quota }))
 }
 
-/// HUB-32c: OCR an image subtitle track (embedded or VobSub sidecar)
-/// into a text track. Synchronous — a feature film OCRs in ~30 s and
-/// the caller is a human who pressed a button; the result is cached,
-/// so it runs once per track. Feature-gated: without `ocr` the route
-/// answers with what is missing rather than 404.
 /// Remove a DOWNLOADED track, as its creator or an admin. Anything
 /// else — a cache, a scan-owned row, someone else's download — refuses
 /// with 404-shaped `removed: false`.

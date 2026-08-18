@@ -158,7 +158,8 @@ pub fn ocr_sets_file(sets: &std::path::Path, model: &str) -> Result<Vec<Cue>> {
             text,
         });
     }
-    anyhow::ensure!(!cues.is_empty(), "OCR produced no text");
+    // Empty is an ANSWER (a signs-only or decorative track), not an
+    // error: the caller records it so the question is not asked again.
     Ok(cues)
 }
 

@@ -9,7 +9,7 @@
     },
     "version": "0.0.0-dev"
   },
-  "x-kahawai-source-sha256": "2b9db104942c89542ddcd0fb27db418b40ba9821d236ab78ced3ab6c1de3a0c6",
+  "x-kahawai-source-sha256": "ce02c76bc5d1fe01582f10b8f13300cbbbcb89609aa5512879dfbeac756b1283",
   "paths": {
     "/admin/v1/collections": {
       "get": {
@@ -5733,7 +5733,7 @@
         "tags": [
           "Subtitles"
         ],
-        "summary": "HUB-32c: OCR an image subtitle track (embedded or VobSub sidecar)\ninto a text track. Synchronous — a feature film OCRs in ~30 s and\nthe caller is a human who pressed a button; the result is cached,\nso it runs once per track. Feature-gated: without `ocr` the route\nanswers with what is missing rather than 404.\nRemove a DOWNLOADED track, as its creator or an admin. Anything\nelse — a cache, a scan-owned row, someone else's download — refuses\nwith 404-shaped `removed: false`.",
+        "summary": "Remove a DOWNLOADED track, as its creator or an admin. Anything\nelse — a cache, a scan-owned row, someone else's download — refuses\nwith 404-shaped `removed: false`.",
         "operationId": "subtitle_delete",
         "parameters": [
           {
