@@ -9,7 +9,7 @@
     },
     "version": "0.0.0-dev"
   },
-  "x-kahawai-source-sha256": "b4df214a4ac701e352fd97ae1398c54eb6c0cb6c2e32e9b07c886c3aa5c42ebd",
+  "x-kahawai-source-sha256": "930cf1290948614a02eec30350c62c3aa6c083230f57fe8c0a1c19de16179f79",
   "paths": {
     "/admin/v1/collections": {
       "get": {
@@ -80,7 +80,7 @@
           "Admin enrichment"
         ],
         "summary": "Get enrichment status",
-        "description": "Returns the current state of the metadata enricher, including whether a\nrun is in progress. Admin only.",
+        "description": "Admin only. Returns the current state of the metadata enricher, including\nwhether a run is in progress.",
         "operationId": "admin_enrich_status",
         "responses": {
           "200": {
@@ -132,7 +132,7 @@
           "Admin enrichment"
         ],
         "summary": "Start an enrichment run",
-        "description": "Starts a metadata enrichment run in the background and responds\nimmediately with started true. Admin only. Poll GET /admin/v1/enrich for\nprogress.",
+        "description": "Admin only. Starts a metadata enrichment run in the background and\nresponds immediately with started true. Poll GET /admin/v1/enrich for\nprogress.",
         "operationId": "admin_enrich_run",
         "responses": {
           "200": {
@@ -186,7 +186,7 @@
           "Admin enrichment"
         ],
         "summary": "List items needing match review",
-        "description": "Returns movies, shows and albums whose metadata match is a miss, weak or\nrejected, with the current guess where there is one. Admin only. Episodes\nand tracks are excluded because they inherit their parent's match.",
+        "description": "Admin only. Returns movies, shows and albums whose metadata match is a\nmiss, weak or rejected, with the current guess where there is one.\nEpisodes and tracks are excluded because they inherit their parent's\nmatch.",
         "operationId": "admin_review_list",
         "responses": {
           "200": {
@@ -249,7 +249,7 @@
           "Admin enrichment"
         ],
         "summary": "Search metadata candidates",
-        "description": "Searches the metadata providers for candidates matching a title, kind and\noptional year, for use when manually matching an item. Admin only. Supply\nitem to bias ranking toward the provider owning that item's identity\nspace.",
+        "description": "Admin only. Searches the metadata providers for candidates matching a\ntitle, kind and optional year, for use when manually matching an item.\nSupply item to bias ranking toward the provider owning that item's\nidentity space.",
         "operationId": "admin_review_search",
         "requestBody": {
           "content": {
@@ -352,7 +352,7 @@
           "Admin"
         ],
         "summary": "List pending satellite enrollments",
-        "description": "Lists satellite enrollments awaiting approval, with each entry's CSR\nfingerprint, module type, module id and name. Admin only; returns 503\nbefore the hub has an administrator.",
+        "description": "Admin only. Lists satellite enrollments awaiting approval, with each\nentry's CSR fingerprint, module type, module id and name. Returns 503\nbefore the hub has an administrator.",
         "operationId": "admin_enrollments",
         "responses": {
           "200": {
@@ -406,7 +406,7 @@
           "Admin"
         ],
         "summary": "Approve a pending satellite enrollment",
-        "description": "Approves a pending enrollment by its code, signing the satellite's\ncertificate and recording the satellite. Admin only; returns 404 when no\npending enrollment matches the code.",
+        "description": "Admin only. Approves a pending enrollment by its code, signing the\nsatellite's certificate and recording the satellite. Returns 404 when no\npending enrollment matches the code.",
         "operationId": "admin_approve",
         "requestBody": {
           "content": {
@@ -620,7 +620,7 @@
           "Admin enrichment"
         ],
         "summary": "Apply a match decision to an item",
-        "description": "Applies action pick, confirm or reject to the item's metadata match. Admin\nonly. pick requires provider and candidate with an id; any other action,\nor a missing field, returns 400. Picked and confirmed matches are pinned\nagainst automatic re-matching.",
+        "description": "Admin only. Applies action pick, confirm or reject to the item's metadata\nmatch. A pick requires provider and candidate with an id; any other\naction, or a missing field, returns 400. Picked and confirmed matches are\npinned against automatic re-matching.",
         "operationId": "admin_apply_match",
         "parameters": [
           {
@@ -1219,7 +1219,7 @@
           "Admin libraries"
         ],
         "summary": "Refresh a library",
-        "description": "Sends a scan request to the mediahost of every collection in the library\nand returns how many were asked and how many were offline. Admin only.\nPass deep=true to re-probe every file. Returns 404 if the library has no\ncollections.",
+        "description": "Admin only. Sends a scan request to the mediahost of every collection in\nthe library and returns how many were asked and how many were offline.\nPass deep=true to re-probe every file. Returns 404 if the library has no\ncollections.",
         "operationId": "admin_refresh_library",
         "parameters": [
           {
@@ -1320,7 +1320,7 @@
           "Admin providers"
         ],
         "summary": "Metadata provider configuration",
-        "description": "Reports whether TMDB, TVDB and AniDB credentials are configured, plus the\neffective and default provider chain for each media type. Admin only.",
+        "description": "Admin only. Reports whether TMDB, TVDB and AniDB credentials are\nconfigured, plus the effective and default provider chain for each media\ntype.",
         "operationId": "admin_providers",
         "responses": {
           "200": {
@@ -1383,7 +1383,7 @@
           "Admin providers"
         ],
         "summary": "Set AniDB credentials",
-        "description": "Stores the AniDB username, password and optional UDP API key, then\nattempts a login. Admin only. A failed login still returns 200 with saved\ntrue and verified false plus the error; a successful one starts an\nenrichment run.",
+        "description": "Admin only. Stores the AniDB username, password and optional UDP API key,\nthen attempts a login. A failed login still returns 200 with saved true\nand verified false plus the error; a successful one starts an enrichment\nrun.",
         "operationId": "admin_set_anidb",
         "requestBody": {
           "content": {
@@ -1485,7 +1485,7 @@
           "Admin providers"
         ],
         "summary": "Verify stored AniDB credentials",
-        "description": "Re-validates the AniDB credentials already stored on the hub by logging\nin, without resending them. Admin only; a failed login returns 200 with\nverified false and an error message, while 503 means no AniDB account is\nconfigured.",
+        "description": "Admin only. Re-validates the AniDB credentials already stored on the hub\nby logging in, without resending them. A failed login returns 200 with\nverified false and an error message, while 503 means no AniDB account is\nconfigured.",
         "operationId": "admin_verify_anidb",
         "responses": {
           "200": {
@@ -1548,7 +1548,7 @@
           "Admin providers"
         ],
         "summary": "Set provider order for a media type",
-        "description": "Sets the provider precedence order for one media type and re-merges\nmetadata from stored answers without contacting any provider. Admin only;\nthe order must be a permutation of that media type's providers or the call\nreturns 400.",
+        "description": "Admin only. Sets the provider precedence order for one media type and\nre-merges metadata from stored answers without contacting any provider.\nThe order must be a permutation of that media type's providers or the call\nreturns 400.",
         "operationId": "admin_set_chain",
         "parameters": [
           {
@@ -1660,7 +1660,7 @@
           "Admin providers"
         ],
         "summary": "Set TMDB credentials",
-        "description": "Stores the TMDB API key and starts an enrichment run in the background.\nAdmin only. An empty api_key is rejected with 400.",
+        "description": "Admin only. Stores the TMDB API key and starts an enrichment run in the\nbackground. An empty api_key is rejected with 400.",
         "operationId": "admin_set_tmdb",
         "requestBody": {
           "content": {
@@ -1762,7 +1762,7 @@
           "Admin providers"
         ],
         "summary": "Set TVDB credentials",
-        "description": "Stores the TVDB API key and optional subscriber PIN, then starts an\nenrichment run in the background. Admin only. An empty api_key is rejected\nwith 400.",
+        "description": "Admin only. Stores the TVDB API key and optional subscriber PIN, then\nstarts an enrichment run in the background. An empty api_key is rejected\nwith 400.",
         "operationId": "admin_set_tvdb",
         "requestBody": {
           "content": {
@@ -2508,7 +2508,7 @@
           "Admin users"
         ],
         "summary": "List users",
-        "description": "Returns every account with its admin flag and the libraries it may see.\nAdmin only.",
+        "description": "Admin only. Returns every account with its admin flag and the libraries it\nmay see.",
         "operationId": "admin_users",
         "responses": {
           "200": {
@@ -2569,7 +2569,7 @@
           "Admin users"
         ],
         "summary": "Create a user",
-        "description": "Creates an account with a username, password and optional admin flag,\nreturning its id. Admin only. A taken username returns 409; a username or\npassword that breaks the credential policy returns 400 naming the rule.",
+        "description": "Admin only. Creates an account with a username, password and optional\nadmin flag, returning its id. A taken username returns 409; a username or\npassword that breaks the credential policy returns 400 naming the rule.",
         "operationId": "admin_create_user",
         "requestBody": {
           "content": {
@@ -2782,7 +2782,7 @@
           "Admin users"
         ],
         "summary": "Promote or demote a user",
-        "description": "Sets the account's admin flag, leaving its library grants untouched, and\nrevokes the account's existing tokens so the change applies to the next\nrequest. Admin only. Demoting the last admin returns 409 last_admin.",
+        "description": "Admin only. Sets the account's admin flag, leaving its library grants\nuntouched, and revokes the account's existing tokens so the change applies\nto the next request. Demoting the last admin returns 409 last_admin.",
         "operationId": "admin_set_user_admin",
         "parameters": [
           {
@@ -2913,7 +2913,7 @@
           "Admin users"
         ],
         "summary": "Replace a user's library access",
-        "description": "Replaces the account's library grants wholesale and returns what was\nstored along with the new grants_version. Admin only. Send the\ngrants_version you read; a stale one returns 409 stale_write. Running\nsessions are unaffected.",
+        "description": "Admin only. Replaces the account's library grants wholesale and returns\nwhat was stored along with the new grants_version. Send the grants_version\nyou read; a stale one returns 409 stale_write. Running sessions are\nunaffected.",
         "operationId": "admin_set_user_libraries",
         "parameters": [
           {

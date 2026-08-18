@@ -1307,8 +1307,8 @@ async fn require_admin(req: Request, next: Next) -> Result<Response, ApiError> {
 
 /// List pending satellite enrollments
 ///
-/// Lists satellite enrollments awaiting approval, with each entry's CSR
-/// fingerprint, module type, module id and name. Admin only; returns 503
+/// Admin only. Lists satellite enrollments awaiting approval, with each
+/// entry's CSR fingerprint, module type, module id and name. Returns 503
 /// before the hub has an administrator.
 #[utoipa::path(
     get, path = "/admin/v1/enrollments", tag = "Admin",
@@ -1342,8 +1342,8 @@ struct ApproveRequest {
 
 /// Approve a pending satellite enrollment
 ///
-/// Approves a pending enrollment by its code, signing the satellite's
-/// certificate and recording the satellite. Admin only; returns 404 when no
+/// Admin only. Approves a pending enrollment by its code, signing the
+/// satellite's certificate and recording the satellite. Returns 404 when no
 /// pending enrollment matches the code.
 #[utoipa::path(
     post, path = "/admin/v1/enrollments/approve", tag = "Admin",
@@ -1386,8 +1386,9 @@ async fn admin_approve(
 
 /// Metadata provider configuration
 ///
-/// Reports whether TMDB, TVDB and AniDB credentials are configured, plus the
-/// effective and default provider chain for each media type. Admin only.
+/// Admin only. Reports whether TMDB, TVDB and AniDB credentials are
+/// configured, plus the effective and default provider chain for each media
+/// type.
 #[utoipa::path(
     get, path = "/admin/v1/providers", tag = "Admin providers",
     security(("bearer_auth" = [])),
@@ -1449,9 +1450,9 @@ struct SetChain {
 
 /// Set provider order for a media type
 ///
-/// Sets the provider precedence order for one media type and re-merges
-/// metadata from stored answers without contacting any provider. Admin only;
-/// the order must be a permutation of that media type's providers or the call
+/// Admin only. Sets the provider precedence order for one media type and
+/// re-merges metadata from stored answers without contacting any provider.
+/// The order must be a permutation of that media type's providers or the call
 /// returns 400.
 #[utoipa::path(
     post, path = "/admin/v1/providers/chains/{media_type}", tag = "Admin providers",
@@ -1622,8 +1623,8 @@ async fn subtitle_delete(
 
 /// Verify stored AniDB credentials
 ///
-/// Re-validates the AniDB credentials already stored on the hub by logging
-/// in, without resending them. Admin only; a failed login returns 200 with
+/// Admin only. Re-validates the AniDB credentials already stored on the hub
+/// by logging in, without resending them. A failed login returns 200 with
 /// verified false and an error message, while 503 means no AniDB account is
 /// configured.
 #[utoipa::path(
@@ -1699,10 +1700,10 @@ struct SetAnidb {
 
 /// Set AniDB credentials
 ///
-/// Stores the AniDB username, password and optional UDP API key, then
-/// attempts a login. Admin only. A failed login still returns 200 with saved
-/// true and verified false plus the error; a successful one starts an
-/// enrichment run.
+/// Admin only. Stores the AniDB username, password and optional UDP API key,
+/// then attempts a login. A failed login still returns 200 with saved true
+/// and verified false plus the error; a successful one starts an enrichment
+/// run.
 #[utoipa::path(
     post, path = "/admin/v1/providers/anidb", tag = "Admin providers",
     security(("bearer_auth" = [])),
@@ -1792,8 +1793,8 @@ struct SetTvdb {
 
 /// Set TVDB credentials
 ///
-/// Stores the TVDB API key and optional subscriber PIN, then starts an
-/// enrichment run in the background. Admin only. An empty api_key is rejected
+/// Admin only. Stores the TVDB API key and optional subscriber PIN, then
+/// starts an enrichment run in the background. An empty api_key is rejected
 /// with 400.
 #[utoipa::path(
     post, path = "/admin/v1/providers/tvdb", tag = "Admin providers",
@@ -1853,8 +1854,8 @@ struct SetTmdb {
 
 /// Set TMDB credentials
 ///
-/// Stores the TMDB API key and starts an enrichment run in the background.
-/// Admin only. An empty api_key is rejected with 400.
+/// Admin only. Stores the TMDB API key and starts an enrichment run in the
+/// background. An empty api_key is rejected with 400.
 #[utoipa::path(
     post, path = "/admin/v1/providers/tmdb", tag = "Admin providers",
     security(("bearer_auth" = [])),
@@ -1902,8 +1903,8 @@ async fn admin_set_tmdb(
 
 /// Get enrichment status
 ///
-/// Returns the current state of the metadata enricher, including whether a
-/// run is in progress. Admin only.
+/// Admin only. Returns the current state of the metadata enricher, including
+/// whether a run is in progress.
 #[utoipa::path(
     get, path = "/admin/v1/enrich", tag = "Admin enrichment",
     security(("bearer_auth" = [])),
@@ -1920,8 +1921,8 @@ async fn admin_enrich_status(State(state): State<AppState>) -> Json<crate::enric
 
 /// Start an enrichment run
 ///
-/// Starts a metadata enrichment run in the background and responds
-/// immediately with started true. Admin only. Poll GET /admin/v1/enrich for
+/// Admin only. Starts a metadata enrichment run in the background and
+/// responds immediately with started true. Poll GET /admin/v1/enrich for
 /// progress.
 #[utoipa::path(
     post, path = "/admin/v1/enrich", tag = "Admin enrichment",
@@ -1954,8 +1955,8 @@ struct RefreshQuery {
 
 /// Refresh a library
 ///
-/// Sends a scan request to the mediahost of every collection in the library
-/// and returns how many were asked and how many were offline. Admin only.
+/// Admin only. Sends a scan request to the mediahost of every collection in
+/// the library and returns how many were asked and how many were offline.
 /// Pass deep=true to re-probe every file. Returns 404 if the library has no
 /// collections.
 #[utoipa::path(
@@ -2024,9 +2025,10 @@ async fn request_scan(state: &AppState, module_id: &str, collection_id: &str) ->
 
 /// List items needing match review
 ///
-/// Returns movies, shows and albums whose metadata match is a miss, weak or
-/// rejected, with the current guess where there is one. Admin only. Episodes
-/// and tracks are excluded because they inherit their parent's match.
+/// Admin only. Returns movies, shows and albums whose metadata match is a
+/// miss, weak or rejected, with the current guess where there is one.
+/// Episodes and tracks are excluded because they inherit their parent's
+/// match.
 #[utoipa::path(
     get, path = "/admin/v1/enrich/review", tag = "Admin enrichment",
     security(("bearer_auth" = [])),
@@ -2086,10 +2088,10 @@ struct ReviewSearch {
 
 /// Search metadata candidates
 ///
-/// Searches the metadata providers for candidates matching a title, kind and
-/// optional year, for use when manually matching an item. Admin only. Supply
-/// item to bias ranking toward the provider owning that item's identity
-/// space.
+/// Admin only. Searches the metadata providers for candidates matching a
+/// title, kind and optional year, for use when manually matching an item.
+/// Supply item to bias ranking toward the provider owning that item's
+/// identity space.
 #[utoipa::path(
     post, path = "/admin/v1/enrich/search", tag = "Admin enrichment",
     security(("bearer_auth" = [])),
@@ -2135,10 +2137,10 @@ struct ApplyMatch {
 
 /// Apply a match decision to an item
 ///
-/// Applies action pick, confirm or reject to the item's metadata match. Admin
-/// only. pick requires provider and candidate with an id; any other action,
-/// or a missing field, returns 400. Picked and confirmed matches are pinned
-/// against automatic re-matching.
+/// Admin only. Applies action pick, confirm or reject to the item's metadata
+/// match. A pick requires provider and candidate with an id; any other
+/// action, or a missing field, returns 400. Picked and confirmed matches are
+/// pinned against automatic re-matching.
 #[utoipa::path(
     post, path = "/admin/v1/items/{id}/match", tag = "Admin enrichment",
     security(("bearer_auth" = [])),
@@ -2221,8 +2223,8 @@ async fn admin_apply_match(
 
 /// List users
 ///
-/// Returns every account with its admin flag and the libraries it may see.
-/// Admin only.
+/// Admin only. Returns every account with its admin flag and the libraries it
+/// may see.
 #[utoipa::path(
     get, path = "/admin/v1/users", tag = "Admin users",
     security(("bearer_auth" = [])),
@@ -2260,10 +2262,10 @@ struct SetAccess {
 
 /// Replace a user's library access
 ///
-/// Replaces the account's library grants wholesale and returns what was
-/// stored along with the new grants_version. Admin only. Send the
-/// grants_version you read; a stale one returns 409 stale_write. Running
-/// sessions are unaffected.
+/// Admin only. Replaces the account's library grants wholesale and returns
+/// what was stored along with the new grants_version. Send the grants_version
+/// you read; a stale one returns 409 stale_write. Running sessions are
+/// unaffected.
 // Wholesale and idempotent so two admins toggling different checkboxes
 // cannot interleave into a set neither chose; the response echoes what
 // was stored, so a dropped stale library id is visible.
@@ -2328,9 +2330,9 @@ struct SetAdminBody {
 
 /// Promote or demote a user
 ///
-/// Sets the account's admin flag, leaving its library grants untouched, and
-/// revokes the account's existing tokens so the change applies to the next
-/// request. Admin only. Demoting the last admin returns 409 last_admin.
+/// Admin only. Sets the account's admin flag, leaving its library grants
+/// untouched, and revokes the account's existing tokens so the change applies
+/// to the next request. Demoting the last admin returns 409 last_admin.
 #[utoipa::path(
     put, path = "/admin/v1/users/{id}/admin", tag = "Admin users",
     security(("bearer_auth" = [])),
@@ -2386,8 +2388,8 @@ struct CreateUser {
 
 /// Create a user
 ///
-/// Creates an account with a username, password and optional admin flag,
-/// returning its id. Admin only. A taken username returns 409; a username or
+/// Admin only. Creates an account with a username, password and optional
+/// admin flag, returning its id. A taken username returns 409; a username or
 /// password that breaks the credential policy returns 400 naming the rule.
 #[utoipa::path(
     post, path = "/admin/v1/users", tag = "Admin users",
