@@ -9,13 +9,15 @@
     },
     "version": "0.0.0-dev"
   },
-  "x-kahawai-source-sha256": "27f7e5157a238dc1b12c6435bd5330cd3e9d7fd67f9716ebe121f8408c8100b6",
+  "x-kahawai-source-sha256": "ef18702f8e1b61c6af6adfd77874d9583052020b7d1c349c1aacbdae276d9567",
   "paths": {
     "/admin/v1/collections": {
       "get": {
         "tags": [
           "Admin libraries"
         ],
+        "summary": "List collections",
+        "description": "Admin only. Returns every collection known to the hub across all\nsatellites, whether or not it is attached to a library.",
         "operationId": "admin_collections",
         "responses": {
           "200": {
@@ -77,6 +79,8 @@
         "tags": [
           "Admin enrichment"
         ],
+        "summary": "Get enrichment status",
+        "description": "Returns the current state of the metadata enricher, including whether a\nrun is in progress. Admin only.",
         "operationId": "admin_enrich_status",
         "responses": {
           "200": {
@@ -127,6 +131,8 @@
         "tags": [
           "Admin enrichment"
         ],
+        "summary": "Start an enrichment run",
+        "description": "Starts a metadata enrichment run in the background and responds\nimmediately with started true. Admin only. Poll GET /admin/v1/enrich for\nprogress.",
         "operationId": "admin_enrich_run",
         "responses": {
           "200": {
@@ -179,7 +185,8 @@
         "tags": [
           "Admin enrichment"
         ],
-        "summary": "HUB-8 review queue: everything not matched confidently — misses,\nweak matches (with their current guess for confirm/reject), and\nrejected items.",
+        "summary": "List items needing match review",
+        "description": "Returns movies, shows and albums whose metadata match is a miss, weak or\nrejected, with the current guess where there is one. Admin only. Episodes\nand tracks are excluded because they inherit their parent's match.",
         "operationId": "admin_review_list",
         "responses": {
           "200": {
@@ -241,6 +248,8 @@
         "tags": [
           "Admin enrichment"
         ],
+        "summary": "Search metadata candidates",
+        "description": "Searches the metadata providers for candidates matching a title, kind and\noptional year, for use when manually matching an item. Admin only. Supply\nitem to bias ranking toward the provider owning that item's identity\nspace.",
         "operationId": "admin_review_search",
         "requestBody": {
           "content": {
@@ -342,6 +351,8 @@
         "tags": [
           "Admin"
         ],
+        "summary": "List pending satellite enrollments",
+        "description": "Lists satellite enrollments awaiting approval, with each entry's CSR\nfingerprint, module type, module id and name. Admin only; returns 503\nbefore the hub has an administrator.",
         "operationId": "admin_enrollments",
         "responses": {
           "200": {
@@ -394,6 +405,8 @@
         "tags": [
           "Admin"
         ],
+        "summary": "Approve a pending satellite enrollment",
+        "description": "Approves a pending enrollment by its code, signing the satellite's\ncertificate and recording the satellite. Admin only; returns 404 when no\npending enrollment matches the code.",
         "operationId": "admin_approve",
         "requestBody": {
           "content": {
@@ -507,7 +520,8 @@
         "tags": [
           "Admin sessions"
         ],
-        "summary": "The newest bundle for an item, whoever played it.",
+        "summary": "Download newest session log for an item",
+        "description": "Admin only. Returns the most recent session diagnostics recorded for the\nitem, by any user, as a plain-text attachment. Returns 404 when no such\nlog has been stored.",
         "operationId": "admin_item_log",
         "parameters": [
           {
@@ -605,6 +619,8 @@
         "tags": [
           "Admin enrichment"
         ],
+        "summary": "Apply a match decision to an item",
+        "description": "Applies action pick, confirm or reject to the item's metadata match. Admin\nonly. pick requires provider and candidate with an id; any other action,\nor a missing field, returns 400. Picked and confirmed matches are pinned\nagainst automatic re-matching.",
         "operationId": "admin_apply_match",
         "parameters": [
           {
@@ -715,7 +731,8 @@
         "tags": [
           "Admin libraries"
         ],
-        "summary": "Admin drain toggle: placement skips a disabled satellite; running\nsessions finish on their own.",
+        "summary": "List libraries",
+        "description": "Admin only. Returns every library with its administrative overview data.",
         "operationId": "admin_libraries",
         "responses": {
           "200": {
@@ -775,6 +792,8 @@
         "tags": [
           "Admin libraries"
         ],
+        "summary": "Create a library",
+        "description": "Admin only. Creates a library with the given name and media type and\nreturns its id. Returns 400 for an empty name or unknown media type, and\n409 when the name is already taken.",
         "operationId": "admin_create_library",
         "requestBody": {
           "content": {
@@ -885,6 +904,8 @@
         "tags": [
           "Admin libraries"
         ],
+        "summary": "Delete a library",
+        "description": "Admin only. Deletes the library and returns 204 on success, or 404 when no\nlibrary has that id.",
         "operationId": "admin_delete_library",
         "parameters": [
           {
@@ -969,6 +990,8 @@
         "tags": [
           "Admin libraries"
         ],
+        "summary": "Attach a collection to a library",
+        "description": "Admin only. Attaches the given satellite collection to the library and\nreturns 204. Returns 404 when the library or collection is unknown, and\n409 when their media types do not match.",
         "operationId": "admin_attach_collection",
         "parameters": [
           {
@@ -1093,6 +1116,8 @@
         "tags": [
           "Admin libraries"
         ],
+        "summary": "Detach a collection from a library",
+        "description": "Admin only. Detaches the collection from the library and returns 204, or\n404 when that collection is not attached to it.",
         "operationId": "admin_detach_collection",
         "parameters": [
           {
@@ -1193,7 +1218,8 @@
         "tags": [
           "Admin libraries"
         ],
-        "summary": "HUB-35: granular refresh. The admin-facing unit is the LIBRARY —\nfan out collection-scoped scan requests to each member collection's\nmediahost. There is deliberately no global rescan.",
+        "summary": "Refresh a library",
+        "description": "Sends a scan request to the mediahost of every collection in the library\nand returns how many were asked and how many were offline. Admin only.\nPass deep=true to re-probe every file. Returns 404 if the library has no\ncollections.",
         "operationId": "admin_refresh_library",
         "parameters": [
           {
@@ -1293,6 +1319,8 @@
         "tags": [
           "Admin providers"
         ],
+        "summary": "Metadata provider configuration",
+        "description": "Reports whether TMDB, TVDB and AniDB credentials are configured, plus the\neffective and default provider chain for each media type. Admin only.",
         "operationId": "admin_providers",
         "responses": {
           "200": {
@@ -1354,7 +1382,8 @@
         "tags": [
           "Admin providers"
         ],
-        "summary": "AniDB account for the UDP FILE-by-ED2K gold path (HUB-30). The\nclient identity (\"kahawai\" v1) is compiled in; only the account is\nconfiguration. Optional UDP API key upgrades to an encrypted session.",
+        "summary": "Set AniDB credentials",
+        "description": "Stores the AniDB username, password and optional UDP API key, then\nattempts a login. Admin only. A failed login still returns 200 with saved\ntrue and verified false plus the error; a successful one starts an\nenrichment run.",
         "operationId": "admin_set_anidb",
         "requestBody": {
           "content": {
@@ -1455,7 +1484,8 @@
         "tags": [
           "Admin providers"
         ],
-        "summary": "Re-validate the STORED AniDB credentials (no resend needed).",
+        "summary": "Verify stored AniDB credentials",
+        "description": "Re-validates the AniDB credentials already stored on the hub by logging\nin, without resending them. Admin only; a failed login returns 200 with\nverified false and an error message, while 503 means no AniDB account is\nconfigured.",
         "operationId": "admin_verify_anidb",
         "responses": {
           "200": {
@@ -1517,7 +1547,8 @@
         "tags": [
           "Admin providers"
         ],
-        "summary": "HUB-5: reorder a media type's providers. Precedence is per field, so\nthis decides who wins where two providers both have an answer — and\nit re-merges from stored answers, sending no provider a request.",
+        "summary": "Set provider order for a media type",
+        "description": "Sets the provider precedence order for one media type and re-merges\nmetadata from stored answers without contacting any provider. Admin only;\nthe order must be a permutation of that media type's providers or the call\nreturns 400.",
         "operationId": "admin_set_chain",
         "parameters": [
           {
@@ -1628,6 +1659,8 @@
         "tags": [
           "Admin providers"
         ],
+        "summary": "Set TMDB credentials",
+        "description": "Stores the TMDB API key and starts an enrichment run in the background.\nAdmin only. An empty api_key is rejected with 400.",
         "operationId": "admin_set_tmdb",
         "requestBody": {
           "content": {
@@ -1728,6 +1761,8 @@
         "tags": [
           "Admin providers"
         ],
+        "summary": "Set TVDB credentials",
+        "description": "Stores the TVDB API key and optional subscriber PIN, then starts an\nenrichment run in the background. Admin only. An empty api_key is rejected\nwith 400.",
         "operationId": "admin_set_tvdb",
         "requestBody": {
           "content": {
@@ -1828,6 +1863,8 @@
         "tags": [
           "Admin satellites"
         ],
+        "summary": "List registered satellites",
+        "description": "Admin only. Returns an overview of every registered satellite, including\nthe hub's in-process mediahost.",
         "operationId": "admin_satellites",
         "responses": {
           "200": {
@@ -1889,7 +1926,8 @@
         "tags": [
           "Admin satellites"
         ],
-        "summary": "SEC-6/HUB-20: allowlist removal + end sessions + cascade. Refusal of\nreconnection happens at the TLS layer (fingerprint no longer admitted).",
+        "summary": "Remove a satellite",
+        "description": "Admin only. Removes the satellite from the allowlist, ends its sessions\nand deletes orphaned subtitle payloads. Returns 409 for the in-process\nmediahost and 404 for an unknown id.",
         "operationId": "admin_delete_satellite",
         "parameters": [
           {
@@ -1989,6 +2027,8 @@
         "tags": [
           "Admin satellites"
         ],
+        "summary": "Set satellite placement state",
+        "description": "Admin only. Marks a satellite disabled or enabled for session placement\nand returns 204. Disabling only stops new placements; sessions already\nrunning on it continue.",
         "operationId": "admin_set_disabled",
         "parameters": [
           {
@@ -2094,7 +2134,8 @@
         "tags": [
           "Admin segments"
         ],
-        "summary": "What the intro detector is doing, and which seasons it has still to look at.",
+        "summary": "Intro detector status",
+        "description": "Admin only. Returns the intro detector's counters together with up to 50\nseasons still awaiting analysis.",
         "operationId": "admin_segments_status",
         "responses": {
           "200": {
@@ -2154,7 +2195,8 @@
         "tags": [
           "Admin segments"
         ],
-        "summary": "Start analysing the next season waiting, now, rather than when the sweep\nreaches it. The analysis is DETACHED: axum drops a handler future the\nmoment the client disconnects, and this one used to run the season inside\nthe request — a proxy timeout then cancelled it mid-way, threw away the\nfinished-but-unstored result, left the status flag saying running for\never, and released the one-at-a-time lock while the orphaned blocking\ntask was still reading the byte plane. The season the caller started is\nnobody's to cancel but the hub's.",
+        "summary": "Analyse the next pending season",
+        "description": "Admin only. Picks the next season awaiting intro detection and analyses it\nin the background, responding immediately with the season chosen. Returns\n409 when segment detection is disabled.",
         "operationId": "admin_segments_run",
         "responses": {
           "200": {
@@ -2226,6 +2268,8 @@
         "tags": [
           "Admin sessions"
         ],
+        "summary": "List active playback sessions",
+        "description": "Admin only. Returns every live session with its user, item title, playback\nmode, satellite, idle time and, once negotiated, its stream and delivery\ncost summary.",
         "operationId": "admin_sessions",
         "responses": {
           "200": {
@@ -2287,6 +2331,8 @@
         "tags": [
           "Admin sessions"
         ],
+        "summary": "End a playback session",
+        "description": "Admin only. Ends the session and returns 204, or 404 when no session with\nthat id is active.",
         "operationId": "admin_end_session",
         "parameters": [
           {
@@ -2362,7 +2408,8 @@
         "tags": [
           "Admin sessions"
         ],
-        "summary": "OPS-10: a session's diagnostics, as an attachment. A live session is\ncollected on the spot; an ended one is served from what teardown\nstored, which is the case that matters — nobody presses a button on\na session they already closed.",
+        "summary": "Download session diagnostics log",
+        "description": "Admin only. Returns the session's diagnostics as a plain-text attachment.\nReturns 404 when no log exists and 503 when the satellite holding the log\nis not answering.",
         "operationId": "admin_session_log",
         "parameters": [
           {
@@ -2460,7 +2507,8 @@
         "tags": [
           "Admin users"
         ],
-        "summary": "HUB-10: the accounts and what each may see (HUB-26 users panel).",
+        "summary": "List users",
+        "description": "Returns every account with its admin flag and the libraries it may see.\nAdmin only.",
         "operationId": "admin_users",
         "responses": {
           "200": {
@@ -2520,6 +2568,8 @@
         "tags": [
           "Admin users"
         ],
+        "summary": "Create a user",
+        "description": "Creates an account with a username, password and optional admin flag,\nreturning its id. Admin only. A taken username returns 409; a username or\npassword that breaks the credential policy returns 400 naming the rule.",
         "operationId": "admin_create_user",
         "requestBody": {
           "content": {
@@ -2630,8 +2680,8 @@
         "tags": [
           "Admin users"
         ],
-        "summary": "HUB-10: remove an account. Sessions first — a stream outliving its\nowner has nobody left to stop it — then the rows.",
-        "description": "What survives on purpose: subtitles this user downloaded. They are\nattached to the item, not to the person who fetched them.",
+        "summary": "Delete a user account",
+        "description": "Admin only. Deletes the user and ends their playback sessions, returning\nthe deleted id, username and session count. Returns 409 when deleting\nyourself or the last remaining admin.",
         "operationId": "admin_delete_user",
         "parameters": [
           {
@@ -2731,8 +2781,8 @@
         "tags": [
           "Admin users"
         ],
-        "summary": "HUB-10: promote or demote an account.",
-        "description": "Grants are untouched. A demoted admin falls back to whatever its\n`user_libraries` rows already said, which is what the panel then shows.\nAUTH-3 increments the account's durable access generation in the same write,\nso even a self-demotion takes effect on the next request; the last-admin\npredicate remains the independent database backstop against reaching zero.",
+        "summary": "Promote or demote a user",
+        "description": "Sets the account's admin flag, leaving its library grants untouched, and\nrevokes the account's existing tokens so the change applies to the next\nrequest. Admin only. Demoting the last admin returns 409 last_admin.",
         "operationId": "admin_set_user_admin",
         "parameters": [
           {
@@ -2862,8 +2912,8 @@
         "tags": [
           "Admin users"
         ],
-        "summary": "HUB-10: replace an account's library access.",
-        "description": "Wholesale, and idempotent: a panel of checkboxes holds the whole\nanswer, and PUTting it means two admins toggling different boxes\ncannot interleave into a set neither chose. Answers with what was\nstored, so a stale library id that got dropped is visible rather than\nassumed.\n\nRunning sessions are left alone. Revoking a library does not reach\ninto a stream already playing; the next request the client makes is\nwhere it finds out.",
+        "summary": "Replace a user's library access",
+        "description": "Replaces the account's library grants wholesale and returns what was\nstored along with the new grants_version. Admin only. Send the\ngrants_version you read; a stale one returns 409 stale_write. Running\nsessions are unaffected.",
         "operationId": "admin_set_user_libraries",
         "parameters": [
           {
@@ -2994,6 +3044,8 @@
         "tags": [
           "Authentication"
         ],
+        "summary": "Revoke a refresh token",
+        "description": "Requires a bearer access token. API clients pass refresh_token in the\nbody; browser clients omit it and send the kahawai_refresh cookie.\nResponds 204 and clears the auth cookies for browser clients.",
         "operationId": "logout",
         "parameters": [
           {
@@ -3110,6 +3162,8 @@
         "tags": [
           "Authentication"
         ],
+        "summary": "Rotate a refresh token for a new access token",
+        "description": "API clients send refresh_token in the body; browser clients omit it, send\nthe kahawai_refresh cookie and get rotated cookies back. An invalid\nbrowser refresh clears the auth cookies.",
         "operationId": "refresh",
         "parameters": [
           {
@@ -3217,6 +3271,8 @@
         "tags": [
           "Authentication"
         ],
+        "summary": "Sign in and get an access token",
+        "description": "Exchanges a username and password for tokens. API clients receive the\nrefresh token in the body; browser clients receive HttpOnly cookies and\nmust send a matching Origin. Repeated failures return 429 with Retry-\nAfter.",
         "operationId": "login",
         "parameters": [
           {
@@ -3341,8 +3397,8 @@
         "tags": [
           "Authentication"
         ],
-        "summary": "Which screen the client should open on, stated rather than inferred.",
-        "description": "Public by necessity, and deliberately so: every route behind\n`require_auth` answers 503 before setup and 401 without a token, so a\nclient reading those is guessing its own state off an error path — and\npays whatever the endpoint it picked costs. The web UI probed\n`/api/v1/items` and pulled the entire catalogue (1.4 MB, 578 ms here)\nto read a status line it then threw away.\n\nSays nothing a caller could not learn by trying to log in:\n`setup_required` is already printed on the console at startup.",
+        "summary": "Client startup state",
+        "description": "Returns the startup state a client should open on, including whether\nfirst-time setup is required and the setup URL. Unauthenticated and always\navailable, so clients need not probe authenticated routes.",
         "operationId": "bootstrap",
         "responses": {
           "200": {
@@ -3363,6 +3419,8 @@
         "tags": [
           "Browse"
         ],
+        "summary": "List browsable collections",
+        "description": "Returns the collections visible to the authenticated user. An account\nrestricted to specific libraries sees only the collections behind those\nlibraries.",
         "operationId": "list_collections",
         "responses": {
           "200": {
@@ -3415,7 +3473,8 @@
         "tags": [
           "Events"
         ],
-        "summary": "HUB-11 event channel: server-sent invalidation hints ({kind, ...}).\nEventSource authenticates via the `kahawai_media` cookie (it cannot\nset headers), like the other browser media resources. Hints, not state —\nclients refetch whatever a hint names.",
+        "summary": "Subscribe to server-sent invalidation events",
+        "description": "Streams server-sent invalidation hints; a client refetches whatever a hint\nnames. Authenticates with a bearer token or, for EventSource, the\nkahawai_media cookie.",
         "operationId": "events",
         "responses": {
           "200": {
@@ -3469,6 +3528,8 @@
         "tags": [
           "Browse"
         ],
+        "summary": "Browse and search items",
+        "description": "Returns one page of items with the caller's watch state, filtered by\nlibrary or title search and sorted by title, year or date added. Pass\nin_progress=true to list started-but-unfinished items instead.",
         "operationId": "list_items",
         "parameters": [
           {
@@ -3482,7 +3543,7 @@
           {
             "name": "q",
             "in": "query",
-            "description": "HUB-12 server-side search: a substring of the title, folded the\nsame way titles are stored so accents and case do not matter.",
+            "description": "Search: a substring of the title, folded the same way titles are\nstored so accents and case do not matter.",
             "required": false,
             "schema": {
               "type": "string"
@@ -3509,7 +3570,7 @@
           {
             "name": "limit",
             "in": "query",
-            "description": "NFR-1: a page, not the catalogue. Absent = the default page size,\nnever \"everything\" — that is the shape that took 13 s over 250k\nitems and shipped 100 MB.",
+            "description": "A page, not the catalogue. Absent means the default page size\nrather than everything; the cap is applied either way.",
             "required": false,
             "schema": {
               "type": "integer",
@@ -3598,6 +3659,8 @@
         "tags": [
           "Items"
         ],
+        "summary": "Get item details",
+        "description": "Returns one item with its playable sources, metadata, chapters, relations\nand the caller's watch state. It performs no playback negotiation; use\nQUERY on the same path for that.",
         "operationId": "item_detail",
         "parameters": [
           {
@@ -3677,8 +3740,8 @@
         "tags": [
           "Items"
         ],
-        "summary": "`QUERY /api/v1/items/{id}` (RFC 10008) — the item, its discovered\nstreams, and what this client would actually be served.",
-        "description": "**It answers only what is knowable now.** QUERY is safe and\nidempotent, so it starts nothing and waits for nothing: no\ndisplay-set extraction dispatched to a mediahost, no rasterisation,\nno lease, no transcoder reserved. It runs the same negotiation a\nsession runs, stopping before the fetches that would make a burn or\nan overlay *real* — so those tiers are reported only when their\nartefacts already exist, and a first play may still land elsewhere\nafter the session materialises one.\n\nReached through `MethodRouter::fallback`, because axum's\n`MethodFilter` has no extension methods. That fallback swallows\nEVERY unmatched method, so the method is checked here and the\n`Allow` header written by hand — axum's own 405 machinery no longer\nruns for this route.",
+        "summary": "Query an item for playback",
+        "description": "Returns the item detail plus per-source stream information, intro segments\nand what this client would be served for the capability profile in the\nbody. Starts no session and reserves nothing.",
         "operationId": "item_query",
         "parameters": [
           {
@@ -3829,6 +3892,8 @@
         "tags": [
           "Item media"
         ],
+        "summary": "Fetch item artwork",
+        "description": "Serves the item's artwork, using the size query parameter or the original\nwhen it is absent or unknown. Missing artwork returns a cacheable 404;\npass v as a cache-buster. Accepts a bearer token or the media cookie.",
         "operationId": "item_artwork",
         "parameters": [
           {
@@ -3969,7 +4034,8 @@
         "tags": [
           "Items"
         ],
-        "summary": "Episodes of a show (docs: /items/{id}/children — seasons are a\nprojection of the season column, not items).",
+        "summary": "List an item's children",
+        "description": "Returns the direct children of a show or album — episodes or tracks —\nordered by season and episode, each with running time, source count and\nthe caller's watch state.",
         "operationId": "item_children",
         "parameters": [
           {
@@ -4051,6 +4117,8 @@
         "tags": [
           "Item media"
         ],
+        "summary": "List subtitle fonts for an item",
+        "description": "Lists the attachment fonts available for rendering this item's subtitles,\nin the order their indices are addressed by the font download route.",
         "operationId": "item_fonts",
         "parameters": [
           {
@@ -4132,6 +4200,8 @@
         "tags": [
           "Item media"
         ],
+        "summary": "Download one subtitle font",
+        "description": "Returns the nth font from this item's font list as font/ttf. Accepts a\nbearer token or the media cookie; an index that does not exist returns\n404.",
         "operationId": "item_font",
         "parameters": [
           {
@@ -4237,7 +4307,8 @@
         "tags": [
           "Subtitles"
         ],
-        "summary": "HUB-24: user-initiated download; the result becomes a normal\nsubtitle track on the item.",
+        "summary": "Download a subtitle for an item",
+        "description": "Downloads the chosen provider file and attaches it to the item as a\nsubtitle track, returning the new track id and remaining quota. Returns\n409 when the download entitlement is spent and 502 when a provider\nrefuses.",
         "operationId": "subtitle_download",
         "parameters": [
           {
@@ -4368,7 +4439,8 @@
         "tags": [
           "Subtitles"
         ],
-        "summary": "HUB-21/22: search external providers for this item's subtitles.",
+        "summary": "Search external subtitle providers",
+        "description": "Searches external providers for subtitles matching an item, optionally\nrestricted to preferred languages, and returns candidates with the\ncaller's remaining quota. Returns 409 when the download entitlement is\nspent and 502 when a provider refuses.",
         "operationId": "subtitle_search",
         "parameters": [
           {
@@ -4499,7 +4571,8 @@
         "tags": [
           "Item media"
         ],
-        "summary": ".vtt (flattened, shiftable) or .ass (faithful, absolute times —\nASS renderers offset via the player clock).",
+        "summary": "Fetch a subtitle track file",
+        "description": "Serves a track by id as {id}.vtt (shiftable with shift_ms), {id}.ass, or\n{id}.jsonl for rasterised tracks. Image tracks have no text form and\nreturn 422. Accepts a bearer token or the media cookie.",
         "operationId": "item_subtitle_file",
         "parameters": [
           {
@@ -4632,8 +4705,8 @@
         "tags": [
           "Items"
         ],
-        "summary": "Mark items watched or unwatched without playing them (HUB-10).",
-        "description": "`post_progress` above was the only way into `watch_state`, and it needs\na live session — so there was no way to tick off something watched\nelsewhere, and no way to undo a mistaken one.\n\nA whole season or show goes in ONE call, as one statement. The client\nused to loop, which was fine on a LAN and poor over a link (a\n26-episode season is 26 round trips), and it could half-apply: a\nfailure at episode 14 left 13 marked. One `INSERT … SELECT` either\napplies or does not.\n\nEither direction clears the resume position: a card carries both a\nplayed tick and a resume bar, and \"watched, and also 40 minutes in\" is\nnot a state the interface can draw honestly.\n\n`play_count` only ever climbs. Marking watched asserts a viewing and\ncounts it; unmarking says \"show this as unwatched\", which is not a\nclaim that the earlier viewings never happened. The `AND NOT played`\nguard means re-marking something already marked counts nothing.",
+        "summary": "Mark items watched or unwatched",
+        "description": "Sets the played flag for this item, or for up to 2000 of its children\nnamed in the body, clearing resume positions and only ever increasing play\ncounts. Returns 404 when nothing matched.",
         "operationId": "item_set_watched",
         "parameters": [
           {
@@ -4744,7 +4817,8 @@
         "tags": [
           "Browse"
         ],
-        "summary": "HUB-10: the libraries THIS account holds. Everything the client shows\nhangs off this list, so filtering it here is what makes a restricted\naccount's whole UI right rather than nine views right one at a time.",
+        "summary": "List libraries",
+        "description": "Returns the libraries this account may see, ordered by name. An account\nrestricted by library grants receives only those it was granted.",
         "operationId": "list_libraries",
         "responses": {
           "200": {
@@ -4797,6 +4871,8 @@
         "tags": [
           "Playback"
         ],
+        "summary": "Start a playback session",
+        "description": "Creates a session for an item and returns its id, negotiated mode (direct,\nremux or transcode), stream URL and subtitle listing. Returns 409 for an\nunplayable item, 429 at the stream cap and 503 when the mediahost is\noffline.",
         "operationId": "start_session",
         "requestBody": {
           "content": {
@@ -4918,6 +4994,8 @@
         "tags": [
           "Playback"
         ],
+        "summary": "End a playback session",
+        "description": "Stops the session and releases its resources, responding 204. An unknown\nor already-ended session returns 404.",
         "operationId": "end_session",
         "parameters": [
           {
@@ -4984,7 +5062,8 @@
         "tags": [
           "Playback"
         ],
-        "summary": "Record playback progress (HUB-10/18): durable resume position, played\nflag + play count on crossing 90%, and a session keep-alive.",
+        "summary": "Report playback progress",
+        "description": "Stores the resume position, keeps the session alive and paces the\npipeline, marking the item played past 90 percent. An unknown or expired\nsession answers 404.",
         "operationId": "post_progress",
         "parameters": [
           {
@@ -5096,7 +5175,8 @@
         "tags": [
           "Playback"
         ],
-        "summary": "Seek-restart (§6): restart the session's pipeline at the offset.\nSame session id and URLs; the client re-attaches to the playlist.",
+        "summary": "Seek a playback session",
+        "description": "Restarts the session's pipeline at the given position, optionally\nswitching the audio, video or burned subtitle track. The session id and\nURLs are unchanged; an unknown session returns 404.",
         "operationId": "seek_session",
         "parameters": [
           {
@@ -5208,6 +5288,8 @@
         "tags": [
           "Playback media"
         ],
+        "summary": "Stream a direct-play session",
+        "description": "Serves the session's media bytes with byte-range support, answering 206\nfor a range and 416 when the range is unsatisfiable. Only direct-play\nsessions serve here; other modes return 409.",
         "operationId": "stream_session",
         "parameters": [
           {
@@ -5365,7 +5447,8 @@
         "tags": [
           "Playback media"
         ],
-        "summary": "Serve session artifacts (playlist + segments): remux sessions from\nlocal scratch, dispatched sessions via the transcoder proxy. Only\nplain filenames are accepted — no separators, no dotfiles — so\ntraversal is impossible by construction.",
+        "summary": "Fetch a session artifact",
+        "description": "Serves a session's playlist, media segments and subtitle files, proxying\nfrom the transcoder for dispatched sessions. Accepts a bearer token or the\nmedia cookie; live subtitle files are followed until the session ends.",
         "operationId": "session_file",
         "parameters": [
           {
@@ -5512,7 +5595,8 @@
         "tags": [
           "Preferences"
         ],
-        "summary": "Per-user preferences (HUB-33): tiny generic KV, scope = library id\nor '' for user-global keys.",
+        "summary": "List the current user's preferences",
+        "description": "Returns every stored preference for the authenticated user as scope, key\nand value, where scope is a library id or an empty string for user-global\nkeys.",
         "operationId": "get_prefs",
         "responses": {
           "200": {
@@ -5563,6 +5647,8 @@
         "tags": [
           "Preferences"
         ],
+        "summary": "Set or delete a preference",
+        "description": "Stores one preference for the authenticated user; an empty value deletes\nit. Scope and key are limited to 64 characters and value to 256, beyond\nwhich the request is rejected with 400.",
         "operationId": "put_pref",
         "requestBody": {
           "content": {
@@ -5654,6 +5740,8 @@
         "tags": [
           "Setup (trusted local listener)"
         ],
+        "summary": "Create the initial administrator",
+        "description": "Served only on the hub's dedicated loopback setup listener. Creates the\nfirst admin and returns 204; refuses with 403 unless Host and Origin match\na loopback address, and 409 once setup is complete.",
         "operationId": "setup",
         "requestBody": {
           "content": {
@@ -5733,7 +5821,8 @@
         "tags": [
           "Subtitles"
         ],
-        "summary": "Remove a DOWNLOADED track, as its creator or an admin. Anything\nelse — a cache, a scan-owned row, someone else's download — refuses\nwith 404-shaped `removed: false`.",
+        "summary": "Delete a downloaded subtitle track",
+        "description": "Deletes a downloaded subtitle track when the caller downloaded it or is an\nadmin. Any other track, including cached or scan-owned rows, is left in\nplace and answered with 200 and removed set to false.",
         "operationId": "subtitle_delete",
         "parameters": [
           {
@@ -5807,8 +5896,8 @@
         "tags": [
           "Observability"
         ],
-        "summary": "NFR-6: health for the hub and every module it knows.",
-        "description": "200 while the hub itself is serving, even when a satellite is away —\nits collections go unavailable, nothing is lost (AR-6), and a check\nthat fails the whole server because one Pi is unplugged gets muted.\nThe body carries the detail, and `status` distinguishes the two.",
+        "summary": "Hub and satellite health",
+        "description": "Returns health for the hub and every module it knows. Answers 200 while\nthe hub itself is serving even if a satellite is unreachable; the body's\nstatus field carries that detail.",
         "operationId": "health",
         "responses": {
           "200": {
@@ -5839,8 +5928,8 @@
         "tags": [
           "Observability"
         ],
-        "summary": "NFR-6: Prometheus text exposition, behind its own static token.",
-        "description": "NOT a login token. Access tokens live 15 minutes and no scraper\nrefreshes them, so an admin-token endpoint would serve one scrape and\nthen 401 forever. `hub.metrics_token` is a static credential scoped to\nthis one read-only route — no user, no session, no refresh.\n\nUnset means NOT SERVED: 404, so a hub that was never configured for\nscraping does not advertise an endpoint reporting its library size.\nA configured-but-wrong token is 401, so an operator can tell \"off\nhere\" from \"wrong secret\".",
+        "summary": "Prometheus metrics exposition",
+        "description": "Returns Prometheus text exposition for the hub. Requires a static metrics\ntoken as a bearer credential; returns 404 when no metrics token is\nconfigured and 401 when the token does not match.",
         "operationId": "metrics",
         "responses": {
           "200": {

@@ -1083,17 +1083,16 @@ fn request_token(req: &Request, allow_media_cookie: bool) -> Result<Option<&str>
         .flatten())
 }
 
-/// NFR-6: Prometheus text exposition, behind its own static token.
+/// Prometheus metrics exposition
 ///
-/// NOT a login token. Access tokens live 15 minutes and no scraper
-/// refreshes them, so an admin-token endpoint would serve one scrape and
-/// then 401 forever. `hub.metrics_token` is a static credential scoped to
-/// this one read-only route — no user, no session, no refresh.
-///
-/// Unset means NOT SERVED: 404, so a hub that was never configured for
-/// scraping does not advertise an endpoint reporting its library size.
-/// A configured-but-wrong token is 401, so an operator can tell "off
-/// here" from "wrong secret".
+/// Returns Prometheus text exposition for the hub. Requires a static metrics
+/// token as a bearer credential; returns 404 when no metrics token is
+/// configured and 401 when the token does not match.
+// The token is deliberately NOT a login credential: access tokens live
+// 15 minutes and no scraper refreshes them, so an admin-token endpoint
+// would serve one scrape and 401 for ever. Unset means 404 rather than
+// 401, so a hub never configured for scraping does not advertise that
+// it has a library to measure.
 #[utoipa::path(
     get,
     path = "/metrics",
@@ -1140,12 +1139,11 @@ async fn metrics(
         .into_response())
 }
 
-/// NFR-6: health for the hub and every module it knows.
+/// Hub and satellite health
 ///
-/// 200 while the hub itself is serving, even when a satellite is away —
-/// its collections go unavailable, nothing is lost (AR-6), and a check
-/// that fails the whole server because one Pi is unplugged gets muted.
-/// The body carries the detail, and `status` distinguishes the two.
+/// Returns health for the hub and every module it knows. Answers 200 while
+/// the hub itself is serving even if a satellite is unreachable; the body's
+/// status field carries that detail.
 #[utoipa::path(
     get,
     path = "/health",
@@ -1164,17 +1162,14 @@ async fn health(
     Ok(Json(crate::metrics::health(&snap)))
 }
 
-/// Which screen the client should open on, stated rather than inferred.
+/// Client startup state
 ///
-/// Public by necessity, and deliberately so: every route behind
-/// `require_auth` answers 503 before setup and 401 without a token, so a
-/// client reading those is guessing its own state off an error path — and
-/// pays whatever the endpoint it picked costs. The web UI probed
-/// `/api/v1/items` and pulled the entire catalogue (1.4 MB, 578 ms here)
-/// to read a status line it then threw away.
-///
-/// Says nothing a caller could not learn by trying to log in:
-/// `setup_required` is already printed on the console at startup.
+/// Returns the startup state a client should open on, including whether
+/// first-time setup is required and the setup URL. Unauthenticated and always
+/// available, so clients need not probe authenticated routes.
+// Public on purpose, and safe to keep public: it states only what a
+// caller learns by attempting to log in, and the alternative is every
+// client inferring its own state from 401/503 error paths.
 #[utoipa::path(
     get,
     path = "/api/v1/bootstrap",
@@ -1310,6 +1305,11 @@ async fn require_admin(req: Request, next: Next) -> Result<Response, ApiError> {
     Ok(next.run(req).await)
 }
 
+/// List pending satellite enrollments
+///
+/// Lists satellite enrollments awaiting approval, with each entry's CSR
+/// fingerprint, module type, module id and name. Admin only; returns 503
+/// before the hub has an administrator.
 #[utoipa::path(
     get, path = "/admin/v1/enrollments", tag = "Admin",
     security(("bearer_auth" = [])),
@@ -1340,6 +1340,11 @@ struct ApproveRequest {
     code: String,
 }
 
+/// Approve a pending satellite enrollment
+///
+/// Approves a pending enrollment by its code, signing the satellite's
+/// certificate and recording the satellite. Admin only; returns 404 when no
+/// pending enrollment matches the code.
 #[utoipa::path(
     post, path = "/admin/v1/enrollments/approve", tag = "Admin",
     security(("bearer_auth" = [])),
@@ -1379,6 +1384,10 @@ async fn admin_approve(
     Ok(Json(ApprovedResponse { approved: summary }))
 }
 
+/// Metadata provider configuration
+///
+/// Reports whether TMDB, TVDB and AniDB credentials are configured, plus the
+/// effective and default provider chain for each media type. Admin only.
 #[utoipa::path(
     get, path = "/admin/v1/providers", tag = "Admin providers",
     security(("bearer_auth" = [])),
@@ -1438,9 +1447,12 @@ struct SetChain {
     order: Vec<String>,
 }
 
-/// HUB-5: reorder a media type's providers. Precedence is per field, so
-/// this decides who wins where two providers both have an answer — and
-/// it re-merges from stored answers, sending no provider a request.
+/// Set provider order for a media type
+///
+/// Sets the provider precedence order for one media type and re-merges
+/// metadata from stored answers without contacting any provider. Admin only;
+/// the order must be a permutation of that media type's providers or the call
+/// returns 400.
 #[utoipa::path(
     post, path = "/admin/v1/providers/chains/{media_type}", tag = "Admin providers",
     security(("bearer_auth" = [])),
@@ -1489,7 +1501,12 @@ struct SubtitleSearchRequest {
     languages: Vec<String>,
 }
 
-/// HUB-21/22: search external providers for this item's subtitles.
+/// Search external subtitle providers
+///
+/// Searches external providers for subtitles matching an item, optionally
+/// restricted to preferred languages, and returns candidates with the
+/// caller's remaining quota. Returns 409 when the download entitlement is
+/// spent and 502 when a provider refuses.
 #[utoipa::path(
     post, path = "/api/v1/items/{id}/subtitles/search", tag = "Subtitles",
     security(("bearer_auth" = [])),
@@ -1529,8 +1546,12 @@ struct SubtitleDownloadRequest {
     language: Option<String>,
 }
 
-/// HUB-24: user-initiated download; the result becomes a normal
-/// subtitle track on the item.
+/// Download a subtitle for an item
+///
+/// Downloads the chosen provider file and attaches it to the item as a
+/// subtitle track, returning the new track id and remaining quota. Returns
+/// 409 when the download entitlement is spent and 502 when a provider
+/// refuses.
 #[utoipa::path(
     post, path = "/api/v1/items/{id}/subtitles/download", tag = "Subtitles",
     security(("bearer_auth" = [])),
@@ -1569,9 +1590,11 @@ async fn subtitle_download(
     Ok(Json(SubtitleDownloadResponse { track_id, quota }))
 }
 
-/// Remove a DOWNLOADED track, as its creator or an admin. Anything
-/// else — a cache, a scan-owned row, someone else's download — refuses
-/// with 404-shaped `removed: false`.
+/// Delete a downloaded subtitle track
+///
+/// Deletes a downloaded subtitle track when the caller downloaded it or is an
+/// admin. Any other track, including cached or scan-owned rows, is left in
+/// place and answered with 200 and removed set to false.
 #[utoipa::path(
     delete, path = "/api/v1/subtitles/{track_id}", tag = "Subtitles",
     security(("bearer_auth" = [])),
@@ -1597,7 +1620,12 @@ async fn subtitle_delete(
     Ok(Json(RemovedResponse { removed }))
 }
 
-/// Re-validate the STORED AniDB credentials (no resend needed).
+/// Verify stored AniDB credentials
+///
+/// Re-validates the AniDB credentials already stored on the hub by logging
+/// in, without resending them. Admin only; a failed login returns 200 with
+/// verified false and an error message, while 503 means no AniDB account is
+/// configured.
 #[utoipa::path(
     post, path = "/admin/v1/providers/anidb/verify", tag = "Admin providers",
     security(("bearer_auth" = [])),
@@ -1669,9 +1697,12 @@ struct SetAnidb {
     udp_api_key: Option<String>,
 }
 
-/// AniDB account for the UDP FILE-by-ED2K gold path (HUB-30). The
-/// client identity ("kahawai" v1) is compiled in; only the account is
-/// configuration. Optional UDP API key upgrades to an encrypted session.
+/// Set AniDB credentials
+///
+/// Stores the AniDB username, password and optional UDP API key, then
+/// attempts a login. Admin only. A failed login still returns 200 with saved
+/// true and verified false plus the error; a successful one starts an
+/// enrichment run.
 #[utoipa::path(
     post, path = "/admin/v1/providers/anidb", tag = "Admin providers",
     security(("bearer_auth" = [])),
@@ -1759,6 +1790,11 @@ struct SetTvdb {
     pin: Option<String>,
 }
 
+/// Set TVDB credentials
+///
+/// Stores the TVDB API key and optional subscriber PIN, then starts an
+/// enrichment run in the background. Admin only. An empty api_key is rejected
+/// with 400.
 #[utoipa::path(
     post, path = "/admin/v1/providers/tvdb", tag = "Admin providers",
     security(("bearer_auth" = [])),
@@ -1815,6 +1851,10 @@ struct SetTmdb {
     api_key: String,
 }
 
+/// Set TMDB credentials
+///
+/// Stores the TMDB API key and starts an enrichment run in the background.
+/// Admin only. An empty api_key is rejected with 400.
 #[utoipa::path(
     post, path = "/admin/v1/providers/tmdb", tag = "Admin providers",
     security(("bearer_auth" = [])),
@@ -1860,6 +1900,10 @@ async fn admin_set_tmdb(
     Ok(Json(SavedResponse { saved: true }))
 }
 
+/// Get enrichment status
+///
+/// Returns the current state of the metadata enricher, including whether a
+/// run is in progress. Admin only.
 #[utoipa::path(
     get, path = "/admin/v1/enrich", tag = "Admin enrichment",
     security(("bearer_auth" = [])),
@@ -1874,6 +1918,11 @@ async fn admin_enrich_status(State(state): State<AppState>) -> Json<crate::enric
     Json(state.enricher.status())
 }
 
+/// Start an enrichment run
+///
+/// Starts a metadata enrichment run in the background and responds
+/// immediately with started true. Admin only. Poll GET /admin/v1/enrich for
+/// progress.
 #[utoipa::path(
     post, path = "/admin/v1/enrich", tag = "Admin enrichment",
     security(("bearer_auth" = [])),
@@ -1903,9 +1952,12 @@ struct RefreshQuery {
     deep: Option<bool>,
 }
 
-/// HUB-35: granular refresh. The admin-facing unit is the LIBRARY —
-/// fan out collection-scoped scan requests to each member collection's
-/// mediahost. There is deliberately no global rescan.
+/// Refresh a library
+///
+/// Sends a scan request to the mediahost of every collection in the library
+/// and returns how many were asked and how many were offline. Admin only.
+/// Pass deep=true to re-probe every file. Returns 404 if the library has no
+/// collections.
 #[utoipa::path(
     post, path = "/admin/v1/libraries/{id}/refresh", tag = "Admin libraries",
     security(("bearer_auth" = [])),
@@ -1970,9 +2022,11 @@ async fn request_scan(state: &AppState, module_id: &str, collection_id: &str) ->
     state.registry.send_to_host(module_id, msg).await.is_ok()
 }
 
-/// HUB-8 review queue: everything not matched confidently — misses,
-/// weak matches (with their current guess for confirm/reject), and
-/// rejected items.
+/// List items needing match review
+///
+/// Returns movies, shows and albums whose metadata match is a miss, weak or
+/// rejected, with the current guess where there is one. Admin only. Episodes
+/// and tracks are excluded because they inherit their parent's match.
 #[utoipa::path(
     get, path = "/admin/v1/enrich/review", tag = "Admin enrichment",
     security(("bearer_auth" = [])),
@@ -2030,6 +2084,12 @@ struct ReviewSearch {
     item: Option<String>,
 }
 
+/// Search metadata candidates
+///
+/// Searches the metadata providers for candidates matching a title, kind and
+/// optional year, for use when manually matching an item. Admin only. Supply
+/// item to bias ranking toward the provider owning that item's identity
+/// space.
 #[utoipa::path(
     post, path = "/admin/v1/enrich/search", tag = "Admin enrichment",
     security(("bearer_auth" = [])),
@@ -2073,6 +2133,12 @@ struct ApplyMatch {
     candidate: Option<ManualMatchCandidate>,
 }
 
+/// Apply a match decision to an item
+///
+/// Applies action pick, confirm or reject to the item's metadata match. Admin
+/// only. pick requires provider and candidate with an id; any other action,
+/// or a missing field, returns 400. Picked and confirmed matches are pinned
+/// against automatic re-matching.
 #[utoipa::path(
     post, path = "/admin/v1/items/{id}/match", tag = "Admin enrichment",
     security(("bearer_auth" = [])),
@@ -2153,7 +2219,10 @@ async fn admin_apply_match(
     Ok(Json(OkResponse { ok: true }))
 }
 
-/// HUB-10: the accounts and what each may see (HUB-26 users panel).
+/// List users
+///
+/// Returns every account with its admin flag and the libraries it may see.
+/// Admin only.
 #[utoipa::path(
     get, path = "/admin/v1/users", tag = "Admin users",
     security(("bearer_auth" = [])),
@@ -2189,17 +2258,15 @@ struct SetAccess {
     grants_version: i64,
 }
 
-/// HUB-10: replace an account's library access.
+/// Replace a user's library access
 ///
-/// Wholesale, and idempotent: a panel of checkboxes holds the whole
-/// answer, and PUTting it means two admins toggling different boxes
-/// cannot interleave into a set neither chose. Answers with what was
-/// stored, so a stale library id that got dropped is visible rather than
-/// assumed.
-///
-/// Running sessions are left alone. Revoking a library does not reach
-/// into a stream already playing; the next request the client makes is
-/// where it finds out.
+/// Replaces the account's library grants wholesale and returns what was
+/// stored along with the new grants_version. Admin only. Send the
+/// grants_version you read; a stale one returns 409 stale_write. Running
+/// sessions are unaffected.
+// Wholesale and idempotent so two admins toggling different checkboxes
+// cannot interleave into a set neither chose; the response echoes what
+// was stored, so a dropped stale library id is visible.
 #[utoipa::path(
     put, path = "/admin/v1/users/{id}/libraries", tag = "Admin users",
     security(("bearer_auth" = [])),
@@ -2259,13 +2326,11 @@ struct SetAdminBody {
     admin: bool,
 }
 
-/// HUB-10: promote or demote an account.
+/// Promote or demote a user
 ///
-/// Grants are untouched. A demoted admin falls back to whatever its
-/// `user_libraries` rows already said, which is what the panel then shows.
-/// AUTH-3 increments the account's durable access generation in the same write,
-/// so even a self-demotion takes effect on the next request; the last-admin
-/// predicate remains the independent database backstop against reaching zero.
+/// Sets the account's admin flag, leaving its library grants untouched, and
+/// revokes the account's existing tokens so the change applies to the next
+/// request. Admin only. Demoting the last admin returns 409 last_admin.
 #[utoipa::path(
     put, path = "/admin/v1/users/{id}/admin", tag = "Admin users",
     security(("bearer_auth" = [])),
@@ -2319,6 +2384,11 @@ struct CreateUser {
     admin: bool,
 }
 
+/// Create a user
+///
+/// Creates an account with a username, password and optional admin flag,
+/// returning its id. Admin only. A taken username returns 409; a username or
+/// password that breaks the credential policy returns 400 naming the rule.
 #[utoipa::path(
     post, path = "/admin/v1/users", tag = "Admin users",
     security(("bearer_auth" = [])),
@@ -2371,11 +2441,11 @@ async fn admin_create_user(
     }))
 }
 
-/// HUB-10: remove an account. Sessions first — a stream outliving its
-/// owner has nobody left to stop it — then the rows.
+/// Delete a user account
 ///
-/// What survives on purpose: subtitles this user downloaded. They are
-/// attached to the item, not to the person who fetched them.
+/// Admin only. Deletes the user and ends their playback sessions, returning
+/// the deleted id, username and session count. Returns 409 when deleting
+/// yourself or the last remaining admin.
 #[utoipa::path(
     delete, path = "/admin/v1/users/{id}", tag = "Admin users",
     security(("bearer_auth" = [])),
@@ -2429,6 +2499,10 @@ async fn admin_delete_user(
     }))
 }
 
+/// List registered satellites
+///
+/// Admin only. Returns an overview of every registered satellite, including
+/// the hub's in-process mediahost.
 #[utoipa::path(
     get, path = "/admin/v1/satellites", tag = "Admin satellites",
     security(("bearer_auth" = [])),
@@ -2451,8 +2525,11 @@ async fn admin_satellites(
     Ok(Json(SatellitesResponse { satellites }))
 }
 
-/// SEC-6/HUB-20: allowlist removal + end sessions + cascade. Refusal of
-/// reconnection happens at the TLS layer (fingerprint no longer admitted).
+/// Remove a satellite
+///
+/// Admin only. Removes the satellite from the allowlist, ends its sessions
+/// and deletes orphaned subtitle payloads. Returns 409 for the in-process
+/// mediahost and 404 for an unknown id.
 #[utoipa::path(
     delete, path = "/admin/v1/satellites/{id}", tag = "Admin satellites",
     security(("bearer_auth" = [])),
@@ -2511,8 +2588,9 @@ struct SetDisabled {
     disabled: bool,
 }
 
-/// Admin drain toggle: placement skips a disabled satellite; running
-/// sessions finish on their own.
+/// List libraries
+///
+/// Admin only. Returns every library with its administrative overview data.
 #[utoipa::path(
     get, path = "/admin/v1/libraries", tag = "Admin libraries",
     security(("bearer_auth" = [])),
@@ -2535,6 +2613,10 @@ async fn admin_libraries(
     Ok(Json(AdminLibrariesResponse { libraries }))
 }
 
+/// List collections
+///
+/// Admin only. Returns every collection known to the hub across all
+/// satellites, whether or not it is attached to a library.
 #[utoipa::path(
     get, path = "/admin/v1/collections", tag = "Admin libraries",
     security(("bearer_auth" = [])),
@@ -2563,6 +2645,11 @@ struct CreateLibraryRequest {
     media_type: String,
 }
 
+/// Create a library
+///
+/// Admin only. Creates a library with the given name and media type and
+/// returns its id. Returns 400 for an empty name or unknown media type, and
+/// 409 when the name is already taken.
 #[utoipa::path(
     post, path = "/admin/v1/libraries", tag = "Admin libraries",
     security(("bearer_auth" = [])),
@@ -2618,6 +2705,10 @@ async fn admin_create_library(
     Ok(Json(CreatedLibraryResponse { id }))
 }
 
+/// Delete a library
+///
+/// Admin only. Deletes the library and returns 204 on success, or 404 when no
+/// library has that id.
 #[utoipa::path(
     delete, path = "/admin/v1/libraries/{id}", tag = "Admin libraries",
     security(("bearer_auth" = [])),
@@ -2649,6 +2740,11 @@ struct AttachCollectionRequest {
     collection_id: String,
 }
 
+/// Attach a collection to a library
+///
+/// Admin only. Attaches the given satellite collection to the library and
+/// returns 204. Returns 404 when the library or collection is unknown, and
+/// 409 when their media types do not match.
 #[utoipa::path(
     post, path = "/admin/v1/libraries/{id}/collections", tag = "Admin libraries",
     security(("bearer_auth" = [])),
@@ -2701,6 +2797,10 @@ async fn admin_attach_collection(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Detach a collection from a library
+///
+/// Admin only. Detaches the collection from the library and returns 204, or
+/// 404 when that collection is not attached to it.
 #[utoipa::path(
     delete, path = "/admin/v1/libraries/{id}/collections/{module_id}/{collection_id}", tag = "Admin libraries",
     security(("bearer_auth" = [])),
@@ -2735,6 +2835,11 @@ async fn admin_detach_collection(
     }
 }
 
+/// Set satellite placement state
+///
+/// Admin only. Marks a satellite disabled or enabled for session placement
+/// and returns 204. Disabling only stops new placements; sessions already
+/// running on it continue.
 #[utoipa::path(
     post, path = "/admin/v1/satellites/{id}/disabled", tag = "Admin satellites",
     security(("bearer_auth" = [])),
@@ -2765,6 +2870,11 @@ async fn admin_set_disabled(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// List active playback sessions
+///
+/// Admin only. Returns every live session with its user, item title, playback
+/// mode, satellite, idle time and, once negotiated, its stream and delivery
+/// cost summary.
 #[utoipa::path(
     get, path = "/admin/v1/sessions", tag = "Admin sessions",
     security(("bearer_auth" = [])),
@@ -2818,10 +2928,11 @@ async fn admin_sessions(
     Ok(Json(AdminSessionsResponse { sessions }))
 }
 
-/// OPS-10: a session's diagnostics, as an attachment. A live session is
-/// collected on the spot; an ended one is served from what teardown
-/// stored, which is the case that matters — nobody presses a button on
-/// a session they already closed.
+/// Download session diagnostics log
+///
+/// Admin only. Returns the session's diagnostics as a plain-text attachment.
+/// Returns 404 when no log exists and 503 when the satellite holding the log
+/// is not answering.
 #[utoipa::path(
     get, path = "/admin/v1/sessions/{id}/log", tag = "Admin sessions",
     security(("bearer_auth" = [])),
@@ -2864,7 +2975,11 @@ async fn admin_session_log(
     Ok(log_attachment(format!("kahawai-session-{id}.log"), body))
 }
 
-/// The newest bundle for an item, whoever played it.
+/// Download newest session log for an item
+///
+/// Admin only. Returns the most recent session diagnostics recorded for the
+/// item, by any user, as a plain-text attachment. Returns 404 when no such
+/// log has been stored.
 #[utoipa::path(
     get, path = "/admin/v1/items/{id}/log", tag = "Admin sessions",
     security(("bearer_auth" = [])),
@@ -2911,6 +3026,10 @@ fn log_attachment(filename: String, body: String) -> Response {
         .into_response()
 }
 
+/// End a playback session
+///
+/// Admin only. Ends the session and returns 204, or 404 when no session with
+/// that id is active.
 #[utoipa::path(
     delete, path = "/admin/v1/sessions/{id}", tag = "Admin sessions",
     security(("bearer_auth" = [])),
@@ -2949,6 +3068,11 @@ async fn setup_bootstrap(State(state): State<SetupState>) -> Json<BootstrapRespo
     })
 }
 
+/// Create the initial administrator
+///
+/// Served only on the hub's dedicated loopback setup listener. Creates the
+/// first admin and returns 204; refuses with 403 unless Host and Origin match
+/// a loopback address, and 409 once setup is complete.
 #[utoipa::path(
     post, path = "/api/v1/setup", tag = "Setup (trusted local listener)",
     request_body = SetupRequest,
@@ -3194,6 +3318,12 @@ fn token_response(tokens: crate::auth::TokenPair, client: AuthClient, secure: bo
 const THROTTLE_USER_AFTER: u32 = 5;
 const THROTTLE_IP_AFTER: u32 = 20;
 
+/// Sign in and get an access token
+///
+/// Exchanges a username and password for tokens. API clients receive the
+/// refresh token in the body; browser clients receive HttpOnly cookies and
+/// must send a matching Origin. Repeated failures return 429 with Retry-
+/// After.
 #[utoipa::path(
     post, path = "/api/v1/auth/token", tag = "Authentication",
     request_body = LoginRequest,
@@ -3262,6 +3392,11 @@ async fn login(
     }
 }
 
+/// Rotate a refresh token for a new access token
+///
+/// API clients send refresh_token in the body; browser clients omit it, send
+/// the kahawai_refresh cookie and get rotated cookies back. An invalid
+/// browser refresh clears the auth cookies.
 #[utoipa::path(
     post, path = "/api/v1/auth/refresh", tag = "Authentication",
     request_body = RefreshRequest,
@@ -3326,6 +3461,11 @@ async fn refresh(
     }
 }
 
+/// Revoke a refresh token
+///
+/// Requires a bearer access token. API clients pass refresh_token in the
+/// body; browser clients omit it and send the kahawai_refresh cookie.
+/// Responds 204 and clears the auth cookies for browser clients.
 #[utoipa::path(
     post, path = "/api/v1/auth/logout", tag = "Authentication",
     security(("bearer_auth" = [])),
@@ -3413,10 +3553,11 @@ struct StartSessionRequest {
     subtitle_track: Option<i64>,
 }
 
-/// HUB-11 event channel: server-sent invalidation hints ({kind, ...}).
-/// EventSource authenticates via the `kahawai_media` cookie (it cannot
-/// set headers), like the other browser media resources. Hints, not state —
-/// clients refetch whatever a hint names.
+/// Subscribe to server-sent invalidation events
+///
+/// Streams server-sent invalidation hints; a client refetches whatever a hint
+/// names. Authenticates with a bearer token or, for EventSource, the
+/// kahawai_media cookie.
 #[utoipa::path(
     get, path = "/api/v1/events", tag = "Events",
     security(("bearer_auth" = []), ("media_token" = [])),
@@ -3444,8 +3585,11 @@ async fn events(State(state): State<AppState>) -> impl axum::response::IntoRespo
     )
 }
 
-/// Per-user preferences (HUB-33): tiny generic KV, scope = library id
-/// or '' for user-global keys.
+/// List the current user's preferences
+///
+/// Returns every stored preference for the authenticated user as scope, key
+/// and value, where scope is a library id or an empty string for user-global
+/// keys.
 #[utoipa::path(
     get, path = "/api/v1/prefs", tag = "Preferences",
     security(("bearer_auth" = [])),
@@ -3485,6 +3629,11 @@ struct PutPrefRequest {
     value: String,
 }
 
+/// Set or delete a preference
+///
+/// Stores one preference for the authenticated user; an empty value deletes
+/// it. Scope and key are limited to 64 characters and value to 256, beyond
+/// which the request is rejected with 400.
 #[utoipa::path(
     put, path = "/api/v1/prefs", tag = "Preferences",
     security(("bearer_auth" = [])),
@@ -3600,6 +3749,12 @@ fn session_refusal(e: anyhow::Error) -> ApiError {
     }
 }
 
+/// Start a playback session
+///
+/// Creates a session for an item and returns its id, negotiated mode (direct,
+/// remux or transcode), stream URL and subtitle listing. Returns 409 for an
+/// unplayable item, 429 at the stream cap and 503 when the mediahost is
+/// offline.
 #[utoipa::path(
     post, path = "/api/v1/playback/sessions", tag = "Playback",
     security(("bearer_auth" = [])),
@@ -3724,8 +3879,11 @@ struct SeekRequest {
     subtitle_track: Option<i64>,
 }
 
-/// Seek-restart (§6): restart the session's pipeline at the offset.
-/// Same session id and URLs; the client re-attaches to the playlist.
+/// Seek a playback session
+///
+/// Restarts the session's pipeline at the given position, optionally
+/// switching the audio, video or burned subtitle track. The session id and
+/// URLs are unchanged; an unknown session returns 404.
 #[utoipa::path(
     post, path = "/api/v1/playback/sessions/{id}/seek", tag = "Playback",
     security(("bearer_auth" = [])),
@@ -3804,6 +3962,10 @@ async fn seek_session(
     }))
 }
 
+/// End a playback session
+///
+/// Stops the session and releases its resources, responding 204. An unknown
+/// or already-ended session returns 404.
 #[utoipa::path(
     delete, path = "/api/v1/playback/sessions/{id}", tag = "Playback",
     security(("bearer_auth" = [])),
@@ -3882,6 +4044,11 @@ fn parse_range(header: Option<&str>, size: u64) -> Result<Option<(u64, u64)>, ()
     }
 }
 
+/// Stream a direct-play session
+///
+/// Serves the session's media bytes with byte-range support, answering 206
+/// for a range and 416 when the range is unsatisfiable. Only direct-play
+/// sessions serve here; other modes return 409.
 #[utoipa::path(
     get, path = "/api/v1/playback/sessions/{id}/stream", tag = "Playback media",
     security(("bearer_auth" = []), ("media_token" = [])),
@@ -3952,6 +4119,11 @@ async fn stream_session(
     Ok(resp.body(body).unwrap())
 }
 
+/// List browsable collections
+///
+/// Returns the collections visible to the authenticated user. An account
+/// restricted to specific libraries sees only the collections behind those
+/// libraries.
 #[utoipa::path(
     get, path = "/api/v1/collections", tag = "Browse",
     security(("bearer_auth" = [])),
@@ -4008,6 +4180,11 @@ struct ArtworkQuery {
     v: Option<String>,
 }
 
+/// Fetch item artwork
+///
+/// Serves the item's artwork, using the size query parameter or the original
+/// when it is absent or unknown. Missing artwork returns a cacheable 404;
+/// pass v as a cache-buster. Accepts a bearer token or the media cookie.
 #[utoipa::path(
     get, path = "/api/v1/items/{id}/artwork", tag = "Item media",
     security(("bearer_auth" = []), ("media_token" = [])),
@@ -4101,8 +4278,11 @@ struct VttQuery {
     shift_ms: f64,
 }
 
-/// .vtt (flattened, shiftable) or .ass (faithful, absolute times —
-/// ASS renderers offset via the player clock).
+/// Fetch a subtitle track file
+///
+/// Serves a track by id as {id}.vtt (shiftable with shift_ms), {id}.ass, or
+/// {id}.jsonl for rasterised tracks. Image tracks have no text form and
+/// return 422. Accepts a bearer token or the media cookie.
 #[utoipa::path(
     get, path = "/api/v1/items/{id}/subtitles/{file}", tag = "Item media",
     security(("bearer_auth" = []), ("media_token" = [])),
@@ -4253,7 +4433,10 @@ async fn item_subtitle_file(
         .into_response())
 }
 
-/// What the intro detector is doing, and which seasons it has still to look at.
+/// Intro detector status
+///
+/// Admin only. Returns the intro detector's counters together with up to 50
+/// seasons still awaiting analysis.
 #[utoipa::path(
     get, path = "/admin/v1/segments", tag = "Admin segments",
     security(("bearer_auth" = [])),
@@ -4283,14 +4466,11 @@ async fn admin_segments_status(
     }))
 }
 
-/// Start analysing the next season waiting, now, rather than when the sweep
-/// reaches it. The analysis is DETACHED: axum drops a handler future the
-/// moment the client disconnects, and this one used to run the season inside
-/// the request — a proxy timeout then cancelled it mid-way, threw away the
-/// finished-but-unstored result, left the status flag saying running for
-/// ever, and released the one-at-a-time lock while the orphaned blocking
-/// task was still reading the byte plane. The season the caller started is
-/// nobody's to cancel but the hub's.
+/// Analyse the next pending season
+///
+/// Admin only. Picks the next season awaiting intro detection and analyses it
+/// in the background, responding immediately with the season chosen. Returns
+/// 409 when segment detection is disabled.
 #[utoipa::path(
     post, path = "/admin/v1/segments", tag = "Admin segments",
     security(("bearer_auth" = [])),
@@ -4360,6 +4540,10 @@ async fn admin_segments_run(
     }))
 }
 
+/// List subtitle fonts for an item
+///
+/// Lists the attachment fonts available for rendering this item's subtitles,
+/// in the order their indices are addressed by the font download route.
 #[utoipa::path(
     get, path = "/api/v1/items/{id}/fonts", tag = "Item media",
     security(("bearer_auth" = [])),
@@ -4388,6 +4572,11 @@ async fn item_fonts(
     Ok(Json(FontsResponse { fonts }))
 }
 
+/// Download one subtitle font
+///
+/// Returns the nth font from this item's font list as font/ttf. Accepts a
+/// bearer token or the media cookie; an index that does not exist returns
+/// 404.
 #[utoipa::path(
     get, path = "/api/v1/items/{id}/fonts/{n}", tag = "Item media",
     security(("bearer_auth" = []), ("media_token" = [])),
@@ -4427,9 +4616,10 @@ async fn item_font(
         .into_response())
 }
 
-/// HUB-10: the libraries THIS account holds. Everything the client shows
-/// hangs off this list, so filtering it here is what makes a restricted
-/// account's whole UI right rather than nine views right one at a time.
+/// List libraries
+///
+/// Returns the libraries this account may see, ordered by name. An account
+/// restricted by library grants receives only those it was granted.
 #[utoipa::path(
     get, path = "/api/v1/libraries", tag = "Browse",
     security(("bearer_auth" = [])),
@@ -4476,8 +4666,8 @@ async fn list_libraries(
 #[into_params(parameter_in = Query)]
 struct ItemsQuery {
     library: Option<String>,
-    /// HUB-12 server-side search: a substring of the title, folded the
-    /// same way titles are stored so accents and case do not matter.
+    /// Search: a substring of the title, folded the same way titles are
+    /// stored so accents and case do not matter.
     q: Option<String>,
     /// `title` (default), `year`, `added`. Prefixed with `-` for
     /// descending: `-year`.
@@ -4486,9 +4676,8 @@ struct ItemsQuery {
     /// of. Ordered by when you last watched it, so `sort` and `q` do not
     /// apply; `library` still scopes it.
     in_progress: Option<bool>,
-    /// NFR-1: a page, not the catalogue. Absent = the default page size,
-    /// never "everything" — that is the shape that took 13 s over 250k
-    /// items and shipped 100 MB.
+    /// A page, not the catalogue. Absent means the default page size
+    /// rather than everything; the cap is applied either way.
     limit: Option<u32>,
     offset: Option<u32>,
 }
@@ -4656,6 +4845,11 @@ fn item_page_sql(inner: &str, order_out: &str, restricted: bool, scoped: bool) -
     )
 }
 
+/// Browse and search items
+///
+/// Returns one page of items with the caller's watch state, filtered by
+/// library or title search and sorted by title, year or date added. Pass
+/// in_progress=true to list started-but-unfinished items instead.
 #[utoipa::path(
     get, path = "/api/v1/items", tag = "Browse",
     security(("bearer_auth" = [])),
@@ -5059,8 +5253,11 @@ fn item_row<S>(r: &sqlx::sqlite::SqliteRow, sources: S) -> ItemRow<S> {
     }
 }
 
-/// Episodes of a show (docs: /items/{id}/children — seasons are a
-/// projection of the season column, not items).
+/// List an item's children
+///
+/// Returns the direct children of a show or album — episodes or tracks —
+/// ordered by season and episode, each with running time, source count and
+/// the caller's watch state.
 #[utoipa::path(
     get, path = "/api/v1/items/{id}/children", tag = "Items",
     security(("bearer_auth" = [])),
@@ -5299,6 +5496,11 @@ struct NegotiatedStreams {
     subtitles: Vec<kahawai_media::negotiate::SubtitleVerdict>,
 }
 
+/// Get item details
+///
+/// Returns one item with its playable sources, metadata, chapters, relations
+/// and the caller's watch state. It performs no playback negotiation; use
+/// QUERY on the same path for that.
 #[utoipa::path(
     get, path = "/api/v1/items/{id}", tag = "Items",
     security(("bearer_auth" = [])),
@@ -5642,23 +5844,17 @@ struct ItemQuery {
     mode: Option<String>,
 }
 
-/// `QUERY /api/v1/items/{id}` (RFC 10008) — the item, its discovered
-/// streams, and what this client would actually be served.
+/// Query an item for playback
 ///
-/// **It answers only what is knowable now.** QUERY is safe and
-/// idempotent, so it starts nothing and waits for nothing: no
-/// display-set extraction dispatched to a mediahost, no rasterisation,
-/// no lease, no transcoder reserved. It runs the same negotiation a
-/// session runs, stopping before the fetches that would make a burn or
-/// an overlay *real* — so those tiers are reported only when their
-/// artefacts already exist, and a first play may still land elsewhere
-/// after the session materialises one.
-///
-/// Reached through `MethodRouter::fallback`, because axum's
-/// `MethodFilter` has no extension methods. That fallback swallows
-/// EVERY unmatched method, so the method is checked here and the
-/// `Allow` header written by hand — axum's own 405 machinery no longer
-/// runs for this route.
+/// Returns the item detail plus per-source stream information, intro segments
+/// and what this client would be served for the capability profile in the
+/// body. Starts no session and reserves nothing.
+// Reached through `MethodRouter::fallback`, because axum's `MethodFilter`
+// has no extension methods. That fallback swallows EVERY unmatched
+// method, so the method is checked here and the `Allow` header written
+// by hand — axum's own 405 machinery no longer runs for this route.
+// Negotiation stops before anything that would materialise a burn or an
+// overlay, so those tiers are reported only when the artefact exists.
 #[utoipa::path(
     post,
     path = "/api/v1/items/{id}",
@@ -5918,8 +6114,11 @@ struct ProgressRequest {
     position_ms: u64,
 }
 
-/// Record playback progress (HUB-10/18): durable resume position, played
-/// flag + play count on crossing 90%, and a session keep-alive.
+/// Report playback progress
+///
+/// Stores the resume position, keeps the session alive and paces the
+/// pipeline, marking the item played past 90 percent. An unknown or expired
+/// session answers 404.
 #[utoipa::path(
     post, path = "/api/v1/playback/sessions/{id}/progress", tag = "Playback",
     security(("bearer_auth" = [])),
@@ -6014,26 +6213,16 @@ struct WatchedRequest {
     items: Option<Vec<String>>,
 }
 
-/// Mark items watched or unwatched without playing them (HUB-10).
+/// Mark items watched or unwatched
 ///
-/// `post_progress` above was the only way into `watch_state`, and it needs
-/// a live session — so there was no way to tick off something watched
-/// elsewhere, and no way to undo a mistaken one.
-///
-/// A whole season or show goes in ONE call, as one statement. The client
-/// used to loop, which was fine on a LAN and poor over a link (a
-/// 26-episode season is 26 round trips), and it could half-apply: a
-/// failure at episode 14 left 13 marked. One `INSERT … SELECT` either
-/// applies or does not.
-///
-/// Either direction clears the resume position: a card carries both a
-/// played tick and a resume bar, and "watched, and also 40 minutes in" is
-/// not a state the interface can draw honestly.
-///
-/// `play_count` only ever climbs. Marking watched asserts a viewing and
-/// counts it; unmarking says "show this as unwatched", which is not a
-/// claim that the earlier viewings never happened. The `AND NOT played`
-/// guard means re-marking something already marked counts nothing.
+/// Sets the played flag for this item, or for up to 2000 of its children
+/// named in the body, clearing resume positions and only ever increasing play
+/// counts. Returns 404 when nothing matched.
+// One `INSERT … SELECT` for a whole season: a client loop half-applies
+// (a failure at episode 14 leaves 13 marked) and costs a round trip per
+// episode. `play_count` only ever climbs — unmarking says "show this as
+// unwatched", not "those viewings never happened" — and the `AND NOT
+// played` guard keeps re-marking from counting twice.
 #[utoipa::path(
     put, path = "/api/v1/items/{id}/watched", tag = "Items",
     security(("bearer_auth" = [])),
@@ -6204,10 +6393,11 @@ fn declare_target_duration(bytes: Vec<u8>, secs: u32) -> Vec<u8> {
     out.into_bytes()
 }
 
-/// Serve session artifacts (playlist + segments): remux sessions from
-/// local scratch, dispatched sessions via the transcoder proxy. Only
-/// plain filenames are accepted — no separators, no dotfiles — so
-/// traversal is impossible by construction.
+/// Fetch a session artifact
+///
+/// Serves a session's playlist, media segments and subtitle files, proxying
+/// from the transcoder for dispatched sessions. Accepts a bearer token or the
+/// media cookie; live subtitle files are followed until the session ends.
 #[utoipa::path(
     get, path = "/api/v1/playback/sessions/{id}/{file}", tag = "Playback media",
     security(("bearer_auth" = []), ("media_token" = [])),
