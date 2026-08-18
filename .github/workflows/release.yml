@@ -282,11 +282,17 @@ jobs:
           assets="$RUNNER_TEMP/release-assets"
           git archive --format=tar.gz --prefix="kahawai-$VERSION/" \
             -o "$assets/kahawai-$VERSION-source.tar.gz" "$RELEASE_COMMIT"
+          # The API contract as a release artifact, so a third-party client
+          # can generate against a fixed version without cloning or running
+          # the hub. Taken from the stamped release commit, so `info.version`
+          # is this release rather than `0.0.0-dev`.
+          cp web/openapi.json "$assets/kahawai-openapi.json"
           cd "$assets"
-          sha256sum kahawai-*.tar.gz > SHA256SUMS
+          sha256sum kahawai-*.tar.gz kahawai-openapi.json > SHA256SUMS
       - name: Publish GitHub release
         run: |
           gh release upload "$TAG" "$RUNNER_TEMP/release-assets"/kahawai-*.tar.gz \
+            "$RUNNER_TEMP/release-assets/kahawai-openapi.json" \
             "$RUNNER_TEMP/release-assets/SHA256SUMS" --clobber
           if test "$PRERELEASE" = true; then
             gh release edit "$TAG" --draft=false --prerelease
