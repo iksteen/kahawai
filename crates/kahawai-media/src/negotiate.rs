@@ -780,10 +780,27 @@ pub fn negotiate_for_executors(
         StreamMode::Copy => v.is_some_and(|s| s.codec == "h264"),
         StreamMode::Encode => ts.1 == VideoTarget::H264,
     };
+    // The same rule, audio: mpegtsmux really does mux Opus (there is a
+    // registration descriptor and everything), and `caps_muxable` says so
+    // — but hls.js's transport-stream demuxer has no Opus (or FLAC, or
+    // Vorbis) parser, so such a copy into TS is a silent track. Measured
+    // on an AV1+Opus title whose client masked av1: video encoded to
+    // h264, audio "copied", TS won the cost tie, and the session played
+    // picture with no sound. A blacklist of what hls.js provably lacks,
+    // not a whitelist: AAC, MPEG audio and (e)AC-3 all have TS parsers
+    // there and copied fine before. Encodes are safe — the TS ladder
+    // only targets AAC.
+    let ts_delivers_playable_audio = match ts.2 {
+        StreamMode::Off => true,
+        StreamMode::Copy => {
+            !a.is_some_and(|s| matches!(s.codec.as_str(), "opus" | "flac" | "vorbis"))
+        }
+        StreamMode::Encode => true,
+    };
     // Then: fewest dropped streams, then cheapest, tie → TS, the proven
     // path — it wins unless fMP4 delivers more or strictly cheaper.
     let (segment_format, (mut video, video_target, audio, audio_target, _key)) =
-        if !ts_delivers_h264 || f4.4 < ts.4 {
+        if !ts_delivers_h264 || !ts_delivers_playable_audio || f4.4 < ts.4 {
             (SegmentFormat::Fmp4, f4)
         } else {
             (SegmentFormat::Ts, ts)
@@ -1248,6 +1265,28 @@ mod tests {
         assert_eq!(sp.cost, Cost::AudioEncode, "{}", sp.audio_verdict);
         assert_eq!(sp.plan.audio_codec, AudioTarget::Opus);
         assert_eq!(sp.plan.segment_format, SegmentFormat::Fmp4);
+    }
+
+    /// An Opus COPY must pull the session onto fMP4 even when the video
+    /// side alone would settle the cost tie on TS: mpegtsmux muxes Opus
+    /// and `caps_muxable` says so, but hls.js's TS demuxer plays AAC and
+    /// MP3 and nothing newer — the measured shape was an AV1+Opus title
+    /// whose client masked av1: h264 encode, "opus copy", TS, picture
+    /// with no sound.
+    #[test]
+    fn an_opus_copy_is_never_carried_by_ts() {
+        let mut p = chrome();
+        p.audio.push("opus".into());
+        let info = media("matroska", Some(vs("av1")), Some(au("opus", 2)));
+        let sp = negotiate(&p, &info, 0, 0, true, None, true, true, &[], None, &fleet());
+        assert_eq!(sp.cost, Cost::VideoEncode, "{}", sp.video_verdict);
+        assert_eq!(sp.plan.audio, StreamMode::Copy, "{}", sp.audio_verdict);
+        assert_eq!(
+            sp.plan.segment_format,
+            SegmentFormat::Fmp4,
+            "opus copy in TS is a silent track: {}",
+            sp.audio_verdict
+        );
     }
 
     /// An MPEG-1 audio copy must never ride fMP4. isofmp4mux's
