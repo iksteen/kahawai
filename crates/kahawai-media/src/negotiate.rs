@@ -98,7 +98,7 @@ pub struct SubtitleVerdict {
     pub note: &'static str,
 }
 
-/// HUB-32a/b/c policy order as data: bitmap streaming → OCR text →
+/// Subtitle policy order as data: bitmap streaming → OCR text →
 /// burn-in, `Unavailable` when none of them can happen.
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]

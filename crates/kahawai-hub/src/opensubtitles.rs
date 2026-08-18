@@ -83,11 +83,11 @@ pub struct Candidate {
     pub language: Option<String>,
     #[schema(required)]
     pub release_name: Option<String>,
-    /// True when the provider matched by moviehash (exact file, HUB-22)
+    /// True when the provider matched by moviehash (exact file)
     /// rather than by title — surfaced so the UI can rank/badge it.
     pub hash_match: bool,
     pub downloads: i64,
-    /// HUB-24 display fields: who uploaded it and how it rates.
+    /// Display fields: who uploaded it and how it rates.
     #[schema(required)]
     pub uploader: Option<String>,
     #[schema(required)]
@@ -99,7 +99,7 @@ pub struct Candidate {
     pub fps: Option<f64>,
 }
 
-/// HUB-21/24: what is left of the download entitlement. Anonymous
+/// What is left of the download entitlement. Anonymous
 /// usage shares one budget across the whole deployment, which the UI
 /// must say out loud.
 #[derive(Debug, Clone, Default, serde::Serialize, utoipa::ToSchema)]

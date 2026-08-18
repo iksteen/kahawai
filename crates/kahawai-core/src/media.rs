@@ -28,7 +28,7 @@ where
     }
 }
 
-/// A file's own loudness statement (HUB-19).
+/// A file's own loudness statement.
 ///
 /// Gains are dB to apply; peaks are linear sample values where 1.0 is
 /// full scale, so a player can turn a track down without clipping it —
@@ -80,20 +80,20 @@ pub struct MediaInfo {
     pub audio: Vec<AudioStream>,
     #[serde(default)]
     pub subtitles: Vec<SubtitleStream>,
-    /// Sidecar subtitle files next to the media file (MH-4).
+    /// Sidecar subtitle files next to the media file.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub external_subtitles: Vec<SidecarSubtitle>,
-    /// ReplayGain (HUB-19), as the file states it: a loudness
+    /// ReplayGain, as the file states it: a loudness
     /// measurement someone made once, carried to the client rather than
     /// re-measured or applied here. Absent for anything untagged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replay_gain: Option<ReplayGain>,
-    /// Local artwork in the media file's directory (MH-4):
+    /// Local artwork in the media file's directory:
     /// cover/folder/poster image, path relative to the collection root.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artwork: Option<String>,
-    /// A Kodi-style .nfo beside the media file or in its directory
-    /// (HUB-9), path relative to the collection root. Recorded at scan so
+    /// A Kodi-style .nfo beside the media file or in its directory, path
+    /// relative to the collection root. Recorded at scan so
     /// the hub can decline instantly for the files that have none — it
     /// costs a lease read to actually parse one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -102,10 +102,10 @@ pub struct MediaInfo {
     #[serde(default)]
     pub tags: BTreeMap<String, String>,
     /// Embedded attachments (fonts, cover art) DECLARED at scan or by
-    /// the MH-4 backfill: name, mime, and the payload's byte range —
+    /// the attachment backfill: name, mime, and the payload's byte range —
     /// never the payload itself. Tri-state: `None` = never declared
     /// (fall back to demux), `Some([])` = checked and none exist,
-    /// `Some([...])` = read these exact ranges (HUB-34 fonts rung).
+    /// `Some([...])` = read these exact ranges.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attachments: Option<Vec<Attachment>>,
     /// Chapters as the container declares them, in start order:
@@ -167,9 +167,9 @@ pub struct VideoStream {
     #[schema(required)]
     pub bit_depth: Option<u32>,
     pub interlaced: bool,
-    /// "hdr10" | "hlg", from caps colorimetry (MH-3). None = SDR or a
+    /// "hdr10" | "hlg", from caps colorimetry. None = SDR or a
     /// row probed before extraction existed — negotiation treats both
-    /// as SDR (HUB-15a).
+    /// as SDR.
     #[schema(required)]
     pub hdr: Option<String>,
     /// Caps profile string ("high", "main-10", …). None = unknown
@@ -185,8 +185,8 @@ pub struct VideoStream {
     #[serde(default)]
     #[schema(required)]
     pub bitrate_kbps: Option<u32>,
-    /// Longest gap between keyframes, from the container index at scan
-    /// (MH-3). `None` = not measured: an unsupported container, an
+    /// Longest gap between keyframes, from the container index at scan.
+    /// `None` = not measured: an unsupported container, an
     /// absent index, or a row scanned before this existed. Unknown is
     /// NOT zero — a caller that needs a bound must assume it could be
     /// long.
@@ -314,7 +314,7 @@ impl TargetDuration {
     }
 }
 
-/// HUB-14: what the requesting client can play. Sent with each play
+/// What the requesting client can play. Sent with each play
 /// request; per-request state, never persisted. `Default` is the
 /// conservative fallback for requests without one — it reproduces the
 /// pre-negotiation behavior exactly (mp4/webm direct, WEB_TARGET
@@ -347,16 +347,16 @@ pub struct CapabilityProfile {
     /// pipeline, or compositor tone mapping (Chrome/Safari do this on
     /// SDR displays; Firefox does not and renders PQ washed-out).
     /// false + an hdr10 source vetoes copy/direct when the server can
-    /// tone-map an encode instead (HUB-15a decision arm).
+    /// tone-map an encode instead.
     #[serde(default)]
     pub hdr: bool,
     /// min()-ed with the user's stored bandwidth pref by the hub.
     #[serde(default)]
     pub max_bandwidth_kbps: Option<u32>,
-    /// HUB-32a: client renders ASS/SSA faithfully (JASSUB).
+    /// Client renders ASS/SSA faithfully (JASSUB).
     #[serde(default)]
     pub ass_render: bool,
-    /// HUB-32b: client composites bitmap display sets (canvas overlay).
+    /// Client composites bitmap display sets (canvas overlay).
     #[serde(default)]
     pub graphics_overlay: bool,
     /// Client renders plain timed text. Every text rung — a converted

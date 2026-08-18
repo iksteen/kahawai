@@ -3322,8 +3322,8 @@ const THROTTLE_IP_AFTER: u32 = 20;
 ///
 /// Exchanges a username and password for tokens. API clients receive the
 /// refresh token in the body; browser clients receive HttpOnly cookies and
-/// must send a matching Origin. Repeated failures return 429 with Retry-
-/// After.
+/// must send a matching Origin. Repeated failures return 429 with a
+/// Retry-After header.
 #[utoipa::path(
     post, path = "/api/v1/auth/token", tag = "Authentication",
     request_body = LoginRequest,
@@ -3530,7 +3530,7 @@ async fn logout(
 struct StartSessionRequest {
     item_id: String,
     /// Explicit mode = the pre-negotiation contract, verbatim (scripts,
-    /// debugging). Absent = the hub negotiates from `profile` (HUB-14).
+    /// debugging). Absent = the hub negotiates from `profile`.
     #[serde(default)]
     mode: Option<String>,
     /// The client's capability profile; absent = conservative fallback.
@@ -3540,8 +3540,8 @@ struct StartSessionRequest {
     /// catch up) — keyframe-snapped by the pipeline.
     #[serde(default)]
     start_ms: u64,
-    /// Track indexes in the source's discovery order (HUB-27). The UI
-    /// resolves defaults from /api/v1/prefs client-side (HUB-33).
+    /// Track indexes in the source's discovery order. The UI
+    /// resolves defaults from /api/v1/prefs client-side.
     #[serde(default)]
     audio_track: u32,
     #[serde(default)]
@@ -3869,7 +3869,7 @@ async fn start_session(
 #[derive(Deserialize, ToSchema)]
 struct SeekRequest {
     position_ms: u64,
-    /// Switch tracks during the restart (HUB-27).
+    /// Switch tracks during the restart.
     audio_track: Option<u32>,
     video_track: Option<u32>,
     /// Switch the burned subtitle mid-session (unified track id): an
@@ -5444,7 +5444,7 @@ struct ItemQueryResponse {
 struct ItemQueryResult {
     #[schema(required)]
     negotiated: Option<NegotiatedItem>,
-    /// HUB-37: the recap, opening and credits of this item, if they have been
+    /// The recap, opening and credits of this item, if they have been
     /// found. On the QUERY because it is the call a player makes on its way
     /// into playback — the subtitle listing above rides along for the same
     /// reason — and the boundaries are useless until something is playing.

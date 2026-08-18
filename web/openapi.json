@@ -9,7 +9,7 @@
     },
     "version": "0.0.0-dev"
   },
-  "x-kahawai-source-sha256": "ef18702f8e1b61c6af6adfd77874d9583052020b7d1c349c1aacbdae276d9567",
+  "x-kahawai-source-sha256": "b4df214a4ac701e352fd97ae1398c54eb6c0cb6c2e32e9b07c886c3aa5c42ebd",
   "paths": {
     "/admin/v1/collections": {
       "get": {
@@ -3272,7 +3272,7 @@
           "Authentication"
         ],
         "summary": "Sign in and get an access token",
-        "description": "Exchanges a username and password for tokens. API clients receive the\nrefresh token in the body; browser clients receive HttpOnly cookies and\nmust send a matching Origin. Repeated failures return 429 with Retry-\nAfter.",
+        "description": "Exchanges a username and password for tokens. API clients receive the\nrefresh token in the body; browser clients receive HttpOnly cookies and\nmust send a matching Origin. Repeated failures return 429 with a\nRetry-After header.",
         "operationId": "login",
         "parameters": [
           {
@@ -6387,7 +6387,7 @@
           },
           "hash_match": {
             "type": "boolean",
-            "description": "True when the provider matched by moviehash (exact file, HUB-22)\nrather than by title — surfaced so the UI can rank/badge it."
+            "description": "True when the provider matched by moviehash (exact file)\nrather than by title — surfaced so the UI can rank/badge it."
           },
           "language": {
             "type": [
@@ -6416,20 +6416,20 @@
               "string",
               "null"
             ],
-            "description": "HUB-24 display fields: who uploaded it and how it rates."
+            "description": "Display fields: who uploaded it and how it rates."
           }
         }
       },
       "CapabilityProfile": {
         "type": "object",
-        "description": "HUB-14: what the requesting client can play. Sent with each play\nrequest; per-request state, never persisted. `Default` is the\nconservative fallback for requests without one — it reproduces the\npre-negotiation behavior exactly (mp4/webm direct, WEB_TARGET\ncodecs, no ceilings), so old clients and scripts lose nothing.\nEvery field defaults EXCEPT `target_duration`, which is required.\nThe struct-level `#[serde(default)]` used to make the whole profile\npartial; a client must now state what it needs from the playlist,\nbecause there is no answer that is right for all three kinds of\nclient and a silent default would pick one of them for it.",
+        "description": "What the requesting client can play. Sent with each play\nrequest; per-request state, never persisted. `Default` is the\nconservative fallback for requests without one — it reproduces the\npre-negotiation behavior exactly (mp4/webm direct, WEB_TARGET\ncodecs, no ceilings), so old clients and scripts lose nothing.\nEvery field defaults EXCEPT `target_duration`, which is required.\nThe struct-level `#[serde(default)]` used to make the whole profile\npartial; a client must now state what it needs from the playlist,\nbecause there is no answer that is right for all three kinds of\nclient and a silent default would pick one of them for it.",
         "required": [
           "target_duration"
         ],
         "properties": {
           "ass_render": {
             "type": "boolean",
-            "description": "HUB-32a: client renders ASS/SSA faithfully (JASSUB)."
+            "description": "Client renders ASS/SSA faithfully (JASSUB)."
           },
           "audio": {
             "type": "array",
@@ -6447,11 +6447,11 @@
           },
           "graphics_overlay": {
             "type": "boolean",
-            "description": "HUB-32b: client composites bitmap display sets (canvas overlay)."
+            "description": "Client composites bitmap display sets (canvas overlay)."
           },
           "hdr": {
             "type": "boolean",
-            "description": "Client will DISPLAY HDR bytes acceptably — either a real HDR\npipeline, or compositor tone mapping (Chrome/Safari do this on\nSDR displays; Firefox does not and renders PQ washed-out).\nfalse + an hdr10 source vetoes copy/direct when the server can\ntone-map an encode instead (HUB-15a decision arm)."
+            "description": "Client will DISPLAY HDR bytes acceptably — either a real HDR\npipeline, or compositor tone mapping (Chrome/Safari do this on\nSDR displays; Firefox does not and renders PQ washed-out).\nfalse + an hdr10 source vetoes copy/direct when the server can\ntone-map an encode instead."
           },
           "max_audio_channels": {
             "type": "integer",
@@ -6828,7 +6828,7 @@
       },
       "Delivery": {
         "type": "string",
-        "description": "How a track can be served to a given client — the tier ladder\n(HUB-32a/b/c) expressed per track instead of per plan.",
+        "description": "How a track can be served to a given client — the tier ladder\nexpressed per track instead of per plan.",
         "enum": [
           "text",
           "ass",
@@ -7256,7 +7256,7 @@
             "items": {
               "$ref": "#/components/schemas/Segment"
             },
-            "description": "HUB-37: the recap, opening and credits of this item, if they have been\nfound. On the QUERY because it is the call a player makes on its way\ninto playback — the subtitle listing above rides along for the same\nreason — and the boundaries are useless until something is playing.\nThere is deliberately no standalone segments endpoint. Empty when nothing was found, and when\nnothing has been analysed: a player cannot act on the difference.\n\nOutside `negotiated`, because an item whose source is offline still has\nthe boundaries somebody found last week."
+            "description": "The recap, opening and credits of this item, if they have been\nfound. On the QUERY because it is the call a player makes on its way\ninto playback — the subtitle listing above rides along for the same\nreason — and the boundaries are useless until something is playing.\nThere is deliberately no standalone segments endpoint. Empty when nothing was found, and when\nnothing has been analysed: a player cannot act on the difference.\n\nOutside `negotiated`, because an item whose source is offline still has\nthe boundaries somebody found last week."
           },
           "unavailable": {
             "oneOf": [
@@ -7912,7 +7912,7 @@
               "string",
               "null"
             ],
-            "description": "Local artwork in the media file's directory (MH-4):\ncover/folder/poster image, path relative to the collection root."
+            "description": "Local artwork in the media file's directory:\ncover/folder/poster image, path relative to the collection root."
           },
           "attachments": {
             "type": [
@@ -7922,7 +7922,7 @@
             "items": {
               "$ref": "#/components/schemas/Attachment"
             },
-            "description": "Embedded attachments (fonts, cover art) DECLARED at scan or by\nthe MH-4 backfill: name, mime, and the payload's byte range —\nnever the payload itself. Tri-state: `None` = never declared\n(fall back to demux), `Some([])` = checked and none exist,\n`Some([...])` = read these exact ranges (HUB-34 fonts rung)."
+            "description": "Embedded attachments (fonts, cover art) DECLARED at scan or by\nthe attachment backfill: name, mime, and the payload's byte range —\nnever the payload itself. Tri-state: `None` = never declared\n(fall back to demux), `Some([])` = checked and none exist,\n`Some([...])` = read these exact ranges."
           },
           "audio": {
             "type": "array",
@@ -7960,20 +7960,20 @@
             "items": {
               "$ref": "#/components/schemas/SidecarSubtitle"
             },
-            "description": "Sidecar subtitle files next to the media file (MH-4)."
+            "description": "Sidecar subtitle files next to the media file."
           },
           "nfo": {
             "type": [
               "string",
               "null"
             ],
-            "description": "A Kodi-style .nfo beside the media file or in its directory\n(HUB-9), path relative to the collection root. Recorded at scan so\nthe hub can decline instantly for the files that have none — it\ncosts a lease read to actually parse one."
+            "description": "A Kodi-style .nfo beside the media file or in its directory, path\nrelative to the collection root. Recorded at scan so\nthe hub can decline instantly for the files that have none — it\ncosts a lease read to actually parse one."
           },
           "replay_gain": {
             "oneOf": [
               {
                 "$ref": "#/components/schemas/ReplayGain",
-                "description": "ReplayGain (HUB-19), as the file states it: a loudness\nmeasurement someone made once, carried to the client rather than\nre-measured or applied here. Absent for anything untagged."
+                "description": "ReplayGain, as the file states it: a loudness\nmeasurement someone made once, carried to the client rather than\nre-measured or applied here. Absent for anything untagged."
               },
               {
                 "type": "null"
@@ -8378,7 +8378,7 @@
       },
       "Quota": {
         "type": "object",
-        "description": "HUB-21/24: what is left of the download entitlement. Anonymous\nusage shares one budget across the whole deployment, which the UI\nmust say out loud.",
+        "description": "What is left of the download entitlement. Anonymous\nusage shares one budget across the whole deployment, which the UI\nmust say out loud.",
         "required": [
           "remaining",
           "total",
@@ -8486,7 +8486,7 @@
       },
       "ReplayGain": {
         "type": "object",
-        "description": "A file's own loudness statement (HUB-19).\n\nGains are dB to apply; peaks are linear sample values where 1.0 is\nfull scale, so a player can turn a track down without clipping it —\nthe peak is what says whether a positive gain is safe.\n\nAlbum values exist so a record plays with its own dynamics intact:\napplying per-track gain across an album flattens the quiet tracks\nthe artist meant to be quiet. A client that has both should prefer\nalbum when playing an album and track when shuffling.",
+        "description": "A file's own loudness statement.\n\nGains are dB to apply; peaks are linear sample values where 1.0 is\nfull scale, so a player can turn a track down without clipping it —\nthe peak is what says whether a positive gain is safe.\n\nAlbum values exist so a record plays with its own dynamics intact:\napplying per-track gain across an album flattens the quiet tracks\nthe artist meant to be quiet. A client that has both should prefer\nalbum when playing an album and track when shuffling.",
         "properties": {
           "album_gain_db": {
             "type": [
@@ -8815,7 +8815,7 @@
               "null"
             ],
             "format": "int32",
-            "description": "Switch tracks during the restart (HUB-27).",
+            "description": "Switch tracks during the restart.",
             "minimum": 0
           },
           "position_ms": {
@@ -9138,7 +9138,7 @@
           "audio_track": {
             "type": "integer",
             "format": "int32",
-            "description": "Track indexes in the source's discovery order (HUB-27). The UI\nresolves defaults from /api/v1/prefs client-side (HUB-33).",
+            "description": "Track indexes in the source's discovery order. The UI\nresolves defaults from /api/v1/prefs client-side.",
             "minimum": 0
           },
           "item_id": {
@@ -9149,7 +9149,7 @@
               "string",
               "null"
             ],
-            "description": "Explicit mode = the pre-negotiation contract, verbatim (scripts,\ndebugging). Absent = the hub negotiates from `profile` (HUB-14)."
+            "description": "Explicit mode = the pre-negotiation contract, verbatim (scripts,\ndebugging). Absent = the hub negotiates from `profile`."
           },
           "profile": {
             "oneOf": [
@@ -9408,7 +9408,7 @@
       },
       "SubtitleTier": {
         "type": "string",
-        "description": "HUB-32a/b/c policy order as data: bitmap streaming → OCR text →\nburn-in, `Unavailable` when none of them can happen.",
+        "description": "Subtitle policy order as data: bitmap streaming → OCR text →\nburn-in, `Unavailable` when none of them can happen.",
         "enum": [
           "text",
           "convert",
@@ -9903,7 +9903,7 @@
               "string",
               "null"
             ],
-            "description": "\"hdr10\" | \"hlg\", from caps colorimetry (MH-3). None = SDR or a\nrow probed before extraction existed — negotiation treats both\nas SDR (HUB-15a)."
+            "description": "\"hdr10\" | \"hlg\", from caps colorimetry. None = SDR or a\nrow probed before extraction existed — negotiation treats both\nas SDR."
           },
           "height": {
             "type": "integer",
@@ -9926,7 +9926,7 @@
               "null"
             ],
             "format": "int32",
-            "description": "Longest gap between keyframes, from the container index at scan\n(MH-3). `None` = not measured: an unsupported container, an\nabsent index, or a row scanned before this existed. Unknown is\nNOT zero — a caller that needs a bound must assume it could be\nlong.\n\nBounds the longest HLS segment OUR SEGMENTERS produce, and so\nthe honest `EXT-X-TARGETDURATION` (RFC 8216 §4.3.3.1, \"the\nmaximum Media Segment duration\").\n\nThe coupling is our tooling, not the format: `splitmuxsink` and\n`isofmp4mux` both close a fragment at the first keyframe past\nthe fragment target, and a copy has no encoder to ask for one,\nso the source's spacing leaks into segment length. The spec\nitself only RECOMMENDS keyframe-aligned segments (§6.2.1\n\"SHOULD attempt to divide… on packet and key frame\nboundaries\"), and §3 explicitly allows a segment whose leading\nframes are \"downloaded but possibly discarded\". A segmenter\nthat cut on a time grid would make this field irrelevant.",
+            "description": "Longest gap between keyframes, from the container index at scan.\n`None` = not measured: an unsupported container, an\nabsent index, or a row scanned before this existed. Unknown is\nNOT zero — a caller that needs a bound must assume it could be\nlong.\n\nBounds the longest HLS segment OUR SEGMENTERS produce, and so\nthe honest `EXT-X-TARGETDURATION` (RFC 8216 §4.3.3.1, \"the\nmaximum Media Segment duration\").\n\nThe coupling is our tooling, not the format: `splitmuxsink` and\n`isofmp4mux` both close a fragment at the first keyframe past\nthe fragment target, and a copy has no encoder to ask for one,\nso the source's spacing leaks into segment length. The spec\nitself only RECOMMENDS keyframe-aligned segments (§6.2.1\n\"SHOULD attempt to divide… on packet and key frame\nboundaries\"), and §3 explicitly allows a segment whose leading\nframes are \"downloaded but possibly discarded\". A segmenter\nthat cut on a time grid would make this field irrelevant.",
             "minimum": 0
           },
           "orientation": {

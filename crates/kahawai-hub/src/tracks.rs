@@ -83,7 +83,7 @@ pub struct Track {
 }
 
 /// How a track can be served to a given client — the tier ladder
-/// (HUB-32a/b/c) expressed per track instead of per plan.
+/// expressed per track instead of per plan.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Delivery {
