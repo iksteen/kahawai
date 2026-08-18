@@ -1,4 +1,13 @@
 #!/bin/sh
+# The four gates CI would fail anyway, answered before the commit exists.
+# Everything checks the WORKING TREE; only the openapi check has a --staged
+# mode. A partial stage whose worktree is clean passes - the standard trade.
+# `-D warnings` after `--` denies every warning class like CI's RUSTFLAGS
+# does, without a second build cache.
 set -eu
 
+cargo fmt --all --check
+KAHAWAI_SKIP_WEB_BUILD=1 cargo clippy --locked --workspace --all-targets --quiet -- -D warnings
+npm --prefix web run --silent fmt:check
+npm --prefix web run --silent lint
 exec npm --prefix web run api:check -- --staged
