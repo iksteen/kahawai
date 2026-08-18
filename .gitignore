@@ -6,3 +6,7 @@
 /node_modules
 __pycache__/
 /web-mockup
+
+# the reference rig builds intro-skipper into ~/.cache; these are dotnet scratch
+scripts/introref/obj/
+scripts/introref/bin/

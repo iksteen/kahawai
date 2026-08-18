@@ -1,0 +1,21 @@
+[package]
+name = "kahawai-intro"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Intro/credits detection. Its own package because nothing else in the
+# workspace wants an audio fingerprinter, and because the comparison rig
+# (docs/intro-detection-plan.md) measures this crate on its own.
+
+[dependencies]
+kahawai-core = { workspace = true }
+kahawai-media = { workspace = true }
+anyhow = { workspace = true }
+gstreamer = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+gstreamer-app = "0.25.2"
+gstreamer-video = "0.25"
+rusty-chromaprint = "0.3"

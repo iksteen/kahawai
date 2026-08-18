@@ -25,6 +25,7 @@ path = "src/bin/kahawai-hubd.rs"
 [dependencies]
 kahawai-core = { workspace = true }
 kahawai-hub = { workspace = true }
+kahawai-intro = { workspace = true }
 kahawai-media = { workspace = true }
 kahawai-mediahost = { workspace = true }
 kahawai-mediahostd = { workspace = true }

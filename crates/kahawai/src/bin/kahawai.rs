@@ -5,7 +5,7 @@
 
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 /// What this binary can run, and the doctor rows only it can produce:
 /// the OCR tier lives behind the hub crate, so a build without the hub
@@ -99,6 +99,29 @@ enum Cmd {
         /// removes an entry a human put there.
         #[arg(long)]
         fix: bool,
+    },
+    /// Find the intro and end credits of a season's episodes.
+    Intro {
+        /// A season directory, or the episode files themselves.
+        #[arg(required = true, value_name = "PATH")]
+        paths: Vec<PathBuf>,
+        /// Machine-readable output.
+        #[arg(long)]
+        json: bool,
+        /// Anime ordering: match credits by fingerprint before falling back to
+        /// black frames, as intro-skipper does for anime.
+        #[arg(long)]
+        anime: bool,
+        /// Skip the silence and keyframe refinement of a segment's end.
+        #[arg(long)]
+        no_refine: bool,
+        /// Print one file's raw Chromaprint points instead of analyzing:
+        /// the comparison rig's input, and what `fpcalc -raw` prints.
+        #[arg(long)]
+        fingerprint: bool,
+        /// Window for --fingerprint, in seconds ("START:END").
+        #[arg(long, value_name = "START:END", default_value = "0:60")]
+        window: String,
     },
     /// Internal: per-session pipeline worker, spawned by the hub (§1.1
     /// crash isolation). Reads source bytes from the parent's socket.
@@ -224,6 +247,43 @@ async fn main() -> Result<()> {
             calibrate,
             fix,
             config_used.as_deref(),
+        ),
+        Cmd::Intro {
+            paths,
+            fingerprint: true,
+            window,
+            ..
+        } => {
+            let (start, end) = window
+                .split_once(':')
+                .context("--window takes START:END in seconds")?;
+            // Exactly one FILE: silently fingerprinting paths[0] of several
+            // looked like all of them, and a directory reached the decoder
+            // as if it were media.
+            let [path] = paths.as_slice() else {
+                anyhow::bail!("--fingerprint takes exactly one file");
+            };
+            anyhow::ensure!(
+                path.is_file(),
+                "--fingerprint takes a file, not a directory"
+            );
+            kahawai_intro::print_fingerprint(path, (start.parse()?, end.parse()?))
+        }
+        Cmd::Intro {
+            paths,
+            json,
+            anime,
+            no_refine,
+            ..
+        } => kahawai_intro::run(
+            &paths,
+            &kahawai_intro::season::Config {
+                anime,
+                adjust_on_silence: !no_refine,
+                snap_to_keyframe: !no_refine,
+                ..Default::default()
+            },
+            json,
         ),
         Cmd::RemuxWorker(w) => kahawai_runtime::run_remux_worker(&cfg, w),
         Cmd::Benchmark {

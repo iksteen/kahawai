@@ -3686,7 +3686,8 @@ pub fn start_full(
 /// Seek correctness is generation-based, as before: a block read for
 /// generation N is dropped once a seek bumps to N+1, so a slow in-
 /// flight read can never land pre-seek bytes after flush-stop.
-pub(crate) fn seekable_appsrc(mut source: Box<dyn RemuxSource>) -> AppSrc {
+/// A source element that reads a `RemuxSource` on demand, seeks included.
+pub fn seekable_appsrc(mut source: Box<dyn RemuxSource>) -> AppSrc {
     /// One fetch, sized to amortize the byte-plane round trip.
     const READ_BLOCK: usize = 2 * 1024 * 1024;
     /// Ring capacity — the pushback point. 16 MB ≈ 9 s of a 4K HDR

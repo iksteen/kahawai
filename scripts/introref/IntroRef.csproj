@@ -1,0 +1,45 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- The reference implementation for docs/intro-detection-plan.md: builds
+       intro-skipper's analyzer sources, exactly as cloned, against the shims in
+       this directory. Point $(IntroSkipperDir) at the clone; the rig script
+       does that for you.
+
+       Their sources are never copied into this repository. This project file
+       and the two .cs files beside it are ours (MIT); everything it compiles
+       from $(IntroSkipperDir) stays GPL-3.0 and stays where the clone put it,
+       and the binary it produces is a local measurement tool, not a release. -->
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net9.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>introref</AssemblyName>
+    <RootNamespace>IntroRef</RootNamespace>
+    <!-- Their tree builds with analyzers and warnings-as-errors; we only need
+         it to run, and their doc-comment rules are not our business. -->
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+    <NoWarn>$(NoWarn);CS1591;CA1848;CA1031;CA2007;CA1707;SYSLIB1045</NoWarn>
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="9.0.0" />
+  </ItemGroup>
+
+  <ItemGroup Condition="'$(IntroSkipperDir)' != ''">
+    <Compile Include="$(IntroSkipperDir)/IntroSkipper/Analyzers/**/*.cs" />
+    <Compile Include="$(IntroSkipperDir)/IntroSkipper/Data/**/*.cs" />
+    <Compile Include="$(IntroSkipperDir)/IntroSkipper/Configuration/PluginConfiguration.cs" />
+    <Compile Include="$(IntroSkipperDir)/IntroSkipper/FFmpeg/FFmpegService.cs" />
+    <Compile Include="$(IntroSkipperDir)/IntroSkipper/FFmpeg/IFFmpegService.cs" />
+    <Compile Include="$(IntroSkipperDir)/IntroSkipper/FFmpeg/IDetectionCacheService.cs" />
+    <Compile Include="$(IntroSkipperDir)/IntroSkipper/FFmpeg/FFmpegOutputParser.cs" />
+    <!-- Helpers the above reach into. The rest of Helper/ is Jellyfin-shaped. -->
+    <Compile Include="$(IntroSkipperDir)/IntroSkipper/Helper/ExclusionListJsonConverter.cs" />
+    <Compile Include="$(IntroSkipperDir)/IntroSkipper/Helper/OperatingSystem.cs" />
+    <Compile Include="$(IntroSkipperDir)/IntroSkipper/Helper/ConfigHasher.cs" />
+  </ItemGroup>
+
+</Project>
