@@ -9,7 +9,7 @@
     },
     "version": "0.0.0-dev"
   },
-  "x-kahawai-source-sha256": "b7afbd5f850f4e91abc59323faeecd3cedc7ac0040bd04af32d4b673d803ec7e",
+  "x-kahawai-source-sha256": "82250f0f59e096884996f2496593c730ddd9046f8462db150198b86a420a93bb",
   "paths": {
     "/admin/v1/collections": {
       "get": {
@@ -6371,6 +6371,35 @@
           }
         }
       },
+      "Chapter": {
+        "type": "object",
+        "description": "One chapter of a file, on that FILE's timeline. An item assembled from\nseveral parts shifts them onto its own; nothing else does.\n\n`end_ms` is only what the container states. Matroska usually leaves it\nout and means \"until the next one starts\", which a reader can work out\nand a writer must not invent — a stated end can be earlier than the\nnext start, and that gap is a fact about the file.",
+        "required": [
+          "start_ms"
+        ],
+        "properties": {
+          "end_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "start_ms": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "title": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The chapter's name, when it has one. Plenty of files number their\nchapters and say nothing else; a nameless chapter is still a seek\npoint worth showing."
+          }
+        }
+      },
       "ChildrenResponse": {
         "type": "object",
         "required": [
@@ -7665,6 +7694,16 @@
             "items": {
               "$ref": "#/components/schemas/AudioStream"
             }
+          },
+          "chapters": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/Chapter"
+            },
+            "description": "Chapters as the container declares them, in start order:\nthe file's own division of itself, which is a fact about the bytes\nand not an inference like a detected intro. Tri-state, as\n`attachments` is: `None` = never looked for (a row from before the\nfield, which the backfill worklist picks up), `Some([])` = looked\nfor and there are none, `Some([...])` = these."
           },
           "container": {
             "type": [

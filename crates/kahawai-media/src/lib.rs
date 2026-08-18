@@ -25,7 +25,9 @@ use anyhow::{Context, Result};
 use gstreamer as gst;
 use gstreamer_pbutils::prelude::*;
 use gstreamer_pbutils::{Discoverer, DiscovererAudioInfo, DiscovererInfo, DiscovererStreamInfo};
-use kahawai_core::media::{AudioStream, MediaInfo, SubtitleStream, VideoGeometry, VideoStream};
+use kahawai_core::media::{
+    AudioStream, Chapter, MediaInfo, SubtitleStream, VideoGeometry, VideoStream,
+};
 
 pub fn init() -> Result<()> {
     static INIT: OnceLock<Result<(), String>> = OnceLock::new();
@@ -251,6 +253,70 @@ fn geometry(stream: &gstreamer_pbutils::DiscovererVideoInfo, orientation: String
     }
 }
 
+/// A container's table of contents, flattened to chapters in start order.
+/// Editions and other grouping entries are containers for the chapters
+/// underneath them, not chapters themselves.
+fn chapters_of(toc: gst::Toc) -> Vec<Chapter> {
+    fn walk(entry: &gst::TocEntry, out: &mut Vec<Chapter>, depth: usize) {
+        // The same cap as the sparse Matroska reader, for the same reason: a
+        // crafted file nesting ~40k levels in under a megabyte overflows the
+        // stack, and in Rust that ABORTS the scanning process. Any demuxer
+        // that mirrors container nesting into its TOC re-opens the hole here.
+        if depth > 16 {
+            return;
+        }
+        if entry.entry_type() == gst::TocEntryType::Chapter
+            && let Some((start, stop)) = entry.start_stop_times()
+        {
+            out.push(Chapter {
+                start_ms: (start.max(0) / 1_000_000) as u64,
+                // stop >= 0 too: a negative demuxer time sign-wrapped the
+                // cast into an end eighteen trillion ms out.
+                end_ms: (stop > start && stop >= 0).then_some((stop / 1_000_000) as u64),
+                title: entry
+                    .tags()
+                    .and_then(|t| {
+                        t.get::<gst::tags::Title>()
+                            .map(|v| v.get().trim().to_string())
+                    })
+                    .filter(|t| !t.is_empty()),
+            });
+        }
+        for sub in entry.sub_entries() {
+            walk(&sub, out, depth + 1);
+        }
+    }
+    let mut out = Vec::new();
+    for entry in toc.entries() {
+        walk(&entry, &mut out, 0);
+    }
+    out.sort_by_key(|c| c.start_ms);
+    dedup_chapters(&mut out);
+    out
+}
+
+/// One chapter per (start, title): duplicates go, but two DIFFERENT titles
+/// on one timestamp are both information — a grouping "Feature" atom and its
+/// nested "Intro" both start at zero, and keying the dedup on the start
+/// alone silently ate whichever sorted second, which for the skip analyzer
+/// was the one that mattered. An untitled twin yields to a titled one.
+pub(crate) fn dedup_chapters(out: &mut Vec<Chapter>) {
+    out.dedup_by(|next, kept| {
+        if next.start_ms != kept.start_ms {
+            return false;
+        }
+        if kept.title.is_none() {
+            std::mem::swap(kept, next);
+        } else if next.title.is_some() && next.title != kept.title {
+            return false;
+        }
+        // The dropped twin may be the one carrying the container's stated
+        // end — "a fact about the file" the survivor must not lose.
+        kept.end_ms = kept.end_ms.or(next.end_ms);
+        true
+    });
+}
+
 fn map_info(info: &DiscovererInfo) -> MediaInfo {
     let mut out = MediaInfo {
         container: info
@@ -258,6 +324,11 @@ fn map_info(info: &DiscovererInfo) -> MediaInfo {
             .and_then(|s| caps_name(&s))
             .map(|n| normalize_container(&n)),
         duration_ms: info.duration().map(|d| d.mseconds()),
+        // Empty rather than absent: discovery ran, so the question
+        // was asked, and `None` is reserved for rows that predate it.
+        // Matroska is read properly by the caller — see `declare_chapters`
+        // — because the demuxer does not always post a TOC.
+        chapters: Some(info.toc().map(chapters_of).unwrap_or_default()),
         ..Default::default()
     };
 

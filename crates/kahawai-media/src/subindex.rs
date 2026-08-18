@@ -101,13 +101,28 @@ impl<'a> Reader<'a> {
         if let Some(d) = self.deadline
             && std::time::Instant::now() > d
         {
-            bail!("index walk exceeded its read budget");
+            // An io::Error, deliberately: exceeding the budget is the mount
+            // being slow — weather — and the weather-vs-shape rule must send
+            // it down the retry path, not settle a permanent "none".
+            return Err(anyhow::Error::new(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "index walk exceeded its read budget",
+            )));
         }
         let end = off + n as u64;
         let in_window = off >= self.win_start && end <= self.win_start + self.win.len() as u64;
         if !in_window {
+            // The big readahead pays off only when reads are DENSE — walking
+            // an element's children, cue tables. A far jump (cluster hops,
+            // a tail SeekHead) refilled the full 256KB window per 16-byte
+            // read: measured, ~10MB fetched to read 700 bytes of headers on
+            // one sparse walk, which is also what burned the read budget on
+            // network mounts. A jump beyond the window's neighbourhood gets
+            // a small window; the round trip costs the same either way.
+            let near =
+                off >= self.win_start && off <= self.win_start + self.win.len() as u64 + 65_536;
             let want = n
-                .max(READAHEAD)
+                .max(if near { READAHEAD } else { 4096 })
                 .min((self.len.saturating_sub(off)) as usize);
             if want < n {
                 bail!("read past eof");
@@ -157,6 +172,22 @@ const ATTACHED_FILE: u32 = 0x61A7;
 const FILE_NAME: u32 = 0x466E;
 const FILE_MIME: u32 = 0x4660;
 const FILE_DATA: u32 = 0x465C;
+const CHAPTERS: u32 = 0x1043_A770;
+/// The most bytes a header element read whole (SeekHead, Chapters) may
+/// declare. Real ones are kilobytes; the cap only exists so a hostile size
+/// cannot choose our allocation.
+const MAX_HEADER_ELEMENT: u64 = 4 * 1024 * 1024;
+const EDITION_ENTRY: u32 = 0x45B9;
+const EDITION_FLAG_HIDDEN: u32 = 0x45BD;
+const EDITION_FLAG_DEFAULT: u32 = 0x45DB;
+const CHAPTER_ATOM: u32 = 0xB6;
+const CHAPTER_TIME_START: u32 = 0x91;
+const CHAPTER_TIME_END: u32 = 0x92;
+const CHAPTER_FLAG_HIDDEN: u32 = 0x98;
+const CHAPTER_FLAG_ENABLED: u32 = 0x4598;
+const CHAPTER_SEGMENT_UID: u32 = 0x6E67;
+const CHAPTER_DISPLAY: u32 = 0x80;
+const CHAP_STRING: u32 = 0x85;
 const CONTENT_ENCODINGS: u32 = 0x6D80;
 const CONTENT_ENCODING: u32 = 0x6240;
 const CONTENT_COMPRESSION: u32 = 0x5034;
@@ -341,7 +372,11 @@ fn mkv_read_index(r: &mut Reader) -> Result<MkvIndex> {
     anyhow::ensure!(id == SEGMENT, "no segment");
     let (seg_size, sl) = ebml_size(&seg[il..])?;
     let segment_start = pos + il as u64 + sl as u64;
-    let segment_end = seg_size.map(|s| segment_start + s).unwrap_or(r.len);
+    // A declared size big enough to overflow is a lie, not a length; the
+    // file's own end is the honest bound.
+    let segment_end = seg_size
+        .and_then(|s| segment_start.checked_add(s))
+        .unwrap_or(r.len);
 
     let mut idx = MkvIndex {
         segment_start,
@@ -389,7 +424,13 @@ fn mkv_read_index(r: &mut Reader) -> Result<MkvIndex> {
                         if matches!(target, TRACKS | CUES | INFO)
                             && let Some(p) = position
                         {
-                            pending.push(segment_start + p);
+                            // checked: a hostile SeekPosition near u64::MAX overflowed
+                            // the add and PANICKED debug builds (proven with a
+                            // crafted file); the out-of-range filter at the
+                            // jump runs too late to save the arithmetic.
+                            if let Some(target) = segment_start.checked_add(p) {
+                                pending.push(target);
+                            }
                         }
                     }
                     Ok(true)
@@ -398,9 +439,6 @@ fn mkv_read_index(r: &mut Reader) -> Result<MkvIndex> {
             INFO => {
                 let data = r.read_at(body, size as usize)?;
                 walk_children(&data, |id, v| {
-                    if id == TIMESTAMP_SCALE {
-                        // (fields are ordered; a plain assign is fine)
-                    }
                     if id == TIMESTAMP_SCALE {
                         idx.timestamp_scale = uint(v).max(1);
                     }
@@ -512,21 +550,23 @@ fn mkv_read_index(r: &mut Reader) -> Result<MkvIndex> {
     Ok(idx)
 }
 
-/// MH-4: declare embedded attachments (name, mime, payload byte range)
-/// without ever reading a payload. Header reads only; jumps straight to
-/// the Attachments element when the SeekHead promises one, otherwise
-/// hops top-level elements by declared size. Non-matroska → empty.
-pub fn declare_attachments(path: &Path) -> Result<Vec<kahawai_core::media::Attachment>> {
-    let mut src = crate::remux::FileSource::open(path)?;
-    let len = src.size();
-    let mut r = Reader::new(&mut src);
+/// Whether an error is the storage misbehaving rather than the bytes being
+/// wrong. The distinction decides retryability: parse failures are final
+/// (the element is corrupt on every pass), I/O failures are weather.
+fn is_io(e: &anyhow::Error) -> bool {
+    e.chain()
+        .any(|cause| cause.downcast_ref::<std::io::Error>().is_some())
+}
 
-    let head = r.read_at(0, 32.min(len as usize))?;
+/// Where a Matroska file's Segment body starts and ends, or `None` when
+/// this is not a Matroska file at all.
+fn segment_span(r: &mut Reader) -> Result<Option<(u64, u64)>> {
+    let head = r.read_at(0, 32.min(r.len as usize))?;
     let Ok((id, il)) = ebml_id(&head) else {
-        return Ok(Vec::new());
+        return Ok(None);
     };
     if id != EBML_HEADER {
-        return Ok(Vec::new());
+        return Ok(None);
     }
     let (hsize, hsl) = ebml_size(&head[il..])?;
     let pos = il as u64 + hsl as u64 + hsize.context("unknown EBML header size")?;
@@ -534,63 +574,366 @@ pub fn declare_attachments(path: &Path) -> Result<Vec<kahawai_core::media::Attac
     let (id, il) = ebml_id(&seg)?;
     anyhow::ensure!(id == SEGMENT, "no segment");
     let (seg_size, sl) = ebml_size(&seg[il..])?;
-    let segment_start = pos + il as u64 + sl as u64;
-    let segment_end = seg_size.map(|s| segment_start + s).unwrap_or(r.len);
+    let start = pos + il as u64 + sl as u64;
+    // Overflowing declared size = a lie, not a length; the file's own end
+    // is the honest bound (same rule as declare_container's walk).
+    Ok(Some((
+        start,
+        seg_size.and_then(|s| start.checked_add(s)).unwrap_or(r.len),
+    )))
+}
 
-    let mut pos = segment_start;
+/// Parse a Chapters element: the DEFAULT non-hidden edition that yields any
+/// chapters, or failing that the first non-hidden one that does — an
+/// edition whose atoms are all hidden, linked or start-less has nothing to
+/// show, and falling through beats presenting it as "no chapters". The
+/// default flag matters on multi-edition files (theatrical/extended): the
+/// players show the default edition's marks, and taking the first put our
+/// ticks on a cut the viewer is not watching. Times are absolute
+/// nanoseconds — chapters do not go through TimestampScale.
+fn read_chapters(data: &[u8]) -> Result<Vec<kahawai_core::media::Chapter>> {
+    let mut out = Vec::new();
+    let mut out_is_default = false;
+    walk_children(data, |id, edition| {
+        if id != EDITION_ENTRY || out_is_default {
+            return Ok(true);
+        }
+        let (mut hidden, mut default) = (false, false);
+        walk_children(edition, |id, v| {
+            match id {
+                EDITION_FLAG_HIDDEN => hidden = uint(v) == 1,
+                EDITION_FLAG_DEFAULT => default = uint(v) == 1,
+                _ => {}
+            }
+            Ok(true)
+        })?;
+        // A non-default edition is only a fallback while nothing yielded.
+        if hidden || (!out.is_empty() && !default) {
+            return Ok(true);
+        }
+        let mut found = Vec::new();
+        collect_atoms(edition, &mut found, 0)?;
+        if !found.is_empty() {
+            out = found;
+            out_is_default = default;
+        }
+        Ok(true)
+    })?;
+    out.sort_by_key(|c: &kahawai_core::media::Chapter| c.start_ms);
+    crate::dedup_chapters(&mut out);
+    Ok(out)
+}
+
+/// Every ChapterAtom under `data`, nested ones included: a file that
+/// groups its chapters under a parent atom still means each of them.
+fn collect_atoms(
+    data: &[u8],
+    out: &mut Vec<kahawai_core::media::Chapter>,
+    depth: usize,
+) -> Result<()> {
+    // Real files nest a level or two (DVD titles over scenes). The recursion
+    // is otherwise bounded only by the file: ~40k nesting levels fit in 880KB
+    // of bytes and overflow the stack, which in Rust ABORTS the process — the
+    // scanner, mid-library, on one hostile file. Deeper atoms are ignored
+    // rather than refused: erroring would put the file back on the worklist
+    // for ever, and everything above the cap has already been read.
+    if depth > 16 {
+        return Ok(());
+    }
+    walk_children(data, |id, atom| {
+        if id != CHAPTER_ATOM {
+            return Ok(true);
+        }
+        let (mut start, mut end, mut title) = (None, None, None);
+        let (mut hidden, mut enabled, mut linked) = (false, true, false);
+        walk_children(atom, |id, v| {
+            match id {
+                CHAPTER_TIME_START => start = Some(uint(v) / 1_000_000),
+                CHAPTER_TIME_END => end = Some(uint(v) / 1_000_000),
+                CHAPTER_FLAG_HIDDEN => hidden = uint(v) == 1,
+                CHAPTER_FLAG_ENABLED => enabled = uint(v) != 0,
+                // Segment linking: the atom plays ANOTHER file, and its
+                // times are on that file's clock (ordered-chapters anime
+                // with external OP/ED — proven with a probe file). A seek
+                // mark on the wrong clock is worse than none.
+                CHAPTER_SEGMENT_UID => linked = true,
+                CHAPTER_DISPLAY if title.is_none() => {
+                    walk_children(v, |id, s| {
+                        if id == CHAP_STRING {
+                            title = Some(String::from_utf8_lossy(s).trim().to_string());
+                        }
+                        Ok(true)
+                    })?;
+                }
+                _ => {}
+            }
+            Ok(true)
+        })?;
+        if let Some(start_ms) = start
+            && !hidden
+            && enabled
+            && !linked
+        {
+            out.push(kahawai_core::media::Chapter {
+                start_ms,
+                end_ms: end,
+                title: title.filter(|t| !t.is_empty()),
+            });
+        }
+        // A linked atom's NESTED atoms are inside the linked segment too —
+        // their times are on that file's clock along with their parent's.
+        if !linked {
+            collect_atoms(atom, out, depth + 1)?;
+        }
+        Ok(true)
+    })
+}
+
+/// MH-4 + chapters: everything the container DECLARES about itself, from
+/// one walk of its header — the attachments (name, mime, payload byte
+/// range, never a payload) and the chapters.
+///
+/// One walk because the two live in the same header and are reached the
+/// same way: jump straight to each element when the SeekHead promises one,
+/// otherwise hop top-level elements by declared size. Chained SeekHeads are
+/// followed, which is how a file that stores its chapters after the
+/// clusters is reached without walking them. Two separate walks opened the
+/// file twice and read the header twice for every file in the backfill,
+/// which on a network mount is the whole cost of the pass.
+///
+/// Non-matroska returns two empty lists.
+pub fn declare_container(
+    path: &Path,
+) -> Result<(
+    Vec<kahawai_core::media::Attachment>,
+    Vec<kahawai_core::media::Chapter>,
+)> {
+    let mut src = crate::remux::FileSource::open(path)?;
+    // A budget bounds the one unbounded case — a SeekHead-less file hopped
+    // cluster by cluster on a slow mount. Hitting it is WEATHER (an
+    // io::Error): the declaration is discarded and the file stays on the
+    // worklist, because one degraded pass must not settle a permanent
+    // "none". A chronically slow case therefore re-burns the budget once
+    // per worklist offering — which is per scan/reconnect, not a loop —
+    // and that bounded cost is the price of the transient case healing.
+    let mut r = Reader::with_budget(&mut src, std::time::Duration::from_secs(30));
+    // segment_span's failures follow the walk's own rule: weather propagates
+    // (the file stays listed and is retried), shape settles (a header that is
+    // not Matroska-shaped enough declares nothing, finally).
+    let span = match segment_span(&mut r) {
+        Ok(span) => span,
+        Err(e) if is_io(&e) => return Err(e),
+        Err(e) => {
+            tracing::debug!(
+                error = format!("{e:#}"),
+                "container header unreadable by shape"
+            );
+            None
+        }
+    };
+    let Some((segment_start, segment_end)) = span else {
+        return Ok((Vec::new(), Vec::new()));
+    };
+
+    let end = segment_end.min(r.len);
+    let (mut attachments, mut chapters) = (None, None);
     let mut pending: Vec<u64> = Vec::new();
     let mut saw_seekhead = false;
     let mut visited = std::collections::HashSet::new();
-    while pos < segment_end.min(r.len) {
-        if !visited.insert(pos) {
-            break;
+    // The next SeekHead promise worth keeping: unvisited and inside the
+    // segment. Dead promises are marked visited on the way past, so one
+    // truncated target cannot end the hunt for the readable ones behind it.
+    let take_pending = |pending: &[u64], visited: &mut std::collections::HashSet<u64>| {
+        pending.iter().copied().find(|p| {
+            if *p >= end {
+                visited.insert(*p);
+                return false;
+            }
+            !visited.contains(p)
+        })
+    };
+    let mut pos = segment_start;
+    loop {
+        // The linear advance running out is not the end of the hunt: a tail
+        // SeekHead's promises point BACKWARD (chapters appended before it by
+        // an editor), and exiting on `pos >= end` stranded them for good.
+        if pos >= end || !visited.insert(pos) {
+            match take_pending(&pending, &mut visited) {
+                Some(next) => {
+                    pos = next;
+                    continue;
+                }
+                None => break,
+            }
         }
-        let Ok(head) = r.read_at(pos, 16) else { break };
-        let Ok((id, il)) = ebml_id(&head) else { break };
-        let Ok((size, sl)) = ebml_size(&head[il..]) else {
-            break;
+        // A read that fails here fails by weather or by shape like everywhere
+        // else — and a shape failure at one position abandons that POSITION,
+        // not the walk: the remaining SeekHead promises still get their turn.
+        let parsed = (|| {
+            let head = r.read_at(pos, 16)?;
+            let (id, il) = ebml_id(&head)?;
+            let (size, sl) = ebml_size(&head[il..])?;
+            let size = size.context("unknown-size element")?;
+            Ok::<_, anyhow::Error>((id, pos + il as u64 + sl as u64, size))
+        })();
+        let (id, body, size) = match parsed {
+            Ok(v) => v,
+            Err(e) if is_io(&e) => return Err(e),
+            Err(e) => {
+                tracing::debug!(
+                    pos,
+                    error = format!("{e:#}"),
+                    "unreadable element; moving on"
+                );
+                match take_pending(&pending, &mut visited) {
+                    Some(next) => {
+                        pos = next;
+                        continue;
+                    }
+                    None => break,
+                }
+            }
         };
-        let body = pos + il as u64 + sl as u64;
-        let Some(size) = size else { break };
         match id {
+            SEEK_HEAD if size > MAX_HEADER_ELEMENT => {
+                // Seen but unusable; no honest SeekHead is this big. And an
+                // unusable SeekHead must not VOUCH: the vouch is what lets
+                // the walk stop at the first cluster, and a vouch from an
+                // index nobody followed settled tail chapters and fonts as
+                // a permanent "none" for a file whose damage was only here.
+                tracing::debug!(size, "seekhead past the cap; not following it");
+            }
             SEEK_HEAD => {
-                saw_seekhead = true;
-                let data = r.read_at(body, size as usize)?;
-                walk_children(&data, |id, seek| {
-                    if id == SEEK {
-                        let (mut target, mut position) = (0u32, None);
-                        walk_children(seek, |id, v| {
-                            match id {
-                                SEEK_ID => target = uint(v) as u32,
-                                SEEK_POSITION => position = Some(uint(v)),
-                                _ => {}
+                match r.read_at(body, size as usize) {
+                    Err(e) if is_io(&e) => return Err(e),
+                    Err(e) => {
+                        // Same rule as the over-cap arm: no vouch.
+                        tracing::debug!(
+                            error = format!("{e:#}"),
+                            "seekhead unreadable by shape; not following it"
+                        );
+                    }
+                    Ok(data) => match walk_children(&data, |id, seek| {
+                        if id == SEEK {
+                            let (mut target, mut position) = (0u32, None);
+                            walk_children(seek, |id, v| {
+                                match id {
+                                    SEEK_ID => target = uint(v) as u32,
+                                    SEEK_POSITION => position = Some(uint(v)),
+                                    _ => {}
+                                }
+                                Ok(true)
+                            })?;
+                            // A second SeekHead usually lives at the end of
+                            // the file and is where the Chapters entry hides.
+                            if matches!(target, ATTACHMENTS | CHAPTERS | SEEK_HEAD)
+                                && let Some(p) = position
+                            {
+                                // checked: a hostile SeekPosition near u64::MAX
+                                // overflowed the add and PANICKED debug builds
+                                // (proven with a crafted file); the out-of-range
+                                // filter at the jump runs too late to save the
+                                // arithmetic.
+                                if let Some(target) = segment_start.checked_add(p) {
+                                    pending.push(target);
+                                }
                             }
-                            Ok(true)
-                        })?;
-                        if target == ATTACHMENTS
-                            && let Some(p) = position
-                        {
-                            pending.push(segment_start + p);
+                        }
+                        Ok(true)
+                    }) {
+                        // Only a SeekHead that actually PARSED vouches for
+                        // the layout.
+                        Ok(()) => saw_seekhead = true,
+                        Err(e) => tracing::debug!(
+                            error = format!("{e:#}"),
+                            "seekhead unparseable; not following it"
+                        ),
+                    },
+                }
+            }
+            // The two halves fail independently: a corrupt Chapters element
+            // must not cost a file its font declarations, or the other way
+            // round. Only parse/shape failures settle as "none" — a corrupt
+            // element is corrupt on every pass; an I/O failure is the mount
+            // hiccuping and propagates so the file stays listed.
+            ATTACHMENTS if attachments.is_none() => {
+                attachments = Some(match read_attached_files(&mut r, body, size) {
+                    Ok(found) => found,
+                    Err(e) if is_io(&e) => return Err(e),
+                    Err(e) => {
+                        tracing::debug!(
+                            error = format!("{e:#}"),
+                            "attachments unparseable; declaring none"
+                        );
+                        Vec::new()
+                    }
+                });
+            }
+            CHAPTERS if chapters.is_none() => {
+                chapters = Some(if size <= MAX_HEADER_ELEMENT {
+                    match r.read_at(body, size as usize) {
+                        Ok(data) => read_chapters(&data).unwrap_or_else(|e| {
+                            tracing::debug!(
+                                error = format!("{e:#}"),
+                                "chapters unparseable; declaring none"
+                            );
+                            Vec::new()
+                        }),
+                        Err(e) if is_io(&e) => return Err(e),
+                        Err(e) => {
+                            tracing::debug!(
+                                error = format!("{e:#}"),
+                                "chapters unreadable by shape; declaring none"
+                            );
+                            Vec::new()
                         }
                     }
-                    Ok(true)
-                })?;
+                } else {
+                    tracing::debug!(size, "chapters element past the cap; declaring none");
+                    Vec::new()
+                });
             }
-            ATTACHMENTS => return read_attached_files(&mut r, body, size),
-            // Trust a present SeekHead: it indexes the top-level
-            // elements, so no Attachments entry by the time clusters
-            // start means there are none — skip the (long) cluster-hop
-            // walk. Partial SeekHeads lose the declaration and fall
-            // back to the gst rung, which is acceptable.
-            CLUSTER if saw_seekhead && pending.is_empty() => break,
+            CLUSTER => {
+                // LINEAR-FIRST up to here, so header elements a partial
+                // SeekHead never mentioned are still found — following
+                // promises early skipped right past them. From the first
+                // cluster on, the promises are all that is left worth
+                // reading: follow them, or stop if a SeekHead vouched for
+                // the layout, or hop cluster by cluster if none did.
+                if let Some(next) = take_pending(&pending, &mut visited) {
+                    pos = next;
+                    continue;
+                }
+                if saw_seekhead {
+                    break;
+                }
+            }
             _ => {}
         }
-        pos = body + size;
-        if let Some(next) = pending.iter().find(|p| !visited.contains(*p)) {
-            pos = *next;
+        if attachments.is_some() && chapters.is_some() {
+            break;
         }
+        pos = body + size;
     }
-    Ok(Vec::new())
+    Ok((
+        attachments.unwrap_or_default(),
+        chapters.unwrap_or_default(),
+    ))
+}
+
+/// The attachments half of [`declare_container`].
+pub fn declare_attachments(path: &Path) -> Result<Vec<kahawai_core::media::Attachment>> {
+    Ok(declare_container(path)?.0)
+}
+
+/// The chapters half of [`declare_container`].
+///
+/// Read from the container rather than taken from the demuxer's TOC because
+/// the demuxer misses some of them: measured on this library,
+/// `matroskademux` posts no TOC at all for files whose chapters `ffprobe`
+/// reads out without trouble.
+pub fn declare_chapters(path: &Path) -> Result<Vec<kahawai_core::media::Chapter>> {
+    Ok(declare_container(path)?.1)
 }
 
 /// Sparse walk of an Attachments element: child headers are read,
@@ -621,11 +964,15 @@ fn read_attached_files(
                 let cbody = cpos + cil as u64 + csl as u64;
                 let csize = csize.context("unsized element in AttachedFile")?;
                 match cid {
-                    FILE_NAME => {
+                    // Same cap as the elements read whole above: a name is
+                    // bytes we allocate at the file's declared size, and the
+                    // sparse-file attack works through a FileName exactly as
+                    // it did through a Chapters element.
+                    FILE_NAME if csize <= MAX_HEADER_ELEMENT => {
                         name = String::from_utf8_lossy(&r.read_at(cbody, csize as usize)?)
                             .into_owned();
                     }
-                    FILE_MIME => {
+                    FILE_MIME if csize <= MAX_HEADER_ELEMENT => {
                         mime = String::from_utf8_lossy(&r.read_at(cbody, csize as usize)?)
                             .into_owned();
                     }
@@ -922,7 +1269,12 @@ fn mkv_walk(mut r: Reader<'_>, image: Option<usize>) -> Result<MkvOut> {
         tracing::debug!(cues = idx.sub_cues.len(), "sparse mkv: exact cue reads");
         let mut cluster_ts_cache: std::collections::HashMap<u64, u64> = Default::default();
         for (_, cluster_rel, rel, _) in &idx.sub_cues {
-            let cluster_pos = idx.segment_start + cluster_rel;
+            // Cue positions are the file's own claims; an overflowing one is
+            // hostile bytes, not a subtitle location.
+            let cluster_pos = idx
+                .segment_start
+                .checked_add(*cluster_rel)
+                .context("cue position overflows")?;
             let ts = match cluster_ts_cache.get(&cluster_pos) {
                 Some(t) => *t,
                 None => {
@@ -949,7 +1301,9 @@ fn mkv_walk(mut r: Reader<'_>, image: Option<usize>) -> Result<MkvOut> {
             let head = r.read_at(cluster_pos, 16)?;
             let (_, il) = ebml_id(&head)?;
             let (_, sl) = ebml_size(&head[il..])?;
-            let block_at = cluster_pos + il as u64 + sl as u64 + rel.unwrap();
+            let block_at = (cluster_pos + il as u64 + sl as u64)
+                .checked_add(rel.unwrap())
+                .context("cue block position overflows")?;
             let bh = r.read_at(block_at, 16)?;
             let (bid, bil) = ebml_id(&bh)?;
             let (bsize, bsl) = ebml_size(&bh[bil..])?;
@@ -1354,6 +1708,549 @@ fn find_box<'a>(data: &'a [u8], kind: &[u8; 4]) -> Option<&'a [u8]> {
 
 #[cfg(test)]
 mod tests {
+    fn uint_elem(id: u32, v: u64) -> Vec<u8> {
+        elem(id, &v.to_be_bytes())
+    }
+
+    fn atom(start_ns: u64, title: &str) -> Vec<u8> {
+        let mut body = uint_elem(CHAPTER_TIME_START, start_ns);
+        body.extend(elem(CHAPTER_DISPLAY, &elem(CHAP_STRING, title.as_bytes())));
+        elem(CHAPTER_ATOM, &body)
+    }
+
+    /// A declared size is a hostile file choosing our allocation: an 800MB
+    /// "Chapters" element backed by real length allocated 1.5GB before its
+    /// zeroes failed to parse. Oversized header elements are skipped —
+    /// skipped, not refused, so the file does not bounce on the worklist.
+    #[test]
+    fn a_declared_size_does_not_choose_our_allocation() {
+        use std::io::{Seek as _, SeekFrom, Write as _};
+        let mut file = ebml(EBML_HEADER, &[]);
+        // A Segment whose one child is a Chapters element declaring ~64MB.
+        let declared: u64 = 64 * 1024 * 1024;
+        let mut segment_body = CHAPTERS.to_be_bytes().to_vec();
+        segment_body.push(0x01); // 8-byte size field
+        segment_body.extend_from_slice(&declared.to_be_bytes()[1..]);
+        let header_len = file.len() + 12 /* segment id+size */ + segment_body.len();
+        file.extend(ebml(SEGMENT, &segment_body));
+
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(&file).unwrap();
+        // Back the declaration with sparse zeroes so the read would succeed.
+        f.as_file_mut()
+            .seek(SeekFrom::Start(header_len as u64 + declared))
+            .unwrap();
+        f.write_all(&[0]).unwrap();
+        f.flush().unwrap();
+
+        let (atts, chapters) = declare_container(f.path()).unwrap();
+        assert!(atts.is_empty());
+        // Honest limitation: with the cap removed this still passes — the
+        // 64MB of zeroes parses to no chapters — so the assertion pins "no
+        // error, walk survives", not the allocation itself. The name-cap
+        // twin below observes its cap directly; this one has no cheap
+        // observable short of instrumenting the allocator.
+        assert!(chapters.is_empty(), "skipped, not slurped");
+    }
+
+    /// LINEAR-FIRST: a partial SeekHead that references only Chapters must
+    /// not make the walk jump past an Attachments element sitting right
+    /// there in the header. Following promises early skipped it, and the
+    /// fonts settled as a permanent "none".
+    #[test]
+    fn a_partial_seekhead_does_not_hide_the_header() {
+        use std::io::Write as _;
+        let attachments = ebml(
+            ATTACHMENTS,
+            &ebml(
+                ATTACHED_FILE,
+                &[
+                    ebml(FILE_NAME, b"Font.ttf"),
+                    ebml(FILE_MIME, b"font/ttf"),
+                    ebml(FILE_DATA, b"\x00\x01\x00\x00fake"),
+                ]
+                .concat(),
+            ),
+        );
+        let chapters = ebml(EDITION_ENTRY, &{
+            let mut body = encode_uint_elem_for_tests(CHAPTER_TIME_START, 60_000_000_000);
+            body.extend(ebml(CHAPTER_DISPLAY, &ebml(CHAP_STRING, b"Intro")));
+            ebml(CHAPTER_ATOM, &body)
+        });
+        let chapters = ebml(CHAPTERS, &chapters);
+        // SeekHead references ONLY the chapters, which sit after the
+        // attachments; the attachments are unreferenced.
+        let seek = |pos: u64| {
+            ebml(
+                SEEK_HEAD,
+                &ebml(
+                    SEEK,
+                    &[
+                        ebml(SEEK_ID, &CHAPTERS.to_be_bytes()),
+                        ebml(SEEK_POSITION, &pos.to_be_bytes()),
+                    ]
+                    .concat(),
+                ),
+            )
+        };
+        let seek_len = seek(0).len() as u64;
+        let chapters_pos = seek_len + attachments.len() as u64;
+        assert_eq!(seek(chapters_pos).len() as u64, seek_len);
+        let segment_body = [seek(chapters_pos), attachments, chapters].concat();
+        let mut file = ebml(EBML_HEADER, &[]);
+        file.extend(ebml(SEGMENT, &segment_body));
+
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(&file).unwrap();
+        f.flush().unwrap();
+        let (atts, chapters) = declare_container(f.path()).unwrap();
+        assert_eq!(atts.len(), 1, "the unreferenced fonts are still found");
+        assert_eq!(chapters.len(), 1, "and the referenced chapters too");
+    }
+
+    /// An atom linked to another segment carries THAT segment's clock:
+    /// ordered-chapters anime with external OP/ED must not present the
+    /// linked file's times as local seek marks.
+    #[test]
+    fn a_linked_atom_is_not_a_local_chapter() {
+        let mut linked = encode_uint_elem_for_tests(CHAPTER_TIME_START, 600_000_000_000);
+        linked.extend(elem(CHAPTER_SEGMENT_UID, &[0xAA; 16]));
+        linked.extend(elem(CHAPTER_DISPLAY, &elem(CHAP_STRING, b"Linked OP")));
+        // A nested atom rides its parent's clock: inside a linked atom it is
+        // inside the linked segment, and must go down with the parent.
+        let mut nested = encode_uint_elem_for_tests(CHAPTER_TIME_START, 5_000_000_000);
+        nested.extend(elem(CHAPTER_DISPLAY, &elem(CHAP_STRING, b"OP part A")));
+        linked.extend(elem(CHAPTER_ATOM, &nested));
+        let mut local = encode_uint_elem_for_tests(CHAPTER_TIME_START, 90_000_000_000);
+        local.extend(elem(CHAPTER_DISPLAY, &elem(CHAP_STRING, b"Part A")));
+        let edition = [elem(CHAPTER_ATOM, &linked), elem(CHAPTER_ATOM, &local)].concat();
+        let chapters = read_chapters(&elem(EDITION_ENTRY, &edition)).unwrap();
+        assert_eq!(chapters.len(), 1);
+        assert_eq!(chapters[0].title.as_deref(), Some("Part A"));
+    }
+
+    /// A SeekHead nobody could FOLLOW must not vouch for the layout: the
+    /// vouch is what lets the walk stop at the first cluster, and trusting
+    /// a corrupt index settled tail chapters as a permanent "none" for a
+    /// file whose damage was only in the index.
+    #[test]
+    fn a_corrupt_seekhead_does_not_vouch() {
+        use std::io::Write as _;
+        let chapters = ebml(
+            CHAPTERS,
+            &ebml(EDITION_ENTRY, &{
+                let mut body = encode_uint_elem_for_tests(CHAPTER_TIME_START, 60_000_000_000);
+                body.extend(ebml(CHAPTER_DISPLAY, &ebml(CHAP_STRING, b"Intro")));
+                ebml(CHAPTER_ATOM, &body)
+            }),
+        );
+        // A SeekHead whose body is garbage (unparseable shape), then a
+        // cluster, then the chapters AFTER the cluster and unreferenced.
+        let seekhead = ebml(SEEK_HEAD, b"\xff\xff\xff");
+        let cluster = ebml(CLUSTER, &ebml(CLUSTER_TIMESTAMP, &[0]));
+        let segment = [seekhead, cluster, chapters].concat();
+        let mut file = ebml(EBML_HEADER, &[]);
+        file.extend(ebml(SEGMENT, &segment));
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(&file).unwrap();
+        f.flush().unwrap();
+
+        let (_, chapters) = declare_container(f.path()).unwrap();
+        assert_eq!(
+            chapters
+                .iter()
+                .filter_map(|c| c.title.as_deref())
+                .collect::<Vec<_>>(),
+            ["Intro"],
+            "the cluster hop still runs when the index could not be read"
+        );
+    }
+
+    /// The dedup keeps the titled twin, but a stated end is "a fact about
+    /// the file" whichever twin carried it: the survivor inherits it.
+    #[test]
+    fn the_dedup_survivor_keeps_the_stated_end() {
+        let untitled_with_end = ebml(CHAPTER_ATOM, &{
+            let mut body = encode_uint_elem_for_tests(CHAPTER_TIME_START, 0);
+            body.extend(encode_uint_elem_for_tests(CHAPTER_TIME_END, 90_000_000_000));
+            body
+        });
+        let titled = ebml(CHAPTER_ATOM, &{
+            let mut body = encode_uint_elem_for_tests(CHAPTER_TIME_START, 0);
+            body.extend(ebml(CHAPTER_DISPLAY, &ebml(CHAP_STRING, b"Intro")));
+            body
+        });
+        let edition = [untitled_with_end, titled].concat();
+        let chapters = read_chapters(&ebml(EDITION_ENTRY, &edition)).unwrap();
+        assert_eq!(chapters.len(), 1);
+        assert_eq!(chapters[0].title.as_deref(), Some("Intro"));
+        assert_eq!(
+            chapters[0].end_ms,
+            Some(90_000),
+            "the dropped twin's stated end survives"
+        );
+    }
+
+    /// The DEFAULT edition's marks are the ones players show; the first
+    /// edition in file order is not always it.
+    #[test]
+    fn the_default_edition_beats_the_first() {
+        let first = ebml(EDITION_ENTRY, &{
+            let mut body = encode_uint_elem_for_tests(CHAPTER_TIME_START, 10_000_000_000);
+            body.extend(ebml(CHAPTER_DISPLAY, &ebml(CHAP_STRING, b"Theatrical")));
+            ebml(CHAPTER_ATOM, &body)
+        });
+        let marked_default = ebml(EDITION_ENTRY, &{
+            let mut body = encode_uint_elem_for_tests(EDITION_FLAG_DEFAULT, 1);
+            body.extend(ebml(CHAPTER_ATOM, &{
+                let mut atom = encode_uint_elem_for_tests(CHAPTER_TIME_START, 20_000_000_000);
+                atom.extend(ebml(CHAPTER_DISPLAY, &ebml(CHAP_STRING, b"Extended")));
+                atom
+            }));
+            body
+        });
+        let chapters = read_chapters(&[first, marked_default].concat()).unwrap();
+        assert_eq!(chapters.len(), 1);
+        assert_eq!(chapters[0].title.as_deref(), Some("Extended"));
+    }
+
+    /// A hostile SeekPosition near u64::MAX panicked debug builds at the
+    /// add. Now it is simply not a promise.
+    #[test]
+    fn a_hostile_seek_position_is_not_a_promise() {
+        use std::io::Write as _;
+        let seek = ebml(
+            SEEK_HEAD,
+            &ebml(
+                SEEK,
+                &[
+                    ebml(SEEK_ID, &CHAPTERS.to_be_bytes()),
+                    ebml(SEEK_POSITION, &u64::MAX.to_be_bytes()),
+                ]
+                .concat(),
+            ),
+        );
+        let mut file = ebml(EBML_HEADER, &[]);
+        file.extend(ebml(SEGMENT, &[seek, ebml(CLUSTER, &[0u8; 16])].concat()));
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(&file).unwrap();
+        f.flush().unwrap();
+        let (atts, chapters) = declare_container(f.path()).unwrap();
+        assert!(atts.is_empty() && chapters.is_empty());
+    }
+
+    /// A tail SeekHead's promises point BACKWARD — an editor appends the
+    /// chapters and then the meta seek that references them — and the walk
+    /// must turn around for them rather than running off the end.
+    #[test]
+    fn a_backward_promise_is_kept() {
+        use std::io::Write as _;
+        let chapters = ebml(CHAPTERS, &{
+            let mut body = encode_uint_elem_for_tests(CHAPTER_TIME_START, 60_000_000_000);
+            body.extend(ebml(CHAPTER_DISPLAY, &ebml(CHAP_STRING, b"Intro")));
+            ebml(EDITION_ENTRY, &ebml(CHAPTER_ATOM, &body))
+        });
+        // Head SeekHead -> tail SeekHead; tail SeekHead -> chapters, which
+        // sit BEFORE it (appended before the new meta seek), after a cluster.
+        let seek_to = |id: u32, pos: u64| {
+            ebml(
+                SEEK_HEAD,
+                &ebml(
+                    SEEK,
+                    &[
+                        ebml(SEEK_ID, &id.to_be_bytes()),
+                        ebml(SEEK_POSITION, &pos.to_be_bytes()),
+                    ]
+                    .concat(),
+                ),
+            )
+        };
+        let head_len = seek_to(SEEK_HEAD, 0).len() as u64;
+        let cluster = ebml(CLUSTER, &[0u8; 32]);
+        let chapters_pos = head_len + cluster.len() as u64;
+        let tail_pos = chapters_pos + chapters.len() as u64;
+        let segment_body = [
+            seek_to(SEEK_HEAD, tail_pos),
+            cluster,
+            chapters.clone(),
+            seek_to(CHAPTERS, chapters_pos),
+        ]
+        .concat();
+        let mut file = ebml(EBML_HEADER, &[]);
+        file.extend(ebml(SEGMENT, &segment_body));
+
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(&file).unwrap();
+        f.flush().unwrap();
+        let (_, chapters) = declare_container(f.path()).unwrap();
+        assert_eq!(chapters.len(), 1, "the backward promise is kept");
+        assert_eq!(chapters[0].title.as_deref(), Some("Intro"));
+    }
+
+    /// One dead SeekHead promise — a target past the truncation point — must
+    /// not end the hunt for the readable promises behind it.
+    #[test]
+    fn a_dead_promise_does_not_end_the_hunt() {
+        use std::io::Write as _;
+        let attachments = ebml(
+            ATTACHMENTS,
+            &ebml(
+                ATTACHED_FILE,
+                &[
+                    ebml(FILE_NAME, b"Font.ttf"),
+                    ebml(FILE_MIME, b"font/ttf"),
+                    ebml(FILE_DATA, b"\x00\x01\x00\x00fake"),
+                ]
+                .concat(),
+            ),
+        );
+        // Two promises: the first far past EOF (the truncated tail), the
+        // second the real attachments, placed after a cluster so only the
+        // promise reaches it.
+        let seek2 = |dead: u64, live: u64| {
+            ebml(
+                SEEK_HEAD,
+                &[
+                    ebml(
+                        SEEK,
+                        &[
+                            ebml(SEEK_ID, &SEEK_HEAD.to_be_bytes()),
+                            ebml(SEEK_POSITION, &dead.to_be_bytes()),
+                        ]
+                        .concat(),
+                    ),
+                    ebml(
+                        SEEK,
+                        &[
+                            ebml(SEEK_ID, &ATTACHMENTS.to_be_bytes()),
+                            ebml(SEEK_POSITION, &live.to_be_bytes()),
+                        ]
+                        .concat(),
+                    ),
+                ]
+                .concat(),
+            )
+        };
+        let seek_len = seek2(0, 0).len() as u64;
+        let cluster = ebml(CLUSTER, &[0u8; 32]);
+        let live = seek_len + cluster.len() as u64;
+        assert_eq!(seek2(1 << 40, live).len() as u64, seek_len);
+        let segment_body = [seek2(1 << 40, live), cluster, attachments].concat();
+        let mut file = ebml(EBML_HEADER, &[]);
+        file.extend(ebml(SEGMENT, &segment_body));
+
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(&file).unwrap();
+        f.flush().unwrap();
+        let (atts, _) = declare_container(f.path()).unwrap();
+        assert_eq!(atts.len(), 1, "the live promise is kept");
+    }
+
+    /// The retryability discriminator, pinned in both directions: a chained
+    /// io::Error is weather (propagate, retry), a shape complaint is final
+    /// (absorb as none). Regressing either direction re-creates a bug this
+    /// round fixed — absorb-everything turned one NFS blip into a permanent
+    /// "no fonts", propagate-everything bounced truncated files on the
+    /// worklist for ever.
+    #[test]
+    fn weather_and_shape_are_told_apart() {
+        let weather = anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "nfs stalled",
+        ))
+        .context("reading the header");
+        assert!(is_io(&weather));
+        let shape = anyhow::anyhow!("read past eof").context("reading the header");
+        assert!(!is_io(&shape));
+    }
+
+    /// A download truncated mid-Chapters-element settles as "none" instead
+    /// of erroring the declaration on every pass.
+    #[test]
+    fn a_truncated_chapters_element_settles() {
+        use std::io::Write as _;
+        // Chapters declares 4KB; the file ends a few bytes in. The dozen
+        // trailing body bytes matter: they let the walk's own 16-byte head
+        // read succeed so the CHAPTERS arm itself — the code under test —
+        // is the thing that trips over the truncation.
+        let mut chapters_decl = CHAPTERS.to_be_bytes().to_vec();
+        chapters_decl.push(0x01);
+        chapters_decl.extend_from_slice(&(4096u64).to_be_bytes()[1..]);
+        chapters_decl.extend_from_slice(&[0u8; 12]);
+        let mut file = ebml(EBML_HEADER, &[]);
+        file.extend(ebml(SEGMENT, &chapters_decl));
+
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(&file).unwrap();
+        f.flush().unwrap();
+
+        let (_, chapters) = declare_container(f.path()).unwrap();
+        assert!(chapters.is_empty());
+    }
+
+    /// The sparse-size attack works through every element read whole, not
+    /// only Chapters: a FileName declaring 800MB chose our heap the same
+    /// way. Its cap skips the name, never the walk.
+    #[test]
+    fn an_attachment_name_does_not_choose_our_allocation_either() {
+        use std::io::{Seek as _, SeekFrom, Write as _};
+        let mut name_huge = FILE_NAME.to_be_bytes()[2..].to_vec();
+        name_huge.push(0x01);
+        name_huge.extend_from_slice(&(64u64 * 1024 * 1024).to_be_bytes()[1..]);
+        let file_body = [
+            name_huge,
+            ebml(FILE_MIME, b"font/ttf"),
+            ebml(FILE_DATA, b"\x00\x01\x00\x00tiny"),
+        ]
+        .concat();
+        // The AttachedFile/Attachments sizes lie too (they contain the huge
+        // declaration), so hand read_attached_files the span directly.
+        let attachments = ebml(ATTACHMENTS, &[ebml(ATTACHED_FILE, &file_body)].concat());
+        let mut file = ebml(EBML_HEADER, &[]);
+        let header_len = file.len();
+        file.extend(ebml(SEGMENT, &attachments));
+
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(&file).unwrap();
+        f.as_file_mut()
+            .seek(SeekFrom::Start(header_len as u64 + 70 * 1024 * 1024))
+            .unwrap();
+        f.write_all(&[0]).unwrap();
+        f.flush().unwrap();
+
+        let (atts, _) = declare_container(f.path()).unwrap();
+        // The walk survives, and no 64MB name was materialised: with the
+        // cap removed, the sparse file happily serves 64MB of NULs as a
+        // "name" and only the length assertion below can tell. (The count
+        // alone was vacuous either way.)
+        assert!(atts.len() <= 1);
+        assert!(
+            atts.iter().all(|a| a.file_name.len() < 1024),
+            "a declared 64MB name must be skipped, not read"
+        );
+    }
+
+    /// A corrupt Chapters element must not cost a file its fonts: the two
+    /// halves of the walk fail independently.
+    #[test]
+    fn corrupt_chapters_do_not_cost_the_fonts() {
+        use std::io::Write as _;
+        let attachments = ebml(
+            ATTACHMENTS,
+            &ebml(
+                ATTACHED_FILE,
+                &[
+                    ebml(FILE_NAME, b"Font.ttf"),
+                    ebml(FILE_MIME, b"font/ttf"),
+                    ebml(FILE_DATA, b"\x00\x01\x00\x00fake"),
+                ]
+                .concat(),
+            ),
+        );
+        // Chapters whose body is not EBML at all.
+        let chapters = ebml(CHAPTERS, &[0xFF, 0x00, 0xFF, 0x00, 0x01]);
+        let mut file = ebml(EBML_HEADER, &[]);
+        file.extend(ebml(SEGMENT, &[chapters, attachments].concat()));
+
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(&file).unwrap();
+        f.flush().unwrap();
+
+        let (atts, chapters) = declare_container(f.path()).unwrap();
+        assert_eq!(atts.len(), 1, "the fonts survive the corrupt chapters");
+        assert_eq!(atts[0].file_name, "Font.ttf");
+        assert!(chapters.is_empty());
+    }
+
+    /// ~40k nesting levels fit in under a megabyte of bytes and used to
+    /// overflow the stack — an ABORT of the scanning process, from one
+    /// crafted file. Deeper atoms are ignored, not refused: an error here
+    /// would put the file back on the worklist for ever.
+    #[test]
+    fn a_chapter_nested_past_reason_cannot_take_the_process_down() {
+        let mut nested = atom(0, "Recap");
+        for _ in 0..100_000 {
+            nested = elem(CHAPTER_ATOM, &nested);
+        }
+        let chapters = read_chapters(&elem(EDITION_ENTRY, &nested)).unwrap();
+        // The leaf sits far past the cap; losing it is the accepted price.
+        assert!(chapters.is_empty());
+    }
+
+    /// And sane nesting still reads through the same code path.
+    #[test]
+    fn sane_nesting_still_reads() {
+        let mut nested = atom(60_000_000_000, "Scene 2");
+        for _ in 0..10 {
+            let mut body = uint_elem(CHAPTER_TIME_START, 0);
+            body.extend(nested.clone());
+            nested = elem(CHAPTER_ATOM, &body);
+        }
+        let chapters = read_chapters(&elem(EDITION_ENTRY, &nested)).unwrap();
+        assert!(chapters.iter().any(|c| c.start_ms == 60_000));
+    }
+
+    #[test]
+    fn chapters_are_nanoseconds_and_come_out_in_order() {
+        let mut edition = atom(90_000_000_000, "Intro");
+        edition.extend(atom(0, "Recap"));
+        let chapters = read_chapters(&elem(EDITION_ENTRY, &edition)).unwrap();
+        assert_eq!(
+            chapters
+                .iter()
+                .map(|c| (c.start_ms, c.title.clone().unwrap()))
+                .collect::<Vec<_>>(),
+            [(0, "Recap".into()), (90_000, "Intro".into())]
+        );
+    }
+
+    #[test]
+    fn a_hidden_chapter_is_not_offered() {
+        // Hidden atoms are how a file carries markers it does not want a
+        // player to show; enabled=0 says the same thing.
+        let mut edition = atom(0, "Shown");
+        let mut hidden = uint_elem(CHAPTER_TIME_START, 10_000_000_000);
+        hidden.extend(uint_elem(CHAPTER_FLAG_HIDDEN, 1));
+        edition.extend(elem(CHAPTER_ATOM, &hidden));
+        let mut off = uint_elem(CHAPTER_TIME_START, 20_000_000_000);
+        off.extend(uint_elem(CHAPTER_FLAG_ENABLED, 0));
+        edition.extend(elem(CHAPTER_ATOM, &off));
+
+        let chapters = read_chapters(&elem(EDITION_ENTRY, &edition)).unwrap();
+        assert_eq!(chapters.len(), 1);
+        assert_eq!(chapters[0].title.as_deref(), Some("Shown"));
+    }
+
+    #[test]
+    fn a_hidden_edition_is_passed_over_for_the_next_one() {
+        let mut hidden = uint_elem(EDITION_FLAG_HIDDEN, 1);
+        hidden.extend(atom(0, "Ordered cut"));
+        let mut data = elem(EDITION_ENTRY, &hidden);
+        data.extend(elem(EDITION_ENTRY, &atom(0, "Opening Theme")));
+
+        let chapters = read_chapters(&data).unwrap();
+        assert_eq!(chapters.len(), 1);
+        assert_eq!(chapters[0].title.as_deref(), Some("Opening Theme"));
+    }
+
+    #[test]
+    fn a_chapter_nested_under_another_still_counts() {
+        // DVD rips group scenes under a title atom. The children are the
+        // chapters somebody would want to seek to.
+        let mut parent_body = uint_elem(CHAPTER_TIME_START, 0);
+        parent_body.extend(elem(
+            CHAPTER_DISPLAY,
+            &elem(CHAP_STRING, "Feature".as_bytes()),
+        ));
+        parent_body.extend(atom(60_000_000_000, "Scene 2"));
+        let chapters =
+            read_chapters(&elem(EDITION_ENTRY, &elem(CHAPTER_ATOM, &parent_body))).unwrap();
+        assert_eq!(
+            chapters.iter().map(|c| c.start_ms).collect::<Vec<_>>(),
+            [0, 60_000]
+        );
+    }
+
     /// Manual: IMGSUB_SRC=/path/to/file.mkv cargo test -p kahawai-media \
     ///   image_track_from_env -- --ignored --nocapture
     #[test]
@@ -1404,6 +2301,15 @@ mod tests {
     use std::io::Write;
 
     fn ebml(id: u32, body: &[u8]) -> Vec<u8> {
+        encode_element(id, body)
+    }
+
+    fn encode_uint_elem_for_tests(id: u32, v: u64) -> Vec<u8> {
+        elem(id, &v.to_be_bytes())
+    }
+
+    /// Same thing under the name the chapter tests read better with.
+    fn elem(id: u32, body: &[u8]) -> Vec<u8> {
         encode_element(id, body)
     }
 
@@ -1527,7 +2433,7 @@ mod tests {
                     SEEK,
                     &[
                         ebml(SEEK_ID, &ATTACHMENTS.to_be_bytes()),
-                        ebml(SEEK_POSITION, &encode_uint(pos)),
+                        ebml(SEEK_POSITION, &pos.to_be_bytes()),
                     ]
                     .concat(),
                 ),
@@ -1797,7 +2703,11 @@ fn mkv_max_keyframe_gap(src: &mut dyn RemuxSource) -> Result<Option<u32>> {
     }
     let (seg_size, sl) = ebml_size(&seg[il..])?;
     let segment_start = pos + il as u64 + sl as u64;
-    let segment_end = seg_size.map(|s| segment_start + s).unwrap_or(r.len);
+    // A declared size big enough to overflow is a lie, not a length; the
+    // file's own end is the honest bound.
+    let segment_end = seg_size
+        .and_then(|s| segment_start.checked_add(s))
+        .unwrap_or(r.len);
 
     let mut scale = 1_000_000u64; // ns per tick; matroska's default
     let mut video_track: Option<u64> = None;
@@ -1835,7 +2745,13 @@ fn mkv_max_keyframe_gap(src: &mut dyn RemuxSource) -> Result<Option<u32>> {
                         if let Some(p) = position
                             && matches!(target, CUES | TRACKS | INFO)
                         {
-                            pending.push(segment_start + p);
+                            // checked: a hostile SeekPosition near u64::MAX overflowed
+                            // the add and PANICKED debug builds (proven with a
+                            // crafted file); the out-of-range filter at the
+                            // jump runs too late to save the arithmetic.
+                            if let Some(target) = segment_start.checked_add(p) {
+                                pending.push(target);
+                            }
                         }
                     }
                     Ok(true)

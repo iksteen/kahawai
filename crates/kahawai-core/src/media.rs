@@ -108,6 +108,14 @@ pub struct MediaInfo {
     /// `Some([...])` = read these exact ranges (HUB-34 fonts rung).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attachments: Option<Vec<Attachment>>,
+    /// Chapters as the container declares them, in start order:
+    /// the file's own division of itself, which is a fact about the bytes
+    /// and not an inference like a detected intro. Tri-state, as
+    /// `attachments` is: `None` = never looked for (a row from before the
+    /// field, which the backfill worklist picks up), `Some([])` = looked
+    /// for and there are none, `Some([...])` = these.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chapters: Option<Vec<Chapter>>,
     /// Whether the exact source was inspected for PAR/orientation. This is
     /// separate from scanning/reconciliation: old rows are filled by a
     /// targeted, idle mediahost worklist. New discovery gets it for free.
@@ -118,6 +126,25 @@ pub struct MediaInfo {
     /// a later targeted probe succeeds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub video_geometry_error: Option<String>,
+}
+
+/// One chapter of a file, on that FILE's timeline. An item assembled from
+/// several parts shifts them onto its own; nothing else does.
+///
+/// `end_ms` is only what the container states. Matroska usually leaves it
+/// out and means "until the next one starts", which a reader can work out
+/// and a writer must not invent — a stated end can be earlier than the
+/// next start, and that gap is a fact about the file.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, utoipa::ToSchema)]
+pub struct Chapter {
+    pub start_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_ms: Option<u64>,
+    /// The chapter's name, when it has one. Plenty of files number their
+    /// chapters and say nothing else; a nameless chapter is still a seek
+    /// point worth showing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, utoipa::ToSchema)]
