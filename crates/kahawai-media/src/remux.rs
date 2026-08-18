@@ -3687,6 +3687,8 @@ pub fn start_full(
 /// generation N is dropped once a seek bumps to N+1, so a slow in-
 /// flight read can never land pre-seek bytes after flush-stop.
 /// A source element that reads a `RemuxSource` on demand, seeks included.
+/// Public because intro detection runs the same way the remuxer does: in the
+/// hub, over a mediahost lease, for a file it cannot open by name.
 pub fn seekable_appsrc(mut source: Box<dyn RemuxSource>) -> AppSrc {
     /// One fetch, sized to amortize the byte-plane round trip.
     const READ_BLOCK: usize = 2 * 1024 * 1024;
@@ -3706,6 +3708,14 @@ pub fn seekable_appsrc(mut source: Box<dyn RemuxSource>) -> AppSrc {
         eos: bool,
         /// Reader hit a fatal read error.
         failed: bool,
+        /// The appsrc is gone: its callbacks were dropped with the
+        /// element, and the ring must let the reader thread — and the
+        /// SOURCE it owns — go. Without this the thread parked on the
+        /// condvar for ever, and over the byte plane the source is a
+        /// LEASE: the mediahost held one open file per leaked reader
+        /// until the box ran out of file descriptors (os error 24,
+        /// measured at exactly the 1024 cap during a sweep).
+        closed: bool,
     }
     let ring = Arc::new((
         Mutex::new(Ring {
@@ -3715,6 +3725,7 @@ pub fn seekable_appsrc(mut source: Box<dyn RemuxSource>) -> AppSrc {
             seek_to: None,
             eos: false,
             failed: false,
+            closed: false,
         }),
         std::sync::Condvar::new(),
     ));
@@ -3734,12 +3745,27 @@ pub fn seekable_appsrc(mut source: Box<dyn RemuxSource>) -> AppSrc {
     // land after flush-stop.
     let busy: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
 
+    // Owned by the need_data callback, so it lives exactly as long as the
+    // element: when the pipeline is torn down and the appsrc finalized,
+    // the drop hangs up the ring and the reader thread returns, releasing
+    // the source (and any lease inside it) with it.
+    struct Hangup(Arc<(Mutex<Ring>, std::sync::Condvar)>);
+    impl Drop for Hangup {
+        fn drop(&mut self) {
+            let (lock, cv) = &*self.0;
+            lock.lock().unwrap().closed = true;
+            cv.notify_all();
+        }
+    }
+    let hangup = Hangup(ring.clone());
+
     let ring_need = ring.clone();
     let ring_seek = ring.clone();
     let busy_seek = busy.clone();
     appsrc.set_callbacks(
         gstreamer_app::AppSrcCallbacks::builder()
             .need_data(move |_, _length| {
+                let _ = &hangup;
                 let stamp = ring_need.0.lock().unwrap().generation;
                 let _ = cmd_tx.send(FeedCmd::Need(stamp));
             })
@@ -3771,6 +3797,9 @@ pub fn seekable_appsrc(mut source: Box<dyn RemuxSource>) -> AppSrc {
                 let (lock, cv) = &*ring_rd;
                 let mut r = lock.lock().unwrap();
                 loop {
+                    if r.closed || r.failed {
+                        return;
+                    }
                     if r.generation != my_gen {
                         my_gen = r.generation;
                         if let Some(t) = r.seek_to.take() {
@@ -3778,13 +3807,10 @@ pub fn seekable_appsrc(mut source: Box<dyn RemuxSource>) -> AppSrc {
                         }
                         break;
                     }
-                    if r.failed || (!r.eos && r.bytes < RING_BYTES) {
+                    if !r.eos && r.bytes < RING_BYTES {
                         break;
                     }
                     r = cv.wait(r).unwrap();
-                }
-                if r.failed {
-                    return;
                 }
                 if r.eos {
                     continue; // parked until a seek revives us
@@ -3794,6 +3820,9 @@ pub fn seekable_appsrc(mut source: Box<dyn RemuxSource>) -> AppSrc {
             let result = source.read_at(pos, &mut buf);
             let (lock, cv) = &*ring_rd;
             let mut r = lock.lock().unwrap();
+            if r.closed {
+                return; // torn down while we were reading
+            }
             if r.generation != my_gen {
                 continue; // seek raced the read: bytes are stale
             }
@@ -3819,7 +3848,13 @@ pub fn seekable_appsrc(mut source: Box<dyn RemuxSource>) -> AppSrc {
     });
 
     // Feeder: serves appsrc Needs from the ring. No I/O of its own.
-    let feeder_src = appsrc.clone();
+    //
+    // A WEAK element ref, or nothing here ever dies: a strong clone kept
+    // the element alive, the element owned the callbacks, the callbacks
+    // owned this thread's channel (and the ring's hangup), and the thread
+    // waited on that channel — a cycle in which the reader's source, and
+    // the lease inside it, leaked with every torn-down pipeline.
+    let feeder_src = appsrc.downgrade();
     let ring_fd = ring;
     std::thread::spawn(move || {
         while let Ok(FeedCmd::Need(stamp)) = cmd_rx.recv() {
@@ -3828,6 +3863,9 @@ pub fn seekable_appsrc(mut source: Box<dyn RemuxSource>) -> AppSrc {
                 let (lock, cv) = &*ring_fd;
                 let mut r = lock.lock().unwrap();
                 loop {
+                    if r.closed {
+                        return; // the element is gone; nobody wants this Need
+                    }
                     if r.generation != stamp {
                         break None; // stamped before a seek: stale, drop
                     }
@@ -3844,6 +3882,9 @@ pub fn seekable_appsrc(mut source: Box<dyn RemuxSource>) -> AppSrc {
                     }
                     r = cv.wait(r).unwrap();
                 }
+            };
+            let Some(feeder_src) = feeder_src.upgrade() else {
+                return; // element finalized between Needs
             };
             match block {
                 None => continue,
@@ -4439,6 +4480,53 @@ mod multipart {
             playlist.contains("EXT-X-ENDLIST"),
             "playlist never finalised"
         );
+    }
+}
+
+#[cfg(test)]
+mod appsrc_teardown {
+    //! The reader thread OWNS the source, and over the byte plane the
+    //! source is a lease holding a file open on the mediahost. This pins
+    //! that tearing the appsrc down actually releases it: before the
+    //! hangup guard, the reader parked on the ring's condvar for ever and
+    //! the NAS ran out of file descriptors mid-sweep (os error 24 at
+    //! exactly the 1024 cap, one leaked file per probe).
+    use super::*;
+
+    struct Witnessed(std::sync::Arc<std::sync::atomic::AtomicBool>);
+    impl RemuxSource for Witnessed {
+        fn size(&self) -> u64 {
+            64
+        }
+        fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = (64u64.saturating_sub(offset) as usize).min(buf.len());
+            buf[..n].fill(0);
+            Ok(n)
+        }
+    }
+    impl Drop for Witnessed {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn dropping_the_appsrc_releases_the_source() {
+        crate::init().unwrap();
+        let released = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let src = seekable_appsrc(Box::new(Witnessed(released.clone())));
+        // Let the reader hit EOF and park — the state it leaked in.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(!released.load(std::sync::atomic::Ordering::SeqCst));
+        drop(src);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !released.load(std::sync::atomic::Ordering::SeqCst) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the reader thread still holds the source after teardown"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
     }
 }
 
