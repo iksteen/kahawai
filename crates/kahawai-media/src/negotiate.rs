@@ -1275,6 +1275,15 @@ mod tests {
     /// with no sound.
     #[test]
     fn an_opus_copy_is_never_carried_by_ts() {
+        crate::init().unwrap();
+        // Without the fMP4 muxer there is no fMP4 candidate to pull the
+        // session onto, and transcoding the Opus to AAC for TS is then the
+        // right answer rather than the bug this guards. CI's distro stack
+        // has no isofmp4mux, which is exactly where this asserted a copy
+        // the box could not plan.
+        if !crate::testutil::require_elements(&["isofmp4mux"]) {
+            return;
+        }
         let mut p = chrome();
         p.audio.push("opus".into());
         let info = media("matroska", Some(vs("av1")), Some(au("opus", 2)));
