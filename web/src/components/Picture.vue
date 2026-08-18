@@ -327,9 +327,15 @@ function resolve() {
     subsWish = resolved.subs
     subTrackWish = resolved.subTrack
 
-    // The full list arrived with the item: QUERY answered "what would I be
-    // served", and delivery is already computed against this client's bits.
-    const subs = detail.negotiated?.subtitles ?? []
+    // The SESSION's list first: its delivery is computed against the
+    // profile this session actually negotiated with, where the item
+    // QUERY's reflects the page-load profile — after a capability-masked
+    // restart the two disagree, and reading the stale one kept the ASS
+    // renderer alive until a page reload. The QUERY listing remains the
+    // fallback for explicit-mode sessions that answer without one.
+    const subs = props.session.subtitle_listing?.length
+      ? props.session.subtitle_listing
+      : (detail.negotiated?.subtitles ?? [])
     sendTrack({ type: 'subtitles-arrived', subs })
     // A restart puts the viewer back exactly where they were — including
     // "subtitles off", which is as much a choice as any track. The prefs

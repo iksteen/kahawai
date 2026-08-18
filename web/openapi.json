@@ -9,7 +9,7 @@
     },
     "version": "0.0.0-dev"
   },
-  "x-kahawai-source-sha256": "a4bffc7a5a7bc94942f365e098932e965dd585016914bba8717339baabe5c2e3",
+  "x-kahawai-source-sha256": "2f4cf64918eaf57b128c4595e42da9de554d8304c218fb4e943f80b651b64737",
   "paths": {
     "/admin/v1/collections": {
       "get": {
@@ -9105,7 +9105,8 @@
           "parts",
           "content_type",
           "stream_url",
-          "streams"
+          "streams",
+          "subtitle_listing"
         ],
         "properties": {
           "content_type": {
@@ -9151,6 +9152,13 @@
                 "type": "null"
               }
             ]
+          },
+          "subtitle_listing": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TrackListing"
+            },
+            "description": "The unified track list with `delivery` computed against THIS\nsession's effective profile and the source it negotiated. The\nitem QUERY's listing reflects the profile at page load: after a\ncapability-masked restart the two disagree, and a client reading\nthe stale one kept rendering ASS client-side while asking the\nhub for a burn. The session is the authority on what it serves."
           }
         }
       },

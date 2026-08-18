@@ -842,6 +842,13 @@ struct StartSessionResponse {
     stream_url: String,
     #[schema(required)]
     streams: Option<PlaybackStreams>,
+    /// The unified track list with `delivery` computed against THIS
+    /// session's effective profile and the source it negotiated. The
+    /// item QUERY's listing reflects the profile at page load: after a
+    /// capability-masked restart the two disagree, and a client reading
+    /// the stale one kept rendering ASS client-side while asking the
+    /// hub for a burn. The session is the authority on what it serves.
+    subtitle_listing: Vec<crate::subtitles::TrackListing>,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -3671,6 +3678,22 @@ async fn start_session(
             // Additive (HUB-32a/b); [] on explicit-mode sessions.
             subtitles: session.sub_verdicts.lock().unwrap().clone(),
         });
+    let subtitle_listing = match session.parts.first() {
+        Some(p) => state
+            .subtitles
+            .list(
+                &state.registry,
+                &body.item_id,
+                session.effective_profile(),
+                session.ass_policy(),
+                &claims.sub,
+                claims.admin,
+                (&p.module_id, &p.collection_id, &p.root_token, &p.path_rel),
+            )
+            .await
+            .map_err(internal)?,
+        None => Vec::new(),
+    };
     Ok((
         StatusCode::CREATED,
         Json(StartSessionResponse {
@@ -3683,6 +3706,7 @@ async fn start_session(
             content_type: ctype,
             stream_url,
             streams,
+            subtitle_listing,
         }),
     ))
 }

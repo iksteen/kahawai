@@ -1571,6 +1571,46 @@ describe('chapter marks on the bar', () => {
     expect(wrapper.text()).not.toContain('Skip recap available')
   })
 
+  test('the session listing outranks the stale item listing', async () => {
+    // After a capability-masked apply-and-restart the item QUERY still
+    // says delivery ass, but the fresh session re-planned against the
+    // masked profile. Reading the stale listing kept JASSUB alive until
+    // a page reload; the session is the authority on what it serves.
+    const assListing = {
+      id: 9,
+      origin: 'embedded',
+      format: 'ass',
+      language: 'eng',
+      label: null,
+      machine: false,
+      derived_from: null,
+      stream_index: 2,
+      delivery: 'ass',
+      note: '',
+      deletable: false,
+    }
+    const { wrapper } = await watching({
+      item: film({
+        negotiated: {
+          cost: 'copy',
+          mode: 'remux',
+          source: null,
+          streams: { video: 'copy', audio: 'copy' },
+          subtitles: [assListing],
+          target_duration_secs: 6,
+        },
+      }) as never,
+      session: session('s1', {
+        subtitle_listing: [{ ...assListing, delivery: 'text' }],
+      }) as never,
+    })
+    await wrapper.find('[aria-label="Subtitles"]').setValue('9')
+    await flushPromises()
+    // delivery text routes to the native track, not the ASS canvas: the
+    // session's verdict took without a reload.
+    expect(wrapper.find('track').exists()).toBe(true)
+  })
+
   test('the transport underneath still takes a press anywhere else', async () => {
     // The overlay covers the bar, so it must not swallow the pointer between
     // the marks: everything but the marks themselves stays scrubbable.

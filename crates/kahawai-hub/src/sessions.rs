@@ -757,6 +757,18 @@ fn part_index(parts: &[PartSource], abs_ms: u64) -> usize {
 }
 
 impl Session {
+    /// The effective profile this session negotiated with — the one a
+    /// capability-masked restart actually applied, where the item QUERY's
+    /// listing still reflects the page-load profile.
+    pub fn effective_profile(&self) -> &kahawai_core::media::CapabilityProfile {
+        &self.profile
+    }
+
+    /// The ASS ladder the negotiation used, overlay readiness included.
+    pub fn ass_policy(&self) -> &kahawai_media::negotiate::AssPolicy {
+        &self.ass
+    }
+
     /// Timeline base of the part currently playing (0 for single-file).
     pub fn part_base_ms(&self) -> u64 {
         self.parts

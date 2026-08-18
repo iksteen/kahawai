@@ -134,3 +134,72 @@ async fn query_and_a_real_session_agree_on_the_ass_rung() {
         )
         .await;
 }
+
+/// The start response's `subtitle_listing` is computed against the
+/// SESSION's effective profile — the whole point: after a
+/// capability-masked restart the item QUERY's listing still reflects
+/// the page-load profile, and a client reading it kept rendering ASS
+/// client-side until a page reload.
+#[tokio::test]
+async fn the_session_listing_reflects_the_session_profile() {
+    let h = common::harness("Masked (2012).mkv", render_with_ass).await;
+
+    let start = |ass_render: bool| {
+        let api = h.api.clone();
+        let bearer = h.bearer.clone();
+        let item_id = h.item_id.clone();
+        async move {
+            let profile = format!(
+                r#"{{"containers":["mp4"],"video":[{{"codec":"h264"}}],
+                    "audio":["aac"],"hdr":false,
+                    "graphics_overlay":true,"ass_render":{ass_render},
+                    "target_duration":{{"mode":"accurate"}}}}"#
+            );
+            let resp = api
+                .oneshot(
+                    Request::post("/api/v1/playback/sessions")
+                        .header("authorization", &bearer)
+                        .header("content-type", "application/json")
+                        .body(Body::from(format!(
+                            "{{\"item_id\":\"{item_id}\",\"profile\":{profile}}}"
+                        )))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = resp.status();
+            let s = common::json_body(resp).await;
+            assert_eq!(status, StatusCode::CREATED, "{s}");
+            s
+        }
+    };
+
+    let with_render = start(true).await;
+    assert_eq!(
+        with_render["subtitle_listing"][0]["delivery"], "ass",
+        "{with_render}"
+    );
+
+    let without = start(false).await;
+    let delivery = without["subtitle_listing"][0]["delivery"].as_str().unwrap();
+    assert_ne!(
+        delivery, "ass",
+        "the masked profile must change THIS session's listing: {without}"
+    );
+
+    for s in [&with_render, &without] {
+        let _ = h
+            .api
+            .clone()
+            .oneshot(
+                Request::delete(format!(
+                    "/api/v1/playback/sessions/{}",
+                    s["session_id"].as_str().unwrap()
+                ))
+                .header("authorization", &h.bearer)
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await;
+    }
+}
