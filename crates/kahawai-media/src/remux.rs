@@ -1017,7 +1017,7 @@ impl SeekGate {
     /// stream time into `start.pos` (players align subtitles/seekbar to
     /// it — TS PTS can't carry this, mpegtsmux rebases to a fixed epoch).
     fn open_reporting(&self, start_pos: std::path::PathBuf) {
-        let min = Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
+        let min = Arc::new(std::sync::Mutex::new(u64::MAX));
         for (pad, id) in self.blocked.lock().unwrap().drain(..) {
             let min = min.clone();
             let path = start_pos.clone();
@@ -1029,16 +1029,32 @@ impl SeekGate {
                         .and_then(|e| e.segment().downcast_ref::<gst::ClockTime>().cloned())
                     && let Some(st) = seg.to_stream_time(pts)
                 {
-                    let ms = st.mseconds();
-                    if ms < min.fetch_min(ms, std::sync::atomic::Ordering::SeqCst) {
-                        let _ = std::fs::write(&path, ms.to_string());
-                    }
+                    report_start(&min, &path, st.mseconds());
                     return gst::PadProbeReturn::Remove;
                 }
                 gst::PadProbeReturn::Ok // unstamped buffer: keep waiting
             });
             pad.remove_probe(id);
         }
+    }
+}
+
+/// Record `ms` as the playlist origin if it is the earliest a gated pad
+/// has reported.
+///
+/// The decision and the WRITE are one critical section on purpose. Each
+/// pad reports from its own streaming thread, and an atomic compare that
+/// leaves the write outside it is a check-then-act: audio decides 2020 is
+/// the lowest so far, video then decides 2000 and writes it, and audio —
+/// preempted between its decision and its write — lands 2020 on top. The
+/// file then claims playback began LATER than it did, and every client
+/// aligning subtitles and the seekbar to `start.pos` is off by the
+/// difference. Two threads, one file, one lock.
+fn report_start(min: &std::sync::Mutex<u64>, path: &std::path::Path, ms: u64) {
+    let mut lowest = min.lock().unwrap_or_else(|e| e.into_inner());
+    if ms < *lowest {
+        *lowest = ms;
+        let _ = std::fs::write(path, ms.to_string());
     }
 }
 
@@ -4375,6 +4391,39 @@ mod multipart {
         path
     }
 
+    /// Every gated pad reports from its own thread, so the file must end
+    /// at the EARLIEST report however the threads interleave. The atomic
+    /// this replaced compared correctly and wrote outside the comparison,
+    /// so a thread preempted between the two could land a later value on
+    /// top — the origin a client aligns subtitles to, wrong by the gap.
+    #[test]
+    fn the_playlist_origin_is_the_earliest_report_whoever_wins_the_race() {
+        let dir = tempfile::tempdir().unwrap();
+        for round in 0..200 {
+            let path = dir.path().join(format!("start-{round}.pos"));
+            let min = std::sync::Arc::new(std::sync::Mutex::new(u64::MAX));
+            // Descending, so every thread but the last has to be overtaken:
+            // the interleaving that loses a write is the common case here.
+            let reports: Vec<u64> = (0..8).map(|n| 4_000 - n * 20).collect();
+            let hands: Vec<_> = reports
+                .iter()
+                .map(|&ms| {
+                    let (min, path) = (min.clone(), path.clone());
+                    std::thread::spawn(move || super::report_start(&min, &path, ms))
+                })
+                .collect();
+            for hand in hands {
+                hand.join().unwrap();
+            }
+            let wrote: u64 = std::fs::read_to_string(&path).unwrap().parse().unwrap();
+            assert_eq!(
+                wrote,
+                *reports.iter().min().unwrap(),
+                "round {round}: the file kept a later origin than one that was reported"
+            );
+        }
+    }
+
     /// Resuming inside part one still reports where playback actually
     /// began. `start.pos` is the minimum stream time across the GATED
     /// pads and the client adds it to the part base, so gating a later
@@ -4586,7 +4635,17 @@ mod concat_spike {
                 .add_many([src.upcast_ref::<gst::Element>(), &parsebin])
                 .unwrap();
             src.link(&parsebin).unwrap();
-            let concat = concat.clone();
+            // This part's concat pad is requested NOW, in parts order, not
+            // from the callback below. `concat` plays its sink pads in the
+            // order they were requested and ends the stream when the last
+            // pad it knows about goes EOS — so requesting from `pad-added`
+            // raced typefind against playback: under load part one drained
+            // and EOS'd while part two's parsebin was still typefinding,
+            // concat saw a single pad, forwarded EOS, and the playlist
+            // ended at five seconds with part two nowhere. Requested up
+            // front, the ORDER is the parts' order and concat cannot
+            // finish before every part has run.
+            let seat = concat.request_pad_simple("sink_%u").unwrap();
             let pipe = pipeline.downgrade();
             parsebin.connect_pad_added(move |_, pad| {
                 let Some(pipe) = pipe.upgrade() else { return };
@@ -4603,8 +4662,14 @@ mod concat_spike {
                 pipe.add(&queue).unwrap();
                 queue.sync_state_with_parent().unwrap();
                 pad.link(&queue.static_pad("sink").unwrap()).unwrap();
-                let sink = concat.request_pad_simple("sink_%u").unwrap();
-                queue.static_pad("src").unwrap().link(&sink).unwrap();
+                // One seat per part: these fixtures are video-only, so a
+                // second pad here means the fixture grew a stream the seat
+                // plan does not cover. Say so rather than fail obscurely.
+                queue
+                    .static_pad("src")
+                    .unwrap()
+                    .link(&seat)
+                    .expect("a part exposed a second stream; concat_pipeline seats one per part");
             });
         }
         (pipeline, prev)
