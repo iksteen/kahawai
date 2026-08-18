@@ -24,7 +24,11 @@ mTLS, dial the hub, and never accept inbound application traffic.
 Kahawai stores its state in SQLite and requires no external database. The web
 interface provides playback, libraries, users, metadata, match review, watch
 state, and administration. It finds the recap, opening and end credits of a
-season in the background, and offers to skip them.
+season in the background, and offers to skip them. Where it has measured
+nothing — movies, or a season the sweep has not reached — each viewer can opt
+in to fetching community skip times from
+[TheIntroDB](https://theintrodb.org), asked for directly by their browser and
+never by the server.
 
 - [Technical requirements](./docs/kahawai-technical-requirements.md)
 - [Implementation](./docs/kahawai-implementation.md)
