@@ -16,6 +16,8 @@ const LABELS: Record<string, string> = {
   recap: 'Skip recap',
   intro: 'Skip intro',
   credits: 'Skip credits',
+  // Only theintrodb produces this kind; the local detector never does.
+  preview: 'Skip preview',
 }
 
 /// The segment the playhead is inside, if any. The first match wins: the
@@ -44,8 +46,9 @@ export function skipLabel(segment: Segment | null): string {
 /// Where the button lands: the end of the segment, but never the very last
 /// millisecond of the file. A seek to the duration stalls on some browsers and
 /// ends playback on others, and credits usually end exactly there — so land
-/// just inside and let the up-next countdown do what it does at the end of any
-/// episode.
+/// just inside. On an episode the up-next countdown takes over; on a movie
+/// (reachable since community credits exist for films) playback simply ends,
+/// which is what pressing "skip credits" at the end of a film means.
 export function skipTarget(segment: Segment, durationMs: number): number {
   const end = durationMs > 0 ? Math.min(segment.end_ms, durationMs - 1000) : segment.end_ms
   return Math.max(0, end)

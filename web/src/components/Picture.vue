@@ -68,7 +68,9 @@ import {
 import { initialSubtitle, needsBurnRestart } from '../domain/track-choice.ts'
 import { chapterTicks } from '../domain/chapters.ts'
 import { hms } from '../domain/label.ts'
+import type { Segment } from '../api/generated/model/segment.ts'
 import { skipLabel, skipTarget, skippable } from '../domain/segments.ts'
+import { introdbSegments } from '../api/introdb.ts'
 import { initialTracks, tracks as reduceTracks, type TrackEvent } from '../domain/player-tracks.ts'
 import { isTypingTarget, playerIntent } from '../domain/player-keys.ts'
 import { keepSessionAlive } from '../domain/keepalive.ts'
@@ -1310,7 +1312,37 @@ watch(
 /// episode's boundaries arrive with the next episode. Empty when nothing was
 /// found, and when nothing has been analysed: the difference is not one a
 /// player can act on.
-const skipping = computed(() => skippable(props.item.segments ?? [], playing.posMs))
+/// theintrodb's answer, asked for only when the hub's own detector had
+/// nothing, the viewer opted in (the `introdb` pref), and the item carries
+/// an id to key on. Community times keyed on a release version, so the
+/// hub's own measured boundaries always outrank them.
+const remoteSegments = ref<Segment[]>([])
+// A watch rather than `onMounted`, defensively: today Player settles prefs
+// before the session exists, so the immediate pass sees them — but nothing
+// pins that ordering, and a pref that arrived late would still count here.
+// One shot — the `askedIntrodb` latch — so a prefs refresh cannot
+// re-trigger it.
+let askedIntrodb = false
+watch(
+  () => props.prefs,
+  (prefs) => {
+    if (askedIntrodb) return
+    if (props.item.segments?.length) return
+    if (!prefs?.some((p) => p.scope === '' && p.key === 'introdb' && p.value === '1')) return
+    askedIntrodb = true
+    // The duration of what is PLAYING: the session's, not the item's
+    // minimum across renditions — it picks the release version on their
+    // side and resolves null ends on ours.
+    void introdbSegments(props.item, durationMs.value).then((found) => {
+      remoteSegments.value = found
+    })
+  },
+  { immediate: true },
+)
+const skipSegments = computed(() =>
+  props.item.segments?.length ? props.item.segments : remoteSegments.value,
+)
+const skipping = computed(() => skippable(skipSegments.value, playing.posMs))
 const skipText = computed(() => skipLabel(skipping.value))
 
 function skip() {

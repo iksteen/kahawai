@@ -90,6 +90,8 @@ vi.mock('hls.js', () => ({ default: FakeHls }))
 
 const api = await import('../src/api/generated/kahawai.ts')
 const { forgetRecoveries } = await import('../src/domain/recovery.ts')
+const { forgetIntrodb } = await import('../src/domain/introdb-cache.ts')
+const { resetIntrodb } = await import('../src/api/introdb.ts')
 const Picture = (await import('../src/components/Picture.vue')).default
 
 const film = (over: Record<string, unknown> = {}) => ({
@@ -184,6 +186,9 @@ function at(element: HTMLVideoElement, seconds: number) {
 beforeEach(() => {
   engines.length = 0
   forgetRecoveries()
+  localStorage.clear()
+  forgetIntrodb()
+  resetIntrodb()
   vi.stubGlobal(
     'fetch',
     vi.fn(async () => new Response('', { status: 404 })),
@@ -1578,6 +1583,106 @@ describe('chapter marks on the bar', () => {
     at(element, 70)
     await flushPromises()
     expect(wrapper.findAll('button').some((b) => b.text() === 'Skip intro')).toBe(false)
+  })
+
+  test('with nothing local and the pref on, theintrodb fills the offer in', async () => {
+    // The fallback: no locally-detected segments, the viewer opted in, and
+    // the item carries a TMDB id — the community answer becomes the button.
+    localStorage.clear()
+    const wire = vi.fn(async (url: RequestInfo | URL, _init?: RequestInit) => {
+      void _init
+      if (String(url).includes('api.theintrodb.org')) {
+        return new Response(JSON.stringify({ intro: [{ start_ms: 5_000, end_ms: 65_000 }] }), {
+          status: 200,
+        })
+      }
+      return new Response('', { status: 404 })
+    })
+    vi.stubGlobal('fetch', wire)
+    const { wrapper, element } = await watching({
+      item: film({
+        segments: [],
+        duration_ms: 999_000, // deliberately NOT the session's 600_000
+        season: null,
+        episode: null,
+        metadata: { tmdb_id: 949, tvdb_id: null },
+      }) as never,
+      prefs: [{ scope: '', key: 'introdb', value: '1' }] as never,
+    })
+    starts(element)
+    await flushPromises()
+    at(element, 10)
+    await flushPromises()
+    const skip = wrapper.findAll('button').find((b) => b.text() === 'Skip intro')
+    expect(skip, 'the remote intro offers a button').toBeTruthy()
+    expect(wire.mock.calls.some((c) => String(c[0]).includes('api.theintrodb.org'))).toBe(true)
+    // The duration on the wire is the SESSION's (what is playing), not the
+    // item's minimum across renditions — the wrong one fetches the wrong
+    // cut's times.
+    const url = String(wire.mock.calls.find((c) => String(c[0]).includes('theintrodb'))![0])
+    expect(url).toContain('duration_ms=600000')
+  })
+
+  test('the hub-measured boundary outranks a cached community one', async () => {
+    // Both sources present: the hub measured THIS file, theirs is keyed on
+    // a release version. Whatever the cache holds, the local span decides
+    // where the button appears and where it lands.
+    localStorage.setItem(
+      'kahawai.introdb.v1:tmdb:949:d600000',
+      JSON.stringify({
+        at: Date.now(),
+        segments: [{ kind: 'intro', start_ms: 200_000, end_ms: 260_000, source: 'introdb' }],
+      }),
+    )
+    const { wrapper, element } = await watching({
+      item: film({
+        segments: [{ kind: 'intro', start_ms: 5_000, end_ms: 65_000, source: 'chromaprint' }],
+        metadata: { tmdb_id: 949, tvdb_id: null },
+      }) as never,
+      prefs: [{ scope: '', key: 'introdb', value: '1' }] as never,
+    })
+    starts(element)
+    await flushPromises()
+    // Inside the LOCAL span: offered. Inside only the remote span: not.
+    at(element, 10)
+    await flushPromises()
+    expect(wrapper.findAll('button').some((b) => b.text() === 'Skip intro')).toBe(true)
+    at(element, 210)
+    await flushPromises()
+    expect(wrapper.findAll('button').some((b) => b.text() === 'Skip intro')).toBe(false)
+  })
+
+  test('theintrodb is not asked without the pref, nor over local segments', async () => {
+    localStorage.clear()
+    const wire = vi.fn(async (_url: RequestInfo | URL) => new Response('', { status: 404 }))
+    vi.stubGlobal('fetch', wire)
+    // Pref off, nothing local: silence.
+    await watching({
+      item: film({
+        segments: [],
+        metadata: { tmdb_id: 949, tvdb_id: null },
+      }) as never,
+    })
+    await flushPromises()
+    // A pref under some OTHER scope is not this pref.
+    await watching({
+      item: film({
+        segments: [],
+        metadata: { tmdb_id: 949, tvdb_id: null },
+      }) as never,
+      prefs: [{ scope: 'films', key: 'introdb', value: '1' }] as never,
+    })
+    await flushPromises()
+    // Pref on, but the hub already measured this file: its answer stands.
+    await watching({
+      item: film({
+        segments: [{ kind: 'intro', start_ms: 0, end_ms: 30_000, source: 'chromaprint' }],
+        metadata: { tmdb_id: 949, tvdb_id: null },
+      }) as never,
+      prefs: [{ scope: '', key: 'introdb', value: '1' }] as never,
+    })
+    await flushPromises()
+    expect(wire.mock.calls.some((c) => String(c[0]).includes('api.theintrodb.org'))).toBe(false)
   })
 
   test("a direct-play resume does not offer yesterday's recap", async () => {

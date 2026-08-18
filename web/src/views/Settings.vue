@@ -321,6 +321,32 @@ async function saveAccount(user: string, pass: string) {
           connection. Anything above it is re-encoded smaller; a file that cannot be re-encoded will
           refuse to play rather than stall. Leave it empty for no limit.
         </p>
+
+        <div class="flex flex-wrap items-center gap-x-2.5 gap-y-2">
+          <label class="w-[76px] shrink-0 font-mono text-[12px] text-dim" for="introdb">
+            skip data
+          </label>
+          <input
+            id="introdb"
+            class="accent-teal"
+            type="checkbox"
+            :checked="values['introdb'] === '1'"
+            @change="save('introdb', ($event.target as HTMLInputElement).checked ? '1' : '')"
+          />
+          <span class="text-[12.5px]">Fetch skip times from theintrodb.org</span>
+        </div>
+        <p class="mt-[-2px] ml-[86px] max-w-[480px] text-[12px] text-dim">
+          When this server has measured nothing for what you are playing, the player asks
+          <a
+            class="text-teal underline"
+            href="https://theintrodb.org"
+            target="_blank"
+            rel="noopener"
+            >TheIntroDB</a
+          >, a community database — directly from your browser, so that site sees your address, this
+          server's web address, and the provider id, episode numbering and running time of what you
+          are watching. Off unless you turn it on.
+        </p>
       </section>
 
       <section class="flex flex-col gap-3 rounded-md border border-line bg-surface px-4 py-3.5">

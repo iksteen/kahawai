@@ -37,6 +37,14 @@ describe('what the player offers to skip', () => {
     expect(skippable(episode, 60_999)).toBe(null)
   })
 
+  test('a preview span is offered with its own label', () => {
+    // Only the community source produces this kind; the local detector
+    // never does, so nothing else pins the label's existence.
+    const preview = seg('preview', 1_000_000, 1_060_000)
+    expect(skippable([preview], 1_010_000)).toBe(preview)
+    expect(skipLabel(preview)).toBe('Skip preview')
+  })
+
   test('a kind this build does not know is not offered', () => {
     // A hub that grows a fourth kind must not put an unlabelled button on
     // screen in an older player.
