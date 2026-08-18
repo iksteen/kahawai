@@ -5178,6 +5178,12 @@ struct ItemRow<S> {
     season: Option<i64>,
     #[schema(required)]
     episode: Option<i64>,
+    /// The last episode of a multi-episode file (`E01-E02` stores 2);
+    /// null for a single-episode file. Populated on the item detail and
+    /// children listings; null on browse pages, like `duration_ms` — so
+    /// read it from the detail before acting on it. Per-episode
+    /// third-party lookups must skip items that carry one — the single
+    /// answer would belong to the first episode only.
     #[schema(required)]
     episode_end: Option<i64>,
     #[schema(required)]
@@ -5186,6 +5192,9 @@ struct ItemRow<S> {
     parent_title: Option<String>,
     #[schema(required)]
     library_id: Option<String>,
+    /// The DESCRIBING provider's curated numbering, populated on
+    /// children listings only. For third-party lookups use
+    /// `metadata.proj_season`, which is paired with the keyed id.
     #[schema(required)]
     proj_season: Option<i64>,
     #[schema(required)]
@@ -5385,6 +5394,34 @@ struct ItemMetadata {
     confidence: String,
     #[schema(required)]
     provider: Option<String>,
+    /// The TMDB id a third-party lookup should key on: the parent
+    /// show's for an episode, the item's own for a parentless item, and
+    /// never anything for an item under a non-show parent (a track's
+    /// album keys nothing). Taken from that provider's stored answer
+    /// whether or not it is the provider describing the item, so it can
+    /// be set alongside `tvdb_id` and independently of `provider`. Null
+    /// when TMDB holds no confident, unrejected answer for the keyed
+    /// item — an absent match, an unconfirmed weak guess and a
+    /// human-rejected id all read the same. Prefer this over `tvdb_id`
+    /// when both are set — `proj_season`/`proj_episode` are paired with
+    /// the preferred id, and when a curated numbering exists only for
+    /// one provider the ids are narrowed to that provider so the pair
+    /// stays coherent. Send the lookup the duration of the rendition
+    /// actually playing.
+    #[schema(required)]
+    tmdb_id: Option<i64>,
+    /// The TVDB id, keyed and filtered the same way as `tmdb_id`.
+    #[schema(required)]
+    tvdb_id: Option<i64>,
+    /// The provider's curated season number where the file has none of
+    /// its own (absolute-numbered releases). Comes from the same
+    /// provider as the preferred id (`tmdb_id` first), so the pair is
+    /// safe to send together; lookups should prefer it over `season`.
+    #[schema(required)]
+    proj_season: Option<i64>,
+    /// The curated episode number, paired with `proj_season`.
+    #[schema(required)]
+    proj_episode: Option<i64>,
     #[schema(required)]
     original_language: Option<String>,
     #[schema(required)]
@@ -5538,7 +5575,7 @@ async fn item_body(
     with_streams: bool,
 ) -> Result<ItemDetailResponse, ApiError> {
     let item = sqlx::query(
-        "SELECT i.id, i.kind, i.season, i.episode, i.artist,
+        "SELECT i.id, i.kind, i.season, i.episode, i.episode_end, i.artist,
                 COALESCE(md.title, i.title) AS title,
                 COALESCE(i.year, CAST(substr(md.premiered, 1, 4) AS INTEGER)) AS year,
                 p.id AS parent_id,
@@ -5636,6 +5673,102 @@ async fn item_body(
     // Enrichment (own metadata, or the parent show's for episodes).
     let meta = sqlx::query(
         "SELECT m.overview, m.rating, m.premiered, m.confidence, m.provider,
+                -- The ids a third-party lookup keys on. An episode's own
+                -- provider_id names the EPISODE's record; services that
+                -- key TV on the show (season/episode alongside) need the
+                -- parent's id, so an item with a parent answers only from
+                -- the parent — its own id would be the wrong namespace.
+                -- Read from provider_metadata directly, not from the
+                -- CHOSEN provider: a `.nfo` library elects `local` as its
+                -- describing provider while the tmdb answer sits stored
+                -- beside it, and each id stands on its own row (the same
+                -- shape the OpenSubtitles lookup uses).
+                -- Confident or human-vouched answers only: a 'weak' guess
+                -- is the wrong title often enough that keying a third-party
+                -- lookup on it hands out another film's boundaries — unless
+                -- a human confirmed it (`manual_match`, which is all the
+                -- confirm action writes) — and a rejected id was rejected
+                -- by a human.
+                (SELECT p2.provider_id FROM provider_metadata p2
+                  WHERE p2.item_id = COALESCE(
+                          (SELECT sh.id FROM items sh
+                            WHERE sh.id = i.parent_id AND sh.kind = 'show'),
+                          CASE WHEN i.parent_id IS NULL THEN i.id END)
+                    AND p2.provider = 'tmdb' AND p2.provider_id != ''
+                    AND (p2.confidence = 'auto'
+                         OR EXISTS (SELECT 1 FROM manual_match mm
+                                     WHERE mm.item_id = p2.item_id
+                                       AND mm.provider = p2.provider
+                                       AND mm.provider_id = p2.provider_id))
+                    AND NOT EXISTS (SELECT 1 FROM rejected_matches rj
+                                     WHERE rj.item_id = p2.item_id
+                                       AND rj.provider = p2.provider
+                                       AND rj.provider_id = p2.provider_id)) AS keyed_tmdb,
+                (SELECT p2.provider_id FROM provider_metadata p2
+                  WHERE p2.item_id = COALESCE(
+                          (SELECT sh.id FROM items sh
+                            WHERE sh.id = i.parent_id AND sh.kind = 'show'),
+                          CASE WHEN i.parent_id IS NULL THEN i.id END)
+                    AND p2.provider = 'tvdb' AND p2.provider_id != ''
+                    AND (p2.confidence = 'auto'
+                         OR EXISTS (SELECT 1 FROM manual_match mm
+                                     WHERE mm.item_id = p2.item_id
+                                       AND mm.provider = p2.provider
+                                       AND mm.provider_id = p2.provider_id))
+                    AND NOT EXISTS (SELECT 1 FROM rejected_matches rj
+                                     WHERE rj.item_id = p2.item_id
+                                       AND rj.provider = p2.provider
+                                       AND rj.provider_id = p2.provider_id)) AS keyed_tvdb,
+                -- Per provider, from the EPISODE's own rows: the curated
+                -- numbering must come from the same provider as the id it
+                -- will be paired with, or a TVDB projection rides a TMDB id
+                -- into another episode's boundaries.
+                -- The same trust filters as the ids: a rejected or weak
+                -- episode record must not donate its numbering either.
+                (SELECT p3.proj_season FROM provider_metadata p3
+                  WHERE p3.item_id = i.id AND p3.provider = 'tmdb'
+                    AND (p3.confidence = 'auto'
+                         OR EXISTS (SELECT 1 FROM manual_match mm
+                                     WHERE mm.item_id = p3.item_id
+                                       AND mm.provider = p3.provider
+                                       AND mm.provider_id = p3.provider_id))
+                    AND NOT EXISTS (SELECT 1 FROM rejected_matches rj
+                                     WHERE rj.item_id = p3.item_id
+                                       AND rj.provider = p3.provider
+                                       AND rj.provider_id = p3.provider_id)) AS tmdb_proj_season,
+                (SELECT p3.proj_episode FROM provider_metadata p3
+                  WHERE p3.item_id = i.id AND p3.provider = 'tmdb'
+                    AND (p3.confidence = 'auto'
+                         OR EXISTS (SELECT 1 FROM manual_match mm
+                                     WHERE mm.item_id = p3.item_id
+                                       AND mm.provider = p3.provider
+                                       AND mm.provider_id = p3.provider_id))
+                    AND NOT EXISTS (SELECT 1 FROM rejected_matches rj
+                                     WHERE rj.item_id = p3.item_id
+                                       AND rj.provider = p3.provider
+                                       AND rj.provider_id = p3.provider_id)) AS tmdb_proj_episode,
+                (SELECT p3.proj_season FROM provider_metadata p3
+                  WHERE p3.item_id = i.id AND p3.provider = 'tvdb'
+                    AND (p3.confidence = 'auto'
+                         OR EXISTS (SELECT 1 FROM manual_match mm
+                                     WHERE mm.item_id = p3.item_id
+                                       AND mm.provider = p3.provider
+                                       AND mm.provider_id = p3.provider_id))
+                    AND NOT EXISTS (SELECT 1 FROM rejected_matches rj
+                                     WHERE rj.item_id = p3.item_id
+                                       AND rj.provider = p3.provider
+                                       AND rj.provider_id = p3.provider_id)) AS tvdb_proj_season,
+                (SELECT p3.proj_episode FROM provider_metadata p3
+                  WHERE p3.item_id = i.id AND p3.provider = 'tvdb'
+                    AND (p3.confidence = 'auto'
+                         OR EXISTS (SELECT 1 FROM manual_match mm
+                                     WHERE mm.item_id = p3.item_id
+                                       AND mm.provider = p3.provider
+                                       AND mm.provider_id = p3.provider_id))
+                    AND NOT EXISTS (SELECT 1 FROM rejected_matches rj
+                                     WHERE rj.item_id = p3.item_id
+                                       AND rj.provider = p3.provider
+                                       AND rj.provider_id = p3.provider_id)) AS tvdb_proj_episode,
                 -- An episode carries neither; both describe the work, so
                 -- they come from the show when the episode has none.
                 COALESCE(NULLIF(m.genres, ''), NULLIF(pm.genres, '')) AS genres,
@@ -5652,23 +5785,69 @@ async fn item_body(
     .fetch_optional(state.registry.db())
     .await
     .map_err(internal)?;
-    let metadata = meta.map(|m| ItemMetadata {
-        overview: m.get("overview"),
-        rating: m.get("rating"),
-        premiered: m.get("premiered"),
-        confidence: m.get("confidence"),
-        provider: m.try_get("provider").ok().flatten(),
-        original_language: m
-            .get::<Option<String>, _>("original_language")
-            .filter(|language| !language.is_empty()),
-        // Stored as JSON; hand them out as arrays rather than making
-        // every client parse a string out of a field (HUB-6).
-        genres: m
-            .get::<Option<String>, _>("genres")
-            .and_then(|genres| serde_json::from_str(&genres).ok()),
-        cast: m
-            .get::<Option<String>, _>("cast_json")
-            .and_then(|cast| serde_json::from_str(&cast).ok()),
+    let metadata = meta.map(|m| {
+        // Round-trip, not just parse: '007' parses to a DIFFERENT valid id,
+        // and a reinterpreted id keys another title's boundaries.
+        let keyed = |col: &str| {
+            m.get::<Option<String>, _>(col).and_then(|v| {
+                v.parse::<i64>()
+                    .ok()
+                    .filter(|n| *n > 0 && n.to_string() == v)
+            })
+        };
+        let tmdb_id = keyed("keyed_tmdb");
+        let tvdb_id = keyed("keyed_tvdb");
+        // The projection follows the id a client will key on (tmdb first,
+        // matching the client's own preference), never another provider's.
+        // And when a curated numbering exists only on the OTHER provider's
+        // row, the ids narrow to that provider: serving a tmdb id with no
+        // numbering while a usable tvdb pair sits beside it would refuse a
+        // lookup that could have worked — an absolute-numbered episode has
+        // no file numbering to fall back on.
+        let proj = |prefix: &str| {
+            (
+                m.try_get(format!("{prefix}_proj_season").as_str())
+                    .ok()
+                    .flatten(),
+                m.try_get(format!("{prefix}_proj_episode").as_str())
+                    .ok()
+                    .flatten(),
+            )
+        };
+        let tmdb_proj: (Option<i64>, Option<i64>) = proj("tmdb");
+        let tvdb_proj: (Option<i64>, Option<i64>) = proj("tvdb");
+        let (tmdb_id, tvdb_id, (proj_season, proj_episode)) =
+            if tmdb_id.is_some() && tmdb_proj.0.is_some() && tmdb_proj.1.is_some() {
+                (tmdb_id, tvdb_id, tmdb_proj)
+            } else if tvdb_id.is_some() && tvdb_proj.0.is_some() && tvdb_proj.1.is_some() {
+                (None, tvdb_id, tvdb_proj)
+            } else if tmdb_id.is_some() {
+                (tmdb_id, tvdb_id, (None, None))
+            } else {
+                (None, tvdb_id, (None, None))
+            };
+        ItemMetadata {
+            overview: m.get("overview"),
+            rating: m.get("rating"),
+            premiered: m.get("premiered"),
+            confidence: m.get("confidence"),
+            provider: m.try_get("provider").ok().flatten(),
+            tmdb_id,
+            tvdb_id,
+            proj_season,
+            proj_episode,
+            original_language: m
+                .get::<Option<String>, _>("original_language")
+                .filter(|language| !language.is_empty()),
+            // Stored as JSON; hand them out as arrays rather than making
+            // every client parse a string out of a field (HUB-6).
+            genres: m
+                .get::<Option<String>, _>("genres")
+                .and_then(|genres| serde_json::from_str(&genres).ok()),
+            cast: m
+                .get::<Option<String>, _>("cast_json")
+                .and_then(|cast| serde_json::from_str(&cast).ok()),
+        }
     });
 
     // Anime relations (HUB-29): watchable related entries, resolved to

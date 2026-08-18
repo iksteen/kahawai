@@ -9,7 +9,7 @@
     },
     "version": "0.0.0-dev"
   },
-  "x-kahawai-source-sha256": "930cf1290948614a02eec30350c62c3aa6c083230f57fe8c0a1c19de16179f79",
+  "x-kahawai-source-sha256": "620d82f1efe280e218cadc9eb15b10187da6faf5b400a3f0beae2d81a52c094a",
   "paths": {
     "/admin/v1/collections": {
       "get": {
@@ -7125,6 +7125,10 @@
           "premiered",
           "confidence",
           "provider",
+          "tmdb_id",
+          "tvdb_id",
+          "proj_season",
+          "proj_episode",
           "original_language",
           "genres",
           "cast"
@@ -7169,6 +7173,22 @@
               "null"
             ]
           },
+          "proj_episode": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The curated episode number, paired with `proj_season`."
+          },
+          "proj_season": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The provider's curated season number where the file has none of\nits own (absolute-numbered releases). Comes from the same\nprovider as the preferred id (`tmdb_id` first), so the pair is\nsafe to send together; lookups should prefer it over `season`."
+          },
           "provider": {
             "type": [
               "string",
@@ -7181,6 +7201,22 @@
               "null"
             ],
             "format": "double"
+          },
+          "tmdb_id": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The TMDB id a third-party lookup should key on: the parent\nshow's for an episode, the item's own for a parentless item, and\nnever anything for an item under a non-show parent (a track's\nalbum keys nothing). Taken from that provider's stored answer\nwhether or not it is the provider describing the item, so it can\nbe set alongside `tvdb_id` and independently of `provider`. Null\nwhen TMDB holds no confident, unrejected answer for the keyed\nitem — an absent match, an unconfirmed weak guess and a\nhuman-rejected id all read the same. Prefer this over `tvdb_id`\nwhen both are set — `proj_season`/`proj_episode` are paired with\nthe preferred id, and when a curated numbering exists only for\none provider the ids are narrowed to that provider so the pair\nstays coherent. Send the lookup the duration of the rendition\nactually playing."
+          },
+          "tvdb_id": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The TVDB id, keyed and filtered the same way as `tmdb_id`."
           }
         }
       },
@@ -7335,7 +7371,8 @@
               "integer",
               "null"
             ],
-            "format": "int64"
+            "format": "int64",
+            "description": "The last episode of a multi-episode file (`E01-E02` stores 2);\nnull for a single-episode file. Populated on the item detail and\nchildren listings; null on browse pages, like `duration_ms` — so\nread it from the detail before acting on it. Per-episode\nthird-party lookups must skip items that carry one — the single\nanswer would belong to the first episode only."
           },
           "file_title": {
             "type": [
@@ -7411,7 +7448,8 @@
               "integer",
               "null"
             ],
-            "format": "int64"
+            "format": "int64",
+            "description": "The DESCRIBING provider's curated numbering, populated on\nchildren listings only. For third-party lookups use\n`metadata.proj_season`, which is paired with the keyed id."
           },
           "replay_gain": {
             "oneOf": [
@@ -7583,7 +7621,8 @@
               "integer",
               "null"
             ],
-            "format": "int64"
+            "format": "int64",
+            "description": "The last episode of a multi-episode file (`E01-E02` stores 2);\nnull for a single-episode file. Populated on the item detail and\nchildren listings; null on browse pages, like `duration_ms` — so\nread it from the detail before acting on it. Per-episode\nthird-party lookups must skip items that carry one — the single\nanswer would belong to the first episode only."
           },
           "file_title": {
             "type": [
@@ -7659,7 +7698,8 @@
               "integer",
               "null"
             ],
-            "format": "int64"
+            "format": "int64",
+            "description": "The DESCRIBING provider's curated numbering, populated on\nchildren listings only. For third-party lookups use\n`metadata.proj_season`, which is paired with the keyed id."
           },
           "replay_gain": {
             "oneOf": [

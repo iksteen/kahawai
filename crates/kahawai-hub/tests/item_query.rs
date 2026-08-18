@@ -614,6 +614,366 @@ async fn a_trigger_with_nothing_pending_names_no_season() {
     );
 }
 
+/// The id a third-party lookup keys on rides the metadata: the parent
+/// show's for an episode — an episode's own provider_id names the
+/// EPISODE's record, the wrong namespace for services that key TV on
+/// the show — and the item's own otherwise. AniList resolves neither.
+#[tokio::test]
+async fn the_item_carries_the_id_a_lookup_keys_on() {
+    let fx = fixture_with(rec("Heat (1995).mkv", 700_000_000)).await;
+
+    let get = |id: String| {
+        let api = fx.api.clone();
+        let bearer = fx.bearer.clone();
+        async move {
+            let response = api
+                .oneshot(
+                    axum::http::Request::get(format!("/api/v1/items/{id}"))
+                        .header("authorization", &bearer)
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), axum::http::StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+                .await
+                .unwrap();
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()
+        }
+    };
+
+    // A movie answers with its own id.
+    sqlx::query(
+        "INSERT INTO provider_metadata (item_id, provider, provider_id, title, confidence, updated_at)
+         VALUES (?, 'tmdb', '949', 'Heat', 'auto', unixepoch())",
+    )
+    .bind(&fx.id)
+    .execute(&fx.db)
+    .await
+    .unwrap();
+    let movie = get(fx.id.clone()).await;
+    assert_eq!(movie["metadata"]["tmdb_id"], 949, "{movie}");
+    assert!(movie["metadata"]["tvdb_id"].is_null(), "{movie}");
+
+    // An episode answers with its SHOW's id, never its own record's.
+    sqlx::query(
+        "INSERT INTO items (id, kind, title, norm_title, module_id, collection_id, parent_id, season, episode)
+         VALUES ('show1', 'show', 'Lain', 'lain', '01H', 'movies', NULL, NULL, NULL),
+                ('ep1', 'episode', 'Weird', 'weird', '01H', 'movies', 'show1', 1, 1)",
+    )
+    .execute(&fx.db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO provider_metadata (item_id, provider, provider_id, title, confidence, updated_at)
+         VALUES ('show1', 'tmdb', '1403', 'Lain', 'auto', unixepoch()),
+                ('ep1', 'tmdb', '63412', 'Weird', 'auto', unixepoch())",
+    )
+    .execute(&fx.db)
+    .await
+    .unwrap();
+    let episode = get("ep1".into()).await;
+    assert_eq!(episode["metadata"]["tmdb_id"], 1403, "{episode}");
+
+    // An AniList identity keys nothing.
+    sqlx::query(
+        "INSERT INTO items (id, kind, title, norm_title, module_id, collection_id)
+         VALUES ('anime1', 'movie', 'Akira', 'akira', '01H', 'movies')",
+    )
+    .execute(&fx.db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO provider_metadata (item_id, provider, provider_id, title, confidence, updated_at)
+         VALUES ('anime1', 'anilist', '47', 'Akira', 'auto', unixepoch())",
+    )
+    .execute(&fx.db)
+    .await
+    .unwrap();
+    let anime = get("anime1".into()).await;
+    assert!(anime["metadata"]["tmdb_id"].is_null(), "{anime}");
+    assert!(anime["metadata"]["tvdb_id"].is_null(), "{anime}");
+    // Null because the FIELD says so, not because serialization dropped it:
+    // `Value::index` answers Null for an absent key too.
+    let fields = anime["metadata"].as_object().unwrap();
+    assert!(
+        fields.contains_key("tmdb_id") && fields.contains_key("tvdb_id"),
+        "{anime}"
+    );
+
+    // An episode with its OWN tmdb record under an unresolved show must
+    // key nothing — falling back to the episode's id would hand a lookup
+    // the wrong namespace, which is the bug this ordering exists to stop.
+    sqlx::query(
+        "INSERT INTO items (id, kind, title, norm_title, module_id, collection_id, parent_id, season, episode)
+         VALUES ('bareshow', 'show', 'Bare', 'bare', '01H', 'movies', NULL, NULL, NULL),
+                ('bareep', 'episode', 'One', 'one', '01H', 'movies', 'bareshow', 1, 1)",
+    )
+    .execute(&fx.db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO provider_metadata (item_id, provider, provider_id, title, confidence, updated_at)
+         VALUES ('bareep', 'tmdb', '777001', 'One', 'auto', unixepoch())",
+    )
+    .execute(&fx.db)
+    .await
+    .unwrap();
+    let bare = get("bareep".into()).await;
+    assert!(bare["metadata"]["tmdb_id"].is_null(), "{bare}");
+
+    // A `.nfo` library elects `local` as the describing provider; the
+    // stored tmdb answer must key anyway, and tvdb rides alongside
+    // independently of which provider was chosen.
+    sqlx::query(
+        "INSERT INTO items (id, kind, title, norm_title, module_id, collection_id)
+         VALUES ('nfo1', 'movie', 'Kept', 'kept', '01H', 'movies')",
+    )
+    .execute(&fx.db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO provider_metadata (item_id, provider, provider_id, title, confidence, updated_at)
+         VALUES ('nfo1', 'local', 'movie.nfo', 'Kept', 'auto', unixepoch()),
+                ('nfo1', 'tmdb', '603', 'Kept', 'auto', unixepoch()),
+                ('nfo1', 'tvdb', '169', 'Kept', 'auto', unixepoch())",
+    )
+    .execute(&fx.db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT OR REPLACE INTO item_match (item_id, provider, provider_id, media_type, manual, updated_at)
+         VALUES ('nfo1', 'local', 'movie.nfo', 'movies', 0, unixepoch())",
+    )
+    .execute(&fx.db)
+    .await
+    .unwrap();
+    let nfo = get("nfo1".into()).await;
+    assert_eq!(nfo["metadata"]["tmdb_id"], 603, "{nfo}");
+    assert_eq!(nfo["metadata"]["tvdb_id"], 169, "{nfo}");
+
+    // A weak guess and a rejected id must not key a lookup: a losing
+    // 'weak' answer is the wrong title often enough to hand out another
+    // film's boundaries, and a rejected one was rejected by a human.
+    sqlx::query(
+        "INSERT INTO items (id, kind, title, norm_title, module_id, collection_id)
+         VALUES ('weak1', 'movie', 'Guess', 'guess', '01H', 'movies')",
+    )
+    .execute(&fx.db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO provider_metadata (item_id, provider, provider_id, title, confidence, updated_at)
+         VALUES ('weak1', 'tmdb', '111', 'Guess', 'weak', unixepoch()),
+                ('weak1', 'tvdb', '222', 'Guess', 'auto', unixepoch())",
+    )
+    .execute(&fx.db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO rejected_matches (item_id, provider, provider_id, rejected_at)
+         VALUES ('weak1', 'tvdb', '222', unixepoch())",
+    )
+    .execute(&fx.db)
+    .await
+    .unwrap();
+    let weak = get("weak1".into()).await;
+    // The metadata object itself must exist, or these two pass vacuously.
+    assert!(!weak["metadata"]["confidence"].is_null(), "{weak}");
+    assert!(
+        weak["metadata"]["tmdb_id"].is_null(),
+        "weak keys nothing: {weak}"
+    );
+    assert!(
+        weak["metadata"]["tvdb_id"].is_null(),
+        "rejected keys nothing: {weak}"
+    );
+
+    // Unless a human CONFIRMED the weak guess: confirm writes only
+    // manual_match, never the answer row, and a vouched match must key.
+    sqlx::query(
+        "INSERT OR REPLACE INTO manual_match (item_id, provider, provider_id, pinned_at)
+         VALUES ('weak1', 'tmdb', '111', unixepoch())",
+    )
+    .execute(&fx.db)
+    .await
+    .unwrap();
+    let vouched = get("weak1".into()).await;
+    assert_eq!(vouched["metadata"]["tmdb_id"], 111, "{vouched}");
+    assert!(
+        vouched["metadata"]["tvdb_id"].is_null(),
+        "rejection still wins: {vouched}"
+    );
+
+    // The provider's curated numbering rides along for the client's
+    // TV lookups; the show's row carries none.
+    sqlx::query(
+        "UPDATE provider_metadata SET proj_season = 2, proj_episode = 1 WHERE item_id = 'ep1'",
+    )
+    .execute(&fx.db)
+    .await
+    .unwrap();
+    let projected = get("ep1".into()).await;
+    assert_eq!(projected["metadata"]["proj_season"], 2, "{projected}");
+    assert_eq!(projected["metadata"]["proj_episode"], 1, "{projected}");
+
+    // The projection must come from the SAME provider as the id it rides
+    // with: a TVDB numbering under a TMDB id keys another episode. Give the
+    // episode a rival tvdb row with a different projection; the tmdb id is
+    // served, so the tmdb projection must be too.
+    sqlx::query(
+        "INSERT INTO provider_metadata (item_id, provider, provider_id, title, confidence, updated_at, proj_season, proj_episode)
+         VALUES ('ep1', 'tvdb', '55', 'Weird', 'auto', unixepoch(), 4, 9),
+                ('show1', 'tvdb', '5000', 'Lain', 'auto', unixepoch(), NULL, NULL)",
+    )
+    .execute(&fx.db)
+    .await
+    .unwrap();
+    let coherent = get("ep1".into()).await;
+    assert_eq!(coherent["metadata"]["tmdb_id"], 1403, "{coherent}");
+    assert_eq!(
+        coherent["metadata"]["proj_season"], 2,
+        "the numbering must match the tmdb id, not the rival tvdb row: {coherent}"
+    );
+    assert_eq!(coherent["metadata"]["proj_episode"], 1, "{coherent}");
+
+    // The discriminating shape: strip the tmdb projection so ONLY the
+    // rival tvdb row carries one. The tvdb numbering must never ride the
+    // tmdb id — instead the ids NARROW to the provider the numbering
+    // belongs to, so the pair a client sends is coherent and a lookup
+    // that could work is not refused.
+    sqlx::query(
+        "UPDATE provider_metadata SET proj_season = NULL, proj_episode = NULL
+         WHERE item_id = 'ep1' AND provider = 'tmdb'",
+    )
+    .execute(&fx.db)
+    .await
+    .unwrap();
+    let uncurated = get("ep1".into()).await;
+    assert!(
+        uncurated["metadata"]["tmdb_id"].is_null(),
+        "an id with no numbering stands aside for the pair that has one: {uncurated}"
+    );
+    assert_eq!(uncurated["metadata"]["tvdb_id"], 5000, "{uncurated}");
+    assert_eq!(uncurated["metadata"]["proj_season"], 4, "{uncurated}");
+    assert_eq!(uncurated["metadata"]["proj_episode"], 9, "{uncurated}");
+    // Put it back for the cases below.
+    sqlx::query(
+        "UPDATE provider_metadata SET proj_season = 2, proj_episode = 1
+         WHERE item_id = 'ep1' AND provider = 'tmdb'",
+    )
+    .execute(&fx.db)
+    .await
+    .unwrap();
+
+    // A double-episode file carries its span on the detail row — the
+    // client's multi-episode guard reads it, so it must survive this path.
+    sqlx::query("UPDATE items SET episode_end = 2 WHERE id = 'ep1'")
+        .execute(&fx.db)
+        .await
+        .unwrap();
+    let doubled = get("ep1".into()).await;
+    assert_eq!(doubled["episode_end"], 2, "{doubled}");
+
+    // A zero-padded provider id parses to a DIFFERENT valid id; the
+    // round-trip guard must refuse it rather than key another title.
+    sqlx::query(
+        "INSERT INTO items (id, kind, title, norm_title, module_id, collection_id)
+         VALUES ('padded', 'movie', 'Bond', 'bond', '01H', 'movies')",
+    )
+    .execute(&fx.db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO provider_metadata (item_id, provider, provider_id, title, confidence, updated_at)
+         VALUES ('padded', 'tmdb', '007', 'Bond', 'auto', unixepoch())",
+    )
+    .execute(&fx.db)
+    .await
+    .unwrap();
+    let padded = get("padded".into()).await;
+    assert!(padded["metadata"]["tmdb_id"].is_null(), "{padded}");
+
+    // Zero and negatives round-trip cleanly; only the positivity guard
+    // refuses them, and 0 or -1 handed to a lookup is a real key there.
+    sqlx::query(
+        "INSERT INTO items (id, kind, title, norm_title, module_id, collection_id)
+         VALUES ('zero', 'movie', 'Zero', 'zero', '01H', 'movies'),
+                ('neg', 'movie', 'Neg', 'neg', '01H', 'movies')",
+    )
+    .execute(&fx.db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO provider_metadata (item_id, provider, provider_id, title, confidence, updated_at)
+         VALUES ('zero', 'tmdb', '0', 'Zero', 'auto', unixepoch()),
+                ('neg', 'tmdb', '-1', 'Neg', 'auto', unixepoch())",
+    )
+    .execute(&fx.db)
+    .await
+    .unwrap();
+    for id in ["zero", "neg"] {
+        let bad = get(id.into()).await;
+        assert!(bad["metadata"]["tmdb_id"].is_null(), "{bad}");
+    }
+
+    // An item under a NON-show parent keys nothing — not the parent's id
+    // (wrong namespace) and not its own (the parent is the authority the
+    // schema names).
+    sqlx::query(
+        "INSERT INTO items (id, kind, title, norm_title, module_id, collection_id, parent_id)
+         VALUES ('boxset', 'movie', 'Box', 'box', '01H', 'movies', NULL),
+                ('boxed', 'movie', 'Boxed', 'boxed', '01H', 'movies', 'boxset')",
+    )
+    .execute(&fx.db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO provider_metadata (item_id, provider, provider_id, title, confidence, updated_at)
+         VALUES ('boxset', 'tmdb', '888', 'Box', 'auto', unixepoch()),
+                ('boxed', 'tmdb', '999', 'Boxed', 'auto', unixepoch())",
+    )
+    .execute(&fx.db)
+    .await
+    .unwrap();
+    let boxed = get("boxed".into()).await;
+    assert!(
+        boxed["metadata"]["tmdb_id"].is_null(),
+        "a non-show parent must key nothing: {boxed}"
+    );
+
+    // The projection carries the same trust filters as the ids: a weak
+    // tvdb episode row must not donate its numbering — nor trigger the
+    // narrowing — on the strength of a guess.
+    sqlx::query(
+        "UPDATE provider_metadata SET confidence = 'weak' WHERE item_id = 'ep1' AND provider = 'tvdb'",
+    )
+    .execute(&fx.db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE provider_metadata SET proj_season = NULL, proj_episode = NULL
+         WHERE item_id = 'ep1' AND provider = 'tmdb'",
+    )
+    .execute(&fx.db)
+    .await
+    .unwrap();
+    let untrusted = get("ep1".into()).await;
+    assert_eq!(
+        untrusted["metadata"]["tmdb_id"], 1403,
+        "a weak projection must not narrow the ids: {untrusted}"
+    );
+    assert!(
+        untrusted["metadata"]["proj_season"].is_null(),
+        "{untrusted}"
+    );
+    assert!(
+        untrusted["metadata"]["proj_episode"].is_null(),
+        "{untrusted}"
+    );
+}
+
 async fn fixture_with(file: FileUpsertRecord) -> Fx {
     fixture_net(file, Default::default()).await
 }
