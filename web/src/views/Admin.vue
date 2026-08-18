@@ -117,10 +117,16 @@ function key(event: KeyboardEvent, at: number) {
   <!-- Five jobs, a nav instead of one long scroll — and the nav STICKS,
        because the satellite and session lists are unbounded: on a busy fleet a
        strip along the top means scrolling back up past the whole of Libraries
-       to change section. -->
+       to change section.
+       Beside the content it needs no ground of its own. Below `sm` it wraps to
+       full width ABOVE the content, so a transparent nav let the section scroll
+       THROUGH it — and the page's own ground is a viewport-fixed gradient, so
+       a flat fill would sit there as a visibly wrong patch. It becomes a panel
+       instead, in the same surface-and-line idiom as every other card, and
+       `z-10` puts it over a sibling that comes after it in the document. -->
   <main class="flex flex-wrap items-start gap-7">
     <nav
-      class="sticky top-4 flex w-[min(190px,100%)] flex-none flex-col gap-0.5"
+      class="sticky top-4 flex w-[min(190px,100%)] flex-none flex-col gap-0.5 max-sm:z-10 max-sm:rounded-md max-sm:border max-sm:border-line max-sm:bg-surface max-sm:p-1.5"
       role="tablist"
       aria-label="Admin sections"
       aria-orientation="vertical"

@@ -564,11 +564,17 @@ describe('the tabs', () => {
     expect(wrapper.findAll('[role="tab"]')[0]!.attributes('aria-selected')).toBe('true')
   })
 
-  test('and the nav sticks, because the lists below it are unbounded', async () => {
+  test('and the nav sticks, on its own ground where it overlaps', async () => {
     // On a busy fleet a strip along the top means scrolling back up past the
-    // whole of Libraries to change section.
+    // whole of Libraries to change section, so it sticks. Below `sm` it wraps
+    // to full width ABOVE the content, and a sticky nav with no ground of its
+    // own let the section scroll straight through it; it also has to paint
+    // over a sibling that comes after it in the document.
     const wrapper = await open()
-    expect(wrapper.get('[role="tablist"]').classes()).toContain('sticky')
+    const nav = wrapper.get('[role="tablist"]').classes()
+    expect(nav).toContain('sticky')
+    expect(nav).toContain('max-sm:bg-surface')
+    expect(nav).toContain('max-sm:z-10')
   })
 
   test('and Home goes to the first', async () => {
