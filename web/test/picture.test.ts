@@ -753,6 +753,35 @@ describe('what the info panel says', () => {
 })
 
 describe('who owns the veil', () => {
+  test('a mount raises it until the first frame, with no play button under it', async () => {
+    // A capability restart replaces the whole instance, so the veil it put up
+    // dies with it — the REPLACEMENT owns the gap between mounting and its
+    // first frame. A burn-in restart spends seconds there, and it used to
+    // show a black frame with live controls; worse, a paused element showed
+    // the play button as if the player were waiting on the viewer.
+    //
+    // On the prototype, BEFORE the mount: the environment's own `play()`
+    // rejects, which is the refused-autoplay path — a settle of its own.
+    // Restored by hand, in a `finally`: the shared `afterEach` only RESETS
+    // mocks, and a reset prototype `play` returns undefined into `.catch`.
+    const play = vi
+      .spyOn(HTMLMediaElement.prototype, 'play')
+      .mockImplementation(async function (this: HTMLVideoElement) {
+        Object.defineProperty(this, 'paused', { value: false, configurable: true })
+      })
+    try {
+      const { wrapper, element } = await watching()
+      expect(wrapper.text()).toContain('Restarting stream')
+      expect(wrapper.find('.play-veil').exists()).toBe(false)
+
+      element.dispatchEvent(new Event('playing'))
+      await flushPromises()
+      expect(wrapper.text()).not.toContain('Restarting stream')
+    } finally {
+      play.mockRestore()
+    }
+  })
+
   test('a picture arriving is what brings it down', async () => {
     // Not the hub answering: the POST returning means the run has been ASKED
     // for. Nothing else clears it, so without this the transport stays frozen

@@ -494,6 +494,12 @@ async function recover(ourPause = false) {
 /// applying one restarts playback.
 async function restartWithCaps(): Promise<boolean> {
   send({ type: 'caps-restart-started' })
+  // The restart veil, the pause and the frozen transport, same as a seek: a
+  // burn-in restart takes long enough that a bare click looked like a dead
+  // button. On success this instance is unmounted still veiled, and the NEXT
+  // instance keeps the veil up through its own first frame (see `onMounted`).
+  const wasPlaying = video.value ? !video.value.paused : false
+  const mine = beginRestart()
   try {
     const at = Math.round(absMs())
     const fresh = await startPlaybackSession(props.item, at, trk.value.audio, trk.value.video)
@@ -505,6 +511,11 @@ async function restartWithCaps(): Promise<boolean> {
     return true
   } catch (cause) {
     send({ type: 'caps-restart-failed', why: sentence(cause) })
+    // This session is still the one playing: undo everything `beginRestart`
+    // did or the picture is stuck behind a veil for a restart nobody owns.
+    settle(mine)
+    hls?.startLoad()
+    if (wasPlaying) void video.value?.play().catch(() => {})
     return false
   }
 }
@@ -958,7 +969,11 @@ let stopPinging: (() => void) | undefined
 onMounted(() => {
   const element = video.value
   if (!element) return
-  attach()
+  // The mount IS a restart: the veil stays up from the previous instance's
+  // hand-off (or goes up on a cold start) until the first frame, and the
+  // same give-up timer keeps a wedged start from freezing the transport for
+  // ever. `attach` settles it on `playing`, or on a refused autoplay.
+  attach(beginRestart())
   resolve()
   // Fires only for API-opened windows (Firefox's own toolbar toggle emits
   // nothing), which is fine: only `togglePip` opens one.
