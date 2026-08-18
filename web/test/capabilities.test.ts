@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 
 const { buildProfile, forgetProbe, loadMask, probedProfile, saveMask } =
   await import('../src/api/capabilities.ts')
+const { pipPhase } = await import('../src/domain/pip.ts')
 
 /// A browser that says yes to what it is told to.
 function browser({
@@ -114,5 +115,28 @@ describe('the mask on disk', () => {
   test('and unreadable storage is no mask rather than a crash', () => {
     localStorage.setItem('kahawai.capmask', 'not json')
     expect(loadMask()).toEqual({})
+  })
+})
+
+describe('the PiP intent', () => {
+  afterEach(() => {
+    pipPhase.value = 'off'
+  })
+
+  test('masks the overlay renderers on every profile while it stands', () => {
+    browser({ says: true })
+    pipPhase.value = 'entering'
+    const masked = buildProfile(null)
+    expect(masked.ass_render).toBe(false)
+    expect(masked.graphics_overlay).toBe(false)
+    // Text too: burn-in is the one form guaranteed visible in any PiP window.
+    expect(masked.vtt_render).toBe(false)
+  })
+
+  test('and leaves them alone once withdrawn', () => {
+    browser({ says: true })
+    const profile = buildProfile(null)
+    expect(profile.ass_render).not.toBe(false)
+    expect(profile.graphics_overlay).not.toBe(false)
   })
 })

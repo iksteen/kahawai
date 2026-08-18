@@ -14,6 +14,7 @@ import {
   maskSummary,
   rfc6381,
 } from '../domain/capability-mask.ts'
+import { pipMask, pipPhase } from '../domain/pip.ts'
 
 /// One representative codec string per family, at generous profile and level
 /// — the hub's verifier judges the SOURCE's profile against what is reported,
@@ -140,7 +141,12 @@ export function buildProfile(
   if (announced?.length) profile.video?.push(...refineForSources(announced))
   // The mask goes LAST: a source-aware precise cap must not smuggle back a
   // family the mask has just dropped.
-  return applyMask(profile, loadMask())
+  const masked = applyMask(profile, loadMask())
+  // PiP renders in a window the overlay canvases cannot follow, so every
+  // session started while PiP is intended — the deliberate restart AND any
+  // recovery while the window is up — negotiates as a client without them.
+  if (pipPhase.value === 'off') return masked
+  return applyMask(masked, pipMask())
 }
 
 /// For tests, which need a browser that answers differently from the one they

@@ -56,6 +56,7 @@ import {
   postProgress,
 } from '../api/generated/kahawai.ts'
 import { buildProfile, loadMask } from '../api/capabilities.ts'
+import { pipPhase, pipSupported } from '../domain/pip.ts'
 import { deliveryPlan } from '../domain/source.ts'
 import { forgetRecoveries, isSessionGone, mayRecover, startCeiling } from '../domain/recovery.ts'
 import {
@@ -491,18 +492,115 @@ async function recover(ourPause = false) {
 /// A capability mask reaches the hub only on a NEW session — it stores the
 /// effective profile per session and re-plans track switches against it — so
 /// applying one restarts playback.
-async function restartWithCaps() {
+async function restartWithCaps(): Promise<boolean> {
   send({ type: 'caps-restart-started' })
   try {
     const at = Math.round(absMs())
     const fresh = await startPlaybackSession(props.item, at, trk.value.audio, trk.value.video)
     if (goneAway) {
       void endSession(fresh.session_id, { keepalive: true }).catch(() => {})
-      return
+      return false
     }
     emit('restart', props.item.id, fresh, at, liveChoice())
+    return true
   } catch (cause) {
     send({ type: 'caps-restart-failed', why: sentence(cause) })
+    return false
+  }
+}
+
+/// Chrome's Document PiP window hosts DOM, so the whole videobox — element,
+/// subtitle canvases, transport and all — moves in and the renderers keep
+/// drawing. Nothing renegotiates and nothing restarts, which is why this
+/// path is preferred wherever it exists.
+type DocPip = { requestWindow(opts: { width: number; height: number }): Promise<Window> }
+const docPipHost = () =>
+  (window as unknown as { documentPictureInPicture?: DocPip }).documentPictureInPicture
+const docPipSupported = typeof window !== 'undefined' && docPipHost() !== undefined
+let docPipWin: Window | null = null
+const docPipOn = ref(false)
+
+async function toggleDocPip() {
+  if (docPipWin) {
+    docPipWin.close() // `pagehide` below moves the box home
+    return
+  }
+  const el = box.value
+  const element = video.value
+  const host = docPipHost()
+  if (!el || !element || !host) return
+  // The box has to come BACK to its exact slot, not just to its parent.
+  const homeParent = el.parentElement
+  const homeNext = el.nextSibling
+  if (!homeParent) return
+  const win = await host.requestWindow({
+    width: element.videoWidth || 640,
+    height: element.videoHeight || 360,
+  })
+  // The PiP document starts empty: the page's stylesheets (all same-origin,
+  // one bundle) are copied so the moved box keeps its skin, and the scoped
+  // data-attributes travel on the elements themselves.
+  for (const sheet of Array.from(document.styleSheets)) {
+    try {
+      const style = win.document.createElement('style')
+      style.textContent = Array.from(sheet.cssRules)
+        .map((rule) => rule.cssText)
+        .join('')
+      win.document.head.append(style)
+    } catch {
+      if (sheet.href) {
+        const link = win.document.createElement('link')
+        link.rel = 'stylesheet'
+        link.href = sheet.href
+        win.document.head.append(link)
+      }
+    }
+  }
+  const fit = win.document.createElement('style')
+  fit.textContent = 'body{margin:0;background:#000;height:100vh}'
+  win.document.head.append(fit)
+  win.document.body.append(el)
+  docPipWin = win
+  docPipOn.value = true
+  // Fires for every way the window dies — its own close button, ours, the
+  // page navigating away. The unmount hook closes it so a restarted session
+  // never leaves a window showing a box Vue has already torn down.
+  win.addEventListener('pagehide', () => {
+    homeParent.insertBefore(el, homeNext)
+    docPipWin = null
+    docPipOn.value = false
+  })
+}
+onBeforeUnmount(() => docPipWin?.close())
+
+/// Safari's pre-standard PiP surface, still the only one that works without
+/// transient activation there.
+type WebkitPresentationVideo = HTMLVideoElement & {
+  webkitSetPresentationMode?: (mode: 'picture-in-picture' | 'inline') => void
+  webkitPresentationMode?: string
+}
+
+/// Element PiP is a pair of capability restarts instead (see
+/// `domain/pip.ts`): entering masks the overlay renderers and restarts, and
+/// the NEXT instance's first `playing` opens the window; leaving restarts
+/// back. The button never calls `requestPictureInPicture` itself — the
+/// element it would open is about to be replaced.
+async function togglePip() {
+  if (docPipSupported) return toggleDocPip()
+  if (pipPhase.value === 'off') {
+    pipPhase.value = 'entering'
+    if (!(await restartWithCaps())) pipPhase.value = 'off'
+  } else {
+    // The leave handler owns the restart, whether the window is closed here
+    // or by its own button. A webkit-entered window is invisible to the
+    // standard exit — `pictureInPictureElement` stays null — so it gets
+    // closed through the door it came in by.
+    const webkit = video.value as WebkitPresentationVideo | null
+    if (webkit?.webkitPresentationMode === 'picture-in-picture') {
+      webkit.webkitSetPresentationMode?.('inline')
+    } else {
+      void document.exitPictureInPicture?.().catch(() => {})
+    }
   }
 }
 
@@ -795,7 +893,40 @@ function attach(gen = 0) {
   // and it is over for THIS generation only. Registered here so the generation
   // is in the closure: a persistent listener has nothing to compare against,
   // which is how a superseded run's `playing` cleared a newer run's veil.
-  element.addEventListener('playing', () => settle(gen), { once: true })
+  element.addEventListener(
+    'playing',
+    () => {
+      settle(gen)
+      // The restart `togglePip` asked for: this instance IS the masked
+      // session, and the element has a picture to hand over. A refusal
+      // (transient activation expired during the restart) undoes the intent
+      // and restarts back unmasked, or the viewer would keep burned-in
+      // subtitles with no window to show for it.
+      if (pipPhase.value === 'entering') {
+        element.requestPictureInPicture().then(
+          () => {
+            pipPhase.value = 'on'
+          },
+          () => {
+            // Safari's transient activation does not survive the restart, so
+            // the standard call refuses here — but its own older door, the
+            // one its native controls use, demands none. Only when THAT is
+            // also absent is the intent undone, or the viewer would keep
+            // burned-in subtitles with no window to show for it.
+            const webkit = element as WebkitPresentationVideo
+            if (webkit.webkitSetPresentationMode) {
+              webkit.webkitSetPresentationMode('picture-in-picture')
+              pipPhase.value = 'on'
+            } else {
+              pipPhase.value = 'off'
+              void restartWithCaps()
+            }
+          },
+        )
+      }
+    },
+    { once: true },
+  )
   // A refused autoplay is not an error to swallow: it is the whole reason the
   // viewer has to click, and it fires NO `pause` event, so the state has to be
   // set here rather than waited for. An AbortError is the opposite case — a
@@ -829,6 +960,21 @@ onMounted(() => {
   if (!element) return
   attach()
   resolve()
+  // Fires only for API-opened windows (Firefox's own toolbar toggle emits
+  // nothing), which is fine: only `togglePip` opens one.
+  element.addEventListener('leavepictureinpicture', () => {
+    if (pipPhase.value !== 'on') return
+    pipPhase.value = 'off'
+    void restartWithCaps()
+  })
+  // The webkit door reports its exits on its own event; the guard above
+  // makes the two harmless together where both fire.
+  element.addEventListener('webkitpresentationmodechanged', () => {
+    if (pipPhase.value !== 'on') return
+    if ((element as WebkitPresentationVideo).webkitPresentationMode !== 'inline') return
+    pipPhase.value = 'off'
+    void restartWithCaps()
+  })
   // The setting carried in from the last session, pushed by hand: the watcher
   // below only sees CHANGES, and an `immediate` one runs during setup, where
   // there is no element yet. Without this every restart came back at full
@@ -1342,12 +1488,24 @@ const remember = (scope: string, key: string, value: string) =>
   <div
     ref="box"
     class="videobox"
-    :class="(barShown || playing.paused) && 'bar-up'"
+    :class="[(barShown || playing.paused) && 'bar-up', docPipOn && 'in-doc-pip']"
     :style="{ '--video-ratio': ratio }"
     @mousemove="wake"
     @mouseleave="away"
   >
-    <video ref="video" playsinline crossorigin="use-credentials" @click="togglePause">
+    <!-- Firefox's own PiP toggle bypasses content entirely — no event, no
+         pictureInPictureElement — so PiP entered there can never trigger the
+         subtitle renegotiation. The attribute hides it. It cannot simply be
+         SET, though: the spec makes requestPictureInPicture reject with
+         InvalidStateError while it stands, so it lifts for the session our
+         own button starts. -->
+    <video
+      ref="video"
+      playsinline
+      crossorigin="use-credentials"
+      :disablePictureInPicture="pipPhase === 'off'"
+      @click="togglePause"
+    >
       <!-- Requesting a text form of an image track left a <track> load pending
            for ever, which kept Firefox's own buffering overlay latched over a
            playing video. -->
@@ -1742,6 +1900,19 @@ const remember = (scope: string, key: string, value: string) =>
             masked
           </span>
           <button
+            v-if="docPipSupported || pipSupported"
+            class="tbtn"
+            type="button"
+            title="Picture-in-picture"
+            aria-label="Picture-in-picture"
+            :disabled="blocked"
+            :aria-pressed="docPipOn || pipPhase !== 'off'"
+            :class="(docPipOn || pipPhase !== 'off') && 'text-teal'"
+            @click="togglePip"
+          >
+            <Icon name="pip" :size="15" />
+          </button>
+          <button
             class="tbtn"
             type="button"
             title="Theater (t)"
@@ -1875,6 +2046,17 @@ const remember = (scope: string, key: string, value: string) =>
   border-radius: 0;
 }
 .videobox:fullscreen video {
+  width: 100%;
+  height: 100%;
+  max-height: none;
+}
+/* The Document PiP window: the box IS the document, so it fills it the way
+   fullscreen does. */
+.videobox.in-doc-pip {
+  border-radius: 0;
+  height: 100vh;
+}
+.videobox.in-doc-pip video {
   width: 100%;
   height: 100%;
   max-height: none;

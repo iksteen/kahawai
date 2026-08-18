@@ -40,6 +40,8 @@ const GLYPHS = {
     '<polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><line x1="23" y1="9" x2="17" y2="15"/><line x1="17" y1="9" x2="23" y2="15"/>',
   /// Theater and window: the same rectangle, wide or inset.
   theater: '<rect x="2" y="6" width="20" height="12" rx="1.5"/>',
+  /// The frame, and the little window it spawns.
+  pip: '<path d="M22 12V5a2 2 0 0 0-2-2H4a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h6"/><rect x="13" y="14" width="9" height="7" rx="1"/>',
   window: '<rect x="5" y="7" width="14" height="10" rx="1.5"/>',
   expand:
     '<path d="M8 3H5a2 2 0 0 0-2 2v3M21 8V5a2 2 0 0 0-2-2h-3M3 16v3a2 2 0 0 0 2 2h3M16 21h3a2 2 0 0 0 2-2v-3"/>',
