@@ -246,9 +246,17 @@ function go(to: Parameters<typeof router.push>[0], fresh: boolean) {
         </MenuPopover>
       </div>
 
+      <!-- Below `sm` the search box takes a line of its own, under the
+           wordmark and the profile button: at phone widths three items on
+           one row left it about a third of the screen, too narrow to read
+           a title back in. `order-last` puts it after the profile in the
+           flex order so the two buttons keep the top line to themselves,
+           and `w-full` is what actually forces the wrap. From `sm` up the
+           overrides lapse and the header is one row again. -->
       <SearchBox
         v-if="hasBox"
         ref="box"
+        class="max-sm:order-last max-sm:w-full max-sm:max-w-none"
         :model-value="text"
         :panel="panel"
         :shown="showing"
@@ -279,17 +287,16 @@ function go(to: Parameters<typeof router.push>[0], fresh: boolean) {
       </SearchBox>
       <div v-else class="flex-1" />
 
-      <!-- `ml-auto` once the header has WRAPPED, so the profile button stays at
-           the right edge of a line it is alone on: its menu is anchored to its
-           right, and against a button at the left edge that computed a negative
-           x on a phone and clipped its own labels to "…ttings".
-           Only there, though. An auto margin absorbs free space before
-           `justify-between` gets to divide it, so on a header that fits, this
-           collected the whole surplus on one side and packed the search box
-           against the wordmark instead of leaving it centred between the two.
-           Below the wrap the search box has already shrunk to its floor, so
-           there is no surplus for this to take. -->
-      <div class="relative max-sm:ml-auto">
+      <!-- No `ml-auto` here. It used to hold the profile button against the
+           right edge of the line it was alone on once the header wrapped —
+           its menu is anchored to its right, and from the left edge that
+           computed a negative x on a phone and clipped its own labels to
+           "…ttings". The search box now takes that second line instead, so
+           the button shares the top line with the wordmark and
+           `justify-between` puts it at the edge on its own. An auto margin
+           would also absorb free space before `justify-between` divides it,
+           which is what once packed the search box against the wordmark. -->
+      <div class="relative">
         <button
           class="flex cursor-pointer items-center gap-2 rounded-full border border-line py-[3px] pr-2.5 pl-1 hover:border-dim"
           :title="props.username"
