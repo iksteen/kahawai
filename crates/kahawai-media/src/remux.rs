@@ -1561,7 +1561,18 @@ fn route_stream(
             //
             // A no-op for anything that already carries a PTS, which is
             // every container that stores one.
-            guard_pts(from);
+            //
+            // VIDEO only. Matroska LACES audio — eight-ish Opus frames
+            // per block, and the demuxer stamps only the first of each
+            // lace — so a drop here threw away seven of every eight
+            // audio packets and the muxer stretched the survivor over
+            // the hole: 20 ms of sound in every 160 ms, the choppiness
+            // itself. The parser right behind this pad is the thing
+            // that fills those timestamps in; the tail guard below
+            // still protects the muxer.
+            if caps_name.starts_with("video/") {
+                guard_pts(from);
+            }
             let mut tail = from.clone();
             // parser → timestamper, each present only when it applies;
             // every hop is pure repackaging, no decode.

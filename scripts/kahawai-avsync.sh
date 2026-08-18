@@ -5,6 +5,10 @@
 #
 #   -a host:port  API address (default: $KAHAWAI_API or localhost:8420)
 #   -n N          how many segments to measure (default 20)
+#   -c            measure the COPY path: offer every passthrough codec, so
+#                 the session remuxes instead of transcoding (a laced-Opus
+#                 title shipped one packet in eight, ratio 0.125, and only
+#                 this mode's segments carry that failure)
 #   password "-"  prompt for it instead of passing on the command line
 #
 # Starts a transcoded session, waits for segments, and compares — per
@@ -25,10 +29,12 @@ set -euo pipefail
 API="${KAHAWAI_API:-localhost:8420}"
 SEGMENTS=20
 
-while getopts "a:n:h" opt; do
+COPY=""
+while getopts "a:n:ch" opt; do
     case $opt in
         a) API="$OPTARG" ;;
         n) SEGMENTS="$OPTARG" ;;
+        c) COPY=1 ;;
         h|*) grep '^#' "$0" | sed 's/^# \{0,1\}//' | head -12; exit 0 ;;
     esac
 done
@@ -48,11 +54,17 @@ TOKEN=$(curl -fsS -X POST "http://$API/api/v1/auth/token" \
     -d "{\"client\":\"api\",\"username\":\"$USERNAME\",\"password\":\"$PASSWORD\"}" |
     python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])')
 
-# A profile that forces a transcode: no passthrough codecs offered.
+# Default: a profile that forces a transcode (no passthrough codecs
+# offered). -c: the opposite — offer everything, so copy wins and the
+# measurement covers the remux path instead.
+if [ -n "$COPY" ]; then
+    PROFILE='{"containers":["mp4"],"video":[{"codec":"av1"},{"codec":"hevc"},{"codec":"h264"},{"codec":"vp9"}],"audio":["opus","aac","ac3","eac3","flac","mp3"],"hdr":true,"graphics_overlay":false,"ass_render":false,"target_duration":{"mode":"ignore"}}'
+else
+    PROFILE='{"containers":["mp4"],"video":[{"codec":"h264"}],"audio":["aac"],"hdr":false,"graphics_overlay":false,"ass_render":false,"target_duration":{"mode":"ignore"}}'
+fi
 SESSION=$(curl -fsS -X POST "http://$API/api/v1/playback/sessions" \
     -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' \
-    -d "{\"item_id\":\"$ITEM\",\"profile\":{\"containers\":[\"mp4\"],
-         \"video\":[{\"codec\":\"h264\"}],\"audio\":[\"aac\"],\"hdr\":false}}")
+    -d "{\"item_id\":\"$ITEM\",\"profile\":$PROFILE}")
 SID=$(echo "$SESSION" | python3 -c 'import json,sys; print(json.load(sys.stdin)["session_id"])')
 echo "session $SID"
 
@@ -69,57 +81,59 @@ for _ in $(seq 60); do
     # `|| true`: until the run dir exists find exits non-zero, and with
     # pipefail that status would propagate into the assignment and kill
     # the script under `set -e` — silently, before anything is printed.
-    DIR=$(find "$HOME/.local/share"/kahawai*/sessions/"$SID" -name 'segment00000.ts' \
+    DIR=$(find "$HOME/.local/share"/kahawai*/sessions/"$SID" \
+          \( -name 'segment00000.ts' -o -name 'segment00000.m4s' \) \
           -exec dirname {} \; 2>/dev/null | head -1 || true)
     # if/then, not an && chain: a failing AND-list as the last command
     # of a loop body trips `set -e` and exits 1 with nothing printed.
-    if [ -n "$DIR" ] && [ "$(find "$DIR" -name 'segment*.ts' | wc -l)" -ge "$SEGMENTS" ]; then
+    if [ -n "$DIR" ] && [ "$(find "$DIR" -name 'segment*.ts' -o -name 'segment*.m4s' | wc -l)" -ge "$SEGMENTS" ]; then
         break
     fi
     sleep 2
 done
 [ -n "$DIR" ] || { echo "no segments appeared (dispatched to another box?)" >&2; exit 2; }
 
-python3 - "$DIR" "$SEGMENTS" <<'PY'
-import subprocess, sys, glob, os
+# One joined file: TS segments concatenate by design, and fMP4 segments
+# only probe at all with their init in front. Unit-independent seconds
+# from ffprobe, so the same arithmetic serves both.
+JOINED=$(mktemp --suffix=.probe)
+trap 'rm -f "$JOINED"; cleanup' EXIT
+if compgen -G "$DIR/segment*.m4s" >/dev/null; then
+    cat "$DIR/init.mp4" $(ls "$DIR"/segment*.m4s | sort | head -n "$SEGMENTS") > "$JOINED"
+else
+    cat $(ls "$DIR"/segment*.ts | sort | head -n "$SEGMENTS") > "$JOINED"
+fi
 
-d, want = sys.argv[1], int(sys.argv[2])
-segs = sorted(glob.glob(os.path.join(d, "segment*.ts")))[:want]
+python3 - "$JOINED" <<'PY'
+import subprocess, sys
 
-def packets(f, stream, fields="pts"):
+f = sys.argv[1]
+
+def packets(stream):
     out = subprocess.run(
         ["ffprobe", "-v", "error", "-select_streams", stream,
-         "-show_entries", f"packet={fields}", "-of", "csv=p=0", f],
-        capture_output=True, text=True).stdout.split()
-    return [x.rstrip(',') for x in out if x.rstrip(',')]
+         "-show_entries", "packet=pts_time,duration_time", "-of", "csv=p=0", f],
+        capture_output=True, text=True).stdout
+    rows = []
+    for line in out.splitlines():
+        cells = [c for c in line.split(',') if c]
+        if len(cells) == 2 and 'N/A' not in cells:
+            rows.append((float(cells[0]), float(cells[1])))
+    return rows
 
-def rate(f, stream, entry):
-    out = subprocess.run(
-        ["ffprobe", "-v", "error", "-select_streams", stream,
-         "-show_entries", f"stream={entry}", "-of", "csv=p=0", f],
-        capture_output=True, text=True).stdout.strip().rstrip(',')
-    return out.split(',')[0]
-
-vpts, apts = [], []
-for s in segs:
-    vpts += [int(x) for x in packets(s, "v:0")]
-    apts += [int(x) for x in packets(s, "a:0")]
-
-if not vpts or not apts:
+v = packets("v:0")
+a = packets("a:0")
+if not v or not a:
     print("missing a stream — nothing to compare"); sys.exit(2)
 
-fps = rate(segs[0], "v:0", "r_frame_rate")
-num, den = (int(x) for x in fps.split('/'))
-srate = int(rate(segs[0], "a:0", "sample_rate"))
-# AAC-LC: 1024 samples per frame. The muxed cadence is what we check.
-vcontent = len(vpts) * den / num
-acontent = len(apts) * 1024 / srate
-vspan = (max(vpts) - min(vpts)) / 90000
-aspan = (max(apts) - min(apts)) / 90000
-
 bad = False
-for name, n, content, span in (("video", len(vpts), vcontent, vspan),
-                               ("audio", len(apts), acontent, aspan)):
+for name, rows in (("video", v), ("audio", a)):
+    # CONTENT is what the packets carry; TIMELINE is what they span.
+    # Both from ffprobe's own seconds, so any codec and either segment
+    # format measures the same way — the E-AC-3 2:1 race and the laced
+    # Opus one-in-eight both fail this without knowing why.
+    content = sum(d for _, d in rows)
+    span = max(t for t, _ in rows) - min(t for t, _ in rows)
     ratio = span / content if content else 0.0
     flag = ""
     # Span omits the final packet's own duration, so short measurements
@@ -127,10 +141,10 @@ for name, n, content, span in (("video", len(vpts), vcontent, vspan),
     # and of any real cadence error, which halves or doubles.
     if not 0.90 <= ratio <= 1.10:
         flag, bad = "  <-- OUT OF TOLERANCE", True
-    print(f"{name:6s}: {n:5d} packets, content {content:7.2f}s, "
+    print(f"{name:6s}: {len(rows):5d} packets, content {content:7.2f}s, "
           f"timeline {span:7.2f}s, ratio {ratio:.3f}{flag}")
 
-drift = aspan - vspan
+drift = (max(t for t, _ in a) - min(t for t, _ in a)) - (max(t for t, _ in v) - min(t for t, _ in v))
 print(f"\naudio-vs-video timeline drift over the measured span: {drift*1000:+.0f} ms")
 sys.exit(1 if bad else 0)
 PY
