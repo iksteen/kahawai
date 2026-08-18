@@ -524,6 +524,17 @@ How something works and why it was built that way belong in
 - [x] HUB-35 Granular refresh: library-refresh endpoint fanning out
       per-collection scan requests, per-collection live progress in the
       admin overview, global rescan removed (endpoint + button)
+- [x] Chapters as a first-class fact: read at scan beside the attachment
+      declaration, backfilled for older Matroska/WebM rows (other containers
+      keep whatever the demuxer's TOC declared at discovery, so a
+      pre-existing MP4 row gains chapters only when its file changes),
+      carried on the item (offset
+      onto its timeline for a multi-part work), drawn as ticks on the
+      player's seek bar and as a list on the item page that starts playback
+      at a chapter. Checked against ffprobe by
+      `scripts/kahawai-chapters.sh`. No requirement of its own — an
+      unplanned feature, recorded here because the three consumers are
+      real.
 - [x] HUB-36 Pace-aware video placement, on measured capability. Full
       external/AIO transcoders benchmark video encoders and GL tone-map;
       plain hub does neither. Workers meter the

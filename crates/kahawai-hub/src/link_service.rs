@@ -955,12 +955,26 @@ async fn handle_host_msg(
                     &root_token,
                     &source.path_rel,
                     fa.size,
-                    &fa.attachments_json,
+                    crate::registry::Declared {
+                        attachments_json: &fa.attachments_json,
+                        chapters_json: fa.chapters_json.as_deref(),
+                    },
                 )
                 .await?;
-            if fa.attachments_json != "[]" {
+            // `None` is a host that cannot read chapters at all, which is not
+            // the same as one that looked and found none — and this line is
+            // read by somebody asking why a file has no chapters.
+            let chapters = fa.chapters_json.as_deref();
+            if fa.attachments_json != "[]" || chapters.is_some_and(|c| c != "[]") {
                 tracing::info!(%module_id, collection = %fa.collection_id,
-                    path = %source.path_rel, stored, "attachments declared by mediahost");
+                    path = %source.path_rel, stored,
+                    attachments = fa.attachments_json != "[]",
+                    chapters = match chapters {
+                        None => "not read by this host",
+                        Some("[]") => "none",
+                        Some(_) => "declared",
+                    },
+                    "container header declared by mediahost");
             }
         }
         host_to_hub::Msg::FileKeyframeInterval(k) => {

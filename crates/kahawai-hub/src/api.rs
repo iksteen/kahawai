@@ -67,7 +67,7 @@ pub struct AppState {
     pub public_origin: Option<PublicOrigin>,
 }
 
-/// OPS-8 knobs, both defaulting to "off" (same-origin, no proxies).
+/// Network and feature knobs, defaulting to what a bare hub ships with.
 #[derive(Default, Clone)]
 pub struct NetOptions {
     /// Shared so a reload can swap its contents under a running
@@ -86,6 +86,7 @@ pub struct NetOptions {
     /// embedded at build time. None = embedded, which is what a release ships.
     pub web_dir: Option<std::path::PathBuf>,
 }
+
 #[derive(OpenApi)]
 #[openapi(
     version = "3.2.0",
@@ -5024,6 +5025,19 @@ struct ItemDetailResponse {
     item: ItemRow<Vec<ItemSource>>,
     #[schema(required)]
     show_title: Option<String>,
+    /// The chapters the file declares, on the ITEM's timeline —
+    /// what a seek bar puts ticks on and what a detail page lists. On the
+    /// item rather than per source because a client is playing one of
+    /// them: the first COMPLETE, reachable source in `sources` (not
+    /// necessarily `sources[0]` — incomplete part sets and offline
+    /// renditions are passed over), and on QUERY the source negotiation
+    /// actually chose. Do not correlate them with `sources[0]`.
+    ///
+    /// Empty when the file declares none and when nothing has looked yet.
+    /// A player cannot act on the difference, and the file being asked is
+    /// the same file either way.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    chapters: Vec<kahawai_core::media::Chapter>,
     #[serde(skip_serializing_if = "Option::is_none")]
     metadata: Option<ItemMetadata>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -5190,6 +5204,7 @@ async fn item_body(
     .await
     .map_err(internal)?;
 
+    let chapters = item_chapters(&sources, |module_id| state.registry.is_connected(module_id));
     let sources: Vec<ItemSource> = sources
         .iter()
         .map(|r| {
@@ -5275,11 +5290,134 @@ async fn item_body(
         })
         .collect();
     Ok(ItemDetailResponse {
+        chapters,
         item: item_row(&item, sources),
         show_title,
         metadata,
         related,
     })
+}
+
+/// The chapters of the source playback would pick, moved onto the ITEM's
+/// timeline. `sources` is already in playback's order and parts are in
+/// ordinal order within a source, so this is the first source's parts,
+/// each shifted by the running time of the parts before it.
+///
+/// A part with no running time ends the list rather than guessing: after
+/// it, every offset would be wrong, and a chapter mark in the wrong place
+/// is worse than no chapter mark.
+/// Reads the rows rather than the built `ItemSource`s: those carry their
+/// streams only on QUERY, and the detail page asks with GET.
+///
+/// The group is the first one PLAYBACK COULD PICK, which is stricter than
+/// "the first row": `playable_rows` skips incomplete part sets and sources
+/// whose mediahost is away, and this must skip them the same way — a
+/// cd2-only set that ranks first would otherwise publish cd2's chapters at
+/// the start of the timeline, and an offline rendition would supply the
+/// page's chapters while playback serves a different file.
+fn item_chapters(
+    rows: &[sqlx::sqlite::SqliteRow],
+    connected: impl Fn(&str) -> bool,
+) -> Vec<kahawai_core::media::Chapter> {
+    let mut groups: Vec<i64> = Vec::new();
+    for row in rows {
+        let id = row.get::<i64, _>("source_id");
+        if groups.last() != Some(&id) {
+            groups.push(id);
+        }
+    }
+    let complete = |id: i64| {
+        let parts: Vec<_> = rows
+            .iter()
+            .filter(|r| r.get::<i64, _>("source_id") == id)
+            .collect();
+        let expected = parts.first().map(|r| r.get::<i64, _>("parts")).unwrap_or(0);
+        parts.len() as i64 == expected
+            && parts
+                .iter()
+                .enumerate()
+                .all(|(at, r)| r.get::<i64, _>("part") == at as i64 + 1)
+    };
+    let reachable = |id: i64| {
+        rows.iter()
+            .filter(|r| r.get::<i64, _>("source_id") == id)
+            .all(|r| connected(r.get::<String, _>("module_id").as_str()))
+    };
+    // Completeness is law — offsets folded over a missing part are lies —
+    // but connectivity is only a preference: when every complete source is
+    // offline there is nothing to play AT ALL, and the best-ranked one's
+    // chapters are still last week's truth, the same stance `segments`
+    // takes for an offline item.
+    let eligible = groups
+        .iter()
+        .copied()
+        .find(|&id| complete(id) && reachable(id))
+        .or_else(|| groups.iter().copied().find(|&id| complete(id)));
+    let Some(chosen) = eligible else {
+        return Vec::new();
+    };
+    group_chapters(
+        rows.iter()
+            .filter(|r| r.get::<i64, _>("source_id") == chosen)
+            .map(|r| serde_json::from_str(r.get::<String, _>("streams_json").as_str()).ok()),
+    )
+}
+
+/// One source's parts, in ordinal order, folded onto the item's timeline.
+/// `None` (an unparseable record) ends the fold: past it every offset would
+/// be wrong, and a chapter mark in the wrong place is worse than none.
+fn group_chapters(
+    parts: impl Iterator<Item = Option<kahawai_core::media::MediaInfo>>,
+) -> Vec<kahawai_core::media::Chapter> {
+    let mut out = Vec::new();
+    let mut offset_ms = 0u64;
+    let mut parts = parts.peekable();
+    while let Some(info) = parts.next() {
+        let Some(info) = info else {
+            break;
+        };
+        // The part's length is the fold's clock. Zero is a probe that
+        // failed, not a length, and without a real length the parts after
+        // this one cannot be placed.
+        let duration = info.duration_ms.filter(|ms| *ms > 0);
+        let last = parts.peek().is_none();
+        out.extend(
+            info.chapters
+                .iter()
+                .flatten()
+                // A chapter stamped at or past its own part's end is the
+                // author's mistake; offset, it would claim a timestamp in
+                // the NEXT part's stretch of the timeline. The final part
+                // has no next part to trespass on.
+                .filter(|c| last || duration.is_none_or(|ms| c.start_ms < ms))
+                .filter_map(|c| {
+                    Some(kahawai_core::media::Chapter {
+                        start_ms: c.start_ms.checked_add(offset_ms)?,
+                        // Clamped like the starts are filtered: a stated end
+                        // past the part's own length is the same authoring
+                        // mistake, and offset unclamped it claimed a span
+                        // inside the NEXT part's stretch of the timeline.
+                        end_ms: c.end_ms.and_then(|e| e.checked_add(offset_ms)).map(|e| {
+                            match duration.and_then(|d| offset_ms.checked_add(d)) {
+                                Some(part_end) if !last => e.min(part_end),
+                                _ => e,
+                            }
+                        }),
+                        title: c.title.clone(),
+                    })
+                }),
+        );
+        match duration.and_then(|ms| offset_ms.checked_add(ms)) {
+            Some(next) => offset_ms = next,
+            None => break,
+        }
+    }
+    // Part boundaries can land two chapters on one timestamp (part N's tail
+    // chapter at exactly its duration, part N+1's opener at 0); the readers
+    // dedup within one file, this dedups across the fold.
+    out.sort_by_key(|c| c.start_ms);
+    out.dedup_by_key(|c| c.start_ms);
+    out
 }
 
 /// The question `QUERY /api/v1/items/{id}` answers. Same inputs a
@@ -5375,7 +5513,7 @@ async fn item_query(
         "QUERY needs a body with Content-Type: application/json",
     ))?;
 
-    let out = item_body(&state, &id, &claims.sub, true).await?;
+    let mut out = item_body(&state, &id, &claims.sub, true).await?;
     let neg = crate::sessions::Negotiation::new(
         &state.sessions,
         &state.registry,
@@ -5474,6 +5612,44 @@ async fn item_query(
             .map_err(internal)?,
         None => Vec::new(),
     };
+
+    // The chapters must describe the file about to PLAY. `item_body` folded
+    // the rank-first eligible source's; negotiation picks by COST with rank
+    // as tiebreak, and on a multi-rendition item the two can disagree — a 4K
+    // HEVC that needs a transcode beside a 1080p that direct-plays. When
+    // negotiation chose, its choice supplies the ticks.
+    if let Some(part) = parts.first()
+        && let Some(of_group) = out.item.sources.iter().find(|s| {
+            // Size too: ItemSource does not carry the root token, and two
+            // roots of one collection can hold the same relative path.
+            s.module_id == part.module_id
+                && s.collection_id == part.collection_id
+                && s.path_rel == part.path_rel
+                && s.size == part.size as i64
+        })
+    {
+        let group = of_group.source_id;
+        let members: Vec<_> = out
+            .item
+            .sources
+            .iter()
+            .filter(|s| s.source_id == group)
+            .collect();
+        // Completeness is law here as it is on GET: offsets folded over a
+        // missing part are lies, and a stray duplicate (same module, path
+        // and size in another root) can match into an incomplete group.
+        // Anything less than complete keeps item_body's guarded choice.
+        let complete = members.first().is_some_and(|first| {
+            members.len() as i64 == first.parts
+                && members
+                    .iter()
+                    .enumerate()
+                    .all(|(at, s)| s.part == at as i64 + 1)
+        });
+        if complete {
+            out.chapters = group_chapters(members.into_iter().map(|s| s.streams.clone().flatten()));
+        }
+    }
 
     let source = parts.first().map(|part| {
         let video = info.video.first();
@@ -5970,7 +6146,92 @@ async fn session_file(
 
 #[cfg(test)]
 mod tests {
-    use super::{PublicOrigin, openapi_document, parse_range};
+    use super::{PublicOrigin, group_chapters, openapi_document, parse_range};
+
+    /// A CD1 whose author stamped a chapter at (or past) the disc's own end
+    /// must not claim a boundary in CD2's stretch of the timeline — and a
+    /// part whose probe reported zero duration cannot place the parts after
+    /// it at all. The final part keeps its overhang: there is nothing after
+    /// it to trespass on.
+    #[test]
+    fn a_part_fold_keeps_chapters_inside_their_part() {
+        use kahawai_core::media::{Chapter, MediaInfo};
+        let part = |duration_ms: Option<u64>, chapters: Vec<(u64, &str)>| MediaInfo {
+            duration_ms,
+            chapters: Some(
+                chapters
+                    .into_iter()
+                    .map(|(start_ms, title)| Chapter {
+                        start_ms,
+                        end_ms: None,
+                        title: Some(title.into()),
+                    })
+                    .collect(),
+            ),
+            ..Default::default()
+        };
+
+        // CD1 is 10 s; its "end" chapter at 10 s would land on CD2's opener.
+        let folded = group_chapters(
+            [
+                Some(part(Some(10_000), vec![(0, "one"), (10_000, "stray")])),
+                Some(part(Some(10_000), vec![(0, "two"), (12_000, "tail")])),
+            ]
+            .into_iter(),
+        );
+        let titles: Vec<_> = folded.iter().filter_map(|c| c.title.as_deref()).collect();
+        assert_eq!(
+            titles,
+            ["one", "two", "tail"],
+            "the stray is dropped, the final tail kept"
+        );
+        assert_eq!(folded[1].start_ms, 10_000);
+
+        // A zero-duration probe stops the fold before it misplaces CD2.
+        let folded = group_chapters(
+            [
+                Some(part(Some(0), vec![(0, "one")])),
+                Some(part(Some(10_000), vec![(0, "two")])),
+            ]
+            .into_iter(),
+        );
+        let titles: Vec<_> = folded.iter().filter_map(|c| c.title.as_deref()).collect();
+        assert_eq!(titles, ["one"], "an unplaceable second part is left out");
+
+        // A STATED end past its own part is the same authoring mistake as a
+        // stray start: clamped to the part's end on non-final parts, kept on
+        // the final one (nothing after it to trespass on).
+        let stated = |start_ms: u64, end_ms: u64, title: &str| Chapter {
+            start_ms,
+            end_ms: Some(end_ms),
+            title: Some(title.into()),
+        };
+        let folded = group_chapters(
+            [
+                Some(MediaInfo {
+                    duration_ms: Some(10_000),
+                    chapters: Some(vec![stated(5_000, 14_000, "overhang")]),
+                    ..Default::default()
+                }),
+                Some(MediaInfo {
+                    duration_ms: Some(10_000),
+                    chapters: Some(vec![stated(2_000, 25_000, "last")]),
+                    ..Default::default()
+                }),
+            ]
+            .into_iter(),
+        );
+        assert_eq!(
+            folded[0].end_ms,
+            Some(10_000),
+            "clamped to CD1's end, not 4 s into CD2"
+        );
+        assert_eq!(
+            folded[1].end_ms,
+            Some(35_000),
+            "the final part keeps its stated end"
+        );
+    }
 
     #[test]
     fn range_forms() {

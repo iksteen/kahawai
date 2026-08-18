@@ -201,6 +201,36 @@ describe('a film', () => {
     await flushPromises()
     expect(router.currentRoute.value.path).toBe('/library/films/item/heat/play')
   })
+
+  test('pressing a chapter starts there', async () => {
+    vi.mocked(itemQuery).mockResolvedValue(
+      film({
+        chapters: [
+          { start_ms: 0, title: 'Opening' },
+          { start_ms: 470_512, title: 'The heist' },
+          { start_ms: 1_800_000 },
+        ],
+      }) as never,
+    )
+    const { router, wrapper } = await open(Detail, '/library/films/item/heat')
+    // A chapter with no name is still somewhere to jump to.
+    expect(wrapper.text()).toContain('7:50')
+    expect(wrapper.text()).toContain('Chapter 3')
+
+    await wrapper
+      .findAll('button')
+      .find((b) => b.text().includes('The heist'))!
+      .trigger('click')
+    await flushPromises()
+    expect(router.currentRoute.value.path).toBe('/library/films/item/heat/play')
+    expect(router.currentRoute.value.query.start).toBe('470512')
+  })
+
+  test('no chapters, no section', async () => {
+    const { wrapper } = await open(Detail, '/library/films/item/heat')
+    expect(wrapper.text()).not.toContain('CHAPTERS')
+    expect(wrapper.text().toLowerCase()).not.toContain('chapters')
+  })
 })
 
 describe('what the hub says it would do with the file', () => {

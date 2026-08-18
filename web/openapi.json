@@ -9,7 +9,7 @@
     },
     "version": "0.0.0-dev"
   },
-  "x-kahawai-source-sha256": "82250f0f59e096884996f2496593c730ddd9046f8462db150198b86a420a93bb",
+  "x-kahawai-source-sha256": "b4555bd46a019a296b2f8c5027a6a4d2c75362ad2e34b862f63c7b15e049abb4",
   "paths": {
     "/admin/v1/collections": {
       "get": {
@@ -6863,6 +6863,13 @@
               "show_title"
             ],
             "properties": {
+              "chapters": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/Chapter"
+                },
+                "description": "The chapters the file declares, on the ITEM's timeline —\nwhat a seek bar puts ticks on and what a detail page lists. On the\nitem rather than per source because a client is playing one of\nthem: the first COMPLETE, reachable source in `sources` (not\nnecessarily `sources[0]` — incomplete part sets and offline\nrenditions are passed over), and on QUERY the source negotiation\nactually chose. Do not correlate them with `sources[0]`.\n\nEmpty when the file declares none and when nothing has looked yet.\nA player cannot act on the difference, and the file being asked is\nthe same file either way."
+              },
               "metadata": {
                 "oneOf": [
                   {

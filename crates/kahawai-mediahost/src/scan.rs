@@ -373,15 +373,29 @@ fn inspect(root: &Path, path: &Path) -> Result<Inspected> {
         }
     }
     // MH-4: declare embedded attachments (fonts) — name/mime/byte range
-    // only, payloads are never read at scan time.
+    // only, payloads are never read at scan time. Chapters come off the
+    // same header walk, and from the container rather than from
+    // discovery's TOC: matroskademux posts no TOC for some files whose
+    // chapters this reads out exactly.
     if matches!(info.container.as_deref(), Some("matroska" | "webm")) {
-        match kahawai_media::subindex::declare_attachments(path) {
-            Ok(atts) => info.attachments = Some(atts),
-            Err(e) => tracing::debug!(
-                path = %path.display(),
-                error = format!("{e:#}"),
-                "attachment declaration failed"
-            ),
+        match kahawai_media::subindex::declare_container(path) {
+            Ok((attachments, chapters)) => {
+                info.attachments = Some(attachments);
+                info.chapters = Some(chapters);
+            }
+            Err(e) => {
+                tracing::debug!(
+                    path = %path.display(),
+                    error = format!("{e:#}"),
+                    "container header declaration failed"
+                );
+                // Discovery pre-filled chapters from the demuxer's TOC, which
+                // for matroska is exactly the answer this sparse read exists
+                // to replace (the demuxer misses some). A failed declaration
+                // leaves the question OPEN for the backfill worklist rather
+                // than settling it with the unreliable answer.
+                info.chapters = None;
+            }
         }
     }
     Ok((size, mtime_unix, head_xxh3, tail_xxh3, oshash, info))

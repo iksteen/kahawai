@@ -65,6 +65,8 @@ import {
   type SessionEvent,
 } from '../domain/player-session.ts'
 import { initialSubtitle, needsBurnRestart } from '../domain/track-choice.ts'
+import { chapterTicks } from '../domain/chapters.ts'
+import { hms } from '../domain/label.ts'
 import { initialTracks, tracks as reduceTracks, type TrackEvent } from '../domain/player-tracks.ts'
 import { isTypingTarget, playerIntent } from '../domain/player-keys.ts'
 import { keepSessionAlive } from '../domain/keepalive.ts'
@@ -165,6 +167,25 @@ const offset = ref(isHls.value ? props.resumeMs : 0)
 /// absolute origin is partBase + start.pos.
 let partBase = props.session.part_base_ms ?? 0
 const durationMs = computed(() => props.session.duration_ms ?? 0)
+
+/// The file's own chapters, drawn on the bar — and each mark is an 11px
+/// button that seeks to its chapter (pointer events gated on the bar being
+/// visible; see the template). The container itself takes no pointer, so
+/// the transport underneath keeps every press between the marks.
+const ticks = computed(() => chapterTicks(props.item.chapters ?? [], durationMs.value))
+
+/// Which way a mark's label hangs. Centred in the middle third, hung inward
+/// from the tick in the outer thirds: a label centred on a mark near either
+/// end runs past the videobox's overflow and loses its leading timestamp.
+/// Thirds rather than a narrow edge band because the thresholds are in bar
+/// percent while the label's width is in pixels.
+// ponytail: percent thresholds + a 240px cap, not pixel-aware measurement;
+// measure the bar if long titles on very narrow players ever matter.
+function labelSide(pct: number) {
+  if (pct > 67) return 'right-0'
+  if (pct < 33) return 'left-0'
+  return 'left-1/2 -translate-x-1/2'
+}
 
 /// Whether the element's clock means anything yet.
 ///
@@ -1426,23 +1447,65 @@ const remember = (scope: string, key: string, value: string) =>
            The two-layer fill — what the pipeline has produced, and where the
            viewer is — is a gradient on the track, because a range input has no
            children to position. -->
-      <input
-        v-if="durationMs > 0"
-        class="seekbar"
-        type="range"
-        min="0"
-        :max="durationMs"
-        step="1000"
-        :value="Math.round(playing.posMs)"
-        :disabled="frozen"
-        :aria-label="`Seek — ${isHls ? 'beyond what the hub has produced this restarts the pipeline at the target' : 'anywhere in the file'}`"
-        :aria-valuetext="`${fmt(playing.posMs)} of ${fmt(durationMs)}`"
-        :style="{
-          '--played': `${pct}%`,
-          '--made': `${isHls ? producedPct : 100}%`,
-        }"
-        @input="seekTo(Number(($event.target as HTMLInputElement).value))"
-      />
+      <div v-if="durationMs > 0" class="relative flex items-center">
+        <input
+          class="seekbar"
+          type="range"
+          min="0"
+          :max="durationMs"
+          step="1000"
+          :value="Math.round(playing.posMs)"
+          :disabled="frozen"
+          :aria-label="`Seek — ${isHls ? 'beyond what the hub has produced this restarts the pipeline at the target' : 'anywhere in the file'}`"
+          :aria-valuetext="`${fmt(playing.posMs)} of ${fmt(durationMs)}`"
+          :style="{
+            '--played': `${pct}%`,
+            '--made': `${isHls ? producedPct : 100}%`,
+          }"
+          @input="seekTo(Number(($event.target as HTMLInputElement).value))"
+        />
+        <!-- Chapter marks, an overlay rather than more gradient stops on the
+             track — a range input has no children to position, and a chapter
+             list is not a fixed number of stops.
+             A mark is one pixel wide and nobody can hit one pixel, so what
+             takes the pointer is an 11px button around it: five pixels of
+             slack either side, and the press lands on the chapter rather than
+             wherever the cursor actually was. It costs those pixels from the
+             bar underneath, which is a fair trade — a press on a chapter mark
+             means that chapter.
+             Out of the reading order deliberately: fifteen tab stops in front
+             of Play would be a worse transport for a keyboard, which reaches
+             every one of these positions with the arrow keys and finds them
+             named, in order, on the item's own page. -->
+        <div v-if="ticks.length" class="pointer-events-none absolute inset-x-0" aria-hidden="true">
+          <!-- pointer-events only while the bar is SHOWING. An explicit
+               `auto` on a descendant defeats the hidden bar's
+               pointer-events-none — hit-testing descends — so a faded-out
+               bar left invisible seek targets floating over the picture,
+               and a click meant to pause jumped to a chapter instead. -->
+          <button
+            v-for="(tick, nth) in ticks"
+            :key="`${tick.startMs}-${nth}`"
+            class="group absolute top-1/2 h-3 w-[11px] -translate-x-1/2 -translate-y-1/2 cursor-pointer border-0 bg-transparent p-0 disabled:cursor-default"
+            :class="barShown || playing.paused ? 'pointer-events-auto' : 'pointer-events-none'"
+            type="button"
+            tabindex="-1"
+            :disabled="frozen"
+            :style="{ left: `${tick.pct}%` }"
+            @click="seekTo(tick.startMs)"
+          >
+            <span
+              class="absolute top-1/2 left-1/2 h-1.5 w-px -translate-x-1/2 -translate-y-1/2 bg-black/50 group-hover:h-2.5 group-hover:w-[2px] group-hover:bg-sand"
+            />
+            <span
+              class="pointer-events-none absolute bottom-[calc(100%+3px)] hidden max-w-[240px] truncate rounded-sm border border-line bg-bg/95 px-1.5 py-0.5 font-mono text-[11px] text-text group-hover:block"
+              :class="labelSide(tick.pct)"
+            >
+              {{ hms(tick.startMs) }} · {{ tick.title }}
+            </span>
+          </button>
+        </div>
+      </div>
 
       <div class="flex flex-wrap items-center gap-2">
         <!-- This bar sits ABOVE the restart veil, so a Play glyph here would be

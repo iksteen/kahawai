@@ -30,6 +30,7 @@ import {
 } from '../domain/source.ts'
 import {
   episodeOf,
+  hms,
   projecting,
   resumeMs,
   seasonLabel,
@@ -37,6 +38,7 @@ import {
   seLabel,
   watchedPct,
 } from '../domain/label.ts'
+import { chapterTitle } from '../domain/chapters.ts'
 import { adminItemLog, listLibraries } from '../api/generated/kahawai.ts'
 import { notify } from '../composables/notices.ts'
 import { loadMask } from '../api/capabilities.ts'
@@ -215,11 +217,14 @@ const subline = computed(() => {
     .join(' · ')
 })
 
-function play(fromStart = false) {
+/// `at` is a position in milliseconds; leaving it out resumes. Zero is
+/// "play from start", which is the same statement — the player reads a
+/// number, so a chapter is one too rather than a second kind of link.
+function play(at?: number) {
   void router.push({
     name: 'player',
     params: { library: library.value, id: id.value },
-    ...(fromStart ? { query: { start: '0' } } : {}),
+    ...(at === undefined ? {} : { query: { start: String(Math.round(at)) } }),
   })
 }
 
@@ -315,7 +320,7 @@ function markSeason(season: number | null, played: boolean) {
         >
           ▶ {{ resumeAt ? 'Resume' : 'Play' }}
         </Btn>
-        <Btn v-if="resumeAt > 0" ghost @click="play(true)">Play from start</Btn>
+        <Btn v-if="resumeAt > 0" ghost @click="play(0)">Play from start</Btn>
         <Btn
           ghost
           small
@@ -584,6 +589,36 @@ function markSeason(season: number | null, played: boolean) {
           </div>
           <CapabilityDebug v-if="showCaps" class="mt-2" @change="maskChanged" />
         </div>
+      </section>
+
+      <!-- The file's own chapters. Buttons, not a table of numbers:
+           the useful thing about a chapter is that you can be in it a second
+           later, and a viewer who wants "the bit after the recap" should not
+           have to start at the beginning and scrub. -->
+      <section v-if="item.chapters?.length" class="mt-8 max-w-[46rem]">
+        <h2 class="mb-2 text-[14px] font-[650] tracking-[0.08em] text-dim uppercase">Chapters</h2>
+        <ul class="grid grid-cols-[repeat(auto-fill,minmax(15rem,1fr))] gap-x-6">
+          <li
+            v-for="(chapter, at) in item.chapters"
+            :key="`${chapter.start_ms}-${at}`"
+            class="border-b border-hairline last:border-0"
+          >
+            <button
+              class="flex w-full cursor-pointer items-baseline gap-3 border-0 bg-transparent px-0 py-1.5 text-left text-text hover:text-teal disabled:cursor-default disabled:text-dim"
+              type="button"
+              :disabled="!best?.available"
+              :title="
+                best?.available ? undefined : 'The machine holding this file is not answering'
+              "
+              @click="play(chapter.start_ms)"
+            >
+              <span class="font-mono text-[12px] text-dim tabular-nums">
+                {{ hms(chapter.start_ms) }}
+              </span>
+              <span>{{ chapterTitle(chapter, at) }}</span>
+            </button>
+          </li>
+        </ul>
       </section>
 
       <!-- UI-27: grouped into works, so a film in seven numbered parts does

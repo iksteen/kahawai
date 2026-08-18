@@ -39,7 +39,18 @@ const id = computed(() => String(route.params.id ?? ''))
 const library = computed(() => String(route.params.library ?? ''))
 /// Play from the beginning rather than resuming. A hint from the button that
 /// was pressed; a bare URL always resumes, which is the safe default.
-const fromStart = computed(() => route.query.start === '0')
+/// Where to start, in milliseconds, instead of resuming. A hint from what was
+/// pressed — "Play from start" is zero and a chapter is its own position — and
+/// a bare URL always resumes, which is the safe default. Anything that is not
+/// a position (a stale link, a typo) resumes rather than jumping somewhere
+/// nobody asked for.
+const startAt = computed(() => {
+  // Digits only: Number('') is 0, so a truncated ?start= would silently
+  // mean "from the beginning" where the stated rule is "anything that is
+  // not a position resumes".
+  const asked = route.query.start
+  return typeof asked === 'string' && /^\d+$/.test(asked) ? Number(asked) : null
+})
 
 const item = ref<ItemQueryResponse | null>(null)
 const session = ref<StartSessionResponse | null>(null)
@@ -124,7 +135,13 @@ async function start() {
     const detail = await itemQuery(id.value, { profile: buildProfile() })
     if (mine !== attempt.value || left) return
     item.value = detail
-    const at = fromStart.value ? 0 : (detail.resume_position_ms ?? 0)
+    // Range-checked against the file, not only shape-checked: a stale or
+    // hand-edited position past the end is not a position, so it resumes.
+    const asked =
+      startAt.value !== null && (detail.duration_ms == null || startAt.value < detail.duration_ms)
+        ? startAt.value
+        : null
+    const at = asked ?? detail.resume_position_ms ?? 0
     const audio = detail.sources[0]?.streams?.audio ?? []
     let audioTrack = 0
     let prefs: Preference[] = []
@@ -163,6 +180,15 @@ async function start() {
     }
     resumeMs.value = at
     session.value = fresh
+    // The start position is spent only NOW, with the session up: an hour in,
+    // a reload must resume from progress rather than jump back to the
+    // chapter that opened the session — but a start that FAILED must keep
+    // the ask, or Try again after a transient 503 silently resumed mid-film
+    // instead of at the chapter that was pressed. replace(), so Back does
+    // not walk through the parameter either.
+    if (asked !== null) {
+      void router.replace({ query: {} })
+    }
   } catch (cause) {
     if (mine !== attempt.value || left) return
     // Whatever session this route was holding, it is not the one on screen any

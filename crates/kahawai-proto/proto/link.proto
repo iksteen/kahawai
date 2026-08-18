@@ -241,8 +241,9 @@ message HubToHost {
     ExtractSubs extract_subs = 6;
     // … or background pre-warm, drained below the ED2K queue.
     SubsWorklist subs_worklist = 7;
-    // MH-4 backfill: declare attachments for files scanned before
-    // declaration existed. Cheapest tier (header reads only).
+    // MH-4 backfill: declare attachments and chapters for files scanned
+    // before either existed. Cheapest tier (header reads only), one walk
+    // of the container header for both.
     AttachmentsWorklist attachments_worklist = 8;
     // HUB-32b: read one image subtitle track's display-set blocks.
     // Index-driven and free on local disk; the hub cannot do this
@@ -342,6 +343,12 @@ message FileAttachments {
   // JSON array of {file_name, mime_type, offset, size} — exactly what
   // MediaInfo.attachments serializes to. "[]" = checked, none found.
   string attachments_json = 4;
+  // The chapters declared in the SAME sparse pass, as
+  // MediaInfo.chapters serializes. Two facts read from one walk of the
+  // container header rather than two worklists over the same files.
+  // Absent = a host that predates chapters, which leaves the field null
+  // and so keeps the file on the worklist for a host that does.
+  optional string chapters_json = 5;
 }
 
 message FileKeyframeInterval {

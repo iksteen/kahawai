@@ -28,6 +28,19 @@ export type Labelled = Pick<
   | 'resume_duration_ms'
 >
 
+/// A position on a timeline, as a clock: 4:07 inside an hour, 1:04:07 past
+/// it. Hours are dropped rather than padded, because most of what this
+/// labels is under one.
+export function hms(ms: number) {
+  const total = Math.max(0, Math.floor(ms / 1000))
+  const hours = Math.floor(total / 3600)
+  const minutes = Math.floor((total % 3600) / 60)
+  const seconds = total % 60
+  return hours > 0
+    ? `${hours}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`
+    : `${minutes}:${String(seconds).padStart(2, '0')}`
+}
+
 /// S01E02 for seasoned episodes; E11 for absolute numbering (anime); E01-02
 /// for a batch file spanning a range.
 ///

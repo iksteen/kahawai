@@ -300,9 +300,11 @@ pub async fn run(
     }
 }
 
-/// MH-4 backfill: declare one file's attachments (sparse header reads,
-/// ~0.3 s even over a network mount) and ship them to the hub. Errors
-/// still report as "[]" so the hub stops re-listing the file.
+/// MH-4 backfill: declare one file's attachments and its chapters —
+/// sparse header reads, ~0.3 s even over a network mount — and ship them
+/// to the hub. An error here sends NOTHING, on purpose: the reader settles
+/// deterministic shape problems as "[]" itself, so what escapes is
+/// weather (I/O on the mount), and the file stays listed to be retried.
 async fn declare_and_send(
     collections: &[CollectionConfig],
     collection_id: &str,
@@ -310,17 +312,20 @@ async fn declare_and_send(
     path_rel: &str,
     tx: &tokio::sync::mpsc::Sender<HostToHub>,
 ) {
-    let result: anyhow::Result<(u64, String)> = async {
+    let result: anyhow::Result<(u64, String, String)> = async {
         let path = crate::serve::resolve_rel(collections, collection_id, root_token, path_rel)?;
         let size = std::fs::metadata(&path)?.len();
-        let atts = tokio::task::spawn_blocking(move || {
-            kahawai_media::subindex::declare_attachments(&path)
-        })
-        .await??;
-        Ok((size, serde_json::to_string(&atts)?))
+        let (atts, chapters) =
+            tokio::task::spawn_blocking(move || kahawai_media::subindex::declare_container(&path))
+                .await??;
+        Ok((
+            size,
+            serde_json::to_string(&atts)?,
+            serde_json::to_string(&chapters)?,
+        ))
     }
     .await;
-    let (size, attachments_json) = match result {
+    let (size, attachments_json, chapters_json) = match result {
         Ok(v) => v,
         Err(e) => {
             tracing::debug!(collection = %collection_id, path = %path_rel,
@@ -328,8 +333,16 @@ async fn declare_and_send(
             return; // vanished/unreadable: the next scan reconciles
         }
     };
-    if attachments_json != "[]" {
-        tracing::info!(collection = %collection_id, path = %path_rel, "attachments declared");
+    // Say which, because the one investigation this line shows up in is
+    // "why has this file no chapters", and a message that claims both when
+    // only the fonts were found answers it wrongly.
+    if attachments_json != "[]" || chapters_json != "[]" {
+        tracing::info!(
+            collection = %collection_id, path = %path_rel,
+            attachments = attachments_json != "[]",
+            chapters = chapters_json != "[]",
+            "container header declared"
+        );
     }
     let msg = HostToHub {
         msg: Some(host_to_hub::Msg::FileAttachments(FileAttachments {
@@ -337,6 +350,7 @@ async fn declare_and_send(
             source: source(root_token, path_rel),
             size,
             attachments_json,
+            chapters_json: Some(chapters_json),
         })),
     };
     let _ = tx.send(msg).await;

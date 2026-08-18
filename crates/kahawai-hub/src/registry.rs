@@ -73,6 +73,19 @@ pub struct SourcePath {
     pub path_rel: String,
 }
 
+/// What a mediahost read off one walk of a container's header: the
+/// attachments it declares and its chapters. They travel
+/// together because they are read together.
+///
+/// `chapters_json` is `None` from a host too old to know about them, which
+/// leaves the field null — the file stays on the worklist for a host that
+/// does, rather than being marked as looked at.
+#[derive(Debug, Clone, Copy)]
+pub struct Declared<'a> {
+    pub attachments_json: &'a str,
+    pub chapters_json: Option<&'a str>,
+}
+
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct CollectionRow {
     pub module_id: String,
@@ -728,9 +741,11 @@ impl Registry {
     }
 
     /// MH-4 backfill: matroska files whose records predate attachment
-    /// declaration. The mediahost declares them in its cheapest idle
-    /// tier; "attachments":[] marks checked-and-none so the file drops
-    /// out of this list.
+    /// declaration, or chapter declaration. Both come off
+    /// one walk of the container header, so they share a worklist rather
+    /// than reading the same files twice. The mediahost declares them in
+    /// its cheapest idle tier; `[]` marks checked-and-none so the file
+    /// drops out of this list.
     pub async fn attachments_worklist(
         &self,
         module_id: &str,
@@ -751,7 +766,8 @@ impl Registry {
         }
         self.source_worklist(
             "json_extract(streams_json, '$.container') IN ('matroska', 'webm')
-             AND json_extract(streams_json, '$.attachments') IS NULL",
+             AND (json_extract(streams_json, '$.attachments') IS NULL
+                  OR json_extract(streams_json, '$.chapters') IS NULL)",
             module_id,
             collection_id,
         )
@@ -899,9 +915,12 @@ impl Registry {
         Ok(n > 0)
     }
 
-    /// Store a mediahost attachment declaration (size-guarded like ED2K:
-    /// dropped when the row moved on). Writes into streams_json so the
-    /// record looks exactly as if the scan had declared it.
+    /// See [`Declared`].
+    ///
+    /// Store what one sparse pass over a container header found
+    /// (size-guarded like ED2K: dropped when the row moved on). Writes
+    /// into streams_json so the record looks exactly as if the scan had
+    /// declared it.
     pub async fn record_file_attachments(
         &self,
         module_id: &str,
@@ -909,28 +928,47 @@ impl Registry {
         root_token: &str,
         path_rel: &str,
         size: u64,
-        attachments_json: &str,
+        declared: Declared<'_>,
     ) -> Result<bool> {
+        let Declared {
+            attachments_json,
+            chapters_json,
+        } = declared;
         // Reject junk before it reaches the row.
         let parsed: Result<Vec<kahawai_core::media::Attachment>, _> =
             serde_json::from_str(attachments_json);
         anyhow::ensure!(parsed.is_ok(), "malformed attachments json");
+        if let Some(chapters_json) = chapters_json {
+            let parsed: Result<Vec<kahawai_core::media::Chapter>, _> =
+                serde_json::from_str(chapters_json);
+            anyhow::ensure!(parsed.is_ok(), "malformed chapters json");
+        }
         let Some(source_id) = self
             .source_id(module_id, collection_id, root_token, path_rel)
             .await?
         else {
             return Ok(false);
         };
-        let n = sqlx::query(
-            "UPDATE files SET streams_json=json_set(streams_json,'$.attachments',json(?))
-              WHERE id=? AND size=?",
-        )
-        .bind(attachments_json)
-        .bind(source_id)
-        .bind(size as i64)
-        .execute(&self.db)
-        .await?
-        .rows_affected();
+        let query = match chapters_json {
+            Some(chapters) => sqlx::query(
+                "UPDATE files SET streams_json=json_set(streams_json,
+                     '$.attachments',json(?),'$.chapters',json(?))
+                  WHERE id=? AND size=?",
+            )
+            .bind(attachments_json)
+            .bind(chapters),
+            None => sqlx::query(
+                "UPDATE files SET streams_json=json_set(streams_json,'$.attachments',json(?))
+                  WHERE id=? AND size=?",
+            )
+            .bind(attachments_json),
+        };
+        let n = query
+            .bind(source_id)
+            .bind(size as i64)
+            .execute(&self.db)
+            .await?
+            .rows_affected();
         Ok(n > 0)
     }
 
