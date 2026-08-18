@@ -13,12 +13,14 @@
 /// REMOUNTS the picture — it keeps a run's worth of state and expects a fresh
 /// mount per session — while the route stays the same page.
 import { computed, onBeforeUnmount, ref, watch } from 'vue'
+import { useQueryClient } from '@tanstack/vue-query'
 import { useRoute, useRouter } from 'vue-router'
 
 import Btn from '../components/Btn.vue'
 import Failed from '../components/Failed.vue'
 import Picture from '../components/Picture.vue'
 import type { ItemQueryResponse } from '../api/generated/model/itemQueryResponse.ts'
+import type { CarriedTracks } from '../domain/player-tracks.ts'
 import type { PlayerMode } from '../domain/player-keys.ts'
 import type { Preference } from '../api/generated/model/preference.ts'
 import type { StartSessionResponse } from '../api/generated/model/startSessionResponse.ts'
@@ -34,11 +36,10 @@ import { startPlaybackSession } from '../api/playback.ts'
 
 const route = useRoute()
 const router = useRouter()
+const cache = useQueryClient()
 
 const id = computed(() => String(route.params.id ?? ''))
 const library = computed(() => String(route.params.library ?? ''))
-/// Play from the beginning rather than resuming. A hint from the button that
-/// was pressed; a bare URL always resumes, which is the safe default.
 /// Where to start, in milliseconds, instead of resuming. A hint from what was
 /// pressed — "Play from start" is zero and a chapter is its own position — and
 /// a bare URL always resumes, which is the safe default. Anything that is not
@@ -53,8 +54,20 @@ const startAt = computed(() => {
 })
 
 const item = ref<ItemQueryResponse | null>(null)
+/// Read once, on the way in, and handed to the picture: the preferences that
+/// chose the audio track and the media type that shaped that choice. The
+/// picture used to fetch both again to draw its selectors with, which is the
+/// same two answers a moment later.
+const prefs = ref<Preference[]>([])
+const mediaType = ref('')
 const session = ref<StartSessionResponse | null>(null)
 const resumeMs = ref(0)
+/// The track choice live at the moment of the last restart, handed back to
+/// the remounted picture so a recovery does not revert a mid-episode pick to
+/// the prefs snapshot above. Null on a first mount and cleared on any change
+/// of item: a choice carries across restarts of one viewing, never across
+/// episodes.
+const carried = ref<CarriedTracks | null>(null)
 const failure = ref('')
 const attempt = ref(0)
 
@@ -95,12 +108,31 @@ onBeforeUnmount(() => {
   left = true
   const open = session.value
   if (open) void release(open.session_id)
+  // Whatever the watcher below still owed: its queued post-flush job is
+  // SKIPPED once the watcher is stopped, and a navigation landing in the
+  // same flush unmounts this component — and stops the watcher — before
+  // the job runs. Without this drain those sessions held one of the
+  // account's four slots each until the idle reaper.
+  for (const id of owed) void release(id)
+  owed.clear()
 })
 
 const release = (id: string) => endSession(id, { keepalive: true }).catch(() => {})
 
-/// ONE place releases a session, and it is the only writer every other path
-/// goes through.
+/// Sessions retired but not yet released: the release rides on the
+/// post-flush watcher below, and this is the ledger that survives the one
+/// case where that job never runs (unmount in the same flush).
+const owed = new Set<string>()
+
+/// The ONLY writer of `session`: records what the assignment retires, so
+/// the watcher — or, failing that, unmount — releases it.
+function retire(next: StartSessionResponse | null) {
+  const open = session.value
+  if (open && open.session_id !== next?.session_id) owed.add(open.session_id)
+  session.value = next
+}
+
+/// A RETIRED session is released here, after the picture has let go of it.
 ///
 /// Three call sites used to do it by hand and a fourth — `start`, reached by a
 /// route-param change — did not: Back and Forward across two `/play` entries
@@ -118,7 +150,19 @@ const release = (id: string) => endSession(id, { keepalive: true }).catch(() => 
 watch(
   session,
   (fresh, old) => {
-    if (old && old.session_id !== fresh?.session_id) void release(old.session_id)
+    if (old && old.session_id !== fresh?.session_id) {
+      owed.delete(old.session_id)
+      void release(old.session_id)
+    }
+    // Two retires in one flush coalesce to a single watcher run whose `old`
+    // is only the first of them; whatever the ledger still holds beyond the
+    // session now on screen was retired mid-flush and is nobody's.
+    for (const id of owed) {
+      if (id !== fresh?.session_id) {
+        owed.delete(id)
+        void release(id)
+      }
+    }
   },
   { flush: 'post' },
 )
@@ -128,12 +172,23 @@ async function start() {
   // the session's.
   failure.value = ''
   // Already playing this item — the next-episode handover sets both at once,
-  // and the URL catching up must not start a second session for it.
-  if (session.value && item.value?.id === id.value) return
+  // and the URL catching up must not start a second session for it. The bump
+  // is not optional: a start for a route the viewer has already Backed out
+  // of can still be in flight, and without it that start finishes with
+  // `mine === attempt` and puts the other item's stream under this URL.
+  if (session.value && item.value?.id === id.value) {
+    attempt.value++
+    return
+  }
   const mine = ++attempt.value
   try {
     const detail = await itemQuery(id.value, { profile: buildProfile() })
     if (mine !== attempt.value || left) return
+    // The item and the session render as a PAIR. A session still alive here
+    // belongs to the item this route just left (Back/Forward reuse this
+    // component); assigning the new item beside it rendered one item's
+    // metadata around another's stream for as long as the start took.
+    retire(null)
     item.value = detail
     // Range-checked against the file, not only shape-checked: a stale or
     // hand-edited position past the end is not a position, so it resumes.
@@ -144,26 +199,40 @@ async function start() {
     const at = asked ?? detail.resume_position_ms ?? 0
     const audio = detail.sources[0]?.streams?.audio ?? []
     let audioTrack = 0
-    let prefs: Preference[] = []
+    prefs.value = []
+    carried.value = null
     try {
       const [preferences, libraries] = await Promise.all([
+        // NOT from the query cache, unlike the library list below: `putPref`
+        // writes through without invalidating it, and the write that matters
+        // most here is the one this player just made — pick Japanese on
+        // episode one, start episode two, and a cached list still says English.
         getPrefs(),
+        // Whatever screen you came from already read this — every route into
+        // the player is one of them — and libraries change when an admin edits
+        // one, not while somebody is starting an episode. Read, not
+        // `ensureQueryData`: that would put this call under the cache's retry
+        // policy, and a failing one would hold up the session start for as
+        // long as it retried.
+        //
         // Guarded: `prefs` is assigned after this await, so a rejection here
         // left it `[]` — and `[]` is not nullish, so the preferences that DID
         // arrive were replaced by nothing. That drops the bandwidth cap
         // silently and starts on track 0, which is the anime-in-English bug.
         // The media type is the only thing actually at stake.
-        listLibraries().catch((cause: unknown) => {
-          notify(`Could not load the library details: ${sentence(cause)}`)
-          return { libraries: [] }
-        }),
+        cache.getQueryData<{ libraries: { id: string; media_type: string }[] }>(['libraries']) ??
+          listLibraries().catch((cause: unknown) => {
+            notify(`Could not load the library details: ${sentence(cause)}`)
+            return { libraries: [] }
+          }),
       ])
-      prefs = preferences.prefs
+      prefs.value = preferences.prefs
+      mediaType.value = libraries.libraries.find((l) => l.id === library.value)?.media_type ?? ''
       audioTrack = resolveTracks(
-        prefs,
+        prefs.value,
         detail.parent_id ?? detail.id,
         detail.id,
-        libraries.libraries.find((l) => l.id === library.value)?.media_type ?? '',
+        mediaType.value,
         detail.metadata?.original_language,
         audio,
       ).audioTrack
@@ -173,13 +242,13 @@ async function start() {
       // to pick is the one about to play.
       notify(`Could not resolve the audio track: ${sentence(cause)}`)
     }
-    const fresh = await startPlaybackSession(detail, at, audioTrack, 0, prefs)
+    const fresh = await startPlaybackSession(detail, at, audioTrack, 0, prefs.value)
     if (mine !== attempt.value || left) {
       void release(fresh.session_id)
       return
     }
     resumeMs.value = at
-    session.value = fresh
+    retire(fresh)
     // The start position is spent only NOW, with the session up: an hour in,
     // a reload must resume from progress rather than jump back to the
     // chapter that opened the session — but a start that FAILED must keep
@@ -195,7 +264,7 @@ async function start() {
     // more: the guard above reads `session && item?.id === id`, so a failure
     // that leaves the OLD session beside the NEW item makes Try again return
     // early and hand the picture one item's metadata over another's stream.
-    session.value = null
+    retire(null)
     // 503 and nothing else. `startCeiling` also returns `null` for a request
     // that got no answer at all and for a gateway status, and telling somebody
     // whose wifi is off that the machine holding the file is not answering
@@ -224,17 +293,45 @@ const ratio = computed(() => {
 /// A restart replaces the session in place: same page, same frame, new picture.
 /// The watcher above releases the one it replaced, after the picture holding it
 /// has reported where the viewer got to.
-function restarted(fresh: StartSessionResponse, at: number) {
+function restarted(from: string, fresh: StartSessionResponse, at: number, choice: CarriedTracks) {
+  // A picture the route has already left behind can finish its restart late;
+  // adopting that session would put the previous episode's stream under this
+  // item's page. Release it instead — nobody else holds it. BOTH checks:
+  // Back/Forward moves `id` before `item` catches up, while an autoplay
+  // advance moves `item` before the route commits — a stale restart landing
+  // in either gap matches the one that has not moved yet.
+  if (from !== id.value || from !== item.value?.id) {
+    void release(fresh.session_id)
+    return
+  }
+  // Any start() still in flight is now about a session nobody wants twice.
+  attempt.value++
   resumeMs.value = at
-  session.value = fresh
+  carried.value = choice
+  retire(fresh)
 }
 
 /// The next episode: the URL follows it WITHOUT this component remounting and
 /// throwing away the session it has already started.
-function advanced(nextItem: ItemQueryResponse, fresh: StartSessionResponse) {
+function advanced(
+  from: string,
+  nextItem: ItemQueryResponse,
+  fresh: StartSessionResponse,
+  nextPrefs: Preference[],
+) {
+  // Same stale-picture guard as `restarted`.
+  if (from !== id.value || from !== item.value?.id) {
+    void release(fresh.session_id)
+    return
+  }
+  attempt.value++
   item.value = nextItem
+  // The picture read these to resolve the next episode's tracks; adopting them
+  // keeps the remounted one from drawing its selectors off a staler set.
+  prefs.value = nextPrefs
+  carried.value = null
   resumeMs.value = 0
-  session.value = fresh
+  retire(fresh)
   // Replaces the entry rather than stacking one: browser-back should leave the
   // player, not walk back through an evening's autoplay.
   void router.replace({
@@ -291,6 +388,9 @@ function advanced(nextItem: ItemQueryResponse, fresh: StartSessionResponse) {
       :session="session"
       :resume-ms="resumeMs"
       :library-id="library"
+      :prefs="prefs"
+      :media-type="mediaType"
+      :carried="carried"
       :mode="mode"
       @mode="mode = $event"
       @close="leave"

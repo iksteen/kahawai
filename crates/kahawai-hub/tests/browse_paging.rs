@@ -58,6 +58,7 @@ async fn harness() -> (
             enricher.clone(),
         )),
         enricher,
+        Arc::new(kahawai_hub::segments::Detector::new()),
         kahawai_hub::api::NetOptions::default(),
     );
     auth.complete_setup("pager", "hunter22222hunter")

@@ -514,6 +514,7 @@ fn test_router_with_net(
         Arc::new(kahawai_hub::enrich::Enricher::new(
             tempfile::tempdir().unwrap().keep(),
         )),
+        Arc::new(kahawai_hub::segments::Detector::new()),
         net,
     )
 }

@@ -216,6 +216,7 @@ pub async fn harness(file_name: &str, render: fn(&Path)) -> Harness {
             enricher.clone(),
         )),
         enricher,
+        Arc::new(kahawai_hub::segments::Detector::new()),
         kahawai_hub::api::NetOptions::default(),
     );
 

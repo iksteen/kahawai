@@ -174,6 +174,7 @@ async fn seed(dir: &std::path::Path, items: usize) -> Bench {
             enricher.clone(),
         )),
         enricher,
+        Arc::new(kahawai_hub::segments::Detector::new()),
         kahawai_hub::api::NetOptions::default(),
     );
     auth.complete_setup("bench", "hunter22222hunter")

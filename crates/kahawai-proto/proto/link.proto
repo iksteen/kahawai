@@ -375,6 +375,21 @@ message OpenRead {
   string lease_token = 1;
   string collection_id = 2;
   SourcePath source = 3;
+  // Whether this lease is the hub's own background work — intro
+  // detection's season sweep and the enricher's .nfo reads — rather than a
+  // viewer. (Subtitle and artwork leases open as viewers on purpose: a
+  // client is waiting on those.)
+  //
+  // The host cannot tell otherwise, and it schedules its OWN work — hashes,
+  // declarations, probes, extractions — around whether it is busy serving.
+  // A sweep that reads every episode of the library therefore looked
+  // exactly like somebody watching all day: measured, hours of detection
+  // during which the host declared nothing at all. Background leases are
+  // served identically and simply do not count as somebody waiting.
+  //
+  // Default false, so a hub too old to say means "a viewer", which is the
+  // safe reading.
+  bool background = 4;
 }
 
 message ByteChunk {

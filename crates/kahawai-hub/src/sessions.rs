@@ -15,6 +15,23 @@ use sqlx::Row;
 use crate::leases::{Lease, Leases, new_lease_token};
 use crate::registry::Registry;
 
+/// Who a read lease is for. It travels to the mediahost, which serves both
+/// identically and schedules its OWN local work — hashes, declarations,
+/// probes, extractions — around whether it is serving a viewer.
+///
+/// The distinction has to be stated because the host cannot infer it: bytes
+/// are bytes. Without it, a sweep reading every episode in the library is
+/// indistinguishable from somebody watching all day, and the host's queues
+/// never drain — measured, hours of intro detection during which not one
+/// file was declared.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Reader {
+    /// Somebody is waiting on these bytes.
+    Viewer,
+    /// The hub's own background work, which can be outrun by anything.
+    Sweep,
+}
+
 pub enum Mode {
     Direct {
         lease: Lease,
@@ -168,6 +185,10 @@ pub struct PartSource {
     pub root_token: String,
     pub path_rel: String,
     pub size: u64,
+    /// The file's modification time, for callers whose records are about
+    /// BYTES: the detector keys its scan rows on the mtime of the rendition
+    /// it actually read.
+    pub mtime_unix: i64,
     pub base_ms: u64,
     pub duration_ms: u64,
 }
@@ -781,6 +802,9 @@ pub(crate) struct LeaseSource {
     pub(crate) lease: Lease,
     pub(crate) size: u64,
     pub(crate) handle: tokio::runtime::Handle,
+    /// Reads served, for the log line that says whether a stalled consumer ever
+    /// got its first byte.
+    pub(crate) reads: u64,
 }
 
 impl kahawai_media::remux::RemuxSource for LeaseSource {
@@ -793,9 +817,15 @@ impl kahawai_media::remux::RemuxSource for LeaseSource {
             return Ok(0);
         }
         let len = (buf.len() as u64).min(self.size - offset);
+        self.reads += 1;
+        let started = std::time::Instant::now();
+        if self.reads % 64 == 1 {
+            tracing::debug!(offset, len, reads = self.reads, "lease read");
+        }
+        tracing::trace!(offset, len, reads = self.reads, "lease read: asking");
         let _guard = self.handle.enter();
         let mut stream = self.lease.read_range(offset, len).into_inner();
-        self.handle.block_on(async {
+        let outcome = self.handle.block_on(async {
             let mut filled = 0usize;
             while filled < len as usize {
                 match stream.recv().await {
@@ -809,7 +839,26 @@ impl kahawai_media::remux::RemuxSource for LeaseSource {
                 }
             }
             Ok(filled)
-        })
+        });
+        // A read that takes seconds is the byte plane, not the analyzer; a read
+        // that never returns does not reach this line at all, which is the
+        // distinction worth having in a log.
+        tracing::trace!(
+            offset,
+            ok = outcome.is_ok(),
+            seconds = started.elapsed().as_secs_f64(),
+            "lease read: answered"
+        );
+        if started.elapsed() > std::time::Duration::from_secs(5) {
+            tracing::warn!(
+                offset,
+                len,
+                seconds = started.elapsed().as_secs_f64(),
+                ok = outcome.is_ok(),
+                "slow lease read"
+            );
+        }
+        outcome
     }
 }
 
@@ -1323,6 +1372,7 @@ impl Sessions {
         &self,
         registry: &Registry,
         item_id: &str,
+        reader: Reader,
     ) -> Result<(String, String, u64, kahawai_core::media::MediaInfo, Lease)> {
         let (parts, info) = self.source_parts(registry, item_id).await?;
         let p = &parts[0];
@@ -1333,6 +1383,7 @@ impl Sessions {
                 &p.collection_id,
                 &p.root_token,
                 &p.path_rel,
+                reader,
             )
             .await?;
         Ok((p.module_id.clone(), p.path_rel.clone(), p.size, info, lease))
@@ -1387,6 +1438,7 @@ impl Sessions {
                     collection_id: r.get("collection_id"),
                     root_token: r.get("root_token"),
                     path_rel: r.get("source_path"),
+                    mtime_unix: r.get("mtime_unix"),
                     size: r.get::<i64, _>("size") as u64,
                     base_ms: base,
                     duration_ms,
@@ -1410,7 +1462,7 @@ impl Sessions {
         Ok(sqlx::query(
             "SELECT ps.id AS playable_source_id,ps.expected_parts,
                     p.ordinal AS part,f.module_id,f.collection_id,r.root_token,
-                    f.path_rel AS source_path,f.size,f.streams_json
+                    f.path_rel AS source_path,f.size,f.mtime_unix,f.streams_json
              FROM playable_sources ps
              JOIN playable_source_parts p ON p.playable_source_id=ps.id
              JOIN files f ON f.id=p.file_id
@@ -1480,6 +1532,7 @@ impl Sessions {
                     collection_id: r.get("collection_id"),
                     root_token: r.get("root_token"),
                     path_rel: r.get("source_path"),
+                    mtime_unix: r.get("mtime_unix"),
                     size: r.get::<i64, _>("size") as u64,
                     base_ms,
                     duration_ms,
@@ -1542,6 +1595,7 @@ impl Sessions {
         collection_id: &str,
         root_token: &str,
         path_rel: &str,
+        reader: Reader,
     ) -> Result<Lease> {
         // AR-5/AR-11: the in-process mediahost's byte plane is a
         // function call — resolve the path and read the disk directly.
@@ -1563,6 +1617,7 @@ impl Sessions {
                     root_token: root_token.to_string(),
                     path_rel: path_rel.to_string(),
                 }),
+                background: reader == Reader::Sweep,
             })),
         };
         // A send failure here means the host went away between being judged
@@ -1814,6 +1869,7 @@ impl Sessions {
                 &part.collection_id,
                 &part.root_token,
                 &part.path_rel,
+                Reader::Viewer,
             )
             .await?;
 
@@ -2096,6 +2152,7 @@ impl Sessions {
                     &part.collection_id,
                     &part.root_token,
                     &part.path_rel,
+                    Reader::Viewer,
                 )
                 .await?;
             out.push((lease, part.size));
@@ -2263,6 +2320,7 @@ impl Sessions {
                             lease,
                             size,
                             handle: handle.clone(),
+                            reads: 0,
                         }) as Box<dyn kahawai_media::remux::RemuxSource>
                     })
                     .collect();
@@ -3462,6 +3520,7 @@ mod reads_from_tests {
             root_token: "root".into(),
             path_rel: "x.mkv".into(),
             size: 1,
+            mtime_unix: 0,
             base_ms: 0,
             duration_ms: 1,
         }
@@ -3507,6 +3566,50 @@ mod reads_from_tests {
         let parts = [part("A")];
         assert!(reads_from("A", &parts, "A"));
         assert!(!reads_from("A", &parts, "B"));
+    }
+}
+
+#[cfg(test)]
+mod lease_purpose_tests {
+    use super::{Reader, Sessions};
+
+    /// The mediahost schedules its own local work — hashes, declarations,
+    /// probes, extractions — around whether it is serving somebody. It
+    /// cannot tell a sweep from a viewer by looking at the bytes, so the
+    /// lease has to say, and this is the only place that says it.
+    async fn opened_as(reader: Reader) -> bool {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::open(dir.path()).await.unwrap();
+        let registry = crate::registry::Registry::new(db, Default::default());
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        registry.register_link("01MH", tx);
+
+        let sessions = std::sync::Arc::new(Sessions::new(dir.path().join("sessions")));
+        // Nobody answers the OpenRead, so the lease never establishes; the
+        // message is on the wire either way, which is the whole subject.
+        let opening = tokio::spawn(async move {
+            let _ = sessions
+                .open_lease(&registry, "01MH", "c", "r", "e.mkv", reader)
+                .await;
+        });
+        let sent = rx.recv().await.expect("an OpenRead reaches the host");
+        opening.abort();
+        match sent.unwrap().msg {
+            Some(kahawai_proto::v1::hub_to_host::Msg::OpenRead(open)) => open.background,
+            other => panic!("expected an OpenRead, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_sweeps_lease_says_so() {
+        assert!(opened_as(Reader::Sweep).await);
+    }
+
+    #[tokio::test]
+    async fn and_a_viewers_does_not() {
+        // The default reading of a missing field, so a hub too old to say
+        // is taken as a viewer — the safe way round.
+        assert!(!opened_as(Reader::Viewer).await);
     }
 }
 
@@ -3600,6 +3703,7 @@ mod tests {
             root_token: "root".into(),
             path_rel: format!("CD{}.avi", base_ms),
             size: 1,
+            mtime_unix: 0,
             base_ms,
             duration_ms,
         }

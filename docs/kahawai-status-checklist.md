@@ -524,6 +524,18 @@ How something works and why it was built that way belong in
 - [x] HUB-35 Granular refresh: library-refresh endpoint fanning out
       per-collection scan requests, per-collection live progress in the
       admin overview, global rescan removed (endpoint + button)
+- [x] HUB-37 Recap / intro / credits detection, stored per episode and
+      carried on the item QUERY; the web player offers a skip
+      button while the playhead is inside one. A background sweep walks
+      the library a season at a time, ordered by what has been watched,
+      pausing while anything is playing; the admin API reports what is
+      left and can run the next season now. A scan record is keyed to the
+      analysed file's mtime, so a replaced episode is analysed again. Chapter-name
+      analysis IS implemented: chapters are read from the container at scan
+      and a season that names its own opening and credits is answered from
+      the names, without reading a byte. Design in implementation §4.9; the
+      detector is measured against intro-skipper in
+      `docs/intro-detection-results.md`.
 - [x] Chapters as a first-class fact: read at scan beside the attachment
       declaration, backfilled for older Matroska/WebM rows (other containers
       keep whatever the demuxer's TOC declared at discovery, so a

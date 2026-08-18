@@ -291,7 +291,14 @@ impl Artwork {
             return Ok(Some((bytes, ctype, cache_key)));
         }
         let lease = sessions
-            .open_lease(registry, &module_id, &collection_id, &root_token, &art_rel)
+            .open_lease(
+                registry,
+                &module_id,
+                &collection_id,
+                &root_token,
+                &art_rel,
+                crate::sessions::Reader::Viewer,
+            )
             .await?;
         let bytes = read_all(lease).await?;
         std::fs::create_dir_all(&self.dir)?;

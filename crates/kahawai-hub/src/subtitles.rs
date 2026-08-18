@@ -414,11 +414,14 @@ impl Subtitles {
         {
             return Ok(AssBody::Full(ex.ass.context("subtitle has no ASS form")?));
         }
-        let (_, _, size, _, lease) = sessions.open_source(registry, item_id).await?;
+        let (_, _, size, _, lease) = sessions
+            .open_source(registry, item_id, crate::sessions::Reader::Viewer)
+            .await?;
         let source = crate::sessions::LeaseSource {
             lease,
             size,
             handle: tokio::runtime::Handle::current(),
+            reads: 0,
         };
         let (tx, rx) = tokio::sync::mpsc::channel::<String>(256);
         let this = self.clone();
@@ -535,6 +538,7 @@ impl Subtitles {
                     &collection_id,
                     &root_token,
                     &sidecar.path_rel,
+                    crate::sessions::Reader::Viewer,
                 )
                 .await?;
             let bytes = read_all(lease).await?;
@@ -557,11 +561,14 @@ impl Subtitles {
             {
                 return Ok(ex);
             }
-            let (_, _, size, _, lease) = sessions.open_source(registry, item_id).await?;
+            let (_, _, size, _, lease) = sessions
+                .open_source(registry, item_id, crate::sessions::Reader::Viewer)
+                .await?;
             let source = crate::sessions::LeaseSource {
                 lease,
                 size,
                 handle: tokio::runtime::Handle::current(),
+                reads: 0,
             };
             // Last-resort lease pass: extract every text track in the one
             // read and cache them all — a second track request must never
@@ -1660,7 +1667,9 @@ impl Subtitles {
                     Vec::new()
                 } else {
                     use tokio_stream::StreamExt;
-                    let (_, _, _, _, lease) = sessions.open_source(registry, item_id).await?;
+                    let (_, _, _, _, lease) = sessions
+                        .open_source(registry, item_id, crate::sessions::Reader::Viewer)
+                        .await?;
                     let mut out = Vec::with_capacity(declared.len());
                     for a in declared {
                         let mut stream = lease.read_range(a.offset, a.size);
@@ -1684,11 +1693,14 @@ impl Subtitles {
                 }
             }
             None => {
-                let (_, _, size, _, lease) = sessions.open_source(registry, item_id).await?;
+                let (_, _, size, _, lease) = sessions
+                    .open_source(registry, item_id, crate::sessions::Reader::Viewer)
+                    .await?;
                 let source = crate::sessions::LeaseSource {
                     lease,
                     size,
                     handle: tokio::runtime::Handle::current(),
+                    reads: 0,
                 };
                 tokio::task::spawn_blocking(move || {
                     kahawai_media::subtitles::extract_fonts(Box::new(source))

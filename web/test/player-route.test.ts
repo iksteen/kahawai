@@ -6,10 +6,12 @@
 /// the hub reaps it.
 
 import { flushPromises, mount } from '@vue/test-utils'
+import { VueQueryPlugin } from '@tanstack/vue-query'
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 import { createMemoryHistory, createRouter } from 'vue-router'
 
 import { ApiError } from '../src/api/errors.ts'
+import { createQueryClient } from '../src/api/query.ts'
 
 vi.mock('../src/api/generated/kahawai.ts', () => ({
   itemQuery: vi.fn(),
@@ -85,7 +87,11 @@ async function open(at = '/library/films/item/heat/play') {
   })
   await router.push(at)
   await router.isReady()
-  const wrapper = mount(Player, { global: { plugins: [router] } })
+  // The page reads the library list through the shared cache — every route
+  // into it already has one — so the harness has to provide it too.
+  const wrapper = mount(Player, {
+    global: { plugins: [router, [VueQueryPlugin, { queryClient: createQueryClient() }]] },
+  })
   await flushPromises()
   return { router, wrapper }
 }
@@ -145,6 +151,64 @@ describe('opening the player', () => {
     vi.mocked(api.itemQuery).mockResolvedValue(film({ resume_position_ms: 90_000 }) as never)
     await open('/library/films/item/heat/play?start=0')
     expect(api.startSession).toHaveBeenCalledWith(expect.objectContaining({ start_ms: 0 }))
+  })
+
+  test('a chapter position starts there, and is spent on arrival', async () => {
+    vi.mocked(api.itemQuery).mockResolvedValue(film({ resume_position_ms: 90_000 }) as never)
+    const { router } = await open('/library/films/item/heat/play?start=470512')
+    expect(api.startSession).toHaveBeenCalledWith(expect.objectContaining({ start_ms: 470_512 }))
+    // Spent: an hour later a reload must resume from progress, not jump the
+    // viewer back to the chapter that opened the session.
+    expect(router.currentRoute.value.query.start).toBeUndefined()
+  })
+
+  test('a failed start does not spend the asked-for position', async () => {
+    // The chapter position is spent only once the session is UP: spent on
+    // arrival, a transient 503 plus Try again silently resumed mid-film
+    // instead of at the chapter that was pressed.
+    vi.mocked(api.itemQuery).mockResolvedValue(film({ resume_position_ms: 90_000 }) as never)
+    vi.mocked(api.startSession).mockRejectedValueOnce(new ApiError(503, 'host away'))
+    const { router, wrapper } = await open('/library/films/item/heat/play?start=470512')
+    expect(router.currentRoute.value.query.start).toBe('470512')
+
+    vi.mocked(api.startSession).mockResolvedValue(session('s2') as never)
+    await wrapper
+      .findAll('button')
+      .find((b) => b.text().includes('Try again'))!
+      .trigger('click')
+    await flushPromises()
+    expect(api.startSession).toHaveBeenLastCalledWith(
+      expect.objectContaining({ start_ms: 470_512 }),
+    )
+    expect(router.currentRoute.value.query.start).toBeUndefined()
+  })
+
+  test('a start at or past the end is not a position, so it resumes', async () => {
+    // Stale bookmark, hand-edited URL, or a file replaced by a shorter cut:
+    // a position the file does not contain must not open a session there.
+    vi.mocked(api.itemQuery).mockResolvedValue(
+      film({ resume_position_ms: 90_000, duration_ms: 600_000 }) as never,
+    )
+    await open('/library/films/item/heat/play?start=600000')
+    expect(api.startSession).toHaveBeenCalledWith(expect.objectContaining({ start_ms: 90_000 }))
+  })
+
+  test('an unknown running time lets the asked-for position through', async () => {
+    // The range check needs a range; without one the hub clamps, which is
+    // strictly better than silently resuming somewhere else.
+    vi.mocked(api.itemQuery).mockResolvedValue(
+      film({ resume_position_ms: 90_000, duration_ms: null }) as never,
+    )
+    await open('/library/films/item/heat/play?start=470512')
+    expect(api.startSession).toHaveBeenCalledWith(expect.objectContaining({ start_ms: 470_512 }))
+  })
+
+  test('a mangled start is not a position, so it resumes', async () => {
+    // Number('') is 0: a truncated ?start= would otherwise silently mean
+    // "from the beginning".
+    vi.mocked(api.itemQuery).mockResolvedValue(film({ resume_position_ms: 90_000 }) as never)
+    await open('/library/films/item/heat/play?start=')
+    expect(api.startSession).toHaveBeenCalledWith(expect.objectContaining({ start_ms: 90_000 }))
   })
 
   test('and asks for the track the viewer’s preferences name (HUB-33)', async () => {
@@ -261,11 +325,59 @@ describe('a session nobody will play', () => {
     const started = vi.mocked(api.startSession).mock.calls.length
 
     const picture = wrapper.findComponent(Picture)
-    picture.vm.$emit('playNext', film({ id: 'next' }), session('s2'))
+    picture.vm.$emit('playNext', 'heat', film({ id: 'next' }), session('s2'))
     await flushPromises()
     expect(vi.mocked(api.startSession).mock.calls.length).toBe(started)
     // ...and the one it replaced is released, exactly once.
     expect(vi.mocked(api.endSession).mock.calls.filter((c) => c[0] === 's1')).toHaveLength(1)
+  })
+
+  test('a restart from a picture the route left behind is released, not adopted', async () => {
+    // An async restart can land after the viewer has navigated to another
+    // item; adopting it would put the previous episode's stream under this
+    // page. Nobody else holds that session, so this handler ends it.
+    const { wrapper } = await open()
+    const picture = wrapper.findComponent(Picture)
+    picture.vm.$emit('restart', 'somewhere-else', session('s9'), 1000, {
+      audio: 0,
+      video: 0,
+      subKey: '',
+    })
+    await flushPromises()
+    expect(api.endSession).toHaveBeenCalledWith('s9', { keepalive: true })
+    expect(wrapper.find('video').exists()).toBe(true)
+  })
+
+  test('a handover from a picture the route left behind is released too', async () => {
+    // Same guard as the restart twin below-left: `advanced` adopts nothing
+    // from a picture whose item is not this page's any more.
+    const { wrapper } = await open()
+    const picture = wrapper.findComponent(Picture)
+    picture.vm.$emit('playNext', 'somewhere-else', film({ id: 'next' }), session('s9'), [])
+    await flushPromises()
+    expect(api.endSession).toHaveBeenCalledWith('s9', { keepalive: true })
+    // The page still plays what it was playing.
+    expect(vi.mocked(api.endSession).mock.calls.filter((c) => c[0] === 's1')).toHaveLength(0)
+  })
+
+  test('an unmount in the same flush as a restart releases the retired one too', async () => {
+    // The release rides a post-flush watcher, and a stopped watcher's
+    // queued job is SKIPPED: a navigation landing in the same flush as a
+    // restart unmounted the page with the retired session still unreleased,
+    // holding one of the account's four slots until the idle reaper. The
+    // owed ledger's unmount drain is what pays it.
+    const { wrapper } = await open()
+    const picture = wrapper.findComponent(Picture)
+    picture.vm.$emit('restart', 'heat', session('s2'), 1000, {
+      audio: 0,
+      video: 0,
+      subKey: '',
+    })
+    // No flush: unmount before the watcher's job can run.
+    wrapper.unmount()
+    await flushPromises()
+    expect(vi.mocked(api.endSession).mock.calls.filter((c) => c[0] === 's1')).toHaveLength(1)
+    expect(vi.mocked(api.endSession).mock.calls.filter((c) => c[0] === 's2')).toHaveLength(1)
   })
 
   test('and leaving the page releases the one that was playing', async () => {

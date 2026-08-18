@@ -4023,6 +4023,7 @@ impl crate::providers::Provider for LocalProvider {
                     &collection_id,
                     &root_token,
                     &nfo_rel,
+                    crate::sessions::Reader::Sweep,
                 )
                 .await?;
             let bytes = read_nfo(lease).await?;

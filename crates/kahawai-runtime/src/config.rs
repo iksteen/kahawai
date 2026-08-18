@@ -140,6 +140,19 @@ pub struct HubConfig {
     pub metrics_token: Option<String>,
     #[serde(default)]
     pub subtitles: SubtitlesConfig,
+    /// HUB-37: hunt for recaps, openings and credits in the background.
+    /// On by default — the buttons only exist if something looks. The
+    /// switch is here because the sweep reads a quarter of every episode
+    /// plus its tail through the byte plane, which on a remote mediahost
+    /// is real traffic for as long as the library has seasons it has not
+    /// seen; an operator who would rather spend that bandwidth on
+    /// something else can say so.
+    #[serde(default = "yes")]
+    pub detect_segments: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -173,6 +186,7 @@ impl Default for HubConfig {
             hostnames: vec!["localhost".into()],
             satellite_cert_days: 90,
             enrollment_ttl_minutes: 15,
+            detect_segments: true,
             max_sessions_per_user: 4,
             trusted_proxies: Vec::new(),
             cors_origins: Vec::new(),

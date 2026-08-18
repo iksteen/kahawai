@@ -9,7 +9,7 @@
     },
     "version": "0.0.0-dev"
   },
-  "x-kahawai-source-sha256": "7392746a764e3e54df522e544e5c548a2995648ecd56a474fdcd3bd87cb0f341",
+  "x-kahawai-source-sha256": "2b9db104942c89542ddcd0fb27db418b40ba9821d236ab78ced3ab6c1de3a0c6",
   "paths": {
     "/admin/v1/collections": {
       "get": {
@@ -2054,6 +2054,138 @@
           },
           "415": {
             "description": "The body needs Content-Type: application/json",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The hub has no administrator yet: `setup_required`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/admin/v1/segments": {
+      "get": {
+        "tags": [
+          "Admin segments"
+        ],
+        "summary": "What the intro detector is doing, and which seasons it has still to look at.",
+        "operationId": "admin_segments_status",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SegmentStatusResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The hub has no administrator yet: `setup_required`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "Admin segments"
+        ],
+        "summary": "Start analysing the next season waiting, now, rather than when the sweep\nreaches it. The analysis is DETACHED: axum drops a handler future the\nmoment the client disconnects, and this one used to run the season inside\nthe request — a proxy timeout then cancelled it mid-way, threw away the\nfinished-but-unstored result, left the status flag saying running for\never, and released the one-at-a-time lock while the orphaned blocking\ntask was still reading the byte plane. The season the caller started is\nnobody's to cancel but the hub's.",
+        "operationId": "admin_segments_run",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SegmentRunResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Segment detection is disabled on this hub",
             "content": {
               "application/json": {
                 "schema": {
@@ -7030,6 +7162,13 @@
               }
             ]
           },
+          "segments": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Segment"
+            },
+            "description": "HUB-37: the recap, opening and credits of this item, if they have been\nfound. On the QUERY because it is the call a player makes on its way\ninto playback — the subtitle listing above rides along for the same\nreason — and the boundaries are useless until something is playing.\nThere is deliberately no standalone segments endpoint. Empty when nothing was found, and when\nnothing has been analysed: a player cannot act on the difference.\n\nOutside `negotiated`, because an item whose source is offline still has\nthe boundaries somebody found last week."
+          },
           "unavailable": {
             "oneOf": [
               {
@@ -7930,6 +8069,37 @@
           }
         }
       },
+      "PendingSeason": {
+        "type": "object",
+        "description": "A season worth analyzing: its show, its number, and how many of its episodes\nhave never been looked at.",
+        "required": [
+          "series_id",
+          "title",
+          "season",
+          "episodes",
+          "pending"
+        ],
+        "properties": {
+          "episodes": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "pending": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "season": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "series_id": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          }
+        }
+      },
       "PlaybackStreams": {
         "type": "object",
         "required": [
@@ -8606,6 +8776,90 @@
           }
         }
       },
+      "Segment": {
+        "type": "object",
+        "description": "One boundary pair for one episode.",
+        "required": [
+          "kind",
+          "start_ms",
+          "end_ms",
+          "source"
+        ],
+        "properties": {
+          "end_ms": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "kind": {
+            "type": "string",
+            "description": "`recap`, `intro` or `credits`."
+          },
+          "source": {
+            "type": "string",
+            "description": "Which analyzer answered: `chapter`, `chromaprint` or `blackframe`."
+          },
+          "start_ms": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
+      "SegmentRunResponse": {
+        "type": "object",
+        "required": [
+          "follow",
+          "boot"
+        ],
+        "properties": {
+          "boot": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The hub process the mark belongs to. A status whose `boot` differs\nanswers for a restarted hub whose counter reset; the mark is void.",
+            "minimum": 0
+          },
+          "follow": {
+            "type": "integer",
+            "description": "Dispatched runs finished when this one was queued. Poll the status\nuntil its `dispatched` count passes this mark; the\n`dispatched_awaiting_host` / `dispatched_failed` flags then describe\nTHIS run — the shared pass flags describe whichever pass finished\nlast, which mid-sweep is usually not this one.",
+            "minimum": 0
+          },
+          "season": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "series": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The season now QUEUED for background analysis, absent when nothing\nwas pending. Queued, not necessarily started: runs serialize behind\nwhatever the sweep holds, and a repeat POST queues a task that will\nno-op once it sees the season finished. Progress and completion are\n`GET /admin/v1/segments`'s to report: a season is minutes of work,\nand an answer held open that long dies with the first proxy timeout."
+          }
+        }
+      },
+      "SegmentStatusResponse": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/Status"
+          },
+          {
+            "type": "object",
+            "required": [
+              "seasons"
+            ],
+            "properties": {
+              "seasons": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/PendingSeason"
+                },
+                "description": "The first 50 pending seasons, in sweep order; `pending_seasons` in\nthe status is the FULL count, so the two disagreeing means the list\nis truncated, not that the hub lost track."
+              }
+            }
+          }
+        ]
+      },
       "SessionStreamSummary": {
         "type": "object",
         "required": [
@@ -8907,6 +9161,68 @@
         ],
         "properties": {
           "started": {
+            "type": "boolean"
+          }
+        }
+      },
+      "Status": {
+        "type": "object",
+        "description": "What the detector is doing, for the admin page.",
+        "required": [
+          "running",
+          "awaiting_host",
+          "last_failed",
+          "boot",
+          "dispatched",
+          "dispatched_awaiting_host",
+          "dispatched_failed",
+          "analyzed",
+          "pending_seasons",
+          "detector"
+        ],
+        "properties": {
+          "analyzed": {
+            "type": "integer",
+            "description": "Episodes analyzed since this hub started.",
+            "minimum": 0
+          },
+          "awaiting_host": {
+            "type": "boolean",
+            "description": "The last pass left episodes waiting on an absent mediahost."
+          },
+          "boot": {
+            "type": "integer",
+            "format": "int64",
+            "description": "When the hub process started (unix seconds). The dispatch counter\nresets with the process; compare this against the dispatch answer's\n`boot` before trusting the count.",
+            "minimum": 0
+          },
+          "detector": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "dispatched": {
+            "type": "integer",
+            "description": "Admin-dispatched runs finished since the hub started.",
+            "minimum": 0
+          },
+          "dispatched_awaiting_host": {
+            "type": "boolean",
+            "description": "The latest dispatched run left episodes waiting on an absent\nmediahost."
+          },
+          "dispatched_failed": {
+            "type": "boolean",
+            "description": "The latest dispatched run ended in an error."
+          },
+          "last_failed": {
+            "type": "boolean",
+            "description": "The last pass ended in an error (the hub log has the story)."
+          },
+          "pending_seasons": {
+            "type": "integer",
+            "description": "Seasons still waiting.",
+            "minimum": 0
+          },
+          "running": {
             "type": "boolean"
           }
         }

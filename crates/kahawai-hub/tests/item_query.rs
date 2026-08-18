@@ -80,11 +80,358 @@ fn rec(path: &str, size: u64) -> FileUpsertRecord {
     }
 }
 
-fn test_router(
+/// One part of a work, with its own running time and its own chapters on
+/// its own timeline — which is how a container states them.
+fn chaptered(path: &str, size: u64, duration_ms: u64, at: &[(u64, &str)]) -> FileUpsertRecord {
+    let mut declared = info(&[]);
+    declared.duration_ms = Some(duration_ms);
+    declared.chapters = Some(
+        at.iter()
+            .map(|(start_ms, title)| kahawai_core::media::Chapter {
+                start_ms: *start_ms,
+                end_ms: None,
+                title: Some((*title).into()),
+            })
+            .collect(),
+    );
+    FileUpsertRecord {
+        streams_json: serde_json::to_string(&declared).unwrap(),
+        ..rec(path, size)
+    }
+}
+
+/// The chapter list a seek bar and a detail page draw from, on the
+/// item's timeline rather than each file's.
+#[tokio::test]
+async fn chapters_of_a_two_part_film_run_on_one_timeline() {
+    let fx = fixture_with(chaptered(
+        "Heat (1995)/Heat (1995) cd1.mkv",
+        100,
+        60_000,
+        &[(0, "Opening"), (30_000, "Part A")],
+    ))
+    .await;
+    fx.reg
+        .upsert_files(
+            "01H",
+            "movies",
+            vec![
+                chaptered(
+                    "Heat (1995)/Heat (1995) cd1.mkv",
+                    100,
+                    60_000,
+                    &[(0, "Opening"), (30_000, "Part A")],
+                ),
+                chaptered(
+                    "Heat (1995)/Heat (1995) cd2.mkv",
+                    110,
+                    50_000,
+                    &[(0, "Part B"), (40_000, "Credits")],
+                ),
+            ],
+        )
+        .await
+        .unwrap();
+
+    let response = fx
+        .api
+        .clone()
+        .oneshot(
+            axum::http::Request::get(format!("/api/v1/items/{}", fx.id))
+                .header("authorization", &fx.bearer)
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let item: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let listed: Vec<(u64, String)> = item["chapters"]
+        .as_array()
+        .expect("chapters on the detail")
+        .iter()
+        .map(|c| {
+            (
+                c["start_ms"].as_u64().unwrap(),
+                c["title"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    // The second CD's own clock starts at zero; the viewer's does not.
+    assert_eq!(
+        listed,
+        [
+            (0, "Opening".to_string()),
+            (30_000, "Part A".into()),
+            (60_000, "Part B".into()),
+            (100_000, "Credits".into()),
+        ]
+    );
+}
+
+/// Alternative encodes are alternatives, and only one of them is playing.
+#[tokio::test]
+async fn chapters_come_from_the_source_playback_would_pick() {
+    let fx = fixture_with(chaptered(
+        "Heat (1995) cd1.mkv",
+        100,
+        60_000,
+        &[(0, "Split")],
+    ))
+    .await;
+    fx.reg
+        .upsert_files(
+            "01H",
+            "movies",
+            vec![
+                chaptered("Heat (1995) cd1.mkv", 100, 60_000, &[(0, "Split")]),
+                chaptered("Heat (1995) REPACK.mkv", 400, 110_000, &[(0, "Whole")]),
+            ],
+        )
+        .await
+        .unwrap();
+
+    let response = fx
+        .api
+        .clone()
+        .oneshot(
+            axum::http::Request::get(format!("/api/v1/items/{}", fx.id))
+                .header("authorization", &fx.bearer)
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let item: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let first_source = item["sources"][0]["path_rel"].as_str().unwrap().to_string();
+    let titles: Vec<&str> = item["chapters"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["title"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        titles,
+        [if first_source.contains("REPACK") {
+            "Whole"
+        } else {
+            "Split"
+        }],
+        "the chapters must belong to the source listed first"
+    );
+}
+
+/// A chaptered rendition with a stated codec and height, for the tests where
+/// which FILE supplies the chapters is the whole question.
+fn rendition(path: &str, size: u64, codec: &str, height: u32, chapter: &str) -> FileUpsertRecord {
+    let mut declared = info(&[]);
+    declared.video[0].codec = codec.into();
+    declared.video[0].height = height;
+    declared.chapters = Some(vec![kahawai_core::media::Chapter {
+        start_ms: 30_000,
+        end_ms: None,
+        title: Some(chapter.into()),
+    }]);
+    FileUpsertRecord {
+        streams_json: serde_json::to_string(&declared).unwrap(),
+        ..rec(path, size)
+    }
+}
+
+/// An incomplete part set folds wrong offsets, so it supplies nothing.
+#[tokio::test]
+async fn a_part_set_missing_its_first_cd_supplies_no_chapters() {
+    let fx = fixture_with(chaptered(
+        "Heat (1995)/Heat (1995) cd1.mkv",
+        100,
+        60_000,
+        &[(0, "Opening"), (30_000, "Part A")],
+    ))
+    .await;
+    fx.reg
+        .upsert_files(
+            "01H",
+            "movies",
+            vec![
+                chaptered(
+                    "Heat (1995)/Heat (1995) cd1.mkv",
+                    100,
+                    60_000,
+                    &[(0, "Opening")],
+                ),
+                chaptered(
+                    "Heat (1995)/Heat (1995) cd2.mkv",
+                    110,
+                    50_000,
+                    &[(0, "Part B"), (40_000, "Credits")],
+                ),
+            ],
+        )
+        .await
+        .unwrap();
+    // cd1 vanishes: the set is cd2-only, and cd2's chapters folded from
+    // offset zero would be an hour early.
+    sqlx::query(
+        "DELETE FROM playable_source_parts WHERE file_id IN
+           (SELECT id FROM files WHERE path_rel LIKE '%cd1%')",
+    )
+    .execute(&fx.db)
+    .await
+    .unwrap();
+
+    let response = fx
+        .api
+        .clone()
+        .oneshot(
+            axum::http::Request::get(format!("/api/v1/items/{}", fx.id))
+                .header("authorization", &fx.bearer)
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let item: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(
+        item["chapters"].is_null(),
+        "an incomplete set must not supply chapters: {}",
+        item["chapters"]
+    );
+
+    // End-to-end on QUERY too: an incomplete-only item answers null there
+    // as well. (This travels item_body's guard — negotiation never picks
+    // the incomplete set, so the override's own completeness check is
+    // belt-and-braces for the duplicate-path-across-roots case and has no
+    // reachable fixture; proven by mutating it to `true` under this test.)
+    let resp = fx
+        .api
+        .clone()
+        .oneshot(query(
+            &format!("/api/v1/items/{}", fx.id),
+            Some(&fx.bearer),
+            Some("application/json"),
+            "{}",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let j = json_of(resp).await;
+    assert!(
+        j["chapters"].is_null(),
+        "QUERY must not fold an incomplete set either: {}",
+        j["chapters"]
+    );
+}
+
+/// An item whose only source is offline still shows last week's chapters —
+/// the same stance `segments` takes — because there is nothing to play at
+/// all, so the list cannot describe the wrong file.
+#[tokio::test]
+async fn an_offline_sole_source_still_lists_its_chapters() {
+    let fx = fixture_with(chaptered(
+        "Heat (1995).mkv",
+        100,
+        60_000,
+        &[(30_000, "Act 2")],
+    ))
+    .await;
+    fx.reg.disconnected("01H");
+
+    let response = fx
+        .api
+        .clone()
+        .oneshot(
+            axum::http::Request::get(format!("/api/v1/items/{}", fx.id))
+                .header("authorization", &fx.bearer)
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let item: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(item["chapters"][0]["title"], "Act 2");
+}
+
+/// QUERY's ticks must describe the file the client will PLAY. Ranking says
+/// 4K HEVC; an h264-only client negotiates the 1080p — and the chapters
+/// follow the negotiation, not the rank.
+#[tokio::test]
+async fn query_chapters_follow_the_negotiated_source() {
+    let fx = fixture_with(rendition(
+        "Heat (1995).mkv",
+        400,
+        "hevc",
+        2160,
+        "From the 4K",
+    ))
+    .await;
+    fx.reg
+        .upsert_files(
+            "01H",
+            "movies",
+            vec![
+                rendition("Heat (1995).mkv", 400, "hevc", 2160, "From the 4K"),
+                rendition(
+                    "Heat (1995) [1080p].mkv",
+                    100,
+                    "h264",
+                    1080,
+                    "From the 1080p",
+                ),
+            ],
+        )
+        .await
+        .unwrap();
+
+    let profile = r#"{"profile":{"containers":["mp4"],
+        "video":[{"codec":"h264"}],"audio":["aac"],
+        "hdr":false,"graphics_overlay":false,"ass_render":false,
+        "target_duration":{"mode":"ignore"}}}"#;
+    let resp = fx
+        .api
+        .clone()
+        .oneshot(query(
+            &format!("/api/v1/items/{}", fx.id),
+            Some(&fx.bearer),
+            Some("application/json"),
+            profile,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let j = json_of(resp).await;
+    // Rank (height DESC) lists the 4K first…
+    assert!(
+        j["sources"][0]["path_rel"]
+            .as_str()
+            .unwrap()
+            .contains("Heat (1995).mkv")
+    );
+    // …but an h264-only client plays the 1080p, and the ticks say so.
+    assert_eq!(
+        j["negotiated"]["source"]["path_rel"], "Heat (1995) [1080p].mkv",
+        "premise: negotiation picked the cheaper file"
+    );
+    assert_eq!(j["chapters"][0]["title"], "From the 1080p");
+}
+
+fn test_router_with(
     registry: Arc<Registry>,
     auth: Arc<kahawai_hub::auth::Auth>,
     sessions: Arc<kahawai_hub::sessions::Sessions>,
     subs_dir: std::path::PathBuf,
+    net: kahawai_hub::api::NetOptions,
 ) -> axum::Router {
     let ca = Arc::new(
         kahawai_hub::pki::HubCa::load_or_create(tempfile::tempdir().unwrap().keep().as_path())
@@ -111,7 +458,8 @@ fn test_router(
         Arc::new(kahawai_hub::enrich::Enricher::new(
             tempfile::tempdir().unwrap().keep(),
         )),
-        kahawai_hub::api::NetOptions::default(),
+        Arc::new(kahawai_hub::segments::Detector::new()),
+        net,
     )
 }
 
@@ -212,7 +560,65 @@ async fn a_multi_part_film_is_tellable_from_alternative_encodes() {
     }
 }
 
+/// HUB-37's off switch is a promise: "off spends no byte". The admin
+/// trigger must refuse — a silent dispatch resumes full-season reads on a
+/// hub whose operator turned them off, and only this server-side pin
+/// notices (the web test mocks the client).
+#[tokio::test]
+async fn a_disabled_hub_refuses_the_detection_trigger() {
+    let net = kahawai_hub::api::NetOptions {
+        detect_segments: false,
+        ..Default::default()
+    };
+    let fx = fixture_net(rec("Heat (1995).mkv", 100), net).await;
+    let response = fx
+        .api
+        .clone()
+        .oneshot(
+            axum::http::Request::post("/admin/v1/segments")
+                .header("authorization", &fx.bearer)
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
+}
+
+/// Nothing pending answers immediately with no season named — the shape
+/// the web poller's "Every season has been analysed" exit depends on —
+/// and still carries the follow/boot pair.
+#[tokio::test]
+async fn a_trigger_with_nothing_pending_names_no_season() {
+    let fx = fixture().await;
+    let response = fx
+        .api
+        .clone()
+        .oneshot(
+            axum::http::Request::post("/admin/v1/segments")
+                .header("authorization", &fx.bearer)
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let answer: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(answer["series"].is_null(), "{answer}");
+    assert!(
+        answer["follow"].is_u64() && answer["boot"].is_u64(),
+        "{answer}"
+    );
+}
+
 async fn fixture_with(file: FileUpsertRecord) -> Fx {
+    fixture_net(file, Default::default()).await
+}
+
+async fn fixture_net(file: FileUpsertRecord, net: kahawai_hub::api::NetOptions) -> Fx {
     let dir = tempfile::tempdir().unwrap();
     let db = kahawai_hub::db::open(dir.path()).await.unwrap();
     let reg = Arc::new(Registry::new(db.clone(), Default::default()));
@@ -238,13 +644,14 @@ async fn fixture_with(file: FileUpsertRecord) -> Fx {
         .await
         .unwrap();
     let subs_dir = tempfile::tempdir().unwrap().keep();
-    let api = test_router(
+    let api = test_router_with(
         reg.clone(),
         auth,
         Arc::new(kahawai_hub::sessions::Sessions::new(
             tempfile::tempdir().unwrap().keep(),
         )),
         subs_dir.clone(),
+        net,
     );
     Fx {
         reg,
@@ -325,6 +732,66 @@ async fn query_returns_the_item_and_what_it_would_be_served() {
     assert_ne!(n["streams"]["video"], "none", "{n}");
     assert_ne!(n["streams"]["audio"], "none", "{n}");
     assert!(n["subtitles"].is_array());
+}
+
+/// HUB-37. The skip boundaries ride on QUERY, and this is the only way a
+/// client gets them: the player asks once on its way into playback and the
+/// answer arrives with the source it was chosen for.
+#[tokio::test]
+async fn query_carries_the_skip_boundaries() {
+    let Fx {
+        _dir,
+        api,
+        bearer,
+        id,
+        db,
+        ..
+    } = fixture().await;
+    for (kind, start, end, source) in [
+        ("recap", 0, 91_000, "blackframe"),
+        ("intro", 270_000, 306_000, "chromaprint"),
+        ("credits", 2_882_000, 2_916_000, "blackframe"),
+    ] {
+        sqlx::query(
+            "INSERT INTO media_segments (item_id, kind, start_ms, end_ms, source)
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(&id)
+        .bind(kind)
+        .bind(start)
+        .bind(end)
+        .bind(source)
+        .execute(&db)
+        .await
+        .unwrap();
+    }
+
+    let profile = r#"{"profile":{"containers":["mp4"],
+        "video":[{"codec":"h264"}],"audio":["aac"],
+        "hdr":false,"graphics_overlay":false,"ass_render":false,
+        "target_duration":{"mode":"ignore"}}}"#;
+    let resp = api
+        .oneshot(query(
+            &format!("/api/v1/items/{id}"),
+            Some(&bearer),
+            Some("application/json"),
+            profile,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let j = json_of(resp).await;
+    let segments = j["segments"].as_array().expect("segments array");
+    // Earliest first, so a player can take the first match rather than sort.
+    let kinds: Vec<&str> = segments
+        .iter()
+        .map(|s| s["kind"].as_str().unwrap())
+        .collect();
+    assert_eq!(kinds, ["recap", "intro", "credits"], "{j}");
+    assert_eq!(segments[1]["start_ms"], 270_000);
+    assert_eq!(segments[1]["end_ms"], 306_000);
+    // Which analyzer answered, because the two fail differently.
+    assert_eq!(segments[2]["source"], "blackframe");
 }
 
 /// The failure this would otherwise hide: `Router::route_layer` maps

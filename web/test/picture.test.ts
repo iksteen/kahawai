@@ -125,6 +125,10 @@ async function watching(over: Record<string, unknown> = {}) {
       session: session() as never,
       resumeMs: 0,
       libraryId: 'films',
+      // What the page read on its way in and passes down; the picture no
+      // longer asks the hub for either.
+      prefs: [] as never,
+      mediaType: '',
       mode: 'window' as const,
       ...over,
     },
@@ -141,6 +145,16 @@ async function scrub(wrapper: ReturnType<typeof mount>, fraction: number) {
   const bar = wrapper.find('.seekbar')
   await bar.setValue(String(Math.round(600_000 * fraction)))
   await flushPromises()
+}
+
+/// Every polite live region's text, joined: the skip offer's region is
+/// always mounted (so it can announce), which makes "the" region ambiguous.
+function liveText(wrapper: ReturnType<typeof mount>): string {
+  return wrapper
+    .findAll('[aria-live="polite"]')
+    .map((n) => n.text())
+    .filter(Boolean)
+    .join(' ')
 }
 
 /// An answer somebody else decides when to give.
@@ -351,7 +365,7 @@ describe('seeking', () => {
     await element.play()
     await scrub(wrapper, 0.9)
     expect(api.startSession).toHaveBeenCalled()
-    expect(wrapper.find('[aria-live="polite"]').text()).toBe('')
+    expect(liveText(wrapper)).toBe('')
   })
 
   test('and a seek that finds the host away stands by, at where they ASKED to be', async () => {
@@ -377,7 +391,7 @@ describe('seeking', () => {
     const { wrapper, element } = await watching()
     await scrub(wrapper, 0.9)
     void element
-    expect(wrapper.find('[aria-live="polite"]').text()).toContain('Could not seek')
+    expect(liveText(wrapper)).toContain('Could not seek')
     expect(wrapper.find('[aria-label="Restarting stream"]').exists()).toBe(false)
   })
 })
@@ -515,7 +529,7 @@ describe('a session the hub has forgotten', () => {
     await vi.advanceTimersByTimeAsync(PING_MS + 100)
     await flushPromises()
     expect(api.startSession).toHaveBeenCalledWith(expect.objectContaining({ start_ms: 120_000 }))
-    expect(wrapper.emitted('restart')?.[0]?.[1]).toBe(120_000)
+    expect(wrapper.emitted('restart')?.[0]?.[2]).toBe(120_000)
   })
 
   test('but not while it is paused — the death is remembered instead', async () => {
@@ -593,7 +607,7 @@ describe('a fatal network error', () => {
     await flushPromises()
     // Still asking: there are ninety seconds in hand.
     expect(engine.started).toBe(12)
-    expect(wrapper.find('[aria-live="polite"]').text()).toBe('')
+    expect(liveText(wrapper)).toBe('')
 
     // The buffer runs out, and now the budget bites.
     Object.defineProperty(element, 'buffered', {
@@ -603,7 +617,7 @@ describe('a fatal network error', () => {
     engine.fail({ fatal: true, type: 'networkError', details: 'fragLoadError' })
     await flushPromises()
     expect(engine.started).toBe(12)
-    expect(wrapper.find('[aria-live="polite"]').text()).toContain('did not come back')
+    expect(liveText(wrapper)).toContain('did not come back')
   })
 
   test('and a segment arriving refills the budget', async () => {
@@ -647,9 +661,9 @@ describe('a fatal media error', () => {
     }
     await flushPromises()
     expect(engine.recovered).toBe(3)
-    expect(wrapper.find('[aria-live="polite"]').text()).toContain('will not play')
+    expect(liveText(wrapper)).toContain('will not play')
     // The reason is in the sentence: "it did not work" sends nobody anywhere.
-    expect(wrapper.find('[aria-live="polite"]').text()).toContain('bufferAppendError')
+    expect(liveText(wrapper)).toContain('bufferAppendError')
   })
 
   test('and a segment arriving does NOT refill the budget', async () => {
@@ -813,7 +827,7 @@ describe('who owns the veil', () => {
     await vi.advanceTimersByTimeAsync(26_000)
     await flushPromises()
     expect(wrapper.text()).not.toContain('Restarting stream')
-    expect(wrapper.find('[aria-live="polite"]').text()).toContain('did not come back')
+    expect(liveText(wrapper)).toContain('did not come back')
   })
 
   test('and the ceiling is disarmed when the picture goes', async () => {
@@ -834,7 +848,7 @@ describe('who owns the veil', () => {
     const second = await watching()
     await vi.advanceTimersByTimeAsync(26_000)
     await flushPromises()
-    expect(second.wrapper.find('[aria-live="polite"]').text()).toBe('')
+    expect(liveText(second.wrapper)).toBe('')
   })
 
   // NOT tested, and not deleted: `giveUp`'s generation check. Every caller
@@ -943,23 +957,27 @@ describe('choosing a track', () => {
       streams: { video: 'copy', audio: 'copy', cost: 'copy', subtitles: [] },
     })
 
-  async function switching() {
-    vi.mocked(api.itemQuery).mockResolvedValue(
-      film({
-        sources: [
-          {
-            streams: {
-              audio: [
-                { language: 'eng', codec: 'aac', channels: 2 },
-                { language: 'jpn', codec: 'aac', channels: 2 },
-              ],
-              video: [],
-            },
+  const dualAudio = (over: Record<string, unknown> = {}) =>
+    film({
+      sources: [
+        {
+          streams: {
+            audio: [
+              { language: 'eng', codec: 'aac', channels: 2 },
+              { language: 'jpn', codec: 'aac', channels: 2 },
+            ],
+            video: [],
           },
-        ],
-      }) as never,
-    )
-    const it = await watching({ session: withTracks() as never })
+        },
+      ],
+      ...over,
+    })
+
+  async function switching() {
+    const it = await watching({
+      item: dualAudio() as never,
+      session: withTracks() as never,
+    })
     starts(it.element)
     return it
   }
@@ -992,25 +1010,8 @@ describe('choosing a track', () => {
     movie.wrapper.unmount()
 
     vi.mocked(api.putPref).mockClear()
-    vi.mocked(api.itemQuery).mockResolvedValue(
-      film({
-        kind: 'episode',
-        parent_id: 'show',
-        sources: [
-          {
-            streams: {
-              audio: [
-                { language: 'eng', codec: 'aac', channels: 2 },
-                { language: 'jpn', codec: 'aac', channels: 2 },
-              ],
-              video: [],
-            },
-          },
-        ],
-      }) as never,
-    )
     const episode = await watching({
-      item: film({ kind: 'episode', parent_id: 'show' }) as never,
+      item: dualAudio({ kind: 'episode', parent_id: 'show' }) as never,
       session: withTracks() as never,
     })
     starts(episode.element)
@@ -1062,6 +1063,145 @@ describe('choosing a track', () => {
   })
 })
 
+describe('chapter marks while the bar is hidden', () => {
+  test('a hidden bar has no invisible seek targets', async () => {
+    // pointer-events-none on the bar does NOT shield a descendant that says
+    // auto — hit-testing descends — so while the bar is faded out the marks
+    // must drop their pointer events too, or a stationary click meant to
+    // pause seeks to a chapter instead. This regression shipped once.
+    const { wrapper, element } = await watching({
+      item: film({ chapters: [{ start_ms: 300_000, title: 'The heist' }] }) as never,
+    })
+    starts(element)
+    await element.play()
+    Object.defineProperty(element, 'paused', { value: false, configurable: true })
+    element.dispatchEvent(new Event('play'))
+    await wrapper.find('.videobox').trigger('mouseleave')
+    await flushPromises()
+    expect(wrapper.find('[aria-hidden="true"] button').classes()).toContain('pointer-events-none')
+
+    // And they come back with the bar.
+    await wrapper.find('.videobox').trigger('mousemove')
+    await flushPromises()
+    expect(wrapper.find('[aria-hidden="true"] button').classes()).toContain('pointer-events-auto')
+  })
+})
+
+describe('a restart keeps the choice the viewer made', () => {
+  // Two selectable tracks; the wishlist below would pick English.
+  const listing = (over: Record<string, unknown> = {}) => ({
+    id: 3,
+    origin: 'embedded',
+    format: 'srt',
+    language: 'eng',
+    label: null,
+    machine: false,
+    derived_from: null,
+    stream_index: 2,
+    delivery: 'text',
+    note: '',
+    deletable: false,
+    ...over,
+  })
+  const subbed = () =>
+    film({
+      negotiated: {
+        cost: 'copy',
+        mode: 'remux',
+        source: null,
+        streams: { video: 'copy', audio: 'copy' },
+        subtitles: [listing(), listing({ id: 7, language: 'nld' })],
+        target_duration_secs: 6,
+      },
+    })
+  const wishes = [{ scope: '', key: 'subs.movies', value: 'en' }]
+  const value = (wrapper: ReturnType<typeof mount>) =>
+    (wrapper.find('[aria-label="Subtitles"]').element as HTMLSelectElement).value
+
+  test('a first mount follows the prefs', async () => {
+    const { wrapper } = await watching({
+      item: subbed() as never,
+      prefs: wishes as never,
+      mediaType: 'movies',
+    })
+    expect(value(wrapper)).toBe('3')
+  })
+
+  test('a restart mount follows what was live instead', async () => {
+    // The prefs prop is the snapshot the page took at session start; the
+    // viewer picked Dutch since. Re-resolving from the snapshot silently
+    // reverted the pick on every recovery.
+    const { wrapper } = await watching({
+      item: subbed() as never,
+      prefs: wishes as never,
+      mediaType: 'movies',
+      carried: { audio: 0, video: 0, subKey: '7' } as never,
+    })
+    expect(value(wrapper)).toBe('7')
+  })
+
+  test('and carried-off stays off, even with a wishlist that would pick', async () => {
+    const { wrapper } = await watching({
+      item: subbed() as never,
+      prefs: wishes as never,
+      mediaType: 'movies',
+      carried: { audio: 0, video: 0, subKey: '' } as never,
+    })
+    expect(value(wrapper)).toBe('')
+  })
+
+  test('the video track carries too', async () => {
+    // The session restarts on the carried video track; a selector left at
+    // zero would hand track 0 to the NEXT restart — the same silent revert,
+    // on the other axis.
+    const { wrapper } = await watching({
+      item: film({
+        sources: [
+          {
+            streams: {
+              audio: [{ language: 'eng', codec: 'aac', channels: 2 }],
+              video: [
+                { codec: 'h264', width: 1920, height: 1080 },
+                { codec: 'h264', width: 1280, height: 720 },
+              ],
+            },
+          },
+        ],
+      }) as never,
+      carried: { audio: 0, video: 1, subKey: '' } as never,
+    })
+    const select = wrapper.find('[aria-label="Video track"]')
+    expect((select.element as HTMLSelectElement).value).toBe('1')
+  })
+
+  test('a carried key the list no longer has falls back to the wishlist', async () => {
+    // Nothing produces this today — the item is not refetched on restart —
+    // but ids are only as stable as that stays true, and the wrong quiet
+    // answer would be subtitles-off.
+    const { wrapper } = await watching({
+      item: subbed() as never,
+      prefs: wishes as never,
+      mediaType: 'movies',
+      carried: { audio: 0, video: 0, subKey: '99' } as never,
+    })
+    expect(value(wrapper)).toBe('3')
+  })
+
+  test('the restart emit carries what is live at that moment', async () => {
+    // A seek answered by 404 is a restart; whatever the viewer had chosen by
+    // then must ride along, or the next mount cannot honour it.
+    vi.mocked(api.seekSession).mockRejectedValue(new ApiError(404, 'no such session'))
+    const { wrapper, element } = await watching({ item: subbed() as never })
+    await wrapper.find('[aria-label="Subtitles"]').setValue('7')
+    await flushPromises()
+    await element.play()
+    await scrub(wrapper, 0.9)
+    const restart = wrapper.emitted('restart')
+    expect(restart).toBeTruthy()
+    expect((restart![0]![3] as { subKey: string }).subKey).toBe('7')
+  })
+})
+
 describe('choosing subtitles', () => {
   const listing = (over: Record<string, unknown> = {}) => ({
     id: 7,
@@ -1079,9 +1219,9 @@ describe('choosing subtitles', () => {
     ...over,
   })
 
-  async function withSubs(subs: Record<string, unknown>[]) {
-    vi.mocked(api.itemQuery).mockResolvedValue(
-      film({
+  async function withSubs(subs: Record<string, unknown>[], over: Record<string, unknown> = {}) {
+    const it = await watching({
+      item: film({
         negotiated: {
           cost: 'copy',
           mode: 'remux',
@@ -1091,8 +1231,8 @@ describe('choosing subtitles', () => {
           target_duration_secs: 6,
         },
       }) as never,
-    )
-    const it = await watching()
+      ...over,
+    })
     starts(it.element)
     return it
   }
@@ -1171,13 +1311,12 @@ describe('choosing subtitles', () => {
     // milliseconds into playback it could take the generation from a seek the
     // viewer had just made and restart before that seek had written its
     // origin — the drag went silently.
-    vi.mocked(api.getPrefs).mockResolvedValue({
-      prefs: [{ scope: 'heat', key: 'subs.track', value: '9' }],
-    } as never)
     vi.mocked(api.seekSession).mockReturnValue(new Promise(() => {}) as never)
     const queued = held<{ part_base_ms: number }>({ part_base_ms: 0 })
     void queued
-    const { wrapper } = await withSubs([listing({ id: 9, delivery: 'burn' })])
+    const { wrapper } = await withSubs([listing({ id: 9, delivery: 'burn' })], {
+      prefs: [{ scope: 'heat', key: 'subs.track', value: '9' }] as never,
+    })
     void wrapper
     // The burn was wanted the moment the tracks resolved, and the pipeline was
     // not frozen, so it went out at once.
@@ -1223,6 +1362,30 @@ describe('the next episode', () => {
     const { wrapper } = await nearTheEnd()
     expect(wrapper.text()).toContain('next episode')
     expect(wrapper.text()).toContain('Episode 2')
+  })
+
+  test('and the skip offer stands aside for it', async () => {
+    // Credits segments and the up-next card fire in the same corner at the
+    // same moment; both at once is two buttons stacked on one spot, and
+    // the countdown is the one that acts on its own.
+    vi.mocked(api.itemChildren).mockResolvedValue({
+      children: [episode('e1', 1), episode('e2', 2)],
+    } as never)
+    vi.mocked(api.itemQuery).mockImplementation(
+      async (id) => (id === 'e2' ? episode('e2', 2) : episode('e1', 1)) as never,
+    )
+    const { wrapper, element } = await watching({
+      item: {
+        ...episode('e1', 1),
+        segments: [{ kind: 'credits', start_ms: 560_000, end_ms: 600_000, source: 'blackframe' }],
+      } as never,
+    })
+    starts(element)
+    at(element, 595)
+    await flushPromises()
+    expect(wrapper.text()).toContain('next episode')
+    expect(wrapper.findAll('button').some((b) => b.text() === 'Skip credits')).toBe(false)
+    expect(wrapper.text()).not.toContain('Skip credits available')
   })
 
   test('and is announced, because it takes over on its own', async () => {
@@ -1308,6 +1471,113 @@ describe('a multi-part source', () => {
     element.dispatchEvent(new Event('ended'))
     await flushPromises()
     expect(api.seekSession).not.toHaveBeenCalled()
+  })
+})
+
+describe('chapter marks on the bar', () => {
+  const chaptered = () =>
+    film({
+      chapters: [
+        { start_ms: 0, title: 'Opening' },
+        { start_ms: 300_000, title: 'The heist' },
+      ],
+    })
+
+  test('one per chapter, where the chapter starts', async () => {
+    // A ten-minute film: halfway is 50%, and the mark at zero is not drawn.
+    const { wrapper } = await watching({ item: chaptered() as never })
+    const marks = wrapper.findAll('[aria-hidden="true"] button')
+    expect(marks).toHaveLength(1)
+    expect(marks[0]!.attributes('style')).toContain('left: 50%')
+  })
+
+  test('and none when the file declares none', async () => {
+    const { wrapper } = await watching()
+    expect(wrapper.findAll('[aria-hidden="true"] button')).toHaveLength(0)
+  })
+
+  test('a mark is wider than the line it draws', async () => {
+    // Nobody can hit one pixel. The line is 1px; what takes the pointer is
+    // 11px of it, five either side.
+    const { wrapper } = await watching({ item: chaptered() as never })
+    const mark = wrapper.find('[aria-hidden="true"] button')
+    expect(mark.classes()).toContain('w-[11px]')
+    expect(mark.find('span').classes()).toContain('w-px')
+  })
+
+  test('it names the chapter and when it starts', async () => {
+    const { wrapper } = await watching({ item: chaptered() as never })
+    expect(wrapper.find('[aria-hidden="true"] button').text()).toBe('5:00 · The heist')
+  })
+
+  test('and pressing one goes there', async () => {
+    const { wrapper, element } = await watching({ item: chaptered() as never })
+    Object.defineProperty(element, 'seekable', {
+      value: { length: 1, start: () => 0, end: () => 600 },
+      configurable: true,
+    })
+    await wrapper.find('[aria-hidden="true"] button').trigger('click')
+    await flushPromises()
+    // Inside what the pipeline has produced, so the element's own jump —
+    // the point is where it landed.
+    expect(element.currentTime).toBe(300)
+  })
+
+  test('an intro under the playhead offers Skip, and pressing it seeks past', async () => {
+    // The button and the wiring, not just the pure functions: segments.ts is
+    // unit-tested, but nothing else proves the component feeds it SEGMENTS
+    // (not chapters), renders the offer, and lands the seek at the end.
+    const { wrapper, element } = await watching({
+      item: film({
+        segments: [{ kind: 'intro', start_ms: 5_000, end_ms: 65_000, source: 'chromaprint' }],
+      }) as never,
+    })
+    Object.defineProperty(element, 'seekable', {
+      value: { length: 1, start: () => 0, end: () => 600 },
+      configurable: true,
+    })
+    at(element, 10)
+    await flushPromises()
+    const offer = wrapper.findAll('button').find((b) => b.text() === 'Skip intro')
+    expect(offer, 'the offer appears while the playhead is inside').toBeTruthy()
+    expect(wrapper.text()).toContain('Skip intro available')
+    await offer!.trigger('click')
+    await flushPromises()
+    expect(element.currentTime).toBe(65)
+
+    // Past the segment, the offer goes away — nothing is skipped by itself.
+    at(element, 70)
+    await flushPromises()
+    expect(wrapper.findAll('button').some((b) => b.text() === 'Skip intro')).toBe(false)
+  })
+
+  test("a direct-play resume does not offer yesterday's recap", async () => {
+    // Until the first timeupdate the position is UNKNOWN; for a direct
+    // session `offset` is 0, and initialising the clock from it rendered
+    // and announced "Skip recap" for a segment forty minutes behind the
+    // viewer — then a press seeked backwards. The initial reading must be
+    // the resume position, exactly as absMs answers while unknown.
+    const { wrapper } = await watching({
+      item: film({
+        segments: [{ kind: 'recap', start_ms: 0, end_ms: 90_000, source: 'blackframe' }],
+      }) as never,
+      session: session('s1', {
+        stream_url: '/stream/s1/file.mp4',
+        content_type: 'video/mp4',
+      }) as never,
+      resumeMs: 2_400_000,
+    })
+    expect(wrapper.findAll('button').some((b) => b.text() === 'Skip recap')).toBe(false)
+    expect(wrapper.text()).not.toContain('Skip recap available')
+  })
+
+  test('the transport underneath still takes a press anywhere else', async () => {
+    // The overlay covers the bar, so it must not swallow the pointer between
+    // the marks: everything but the marks themselves stays scrubbable.
+    const { wrapper } = await watching({ item: chaptered() as never })
+    const overlay = wrapper.find('[aria-hidden="true"]')
+    expect(overlay.classes()).toContain('pointer-events-none')
+    expect(overlay.find('button').classes()).toContain('pointer-events-auto')
   })
 })
 

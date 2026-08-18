@@ -38,6 +38,8 @@ vi.mock('../src/api/generated/kahawai.ts', () => ({
   adminSetAnidb: vi.fn(),
   adminSetChain: vi.fn(),
   adminSetDisabled: vi.fn(),
+  adminSegmentsRun: vi.fn(),
+  adminSegmentsStatus: vi.fn(),
   adminSetTmdb: vi.fn(),
   adminSetTvdb: vi.fn(),
   adminSetUserAdmin: vi.fn(),
@@ -1221,6 +1223,68 @@ describe('providers', () => {
       .trigger('click')
     await flushPromises()
     expect(notice.value).toContain('bad password')
+  })
+
+  test('finding skip points follows its own run to a toast, and only its own', async () => {
+    // The poll's three exits: normal completion via the dispatch mark on the
+    // same boot, "nothing pending" without entering the loop at all, and a
+    // hub restart voiding the mark. Each was a forever-spin at some point.
+    vi.useFakeTimers()
+    const status = (over: Record<string, unknown> = {}) => ({
+      running: false,
+      awaiting_host: false,
+      last_failed: false,
+      boot: 1000,
+      dispatched: 0,
+      dispatched_awaiting_host: false,
+      dispatched_failed: false,
+      analyzed: 0,
+      pending_seasons: 3,
+      detector: 1,
+      seasons: [],
+      ...over,
+    })
+    vi.mocked(api.adminSegmentsStatus).mockResolvedValue(status() as never)
+    const wrapper = await open()
+    await tab(wrapper, 'Providers')
+
+    // Normal completion: the counter passes the mark on the same boot.
+    vi.mocked(api.adminSegmentsRun).mockResolvedValue({
+      series: 'Show',
+      season: 1,
+      follow: 0,
+      boot: 1000,
+    } as never)
+    await press(wrapper, 'Find skip points now')
+    vi.mocked(api.adminSegmentsStatus).mockResolvedValue(
+      status({ dispatched: 1, pending_seasons: 2 }) as never,
+    )
+    await vi.advanceTimersByTimeAsync(5100)
+    expect(notice.value).toContain('Season analysed. 2 still to go.')
+
+    // Nothing pending: no season named, no poll, an immediate answer.
+    clearNotices()
+    vi.mocked(api.adminSegmentsRun).mockResolvedValue({ follow: 1, boot: 1000 } as never)
+    await press(wrapper, 'Find skip points now')
+    // Immediate — no timer was advanced, so a poll loop cannot have run:
+    // the toast came from the dispatch answer alone.
+    expect(notice.value).toContain('Every season has been analysed.')
+
+    // A restart voids the mark: the counter reset below it must not read as
+    // still-running (nor a later run's flags as this one's).
+    clearNotices()
+    vi.mocked(api.adminSegmentsRun).mockResolvedValue({
+      series: 'Show',
+      season: 1,
+      follow: 1,
+      boot: 1000,
+    } as never)
+    await press(wrapper, 'Find skip points now')
+    vi.mocked(api.adminSegmentsStatus).mockResolvedValue(
+      status({ boot: 2000, dispatched: 0 }) as never,
+    )
+    await vi.advanceTimersByTimeAsync(5100)
+    expect(notice.value).toContain('The hub restarted')
   })
 
   test('Enrich now is offered for ANY provider, not TMDB alone', async () => {

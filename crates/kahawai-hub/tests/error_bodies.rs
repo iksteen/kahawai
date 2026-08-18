@@ -90,6 +90,7 @@ async fn api_harness() -> (tempfile::TempDir, axum::Router) {
             enricher.clone(),
         )),
         enricher,
+        Arc::new(kahawai_hub::segments::Detector::new()),
         kahawai_hub::api::NetOptions {
             cors_origins: vec!["https://app.example.com".into()],
             ..Default::default()

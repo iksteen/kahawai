@@ -38,6 +38,21 @@ export type Tracks = {
   vttFallback: boolean
 }
 
+/// The live track choice at the moment a restart replaced the session, so the
+/// remounted picture can put the viewer back where they WERE — not where the
+/// preferences they started with would put them. The prefs the page holds are
+/// a snapshot from session start; a subtitle picked mid-episode lives only
+/// here and on the server, and re-resolving from the snapshot after a
+/// recovery/stand-by/caps restart silently reverted it.
+export type CarriedTracks = {
+  audio: number
+  video: number
+  /// '' carries "none showing", which is as much a state as any track: a
+  /// viewer who turned subtitles off mid-film must not get them back because
+  /// the wishlist would have picked some.
+  subKey: string
+}
+
 export type TrackEvent =
   | { type: 'lists-arrived'; audioList: AudioChoice[]; videoList: VideoChoice[] }
   | { type: 'audio-known'; audio: number }

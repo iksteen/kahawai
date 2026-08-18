@@ -2027,6 +2027,7 @@ dependencies = [
  "ipnet",
  "jsonwebtoken",
  "kahawai-core",
+ "kahawai-intro",
  "kahawai-media",
  "kahawai-mediahost",
  "kahawai-proto",

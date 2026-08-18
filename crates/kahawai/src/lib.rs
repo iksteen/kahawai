@@ -490,6 +490,7 @@ async fn run_hub_inner(
         setup_url: Some(setup_url),
         public_origin,
         web_dir,
+        detect_segments: cfg.detect_segments,
     };
     match cfg.metrics_token.as_deref() {
         Some(t) if !t.is_empty() => tracing::info!("/metrics enabled (hub.metrics_token)"),
@@ -514,7 +515,8 @@ async fn run_hub_inner(
                     Ok((fresh, _)) => match proxy_trust.reload(&fresh.hub.trusted_proxies) {
                         Ok(n) => tracing::info!(
                             trusted_proxies = n,
-                            "config reloaded (listeners, data_dir and cert SANs need a restart)"
+                            "config reloaded (listeners, data_dir, cert SANs and \
+                             detect_segments need a restart)"
                         ),
                         Err(e) => tracing::warn!(
                             error = format!("{e:#}"),
@@ -529,6 +531,12 @@ async fn run_hub_inner(
             }
         });
     }
+    // HUB-37: find the recap, opening and credits of every season, in the
+    // background, so the player has boundaries to offer a skip for.
+    let segments = Arc::new(kahawai_hub::segments::Detector::new());
+    if cfg.detect_segments {
+        segments.spawn_sweep(registry.clone(), sessions.clone());
+    }
     let api = kahawai_hub::api::router(
         registry.clone(),
         auth,
@@ -537,6 +545,7 @@ async fn run_hub_inner(
         subtitles.clone(),
         artwork,
         enricher.clone(),
+        segments,
         net,
     );
     tokio::spawn(async move {

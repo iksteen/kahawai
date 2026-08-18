@@ -51,6 +51,7 @@ async fn harness() -> (axum::Router, String) {
             enricher.clone(),
         )),
         enricher,
+        Arc::new(kahawai_hub::segments::Detector::new()),
         kahawai_hub::api::NetOptions {
             metrics_token: Some(SCRAPE_TOKEN.into()),
             ..Default::default()
@@ -214,6 +215,7 @@ async fn metrics_are_not_served_when_no_token_is_configured() {
         )),
         enricher,
         // The default: no scrape token.
+        Arc::new(kahawai_hub::segments::Detector::new()),
         kahawai_hub::api::NetOptions::default(),
     );
     std::mem::forget(dir);

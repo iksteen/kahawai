@@ -35,6 +35,7 @@ import CapabilityDebug from './CapabilityDebug.vue'
 import Icon from './Icon.vue'
 import PlayerNote from './PlayerNote.vue'
 import type { ItemQueryResponse } from '../api/generated/model/itemQueryResponse.ts'
+import type { CarriedTracks } from '../domain/player-tracks.ts'
 import type { PlayerMode } from '../domain/player-keys.ts'
 import type { Preference } from '../api/generated/model/preference.ts'
 import type { StartSessionResponse } from '../api/generated/model/startSessionResponse.ts'
@@ -52,7 +53,6 @@ import {
   getPrefs,
   itemChildren,
   itemQuery,
-  listLibraries,
   postProgress,
 } from '../api/generated/kahawai.ts'
 import { buildProfile, loadMask } from '../api/capabilities.ts'
@@ -67,6 +67,7 @@ import {
 import { initialSubtitle, needsBurnRestart } from '../domain/track-choice.ts'
 import { chapterTicks } from '../domain/chapters.ts'
 import { hms } from '../domain/label.ts'
+import { skipLabel, skipTarget, skippable } from '../domain/segments.ts'
 import { initialTracks, tracks as reduceTracks, type TrackEvent } from '../domain/player-tracks.ts'
 import { isTypingTarget, playerIntent } from '../domain/player-keys.ts'
 import { keepSessionAlive } from '../domain/keepalive.ts'
@@ -88,6 +89,18 @@ const props = defineProps<{
   session: StartSessionResponse
   resumeMs: number
   libraryId: string
+  /// The viewer's preferences and this library's media type, as the page that
+  /// started the session already read them. Passed rather than fetched: the
+  /// same QUERY, prefs and library list used to arrive twice per playback —
+  /// once to choose the audio track and start the session, once here to draw
+  /// the selectors with — and the second set said the same thing as the first.
+  prefs: Preference[]
+  mediaType: string
+  /// The track choice live at the moment of the restart that produced this
+  /// mount, if this mount IS a restart. Outranks the prefs snapshot: the
+  /// viewer's mid-episode pick is newer than anything the page fetched at
+  /// session start.
+  carried?: CarriedTracks | null
   /// How big the picture is. Owned by the frame around this component, which
   /// outlives it: a restart replaces the player, and the window it sits in must
   /// not blink while that happens.
@@ -98,11 +111,22 @@ const emit = defineEmits<{
   mode: [PlayerMode]
   close: []
   home: []
-  /// Play again from `at` on a freshly negotiated session.
-  restart: [session: StartSessionResponse, at: number]
+  /// Play again from `at` on a freshly negotiated session, carrying the
+  /// track choice that was live when the old one died.
+  /// `from` names the item this picture was playing: the page may already be
+  /// on another item by the time an async restart lands, and the handler must
+  /// be able to tell a stale picture's session from its own.
+  restart: [from: string, session: StartSessionResponse, at: number, carried: CarriedTracks]
   /// Another item on its own session — the next episode, whether the countdown
-  /// ran out or it was asked for.
-  playNext: [item: ItemQueryResponse, session: StartSessionResponse]
+  /// ran out or it was asked for. Carries the preferences it resolved that
+  /// episode's tracks from: they were read a moment ago, and the page holding
+  /// them would otherwise hand the remounted player a staler set.
+  playNext: [
+    from: string,
+    item: ItemQueryResponse,
+    session: StartSessionResponse,
+    prefs: Preference[],
+  ]
 }>()
 
 /// Seconds of lead-in before the next episode starts by itself. Long enough to
@@ -168,25 +192,6 @@ const offset = ref(isHls.value ? props.resumeMs : 0)
 let partBase = props.session.part_base_ms ?? 0
 const durationMs = computed(() => props.session.duration_ms ?? 0)
 
-/// The file's own chapters, drawn on the bar — and each mark is an 11px
-/// button that seeks to its chapter (pointer events gated on the bar being
-/// visible; see the template). The container itself takes no pointer, so
-/// the transport underneath keeps every press between the marks.
-const ticks = computed(() => chapterTicks(props.item.chapters ?? [], durationMs.value))
-
-/// Which way a mark's label hangs. Centred in the middle third, hung inward
-/// from the tick in the outer thirds: a label centred on a mark near either
-/// end runs past the videobox's overflow and loses its leading timestamp.
-/// Thirds rather than a narrow edge band because the thresholds are in bar
-/// percent while the label's width is in pixels.
-// ponytail: percent thresholds + a 240px cap, not pixel-aware measurement;
-// measure the bar if long titles on very narrow players ever matter.
-function labelSide(pct: number) {
-  if (pct > 67) return 'right-0'
-  if (pct < 33) return 'left-0'
-  return 'left-1/2 -translate-x-1/2'
-}
-
 /// Whether the element's clock means anything yet.
 ///
 /// A direct session applies its resume by seeking once `loadedmetadata`
@@ -211,7 +216,12 @@ const absMs = (element: HTMLVideoElement | null = video.value) =>
 /// events rather than tracked in parallel: the element pauses for reasons of
 /// its own, and a button drawn from a guess disagrees with it.
 const playing = reactive({
-  posMs: offset.value,
+  // The resume point, not `offset` (0 for direct play): until the first
+  // timeupdate, `absMs` answers `resumeMs` for an unknown position, and
+  // this initial value is the one reading that bypassed it — a direct-play
+  // resume then sat at "0" long enough for the skip offer to render and
+  // announce for a recap forty minutes behind the viewer.
+  posMs: positionKnown ? offset.value : props.resumeMs,
   producedMs: 0,
   paused: false,
   ...lastHeard,
@@ -240,10 +250,9 @@ let lastFailure = ''
 let goneAway = false
 
 /// HUB-33 memory scope, and the wishlists the opening choice came from.
-let seriesId = props.item.parent_id ?? props.item.id
+const seriesId = props.item.parent_id ?? props.item.id
 let subsWish: string[] = []
 let subTrackWish: number | null = null
-let mediaType = ''
 /// A remembered burn that could not be applied yet, because the viewer was
 /// already steering.
 let pendingBurn: number | null = null
@@ -282,34 +291,12 @@ const subtitles = useSubtitleRenderers({
 // ---- what is being played, and with which tracks -------------------------
 
 /// One resolution (HUB-33): prefs plus the announced streams give the selector
-/// state and the subtitle default.
-///
-/// Fenced, because everything this reports goes through `playerNote`, whose one
-/// listener belongs to whichever player is mounted when it fires. A blip that
-/// 404s the session also fails these fetches; recovery then remounts on a new
-/// session, and the late rejection painted "Could not load the track list" over
-/// video that was playing perfectly.
-let listsDead = false
-async function resolve() {
+/// state and the subtitle default. Everything it needs arrived with the props —
+/// the QUERY that chose this source, the preferences that chose its audio
+/// track, and the library's media type — so this asks the hub for nothing.
+function resolve() {
   try {
-    const [detail, prefs, libraries] = await Promise.all([
-      itemQuery(props.item.id, { profile: buildProfile() }),
-      // Inner fallbacks, so one dead half does not cost the others — but each
-      // says so. Both were silent: prefs down came up on the wrong audio track
-      // with the selector naming a different one, and libraries down skipped
-      // the per-media-type language wishlist.
-      getPrefs().catch((cause: unknown) => {
-        playerNote(`Could not load your preferences: ${sentence(cause)}`)
-        return { prefs: [] as Preference[] }
-      }),
-      listLibraries().catch((cause: unknown) => {
-        playerNote(`Could not load the library details: ${sentence(cause)}`)
-        return { libraries: [] }
-      }),
-    ])
-    if (listsDead) return
-    seriesId = detail.parent_id ?? props.item.id
-    mediaType = libraries.libraries.find((l) => l.id === props.libraryId)?.media_type ?? ''
+    const detail = props.item
     const audio = detail.sources[0]?.streams?.audio ?? []
     sendTrack({
       type: 'lists-arrived',
@@ -317,14 +304,26 @@ async function resolve() {
       videoList: detail.sources[0]?.streams?.video ?? [],
     })
     const resolved = resolveTracks(
-      prefs.prefs,
+      props.prefs,
       seriesId,
       props.item.id,
-      mediaType,
+      props.mediaType,
       detail.metadata?.original_language,
       audio,
     )
-    sendTrack({ type: 'audio-known', audio: resolved.audioTrack })
+    // A restart carries BOTH axes: the session was started on the carried
+    // video track, and a selector left reading zero would hand track 0 back
+    // to the NEXT restart — the same silent revert this prop exists to stop,
+    // on the other axis.
+    if (props.carried) {
+      sendTrack({
+        type: 'tracks-chosen',
+        audio: props.carried.audio,
+        video: props.carried.video,
+      })
+    } else {
+      sendTrack({ type: 'audio-known', audio: resolved.audioTrack })
+    }
     subsWish = resolved.subs
     subTrackWish = resolved.subTrack
 
@@ -332,7 +331,19 @@ async function resolve() {
     // served", and delivery is already computed against this client's bits.
     const subs = detail.negotiated?.subtitles ?? []
     sendTrack({ type: 'subtitles-arrived', subs })
-    const pick = initialSubtitle({ subs, exactId: subTrackWish, wishlist: subsWish })
+    // A restart puts the viewer back exactly where they were — including
+    // "subtitles off", which is as much a choice as any track. The prefs
+    // pick below is for a FIRST mount, resolved from a snapshot that
+    // predates anything chosen mid-episode.
+    if (props.carried?.subKey === '') return
+    // A carried key the new session's list no longer resolves (nothing does
+    // this today — the item is not refetched on restart — but ids are only
+    // as stable as that stays true) falls back to the wishlist rather than
+    // silently landing on subtitles-off.
+    const carried = props.carried
+      ? subs.find((s) => String(s.id) === props.carried?.subKey)
+      : undefined
+    const pick = carried ?? initialSubtitle({ subs, exactId: subTrackWish, wishlist: subsWish })
     if (!pick) return
     // Never overrides a choice already made.
     sendTrack({ type: 'subtitle-chosen', key: String(pick.id), onlyIfUnset: true })
@@ -343,14 +354,14 @@ async function resolve() {
     // the viewer had just made and restart before that seek had written
     // `offset` — the drag went silently.
     if (isFrozen(health.value)) pendingBurn = pick.id
-    else await switchBurn(pick.id)
+    else void switchBurn(pick.id)
   } catch (cause) {
     // NOT emptied. The picture is playing — this session was negotiated — so a
-    // blip on the player's own track fetch says nothing about what the file
-    // contains. Blanking them removed the selectors entirely, and the viewer's
-    // reading of that is "this file has no subtitles", which is false and
-    // offers nothing to press.
-    if (!listsDead) playerNote(`Could not load the track list: ${sentence(cause)}`)
+    // fault in the player's own track resolution says nothing about what the
+    // file contains. Blanking them removed the selectors entirely, and the
+    // viewer's reading of that is "this file has no subtitles", which is false
+    // and offers nothing to press.
+    playerNote(`Could not work out the track list: ${sentence(cause)}`)
   }
 }
 
@@ -390,6 +401,12 @@ function giveUp(why: string, gen = health.value.awaitingGen) {
   playerNote(why)
 }
 
+/// What the viewer is actually watching with right now, for the restart to
+/// hand back to the next mount.
+function liveChoice(): CarriedTracks {
+  return { audio: trk.value.audio, video: trk.value.video, subKey: trk.value.subKey }
+}
+
 /// The restart itself, without the guards. Shared by the automatic path and by
 /// the viewer pressing Try again, which is not a loop and must not be treated
 /// as one.
@@ -400,7 +417,7 @@ async function restartAt(at: number): Promise<boolean> {
       void endSession(fresh.session_id, { keepalive: true }).catch(() => {})
       return false
     }
-    emit('restart', fresh, at)
+    emit('restart', props.item.id, fresh, at, liveChoice())
     return true
   } catch (cause) {
     lastFailure = sentence(cause)
@@ -477,7 +494,7 @@ async function restartWithCaps() {
       void endSession(fresh.session_id, { keepalive: true }).catch(() => {})
       return
     }
-    emit('restart', fresh, at)
+    emit('restart', props.item.id, fresh, at, liveChoice())
   } catch (cause) {
     send({ type: 'caps-restart-failed', why: sentence(cause) })
   }
@@ -805,7 +822,7 @@ onMounted(() => {
   const element = video.value
   if (!element) return
   attach()
-  void resolve()
+  resolve()
   // The setting carried in from the last session, pushed by hand: the watcher
   // below only sees CHANGES, and an `immediate` one runs during setup, where
   // there is no element yet. Without this every restart came back at full
@@ -907,7 +924,6 @@ onMounted(() => {
 
   onBeforeUnmount(() => {
     goneAway = true
-    listsDead = true
     stopPinging?.()
     clearTimeout(barTimer)
     clearTimeout(giveUpTimer)
@@ -978,7 +994,7 @@ watch(
         // A session started after the player left is one nobody will ever play,
         // ping or end.
         if (stop) void endSession(fresh.session_id, { keepalive: true }).catch(() => {})
-        else emit('restart', fresh, standby)
+        else emit('restart', props.item.id, fresh, standby, liveChoice())
       } catch (cause) {
         // Still away: keep waiting. Anything else is a real failure and the
         // stand-by was the wrong answer to it.
@@ -1119,6 +1135,42 @@ watch(
   { flush: 'post' },
 )
 
+// ---- skipping the recap, the opening and the credits ----------------------
+
+/// HUB-37. What the hub found in this episode, as the QUERY that chose this
+/// source reported it — the same call that carries the subtitle listing, so
+/// there is no second round trip on the way into playback and the next
+/// episode's boundaries arrive with the next episode. Empty when nothing was
+/// found, and when nothing has been analysed: the difference is not one a
+/// player can act on.
+const skipping = computed(() => skippable(props.item.segments ?? [], playing.posMs))
+const skipText = computed(() => skipLabel(skipping.value))
+
+function skip() {
+  const segment = skipping.value
+  if (segment) void seekTo(skipTarget(segment, durationMs.value))
+}
+
+/// The file's own chapters, drawn on the bar — and each mark is an 11px
+/// button that seeks to its chapter (pointer events gated on the bar being
+/// visible; see the template). The container itself takes no pointer, so
+/// the transport underneath keeps every press between the marks.
+const ticks = computed(() => chapterTicks(props.item.chapters ?? [], durationMs.value))
+
+/// Which way a mark's label hangs. Centred in the middle third, hung inward
+/// from the tick in the outer thirds: a label centred on a mark near either
+/// end runs past the videobox's overflow and loses its leading timestamp.
+/// Thirds rather than a narrow edge band because the thresholds are in bar
+/// percent while the label's width is in pixels — on a narrow window-mode
+/// player the old 15/85 band left centred labels at 16% clipping.
+// ponytail: percent thresholds + a 240px cap, not pixel-aware measurement;
+// measure the bar if long titles on very narrow players ever matter.
+function labelSide(pct: number) {
+  if (pct > 67) return 'right-0'
+  if (pct < 33) return 'left-0'
+  return 'left-1/2 -translate-x-1/2'
+}
+
 // ---- the next episode -----------------------------------------------------
 
 const next = ref<ItemQueryResponse | null>(null)
@@ -1160,12 +1212,18 @@ async function playNext() {
     // Prefs are re-read rather than cached: a track switch during this episode
     // wrote the series' language a moment ago, and that is exactly the choice
     // the next episode should follow.
-    const prefs = await getPrefs().catch(() => ({ prefs: [] as Preference[] }))
+    // A failed re-read falls back to the set THIS episode resolved from, not
+    // to nothing: `[]` dropped the bandwidth cap and the series' language on
+    // the next episode without a word.
+    const prefs = await getPrefs().catch((cause: unknown) => {
+      playerNote(`Could not re-read your preferences: ${sentence(cause)}`)
+      return { prefs: props.prefs }
+    })
     const resolved = resolveTracks(
       prefs.prefs,
       seriesId,
       after.id,
-      mediaType,
+      props.mediaType,
       after.metadata?.original_language,
       after.sources[0]?.streams?.audio ?? [],
     )
@@ -1176,7 +1234,7 @@ async function playNext() {
       void endSession(fresh.session_id, { keepalive: true }).catch(() => {})
       return
     }
-    emit('playNext', after, fresh)
+    emit('playNext', props.item.id, after, fresh, prefs.prefs)
   } catch (cause) {
     playerNote(`Could not start the next episode: ${sentence(cause)}`)
     startingNext.value = false
@@ -1207,15 +1265,7 @@ onMounted(() => {
 
 // ---- what is drawn --------------------------------------------------------
 
-function fmt(ms: number) {
-  const total = Math.max(0, Math.floor(ms / 1000))
-  const hours = Math.floor(total / 3600)
-  const minutes = Math.floor((total % 3600) / 60)
-  const seconds = total % 60
-  return hours > 0
-    ? `${hours}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`
-    : `${minutes}:${String(seconds).padStart(2, '0')}`
-}
+const fmt = hms
 
 const pct = computed(() =>
   durationMs.value > 0 ? Math.min(100, (playing.posMs / durationMs.value) * 100) : 0,
@@ -1365,6 +1415,27 @@ const remember = (scope: string, key: string, value: string) =>
       >
         download session log
       </button>
+    </div>
+
+    <!-- HUB-37. Bottom right, clear of the transport, and it rides up with the
+         bar so it is never under it. Announced once when it appears: a viewer
+         who cannot see it still gets the offer, and it is only an offer —
+         nothing is skipped unless it is pressed. Hidden while the next-episode
+         card is up, which owns the same corner and is the more urgent of the
+         two. -->
+    <!-- The live region is ALWAYS mounted and only its text changes: a
+         region inserted together with its content is the pattern several
+         screen readers do not announce, and this announcement is the whole
+         reason the sr-only text exists. -->
+    <p class="sr-only" role="status" aria-live="polite">
+      {{ skipping && !upNextOn ? `${skipText} available` : '' }}
+    </p>
+    <div
+      v-if="skipping && !upNextOn"
+      class="animate-rise absolute right-4 z-8"
+      :class="barShown || playing.paused ? 'bottom-24' : 'bottom-8'"
+    >
+      <Btn small :disabled="frozen" @click="skip">{{ skipText }}</Btn>
     </div>
 
     <!-- Announced, because it takes over on its own: nine seconds is not long

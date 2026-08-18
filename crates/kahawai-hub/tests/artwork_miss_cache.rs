@@ -96,6 +96,7 @@ async fn fixture() -> Fx {
         Arc::new(kahawai_hub::enrich::Enricher::new(
             tempfile::tempdir().unwrap().keep(),
         )),
+        Arc::new(kahawai_hub::segments::Detector::new()),
         kahawai_hub::api::NetOptions::default(),
     );
     Fx {

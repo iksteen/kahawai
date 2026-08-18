@@ -61,14 +61,17 @@ pub struct AppState {
     pub subtitles: Arc<crate::subtitles::Subtitles>,
     pub artwork: Arc<crate::artwork::Artwork>,
     pub enricher: Arc<crate::enrich::Enricher>,
+    pub segments: Arc<crate::segments::Detector>,
     pub proxy_trust: Arc<crate::proxy::ProxyTrust>,
     pub metrics_token: Arc<Option<String>>,
     pub setup_url: Arc<Option<String>>,
     pub public_origin: Option<PublicOrigin>,
+    /// Mirrors `NetOptions::detect_segments` for the admin trigger's gate.
+    pub detect_segments: bool,
 }
 
 /// Network and feature knobs, defaulting to what a bare hub ships with.
-#[derive(Default, Clone)]
+#[derive(Clone)]
 pub struct NetOptions {
     /// Shared so a reload can swap its contents under a running
     /// router (NFR-6) instead of rebuilding one.
@@ -85,8 +88,28 @@ pub struct NetOptions {
     /// `--web-dir`: serve `/app/` from this directory instead of the bundle
     /// embedded at build time. None = embedded, which is what a release ships.
     pub web_dir: Option<std::path::PathBuf>,
+    /// `[hub] detect_segments`. The config promises "off spends no byte
+    /// plane on it", so off gates the ADMIN trigger too, not only the sweep
+    /// — the button used to dispatch a full season of reads regardless.
+    pub detect_segments: bool,
 }
 
+impl Default for NetOptions {
+    fn default() -> Self {
+        Self {
+            proxy_trust: Default::default(),
+            cors_origins: Default::default(),
+            metrics_token: None,
+            setup_url: None,
+            public_origin: None,
+            web_dir: None,
+            // The shipped config default. A derive would say false, and a
+            // test or embedder building Default would find the admin
+            // trigger answering 409 though nothing disabled anything.
+            detect_segments: true,
+        }
+    }
+}
 #[derive(OpenApi)]
 #[openapi(
     version = "3.2.0",
@@ -152,7 +175,9 @@ pub struct NetOptions {
         admin_sessions,
         admin_end_session,
         admin_session_log,
-        admin_item_log
+        admin_item_log,
+        admin_segments_status,
+        admin_segments_run
     ),
     modifiers(&BearerSecurity)
 )]
@@ -223,6 +248,7 @@ pub fn router(
     subtitles: Arc<crate::subtitles::Subtitles>,
     artwork: Arc<crate::artwork::Artwork>,
     enricher: Arc<crate::enrich::Enricher>,
+    segments: Arc<crate::segments::Detector>,
     net: NetOptions,
 ) -> Router {
     let cors = cors_layer(&net.cors_origins);
@@ -235,10 +261,12 @@ pub fn router(
         subtitles,
         artwork,
         enricher,
+        segments,
         proxy_trust: net.proxy_trust,
         metrics_token: Arc::new(net.metrics_token),
         setup_url: Arc::new(net.setup_url),
         public_origin: net.public_origin,
+        detect_segments: net.detect_segments,
     };
     // Method/path membership is the cookie authority. Item/session ownership
     // remains inside authentication for both transport groups.
@@ -397,6 +425,10 @@ pub fn router(
         )
         // OPS-10: one session's diagnostics as a downloadable bundle,
         // and the newest bundle for an item (whoever played it).
+        .route(
+            "/admin/v1/segments",
+            get(admin_segments_status).post(admin_segments_run),
+        )
         .route("/admin/v1/sessions/{id}/log", get(admin_session_log))
         .route("/admin/v1/items/{id}/log", get(admin_item_log))
         .route_layer(axum::middleware::from_fn(require_admin))
@@ -827,6 +859,39 @@ struct CollectionsResponse {
 #[derive(Serialize, ToSchema)]
 struct FontsResponse {
     fonts: Vec<String>,
+}
+
+#[derive(Serialize, ToSchema)]
+struct SegmentStatusResponse {
+    #[serde(flatten)]
+    status: crate::segments::Status,
+    /// The first 50 pending seasons, in sweep order; `pending_seasons` in
+    /// the status is the FULL count, so the two disagreeing means the list
+    /// is truncated, not that the hub lost track.
+    seasons: Vec<crate::segments::PendingSeason>,
+}
+
+#[derive(Serialize, ToSchema)]
+struct SegmentRunResponse {
+    /// The season now QUEUED for background analysis, absent when nothing
+    /// was pending. Queued, not necessarily started: runs serialize behind
+    /// whatever the sweep holds, and a repeat POST queues a task that will
+    /// no-op once it sees the season finished. Progress and completion are
+    /// `GET /admin/v1/segments`'s to report: a season is minutes of work,
+    /// and an answer held open that long dies with the first proxy timeout.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    series: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    season: Option<i64>,
+    /// Dispatched runs finished when this one was queued. Poll the status
+    /// until its `dispatched` count passes this mark; the
+    /// `dispatched_awaiting_host` / `dispatched_failed` flags then describe
+    /// THIS run — the shared pass flags describe whichever pass finished
+    /// last, which mid-sweep is usually not this one.
+    follow: usize,
+    /// The hub process the mark belongs to. A status whose `boot` differs
+    /// answers for a restarted hub whose counter reset; the mark is void.
+    boot: u64,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -4169,6 +4234,113 @@ async fn item_subtitle_file(
         .into_response())
 }
 
+/// What the intro detector is doing, and which seasons it has still to look at.
+#[utoipa::path(
+    get, path = "/admin/v1/segments", tag = "Admin segments",
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, body = SegmentStatusResponse),
+        (status = 401, body = ApiErrorBody),
+        (status = 403, body = ApiErrorBody),
+        (status = 500, body = ApiErrorBody),
+        (status = 503, description = "The hub has no administrator yet: `setup_required`", body = ApiErrorBody)
+    )
+)]
+async fn admin_segments_status(
+    State(state): State<AppState>,
+) -> Result<Json<SegmentStatusResponse>, ApiError> {
+    let db = state.registry.db();
+    // ONE walk of the pending list: the count and the rows must agree
+    // within a response, and Detector::status would run the same
+    // aggregation a second time to disagree across a season completing.
+    let seasons = crate::segments::pending_seasons(db)
+        .await
+        .map_err(internal)?;
+    let mut status = state.segments.status_counters();
+    status.pending_seasons = seasons.len();
+    Ok(Json(SegmentStatusResponse {
+        status,
+        seasons: seasons.into_iter().take(50).collect(),
+    }))
+}
+
+/// Start analysing the next season waiting, now, rather than when the sweep
+/// reaches it. The analysis is DETACHED: axum drops a handler future the
+/// moment the client disconnects, and this one used to run the season inside
+/// the request — a proxy timeout then cancelled it mid-way, threw away the
+/// finished-but-unstored result, left the status flag saying running for
+/// ever, and released the one-at-a-time lock while the orphaned blocking
+/// task was still reading the byte plane. The season the caller started is
+/// nobody's to cancel but the hub's.
+#[utoipa::path(
+    post, path = "/admin/v1/segments", tag = "Admin segments",
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, body = SegmentRunResponse),
+        (status = 401, body = ApiErrorBody),
+        (status = 403, body = ApiErrorBody),
+        (status = 409, description = "Segment detection is disabled on this hub", body = ApiErrorBody),
+        (status = 500, body = ApiErrorBody),
+        (status = 503, description = "The hub has no administrator yet: `setup_required`", body = ApiErrorBody)
+    )
+)]
+async fn admin_segments_run(
+    State(state): State<AppState>,
+) -> Result<Json<SegmentRunResponse>, ApiError> {
+    if !state.detect_segments {
+        return Err(ApiError::new(
+            ErrorCode::Conflict,
+            "segment detection is disabled in the hub's config (detect_segments)",
+        ));
+    }
+    let db = state.registry.db();
+    // The detector's pick, not the pending head: the head can be a season
+    // the sweep has set aside as unfinishable, and the button must reach
+    // the seasons behind it.
+    let Some(next) = state.segments.next_season(db).await.map_err(internal)? else {
+        return Ok(Json(SegmentRunResponse {
+            series: None,
+            season: None,
+            follow: state.segments.dispatched_so_far(),
+            boot: state.segments.boot(),
+        }));
+    };
+    let (registry, sessions, detector) = (
+        state.registry.clone(),
+        state.sessions.clone(),
+        state.segments.clone(),
+    );
+    let (series_id, season, title) = (next.series_id.clone(), next.season, next.title.clone());
+    let follow = detector.dispatched_so_far();
+    tokio::spawn(async move {
+        let outcome = detector
+            .analyze_season(&registry, &sessions, &series_id, season)
+            .await;
+        detector.record_dispatched(&outcome);
+        match outcome {
+            Ok(outcome) if outcome.awaiting > 0 => tracing::warn!(
+                series = %title, season,
+                scanned = outcome.scanned, awaiting = outcome.awaiting,
+                "intro detection (admin-triggered): episodes await their mediahost"
+            ),
+            Ok(outcome) => tracing::info!(
+                series = %title, season, episodes = outcome.scanned,
+                "intro detection (admin-triggered) finished"
+            ),
+            Err(e) => tracing::warn!(
+                series = %title, season, error = format!("{e:#}"),
+                "intro detection (admin-triggered) failed"
+            ),
+        }
+    });
+    Ok(Json(SegmentRunResponse {
+        series: Some(next.title),
+        season: Some(next.season),
+        follow,
+        boot: state.segments.boot(),
+    }))
+}
+
 #[utoipa::path(
     get, path = "/api/v1/items/{id}/fonts", tag = "Item media",
     security(("bearer_auth" = [])),
@@ -5056,6 +5228,17 @@ struct ItemQueryResponse {
 struct ItemQueryResult {
     #[schema(required)]
     negotiated: Option<NegotiatedItem>,
+    /// HUB-37: the recap, opening and credits of this item, if they have been
+    /// found. On the QUERY because it is the call a player makes on its way
+    /// into playback — the subtitle listing above rides along for the same
+    /// reason — and the boundaries are useless until something is playing.
+    /// There is deliberately no standalone segments endpoint. Empty when nothing was found, and when
+    /// nothing has been analysed: a player cannot act on the difference.
+    ///
+    /// Outside `negotiated`, because an item whose source is offline still has
+    /// the boundaries somebody found last week.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    segments: Vec<crate::segments::Segment>,
     /// Why the converged half is null. Not an error — the item loaded, and
     /// its page must render — but the same distinction as an error carries,
     /// in the same shape: `source_offline` comes back once the host does,
@@ -5576,6 +5759,13 @@ async fn item_query(
                 item: out,
                 query: ItemQueryResult {
                     negotiated: None,
+                    segments: crate::segments::for_item(state.registry.db(), &id)
+                        .await
+                        .unwrap_or_else(|e| {
+                            tracing::warn!(item = %id, error = format!("{e:#}"),
+                                "segments unreadable");
+                            Vec::new()
+                        }),
                     unavailable: Some(unavailable),
                 },
             };
@@ -5682,6 +5872,15 @@ async fn item_query(
                 },
                 subtitles,
             }),
+            segments: crate::segments::for_item(state.registry.db(), &id)
+                .await
+                .unwrap_or_else(|e| {
+                    // Swallowed on purpose — the item must load — but LOUDLY:
+                    // silent, a broken migration reads exactly like "nothing
+                    // analysed yet" and gets debugged as a detector problem.
+                    tracing::warn!(item = %id, error = format!("{e:#}"), "segments unreadable");
+                    Vec::new()
+                }),
             unavailable: None,
         },
     };
@@ -6372,6 +6571,8 @@ mod tests {
             ("delete", "/admin/v1/sessions/{id}"),
             ("get", "/admin/v1/sessions/{id}/log"),
             ("get", "/admin/v1/items/{id}/log"),
+            ("get", "/admin/v1/segments"),
+            ("post", "/admin/v1/segments"),
         ]
         .into_iter()
         .collect::<BTreeSet<_>>();

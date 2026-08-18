@@ -687,7 +687,11 @@ async fn link_once(
                                 tracing::warn!(error = format!("{e:#}"), "refusing OpenRead");
                             }
                             let ch = byte_channel.clone();
-                            let busy = engine.activity.lease();
+                            // A background lease is served like any other and
+                            // does not make this box busy: the hub's own sweeps
+                            // must not shut the gate on the work only this box
+                            // can do.
+                            let busy = (!req.background).then(|| engine.activity.lease());
                             tokio::spawn(async move {
                                 let _busy = busy;
                                 if let Err(e) =

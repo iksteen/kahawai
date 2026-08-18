@@ -162,6 +162,7 @@ mod tests {
                 root_token: kahawai_core::media::root_token(root),
                 path_rel: path.into(),
             }),
+            background: false,
         }
     }
 

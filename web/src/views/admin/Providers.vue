@@ -4,7 +4,7 @@
 /// Grouped by what they are FOR, not by who runs them: an admin comes here
 /// because anime is matching badly, not because they were thinking about
 /// AniDB. The provider name is the row label.
-import { computed, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import { useQuery, useQueryClient } from '@tanstack/vue-query'
 
 import Btn from '../../components/Btn.vue'
@@ -13,12 +13,15 @@ import Ordered from '../../components/Ordered.vue'
 import {
   adminEnrichRun,
   adminEnrichStatus,
+  adminSegmentsRun,
+  adminSegmentsStatus,
   adminProviders,
   adminSetAnidb,
   adminSetChain,
   adminSetTmdb,
   adminSetTvdb,
 } from '../../api/generated/kahawai.ts'
+import type { SegmentRunResponse } from '../../api/generated/model/segmentRunResponse.ts'
 import { moved } from '../../domain/reorder.ts'
 import { notify } from '../../composables/notices.ts'
 import { POLL_MS } from '../../composables/admin.ts'
@@ -42,6 +45,14 @@ const providers = useQuery({
 const enrich = useQuery({
   queryKey: ['admin', 'enrich'],
   queryFn: () => adminEnrichStatus(),
+  refetchInterval: POLL_MS,
+})
+/// HUB-37. Beside enrichment because it is the same kind of thing: a
+/// library-wide background pass whose progress an administrator can see and
+/// whose next unit of work they can ask for now.
+const segments = useQuery({
+  queryKey: ['admin', 'segments'],
+  queryFn: () => adminSegmentsStatus(),
   refetchInterval: POLL_MS,
 })
 
@@ -175,6 +186,79 @@ async function apply(type: string) {
 async function run() {
   if (!(await props.act(() => adminEnrichRun()))) return
   void reload()
+}
+
+/// One season, dispatched: the run is DETACHED server-side, because a season
+/// is minutes of work and an answer held open that long dies with the first
+/// proxy timeout — which used to cancel the analysis itself. The wait below
+/// is only for the toast; closing the page abandons the toast, never the run.
+const detecting = ref(false)
+/// The poll stops when the page goes; the run does not.
+let left = false
+onBeforeUnmount(() => {
+  left = true
+})
+async function detect() {
+  detecting.value = true
+  try {
+    // `act` wraps the call for error toasts and answers only success; the
+    // dispatch answer has to be caught on the way through.
+    let answered: SegmentRunResponse | null = null
+    const started = await props.act(async () => {
+      answered = await adminSegmentsRun()
+    })
+    // The cast undoes TS's assumption that the closure never ran.
+    const dispatched = answered as SegmentRunResponse | null
+    if (!started || dispatched === null) return
+    // No season named means nothing was dispatched — the sweep (or another
+    // admin) drained the list under a stale button. Nothing will ever move
+    // the counter past the mark, so a poll here waited for ever.
+    if (dispatched.series == null) {
+      notify('Every season has been analysed.')
+      return
+    }
+    const mark = dispatched.follow
+    // Follow THIS run to the end: a completion toast at dispatch time would
+    // say "Season analysed" about a season that has only just been claimed,
+    // and the shared pass flags describe whichever pass finished last — with
+    // the sweep grinding beside the dispatched run, usually not this one.
+    // The dispatch answered with a mark; the run is done when the dispatched
+    // count passes it, and the dispatched_* flags then describe it alone.
+    // A status read that fails is one blip in a minutes-long poll and is
+    // retried, not thrown out of the loop with the toast lost.
+    for (;;) {
+      await new Promise((resolve) => setTimeout(resolve, 5000))
+      if (left) return
+      let answer
+      try {
+        answer = await adminSegmentsStatus()
+      } catch {
+        continue
+      }
+      // The counter lives in the hub's memory: a different boot answers
+      // for a restarted hub whose counter reset, so the mark is void.
+      // Compared by boot, not by `dispatched < mark`, which reads a reset
+      // 0 under a mark of 0 as "still running" for ever.
+      if (answer.boot !== dispatched.boot) {
+        notify('The hub restarted while the season was being analysed — the log has the story.')
+        return
+      }
+      if (answer.dispatched <= mark) continue
+      notify(
+        answer.dispatched_failed
+          ? 'The analysis failed — the hub log has the story.'
+          : answer.dispatched_awaiting_host
+            ? 'The machine holding these files is not answering; the sweep will retry.'
+            : answer.pending_seasons > 0
+              ? `Season analysed. ${answer.pending_seasons} still to go.`
+              : 'Every season has been analysed.',
+      )
+      return
+    }
+  } finally {
+    detecting.value = false
+    void client.invalidateQueries({ queryKey: ['admin', 'segments'] })
+  }
 }
 </script>
 
@@ -353,6 +437,36 @@ async function run() {
       >
         {{ enrich.data.value.matched }} matched · {{ enrich.data.value.weak }} weak ·
         {{ enrich.data.value.missed }} missed
+      </span>
+    </div>
+
+    <!-- Skip segments: the same shape as enrichment above — a background pass,
+         its progress, and a way to ask for the next unit of work now. -->
+    <div class="flex flex-wrap items-center gap-3">
+      <Btn
+        ghost
+        small
+        :disabled="detecting || (segments.data.value?.pending_seasons ?? 0) === 0"
+        @click="detect"
+      >
+        {{ detecting ? 'Analysing a season…' : 'Find skip points now' }}
+      </Btn>
+      <span
+        v-if="segments.data.value"
+        class="font-mono text-[12px]"
+        :class="segments.data.value.running ? 'text-teal' : 'text-dim'"
+      >
+        {{ segments.data.value.pending_seasons }} seasons to analyse ·
+        {{ segments.data.value.analyzed }} episodes done since the hub started
+      </span>
+      <!-- Only once the status has actually answered: before it loads (or
+           when it failed) the ?? 0 read as "all done" about a hub nobody
+           had heard from. -->
+      <span
+        v-if="segments.data.value && segments.data.value.pending_seasons === 0"
+        class="text-dim"
+      >
+        Nothing waiting: intros, recaps and credits are found in the background.
       </span>
     </div>
   </div>

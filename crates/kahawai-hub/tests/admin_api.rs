@@ -87,6 +87,7 @@ async fn admin_flow_enrollments_satellites_archive_restore() {
         Arc::new(kahawai_hub::enrich::Enricher::new(
             tempfile::tempdir().unwrap().keep(),
         )),
+        Arc::new(kahawai_hub::segments::Detector::new()),
         kahawai_hub::api::NetOptions::default(),
     );
 
@@ -151,7 +152,7 @@ async fn admin_flow_enrollments_satellites_archive_restore() {
             mounted += 1;
         }
     }
-    assert_eq!(mounted, 56);
+    assert_eq!(mounted, 58);
     assert_eq!(
         api.clone()
             .oneshot(Request::get("/health").body(Body::empty()).unwrap())
@@ -536,6 +537,7 @@ async fn review_queue_flow() {
         Arc::new(kahawai_hub::enrich::Enricher::new(
             tempfile::tempdir().unwrap().keep(),
         )),
+        Arc::new(kahawai_hub::segments::Detector::new()),
         kahawai_hub::api::NetOptions::default(),
     );
     // Two movie items with metadata states: one miss, one weak.

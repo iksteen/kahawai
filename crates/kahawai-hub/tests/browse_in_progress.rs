@@ -56,6 +56,7 @@ async fn harness() -> (axum::Router, Arc<kahawai_hub::auth::Auth>, sqlx::SqliteP
             enricher.clone(),
         )),
         enricher,
+        Arc::new(kahawai_hub::segments::Detector::new()),
         kahawai_hub::api::NetOptions::default(),
     );
     std::mem::forget(dir);
