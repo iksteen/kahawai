@@ -26,6 +26,11 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
+/// The secrets a snapshot has to carry, none of which live in a tree. A hub
+/// restored without `jwt.secret` invalidates every session; one restored
+/// without the metrics token silently stops answering its scraper.
+pub const SECRET_FILES: [&str; 2] = ["jwt.secret", crate::api::METRICS_TOKEN_FILE];
+
 /// Written beside the snapshot so a restore can tell what it is holding —
 /// and refuse a directory that merely looks like one.
 #[derive(Debug, Serialize, Deserialize)]
@@ -108,11 +113,15 @@ pub async fn backup(data_dir: &Path, config: Option<&Path>, dest: &Path) -> Resu
         }
     }
 
-    // The token secret lives beside the database, not in a tree: without
-    // it every session is invalidated by a restore.
-    let jwt = data_dir.join("jwt.secret");
-    if jwt.exists() {
-        std::fs::copy(&jwt, dest.join("jwt.secret")).context("copying jwt.secret")?;
+    // Beside the database rather than in a tree. Without `jwt.secret` a
+    // restore invalidates every session; without the metrics token a restored
+    // hub silently stops answering its scraper. `fs::copy` carries the
+    // source's mode, so 0600 survives.
+    for name in SECRET_FILES {
+        let from = data_dir.join(name);
+        if from.exists() {
+            std::fs::copy(&from, dest.join(name)).with_context(|| format!("copying {name}"))?;
+        }
     }
     let has_config = match config {
         Some(path) if path.exists() => {
@@ -174,13 +183,15 @@ pub fn restore(src: &Path, data_dir: &Path, force: bool) -> Result<Manifest> {
                 .with_context(|| format!("restoring {}", from.display()))?;
         }
     }
-    let jwt = src.join("jwt.secret");
-    if jwt.exists() {
-        let to = data_dir.join("jwt.secret");
-        std::fs::copy(&jwt, &to).context("restoring jwt.secret")?;
-        // `fs::copy` carries the SOURCE's mode, and a snapshot that has been
-        // through tar or an object store commonly comes back 0644.
-        kahawai_core::private::narrow(&to).context("restricting jwt.secret")?;
+    for name in SECRET_FILES {
+        let from = src.join(name);
+        if from.exists() {
+            let to = data_dir.join(name);
+            std::fs::copy(&from, &to).with_context(|| format!("restoring {name}"))?;
+            // `fs::copy` carries the SOURCE's mode, and a snapshot that has
+            // been through tar or an object store commonly comes back 0644.
+            kahawai_core::private::narrow(&to).with_context(|| format!("restricting {name}"))?;
+        }
     }
     Ok(manifest)
 }

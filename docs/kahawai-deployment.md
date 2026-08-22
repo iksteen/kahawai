@@ -200,15 +200,20 @@ niceness orders the worker *against the hub inside it*.
 
 ## Scraping metrics (NFR-6)
 
-`/metrics` is off until `hub.metrics_token` is set, and it takes that
-token — not a login token. Access tokens expire after 15 minutes and
-Prometheus has no refresh flow, so a static credential scoped to this one
-read-only route is the only thing that actually scrapes.
+`/metrics` is off until `metrics.secret` exists in the data directory, and
+it takes the token in that file — not a login token. Access tokens expire
+after 15 minutes and Prometheus has no refresh flow, so a static credential
+scoped to this one read-only route is the only thing that actually scrapes.
+It sits beside `jwt.secret` rather than in the config file, so a config you
+can paste into an issue carries no credential:
 
-```toml
-[hub]
-metrics_token = "a-long-random-string"
+```console
+$ (umask 077; openssl rand -hex 32 > ~/.local/share/kahawai/metrics.secret)
 ```
+
+Trailing whitespace is ignored, so `$(cat metrics.secret)` in the scraper's
+configuration matches. The hub restricts the file to 0600 on startup and
+says so if it had to.
 
 ```yaml
 scrape_configs:

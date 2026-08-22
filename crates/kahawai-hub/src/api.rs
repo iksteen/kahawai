@@ -70,6 +70,12 @@ pub struct AppState {
     pub detect_segments: bool,
 }
 
+/// The bearer Prometheus scrapes `/metrics` with, kept beside `jwt.secret`
+/// in the data directory rather than in the config file. Named here because
+/// the composition root reads it and `backup` has to carry it, and two
+/// spellings of one file name is one too many.
+pub const METRICS_TOKEN_FILE: &str = "metrics.secret";
+
 /// Network and feature knobs, defaulting to what a bare hub ships with.
 #[derive(Clone)]
 pub struct NetOptions {

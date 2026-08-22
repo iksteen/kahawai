@@ -173,7 +173,7 @@ async fn health_answers_without_a_credential_and_metrics_does_not() {
     }
 }
 
-/// With no `hub.metrics_token` configured the endpoint is not served at
+/// With no metrics token configured the endpoint is not served at
 /// all — not 401, not an empty body. A hub nobody set up for scraping
 /// should not advertise an endpoint that reports its library size, and
 /// the 404/401 split lets an operator tell "off here" from "wrong

@@ -125,7 +125,7 @@ mod tests {
         let (_d, path) = write(
             "# top of file\n\
              [hub]\n\
-             metrics_token = \"secret\"\n\
+             public_url = \"https://kahawai.example\"\n\
              \n\
              [transcoder]\n\
              # dtsdec only decodes the lossy core — demoted on purpose.\n\
@@ -143,7 +143,7 @@ mod tests {
             "the reason a human recorded was lost:\n{text}"
         );
         assert!(
-            text.contains("metrics_token = \"secret\""),
+            text.contains("public_url = \"https://kahawai.example\""),
             "unrelated key changed"
         );
         assert!(text.contains("\"dtsdec\""), "a human's entry was removed");

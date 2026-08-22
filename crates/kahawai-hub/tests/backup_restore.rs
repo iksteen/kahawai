@@ -131,6 +131,32 @@ async fn a_snapshot_is_not_readable_by_anyone_else() {
     );
 }
 
+/// A restored hub that stops answering its scraper says nothing about why, so
+/// the token travels with the snapshot like the session secret does.
+#[tokio::test]
+async fn a_snapshot_carries_the_metrics_token() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    db.close().await;
+    for name in kahawai_hub::backup::SECRET_FILES {
+        std::fs::write(dir.path().join(name), format!("secret-{name}")).unwrap();
+    }
+    let dest = tempfile::tempdir().unwrap().keep().join("snapshot");
+    kahawai_hub::backup::backup(dir.path(), None, &dest)
+        .await
+        .unwrap();
+
+    let into = tempfile::tempdir().unwrap();
+    kahawai_hub::backup::restore(&dest, into.path(), true).unwrap();
+    for name in kahawai_hub::backup::SECRET_FILES {
+        assert_eq!(
+            std::fs::read_to_string(into.path().join(name)).unwrap(),
+            format!("secret-{name}"),
+            "{name} did not survive the round trip"
+        );
+    }
+}
+
 #[tokio::test]
 async fn a_restore_refuses_to_overwrite_without_being_told() {
     let live = tempfile::tempdir().unwrap();

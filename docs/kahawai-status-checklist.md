@@ -687,9 +687,9 @@ How something works and why it was built that way belong in
       over mTLS, scanned, served direct play through the hub
 - [x] NFR-6 Operability: structured logging, single-file TOML with env
       overrides, `GET /health` (public) and `GET /metrics` (Prometheus
-      0.0.4, behind its own static `hub.metrics_token`; unset = not
-      served at all), SIGHUP reload for what can change under a running
-      process.
+      0.0.4, behind its own static token in `<data_dir>/metrics.secret`;
+      no file = not served at all), SIGHUP reload for what can change
+      under a running process.
 - [x] NFR-7 Versioned client API (`/api/v1`)
       *(One sanctioned exception, taken in place rather than as `/api/v2`:
       the item resource was split by method — `GET` for what was
