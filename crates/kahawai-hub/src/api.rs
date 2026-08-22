@@ -1723,7 +1723,10 @@ async fn admin_set_anidb(
     State(state): State<AppState>,
     ApiJson(body): ApiJson<SetAnidb>,
 ) -> Result<Json<SavedVerificationResponse>, ApiError> {
-    let (user, pass) = (body.username.trim(), body.password.trim());
+    // Stored as sent. What is inside a password or a UDP key is the account
+    // holder's business, and the key is a cipher input: a trimmed one is a
+    // different key, which AniDB answers by refusing to decrypt.
+    let (user, pass) = (body.username.as_str(), body.password.as_str());
     if user.is_empty() || pass.is_empty() {
         return Err(ApiError::new(
             ErrorCode::BadRequest,
@@ -1746,7 +1749,7 @@ async fn admin_set_anidb(
         .registry
         .set_setting(
             crate::anidb::APIKEY_SETTING,
-            body.udp_api_key.as_deref().map(str::trim).unwrap_or(""),
+            body.udp_api_key.as_deref().unwrap_or(""),
         )
         .await
         .map_err(internal)?;
@@ -1815,7 +1818,9 @@ async fn admin_set_tvdb(
     State(state): State<AppState>,
     ApiJson(body): ApiJson<SetTvdb>,
 ) -> Result<Json<SavedResponse>, ApiError> {
-    let key = body.api_key.trim();
+    // Stored as sent: a credential is the account holder's to compose, and a
+    // hub that edits one hands the provider something nobody typed.
+    let key = body.api_key.as_str();
     if key.is_empty() {
         return Err(ApiError::new(
             // Not ProviderUnconfigured: that says the DEPLOYMENT has no
@@ -1830,7 +1835,7 @@ async fn admin_set_tvdb(
         .set_setting(crate::enrich::TVDB_KEY_SETTING, key)
         .await
         .map_err(internal)?;
-    if let Some(pin) = body.pin.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
+    if let Some(pin) = body.pin.as_deref().filter(|p| !p.is_empty()) {
         state
             .registry
             .set_setting(crate::enrich::TVDB_PIN_SETTING, pin)
@@ -1875,7 +1880,8 @@ async fn admin_set_tmdb(
     State(state): State<AppState>,
     ApiJson(body): ApiJson<SetTmdb>,
 ) -> Result<Json<SavedResponse>, ApiError> {
-    let key = body.api_key.trim();
+    // Stored as sent, like every other credential here.
+    let key = body.api_key.as_str();
     if key.is_empty() {
         return Err(ApiError::new(
             // Not ProviderUnconfigured: that says the DEPLOYMENT has no

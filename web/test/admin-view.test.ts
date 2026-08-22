@@ -1206,9 +1206,11 @@ describe('providers', () => {
     vi.mocked(api.adminSetTmdb).mockResolvedValue({ saved: true } as never)
     const wrapper = await open()
     await tab(wrapper, 'Providers')
-    await wrapper.find('#tmdb-key').setValue('secret')
+    // Padded on purpose: a key goes out as typed, here and in every other
+    // provider form.
+    await wrapper.find('#tmdb-key').setValue(' secret ')
     await press(wrapper, 'Save')
-    expect(api.adminSetTmdb).toHaveBeenCalledWith({ api_key: 'secret' })
+    expect(api.adminSetTmdb).toHaveBeenCalledWith({ api_key: ' secret ' })
     expect((wrapper.find('#tmdb-key').element as HTMLInputElement).value).toBe('')
     expect(notice.value).toContain('TMDB key saved')
   })
@@ -1229,6 +1231,32 @@ describe('providers', () => {
       .trigger('click')
     await flushPromises()
     expect(notice.value).toContain('bad password')
+  })
+
+  test('an AniDB account goes out exactly as typed', async () => {
+    // The form used to trim the username and the UDP key. The key is a cipher
+    // input: trimmed, it encrypts packets AniDB cannot read, and the failure
+    // arrives as a decrypt error about a key the admin pasted correctly.
+    vi.mocked(api.adminSetAnidb).mockResolvedValue({
+      saved: true,
+      verified: true,
+      error: null,
+    } as never)
+    const wrapper = await open()
+    await tab(wrapper, 'Providers')
+    await wrapper.find('#anidb-user').setValue(' someone ')
+    await wrapper.find('#anidb-pass').setValue('  hunter2  ')
+    await wrapper.find('#anidb-udp').setValue('  a-udp-key  ')
+    await wrapper
+      .findAll('button')
+      .filter((b) => b.text() === 'Save')[2]!
+      .trigger('click')
+    await flushPromises()
+    expect(api.adminSetAnidb).toHaveBeenCalledWith({
+      username: ' someone ',
+      password: '  hunter2  ',
+      udp_api_key: '  a-udp-key  ',
+    })
   })
 
   test('finding skip points follows its own run to a toast, and only its own', async () => {
@@ -1331,14 +1359,16 @@ describe('providers', () => {
     await flushPromises()
     expect(api.adminSetTvdb).toHaveBeenCalledWith({ api_key: 'secret' })
 
+    // And a pin that is sent goes out as typed — a PIN is a credential, not
+    // a number the form may tidy.
     await wrapper.find('#tvdb-key').setValue('secret')
-    await wrapper.find('#tvdb-pin').setValue('1234')
+    await wrapper.find('#tvdb-pin').setValue(' 1234 ')
     await wrapper
       .findAll('button')
       .filter((b) => b.text() === 'Save')[1]!
       .trigger('click')
     await flushPromises()
-    expect(api.adminSetTvdb).toHaveBeenLastCalledWith({ api_key: 'secret', pin: '1234' })
+    expect(api.adminSetTvdb).toHaveBeenLastCalledWith({ api_key: 'secret', pin: ' 1234 ' })
   })
 
   test('a chain is a draft until it is applied', async () => {

@@ -104,7 +104,7 @@ const anyProvider = computed(
 )
 
 async function saveTmdb() {
-  if (!(await props.act(() => adminSetTmdb({ api_key: tmdb.value.trim() })))) return
+  if (!(await props.act(() => adminSetTmdb({ api_key: tmdb.value })))) return
   tmdb.value = ''
   notify('TMDB key saved — enrichment started.')
   void reload()
@@ -112,9 +112,7 @@ async function saveTmdb() {
 
 async function saveTvdb() {
   const { key, pin } = tvdb.value
-  const ok = await props.act(() =>
-    adminSetTvdb(pin.trim() ? { api_key: key.trim(), pin: pin.trim() } : { api_key: key.trim() }),
-  )
+  const ok = await props.act(() => adminSetTvdb(pin ? { api_key: key, pin } : { api_key: key }))
   if (!ok) return
   tvdb.value = { key: '', pin: '' }
   notify('TVDB key saved — enrichment started.')
@@ -126,10 +124,10 @@ async function saveAnidb() {
   let verified = false
   let why: string | null | undefined
   const ok = await props.act(async () => {
+    // Sent as typed. The UDP key is a cipher input, and a form that quietly
+    // trims one stores a key AniDB will not decrypt with.
     const answer = await adminSetAnidb(
-      udp.trim()
-        ? { username: username.trim(), password, udp_api_key: udp.trim() }
-        : { username: username.trim(), password },
+      udp ? { username, password, udp_api_key: udp } : { username, password },
     )
     verified = answer.verified
     why = answer.error

@@ -522,6 +522,18 @@ pub(crate) fn fold(s: &str) -> String {
         .join(" ")
 }
 
+/// Which TMDB credential style this is: the v3 "API Key" rides the `api_key`
+/// query parameter, the v4 "API Read Access Token" is a JWT and rides a Bearer
+/// header.
+///
+/// Trimmed only to LOOK at it. A key is stored exactly as its owner typed it,
+/// and a leading space is not ours to reject — but it must not decide the
+/// transport, because the fallback puts a long-lived token in a URL, where
+/// TMDB's access log and every intermediary between here and there keeps it.
+fn is_v4_token(key: &str) -> bool {
+    key.trim_start().starts_with("eyJ")
+}
+
 impl Enricher {
     pub fn new(data_dir: std::path::PathBuf) -> Self {
         let http = std::sync::Arc::new(crate::gate::Http::new().expect("http client"));
@@ -575,7 +587,7 @@ impl Enricher {
         // Both TMDB credential styles work: the v3 "API Key" rides the
         // api_key query param, the v4 "API Read Access Token" (a JWT,
         // starts with "eyJ") rides a Bearer header.
-        if key.starts_with("eyJ") {
+        if is_v4_token(key) {
             req = req.bearer_auth(key);
         } else {
             req = req.query(&[("api_key", key)]);
@@ -730,7 +742,7 @@ impl Enricher {
         let mut req = self.http.get(format!(
             "https://api.themoviedb.org/3/tv/{show_id}/season/{season}"
         ));
-        if key.starts_with("eyJ") {
+        if is_v4_token(key) {
             req = req.bearer_auth(key);
         } else {
             req = req.query(&[("api_key", key)]);
@@ -769,7 +781,7 @@ impl Enricher {
         let mut req = self
             .http
             .get(format!("https://api.themoviedb.org/3/tv/{show_id}"));
-        if key.starts_with("eyJ") {
+        if is_v4_token(key) {
             req = req.bearer_auth(key);
         } else {
             req = req.query(&[("api_key", key)]);
@@ -3247,6 +3259,20 @@ pub fn absolute_to_seasoned(seasons: &[(i64, i64)], absolute: i64) -> Option<(i6
 mod tests {
     use super::*;
 
+    /// A v4 token is a JWT and goes in a header; a v3 key goes in the query.
+    /// The value is stored as typed, so the test for which one it is has to
+    /// look past whitespace — otherwise a pasted leading space sends a
+    /// long-lived token to TMDB in the URL.
+    #[test]
+    fn a_pasted_space_does_not_put_a_tmdb_token_in_the_url() {
+        assert!(is_v4_token("eyJhbGciOiJIUzI1NiJ9.body.sig"));
+        assert!(is_v4_token(" eyJhbGciOiJIUzI1NiJ9.body.sig"));
+        assert!(is_v4_token("\n\teyJhbGciOiJIUzI1NiJ9.body.sig"));
+        // A v3 key is 32 hex characters and has no business in a header.
+        assert!(!is_v4_token("0123456789abcdef0123456789abcdef"));
+        assert!(!is_v4_token(" 0123456789abcdef0123456789abcdef"));
+    }
+
     /// Both halves of one error. 401 is the revoked-key case, the likeliest
     /// to leak; 404 is the one `is_http_404` has to keep recognising, and
     /// rewriting the error as a string would quietly lose it.
@@ -3475,7 +3501,7 @@ impl Enricher {
         let mut req = self
             .http
             .get(format!("https://api.themoviedb.org/3/{path}/{tmdb_id}"));
-        if key.starts_with("eyJ") {
+        if is_v4_token(key) {
             req = req.bearer_auth(key);
         } else {
             req = req.query(&[("api_key", key)]);
