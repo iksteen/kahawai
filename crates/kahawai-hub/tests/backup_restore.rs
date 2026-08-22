@@ -78,7 +78,9 @@ async fn a_snapshot_restores_the_database_pki_and_subtitles() {
 
     // Restore onto a FRESH install, as the requirement words it.
     let fresh = tempfile::tempdir().unwrap();
-    let restored = kahawai_hub::backup::restore(&snap, fresh.path(), false).unwrap();
+    let restored = kahawai_hub::backup::restore(&snap, fresh.path(), false)
+        .await
+        .unwrap();
     assert_eq!(restored.kahawai_version, m.kahawai_version);
     assert_eq!(
         std::fs::read_to_string(fresh.path().join("pki/ca.key")).unwrap(),
@@ -147,7 +149,9 @@ async fn a_snapshot_carries_the_metrics_token() {
         .unwrap();
 
     let into = tempfile::tempdir().unwrap();
-    kahawai_hub::backup::restore(&dest, into.path(), true).unwrap();
+    kahawai_hub::backup::restore(&dest, into.path(), true)
+        .await
+        .unwrap();
     for name in kahawai_hub::backup::SECRET_FILES {
         assert_eq!(
             std::fs::read_to_string(into.path().join(name)).unwrap(),
@@ -173,9 +177,13 @@ async fn a_restore_refuses_to_overwrite_without_being_told() {
 
     // The data dir already holds a database — quietly replacing it while
     // a hub might be running is how you lose the state you meant to keep.
-    let err = kahawai_hub::backup::restore(&snap, live.path(), false).unwrap_err();
+    let err = kahawai_hub::backup::restore(&snap, live.path(), false)
+        .await
+        .unwrap_err();
     assert!(format!("{err:#}").contains("--force"), "{err:#}");
-    kahawai_hub::backup::restore(&snap, live.path(), true).expect("--force restores");
+    kahawai_hub::backup::restore(&snap, live.path(), true)
+        .await
+        .expect("--force restores");
 }
 
 #[tokio::test]
@@ -227,7 +235,9 @@ async fn a_snapshot_is_taken_while_the_hub_keeps_writing() {
     // The snapshot is consistent: it opens, and whatever it caught is a
     // real point in time rather than a torn page.
     let restored = tempfile::tempdir().unwrap();
-    kahawai_hub::backup::restore(&snap, restored.path(), false).unwrap();
+    kahawai_hub::backup::restore(&snap, restored.path(), false)
+        .await
+        .unwrap();
     let db2 = kahawai_hub::db::open(restored.path()).await.unwrap();
     let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM items")
         .fetch_one(&db2)
@@ -236,4 +246,237 @@ async fn a_snapshot_is_taken_while_the_hub_keeps_writing() {
     assert!(n <= 200, "snapshot cannot hold more than was written: {n}");
     db2.close().await;
     db.close().await;
+}
+
+/// A restored hub must be able to open what it restored.
+///
+/// The credential key is the whole of that: without it every sealed value is
+/// unreadable, and because the database remembers seeding a key the hub
+/// refuses to start rather than minting a replacement.
+/// The manifest records which secrets a snapshot carries, so one that lost a
+/// file between being taken and being restored says so — instead of restoring
+/// a hub that starts and cannot open a single credential.
+#[tokio::test]
+async fn a_snapshot_missing_what_its_manifest_lists_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    db.close().await;
+    for name in kahawai_hub::backup::SECRET_FILES {
+        std::fs::write(dir.path().join(name), b"pretend-secret").unwrap();
+    }
+    let dest = tempfile::tempdir().unwrap().keep().join("snapshot");
+    let manifest = kahawai_hub::backup::backup(dir.path(), None, &dest)
+        .await
+        .unwrap();
+    assert_eq!(
+        manifest.secrets,
+        kahawai_hub::backup::SECRET_FILES
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>(),
+        "the manifest does not say what it carries"
+    );
+
+    // Somebody's rsync excluded a dotless file, or a tar dropped one.
+    std::fs::remove_file(dest.join(kahawai_hub::secrets::KEY_FILE)).unwrap();
+    let into = tempfile::tempdir().unwrap();
+    write(&into.path().join("hub.db"), "standing database");
+    write(&into.path().join("hub.db-wal"), "standing wal");
+    let e = kahawai_hub::backup::restore(&dest, into.path(), true)
+        .await
+        .expect_err("a snapshot missing its credential key was restored");
+    assert!(
+        format!("{e:#}").contains(kahawai_hub::secrets::KEY_FILE),
+        "{e:#}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(into.path().join("hub.db")).unwrap(),
+        "standing database",
+        "restore rejected the snapshot only after replacing the live database"
+    );
+    assert_eq!(
+        std::fs::read_to_string(into.path().join("hub.db-wal")).unwrap(),
+        "standing wal",
+        "restore removed the live journal before validating the snapshot"
+    );
+}
+
+#[tokio::test]
+async fn a_restore_refuses_a_key_that_does_not_match_the_snapshot_database() {
+    let live = tempfile::tempdir().unwrap();
+    let db = kahawai_hub::db::open(live.path()).await.unwrap();
+    kahawai_hub::secrets::Secrets::load_or_create(live.path(), &db)
+        .await
+        .unwrap();
+    db.close().await;
+    let snap = tempfile::tempdir().unwrap().keep().join("snapshot");
+    kahawai_hub::backup::backup(live.path(), None, &snap)
+        .await
+        .unwrap();
+
+    let key_path = snap.join(kahawai_hub::secrets::KEY_FILE);
+    let mut wrong_key = std::fs::read(&key_path).unwrap();
+    wrong_key[0] ^= 1;
+    std::fs::write(&key_path, wrong_key).unwrap();
+
+    let into = tempfile::tempdir().unwrap();
+    write(&into.path().join("hub.db"), "standing database");
+    write(&into.path().join("hub.db-wal"), "standing wal");
+    write(
+        &into.path().join(kahawai_hub::secrets::KEY_FILE),
+        "standing key",
+    );
+    let error = kahawai_hub::backup::restore(&snap, into.path(), true)
+        .await
+        .expect_err("a snapshot with the wrong credential key was restored");
+    assert!(format!("{error:#}").contains("does not match"), "{error:#}");
+    assert_eq!(
+        std::fs::read_to_string(into.path().join("hub.db")).unwrap(),
+        "standing database"
+    );
+    assert_eq!(
+        std::fs::read_to_string(into.path().join("hub.db-wal")).unwrap(),
+        "standing wal"
+    );
+    assert_eq!(
+        std::fs::read_to_string(into.path().join(kahawai_hub::secrets::KEY_FILE)).unwrap(),
+        "standing key"
+    );
+}
+
+/// A marker in the database means the key is not optional. Silently omitting
+/// it produces a backup that reports success and can never start after restore.
+#[tokio::test]
+async fn a_backup_refuses_a_seeded_database_without_its_key() {
+    let live = tempfile::tempdir().unwrap();
+    let db = kahawai_hub::db::open(live.path()).await.unwrap();
+    kahawai_hub::secrets::Secrets::load_or_create(live.path(), &db)
+        .await
+        .unwrap();
+    std::fs::remove_file(live.path().join(kahawai_hub::secrets::KEY_FILE)).unwrap();
+    db.close().await;
+    let dest = tempfile::tempdir().unwrap().keep().join("snapshot");
+
+    let error = kahawai_hub::backup::backup(live.path(), None, &dest)
+        .await
+        .expect_err("an unusable backup reported success");
+    assert!(
+        format!("{error:#}").contains(kahawai_hub::secrets::KEY_FILE),
+        "{error:#}"
+    );
+    assert!(
+        !dest.exists(),
+        "backup created a snapshot before checking its required key"
+    );
+}
+
+#[tokio::test]
+async fn a_backup_refuses_a_key_that_does_not_match_its_database() {
+    let live = tempfile::tempdir().unwrap();
+    let db = kahawai_hub::db::open(live.path()).await.unwrap();
+    kahawai_hub::secrets::Secrets::load_or_create(live.path(), &db)
+        .await
+        .unwrap();
+    let key_path = live.path().join(kahawai_hub::secrets::KEY_FILE);
+    let mut wrong_key = std::fs::read(&key_path).unwrap();
+    wrong_key[0] ^= 1;
+    std::fs::write(&key_path, wrong_key).unwrap();
+    db.close().await;
+    let dest = tempfile::tempdir().unwrap().keep().join("snapshot");
+
+    let error = kahawai_hub::backup::backup(live.path(), None, &dest)
+        .await
+        .expect_err("an unusable backup reported success");
+    assert!(format!("{error:#}").contains("does not match"), "{error:#}");
+    assert!(
+        !dest.exists(),
+        "backup created a snapshot before validating its credential key"
+    );
+}
+#[tokio::test]
+async fn a_snapshot_carries_the_credential_key() {
+    let live = tempfile::tempdir().unwrap();
+    let snap = tempfile::tempdir().unwrap();
+    let snap = snap.path().join("snapshot");
+
+    let db = kahawai_hub::db::open(live.path()).await.unwrap();
+    let secrets = kahawai_hub::secrets::Secrets::load_or_create(live.path(), &db)
+        .await
+        .unwrap();
+    let sealed = secrets.seal("", "tmdb", "api_key", "operator-key").unwrap();
+    db.close().await;
+
+    kahawai_hub::backup::backup(live.path(), None, &snap)
+        .await
+        .unwrap();
+
+    let fresh = tempfile::tempdir().unwrap();
+    kahawai_hub::backup::restore(&snap, fresh.path(), false)
+        .await
+        .unwrap();
+
+    let key = fresh.path().join(kahawai_hub::secrets::KEY_FILE);
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(
+        std::fs::metadata(&key).unwrap().permissions().mode() & 0o777,
+        0o600,
+        "a restored key wider than the one it came from is a new leak"
+    );
+    let db = kahawai_hub::db::open(fresh.path()).await.unwrap();
+    let restored = kahawai_hub::secrets::Secrets::load_or_create(fresh.path(), &db)
+        .await
+        .unwrap();
+    assert_eq!(
+        restored.open("", "tmdb", "api_key", &sealed).unwrap(),
+        "operator-key",
+        "the key travelled but does not open what it sealed"
+    );
+}
+
+#[tokio::test]
+async fn a_restore_replaces_a_standing_key() {
+    let live = tempfile::tempdir().unwrap();
+    let snap = tempfile::tempdir().unwrap();
+    let snap = snap.path().join("snapshot");
+    kahawai_hub::db::open(live.path())
+        .await
+        .unwrap()
+        .close()
+        .await;
+    write(
+        &live.path().join(kahawai_hub::secrets::KEY_FILE),
+        "the-snapshot-key-32-bytes-long!!",
+    );
+    kahawai_hub::backup::backup(live.path(), None, &snap)
+        .await
+        .unwrap();
+
+    let onto = tempfile::tempdir().unwrap();
+    kahawai_hub::db::open(onto.path())
+        .await
+        .unwrap()
+        .close()
+        .await;
+    write(
+        &onto.path().join(kahawai_hub::secrets::KEY_FILE),
+        "the-standing-key-32-bytes-long!!",
+    );
+    kahawai_hub::backup::restore(&snap, onto.path(), true)
+        .await
+        .unwrap();
+
+    let key = onto.path().join(kahawai_hub::secrets::KEY_FILE);
+    assert_eq!(
+        std::fs::read_to_string(&key).unwrap(),
+        "the-snapshot-key-32-bytes-long!!",
+        "the restored database's credentials are sealed under the snapshot's key"
+    );
+    // The snapshot's own mode is whatever it came back from tar or an object
+    // store with; the live copy is not allowed to inherit it.
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(
+        std::fs::metadata(&key).unwrap().permissions().mode() & 0o777,
+        0o600,
+        "a restored key wider than 0600 undoes what creating it restricted"
+    );
 }

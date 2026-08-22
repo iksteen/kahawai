@@ -225,7 +225,7 @@ async fn main() -> Result<()> {
             cmd: Some(HubCmd::Restore { src, force }),
             ..
         } => {
-            let m = kahawai_hub::backup::restore(&src, &cfg.hub.data_dir, force)?;
+            let m = kahawai_hub::backup::restore(&src, &cfg.hub.data_dir, force).await?;
             println!(
                 "restored a snapshot taken at {} (kahawai {}) into {}",
                 m.taken_at,

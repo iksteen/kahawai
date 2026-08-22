@@ -314,7 +314,7 @@ where
 
 /// Names the key without being it: SHA-256 of the key bytes, which reveals
 /// nothing usable and is stable across restarts.
-fn fingerprint(key: &[u8]) -> String {
+pub(crate) fn fingerprint(key: &[u8]) -> String {
     use sha2::Digest;
     data_encoding::HEXLOWER.encode(&sha2::Sha256::digest(key))
 }

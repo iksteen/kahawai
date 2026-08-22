@@ -26,11 +26,6 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-/// The secrets a snapshot has to carry, none of which live in a tree. A hub
-/// restored without `jwt.secret` invalidates every session; one restored
-/// without the metrics token silently stops answering its scraper.
-pub const SECRET_FILES: [&str; 2] = ["jwt.secret", crate::api::METRICS_TOKEN_FILE];
-
 /// Written beside the snapshot so a restore can tell what it is holding —
 /// and refuse a directory that merely looks like one.
 #[derive(Debug, Serialize, Deserialize)]
@@ -46,7 +41,24 @@ pub struct Manifest {
     pub subtitle_bytes: u64,
     pub has_pki: bool,
     pub has_config: bool,
+    /// The secret files this snapshot carries, by name. Recorded rather than
+    /// inferred, so a snapshot that lost one says so instead of restoring a
+    /// hub that cannot open its own credentials. Absent in snapshots taken
+    /// before it was recorded, which is not the same as "carried none".
+    #[serde(default)]
+    pub secrets: Vec<String>,
 }
+
+/// Beside the database rather than in a tree. Without `jwt.secret` a restore
+/// invalidates every session; without the credential key every stored
+/// credential restores unopenable and the hub refuses to start, because the
+/// database remembers seeding one; without the metrics token a restored hub
+/// silently stops answering its scraper.
+pub const SECRET_FILES: [&str; 3] = [
+    "jwt.secret",
+    crate::secrets::KEY_FILE,
+    crate::api::METRICS_TOKEN_FILE,
+];
 
 const FORMAT: u32 = 1;
 const MANIFEST: &str = "kahawai-backup.json";
@@ -73,11 +85,6 @@ pub async fn backup(data_dir: &Path, config: Option<&Path>, dest: &Path) -> Resu
             dest.display()
         );
     }
-    // 0700, so what lands inside is unreachable to anyone else whatever mode
-    // the writer chose: the snapshot holds every password hash and every
-    // session on the hub.
-    kahawai_core::private::create_dir(dest)
-        .with_context(|| format!("creating {}", dest.display()))?;
 
     // The database first, and through sqlite rather than the filesystem:
     // copying hub.db while the hub runs would catch a torn page or miss
@@ -85,6 +92,30 @@ pub async fn backup(data_dir: &Path, config: Option<&Path>, dest: &Path) -> Resu
     let pool = crate::db::open(data_dir)
         .await
         .context("opening the hub database")?;
+    let credential_key_expected: Option<String> =
+        sqlx::query_scalar("SELECT value FROM settings WHERE key = ?")
+            .bind(crate::secrets::SEEDED_SETTING)
+            .fetch_optional(&pool)
+            .await
+            .context("checking whether the credential key is required")?;
+    let credential_key = if let Some(expected) = credential_key_expected {
+        let path = data_dir.join(crate::secrets::KEY_FILE);
+        let key = std::fs::read(&path)
+            .with_context(|| format!("reading required {}", crate::secrets::KEY_FILE))?;
+        anyhow::ensure!(
+            crate::secrets::fingerprint(&key) == expected,
+            "{} does not match the database",
+            crate::secrets::KEY_FILE
+        );
+        Some(key)
+    } else {
+        None
+    };
+    // 0700, so what lands inside is unreachable to anyone else whatever mode
+    // the writer chose: the snapshot holds every password hash, every session
+    // and the key the credentials are sealed under.
+    kahawai_core::private::create_dir(dest)
+        .with_context(|| format!("creating {}", dest.display()))?;
     let db_out = dest.join("hub.db");
     let taken_at = now_unix();
     sqlx::query("VACUUM INTO ?")
@@ -113,14 +144,21 @@ pub async fn backup(data_dir: &Path, config: Option<&Path>, dest: &Path) -> Resu
         }
     }
 
-    // Beside the database rather than in a tree. Without `jwt.secret` a
-    // restore invalidates every session; without the metrics token a restored
-    // hub silently stops answering its scraper. `fs::copy` carries the
-    // source's mode, so 0600 survives.
+    // A required credential key was read and validated above. Write those
+    // exact bytes rather than reopening a file that could have changed while
+    // the online database snapshot was being taken.
+    let mut secrets = Vec::new();
     for name in SECRET_FILES {
         let from = data_dir.join(name);
-        if from.exists() {
+        if name == crate::secrets::KEY_FILE
+            && let Some(key) = &credential_key
+        {
+            kahawai_core::private::write(&dest.join(name), key)
+                .with_context(|| format!("copying {name}"))?;
+            secrets.push(name.to_string());
+        } else if from.exists() {
             std::fs::copy(&from, dest.join(name)).with_context(|| format!("copying {name}"))?;
+            secrets.push(name.to_string());
         }
     }
     let has_config = match config {
@@ -140,6 +178,7 @@ pub async fn backup(data_dir: &Path, config: Option<&Path>, dest: &Path) -> Resu
         subtitle_bytes,
         has_pki: dest.join("pki").exists(),
         has_config,
+        secrets,
     };
     std::fs::write(dest.join(MANIFEST), serde_json::to_vec_pretty(&manifest)?)
         .context("writing the manifest")?;
@@ -151,7 +190,7 @@ pub async fn backup(data_dir: &Path, config: Option<&Path>, dest: &Path) -> Resu
 /// Refuses a data dir that already holds a database unless `force`: a
 /// restore over a live hub would leave the on-disk state and the running
 /// process disagreeing, and the running process wins until it exits.
-pub fn restore(src: &Path, data_dir: &Path, force: bool) -> Result<Manifest> {
+pub async fn restore(src: &Path, data_dir: &Path, force: bool) -> Result<Manifest> {
     let raw = std::fs::read(src.join(MANIFEST))
         .with_context(|| format!("{} is not a kahawai snapshot", src.display()))?;
     let manifest: Manifest = serde_json::from_slice(&raw).context("unreadable manifest")?;
@@ -160,6 +199,56 @@ pub fn restore(src: &Path, data_dir: &Path, force: bool) -> Result<Manifest> {
             "snapshot format {} is newer than this build understands ({FORMAT})",
             manifest.format
         );
+    }
+    // Validate the complete source before touching a destination. In
+    // particular, a missing credential key must not be discovered after
+    // `--force` has already replaced the live database.
+    anyhow::ensure!(
+        src.join("hub.db").is_file(),
+        "the snapshot does not have hub.db"
+    );
+    for name in &manifest.secrets {
+        anyhow::ensure!(
+            src.join(name).is_file(),
+            "the manifest lists {name}, and the snapshot does not have it"
+        );
+    }
+    if manifest.format >= 2 {
+        let db = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                sqlx::sqlite::SqliteConnectOptions::new()
+                    .filename(src.join("hub.db"))
+                    .read_only(true),
+            )
+            .await
+            .context("opening the snapshot database")?;
+        let expected: Option<String> =
+            sqlx::query_scalar("SELECT value FROM settings WHERE key = ?")
+                .bind(crate::secrets::SEEDED_SETTING)
+                .fetch_optional(&db)
+                .await
+                .context("reading the snapshot credential key marker")?;
+        db.close().await;
+        if let Some(expected) = expected {
+            let key_path = src.join(crate::secrets::KEY_FILE);
+            anyhow::ensure!(
+                manifest
+                    .secrets
+                    .iter()
+                    .any(|name| name == crate::secrets::KEY_FILE)
+                    && key_path.is_file(),
+                "the snapshot database requires {}, but the snapshot does not carry it",
+                crate::secrets::KEY_FILE
+            );
+            let key = std::fs::read(&key_path)
+                .with_context(|| format!("reading {}", key_path.display()))?;
+            anyhow::ensure!(
+                crate::secrets::fingerprint(&key) == expected,
+                "{} does not match the snapshot database",
+                crate::secrets::KEY_FILE
+            );
+        }
     }
     let existing = data_dir.join("hub.db");
     if existing.exists() && !force {
