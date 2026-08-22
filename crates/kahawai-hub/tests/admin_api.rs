@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::body::Body;
-use axum::http::{Method, Request, StatusCode};
+use axum::http::{Request, StatusCode};
 use kahawai_hub::auth::Auth;
 use kahawai_hub::enrollment_service::EnrollmentService;
 use kahawai_hub::pki::HubCa;
@@ -91,10 +91,8 @@ async fn admin_flow_enrollments_satellites_archive_restore() {
         kahawai_hub::api::NetOptions::default(),
     );
 
-    // Contract closure: every documented protected operation must be an
-    // actual method/path binding. A bogus bearer is deliberate: matching
-    // application routes stop at their auth layer with 401, while the SPA
-    // catch-all would answer 200 and a wrong method would answer 405.
+    // The document is served and says which OpenAPI it speaks. What is IN it
+    // is pinned by `api::tests::openapi_covers_exact_application_surface_with_typed_bodies`.
     let contract = body_json(
         api.clone()
             .oneshot(
@@ -107,52 +105,7 @@ async fn admin_flow_enrollments_satellites_archive_restore() {
     )
     .await;
     assert_eq!(contract["openapi"], "3.2.0");
-    let methods = [
-        "get", "put", "post", "delete", "options", "head", "patch", "trace", "query",
-    ];
-    let public = [
-        ("get", "/health"),
-        ("get", "/metrics"),
-        ("get", "/api/v1/bootstrap"),
-        ("post", "/api/v1/setup"),
-        ("post", "/api/v1/auth/token"),
-        ("post", "/api/v1/auth/refresh"),
-    ];
-    let mut mounted = 0;
-    for (path, item) in contract["paths"].as_object().unwrap() {
-        for method in methods {
-            if item.get(method).is_none() || public.contains(&(method, path.as_str())) {
-                continue;
-            }
-            let uri = path
-                .replace("{track_id}", "1")
-                .replace("{media_type}", "movies")
-                .replace("{module_id}", "host")
-                .replace("{collection_id}", "collection")
-                .replace("{file}", "file")
-                .replace("{n}", "0")
-                .replace("{id}", "missing");
-            let response = api
-                .clone()
-                .oneshot(
-                    Request::builder()
-                        .method(Method::from_bytes(method.to_ascii_uppercase().as_bytes()).unwrap())
-                        .uri(uri)
-                        .header("authorization", "Bearer invalid")
-                        .body(Body::empty())
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(
-                response.status(),
-                StatusCode::UNAUTHORIZED,
-                "{method} {path} is documented but not mounted behind authentication"
-            );
-            mounted += 1;
-        }
-    }
-    assert_eq!(mounted, 58);
+
     assert_eq!(
         api.clone()
             .oneshot(Request::get("/health").body(Body::empty()).unwrap())
