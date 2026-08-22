@@ -135,10 +135,10 @@ async function saveBandwidth(typed: string) {
   bandwidth.value = values.value['bandwidth_kbps'] ?? ''
 }
 
-const ladder = computed(() => assLadder(values.value['subs.ass'] ?? ''))
+const ladder = computed(() => assLadder(values.value['ass_order'] ?? ''))
 function moveRung(from: number, to: number) {
   const next = moved(ladder.value, from, to)
-  if (next) void save('subs.ass', stored(next))
+  if (next) void save('ass_order', stored(next))
 }
 
 /// HUB-31: which numbering an absolute-numbered series is shown in. The two

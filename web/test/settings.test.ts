@@ -168,7 +168,7 @@ describe('the styled-subtitle ladder', () => {
     await flushPromises()
     expect(putPref).toHaveBeenCalledWith({
       scope: '',
-      key: 'subs.ass',
+      key: 'ass_order',
       value: 'flatten,burn,overlay',
     })
   })
