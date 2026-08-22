@@ -68,7 +68,11 @@ pub async fn backup(data_dir: &Path, config: Option<&Path>, dest: &Path) -> Resu
             dest.display()
         );
     }
-    std::fs::create_dir_all(dest).with_context(|| format!("creating {}", dest.display()))?;
+    // 0700, so what lands inside is unreachable to anyone else whatever mode
+    // the writer chose: the snapshot holds every password hash and every
+    // session on the hub.
+    kahawai_core::private::create_dir(dest)
+        .with_context(|| format!("creating {}", dest.display()))?;
 
     // The database first, and through sqlite rather than the filesystem:
     // copying hub.db while the hub runs would catch a torn page or miss
@@ -84,6 +88,10 @@ pub async fn backup(data_dir: &Path, config: Option<&Path>, dest: &Path) -> Resu
         .await
         .context("VACUUM INTO — is the destination on a writable filesystem?")?;
     pool.close().await;
+    // SQLite gives the new file 0666 & ~umask — 0644 under the usual one —
+    // and there is no pragma for it. The directory above already hides it;
+    // this makes it survive being moved somewhere less private.
+    kahawai_core::private::narrow(&db_out).context("restricting the snapshot database")?;
     let db_bytes = std::fs::metadata(&db_out)?.len();
 
     let mut subtitle_files = 0;
@@ -168,7 +176,11 @@ pub fn restore(src: &Path, data_dir: &Path, force: bool) -> Result<Manifest> {
     }
     let jwt = src.join("jwt.secret");
     if jwt.exists() {
-        std::fs::copy(&jwt, data_dir.join("jwt.secret")).context("restoring jwt.secret")?;
+        let to = data_dir.join("jwt.secret");
+        std::fs::copy(&jwt, &to).context("restoring jwt.secret")?;
+        // `fs::copy` carries the SOURCE's mode, and a snapshot that has been
+        // through tar or an object store commonly comes back 0644.
+        kahawai_core::private::narrow(&to).context("restricting jwt.secret")?;
     }
     Ok(manifest)
 }

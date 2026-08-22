@@ -11,9 +11,23 @@ pub async fn open(data_dir: &Path) -> Result<SqlitePool> {
     std::fs::create_dir_all(data_dir)
         .with_context(|| format!("creating {}", data_dir.display()))?;
     let path = data_dir.join("hub.db");
+    match kahawai_core::private::create(&path) {
+        Ok(file) => drop(file),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            anyhow::ensure!(
+                std::fs::metadata(&path)?.is_file(),
+                "{} is not a file",
+                path.display()
+            );
+            kahawai_core::private::narrow(&path)
+                .with_context(|| format!("restricting {}", path.display()))?;
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("creating {}", path.display()));
+        }
+    }
     let opts = SqliteConnectOptions::new()
         .filename(&path)
-        .create_if_missing(true)
         .journal_mode(SqliteJournalMode::Wal)
         .foreign_keys(true)
         // Overwrite deleted rows instead of unlinking them: a freed cell keeps
@@ -45,17 +59,10 @@ pub async fn open(data_dir: &Path) -> Result<SqlitePool> {
         .connect_with(opts)
         .await
         .with_context(|| format!("opening {}", path.display()))?;
-    // The DB holds password hashes and session state; SQLite gives -wal/-shm
-    // the same mode as the main file, so 0600 here covers all three.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        for suffix in ["", "-wal", "-shm"] {
-            let p = data_dir.join(format!("hub.db{suffix}"));
-            if p.exists() {
-                std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600))?;
-            }
-        }
+    // WAL and SHM are created by SQLite after the main file, inheriting its
+    // mode. Narrow them as well for existing databases that arrived wider.
+    for suffix in ["-wal", "-shm"] {
+        kahawai_core::private::narrow(&data_dir.join(format!("hub.db{suffix}")))?;
     }
     sqlx::migrate!("./migrations")
         .run(&pool)
@@ -326,6 +333,30 @@ async fn install_derived(pool: &SqlitePool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_database_is_private_before_and_after_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hub.db");
+
+        let db = open(dir.path()).await.unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        db.close().await;
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let db = open(dir.path()).await.unwrap();
+        assert_eq!(
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        db.close().await;
+    }
 
     /// The provider keys live in `settings` in the clear. The second row is
     /// what keeps the page allocated, so the freeblock is not simply freed.

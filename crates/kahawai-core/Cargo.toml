@@ -12,4 +12,6 @@ serde = { workspace = true }
 utoipa = { workspace = true }
 
 [dev-dependencies]
+libc = { workspace = true }
 serde_json = { workspace = true }
+tempfile = { workspace = true }

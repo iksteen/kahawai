@@ -293,17 +293,14 @@ impl Auth {
     /// Load or create the JWT secret; enter setup mode if no users exist.
     pub async fn new(db: SqlitePool, data_dir: &Path) -> Result<Self> {
         let secret_path = data_dir.join("jwt.secret");
+        kahawai_core::private::narrow(&secret_path)
+            .with_context(|| format!("restricting {}", secret_path.display()))?;
         let secret = if secret_path.exists() {
             std::fs::read(&secret_path)?
         } else {
             let mut s = vec![0u8; 32];
             OsRng.fill_bytes(&mut s);
-            std::fs::write(&secret_path, &s)?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&secret_path, std::fs::Permissions::from_mode(0o600))?;
-            }
+            kahawai_core::private::write(&secret_path, &s)?;
             s
         };
 
@@ -826,4 +823,26 @@ pub async fn reset_password(db: &SqlitePool, username: &str, new_password: &str)
     .await?;
     tx.commit().await?;
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[tokio::test]
+    async fn loading_an_existing_jwt_secret_restricts_its_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::open(dir.path()).await.unwrap();
+        let path = dir.path().join("jwt.secret");
+        std::fs::write(&path, [7_u8; 32]).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        Auth::new(db, dir.path()).await.unwrap();
+
+        assert_eq!(
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
 }

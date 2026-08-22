@@ -33,6 +33,8 @@ impl HubCa {
         if !(key_path.exists() && cert_path.exists()) {
             create(pki_dir, &key_path, &cert_path)?;
         }
+        kahawai_core::private::narrow(&key_path)
+            .with_context(|| format!("restricting {}", key_path.display()))?;
         let key_pem = fs::read_to_string(&key_path)
             .with_context(|| format!("reading {}", key_path.display()))?;
         let ca_cert_pem = fs::read_to_string(&cert_path)
@@ -141,13 +143,7 @@ pub struct SignedCert {
 
 /// Write a key file with 0600 permissions (SEC-1).
 fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
-    fs::write(path, bytes).with_context(|| format!("writing {}", path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-    }
-    Ok(())
+    kahawai_core::private::write(path, bytes).with_context(|| format!("writing {}", path.display()))
 }
 
 /// Convenience: the hub's PKI directory under its data dir.
@@ -183,9 +179,24 @@ mod tests {
                 .mode();
             assert_eq!(mode & 0o777, 0o600);
         }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(dir.path().join("ca.key"), fs::Permissions::from_mode(0o644))
+                .unwrap();
+        }
         // Reload gives the same CA, not a new one.
         let reloaded = HubCa::load_or_create(dir.path()).unwrap();
         assert_eq!(reloaded.ca_fingerprint(), fp);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(dir.path().join("ca.key"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
     }
 
     #[test]

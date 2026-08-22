@@ -2004,10 +2004,12 @@ name = "kahawai-core"
 version = "0.0.0-dev"
 dependencies = [
  "data-encoding",
+ "libc",
  "rcgen",
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "tempfile",
  "utoipa",
 ]
 
@@ -2034,6 +2036,7 @@ dependencies = [
  "kahawai-transcoder",
  "kahawai-transport",
  "leptess",
+ "libc",
  "md-5",
  "rand_core 0.6.4",
  "rcgen",

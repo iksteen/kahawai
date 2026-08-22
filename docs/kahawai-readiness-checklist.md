@@ -460,12 +460,19 @@ marked in that document.
 - [ ] BKP-5 Treat restored directories as authoritative: stale files in the
       current PKI, subtitle or state trees are removed rather than merged into
       the restored snapshot
-- [~] BKP-6 JWT and satellite identity secrets, hub PKI keys and the database
-      already receive mode 0600. Enforce mode 0700 on private state, session,
-      backup, PKI, subtitle and temporary directories, and mode 0600 on the
-      remaining configuration snapshots, backup outputs, logs and generated
-      user artifacts on Unix; add regression checks for both existing and new
-      permission guarantees
+- [~] BKP-6 `kahawai_core::private` is the one way to make a file private and
+      the one way to keep it so. Every secret this hub writes — `jwt.secret`,
+      the CA key, `sat.key` and the renewal pair — is created 0600 by passing
+      the mode to `open(2)`, so none of them exists at a wider mode even for
+      an instant, and `narrow` restricts one that arrives wider from a copy
+      this hub did not make. A backup directory is created 0700 and its
+      database narrowed to 0600 afterwards, since SQLite writes `VACUUM INTO`
+      output at
+      `0666 & ~umask` and has no pragma for it; `private::tests` and
+      `backup_restore::a_snapshot_is_not_readable_by_anyone_else` are the
+      regression checks. Remaining: 0700 on private state, session, PKI,
+      subtitle and temporary directories, and 0600 on configuration snapshots,
+      logs and generated user artifacts
 - [ ] BKP-7 Document exactly which caches are intentionally excluded and prove
       the restored hub accepts the original satellite certificates and resumes
       durable user/library state without an unplanned rescan

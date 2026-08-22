@@ -22,6 +22,10 @@ const RENEWAL_FILE: &str = "renewal.pem";
 
 /// Load a previously enrolled identity, or `None` if not (fully) enrolled.
 pub fn load(state_dir: &Path) -> Result<Option<SatelliteIdentity>> {
+    for private in ["sat.key", RENEWAL_FILE] {
+        kahawai_core::private::narrow(&state_dir.join(private))
+            .with_context(|| format!("restricting {}", state_dir.join(private).display()))?;
+    }
     if !FILES.iter().all(|f| state_dir.join(f).exists()) {
         return Ok(None);
     }
@@ -52,12 +56,7 @@ pub fn load(state_dir: &Path) -> Result<Option<SatelliteIdentity>> {
 /// file, written via temp + rename so the pair changes atomically.
 pub fn store_renewal(state_dir: &Path, id: &SatelliteIdentity) -> Result<()> {
     let tmp = state_dir.join("renewal.pem.tmp");
-    fs::write(&tmp, format!("{}{}", id.key_pem, id.cert_pem))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))?;
-    }
+    kahawai_core::private::write(&tmp, format!("{}{}", id.key_pem, id.cert_pem).as_bytes())?;
     fs::rename(&tmp, state_dir.join(RENEWAL_FILE)).context("activating renewed identity")?;
     Ok(())
 }
@@ -70,12 +69,7 @@ pub fn store(state_dir: &Path, id: &SatelliteIdentity) -> Result<()> {
     fs::write(state_dir.join("sat.crt"), &id.cert_pem)?;
     fs::write(state_dir.join("ca.crt"), &id.ca_pem)?;
     let key_path = state_dir.join("sat.key");
-    fs::write(&key_path, &id.key_pem)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600))?;
-    }
+    kahawai_core::private::write(&key_path, id.key_pem.as_bytes())?;
     Ok(())
 }
 
@@ -95,13 +89,56 @@ mod tests {
             ca_pem: "CA".into(),
         };
         store(dir.path(), &id).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(
+                dir.path().join("sat.key"),
+                fs::Permissions::from_mode(0o644),
+            )
+            .unwrap();
+        }
         let back = load(dir.path()).unwrap().unwrap();
         assert_eq!(back.module_id, "01H");
         assert_eq!(back.ca_pem, "CA");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(dir.path().join("sat.key"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
 
         // A missing file means not enrolled — no half-identities.
         fs::remove_file(dir.path().join("ca.crt")).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(
+                dir.path().join("sat.key"),
+                fs::Permissions::from_mode(0o644),
+            )
+            .unwrap();
+        }
         assert!(load(dir.path()).unwrap().is_none());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(dir.path().join("sat.key"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600,
+                "a partial identity still left its private key readable"
+            );
+        }
     }
 
     #[test]
@@ -121,10 +158,31 @@ mod tests {
             ..base.clone()
         };
         store_renewal(dir.path(), &renewed).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(
+                dir.path().join(RENEWAL_FILE),
+                fs::Permissions::from_mode(0o644),
+            )
+            .unwrap();
+        }
         let back = load(dir.path()).unwrap().unwrap();
         assert_eq!(back.key_pem, renewed.key_pem);
         assert_eq!(back.cert_pem, renewed.cert_pem);
         assert_eq!(back.ca_pem, "CA");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(dir.path().join(RENEWAL_FILE))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
 
         // Re-enrollment wipes the overlay.
         store(dir.path(), &base).unwrap();

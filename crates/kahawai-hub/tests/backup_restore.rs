@@ -101,6 +101,36 @@ async fn a_snapshot_restores_the_database_pki_and_subtitles() {
     db.close().await;
 }
 
+/// A snapshot is every password hash and every session, sitting in a
+/// directory somebody chose. The umask it was taken under is not something to
+/// depend on.
+#[tokio::test]
+async fn a_snapshot_is_not_readable_by_anyone_else() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    db.close().await;
+    let dest = tempfile::tempdir().unwrap().keep().join("snapshot");
+
+    // Under the umask that gives SQLite its usual 0644.
+    let previous = unsafe { libc::umask(0o022) };
+    let taken = kahawai_hub::backup::backup(dir.path(), None, &dest).await;
+    unsafe { libc::umask(previous) };
+    taken.unwrap();
+
+    let mode = |p: std::path::PathBuf| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(
+        mode(dest.clone()),
+        0o700,
+        "the snapshot directory is enterable"
+    );
+    assert_eq!(
+        mode(dest.join("hub.db")),
+        0o600,
+        "the snapshot database is readable by anyone with the path"
+    );
+}
+
 #[tokio::test]
 async fn a_restore_refuses_to_overwrite_without_being_told() {
     let live = tempfile::tempdir().unwrap();
