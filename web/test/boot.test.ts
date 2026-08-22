@@ -17,13 +17,14 @@ vi.mock('../src/api/session.ts', () => ({
 const { bootstrap } = await import('../src/api/generated/kahawai.ts')
 const { onTokensCleared, restoreSession } = await import('../src/api/session.ts')
 const { useBoot } = await import('../src/composables/boot.ts')
+const { QueryClient } = await import('@tanstack/vue-query')
 
 /// In a scope, because the composable registers a session callback and drops
 /// it on dispose — and a test that leaked one would have the next test's
 /// session events delivered to a dead ref.
-function booted() {
+function booted(queryClient = new QueryClient()) {
   const scope = effectScope()
-  const boot = scope.run(() => useBoot())!
+  const boot = scope.run(() => useBoot(queryClient))!
   return { ...boot, stop: () => scope.stop() }
 }
 
@@ -222,6 +223,32 @@ describe('a session that ends while the app is open', () => {
     ended(false)
     expect(boot.phase.value).toBe('login')
     expect(boot.note.value).not.toBe('')
+    boot.stop()
+  })
+
+  test("and takes the last account's answers with it, however it ended", async () => {
+    vi.mocked(bootstrap).mockResolvedValue(ANSWERS)
+    vi.mocked(restoreSession).mockResolvedValue('authenticated')
+    const queryClient = new QueryClient()
+    const boot = booted(queryClient)
+    await boot.start()
+    const seed = () => {
+      queryClient.setQueryData(['libraries'], { libraries: [{ id: 'theirs' }] })
+      queryClient.setQueryData(['prefs'], { prefs: [] })
+    }
+    const ended = vi.mocked(onTokensCleared).mock.calls[0]![0]!
+
+    // Expired, which is the common way a session ends.
+    seed()
+    ended(false)
+    expect(queryClient.getQueryCache().getAll()).toEqual([])
+
+    // And with the app already closed, which is where the DELIBERATE
+    // sign-out lands: `leave` moves the phase before signOut fires this.
+    seed()
+    expect(boot.phase.value).not.toBe('app')
+    ended(true)
+    expect(queryClient.getQueryCache().getAll()).toEqual([])
     boot.stop()
   })
 

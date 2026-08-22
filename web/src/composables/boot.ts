@@ -5,6 +5,7 @@
 /// own it.
 
 import { onScopeDispose, readonly, ref } from 'vue'
+import type { QueryClient } from '@tanstack/vue-query'
 
 import { clearQueue } from './queue.ts'
 import { onTokensCleared, restoreSession } from '../api/session.ts'
@@ -16,7 +17,9 @@ import { sentence } from '../domain/refusal.ts'
 /// check, and the page is blank until it lands.
 export const BOOTSTRAP_TIMEOUT_MS = 10_000
 
-export function useBoot() {
+/// Takes the query client: this runs in an effect scope, not a component, so
+/// there is no injection context to ask.
+export function useBoot(queryClient: QueryClient) {
   const phase = ref<Phase>('boot')
   /// The bootstrap request itself failed. Distinct from every other error in
   /// the app because it happens before there IS an app: no header, no route,
@@ -40,6 +43,11 @@ export function useBoot() {
     // tracks it may not read, which the player retries for ever because a track
     // it may not see looks exactly like a mediahost that is down.
     clearQueue()
+    // Beside the queue and outside the guard: every cached answer was about
+    // the account that just left, and a deliberate sign-out arrives here with
+    // the phase already moved, so a clear under the guard would never run for
+    // it.
+    queryClient.clear()
     if (phase.value !== 'app') return
     note.value = endedNote(deliberate)
     phase.value = 'login'

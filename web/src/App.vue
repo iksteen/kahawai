@@ -6,6 +6,7 @@
 /// returns you to the page you were reading. A deliberate sign-out does not —
 /// see `leave`.
 import { computed, nextTick, onMounted } from 'vue'
+import { useQueryClient } from '@tanstack/vue-query'
 import { useRoute, useRouter } from 'vue-router'
 
 import AppShell from './components/AppShell.vue'
@@ -25,7 +26,7 @@ import { useQueue } from './composables/queue.ts'
 const route = useRoute()
 const router = useRouter()
 
-const { phase, bootError, setupAvailable, setupUrl, note, start } = useBoot()
+const { phase, bootError, setupAvailable, setupUrl, note, start } = useBoot(useQueryClient())
 onMounted(() => void start())
 
 /// The header's jump menu lists what the home screen already asked for, so

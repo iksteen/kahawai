@@ -4,7 +4,7 @@
 import { flushPromises, mount } from '@vue/test-utils'
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 import { defineComponent, h, onUnmounted, ref } from 'vue'
-import { VueQueryPlugin } from '@tanstack/vue-query'
+import { QueryClient, VueQueryPlugin } from '@tanstack/vue-query'
 import { createMemoryHistory, createRouter } from 'vue-router'
 
 import AppShell from '../src/components/AppShell.vue'
@@ -15,15 +15,21 @@ const bootError = ref('')
 const note = ref('')
 const start = vi.fn()
 
+/// Records the client App hands it: clearing a client nobody is using would
+/// pass every other test in here.
+const bootGot: { queryClient?: unknown } = {}
 vi.mock('../src/composables/boot.ts', () => ({
-  useBoot: () => ({
-    phase,
-    bootError,
-    note,
-    setupAvailable: ref(false),
-    setupUrl: ref(undefined),
-    start,
-  }),
+  useBoot: (queryClient: unknown) => {
+    bootGot.queryClient = queryClient
+    return {
+      phase,
+      bootError,
+      note,
+      setupAvailable: ref(false),
+      setupUrl: ref(undefined),
+      start,
+    }
+  },
 }))
 vi.mock('../src/api/generated/kahawai.ts', () => ({
   listLibraries: vi.fn(async () => ({ libraries: [] })),
@@ -80,7 +86,20 @@ describe('what is on screen', () => {
     // between yet, and "Home" over a blank page is a lie about both.
     const router = app()
     await router.isReady()
-    const wrapper = mount(App, { global: { plugins: [router, VueQueryPlugin] } })
+    const queryClient = new QueryClient()
+    const wrapper = mount(App, {
+      global: {
+        plugins: [
+          router,
+          [VueQueryPlugin, { queryClient }] as [
+            typeof VueQueryPlugin,
+            { queryClient: QueryClient },
+          ],
+        ],
+      },
+    })
+    // boot clears the cache when a session ends; it has to be the app's own.
+    expect(bootGot.queryClient).toBe(queryClient)
     expect(wrapper.text()).toBe('')
     expect(wrapper.find('form').exists()).toBe(false)
     expect(wrapper.find('[role="status"]').exists()).toBe(false)
