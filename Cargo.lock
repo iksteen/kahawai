@@ -2025,6 +2025,7 @@ dependencies = [
  "bytes",
  "data-encoding",
  "flate2",
+ "hmac 0.13.0",
  "image",
  "ipnet",
  "jsonwebtoken",

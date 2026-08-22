@@ -1733,6 +1733,22 @@ async fn admin_set_anidb(
             "username and password required",
         ));
     }
+    // Read before the write below overwrites it: whether this is the same
+    // account decides whether the stored session is still ours to use.
+    let same_account = state
+        .registry
+        .get_setting(crate::anidb::USER_SETTING)
+        .await
+        .map_err(internal)?
+        .as_deref()
+        == Some(user)
+        && state
+            .registry
+            .get_setting(crate::anidb::PASS_SETTING)
+            .await
+            .map_err(internal)?
+            .as_deref()
+            == Some(pass);
     state
         .registry
         .set_setting(crate::anidb::USER_SETTING, user)
@@ -1753,6 +1769,21 @@ async fn admin_set_anidb(
         )
         .await
         .map_err(internal)?;
+    // Only when the account changed, and before the login below: a stored
+    // session belongs to the account that authenticated it, so reusing one
+    // across a change would report these credentials verified without ever
+    // having used them. Re-saving the same account keeps its session --
+    // AniDB counts logins, and one per press of Save is a habit worth not
+    // starting. The UDP key needs no such care: ENCRYPT is renegotiated on
+    // every login, and a wrong key fails loudly.
+    if !same_account {
+        let forgotten = crate::anidb::forget_session(state.enricher.data_dir());
+        // The file is only half of it: the enricher holds a logged-in client
+        // for the process, and that one is still the previous account. Mark it
+        // stale even if the durable clear failed.
+        state.enricher.anidb_forget();
+        forgotten.map_err(internal)?;
+    }
     // Validate immediately: a bad login should fail HERE, not silently
     // during the next enrichment run.
     let key = state
@@ -1906,6 +1937,7 @@ async fn admin_set_tmdb(
     });
     Ok(Json(SavedResponse { saved: true }))
 }
+
 
 /// Get enrichment status
 ///

@@ -27,6 +27,7 @@ thiserror = { workspace = true }
 rcgen = { workspace = true }
 x509-parser = { workspace = true }
 sha2 = { workspace = true }
+hmac = { workspace = true }
 data-encoding = { workspace = true }
 time = { workspace = true }
 tracing = { workspace = true }

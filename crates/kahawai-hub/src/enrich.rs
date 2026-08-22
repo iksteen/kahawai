@@ -68,6 +68,10 @@ pub struct Enricher {
     /// in one evening; sessions are cheap to hold and expensive to
     /// re-establish.
     anidb: tokio::sync::Mutex<Option<crate::anidb::Anidb>>,
+    /// Set when the ACCOUNT changes, so the held session — which belongs to
+    /// the previous account, and spends its quota and carries its ban risk —
+    /// is dropped before the next run instead of at the next restart.
+    anidb_stale: AtomicBool,
     /// TheTVDB's bearer token, fetched on FIRST USE and kept for the
     /// process (it is valid for weeks). Lazy so that a login failure
     /// cannot remove TVDB from a whole run: TMDB is present whenever
@@ -75,11 +79,46 @@ pub struct Enricher {
     /// differently made a transient outage indistinguishable from "no
     /// TVDB configured" — including to the selection, which then
     /// stopped counting TVDB work as owed.
-    tvdb: tokio::sync::Mutex<Option<std::sync::Arc<String>>>,
+    ///
+    /// Labelled with a fingerprint of the credential that minted it. A key
+    /// rotated because it leaked would otherwise keep working through the
+    /// token the old one bought, for weeks, with the new key never
+    /// exercised. Labelling it beats invalidating from the admin route,
+    /// which would have to reach into this mutex — held across a login that
+    /// `gate` can park for as long as TVDB's Retry-After asks, up to an hour.
+    tvdb: tokio::sync::Mutex<Option<(String, std::sync::Arc<String>)>>,
     /// The byte plane, for HUB-9: reading a .nfo means leasing it from the
     /// mediahost that holds it. Attached at startup; absent in tests, where
     /// the local provider then simply is not in the chain.
     sessions: std::sync::OnceLock<Arc<crate::sessions::Sessions>>,
+}
+
+/// Names the credential a token was minted from, without keeping a second
+/// copy of it. Lengths go in with the parts, so a key that ends where a pin
+/// begins cannot fingerprint as another pair.
+fn tvdb_fingerprint(creds: &TvdbCreds) -> String {
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update((creds.key.len() as u64).to_le_bytes());
+    hasher.update(creds.key.as_bytes());
+    match creds.pin.as_deref() {
+        Some(pin) => {
+            hasher.update([1u8]);
+            hasher.update(pin.as_bytes());
+        }
+        None => hasher.update([0u8]),
+    }
+    data_encoding::HEXLOWER.encode(&hasher.finalize())
+}
+
+/// The cached token, but only for the credential that bought it.
+fn cached_token(
+    slot: &Option<(String, std::sync::Arc<String>)>,
+    want: &str,
+) -> Option<std::sync::Arc<String>> {
+    slot.as_ref()
+        .filter(|(minted_from, _)| minted_from == want)
+        .map(|(_, token)| token.clone())
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -548,6 +587,7 @@ impl Enricher {
             progress: Default::default(),
             anidb: Default::default(),
             tvdb: Default::default(),
+            anidb_stale: AtomicBool::new(false),
             sessions: Default::default(),
         }
     }
@@ -612,20 +652,32 @@ impl Enricher {
     /// callers queue on the mutex, so a fleet of episode tasks starting
     /// together still costs one login.
     pub(crate) async fn tvdb_token(&self, creds: &TvdbCreds) -> Result<std::sync::Arc<String>> {
+        let want = tvdb_fingerprint(creds);
         let mut slot = self.tvdb.lock().await;
-        if let Some(t) = slot.clone() {
+        if let Some(t) = cached_token(&slot, &want) {
             return Ok(t);
         }
         let token = std::sync::Arc::new(self.tvdb_login(&creds.key, creds.pin.as_deref()).await?);
-        *slot = Some(token.clone());
+        // Safe to store even if the key was replaced while this login was in
+        // the air: it is stored under the credential it came from, so the next
+        // caller — carrying the key stored now — will not be given it.
+        *slot = Some((want, token.clone()));
         Ok(token)
     }
 
     /// Drop the cached token so the next use logs in again. A token
     /// lasts weeks, so the usual reason a request fails on auth is that
     /// this one finally expired — and the process outlives that.
-    async fn tvdb_forget(&self) {
+    pub(crate) async fn tvdb_forget(&self) {
         *self.tvdb.lock().await = None;
+    }
+
+    /// Forget the logged-in AniDB client, so the next run authenticates with
+    /// whatever account is configured now. Setting a flag rather than taking
+    /// the mutex: a lookup holds it across a UDP round trip, and an admin
+    /// saving credentials should not wait on that.
+    pub(crate) fn anidb_forget(&self) {
+        self.anidb_stale.store(true, Ordering::Release);
     }
 
     /// TheTVDB v4: login yields a bearer token (valid for weeks; we
@@ -1522,6 +1574,9 @@ impl Enricher {
         let lists = crate::anime::AnimeLists::load(&self.http, &self.data_dir).await?;
         // Reuse the process's session; only authenticate when there
         // isn't one (first run, or the last one went stale).
+        if self.anidb_stale.swap(false, Ordering::AcqRel) {
+            *self.anidb.lock().await = None;
+        }
         if self.anidb.lock().await.is_some() {
             return Ok(AnimeProvider {
                 enricher: self.clone(),
@@ -3271,6 +3326,92 @@ mod tests {
         // A v3 key is 32 hex characters and has no business in a header.
         assert!(!is_v4_token("0123456789abcdef0123456789abcdef"));
         assert!(!is_v4_token(" 0123456789abcdef0123456789abcdef"));
+    }
+
+    /// A TVDB token lasts weeks, so a key rotated because it leaked would
+    /// keep working through a token minted from the old one until the
+    /// process restarted — unless the cache says which key bought it.
+    #[test]
+    fn a_token_is_only_reused_for_the_key_that_minted_it() {
+        let old = TvdbCreds {
+            key: "leaked".into(),
+            pin: None,
+        };
+        let new = TvdbCreds {
+            key: "rotated".into(),
+            pin: None,
+        };
+        let token = std::sync::Arc::new(String::from("bought-with-the-leaked-key"));
+        let slot = Some((tvdb_fingerprint(&old), token.clone()));
+
+        assert_eq!(cached_token(&slot, &tvdb_fingerprint(&old)), Some(token));
+        assert!(
+            cached_token(&slot, &tvdb_fingerprint(&new)).is_none(),
+            "the rotated key's requests would go out as the leaked one"
+        );
+        assert!(cached_token(&None, &tvdb_fingerprint(&old)).is_none());
+    }
+
+    /// The subscriber pin selects the account behind the same key, and an
+    /// empty pin is not the absence of one.
+    #[test]
+    fn the_tvdb_pin_is_part_of_the_credential() {
+        let fingerprint = |key: &str, pin: Option<&str>| {
+            tvdb_fingerprint(&TvdbCreds {
+                key: key.into(),
+                pin: pin.map(str::to_owned),
+            })
+        };
+        assert_ne!(fingerprint("key", Some("1234")), fingerprint("key", None));
+        assert_ne!(fingerprint("key", Some("")), fingerprint("key", None));
+        assert_ne!(
+            fingerprint("key", Some("1234")),
+            fingerprint("key", Some("5"))
+        );
+        assert_ne!(fingerprint("ab", Some("c")), fingerprint("a", Some("bc")));
+        assert_eq!(
+            fingerprint("key", Some("1234")),
+            fingerprint("key", Some("1234"))
+        );
+    }
+
+    /// The token that finally expires is the usual reason a request fails on
+    /// auth, and the process outlives that.
+    #[tokio::test]
+    async fn forgetting_the_tvdb_token_empties_the_cache() {
+        let enricher = Enricher::new(tempfile::tempdir().unwrap().keep());
+        let creds = TvdbCreds {
+            key: "key".into(),
+            pin: None,
+        };
+        *enricher.tvdb.lock().await = Some((
+            tvdb_fingerprint(&creds),
+            std::sync::Arc::new("expired".into()),
+        ));
+
+        enricher.tvdb_forget().await;
+        assert!(
+            enricher.tvdb.lock().await.is_none(),
+            "the next request would still carry the expired token"
+        );
+    }
+
+    /// A lookup holds the AniDB mutex across a UDP round trip, so the account
+    /// change flags the session instead of taking it — and the flag must
+    /// survive until a run reads it, not be consumed by the admin request.
+    #[tokio::test]
+    async fn changing_the_anidb_account_drops_the_held_session() {
+        let enricher = Enricher::new(tempfile::tempdir().unwrap().keep());
+        let held = enricher.anidb.lock().await;
+
+        // Would deadlock if it waited for the mutex; the test would hang
+        // rather than fail, which is the failure this is here to prevent.
+        enricher.anidb_forget();
+        assert!(
+            enricher.anidb_stale.load(Ordering::Acquire),
+            "the next run would keep querying as the previous account"
+        );
+        drop(held);
     }
 
     /// Both halves of one error. 401 is the revoked-key case, the likeliest

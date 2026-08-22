@@ -174,7 +174,7 @@ pub async fn gather(
               WHERE i.kind IN ('movie', 'show', 'album')
                 AND NOT EXISTS (SELECT 1 FROM item_match m WHERE m.item_id = i.id)")
         .await,
-        anidb_banned_secs: crate::anidb::ban_remaining(data_dir).unwrap_or(0),
+        anidb_banned_secs: crate::anidb::ban_remaining(data_dir)?.unwrap_or(0),
     })
 }
 

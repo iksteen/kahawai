@@ -56,6 +56,7 @@ use sqlx::{Row, SqlitePool};
 pub const ACCESS_TTL_SECS: i64 = 15 * 60;
 pub const REFRESH_TTL_SECS: i64 = 30 * 24 * 3600;
 pub const MIN_PASSWORD_CHARS: usize = 12;
+pub const JWT_SECRET_FILE: &str = "jwt.secret";
 
 /// JWT issuer: the authority that minted the credential. The per-hub signing
 /// secret distinguishes installations; this stable value names the authority
@@ -292,7 +293,7 @@ fn verify_password(password: &str, hash: &str) -> bool {
 impl Auth {
     /// Load or create the JWT secret; enter setup mode if no users exist.
     pub async fn new(db: SqlitePool, data_dir: &Path) -> Result<Self> {
-        let secret_path = data_dir.join("jwt.secret");
+        let secret_path = data_dir.join(JWT_SECRET_FILE);
         kahawai_core::private::narrow(&secret_path)
             .with_context(|| format!("restricting {}", secret_path.display()))?;
         let secret = if secret_path.exists() {

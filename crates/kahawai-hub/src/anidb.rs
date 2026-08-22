@@ -26,6 +26,7 @@ use std::time::Duration;
 
 use aes::cipher::{BlockCipherDecrypt, BlockCipherEncrypt, KeyInit};
 use anyhow::{Context, Result, bail};
+use hmac::{Hmac, Mac};
 use md5::{Digest, Md5};
 
 const SERVER: &str = "api.anidb.net:9000";
@@ -80,6 +81,11 @@ struct State {
     /// Local UDP port the session belongs to; 0 = none stored.
     #[serde(default)]
     port: u16,
+    /// Which username/password established `session`. Without this, a crash
+    /// between replacing credentials and clearing the file can resume the
+    /// previous account without ever testing the replacement.
+    #[serde(default)]
+    credential: String,
     /// Unix seconds; contact is refused until then.
     #[serde(default)]
     banned_until: i64,
@@ -89,21 +95,44 @@ fn state_path(data_dir: &std::path::Path) -> std::path::PathBuf {
     data_dir.join("anime").join("anidb-session.json")
 }
 
-fn load_state(data_dir: &std::path::Path) -> State {
-    std::fs::read(state_path(data_dir))
-        .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or_default()
+fn load_state(data_dir: &std::path::Path) -> Result<State> {
+    let path = state_path(data_dir);
+    kahawai_core::private::narrow(&path)
+        .with_context(|| format!("restricting {}", path.display()))?;
+    match std::fs::read(&path) {
+        Ok(bytes) => {
+            serde_json::from_slice(&bytes).with_context(|| format!("reading {}", path.display()))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(State::default()),
+        Err(error) => Err(error).with_context(|| format!("reading {}", path.display())),
+    }
 }
 
-fn save_state(data_dir: &std::path::Path, st: &State) {
+fn save_state(data_dir: &std::path::Path, st: &State) -> Result<()> {
     let path = state_path(data_dir);
     if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     }
-    if let Ok(bytes) = serde_json::to_vec(st) {
-        let _ = std::fs::write(path, bytes);
-    }
+    let bytes = serde_json::to_vec(st)?;
+    kahawai_core::private::write(&path, &bytes)
+        .with_context(|| format!("writing {}", path.display()))
+}
+
+/// Names the account and password a session authenticated, without persisting
+/// either one beside the reusable session key. Keying the identifier prevents
+/// the state file from becoming an offline password verifier; rotating the
+/// hub secret safely forces a fresh AniDB authentication.
+fn credential_fingerprint(key: &[u8], user: &str, pass: &str) -> String {
+    let mut mac =
+        Hmac::<sha2::Sha256>::new_from_slice(key).expect("HMAC accepts keys of any length");
+    mac.update(&(user.len() as u64).to_le_bytes());
+    mac.update(user.as_bytes());
+    mac.update(pass.as_bytes());
+    data_encoding::HEXLOWER.encode(&mac.finalize().into_bytes())
+}
+
+fn resumable_port(st: &State, credential: &str) -> Option<u16> {
+    (!st.session.is_empty() && st.port != 0 && st.credential == credential).then_some(st.port)
 }
 
 fn now_unix() -> i64 {
@@ -113,11 +142,32 @@ fn now_unix() -> i64 {
         .unwrap_or(0)
 }
 
+/// Forget the stored session, keeping the ban clock.
+///
+/// Explicit disconnection uses this to prevent a later reconnect from
+/// resuming the deleted account. Credential replacement is independently
+/// protected by the fingerprint checked in [`Anidb::login`].
+pub fn forget_session(data_dir: &std::path::Path) -> Result<()> {
+    let st = load_state(data_dir)?;
+    if st.session.is_empty() {
+        return Ok(());
+    }
+    save_state(
+        data_dir,
+        &State {
+            session: String::new(),
+            port: 0,
+            credential: String::new(),
+            banned_until: st.banned_until,
+        },
+    )
+}
+
 /// Seconds left on a recorded ban, if any — checked BEFORE opening a
 /// socket so a banned hub never touches AniDB at all.
-pub fn ban_remaining(data_dir: &std::path::Path) -> Option<i64> {
-    let left = load_state(data_dir).banned_until - now_unix();
-    (left > 0).then_some(left)
+pub fn ban_remaining(data_dir: &std::path::Path) -> Result<Option<i64>> {
+    let left = load_state(data_dir)?.banned_until - now_unix();
+    Ok((left > 0).then_some(left))
 }
 
 pub struct Anidb {
@@ -200,18 +250,25 @@ impl Anidb {
     ) -> Result<Self> {
         // Refuse to speak at all while a ban is on record: contact is
         // what keeps a ban alive.
-        if let Some(left) = ban_remaining(data_dir) {
+        if let Some(left) = ban_remaining(data_dir)? {
             bail!(
                 "anidb banned us; staying silent for another {} h (contact would extend it)",
                 (left + 3599) / 3600
             );
         }
+        let fingerprint_key = std::fs::read(data_dir.join(crate::auth::JWT_SECRET_FILE))
+            .context("reading hub secret for AniDB session binding")?;
+        let credential = credential_fingerprint(&fingerprint_key, user, pass);
+        let st = load_state(data_dir)?;
+        // Rebind only a session established by these credentials. Credential
+        // replacement and this file are separate durable writes; binding the
+        // two here makes either crash order safe.
+        let resume_port = resumable_port(&st, &credential).unwrap_or(0);
         // Rebind the port the stored session belongs to. If it is taken
         // (another instance, or the OS still holding it), fall back to
         // an ephemeral port — the session is then unusable and we
         // authenticate as normal.
-        let st = load_state(data_dir);
-        let socket = match st.port {
+        let socket = match resume_port {
             0 => tokio::net::UdpSocket::bind("0.0.0.0:0").await?,
             p => match tokio::net::UdpSocket::bind(("0.0.0.0", p)).await {
                 Ok(s) => s,
@@ -247,7 +304,7 @@ impl Anidb {
                      Settings → Account on anidb.net, or clear the key here"
                 ),
                 555 => {
-                    client.record_ban(&rest);
+                    client.record_ban(&rest)?;
                     bail!("anidb: BANNED — staying silent for 24 h: {rest}")
                 }
                 other => bail!("ENCRYPT refused: {other} {rest}"),
@@ -261,7 +318,7 @@ impl Anidb {
         // port back, since the key is meaningless from another one.
         // Must come AFTER ENCRYPT: an encrypted session can only be
         // probed over an encrypted channel.
-        if !st.session.is_empty() && st.port != 0 && st.port == bound_port {
+        if resume_port != 0 && resume_port == bound_port {
             client.session = st.session;
             match client
                 .command(&format!("UPTIME s={}", client.session))
@@ -272,7 +329,7 @@ impl Anidb {
                     return Ok(client);
                 }
                 Ok((555, rest)) => {
-                    client.record_ban(&rest);
+                    client.record_ban(&rest)?;
                     bail!("anidb: BANNED — staying silent for 24 h: {rest}");
                 }
                 // 501/506 = expired (35 min idle) or otherwise stale.
@@ -308,9 +365,10 @@ impl Anidb {
                     &State {
                         session: client.session.clone(),
                         port: bound_port,
+                        credential,
                         banned_until: 0,
                     },
-                );
+                )?;
                 if code == 201 {
                     tracing::info!("anidb: a newer client version is available");
                 }
@@ -320,7 +378,7 @@ impl Anidb {
             500 => bail!("anidb login failed (check username/password)"),
             503 | 504 => bail!("anidb rejected the client registration: {code} {rest}"),
             555 => {
-                client.record_ban(&rest);
+                client.record_ban(&rest)?;
                 bail!("anidb: BANNED — staying silent for 24 h: {rest}")
             }
             other => bail!("anidb AUTH unexpected: {other} {rest}"),
@@ -357,18 +415,18 @@ impl Anidb {
             }
             320 => Ok(None),
             501 | 506 => {
-                let st = load_state(&self.data_dir);
+                let st = load_state(&self.data_dir)?;
                 save_state(
                     &self.data_dir,
                     &State {
                         session: String::new(),
                         ..st
                     },
-                );
+                )?;
                 bail!("anidb session lost: {code}")
             }
             555 => {
-                self.record_ban(&rest);
+                self.record_ban(&rest)?;
                 bail!("anidb: BANNED — staying silent for 24 h: {rest}")
             }
             other => bail!("anidb FILE unexpected: {other} {rest}"),
@@ -377,18 +435,19 @@ impl Anidb {
 
     /// Remember a ban and drop the session, so nothing touches AniDB
     /// until it lapses (every attempt would extend it).
-    fn record_ban(&mut self, detail: &str) {
+    fn record_ban(&mut self, detail: &str) -> Result<()> {
         tracing::error!(detail, "anidb BANNED — suppressing all contact for 24 h");
         self.session.clear();
-        let port = load_state(&self.data_dir).port;
+        let port = load_state(&self.data_dir)?.port;
         save_state(
             &self.data_dir,
             &State {
                 session: String::new(),
                 port,
+                credential: String::new(),
                 banned_until: now_unix() + BAN_COOLDOWN.as_secs() as i64,
             },
-        );
+        )
     }
 
     /// Ends the run WITHOUT logging out: the session key stays valid
@@ -593,7 +652,7 @@ mod tests {
     async fn a_recorded_ban_blocks_login_without_contact() {
         let dir = tempfile::tempdir().unwrap();
         assert!(
-            ban_remaining(dir.path()).is_none(),
+            ban_remaining(dir.path()).unwrap().is_none(),
             "clean state is not banned"
         );
 
@@ -603,8 +662,9 @@ mod tests {
                 banned_until: now_unix() + 3600,
                 ..Default::default()
             },
-        );
-        let left = ban_remaining(dir.path()).expect("ban recorded");
+        )
+        .unwrap();
+        let left = ban_remaining(dir.path()).unwrap().expect("ban recorded");
         assert!(left > 3500 && left <= 3600, "{left}");
 
         // Unroutable server would hang/fail if we actually spoke; the
@@ -625,8 +685,9 @@ mod tests {
                 banned_until: now_unix() - 1,
                 ..Default::default()
             },
-        );
-        assert!(ban_remaining(dir.path()).is_none());
+        )
+        .unwrap();
+        assert!(ban_remaining(dir.path()).unwrap().is_none());
     }
 
     /// A session is only resumable from the port it was opened on
@@ -639,11 +700,74 @@ mod tests {
             &State {
                 session: "key".into(),
                 port: 45678,
+                credential: credential_fingerprint(b"hub secret", "user", "password"),
                 banned_until: 0,
             },
-        );
-        let st = load_state(dir.path());
+        )
+        .unwrap();
+        let st = load_state(dir.path()).unwrap();
         assert_eq!((st.session.as_str(), st.port), ("key", 45678));
+    }
+
+    /// Credential storage and session storage cannot share a transaction. A
+    /// crash in either order is safe because a session minted by the previous
+    /// account is never even probed with the replacement credentials.
+    #[test]
+    fn a_persisted_session_is_bound_to_the_credentials_that_minted_it() {
+        let old = credential_fingerprint(b"hub secret", "account", "old password");
+        let new = credential_fingerprint(b"hub secret", "account", "new password");
+        let other_hub = credential_fingerprint(b"other hub secret", "account", "old password");
+        let st = State {
+            session: "old-session".into(),
+            port: 45678,
+            credential: old.clone(),
+            banned_until: 0,
+        };
+
+        assert_eq!(resumable_port(&st, &old), Some(45678));
+        assert_eq!(resumable_port(&st, &new), None);
+        assert_eq!(
+            resumable_port(&st, &other_hub),
+            None,
+            "copying state without its hub secret must re-authenticate"
+        );
+        assert_eq!(
+            resumable_port(
+                &State {
+                    credential: String::new(),
+                    ..st
+                },
+                &old
+            ),
+            None,
+            "a state file from before credential binding must re-authenticate"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn loading_a_session_restricts_its_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        save_state(dir.path(), &State::default()).unwrap();
+        let path = state_path(dir.path());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        load_state(dir.path()).unwrap();
+
+        assert_eq!(
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn a_session_state_write_failure_is_not_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("anime"), b"not a directory").unwrap();
+
+        assert!(save_state(dir.path(), &State::default()).is_err());
     }
 
     /// The long-term rule is the one a bulk run breaks: five packets
