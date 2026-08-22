@@ -7,6 +7,7 @@
 /// rather than a button of its own.
 import { computed, ref } from 'vue'
 
+import Armed from '../../components/Armed.vue'
 import Btn from '../../components/Btn.vue'
 import type { CollectionOverview } from '../../api/generated/model/collectionOverview.ts'
 import type { LibraryOverview } from '../../api/generated/model/libraryOverview.ts'
@@ -96,13 +97,7 @@ async function refresh(library: LibraryOverview) {
 /// narrowed account has to be granted again by hand: an account granted only
 /// this library silently becomes "no access", with nothing on screen to say so.
 /// It was the one that went on a single click.
-const confirming = ref<string | null>(null)
 async function remove(library: LibraryOverview) {
-  if (confirming.value !== library.id) {
-    confirming.value = library.id
-    return
-  }
-  confirming.value = null
   await props.act(() => adminDeleteLibrary(library.id))
 }
 
@@ -227,16 +222,14 @@ const failed = computed(() => props.broken.includes('libraries'))
         </Btn>
         <!-- Filled in the warning colour once it is armed, so the second press
              does not look like the first. -->
-        <Btn
-          :ghost="confirming !== library.id"
-          :danger="confirming === library.id"
-          small
+        <Armed
+          label="Delete"
+          armed-label="Really delete + revoke grants?"
+          :name="`Delete ${library.name}`"
+          :armed-name="`Really delete ${library.name} and revoke its grants?`"
           title="Removes the library, its collection attachments and every grant to it"
-          @click="remove(library)"
-          @blur="confirming = null"
-        >
-          {{ confirming === library.id ? 'Really delete + revoke grants?' : 'Delete' }}
-        </Btn>
+          @confirm="remove(library)"
+        />
       </li>
     </ul>
   </section>

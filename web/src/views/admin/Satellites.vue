@@ -5,6 +5,7 @@
 /// why every control here says so and why the delete is asked twice.
 import { computed, ref, watch } from 'vue'
 
+import Armed from '../../components/Armed.vue'
 import Btn from '../../components/Btn.vue'
 import type { CollectionOverview } from '../../api/generated/model/collectionOverview.ts'
 import type { PendingEnrollment } from '../../api/generated/model/pendingEnrollment.ts'
@@ -85,14 +86,7 @@ watch(
 /// question: swapping it destroys the focused element, so the keyboard is
 /// returned to the top of the document and a screen reader is told nothing at
 /// all. Relabelling in place keeps focus and announces the new name.
-const confirming = ref<string | null>(null)
-
 async function remove(satellite: SatelliteOverview) {
-  if (confirming.value !== satellite.module_id) {
-    confirming.value = satellite.module_id
-    return
-  }
-  confirming.value = null
   if (!(await props.act(() => adminDeleteSatellite(satellite.module_id)))) return
   notify(
     `Deleted ${satellite.name}: certificate revoked, collections removed. Watch state is archived and restored if the media returns.`,
@@ -244,17 +238,15 @@ function some(satellite: SatelliteOverview) {
           </Btn>
           <!-- Filled in the warning colour once it is armed, so the second
                press does not look like the first. -->
-          <Btn
-            :ghost="confirming !== satellite.module_id"
-            :danger="confirming === satellite.module_id"
-            small
+          <Armed
+            label="Delete"
+            armed-label="Really delete + revoke?"
+            :name="`Delete ${satellite.name}`"
+            :armed-name="`Really delete ${satellite.name} and revoke its certificate?`"
             :class="satellite.module_type === 'transcoder' ? '' : 'ml-auto'"
             title="Revokes its certificate: it is refused at the TLS layer and cannot come back on its own"
-            @click="remove(satellite)"
-            @blur="confirming = null"
-          >
-            {{ confirming === satellite.module_id ? 'Really delete + revoke?' : 'Delete' }}
-          </Btn>
+            @confirm="remove(satellite)"
+          />
         </div>
 
         <!-- What it was measured doing, underneath. As one flex row the chips

@@ -6,6 +6,7 @@
 /// interleave into a set neither picked. The write machinery is `useGrants`.
 import { computed, ref } from 'vue'
 
+import Armed from '../../components/Armed.vue'
 import Btn from '../../components/Btn.vue'
 import type { LibraryOverview } from '../../api/generated/model/libraryOverview.ts'
 import type { UserAccess } from '../../api/generated/model/userAccess.ts'
@@ -79,13 +80,7 @@ async function create() {
   notify(`Created ${username.trim()} — it can see every library until you say otherwise.`)
 }
 
-const confirming = ref<string | null>(null)
 async function remove(user: UserAccess) {
-  if (confirming.value !== user.id) {
-    confirming.value = user.id
-    return
-  }
-  confirming.value = null
   await props.act(() => adminDeleteUser(user.id))
 }
 
@@ -240,16 +235,14 @@ const marooned = (user: UserAccess) =>
           <span v-if="user.username === me" class="font-mono text-[11px] text-dimmer">
             signed in as this account
           </span>
-          <Btn
+          <Armed
             v-else
-            ghost
-            small
-            title="Removes the account, its watch state and its sessions"
-            @click="remove(user)"
-            @blur="confirming = null"
-          >
-            {{ confirming === user.id ? 'Really delete?' : 'Delete' }}
-          </Btn>
+            label="Delete"
+            armed-label="Really delete?"
+            :name="`Delete ${user.username}`"
+            :armed-name="`Really delete ${user.username}?`"
+            @confirm="remove(user)"
+          />
         </div>
 
         <!-- The libraries it may see, underneath: seven of them inline pushed

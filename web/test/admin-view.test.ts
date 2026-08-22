@@ -169,11 +169,14 @@ describe('the fleet', () => {
 
   test('deleting one is asked twice, because it revokes a certificate', async () => {
     const wrapper = await open()
-    await press(wrapper, 'Delete')
+    const button = wrapper.findAll('button').find((candidate) => candidate.text() === 'Delete')!
+    expect(button.attributes('aria-label')).toBe('Delete attic')
+    await button.trigger('click')
+    expect(button.attributes('aria-label')).toBe('Really delete attic and revoke its certificate?')
     expect(wrapper.text()).toContain('Really delete + revoke?')
     expect(api.adminDeleteSatellite).not.toHaveBeenCalled()
 
-    await press(wrapper, 'Really delete + revoke?')
+    await button.trigger('click')
     expect(api.adminDeleteSatellite).toHaveBeenCalledWith('mh1')
     expect(notice.value).toContain('certificate revoked')
   })
@@ -776,13 +779,16 @@ describe('libraries', () => {
   test('and deleting one is asked twice — it takes every grant with it', async () => {
     // The most destructive of the three, and the only one that went on a single
     // click: re-creating the library mints a new id, so an account granted only
-    // that library silently becomes "no access".
+    // this library silently becomes "no access".
     const wrapper = await open()
     await tab(wrapper, 'Libraries')
-    await press(wrapper, 'Delete')
+    const button = wrapper.findAll('button').find((candidate) => candidate.text() === 'Delete')!
+    expect(button.attributes('aria-label')).toBe('Delete Films')
+    await button.trigger('click')
+    expect(button.attributes('aria-label')).toBe('Really delete Films and revoke its grants?')
     expect(api.adminDeleteLibrary).not.toHaveBeenCalled()
     expect(wrapper.text()).toContain('Really delete + revoke grants?')
-    await press(wrapper, 'Really delete + revoke grants?')
+    await button.trigger('click')
     expect(api.adminDeleteLibrary).toHaveBeenCalledWith('films')
   })
 })
