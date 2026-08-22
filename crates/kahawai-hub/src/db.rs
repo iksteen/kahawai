@@ -16,6 +16,10 @@ pub async fn open(data_dir: &Path) -> Result<SqlitePool> {
         .create_if_missing(true)
         .journal_mode(SqliteJournalMode::Wal)
         .foreign_keys(true)
+        // Overwrite deleted rows instead of unlinking them: a freed cell keeps
+        // its bytes, so `strings hub.db` reads back deleted settings, the
+        // operator's provider keys among them.
+        .pragma("secure_delete", "on")
         // 8 MiB of page cache PER CONNECTION (negative = KiB, not pages).
         //
         // SQLite's default is 2 MB, which is smaller than the index a
@@ -317,4 +321,41 @@ async fn install_derived(pool: &SqlitePool) -> Result<()> {
         "assignment triggers installed; item_match rebuilt"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The provider keys live in `settings` in the clear. The second row is
+    /// what keeps the page allocated, so the freeblock is not simply freed.
+    #[tokio::test]
+    async fn a_deleted_setting_is_not_still_in_the_file() {
+        const CANARY: &str = "CANARY-provider-key-0123456789";
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = open(dir.path()).await.unwrap();
+        for (key, value) in [("tmdb_api_key", CANARY), ("stays", "keeps the page")] {
+            sqlx::query("INSERT INTO settings (key, value) VALUES (?, ?)")
+                .bind(key)
+                .bind(value)
+                .execute(&db)
+                .await
+                .unwrap();
+        }
+        sqlx::query("DELETE FROM settings WHERE key = 'tmdb_api_key'")
+            .execute(&db)
+            .await
+            .unwrap();
+        // Closing the last connection checkpoints and removes the WAL, so the
+        // main file is the whole story by the time it is read.
+        db.close().await;
+        assert!(!dir.path().join("hub.db-wal").exists());
+
+        let bytes = std::fs::read(dir.path().join("hub.db")).unwrap();
+        assert!(
+            !bytes.windows(CANARY.len()).any(|w| w == CANARY.as_bytes()),
+            "the deleted value is still readable in hub.db"
+        );
+    }
 }
