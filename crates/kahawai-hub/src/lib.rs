@@ -23,6 +23,7 @@ pub mod providers;
 pub mod proxy;
 pub mod registry;
 pub mod renewal_service;
+pub mod secrets;
 pub mod segments;
 pub mod sessionlog;
 pub mod sessions;

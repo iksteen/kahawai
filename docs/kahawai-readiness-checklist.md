@@ -189,11 +189,13 @@ marked in that document.
       preferences and choose the credential-store/key-management design from an
       explicit threat, recovery and operating-system support model;
       configuration-file secrets remain documented and permission-checked
-- [ ] SEC-WEB-4 Protect stored credentials with a reviewed authenticated-
-      encryption design whose keys are separated from ciphertext, restricted on
-      disk and included in the recovery model. Bind ciphertext to its owning
-      user/provider/field and cite current primary cryptographic guidance; AES-
-      256-GCM plus a mode-0600 generated key is one candidate, not a preset gate
+- [x] SEC-WEB-4 AES-256-GCM from `ring`, a fresh 96-bit nonce per seal, and
+      the key in `<data_dir>/credentials.secret` rather than in the database it
+      opens. It is created 0600 in one `open(2)` and narrowed if it arrives
+      wider. The additional data is the row's own owner, provider and field,
+      length-prefixed, so a ciphertext moved to another row does not open:
+      `secrets::tests::a_row_does_not_open_as_another_row` and
+      `::each_seal_draws_a_fresh_nonce`
 - [ ] SEC-WEB-5 Use a new immutable migration to move existing plaintext
       preference/setting credentials, verify decryption, then remove plaintext
       values; document schema meaning in the enforcing Rust module and include

@@ -335,6 +335,13 @@ async fn run_hub_inner(
         &kahawai_hub::pki::pki_dir(&cfg.data_dir),
     )?);
     let db = kahawai_hub::db::open(&cfg.data_dir).await?;
+    // Generated on first start; fatal thereafter if it cannot be read. No
+    // caller holds it yet — this is what creates the key and proves it works.
+    // Loaded here rather than in `db::open`, which `backup` also calls
+    // against a running hub's data directory from a second process.
+    let credentials =
+        Arc::new(kahawai_hub::secrets::Credentials::open(&cfg.data_dir, db.clone()).await?);
+    let _ = &credentials;
     // The satellites table IS the mTLS allowlist (SEC-5): load it, then
     // the registry keeps it in sync on approve/delete.
     let allowed = kahawai_transport::mtls::AllowedCerts::default();

@@ -492,6 +492,12 @@ impl Auth {
             .bind(id)
             .execute(&mut *tx)
             .await?;
+        // Nor has `credentials`, whose owner_id is a user id OR `HUB` — a
+        // column no foreign key can describe. Their provider account is the
+        // one thing here that is not ours to keep, and once the users row is
+        // gone nothing can name it again: every route that reaches a
+        // credential reads `claims.sub`.
+        crate::secrets::delete_owner(&mut *tx, id).await?;
         // The count and delete are one statement under SQLite's write lock.
         // Other user-owned rows and refresh families cascade from users.
         let changed = sqlx::query(

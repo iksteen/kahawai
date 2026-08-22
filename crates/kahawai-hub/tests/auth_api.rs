@@ -2175,6 +2175,27 @@ async fn admin_deletes_users() {
     .await
     .unwrap();
 
+    // A sealed credential has no foreign key either — owner_id is a user id
+    // or HUB. Raw rows: this is about the delete, not about the cipher.
+    for owner in [victim.as_str(), admin_id.as_str()] {
+        sqlx::query(
+            "INSERT INTO credentials (owner_id, provider, field, secret)
+             VALUES (?, 'opensubtitles', 'password', x'00')",
+        )
+        .bind(owner)
+        .execute(&db)
+        .await
+        .unwrap();
+    }
+    // The hub's own, which deleting any user must leave alone.
+    sqlx::query(
+        "INSERT INTO credentials (owner_id, provider, field, secret)
+         VALUES ('', 'tmdb', 'api_key', x'00')",
+    )
+    .execute(&db)
+    .await
+    .unwrap();
+
     let del = |token: String, id: String| {
         let api = api.clone();
         async move {
@@ -2205,6 +2226,18 @@ async fn admin_deletes_users() {
     assert_eq!(
         del(admin_token.clone(), admin_id.clone()).await.status(),
         StatusCode::CONFLICT
+    );
+    // And the refusal took the credential delete back with it: the whole
+    // teardown is one transaction, so a user who is still here still has
+    // their account.
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM credentials WHERE owner_id = ?")
+            .bind(&admin_id)
+            .fetch_one(&db)
+            .await
+            .unwrap(),
+        1,
+        "a refused deletion still destroyed the credential"
     );
     // A token minted while bob was an admin dies with the demotion's durable
     // generation bump. It cannot use a stale role to reach any admin action.
@@ -2262,6 +2295,20 @@ async fn admin_deletes_users() {
         count("SELECT COUNT(*) FROM watch_state_archive WHERE user_id = ?").await,
         0,
         "archived rows outlived the user and would break a later restore"
+    );
+    assert_eq!(
+        count("SELECT COUNT(*) FROM credentials WHERE owner_id = ?").await,
+        0,
+        "a deleted account's provider credential is still in the database, \
+         and no route can ever reach it again"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM credentials WHERE owner_id = ''")
+            .fetch_one(&db)
+            .await
+            .unwrap(),
+        1,
+        "deleting a user took the hub's own credentials with it"
     );
 
     // The token bob is holding verifies fine — right signature, not yet
