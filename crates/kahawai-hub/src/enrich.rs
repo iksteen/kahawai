@@ -15,6 +15,22 @@ use utoipa::ToSchema;
 
 use crate::registry::Registry;
 
+/// `error_for_status`, without the URL.
+///
+/// TMDB v3 carries its API key in the query string and reqwest's `Display`
+/// appends the URL it failed on, so one 404 logs the operator's key. Keeping
+/// it a `reqwest::Error` is what lets [`is_http_404`] still read the status.
+trait StatusChecked: Sized {
+    fn status_checked(self) -> Result<reqwest::Response>;
+}
+
+impl StatusChecked for reqwest::Response {
+    fn status_checked(self) -> Result<reqwest::Response> {
+        self.error_for_status()
+            .map_err(|e| anyhow::Error::new(e.without_url()))
+    }
+}
+
 pub const TMDB_KEY_SETTING: &str = "tmdb_api_key";
 pub const TVDB_KEY_SETTING: &str = "tvdb_api_key";
 pub const TVDB_PIN_SETTING: &str = "tvdb_pin";
@@ -572,7 +588,7 @@ impl Enricher {
             resp.status() != reqwest::StatusCode::UNAUTHORIZED,
             "TMDB rejected the API key"
         );
-        let resp = resp.error_for_status().context("tmdb response")?;
+        let resp = resp.status_checked().context("tmdb response")?;
         Ok(resp
             .json::<SearchResponse>()
             .await
@@ -624,7 +640,7 @@ impl Enricher {
             )
             .await
             .context("tvdb login request")?
-            .error_for_status()
+            .status_checked()
             .context("tvdb login rejected (key/pin?)")?;
         Ok(resp
             .json::<LoginResp>()
@@ -666,7 +682,7 @@ impl Enricher {
             )
             .await
             .context("tvdb search")?
-            .error_for_status()?
+            .status_checked()?
             .json::<SearchResp>()
             .await
             .context("tvdb search json")?;
@@ -719,13 +735,7 @@ impl Enricher {
         } else {
             req = req.query(&[("api_key", key)]);
         }
-        let s: Season = self
-            .http
-            .send(req)
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
+        let s: Season = self.http.send(req).await?.status_checked()?.json().await?;
         Ok(s.episodes
             .into_iter()
             .map(|e| EpisodeData {
@@ -764,13 +774,7 @@ impl Enricher {
         } else {
             req = req.query(&[("api_key", key)]);
         }
-        let s: Show = self
-            .http
-            .send(req)
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
+        let s: Show = self.http.send(req).await?.status_checked()?.json().await?;
         Ok(s.seasons
             .into_iter()
             .filter(|s| s.season_number > 0)
@@ -1333,7 +1337,7 @@ impl Enricher {
             .http
             .send(self.http.get(&url))
             .await?
-            .error_for_status()?
+            .status_checked()?
             .json()
             .await?;
         let groups = resp["release-groups"]
@@ -2665,12 +2669,7 @@ impl Enricher {
                     .http
                     .get(format!("https://api.themoviedb.org/3/{path}/{tmdb_id}"))
                     .query(&[("api_key", key.as_str()), ("append_to_response", "credits")]);
-                let det = match this
-                    .http
-                    .send(req)
-                    .await
-                    .and_then(|r| Ok(r.error_for_status()?))
-                {
+                let det = match this.http.send(req).await.and_then(|r| r.status_checked()) {
                     Ok(resp) => match resp.json::<Details>().await {
                         Ok(det) => det,
                         Err(e) => {
@@ -3209,7 +3208,7 @@ impl Enricher {
             tracing::debug!(%url, "provider holds no poster here");
             return Ok(None);
         }
-        let resp = resp.error_for_status()?;
+        let resp = resp.status_checked()?;
         Ok(Some(resp.bytes().await?.to_vec()))
     }
 }
@@ -3247,6 +3246,36 @@ pub fn absolute_to_seasoned(seasons: &[(i64, i64)], absolute: i64) -> Option<(i6
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Both halves of one error. 401 is the revoked-key case, the likeliest
+    /// to leak; 404 is the one `is_http_404` has to keep recognising, and
+    /// rewriting the error as a string would quietly lose it.
+    #[tokio::test]
+    async fn a_refused_call_keeps_its_status_and_loses_its_url() {
+        for (code, line) in [(404, "404 Not Found"), (401, "401 Unauthorized")] {
+            let l = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .unwrap();
+            let addr = l.local_addr().unwrap();
+            let reply = format!("HTTP/1.1 {line}\r\ncontent-length: 0\r\n\r\n");
+            tokio::spawn(async move {
+                while let Ok((mut s, _)) = l.accept().await {
+                    use tokio::io::AsyncWriteExt;
+                    let _ = s.write_all(reply.as_bytes()).await;
+                }
+            });
+
+            let url = format!("http://{addr}/3/tv/1399?api_key=SECRET-OPERATOR-KEY");
+            let e = reqwest::get(&url)
+                .await
+                .unwrap()
+                .status_checked()
+                .unwrap_err();
+            let shown = format!("{e:#}");
+            assert!(!shown.contains("SECRET-OPERATOR-KEY"), "{code}: {shown}");
+            assert_eq!(is_http_404(&e), code == 404, "{code}: {shown}");
+        }
+    }
 
     fn cand(id: u64, title: &str, date: &str) -> Candidate {
         Candidate {
@@ -3417,7 +3446,7 @@ impl Enricher {
             .send(req)
             .await
             .context("tvdb details")?
-            .error_for_status()?
+            .status_checked()?
             .json()
             .await
             .context("tvdb details json")?;
@@ -3456,7 +3485,7 @@ impl Enricher {
             .send(req)
             .await
             .context("tmdb details")?
-            .error_for_status()?
+            .status_checked()?
             .json()
             .await
             .context("tmdb details json")?;

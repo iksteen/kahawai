@@ -135,7 +135,11 @@ impl Http {
         tokio::time::sleep_until(*next).await;
         let resp = client.execute(req).await;
         *next = Instant::now() + spacing(&host);
-        let resp = resp.with_context(|| format!("{host} request failed"))?;
+        // A timeout or refused connection carries the URL it was reaching for,
+        // and `providers::reschedule` writes that message into the database.
+        let resp = resp
+            .map_err(reqwest::Error::without_url)
+            .with_context(|| format!("{host} request failed"))?;
         if matches!(resp.status().as_u16(), 429 | 503) {
             // MusicBrainz answers 503 with `Retry-After: 0` — "just slow
             // down" — which read literally parks for nothing and the next
@@ -202,6 +206,23 @@ mod tests {
         let q = queues().lock().await.get(&host).unwrap().clone();
         let at = *q.lock().await;
         at.saturating_duration_since(Instant::now())
+    }
+
+    /// A refused connection must not carry the URL: the key rides in it, and
+    /// `providers::reschedule` puts this message in the database.
+    #[tokio::test]
+    async fn a_transport_failure_does_not_carry_the_url() {
+        // Bound then dropped, so the port answers nothing.
+        let dead = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let http = Http::new().unwrap();
+        let url = format!("http://{dead}/3/tv/1399?api_key=SECRET-OPERATOR-KEY");
+        let e = http.send(http.get(&url)).await.unwrap_err();
+        let shown = format!("{e:#}");
+        assert!(!shown.contains("SECRET-OPERATOR-KEY"), "{shown}");
     }
 
     #[tokio::test]
