@@ -89,14 +89,57 @@ impl From<&std::path::Path> for Media {
         Media::Path(path.to_path_buf())
     }
 }
+/// Caps that still describe a container rather than one elementary stream.
+/// `decodebin` must autoplug these far enough to expose the tracks before we
+/// can stop the tracks the current analyzer does not consume.
+fn is_container_caps(caps: &gst::CapsRef) -> bool {
+    caps.structure(0).is_some_and(|s| {
+        matches!(
+            s.name().as_str(),
+            "application/mxf"
+                | "application/ogg"
+                | "audio/x-matroska"
+                | "audio/webm"
+                | "video/quicktime"
+                | "video/webm"
+                | "video/x-flv"
+                | "video/x-matroska"
+                | "video/x-ms-asf"
+                | "video/x-msvideo"
+                | "video/mpegts"
+        ) || (s.name() == "video/mpeg" && s.get::<bool>("systemstream").unwrap_or(false))
+    })
+}
+
+/// Continue autoplugging this stream only when it can still reveal tracks or
+/// when it is a media type this analyzer requested. Returning false exposes an
+/// unwanted compressed elementary stream immediately, so parking it below
+/// does not first instantiate and run its decoder.
+fn should_autoplug(caps: &gst::CapsRef, want: &[&str]) -> bool {
+    if is_container_caps(caps) {
+        return true;
+    }
+    let Some(name) = caps.structure(0).map(|s| s.name()) else {
+        return true;
+    };
+    if name.starts_with("audio/") {
+        return want.iter().any(|w| w.starts_with("audio/"));
+    }
+    if name.starts_with("video/") || name.starts_with("image/") {
+        return want
+            .iter()
+            .any(|w| w.starts_with("video/") || w.starts_with("image/"));
+    }
+    true
+}
 
 /// Build `<source> ! <opener> ! <chain…> ! appsink`, linking only the streams
 /// whose caps start with one of `want` and parking the rest on fakesinks.
 ///
-/// The parking matters: `uridecodebin`'s stream filtering reports a missing
-/// decoder when it cannot decode an audio track into the video caps it was
-/// asked for, which fails the whole preroll. Linking pads ourselves keeps one
-/// unwanted track from deciding the run.
+/// Unwanted elementary streams stop autoplugging before their decoder. Parking
+/// only the decoded pad made an audio fingerprint decode the video's first
+/// quarter too (and made a luma probe decode audio); on Silence that turned a
+/// local 1080p season into six minutes of work.
 fn open(
     media: &Media,
     stop_at: Option<gst::Caps>,
@@ -120,6 +163,11 @@ fn open(
         opener = opener.property("caps", stop_at);
     }
     let opener_element = opener.build().context("decodebin")?;
+    let autoplug_want = want;
+    opener_element.connect("autoplug-continue", false, move |args| {
+        let caps = args[2].get::<gst::Caps>().ok()?;
+        Some(should_autoplug(&caps, autoplug_want).to_value())
+    });
 
     // `max-buffers`: with sync=false nothing else throttles the decoder,
     // and appsink's default queue is UNLIMITED — a consumer doing per-frame
@@ -562,4 +610,44 @@ pub fn luma_window(media: &Media, start: f64, end: f64, threshold: u8) -> Result
     )?;
 
     Ok(frames)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn init() {
+        kahawai_media::init().unwrap();
+    }
+
+    #[test]
+    fn an_audio_probe_stops_video_before_its_decoder() {
+        init();
+        let video = gst::Caps::builder("video/x-h265").build();
+        let audio = gst::Caps::builder("audio/x-eac3").build();
+        assert!(!should_autoplug(&video, &["audio/"]));
+        assert!(should_autoplug(&audio, &["audio/"]));
+    }
+
+    #[test]
+    fn a_video_probe_stops_audio_before_its_decoder() {
+        init();
+        let video = gst::Caps::builder("video/x-h264").build();
+        let audio = gst::Caps::builder("audio/x-ac3").build();
+        assert!(should_autoplug(&video, &["video/"]));
+        assert!(!should_autoplug(&audio, &["video/"]));
+    }
+
+    #[test]
+    fn container_caps_keep_autoplugging_until_tracks_exist() {
+        init();
+        for name in ["video/x-matroska", "video/quicktime", "application/ogg"] {
+            let caps = gst::Caps::builder(name).build();
+            assert!(should_autoplug(&caps, &["audio/"]), "{name}");
+            assert!(should_autoplug(&caps, &["video/"]), "{name}");
+        }
+        let mpeg = gst::Caps::builder("video/mpeg")
+            .field("systemstream", true)
+            .build();
+        assert!(should_autoplug(&mpeg, &["audio/"]));
+    }
 }

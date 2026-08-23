@@ -77,6 +77,10 @@ fn default_config_path() -> PathBuf {
 #[derive(Debug, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    /// Process-global GStreamer policy. When absent, decoder demotions are
+    /// inherited from the legacy role sections and merged.
+    #[serde(default)]
+    pub gstreamer: Option<GstreamerConfig>,
     #[serde(default)]
     pub all_in_one: AllInOneConfig,
     #[serde(default)]
@@ -85,6 +89,34 @@ pub struct Config {
     pub mediahost: MediahostConfig,
     #[serde(default)]
     pub transcoder: TranscoderConfig,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields, default)]
+pub struct GstreamerConfig {
+    pub demote_decoders: Vec<String>,
+}
+
+impl Config {
+    /// Decoder ranks are process-global. An explicit `[gstreamer]` section is
+    /// authoritative (including an empty list); legacy configs inherit the
+    /// union of the mediahost and transcoder lists in stable order.
+    pub fn effective_decoder_demotions(&self) -> Vec<String> {
+        let configured: Box<dyn Iterator<Item = &String> + '_> = match &self.gstreamer {
+            Some(global) => Box::new(global.demote_decoders.iter()),
+            None => Box::new(
+                self.mediahost
+                    .demote_decoders
+                    .iter()
+                    .chain(self.transcoder.demote_decoders.iter()),
+            ),
+        };
+        let mut seen = std::collections::HashSet::new();
+        configured
+            .filter(|name| seen.insert((*name).clone()))
+            .cloned()
+            .collect()
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -200,21 +232,13 @@ pub struct MediahostConfig {
     /// detector is the filesystem watcher — which network mounts like
     /// sshfs can't serve, so the sweep catches what inotify can't see.
     pub rescan_minutes: u64,
-    /// Decoder elements to demote below software for DISCOVERY on this
-    /// box. Separate from the transcoder's list because the two modules
-    /// run on the same box with different jobs, and a decoder can be
-    /// right for one and wrong for the other.
+    /// Legacy decoder-demotion input. When `[gstreamer]` is absent this is
+    /// merged with `[transcoder].demote_decoders`; an explicit global section
+    /// overrides both. Kept so deployed configs cut over without changing
+    /// decoder choice.
     ///
-    /// What discovery records is whatever decoder GStreamer autoplugs,
-    /// so a decoder that sees less of a stream than the playback one
-    /// writes that smaller view into the library: `dtsdec` (libdca)
-    /// decodes only the lossy DTS core and filed every DTS-HD MA 7.1
-    /// title as 5.1 (measured — 8 channels via avdec_dca, 6 via
-    /// dtsdec). Demoting it here makes the scan agree with playback.
-    ///
-    /// Ranks are process-global, so `all-in-one` effectively unions
-    /// this with `[transcoder] demote_decoders`; the lean satellite
-    /// binaries are separate processes and keep the lists independent.
+    /// Discovery records whatever decoder GStreamer autoplugs, so `dtsdec`
+    /// (lossy core only) must not file DTS-HD MA 7.1 as 5.1.
     pub demote_decoders: Vec<String>,
 }
 
@@ -227,10 +251,10 @@ pub struct TranscoderConfig {
     pub name: String,
     /// Concurrent encode sessions this box offers (TC-6).
     pub max_sessions: u32,
-    /// Decoder elements to demote below software on this box — the
-    /// per-box calibration knob for hardware whose decode path is
-    /// pathologically slow (e.g. Gemini Lake VA-API: vah265dec 6 fps
-    /// where avdec_h265 does 121). Encode preference is unaffected.
+    /// Legacy decoder-demotion input. Merged with the mediahost list only when
+    /// `[gstreamer]` is absent. The calibration case is hardware whose decode
+    /// path is pathologically slow (Gemini Lake `vah265dec` measured at 6 fps
+    /// where `avdec_h265` does 121); encode preference is unaffected.
     pub demote_decoders: Vec<String>,
     /// TC-6 CPU share: niceness applied by each pipeline worker to
     /// itself at startup. 0 = leave it alone, which is what every
@@ -466,6 +490,37 @@ mod tests {
             jail.create_file("kahawai.toml", "[all_in_one]\ntranscoder = false\n")?;
             let (cfg, _) = load(Some(Path::new("kahawai.toml"))).unwrap();
             assert!(!cfg.all_in_one.transcoder);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn absent_global_demotions_merge_legacy_roles_stably() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file(
+                "kahawai.toml",
+                "[mediahost]\ndemote_decoders = [\"dtsdec\", \"shared\"]\n\
+                 [transcoder]\ndemote_decoders = [\"vah265dec\", \"shared\"]\n",
+            )?;
+            let (cfg, _) = load(Some(Path::new("kahawai.toml"))).unwrap();
+            assert_eq!(
+                cfg.effective_decoder_demotions(),
+                ["dtsdec", "shared", "vah265dec"]
+            );
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn explicit_global_demotions_are_authoritative_even_when_empty() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file(
+                "kahawai.toml",
+                "[gstreamer]\ndemote_decoders = []\n\
+                 [transcoder]\ndemote_decoders = [\"vah265dec\"]\n",
+            )?;
+            let (cfg, _) = load(Some(Path::new("kahawai.toml"))).unwrap();
+            assert!(cfg.effective_decoder_demotions().is_empty());
             Ok(())
         });
     }

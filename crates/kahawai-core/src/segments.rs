@@ -1,4 +1,4 @@
-//! Boundaries a file NAMES, rather than ones we infer.
+//! Named chapter boundaries and protocol validation for inferred boundaries.
 //!
 //! intro-skipper's `ChapterAnalyzer` in one function: plenty of rips mark
 //! their own opening, recap and credits, and where they do there is nothing
@@ -11,13 +11,72 @@
 //! left alone for the fingerprint pass rather than turned into a boundary
 //! somebody's player would jump on.
 
-/// A boundary and what it is: `recap`, `intro` or `credits`, in seconds on
-/// the file's own timeline.
+/// A boundary and what it is: `recap`, `intro` or `credits`, in milliseconds
+/// on the file's own timeline.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Named {
     pub kind: &'static str,
-    pub start: f64,
-    pub end: f64,
+    pub start_ms: u64,
+    pub end_ms: u64,
+}
+
+pub const INTRO_MAX_MS: u64 = 120_000;
+pub const RECAP_MAX_MS: u64 = 120_000;
+pub const CREDITS_WINDOW_MS: u64 = 450_000;
+pub const INTRO_WINDOW_LIMIT_MS: u64 = 600_000;
+pub const INTRO_PERCENT_MIN_DURATION_MS: u64 = 300_000;
+pub const END_REFINEMENT_OUTWARD_MS: u64 = 2_000;
+pub const SHARED_REGION_MIN_MS: u64 = 15_000;
+pub const RECAP_MIN_MS: u64 = 15_000;
+pub const BLACK_CREDITS_MIN_MS: u64 = 15_000;
+pub const END_REFINEMENT_INWARD_MS: u64 = 5_000;
+pub const INTRO_START_SNAP_MS: u64 = 5_000;
+
+/// Whether a generation-2 inferred answer could have been produced by the
+/// detector's configured search windows. This is the hub's trust-boundary
+/// check for mediahost replies, kept beside the constants the analyzer uses.
+pub fn inferred_within_bounds(
+    kind: &str,
+    analyzer: &str,
+    start_ms: u64,
+    end_ms: u64,
+    duration_ms: u64,
+) -> bool {
+    if end_ms <= start_ms || end_ms > duration_ms {
+        return false;
+    }
+    let length = end_ms - start_ms;
+    match (kind, analyzer) {
+        ("recap", "blackframe") => start_ms == 0 && (RECAP_MIN_MS..=RECAP_MAX_MS).contains(&length),
+        ("intro", "chromaprint") => {
+            let head_end = if duration_ms >= INTRO_PERCENT_MIN_DURATION_MS {
+                (duration_ms / 4).min(INTRO_WINDOW_LIMIT_MS)
+            } else {
+                duration_ms
+            };
+            let minimum = SHARED_REGION_MIN_MS - END_REFINEMENT_INWARD_MS;
+            let raw_region_fits = start_ms.saturating_add(SHARED_REGION_MIN_MS) <= head_end;
+            let start_is_representable = start_ms == 0 || start_ms >= INTRO_START_SNAP_MS;
+            raw_region_fits
+                && start_is_representable
+                && length >= minimum
+                && length <= INTRO_MAX_MS + END_REFINEMENT_OUTWARD_MS
+                && start_ms <= head_end
+                && end_ms <= (head_end + END_REFINEMENT_OUTWARD_MS).min(duration_ms)
+        }
+        ("credits", "blackframe") => {
+            end_ms == duration_ms
+                && length >= BLACK_CREDITS_MIN_MS
+                && start_ms >= duration_ms.saturating_sub(CREDITS_WINDOW_MS)
+        }
+        ("credits", "chromaprint") => {
+            start_ms.saturating_add(SHARED_REGION_MIN_MS) <= duration_ms
+                && length >= SHARED_REGION_MIN_MS - END_REFINEMENT_INWARD_MS
+                && start_ms >= duration_ms / 2
+                && start_ms >= duration_ms.saturating_sub(CREDITS_WINDOW_MS)
+        }
+        _ => false,
+    }
 }
 
 /// What the title says this chapter is, or `None` for the ones that are
@@ -75,14 +134,11 @@ fn kind_of(title: &str) -> Option<&'static str> {
     None
 }
 
-/// How long a named boundary is allowed to be, in seconds — upstream's
-/// `GetBounds`, and its real safety net: the name patterns also match
-/// things like "The Opening Ceremony", and only the duration check keeps a
-/// six-minute scene chapter from becoming a skip over real content.
-fn bounds(kind: &str) -> (f64, f64) {
+/// How long a named boundary is allowed to be, in milliseconds.
+fn bounds(kind: &str) -> (u64, u64) {
     match kind {
-        "credits" => (15.0, 450.0),
-        _ => (15.0, 120.0),
+        "credits" => (SHARED_REGION_MIN_MS, CREDITS_WINDOW_MS),
+        _ => (SHARED_REGION_MIN_MS, INTRO_MAX_MS),
     }
 }
 
@@ -94,7 +150,7 @@ fn bounds(kind: &str) -> (f64, f64) {
 /// file. One of each kind: recap and intro keep the FIRST in-bounds match,
 /// credits keep the LAST — upstream scans reversed for credits precisely so
 /// a double episode's mid-file credits lose to the ones at the end.
-pub fn named(chapters: &[kahawai_core::media::Chapter], duration_ms: u64) -> Vec<Named> {
+pub fn named(chapters: &[crate::media::Chapter], duration_ms: u64) -> Vec<Named> {
     let kinds: Vec<Option<&'static str>> = chapters
         .iter()
         .map(|c| c.title.as_deref().and_then(kind_of))
@@ -134,12 +190,15 @@ pub fn named(chapters: &[kahawai_core::media::Chapter], duration_ms: u64) -> Vec
         if end_ms <= chapter.start_ms {
             continue;
         }
-        let (start, end) = (chapter.start_ms as f64 / 1000.0, end_ms as f64 / 1000.0);
         let (shortest, longest) = bounds(kind);
-        if end - start < shortest || end - start > longest {
+        if !(shortest..=longest).contains(&(end_ms - chapter.start_ms)) {
             continue;
         }
-        candidates.push(Named { kind, start, end });
+        candidates.push(Named {
+            kind,
+            start_ms: chapter.start_ms,
+            end_ms,
+        });
     }
     let mut out: Vec<Named> = Vec::new();
     for kind in ["recap", "intro", "credits"] {
@@ -151,14 +210,14 @@ pub fn named(chapters: &[kahawai_core::media::Chapter], duration_ms: u64) -> Vec
         };
         out.extend(pick.cloned());
     }
-    out.sort_by(|a, b| a.start.total_cmp(&b.start));
+    out.sort_by_key(|boundary| boundary.start_ms);
     out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kahawai_core::media::Chapter;
+    use crate::media::Chapter;
 
     fn at(start_ms: u64, title: &str) -> Chapter {
         Chapter {
@@ -186,18 +245,18 @@ mod tests {
             [
                 Named {
                     kind: "recap",
-                    start: 4.0,
-                    end: 69.708
+                    start_ms: 4_000,
+                    end_ms: 69_708,
                 },
                 Named {
                     kind: "intro",
-                    start: 69.75,
-                    end: 93.417
+                    start_ms: 69_750,
+                    end_ms: 93_417,
                 },
                 Named {
                     kind: "credits",
-                    start: 2198.667,
-                    end: 2417.27
+                    start_ms: 2_198_667,
+                    end_ms: 2_417_270,
                 },
             ]
         );
@@ -219,8 +278,12 @@ mod tests {
             2_142_599,
         );
         assert_eq!(
-            found.iter().map(|n| (n.kind, n.end)).collect::<Vec<_>>(),
-            [("recap", 64.022), ("intro", 512.679), ("credits", 2142.599)]
+            found.iter().map(|n| (n.kind, n.end_ms)).collect::<Vec<_>>(),
+            [
+                ("recap", 64_022),
+                ("intro", 512_679),
+                ("credits", 2_142_599)
+            ]
         );
     }
 
@@ -254,7 +317,7 @@ mod tests {
         intro.end_ms = Some(120_000);
         let found = named(&[intro], 0);
         assert_eq!(found.len(), 1);
-        assert_eq!(found[0].end, 120.0);
+        assert_eq!(found[0].end_ms, 120_000);
     }
 
     #[test]
@@ -262,7 +325,7 @@ mod tests {
         let mut intro = at(30_000, "Opening Theme");
         intro.end_ms = Some(120_000);
         let found = named(&[intro, at(600_000, "Part A")], 1_200_000);
-        assert_eq!(found[0].end, 120.0);
+        assert_eq!(found[0].end_ms, 120_000);
     }
 
     #[test]
@@ -281,7 +344,7 @@ mod tests {
             2_580_000,
         );
         assert_eq!(found.len(), 1);
-        assert_eq!(found[0].start, 2520.0);
+        assert_eq!(found[0].start_ms, 2_520_000);
     }
 
     #[test]
@@ -364,7 +427,7 @@ mod tests {
             1_200_000,
         );
         assert_eq!(found.len(), 1);
-        assert_eq!((found[0].start, found[0].end), (30.0, 90.0));
+        assert_eq!((found[0].start_ms, found[0].end_ms), (30_000, 90_000));
 
         // Credits scan reversed, so the PREVIOUS neighbour wins: the skip
         // must start at Part 1, not Part 2.
@@ -377,7 +440,7 @@ mod tests {
             1_200_000,
         );
         assert_eq!(found.len(), 1);
-        assert_eq!(found[0].start, 1000.0);
+        assert_eq!(found[0].start_ms, 1_000_000);
     }
 
     #[test]

@@ -16,6 +16,7 @@ use std::collections::{HashMap, HashSet};
 /// Seconds of audio per fingerprint point: Chromaprint's 4096-sample frame at
 /// 11025 Hz with 2/3 overlap. `Data/ChromaprintConstants.cs`.
 pub const SAMPLE_DURATION: f64 = 4096.0 / 11025.0 / 3.0;
+const START_SNAP_SECS: f64 = kahawai_core::segments::INTRO_START_SNAP_MS as f64 / 1000.0;
 
 /// Search tuning. Defaults are intro-skipper's, from
 /// `Configuration/PluginConfiguration.cs`.
@@ -38,7 +39,7 @@ impl Default for SearchParams {
             max_point_differences: 6,
             inverted_index_shift: 2,
             max_time_skip: 3.5,
-            min_region_duration: 15.0,
+            min_region_duration: kahawai_core::segments::SHARED_REGION_MIN_MS as f64 / 1000.0,
         }
     }
 }
@@ -224,10 +225,10 @@ pub fn compare_with(
             })
             .expect("at least one pair");
         let (mut left, mut right) = (lhs_ranges[earliest], rhs_ranges[earliest]);
-        if left.start <= 5.0 {
+        if left.start <= START_SNAP_SECS {
             left.start = 0.0;
         }
-        if right.start <= 5.0 {
+        if right.start <= START_SNAP_SECS {
             right.start = 0.0;
         }
         return (left, right);
@@ -246,10 +247,10 @@ pub fn compare_with(
 
     let mut left = lhs_ranges[0];
     let mut right = rhs_ranges[0];
-    if left.start <= 5.0 {
+    if left.start <= START_SNAP_SECS {
         left.start = 0.0;
     }
-    if right.start <= 5.0 {
+    if right.start <= START_SNAP_SECS {
         right.start = 0.0;
     }
     (left, right)

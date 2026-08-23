@@ -26,7 +26,7 @@ impl Default for BlackFrameParams {
         Self {
             minimum_percentage: 85.0,
             threshold: 28,
-            minimum_credits_duration: 15.0,
+            minimum_credits_duration: kahawai_core::segments::BLACK_CREDITS_MIN_MS as f64 / 1000.0,
             maximum_error: 4.0,
         }
     }

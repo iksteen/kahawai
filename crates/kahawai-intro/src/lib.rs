@@ -16,7 +16,6 @@
 //! as with `kahawai-media`.
 
 pub mod blackframe;
-pub mod chapters;
 pub mod chroma;
 pub mod decode;
 pub mod fingerprint;

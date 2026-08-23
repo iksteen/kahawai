@@ -138,6 +138,13 @@ How something works and why it was built that way belong in
       host too slow to walk an index is too slow to serve video and
       fails at playback, where the failure is
 
+- [x] MH-13 Source-local season analysis: the hub sends one ordered set of
+      playback-ranked exact sources; the mediahost size/mtime-guards them,
+      runs recap/intro/credits detection against local paths, and returns only
+      boundaries. Audio analysis stops video before decode, video analysis
+      stops audio, and keyframe inspection decodes neither. Protocol-minor
+      gating leaves old hosts playable/scannable without a lease fallback.
+
 ## Hub — registry, resolution, enrichment
 
 - [x] HUB-1 Registry of mediahosts, collections, transcoders (live + persistent)
@@ -531,16 +538,16 @@ How something works and why it was built that way belong in
       admin overview, global rescan removed (endpoint + button)
 - [x] HUB-37 Recap / intro / credits detection, stored per episode and
       carried on the item QUERY; the web player offers a skip
-      button while the playhead is inside one. A background sweep walks
-      the library a season at a time, ordered by what has been watched,
-      pausing while anything is playing; the admin API reports what is
-      left and can run the next season now. A scan record is keyed to the
-      analysed file's mtime, so a replaced episode is analysed again. Chapter-name
-      analysis IS implemented: chapters are read from the container at scan
-      and a season that names its own opening and credits is answered from
-      the names, without reading a byte. Design in implementation §4.9; the
-      detector is measured against intro-skipper in
-      `docs/intro-detection-results.md`.
+      button while the playhead is inside one. The hub's background sweep
+      chooses seasons in watched-first order and remains the sole persistence
+      authority; the owning mediahost performs the decode work locally, yielding
+      to scans and viewer leases, so analysis sends no media bytes over a lease.
+      The admin API reports what is left and can run the next season now. A scan
+      record is keyed to the analysed file's mtime, so a replaced episode is
+      analysed again. Chapter-name analysis stays hub-side over stored source
+      facts: a season that names its own opening and credits is answered without
+      dispatching work. Design in implementation §4.9; detector parity remains
+      measured against intro-skipper in `docs/intro-detection-results.md`.
 - [x] Chapters as a first-class fact: read at scan beside the attachment
       declaration, backfilled for older Matroska/WebM rows (other containers
       keep whatever the demuxer's TOC declared at discovery, so a

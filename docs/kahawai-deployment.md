@@ -158,6 +158,27 @@ It honours the usual env override
    `login throttled` log lines.
 
 
+## GStreamer decoder policy
+
+Decoder ranks are process-global, so their configuration is too:
+
+```toml
+[gstreamer]
+demote_decoders = ["vah264dec", "vah265dec", "dtsdec"]
+```
+
+An explicit global section is authoritative, including an empty list. For
+existing deployments with no `[gstreamer]`, Kahawai merges the old
+`[mediahost]` and `[transcoder]` lists in stable order. `doctor --fix` creates
+the global section by seeding that union before adding newly measured failures,
+so the compatibility cutover cannot discard an operator's old policy.
+
+The Silence deploy script copies `~/.local/lib/kahawai-gst/`, sets an exclusive
+custom-plus-system plugin search path for both satellite processes, and refuses
+to restart them unless `matroskademux` resolves to the staged directory. This
+matters for segment analysis: it now runs inside the mediahost process and must
+see the same patched demuxers as scans and playback workers.
+
 ## Capping what a transcode costs the box (TC-6)
 
 Each session's pipeline is a separate `remux-worker` process, and two

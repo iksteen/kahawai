@@ -69,23 +69,24 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             analysis_percent: 0.25,
-            analysis_length_limit: 600.0,
-            maximum_intro_duration: 120.0,
-            maximum_credits_duration: 450.0,
+            analysis_length_limit: kahawai_core::segments::INTRO_WINDOW_LIMIT_MS as f64 / 1000.0,
+            maximum_intro_duration: kahawai_core::segments::INTRO_MAX_MS as f64 / 1000.0,
+            maximum_credits_duration: kahawai_core::segments::CREDITS_WINDOW_MS as f64 / 1000.0,
             search: SearchParams::default(),
             black: BlackFrameParams::default(),
             silence_noise_db: -50.0,
             silence_minimum_duration: 0.33,
-            adjust_window_inward: 5.0,
-            adjust_window_outward: 2.0,
+            adjust_window_inward: kahawai_core::segments::END_REFINEMENT_INWARD_MS as f64 / 1000.0,
+            adjust_window_outward: kahawai_core::segments::END_REFINEMENT_OUTWARD_MS as f64
+                / 1000.0,
             end_snap_threshold: 2.0,
             adjust_on_silence: true,
             snap_to_keyframe: true,
             anime: false,
             scan_recap: true,
             recap_card_minimum_duration: 3.0,
-            minimum_recap_duration: 15.0,
-            maximum_recap_duration: 120.0,
+            minimum_recap_duration: kahawai_core::segments::RECAP_MIN_MS as f64 / 1000.0,
+            maximum_recap_duration: kahawai_core::segments::RECAP_MAX_MS as f64 / 1000.0,
         }
     }
 }
@@ -190,13 +191,12 @@ pub struct SeasonReport {
     pub seconds: f64,
 }
 
-/// Called between episodes, wherever the analysis can be interrupted without
-/// losing work. The hub blocks inside it while anything is playing: a season is
-/// twenty minutes of reading and a viewer should not wait for it.
-pub type Between<'a> = &'a (dyn Fn() + Sync);
+/// Called between bounded reads, wherever analysis can yield without losing
+/// work. An error cancels the season after the current read finishes.
+pub type Between<'a> = &'a (dyn Fn() -> Result<()> + Sync);
 
-/// Nothing to do between episodes — the command line's answer.
-pub const STRAIGHT_THROUGH: Between<'static> = &|| {};
+/// Nothing to do between reads — the command line's answer.
+pub const STRAIGHT_THROUGH: Between<'static> = &|| Ok(());
 
 /// Analyze local files as one season.
 pub fn analyze_paths(paths: &[PathBuf], cfg: &Config) -> Result<SeasonReport> {
@@ -272,7 +272,7 @@ pub fn analyze(episodes: &[Episode], cfg: &Config, between: Between<'_>) -> Resu
     let intro_prints = if single {
         HashMap::new()
     } else {
-        fingerprints(episodes, &intro_windows, &all, between, &mut unreadable)
+        fingerprints(episodes, &intro_windows, &all, between, &mut unreadable)?
     };
     let intros = search_regions(
         episodes,
@@ -313,7 +313,7 @@ pub fn analyze(episodes: &[Episode], cfg: &Config, between: Between<'_>) -> Resu
                 return Ok(HashMap::new());
             }
             let queue = search_queue(episodes, wanted);
-            let prints = fingerprints(episodes, &credits_windows, &queue, between, unreadable);
+            let prints = fingerprints(episodes, &credits_windows, &queue, between, unreadable)?;
             search_regions(
                 episodes,
                 cfg,
@@ -345,7 +345,7 @@ pub fn analyze(episodes: &[Episode], cfg: &Config, between: Between<'_>) -> Resu
         if credits.contains_key(&i) {
             continue;
         }
-        between();
+        between()?;
         // A file the decoder cannot read costs its own episode and no more.
         // One truncated download — a Matroska whose index is promised past the
         // end of the file, so every seek fails — used to take its whole season
@@ -451,7 +451,7 @@ fn recaps(
     tracing::debug!(cards = cards.len(), "recap cards found");
     let mut found = HashMap::new();
     for (i, card) in cards {
-        between();
+        between()?;
         let episode = &episodes[i];
         let intro_start = intros.get(&i).map(|r| r.start);
         // Scan a little past the intro's start: the fade the recap ends on
@@ -556,10 +556,10 @@ fn fingerprints(
     wanted: &[usize],
     between: Between<'_>,
     unreadable: &mut HashSet<usize>,
-) -> HashMap<usize, Vec<u32>> {
+) -> Result<HashMap<usize, Vec<u32>>> {
     let mut prints: HashMap<usize, Vec<u32>> = HashMap::new();
     for &i in wanted {
-        between();
+        between()?;
         let (start, end) = windows[i];
         // A file we cannot fingerprint is not a reason to abandon the season;
         // theirs substitutes an empty fingerprint and carries on. But the
@@ -573,7 +573,7 @@ fn fingerprints(
         });
         prints.insert(i, points);
     }
-    prints
+    Ok(prints)
 }
 
 /// The queue the pairwise search walks: the episodes asked for, plus a

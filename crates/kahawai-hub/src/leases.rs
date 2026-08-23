@@ -35,6 +35,8 @@ pub fn new_lease_token() -> String {
 struct LeaseInner {
     req_tx: mpsc::Sender<Result<ReadRequest, tonic::Status>>,
     chunk_rx: tokio::sync::Mutex<mpsc::Receiver<ByteChunk>>,
+    /// All-in-one foreground activity, held until the last lease clone drops.
+    _activity_guard: Option<Box<dyn Send + Sync>>,
 }
 
 /// Cloneable handle; all clones share one sequential byte channel.
@@ -118,6 +120,13 @@ impl Lease {
     /// serving task speaks the same ReadRequest/ByteChunk protocol so
     /// every consumer of Lease works unchanged.
     pub fn local(path: std::path::PathBuf) -> Lease {
+        Self::local_guarded(path, None)
+    }
+
+    pub fn local_guarded(
+        path: std::path::PathBuf,
+        activity_guard: Option<Box<dyn Send + Sync>>,
+    ) -> Lease {
         let (req_tx, mut req_rx) = mpsc::channel::<Result<ReadRequest, tonic::Status>>(4);
         let (chunk_tx, chunk_rx) = mpsc::channel::<ByteChunk>(8);
         tokio::spawn(async move {
@@ -197,6 +206,7 @@ impl Lease {
         Lease(Arc::new(LeaseInner {
             req_tx,
             chunk_rx: tokio::sync::Mutex::new(chunk_rx),
+            _activity_guard: activity_guard,
         }))
     }
 }
@@ -239,6 +249,7 @@ impl Leases {
         let lease = Lease(Arc::new(LeaseInner {
             req_tx,
             chunk_rx: tokio::sync::Mutex::new(chunk_rx),
+            _activity_guard: None,
         }));
         waiter.send(lease).ok()?;
         Some((ReceiverStream::new(req_rx), chunk_tx))

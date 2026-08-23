@@ -477,7 +477,7 @@ A library grid reserves the full height of the result set from the first respons
 
 Two things learned by measuring rather than by reading the source they came from: seeking into the middle of a GOP and reading pixels immediately measures the decoder recovering, not the film — 92% of a frame reads as black where 4% of it is — so every video window decodes two seconds of lead-in first; and the black-frame search must carry its position from one episode to the next, as theirs does, or it converges on a different black run and lands minutes out.
 
-**Where it runs.** In the hub, over a mediahost lease, exactly as subtitle extraction does (§4.3a) and for the same reason: satellites stay simple and one implementation serves every deployment. The cost is real — a quarter of each episode plus its tail crosses the byte plane, roughly 500 MB per episode, about a minute each on a LAN, next to nothing for an all-in-one where the lease is a file read. A background sweep therefore works a season at a time, waits while anything is playing, and takes seasons in the order somebody has been watching them. `media_segment_scans` records every episode finished with, found or not, so a season with no shared opening is asked once. Two things reopen the question and nothing else does: the detector generation in that row, which asks the whole library again after an algorithm change, and the mtime of the file the detector actually read, which asks one episode again when those bytes are replaced or removed: a re-download of a truncated file, a re-encode, a restore. Keyed on the item alone, a scan record would say "analysed, nothing there" for ever about a file that was broken when it was read.
+**Where it runs.** The hub remains the orchestrator and authority: it chooses seasons in watched-first order, resolves the same connected playback-ranked exact source for each episode, handles the chapter-only fast path, and stores `media_segments` / `media_segment_scans`. For inferred boundaries it sends the ordered exact-source season over the mediahost control link. The mediahost validates each size/mtime, runs the unchanged `kahawai-intro` comparison against local paths, re-stats the sources, and returns only boundaries. This removes the measured ~500 MB and ~one LAN minute per episode from the byte plane. A protocol-minor gate leaves work pending on old mediahosts rather than silently falling back to leases. Existing completed rows remain detector generation 2 because execution moved but the algorithm did not.
 
 **What the client gets.** The boundaries ride on `QUERY /api/v1/items/{id}` — the call a player already makes on its way into playback, carrying the negotiation verdict and the subtitle listing — as `segments`, in milliseconds on the item's own timeline. There is no separate endpoint: a second one would be a second round trip on the path that matters and a second thing for a client to know, and the standalone case (marking boundaries on a page that is not playing anything) has not turned up yet. The field sits outside `negotiated`, because an item whose source is offline still has the boundaries somebody found last week. The web player takes them from that response and shows a single button — *Skip recap* / *Skip intro* / *Skip credits* — while the playhead is inside a segment and not within a second and a half of its end; pressing it seeks to the end of the segment (or, for credits that run to the file end, just inside it, so the up-next countdown takes over). Nothing is skipped automatically: the button is an offer.
 
@@ -495,9 +495,9 @@ A validated announcement inserts `collection_roots`. One configured root proves 
 
 **Reconnect sync (MH-10).** The scanner's local journal (MH-7) carries a per-collection `sync_generation`, advanced in the same transaction that records a change batch as acknowledged by the hub. On reconnect, `AnnounceCollection` carries it and the hub compares against its stored value. Match → in sync: no manifest, no directory walk, availability flips on — that's the entire handshake, so a hub or mediahost restart over a 250k-file collection costs one message. Mismatch → the mediahost replays un-acknowledged changes and streams a `FilesSeen` enumeration so the hub prunes rows for files that vanished while offline: incremental in both directions. Combined with content identity (MH-5), reconnection never costs a rescan (criterion 4). Newly added source facts do not justify invalidating this contract: PAR/orientation/display dimensions for old rows use a source-owned targeted worklist sent after an in-sync handshake or completed scan. The mediahost opens only those exact sources and returns GStreamer's PAR plus normalized `image-orientation`; the hub computes/stores the display dimensions in that source's `MediaInfo`, size-guards the result, records terminal failures, and never changes a generation or enters reconciliation. GStreamer's documented orientation values are the clockwise transform to apply, including horizontal `flip-rotate-*`; PAR is the discoverer's exact numerator/denominator. A changed FileUpsert replaces that source JSON and naturally retries only that revision. The inverse administrative knob still exists: `POST /admin/v1/libraries/{id}/refresh?deep=true` marks each member collection so the hub answers the NEXT manifest request empty — first-scan semantics for facts that genuinely require the whole scan path. One-shot and hub-side only, so it works against any satellite version; the incremental scan stays the default because a deep pass re-reads hash windows and re-probes 900-file collections for tens of minutes.
 
-**Job runner (MH-11).** All auxiliary work funnels through a three-tier priority runner. Tier 0 — `ExtractStream` requests (HUB-34 ladder step 3): a viewer is waiting, so these are never idle-gated and preempt everything below. Tier 1 — ED2K hashing, idle-gated. Tier 2 — subtitle pre-warm, idle-gated and strictly below hashing: opportunistically materializes embedded subtitle streams for recently added items so the HUB-34 ladder later hits step 1 instead of 3. *Idle* means exactly: no scan in progress **and** no read lease currently being served — background work never steals I/O from a scan or from someone's playback.
+**Job runners (MH-11/MH-13).** Urgent subtitle/image requests run immediately because a viewer is waiting. ED2K, declarations, geometry/keyframe probes and subtitle pre-warm remain idle-gated background work. Season analysis has its own one-at-a-time queue because its unit is a whole ordered season rather than one source; it waits while a scan or viewer lease is active and checks that gate between analyzer steps. Both runners keep control-link intake and heartbeats independent of blocking file work.
 
-A lease says which it is. `OpenRead.background` marks the hub's own sweeps — intro detection above all — and those do not make the box busy. Without that distinction a sweep reading every episode in the library is indistinguishable from somebody watching all day: measured, hours of detection during which the host declared nothing at all, and a backfill that would never have finished. The hub deliberately does not schedule this from its side; it cannot see the host's queues, and restating their predicates to guess at them would be wrong the day a seventh worklist is added.
+`OpenRead.background` remains for small hub-owned work such as NFO reads, but intro detection no longer opens one. The mediahost sees the analysis job directly and schedules it from its real scan/lease activity rather than forcing the hub to infer the host's queues.
 
 **ED2K hasher (MH-9).** Tier 1 of the job runner, enabled per collection on hub request (anime): full-file ED2K (9.28 MiB chunked MD4) computed at bounded read rate, optionally verifying a filename CRC32 in the same pass. Results ship as dedicated `FileHashes` messages — not `FileUpsert` amendments — and the mediahost keeps no hash state: the hub persists the hash on the `files` row, and content-identity copy-forward (a renamed/moved file inherits the row's hash along with its identity) gives at-most-once hashing with zero new persistence. The hub's `RequestHashes` simply enumerates files whose rows lack a hash. Scan completion never waits on any of this — hash matches upgrade an item's identification asynchronously.
 
@@ -661,12 +661,11 @@ nothing to play (`unplayable`).
 [hub]
 bind = "0.0.0.0:8420"
 data_dir = "/var/lib/kahawai"
-detect_segments = true                # HUB-37: hunt for recaps/intros/credits
-                                      # in the background. Off spends no byte
-                                      # plane on it — the sweep does not run
-                                      # and the admin run-now trigger refuses
-                                      # — and leaves the buttons unavailable
-                                      # for anything unanalyzed.
+detect_segments = true                # HUB-37: queue recaps/intros/credits
+                                      # in watched-first order. The owning
+                                      # mediahost performs local analysis;
+                                      # off disables the sweep and admin
+                                      # run-now trigger.
 [hub.enrichment]
 providers = ["local", "thetvdb", "tmdb", "musicbrainz"]
 anime_providers = ["local", "anidb", "anilist"]   # used by anime libraries
@@ -698,6 +697,11 @@ api_key = "${KAHAWAI_OS_KEY}"         # optional override of the embedded applic
 [hub.pki]
 satellite_cert_days = 90
 enrollment_ttl_minutes = 15
+
+[gstreamer]
+# Process-global decoder policy. If this section is absent, legacy
+# mediahost/transcoder demotion lists are merged for compatibility.
+demote_decoders = ["vah264dec", "vah265dec", "dtsdec"]
 
 [mediahost]
 hub = "hub.lan:8421"

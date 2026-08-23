@@ -1,46 +1,23 @@
-//! OPS-9 remediation: write the decoder demotions this box needs into
-//! this box's own config file.
+//! OPS-9 remediation: write this box's decoder demotions into the global
+//! GStreamer policy without rewriting the operator's TOML.
 //!
-//! The requirement exists because the DTS check already warned, in
-//! exactly the words that describe the bug, on a box nobody was reading
-//! the output of — and the library silently accumulated 312 wrongly
-//! filed channel counts. A check whose remedy is a hand-edited TOML on
-//! each satellite is a check that will be ignored.
+//! Four rules govern the write:
+//! 1. **Format-preserving.** `toml_edit` keeps comments and layout.
+//! 2. **Additive only.** A human's entry is never removed.
+//! 3. **Idempotent.** A second run changes nothing.
+//! 4. **Backward-compatible.** Creating `[gstreamer]` first seeds it from the
+//!    merged legacy mediahost/transcoder lists. An explicit global section is
+//!    authoritative, so omitting that seed would silently discard old policy.
 //!
-//! Four rules govern the write, and each one is a way this could
-//! quietly destroy an operator's file:
-//!
-//! 1. **Format-preserving.** Read-modify-serialize would reflow the
-//!    document and drop every comment — including the three-line note
-//!    beside the existing `demote_decoders` explaining WHY dtsdec is
-//!    demoted, which is worth more than the line it annotates. So the
-//!    edit goes through `toml_edit`, which keeps the original bytes of
-//!    everything it does not touch.
-//! 2. **Additive only.** A human's entry is never removed, even when
-//!    this box cannot reproduce the reason for it. The measurement runs
-//!    on one box at one moment; the human may know something it does
-//!    not, and the cost of being wrong is asymmetric — a spurious
-//!    demotion loses some speed, a removed one silently files 312 files
-//!    wrong again.
-//! 3. **Idempotent.** Running twice changes nothing the second time,
-//!    which is what makes it safe to put in a provisioning script.
-//! 4. **Per box.** A demotion is calibration of one machine's hardware
-//!    and drivers, so `--fix` only ever writes the config of the box it
-//!    runs on, and only for elements it measured or holds on the
-//!    known-bad list.
-//!
-//! Both `[transcoder]` and `[mediahost]` get the demotion because the
-//! two lists exist precisely because a decoder can be right for one job
-//! and wrong for the other — and `dtsdec` is wrong for both: it decodes
-//! the wrong thing AND, through discovery, files the wrong thing.
+//! Decoder ranks are process-global. A single section now describes that
+//! reality; the role-local lists remain input only when `[gstreamer]` is absent.
 
 use std::path::Path;
 
 use anyhow::{Context, Result};
 
-/// The sections a demotion is written to. Both, always: see the module
-/// doc — a decoder that decodes the wrong thing also files it.
-const SECTIONS: [&str; 2] = ["transcoder", "mediahost"];
+const GLOBAL: &str = "gstreamer";
+const LEGACY_SECTIONS: [&str; 2] = ["mediahost", "transcoder"];
 
 /// One change `--fix` made (or would make).
 pub struct Written {
@@ -49,38 +26,58 @@ pub struct Written {
     pub why: String,
 }
 
-/// Add `demote` to `[transcoder]` and `[mediahost] demote_decoders` in
-/// `path`, preserving everything else byte for byte. Returns what
-/// changed; an empty result means the file already said it.
+/// Add measured demotions to `[gstreamer]`, seeding a newly-created section
+/// from both legacy role lists. Returns what changed.
 pub fn apply(path: &Path, demote: &[(String, String)]) -> Result<Vec<Written>> {
     let text =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     let mut doc = text
         .parse::<toml_edit::DocumentMut>()
         .with_context(|| format!("parsing {} — fix it by hand first", path.display()))?;
+    let inherited = if doc.contains_key(GLOBAL) {
+        Vec::new()
+    } else {
+        legacy_demotions(&doc)
+    };
 
     let mut written = Vec::new();
-    for section in SECTIONS {
-        for (element, why) in demote {
-            if add_one(&mut doc, section, element) {
-                written.push(Written {
-                    section,
-                    element: element.clone(),
-                    why: why.clone(),
-                });
-            }
+    for element in inherited {
+        if add_one(&mut doc, GLOBAL, &element) {
+            written.push(Written {
+                section: GLOBAL,
+                element,
+                why: "inherited from legacy role policy".into(),
+            });
+        }
+    }
+    for (element, why) in demote {
+        if add_one(&mut doc, GLOBAL, element) {
+            written.push(Written {
+                section: GLOBAL,
+                element: element.clone(),
+                why: why.clone(),
+            });
         }
     }
     if written.is_empty() {
         return Ok(written);
     }
-    // Write through a temp file in the same directory: a half-written
-    // config is a box that will not start, and this runs on satellites
-    // reachable only over ssh.
     let tmp = path.with_extension("toml.kahawai-new");
     std::fs::write(&tmp, doc.to_string()).with_context(|| format!("writing {}", tmp.display()))?;
     std::fs::rename(&tmp, path).with_context(|| format!("replacing {}", path.display()))?;
     Ok(written)
+}
+
+fn legacy_demotions(doc: &toml_edit::DocumentMut) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    LEGACY_SECTIONS
+        .iter()
+        .filter_map(|section| doc.get(section)?.as_table_like())
+        .filter_map(|table| table.get("demote_decoders")?.as_array())
+        .flat_map(|array| array.iter().filter_map(|value| value.as_str()))
+        .filter(|name| seen.insert((*name).to_string()))
+        .map(str::to_string)
+        .collect()
 }
 
 /// True if the element was added — false if it was already there,
@@ -151,17 +148,12 @@ mod tests {
             text.contains("\"vah265dec\""),
             "the demotion was not written"
         );
-        // Both sections, because a decoder that decodes wrong also files
-        // wrong — [mediahost] did not exist and had to be created.
-        assert_eq!(
-            out.len(),
-            2,
-            "expected one write per section, got {}",
-            out.len()
-        );
+        // The new global section is seeded with the legacy entry before the
+        // measured one lands, or its presence would override and lose dtsdec.
+        assert_eq!(out.len(), 2);
         assert!(
-            text.contains("[mediahost]"),
-            "mediahost section not created:\n{text}"
+            text.contains("[gstreamer]"),
+            "global section not created:\n{text}"
         );
     }
 
@@ -171,7 +163,7 @@ mod tests {
     fn a_second_run_changes_nothing() {
         let (_d, path) = write("[transcoder]\ndemote_decoders = []\n");
         let demote = vec![("dtsdec".into(), "core only".into())];
-        assert_eq!(apply(&path, &demote).unwrap().len(), 2);
+        assert_eq!(apply(&path, &demote).unwrap().len(), 1);
         let after_first = std::fs::read_to_string(&path).unwrap();
 
         assert!(
@@ -183,6 +175,26 @@ mod tests {
             std::fs::read_to_string(&path).unwrap(),
             "second run rewrote the file"
         );
+    }
+
+    #[test]
+    fn an_explicit_global_section_does_not_inherit_legacy_policy() {
+        let (_d, path) = write(
+            "[gstreamer]\n\
+             demote_decoders = []\n\
+             [transcoder]\n\
+             demote_decoders = [\"legacydec\"]\n",
+        );
+        apply(&path, &[("measureddec".into(), "slow".into())]).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let doc = text.parse::<toml_edit::DocumentMut>().unwrap();
+        let global = doc["gstreamer"]["demote_decoders"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(global, ["measureddec"]);
     }
 
     /// A config we cannot parse is a config we must not overwrite.

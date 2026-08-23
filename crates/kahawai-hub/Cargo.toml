@@ -15,13 +15,13 @@ ocr = ["dep:leptess"]
 [dependencies]
 leptess = { version = "0.14", optional = true }
 kahawai-core = { workspace = true }
-kahawai-intro = { workspace = true }
 kahawai-media = { workspace = true }
 kahawai-proto = { workspace = true }
 kahawai-transport = { workspace = true }
 tonic = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
+parking_lot = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 rcgen = { workspace = true }

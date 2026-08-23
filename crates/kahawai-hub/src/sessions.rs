@@ -966,6 +966,7 @@ fn playlist_span_secs(playlist: &str) -> f64 {
 
 type LocalResolver =
     std::sync::Arc<dyn Fn(&str, &str, &str) -> Result<std::path::PathBuf> + Send + Sync>;
+type LocalActivity = std::sync::Arc<dyn Fn() -> Box<dyn Send + Sync> + Send + Sync>;
 
 /// How long a burn-in session waits for the mediahost to walk its
 /// index. Milliseconds on local disk; this is the sanity bound, well
@@ -1008,6 +1009,8 @@ pub struct Sessions {
     /// AR-5: the in-process mediahost, if any — (module_id, path
     /// resolver). Its leases are direct file reads, no OpenRead.
     local_source: Mutex<Option<(String, LocalResolver)>>,
+    /// Enters the in-process mediahost's foreground gate for a local lease.
+    local_activity: Mutex<Option<LocalActivity>>,
     /// Scratch space for remux sessions (`<data_dir>/sessions`).
     scratch_root: PathBuf,
     max_per_user: usize,
@@ -1323,6 +1326,7 @@ impl Sessions {
         Self {
             leases: Leases::default(),
             local_source: Mutex::new(None),
+            local_activity: Mutex::new(None),
             scratch_root,
             max_per_user,
             idle_timeout,
@@ -1600,6 +1604,13 @@ impl Sessions {
             Some((module_id.to_string(), std::sync::Arc::new(resolve)));
     }
 
+    pub fn set_local_activity(
+        &self,
+        enter: impl Fn() -> Box<dyn Send + Sync> + Send + Sync + 'static,
+    ) {
+        *self.local_activity.lock().unwrap() = Some(std::sync::Arc::new(enter));
+    }
+
     pub(crate) async fn open_lease(
         &self,
         registry: &Registry,
@@ -1618,7 +1629,13 @@ impl Sessions {
             })
         };
         if let Some(path) = local {
-            return Ok(Lease::local(path?));
+            let activity_guard = self
+                .local_activity
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|enter| enter());
+            return Ok(Lease::local_guarded(path?, activity_guard));
         }
         let token = new_lease_token();
         let msg = HubToHost {
@@ -3594,7 +3611,7 @@ mod lease_purpose_tests {
         let db = crate::db::open(dir.path()).await.unwrap();
         let registry = crate::registry::Registry::new(db, Default::default());
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
-        registry.register_link("01MH", tx);
+        registry.register_link("01MH", tx, kahawai_proto::PROTOCOL_MINOR);
 
         let sessions = std::sync::Arc::new(Sessions::new(dir.path().join("sessions")));
         // Nobody answers the OpenRead, so the lease never establishes; the
@@ -3622,6 +3639,38 @@ mod lease_purpose_tests {
         // The default reading of a missing field, so a hub too old to say
         // is taken as a viewer — the safe way round.
         assert!(!opened_as(Reader::Viewer).await);
+    }
+
+    #[tokio::test]
+    async fn a_local_lease_holds_mediahost_activity_until_drop() {
+        struct Guard(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("episode.mkv");
+        std::fs::write(&source, b"bytes").unwrap();
+        let db = crate::db::open(dir.path()).await.unwrap();
+        let registry = crate::registry::Registry::new(db, Default::default());
+        let sessions = Sessions::new(dir.path().join("sessions"));
+        sessions.set_local_source("local", move |_, _, _| Ok(source.clone()));
+        let active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let entered = active.clone();
+        sessions.set_local_activity(move || {
+            entered.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Box::new(Guard(entered.clone()))
+        });
+
+        let lease = sessions
+            .open_lease(&registry, "local", "c", "r", "episode.mkv", Reader::Viewer)
+            .await
+            .unwrap();
+        assert_eq!(active.load(std::sync::atomic::Ordering::Relaxed), 1);
+        drop(lease);
+        assert_eq!(active.load(std::sync::atomic::Ordering::Relaxed), 0);
     }
 }
 

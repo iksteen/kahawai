@@ -587,7 +587,14 @@ async fn protocol_2_mediahost_is_rejected_during_hello() {
         .await
         .unwrap_err();
     assert_eq!(status.code(), tonic::Code::FailedPrecondition);
-    assert!(status.message().contains("hub speaks 3.0"), "{status}");
+    assert!(
+        status.message().contains(&format!(
+            "hub speaks {}.{}",
+            kahawai_proto::PROTOCOL_MAJOR,
+            kahawai_proto::PROTOCOL_MINOR
+        )),
+        "{status}"
+    );
 }
 
 #[tokio::test]

@@ -54,17 +54,17 @@ fn end_sessions_on(sessions: &Sessions, module_id: &str) {
 pub(crate) fn forget_link(
     registry: &Registry,
     sessions: &Sessions,
+    segments: &crate::segments::Detector,
     module_id: &str,
+    generation: u64,
     tx: &tokio::sync::mpsc::Sender<Result<HubToHost, Status>>,
 ) {
-    // Only if this task's link is still the registered one. A link that dies
-    // without a FIN sits in its heartbeat window while the box comes back and
-    // registers afresh; clearing by module id then wiped the LIVE link, and
-    // nothing restores it — `seen` writes `last_seen`, which nothing reads.
-    // Sender and state together, under `links`: splitting them left a window
-    // in which the box reconnected between the two and the late `disconnected`
-    // marked the LIVE connection absent, which nothing ever undoes.
-    if !registry.unregister_link_if_current(module_id, tx) {
+    // Remove routing first, then retire this generation's work. A dispatcher
+    // that raced before removal is cancelled below; one that races after sees
+    // the generation is no longer current and cancels its own waiter.
+    let current = registry.unregister_link_if_current(module_id, tx);
+    segments.segment_link_disconnected(module_id, generation);
+    if !current {
         tracing::info!(%module_id, "link already replaced; leaving the new one alone");
         return;
     }
@@ -76,6 +76,7 @@ pub struct MediahostLinkService {
     sessions: Arc<Sessions>,
     subtitles: Arc<crate::subtitles::Subtitles>,
     enricher: Arc<crate::enrich::Enricher>,
+    segments: Arc<crate::segments::Detector>,
 }
 
 impl MediahostLinkService {
@@ -85,11 +86,28 @@ impl MediahostLinkService {
         subtitles: Arc<crate::subtitles::Subtitles>,
         enricher: Arc<crate::enrich::Enricher>,
     ) -> Self {
+        Self::new_with_segments(
+            registry,
+            sessions,
+            subtitles,
+            enricher,
+            Arc::new(crate::segments::Detector::new()),
+        )
+    }
+
+    pub fn new_with_segments(
+        registry: Arc<Registry>,
+        sessions: Arc<Sessions>,
+        subtitles: Arc<crate::subtitles::Subtitles>,
+        enricher: Arc<crate::enrich::Enricher>,
+        segments: Arc<crate::segments::Detector>,
+    ) -> Self {
         Self {
             registry,
             sessions,
             subtitles,
             enricher,
+            segments,
         }
     }
 
@@ -98,6 +116,20 @@ impl MediahostLinkService {
         // tonic's 4 MB default, which kills the whole control link.
         MediahostLinkServer::new(self).max_decoding_message_size(64 * 1024 * 1024)
     }
+}
+
+fn register_host_link(
+    registry: &Registry,
+    segments: &crate::segments::Detector,
+    module_id: &str,
+    tx: tokio::sync::mpsc::Sender<Result<HubToHost, Status>>,
+    protocol_minor: u32,
+) -> u64 {
+    let (generation, replaced) = registry.register_link(module_id, tx, protocol_minor);
+    if let Some(replaced) = replaced {
+        segments.segment_link_disconnected(module_id, replaced);
+    }
+    generation
 }
 
 /// AR-5: attach an in-process mediahost. Same message handling as a
@@ -109,6 +141,7 @@ pub fn local_link(
     registry: Arc<Registry>,
     subtitles: Arc<crate::subtitles::Subtitles>,
     enricher: Arc<crate::enrich::Enricher>,
+    segments: Arc<crate::segments::Detector>,
     module_id: &str,
     name: &str,
 ) -> (
@@ -117,6 +150,7 @@ pub fn local_link(
 ) {
     let (host_tx, mut host_rx) = tokio::sync::mpsc::channel::<HostToHub>(64);
     let (hub_tx, hub_rx) = tokio::sync::mpsc::channel::<Result<HubToHost, Status>>(16);
+    let registered_tx = hub_tx.clone();
     registry.connected(
         module_id,
         "mediahost",
@@ -124,7 +158,7 @@ pub fn local_link(
         "in-process",
         kahawai_core::build_stamp(),
     );
-    registry.register_link(module_id, hub_tx);
+    let generation = register_host_link(&registry, &segments, module_id, hub_tx, PROTOCOL_MINOR);
     let module_id = module_id.to_string();
     tokio::spawn(async move {
         let mut seen: std::collections::HashMap<
@@ -139,11 +173,16 @@ pub fn local_link(
                 registry.seen(&module_id);
                 continue;
             }
+            let Some(msg) = route_segment_reply(&segments, &module_id, generation, msg) else {
+                continue;
+            };
             if let Err(e) = handle_host_msg(
                 &registry,
                 &subtitles,
                 &enricher,
+                &segments,
                 &module_id,
+                generation,
                 msg,
                 &mut seen,
                 &mut partial,
@@ -161,8 +200,8 @@ pub fn local_link(
         // subtitle and scan paths that gate on `is_connected` stop working for
         // the hub's own library with nothing to re-establish it. Recorded
         // rather than fixed here. Both maps together, before the task returns.
-        registry.unregister_link(&module_id);
-        registry.disconnected(&module_id);
+        registry.unregister_link_if_current(&module_id, &registered_tx);
+        segments.segment_link_disconnected(&module_id, generation);
     });
     (host_tx, hub_rx)
 }
@@ -203,13 +242,20 @@ impl MediahostLink for MediahostLinkService {
         let registry = self.registry.clone();
         let outer_subtitles = self.subtitles.clone();
         let outer_enricher = self.enricher.clone();
+        let outer_segments = self.segments.clone();
         let sessions = self.sessions.clone();
         let module_id = peer.module_id.clone();
         // Sender first, and only then "present". The reverse order left this
         // host offered as a playback source across the renewal settlement's DB
         // work below — SELECT, sometimes an UPDATE with an audit row — with no
         // way to reach it, which is answered 409 rather than 503.
-        registry.register_link(&module_id, tx.clone());
+        let generation = register_host_link(
+            &registry,
+            &outer_segments,
+            &module_id,
+            tx.clone(),
+            hello.protocol_minor,
+        );
         registry.connected(
             &module_id,
             &peer.module_type,
@@ -229,7 +275,14 @@ impl MediahostLink for MediahostLinkService {
                 })),
             };
             if tx.send(Ok(ack)).await.is_err() {
-                forget_link(&registry, &sessions, &module_id, &tx);
+                forget_link(
+                    &registry,
+                    &sessions,
+                    &outer_segments,
+                    &module_id,
+                    generation,
+                    &tx,
+                );
                 return;
             }
             // Heavy messages (upserts with resolution, reconciliation)
@@ -243,6 +296,7 @@ impl MediahostLink for MediahostLinkService {
                 let module_id = module_id.clone();
                 let subtitles = outer_subtitles.clone();
                 let enricher = outer_enricher.clone();
+                let segments = outer_segments.clone();
                 tokio::spawn(async move {
                     let mut seen: std::collections::HashMap<
                         String,
@@ -257,7 +311,9 @@ impl MediahostLink for MediahostLinkService {
                             &registry,
                             &subtitles,
                             &enricher,
+                            &segments,
                             &module_id,
+                            generation,
                             msg,
                             &mut seen,
                             &mut partial,
@@ -289,14 +345,14 @@ impl MediahostLink for MediahostLinkService {
                                 .await;
                             break;
                         }
-                        // Liveness inline; everything else in order on
-                        // the worker (a full queue applies backpressure
-                        // but 64 batches of headroom outlasts any DB
-                        // stall shorter than the timeout).
+                        // Liveness and segment correlation are synchronous:
+                        // neither may wait behind scan/database work.
                         if matches!(msg, host_to_hub::Msg::Heartbeat(_)) {
                             tracing::debug!(%module_id, "heartbeat read");
                             registry.seen(&module_id);
-                        } else {
+                        } else if let Some(msg) =
+                            route_segment_reply(&outer_segments, &module_id, generation, msg)
+                        {
                             let kind = kind_name(&msg);
                             tracing::debug!(%module_id, kind, "link msg read");
                             let queued = tokio::time::Instant::now();
@@ -337,7 +393,14 @@ impl MediahostLink for MediahostLinkService {
             // the old ordering the leftover was `connected: false`, which at
             // least produced the 503 stand-by. Safe to move because nothing in
             // the drained queue sends to the host; it only writes the DB.
-            forget_link(&registry, &sessions, &module_id, &tx);
+            forget_link(
+                &registry,
+                &sessions,
+                &outer_segments,
+                &module_id,
+                generation,
+                &tx,
+            );
             let _ = worker.await; // then drain in order, touching no maps
         });
 
@@ -534,9 +597,33 @@ fn validate_exact_host_msg(m: &host_to_hub::Msg) -> anyhow::Result<()> {
             valid(&message.source, "FileVideoGeometry")?
         }
         host_to_hub::Msg::ImageSubtitles(message) => valid(&message.source, "ImageSubtitles")?,
+        host_to_hub::Msg::SegmentDetectionResult(result) => {
+            for episode in &result.episodes {
+                valid(&episode.source, "SegmentEpisodeResult")?;
+            }
+        }
         _ => {}
     }
     Ok(())
+}
+
+fn route_segment_reply(
+    segments: &crate::segments::Detector,
+    module_id: &str,
+    generation: u64,
+    msg: host_to_hub::Msg,
+) -> Option<host_to_hub::Msg> {
+    match msg {
+        host_to_hub::Msg::SegmentDetectionAccepted(accepted) => {
+            segments.segment_accepted(module_id, generation, accepted);
+            None
+        }
+        host_to_hub::Msg::SegmentDetectionResult(result) => {
+            segments.segment_result(module_id, generation, result);
+            None
+        }
+        other => Some(other),
+    }
 }
 
 fn kind_name(m: &host_to_hub::Msg) -> &'static str {
@@ -557,6 +644,8 @@ fn kind_name(m: &host_to_hub::Msg) -> &'static str {
         host_to_hub::Msg::ImageSubtitles(_) => "image_subtitles",
         host_to_hub::Msg::RootResolutions(_) => "root_resolutions",
         host_to_hub::Msg::RootAdoptionAck(_) => "root_adoption_ack",
+        host_to_hub::Msg::SegmentDetectionAccepted(_) => "segment_detection_accepted",
+        host_to_hub::Msg::SegmentDetectionResult(_) => "segment_detection_result",
     }
 }
 
@@ -568,7 +657,9 @@ async fn handle_host_msg(
     registry: &Arc<Registry>,
     subtitles: &crate::subtitles::Subtitles,
     enricher: &Arc<crate::enrich::Enricher>,
+    segments: &Arc<crate::segments::Detector>,
     module_id: &str,
+    generation: u64,
     msg: host_to_hub::Msg,
     seen: &mut std::collections::HashMap<
         String,
@@ -1088,6 +1179,12 @@ async fn handle_host_msg(
             }
             enricher.nudge(registry.clone());
         }
+        host_to_hub::Msg::SegmentDetectionAccepted(accepted) => {
+            segments.segment_accepted(module_id, generation, accepted);
+        }
+        host_to_hub::Msg::SegmentDetectionResult(result) => {
+            segments.segment_result(module_id, generation, result);
+        }
         host_to_hub::Msg::ScanProgress(_) | host_to_hub::Msg::Hello(_) => {}
     }
     Ok(())
@@ -1410,7 +1507,7 @@ mod chunk_tests {
 
 #[cfg(test)]
 mod forget_link_tests {
-    use super::forget_link;
+    use super::{forget_link, register_host_link, route_segment_reply};
     use crate::registry::Registry;
     use crate::sessions::Sessions;
     use std::sync::Arc;
@@ -1429,10 +1526,19 @@ mod forget_link_tests {
 
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
         registry.connected("01HOST", "mediahost", "nas", "fp", "test");
-        registry.register_link("01HOST", tx.clone());
+        let generation = registry
+            .register_link("01HOST", tx.clone(), kahawai_proto::PROTOCOL_MINOR)
+            .0;
         assert!(registry.is_connected("01HOST"));
 
-        forget_link(&registry, &sessions, "01HOST", &tx);
+        forget_link(
+            &registry,
+            &sessions,
+            &crate::segments::Detector::new(),
+            "01HOST",
+            generation,
+            &tx,
+        );
 
         assert!(
             !registry.is_connected("01HOST"),
@@ -1463,15 +1569,23 @@ mod forget_link_tests {
 
         let (old_tx, _old_rx) = tokio::sync::mpsc::channel(1);
         registry.connected("01HOST", "mediahost", "nas", "fp", "test");
-        registry.register_link("01HOST", old_tx.clone());
+        let (old_generation, _) =
+            registry.register_link("01HOST", old_tx.clone(), kahawai_proto::PROTOCOL_MINOR);
 
         // The box reconnects before the old task notices.
         let (new_tx, _new_rx) = tokio::sync::mpsc::channel(1);
-        registry.register_link("01HOST", new_tx.clone());
+        registry.register_link("01HOST", new_tx.clone(), kahawai_proto::PROTOCOL_MINOR);
         registry.connected("01HOST", "mediahost", "nas", "fp", "test");
 
         // Now the old task times out and tears down.
-        forget_link(&registry, &sessions, "01HOST", &old_tx);
+        forget_link(
+            &registry,
+            &sessions,
+            &crate::segments::Detector::new(),
+            "01HOST",
+            old_generation,
+            &old_tx,
+        );
 
         assert!(
             registry.is_connected("01HOST"),
@@ -1484,5 +1598,54 @@ mod forget_link_tests {
                 .is_ok(),
             "and its sender must still be reachable"
         );
+    }
+
+    #[tokio::test]
+    async fn segment_jobs_are_gated_on_the_mediahost_minor() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::open(dir.path()).await.unwrap();
+        let registry = Registry::new(db, Default::default());
+        let (old_tx, _old_rx) = tokio::sync::mpsc::channel(1);
+        registry.register_link("host", old_tx, 0);
+        assert!(!registry.host_supports_segment_detection("host"));
+
+        let (new_tx, _new_rx) = tokio::sync::mpsc::channel(1);
+        registry.register_link("host", new_tx, 1);
+        assert!(registry.host_supports_segment_detection("host"));
+    }
+
+    #[tokio::test]
+    async fn replacing_a_link_cancels_its_segment_waiter() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::open(dir.path()).await.unwrap();
+        let registry = Registry::new(db, Default::default());
+        let detector = crate::segments::Detector::new();
+        let (old_tx, _old_rx) = tokio::sync::mpsc::channel(1);
+        let old_generation = register_host_link(&registry, &detector, "host", old_tx, 1);
+        let reply = detector.wait_for_segment_result("host", old_generation, "job");
+
+        let (new_tx, _new_rx) = tokio::sync::mpsc::channel(1);
+        register_host_link(&registry, &detector, "host", new_tx, 1);
+
+        assert!(
+            reply.await.unwrap().is_err(),
+            "replacement left waiter alive"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_segment_result_completes_before_the_ordered_queue_drains() {
+        let detector = crate::segments::Detector::new();
+        let generation = 7;
+        let reply = detector.wait_for_segment_result("host", generation, "job");
+        let message = kahawai_proto::v1::host_to_hub::Msg::SegmentDetectionResult(
+            kahawai_proto::v1::SegmentDetectionResult {
+                request_id: "job".into(),
+                ..Default::default()
+            },
+        );
+
+        assert!(route_segment_reply(&detector, "host", generation, message).is_none());
+        assert!(reply.await.unwrap().is_ok());
     }
 }

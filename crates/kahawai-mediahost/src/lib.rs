@@ -4,6 +4,7 @@
 pub mod ed2k;
 pub mod hasher;
 pub mod scan;
+pub mod segments;
 pub mod serve;
 
 use std::path::Path;
@@ -27,12 +28,21 @@ const RECONNECT_DELAY: Duration = Duration::from_secs(5);
 pub struct Activity {
     scans: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     leases: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    urgent: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    background: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 pub struct ActivityGuard(std::sync::Arc<std::sync::atomic::AtomicUsize>);
 impl Drop for ActivityGuard {
     fn drop(&mut self) {
         self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+pub struct BackgroundGuard(std::sync::Arc<std::sync::atomic::AtomicBool>);
+impl Drop for BackgroundGuard {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -47,12 +57,32 @@ impl Activity {
     pub fn lease(&self) -> ActivityGuard {
         Self::enter(&self.leases)
     }
+    pub fn urgent(&self) -> ActivityGuard {
+        Self::enter(&self.urgent)
+    }
+    pub fn try_background(&self) -> Option<BackgroundGuard> {
+        self.background
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::Acquire,
+                std::sync::atomic::Ordering::Relaxed,
+            )
+            .ok()
+            .map(|_| BackgroundGuard(self.background.clone()))
+    }
     pub fn busy(&self) -> bool {
         self.scans.load(std::sync::atomic::Ordering::Relaxed) != 0
             || self.leases.load(std::sync::atomic::Ordering::Relaxed) != 0
+            || self.urgent.load(std::sync::atomic::Ordering::Relaxed) != 0
     }
 }
 
+#[derive(Clone, Default)]
+struct JobRuntime {
+    activity: Activity,
+    segment_serial: std::sync::Arc<tokio::sync::Mutex<()>>,
+}
 /// Enroll (or load identity) and keep the hub link up forever.
 pub async fn run(
     hub_addr: &str,
@@ -63,7 +93,8 @@ pub async fn run(
 ) -> Result<()> {
     let mut id =
         kahawai_transport::enroll::ensure_identity(hub_addr, state_dir, "mediahost", name).await?;
-
+    // Survives link engines: cancelled spawn_blocking work retains this permit
+    let jobs = JobRuntime::default();
     loop {
         // SEC-7: renew before (re)connecting when inside the window, and
         // bound the link's lifetime so a long-lived link still renews.
@@ -80,7 +111,15 @@ pub async fn run(
             .unwrap_or(i64::MAX)
             .max(3600) as u64;
         tokio::select! {
-            r = link_once(hub_addr, tls.clone(), name, &collections, rescan_minutes, state_dir) => match r {
+            r = link_once(
+                hub_addr,
+                tls.clone(),
+                name,
+                &collections,
+                rescan_minutes,
+                state_dir,
+                jobs.clone(),
+            ) => match r {
                 Ok(()) => tracing::warn!("hub closed the link; reconnecting"),
                 Err(e) => tracing::warn!(error = format!("{e:#}"), "link failed; reconnecting"),
             },
@@ -99,10 +138,17 @@ pub async fn run_local(
     collections: Vec<scan::CollectionConfig>,
     rescan_minutes: u64,
     state_dir: &Path,
+    activity: Activity,
     tx: tokio::sync::mpsc::Sender<HostToHub>,
     mut rx: tokio::sync::mpsc::Receiver<Result<HubToHost, tonic::Status>>,
 ) -> Result<()> {
-    let engine = Engine::start(&collections, rescan_minutes, state_dir, tx.clone());
+    let engine = Engine::start_with_activity(
+        &collections,
+        rescan_minutes,
+        state_dir,
+        tx.clone(),
+        activity,
+    );
     let mut ticker = tokio::time::interval(HEARTBEAT_INTERVAL);
     loop {
         tokio::select! {
@@ -192,6 +238,7 @@ pub struct Engine {
         >,
     >,
     hash_tx: tokio::sync::mpsc::Sender<hasher::JobMsg>,
+    segment_tx: tokio::sync::mpsc::UnboundedSender<kahawai_proto::v1::DetectSegments>,
     collections: Vec<CollectionConfig>,
     tx: tokio::sync::mpsc::Sender<HostToHub>,
     pub activity: Activity,
@@ -205,6 +252,40 @@ impl Engine {
         state_dir: &Path,
         tx: tokio::sync::mpsc::Sender<HostToHub>,
     ) -> Engine {
+        Self::start_with_activity(
+            collections,
+            rescan_minutes,
+            state_dir,
+            tx,
+            Activity::default(),
+        )
+    }
+
+    pub fn start_with_activity(
+        collections: &[scan::CollectionConfig],
+        rescan_minutes: u64,
+        state_dir: &Path,
+        tx: tokio::sync::mpsc::Sender<HostToHub>,
+        activity: Activity,
+    ) -> Engine {
+        Self::start_with_runtime(
+            collections,
+            rescan_minutes,
+            state_dir,
+            tx,
+            activity,
+            std::sync::Arc::new(tokio::sync::Mutex::new(())),
+        )
+    }
+
+    fn start_with_runtime(
+        collections: &[scan::CollectionConfig],
+        rescan_minutes: u64,
+        state_dir: &Path,
+        tx: tokio::sync::mpsc::Sender<HostToHub>,
+        activity: Activity,
+        segment_serial: std::sync::Arc<tokio::sync::Mutex<()>>,
+    ) -> Engine {
         // Manifest responses are routed to the scan task of their collection.
         let manifest_waiters: std::sync::Arc<
             std::sync::Mutex<
@@ -216,7 +297,6 @@ impl Engine {
         > = Default::default();
         let mut guards: Vec<tokio::task::JoinHandle<()>> = Vec::new();
         let mut triggers: std::collections::HashMap<String, TriggerSink> = Default::default();
-        let activity = Activity::default();
         // ED2K hasher (MH-9): consumes hub Hashlists, chugs only when idle.
         let (hash_tx, hash_rx) = tokio::sync::mpsc::channel::<hasher::JobMsg>(32);
         guards.push(tokio::spawn(hasher::run(
@@ -224,6 +304,14 @@ impl Engine {
             tx.clone(),
             collections.to_vec(),
             activity.clone(),
+        )));
+        let (segment_tx, segment_rx) = tokio::sync::mpsc::unbounded_channel();
+        guards.push(tokio::spawn(segments::run(
+            segment_rx,
+            tx.clone(),
+            collections.to_vec(),
+            activity.clone(),
+            segment_serial,
         )));
         for c in collections {
             let (ttx, mut trx) = tokio::sync::mpsc::channel::<ScanTrigger>(8);
@@ -417,6 +505,7 @@ impl Engine {
             triggers,
             manifest_waiters,
             hash_tx,
+            segment_tx,
             collections: collections.to_vec(),
             tx,
             activity,
@@ -524,6 +613,23 @@ impl Engine {
                 });
                 Ok(None)
             }
+            hub_to_host::Msg::DetectSegments(job) => {
+                anyhow::ensure!(
+                    !job.request_id.is_empty(),
+                    "DetectSegments has no request id"
+                );
+                anyhow::ensure!(
+                    job.episodes.iter().all(|episode| episode
+                        .source
+                        .as_ref()
+                        .is_some_and(|source| !source.root_token.is_empty())),
+                    "DetectSegments contains a missing or empty exact source"
+                );
+                self.segment_tx
+                    .send(job)
+                    .map_err(|_| anyhow::anyhow!("segment worker stopped"))?;
+                Ok(None)
+            }
             hub_to_host::Msg::OpenRead(req) => {
                 let source = req
                     .source
@@ -605,6 +711,7 @@ async fn link_once(
     collections: &[CollectionConfig],
     rescan_minutes: u64,
     state_dir: &Path,
+    jobs: JobRuntime,
 ) -> Result<()> {
     let channel = kahawai_transport::tls::grpc_channel_with(hub_addr, tls.clone()).await?;
     // The byte plane gets its OWN connection: lease streams pushing (or
@@ -636,7 +743,6 @@ async fn link_once(
         .context("opening link")?
         .into_inner();
 
-    // Hub speaks first: HelloAck with its protocol version (AR-7).
     match inbound.message().await.context("awaiting HelloAck")? {
         Some(m) => match m.msg {
             Some(hub_to_host::Msg::HelloAck(ack)) => {
@@ -658,7 +764,14 @@ async fn link_once(
         None => bail!("hub closed the link before HelloAck"),
     }
 
-    let engine = Engine::start(collections, rescan_minutes, state_dir, tx.clone());
+    let engine = Engine::start_with_runtime(
+        collections,
+        rescan_minutes,
+        state_dir,
+        tx.clone(),
+        jobs.activity,
+        jobs.segment_serial,
+    );
 
     let mut ticker = tokio::time::interval(HEARTBEAT_INTERVAL);
     loop {
@@ -751,6 +864,62 @@ async fn scan_cycle(
     .await
     .context("link closed before manifest request")?;
     scan::scan_collection(c.clone(), tx.clone(), mrx, force_dirs, report_version).await
+}
+
+#[cfg(test)]
+mod activity_tests {
+    use super::Activity;
+
+    #[test]
+    fn urgent_work_is_foreground_and_background_is_exclusive() {
+        let activity = Activity::default();
+        assert!(!activity.busy());
+        let urgent = activity.urgent();
+        assert!(activity.busy());
+        drop(urgent);
+        assert!(!activity.busy());
+
+        let background = activity.try_background().expect("first background job");
+        assert!(
+            activity.try_background().is_none(),
+            "two heavy background jobs entered together"
+        );
+        drop(background);
+        assert!(activity.try_background().is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn blocking_work_retains_background_permit_after_async_abort() {
+        let activity = Activity::default();
+        let permit: std::sync::Arc<dyn Send + Sync> =
+            std::sync::Arc::new(activity.try_background().unwrap());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let task = tokio::spawn(async move {
+            let blocking = permit.clone();
+            tokio::task::spawn_blocking(move || {
+                let _permit = blocking;
+                let _ = started_tx.send(());
+                let _ = release_rx.recv();
+            })
+            .await
+        });
+        started_rx.await.unwrap();
+        task.abort();
+        assert!(
+            activity.try_background().is_none(),
+            "abort released permit while blocking work was live"
+        );
+
+        release_tx.send(()).unwrap();
+        for _ in 0..100 {
+            if activity.try_background().is_some() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("blocking work did not release its permit");
+    }
 }
 
 #[cfg(test)]

@@ -9,6 +9,7 @@
 //! translated only at the database boundary.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
@@ -272,6 +273,32 @@ fn unix_now() -> i64 {
         .as_secs() as i64
 }
 
+static NEXT_HOST_LINK_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone)]
+pub(crate) struct HostLink {
+    tx: tokio::sync::mpsc::Sender<Result<kahawai_proto::v1::HubToHost, tonic::Status>>,
+    protocol_minor: u32,
+    generation: u64,
+}
+
+impl HostLink {
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub(crate) fn supports_segment_detection(&self) -> bool {
+        self.protocol_minor >= 1
+    }
+
+    pub(crate) async fn send(&self, msg: kahawai_proto::v1::HubToHost) -> Result<()> {
+        self.tx
+            .send(Ok(msg))
+            .await
+            .map_err(|_| anyhow::anyhow!("mediahost link closed"))
+    }
+}
+
 pub struct Registry {
     db: SqlitePool,
     /// The credential store. `None` only in tests that never reach one — the
@@ -317,13 +344,8 @@ pub struct Registry {
     /// it inside `unregister_link` look free. Only `set_disabled` and
     /// `delete_satellite` may touch it.
     disabled: Mutex<std::collections::HashSet<String>>,
-    /// Command senders for connected hosts' Link streams.
-    links: Mutex<
-        HashMap<
-            String,
-            tokio::sync::mpsc::Sender<Result<kahawai_proto::v1::HubToHost, tonic::Status>>,
-        >,
-    >,
+    /// Command senders and negotiated protocol minors for connected hosts.
+    links: Mutex<HashMap<String, HostLink>>,
     /// Live per-collection scan progress (HUB-35): last report wins.
     scan_progress: Mutex<HashMap<(String, String), ScanState>>,
     /// Deep-refresh marks: the next manifest request for (module,
@@ -1128,8 +1150,23 @@ impl Registry {
         &self,
         module_id: &str,
         tx: tokio::sync::mpsc::Sender<Result<kahawai_proto::v1::HubToHost, tonic::Status>>,
-    ) {
-        self.links.lock().unwrap().insert(module_id.to_string(), tx);
+        protocol_minor: u32,
+    ) -> (u64, Option<u64>) {
+        let generation = NEXT_HOST_LINK_GENERATION.fetch_add(1, Ordering::Relaxed);
+        let replaced = self
+            .links
+            .lock()
+            .unwrap()
+            .insert(
+                module_id.to_string(),
+                HostLink {
+                    tx,
+                    protocol_minor,
+                    generation,
+                },
+            )
+            .map(|link| link.generation);
+        (generation, replaced)
     }
 
     /// Drop a host's send side. Called from every teardown path.
@@ -1175,7 +1212,7 @@ impl Registry {
     ) -> bool {
         let mut links = self.links.lock().unwrap();
         match links.get(module_id) {
-            Some(current) if current.same_channel(tx) => {
+            Some(current) if current.tx.same_channel(tx) => {
                 links.remove(module_id);
                 if let Some(s) = self.connected.lock().unwrap().get_mut(module_id) {
                     s.connected = false;
@@ -1205,11 +1242,28 @@ impl Registry {
             .lock()
             .unwrap()
             .get(module_id)
-            .cloned()
+            .map(|link| link.tx.clone())
             .with_context(|| format!("mediahost {module_id} is not connected"))?;
         tx.send(Ok(msg))
             .await
             .map_err(|_| anyhow::anyhow!("link to {module_id} closed"))
+    }
+
+    pub(crate) fn host_link(&self, module_id: &str) -> Option<HostLink> {
+        self.links.lock().unwrap().get(module_id).cloned()
+    }
+
+    pub(crate) fn host_link_is_current(&self, module_id: &str, generation: u64) -> bool {
+        self.links
+            .lock()
+            .unwrap()
+            .get(module_id)
+            .is_some_and(|link| link.generation == generation)
+    }
+
+    pub fn host_supports_segment_detection(&self, module_id: &str) -> bool {
+        self.host_link(module_id)
+            .is_some_and(|link| link.supports_segment_detection())
     }
 
     pub fn db(&self) -> &SqlitePool {

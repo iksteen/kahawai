@@ -528,6 +528,12 @@ async fn run_hub_inner(
         cfg.data_dir.join("artwork"),
         enricher.clone(),
     ));
+    // HUB-37: the hub orders and persists season analysis; the owning
+    // mediahost executes it against local exact sources.
+    let segments = Arc::new(kahawai_hub::segments::Detector::new());
+    if cfg.detect_segments {
+        segments.spawn_sweep(registry.clone(), sessions.clone());
+    }
     // Enrich whatever resolution has produced since last time.
     {
         let enricher = enricher.clone();
@@ -547,6 +553,7 @@ async fn run_hub_inner(
             registry.clone(),
             subtitles.clone(),
             enricher.clone(),
+            segments.clone(),
             LOCAL_ID,
             &mh.name,
         );
@@ -554,15 +561,20 @@ async fn run_hub_inner(
         sessions.set_local_source(LOCAL_ID, move |collection, root_token, path| {
             kahawai_mediahost::serve::resolve_rel(&cols, collection, root_token, path)
         });
+        let local_activity = kahawai_mediahost::Activity::default();
+        let lease_activity = local_activity.clone();
+        sessions.set_local_activity(move || Box::new(lease_activity.lease()));
         let state_dir = mh.state_dir.clone();
-        // Same reason as run_mediahost. Ranks are process-global, so in
-        // this binary the demotion is shared with the co-hosted
-        // transcoder — the lean satellite binaries keep them apart.
-        let _ = kahawai_media::demote_elements(&mh.demote_decoders);
         tokio::spawn(async move {
-            if let Err(e) =
-                kahawai_mediahost::run_local(mh.collections, mh.rescan_minutes, &state_dir, tx, rx)
-                    .await
+            if let Err(e) = kahawai_mediahost::run_local(
+                mh.collections,
+                mh.rescan_minutes,
+                &state_dir,
+                local_activity,
+                tx,
+                rx,
+            )
+            .await
             {
                 tracing::error!(error = format!("{e:#}"), "in-process mediahost exited");
             }
@@ -630,12 +642,6 @@ async fn run_hub_inner(
             }
         });
     }
-    // HUB-37: find the recap, opening and credits of every season, in the
-    // background, so the player has boundaries to offer a skip for.
-    let segments = Arc::new(kahawai_hub::segments::Detector::new());
-    if cfg.detect_segments {
-        segments.spawn_sweep(registry.clone(), sessions.clone());
-    }
     let api = kahawai_hub::api::router(
         registry.clone(),
         auth,
@@ -644,7 +650,7 @@ async fn run_hub_inner(
         subtitles.clone(),
         artwork,
         enricher.clone(),
-        segments,
+        segments.clone(),
         net,
     );
     tokio::spawn(async move {
@@ -675,11 +681,12 @@ async fn run_hub_inner(
             .into_server(),
         )
         .add_service(
-            kahawai_hub::link_service::MediahostLinkService::new(
+            kahawai_hub::link_service::MediahostLinkService::new_with_segments(
                 registry.clone(),
                 sessions.clone(),
                 subtitles.clone(),
                 enricher.clone(),
+                segments,
             )
             .into_server(),
         )

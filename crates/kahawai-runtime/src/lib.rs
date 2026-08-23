@@ -58,6 +58,7 @@ pub fn load_config(path: Option<&std::path::Path>) -> Result<(config::Config, Op
         Some(p) => tracing::info!(config = %p.display(), "loaded config"),
         None => tracing::info!("no config file found; using built-in defaults"),
     }
+    kahawai_media::demote_elements(&cfg.effective_decoder_demotions())?;
     Ok((cfg, used))
 }
 
@@ -137,12 +138,11 @@ pub struct WorkerArgs {
 /// it. A dead child is a missing measurement; a dead satellite is an
 /// outage.
 pub fn run_benchmark(
-    cfg: &config::Config,
+    _cfg: &config::Config,
     cache: PathBuf,
     only: Option<String>,
     tonemap: bool,
 ) -> Result<()> {
-    kahawai_media::demote_elements(&cfg.transcoder.demote_decoders)?;
     let elements: Vec<&str> = match &only {
         // One element per process: a segfault costs that measurement,
         // never the ones after it.
@@ -229,8 +229,6 @@ pub fn run_remux_worker(cfg: &config::Config, w: WorkerArgs) -> Result<()> {
     if cfg.transcoder.worker_threads > 0 {
         kahawai_media::remux::set_encoder_threads(cfg.transcoder.worker_threads);
     }
-    // Blocking by design: this process exists only for the pipeline.
-    kahawai_media::demote_elements(&cfg.transcoder.demote_decoders)?;
     let mut all = vec![(w.socket, w.size)];
     for p in &w.parts {
         let (sock, sz) = p.rsplit_once(':').context("--part wants <socket>:<size>")?;
@@ -271,13 +269,9 @@ pub fn doctor_checks(
     extra: Vec<kahawai_media::doctor::Check>,
 ) -> Vec<kahawai_media::doctor::Check> {
     use kahawai_media::doctor::Check;
-    // The workers apply these before building pipelines, so the doctor
-    // must too — otherwise it reports the ranks of a registry no session
-    // actually uses (and flags a shadow the config already demoted).
+    // `load_config` applied the process-global decoder policy before any
+    // checker or worker could initialize GStreamer.
     let verify_encoders = roles.transcoder || roles.local_encode;
-    if verify_encoders {
-        let _ = kahawai_media::demote_elements(&cfg.transcoder.demote_decoders);
-    }
     // HUB-36: whichever role this box plays, its benchmark cache lives
     // beside that role's state; show measured speeds when they exist.
     let bench_cache = verify_encoders

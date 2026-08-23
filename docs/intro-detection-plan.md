@@ -100,12 +100,12 @@ A new crate, `crates/kahawai-intro`, because it carries the one dependency
   `scripts/kahawai-intro.sh` per the house rule.
 
 **Since shipped (HUB-37).** The crate is no longer only a command-line tool:
-the hub runs it a season at a time over a mediahost lease, stores the
-boundaries per episode, carries them on the item QUERY, and the web
-player offers a skip button while the playhead is inside one. Recap detection
-was added with that work. `docs/kahawai-implementation.md` §4.9 has the
-design; this document remains the record of *why the port is faithful*, which
-is what makes the comparison below meaningful.
+the hub chooses and persists a season while the owning mediahost runs this
+crate against exact local paths and returns only boundaries. Those boundaries
+ride on the item QUERY and the web player offers a skip button while the
+playhead is inside one. Recap detection was added with that work.
+`docs/kahawai-implementation.md` §4.9 has the system design; this document
+remains the record of *why the port is faithful*.
 
 GStreamer, not ffmpeg: it is what Kahawai ships, and it makes the comparison
 worth running — two decode stacks, one algorithm, and any disagreement that

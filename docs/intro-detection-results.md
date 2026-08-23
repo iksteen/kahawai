@@ -172,15 +172,35 @@ Per episode, on the dev box, release build, cold cache on both sides:
 | Anime 24 min | 4.8 s | 0.6 s |
 | Andor 40 min 4K HDR | 21.0 s | 6.6 s |
 
-Inside the hub, reading a remote mediahost over the byte plane, the same work
-costs about a minute an episode: roughly 500 MB crosses the LAN per episode,
-and that — not the search — is what the time is spent on.
+The original hub integration read remote sources over the byte plane and cost
+about a minute and roughly 500 MB of LAN traffic per episode; transport, not
+the search, dominated. HUB-37 now sends one ordered exact-source season over
+the control link and runs the same analyzer on the owning mediahost's local
+paths. Only boundaries return.
 
-The gap is decode plus per-probe pipeline setup: we build and preroll a
-GStreamer pipeline per probe where they hand one ffmpeg process a filter
-graph, and `rusty-chromaprint` is a pure-Rust port of a C library. Nothing here
-suggests an algorithmic difference, and neither number matters much for a pass
-that runs once per episode ever.
+That move also exposed wasted local work: `decodebin` used to instantiate video
+decoders during audio fingerprinting and audio decoders during luma analysis.
+The analyzer now stops unwanted elementary streams before their decoder.
+
+Measured on Silence's J5005 with its global decoder demotions and the staged
+GStreamer 1.28.5 build:
+
+| corpus | shape | before stream selection | after | after / episode |
+|---|---|---:|---:|---:|
+| FLCL | 6 anime episodes | 77.05 s | 41.02 s | 6.84 s |
+| Travelers S3 | 3 480p H.264 episodes | 35.49 s | 18.00 s | 6.00 s |
+| Black Mirror S2 | 3 1080p HEVC episodes | 369.06 s | 104.27 s | 34.76 s |
+| Foundation S2E1 | 4K HEVC credits pass | 27.07 s | 26.58 s | 26.58 s |
+| Foundation S2E1 | 60 s audio fingerprint | 70.40 s | 6.11 s | — |
+
+The four episode-level samples have a 16.7 s median, 3.6× faster than the old
+roughly 60 s/episode LAN path. Every returned boundary remained identical;
+an element-factory trace of Black Mirror's audio pass contains only `avdec_eac3`
+and no HEVC decoder.
+The remaining gap to the reference is decode plus per-probe pipeline setup:
+Kahawai builds and prerolls a GStreamer pipeline per probe where theirs hands
+one ffmpeg process a filter graph, and `rusty-chromaprint` is a pure-Rust port
+of a C library.
 
 ## What is not replicated
 

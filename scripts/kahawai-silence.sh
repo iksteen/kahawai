@@ -18,6 +18,12 @@ echo "==> building lean satellite binaries" >&2
 (cd "$repo" && cargo build --release -p kahawai-mediahostd)
 (cd "$repo" && cargo build --release -p kahawai-transcoderd)
 
+gst_dir="$HOME/.local/lib/kahawai-gst"
+if [[ ! -d "$gst_dir/plugins" || ! -d "$gst_dir/lib" ]]; then
+    echo "error: staged GStreamer missing at $gst_dir" >&2
+    exit 1
+fi
+
 # Stop FIRST: scp into a running executable fails with ETXTBSY.
 echo "==> stopping satellites on $HOST" >&2
 ssh "$HOST" 'bash -s' <<'REMOTE'
@@ -50,13 +56,23 @@ if [[ -n "$left" ]]; then
 fi
 REMOTE
 
-echo "==> shipping to $HOST" >&2
+echo "==> shipping binaries and staged GStreamer to $HOST" >&2
 scp -q "$repo/target/release/kahawai-mediahost" \
     "$repo/target/release/kahawai-transcoder" "$HOST:~/"
+rsync -a "$gst_dir/" "$HOST:~/.local/lib/kahawai-gst/"
 
 echo "==> starting" >&2
 ssh "$HOST" 'bash -s' <<'REMOTE'
 set -euo pipefail
+gst="$HOME/.local/lib/kahawai-gst"
+export GST_PLUGIN_PATH="$gst/plugins"
+export GST_PLUGIN_SYSTEM_PATH_1_0="$gst/plugins:/usr/lib/gstreamer-1.0"
+export LD_LIBRARY_PATH="$gst/lib"
+loaded=$(gst-inspect-1.0 matroskademux | sed -n 's/^  Filename *//p')
+[[ "$loaded" == "$gst/plugins/libgstmatroska.so" ]] || {
+    echo "staged matroskademux did not load: $loaded" >&2
+    exit 1
+}
 nohup ~/kahawai-mediahost >> ~/kahawai-mediahost.log 2>&1 &
 nohup ~/kahawai-transcoder >> ~/kahawai-transcoder.log 2>&1 &
 sleep 5

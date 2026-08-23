@@ -3,6 +3,7 @@ pub mod media;
 pub mod names;
 pub mod pki;
 pub mod private;
+pub mod segments;
 
 /// This binary's build stamp — "<short-hash>[+dirty] <commit-date>",
 /// stamped at compile time (see build.rs). Carried in the AR-7 Hello and

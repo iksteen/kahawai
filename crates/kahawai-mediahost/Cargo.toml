@@ -8,6 +8,7 @@ license.workspace = true
 md4 = { workspace = true }
 crc32fast = { workspace = true }
 kahawai-core = { workspace = true }
+kahawai-intro = { workspace = true }
 kahawai-media = { workspace = true }
 kahawai-proto = { workspace = true }
 kahawai-transport = { workspace = true }
@@ -25,3 +26,4 @@ notify = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+gstreamer = { workspace = true }

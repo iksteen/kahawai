@@ -58,6 +58,9 @@ message HostToHub {
     RootAdoptionAck root_adoption_ack = 15;
     // Targeted PAR/orientation/display-size result for one exact source.
     FileVideoGeometry file_video_geometry = 16;
+    // Season-wide recap/intro/credits analysis performed against local paths.
+    SegmentDetectionAccepted segment_detection_accepted = 17;
+    SegmentDetectionResult segment_detection_result = 18;
   }
 }
 
@@ -257,6 +260,8 @@ message HubToHost {
     // Files scanned before display geometry was recorded. This probes only
     // the named exact sources and never enters reconciliation.
     VideoGeometryWorklist video_geometry_worklist = 12;
+    // HUB-37: analyze one ordered season against exact local sources.
+    DetectSegments detect_segments = 13;
   }
 }
 
@@ -362,6 +367,57 @@ message FileKeyframeInterval {
   optional uint32 max_keyframe_interval_ms = 4;
 }
 
+message DetectSegments {
+  string request_id = 1;
+  int64 detector = 2;
+  string collection_id = 3;
+  bool anime = 4;
+  repeated SegmentEpisode episodes = 5;
+}
+
+message SegmentEpisode {
+  // Opaque hub item identity, returned only for correlation.
+  string item_id = 1;
+  SourcePath source = 2;
+  uint64 expected_size = 3;
+  int64 expected_mtime_unix = 4;
+  uint64 duration_ms = 5;
+}
+
+message SegmentDetectionAccepted {
+  string request_id = 1;
+  // "queued" | "running" | "rejected"
+  string state = 2;
+  string error = 3;
+}
+
+message SegmentDetectionResult {
+  string request_id = 1;
+  int64 detector = 2;
+  uint64 elapsed_ms = 3;
+  repeated SegmentEpisodeResult episodes = 4;
+  string error = 5;
+}
+
+message SegmentEpisodeResult {
+  string item_id = 1;
+  SourcePath source = 2;
+  uint64 observed_size = 3;
+  int64 observed_mtime_unix = 4;
+  bool unreadable = 5;
+  string error = 6;
+  repeated DetectedSegment segments = 7;
+}
+
+message DetectedSegment {
+  // "recap" | "intro" | "credits"
+  string kind = 1;
+  uint64 start_ms = 2;
+  uint64 end_ms = 3;
+  // "chromaprint" | "blackframe"
+  string analyzer = 4;
+}
+
 message Hashlist {
   string collection_id = 1;
   repeated SourcePath sources = 2;
@@ -375,17 +431,13 @@ message OpenRead {
   string lease_token = 1;
   string collection_id = 2;
   SourcePath source = 3;
-  // Whether this lease is the hub's own background work — intro
-  // detection's season sweep and the enricher's .nfo reads — rather than a
-  // viewer. (Subtitle and artwork leases open as viewers on purpose: a
-  // client is waiting on those.)
+  // Whether this lease is the hub's own background work (currently local NFO
+  // enrichment) rather than a viewer. Subtitle and artwork leases open as
+  // viewers because a client is waiting on them.
   //
-  // The host cannot tell otherwise, and it schedules its OWN work — hashes,
-  // declarations, probes, extractions — around whether it is busy serving.
-  // A sweep that reads every episode of the library therefore looked
-  // exactly like somebody watching all day: measured, hours of detection
-  // during which the host declared nothing at all. Background leases are
-  // served identically and simply do not count as somebody waiting.
+  // The host schedules its own hashes, declarations, probes and extractions
+  // around foreground serving. Background leases are served identically and
+  // simply do not count as somebody waiting.
   //
   // Default false, so a hub too old to say means "a viewer", which is the
   // safe reading.

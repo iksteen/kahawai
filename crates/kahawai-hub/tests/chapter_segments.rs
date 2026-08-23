@@ -1,9 +1,8 @@
 //! A season that names its own boundaries is answered from the names.
 //!
-//! The claim being tested is not just "the numbers are right" but "no bytes
-//! were read": there is no mediahost in this test, so any attempt to open a
-//! lease fails the call. A season of 4K episodes is minutes of LAN traffic,
-//! and the file already said where its opening is.
+//! The claim is not just that the numbers are right: a fully named season
+//! dispatches no mediahost job. This harness registers a connected protocol-old
+//! host, so any inferred analysis remains pending.
 
 use std::sync::Arc;
 
@@ -219,24 +218,20 @@ async fn a_named_pass_wipes_replaced_bytes_and_keeps_settled_ones() {
 }
 
 #[tokio::test]
-async fn dead_reads_under_a_live_host_are_a_failure() {
-    // The harness's module is registered as connected while every byte read
-    // dies at the lease: a broken batch, not an outage. That used to come
-    // back as Ok with a scan row per episode — "analysed, nothing found",
-    // for ever. A season nobody could read has not been analysed.
+async fn a_connected_old_mediahost_is_awaited_not_failed() {
     let (_dir, registry) = season(&["Scene 1", "Scene 2"]).await;
-    // The harness's module is CONNECTED while every read dies at the lease:
-    // that is the season's own defect (a broken batch), a failure outright —
-    // returning "awaiting" for it would re-read the whole season's bytes
-    // every cycle for ever.
     let detector = kahawai_hub::segments::Detector::new();
-    assert!(analyze_on(&registry, &detector).await.is_err());
-    let status = detector.status_counters();
-    assert!(
-        status.last_failed,
-        "a failed pass must not toast as analysed"
+    assert_eq!(
+        analyze_on(&registry, &detector).await.unwrap(),
+        Analysis {
+            scanned: 0,
+            awaiting: 2,
+            attempted: 0
+        }
     );
-    assert!(!status.awaiting_host);
+    let status = detector.status_counters();
+    assert!(status.awaiting_host);
+    assert!(!status.last_failed);
 
     let scans: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM media_segment_scans")
         .fetch_one(registry.db())
@@ -279,13 +274,11 @@ async fn an_absent_host_is_awaited_not_failed() {
 
 #[tokio::test]
 async fn naming_only_the_credits_still_needs_the_season_compared() {
-    // One kind named leaves the opening unknown, so the season goes to the
-    // byte plane — where, with no mediahost, every read fails. The whole
-    // pass is then a failure: even the named credits wait for a pass that
-    // can actually read, because a scan row written now would freeze the
-    // half-answer for ever.
+    // One kind named leaves the opening unknown, so the season needs a
+    // mediahost job. This connected host predates the additive job message;
+    // the half-answer remains pending rather than falling back to a lease.
     let (_dir, registry) = season(&["Scene 1", "Scene 2", "End Credits"]).await;
-    assert!(analyze(&registry).await.is_err());
+    assert_eq!(analyze(&registry).await.unwrap().awaiting, 2);
 
     let scans: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM media_segment_scans")
         .fetch_one(registry.db())
@@ -296,10 +289,10 @@ async fn naming_only_the_credits_still_needs_the_season_compared() {
 
 #[tokio::test]
 async fn a_numbered_chapter_list_invents_nothing() {
-    // Numbered chapters name nothing, so this is the outage shape too: the
-    // byte plane is asked and cannot answer.
+    // Numbered chapters name nothing; the old connected mediahost cannot run
+    // the inferred pass, so nothing is invented and the season stays pending.
     let (_dir, registry) = season(&["Chapter 1", "Chapter 2", "Chapter 3"]).await;
-    assert!(analyze(&registry).await.is_err());
+    assert_eq!(analyze(&registry).await.unwrap().awaiting, 2);
 
     let stored: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM media_segments")
         .fetch_one(registry.db())

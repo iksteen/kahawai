@@ -1,11 +1,10 @@
 //! Media segments: where the recap, the opening and the end credits are, so a
 //! client can offer to skip them.
 //!
-//! Detection is `kahawai-intro`, run here rather than on the mediahost — the
-//! same answer subtitle extraction already gave (see that module's doc): the
-//! hub reads the bytes over a lease and satellites stay simple. A season is the
-//! unit of work, because the opening is found by comparing episodes against
-//! each other; one episode on its own has nothing to match.
+//! The hub chooses and persists work; the owning mediahost runs
+//! `kahawai-intro` against exact local sources and returns boundaries. A season
+//! is the unit because an opening is found by comparing episodes; one episode
+//! on its own has nothing to match.
 //!
 //! ## `media_segments` schema (authority for migration 0062)
 //!
@@ -155,6 +154,21 @@ pub struct Status {
     pub detector: i64,
 }
 
+struct SegmentWaiter {
+    module_id: String,
+    generation: u64,
+    tx: tokio::sync::oneshot::Sender<SegmentReply>,
+}
+
+#[derive(Debug)]
+pub(crate) enum SegmentJobFailure {
+    Disconnected,
+    Rejected(String),
+}
+
+pub(crate) type SegmentReply =
+    std::result::Result<kahawai_proto::v1::SegmentDetectionResult, SegmentJobFailure>;
+
 pub struct Detector {
     running: AtomicBool,
     /// Whether the LAST pass left episodes waiting on an absent mediahost —
@@ -191,10 +205,10 @@ pub struct Detector {
     /// flap victims recovering on their own.
     failed: tokio::sync::Mutex<std::collections::HashMap<(String, i64), std::time::Instant>>,
     /// One season at a time, across the sweep and the admin trigger alike.
-    /// Two at once double the byte plane's load for no gain: the work is
-    /// bounded by reading, and the sweep would happily start a second while an
-    /// administrator waits on the first.
+    /// The mediahost also serializes its local jobs, but this lock prevents the
+    /// hub from queueing the same global work twice.
     one_at_a_time: tokio::sync::Mutex<()>,
+    waiters: parking_lot::Mutex<std::collections::HashMap<String, SegmentWaiter>>,
 }
 
 impl Default for Detector {
@@ -219,6 +233,94 @@ impl Detector {
             analyzed: AtomicUsize::new(0),
             failed: Default::default(),
             one_at_a_time: Default::default(),
+            waiters: Default::default(),
+        }
+    }
+
+    pub(crate) fn wait_for_segment_result(
+        &self,
+        module_id: &str,
+        generation: u64,
+        request_id: &str,
+    ) -> tokio::sync::oneshot::Receiver<SegmentReply> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.waiters.lock().insert(
+            request_id.to_string(),
+            SegmentWaiter {
+                module_id: module_id.to_string(),
+                generation,
+                tx,
+            },
+        );
+        rx
+    }
+
+    pub(crate) fn segment_accepted(
+        &self,
+        module_id: &str,
+        generation: u64,
+        accepted: kahawai_proto::v1::SegmentDetectionAccepted,
+    ) {
+        if accepted.state != "rejected" {
+            return;
+        }
+        let waiter = {
+            let mut waiters = self.waiters.lock();
+            waiters
+                .get(&accepted.request_id)
+                .is_some_and(|waiter| {
+                    waiter.module_id == module_id && waiter.generation == generation
+                })
+                .then(|| waiters.remove(&accepted.request_id))
+                .flatten()
+        };
+        if let Some(waiter) = waiter {
+            let _ = waiter
+                .tx
+                .send(Err(SegmentJobFailure::Rejected(accepted.error)));
+        }
+    }
+
+    pub(crate) fn segment_result(
+        &self,
+        module_id: &str,
+        generation: u64,
+        result: kahawai_proto::v1::SegmentDetectionResult,
+    ) {
+        let waiter = {
+            let mut waiters = self.waiters.lock();
+            waiters
+                .get(&result.request_id)
+                .is_some_and(|waiter| {
+                    waiter.module_id == module_id && waiter.generation == generation
+                })
+                .then(|| waiters.remove(&result.request_id))
+                .flatten()
+        };
+        if let Some(waiter) = waiter {
+            let _ = waiter.tx.send(Ok(result));
+        } else {
+            tracing::warn!(%module_id, request = %result.request_id,
+                "late or wrong-host segment result dropped");
+        }
+    }
+
+    pub(crate) fn segment_link_disconnected(&self, module_id: &str, generation: u64) {
+        let lost = {
+            let mut waiters = self.waiters.lock();
+            let ids = waiters
+                .iter()
+                .filter(|(_, waiter)| {
+                    waiter.module_id == module_id && waiter.generation == generation
+                })
+                .map(|(id, _)| id.clone())
+                .collect::<Vec<_>>();
+            ids.into_iter()
+                .filter_map(|id| waiters.remove(&id))
+                .collect::<Vec<_>>()
+        };
+        for waiter in lost {
+            let _ = waiter.tx.send(Err(SegmentJobFailure::Disconnected));
         }
     }
 
@@ -277,9 +379,8 @@ impl Detector {
         }
     }
 
-    /// Walk the library a season at a time, forever, pausing while anything is
-    /// playing. Detection reads a quarter of every episode plus its tail
-    /// through the byte plane; a viewer's stream comes first.
+    /// Walk the library a season at a time, forever. The mediahost owns the
+    /// foreground gate because only it can see scans and viewer leases.
     pub fn spawn_sweep(self: &Arc<Self>, registry: Arc<Registry>, sessions: Arc<Sessions>) {
         let detector = self.clone();
         tokio::spawn(async move {
@@ -289,8 +390,7 @@ impl Detector {
             // outstanding then. A map rather than the single last season:
             // with only one remembered, TWO unfinishable seasons whose order
             // flips with watch activity alternated for ever, each pass a
-            // full season read over the byte plane, and neither ever seen
-            // "twice in a row".
+            // full season analysis, and neither ever seen "twice in a row".
             let mut offered: std::collections::HashMap<(String, i64), i64> = Default::default();
             // Seasons whose mediahost is away THIS cycle. Its own set, apart
             // from `failed`: an absent host is the hub's weather, so these
@@ -447,10 +547,9 @@ impl Detector {
         });
     }
 
-    /// Analyze one season and store what it finds — or report the byte plane
-    /// unreachable, which is the caller's cue to wait rather than to blame
-    /// the season. `Done(0)` covers a season that was finished by another
-    /// runner since it was picked, and one with too few comparable episodes.
+    /// Orchestrate one season and store what the owning mediahost returns.
+    /// `Done(0)` covers a season finished by another runner and one with too
+    /// few comparable episodes.
     pub async fn analyze_season(
         &self,
         registry: &Arc<Registry>,
@@ -487,11 +586,9 @@ impl Detector {
         // and error path lowers it.
         self.running.store(true, Ordering::Relaxed);
         let _busy = Lowered(&self.running);
-        // Re-check under the lock: the sweep picks its season BEFORE blocking
-        // here, and the admin route answers before its detached run begins —
-        // both can hand this function a season another runner has just
-        // finished, and without this the second runner re-reads the whole
-        // season over the byte plane to rewrite identical rows.
+        // Re-check under the lock: the sweep picks its season before blocking
+        // here, and the admin route answers before its detached run begins.
+        // Another runner may have completed it in that interval.
         let pending_ids: Vec<String> = sqlx::query_scalar(
             "SELECT i.id FROM items i
               WHERE i.parent_id = ? AND i.season = ? AND i.kind = 'episode'
@@ -555,36 +652,23 @@ impl Detector {
             .map(|t| t == "anime")
             .unwrap_or(false);
 
+        let mut revisions: std::collections::HashMap<String, SourceRevision> = Default::default();
         tracing::info!(
             series = %series_id, season, episodes = rows.len(), anime,
             "intro detection: opening a season"
         );
-        let handle = tokio::runtime::Handle::current();
-        let mut episodes = Vec::with_capacity(rows.len());
+        let mut episode_ids = Vec::with_capacity(rows.len());
         // What each episode's bytes were when this pass read them, recorded
-        // with the scan so a replaced file asks again. Filled from the
-        // RESOLVED rendition below — a MAX over every rendition's files here
-        // stamped scans with a sibling's mtime and never matched the
-        // predicate again.
+        // with the scan so a replaced file asks again.
         let mut identity: std::collections::HashMap<String, Option<i64>> = Default::default();
-        // What each file says about itself, which is worth more than anything
-        // we can infer and costs nothing to read.
-        let mut named: std::collections::HashMap<String, Vec<kahawai_intro::chapters::Named>> =
+        let mut named: std::collections::HashMap<String, Vec<kahawai_core::segments::Named>> =
             Default::default();
-        // How many episodes had sources but no REACHABLE one right now.
+        let mut descriptors = Vec::with_capacity(rows.len());
+        let mut job_home: Option<(String, String)> = None;
         let mut awaiting = 0usize;
-        // Which mediahost each analysed episode reads from, so a read that
-        // died can later be classified: host gone = weather, host up = the
-        // file itself.
-        let mut homes: std::collections::HashMap<String, String> = Default::default();
         for row in &rows {
             let item_id: String = row.get("id");
             let title: String = row.get("title");
-            // The SAME resolver playback uses — rank, completeness and
-            // connectivity included — so the running time and the chapters
-            // can only come from the file `open_source` will actually read.
-            // Three hand-rolled SQL copies of its ordering drifted from it
-            // three different ways before this.
             let (parts, info) = match sessions.source_parts(registry, &item_id).await {
                 Ok(v) => v,
                 Err(e) => {
@@ -598,242 +682,244 @@ impl Detector {
                 }
             };
             if parts.len() != 1 {
-                // `open_source` opens ONE file; a CD1/CD2-only item must not
-                // reach the byte path with a summed running time that maps
-                // its credits window past CD1's end.
                 tracing::debug!(episode = %title, parts = parts.len(),
                     "intro detection: multi-part only, skipped");
                 continue;
             }
-            let duration_ms = parts[0].duration_ms as i64;
-            if duration_ms <= 0 {
+            let part = &parts[0];
+            if part.duration_ms == 0 {
                 tracing::debug!(episode = %title, "intro detection: no running time, skipped");
                 continue;
             }
-            homes.insert(item_id.clone(), parts[0].module_id.clone());
-            identity.insert(item_id.clone(), Some(parts[0].mtime_unix));
+            if let Some((module_id, collection_id)) = &job_home {
+                anyhow::ensure!(
+                    module_id == &part.module_id && collection_id == &part.collection_id,
+                    "one season resolved across multiple mediahosts or collections"
+                );
+            } else {
+                job_home = Some((part.module_id.clone(), part.collection_id.clone()));
+            }
+            identity.insert(item_id.clone(), Some(part.mtime_unix));
             named.insert(
                 item_id.clone(),
                 info.chapters
                     .as_deref()
-                    .map(|chapters| kahawai_intro::chapters::named(chapters, duration_ms as u64))
+                    .map(|chapters| kahawai_core::segments::named(chapters, part.duration_ms))
                     .unwrap_or_default(),
             );
-            // A lease per pass, opened when the analyzer actually reads and
-            // dropped with the pipeline. Holding one per episode for the length
-            // of a season keeps a file open on the mediahost for every episode
-            // at once, and a season is minutes of work.
-            //
-            // The lease opens the EXACT file resolved above — not open_source
-            // again. Re-resolving per read window let the ranking (or a host
-            // flip) swap the rendition mid-pass, pairing this rendition's
-            // stated running time and chapters with another's bytes, and the
-            // wrong boundaries then froze under a matching scan row.
-            let part = parts.into_iter().next().expect("len checked above");
-            let (registry, sessions, handle) = (registry.clone(), sessions.clone(), handle.clone());
-            let media = kahawai_intro::decode::Media::Remote {
-                name: title.clone(),
-                open: Arc::new(move || {
-                    let (registry, sessions, part) =
-                        (registry.clone(), sessions.clone(), part.clone());
-                    let _guard = handle.enter();
-                    tracing::debug!(path = %part.path_rel, "intro detection: opening a lease");
-                    let lease = handle.block_on(async move {
-                        sessions
-                            .open_lease(
-                                &registry,
-                                &part.module_id,
-                                &part.collection_id,
-                                &part.root_token,
-                                &part.path_rel,
-                                crate::sessions::Reader::Sweep,
-                            )
-                            .await
-                    })?;
-                    tracing::debug!(size = part.size, "intro detection: lease open");
-                    Ok(Box::new(crate::sessions::LeaseSource {
-                        lease,
-                        size: part.size,
-                        handle: tokio::runtime::Handle::current(),
-                        reads: 0,
-                    })
-                        as Box<dyn kahawai_media::remux::RemuxSource>)
-                }),
-            };
-            episodes.push(
-                kahawai_intro::season::Episode::new(media, title, duration_ms as f64 / 1000.0)
-                    .with_id(item_id),
+            episode_ids.push(item_id.clone());
+            revisions.insert(
+                item_id.clone(),
+                SourceRevision {
+                    module_id: part.module_id.clone(),
+                    collection_id: part.collection_id.clone(),
+                    root_token: part.root_token.clone(),
+                    path_rel: part.path_rel.clone(),
+                    size: part.size,
+                    mtime_unix: part.mtime_unix,
+                },
             );
+            descriptors.push(kahawai_proto::v1::SegmentEpisode {
+                item_id,
+                source: Some(kahawai_proto::v1::SourcePath {
+                    root_token: part.root_token.clone(),
+                    path_rel: part.path_rel.clone(),
+                }),
+                expected_size: part.size,
+                expected_mtime_unix: part.mtime_unix,
+                duration_ms: part.duration_ms,
+            });
         }
-        // The season is the unit of ANALYSIS, but progress is per episode:
-        // when none of the still-pending episodes could be resolved to a
-        // readable file, this pass can settle nothing — and it says so
-        // before the all-named branch too, which otherwise rewrote every
-        // reachable episode's rows and inflated the analysed counter once
-        // per outage cycle.
-        let pending_reachable = episodes
+        let pending_reachable = episode_ids
             .iter()
-            .filter(|e| pending_ids.iter().any(|id| id == &e.id))
+            .filter(|id| pending_ids.contains(id))
             .count();
-        if pending_reachable == 0 || episodes.len() < 2 {
+        if pending_reachable == 0 || descriptors.len() < 2 {
             return Ok(Analysis {
                 scanned: 0,
                 awaiting,
                 attempted: 0,
             });
         }
-        // How much of THIS pass's work is new: the analysis re-reads the
-        // whole season (the pairwise search needs every episode), but only
-        // newly-scanned pending episodes are progress, and only they count —
-        // counted from what `store` actually RECORDED, since an answer for
-        // an item deleted mid-pass is dropped there and must not reset the
-        // no-progress guard or move the admin counter.
         let progress =
             |stored: &[String]| stored.iter().filter(|id| pending_ids.contains(id)).count();
-        // A season that names its own boundaries needs no analysis at all:
-        // no fingerprints, no black-frame search, and not one byte across
-        // the byte plane. The bar is every episode naming both an opening
-        // and its credits — one episode short of that and the season still
-        // has to be compared, since the fingerprint search works on the
-        // whole season or not at all.
         let all_named = !named.is_empty()
-            && episodes.iter().all(|episode| {
-                let found = named
-                    .get(&episode.id)
-                    .map(Vec::as_slice)
-                    .unwrap_or_default();
+            && episode_ids.iter().all(|item_id| {
+                let found = named.get(item_id).map(Vec::as_slice).unwrap_or_default();
                 found.iter().any(|n| n.kind == "intro") && found.iter().any(|n| n.kind == "credits")
             });
         if all_named {
             tracing::info!(
-                series = %series_id, season, episodes = episodes.len(),
+                series = %series_id, season, episodes = episode_ids.len(),
                 "intro detection: the files name their own boundaries"
             );
-            let boundaries = episodes
+            let boundaries = episode_ids
                 .iter()
-                .map(|episode| Answered {
-                    item_id: episode.id.clone(),
-                    found: from_chapters(named.get(&episode.id)),
+                .map(|item_id| Answered {
+                    item_id: item_id.clone(),
+                    found: from_chapters(named.get(item_id)),
                     scanned: true,
-                    // Pending means the bytes are NEW to this detector —
-                    // never scanned, or replaced since. Whatever an earlier
-                    // file's analysis inferred is about bytes that no longer
-                    // exist, so those episodes start clean; the rest keep
-                    // their inferred rows for the kinds the names skip.
-                    wholesale: pending_ids.iter().any(|id| id == &episode.id),
+                    wholesale: pending_ids.contains(item_id),
                 })
                 .collect::<Vec<_>>();
-            let stored = self.store(registry, boundaries, &identity).await?;
+            let stored = self
+                .store_guarded(registry, boundaries, &identity, &revisions)
+                .await?;
             let scanned = progress(&stored);
             self.analyzed.fetch_add(scanned, Ordering::Relaxed);
             return Ok(Analysis {
                 scanned,
                 awaiting,
-                // The whole point of this branch is that no byte was
-                // attempted; the field says so.
                 attempted: 0,
             });
         }
-
-        let config = kahawai_intro::season::Config {
+        let (module_id, collection_id) = job_home.context("season has no source home")?;
+        let Some(link) = registry.host_link(&module_id) else {
+            return Ok(Analysis {
+                scanned: 0,
+                awaiting: awaiting + pending_reachable,
+                attempted: 0,
+            });
+        };
+        if !link.supports_segment_detection() {
+            tracing::warn!(%module_id,
+                "intro detection awaits a mediahost with protocol-minor segment support");
+            return Ok(Analysis {
+                scanned: 0,
+                awaiting: awaiting + pending_reachable,
+                attempted: 0,
+            });
+        }
+        let generation = link.generation();
+        let request_id = ulid::Ulid::generate().to_string();
+        let mut reply_rx = self.wait_for_segment_result(&module_id, generation, &request_id);
+        let job = kahawai_proto::v1::DetectSegments {
+            request_id: request_id.clone(),
+            detector: DETECTOR,
+            collection_id,
             anime,
-            ..Default::default()
+            episodes: descriptors.clone(),
         };
-        // Between episodes, wait out anything playing. The check belongs here
-        // and not only before the season: a season is many minutes of reading,
-        // and a viewer who presses play in the middle of one would otherwise
-        // share the byte plane with it for the rest.
-        let waiting_on = sessions.clone();
-        let handle = tokio::runtime::Handle::current();
-        let between = move || {
-            while !waiting_on.list().is_empty() {
-                tracing::debug!("intro detection: standing by while something plays");
-                handle.block_on(tokio::time::sleep(std::time::Duration::from_secs(30)));
+        if !registry.host_link_is_current(&module_id, generation) {
+            self.segment_link_disconnected(&module_id, generation);
+            return Ok(Analysis {
+                scanned: 0,
+                awaiting: awaiting + pending_reachable,
+                attempted: 0,
+            });
+        }
+        let message = kahawai_proto::v1::HubToHost {
+            msg: Some(kahawai_proto::v1::hub_to_host::Msg::DetectSegments(job)),
+        };
+        let early_reply = tokio::select! {
+            send_result = link.send(message) => {
+                if let Err(error) = send_result {
+                    self.waiters.lock().remove(&request_id);
+                    tracing::warn!(%module_id, error = format!("{error:#}"),
+                        "segment job could not reach mediahost");
+                    return Ok(Analysis {
+                        scanned: 0,
+                        awaiting: awaiting + pending_reachable,
+                        attempted: 0,
+                    });
+                }
+                None
             }
+            reply = &mut reply_rx => Some(reply),
         };
+        let reply = match early_reply {
+            Some(reply) => reply,
+            None => reply_rx.await,
+        };
+        let result = match reply {
+            Ok(Ok(result)) => result,
+            Ok(Err(SegmentJobFailure::Disconnected)) => {
+                return Ok(Analysis {
+                    scanned: 0,
+                    awaiting: awaiting + pending_reachable,
+                    attempted: 0,
+                });
+            }
+            Ok(Err(SegmentJobFailure::Rejected(error))) => {
+                anyhow::bail!("mediahost rejected segment job: {error}");
+            }
+            Err(_) => anyhow::bail!("segment result waiter dropped"),
+        };
+        anyhow::ensure!(
+            result.detector == DETECTOR,
+            "segment result has wrong detector generation"
+        );
+        anyhow::ensure!(
+            result.error.is_empty(),
+            "mediahost segment analysis failed: {}",
+            result.error
+        );
+        validate_result_set(&descriptors, &result.episodes)?;
 
-        let report = tokio::task::spawn_blocking(move || {
-            kahawai_intro::season::analyze(&episodes, &config, &between)
-        })
-        .await;
-        let report = report.context("detection task panicked")??;
-
-        // A read that died under a host that has GONE is weather — counted
-        // as awaiting, retried when the host returns. Under a host still
-        // connected it is the file itself, which no retry fixes; those
-        // episodes keep no scan row and the season's no-progress guard
-        // eventually sets it aside. When every episode is a dead read on a
-        // connected host, the season is a failure outright: returning
-        // "awaiting" for it would re-read the whole season's bytes every
-        // cycle for ever, which is the loop the failed set exists to stop.
-        // One connectivity snapshot for both counts: taken twice (the second
-        // after the store's await), they could disagree about a host that
-        // flipped in between, costing one self-correcting no-op cycle.
-        let gone_mid_read: Vec<&str> = report
-            .episodes
+        let expected = descriptors
             .iter()
-            .filter(|e| {
-                e.unreadable
-                    && homes
-                        .get(&e.id)
-                        .is_some_and(|module| !registry.is_connected(module))
-            })
-            .map(|e| e.id.as_str())
-            .collect();
+            .map(|episode| (episode.item_id.as_str(), episode))
+            .collect::<std::collections::HashMap<_, _>>();
+        let mut gone_mid_read = Vec::new();
+        let mut boundaries = Vec::with_capacity(result.episodes.len());
+        for episode in result.episodes {
+            let descriptor = expected.get(episode.item_id.as_str()).with_context(|| {
+                format!("segment result names unknown item {}", episode.item_id)
+            })?;
+            validate_episode_segments(&episode, descriptor)?;
+            let revision_matches = result_matches_request(&episode, descriptor)?;
+            if !revision_matches {
+                // The mediahost observed a replacement after doing useful work
+                // on the siblings. Keep this episode pending without rejecting
+                // or discarding the rest of the season.
+                boundaries.push(Answered {
+                    item_id: episode.item_id,
+                    found: Vec::new(),
+                    scanned: false,
+                    wholesale: false,
+                });
+                continue;
+            }
+            if episode.unreadable && !registry.is_connected(&module_id) {
+                gone_mid_read.push(episode.item_id.clone());
+            }
+            let mut found = from_chapters(named.get(&episode.item_id));
+            for segment in episode.segments {
+                let kind = match segment.kind.as_str() {
+                    "recap" => "recap",
+                    "intro" => "intro",
+                    "credits" => "credits",
+                    other => anyhow::bail!("unknown segment kind {other}"),
+                };
+                let analyzer = match segment.analyzer.as_str() {
+                    "chromaprint" => "chromaprint",
+                    "blackframe" => "blackframe",
+                    other => anyhow::bail!("unknown segment analyzer {other}"),
+                };
+                if !found.iter().any(|(existing, ..)| *existing == kind) {
+                    found.push((kind, segment.start_ms, segment.end_ms, analyzer));
+                }
+            }
+            boundaries.push(Answered {
+                item_id: episode.item_id,
+                found,
+                scanned: !episode.unreadable,
+                wholesale: !episode.unreadable,
+            });
+        }
         let awaiting_mid_read = gone_mid_read.len();
         let awaiting = awaiting + awaiting_mid_read;
-        if report.episodes.iter().all(|e| e.unreadable)
-            && !report.episodes.is_empty()
-            && awaiting == 0
-        {
+        if boundaries.iter().all(|episode| !episode.scanned) && awaiting == 0 {
             anyhow::bail!("no episode's bytes could be read, and the mediahost is up");
         }
-        // What the analysis found, with anything the file NAMED on top of it:
-        // a stated boundary beats an inferred one. An episode whose bytes
-        // failed somewhere along the way keeps whatever WAS found — a
-        // truncated file's opening is found on every pass, and dropping it
-        // because the tail would not read served nobody — but is not marked
-        // scanned: half an answer keeps the question open.
-        let boundaries = report
-            .episodes
-            .iter()
-            .map(|episode| {
-                let mut found = from_chapters(named.get(&episode.id));
-                let inferred = [
-                    ("recap", episode.recap, "blackframe"),
-                    ("intro", episode.intro, "chromaprint"),
-                    (
-                        "credits",
-                        episode.credits,
-                        episode.credits_source.unwrap_or("chromaprint"),
-                    ),
-                ];
-                for (kind, range, source) in inferred {
-                    let Some(range) = range else { continue };
-                    if found.iter().any(|(k, ..)| *k == kind) {
-                        continue;
-                    }
-                    found.push((kind, range.start, range.end, source));
-                }
-                Answered {
-                    item_id: episode.id.clone(),
-                    found,
-                    scanned: !episode.unreadable,
-                    wholesale: !episode.unreadable,
-                }
-            })
-            .collect::<Vec<_>>();
-        let stored = self.store(registry, boundaries, &identity).await?;
+        let stored = self
+            .store_guarded(registry, boundaries, &identity, &revisions)
+            .await?;
         let scanned = progress(&stored);
         self.analyzed.fetch_add(scanned, Ordering::Relaxed);
-        // An attempt the host died under told us nothing about the season:
-        // a retry would resolve it as plain offline (attempted zero, the
-        // step-aside arm). Counting those attempts routed a mid-read outage
-        // through the no-progress guard into the six-hour set-aside without
-        // ever checking whether the host came back.
         let pending_gone = gone_mid_read
             .iter()
-            .filter(|gone| pending_ids.iter().any(|id| id == *gone))
+            .filter(|gone| pending_ids.contains(gone))
             .count();
         Ok(Analysis {
             scanned,
@@ -842,18 +928,26 @@ impl Detector {
         })
     }
 
-    /// Write one season's boundaries and mark its episodes scanned, found
-    /// something or not. Returns the episodes whose scan rows actually
-    /// LANDED, so the caller counts progress from the database's answer.
-    ///
-    /// Both analyzers land here: the fingerprint pass and the chapter names,
-    /// which are the same statement about an episode arrived at differently
-    /// and must be stored identically or a client can tell them apart.
+    #[cfg(test)]
     async fn store(
         &self,
         registry: &Arc<Registry>,
         boundaries: Vec<Answered>,
         identity: &std::collections::HashMap<String, Option<i64>>,
+    ) -> Result<Vec<String>> {
+        self.store_guarded(registry, boundaries, identity, &Default::default())
+            .await
+    }
+
+    /// Write one season's boundaries and mark its episodes scanned, found
+    /// something or not. A source revision supplied by the dispatcher must
+    /// still be the item's current exact source inside this transaction.
+    async fn store_guarded(
+        &self,
+        registry: &Arc<Registry>,
+        boundaries: Vec<Answered>,
+        identity: &std::collections::HashMap<String, Option<i64>>,
+        revisions: &std::collections::HashMap<String, SourceRevision>,
     ) -> Result<Vec<String>> {
         // IMMEDIATE, because the first statement is a READ: a deferred
         // transaction pins its snapshot there, and any write committing
@@ -866,6 +960,39 @@ impl Detector {
         let mut scanned = Vec::new();
         for answer in &boundaries {
             let item_id = &answer.item_id;
+            if let Some(revision) = revisions.get(item_id) {
+                let current: bool = sqlx::query_scalar(
+                    "SELECT EXISTS (
+                       SELECT 1 FROM files f
+                       JOIN collection_roots r ON r.id = f.root_id
+                       WHERE f.module_id = ? AND f.collection_id = ?
+                         AND r.root_token = ? AND f.path_rel = ?
+                         AND f.size = ? AND f.mtime_unix = ?
+                         AND EXISTS (
+                           SELECT 1 FROM playable_source_parts psp
+                           JOIN playable_sources ps ON ps.id = psp.playable_source_id
+                           WHERE psp.file_id = f.id AND ps.item_id = ?
+                             AND ps.expected_parts = 1 AND psp.ordinal = 1
+                             AND (SELECT COUNT(*) FROM playable_source_parts all_parts
+                                  WHERE all_parts.playable_source_id = ps.id) = 1
+                         )
+                     )",
+                )
+                .bind(&revision.module_id)
+                .bind(&revision.collection_id)
+                .bind(&revision.root_token)
+                .bind(&revision.path_rel)
+                .bind(revision.size as i64)
+                .bind(revision.mtime_unix)
+                .bind(item_id)
+                .fetch_one(&mut *tx)
+                .await?;
+                if !current {
+                    tracing::debug!(item = %item_id,
+                        "segment answer stale against current source; dropped");
+                    continue;
+                }
+            }
             // A season is minutes of analysis, long enough for a library
             // resync to delete and re-key its items. Writing this answer
             // would abort the WHOLE transaction on the foreign key and lose
@@ -916,8 +1043,13 @@ impl Detector {
                         .await?;
                 }
             }
-            for (kind, start, end, source) in &answer.found {
-                let (start_ms, end_ms) = ((start * 1000.0) as i64, (end * 1000.0) as i64);
+            for (kind, start_ms, end_ms, source) in &answer.found {
+                let (Ok(start_ms), Ok(end_ms)) = (i64::try_from(*start_ms), i64::try_from(*end_ms))
+                else {
+                    tracing::warn!(item = %item_id, kind,
+                        "segment boundary exceeds SQLite integer range; dropped");
+                    continue;
+                };
                 if end_ms <= start_ms {
                     continue;
                 }
@@ -951,9 +1083,103 @@ impl Detector {
                 .await?;
             }
         }
+
         tx.commit().await?;
         Ok(scanned)
     }
+}
+
+#[derive(Clone)]
+struct SourceRevision {
+    module_id: String,
+    collection_id: String,
+    root_token: String,
+    path_rel: String,
+    size: u64,
+    mtime_unix: i64,
+}
+
+fn result_matches_request(
+    result: &kahawai_proto::v1::SegmentEpisodeResult,
+    request: &kahawai_proto::v1::SegmentEpisode,
+) -> Result<bool> {
+    let expected_source = request.source.as_ref().context("job source missing")?;
+    let source = result.source.as_ref().context("result source missing")?;
+    anyhow::ensure!(
+        source.root_token == expected_source.root_token
+            && source.path_rel == expected_source.path_rel,
+        "segment result source does not match its job"
+    );
+    let matches = result.observed_size == request.expected_size
+        && result.observed_mtime_unix == request.expected_mtime_unix;
+    anyhow::ensure!(
+        matches || result.unreadable,
+        "readable segment result changed source revision"
+    );
+    Ok(matches)
+}
+
+fn validate_result_set(
+    requests: &[kahawai_proto::v1::SegmentEpisode],
+    results: &[kahawai_proto::v1::SegmentEpisodeResult],
+) -> Result<()> {
+    anyhow::ensure!(
+        results.len() == requests.len(),
+        "segment result returned {} of {} episodes",
+        results.len(),
+        requests.len()
+    );
+    let expected = requests
+        .iter()
+        .map(|episode| episode.item_id.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    let mut returned = std::collections::HashSet::new();
+    for result in results {
+        anyhow::ensure!(
+            expected.contains(result.item_id.as_str()),
+            "segment result names unknown item {}",
+            result.item_id
+        );
+        anyhow::ensure!(
+            returned.insert(result.item_id.as_str()),
+            "segment result duplicates item {}",
+            result.item_id
+        );
+    }
+    anyhow::ensure!(returned == expected, "segment result omitted an item");
+    Ok(())
+}
+
+fn validate_episode_segments(
+    result: &kahawai_proto::v1::SegmentEpisodeResult,
+    request: &kahawai_proto::v1::SegmentEpisode,
+) -> Result<()> {
+    let mut kinds = std::collections::HashSet::new();
+    for segment in &result.segments {
+        anyhow::ensure!(
+            kinds.insert(segment.kind.as_str()),
+            "segment result duplicates {} for {}",
+            segment.kind,
+            result.item_id
+        );
+        anyhow::ensure!(
+            segment.end_ms <= i64::MAX as u64,
+            "segment range exceeds storage bounds for {}",
+            result.item_id
+        );
+        anyhow::ensure!(
+            kahawai_core::segments::inferred_within_bounds(
+                &segment.kind,
+                &segment.analyzer,
+                segment.start_ms,
+                segment.end_ms,
+                request.duration_ms,
+            ),
+            "segment range is outside detector bounds for {}",
+            result.item_id
+        );
+    }
+    Ok(())
 }
 
 /// Lowers the detector's busy flag however its scope ends.
@@ -1001,17 +1227,17 @@ pub struct Analysis {
     pub attempted: usize,
 }
 
-/// One stored boundary: kind, start and end in seconds, and which analyzer
-/// said so.
-type Boundary = (&'static str, f64, f64, &'static str);
+/// One stored boundary: kind, start and end in milliseconds, and which
+/// analyzer said so.
+type Boundary = (&'static str, u64, u64, &'static str);
 
 /// The boundaries a file named, in the shape [`Detector::store`] writes.
-fn from_chapters(named: Option<&Vec<kahawai_intro::chapters::Named>>) -> Vec<Boundary> {
+fn from_chapters(named: Option<&Vec<kahawai_core::segments::Named>>) -> Vec<Boundary> {
     named
         .map(Vec::as_slice)
         .unwrap_or_default()
         .iter()
-        .map(|n| (n.kind, n.start, n.end, "chapter"))
+        .map(|n| (n.kind, n.start_ms, n.end_ms, "chapter"))
         .collect()
 }
 
@@ -1143,7 +1369,7 @@ mod tests {
                 &registry,
                 vec![Answered {
                     item_id: "e1".into(),
-                    found: vec![("recap", 0.0, 30.0, "blackframe")],
+                    found: vec![("recap", 0, 30_000, "blackframe")],
                     scanned: true,
                     wholesale: true,
                 }],
@@ -1158,8 +1384,8 @@ mod tests {
                 vec![Answered {
                     item_id: "e1".into(),
                     found: vec![
-                        ("intro", 30.0, 90.0, "chapter"),
-                        ("credits", 1300.0, 1400.0, "chapter"),
+                        ("intro", 30_000, 90_000, "chapter"),
+                        ("credits", 1_300_000, 1_400_000, "chapter"),
                     ],
                     scanned: true,
                     wholesale: false,
@@ -1203,13 +1429,13 @@ mod tests {
                 vec![
                     Answered {
                         item_id: "gone".into(),
-                        found: vec![("intro", 30.0, 90.0, "chromaprint")],
+                        found: vec![("intro", 30_000, 90_000, "chromaprint")],
                         scanned: true,
                         wholesale: true,
                     },
                     Answered {
                         item_id: "e1".into(),
-                        found: vec![("intro", 30.0, 90.0, "chromaprint")],
+                        found: vec![("intro", 30_000, 90_000, "chromaprint")],
                         scanned: true,
                         wholesale: true,
                     },
@@ -1254,9 +1480,9 @@ mod tests {
                 vec![Answered {
                     item_id: "e1".into(),
                     found: vec![
-                        ("recap", 0.0, 30.0, "chapter"),
-                        ("intro", 30.0, 90.0, "chapter"),
-                        ("credits", 1300.0, 1400.0, "chapter"),
+                        ("recap", 0, 30_000, "chapter"),
+                        ("intro", 30_000, 90_000, "chapter"),
+                        ("credits", 1_300_000, 1_400_000, "chapter"),
                     ],
                     scanned: true,
                     wholesale: false,
@@ -1272,8 +1498,8 @@ mod tests {
                 vec![Answered {
                     item_id: "e1".into(),
                     found: vec![
-                        ("intro", 10.0, 70.0, "chapter"),
-                        ("credits", 1200.0, 1300.0, "chapter"),
+                        ("intro", 10_000, 70_000, "chapter"),
+                        ("credits", 1_200_000, 1_300_000, "chapter"),
                     ],
                     scanned: true,
                     wholesale: false,
@@ -1318,7 +1544,7 @@ mod tests {
                 &registry,
                 vec![Answered {
                     item_id: "e1".into(),
-                    found: vec![("credits", 1300.0, 1400.0, "blackframe")],
+                    found: vec![("credits", 1_300_000, 1_400_000, "blackframe")],
                     scanned: true,
                     wholesale: true,
                 }],
@@ -1334,7 +1560,7 @@ mod tests {
                 &registry,
                 vec![Answered {
                     item_id: "e1".into(),
-                    found: vec![("intro", 10.0, 40.0, "chromaprint")],
+                    found: vec![("intro", 10_000, 40_000, "chromaprint")],
                     scanned: false,
                     wholesale: false,
                 }],
@@ -1355,5 +1581,340 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(scans, 1, "only the whole pass counts as a scan");
+    }
+
+    #[tokio::test]
+    async fn a_segment_result_is_bound_to_the_requested_host() {
+        let detector = Detector::new();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        detector.waiters.lock().insert(
+            "job".into(),
+            SegmentWaiter {
+                module_id: "right".into(),
+                generation: 1,
+                tx,
+            },
+        );
+        let result = kahawai_proto::v1::SegmentDetectionResult {
+            request_id: "job".into(),
+            detector: DETECTOR,
+            ..Default::default()
+        };
+        detector.segment_result("wrong", 1, result.clone());
+        detector.segment_result("right", 2, result.clone());
+        assert!(
+            detector.waiters.lock().contains_key("job"),
+            "wrong host or generation consumed the waiter"
+        );
+        detector.segment_result("right", 1, result);
+        assert!(rx.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn disconnect_wakes_segment_waiters() {
+        let detector = Detector::new();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        detector.waiters.lock().insert(
+            "job".into(),
+            SegmentWaiter {
+                module_id: "host".into(),
+                generation: 2,
+                tx,
+            },
+        );
+        let (new_tx, new_rx) = tokio::sync::oneshot::channel();
+        detector.waiters.lock().insert(
+            "new-job".into(),
+            SegmentWaiter {
+                module_id: "host".into(),
+                generation: 3,
+                tx: new_tx,
+            },
+        );
+        detector.segment_link_disconnected("host", 2);
+        assert!(matches!(
+            rx.await.unwrap(),
+            Err(SegmentJobFailure::Disconnected)
+        ));
+        assert!(
+            detector.waiters.lock().contains_key("new-job"),
+            "old teardown cancelled replacement generation"
+        );
+        detector.segment_result(
+            "host",
+            3,
+            kahawai_proto::v1::SegmentDetectionResult {
+                request_id: "new-job".into(),
+                ..Default::default()
+            },
+        );
+        assert!(new_rx.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_result_for_a_replaced_or_multipart_source_is_dropped_at_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::open(dir.path()).await.unwrap();
+        sqlx::raw_sql(
+            "INSERT INTO collections(module_id,collection_id,media_type)
+               VALUES('m','c','series');
+             INSERT INTO collection_roots(module_id,collection_id,root_token,normalized_path)
+               VALUES('m','c','r','/series');
+             INSERT INTO items(id,kind,title,norm_title,sort_title,module_id,collection_id)
+               VALUES('e1','episode','One','one','one','m','c');
+             INSERT INTO files(module_id,collection_id,root_id,path_rel,size,mtime_unix,
+                               head_xxh3,tail_xxh3,oshash,streams_json)
+               SELECT 'm','c',id,'e1.mkv',10,2,0,0,0,'{}' FROM collection_roots;
+             INSERT INTO playable_sources(module_id,collection_id,item_id,root_id,
+                                          family_key,expected_parts)
+               VALUES('m','c','e1',NULL,'file:e1.mkv',1);
+             INSERT INTO playable_source_parts(playable_source_id,module_id,collection_id,
+                                               ordinal,file_id)
+               SELECT ps.id,'m','c',1,f.id FROM playable_sources ps,files f;",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        let registry = Arc::new(Registry::new(db, Default::default()));
+        let detector = Detector::new();
+        let identity = std::collections::HashMap::from([("e1".to_string(), Some(1))]);
+        let revisions = std::collections::HashMap::from([(
+            "e1".to_string(),
+            SourceRevision {
+                module_id: "m".into(),
+                collection_id: "c".into(),
+                root_token: "r".into(),
+                path_rel: "e1.mkv".into(),
+                size: 10,
+                mtime_unix: 1,
+            },
+        )]);
+        let answer = || {
+            vec![Answered {
+                item_id: "e1".into(),
+                found: vec![("intro", 1_000, 2_000, "chromaprint")],
+                scanned: true,
+                wholesale: true,
+            }]
+        };
+
+        let stored = detector
+            .store_guarded(&registry, answer(), &identity, &revisions)
+            .await
+            .unwrap();
+        assert!(stored.is_empty());
+        let segments: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM media_segments")
+            .fetch_one(registry.db())
+            .await
+            .unwrap();
+        assert_eq!(segments, 0);
+
+        sqlx::raw_sql(
+            "UPDATE files SET mtime_unix = 1;
+             UPDATE playable_sources SET expected_parts = 2;",
+        )
+        .execute(registry.db())
+        .await
+        .unwrap();
+        let stored = detector
+            .store_guarded(&registry, answer(), &identity, &revisions)
+            .await
+            .unwrap();
+        assert!(
+            stored.is_empty(),
+            "a file that became one part of a multipart source was accepted"
+        );
+
+        sqlx::raw_sql(
+            "UPDATE playable_sources SET expected_parts = 1;
+             INSERT INTO files(module_id,collection_id,root_id,path_rel,size,mtime_unix,
+                               head_xxh3,tail_xxh3,oshash,streams_json)
+               SELECT 'm','c',id,'duplicate.mkv',10,1,0,0,0,'{}' FROM collection_roots;
+             INSERT INTO playable_source_parts(playable_source_id,module_id,collection_id,
+                                               ordinal,file_id)
+               SELECT ps.id,'m','c',1,f.id FROM playable_sources ps
+               JOIN files f ON f.path_rel = 'duplicate.mkv';",
+        )
+        .execute(registry.db())
+        .await
+        .unwrap();
+        let stored = detector
+            .store_guarded(&registry, answer(), &identity, &revisions)
+            .await
+            .unwrap();
+        assert!(
+            stored.is_empty(),
+            "a source with duplicate ordinal-one rows was accepted"
+        );
+    }
+    #[test]
+    fn an_unreadable_changed_revision_does_not_reject_its_siblings() {
+        let request = kahawai_proto::v1::SegmentEpisode {
+            source: Some(kahawai_proto::v1::SourcePath::new("root", "episode.mkv")),
+            expected_size: 10,
+            expected_mtime_unix: 1,
+            ..Default::default()
+        };
+        let mut result = kahawai_proto::v1::SegmentEpisodeResult {
+            source: request.source.clone(),
+            observed_size: 11,
+            observed_mtime_unix: 2,
+            unreadable: true,
+            ..Default::default()
+        };
+        assert!(!result_matches_request(&result, &request).unwrap());
+
+        result.unreadable = false;
+        assert!(result_matches_request(&result, &request).is_err());
+
+        result.unreadable = true;
+        result.source.as_mut().unwrap().path_rel = "other.mkv".into();
+        assert!(result_matches_request(&result, &request).is_err());
+    }
+
+    #[test]
+    fn result_sets_are_exact_and_ranges_stay_on_the_file_timeline() {
+        let request = |id: &str| kahawai_proto::v1::SegmentEpisode {
+            item_id: id.into(),
+            duration_ms: 1_000,
+            ..Default::default()
+        };
+        let result = |id: &str| kahawai_proto::v1::SegmentEpisodeResult {
+            item_id: id.into(),
+            ..Default::default()
+        };
+        let requests = [request("a"), request("b")];
+        assert!(validate_result_set(&requests, &[result("a"), result("b")]).is_ok());
+        assert!(validate_result_set(&requests, &[result("a"), result("a")]).is_err());
+        assert!(validate_result_set(&requests, &[result("a"), result("c")]).is_err());
+
+        let mut episode = result("a");
+        episode.segments = vec![kahawai_proto::v1::DetectedSegment {
+            kind: "intro".into(),
+            start_ms: 10,
+            end_ms: 1_001,
+            analyzer: "chromaprint".into(),
+        }];
+        assert!(validate_episode_segments(&episode, &requests[0]).is_err());
+
+        episode.segments[0].end_ms = 100;
+        episode.segments.push(episode.segments[0].clone());
+        assert!(validate_episode_segments(&episode, &requests[0]).is_err());
+
+        let long = kahawai_proto::v1::SegmentEpisode {
+            item_id: "a".into(),
+            duration_ms: 600_000,
+            ..Default::default()
+        };
+        episode.segments.truncate(1);
+        let set = |episode: &mut kahawai_proto::v1::SegmentEpisodeResult,
+                   kind: &str,
+                   analyzer: &str,
+                   start_ms,
+                   end_ms| {
+            episode.segments[0] = kahawai_proto::v1::DetectedSegment {
+                kind: kind.into(),
+                analyzer: analyzer.into(),
+                start_ms,
+                end_ms,
+            };
+        };
+        set(&mut episode, "recap", "blackframe", 1, 100_000);
+        assert!(validate_episode_segments(&episode, &long).is_err());
+
+        set(&mut episode, "intro", "chromaprint", 0, 123_000);
+        assert!(validate_episode_segments(&episode, &long).is_err());
+
+        set(&mut episode, "credits", "blackframe", 100_000, 600_000);
+        assert!(validate_episode_segments(&episode, &long).is_err());
+
+        set(&mut episode, "intro", "blackframe", 1_000, 100_000);
+        assert!(validate_episode_segments(&episode, &long).is_err());
+
+        set(&mut episode, "intro", "chromaprint", 1_000, 100_000);
+        assert!(validate_episode_segments(&episode, &long).is_err());
+        set(&mut episode, "intro", "chromaprint", 6_000, 100_000);
+        assert!(validate_episode_segments(&episode, &long).is_ok());
+
+        set(&mut episode, "credits", "blackframe", 200_000, 500_000);
+        assert!(validate_episode_segments(&episode, &long).is_err());
+        set(&mut episode, "credits", "chromaprint", 150_000, 300_000);
+        assert!(validate_episode_segments(&episode, &long).is_err());
+
+        set(&mut episode, "recap", "blackframe", 0, 14_000);
+        assert!(validate_episode_segments(&episode, &long).is_err());
+        set(&mut episode, "intro", "chromaprint", 1_000, 9_000);
+        assert!(validate_episode_segments(&episode, &long).is_err());
+        set(&mut episode, "intro", "chromaprint", 140_000, 150_000);
+        assert!(validate_episode_segments(&episode, &long).is_err());
+        set(&mut episode, "credits", "chromaprint", 590_000, 600_000);
+        assert!(validate_episode_segments(&episode, &long).is_err());
+        set(&mut episode, "credits", "blackframe", 590_000, 600_000);
+        assert!(validate_episode_segments(&episode, &long).is_err());
+
+        set(&mut episode, "credits", "blackframe", 500_000, 600_000);
+        assert!(validate_episode_segments(&episode, &long).is_ok());
+        set(&mut episode, "credits", "chromaprint", 300_000, 400_000);
+        assert!(validate_episode_segments(&episode, &long).is_ok());
+    }
+
+    #[tokio::test]
+    async fn protocol_milliseconds_are_stored_exactly() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::open(dir.path()).await.unwrap();
+        sqlx::raw_sql(
+            "INSERT INTO collections(module_id,collection_id,media_type)
+               VALUES('m','c','series');
+             INSERT INTO items(id,kind,title,norm_title,sort_title,module_id,collection_id)
+               VALUES('e1','episode','One','one','one','m','c');",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        let registry = Arc::new(Registry::new(db, Default::default()));
+        Detector::new()
+            .store(
+                &registry,
+                vec![Answered {
+                    item_id: "e1".into(),
+                    found: vec![("intro", 1_001, 2_003, "chromaprint")],
+                    scanned: true,
+                    wholesale: true,
+                }],
+                &std::collections::HashMap::new(),
+            )
+            .await
+            .unwrap();
+
+        let stored: (i64, i64) =
+            sqlx::query_as("SELECT start_ms,end_ms FROM media_segments WHERE item_id='e1'")
+                .fetch_one(registry.db())
+                .await
+                .unwrap();
+        assert_eq!(stored, (1_001, 2_003));
+
+        Detector::new()
+            .store(
+                &registry,
+                vec![Answered {
+                    item_id: "e1".into(),
+                    found: vec![(
+                        "credits",
+                        i64::MAX as u64 + 1,
+                        i64::MAX as u64 + 2,
+                        "blackframe",
+                    )],
+                    scanned: false,
+                    wholesale: false,
+                }],
+                &std::collections::HashMap::new(),
+            )
+            .await
+            .unwrap();
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM media_segments")
+            .fetch_one(registry.db())
+            .await
+            .unwrap();
+        assert_eq!(count, 1, "unrepresentable boundary was stored");
     }
 }

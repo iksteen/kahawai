@@ -6,6 +6,7 @@
 
 use std::collections::{HashSet, VecDeque};
 use std::io::Read;
+use std::sync::Arc;
 use std::time::Duration;
 
 use kahawai_proto::v1::{
@@ -14,6 +15,7 @@ use kahawai_proto::v1::{
 };
 
 use crate::Activity;
+type BlockingGuard = Arc<dyn Send + Sync>;
 use crate::ed2k::{self, CHUNK, Ed2k};
 use crate::scan::CollectionConfig;
 
@@ -130,6 +132,20 @@ enum Bg {
     Subs,
 }
 
+async fn wait_for_intake(
+    rx: &mut tokio::sync::mpsc::Receiver<JobMsg>,
+    queues: &mut Queues,
+) -> bool {
+    match tokio::time::timeout(Duration::from_millis(100), rx.recv()).await {
+        Ok(Some(message)) => {
+            intake(message, queues);
+            true
+        }
+        Ok(None) => false,
+        Err(_) => true,
+    }
+}
+
 pub async fn run(
     mut rx: tokio::sync::mpsc::Receiver<JobMsg>,
     tx: tokio::sync::mpsc::Sender<HostToHub>,
@@ -169,10 +185,20 @@ pub async fn run(
         // Tier order: urgent (never idle-gated — the active lease IS the
         // requesting viewer) → ED2K → background subs.
         if let Some((collection_id, root_token, path_rel)) = queues.urgent.pop_front() {
-            extract_and_send(&collections, &collection_id, &root_token, &path_rel, &tx).await;
+            let urgent: BlockingGuard = Arc::new(activity.urgent());
+            extract_and_send(
+                &collections,
+                &collection_id,
+                &root_token,
+                &path_rel,
+                Some(urgent),
+                &tx,
+            )
+            .await;
             continue;
         }
         if let Some(e) = queues.urgent_image.pop_front() {
+            let urgent: BlockingGuard = Arc::new(activity.urgent());
             if let Some(source) = e.source {
                 extract_image_and_send(
                     &collections,
@@ -180,6 +206,7 @@ pub async fn run(
                     &source.root_token,
                     &source.path_rel,
                     e.sub_index,
+                    urgent,
                     &tx,
                 )
                 .await;
@@ -187,12 +214,24 @@ pub async fn run(
             continue;
         }
         if let Some((collection_id, root_token, path_rel)) = queues.ed2k.q.pop_front() {
+            let Some(background) = activity.try_background() else {
+                queues
+                    .ed2k
+                    .q
+                    .push_front((collection_id, root_token, path_rel));
+                if !wait_for_intake(&mut rx, &mut queues).await {
+                    return;
+                }
+                continue;
+            };
+            let background: BlockingGuard = Arc::new(background);
             match hash_one(
                 &collections,
                 &collection_id,
                 &root_token,
                 &path_rel,
                 &activity,
+                background,
             )
             .await
             {
@@ -239,6 +278,21 @@ pub async fn run(
             },
         };
         if let Some((collection_id, root_token, path_rel)) = job {
+            let Some(background) = activity.try_background() else {
+                match which {
+                    Bg::Subs => &mut queues.subs,
+                    Bg::Atts => &mut queues.atts,
+                    Bg::Keyframe => &mut queues.keys,
+                    Bg::Geometry => &mut queues.geometry,
+                }
+                .q
+                .push_front((collection_id, root_token, path_rel));
+                if !wait_for_intake(&mut rx, &mut queues).await {
+                    return;
+                }
+                continue;
+            };
+            let background: BlockingGuard = Arc::new(background);
             // Idle gate before starting; the work itself is a bounded
             // local read (ponytail: can't pause a gst pipeline mid-walk).
             let mut preempted = false;
@@ -267,12 +321,26 @@ pub async fn run(
             }
             match which {
                 Bg::Subs => {
-                    extract_and_send(&collections, &collection_id, &root_token, &path_rel, &tx)
-                        .await
+                    extract_and_send(
+                        &collections,
+                        &collection_id,
+                        &root_token,
+                        &path_rel,
+                        Some(background),
+                        &tx,
+                    )
+                    .await
                 }
                 Bg::Atts => {
-                    declare_and_send(&collections, &collection_id, &root_token, &path_rel, &tx)
-                        .await
+                    declare_and_send(
+                        &collections,
+                        &collection_id,
+                        &root_token,
+                        &path_rel,
+                        background,
+                        &tx,
+                    )
+                    .await
                 }
                 Bg::Keyframe => {
                     measure_keyframes_and_send(
@@ -280,6 +348,7 @@ pub async fn run(
                         &collection_id,
                         &root_token,
                         &path_rel,
+                        background,
                         &tx,
                     )
                     .await
@@ -290,6 +359,7 @@ pub async fn run(
                         &collection_id,
                         &root_token,
                         &path_rel,
+                        background,
                         &tx,
                     )
                     .await
@@ -310,14 +380,18 @@ async fn declare_and_send(
     collection_id: &str,
     root_token: &str,
     path_rel: &str,
+    background: BlockingGuard,
     tx: &tokio::sync::mpsc::Sender<HostToHub>,
 ) {
     let result: anyhow::Result<(u64, String, String)> = async {
         let path = crate::serve::resolve_rel(collections, collection_id, root_token, path_rel)?;
         let size = std::fs::metadata(&path)?.len();
-        let (atts, chapters) =
-            tokio::task::spawn_blocking(move || kahawai_media::subindex::declare_container(&path))
-                .await??;
+        let blocking = background.clone();
+        let (atts, chapters) = tokio::task::spawn_blocking(move || {
+            let _background = blocking;
+            kahawai_media::subindex::declare_container(&path)
+        })
+        .await??;
         Ok((
             size,
             serde_json::to_string(&atts)?,
@@ -365,12 +439,15 @@ async fn measure_keyframes_and_send(
     collection_id: &str,
     root_token: &str,
     path_rel: &str,
+    background: BlockingGuard,
     tx: &tokio::sync::mpsc::Sender<HostToHub>,
 ) {
     let result: anyhow::Result<(u64, Option<u32>)> = async {
         let path = crate::serve::resolve_rel(collections, collection_id, root_token, path_rel)?;
         let size = std::fs::metadata(&path)?.len();
+        let blocking = background.clone();
         let ms = tokio::task::spawn_blocking(move || {
+            let _background = blocking;
             kahawai_media::subindex::max_keyframe_interval_ms(&path)
         })
         .await?
@@ -411,6 +488,7 @@ async fn probe_geometry_and_send(
     collection_id: &str,
     root_token: &str,
     path_rel: &str,
+    background: BlockingGuard,
     tx: &tokio::sync::mpsc::Sender<HostToHub>,
 ) {
     let path = match crate::serve::resolve_rel(collections, collection_id, root_token, path_rel) {
@@ -431,7 +509,9 @@ async fn probe_geometry_and_send(
         }
     };
     let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+    let blocking = background.clone();
     let result = tokio::task::spawn_blocking(move || {
+        let _background = blocking;
         kahawai_media::probe_video_geometry(&path, Duration::from_secs(30))
     })
     .await;
@@ -465,6 +545,7 @@ async fn extract_image_and_send(
     root_token: &str,
     path_rel: &str,
     sub_index: u32,
+    blocking_guard: BlockingGuard,
     tx: &tokio::sync::mpsc::Sender<HostToHub>,
 ) {
     let started = std::time::Instant::now();
@@ -474,7 +555,9 @@ async fn extract_image_and_send(
         root_token.to_string(),
         path_rel.to_string(),
     );
+    let blocking_guard2 = blocking_guard.clone();
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let _blocking_guard = blocking_guard2;
         let path = crate::serve::resolve_rel(&collections2, &cid, &token, &prel)?;
         // A `.idx` path means a VobSub sidecar pair, not a container:
         // `sub_index` is the track index INSIDE the idx, and the result
@@ -577,13 +660,16 @@ async fn extract_and_send(
     collection_id: &str,
     root_token: &str,
     path_rel: &str,
+    background: Option<BlockingGuard>,
     tx: &tokio::sync::mpsc::Sender<HostToHub>,
 ) {
     let started = std::time::Instant::now();
     let result: anyhow::Result<(u64, Vec<(usize, kahawai_media::subtitles::Extracted)>)> = async {
         let path = crate::serve::resolve_rel(collections, collection_id, root_token, path_rel)?;
         let size = std::fs::metadata(&path)?.len();
+        let blocking = background.clone();
         let tracks = tokio::task::spawn_blocking(move || {
+            let _background = blocking;
             // Sparse first (index-driven reads, no demux); trust it
             // only when it actually produced events — a parser gap
             // must never look like "no subtitles".
@@ -648,6 +734,7 @@ async fn hash_one(
     root_token: &str,
     path_rel: &str,
     activity: &Activity,
+    background: BlockingGuard,
 ) -> anyhow::Result<FileHash> {
     let path = crate::serve::resolve_rel(collections, collection_id, root_token, path_rel)?;
     let claimed_crc = path
@@ -667,7 +754,9 @@ async fn hash_one(
             tokio::time::sleep(BUSY_POLL).await;
         }
         let want = remaining.min(CHUNK as u64) as usize;
+        let blocking = background.clone();
         let (f, buf) = tokio::task::spawn_blocking(move || {
+            let _background = blocking;
             let mut buf = vec![0u8; want];
             file.read_exact(&mut buf).map(|_| (file, buf))
         })
