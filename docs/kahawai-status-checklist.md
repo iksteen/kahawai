@@ -618,8 +618,9 @@ How something works and why it was built that way belong in
       the hub keeps serving, including the PKI so restored hubs accept existing
       satellite certs without re-enrolment, and excluding caches as
       re-derivable. Manifest v3 inventories every included regular file by
-      safe relative path, size and SHA-256 and validates the complete source
-      before restore mutation; v1/v2 remain restorable.
+      safe relative path, size and SHA-256, validates into private sibling
+      staging, and consumes only those stable bytes before live mutation;
+      v1/v2 remain restorable.
 - [x] OPS-6 Quota-bounded caches with eviction — satisfied by there being
       nothing eligible to evict; requirement amended 2026-07-26 with the
       audit, reasoning in implementation §10. The one deletion is

@@ -469,9 +469,14 @@ marked in that document.
       restorable while v3 rejects missing, extra, duplicate, unsafe, wrong-size
       or wrong-hash artifacts before touching live state. Snapshot copies hash
       in the same buffered pass; SQLite's `VACUUM INTO` output is hashed once
-      afterwards. The format, compatibility and corruption checks live in
-      `backup_restore`; `scripts/kahawai-backup-cycle.sh` exercises the CLI and
-      queries the restored database.
+      afterwards. Restore validates while copying into a private sibling
+      scratch directory and consumes only that stable copy, so a changing
+      source cannot swap bytes between validation and restore. The cost is
+      temporary disk equal to the snapshot plus one local write/read; BKP-4
+      remains the separate atomic destination swap and rollback. The format,
+      compatibility and corruption checks live in `backup_restore`;
+      `scripts/kahawai-backup-cycle.sh` exercises the CLI and queries the
+      restored database.
 - [ ] BKP-2 Add `restore --config-out`; default to the configuration path used
       by the command or `<data_dir>/kahawai.toml`, and rewrite the restored
       `hub.data_dir` to the selected restore destination. Add a companion script

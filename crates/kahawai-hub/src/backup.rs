@@ -23,7 +23,7 @@
 
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -80,6 +80,31 @@ const MANIFEST: &str = "kahawai-backup.json";
 /// Everything a restore puts back, relative to the data dir. Ordered so
 /// the database lands first: it is the part a partial restore most needs.
 const TREES: [&str; 2] = ["pki", "subtitles"];
+
+struct StagingDir(PathBuf);
+
+impl StagingDir {
+    fn create(next_to: &Path) -> Result<Self> {
+        let parent = next_to
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let path = parent.join(format!(".kahawai-restore-{}", ulid::Ulid::generate()));
+        kahawai_core::private::create_dir(&path)
+            .with_context(|| format!("creating restore staging directory {}", path.display()))?;
+        Ok(Self(path))
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for StagingDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
 
 fn now_unix() -> i64 {
     std::time::SystemTime::now()
@@ -226,19 +251,37 @@ pub async fn restore(src: &Path, data_dir: &Path, force: bool) -> Result<Manifes
             manifest.format
         );
     }
-    if manifest.format >= 3 {
-        validate_artifacts(src, &manifest.artifacts)?;
+
+    let existing = data_dir.join("hub.db");
+    if existing.exists() && !force {
+        bail!(
+            "{} already holds a database — stop the hub and pass --force to replace it",
+            data_dir.display()
+        );
     }
+
+    // A format-3 restore consumes only these private staged bytes. The source
+    // may be an rsync target or mounted object store that changes while this
+    // command runs; hashing one open and copying a later open would be a race.
+    let staging = if manifest.format >= 3 {
+        let staging = StagingDir::create(data_dir)?;
+        stage_artifacts(src, staging.path(), &manifest.artifacts)?;
+        Some(staging)
+    } else {
+        None
+    };
+    let source = staging.as_ref().map_or(src, StagingDir::path);
+
     // Validate the complete source before touching a destination. In
     // particular, a missing credential key must not be discovered after
     // `--force` has already replaced the live database.
     anyhow::ensure!(
-        src.join("hub.db").is_file(),
+        source.join("hub.db").is_file(),
         "the snapshot does not have hub.db"
     );
     for name in &manifest.secrets {
         anyhow::ensure!(
-            src.join(name).is_file(),
+            source.join(name).is_file(),
             "the manifest lists {name}, and the snapshot does not have it"
         );
     }
@@ -247,7 +290,7 @@ pub async fn restore(src: &Path, data_dir: &Path, force: bool) -> Result<Manifes
             .max_connections(1)
             .connect_with(
                 sqlx::sqlite::SqliteConnectOptions::new()
-                    .filename(src.join("hub.db"))
+                    .filename(source.join("hub.db"))
                     .read_only(true),
             )
             .await
@@ -260,7 +303,7 @@ pub async fn restore(src: &Path, data_dir: &Path, force: bool) -> Result<Manifes
                 .context("reading the snapshot credential key marker")?;
         db.close().await;
         if let Some(expected) = expected {
-            let key_path = src.join(crate::secrets::KEY_FILE);
+            let key_path = source.join(crate::secrets::KEY_FILE);
             anyhow::ensure!(
                 manifest
                     .secrets
@@ -279,13 +322,6 @@ pub async fn restore(src: &Path, data_dir: &Path, force: bool) -> Result<Manifes
             );
         }
     }
-    let existing = data_dir.join("hub.db");
-    if existing.exists() && !force {
-        bail!(
-            "{} already holds a database — stop the hub and pass --force to replace it",
-            data_dir.display()
-        );
-    }
     std::fs::create_dir_all(data_dir)?;
 
     // The WAL and shm belong to the database being replaced. Leaving them
@@ -293,16 +329,16 @@ pub async fn restore(src: &Path, data_dir: &Path, force: bool) -> Result<Manifes
     for stale in ["hub.db-wal", "hub.db-shm"] {
         let _ = std::fs::remove_file(data_dir.join(stale));
     }
-    std::fs::copy(src.join("hub.db"), &existing).context("restoring the database")?;
+    std::fs::copy(source.join("hub.db"), &existing).context("restoring the database")?;
     for tree in TREES {
-        let from = src.join(tree);
+        let from = source.join(tree);
         if from.exists() {
             copy_tree(&from, &data_dir.join(tree))
                 .with_context(|| format!("restoring {}", from.display()))?;
         }
     }
     for name in SECRET_FILES {
-        let from = src.join(name);
+        let from = source.join(name);
         if from.exists() {
             let to = data_dir.join(name);
             std::fs::copy(&from, &to).with_context(|| format!("restoring {name}"))?;
@@ -429,7 +465,7 @@ fn copy_snapshot_tree(
     Ok((files, bytes))
 }
 
-fn validate_artifacts(src: &Path, listed: &[Artifact]) -> Result<()> {
+fn stage_artifacts(src: &Path, staging: &Path, listed: &[Artifact]) -> Result<()> {
     let mut expected = BTreeMap::new();
     for artifact in listed {
         anyhow::ensure!(
@@ -455,19 +491,21 @@ fn validate_artifacts(src: &Path, listed: &[Artifact]) -> Result<()> {
     }
 
     let mut actual = BTreeMap::new();
-    collect_artifacts(src, src, &mut actual)?;
+    collect_artifact_paths(src, src, &mut actual)?;
     for (path, artifact) in expected {
-        let found = actual.remove(path).with_context(|| {
+        let from = actual.remove(path).with_context(|| {
             format!("the manifest lists {path}, and the snapshot does not have it")
         })?;
+        let relative = Path::new(path);
+        let staged = copy_artifact(&from, &staging.join(relative), relative)?;
         anyhow::ensure!(
-            found.bytes == artifact.bytes,
+            staged.bytes == artifact.bytes,
             "snapshot artifact {path} has {} bytes, expected {}",
-            found.bytes,
+            staged.bytes,
             artifact.bytes
         );
         anyhow::ensure!(
-            found.sha256 == artifact.sha256,
+            staged.sha256 == artifact.sha256,
             "snapshot artifact {path} failed its SHA-256 check"
         );
     }
@@ -477,10 +515,10 @@ fn validate_artifacts(src: &Path, listed: &[Artifact]) -> Result<()> {
     Ok(())
 }
 
-fn collect_artifacts(
+fn collect_artifact_paths(
     root: &Path,
     directory: &Path,
-    artifacts: &mut BTreeMap<String, Artifact>,
+    artifacts: &mut BTreeMap<String, PathBuf>,
 ) -> Result<()> {
     for entry in std::fs::read_dir(directory)? {
         let entry = entry?;
@@ -488,13 +526,12 @@ fn collect_artifacts(
         let relative = path.strip_prefix(root)?;
         let file_type = entry.file_type()?;
         if file_type.is_dir() {
-            collect_artifacts(root, &path, artifacts)?;
+            collect_artifact_paths(root, &path, artifacts)?;
         } else if file_type.is_file() {
             if relative == Path::new(MANIFEST) {
                 continue;
             }
-            let artifact = hash_artifact(&path, relative)?;
-            artifacts.insert(artifact.path.clone(), artifact);
+            artifacts.insert(artifact_path(relative)?, path);
         } else {
             bail!(
                 "snapshot artifact {} is not a regular file",
@@ -524,4 +561,27 @@ fn copy_tree(from: &Path, to: &Path) -> Result<(u64, u64)> {
         }
     }
     Ok((files, bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn staging_freezes_the_bytes_restore_will_consume() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("snapshot");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join("hub.db"), b"validated").unwrap();
+        let artifact = artifact_for_bytes(Path::new("hub.db"), b"validated").unwrap();
+        let staging = StagingDir::create(&root.path().join("live")).unwrap();
+
+        stage_artifacts(&source, staging.path(), &[artifact]).unwrap();
+        std::fs::write(source.join("hub.db"), b"changed later").unwrap();
+
+        assert_eq!(
+            std::fs::read(staging.path().join("hub.db")).unwrap(),
+            b"validated"
+        );
+    }
 }

@@ -327,13 +327,25 @@ async fn a_restore_refuses_to_overwrite_without_being_told() {
     kahawai_hub::backup::backup(live.path(), None, &snap)
         .await
         .unwrap();
+    let manifest_path = snap.join("kahawai-backup.json");
+    let original_manifest = std::fs::read(&manifest_path).unwrap();
+    let mut invalid_manifest: serde_json::Value =
+        serde_json::from_slice(&original_manifest).unwrap();
+    invalid_manifest["artifacts"][0]["sha256"] = "0".repeat(64).into();
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&invalid_manifest).unwrap(),
+    )
+    .unwrap();
 
-    // The data dir already holds a database — quietly replacing it while
-    // a hub might be running is how you lose the state you meant to keep.
+    // Refusing a live destination is constant work: a missing `--force` must
+    // win even when the snapshot would fail its full integrity scan.
     let err = kahawai_hub::backup::restore(&snap, live.path(), false)
         .await
         .unwrap_err();
     assert!(format!("{err:#}").contains("--force"), "{err:#}");
+
+    std::fs::write(manifest_path, original_manifest).unwrap();
     kahawai_hub::backup::restore(&snap, live.path(), true)
         .await
         .expect("--force restores");
