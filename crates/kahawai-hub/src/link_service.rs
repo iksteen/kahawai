@@ -124,8 +124,10 @@ fn register_host_link(
     module_id: &str,
     tx: tokio::sync::mpsc::Sender<Result<HubToHost, Status>>,
     protocol_minor: u32,
+    segment_detector_generation: i64,
 ) -> u64 {
-    let (generation, replaced) = registry.register_link(module_id, tx, protocol_minor);
+    let (generation, replaced) =
+        registry.register_link(module_id, tx, protocol_minor, segment_detector_generation);
     if let Some(replaced) = replaced {
         segments.segment_link_disconnected(module_id, replaced);
     }
@@ -158,7 +160,14 @@ pub fn local_link(
         "in-process",
         kahawai_core::build_stamp(),
     );
-    let generation = register_host_link(&registry, &segments, module_id, hub_tx, PROTOCOL_MINOR);
+    let generation = register_host_link(
+        &registry,
+        &segments,
+        module_id,
+        hub_tx,
+        PROTOCOL_MINOR,
+        kahawai_core::segments::DETECTOR_GENERATION,
+    );
     let module_id = module_id.to_string();
     tokio::spawn(async move {
         let mut seen: std::collections::HashMap<
@@ -255,6 +264,7 @@ impl MediahostLink for MediahostLinkService {
             &module_id,
             tx.clone(),
             hello.protocol_minor,
+            hello.segment_detector_generation,
         );
         registry.connected(
             &module_id,
@@ -1527,7 +1537,12 @@ mod forget_link_tests {
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
         registry.connected("01HOST", "mediahost", "nas", "fp", "test");
         let generation = registry
-            .register_link("01HOST", tx.clone(), kahawai_proto::PROTOCOL_MINOR)
+            .register_link(
+                "01HOST",
+                tx.clone(),
+                kahawai_proto::PROTOCOL_MINOR,
+                kahawai_core::segments::DETECTOR_GENERATION,
+            )
             .0;
         assert!(registry.is_connected("01HOST"));
 
@@ -1569,12 +1584,21 @@ mod forget_link_tests {
 
         let (old_tx, _old_rx) = tokio::sync::mpsc::channel(1);
         registry.connected("01HOST", "mediahost", "nas", "fp", "test");
-        let (old_generation, _) =
-            registry.register_link("01HOST", old_tx.clone(), kahawai_proto::PROTOCOL_MINOR);
+        let (old_generation, _) = registry.register_link(
+            "01HOST",
+            old_tx.clone(),
+            kahawai_proto::PROTOCOL_MINOR,
+            kahawai_core::segments::DETECTOR_GENERATION,
+        );
 
         // The box reconnects before the old task notices.
         let (new_tx, _new_rx) = tokio::sync::mpsc::channel(1);
-        registry.register_link("01HOST", new_tx.clone(), kahawai_proto::PROTOCOL_MINOR);
+        registry.register_link(
+            "01HOST",
+            new_tx.clone(),
+            kahawai_proto::PROTOCOL_MINOR,
+            kahawai_core::segments::DETECTOR_GENERATION,
+        );
         registry.connected("01HOST", "mediahost", "nas", "fp", "test");
 
         // Now the old task times out and tears down.
@@ -1601,16 +1625,35 @@ mod forget_link_tests {
     }
 
     #[tokio::test]
-    async fn segment_jobs_are_gated_on_the_mediahost_minor() {
+    async fn segment_jobs_require_the_protocol_feature_and_detector_generation() {
         let dir = tempfile::tempdir().unwrap();
         let db = crate::db::open(dir.path()).await.unwrap();
         let registry = Registry::new(db, Default::default());
         let (old_tx, _old_rx) = tokio::sync::mpsc::channel(1);
-        registry.register_link("host", old_tx, 0);
+        registry.register_link(
+            "host",
+            old_tx,
+            0,
+            kahawai_core::segments::DETECTOR_GENERATION,
+        );
+        assert!(!registry.host_supports_segment_detection("host"));
+
+        let (mismatch_tx, _mismatch_rx) = tokio::sync::mpsc::channel(1);
+        registry.register_link(
+            "host",
+            mismatch_tx,
+            kahawai_proto::PROTOCOL_MINOR,
+            kahawai_core::segments::DETECTOR_GENERATION - 1,
+        );
         assert!(!registry.host_supports_segment_detection("host"));
 
         let (new_tx, _new_rx) = tokio::sync::mpsc::channel(1);
-        registry.register_link("host", new_tx, 1);
+        registry.register_link(
+            "host",
+            new_tx,
+            kahawai_proto::PROTOCOL_MINOR,
+            kahawai_core::segments::DETECTOR_GENERATION,
+        );
         assert!(registry.host_supports_segment_detection("host"));
     }
 
@@ -1621,11 +1664,26 @@ mod forget_link_tests {
         let registry = Registry::new(db, Default::default());
         let detector = crate::segments::Detector::new();
         let (old_tx, _old_rx) = tokio::sync::mpsc::channel(1);
-        let old_generation = register_host_link(&registry, &detector, "host", old_tx, 1);
-        let reply = detector.wait_for_segment_result("host", old_generation, "job");
+        let old_generation = register_host_link(
+            &registry,
+            &detector,
+            "host",
+            old_tx,
+            1,
+            kahawai_core::segments::DETECTOR_GENERATION,
+        );
+        let current = registry.host_link("host").unwrap().current_token();
+        let reply = detector.wait_for_segment_result("host", old_generation, current, "job");
 
         let (new_tx, _new_rx) = tokio::sync::mpsc::channel(1);
-        register_host_link(&registry, &detector, "host", new_tx, 1);
+        register_host_link(
+            &registry,
+            &detector,
+            "host",
+            new_tx,
+            1,
+            kahawai_core::segments::DETECTOR_GENERATION,
+        );
 
         assert!(
             reply.await.unwrap().is_err(),
@@ -1634,10 +1692,55 @@ mod forget_link_tests {
     }
 
     #[tokio::test]
+    async fn replacement_invalidates_results_before_waiters_are_drained() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::open(dir.path()).await.unwrap();
+        let registry = Registry::new(db, Default::default());
+        let detector = crate::segments::Detector::new();
+        let (old_tx, _old_rx) = tokio::sync::mpsc::channel(1);
+        let (old_generation, _) = registry.register_link(
+            "host",
+            old_tx,
+            1,
+            kahawai_core::segments::DETECTOR_GENERATION,
+        );
+        let current = registry.host_link("host").unwrap().current_token();
+        let mut reply = detector.wait_for_segment_result("host", old_generation, current, "job");
+
+        let (new_tx, _new_rx) = tokio::sync::mpsc::channel(1);
+        let (_, replaced) = registry.register_link(
+            "host",
+            new_tx,
+            1,
+            kahawai_core::segments::DETECTOR_GENERATION,
+        );
+        assert_eq!(replaced, Some(old_generation));
+        detector.segment_result(
+            "host",
+            old_generation,
+            kahawai_proto::v1::SegmentDetectionResult {
+                request_id: "job".into(),
+                ..Default::default()
+            },
+        );
+        assert!(matches!(
+            reply.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+
+        detector.segment_link_disconnected("host", old_generation);
+        assert!(matches!(
+            reply.await.unwrap(),
+            Err(crate::segments::SegmentJobFailure::Disconnected)
+        ));
+    }
+
+    #[tokio::test]
     async fn a_segment_result_completes_before_the_ordered_queue_drains() {
         let detector = crate::segments::Detector::new();
         let generation = 7;
-        let reply = detector.wait_for_segment_result("host", generation, "job");
+        let current = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let reply = detector.wait_for_segment_result("host", generation, current, "job");
         let message = kahawai_proto::v1::host_to_hub::Msg::SegmentDetectionResult(
             kahawai_proto::v1::SegmentDetectionResult {
                 request_id: "job".into(),

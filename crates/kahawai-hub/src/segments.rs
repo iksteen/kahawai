@@ -27,7 +27,8 @@
 //! not, with the `detector` generation that finished it. It is what stops the
 //! sweep from re-analyzing a season whose episodes simply share no opening —
 //! which is most films, most documentaries, and any show whose season was
-//! ripped without one. Bump [`DETECTOR`] to ask every season again.
+//! ripped without one. Bump [`kahawai_core::segments::DETECTOR_GENERATION`] to
+//! ask every season again.
 //!
 //! (Migration 0062's inline comment predates the `chapter` source and its
 //! checksum is frozen with the applied file; this doc is the authority.)
@@ -66,6 +67,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use anyhow::{Context, Result};
+use kahawai_core::segments::DETECTOR_GENERATION as DETECTOR;
 use serde::Serialize;
 use sqlx::Row;
 use utoipa::ToSchema;
@@ -75,15 +77,6 @@ use crate::sessions::Sessions;
 
 /// How long a failed season stays set aside before the sweep tries it again.
 const FAILED_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
-
-/// Detector generation. Bumping it invalidates every scan record, so the sweep
-/// walks the library again with the new algorithm.
-///
-/// 2: the chapter-name analyzer adopted upstream's duration bounds,
-/// word-boundary matching and last-credits selection — rows stored by the
-/// looser matcher (a "Recapture" scene as a recap, an unbounded "Opening
-/// Scene" as an intro) are wrong in ways no mtime change will re-ask about.
-pub const DETECTOR: i64 = 2;
 
 /// One boundary pair for one episode.
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -157,12 +150,14 @@ pub struct Status {
 struct SegmentWaiter {
     module_id: String,
     generation: u64,
+    current: Arc<AtomicBool>,
     tx: tokio::sync::oneshot::Sender<SegmentReply>,
 }
 
 #[derive(Debug)]
 pub(crate) enum SegmentJobFailure {
     Disconnected,
+    UnsupportedDetector(String),
     Rejected(String),
 }
 
@@ -241,6 +236,7 @@ impl Detector {
         &self,
         module_id: &str,
         generation: u64,
+        current: Arc<AtomicBool>,
         request_id: &str,
     ) -> tokio::sync::oneshot::Receiver<SegmentReply> {
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -249,6 +245,7 @@ impl Detector {
             SegmentWaiter {
                 module_id: module_id.to_string(),
                 generation,
+                current,
                 tx,
             },
         );
@@ -264,20 +261,29 @@ impl Detector {
         if accepted.state != "rejected" {
             return;
         }
+        let failure = if accepted.rejection
+            == kahawai_proto::v1::SegmentDetectionRejection::UnsupportedDetector as i32
+        {
+            SegmentJobFailure::UnsupportedDetector(accepted.error)
+        } else {
+            // Default/unknown reasons retain the old protocol's generic
+            // rejection behavior. An old mediahost sends zero here.
+            SegmentJobFailure::Rejected(accepted.error)
+        };
         let waiter = {
             let mut waiters = self.waiters.lock();
             waiters
                 .get(&accepted.request_id)
                 .is_some_and(|waiter| {
-                    waiter.module_id == module_id && waiter.generation == generation
+                    waiter.module_id == module_id
+                        && waiter.generation == generation
+                        && waiter.current.load(Ordering::Acquire)
                 })
                 .then(|| waiters.remove(&accepted.request_id))
                 .flatten()
         };
         if let Some(waiter) = waiter {
-            let _ = waiter
-                .tx
-                .send(Err(SegmentJobFailure::Rejected(accepted.error)));
+            let _ = waiter.tx.send(Err(failure));
         }
     }
 
@@ -292,7 +298,9 @@ impl Detector {
             waiters
                 .get(&result.request_id)
                 .is_some_and(|waiter| {
-                    waiter.module_id == module_id && waiter.generation == generation
+                    waiter.module_id == module_id
+                        && waiter.generation == generation
+                        && waiter.current.load(Ordering::Acquire)
                 })
                 .then(|| waiters.remove(&result.request_id))
                 .flatten()
@@ -782,8 +790,12 @@ impl Detector {
             });
         };
         if !link.supports_segment_detection() {
-            tracing::warn!(%module_id,
-                "intro detection awaits a mediahost with protocol-minor segment support");
+            tracing::warn!(
+                %module_id,
+                offered = link.segment_detector_generation(),
+                required = DETECTOR,
+                "intro detection awaits a mediahost with matching detector support"
+            );
             return Ok(Analysis {
                 scanned: 0,
                 awaiting: awaiting + pending_reachable,
@@ -792,7 +804,8 @@ impl Detector {
         }
         let generation = link.generation();
         let request_id = ulid::Ulid::generate().to_string();
-        let mut reply_rx = self.wait_for_segment_result(&module_id, generation, &request_id);
+        let mut reply_rx =
+            self.wait_for_segment_result(&module_id, generation, link.current_token(), &request_id);
         let job = kahawai_proto::v1::DetectSegments {
             request_id: request_id.clone(),
             detector: DETECTOR,
@@ -834,6 +847,15 @@ impl Detector {
         let result = match reply {
             Ok(Ok(result)) => result,
             Ok(Err(SegmentJobFailure::Disconnected)) => {
+                return Ok(Analysis {
+                    scanned: 0,
+                    awaiting: awaiting + pending_reachable,
+                    attempted: 0,
+                });
+            }
+            Ok(Err(SegmentJobFailure::UnsupportedDetector(error))) => {
+                tracing::warn!(%module_id, %error,
+                    "intro detection awaits a mediahost with matching detector support");
                 return Ok(Analysis {
                     scanned: 0,
                     awaiting: awaiting + pending_reachable,
@@ -1584,6 +1606,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unsupported_detector_rejection_is_machine_readable_and_terminal() {
+        let detector = Detector::new();
+        let current = Arc::new(AtomicBool::new(true));
+        let reply = detector.wait_for_segment_result("host", 1, current, "job");
+        detector.segment_accepted(
+            "host",
+            1,
+            kahawai_proto::v1::SegmentDetectionAccepted {
+                request_id: "job".into(),
+                state: "rejected".into(),
+                error: "generation mismatch".into(),
+                rejection: kahawai_proto::v1::SegmentDetectionRejection::UnsupportedDetector as i32,
+            },
+        );
+
+        assert!(matches!(
+            reply.await.unwrap(),
+            Err(SegmentJobFailure::UnsupportedDetector(error))
+                if error == "generation mismatch"
+        ));
+    }
+
+    #[tokio::test]
     async fn a_segment_result_is_bound_to_the_requested_host() {
         let detector = Detector::new();
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -1592,6 +1637,7 @@ mod tests {
             SegmentWaiter {
                 module_id: "right".into(),
                 generation: 1,
+                current: Arc::new(AtomicBool::new(true)),
                 tx,
             },
         );
@@ -1619,6 +1665,7 @@ mod tests {
             SegmentWaiter {
                 module_id: "host".into(),
                 generation: 2,
+                current: Arc::new(AtomicBool::new(true)),
                 tx,
             },
         );
@@ -1628,6 +1675,7 @@ mod tests {
             SegmentWaiter {
                 module_id: "host".into(),
                 generation: 3,
+                current: Arc::new(AtomicBool::new(true)),
                 tx: new_tx,
             },
         );

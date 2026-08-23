@@ -137,6 +137,7 @@ pub async fn harness(file_name: &str, render: fn(&Path)) -> Harness {
             protocol_minor: kahawai_proto::PROTOCOL_MINOR,
             name: "nas".into(),
             build: String::new(),
+            segment_detector_generation: 0,
         })),
     })
     .await

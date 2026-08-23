@@ -384,11 +384,18 @@ message SegmentEpisode {
   uint64 duration_ms = 5;
 }
 
+enum SegmentDetectionRejection {
+  SEGMENT_DETECTION_REJECTION_UNSPECIFIED = 0;
+  SEGMENT_DETECTION_REJECTION_UNSUPPORTED_DETECTOR = 1;
+}
+
 message SegmentDetectionAccepted {
   string request_id = 1;
-  // "queued" | "running" | "rejected"
+  // "queued" | "running" | "rejected". Rejection meaning is typed below so
+  // older hubs still recognize the terminal state and release their waiter.
   string state = 2;
   string error = 3;
+  SegmentDetectionRejection rejection = 4;
 }
 
 message SegmentDetectionResult {
@@ -468,6 +475,11 @@ message Hello {
   // by the hub so "which build is that box running?" is answerable from
   // the hub's own log instead of a shell on the satellite.
   string build = 4;
+  // Detector algorithm generation this peer can execute. Mediahosts set the
+  // shared DETECTOR_GENERATION; peers that do not run segment analysis and
+  // older binaries leave zero. The hub uses this before dispatch so a rolling
+  // upgrade is host capability weather, not a failed season.
+  int64 segment_detector_generation = 5;
 }
 
 message HelloAck {

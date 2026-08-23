@@ -366,6 +366,7 @@ async fn manifest_and_files_seen_survive_rescan() {
                     protocol_minor: kahawai_proto::PROTOCOL_MINOR,
                     name: "nas".into(),
                     build: String::new(),
+                    segment_detector_generation: 0,
                 })),
             })
             .await

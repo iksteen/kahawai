@@ -166,6 +166,7 @@ async fn negotiation_picks_cheapest_source_and_honors_caps() {
             protocol_minor: kahawai_proto::PROTOCOL_MINOR,
             name: "nas".into(),
             build: String::new(),
+            segment_detector_generation: 0,
         })),
     })
     .await

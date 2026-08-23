@@ -106,6 +106,7 @@ async fn remux_to_hls_end_to_end() {
         protocol_minor: kahawai_proto::PROTOCOL_MINOR,
         name: "nas".into(),
         build: String::new(),
+        segment_detector_generation: 0,
     })] {
         tx.send(pb::HostToHub { msg: Some(msg) }).await.unwrap();
     }

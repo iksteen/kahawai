@@ -110,6 +110,7 @@ async fn direct_play_ranges_end_to_end() {
         protocol_minor: kahawai_proto::PROTOCOL_MINOR,
         name: "nas".into(),
         build: String::new(),
+        segment_detector_generation: 0,
     }))
     .await;
     let mut inbound = client

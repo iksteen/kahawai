@@ -300,6 +300,7 @@ pub async fn link_once(
             protocol_minor: PROTOCOL_MINOR,
             name: name.to_string(),
             build: kahawai_core::build_stamp().into(),
+            segment_detector_generation: 0,
         })),
     })
     .await

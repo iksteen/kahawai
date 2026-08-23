@@ -197,7 +197,7 @@ async fn a_named_pass_wipes_replaced_bytes_and_keeps_settled_ones() {
         "INSERT INTO media_segment_scans(item_id,scanned_at,detector,mtime_unix)
          VALUES('e2',1,?,1)",
     )
-    .bind(kahawai_hub::segments::DETECTOR)
+    .bind(kahawai_core::segments::DETECTOR_GENERATION)
     .execute(registry.db())
     .await
     .unwrap();
@@ -243,6 +243,35 @@ async fn a_connected_old_mediahost_is_awaited_not_failed() {
         .await
         .unwrap();
     assert_eq!(stored, 0);
+}
+
+#[tokio::test]
+async fn a_mismatched_detector_generation_is_awaited_not_failed() {
+    let (_dir, registry) = season(&["Scene 1", "Scene 2"]).await;
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    registry.register_link(
+        "m",
+        tx,
+        kahawai_proto::PROTOCOL_MINOR,
+        kahawai_core::segments::DETECTOR_GENERATION - 1,
+    );
+
+    let detector = kahawai_hub::segments::Detector::new();
+    assert_eq!(
+        analyze_on(&registry, &detector).await.unwrap(),
+        Analysis {
+            scanned: 0,
+            awaiting: 2,
+            attempted: 0
+        }
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "mismatched host received detector work"
+    );
+    let status = detector.status_counters();
+    assert!(status.awaiting_host);
+    assert!(!status.last_failed);
 }
 
 #[tokio::test]

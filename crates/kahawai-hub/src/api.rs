@@ -2639,11 +2639,22 @@ async fn admin_satellites(
     Ok(Json(SatellitesResponse { satellites }))
 }
 
+fn retire_deleted_segment_link(
+    detector: &crate::segments::Detector,
+    module_id: &str,
+    generation: Option<u64>,
+) {
+    if let Some(generation) = generation {
+        detector.segment_link_disconnected(module_id, generation);
+    }
+}
+
 /// Remove a satellite
 ///
 /// Admin only. Removes the satellite from the allowlist, ends its sessions
 /// and deletes orphaned subtitle payloads. Returns 409 for the in-process
 /// mediahost and 404 for an unknown id.
+
 #[utoipa::path(
     delete, path = "/admin/v1/satellites/{id}", tag = "Admin satellites",
     security(("bearer_auth" = [])),
@@ -2673,7 +2684,7 @@ async fn admin_delete_satellite(
         ));
     }
     let ended = state.sessions.end_for_module(&id);
-    let fingerprint = state
+    let deleted = state
         .registry
         .delete_satellite(&id)
         .await
@@ -2684,6 +2695,7 @@ async fn admin_delete_satellite(
         // registry would be the durable fix; until then the two must not
         // diverge.
         .map_err(|e| refusal_or_internal(ErrorCode::NotFound, "no such satellite", e))?;
+    retire_deleted_segment_link(&state.segments, &id, deleted.mediahost_link_generation);
     let removed_payloads = state
         .subtitles
         .clean_orphaned_payloads(&state.registry)
@@ -2691,7 +2703,7 @@ async fn admin_delete_satellite(
         .map_err(internal)?;
     Ok(Json(DeletedSatelliteResponse {
         deleted: id,
-        removed: fingerprint,
+        removed: deleted.fingerprint,
         sessions_ended: ended,
         subtitle_payloads_removed: removed_payloads,
     }))
@@ -6961,9 +6973,23 @@ async fn session_file(
 mod tests {
     use super::{
         ErrorCode, PublicOrigin, group_chapters, openapi_document, parse_range,
-        refusal_or_internal, same_fields,
+        refusal_or_internal, retire_deleted_segment_link, same_fields,
     };
     use std::collections::BTreeMap;
+
+    #[tokio::test]
+    async fn deleting_a_satellite_wakes_its_segment_waiter() {
+        let detector = crate::segments::Detector::new();
+        let current = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let reply = detector.wait_for_segment_result("host", 7, current, "job");
+
+        retire_deleted_segment_link(&detector, "host", Some(7));
+
+        assert!(matches!(
+            reply.await.unwrap(),
+            Err(crate::segments::SegmentJobFailure::Disconnected)
+        ));
+    }
 
     #[test]
     fn credential_fields_change_only_when_the_plaintext_set_differs() {

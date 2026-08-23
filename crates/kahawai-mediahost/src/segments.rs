@@ -11,8 +11,9 @@ use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
 use kahawai_proto::v1::{
-    DetectSegments, DetectedSegment, HostToHub, SegmentDetectionAccepted, SegmentDetectionResult,
-    SegmentEpisode, SegmentEpisodeResult, host_to_hub,
+    DetectSegments, DetectedSegment, HostToHub, SegmentDetectionAccepted,
+    SegmentDetectionRejection, SegmentDetectionResult, SegmentEpisode, SegmentEpisodeResult,
+    host_to_hub,
 };
 
 use crate::Activity;
@@ -39,6 +40,30 @@ pub async fn run(
     segment_serial: Arc<tokio::sync::Mutex<()>>,
 ) {
     while let Some(job) = rx.recv().await {
+        if job.detector != kahawai_core::segments::DETECTOR_GENERATION {
+            let error = format!(
+                "unsupported detector generation {}; this mediahost implements {}",
+                job.detector,
+                kahawai_core::segments::DETECTOR_GENERATION
+            );
+            if tx
+                .send(HostToHub {
+                    msg: Some(host_to_hub::Msg::SegmentDetectionAccepted(
+                        SegmentDetectionAccepted {
+                            request_id: job.request_id,
+                            state: "rejected".into(),
+                            error,
+                            rejection: SegmentDetectionRejection::UnsupportedDetector as i32,
+                        },
+                    )),
+                })
+                .await
+                .is_err()
+            {
+                return;
+            }
+            continue;
+        }
         if tx
             .send(HostToHub {
                 msg: Some(host_to_hub::Msg::SegmentDetectionAccepted(
@@ -46,6 +71,7 @@ pub async fn run(
                         request_id: job.request_id.clone(),
                         state: "queued".into(),
                         error: String::new(),
+                        rejection: SegmentDetectionRejection::Unspecified as i32,
                     },
                 )),
             })
@@ -225,7 +251,7 @@ fn analyze(
                     .as_ref()
                     .map(|source| source.path_rel.clone())
                     .unwrap_or_default(),
-                prepared.request.duration_ms as f64 / 1000.0,
+                Milliseconds(prepared.request.duration_ms).as_seconds(),
             )
             .with_id(prepared.request.item_id.clone())
         })
@@ -267,17 +293,27 @@ fn analyze(
         let mut segments = Vec::new();
         if !stale {
             if let Some(range) = answer.recap {
-                segments.push(segment("recap", range, "blackframe"));
+                segments.push(segment(
+                    "recap",
+                    MillisecondRange::from_seconds(range)?,
+                    "blackframe",
+                ));
             }
             if let Some(range) = answer.intro {
-                segments.push(segment("intro", range, "chromaprint"));
+                segments.push(segment(
+                    "intro",
+                    MillisecondRange::from_seconds(range)?,
+                    "chromaprint",
+                ));
             }
             if let Some(range) = answer.credits {
-                segments.push(segment(
-                    "credits",
-                    range,
-                    answer.credits_source.unwrap_or("chromaprint"),
-                ));
+                let analyzer = answer.credits_source.unwrap_or("chromaprint");
+                let range = if analyzer == "blackframe" {
+                    MillisecondRange::ending_at(range, Milliseconds(prepared.request.duration_ms))?
+                } else {
+                    MillisecondRange::from_seconds(range)?
+                };
+                segments.push(segment("credits", range, analyzer));
             }
         }
         results.push(SegmentEpisodeResult {
@@ -295,7 +331,7 @@ fn analyze(
     Ok(SegmentDetectionResult {
         request_id: job.request_id,
         detector: job.detector,
-        elapsed_ms: (report.seconds * 1000.0) as u64,
+        elapsed_ms: Milliseconds::from_seconds(report.seconds)?.0,
         episodes: results,
         error: String::new(),
     })
@@ -318,11 +354,58 @@ fn preflight_failure(
     }
 }
 
-fn segment(kind: &str, range: kahawai_intro::chroma::Range, analyzer: &str) -> DetectedSegment {
+/// Integer timeline value. Seconds enter only through the checked, rounded
+/// constructor; protocol boundaries never cast floating-point values directly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Milliseconds(u64);
+
+impl Milliseconds {
+    fn from_seconds(seconds: f64) -> Result<Self> {
+        let duration = Duration::try_from_secs_f64(seconds)
+            .map_err(|error| anyhow::anyhow!("invalid segment timestamp {seconds}: {error}"))?;
+        let rounded = (duration.as_nanos() + 500_000) / 1_000_000;
+        Ok(Self(
+            u64::try_from(rounded).context("segment timestamp exceeds protocol range")?,
+        ))
+    }
+
+    fn as_seconds(self) -> f64 {
+        self.0 as f64 / 1000.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MillisecondRange {
+    start: Milliseconds,
+    end: Milliseconds,
+}
+
+impl MillisecondRange {
+    fn from_seconds(range: kahawai_intro::chroma::Range) -> Result<Self> {
+        Self::new(
+            Milliseconds::from_seconds(range.start)?,
+            Milliseconds::from_seconds(range.end)?,
+        )
+    }
+
+    /// Black-frame credits end at the file's declared integer duration. Keep
+    /// that authoritative endpoint rather than round-tripping it through the
+    /// analyzer's floating-point seconds.
+    fn ending_at(range: kahawai_intro::chroma::Range, end: Milliseconds) -> Result<Self> {
+        Self::new(Milliseconds::from_seconds(range.start)?, end)
+    }
+
+    fn new(start: Milliseconds, end: Milliseconds) -> Result<Self> {
+        anyhow::ensure!(end.0 > start.0, "segment range is empty or inverted");
+        Ok(Self { start, end })
+    }
+}
+
+fn segment(kind: &str, range: MillisecondRange, analyzer: &str) -> DetectedSegment {
     DetectedSegment {
         kind: kind.to_string(),
-        start_ms: (range.start * 1000.0) as u64,
-        end_ms: (range.end * 1000.0) as u64,
+        start_ms: range.start.0,
+        end_ms: range.end.0,
         analyzer: analyzer.to_string(),
     }
 }
@@ -366,6 +449,24 @@ mod tests {
         );
     }
 
+    #[test]
+    fn millisecond_boundaries_are_rounded_and_exact_endpoints_stay_integer() {
+        let detected =
+            MillisecondRange::from_seconds(kahawai_intro::chroma::Range::new(1.001, 2048.006))
+                .unwrap();
+        assert_eq!(detected.start, Milliseconds(1_001));
+        assert_eq!(detected.end, Milliseconds(2_048_006));
+
+        let credits = MillisecondRange::ending_at(
+            kahawai_intro::chroma::Range::new(2000.0, 2048.006),
+            Milliseconds(2_048_006),
+        )
+        .unwrap();
+        assert_eq!(credits.end, Milliseconds(2_048_006));
+        assert!(Milliseconds::from_seconds(f64::NAN).is_err());
+        assert!(Milliseconds::from_seconds(-1.0).is_err());
+    }
+
     #[tokio::test]
     async fn a_job_is_acknowledged_before_a_source_error_is_reported() {
         let dir = tempfile::tempdir().unwrap();
@@ -387,7 +488,7 @@ mod tests {
         };
         let job = DetectSegments {
             request_id: "job".into(),
-            detector: 2,
+            detector: kahawai_core::segments::DETECTOR_GENERATION,
             collection_id: "series".into(),
             anime: false,
             episodes: vec![episode("one", "one.mkv"), episode("two", "two.mkv")],
@@ -424,6 +525,45 @@ mod tests {
                 .episodes
                 .iter()
                 .all(|episode| episode.error.contains("path not found"))
+        );
+        drop(job_tx);
+        worker.await.unwrap();
+    }
+    #[tokio::test]
+    async fn an_unsupported_detector_generation_is_rejected_without_running() {
+        let (job_tx, job_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (result_tx, mut result_rx) = tokio::sync::mpsc::channel(2);
+        let worker = tokio::spawn(run(
+            job_rx,
+            result_tx,
+            Vec::new(),
+            Activity::default(),
+            Arc::new(tokio::sync::Mutex::new(())),
+        ));
+        job_tx
+            .send(DetectSegments {
+                request_id: "future".into(),
+                detector: kahawai_core::segments::DETECTOR_GENERATION + 1,
+                ..Default::default()
+            })
+            .unwrap();
+
+        let reply = result_rx.recv().await.unwrap().msg.unwrap();
+        assert!(matches!(
+            reply,
+            host_to_hub::Msg::SegmentDetectionAccepted(SegmentDetectionAccepted {
+                ref request_id,
+                ref state,
+                ref error,
+                rejection,
+            }) if request_id == "future"
+                && state == "rejected"
+                && error.contains("unsupported detector generation")
+                && rejection == SegmentDetectionRejection::UnsupportedDetector as i32
+        ));
+        assert!(
+            result_rx.try_recv().is_err(),
+            "rejected job produced a result"
         );
         drop(job_tx);
         worker.await.unwrap();
@@ -465,7 +605,7 @@ mod tests {
         };
         let job = DetectSegments {
             request_id: "local".into(),
-            detector: 2,
+            detector: kahawai_core::segments::DETECTOR_GENERATION,
             collection_id: "series".into(),
             anime: false,
             episodes: vec![

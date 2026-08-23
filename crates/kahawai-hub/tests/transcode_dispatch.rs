@@ -167,6 +167,7 @@ async fn keeps_audio_encode_local_and_dispatches_video_encode() {
             protocol_minor: kahawai_proto::PROTOCOL_MINOR,
             name: "nas".into(),
             build: String::new(),
+            segment_detector_generation: 0,
         })),
     })
     .await

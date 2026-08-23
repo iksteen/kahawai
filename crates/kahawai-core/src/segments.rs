@@ -11,6 +11,16 @@
 //! left alone for the fingerprint pass rather than turned into a boundary
 //! somebody's player would jump on.
 
+/// Segment algorithm generation implemented by this build. The hub stores it
+/// with scan rows; the mediahost rejects jobs for any other generation rather
+/// than relabelling its compiled algorithm during a rolling upgrade.
+///
+/// Bump this whenever an algorithm change invalidates completed scans.
+///
+/// 2: the chapter-name analyzer adopted upstream's duration bounds,
+/// word-boundary matching and last-credits selection.
+pub const DETECTOR_GENERATION: i64 = 2;
+
 /// A boundary and what it is: `recap`, `intro` or `credits`, in milliseconds
 /// on the file's own timeline.
 #[derive(Debug, Clone, PartialEq)]

@@ -119,6 +119,7 @@ async fn enrolled_mediahost_links_and_disconnect_is_tracked() {
                     protocol_minor: kahawai_proto::PROTOCOL_MINOR,
                     name: "nas".into(),
                     build: String::new(),
+                    segment_detector_generation: 0,
                 },
             )),
         })
@@ -287,6 +288,7 @@ async fn root_adoption_suppresses_only_its_own_generation_mismatch() {
                 protocol_minor: 0,
                 name: "adopter".into(),
                 build: String::new(),
+                segment_detector_generation: 0,
             },
         )),
     })
@@ -446,6 +448,7 @@ async fn try_link(addr: &str, id: &SatelliteIdentity) -> Result<(), Box<dyn std:
                     protocol_minor: kahawai_proto::PROTOCOL_MINOR,
                     name: "probe".into(),
                     build: String::new(),
+                    segment_detector_generation: 0,
                 },
             )),
         })
@@ -478,6 +481,7 @@ async fn protocol_3_rejects_a_missing_exact_source() {
                 protocol_minor: 0,
                 name: "bad-p3".into(),
                 build: String::new(),
+                segment_detector_generation: 0,
             },
         )),
     })
@@ -527,6 +531,7 @@ async fn protocol_3_rejects_an_invalid_root_binding() {
                 protocol_minor: 0,
                 name: "bad-root".into(),
                 build: String::new(),
+                segment_detector_generation: 0,
             },
         )),
     })
@@ -577,6 +582,7 @@ async fn protocol_2_mediahost_is_rejected_during_hello() {
                 protocol_minor: 4,
                 name: "old".into(),
                 build: String::new(),
+                segment_detector_generation: 0,
             },
         )),
     })

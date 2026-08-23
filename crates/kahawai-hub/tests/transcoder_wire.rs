@@ -111,6 +111,7 @@ async fn open_link(
             protocol_minor: kahawai_proto::PROTOCOL_MINOR,
             name: name.into(),
             build: String::new(),
+            segment_detector_generation: 0,
         })),
     })
     .await
@@ -139,6 +140,7 @@ async fn protocol_2_transcoder_is_rejected_during_hello() {
             protocol_minor: 4,
             name: "old-tc".into(),
             build: String::new(),
+            segment_detector_generation: 0,
         })),
     })
     .await
@@ -337,6 +339,7 @@ async fn mediahost_cert_is_refused_on_transcoder_link() {
             protocol_minor: kahawai_proto::PROTOCOL_MINOR,
             name: "nas".into(),
             build: String::new(),
+            segment_detector_generation: 0,
         })),
     })
     .await

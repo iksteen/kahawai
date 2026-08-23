@@ -3611,7 +3611,12 @@ mod lease_purpose_tests {
         let db = crate::db::open(dir.path()).await.unwrap();
         let registry = crate::registry::Registry::new(db, Default::default());
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
-        registry.register_link("01MH", tx, kahawai_proto::PROTOCOL_MINOR);
+        registry.register_link(
+            "01MH",
+            tx,
+            kahawai_proto::PROTOCOL_MINOR,
+            kahawai_core::segments::DETECTOR_GENERATION,
+        );
 
         let sessions = std::sync::Arc::new(Sessions::new(dir.path().join("sessions")));
         // Nobody answers the OpenRead, so the lease never establishes; the

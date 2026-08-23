@@ -38,6 +38,7 @@ impl Drop for ActivityGuard {
         self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
     }
 }
+pub(crate) type BlockingActivityGuard = std::sync::Arc<ActivityGuard>;
 
 pub struct BackgroundGuard(std::sync::Arc<std::sync::atomic::AtomicBool>);
 impl Drop for BackgroundGuard {
@@ -344,7 +345,7 @@ impl Engine {
                 let handshake = if trig.initial { version } else { 0 };
                 let next = version + 1;
                 let force_dirs = trig.force_dirs;
-                let _busy = activity.scan();
+                let busy: BlockingActivityGuard = std::sync::Arc::new(activity.scan());
                 loop {
                     match scan_cycle(
                         &c,
@@ -353,6 +354,7 @@ impl Engine {
                         force_dirs.clone(),
                         handshake,
                         next,
+                        busy.clone(),
                     )
                     .await
                     {
@@ -732,6 +734,7 @@ async fn link_once(
             protocol_minor: PROTOCOL_MINOR,
             name: name.to_string(),
             build: kahawai_core::build_stamp().into(),
+            segment_detector_generation: kahawai_core::segments::DETECTOR_GENERATION,
         })),
     })
     .await
@@ -835,6 +838,7 @@ async fn scan_cycle(
     force_dirs: std::collections::HashSet<std::path::PathBuf>,
     handshake_version: u64,
     report_version: u64,
+    blocking_guard: BlockingActivityGuard,
 ) -> Result<scan::ScanOutcome> {
     tx.send(HostToHub {
         msg: Some(host_to_hub::Msg::AnnounceCollection(AnnounceCollection {
@@ -863,7 +867,15 @@ async fn scan_cycle(
     })
     .await
     .context("link closed before manifest request")?;
-    scan::scan_collection(c.clone(), tx.clone(), mrx, force_dirs, report_version).await
+    scan::scan_collection(
+        c.clone(),
+        tx.clone(),
+        mrx,
+        force_dirs,
+        report_version,
+        blocking_guard,
+    )
+    .await
 }
 
 #[cfg(test)]

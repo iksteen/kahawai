@@ -94,6 +94,7 @@ async fn progress_resume_played_caps_and_idle() {
             protocol_minor: kahawai_proto::PROTOCOL_MINOR,
             name: "nas".into(),
             build: String::new(),
+            segment_detector_generation: 0,
         })),
     })
     .await

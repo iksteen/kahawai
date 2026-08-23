@@ -75,9 +75,20 @@ async fn deleting_a_satellite_forgets_its_drain() {
     let (reg, db, _dir) = enrolled().await;
     reg.set_disabled("01MH", true).await.unwrap();
     assert!(shown_as_disabled(&reg).await);
+    let (link_tx, _link_rx) = tokio::sync::mpsc::channel(1);
+    let (generation, _) = reg.register_link(
+        "01MH",
+        link_tx,
+        kahawai_proto::PROTOCOL_MINOR,
+        kahawai_core::segments::DETECTOR_GENERATION,
+    );
 
-    reg.delete_satellite("01MH").await.unwrap();
-
+    let deleted = reg.delete_satellite("01MH").await.unwrap();
+    assert_eq!(
+        deleted.mediahost_link_generation,
+        Some(generation),
+        "the composition layer needs the exact generation to cancel its waiter"
+    );
     // Same module id enrolled again, a fresh row with the toggle off.
     sqlx::query(
         "INSERT INTO satellites (module_id, module_type, name, cert_fingerprint, enrolled_at)

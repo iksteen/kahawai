@@ -45,7 +45,7 @@ async fn scanned(db: &sqlx::SqlitePool, item: &str, mtime: Option<i64>) {
          ON CONFLICT(item_id) DO UPDATE SET mtime_unix = excluded.mtime_unix",
     )
     .bind(item)
-    .bind(kahawai_hub::segments::DETECTOR)
+    .bind(kahawai_core::segments::DETECTOR_GENERATION)
     .bind(mtime)
     .execute(db)
     .await

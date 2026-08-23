@@ -9,7 +9,7 @@
 //! translated only at the database boundary.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
@@ -280,23 +280,43 @@ pub(crate) struct HostLink {
     tx: tokio::sync::mpsc::Sender<Result<kahawai_proto::v1::HubToHost, tonic::Status>>,
     protocol_minor: u32,
     generation: u64,
+    segment_detector_generation: i64,
+    current: Arc<AtomicBool>,
 }
 
 impl HostLink {
     pub(crate) fn generation(&self) -> u64 {
         self.generation
     }
+    pub(crate) fn current_token(&self) -> Arc<AtomicBool> {
+        self.current.clone()
+    }
+    pub(crate) fn segment_detector_generation(&self) -> i64 {
+        self.segment_detector_generation
+    }
 
     pub(crate) fn supports_segment_detection(&self) -> bool {
         self.protocol_minor >= 1
+            && self.segment_detector_generation == kahawai_core::segments::DETECTOR_GENERATION
     }
 
     pub(crate) async fn send(&self, msg: kahawai_proto::v1::HubToHost) -> Result<()> {
+        anyhow::ensure!(
+            self.current.load(Ordering::Acquire),
+            "mediahost link generation was replaced"
+        );
         self.tx
             .send(Ok(msg))
             .await
             .map_err(|_| anyhow::anyhow!("mediahost link closed"))
     }
+}
+#[derive(Debug, PartialEq, Eq)]
+pub struct DeletedSatellite {
+    pub fingerprint: String,
+    /// Exact mediahost link generation removed with the row. The API retires
+    /// this generation's segment waiter before returning to the administrator.
+    pub mediahost_link_generation: Option<u64>,
 }
 
 pub struct Registry {
@@ -1151,21 +1171,27 @@ impl Registry {
         module_id: &str,
         tx: tokio::sync::mpsc::Sender<Result<kahawai_proto::v1::HubToHost, tonic::Status>>,
         protocol_minor: u32,
+        segment_detector_generation: i64,
     ) -> (u64, Option<u64>) {
         let generation = NEXT_HOST_LINK_GENERATION.fetch_add(1, Ordering::Relaxed);
-        let replaced = self
-            .links
-            .lock()
-            .unwrap()
-            .insert(
-                module_id.to_string(),
-                HostLink {
-                    tx,
-                    protocol_minor,
-                    generation,
-                },
-            )
-            .map(|link| link.generation);
+        let mut links = self.links.lock().unwrap();
+        let replaced = links.get(module_id).map(|link| {
+            // Invalidate clones before the replacement becomes observable.
+            // Segment waiters carry this token, so an old result racing the
+            // later waiter-drain cannot win after publication.
+            link.current.store(false, Ordering::Release);
+            link.generation
+        });
+        links.insert(
+            module_id.to_string(),
+            HostLink {
+                tx,
+                protocol_minor,
+                generation,
+                segment_detector_generation,
+                current: Arc::new(AtomicBool::new(true)),
+            },
+        );
         (generation, replaced)
     }
 
@@ -1178,10 +1204,12 @@ impl Registry {
     /// satellite that bounced came back enabled in memory while the row still
     /// said disabled, placement started sending it work again, and the admin
     /// panel reported it as enabled to match.
-    pub fn unregister_link(&self, module_id: &str) {
-        self.links.lock().unwrap().remove(module_id);
+    pub fn unregister_link(&self, module_id: &str) -> Option<u64> {
+        self.links.lock().unwrap().remove(module_id).map(|link| {
+            link.current.store(false, Ordering::Release);
+            link.generation
+        })
     }
-
     /// Drop a host's send side, but only if it is still the one `tx` opened.
     ///
     /// Returns whether anything was removed, so a teardown can tell "I was the
@@ -1213,6 +1241,7 @@ impl Registry {
         let mut links = self.links.lock().unwrap();
         match links.get(module_id) {
             Some(current) if current.tx.same_channel(tx) => {
+                current.current.store(false, Ordering::Release);
                 links.remove(module_id);
                 if let Some(s) = self.connected.lock().unwrap().get_mut(module_id) {
                     s.connected = false;
@@ -1258,7 +1287,9 @@ impl Registry {
             .lock()
             .unwrap()
             .get(module_id)
-            .is_some_and(|link| link.generation == generation)
+            .is_some_and(|link| {
+                link.generation == generation && link.current.load(Ordering::Acquire)
+            })
     }
 
     pub fn host_supports_segment_detection(&self, module_id: &str) -> bool {
@@ -3219,9 +3250,10 @@ impl Registry {
     /// Delete a satellite (SEC-6/HUB-20): remove its cert from the
     /// allowlist, close its link, archive watch state by content identity,
     /// cascade-delete its collections/files/sources and orphaned items.
-    /// Returns the removed fingerprint. Transient disconnects never come
-    /// here.
-    pub async fn delete_satellite(&self, module_id: &str) -> Result<String> {
+    /// Returns the removed identity and exact mediahost link generation so the
+    /// composition layer can retire work owned by the deleted connection.
+    /// Transient disconnects never come here.
+    pub async fn delete_satellite(&self, module_id: &str) -> Result<DeletedSatellite> {
         let fingerprint: String =
             sqlx::query_scalar("SELECT cert_fingerprint FROM satellites WHERE module_id = ?")
                 .bind(module_id)
@@ -3298,7 +3330,7 @@ impl Registry {
         // Off the allowlist and off the wire: the satellite's reconnects
         // die at the TLS handshake from here on (SEC-6).
         self.allowed.remove(&fingerprint);
-        self.links.lock().unwrap().remove(module_id);
+        let mediahost_link_generation = self.unregister_link(module_id);
         self.connected.lock().unwrap().remove(module_id);
         // Deleting the satellite forgets the drain with it. This used to happen
         // by accident, because `unregister_link` cleared the set as a side
@@ -3307,7 +3339,10 @@ impl Registry {
         // a fresh row saying enabled.
         self.disabled.lock().unwrap().remove(module_id);
         tracing::info!(%module_id, fingerprint = %fingerprint, "satellite deleted; cert no longer admitted");
-        Ok(fingerprint)
+        Ok(DeletedSatellite {
+            fingerprint,
+            mediahost_link_generation,
+        })
     }
 
     pub async fn collections(&self) -> Result<Vec<CollectionRow>> {
