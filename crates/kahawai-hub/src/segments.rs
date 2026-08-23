@@ -57,6 +57,20 @@
 //! the newest mtime, which costs that row one re-analysis. Rows for items
 //! with no files stayed `NULL` and match any bytes.
 //!
+//! ## Per-file chapter classifier index (authority for migration 0066)
+//!
+//! `files.chapter_segment_kinds` is a bitmask derived from the file's raw
+//! `streams_json.chapters`: recap = 1, intro = 2, credits = 4.
+//! `chapter_segments_detector` says which
+//! [`kahawai_core::segments::DETECTOR_GENERATION`] interpreted those names.
+//! File upserts and later chapter declarations replace raw facts and mask
+//! together; startup rebuilds null/stale masks by parsing SQLite JSON in Rust.
+//! Rebuild cost is one pure pass over stored metadata — no source opens
+//! or media bytes — while point-of-need scheduling is an indexed integer test.
+//! The sweep admits an incompatible host's chapter exception only when every
+//! episode has some complete single-part source with both intro and credits
+//! bits; generic scene chapter lists stay module-skipped.
+//!
 //! Accepted residual: the sweep's no-progress guard compares the pending
 //! COUNT, not the set. A pass that scans one episode while a replacement
 //! makes another pending again can present the same count and trip the
@@ -114,6 +128,17 @@ pub async fn for_item(db: &sqlx::SqlitePool, item_id: &str) -> Result<Vec<Segmen
 /// have never been looked at.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct PendingSeason {
+    /// Scheduler ownership. Internal: clients need the season, not which
+    /// control link will execute inferred analysis.
+    #[serde(skip)]
+    #[schema(ignore)]
+    pub(crate) module_id: String,
+    /// Conservative chapter fast-path hint: true when every episode has at
+    /// least one complete single-part source with stored chapter data. Names
+    /// are checked later; false is the only value safe for module-wide skip.
+    #[serde(skip)]
+    #[schema(ignore)]
+    pub(crate) may_be_all_named: bool,
     pub series_id: String,
     pub title: String,
     pub season: i64,
@@ -400,12 +425,13 @@ impl Detector {
             // flips with watch activity alternated for ever, each pass a
             // full season analysis, and neither ever seen "twice in a row".
             let mut offered: std::collections::HashMap<(String, i64), i64> = Default::default();
-            // Seasons whose mediahost is away THIS cycle. Its own set, apart
-            // from `failed`: an absent host is the hub's weather, so these
-            // are stepped over — one host's outage must not starve the
-            // seasons of every other host — and retried on the next cycle,
-            // when the set clears.
+            // Seasons whose mediahost is away THIS cycle. Per-season weather
+            // covers source/read failures on an otherwise usable host.
             let mut awaiting_host: std::collections::HashSet<(String, i64)> = Default::default();
+            // Protocol/detector incompatibility is module-wide. Once observed,
+            // skip every other season on that module for this cycle rather than
+            // resolving every episode only to rediscover the same registration.
+            let mut awaiting_modules: std::collections::HashSet<String> = Default::default();
             loop {
                 // One season per look, from a FRESH list. Walking a snapshot of
                 // the whole library instead put anything that became pending
@@ -430,10 +456,7 @@ impl Detector {
                 let next = {
                     let mut failed = detector.failed.lock().await;
                     failed.retain(|_, at| at.elapsed() < FAILED_RETRY_AFTER);
-                    seasons.into_iter().find(|s| {
-                        let key = (s.series_id.clone(), s.season);
-                        !failed.contains_key(&key) && !awaiting_host.contains(&key)
-                    })
+                    next_pending_season(seasons, &failed, &awaiting_host, &awaiting_modules)
                 };
                 let Some(season) = next else {
                     offered.clear();
@@ -441,8 +464,9 @@ impl Detector {
                     // host get another look next cycle — sooner when an
                     // outage is what emptied the list, since a host that
                     // comes back should not wait out the long idle sleep.
-                    let outage = !awaiting_host.is_empty();
+                    let outage = !awaiting_host.is_empty() || !awaiting_modules.is_empty();
                     awaiting_host.clear();
+                    awaiting_modules.clear();
                     tokio::time::sleep(std::time::Duration::from_secs(if outage {
                         300
                     } else {
@@ -451,6 +475,26 @@ impl Detector {
                     .await;
                     continue;
                 };
+                if let Some(link) = registry
+                    .host_link(&season.module_id)
+                    .filter(|link| !link.supports_segment_detection())
+                {
+                    if awaiting_modules.insert(season.module_id.clone()) {
+                        tracing::warn!(
+                            module_id = %season.module_id,
+                            offered = link.segment_detector_generation(),
+                            required = DETECTOR,
+                            "intro detection awaits a mediahost with matching detector support"
+                        );
+                    }
+                    // Chapter-complete candidates still enter `analyze_season`:
+                    // their stored names can settle the season without sending
+                    // one message to this incompatible host.
+                    if !season.may_be_all_named {
+                        detector.awaiting_host.store(true, Ordering::Relaxed);
+                        continue;
+                    }
+                }
 
                 // Asking for the same season twice with nothing crossed off
                 // means it cannot be finished: an episode with no running time
@@ -1263,6 +1307,20 @@ fn from_chapters(named: Option<&Vec<kahawai_core::segments::Named>>) -> Vec<Boun
         .collect()
 }
 
+fn next_pending_season(
+    seasons: Vec<PendingSeason>,
+    failed: &std::collections::HashMap<(String, i64), std::time::Instant>,
+    awaiting_seasons: &std::collections::HashSet<(String, i64)>,
+    awaiting_modules: &std::collections::HashSet<String>,
+) -> Option<PendingSeason> {
+    seasons.into_iter().find(|season| {
+        let key = (season.series_id.clone(), season.season);
+        !failed.contains_key(&key)
+            && !awaiting_seasons.contains(&key)
+            && (!awaiting_modules.contains(&season.module_id) || season.may_be_all_named)
+    })
+}
+
 /// Seasons with at least two playable episodes and at least one never analyzed
 /// by this detector generation.
 ///
@@ -1273,11 +1331,25 @@ fn from_chapters(named: Option<&Vec<kahawai_core::segments::Named>>) -> Vec<Boun
 /// never opened.
 pub async fn pending_seasons(db: &sqlx::SqlitePool) -> Result<Vec<PendingSeason>> {
     let rows = sqlx::query(
-        "SELECT i.parent_id AS series_id,
+        "SELECT i.module_id AS module_id,
+                i.parent_id AS series_id,
                 COALESCE(p.title, '') AS title,
                 i.season AS season,
                 COUNT(*) AS episodes,
                 SUM(CASE WHEN s.item_id IS NULL THEN 1 ELSE 0 END) AS pending,
+                MIN(CASE WHEN EXISTS (
+                    SELECT 1
+                      FROM playable_sources chapter_source
+                      JOIN playable_source_parts chapter_part
+                           ON chapter_part.playable_source_id = chapter_source.id
+                      JOIN files chapter_file ON chapter_file.id = chapter_part.file_id
+                     WHERE chapter_source.item_id = i.id
+                       AND chapter_source.expected_parts = 1
+                       AND (SELECT COUNT(*) FROM playable_source_parts all_chapter_parts
+                             WHERE all_chapter_parts.playable_source_id = chapter_source.id) = 1
+                       AND chapter_file.chapter_segments_detector = ?
+                       AND (chapter_file.chapter_segment_kinds & ?) = ?
+                ) THEN 1 ELSE 0 END) AS may_be_all_named,
                 -- A subselect, not a join: `watch_state` is keyed on
                 -- (user, item), so joining it counts an episode once per
                 -- viewer who has touched it, and BOTH counts above are the
@@ -1310,16 +1382,21 @@ pub async fn pending_seasons(db: &sqlx::SqlitePool) -> Result<Vec<PendingSeason>
                         WHERE ps.item_id = i.id AND ps.expected_parts = 1))
           WHERE i.kind = 'episode' AND i.season IS NOT NULL
             AND EXISTS (SELECT 1 FROM playable_sources ps WHERE ps.item_id = i.id)
-          GROUP BY i.parent_id, i.season
+          GROUP BY i.module_id, i.parent_id, i.season
          HAVING episodes >= 2 AND pending > 0
           ORDER BY watched_at DESC, pending ASC, title",
     )
+    .bind(DETECTOR)
+    .bind(kahawai_core::segments::NAMED_COMPLETE as i64)
+    .bind(kahawai_core::segments::NAMED_COMPLETE as i64)
     .bind(DETECTOR)
     .fetch_all(db)
     .await?;
     Ok(rows
         .into_iter()
         .map(|r| PendingSeason {
+            module_id: r.get("module_id"),
+            may_be_all_named: r.get::<i64, _>("may_be_all_named") != 0,
             series_id: r.get("series_id"),
             title: r.get("title"),
             season: r.get("season"),
@@ -1332,6 +1409,121 @@ pub async fn pending_seasons(db: &sqlx::SqlitePool) -> Result<Vec<PendingSeason>
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn incompatible_modules_are_skipped_without_losing_fresh_order() {
+        let season = |module: &str, series: &str, may_be_all_named: bool| PendingSeason {
+            module_id: module.into(),
+            may_be_all_named,
+            series_id: series.into(),
+            title: series.into(),
+            season: 1,
+            episodes: 2,
+            pending: 2,
+        };
+        let seasons = vec![
+            season("old-host", "newly-watched", false),
+            season("old-host", "named-on-disk", true),
+            season("old-host", "also-old", false),
+            season("ready-host", "next-ready", false),
+        ];
+        let awaiting_modules = std::collections::HashSet::from(["old-host".to_string()]);
+
+        let next = next_pending_season(
+            seasons,
+            &Default::default(),
+            &Default::default(),
+            &awaiting_modules,
+        )
+        .unwrap();
+
+        assert_eq!(next.series_id, "named-on-disk");
+    }
+    #[tokio::test]
+    async fn chapter_hint_requires_normalized_names_for_every_episode() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::open(dir.path()).await.unwrap();
+        sqlx::raw_sql(
+            r#"
+            INSERT INTO collections(module_id,collection_id,media_type)
+              VALUES('m','c','series');
+            INSERT INTO collection_roots(module_id,collection_id,root_token,normalized_path)
+              VALUES('m','c','r','/series');
+            INSERT INTO items(id,kind,title,norm_title,sort_title,module_id,collection_id)
+              VALUES('show','show','Show','show','show','m','c');
+            INSERT INTO items(id,kind,title,norm_title,sort_title,module_id,collection_id,
+                              parent_id,season,episode)
+              VALUES('e1','episode','One','one','one','m','c','show',1,1),
+                    ('e2','episode','Two','two','two','m','c','show',1,2);
+            INSERT INTO files(module_id,collection_id,root_id,path_rel,size,mtime_unix,
+                              head_xxh3,tail_xxh3,oshash,streams_json)
+              SELECT 'm','c',id,'e1.mkv',10,1,0,0,0,'{}'
+                FROM collection_roots
+              UNION ALL
+              SELECT 'm','c',id,'e2.mkv',10,1,0,0,0,'{}'
+                FROM collection_roots;
+            INSERT INTO playable_sources(module_id,collection_id,item_id,root_id,
+                                         family_key,expected_parts)
+              SELECT 'm','c',id,NULL,'file:' || id,1
+                FROM items WHERE kind='episode';
+            INSERT INTO playable_source_parts(playable_source_id,module_id,collection_id,
+                                              ordinal,file_id)
+              SELECT ps.id,'m','c',1,f.id
+                FROM playable_sources ps
+                JOIN files f ON f.path_rel = ps.item_id || '.mkv';
+            "#,
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        let info = kahawai_core::media::MediaInfo {
+            duration_ms: Some(600_000),
+            chapters: Some(vec![
+                kahawai_core::media::Chapter {
+                    start_ms: 0,
+                    end_ms: Some(60_000),
+                    title: Some("Intro".into()),
+                },
+                kahawai_core::media::Chapter {
+                    start_ms: 540_000,
+                    end_ms: Some(600_000),
+                    title: Some("Credits".into()),
+                },
+            ]),
+            ..Default::default()
+        };
+        sqlx::query("UPDATE files SET streams_json=?")
+            .bind(serde_json::to_string(&info).unwrap())
+            .execute(&db)
+            .await
+            .unwrap();
+        let registry = Registry::new(db.clone(), Default::default());
+        assert_eq!(registry.backfill_chapter_segments().await.unwrap(), 2);
+
+        let pending = pending_seasons(&db).await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(pending[0].may_be_all_named);
+
+        sqlx::query("UPDATE files SET chapter_segment_kinds=? WHERE path_rel='e2.mkv'")
+            .bind(kahawai_core::segments::NAMED_INTRO as i64)
+            .execute(&db)
+            .await
+            .unwrap();
+        let pending = pending_seasons(&db).await.unwrap();
+        assert!(!pending[0].may_be_all_named);
+
+        sqlx::query(
+            "UPDATE files
+                SET chapter_segment_kinds=?, chapter_segments_detector=?
+              WHERE path_rel='e2.mkv'",
+        )
+        .bind(kahawai_core::segments::NAMED_COMPLETE as i64)
+        .bind(DETECTOR - 1)
+        .execute(&db)
+        .await
+        .unwrap();
+        let pending = pending_seasons(&db).await.unwrap();
+        assert!(!pending[0].may_be_all_named);
+    }
 
     /// The toast's whole data path: a run's outcome lands in the dispatched
     /// cells and moves the counter, or the admin page waits for ever (or

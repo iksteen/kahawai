@@ -546,8 +546,11 @@ How something works and why it was built that way belong in
       record is keyed to the analysed file's mtime, so a replaced episode is
       analysed again. Chapter-name analysis stays hub-side over stored source
       facts: a season that names its own opening and credits is answered without
-      dispatching work. Design in implementation §4.9; detector parity remains
-      measured against intro-skipper in `docs/intro-detection-results.md`.
+      dispatching work. Per-file chapter-kind masks are normalized on ingest and
+      generation-backfilled from stored JSON, so old mediahosts skip generic
+      chapter lists without hiding genuinely complete named seasons. Design in
+      implementation §4.9; detector parity remains measured against
+      intro-skipper in `docs/intro-detection-results.md`.
 - [x] Chapters as a first-class fact: read at scan beside the attachment
       declaration, backfilled for older Matroska/WebM rows (other containers
       keep whatever the demuxer's TOC declared at discovery, so a

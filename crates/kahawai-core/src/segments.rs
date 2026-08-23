@@ -29,6 +29,10 @@ pub struct Named {
     pub start_ms: u64,
     pub end_ms: u64,
 }
+pub const NAMED_RECAP: u8 = 1;
+pub const NAMED_INTRO: u8 = 1 << 1;
+pub const NAMED_CREDITS: u8 = 1 << 2;
+pub const NAMED_COMPLETE: u8 = NAMED_INTRO | NAMED_CREDITS;
 
 pub const INTRO_MAX_MS: u64 = 120_000;
 pub const RECAP_MAX_MS: u64 = 120_000;
@@ -223,6 +227,21 @@ pub fn named(chapters: &[crate::media::Chapter], duration_ms: u64) -> Vec<Named>
     out.sort_by_key(|boundary| boundary.start_ms);
     out
 }
+/// Compact, persisted meaning of a file's chapter names. Boundaries remain in
+/// the raw chapter facts; this mask lets the scheduler distinguish a genuinely
+/// chapter-complete source without re-parsing titles on every sweep.
+pub fn named_kind_mask(chapters: &[crate::media::Chapter], duration_ms: u64) -> u8 {
+    named(chapters, duration_ms)
+        .into_iter()
+        .fold(0, |mask, boundary| {
+            mask | match boundary.kind {
+                "recap" => NAMED_RECAP,
+                "intro" => NAMED_INTRO,
+                "credits" => NAMED_CREDITS,
+                _ => 0,
+            }
+        })
+}
 
 #[cfg(test)]
 mod tests {
@@ -270,6 +289,21 @@ mod tests {
                 },
             ]
         );
+    }
+    #[test]
+    fn named_kind_mask_records_classifier_meaning() {
+        let chapters = [
+            at(4_000, "Recap"),
+            at(69_708, "Scene 1"),
+            at(69_750, "Intro"),
+            at(93_417, "Scene 2"),
+            at(2_198_667, "Credits"),
+        ];
+        assert_eq!(
+            named_kind_mask(&chapters, 2_417_270),
+            NAMED_RECAP | NAMED_COMPLETE
+        );
+        assert_eq!(named_kind_mask(&[at(0, "Chapter 1")], 60_000), 0);
     }
 
     #[test]

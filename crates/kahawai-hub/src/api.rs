@@ -95,9 +95,9 @@ pub struct NetOptions {
     /// `--web-dir`: serve `/app/` from this directory instead of the bundle
     /// embedded at build time. None = embedded, which is what a release ships.
     pub web_dir: Option<std::path::PathBuf>,
-    /// `[hub] detect_segments`. The config promises "off spends no byte
-    /// plane on it", so off gates the ADMIN trigger too, not only the sweep
-    /// — the button used to dispatch a full season of reads regardless.
+    /// `[hub] detect_segments`. Off means no source-local season reads or
+    /// decode work, so it gates the ADMIN trigger as well as the sweep — the
+    /// button must not bypass the operator's cost decision.
     pub detect_segments: bool,
 }
 

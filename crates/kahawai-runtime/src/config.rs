@@ -166,12 +166,12 @@ pub struct HubConfig {
     #[serde(default)]
     pub subtitles: SubtitlesConfig,
     /// HUB-37: hunt for recaps, openings and credits in the background.
-    /// On by default — the buttons only exist if something looks. The
-    /// switch is here because the sweep reads a quarter of every episode
-    /// plus its tail through the byte plane, which on a remote mediahost
-    /// is real traffic for as long as the library has seasons it has not
-    /// seen; an operator who would rather spend that bandwidth on
-    /// something else can say so.
+    /// On by default — the buttons only exist if something looks. Inferred
+    /// analysis reads and decodes the head and tail of every episode on the
+    /// owning mediahost: no media bytes cross the hub, but local disk/decode
+    /// work can contend with scans or playback until the worker yields at its
+    /// next checkpoint. Off is for an operator who does not want to spend that
+    /// source-local work or its latency.
     #[serde(default = "yes")]
     pub detect_segments: bool,
 }

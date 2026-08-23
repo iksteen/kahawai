@@ -27,7 +27,7 @@ async fn library() -> (tempfile::TempDir, kahawai_hub::registry::Registry) {
            VALUES('m','c','r','/series');
          INSERT INTO files(module_id,collection_id,root_id,path_rel,size,mtime_unix,
                            head_xxh3,tail_xxh3,oshash,streams_json)
-           SELECT 'm','c',id,'e.mkv',10,1,0,0,0,'{\"container\":\"matroska\"}'
+           SELECT 'm','c',id,'e.mkv',10,1,0,0,0,'{\"container\":\"matroska\",\"future_fact\":7}'
              FROM collection_roots;",
     )
     .execute(&db)
@@ -48,6 +48,12 @@ async fn chapters(registry: &kahawai_hub::registry::Registry) -> Option<String> 
         .unwrap()
         .get("c")
 }
+async fn normalized(registry: &kahawai_hub::registry::Registry) -> (i64, i64) {
+    sqlx::query_as("SELECT chapter_segment_kinds,chapter_segments_detector FROM files")
+        .fetch_one(registry.db())
+        .await
+        .unwrap()
+}
 
 #[tokio::test]
 async fn a_file_leaves_the_worklist_once_both_are_declared() {
@@ -61,13 +67,29 @@ async fn a_file_leaves_the_worklist_once_both_are_declared() {
             "r",
             "e.mkv",
             10,
-            declared(Some(r#"[{"start_ms":0,"title":"Intro"}]"#)),
+            declared(Some(r#"[{"start_ms":0,"end_ms":60000,"title":"Intro"}]"#)),
         )
         .await
         .unwrap();
     assert!(stored);
     assert_eq!(pending(&registry).await, 0);
     assert!(chapters(&registry).await.unwrap().contains("Intro"));
+    assert_eq!(
+        normalized(&registry).await,
+        (
+            kahawai_core::segments::NAMED_INTRO as i64,
+            kahawai_core::segments::DETECTOR_GENERATION,
+        )
+    );
+    let future_fact: i64 =
+        sqlx::query_scalar("SELECT json_extract(streams_json,'$.future_fact') FROM files")
+            .fetch_one(registry.db())
+            .await
+            .unwrap();
+    assert_eq!(
+        future_fact, 7,
+        "json_set must preserve unknown source facts"
+    );
 }
 
 #[tokio::test]
@@ -96,6 +118,10 @@ async fn a_file_with_no_chapters_is_answered_for() {
         .unwrap();
     assert_eq!(chapters(&registry).await.as_deref(), Some("[]"));
     assert_eq!(pending(&registry).await, 0);
+    assert_eq!(
+        normalized(&registry).await,
+        (0, kahawai_core::segments::DETECTOR_GENERATION)
+    );
 }
 
 #[tokio::test]

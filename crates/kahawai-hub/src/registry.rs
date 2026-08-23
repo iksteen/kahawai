@@ -86,6 +86,15 @@ pub struct Declared<'a> {
     pub attachments_json: &'a str,
     pub chapters_json: Option<&'a str>,
 }
+fn chapter_segment_kinds(info: &kahawai_core::media::MediaInfo) -> i64 {
+    info.chapters
+        .as_deref()
+        .map(|chapters| {
+            kahawai_core::segments::named_kind_mask(chapters, info.duration_ms.unwrap_or_default())
+                as i64
+        })
+        .unwrap_or_default()
+}
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct CollectionRow {
@@ -845,6 +854,47 @@ impl Registry {
         )
         .await
     }
+    /// Rebuild the cheap, queryable meaning of stored chapter facts. This is a
+    /// derived index over `streams_json`: no media reads, and detector
+    /// generation makes a classifier change self-invalidating.
+    pub async fn backfill_chapter_segments(&self) -> Result<usize> {
+        const BATCH: i64 = 500;
+        let mut tx = self.db.begin_with("BEGIN IMMEDIATE").await?;
+        let mut updated = 0usize;
+        loop {
+            let rows = sqlx::query(
+                "SELECT id, streams_json FROM files
+                  WHERE chapter_segment_kinds IS NULL
+                     OR chapter_segments_detector IS NULL
+                     OR chapter_segments_detector != ?
+                  LIMIT ?",
+            )
+            .bind(kahawai_core::segments::DETECTOR_GENERATION)
+            .bind(BATCH)
+            .fetch_all(&mut *tx)
+            .await?;
+            if rows.is_empty() {
+                break;
+            }
+            for row in &rows {
+                let info: kahawai_core::media::MediaInfo =
+                    serde_json::from_str(row.get("streams_json"))?;
+                sqlx::query(
+                    "UPDATE files
+                        SET chapter_segment_kinds=?, chapter_segments_detector=?
+                      WHERE id=?",
+                )
+                .bind(chapter_segment_kinds(&info))
+                .bind(kahawai_core::segments::DETECTOR_GENERATION)
+                .bind(row.get::<i64, _>("id"))
+                .execute(&mut *tx)
+                .await?;
+            }
+            updated += rows.len();
+        }
+        tx.commit().await?;
+        Ok(updated)
+    }
 
     /// Files whose longest keyframe gap was never measured — rows
     /// scanned before it existed. Any container: the mediahost decides
@@ -990,9 +1040,9 @@ impl Registry {
     /// See [`Declared`].
     ///
     /// Store what one sparse pass over a container header found
-    /// (size-guarded like ED2K: dropped when the row moved on). Writes
-    /// into streams_json so the record looks exactly as if the scan had
-    /// declared it.
+    /// (size-guarded like ED2K: dropped when the row moved on). Raw declarations
+    /// and their classifier meaning land in one transaction, so the scheduler
+    /// never observes new chapters with an old kind mask.
     pub async fn record_file_attachments(
         &self,
         module_id: &str,
@@ -1002,45 +1052,65 @@ impl Registry {
         size: u64,
         declared: Declared<'_>,
     ) -> Result<bool> {
-        let Declared {
-            attachments_json,
-            chapters_json,
-        } = declared;
-        // Reject junk before it reaches the row.
-        let parsed: Result<Vec<kahawai_core::media::Attachment>, _> =
-            serde_json::from_str(attachments_json);
-        anyhow::ensure!(parsed.is_ok(), "malformed attachments json");
-        if let Some(chapters_json) = chapters_json {
-            let parsed: Result<Vec<kahawai_core::media::Chapter>, _> =
-                serde_json::from_str(chapters_json);
-            anyhow::ensure!(parsed.is_ok(), "malformed chapters json");
-        }
+        let _: Vec<kahawai_core::media::Attachment> =
+            serde_json::from_str(declared.attachments_json)
+                .context("malformed attachments json")?;
+        let chapters: Option<Vec<kahawai_core::media::Chapter>> = declared
+            .chapters_json
+            .map(serde_json::from_str)
+            .transpose()
+            .context("malformed chapters json")?;
         let Some(source_id) = self
             .source_id(module_id, collection_id, root_token, path_rel)
             .await?
         else {
             return Ok(false);
         };
-        let query = match chapters_json {
-            Some(chapters) => sqlx::query(
-                "UPDATE files SET streams_json=json_set(streams_json,
-                     '$.attachments',json(?),'$.chapters',json(?))
+        let mut tx = self.db.begin_with("BEGIN IMMEDIATE").await?;
+        let Some(streams_json): Option<String> =
+            sqlx::query_scalar("SELECT streams_json FROM files WHERE id=? AND size=?")
+                .bind(source_id)
+                .bind(size as i64)
+                .fetch_optional(&mut *tx)
+                .await?
+        else {
+            return Ok(false);
+        };
+        let mut info: kahawai_core::media::MediaInfo =
+            serde_json::from_str(&streams_json).context("malformed stored media info")?;
+        if let Some(chapters) = chapters {
+            info.chapters = Some(chapters);
+        }
+        let kinds = chapter_segment_kinds(&info);
+        // Keep json_set rather than reserializing MediaInfo: an older hub must
+        // preserve source facts added by a newer mediahost that serde ignores.
+        let query = match declared.chapters_json {
+            Some(chapters_json) => sqlx::query(
+                "UPDATE files
+                    SET streams_json=json_set(streams_json,
+                          '$.attachments',json(?),'$.chapters',json(?)),
+                        chapter_segment_kinds=?, chapter_segments_detector=?
                   WHERE id=? AND size=?",
             )
-            .bind(attachments_json)
-            .bind(chapters),
+            .bind(declared.attachments_json)
+            .bind(chapters_json),
             None => sqlx::query(
-                "UPDATE files SET streams_json=json_set(streams_json,'$.attachments',json(?))
+                "UPDATE files
+                    SET streams_json=json_set(streams_json,'$.attachments',json(?)),
+                        chapter_segment_kinds=?, chapter_segments_detector=?
                   WHERE id=? AND size=?",
             )
-            .bind(attachments_json),
+            .bind(declared.attachments_json),
         };
         let n = query
+            .bind(kinds)
+            .bind(kahawai_core::segments::DETECTOR_GENERATION)
             .bind(source_id)
             .bind(size as i64)
-            .execute(&self.db)
+            .execute(&mut *tx)
             .await?
             .rows_affected();
+        tx.commit().await?;
         Ok(n > 0)
     }
 
@@ -1904,6 +1974,9 @@ impl Registry {
         let n = files.len();
         for f in files {
             anyhow::ensure!(!f.root_token.is_empty(), "file record has no root token");
+            let media_info: kahawai_core::media::MediaInfo =
+                serde_json::from_str(&f.streams_json).context("malformed media info")?;
+            let chapter_kinds = chapter_segment_kinds(&media_info);
             let root_id: i64 = sqlx::query_scalar(
                 "SELECT id FROM collection_roots
                   WHERE module_id=? AND collection_id=? AND root_token=? AND configured=1",
@@ -1917,8 +1990,9 @@ impl Registry {
             let source_id: i64 = sqlx::query_scalar(
                 "INSERT INTO files
                    (module_id,collection_id,root_id,path_rel,size,mtime_unix,
-                    head_xxh3,tail_xxh3,oshash,streams_json,revision)
-                 VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                    head_xxh3,tail_xxh3,oshash,streams_json,revision,
+                    chapter_segment_kinds,chapter_segments_detector)
+                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
                  ON CONFLICT (module_id,collection_id,root_id,path_rel)
                    WHERE root_id IS NOT NULL DO UPDATE SET
                    revision=excluded.revision,
@@ -1930,7 +2004,9 @@ impl Registry {
                                        THEN files.subs_extracted ELSE 0 END,
                    size=excluded.size,mtime_unix=excluded.mtime_unix,
                    head_xxh3=excluded.head_xxh3,tail_xxh3=excluded.tail_xxh3,
-                   oshash=excluded.oshash,streams_json=excluded.streams_json
+                   oshash=excluded.oshash,streams_json=excluded.streams_json,
+                   chapter_segment_kinds=excluded.chapter_segment_kinds,
+                   chapter_segments_detector=excluded.chapter_segments_detector
                  RETURNING id",
             )
             .bind(module_id)
@@ -1944,6 +2020,8 @@ impl Registry {
             .bind(f.oshash as i64)
             .bind(&f.streams_json)
             .bind(names::release_revision(&f.path_rel) as i64)
+            .bind(chapter_kinds)
+            .bind(kahawai_core::segments::DETECTOR_GENERATION)
             .fetch_one(&mut *tx)
             .await?;
 
@@ -1988,9 +2066,7 @@ impl Registry {
             } else if resolve_music {
                 // Tags win (the scanner extracted them); the Lidarr
                 // filename layout is the fallback for untagged rips.
-                let info: kahawai_core::media::MediaInfo =
-                    serde_json::from_str(&f.streams_json).unwrap_or_default();
-                let tags = &info.tags;
+                let tags = &media_info.tags;
                 let tag = |k: &str| tags.get(k).map(|s| s.trim()).filter(|s| !s.is_empty());
                 let parsed = names::parse_music(&f.path_rel);
                 let artist = tag("artist")

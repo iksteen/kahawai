@@ -394,6 +394,8 @@ async fn run_hub_inner(
             .with_credentials(credentials)
             .with_local_video_executor(local_transcoder),
     );
+    let chapter_files = registry.backfill_chapter_segments().await?;
+    tracing::info!(files = chapter_files, "chapter segment index ready");
     let admitted = registry.load_allowlist().await?;
     tracing::info!(admitted, "mTLS allowlist loaded");
     // HUB-36 phase 4: what the fleet has been measured to achieve, so a
