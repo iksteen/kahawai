@@ -528,7 +528,13 @@ async fn auth_harness() -> (
 ) {
     let dir = tempfile::tempdir().unwrap();
     let db = kahawai_hub::db::open(dir.path()).await.unwrap();
-    let registry = Arc::new(Registry::new(db.clone(), Default::default()));
+    let credentials = Arc::new(
+        kahawai_hub::secrets::Credentials::open(dir.path(), db.clone())
+            .await
+            .unwrap(),
+    );
+    let registry =
+        Arc::new(Registry::new(db.clone(), Default::default()).with_credentials(credentials));
     let auth = Arc::new(Auth::new(db.clone(), dir.path()).await.unwrap());
     auth.complete_setup("root", "hunter22222hunter")
         .await
@@ -2174,7 +2180,6 @@ async fn admin_deletes_users() {
     .execute(&db)
     .await
     .unwrap();
-
     // A sealed credential has no foreign key either — owner_id is a user id
     // or HUB. Raw rows: this is about the delete, not about the cipher.
     for owner in [victim.as_str(), admin_id.as_str()] {
@@ -2349,4 +2354,161 @@ async fn admin_deletes_users() {
         kahawai_hub::auth::DeleteUser::LastAdmin,
         "the last admin was deletable"
     );
+}
+
+/// A viewer's own OpenSubtitles account: stored sealed, reported as a fact and
+/// nothing more, and one viewer's account is not another's.
+#[tokio::test]
+async fn an_opensubtitles_account_is_stored_sealed_and_reported_as_a_fact() {
+    let (_dir, db, auth, api, root) = auth_harness().await;
+    // Spaces at both ends, on purpose: a route that trims would store a
+    // different secret than the one the account has.
+    const PASSWORD: &str = "  a-provider-password  ";
+    let configured = |token: String| {
+        let api = api.clone();
+        async move {
+            let response = api
+                .oneshot(get_authed("/api/v1/account/opensubtitles", &token))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            body_json(response).await
+        }
+    };
+
+    // A second viewer, to prove the account is not the deployment's.
+    sqlx::query(
+        "INSERT INTO users (id, username, password_hash, is_admin) VALUES ('u2','viewer',?,0)",
+    )
+    .bind(kahawai_hub::auth::hash_password("viewer-password").unwrap())
+    .execute(&db)
+    .await
+    .unwrap();
+    let viewer = auth.login("viewer", "viewer-password").await.unwrap();
+
+    assert_eq!(
+        configured(root.access_token.clone()).await,
+        serde_json::json!({ "configured": false })
+    );
+
+    // Half a form is a 400. Only empty: a password of spaces is a password,
+    // and this route does not get to decide otherwise.
+    for body in [
+        serde_json::json!({ "username": "", "password": PASSWORD }),
+        serde_json::json!({ "username": "a-name", "password": "" }),
+    ] {
+        let response = api
+            .clone()
+            .oneshot(post_headers(
+                "/api/v1/account/opensubtitles",
+                body.clone(),
+                &[(
+                    "authorization",
+                    &format!("Bearer {}", root.access_token) as &str,
+                )],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{body}");
+    }
+    let stored: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM credentials")
+        .fetch_one(&db)
+        .await
+        .unwrap();
+    assert_eq!(stored, 0, "a refused save stored nothing");
+
+    let response = api
+        .clone()
+        .oneshot(post_headers(
+            "/api/v1/account/opensubtitles",
+            serde_json::json!({ "username": "a-name", "password": PASSWORD }),
+            &[(
+                "authorization",
+                &format!("Bearer {}", root.access_token) as &str,
+            )],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    assert_eq!(
+        configured(root.access_token.clone()).await,
+        serde_json::json!({ "configured": true })
+    );
+    assert_eq!(
+        configured(viewer.access_token.clone()).await,
+        serde_json::json!({ "configured": false }),
+        "one viewer's account is not another's"
+    );
+
+    // Sealed, not stored: the two fields are there and neither holds the
+    // password as bytes.
+    let secrets: Vec<Vec<u8>> =
+        sqlx::query_scalar("SELECT secret FROM credentials WHERE provider = 'opensubtitles'")
+            .fetch_all(&db)
+            .await
+            .unwrap();
+    assert_eq!(secrets.len(), 2, "username and password");
+    // Sealed whole, spaces included. The ciphertext is the plaintext's length
+    // plus a 12-byte nonce and a 16-byte tag, so the length says what was
+    // sealed without anything having to decrypt it.
+    let password_len: i64 = sqlx::query_scalar(
+        "SELECT length(secret) FROM credentials WHERE provider = 'opensubtitles' AND field = 'password'",
+    )
+    .fetch_one(&db)
+    .await
+    .unwrap();
+    assert_eq!(password_len as usize, PASSWORD.len() + 12 + 16);
+    for secret in &secrets {
+        assert!(
+            !secret
+                .windows(PASSWORD.len())
+                .any(|window| window == PASSWORD.as_bytes()),
+            "a stored credential holds its plaintext"
+        );
+    }
+
+    // Half an account cannot log in, and the shape is reachable: a viewer who
+    // only ever stored a username under the old preference keys adopts one row.
+    sqlx::query("DELETE FROM credentials WHERE provider = 'opensubtitles' AND field = 'password'")
+        .execute(&db)
+        .await
+        .unwrap();
+    assert_eq!(
+        configured(root.access_token.clone()).await,
+        serde_json::json!({ "configured": false }),
+        "a username with no password is not an attached account"
+    );
+    api.clone()
+        .oneshot(post_headers(
+            "/api/v1/account/opensubtitles",
+            serde_json::json!({ "username": "a-name", "password": PASSWORD }),
+            &[(
+                "authorization",
+                &format!("Bearer {}", root.access_token) as &str,
+            )],
+        ))
+        .await
+        .unwrap();
+
+    let response = api
+        .clone()
+        .oneshot(
+            Request::delete("/api/v1/account/opensubtitles")
+                .header("authorization", format!("Bearer {}", root.access_token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        configured(root.access_token.clone()).await,
+        serde_json::json!({ "configured": false })
+    );
+    let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM credentials")
+        .fetch_one(&db)
+        .await
+        .unwrap();
+    assert_eq!(left, 0, "detaching leaves nothing behind");
 }

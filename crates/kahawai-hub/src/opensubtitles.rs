@@ -34,12 +34,13 @@ pub fn default_api_key() -> &'static str {
     DEFAULT_API_KEY
 }
 
-/// Per-USER preference keys (user_prefs, global scope): each user
-/// attaches their own OpenSubtitles account, spending their own
-/// download entitlement. What they download is shared with everyone —
-/// subtitles belong to the item, not the downloader (HUB-23).
-pub const USER_PREF_USERNAME: &str = "opensubtitles.username";
-pub const USER_PREF_PASSWORD: &str = "opensubtitles.password";
+/// A per-USER credential: the owner is the viewer, not `HUB`. Each user
+/// attaches their own OpenSubtitles account and spends their own download
+/// entitlement. What they download is shared with everyone — subtitles belong
+/// to the item, not the downloader (HUB-23).
+pub const OPENSUBTITLES: &str = "opensubtitles";
+pub const USERNAME: &str = "username";
+pub const PASSWORD: &str = "password";
 
 /// The download entitlement is spent — this account's, or the server's shared
 /// anonymous one.
@@ -284,7 +285,7 @@ fn rank_candidates(out: &mut [Candidate], languages: &[String]) {
 #[async_trait::async_trait]
 impl SubtitleProvider for OpenSubtitles {
     fn name(&self) -> &'static str {
-        "opensubtitles"
+        OPENSUBTITLES
     }
 
     async fn search(&self, q: &SearchQuery) -> Result<Vec<Candidate>> {

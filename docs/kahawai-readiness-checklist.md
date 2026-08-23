@@ -179,27 +179,43 @@ marked in that document.
       JASSUB workers and WASM, plus `frame-ancestors 'none'`, nosniff, a strict
       referrer policy and a minimal permissions policy. Derive browser-policy
       details from current primary browser specifications/documentation
-- [ ] SEC-WEB-2 Remove OpenSubtitles username/password values from the generic
-      preference API. Replace them with typed read/update/delete operations;
-      reads expose only `configured` and non-secret account identity, reusing
-      the write-only response pattern already implemented by `admin_providers`
-- [~] SEC-WEB-3 Administrator provider reads already expose configuration state
-      without returning keys, and their values live outside generic user
-      preferences. Move the remaining user credentials out of generic
-      preferences and choose the credential-store/key-management design from an
-      explicit threat, recovery and operating-system support model;
-      configuration-file secrets remain documented and permission-checked
-- [x] SEC-WEB-4 AES-256-GCM from `ring`, a fresh 96-bit nonce per seal, and
-      the key in `<data_dir>/credentials.secret` rather than in the database it
-      opens. It is created 0600 in one `open(2)` and narrowed if it arrives
-      wider. The additional data is the row's own owner, provider and field,
-      length-prefixed, so a ciphertext moved to another row does not open:
-      `secrets::tests::a_row_does_not_open_as_another_row` and
-      `::each_seal_draws_a_fresh_nonce`
-- [ ] SEC-WEB-5 Use a new immutable migration to move existing plaintext
-      preference/setting credentials, verify decryption, then remove plaintext
-      values; document schema meaning in the enforcing Rust module and include
-      required recovery keys in the protected backup manifest
+- [x] SEC-WEB-2 A viewer's OpenSubtitles account has its own routes —
+      `GET`/`POST`/`DELETE /api/v1/account/opensubtitles` — and is stored under
+      that viewer's own owner id. The read answers `ProviderConfiguration` and
+      nothing else, so the username never returns to a client; `PUT
+      /api/v1/prefs` carries no credential in either direction, and
+      `subtitles::external_provider` searches with the account the store
+      holds for that viewer.
+      `auth_api::an_opensubtitles_account_is_stored_sealed_and_reported_as_a_fact`
+      covers the pair, one viewer's account not being another's, and the
+      absence of the plaintext in the stored bytes
+- [x] SEC-WEB-3 Every credential the hub holds — TMDB, TheTVDB, AniDB and each
+      viewer's OpenSubtitles account — is in `credentials`, outside `settings`
+      and `user_prefs`, and `hub/secrets.rs` documents the key's lifecycle and
+      the four states it distinguishes. Deleting a user deletes their
+      credentials in the same transaction. `kahawai.toml` holds no credential:
+      the metrics bearer is `<data_dir>/metrics.secret`, narrowed to 0600 on
+      load beside `jwt.secret` and `credentials.secret`. Its one provider
+      value overrides an OpenSubtitles application key that ships as a public
+      constant in every copy of the binary, which is an operator's own to use
+      rather than a secret to protect
+- [x] SEC-WEB-4 AES-256-GCM from `ring`, a fresh 96-bit nonce per seal, and the
+      key in `<data_dir>/credentials.secret` rather than in the database it opens.
+      It is created 0600 in one `open(2)`, narrowed if it arrives wider, and
+      carried by backup and restore. The additional data is the row's own
+      owner, provider and field, length-prefixed, so a ciphertext moved to
+      another row does not open: `secrets::tests::a_row_does_not_open_as_another_row`,
+      `::each_seal_draws_a_fresh_nonce` and
+      `backup_restore::a_snapshot_carries_the_credential_key`
+- [x] SEC-WEB-5 Migration 0065 adds `credentials` and `hub/secrets.rs` carries
+      its meaning. Startup adoption seals each plaintext credential, reads the
+      sealed set back and compares it before deleting anything, removes the
+      plaintext in one statement, and truncates the write-ahead log — for
+      whatever moved, including on the way out of a later failure. The manifest
+      lists the secret files a snapshot carries (`jwt.secret`,
+      `credentials.secret`, `metrics.secret`) and a restore refuses a snapshot
+      that has lost one. `secrets::adoption_tests::plaintext_survives_a_seal_that_does_not_read_back`
+      and `backup_restore::a_snapshot_missing_what_its_manifest_lists_is_refused`
 - [ ] SEC-WEB-6 Replace `(StatusCode, String)` and raw internal errors with the
       stable JSON shape `{ "code", "message", "request_id" }`; unexpected
       errors use a generic message while complete causes are logged server-side
@@ -464,12 +480,11 @@ marked in that document.
       the restored snapshot
 - [~] BKP-6 `kahawai_core::private` is the one way to make a file private and
       the one way to keep it so. Every secret this hub writes — `jwt.secret`,
-      the CA key, `sat.key` and the renewal pair — is created 0600 by passing
-      the mode to `open(2)`, so none of them exists at a wider mode even for
-      an instant, and `narrow` restricts one that arrives wider from a copy
-      this hub did not make. A backup directory is created 0700 and its
-      database narrowed to 0600 afterwards, since SQLite writes `VACUUM INTO`
-      output at
+      the CA key, `sat.key`, the renewal pair, `credentials.secret` — is
+      created 0600 by passing the mode to `open(2)`, so none of them exists at
+      a wider mode even for an instant, and `narrow` restricts one that arrives
+      wider from a copy this hub did not make. A backup directory is created 0700 and its database
+      narrowed to 0600 afterwards, since SQLite writes `VACUUM INTO` output at
       `0666 & ~umask` and has no pragma for it; `private::tests` and
       `backup_restore::a_snapshot_is_not_readable_by_anyone_else` are the
       regression checks. Remaining: 0700 on private state, session, PKI,
@@ -602,7 +617,7 @@ marked in that document.
       DTO: failures still use `(StatusCode, String)`. A separate shared API
       crate remains unjustified while the binary is the only Rust consumer
 - [~] ENG-2 The same DTOs generate a complete OpenAPI 3.2 document for the
-      exact 62-operation application surface and vendored Swagger UI.
+      exact 68-operation application surface and vendored Swagger UI.
       Generation fails closed on operation membership, typed JSON schemas,
       security declarations, QUERY placement, query-parameter location and
       null-versus-omitted fields. `web/openapi.json` is committed, source-

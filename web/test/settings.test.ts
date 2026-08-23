@@ -7,9 +7,21 @@ import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 
 import { ApiError } from '../src/api/errors.ts'
 
-vi.mock('../src/api/generated/kahawai.ts', () => ({ getPrefs: vi.fn(), putPref: vi.fn() }))
+vi.mock('../src/api/generated/kahawai.ts', () => ({
+  accountOpensubtitles: vi.fn(),
+  deleteAccountOpensubtitles: vi.fn(),
+  getPrefs: vi.fn(),
+  putPref: vi.fn(),
+  setAccountOpensubtitles: vi.fn(),
+}))
 
-const { getPrefs, putPref } = await import('../src/api/generated/kahawai.ts')
+const {
+  accountOpensubtitles,
+  deleteAccountOpensubtitles,
+  getPrefs,
+  putPref,
+  setAccountOpensubtitles,
+} = await import('../src/api/generated/kahawai.ts')
 const { clearNotices, notice } = await import('../src/composables/notices.ts')
 const Settings = (await import('../src/views/Settings.vue')).default
 
@@ -35,6 +47,9 @@ async function open() {
 beforeEach(() => {
   vi.mocked(getPrefs).mockResolvedValue(prefs({ 'audio.movies': 'en,original' }) as never)
   vi.mocked(putPref).mockResolvedValue({ ok: true } as never)
+  vi.mocked(accountOpensubtitles).mockResolvedValue({ configured: false } as never)
+  vi.mocked(setAccountOpensubtitles).mockResolvedValue({ ok: true } as never)
+  vi.mocked(deleteAccountOpensubtitles).mockResolvedValue({ ok: true } as never)
   clearNotices()
 })
 afterEach(() => vi.resetAllMocks())
@@ -175,27 +190,29 @@ describe('the styled-subtitle ladder', () => {
 })
 
 describe('the opensubtitles account', () => {
-  test('and attaching one writes both halves', async () => {
+  test('and attaching one sends the pair exactly as typed, then empties the form', async () => {
+    // Padded on both sides: the account is the account holder's to compose,
+    // and neither this form nor the hub trims it.
     const wrapper = await open()
-    await wrapper.get('#os-user').setValue('someone')
-    await wrapper.get('#os-pass').setValue('a-secret')
-    const save = wrapper.findAll('button').find((b) => b.text() === 'Save')!
-    await save.trigger('click')
+    await wrapper.get('#os-user').setValue(' someone ')
+    await wrapper.get('#os-pass').setValue('  a-secret  ')
+    await wrapper
+      .findAll('button')
+      .find((b) => b.text() === 'Save')!
+      .trigger('click')
     await flushPromises()
-    expect(vi.mocked(putPref).mock.calls.map((c) => c[0])).toEqual([
-      { scope: '', key: 'opensubtitles.username', value: 'someone' },
-      { scope: '', key: 'opensubtitles.password', value: 'a-secret' },
-    ])
+    expect(setAccountOpensubtitles).toHaveBeenCalledWith({
+      username: ' someone ',
+      password: '  a-secret  ',
+    })
+    // Nothing to keep them for: the hub will not read either back, so a filled
+    // box after a save would be showing a value only this tab remembers.
+    expect((wrapper.get('#os-user').element as HTMLInputElement).value).toBe('')
+    expect((wrapper.get('#os-pass').element as HTMLInputElement).value).toBe('')
   })
 
-  test('and a half-save reports which half, and shows what landed', async () => {
-    // One flat failure for a half-save left the hub holding the new username
-    // while the card still showed the old one — and the badge still read
-    // "shared budget" for an account that was half attached.
-    vi.mocked(putPref).mockImplementation((async (body: { key: string }) =>
-      body.key.endsWith('password')
-        ? Promise.reject(new ApiError(503, 'nope'))
-        : { ok: true }) as never)
+  test('and a refused save says so and keeps what was typed', async () => {
+    vi.mocked(setAccountOpensubtitles).mockRejectedValue(new ApiError(503, 'restarting'))
     const wrapper = await open()
     await wrapper.get('#os-user').setValue('someone')
     await wrapper.get('#os-pass').setValue('a-secret')
@@ -204,17 +221,61 @@ describe('the opensubtitles account', () => {
       .find((b) => b.text() === 'Save')!
       .trigger('click')
     await flushPromises()
-    expect(notice.value).toContain('password')
-    // Whatever landed is what the hub has, so the card must show that: the
-    // username stuck, and the password box is empty because that half did not.
+    expect(notice.value).toBeTruthy()
+    // Clearing here would cost the password a second time for a save that
+    // never happened.
     expect((wrapper.get('#os-user').element as HTMLInputElement).value).toBe('someone')
-    expect((wrapper.get('#os-pass').element as HTMLInputElement).value).toBe('')
+    expect((wrapper.get('#os-pass').element as HTMLInputElement).value).toBe('a-secret')
   })
 
-  test('and Disconnect is only offered once there is something to disconnect', async () => {
-    expect((await open()).findAll('button').some((b) => b.text() === 'Disconnect')).toBe(false)
-    vi.mocked(getPrefs).mockResolvedValue(prefs({ 'opensubtitles.username': 'someone' }) as never)
-    expect((await open()).findAll('button').some((b) => b.text() === 'Disconnect')).toBe(true)
+  test('and the hub says whether one is attached, never which', async () => {
+    let wrapper = await open()
+    expect(wrapper.findAll('button').some((b) => b.text() === 'Disconnect')).toBe(false)
+    expect(wrapper.get('#os-user').attributes('placeholder')).toContain('username')
+
+    vi.mocked(accountOpensubtitles).mockResolvedValue({ configured: true } as never)
+    wrapper = await open()
+    expect(wrapper.findAll('button').some((b) => b.text() === 'Disconnect')).toBe(true)
+    // The name is not in the answer and so cannot be on the screen; the field
+    // says an account is there and offers to replace it.
+    expect(wrapper.get('#os-user').attributes('placeholder')).toBe(
+      'account configured — enter to replace',
+    )
+    expect((wrapper.get('#os-user').element as HTMLInputElement).value).toBe('')
+  })
+
+  test('and a read it could not make says so rather than "no account"', async () => {
+    // Defaulting the failed read to false claimed the account was not
+    // attached — while the viewer's searches were failing for the same reason
+    // the read did, which is a credential the hub cannot open.
+    vi.mocked(accountOpensubtitles).mockRejectedValue(new ApiError(500, 'boom'))
+    const wrapper = await open()
+    expect(wrapper.text()).toContain('unknown')
+    expect(wrapper.findAll('button').some((b) => b.text() === 'Disconnect')).toBe(false)
+    // The rest of the page is unaffected: one card's read failing is not the
+    // settings failing.
+    expect(wrapper.text()).not.toContain('Could not load your settings.')
+    expect(wrapper.find('#os-user').exists()).toBe(true)
+  })
+
+  test('and disconnecting is asked twice, then asks the hub rather than saving a blank', async () => {
+    vi.mocked(accountOpensubtitles).mockResolvedValue({ configured: true } as never)
+    const wrapper = await open()
+    const press = async (label: string) => {
+      await wrapper
+        .findAll('button')
+        .find((b) => b.text() === label)!
+        .trigger('click')
+      await flushPromises()
+    }
+    // One press arms it. The hub will not read the account back, so a stray
+    // press costs a trip to opensubtitles.com, not a glance at the screen.
+    await press('Disconnect')
+    expect(deleteAccountOpensubtitles).not.toHaveBeenCalled()
+
+    await press('Really disconnect?')
+    expect(deleteAccountOpensubtitles).toHaveBeenCalled()
+    expect(setAccountOpensubtitles).not.toHaveBeenCalled()
   })
 })
 

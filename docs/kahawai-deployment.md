@@ -204,8 +204,8 @@ niceness orders the worker *against the hub inside it*.
 it takes the token in that file — not a login token. Access tokens expire
 after 15 minutes and Prometheus has no refresh flow, so a static credential
 scoped to this one read-only route is the only thing that actually scrapes.
-It sits beside `jwt.secret` rather than in the config file, so a config you
-can paste into an issue carries no credential:
+It sits beside `jwt.secret` and `credentials.secret` rather than in the config
+file, so a config you can paste into an issue carries no credential:
 
 ```console
 $ (umask 077; openssl rand -hex 32 > ~/.local/share/kahawai/metrics.secret)

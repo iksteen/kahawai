@@ -179,6 +179,23 @@ pub struct Credentials {
 /// The owner of a credential the hub holds for everyone, not for one viewer.
 pub const HUB: &str = "";
 
+/// A stored credential that would not open.
+///
+/// A type, because the answer to it is a decision and not a sentence: this is
+/// THIS hub's fault — a tampered row, or a key that does not match the
+/// database — and a route that reads it as a refusal tells a viewer the
+/// provider did not answer. `api::refusal_or_internal` downcasts to it.
+#[derive(Debug)]
+pub struct UnreadableCredential;
+
+impl std::fmt::Display for UnreadableCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("a stored credential could not be read")
+    }
+}
+
+impl std::error::Error for UnreadableCredential {}
+
 impl Credentials {
     pub async fn open(data_dir: &Path, db: SqlitePool) -> Result<Self> {
         let secrets = Secrets::load_or_create(data_dir, &db).await?;
@@ -204,7 +221,8 @@ impl Credentials {
                 let value = self
                     .secrets
                     .open(owner_id, provider, &field, &blob)
-                    .with_context(|| format!("stored {provider} {field}"))?;
+                    .with_context(|| format!("stored {provider} {field}"))
+                    .context(UnreadableCredential)?;
                 Ok((field, value))
             })
             .collect()
@@ -320,12 +338,21 @@ pub async fn adopt_settings(
 pub async fn adopt_all(
     credentials: &Credentials,
     settings: &[(&str, &[(&str, &str)])],
+    prefs: &[(&str, &[(&str, &str)])],
 ) -> Result<()> {
     let mut retired = false;
     let adopted: Result<()> = async {
         for (provider, from) in settings {
             if adopt_settings(credentials, provider, from).await? {
                 tracing::info!(provider, "plaintext credential sealed");
+                retired = true;
+            }
+        }
+        for (provider, from) in prefs {
+            // Every user's own, so the count is the interesting part.
+            let owners = adopt_prefs(credentials, provider, from).await?;
+            if owners > 0 {
+                tracing::info!(provider, owners, "plaintext credentials taken out of prefs");
                 retired = true;
             }
         }
@@ -378,6 +405,61 @@ fn in_clause(prefix: &str, n: usize) -> String {
     }
     sql.push(')');
     sql
+}
+
+/// The same move for a credential held per user, in `user_prefs` at global
+/// scope. Returns how many owners had plaintext to retire — which is what the
+/// caller checkpoints the write-ahead log for, sealed or superseded.
+///
+/// Unlike `adopt_settings`, an owner the store ALREADY holds this provider for
+/// keeps what is sealed. A per-user preference outlives the port: the route
+/// that writes the store is live while the old rows are still on disk, so the
+/// first adoption can meet a sealed account that is newer than the plaintext
+/// beside it, and replacing it would undo something its owner just typed.
+/// The plaintext goes either way — it is what this exists to retire.
+pub async fn adopt_prefs(
+    credentials: &Credentials,
+    provider: &str,
+    from: &[(&str, &str)],
+) -> Result<usize> {
+    let db = &credentials.db;
+    let mut found: BTreeMap<String, BTreeMap<&str, String>> = BTreeMap::new();
+    for (pref, field) in from {
+        let rows = sqlx::query_as::<_, (String, String)>(
+            "SELECT user_id, value FROM user_prefs WHERE scope = '' AND key = ?",
+        )
+        .bind(pref)
+        .fetch_all(db)
+        .await?;
+        for (owner, value) in rows {
+            found.entry(owner).or_default().insert(*field, value);
+        }
+    }
+    if found.is_empty() {
+        return Ok(0);
+    }
+
+    for (owner, fields) in &found {
+        if !credentials.get_provider(owner, provider).await?.is_empty() {
+            continue;
+        }
+        let borrowed: BTreeMap<&str, &str> = fields.iter().map(|(f, v)| (*f, v.as_str())).collect();
+        credentials.set_provider(owner, provider, &borrowed).await?;
+        verify(credentials, owner, provider, fields).await?;
+    }
+    // One statement, like the settings above. Sealed-wins already makes a
+    // partial delete harmless here, but two shapes for one job is how the
+    // safe one gets copied from the other next time.
+    let sql = in_clause(
+        "DELETE FROM user_prefs WHERE scope = '' AND key",
+        from.len(),
+    );
+    let mut delete = sqlx::query(sqlx::AssertSqlSafe(sql));
+    for (pref, _) in from {
+        delete = delete.bind(*pref);
+    }
+    delete.execute(db).await?;
+    Ok(found.len())
 }
 
 /// Everything one owner holds for one provider, in one statement.
@@ -1060,6 +1142,203 @@ mod adoption_tests {
         assert_eq!(setting(&c, "tmdb_api_key").await, None);
     }
 
+    /// Several settings land as one provider, and a settings row that is not
+    /// there is not an error -- TVDB's pin and AniDB's UDP key are optional.
+    #[tokio::test]
+    async fn a_providers_settings_land_together() {
+        let (_d, c) = store().await;
+        plaintext(&c, "tvdb_api_key", "a-key").await;
+        plaintext(&c, "tvdb_pin", "a-pin").await;
+        plaintext(&c, "unrelated", "keep me").await;
+
+        // The third pair has no settings row: TVDB's pin and AniDB's UDP key
+        // are optional, so a declared field that is absent is not an error.
+        assert!(
+            adopt_settings(
+                &c,
+                "tvdb",
+                &[
+                    ("tvdb_api_key", "api_key"),
+                    ("tvdb_pin", "pin"),
+                    ("tvdb_absent", "absent"),
+                ]
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(
+            c.get_provider(HUB, "tvdb").await.unwrap(),
+            BTreeMap::from([
+                ("api_key".to_string(), "a-key".to_string()),
+                ("pin".to_string(), "a-pin".to_string()),
+            ]),
+            "every present setting becomes a field, and no absent one does"
+        );
+        assert_eq!(
+            setting(&c, "unrelated").await,
+            Some("keep me".into()),
+            "adoption deleted a setting that was not its own"
+        );
+    }
+
+    async fn user(c: &Credentials, id: &str) {
+        sqlx::query("INSERT INTO users (id, username, password_hash) VALUES (?, ?, 'x')")
+            .bind(id)
+            .bind(id)
+            .execute(&c.db)
+            .await
+            .unwrap();
+    }
+
+    async fn pref(c: &Credentials, owner: &str, key: &str, value: &str) {
+        sqlx::query("INSERT INTO user_prefs (user_id, scope, key, value) VALUES (?, '', ?, ?)")
+            .bind(owner)
+            .bind(key)
+            .bind(value)
+            .execute(&c.db)
+            .await
+            .unwrap();
+    }
+
+    const OS: &[(&str, &str)] = &[
+        ("opensubtitles.username", "username"),
+        ("opensubtitles.password", "password"),
+    ];
+
+    /// Each viewer's account becomes their own, and nobody else's.
+    #[tokio::test]
+    async fn a_preference_is_adopted_per_owner() {
+        let (_d, c) = store().await;
+        user(&c, "u1").await;
+        user(&c, "u2").await;
+        pref(&c, "u1", "opensubtitles.username", "one").await;
+        pref(&c, "u1", "opensubtitles.password", "one-secret").await;
+        pref(&c, "u2", "opensubtitles.username", "two").await;
+        pref(&c, "u2", "opensubtitles.password", "two-secret").await;
+        pref(&c, "u1", "bandwidth_kbps", "8000").await;
+
+        assert_eq!(adopt_prefs(&c, "opensubtitles", OS).await.unwrap(), 2);
+        for (owner, name, secret) in [("u1", "one", "one-secret"), ("u2", "two", "two-secret")] {
+            assert_eq!(
+                c.get_provider(owner, "opensubtitles").await.unwrap(),
+                BTreeMap::from([
+                    ("username".to_string(), name.to_string()),
+                    ("password".to_string(), secret.to_string()),
+                ]),
+                "{owner}"
+            );
+        }
+        let left: Vec<String> = sqlx::query_scalar("SELECT key FROM user_prefs")
+            .fetch_all(&c.db)
+            .await
+            .unwrap();
+        assert_eq!(
+            left,
+            vec!["bandwidth_kbps".to_string()],
+            "left in the clear"
+        );
+
+        // A second pass has nothing to do and must not disturb what moved.
+        assert_eq!(adopt_prefs(&c, "opensubtitles", OS).await.unwrap(), 0);
+        assert_eq!(
+            c.get_provider("u1", "opensubtitles").await.unwrap().len(),
+            2
+        );
+    }
+
+    /// The opposite of `plaintext_replaces_what_is_sealed`, and deliberately.
+    /// The route that seals a viewer's account is live while their old
+    /// preference rows are still on disk, so plaintext here can be the OLDER
+    /// value — replacing with it would undo an account just re-typed.
+    #[tokio::test]
+    async fn a_sealed_account_survives_the_plaintext_beside_it() {
+        let (_d, c) = store().await;
+        user(&c, "u1").await;
+        c.set_provider(
+            "u1",
+            "opensubtitles",
+            &BTreeMap::from([("username", "the-new-one"), ("password", "new-secret")]),
+        )
+        .await
+        .unwrap();
+        pref(&c, "u1", "opensubtitles.username", "the-old-one").await;
+        pref(&c, "u1", "opensubtitles.password", "old-secret").await;
+
+        assert_eq!(
+            adopt_prefs(&c, "opensubtitles", OS).await.unwrap(),
+            1,
+            "the plaintext still has to be retired, and the caller checkpointed"
+        );
+        assert_eq!(
+            c.get_provider("u1", "opensubtitles").await.unwrap(),
+            BTreeMap::from([
+                ("username".to_string(), "the-new-one".to_string()),
+                ("password".to_string(), "new-secret".to_string()),
+            ])
+        );
+        let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM user_prefs")
+            .fetch_one(&c.db)
+            .await
+            .unwrap();
+        assert_eq!(left, 0);
+    }
+
+    /// Half an account still moves: what a viewer had is what they get, and
+    /// the route that reads it calls a username without a password
+    /// unconfigured.
+    #[tokio::test]
+    async fn half_a_preference_pair_is_still_adopted() {
+        let (_d, c) = store().await;
+        user(&c, "u1").await;
+        pref(&c, "u1", "opensubtitles.username", "one").await;
+
+        assert_eq!(adopt_prefs(&c, "opensubtitles", OS).await.unwrap(), 1);
+        assert_eq!(
+            c.get_provider("u1", "opensubtitles").await.unwrap(),
+            BTreeMap::from([("username".to_string(), "one".to_string())])
+        );
+    }
+
+    #[tokio::test]
+    async fn no_preference_to_adopt_is_not_an_error() {
+        let (_d, c) = store().await;
+        user(&c, "u1").await;
+        pref(&c, "u1", "bandwidth_kbps", "8000").await;
+        assert_eq!(adopt_prefs(&c, "opensubtitles", OS).await.unwrap(), 0);
+        assert!(
+            c.get_provider("u1", "opensubtitles")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// The error a route has to be able to tell from an upstream one.
+    #[tokio::test]
+    async fn a_row_that_will_not_open_says_whose_fault_it_is() {
+        let (_d, c) = store().await;
+        c.set_provider(HUB, "tmdb", &BTreeMap::from([("api_key", "a-key")]))
+            .await
+            .unwrap();
+        sqlx::query("UPDATE credentials SET secret = randomblob(length(secret))")
+            .execute(&c.db)
+            .await
+            .unwrap();
+
+        let e = c
+            .get_provider(HUB, "tmdb")
+            .await
+            .expect_err("must not open");
+        assert!(
+            e.downcast_ref::<UnreadableCredential>().is_some(),
+            "the failure is untyped, so a caller can only read the message: {e:#}"
+        );
+        assert!(
+            !format!("{e:#}").contains("a-key"),
+            "the error names the value it could not read"
+        );
+    }
+
     /// The plaintext one provider left behind is deleted the moment it moves,
     /// and deleted is not gone until the log is truncated. A LATER provider
     /// failing must not take the checkpoint down with it.
@@ -1087,6 +1366,7 @@ mod adoption_tests {
                 ("tmdb", &[("tmdb_api_key", "api_key")]),
                 ("tvdb", &[("tvdb_api_key", "api_key")]),
             ],
+            &[],
         )
         .await;
         assert!(outcome.is_err(), "the unreadable setting was not fatal");

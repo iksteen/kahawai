@@ -190,23 +190,24 @@ impl Subtitles {
         } else {
             self.provider_cfg.api_key.clone()
         };
-        // The account is this USER's, from their own settings: they
-        // spend their own download entitlement. Without one they fall
-        // back to the deployment-wide anonymous budget.
-        let pref = |key: &'static str| async move {
-            sqlx::query_scalar::<_, String>(
-                "SELECT value FROM user_prefs WHERE user_id = ? AND scope = '' AND key = ?",
-            )
-            .bind(user_id)
-            .bind(key)
-            .fetch_optional(registry.db())
-            .await
-            .ok()
-            .flatten()
-            .filter(|v| !v.is_empty())
+        // The account is this USER's, from the credential store: they spend
+        // their own download entitlement. Without one they fall back to the
+        // deployment-wide anonymous budget, and half an account is no account
+        // — `token()` needs both halves before it will log in.
+        //
+        // A store that will not answer stops the search rather than quietly
+        // downgrading it: an account that silently reverted to the shared
+        // five-a-day budget looks like OpenSubtitles being stingy.
+        let mut account = match registry.credentials() {
+            Some(store) => {
+                store
+                    .get_provider(user_id, crate::opensubtitles::OPENSUBTITLES)
+                    .await?
+            }
+            None => Default::default(),
         };
-        let user = pref(crate::opensubtitles::USER_PREF_USERNAME).await;
-        let pass = pref(crate::opensubtitles::USER_PREF_PASSWORD).await;
+        let user = account.remove(crate::opensubtitles::USERNAME);
+        let pass = account.remove(crate::opensubtitles::PASSWORD);
         Ok(Box::new(crate::opensubtitles::OpenSubtitles::new(
             self.http.clone(),
             key,
@@ -1940,6 +1941,105 @@ mod ocr_memory_tests {
             subs.ocr_candidates(&registry).await.is_empty(),
             "a remembered empty answer is not re-asked"
         );
+    }
+}
+
+#[cfg(test)]
+mod account_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    /// `per_account` is the observable end of the account: `OpenSubtitles::new`
+    /// sets it only when both halves arrived, and it is what tells a viewer
+    /// whose budget a search is spending.
+    async fn spends_own_budget(fields: Option<BTreeMap<&str, &str>>) -> bool {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::open_in_memory().await.unwrap();
+        sqlx::query("INSERT INTO users (id, username, password_hash) VALUES ('u1','one','x')")
+            .execute(&db)
+            .await
+            .unwrap();
+        let credentials = std::sync::Arc::new(
+            crate::secrets::Credentials::open(dir.path(), db.clone())
+                .await
+                .unwrap(),
+        );
+        if let Some(fields) = fields {
+            credentials
+                .set_provider("u1", crate::opensubtitles::OPENSUBTITLES, &fields)
+                .await
+                .unwrap();
+        }
+        let registry = Registry::new(db, Default::default()).with_credentials(credentials);
+        let subtitles = Subtitles::new(tempfile::tempdir().unwrap().keep());
+        subtitles
+            .external_provider(&registry, "u1")
+            .await
+            .unwrap()
+            .quota()
+            .per_account
+    }
+
+    #[tokio::test]
+    async fn an_account_in_the_store_is_the_one_the_search_spends() {
+        assert!(
+            spends_own_budget(Some(BTreeMap::from([
+                (crate::opensubtitles::USERNAME, "someone"),
+                (crate::opensubtitles::PASSWORD, "a-secret"),
+            ])))
+            .await
+        );
+    }
+
+    #[tokio::test]
+    async fn without_one_the_search_falls_back_to_the_shared_budget() {
+        assert!(!spends_own_budget(None).await);
+        // Half an account cannot log in, so it is not an account. Adoption can
+        // leave this shape behind, from a viewer who stored only a username.
+        assert!(
+            !spends_own_budget(Some(BTreeMap::from([(
+                crate::opensubtitles::USERNAME,
+                "someone"
+            )])))
+            .await
+        );
+    }
+
+    /// The store answers errors as errors. A row that will not open used to be
+    /// swallowed into "no account", which reads as OpenSubtitles being stingy
+    /// rather than as something being wrong here.
+    #[tokio::test]
+    async fn an_unreadable_credential_stops_the_search() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::open_in_memory().await.unwrap();
+        sqlx::query("INSERT INTO users (id, username, password_hash) VALUES ('u1','one','x')")
+            .execute(&db)
+            .await
+            .unwrap();
+        let credentials = std::sync::Arc::new(
+            crate::secrets::Credentials::open(dir.path(), db.clone())
+                .await
+                .unwrap(),
+        );
+        credentials
+            .set_provider(
+                "u1",
+                crate::opensubtitles::OPENSUBTITLES,
+                &BTreeMap::from([
+                    (crate::opensubtitles::USERNAME, "someone"),
+                    (crate::opensubtitles::PASSWORD, "a-secret"),
+                ]),
+            )
+            .await
+            .unwrap();
+        sqlx::query("UPDATE credentials SET secret = randomblob(length(secret))")
+            .execute(&db)
+            .await
+            .unwrap();
+
+        let registry = Registry::new(db, Default::default()).with_credentials(credentials);
+        let subtitles = Subtitles::new(tempfile::tempdir().unwrap().keep());
+        assert!(subtitles.external_provider(&registry, "u1").await.is_err());
     }
 }
 

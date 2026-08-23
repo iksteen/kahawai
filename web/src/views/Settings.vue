@@ -3,7 +3,9 @@
 /// why every control is optimistic and every failure puts the value back —
 /// see `useOptimistic`, which is where the hard part is.
 import { computed, ref, watch } from 'vue'
+import { useQuery, useQueryClient } from '@tanstack/vue-query'
 
+import Armed from '../components/Armed.vue'
 import Btn from '../components/Btn.vue'
 import Failed from '../components/Failed.vue'
 import Icon from '../components/Icon.vue'
@@ -18,6 +20,11 @@ import {
   validToken,
   wishlist,
 } from '../domain/prefs.ts'
+import {
+  accountOpensubtitles,
+  deleteAccountOpensubtitles,
+  setAccountOpensubtitles,
+} from '../api/generated/kahawai.ts'
 import { addAbove, moved } from '../domain/reorder.ts'
 import { notify } from '../composables/notices.ts'
 import { putPref, usePrefs } from '../composables/prefs.ts'
@@ -29,6 +36,7 @@ import { useOptimistic } from '../composables/optimistic.ts'
 const MEDIA_TYPES = ['movies', 'series', 'anime'] as const
 
 const { query, values, known } = usePrefs()
+const client = useQueryClient()
 
 /// The screen's own copy, seeded from the server's answer and edited in place.
 /// An optimistic control needs somewhere to hold a value the server has not
@@ -163,50 +171,48 @@ function promote(kind: 'audio' | 'subs', mediaType: string, at: number) {
 /// HUB-21. Subtitle search works without an account, on a download budget the
 /// whole server shares; attaching your own spends your own instead.
 ///
-/// The two writes are settled independently. Reporting one flat failure for a
-/// half-save left the hub holding the new username while the card still showed
-/// the old one — and the badge still reading "shared budget" for an account
-/// that was half attached.
+/// The account lives in the hub's credential store, which does not read secrets
+/// back — so the hub answers whether one is attached and nothing else. Both
+/// fields therefore start empty on every visit, including the username: the
+/// card says an account is there, not which.
 const osUser = ref('')
 const osPass = ref('')
 const osBusy = ref(false)
-watch(
-  () => values.value['opensubtitles.username'],
-  (name) => (osUser.value = name ?? ''),
-  { immediate: true },
-)
-const osAttached = computed(
-  () => !!values.value['opensubtitles.username'] || !!values.value['opensubtitles.password'],
-)
+const osAccount = useQuery({
+  queryKey: ['account', 'opensubtitles'],
+  queryFn: () => accountOpensubtitles(),
+})
+const osAttached = computed(() => osAccount.data.value?.configured ?? false)
+/// A read that failed is not an answer. Defaulting it to false said "no
+/// account" — the same quiet downgrade the hub refuses to make on its side —
+/// while the viewer's subtitle searches were failing for the very reason this
+/// read did: a credential the hub cannot open answers 500, not `false`.
+const osUnknown = computed(() => (osAccount.isError.value ? sentence(osAccount.error.value) : ''))
 
-/// Its own function, not two statements in the template: a multi-statement
-/// inline handler parses nowhere except by accident.
-function disconnect() {
-  osUser.value = ''
-  void saveAccount('', '')
-}
-
-async function saveAccount(user: string, pass: string) {
+async function saveAccount() {
   osBusy.value = true
   try {
-    const [name, secret] = await Promise.allSettled([
-      putPref('', 'opensubtitles.username', user),
-      putPref('', 'opensubtitles.password', pass),
-    ])
+    // As typed. A password is not the form's to tidy.
+    await setAccountOpensubtitles({ username: osUser.value, password: osPass.value })
+    osUser.value = ''
     osPass.value = ''
-    // Whatever landed is what the hub has, so the card must show that.
-    values.value = {
-      ...values.value,
-      'opensubtitles.username':
-        name.status === 'fulfilled' ? user : (values.value['opensubtitles.username'] ?? ''),
-      'opensubtitles.password': secret.status === 'fulfilled' ? pass : '',
-    }
-    const failed = [
-      name.status === 'rejected' ? 'username' : null,
-      secret.status === 'rejected' ? 'password' : null,
-    ].filter(Boolean)
-    if (failed.length === 0) flash()
-    else notify(`Could not save the ${failed.join(' or ')}.`)
+    await client.invalidateQueries({ queryKey: ['account', 'opensubtitles'] })
+    flash()
+  } catch (e) {
+    notify(sentence(e))
+  } finally {
+    osBusy.value = false
+  }
+}
+
+async function disconnect() {
+  osBusy.value = true
+  try {
+    await deleteAccountOpensubtitles()
+    await client.invalidateQueries({ queryKey: ['account', 'opensubtitles'] })
+    flash()
+  } catch (e) {
+    notify(sentence(e))
   } finally {
     osBusy.value = false
   }
@@ -255,6 +261,12 @@ async function saveAccount(user: string, pass: string) {
           this server. Attach your own opensubtitles.com account to spend your own budget instead.
           Subtitles you download are shared with everyone here.
         </p>
+        <!-- In the document from the first render, like the admin panel's:
+             a live region inserted together with its text is commonly
+             announced by nothing. -->
+        <p class="m-0 min-h-0 text-[12.5px] text-warn empty:hidden" role="status">
+          {{ osUnknown ? `${osUnknown} — whether an account is attached is unknown.` : '' }}
+        </p>
         <div class="flex flex-wrap items-center gap-x-2.5 gap-y-2">
           <label class="w-[76px] shrink-0 font-mono text-[12px] text-dim" for="os-user">
             account
@@ -263,7 +275,10 @@ async function saveAccount(user: string, pass: string) {
             id="os-user"
             v-model="osUser"
             class="min-w-[150px] flex-[1_1_170px] rounded border border-line bg-bg px-2 py-1"
-            placeholder="opensubtitles.com username"
+            autocomplete="off"
+            :placeholder="
+              osAttached ? 'account configured — enter to replace' : 'opensubtitles.com username'
+            "
           />
           <label class="sr-only" for="os-pass">opensubtitles.com password</label>
           <input
@@ -271,20 +286,23 @@ async function saveAccount(user: string, pass: string) {
             v-model="osPass"
             class="min-w-[150px] flex-[1_1_170px] rounded border border-line bg-bg px-2 py-1"
             type="password"
-            :placeholder="
-              values['opensubtitles.password'] ? 'password saved — enter to replace' : 'password'
-            "
+            autocomplete="off"
+            placeholder="password"
           />
-          <Btn
-            small
-            :disabled="osBusy || !osUser.trim() || !osPass.trim()"
-            @click="saveAccount(osUser.trim(), osPass)"
-          >
-            Save
-          </Btn>
-          <Btn v-if="osAttached" ghost small :disabled="osBusy" @click="disconnect">
-            Disconnect
-          </Btn>
+          <!-- Lights when the hub would accept it: both fields non-empty, and
+               nothing else judged here. -->
+          <Btn small :disabled="osBusy || !osUser || !osPass" @click="saveAccount">Save</Btn>
+          <!-- Asked twice, like the admin panel's: the hub will not read the
+               account back, so a stray press costs a trip to
+               opensubtitles.com rather than a glance at the screen. -->
+          <Armed
+            v-if="osAttached"
+            label="Disconnect"
+            armed-label="Really disconnect?"
+            :disabled="osBusy"
+            title="Deletes the stored account; searches fall back to the shared budget"
+            @confirm="disconnect"
+          />
         </div>
       </section>
 

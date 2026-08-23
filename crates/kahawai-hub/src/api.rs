@@ -144,6 +144,9 @@ impl Default for NetOptions {
         item_font,
         get_prefs,
         put_pref,
+        account_opensubtitles,
+        set_account_opensubtitles,
+        delete_account_opensubtitles,
         start_session,
         end_session,
         post_progress,
@@ -352,6 +355,12 @@ pub fn router(
             axum::routing::delete(subtitle_delete),
         )
         .route("/api/v1/prefs", get(get_prefs).put(put_pref))
+        .route(
+            "/api/v1/account/opensubtitles",
+            get(account_opensubtitles)
+                .post(set_account_opensubtitles)
+                .delete(delete_account_opensubtitles),
+        )
         .route("/api/v1/playback/sessions", post(start_session))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -997,7 +1006,14 @@ struct UpdatedResponse {
 fn refusal_or_internal(code: ErrorCode, message: &'static str, e: anyhow::Error) -> ApiError {
     let ours = e.downcast_ref::<sqlx::Error>().is_some()
         || e.downcast_ref::<std::io::Error>().is_some()
-        || e.downcast_ref::<serde_json::Error>().is_some();
+        || e.downcast_ref::<serde_json::Error>().is_some()
+        // A credential that will not open is a tampered row or the wrong key,
+        // both of them here. Without this the subtitle search answers "the
+        // provider did not answer", which sends a viewer to blame
+        // OpenSubtitles and an operator's alerting to file our fault as an
+        // upstream outage — the inversion this helper exists to prevent.
+        || e.downcast_ref::<crate::secrets::UnreadableCredential>()
+            .is_some();
     if ours {
         return internal(e);
     }
@@ -3760,6 +3776,118 @@ async fn put_pref(
         .await
         .map_err(internal)?;
     }
+    Ok(Json(OkResponse { ok: true }))
+}
+
+/// Whether an OpenSubtitles account is attached
+///
+/// Both halves or neither: a username with no password cannot log in, and
+/// answering `configured` for it sends the viewer looking for a fault
+/// somewhere else. The account itself is never returned — the store does not
+/// read secrets back out to clients.
+#[utoipa::path(
+    get, path = "/api/v1/account/opensubtitles", tag = "Preferences",
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, body = ProviderConfiguration),
+        (status = 401, body = ApiErrorBody),
+        (status = 500, body = ApiErrorBody),
+        (status = 503, description = "The hub has no administrator yet: `setup_required`", body = ApiErrorBody)
+    )
+)]
+async fn account_opensubtitles(
+    State(state): State<AppState>,
+    axum::Extension(claims): axum::Extension<crate::auth::Claims>,
+) -> Result<Json<ProviderConfiguration>, ApiError> {
+    let fields = store(&state.registry)?
+        .get_provider(&claims.sub, crate::opensubtitles::OPENSUBTITLES)
+        .await
+        .map_err(internal)?;
+    Ok(Json(ProviderConfiguration {
+        configured: fields.contains_key(crate::opensubtitles::USERNAME)
+            && fields.contains_key(crate::opensubtitles::PASSWORD),
+    }))
+}
+
+#[derive(Deserialize, ToSchema)]
+struct SetOpenSubtitlesAccount {
+    username: String,
+    password: String,
+}
+
+/// Attach an OpenSubtitles account
+///
+/// The account is the authenticated user's own, and its download entitlement
+/// is what their searches spend. Both fields are stored together, replacing
+/// whatever was there; either one empty is rejected with 400. Detaching is
+/// DELETE, not a blank save.
+#[utoipa::path(
+    post, path = "/api/v1/account/opensubtitles", tag = "Preferences",
+    security(("bearer_auth" = [])),
+    request_body = SetOpenSubtitlesAccount,
+    responses(
+        (status = 200, body = OkResponse),
+        (status = 400, body = ApiErrorBody),
+        (status = 401, body = ApiErrorBody),
+        (status = 500, body = ApiErrorBody),
+        (status = 415, description = "The body needs Content-Type: application/json", body = ApiErrorBody),
+        (status = 413, description = "The body is past the hub's buffer limit", body = ApiErrorBody),
+        (status = 503, description = "The hub has no administrator yet: `setup_required`", body = ApiErrorBody)
+    )
+)]
+async fn set_account_opensubtitles(
+    State(state): State<AppState>,
+    axum::Extension(claims): axum::Extension<crate::auth::Claims>,
+    ApiJson(body): ApiJson<SetOpenSubtitlesAccount>,
+) -> Result<Json<OkResponse>, ApiError> {
+    // Both halves required: a blank either side is an account that reports
+    // itself attached and can never log in. Stored as sent -- what is inside
+    // a password is the account holder's business, not this route's.
+    let (user, pass) = (body.username.as_str(), body.password.as_str());
+    if user.is_empty() || pass.is_empty() {
+        return Err(ApiError::new(
+            ErrorCode::BadRequest,
+            "username and password required",
+        ));
+    }
+    store(&state.registry)?
+        .set_provider(
+            &claims.sub,
+            crate::opensubtitles::OPENSUBTITLES,
+            &std::collections::BTreeMap::from([
+                (crate::opensubtitles::USERNAME, user),
+                (crate::opensubtitles::PASSWORD, pass),
+            ]),
+        )
+        .await
+        .map_err(internal)?;
+    Ok(Json(OkResponse { ok: true }))
+}
+
+/// Detach the OpenSubtitles account
+///
+/// Searches then fall back to the deployment's shared anonymous budget.
+#[utoipa::path(
+    delete, path = "/api/v1/account/opensubtitles", tag = "Preferences",
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, body = OkResponse),
+        (status = 401, body = ApiErrorBody),
+        (status = 500, body = ApiErrorBody),
+        (status = 503, description = "The hub has no administrator yet: `setup_required`", body = ApiErrorBody)
+    )
+)]
+async fn delete_account_opensubtitles(
+    State(state): State<AppState>,
+    axum::Extension(claims): axum::Extension<crate::auth::Claims>,
+) -> Result<Json<OkResponse>, ApiError> {
+    crate::secrets::delete_provider(
+        state.registry.db(),
+        &claims.sub,
+        crate::opensubtitles::OPENSUBTITLES,
+    )
+    .await
+    .map_err(internal)?;
     Ok(Json(OkResponse { ok: true }))
 }
 
@@ -6816,7 +6944,39 @@ async fn session_file(
 
 #[cfg(test)]
 mod tests {
-    use super::{PublicOrigin, group_chapters, openapi_document, parse_range};
+    use super::{
+        ErrorCode, PublicOrigin, group_chapters, openapi_document, parse_range, refusal_or_internal,
+    };
+
+    /// The subtitle routes hand every provider failure to this classifier, so
+    /// it is the one place that decides whether a viewer is told OpenSubtitles
+    /// is down. A credential this hub cannot decrypt is not.
+    #[test]
+    fn a_credential_that_will_not_open_is_ours_not_the_providers() {
+        let ours = anyhow::Error::new(crate::secrets::UnreadableCredential)
+            .context("stored opensubtitles password");
+        assert_eq!(
+            refusal_or_internal(
+                ErrorCode::ProviderError,
+                "the provider did not answer",
+                ours
+            )
+            .code(),
+            ErrorCode::Internal
+        );
+        // The control: a plain refusal from the provider still reads as one,
+        // so the assertion above is about the type and not about the helper
+        // having stopped classifying anything.
+        assert_eq!(
+            refusal_or_internal(
+                ErrorCode::ProviderError,
+                "the provider did not answer",
+                anyhow::anyhow!("opensubtitles returned 503"),
+            )
+            .code(),
+            ErrorCode::ProviderError
+        );
+    }
 
     /// A CD1 whose author stamped a chapter at (or past) the disc's own end
     /// must not claim a boundary in CD2's stretch of the timeline — and a
@@ -7001,6 +7161,9 @@ mod tests {
             ("get", "/api/v1/items/{id}/fonts/{n}"),
             ("get", "/api/v1/prefs"),
             ("put", "/api/v1/prefs"),
+            ("get", "/api/v1/account/opensubtitles"),
+            ("post", "/api/v1/account/opensubtitles"),
+            ("delete", "/api/v1/account/opensubtitles"),
             ("post", "/api/v1/playback/sessions"),
             ("delete", "/api/v1/playback/sessions/{id}"),
             ("post", "/api/v1/playback/sessions/{id}/progress"),
