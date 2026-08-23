@@ -17,11 +17,12 @@
 //! requests per IP/key, not per struct.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, watch};
 use tokio::time::Instant;
 
 /// MusicBrainz rejects anonymous/library user agents outright and
@@ -37,6 +38,46 @@ const UA: &str = concat!(
 const DEFAULT_PENALTY: Duration = Duration::from_secs(60);
 /// Never park a provider longer than this, whatever it asks for.
 const MAX_PENALTY: Duration = Duration::from_secs(3600);
+
+#[derive(Clone)]
+pub(crate) struct CredentialLease {
+    provider: &'static str,
+    expected: u64,
+    current: watch::Receiver<u64>,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{0} credentials changed")]
+pub(crate) struct CredentialsChanged(&'static str);
+
+impl CredentialLease {
+    pub(crate) fn new(provider: &'static str, mut current: watch::Receiver<u64>) -> Self {
+        let expected = *current.borrow_and_update();
+        Self {
+            provider,
+            expected,
+            current,
+        }
+    }
+
+    pub(crate) fn check(&self) -> Result<(), CredentialsChanged> {
+        (*self.current.borrow() == self.expected)
+            .then_some(())
+            .ok_or(CredentialsChanged(self.provider))
+    }
+
+    pub(crate) async fn wait<F: Future>(&self, future: F) -> Result<F::Output, CredentialsChanged> {
+        self.check()?;
+        let mut current = self.current.clone();
+        tokio::select! {
+            output = future => {
+                self.check()?;
+                Ok(output)
+            }
+            _ = current.changed() => Err(CredentialsChanged(self.provider)),
+        }
+    }
+}
 
 /// Minimum gap between two requests to one provider host, from each
 /// provider's own documentation. Sources are named because these
@@ -113,6 +154,25 @@ impl Http {
     /// next run — and silence for that provider until it says it will
     /// listen again.
     pub async fn send(&self, req: reqwest::RequestBuilder) -> Result<reqwest::Response> {
+        self.send_inner(req, None).await
+    }
+
+    /// The same queue, but abandon a credentialed request if its lease changes
+    /// while it waits. A replacement must not wait behind a provider's
+    /// `Retry-After`, and the parked request must not send afterwards.
+    pub(crate) async fn send_current(
+        &self,
+        req: reqwest::RequestBuilder,
+        lease: CredentialLease,
+    ) -> Result<reqwest::Response> {
+        self.send_inner(req, Some(lease)).await
+    }
+
+    async fn send_inner(
+        &self,
+        req: reqwest::RequestBuilder,
+        lease: Option<CredentialLease>,
+    ) -> Result<reqwest::Response> {
         let (client, req) = req.build_split();
         let req = req.context("building provider request")?;
         let host = req
@@ -131,15 +191,33 @@ impl Http {
         // what a rate limit actually counts.
         // ponytail: this serializes bulk artwork off a CDN too; give
         // the zero-spacing hosts a bypass if that ever measures slow.
-        let mut next = queue.lock().await;
-        tokio::time::sleep_until(*next).await;
+        let mut next = match &lease {
+            Some(lease) => lease.wait(queue.lock()).await?,
+            None => queue.lock().await,
+        };
+        match &lease {
+            Some(lease) => {
+                lease.wait(tokio::time::sleep_until(*next)).await?;
+                // Covers revocation after the sleep won but before execution.
+                lease.check()?;
+            }
+            None => tokio::time::sleep_until(*next).await,
+        }
         let resp = client.execute(req).await;
         *next = Instant::now() + spacing(&host);
         // A timeout or refused connection carries the URL it was reaching for,
         // and `providers::reschedule` writes that message into the database.
-        let resp = resp
-            .map_err(reqwest::Error::without_url)
-            .with_context(|| format!("{host} request failed"))?;
+        // If the request's credentials changed during execution, cancellation
+        // wins over a transport failure from the now-stale call.
+        let resp = match resp {
+            Ok(resp) => resp,
+            Err(error) => {
+                if let Some(lease) = &lease {
+                    lease.check()?;
+                }
+                return Err(error.without_url()).with_context(|| format!("{host} request failed"));
+            }
+        };
         if matches!(resp.status().as_u16(), 429 | 503) {
             // MusicBrainz answers 503 with `Retry-After: 0` — "just slow
             // down" — which read literally parks for nothing and the next
@@ -223,6 +301,113 @@ mod tests {
         let e = http.send(http.get(&url)).await.unwrap_err();
         let shown = format!("{e:#}");
         assert!(!shown.contains("SECRET-OPERATOR-KEY"), "{shown}");
+    }
+
+    #[tokio::test]
+    async fn lease_created_after_revision_does_not_self_cancel() {
+        let (revision, current) = watch::channel(0);
+        revision.send_replace(1);
+
+        CredentialLease::new("tmdb", current)
+            .wait(async {})
+            .await
+            .expect("the lease left its current revision unseen");
+    }
+
+    #[tokio::test]
+    async fn disconnect_wakes_a_parked_request_before_it_sends() {
+        let http = Http::new().unwrap();
+        let url = server(
+            "127.0.0.4",
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi",
+        )
+        .await;
+        let host = reqwest::Url::parse(&url)
+            .unwrap()
+            .host_str()
+            .unwrap()
+            .to_string();
+        let queue = {
+            let mut queues = queues().lock().await;
+            queues
+                .entry(host)
+                .or_insert_with(|| Arc::new(Mutex::new(Instant::now())))
+                .clone()
+        };
+        *queue.lock().await = Instant::now() + Duration::from_secs(60);
+
+        let (generation, current) = watch::channel(0);
+        let lease = CredentialLease::new("tmdb", current);
+        let request = tokio::spawn(async move { http.send_current(http.get(&url), lease).await });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        generation.send_replace(1);
+
+        let error = tokio::time::timeout(Duration::from_secs(1), request)
+            .await
+            .expect("disconnect left the request parked")
+            .unwrap()
+            .expect_err("the request sent after its credential was disconnected");
+        assert!(error.is::<CredentialsChanged>(), "{error:#}");
+    }
+
+    #[tokio::test]
+    async fn credential_change_wakes_a_request_waiting_for_the_host_mutex() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.5", 0))
+            .await
+            .unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let connections = Arc::new(AtomicUsize::new(0));
+        let counted = connections.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await.unwrap();
+            counted.fetch_add(1, Ordering::SeqCst);
+            started_tx.send(()).unwrap();
+            tokio::spawn(async move {
+                release_rx.await.unwrap();
+                first
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi")
+                    .await
+                    .unwrap();
+            });
+            while let Ok((mut stream, _)) = listener.accept().await {
+                counted.fetch_add(1, Ordering::SeqCst);
+                let _ = stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi")
+                    .await;
+            }
+        });
+
+        let http = Arc::new(Http::new().unwrap());
+        let first_http = http.clone();
+        let first_url = url.clone();
+        let first = tokio::spawn(async move { first_http.send(first_http.get(&first_url)).await });
+        started_rx.await.unwrap();
+
+        let (generation, current) = watch::channel(0);
+        let lease = CredentialLease::new("tmdb", current);
+        let second = tokio::spawn(async move { http.send_current(http.get(&url), lease).await });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        generation.send_replace(1);
+
+        let error = tokio::time::timeout(Duration::from_secs(1), second)
+            .await
+            .expect("revision left the request waiting for the host mutex")
+            .unwrap()
+            .expect_err("the stale request sent after the credential changed");
+        assert!(error.is::<CredentialsChanged>(), "{error:#}");
+        assert!(!first.is_finished(), "request A released the host mutex");
+        assert_eq!(
+            connections.load(Ordering::SeqCst),
+            1,
+            "request B transmitted before request A finished"
+        );
+
+        release_tx.send(()).unwrap();
+        first.await.unwrap().unwrap();
     }
 
     #[tokio::test]

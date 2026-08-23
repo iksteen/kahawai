@@ -60,7 +60,7 @@ pub const SECRET_FILES: [&str; 3] = [
     crate::api::METRICS_TOKEN_FILE,
 ];
 
-const FORMAT: u32 = 1;
+const FORMAT: u32 = 2;
 const MANIFEST: &str = "kahawai-backup.json";
 
 /// Everything a restore puts back, relative to the data dir. Ordered so

@@ -3,6 +3,7 @@
 //! During setup mode (OPS-1) the public router is locked; initial-admin
 //! creation exists only on the separately bound trusted-local router.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use axum::extract::{Request, State};
@@ -1658,6 +1659,13 @@ async fn subtitle_delete(
     Ok(Json(RemovedResponse { removed }))
 }
 
+fn same_fields(current: &BTreeMap<String, String>, proposed: &BTreeMap<&str, &str>) -> bool {
+    current.len() == proposed.len()
+        && proposed
+            .iter()
+            .all(|(field, value)| current.get(*field).is_some_and(|held| held == value))
+}
+
 /// Verify stored AniDB credentials
 ///
 /// Admin only. Re-validates the AniDB credentials already stored on the hub
@@ -1683,9 +1691,9 @@ async fn subtitle_delete(
 async fn admin_verify_anidb(
     State(state): State<AppState>,
 ) -> Result<Json<VerificationResponse>, ApiError> {
-    let mut account = state
-        .registry
-        .hub_credential(crate::anidb::ANIDB)
+    let (mut account, lease) = state
+        .enricher
+        .credential_snapshot(&state.registry, crate::anidb::ANIDB)
         .await
         .map_err(internal)?;
     let user = account.remove(crate::anidb::USERNAME);
@@ -1699,7 +1707,14 @@ async fn admin_verify_anidb(
             "no AniDB account configured",
         ));
     };
-    match crate::anidb::Anidb::login(state.enricher.data_dir(), &user, &pass, key.as_deref()).await
+    match crate::anidb::Anidb::login_current(
+        state.enricher.data_dir(),
+        &user,
+        &pass,
+        key.as_deref(),
+        lease,
+    )
+    .await
     {
         Ok(client) => {
             client.finish().await;
@@ -1764,17 +1779,20 @@ async fn admin_set_anidb(
             "username and password required",
         ));
     }
+    let change = state.enricher.changing_credentials().await;
     // Read before the write below replaces it: whether this is the same
     // account decides whether the stored session is still ours to use.
-    let same_account = {
-        let mut held = state
-            .registry
-            .hub_credential(crate::anidb::ANIDB)
-            .await
-            .map_err(internal)?;
-        held.remove(crate::anidb::USERNAME).as_deref() == Some(user)
-            && held.remove(crate::anidb::PASSWORD).as_deref() == Some(pass)
+    // An unreadable old value is unknown, so overwrite it and invalidate
+    // anything that might still hold its plaintext.
+    let held = match state.registry.hub_credential(crate::anidb::ANIDB).await {
+        Ok(fields) => Some(fields),
+        Err(error) if error.is::<crate::secrets::UnreadableCredential>() => None,
+        Err(error) => return Err(internal(error)),
     };
+    let same_account = held.as_ref().is_some_and(|held| {
+        held.get(crate::anidb::USERNAME).map(String::as_str) == Some(user)
+            && held.get(crate::anidb::PASSWORD).map(String::as_str) == Some(pass)
+    });
     // No key = a plaintext session, which works; an absent row says that
     // without an empty one having to mean it.
     let key = body.udp_api_key.as_deref().filter(|k| !k.is_empty());
@@ -1785,35 +1803,32 @@ async fn admin_set_anidb(
     if let Some(key) = key {
         fields.insert(crate::anidb::UDP_API_KEY, key);
     }
+    let changed = held
+        .as_ref()
+        .is_none_or(|current| !same_fields(current, &fields));
     store(&state.registry)?
         .set_provider(crate::secrets::HUB, crate::anidb::ANIDB, &fields)
         .await
         .map_err(internal)?;
-    // Only when the account changed, and before the login below: a stored
-    // session belongs to the account that authenticated it, so reusing one
-    // across a change would report these credentials verified without ever
-    // having used them. Re-saving the same account keeps its session --
-    // AniDB counts logins, and one per press of Save is a habit worth not
-    // starting. The UDP key needs no such care: ENCRYPT is renegotiated on
-    // every login, and a wrong key fails loudly.
-    if !same_account {
-        let forgotten = crate::anidb::forget_session(state.enricher.data_dir());
-        // The file is only half of it: the enricher holds a logged-in client
-        // for the process, and that one is still the previous account. Mark it
-        // stale even if the durable clear failed.
-        state.enricher.anidb_forget();
-        forgotten.map_err(internal)?;
+    // Invalidate copied credentials only when the whole plaintext provider
+    // set changed. A UDP-key-only change keeps the durable session, but the
+    // held client still carries the old cipher and must go stale.
+    if changed {
+        state.enricher.revoke_provider(crate::anidb::ANIDB);
     }
-    match crate::anidb::Anidb::login(state.enricher.data_dir(), user, pass, key).await {
+    // A durable session is bound to username/password. Clear it when that
+    // account changed; revocation above remains in force if this write fails.
+    if !same_account {
+        crate::anidb::forget_session(state.enricher.data_dir()).map_err(internal)?;
+    }
+    let lease = state.enricher.provider_lease(crate::anidb::ANIDB);
+    drop(change);
+    match crate::anidb::Anidb::login_current(state.enricher.data_dir(), user, pass, key, lease)
+        .await
+    {
         Ok(client) => {
             client.finish().await;
-            let enricher = state.enricher.clone();
-            let registry = state.registry.clone();
-            tokio::spawn(async move {
-                if let Err(e) = enricher.run_once(&registry).await {
-                    tracing::warn!(error = format!("{e:#}"), "enrichment run failed");
-                }
-            });
+            state.enricher.request_run(state.registry.clone());
             Ok(Json(SavedVerificationResponse {
                 saved: true,
                 verified: true,
@@ -1881,17 +1896,21 @@ async fn admin_set_tvdb(
     if let Some(pin) = body.pin.as_deref().filter(|p| !p.is_empty()) {
         fields.insert(crate::enrich::TVDB_PIN, pin);
     }
+    let change = state.enricher.changing_credentials().await;
+    let changed = match state.registry.hub_credential(crate::enrich::TVDB).await {
+        Ok(current) => !same_fields(&current, &fields),
+        Err(error) if error.is::<crate::secrets::UnreadableCredential>() => true,
+        Err(error) => return Err(internal(error)),
+    };
     store(&state.registry)?
         .set_provider(crate::secrets::HUB, crate::enrich::TVDB, &fields)
         .await
         .map_err(internal)?;
-    let enricher = state.enricher.clone();
-    let registry = state.registry.clone();
-    tokio::spawn(async move {
-        if let Err(e) = enricher.run_once(&registry).await {
-            tracing::warn!(error = format!("{e:#}"), "enrichment run failed");
-        }
-    });
+    if changed {
+        state.enricher.revoke_provider(crate::enrich::TVDB);
+    }
+    drop(change);
+    state.enricher.request_run(state.registry.clone());
     Ok(Json(SavedResponse { saved: true }))
 }
 
@@ -1934,22 +1953,23 @@ async fn admin_set_tmdb(
             "api_key required",
         ));
     }
+    let fields = BTreeMap::from([(crate::enrich::TMDB_API_KEY, key)]);
+    let change = state.enricher.changing_credentials().await;
+    let changed = match state.registry.hub_credential(crate::enrich::TMDB).await {
+        Ok(current) => !same_fields(&current, &fields),
+        Err(error) if error.is::<crate::secrets::UnreadableCredential>() => true,
+        Err(error) => return Err(internal(error)),
+    };
     store(&state.registry)?
-        .set_provider(
-            crate::secrets::HUB,
-            crate::enrich::TMDB,
-            &std::collections::BTreeMap::from([(crate::enrich::TMDB_API_KEY, key)]),
-        )
+        .set_provider(crate::secrets::HUB, crate::enrich::TMDB, &fields)
         .await
         .map_err(internal)?;
-    // Kick a run right away — saving the key is the natural trigger.
-    let enricher = state.enricher.clone();
-    let registry = state.registry.clone();
-    tokio::spawn(async move {
-        if let Err(e) = enricher.run_once(&registry).await {
-            tracing::warn!(error = format!("{e:#}"), "enrichment run failed");
-        }
-    });
+    if changed {
+        state.enricher.revoke_provider(crate::enrich::TMDB);
+    }
+    drop(change);
+    // Saving still requests a pass when the plaintext is identical.
+    state.enricher.request_run(state.registry.clone());
     Ok(Json(SavedResponse { saved: true }))
 }
 
@@ -1981,6 +2001,7 @@ async fn admin_disconnect_provider(
     ) {
         return Err(ApiError::new(ErrorCode::BadRequest, "unknown provider"));
     }
+    let _change = state.enricher.changing_credentials().await;
     crate::secrets::delete_provider(state.registry.db(), crate::secrets::HUB, &provider)
         .await
         .map_err(internal)?;
@@ -2034,13 +2055,7 @@ async fn admin_enrich_status(State(state): State<AppState>) -> Json<crate::enric
 async fn admin_enrich_run(
     State(state): State<AppState>,
 ) -> Result<Json<StartedResponse>, ApiError> {
-    let enricher = state.enricher.clone();
-    let registry = state.registry.clone();
-    tokio::spawn(async move {
-        if let Err(e) = enricher.run_once(&registry).await {
-            tracing::warn!(error = format!("{e:#}"), "enrichment run failed");
-        }
-    });
+    state.enricher.request_run(state.registry.clone());
     Ok(Json(StartedResponse { started: true }))
 }
 
@@ -6945,8 +6960,35 @@ async fn session_file(
 #[cfg(test)]
 mod tests {
     use super::{
-        ErrorCode, PublicOrigin, group_chapters, openapi_document, parse_range, refusal_or_internal,
+        ErrorCode, PublicOrigin, group_chapters, openapi_document, parse_range,
+        refusal_or_internal, same_fields,
     };
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn credential_fields_change_only_when_the_plaintext_set_differs() {
+        let current = BTreeMap::from([
+            ("api_key".to_string(), "key".to_string()),
+            ("pin".to_string(), "1234".to_string()),
+        ]);
+
+        assert!(same_fields(
+            &current,
+            &BTreeMap::from([("api_key", "key"), ("pin", "1234")])
+        ));
+        assert!(!same_fields(
+            &current,
+            &BTreeMap::from([("api_key", "rotated"), ("pin", "1234")])
+        ));
+        assert!(!same_fields(
+            &current,
+            &BTreeMap::from([("api_key", "key"), ("pin", "1234"), ("extra", "field"),])
+        ));
+        assert!(!same_fields(
+            &current,
+            &BTreeMap::from([("api_key", "key")])
+        ));
+    }
 
     /// The subtitle routes hand every provider failure to this classifier, so
     /// it is the one place that decides whether a viewer is told OpenSubtitles

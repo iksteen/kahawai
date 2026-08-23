@@ -181,6 +181,9 @@ How something works and why it was built that way belong in
       rather than a TTL response cache (implementation §4.3). Stored
       limits were corrected against the specs 2026-07-26 — three of four
       were wrong in our favour.
+      TMDB, TheTVDB and AniDB plaintext snapshots carry revocable runtime
+      leases: replacement wakes queued/paced work before its next send,
+      creates no retry debt, and coalesces one fresh follow-up pass.
 - [x] HUB-8 Ambiguous matches flagged for manual review (card-based review UI,
       per-item re-match/search dialog)
 - [x] HUB-9 Local metadata as authoritative provider — unranked and

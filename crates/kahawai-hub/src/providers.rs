@@ -1169,6 +1169,13 @@ impl ProviderSet {
                     settled(db, &item.id, name).await;
                 }
                 Ok(Outcome::NotApplicable) => settled(db, &item.id, name).await,
+                Err(e) if e.is::<crate::gate::CredentialsChanged>() => {
+                    tracing::debug!(
+                        provider = %name,
+                        title = %item.title,
+                        "provider credentials changed; leaving retry state unchanged"
+                    );
+                }
                 Err(e) => {
                     let reason = format!("{e:#}");
                     tracing::warn!(provider = %name, title = %item.title, error = %reason,
@@ -1345,4 +1352,154 @@ SELECT i.id AS item_id,
      FROM answer_priority ap WHERE ap.item_id = i.id) AS updated_at
 FROM items i"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    enum Reply {
+        Changed(crate::gate::CredentialLease),
+        Failed,
+        Settled,
+    }
+
+    struct FakeProvider {
+        name: &'static str,
+        reply: Reply,
+        runs: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for FakeProvider {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+
+        async fn enrich(&self, _db: &SqlitePool, _item: &ItemRef) -> Result<Outcome> {
+            self.runs.fetch_add(1, Ordering::SeqCst);
+            match &self.reply {
+                Reply::Changed(lease) => {
+                    lease.check()?;
+                    unreachable!("the test lease is stale")
+                }
+                Reply::Failed => anyhow::bail!("ordinary outage"),
+                Reply::Settled => Ok(Outcome::Settled),
+            }
+        }
+    }
+
+    async fn fixture_item(db: &SqlitePool) -> ItemRef {
+        sqlx::query(
+            "INSERT INTO satellites(module_id,module_type,name,cert_fingerprint)
+             VALUES('fixture','mediahost','fixture','fp')",
+        )
+        .execute(db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO collections(module_id,collection_id,media_type)
+             VALUES('fixture','default','movies')",
+        )
+        .execute(db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO items(id,kind,title,norm_title,module_id,collection_id)
+             VALUES('item','movie','Item','item','fixture','default')",
+        )
+        .execute(db)
+        .await
+        .unwrap();
+        ItemRef {
+            id: "item".into(),
+            kind: "movie".into(),
+            title: "Item".into(),
+            norm_title: "item".into(),
+            year: None,
+            artist: None,
+            norm_artist: None,
+            alt: None,
+            existing: None,
+            manual: false,
+            known_aid: None,
+            identified: false,
+            owner: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn credential_change_preserves_retry_debt_and_continues_the_chain() {
+        let db = crate::db::open_in_memory().await.unwrap();
+        let item = fixture_item(&db).await;
+        sqlx::query(
+            "INSERT INTO enrichment_queue(item_id,provider,due_at,attempts,reason)
+             VALUES('item','tmdb',123,4,'existing debt')",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        let seeded: (i64, i64, String) = sqlx::query_as(
+            "SELECT due_at,attempts,reason FROM enrichment_queue
+             WHERE item_id='item' AND provider='tmdb'",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+
+        let (revision, current) = tokio::sync::watch::channel(0);
+        let stale = crate::gate::CredentialLease::new("tmdb", current);
+        revision.send_replace(1);
+        let later_runs = Arc::new(AtomicUsize::new(0));
+        let mut changed = ProviderSet::default();
+        changed.add(Box::new(FakeProvider {
+            name: "tmdb",
+            reply: Reply::Changed(stale),
+            runs: Arc::new(AtomicUsize::new(0)),
+        }));
+        changed.add(Box::new(FakeProvider {
+            name: "tvdb",
+            reply: Reply::Settled,
+            runs: later_runs.clone(),
+        }));
+
+        changed.run_chain("movies", &db, &item).await;
+
+        let unchanged: (i64, i64, String) = sqlx::query_as(
+            "SELECT due_at,attempts,reason FROM enrichment_queue
+             WHERE item_id='item' AND provider='tmdb'",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(
+            unchanged, seeded,
+            "credential cancellation changed retry debt"
+        );
+        assert_eq!(
+            later_runs.load(Ordering::SeqCst),
+            1,
+            "credential cancellation stopped the provider chain"
+        );
+
+        let mut failed = ProviderSet::default();
+        failed.add(Box::new(FakeProvider {
+            name: "tmdb",
+            reply: Reply::Failed,
+            runs: Arc::new(AtomicUsize::new(0)),
+        }));
+        failed.run_chain("movies", &db, &item).await;
+
+        let (attempts, reason): (i64, String) = sqlx::query_as(
+            "SELECT attempts,reason FROM enrichment_queue
+             WHERE item_id='item' AND provider='tmdb'",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(attempts, seeded.1 + 1);
+        assert_eq!(reason, "ordinary outage");
+    }
 }

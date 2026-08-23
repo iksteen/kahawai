@@ -182,6 +182,9 @@ pub struct Anidb {
     last_send: Option<tokio::time::Instant>,
     bucket: Bucket,
     tag_seq: u32,
+    /// The credential lease this client authenticated under. Production
+    /// clients carry one; the standalone probe does not.
+    revocation: Option<crate::gate::CredentialLease>,
 }
 
 /// The long-term half of the flood rule: packets refilling at one per
@@ -251,6 +254,26 @@ impl Anidb {
         pass: &str,
         api_key: Option<&str>,
     ) -> Result<Self> {
+        Self::login_with(data_dir, user, pass, api_key, None).await
+    }
+
+    pub(crate) async fn login_current(
+        data_dir: &std::path::Path,
+        user: &str,
+        pass: &str,
+        api_key: Option<&str>,
+        lease: crate::gate::CredentialLease,
+    ) -> Result<Self> {
+        Self::login_with(data_dir, user, pass, api_key, Some(lease)).await
+    }
+
+    async fn login_with(
+        data_dir: &std::path::Path,
+        user: &str,
+        pass: &str,
+        api_key: Option<&str>,
+        revocation: Option<crate::gate::CredentialLease>,
+    ) -> Result<Self> {
         // Refuse to speak at all while a ban is on record: contact is
         // what keeps a ban alive.
         if let Some(left) = ban_remaining(data_dir)? {
@@ -294,6 +317,7 @@ impl Anidb {
             last_send: None,
             bucket: Bucket::new(),
             tag_seq: 0,
+            revocation,
         };
 
         if let Some(key) = api_key.filter(|k| !k.is_empty()) {
@@ -341,6 +365,7 @@ impl Anidb {
                     client.session.clear();
                 }
                 Err(e) => {
+                    client.ensure_current()?;
                     tracing::debug!(
                         error = format!("{e:#}"),
                         "session probe failed; authenticating"
@@ -458,9 +483,16 @@ impl Anidb {
     /// next run to AUTH again — the very pattern that got us banned.
     pub async fn finish(self) {}
 
+    fn ensure_current(&self) -> Result<()> {
+        if let Some(lease) = &self.revocation {
+            lease.check()?;
+        }
+        Ok(())
+    }
+
     /// Wait until both halves of the flood rule allow another packet.
     /// `retry` widens the short-term gap for a timeout re-send.
-    async fn pace(&mut self, retry: u32) {
+    async fn pace(&mut self, retry: u32) -> Result<()> {
         let owed = pace_delay(
             &mut self.bucket,
             self.last_send,
@@ -468,9 +500,16 @@ impl Anidb {
             tokio::time::Instant::now(),
         );
         if !owed.is_zero() {
-            tokio::time::sleep(owed).await;
+            match &self.revocation {
+                Some(lease) => {
+                    lease.wait(tokio::time::sleep(owed)).await?;
+                }
+                None => tokio::time::sleep(owed).await,
+            }
         }
+        self.ensure_current()?;
         self.last_send = Some(tokio::time::Instant::now());
+        Ok(())
     }
 
     /// One request/response with spacing, tagging, optional encryption,
@@ -485,9 +524,12 @@ impl Anidb {
         };
 
         for attempt in 0..2 {
-            self.pace(attempt).await;
-            self.socket.send(&payload).await?;
-
+            self.pace(attempt).await?;
+            self.ensure_current()?;
+            if let Err(error) = self.socket.send(&payload).await {
+                self.ensure_current()?;
+                return Err(error.into());
+            }
             let mut buf = vec![0u8; 4096];
             match tokio::time::timeout(REPLY_TIMEOUT, self.socket.recv(&mut buf)).await {
                 Ok(Ok(n)) => {
@@ -506,14 +548,26 @@ impl Anidb {
                     let rest = match text.strip_prefix(&format!("{tag} ")) {
                         Some(r) => r,
                         None if text.chars().take(3).all(|c| c.is_ascii_digit()) => &text,
-                        None if attempt == 0 => continue,
-                        None => bail!("anidb reply tag mismatch: {text}"),
+                        None if attempt == 0 => {
+                            self.ensure_current()?;
+                            continue;
+                        }
+                        None => {
+                            self.ensure_current()?;
+                            bail!("anidb reply tag mismatch: {text}")
+                        }
                     };
                     let (code_s, msg) = rest.split_once(' ').unwrap_or((rest, ""));
                     let code: u16 = code_s
                         .trim()
                         .parse()
                         .with_context(|| format!("unparseable reply: {text}"))?;
+                    // A ban is deployment-wide and remains authoritative after
+                    // replacement. Every other reply belongs to the lease that
+                    // sent it and must not reach session-state handling stale.
+                    if code != 555 {
+                        self.ensure_current()?;
+                    }
                     if code == 598 && self.cipher.is_some() {
                         bail!(
                             "AniDB could not decrypt our packets — the UDP API key \
@@ -522,8 +576,14 @@ impl Anidb {
                     }
                     return Ok((code, msg.to_string()));
                 }
-                _ if attempt == 0 => continue, // one retry, doubled spacing
-                _ => bail!("anidb did not reply"),
+                _ if attempt == 0 => {
+                    self.ensure_current()?;
+                    continue;
+                }
+                _ => {
+                    self.ensure_current()?;
+                    bail!("anidb did not reply")
+                }
             }
         }
         unreachable!()
@@ -677,6 +737,59 @@ mod tests {
             Err(e) => e,
         };
         assert!(err.to_string().contains("staying silent"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn disconnect_wakes_anidb_pacing_before_the_next_packet() {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        socket.connect("127.0.0.1:9").await.unwrap();
+        let (generation, current) = tokio::sync::watch::channel(0);
+        let mut client = Anidb {
+            socket,
+            data_dir: tempfile::tempdir().unwrap().keep(),
+            session: String::new(),
+            cipher: None,
+            last_send: Some(tokio::time::Instant::now()),
+            bucket: Bucket::new(),
+            tag_seq: 0,
+            revocation: Some(crate::gate::CredentialLease::new("anidb", current)),
+        };
+
+        let revoke = async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            generation.send_replace(1);
+        };
+        let (_, paced) = tokio::join!(revoke, client.pace(0));
+        let error = paced.expect_err("pacing completed after disconnect");
+        assert!(error.is::<crate::gate::CredentialsChanged>(), "{error:#}");
+    }
+
+    #[tokio::test]
+    async fn credential_change_discards_an_in_flight_reply() {
+        let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        socket.connect(server.local_addr().unwrap()).await.unwrap();
+        let (generation, current) = tokio::sync::watch::channel(0);
+        let mut client = Anidb {
+            socket,
+            data_dir: tempfile::tempdir().unwrap().keep(),
+            session: "old".into(),
+            cipher: None,
+            last_send: None,
+            bucket: Bucket::new(),
+            tag_seq: 0,
+            revocation: Some(crate::gate::CredentialLease::new("anidb", current)),
+        };
+
+        let reply = async {
+            let mut buf = [0u8; 1024];
+            let (_, peer) = server.recv_from(&mut buf).await.unwrap();
+            generation.send_replace(1);
+            server.send_to(b"k1 501 LOST\n", peer).await.unwrap();
+        };
+        let (_, result) = tokio::join!(reply, client.command("FILE"));
+        let error = result.expect_err("stale reply reached session-state handling");
+        assert!(error.is::<crate::gate::CredentialsChanged>(), "{error:#}");
     }
 
     #[test]

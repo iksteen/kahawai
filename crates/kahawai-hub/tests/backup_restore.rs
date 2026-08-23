@@ -58,6 +58,7 @@ async fn a_snapshot_restores_the_database_pki_and_subtitles() {
     let m = kahawai_hub::backup::backup(live.path(), Some(&cfg), &snap)
         .await
         .unwrap();
+    assert_eq!(m.format, 2, "the credential-key layout needs format 2");
     assert!(
         m.has_pki,
         "a snapshot without the CA cannot reconnect satellites"
