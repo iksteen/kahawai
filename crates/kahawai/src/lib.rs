@@ -93,6 +93,34 @@ fn metrics_token(data_dir: &std::path::Path) -> Result<Option<String>> {
     Ok(Some(token.to_string()))
 }
 
+/// Plaintext credentials still to be moved into the store, and which field
+/// each `settings` row becomes. One line per provider as they are ported.
+///
+/// The settings keys are spelled out rather than named: this is the last place
+/// they are read, and a constant would offer itself to code that should be
+/// asking the store.
+const ADOPT: &[(&str, &[(&str, &str)])] = &[
+    (
+        kahawai_hub::enrich::TMDB,
+        &[("tmdb_api_key", kahawai_hub::enrich::TMDB_API_KEY)],
+    ),
+    (
+        kahawai_hub::enrich::TVDB,
+        &[
+            ("tvdb_api_key", kahawai_hub::enrich::TVDB_API_KEY),
+            ("tvdb_pin", kahawai_hub::enrich::TVDB_PIN),
+        ],
+    ),
+    (
+        kahawai_hub::anidb::ANIDB,
+        &[
+            ("anidb.username", kahawai_hub::anidb::USERNAME),
+            ("anidb.password", kahawai_hub::anidb::PASSWORD),
+            ("anidb.udp_api_key", kahawai_hub::anidb::UDP_API_KEY),
+        ],
+    ),
+];
+
 #[cfg(unix)]
 fn bootstrap_control_dir(data_dir: &std::path::Path) -> PathBuf {
     data_dir.join("control")
@@ -341,12 +369,13 @@ async fn run_hub_inner(
     // against a running hub's data directory from a second process.
     let credentials =
         Arc::new(kahawai_hub::secrets::Credentials::open(&cfg.data_dir, db.clone()).await?);
-    let _ = &credentials;
+    kahawai_hub::secrets::adopt_all(&credentials, ADOPT).await?;
     // The satellites table IS the mTLS allowlist (SEC-5): load it, then
     // the registry keeps it in sync on approve/delete.
     let allowed = kahawai_transport::mtls::AllowedCerts::default();
     let registry = Arc::new(
         kahawai_hub::registry::Registry::new(db.clone(), allowed.clone())
+            .with_credentials(credentials)
             .with_local_video_executor(local_transcoder),
     );
     let admitted = registry.load_allowlist().await?;

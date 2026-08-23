@@ -1654,14 +1654,27 @@ async fn a_provider_outside_the_bound_set_owes_no_work() {
 async fn a_restart_that_re_selects_a_matched_item_does_not_erase_it() {
     let dir = tempfile::tempdir().unwrap();
     let db = kahawai_hub::db::open(dir.path()).await.unwrap();
-    let registry = kahawai_hub::registry::Registry::new(db.clone(), Default::default());
+    let credentials = std::sync::Arc::new(
+        kahawai_hub::secrets::Credentials::open(dir.path(), db.clone())
+            .await
+            .unwrap(),
+    );
     // Never dialled: the item's tmdb answer already stands, so
     // `has_real_answer` skips the provider before it would place a
     // request with this key.
-    registry
-        .set_setting("tmdb_api_key", "unused-in-this-test")
+    credentials
+        .set_provider(
+            kahawai_hub::secrets::HUB,
+            kahawai_hub::enrich::TMDB,
+            &std::collections::BTreeMap::from([(
+                kahawai_hub::enrich::TMDB_API_KEY,
+                "unused-in-this-test",
+            )]),
+        )
         .await
         .unwrap();
+    let registry = kahawai_hub::registry::Registry::new(db.clone(), Default::default())
+        .with_credentials(credentials);
 
     item(&db, "i1").await;
     store_answer(
@@ -1845,11 +1858,18 @@ fn the_chains_share_no_providers() {
 async fn a_run_without_a_tmdb_key_still_runs() {
     let dir = tempfile::tempdir().unwrap();
     let db = kahawai_hub::db::open(dir.path()).await.unwrap();
-    let registry = std::sync::Arc::new(kahawai_hub::registry::Registry::new(
-        db.clone(),
-        Default::default(),
-    ));
-    // Deliberately no tmdb_api_key setting at all.
+    // A real store, holding nothing: without one this proves the rule through
+    // the no-store branch, which production never takes.
+    let credentials = std::sync::Arc::new(
+        kahawai_hub::secrets::Credentials::open(dir.path(), db.clone())
+            .await
+            .unwrap(),
+    );
+    let registry = std::sync::Arc::new(
+        kahawai_hub::registry::Registry::new(db.clone(), Default::default())
+            .with_credentials(credentials),
+    );
+    // Deliberately no TMDB credential at all.
     item(&db, "i1").await;
 
     let enricher =
@@ -1866,4 +1886,116 @@ async fn a_run_without_a_tmdb_key_still_runs() {
             .await
             .unwrap();
     assert_eq!(tmdb_rows, 0, "no TMDB provider ran, so no TMDB rows");
+}
+
+/// A credential row that will not open must not stop the run.
+///
+/// The store treats an unopenable row as an error rather than an absence, on
+/// purpose — but `run_inner` reads TMDB's key before any chain is consulted,
+/// so propagating it there ends enrichment for every media type, including
+/// the ones whose chains never mention TMDB.
+#[tokio::test]
+async fn an_unreadable_tmdb_credential_does_not_stop_enrichment() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    let credentials = std::sync::Arc::new(
+        kahawai_hub::secrets::Credentials::open(dir.path(), db.clone())
+            .await
+            .unwrap(),
+    );
+    credentials
+        .set_provider(
+            kahawai_hub::secrets::HUB,
+            kahawai_hub::enrich::TMDB,
+            &std::collections::BTreeMap::from([(kahawai_hub::enrich::TMDB_API_KEY, "a-key")]),
+        )
+        .await
+        .unwrap();
+    // The row is there and it will not open — the shape a rotated key or a
+    // tampered row leaves, not a truncated one.
+    sqlx::query("UPDATE credentials SET secret = randomblob(length(secret))")
+        .execute(&db)
+        .await
+        .unwrap();
+
+    let registry = std::sync::Arc::new(
+        kahawai_hub::registry::Registry::new(db.clone(), Default::default())
+            .with_credentials(credentials),
+    );
+    assert!(
+        kahawai_hub::enrich::tmdb_key(&registry).await.is_err(),
+        "the store must still call an unopenable row an error"
+    );
+
+    let enricher = std::sync::Arc::new(kahawai_hub::enrich::Enricher::new(
+        tempfile::tempdir().unwrap().keep(),
+    ));
+    let mut events = registry.subscribe_events();
+    enricher
+        .run_once(&registry)
+        .await
+        .expect("one unreadable credential ended the whole run");
+    assert!(
+        finished(&mut events),
+        "the run returned Ok without reaching its end"
+    );
+}
+
+/// Whether the run got all the way through. `run_inner` emits `running: false`
+/// as its last act and nothing emits it on the way out of an error, so this
+/// separates a run that completed from one that returned early -- which an
+/// `Ok(())` on its own cannot, and which is the whole claim of HUB-5a.
+fn finished(
+    events: &mut tokio::sync::broadcast::Receiver<kahawai_hub::registry::RegistryEvent>,
+) -> bool {
+    let mut done = false;
+    while let Ok(event) = events.try_recv() {
+        if let kahawai_hub::registry::RegistryEvent::EnrichRunning { running: false, .. } = event {
+            done = true;
+        }
+    }
+    done
+}
+
+/// HUB-5a for the OTHER hub-wide credential. TVDB's read was the one line in
+/// `run_inner` that still bailed, so a music-only library enriched nothing
+/// because of a provider `chain_for("music")` never mentions.
+#[tokio::test]
+async fn an_unreadable_tvdb_credential_does_not_stop_enrichment() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    let credentials = std::sync::Arc::new(
+        kahawai_hub::secrets::Credentials::open(dir.path(), db.clone())
+            .await
+            .unwrap(),
+    );
+    credentials
+        .set_provider(
+            kahawai_hub::secrets::HUB,
+            kahawai_hub::enrich::TVDB,
+            &std::collections::BTreeMap::from([(kahawai_hub::enrich::TVDB_API_KEY, "a-key")]),
+        )
+        .await
+        .unwrap();
+    sqlx::query("UPDATE credentials SET secret = randomblob(length(secret))")
+        .execute(&db)
+        .await
+        .unwrap();
+    item(&db, "i1").await;
+
+    let registry = std::sync::Arc::new(
+        kahawai_hub::registry::Registry::new(db.clone(), Default::default())
+            .with_credentials(credentials),
+    );
+    let enricher =
+        std::sync::Arc::new(kahawai_hub::enrich::Enricher::new(dir.path().to_path_buf()));
+    let mut events = registry.subscribe_events();
+    enricher
+        .run_once(&registry)
+        .await
+        .expect("an unreadable TVDB credential ended the whole run");
+    assert!(
+        finished(&mut events),
+        "the run returned Ok without reaching its end"
+    );
 }

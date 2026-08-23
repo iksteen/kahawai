@@ -20,19 +20,20 @@ async fn probe_anidb_once() {
     let data_dir =
         std::path::PathBuf::from(std::env::var("HOME").unwrap()).join(".local/share/kahawai");
     let db = kahawai_hub::db::open(&data_dir).await.expect("open hub db");
-    let registry = Registry::new(db, Default::default());
-    let user = registry
-        .get_setting(kahawai_hub::anidb::USER_SETTING)
+    // The live hub's own key, so the probe reads the credentials it stored.
+    let credentials = std::sync::Arc::new(
+        kahawai_hub::secrets::Credentials::open(&data_dir, db.clone())
+            .await
+            .expect("credential store"),
+    );
+    let registry = Registry::new(db, Default::default()).with_credentials(credentials);
+    let mut account = registry
+        .hub_credential(kahawai_hub::anidb::ANIDB)
         .await
         .unwrap();
-    let pass = registry
-        .get_setting(kahawai_hub::anidb::PASS_SETTING)
-        .await
-        .unwrap();
-    let key = registry
-        .get_setting(kahawai_hub::anidb::APIKEY_SETTING)
-        .await
-        .unwrap();
+    let user = account.remove(kahawai_hub::anidb::USERNAME);
+    let pass = account.remove(kahawai_hub::anidb::PASSWORD);
+    let key = account.remove(kahawai_hub::anidb::UDP_API_KEY);
     let (Some(user), Some(pass)) = (user, pass) else {
         eprintln!("PROBE: no anidb credentials configured");
         return;

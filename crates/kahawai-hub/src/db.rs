@@ -256,6 +256,31 @@ async fn repair_release_tag_titles(pool: &SqlitePool) -> Result<()> {
     Ok(())
 }
 
+/// Reset the write-ahead log, and say so when it could not be.
+///
+/// `secure_delete` zeroes a deleted row in the page image it writes, but the
+/// image from BEFORE the delete stays readable in the log until this runs — so
+/// "the plaintext is gone" is only true once the log has been truncated.
+///
+/// The pragma reports failure in its result row rather than as an error:
+/// `busy = 1` means another connection held the log open and nothing was
+/// truncated. `execute()` discards that row, which made a checkpoint that did
+/// nothing look exactly like one that worked.
+pub async fn checkpoint_truncate(db: &SqlitePool) -> Result<()> {
+    let (busy, _log, _checkpointed): (i64, i64, i64) =
+        sqlx::query_as("PRAGMA wal_checkpoint(TRUNCATE)")
+            .fetch_one(db)
+            .await
+            .context("truncating the write-ahead log")?;
+    if busy != 0 {
+        tracing::warn!(
+            "the write-ahead log could not be truncated — a reader held it open, so what was \
+             just deleted stays readable in hub.db-wal until a later checkpoint"
+        );
+    }
+    Ok(())
+}
+
 /// In-memory DB for tests.
 pub async fn open_in_memory() -> Result<SqlitePool> {
     let pool = SqlitePoolOptions::new()

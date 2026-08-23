@@ -71,9 +71,9 @@ pub struct AppState {
 }
 
 /// The bearer Prometheus scrapes `/metrics` with, kept beside `jwt.secret`
-/// in the data directory rather than in the config file. Named here because
-/// the composition root reads it and `backup` has to carry it, and two
-/// spellings of one file name is one too many.
+/// and `credentials.secret` in the data directory rather than in the config
+/// file. Named here because the composition root reads it and `backup` has to
+/// carry it, and two spellings of one file name is one too many.
 pub const METRICS_TOKEN_FILE: &str = "metrics.secret";
 
 /// Network and feature knobs, defaulting to what a bare hub ships with.
@@ -171,6 +171,7 @@ impl Default for NetOptions {
         admin_set_tmdb,
         admin_set_tvdb,
         admin_set_anidb,
+        admin_disconnect_provider,
         admin_verify_anidb,
         admin_enrich_status,
         admin_enrich_run,
@@ -414,6 +415,10 @@ pub fn router(
         .route("/admin/v1/providers/anidb", post(admin_set_anidb))
         .route("/admin/v1/providers/anidb/verify", post(admin_verify_anidb))
         .route(
+            "/admin/v1/providers/{provider}/credentials",
+            axum::routing::delete(admin_disconnect_provider),
+        )
+        .route(
             "/admin/v1/enrich",
             get(admin_enrich_status).post(admin_enrich_run),
         )
@@ -588,6 +593,15 @@ struct EnrollmentsResponse {
 #[derive(Serialize, ToSchema)]
 struct ApprovedResponse {
     approved: String,
+}
+
+/// The credential store. `None` is unreachable in production — only a test
+/// registry is built without one — so this is a 500 rather than a state the
+/// API has to describe.
+fn store(registry: &Registry) -> Result<&crate::secrets::Credentials, ApiError> {
+    registry
+        .credentials()
+        .ok_or_else(|| internal(anyhow::anyhow!("no credential store")))
 }
 
 #[derive(Serialize, ToSchema)]
@@ -1409,24 +1423,25 @@ async fn admin_approve(
 async fn admin_providers(
     State(state): State<AppState>,
 ) -> Result<Json<ProvidersResponse>, ApiError> {
-    let tmdb = state
-        .registry
-        .get_setting(crate::enrich::TMDB_KEY_SETTING)
+    let tmdb = crate::enrich::tmdb_key(&state.registry)
         .await
         .map_err(internal)?
         .is_some();
-    let tvdb = state
-        .registry
-        .get_setting(crate::enrich::TVDB_KEY_SETTING)
+    let tvdb = crate::enrich::tvdb_creds(&state.registry)
         .await
         .map_err(internal)?
         .is_some();
     let anidb = state
         .registry
-        .get_setting(crate::anidb::USER_SETTING)
+        .hub_credential(crate::anidb::ANIDB)
         .await
-        .map_err(internal)?
-        .is_some();
+        .map_err(internal)?;
+    let anidb = anidb
+        .get(crate::anidb::USERNAME)
+        .is_some_and(|value| !value.is_empty())
+        && anidb
+            .get(crate::anidb::PASSWORD)
+            .is_some_and(|value| !value.is_empty());
     let db = state.registry.db();
     let mut chains = std::collections::BTreeMap::new();
     for media_type in crate::providers::MEDIA_TYPES {
@@ -1652,21 +1667,15 @@ async fn subtitle_delete(
 async fn admin_verify_anidb(
     State(state): State<AppState>,
 ) -> Result<Json<VerificationResponse>, ApiError> {
-    let user = state
+    let mut account = state
         .registry
-        .get_setting(crate::anidb::USER_SETTING)
+        .hub_credential(crate::anidb::ANIDB)
         .await
         .map_err(internal)?;
-    let pass = state
-        .registry
-        .get_setting(crate::anidb::PASS_SETTING)
-        .await
-        .map_err(internal)?;
-    let key = state
-        .registry
-        .get_setting(crate::anidb::APIKEY_SETTING)
-        .await
-        .map_err(internal)?
+    let user = account.remove(crate::anidb::USERNAME);
+    let pass = account.remove(crate::anidb::PASSWORD);
+    let key = account
+        .remove(crate::anidb::UDP_API_KEY)
         .filter(|k| !k.is_empty());
     let (Some(user), Some(pass)) = (user, pass) else {
         return Err(ApiError::new(
@@ -1739,40 +1748,29 @@ async fn admin_set_anidb(
             "username and password required",
         ));
     }
-    // Read before the write below overwrites it: whether this is the same
+    // Read before the write below replaces it: whether this is the same
     // account decides whether the stored session is still ours to use.
-    let same_account = state
-        .registry
-        .get_setting(crate::anidb::USER_SETTING)
-        .await
-        .map_err(internal)?
-        .as_deref()
-        == Some(user)
-        && state
+    let same_account = {
+        let mut held = state
             .registry
-            .get_setting(crate::anidb::PASS_SETTING)
+            .hub_credential(crate::anidb::ANIDB)
             .await
-            .map_err(internal)?
-            .as_deref()
-            == Some(pass);
-    state
-        .registry
-        .set_setting(crate::anidb::USER_SETTING, user)
-        .await
-        .map_err(internal)?;
-    state
-        .registry
-        .set_setting(crate::anidb::PASS_SETTING, pass)
-        .await
-        .map_err(internal)?;
-    // Empty key = clear it (plaintext session); the login path treats
-    // an empty stored key as absent.
-    state
-        .registry
-        .set_setting(
-            crate::anidb::APIKEY_SETTING,
-            body.udp_api_key.as_deref().unwrap_or(""),
-        )
+            .map_err(internal)?;
+        held.remove(crate::anidb::USERNAME).as_deref() == Some(user)
+            && held.remove(crate::anidb::PASSWORD).as_deref() == Some(pass)
+    };
+    // No key = a plaintext session, which works; an absent row says that
+    // without an empty one having to mean it.
+    let key = body.udp_api_key.as_deref().filter(|k| !k.is_empty());
+    let mut fields = std::collections::BTreeMap::from([
+        (crate::anidb::USERNAME, user),
+        (crate::anidb::PASSWORD, pass),
+    ]);
+    if let Some(key) = key {
+        fields.insert(crate::anidb::UDP_API_KEY, key);
+    }
+    store(&state.registry)?
+        .set_provider(crate::secrets::HUB, crate::anidb::ANIDB, &fields)
         .await
         .map_err(internal)?;
     // Only when the account changed, and before the login below: a stored
@@ -1790,15 +1788,7 @@ async fn admin_set_anidb(
         state.enricher.anidb_forget();
         forgotten.map_err(internal)?;
     }
-    // Validate immediately: a bad login should fail HERE, not silently
-    // during the next enrichment run.
-    let key = state
-        .registry
-        .get_setting(crate::anidb::APIKEY_SETTING)
-        .await
-        .map_err(internal)?
-        .filter(|k| !k.is_empty());
-    match crate::anidb::Anidb::login(state.enricher.data_dir(), user, pass, key.as_deref()).await {
+    match crate::anidb::Anidb::login(state.enricher.data_dir(), user, pass, key).await {
         Ok(client) => {
             client.finish().await;
             let enricher = state.enricher.clone();
@@ -1835,7 +1825,8 @@ struct SetTvdb {
 ///
 /// Admin only. Stores the TVDB API key and optional subscriber PIN, then
 /// starts an enrichment run in the background. An empty api_key is rejected
-/// with 400.
+/// with 400. The pair is stored whole: a request without a pin stores an
+/// account without one, rather than keeping the pin already there.
 #[utoipa::path(
     post, path = "/admin/v1/providers/tvdb", tag = "Admin providers",
     security(("bearer_auth" = [])),
@@ -1867,18 +1858,17 @@ async fn admin_set_tvdb(
             "api_key required",
         ));
     }
-    state
-        .registry
-        .set_setting(crate::enrich::TVDB_KEY_SETTING, key)
+    // The whole provider, so a save without a pin is a TVDB account without
+    // one — credentials for a provider move together, and keeping a field the
+    // caller did not send is how a pair stops agreeing with itself.
+    let mut fields = std::collections::BTreeMap::from([(crate::enrich::TVDB_API_KEY, key)]);
+    if let Some(pin) = body.pin.as_deref().filter(|p| !p.is_empty()) {
+        fields.insert(crate::enrich::TVDB_PIN, pin);
+    }
+    store(&state.registry)?
+        .set_provider(crate::secrets::HUB, crate::enrich::TVDB, &fields)
         .await
         .map_err(internal)?;
-    if let Some(pin) = body.pin.as_deref().filter(|p| !p.is_empty()) {
-        state
-            .registry
-            .set_setting(crate::enrich::TVDB_PIN_SETTING, pin)
-            .await
-            .map_err(internal)?;
-    }
     let enricher = state.enricher.clone();
     let registry = state.registry.clone();
     tokio::spawn(async move {
@@ -1928,9 +1918,12 @@ async fn admin_set_tmdb(
             "api_key required",
         ));
     }
-    state
-        .registry
-        .set_setting(crate::enrich::TMDB_KEY_SETTING, key)
+    store(&state.registry)?
+        .set_provider(
+            crate::secrets::HUB,
+            crate::enrich::TMDB,
+            &std::collections::BTreeMap::from([(crate::enrich::TMDB_API_KEY, key)]),
+        )
         .await
         .map_err(internal)?;
     // Kick a run right away — saving the key is the natural trigger.
@@ -1944,6 +1937,50 @@ async fn admin_set_tmdb(
     Ok(Json(SavedResponse { saved: true }))
 }
 
+/// Disconnect a provider
+///
+/// Admin only. Deletes every credential stored for one provider; the hub then
+/// answers `configured: false` for it and stops contacting it. Metadata
+/// already merged from that provider stays.
+#[utoipa::path(
+    delete, path = "/admin/v1/providers/{provider}/credentials", tag = "Admin providers",
+    security(("bearer_auth" = [])),
+    params(("provider" = String, Path)),
+    responses(
+        (status = 200, body = OkResponse),
+        (status = 400, body = ApiErrorBody),
+        (status = 401, body = ApiErrorBody),
+        (status = 403, body = ApiErrorBody),
+        (status = 500, body = ApiErrorBody),
+        (status = 503, description = "The hub has no administrator yet: `setup_required`", body = ApiErrorBody)
+    )
+)]
+async fn admin_disconnect_provider(
+    State(state): State<AppState>,
+    ApiPath(provider): ApiPath<String>,
+) -> Result<Json<OkResponse>, ApiError> {
+    if !matches!(
+        provider.as_str(),
+        crate::enrich::TMDB | crate::enrich::TVDB | crate::anidb::ANIDB
+    ) {
+        return Err(ApiError::new(ErrorCode::BadRequest, "unknown provider"));
+    }
+    crate::secrets::delete_provider(state.registry.db(), crate::secrets::HUB, &provider)
+        .await
+        .map_err(internal)?;
+    // Credentials copied by a running enrichment pass are invalid now, not
+    // when that pass eventually ends. AniDB additionally keeps both a live
+    // client and a session on disk; revoke marks the client stale without
+    // waiting on its UDP mutex, then the durable session is removed below.
+    state.enricher.revoke_provider(&provider);
+    if provider == crate::anidb::ANIDB {
+        let forgotten = crate::anidb::forget_session(state.enricher.data_dir());
+        // Revocation above remains in force even if removing the persisted
+        // session fails.
+        forgotten.map_err(internal)?;
+    }
+    Ok(Json(OkResponse { ok: true }))
+}
 
 /// Get enrichment status
 ///
@@ -6995,6 +7032,7 @@ mod tests {
             ("post", "/admin/v1/providers/tvdb"),
             ("post", "/admin/v1/providers/anidb"),
             ("post", "/admin/v1/providers/anidb/verify"),
+            ("delete", "/admin/v1/providers/{provider}/credentials"),
             ("get", "/admin/v1/enrich"),
             ("post", "/admin/v1/enrich"),
             ("post", "/admin/v1/libraries/{id}/refresh"),

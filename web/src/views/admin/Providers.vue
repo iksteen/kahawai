@@ -7,10 +7,12 @@
 import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import { useQuery, useQueryClient } from '@tanstack/vue-query'
 
+import Armed from '../../components/Armed.vue'
 import Btn from '../../components/Btn.vue'
 import Icon from '../../components/Icon.vue'
 import Ordered from '../../components/Ordered.vue'
 import {
+  adminDisconnectProvider,
   adminEnrichRun,
   adminEnrichStatus,
   adminSegmentsRun,
@@ -141,6 +143,15 @@ async function saveAnidb() {
       ? 'AniDB account verified — enrichment started.'
       : `AniDB saved but login failed: ${why ?? 'unknown'}`,
   )
+  void reload()
+}
+
+/// Asked twice (see `Armed`): nothing here can show what is about to go — a
+/// stored key is never read back — so a stray press costs a trip to the
+/// provider's site to fetch it again.
+async function disconnect(provider: 'tmdb' | 'tvdb' | 'anidb', name: string) {
+  if (!(await props.act(() => adminDisconnectProvider(provider)))) return
+  notify(`${name} disconnected.`)
   void reload()
 }
 
@@ -290,6 +301,15 @@ async function detect() {
           "
         />
         <Btn small :disabled="!tmdb.trim()" @click="saveTmdb">Save</Btn>
+        <Armed
+          v-if="configured?.tmdb.configured"
+          label="Disconnect"
+          armed-label="Really disconnect?"
+          name="Disconnect TMDB"
+          armed-name="Really disconnect TMDB?"
+          title="Deletes the stored TMDB key from this hub"
+          @confirm="disconnect('tmdb', 'TMDB')"
+        />
       </div>
       <div class="flex flex-wrap items-center gap-2">
         <label class="w-20 font-mono text-[12px] text-dim" for="tvdb-key">TheTVDB</label>
@@ -313,6 +333,15 @@ async function detect() {
           placeholder="PIN, if your key needs one"
         />
         <Btn small :disabled="!tvdb.key.trim()" @click="saveTvdb">Save</Btn>
+        <Armed
+          v-if="configured?.tvdb.configured"
+          label="Disconnect"
+          armed-label="Really disconnect?"
+          name="Disconnect TheTVDB"
+          armed-name="Really disconnect TheTVDB?"
+          title="Deletes the stored TheTVDB key from this hub"
+          @confirm="disconnect('tvdb', 'TheTVDB')"
+        />
       </div>
     </section>
 
@@ -354,9 +383,6 @@ async function detect() {
           autocomplete="off"
           placeholder="password"
         />
-        <Btn small :disabled="!anidb.username.trim() || !anidb.password" @click="saveAnidb">
-          Save
-        </Btn>
       </div>
       <div class="flex flex-wrap items-center gap-2">
         <span class="w-20" aria-hidden="true" />
@@ -368,6 +394,18 @@ async function detect() {
           type="password"
           autocomplete="off"
           placeholder="UDP API key — optional, encrypts the session"
+        />
+        <Btn small :disabled="!anidb.username.trim() || !anidb.password" @click="saveAnidb">
+          Save
+        </Btn>
+        <Armed
+          v-if="configured?.anidb.configured"
+          label="Disconnect"
+          armed-label="Really disconnect?"
+          name="Disconnect AniDB"
+          armed-name="Really disconnect AniDB?"
+          title="Deletes the stored AniDB account from this hub"
+          @confirm="disconnect('anidb', 'AniDB')"
         />
       </div>
       <p class="mt-2 text-dim">AniList and the AniDB↔TVDB mapping need no key.</p>

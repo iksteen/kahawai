@@ -44,7 +44,13 @@ async fn admin_flow_enrollments_satellites_archive_restore() {
     let db = kahawai_hub::db::open(dir.path()).await.unwrap();
     let ca = Arc::new(HubCa::load_or_create(dir.path()).unwrap());
     let allowed = AllowedCerts::default();
-    let registry = Arc::new(Registry::new(db.clone(), allowed.clone()));
+    let credentials = Arc::new(
+        kahawai_hub::secrets::Credentials::open(dir.path(), db.clone())
+            .await
+            .unwrap(),
+    );
+    let registry =
+        Arc::new(Registry::new(db.clone(), allowed.clone()).with_credentials(credentials.clone()));
     let sessions = Arc::new(kahawai_hub::sessions::Sessions::new(
         tempfile::tempdir().unwrap().keep(),
     ));
@@ -70,6 +76,9 @@ async fn admin_flow_enrollments_satellites_archive_restore() {
     let pleb = auth.login("pleb", "pleb-password").await.unwrap();
     let pleb_bearer = format!("Bearer {}", pleb.access_token);
 
+    let enricher = Arc::new(kahawai_hub::enrich::Enricher::new(
+        tempfile::tempdir().unwrap().keep(),
+    ));
     let api = kahawai_hub::api::router(
         registry.clone(),
         auth.clone(),
@@ -84,9 +93,7 @@ async fn admin_flow_enrollments_satellites_archive_restore() {
                 tempfile::tempdir().unwrap().keep(),
             )),
         )),
-        Arc::new(kahawai_hub::enrich::Enricher::new(
-            tempfile::tempdir().unwrap().keep(),
-        )),
+        enricher.clone(),
         Arc::new(kahawai_hub::segments::Detector::new()),
         kahawai_hub::api::NetOptions::default(),
     );
@@ -219,6 +226,107 @@ async fn admin_flow_enrollments_satellites_archive_restore() {
         })
     );
 
+    credentials
+        .set_provider(
+            kahawai_hub::secrets::HUB,
+            kahawai_hub::anidb::ANIDB,
+            &std::collections::BTreeMap::from([(kahawai_hub::anidb::USERNAME, "user")]),
+        )
+        .await
+        .unwrap();
+    let incomplete = body_json(
+        api.clone()
+            .oneshot(get("/admin/v1/providers", &admin_bearer))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        incomplete["anidb"]["configured"], false,
+        "a username without a password is not a usable AniDB account"
+    );
+
+    // Disconnecting takes one provider's credentials and leaves the rest.
+    // Stored through the store rather than the save routes because those
+    // start an enrichment run that would reach for the network.
+    for (provider, fields) in [
+        (
+            kahawai_hub::enrich::TMDB,
+            std::collections::BTreeMap::from([(kahawai_hub::enrich::TMDB_API_KEY, "a-key")]),
+        ),
+        (
+            kahawai_hub::enrich::TVDB,
+            std::collections::BTreeMap::from([(kahawai_hub::enrich::TVDB_API_KEY, "another-key")]),
+        ),
+    ] {
+        credentials
+            .set_provider(kahawai_hub::secrets::HUB, provider, &fields)
+            .await
+            .unwrap();
+    }
+    let disconnect = |provider: &str| {
+        Request::delete(format!("/admin/v1/providers/{provider}/credentials"))
+            .header("authorization", admin_bearer.clone())
+            .body(Body::empty())
+            .unwrap()
+    };
+    assert_eq!(
+        api.clone()
+            .oneshot(disconnect("tmdb"))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    // A name the hub has no provider for is a 400, not a silent no-op that
+    // answers ok.
+    assert_eq!(
+        api.clone()
+            .oneshot(disconnect("credentials"))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+    let v = body_json(
+        api.clone()
+            .oneshot(get("/admin/v1/providers", &admin_bearer))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(v["tmdb"]["configured"], false, "disconnected");
+    assert_eq!(v["tvdb"]["configured"], true, "not the one asked for");
+
+    // What a deleted credential minted goes with it. AniDB's session survives
+    // restarts and says nothing about whose it is, so left behind it would
+    // still authenticate as the account that was just removed.
+    let session = enricher.data_dir().join("anime").join("anidb-session.json");
+    std::fs::create_dir_all(session.parent().unwrap()).unwrap();
+    // A ban in force, which must NOT be forgotten: contact during one is what
+    // extends it.
+    let ban = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+        + 3600;
+    std::fs::write(
+        &session,
+        format!(r#"{{"session":"abc","port":4242,"banned_until":{ban}}}"#),
+    )
+    .unwrap();
+    assert_eq!(
+        api.clone()
+            .oneshot(disconnect("anidb"))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    let left: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&session).unwrap()).unwrap();
+    assert_eq!(left["session"], "", "the session outlived the account");
+    assert_eq!(left["banned_until"], ban, "the ban clock was forgotten");
     // Enrollment via HTTP: submit a CSR (gRPC surface, called in-process),
     // see it listed, approve it with the console code.
     let bundle = kahawai_core::pki::new_satellite_csr("mediahost", "01ADM", "nas").unwrap();

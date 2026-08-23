@@ -9,7 +9,7 @@
 //! translated only at the database boundary.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
@@ -274,6 +274,10 @@ fn unix_now() -> i64 {
 
 pub struct Registry {
     db: SqlitePool,
+    /// The credential store. `None` only in tests that never reach one — the
+    /// composition root always sets it, and a key it cannot load is fatal
+    /// there rather than absent here.
+    credentials: Option<Arc<crate::secrets::Credentials>>,
     /// The live mTLS allowlist (SEC-5), mirrored from the satellites table.
     allowed: kahawai_transport::mtls::AllowedCerts,
     connected: Mutex<HashMap<String, SatelliteState>>,
@@ -455,6 +459,7 @@ impl Registry {
     pub fn new(db: SqlitePool, allowed: kahawai_transport::mtls::AllowedCerts) -> Self {
         Self {
             db,
+            credentials: None,
             allowed,
             connected: Mutex::new(HashMap::new()),
             links: Mutex::new(HashMap::new()),
@@ -469,6 +474,31 @@ impl Registry {
             scan_progress: Mutex::new(HashMap::new()),
             deep_rescan: Mutex::new(std::collections::HashSet::new()),
             events: tokio::sync::broadcast::channel(256).0,
+        }
+    }
+
+    /// Applied while constructing the registry, before it is shared.
+    pub fn with_credentials(mut self, credentials: Arc<crate::secrets::Credentials>) -> Self {
+        self.credentials = Some(credentials);
+        self
+    }
+
+    /// The credential store, where there is one.
+    pub fn credentials(&self) -> Option<&crate::secrets::Credentials> {
+        self.credentials.as_deref()
+    }
+
+    /// Everything the hub holds for one provider, empty when nothing is
+    /// configured — and also when there is no store, which only a test
+    /// registry can be. Here so each provider's helper does not repeat that
+    /// second decision.
+    pub async fn hub_credential(
+        &self,
+        provider: &str,
+    ) -> Result<std::collections::BTreeMap<String, String>> {
+        match self.credentials() {
+            Some(store) => store.get_provider(crate::secrets::HUB, provider).await,
+            None => Ok(Default::default()),
         }
     }
 

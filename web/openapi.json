@@ -9,7 +9,7 @@
     },
     "version": "0.0.0-dev"
   },
-  "x-kahawai-source-sha256": "96e55b101cf9748ca4d3c5e03f7ef477e893b1e96362cdb1403a8a55015e7d27",
+  "x-kahawai-source-sha256": "b4427806ded2cdfc6575be402c83102a1c739573479ffcc40733536b1c294e86",
   "paths": {
     "/admin/v1/collections": {
       "get": {
@@ -1762,7 +1762,7 @@
           "Admin providers"
         ],
         "summary": "Set TVDB credentials",
-        "description": "Admin only. Stores the TVDB API key and optional subscriber PIN, then\nstarts an enrichment run in the background. An empty api_key is rejected\nwith 400.",
+        "description": "Admin only. Stores the TVDB API key and optional subscriber PIN, then\nstarts an enrichment run in the background. An empty api_key is rejected\nwith 400. The pair is stored whole: a request without a pin stores an\naccount without one, rather than keeping the pin already there.",
         "operationId": "admin_set_tvdb",
         "requestBody": {
           "content": {
@@ -1823,6 +1823,88 @@
           },
           "415": {
             "description": "The body needs Content-Type: application/json",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The hub has no administrator yet: `setup_required`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/admin/v1/providers/{provider}/credentials": {
+      "delete": {
+        "tags": [
+          "Admin providers"
+        ],
+        "summary": "Disconnect a provider",
+        "description": "Admin only. Deletes every credential stored for one provider; the hub then\nanswers `configured: false` for it and stops contacting it. Metadata\nalready merged from that provider stays.",
+        "operationId": "admin_disconnect_provider",
+        "parameters": [
+          {
+            "name": "provider",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OkResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
             "content": {
               "application/json": {
                 "schema": {

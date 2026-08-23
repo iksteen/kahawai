@@ -166,7 +166,9 @@ How something works and why it was built that way belong in
       without one. Every chain pass runs regardless — `run_chain`
       already skips providers the set does not hold, and which
       providers exist is the operator's choice, so an absent one is
-      silent rather than a warning.
+      silent rather than a warning. A stored credential that will not
+      open is that provider's absence too, not the end of the run
+      (`Enricher::usable`), which is how both hub-wide reads answer.
 - [x] HUB-6 Descriptive metadata: titles, plots, dates, ratings, posters,
       episode stills, season/episode and album/release structure, genres
       and cast; all stored, so everything reads back with providers

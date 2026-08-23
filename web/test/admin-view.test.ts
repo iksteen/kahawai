@@ -1377,6 +1377,38 @@ describe('providers', () => {
     expect(api.adminSetTvdb).toHaveBeenLastCalledWith({ api_key: 'secret', pin: ' 1234 ' })
   })
 
+  test('each Disconnect says which provider it disconnects', async () => {
+    // Three buttons reading "Disconnect" in a row: the visible text cannot
+    // tell them apart, so the accessible name has to. It still contains the
+    // word on screen, so a spoken "disconnect TMDB" matches what is there.
+    vi.mocked(api.adminProviders).mockResolvedValue({
+      tmdb: { configured: true },
+      tvdb: { configured: true },
+      anidb: { configured: true },
+      chains: {},
+    } as never)
+    const wrapper = await open()
+    await tab(wrapper, 'Providers')
+    const named = wrapper
+      .findAll('button')
+      .filter((b) => b.text() === 'Disconnect')
+      .map((b) => b.attributes('aria-label'))
+    expect(named).toEqual(['Disconnect TMDB', 'Disconnect TheTVDB', 'Disconnect AniDB'])
+
+    // Armed, the name follows the text — a button that now says "Really
+    // disconnect?" must not still be announced as the offer it replaced.
+    const tmdb = wrapper
+      .findAll('button')
+      .find((b) => b.attributes('aria-label') === 'Disconnect TMDB')!
+    await tmdb.trigger('click')
+    await flushPromises()
+    expect(
+      wrapper
+        .findAll('button')
+        .some((b) => b.attributes('aria-label') === 'Really disconnect TMDB?'),
+    ).toBe(true)
+  })
+
   test('a chain is a draft until it is applied', async () => {
     vi.mocked(api.adminProviders).mockResolvedValue({
       tmdb: { configured: true },

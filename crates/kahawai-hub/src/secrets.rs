@@ -263,6 +263,123 @@ impl Credentials {
     }
 }
 
+/// Move a provider's plaintext `settings` rows into the store, once.
+///
+/// Returns whether anything moved. The rows are sealed as a set and then
+/// deleted, so a failure leaves them where they were and the next start tries
+/// again. A provider the store already holds is replaced: reaching that needs
+/// a binary older than the adoption to have written the plaintext back, and
+/// then its value is the one to keep.
+pub async fn adopt_settings(
+    credentials: &Credentials,
+    provider: &str,
+    from: &[(&str, &str)],
+) -> Result<bool> {
+    let db = &credentials.db;
+    let mut found = BTreeMap::new();
+    for (setting, field) in from {
+        if let Some(value) =
+            sqlx::query_scalar::<_, String>("SELECT value FROM settings WHERE key = ?")
+                .bind(setting)
+                .fetch_optional(db)
+                .await?
+        {
+            found.insert(*field, value);
+        }
+    }
+    if found.is_empty() {
+        return Ok(false);
+    }
+
+    let borrowed: BTreeMap<&str, &str> = found.iter().map(|(f, v)| (*f, v.as_str())).collect();
+    credentials.set_provider(HUB, provider, &borrowed).await?;
+    verify(credentials, HUB, provider, &found).await?;
+    // One statement, so the plaintext goes all at once. Deleted key by key, a
+    // crash between two of them leaves a SUBSET behind, and the next start
+    // adopts that subset over the sealed set this one just wrote -- a TVDB
+    // whose pin outlived its api_key ends up with the key in neither table.
+    let sql = in_clause("DELETE FROM settings WHERE key", from.len());
+    let mut delete = sqlx::query(sqlx::AssertSqlSafe(sql));
+    for (setting, _) in from {
+        delete = delete.bind(*setting);
+    }
+    delete.execute(db).await?;
+    Ok(true)
+}
+
+/// Every declared credential, moved out of the clear, and the write-ahead log
+/// reset behind it.
+///
+/// One provider failing is fatal — a credential the hub could not seal is one
+/// it will not read and will not report, with its plaintext still on disk. But
+/// whatever moved BEFORE it is already deleted, and deleted is not gone until
+/// the log has been truncated: the checkpoint therefore runs on the way out of
+/// the failure too, and the error is raised after it.
+///
+/// Each entry is `(provider, &[(plaintext key, field)])`.
+pub async fn adopt_all(
+    credentials: &Credentials,
+    settings: &[(&str, &[(&str, &str)])],
+) -> Result<()> {
+    let mut retired = false;
+    let adopted: Result<()> = async {
+        for (provider, from) in settings {
+            if adopt_settings(credentials, provider, from).await? {
+                tracing::info!(provider, "plaintext credential sealed");
+                retired = true;
+            }
+        }
+        Ok(())
+    }
+    .await;
+    if retired {
+        crate::db::checkpoint_truncate(&credentials.db)
+            .await
+            .context("checkpointing after sealing the plaintext credentials")?;
+    }
+    adopted
+}
+
+/// Read the sealed set back and compare, before the plaintext it came from is
+/// deleted.
+///
+/// Sealing reports its own failures, but this is a one-way door: after the
+/// delete there is nothing to compare against and nothing to retry from. The
+/// error names the provider and never a value.
+async fn verify(
+    credentials: &Credentials,
+    owner_id: &str,
+    provider: &str,
+    expected: &BTreeMap<&str, String>,
+) -> Result<()> {
+    let stored = credentials.get_provider(owner_id, provider).await?;
+    let same = stored.len() == expected.len()
+        && expected
+            .iter()
+            .all(|(field, value)| stored.get(*field) == Some(value));
+    if !same {
+        bail!("sealed {provider} did not read back as it was written; plaintext left in place");
+    }
+    Ok(())
+}
+
+/// `<prefix> IN (?, ?, ...)`, because a placeholder list is the only part of a
+/// statement that cannot itself be a bind parameter. Nothing but the COUNT
+/// reaches the string — every value is still bound — which is what makes the
+/// `AssertSqlSafe` at the call sites true rather than a hope.
+fn in_clause(prefix: &str, n: usize) -> String {
+    let mut sql = String::from(prefix);
+    sql.push_str(" IN (");
+    for i in 0..n {
+        if i > 0 {
+            sql.push(',');
+        }
+        sql.push('?');
+    }
+    sql.push(')');
+    sql
+}
+
 /// Everything one owner holds for one provider, in one statement.
 ///
 /// Detaching an account is the only deletion there is, and a provider's fields
@@ -864,5 +981,174 @@ mod store_tests {
             .unwrap();
         assert!(delete_owner(&c.db, "").await.is_err());
         assert_eq!(c.get_provider(HUB, "tmdb").await.unwrap().len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod adoption_tests {
+    use super::*;
+
+    async fn store() -> (tempfile::TempDir, Credentials) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::open_in_memory().await.unwrap();
+        let c = Credentials::open(dir.path(), db).await.unwrap();
+        (dir, c)
+    }
+
+    async fn plaintext(c: &Credentials, key: &str, value: &str) {
+        sqlx::query("INSERT INTO settings (key, value) VALUES (?, ?)")
+            .bind(key)
+            .bind(value)
+            .execute(&c.db)
+            .await
+            .unwrap();
+    }
+
+    async fn setting(c: &Credentials, key: &str) -> Option<String> {
+        sqlx::query_scalar("SELECT value FROM settings WHERE key = ?")
+            .bind(key)
+            .fetch_optional(&c.db)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn it_moves_the_plaintext_and_then_finds_nothing() {
+        let (_d, c) = store().await;
+        plaintext(&c, "tmdb_api_key", "operator-key").await;
+
+        assert!(
+            adopt_settings(&c, "tmdb", &[("tmdb_api_key", "api_key")])
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            c.get_provider(HUB, "tmdb").await.unwrap(),
+            BTreeMap::from([("api_key".to_string(), "operator-key".to_string())])
+        );
+        assert_eq!(setting(&c, "tmdb_api_key").await, None, "left in the clear");
+
+        // A second pass has nothing to do and must not disturb what moved.
+        assert!(
+            !adopt_settings(&c, "tmdb", &[("tmdb_api_key", "api_key")])
+                .await
+                .unwrap()
+        );
+        assert_eq!(c.get_provider(HUB, "tmdb").await.unwrap().len(), 1);
+    }
+
+    /// Plaintext beside a sealed provider replaces it. Reaching this needs a
+    /// binary older than the adoption to have written the row back, and then
+    /// its value is the newer one.
+    #[tokio::test]
+    async fn plaintext_replaces_what_is_sealed() {
+        let (_d, c) = store().await;
+        c.set_provider(HUB, "tmdb", &BTreeMap::from([("api_key", "the-old-one")]))
+            .await
+            .unwrap();
+        plaintext(&c, "tmdb_api_key", "from-the-old-binary").await;
+
+        assert!(
+            adopt_settings(&c, "tmdb", &[("tmdb_api_key", "api_key")])
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            c.get_provider(HUB, "tmdb").await.unwrap(),
+            BTreeMap::from([("api_key".to_string(), "from-the-old-binary".to_string())])
+        );
+        assert_eq!(setting(&c, "tmdb_api_key").await, None);
+    }
+
+    /// The plaintext one provider left behind is deleted the moment it moves,
+    /// and deleted is not gone until the log is truncated. A LATER provider
+    /// failing must not take the checkpoint down with it.
+    #[tokio::test]
+    async fn a_later_failure_still_truncates_what_already_moved() {
+        const CANARY: &str = "canary-operator-key";
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::open(dir.path()).await.unwrap();
+        let c = Credentials::open(dir.path(), db.clone()).await.unwrap();
+        sqlx::query("INSERT INTO settings (key, value) VALUES ('tmdb_api_key', ?)")
+            .bind(CANARY)
+            .execute(&db)
+            .await
+            .unwrap();
+        // The second provider's plaintext is not text, so reading it fails
+        // AFTER the first has been sealed and its row deleted.
+        sqlx::query("INSERT INTO settings (key, value) VALUES ('tvdb_api_key', X'ff')")
+            .execute(&db)
+            .await
+            .unwrap();
+
+        let outcome = adopt_all(
+            &c,
+            &[
+                ("tmdb", &[("tmdb_api_key", "api_key")]),
+                ("tvdb", &[("tvdb_api_key", "api_key")]),
+            ],
+        )
+        .await;
+        assert!(outcome.is_err(), "the unreadable setting was not fatal");
+
+        assert_eq!(
+            c.get_provider(HUB, "tmdb").await.unwrap(),
+            BTreeMap::from([("api_key".to_string(), CANARY.to_string())]),
+            "the first provider moved"
+        );
+        assert_eq!(setting(&c, "tmdb_api_key").await, None, "left in the clear");
+        // The point of the whole exercise: the pre-delete page image is not
+        // sitting in the log for the next person with the file.
+        let wal = std::fs::metadata(dir.path().join("hub.db-wal"))
+            .map(|m| m.len())
+            .unwrap_or(0);
+        assert_eq!(wal, 0, "the write-ahead log still holds the plaintext");
+        let bytes = std::fs::read(dir.path().join("hub.db")).unwrap();
+        assert!(
+            !bytes.windows(CANARY.len()).any(|w| w == CANARY.as_bytes()),
+            "the plaintext is still readable in hub.db"
+        );
+    }
+
+    /// A one-way door: after the delete there is nothing to compare against
+    /// and nothing to retry from, so the sealed row is read back first.
+    #[tokio::test]
+    async fn plaintext_survives_a_seal_that_does_not_read_back() {
+        let (_d, c) = store().await;
+        plaintext(&c, "tmdb_api_key", "operator-key").await;
+        // Corrupt whatever gets written, the moment it is written: a trigger
+        // is the one way to be inside the same transaction as the insert.
+        sqlx::query(
+            "CREATE TRIGGER spoil AFTER INSERT ON credentials BEGIN
+               UPDATE credentials SET secret = randomblob(length(secret))
+                WHERE owner_id = NEW.owner_id
+                  AND provider = NEW.provider
+                  AND field = NEW.field;
+             END",
+        )
+        .execute(&c.db)
+        .await
+        .unwrap();
+
+        let e = adopt_settings(&c, "tmdb", &[("tmdb_api_key", "api_key")])
+            .await
+            .expect_err("a credential that will not read back was accepted");
+        assert!(format!("{e:#}").contains("tmdb"), "{e:#}");
+        assert_eq!(
+            setting(&c, "tmdb_api_key").await.as_deref(),
+            Some("operator-key"),
+            "the plaintext was deleted for a credential that cannot be read"
+        );
+    }
+
+    #[tokio::test]
+    async fn nothing_to_adopt_is_not_an_error() {
+        let (_d, c) = store().await;
+        assert!(
+            !adopt_settings(&c, "tmdb", &[("tmdb_api_key", "api_key")])
+                .await
+                .unwrap()
+        );
+        assert!(c.get_provider(HUB, "tmdb").await.unwrap().is_empty());
     }
 }

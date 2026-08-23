@@ -55,9 +55,12 @@ const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 /// conservative reading of "come back tomorrow".
 const BAN_COOLDOWN: Duration = Duration::from_secs(24 * 3600);
 
-pub const USER_SETTING: &str = "anidb.username";
-pub const PASS_SETTING: &str = "anidb.password";
-pub const APIKEY_SETTING: &str = "anidb.udp_api_key";
+/// AniDB's names in the credential store.
+pub const ANIDB: &str = "anidb";
+pub const USERNAME: &str = "username";
+pub const PASSWORD: &str = "password";
+/// Optional: without it the UDP session is unencrypted, which works.
+pub const UDP_API_KEY: &str = "udp_api_key";
 
 /// An exact file identification.
 #[derive(Debug, Clone)]
