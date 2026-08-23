@@ -462,9 +462,16 @@ marked in that document.
 
 ## Backup and filesystem safety (BKP)
 
-- [ ] BKP-1 Introduce snapshot manifest v2 with SHA-256 and size metadata for
-      every included artifact: configuration, database, PKI, JWT/credential
-      keys, subtitles and other non-derivable state
+- [x] BKP-1 Snapshot manifest v3 records the safe relative path, byte size and
+      SHA-256 of every included regular artifact: configuration, database, PKI,
+      JWT/credential keys, subtitles and other non-derivable state. Format 2
+      was already assigned to credential-key inventory, so v1/v2 remain
+      restorable while v3 rejects missing, extra, duplicate, unsafe, wrong-size
+      or wrong-hash artifacts before touching live state. Snapshot copies hash
+      in the same buffered pass; SQLite's `VACUUM INTO` output is hashed once
+      afterwards. The format, compatibility and corruption checks live in
+      `backup_restore`; `scripts/kahawai-backup-cycle.sh` exercises the CLI and
+      queries the restored database.
 - [ ] BKP-2 Add `restore --config-out`; default to the configuration path used
       by the command or `<data_dir>/kahawai.toml`, and rewrite the restored
       `hub.data_dir` to the selected restore destination. Add a companion script

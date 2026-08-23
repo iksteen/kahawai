@@ -21,10 +21,13 @@
 //! manifest records when the database was taken rather than when the
 //! command finished.
 
-use std::path::Path;
+use std::collections::BTreeMap;
+use std::io::{Read, Write};
+use std::path::{Component, Path};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 /// Written beside the snapshot so a restore can tell what it is holding —
 /// and refuse a directory that merely looks like one.
@@ -47,6 +50,17 @@ pub struct Manifest {
     /// before it was recorded, which is not the same as "carried none".
     #[serde(default)]
     pub secrets: Vec<String>,
+    /// Every regular file in a format-3 snapshot except this manifest itself.
+    /// Paths are portable, slash-separated names relative to the snapshot root.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifacts: Vec<Artifact>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct Artifact {
+    pub path: String,
+    pub bytes: u64,
+    pub sha256: String,
 }
 
 /// Beside the database rather than in a tree. Without `jwt.secret` a restore
@@ -60,7 +74,7 @@ pub const SECRET_FILES: [&str; 3] = [
     crate::api::METRICS_TOKEN_FILE,
 ];
 
-const FORMAT: u32 = 2;
+const FORMAT: u32 = 3;
 const MANIFEST: &str = "kahawai-backup.json";
 
 /// Everything a restore puts back, relative to the data dir. Ordered so
@@ -129,6 +143,7 @@ pub async fn backup(data_dir: &Path, config: Option<&Path>, dest: &Path) -> Resu
     // this makes it survive being moved somewhere less private.
     kahawai_core::private::narrow(&db_out).context("restricting the snapshot database")?;
     let db_bytes = std::fs::metadata(&db_out)?.len();
+    let mut artifacts = vec![hash_artifact(&db_out, Path::new("hub.db"))?];
 
     let mut subtitle_files = 0;
     let mut subtitle_bytes = 0;
@@ -137,8 +152,9 @@ pub async fn backup(data_dir: &Path, config: Option<&Path>, dest: &Path) -> Resu
         if !from.exists() {
             continue;
         }
-        let (n, bytes) = copy_tree(&from, &dest.join(tree))
-            .with_context(|| format!("copying {}", from.display()))?;
+        let (n, bytes) =
+            copy_snapshot_tree(&from, &dest.join(tree), Path::new(tree), &mut artifacts)
+                .with_context(|| format!("copying {}", from.display()))?;
         if tree == "subtitles" {
             (subtitle_files, subtitle_bytes) = (n, bytes);
         }
@@ -150,24 +166,33 @@ pub async fn backup(data_dir: &Path, config: Option<&Path>, dest: &Path) -> Resu
     let mut secrets = Vec::new();
     for name in SECRET_FILES {
         let from = data_dir.join(name);
-        if name == crate::secrets::KEY_FILE
+        let artifact = if name == crate::secrets::KEY_FILE
             && let Some(key) = &credential_key
         {
             kahawai_core::private::write(&dest.join(name), key)
                 .with_context(|| format!("copying {name}"))?;
-            secrets.push(name.to_string());
+            Some(artifact_for_bytes(Path::new(name), key)?)
         } else if from.exists() {
-            std::fs::copy(&from, dest.join(name)).with_context(|| format!("copying {name}"))?;
+            Some(copy_artifact(&from, &dest.join(name), Path::new(name))?)
+        } else {
+            None
+        };
+        if let Some(artifact) = artifact {
+            artifacts.push(artifact);
             secrets.push(name.to_string());
         }
     }
     let has_config = match config {
         Some(path) if path.exists() => {
-            std::fs::copy(path, dest.join("kahawai.toml")).context("copying config")?;
+            artifacts.push(
+                copy_artifact(path, &dest.join("kahawai.toml"), Path::new("kahawai.toml"))
+                    .context("copying config")?,
+            );
             true
         }
         _ => false,
     };
+    artifacts.sort_by(|a, b| a.path.cmp(&b.path));
 
     let manifest = Manifest {
         format: FORMAT,
@@ -179,6 +204,7 @@ pub async fn backup(data_dir: &Path, config: Option<&Path>, dest: &Path) -> Resu
         has_pki: dest.join("pki").exists(),
         has_config,
         secrets,
+        artifacts,
     };
     std::fs::write(dest.join(MANIFEST), serde_json::to_vec_pretty(&manifest)?)
         .context("writing the manifest")?;
@@ -199,6 +225,9 @@ pub async fn restore(src: &Path, data_dir: &Path, force: bool) -> Result<Manifes
             "snapshot format {} is newer than this build understands ({FORMAT})",
             manifest.format
         );
+    }
+    if manifest.format >= 3 {
+        validate_artifacts(src, &manifest.artifacts)?;
     }
     // Validate the complete source before touching a destination. In
     // particular, a missing credential key must not be discovered after
@@ -283,6 +312,197 @@ pub async fn restore(src: &Path, data_dir: &Path, force: bool) -> Result<Manifes
         }
     }
     Ok(manifest)
+}
+
+fn artifact_path(relative: &Path) -> Result<String> {
+    let mut path = String::new();
+    for component in relative.components() {
+        let Component::Normal(name) = component else {
+            bail!("unsafe snapshot artifact path {}", relative.display());
+        };
+        let name = name
+            .to_str()
+            .context("snapshot artifact path is not utf-8")?;
+        anyhow::ensure!(
+            !name.contains('\\'),
+            "snapshot artifact path is not portable: {}",
+            relative.display()
+        );
+        if !path.is_empty() {
+            path.push('/');
+        }
+        path.push_str(name);
+    }
+    anyhow::ensure!(!path.is_empty(), "empty snapshot artifact path");
+    Ok(path)
+}
+
+fn artifact_for_bytes(relative: &Path, bytes: &[u8]) -> Result<Artifact> {
+    Ok(Artifact {
+        path: artifact_path(relative)?,
+        bytes: bytes.len() as u64,
+        sha256: data_encoding::HEXLOWER.encode(&Sha256::digest(bytes)),
+    })
+}
+
+fn hash_artifact(path: &Path, relative: &Path) -> Result<Artifact> {
+    let mut file = std::fs::File::open(path)
+        .with_context(|| format!("opening snapshot artifact {}", path.display()))?;
+    let mut hash = Sha256::new();
+    let mut bytes = 0u64;
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .with_context(|| format!("reading snapshot artifact {}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        hash.update(&buffer[..read]);
+        bytes = bytes
+            .checked_add(read as u64)
+            .context("snapshot artifact is too large")?;
+    }
+    Ok(Artifact {
+        path: artifact_path(relative)?,
+        bytes,
+        sha256: data_encoding::HEXLOWER.encode(&hash.finalize()),
+    })
+}
+
+fn copy_artifact(from: &Path, to: &Path, relative: &Path) -> Result<Artifact> {
+    let mut source =
+        std::fs::File::open(from).with_context(|| format!("opening {}", from.display()))?;
+    if let Some(parent) = to.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut target =
+        kahawai_core::private::create(to).with_context(|| format!("creating {}", to.display()))?;
+    let mut hash = Sha256::new();
+    let mut bytes = 0u64;
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = source
+            .read(&mut buffer)
+            .with_context(|| format!("reading {}", from.display()))?;
+        if read == 0 {
+            break;
+        }
+        target
+            .write_all(&buffer[..read])
+            .with_context(|| format!("writing {}", to.display()))?;
+        hash.update(&buffer[..read]);
+        bytes = bytes
+            .checked_add(read as u64)
+            .context("snapshot artifact is too large")?;
+    }
+    Ok(Artifact {
+        path: artifact_path(relative)?,
+        bytes,
+        sha256: data_encoding::HEXLOWER.encode(&hash.finalize()),
+    })
+}
+
+fn copy_snapshot_tree(
+    from: &Path,
+    to: &Path,
+    relative: &Path,
+    artifacts: &mut Vec<Artifact>,
+) -> Result<(u64, u64)> {
+    std::fs::create_dir_all(to)?;
+    let (mut files, mut bytes) = (0u64, 0u64);
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let (src, dst, child) = (entry.path(), to.join(&name), relative.join(&name));
+        if entry.file_type()?.is_dir() {
+            let (n, b) = copy_snapshot_tree(&src, &dst, &child, artifacts)?;
+            files += n;
+            bytes += b;
+        } else {
+            let artifact = copy_artifact(&src, &dst, &child)?;
+            bytes += artifact.bytes;
+            files += 1;
+            artifacts.push(artifact);
+        }
+    }
+    Ok((files, bytes))
+}
+
+fn validate_artifacts(src: &Path, listed: &[Artifact]) -> Result<()> {
+    let mut expected = BTreeMap::new();
+    for artifact in listed {
+        anyhow::ensure!(
+            artifact.sha256.len() == 64
+                && artifact
+                    .sha256
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+            "invalid metadata for snapshot artifact {}",
+            artifact.path
+        );
+        let relative = Path::new(&artifact.path);
+        anyhow::ensure!(
+            artifact_path(relative)? == artifact.path,
+            "unsafe snapshot artifact path {}",
+            artifact.path
+        );
+        anyhow::ensure!(
+            expected.insert(artifact.path.as_str(), artifact).is_none(),
+            "snapshot manifest lists {} more than once",
+            artifact.path
+        );
+    }
+
+    let mut actual = BTreeMap::new();
+    collect_artifacts(src, src, &mut actual)?;
+    for (path, artifact) in expected {
+        let found = actual.remove(path).with_context(|| {
+            format!("the manifest lists {path}, and the snapshot does not have it")
+        })?;
+        anyhow::ensure!(
+            found.bytes == artifact.bytes,
+            "snapshot artifact {path} has {} bytes, expected {}",
+            found.bytes,
+            artifact.bytes
+        );
+        anyhow::ensure!(
+            found.sha256 == artifact.sha256,
+            "snapshot artifact {path} failed its SHA-256 check"
+        );
+    }
+    if let Some(path) = actual.keys().next() {
+        bail!("snapshot contains unlisted artifact {path}");
+    }
+    Ok(())
+}
+
+fn collect_artifacts(
+    root: &Path,
+    directory: &Path,
+    artifacts: &mut BTreeMap<String, Artifact>,
+) -> Result<()> {
+    for entry in std::fs::read_dir(directory)? {
+        let entry = entry?;
+        let path = entry.path();
+        let relative = path.strip_prefix(root)?;
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            collect_artifacts(root, &path, artifacts)?;
+        } else if file_type.is_file() {
+            if relative == Path::new(MANIFEST) {
+                continue;
+            }
+            let artifact = hash_artifact(&path, relative)?;
+            artifacts.insert(artifact.path.clone(), artifact);
+        } else {
+            bail!(
+                "snapshot artifact {} is not a regular file",
+                relative.display()
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Recursive copy, returning (files, bytes). Existing files are

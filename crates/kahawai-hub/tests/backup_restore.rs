@@ -3,6 +3,7 @@
 //! hold. A backup that loses the CA turns a restore into a re-enrolment
 //! of every machine, which is the failure worth testing for.
 
+use sha2::{Digest, Sha256};
 use std::path::Path;
 
 fn write(path: &Path, body: &str) {
@@ -58,7 +59,7 @@ async fn a_snapshot_restores_the_database_pki_and_subtitles() {
     let m = kahawai_hub::backup::backup(live.path(), Some(&cfg), &snap)
         .await
         .unwrap();
-    assert_eq!(m.format, 2, "the credential-key layout needs format 2");
+    assert_eq!(m.format, 3, "artifact inventory needs format 3");
     assert!(
         m.has_pki,
         "a snapshot without the CA cannot reconnect satellites"
@@ -66,6 +67,31 @@ async fn a_snapshot_restores_the_database_pki_and_subtitles() {
     assert!(m.has_config);
     assert_eq!(m.subtitle_files, 1);
     assert!(m.db_bytes > 0);
+    assert_eq!(
+        m.artifacts
+            .iter()
+            .map(|artifact| artifact.path.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "hub.db",
+            "jwt.secret",
+            "kahawai.toml",
+            "pki/ca.crt",
+            "pki/ca.key",
+            "subtitles/abc/def.srt",
+        ],
+        "the manifest must list every included regular file in path order"
+    );
+    for artifact in &m.artifacts {
+        let bytes = std::fs::read(snap.join(&artifact.path)).unwrap();
+        assert_eq!(artifact.bytes, bytes.len() as u64, "{}", artifact.path);
+        assert_eq!(
+            artifact.sha256,
+            data_encoding::HEXLOWER.encode(&Sha256::digest(&bytes)),
+            "{}",
+            artifact.path
+        );
+    }
 
     // The exclusions are the point of the requirement, not an oversight.
     assert!(
@@ -102,6 +128,132 @@ async fn a_snapshot_restores_the_database_pki_and_subtitles() {
         .unwrap();
     assert_eq!(title, "Solaris");
     db.close().await;
+}
+
+#[tokio::test]
+async fn a_format_three_restore_rejects_size_and_hash_damage_before_live_state() {
+    let live = tempfile::tempdir().unwrap();
+    kahawai_hub::db::open(live.path())
+        .await
+        .unwrap()
+        .close()
+        .await;
+    let snap = tempfile::tempdir().unwrap().keep().join("snapshot");
+    kahawai_hub::backup::backup(live.path(), None, &snap)
+        .await
+        .unwrap();
+    let original = std::fs::read(snap.join("hub.db")).unwrap();
+
+    let into = tempfile::tempdir().unwrap();
+    write(&into.path().join("hub.db"), "standing database");
+    write(&into.path().join("hub.db-wal"), "standing wal");
+
+    let mut damaged = original.clone();
+    damaged[0] ^= 1;
+    std::fs::write(snap.join("hub.db"), damaged).unwrap();
+    let error = kahawai_hub::backup::restore(&snap, into.path(), true)
+        .await
+        .expect_err("same-size corruption passed the manifest check");
+    assert!(format!("{error:#}").contains("SHA-256"), "{error:#}");
+
+    let mut larger = original;
+    larger.push(0);
+    std::fs::write(snap.join("hub.db"), larger).unwrap();
+    let error = kahawai_hub::backup::restore(&snap, into.path(), true)
+        .await
+        .expect_err("wrong-size artifact passed the manifest check");
+    assert!(format!("{error:#}").contains("bytes"), "{error:#}");
+    assert_eq!(
+        std::fs::read_to_string(into.path().join("hub.db")).unwrap(),
+        "standing database"
+    );
+    assert_eq!(
+        std::fs::read_to_string(into.path().join("hub.db-wal")).unwrap(),
+        "standing wal"
+    );
+}
+
+#[tokio::test]
+async fn a_format_three_restore_rejects_unsafe_and_duplicate_artifact_paths() {
+    let live = tempfile::tempdir().unwrap();
+    kahawai_hub::db::open(live.path())
+        .await
+        .unwrap()
+        .close()
+        .await;
+    let snap = tempfile::tempdir().unwrap().keep().join("snapshot");
+    kahawai_hub::backup::backup(live.path(), None, &snap)
+        .await
+        .unwrap();
+    let manifest_path = snap.join("kahawai-backup.json");
+    let original: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+
+    let mut unsafe_path = original.clone();
+    unsafe_path["artifacts"][0]["path"] = "../hub.db".into();
+    let mut duplicate = original;
+    let repeated = duplicate["artifacts"][0].clone();
+    duplicate["artifacts"]
+        .as_array_mut()
+        .unwrap()
+        .push(repeated);
+
+    let into = tempfile::tempdir().unwrap();
+    write(&into.path().join("hub.db"), "standing database");
+    for (manifest, expected) in [
+        (unsafe_path, "unsafe snapshot artifact path"),
+        (duplicate, "more than once"),
+    ] {
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        let error = kahawai_hub::backup::restore(&snap, into.path(), true)
+            .await
+            .expect_err("malformed artifact inventory was accepted");
+        assert!(format!("{error:#}").contains(expected), "{error:#}");
+        assert_eq!(
+            std::fs::read_to_string(into.path().join("hub.db")).unwrap(),
+            "standing database"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_format_two_snapshot_without_artifacts_remains_restorable() {
+    let live = tempfile::tempdir().unwrap();
+    kahawai_hub::db::open(live.path())
+        .await
+        .unwrap()
+        .close()
+        .await;
+    let snap = tempfile::tempdir().unwrap().keep().join("snapshot");
+    kahawai_hub::backup::backup(live.path(), None, &snap)
+        .await
+        .unwrap();
+    let manifest_path = snap.join("kahawai-backup.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+    manifest["format"] = 2.into();
+    manifest.as_object_mut().unwrap().remove("artifacts");
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+
+    let into = tempfile::tempdir().unwrap();
+    let restored = kahawai_hub::backup::restore(&snap, into.path(), false)
+        .await
+        .expect("format-2 snapshots predate the artifact inventory");
+    assert_eq!(restored.format, 2);
+    assert!(restored.artifacts.is_empty());
+    kahawai_hub::db::open(into.path())
+        .await
+        .unwrap()
+        .close()
+        .await;
 }
 
 /// A snapshot is every password hash and every session, sitting in a
@@ -318,7 +470,17 @@ async fn a_restore_refuses_a_key_that_does_not_match_the_snapshot_database() {
     let key_path = snap.join(kahawai_hub::secrets::KEY_FILE);
     let mut wrong_key = std::fs::read(&key_path).unwrap();
     wrong_key[0] ^= 1;
-    std::fs::write(&key_path, wrong_key).unwrap();
+    std::fs::write(&key_path, &wrong_key).unwrap();
+    let manifest_path = snap.join("kahawai-backup.json");
+    let mut manifest: kahawai_hub::backup::Manifest =
+        serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+    manifest
+        .artifacts
+        .iter_mut()
+        .find(|artifact| artifact.path == kahawai_hub::secrets::KEY_FILE)
+        .unwrap()
+        .sha256 = data_encoding::HEXLOWER.encode(&Sha256::digest(&wrong_key));
+    std::fs::write(manifest_path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
 
     let into = tempfile::tempdir().unwrap();
     write(&into.path().join("hub.db"), "standing database");

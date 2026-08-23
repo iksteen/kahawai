@@ -614,10 +614,12 @@ How something works and why it was built that way belong in
       OPS-8 adds proxy-trust config
 - [x] OPS-3 `doctor` command with plugin/encoder checks
 - [x] OPS-4 Clock-skew tolerance (backdated certs, enrollment skew warning)
-- [x] OPS-5 Online backup/restore (`kahawai hub backup|restore`),
-      taken while the hub keeps serving, and including the PKI so
-      restored hubs accept existing satellite certs without re-enrolment;
-      caches excluded as re-derivable.
+- [x] OPS-5 Online backup/restore (`kahawai hub backup|restore`), taken while
+      the hub keeps serving, including the PKI so restored hubs accept existing
+      satellite certs without re-enrolment, and excluding caches as
+      re-derivable. Manifest v3 inventories every included regular file by
+      safe relative path, size and SHA-256 and validates the complete source
+      before restore mutation; v1/v2 remain restorable.
 - [x] OPS-6 Quota-bounded caches with eviction — satisfied by there being
       nothing eligible to evict; requirement amended 2026-07-26 with the
       audit, reasoning in implementation §10. The one deletion is
