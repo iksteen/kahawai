@@ -9,7 +9,7 @@
     },
     "version": "0.0.0-dev"
   },
-  "x-kahawai-source-sha256": "4d1bfc41ac94f7124889ded5e103437a58a80123a3364a8d1dcf4cb6e8a441e1",
+  "x-kahawai-source-sha256": "c58a213745f0b00563f1bc29900d58ed4eaa03211fa27a48c09b68c1a730590a",
   "paths": {
     "/admin/v1/collections": {
       "get": {
@@ -6135,6 +6135,111 @@
             }
           },
           "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The hub has no administrator yet: `setup_required`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/up-next": {
+      "get": {
+        "tags": [
+          "Browse"
+        ],
+        "summary": "What to watch next, per series",
+        "description": "One episode per series: the one after the last you finished. A series\nis here when you have finished an episode of it, are not part-way\nthrough one (that is continue watching's row, and the two never both\nclaim a series), and it is still current — you watched an episode\nwithin the last month, or the episode you would watch next was added\nwithin it. Most recently watched series first; `library` scopes it and\ngrants bind it, as on the browse.",
+        "operationId": "up_next",
+        "parameters": [
+          {
+            "name": "library",
+            "in": "query",
+            "description": "Scopes the row to one library, as on the browse. There is no\n`sort` and no `q`: the order is when you last watched the series,\nand one episode per series is not a thing to search.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "A page, not the catalogue — the browse's default and cap.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ItemsResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A path segment or query parameter is not the shape this route takes",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
             "content": {
               "application/json": {
                 "schema": {

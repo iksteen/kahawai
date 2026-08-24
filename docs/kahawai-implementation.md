@@ -285,6 +285,7 @@ POST /api/v1/auth/refresh                   # rotate one refresh family
 POST /api/v1/auth/logout                    # bearer + refresh → revoke that family
 GET  /api/v1/libraries
 GET  /api/v1/items?library=&q=&sort=&limit=&offset=   # browse AND search; returns total
+GET  /api/v1/up-next?library=&limit=&offset=          # next episode per series (same rows)
 GET  /api/v1/items/{id}                     # as DISCOVERED: sources[] without StreamInfo
 QUERY /api/v1/items/{id}                    # as NEGOTIATED: the above + streams + verdict
                                             # body: { profile?, audio_track?, video_track?,

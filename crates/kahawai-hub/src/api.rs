@@ -132,6 +132,7 @@ impl Default for NetOptions {
         list_collections,
         list_libraries,
         list_items,
+        up_next,
         item_detail,
         item_query,
         item_children,
@@ -350,6 +351,7 @@ pub fn router(
         .route("/api/v1/collections", get(list_collections))
         .route("/api/v1/libraries", get(list_libraries))
         .route("/api/v1/items", get(list_items))
+        .route("/api/v1/up-next", get(up_next))
         .route("/api/v1/auth/logout", post(logout))
         .route(
             "/api/v1/subtitles/{track_id}",
@@ -5388,6 +5390,219 @@ async fn list_items(
     }))
 }
 
+/// How long "recent" lasts for the up-next row: a month, taken as 30
+/// days. Two independent things are measured against it — when this
+/// account last finished an episode of a series, and when the episode it
+/// would watch next was added — and either one alone keeps the series in
+/// the row.
+const UP_NEXT_WINDOW_SECS: u64 = 30 * 24 * 60 * 60;
+
+#[derive(Deserialize, ToSchema, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
+struct UpNextQuery {
+    /// Scopes the row to one library, as on the browse. There is no
+    /// `sort` and no `q`: the order is when you last watched the series,
+    /// and one episode per series is not a thing to search.
+    library: Option<String>,
+    /// A page, not the catalogue — the browse's default and cap.
+    limit: Option<u32>,
+    offset: Option<u32>,
+}
+
+/// The eligible set for [`up_next`]: one row per series, carrying the
+/// episode to play next and the series' last viewing.
+///
+/// Shared verbatim by the page and its count, so the two cannot come to
+/// disagree — a total that does not match the rows it counts is a paging
+/// bug that only shows up on the last page.
+///
+/// `member` is the caller's reach, correlated on the SERIES alias `c`
+/// rather than on the episode: membership only ever holds top-level
+/// items, and an episode belongs to a library through its show.
+///
+/// Bindings: `?1` the account, `?2` the library (bound even when
+/// unscoped, so the numbering is uniform), `?3` the watched-since cut,
+/// `?4` the added-since cut.
+///
+/// Driven from `watch_state` for the reason continue watching is: the
+/// set is "series this account has finished an episode of", which is
+/// small by construction, so this reads one key range of one user's rows
+/// instead of asking every show whether it has been started.
+fn up_next_from(member: &str) -> String {
+    format!(
+        "FROM (SELECT e.parent_id AS show_id, MAX(w.updated_at) AS last_watched
+                 FROM watch_state w
+                 JOIN items e ON e.id = w.item_id
+                WHERE w.user_id = ?1 AND w.played = 1
+                  AND e.kind = 'episode' AND e.parent_id IS NOT NULL
+                GROUP BY e.parent_id) seen
+         JOIN items c ON c.id = seen.show_id AND c.kind = 'show'
+         -- What to play next: the first episode, in (season, episode, id)
+         -- order, that comes after the last one finished and has not
+         -- itself been finished. A series with nothing after it leaves
+         -- the row entirely, and it is this join that drops it — there is
+         -- no such thing as an up-next entry with no episode in it.
+         --
+         -- A gap is skipped rather than gone back for: what follows the
+         -- last thing watched is the question, so finishing S01E05 out of
+         -- order offers S01E06 and not the four before it.
+         --
+         -- A null season or episode is ordered, not excluded. SQLite
+         -- sorts NULL before every value ascending and after it
+         -- descending, which is exactly where COALESCE(...,-1) puts it —
+         -- so the ORDER BYs stay on `items_children` while the row-value
+         -- comparison, where one NULL makes the whole predicate NULL and
+         -- silently drops the row, spells the -1 out.
+         JOIN items nx ON nx.id = (
+               SELECT n.id FROM items n
+                WHERE n.parent_id = c.id AND n.kind = 'episode'
+                  AND (COALESCE(n.season, -1), COALESCE(n.episode, -1), n.id) >
+                      (SELECT COALESCE(p.season, -1), COALESCE(p.episode, -1), p.id
+                         FROM items p
+                         JOIN watch_state pw ON pw.item_id = p.id
+                          AND pw.user_id = ?1 AND pw.played = 1
+                        WHERE p.parent_id = c.id AND p.kind = 'episode'
+                        ORDER BY p.season DESC, p.episode DESC, p.id DESC LIMIT 1)
+                  AND NOT EXISTS (SELECT 1 FROM watch_state nw
+                                   WHERE nw.user_id = ?1 AND nw.item_id = n.id
+                                     AND nw.played = 1)
+                ORDER BY n.season, n.episode, n.id LIMIT 1)
+         -- Part-way through an episode of this series? Then the series
+         -- belongs to continue watching and not here. Deliberately the
+         -- same predicate that row is made of (`position_ms > 0 AND
+         -- played = 0`), so the two rows partition the series between
+         -- them instead of both claiming one or neither offering it.
+        WHERE NOT EXISTS (SELECT 1 FROM items pe
+                            JOIN watch_state pw ON pw.item_id = pe.id AND pw.user_id = ?1
+                           WHERE pe.parent_id = c.id
+                             AND pw.position_ms > 0 AND pw.played = 0)
+          -- Still current, either way round: you watched one lately, or
+          -- the one you would watch next arrived lately — the season
+          -- that starts up again after a year off is the case the second
+          -- half is for. `nx.id` IS when it was added: item ids are
+          -- ULIDs, which sort lexicographically by the moment they were
+          -- minted, and `sort=-added` orders the browse by the same
+          -- thing, so the two cannot drift apart.
+          AND (seen.last_watched >= ?3 OR nx.id >= ?4)
+          {member}"
+    )
+}
+
+/// What to watch next, per series
+///
+/// One episode per series: the one after the last you finished. A series
+/// is here when you have finished an episode of it, are not part-way
+/// through one (that is continue watching's row, and the two never both
+/// claim a series), and it is still current — you watched an episode
+/// within the last month, or the episode you would watch next was added
+/// within it. Most recently watched series first; `library` scopes it and
+/// grants bind it, as on the browse.
+#[utoipa::path(
+    get, path = "/api/v1/up-next", tag = "Browse",
+    security(("bearer_auth" = [])),
+    params(UpNextQuery),
+    responses(
+        (status = 200, body = ItemsResponse),
+        (status = 401, body = ApiErrorBody),
+        (status = 404, body = ApiErrorBody),
+        (status = 500, body = ApiErrorBody),
+        (status = 400, description = "A path segment or query parameter is not the shape this route takes", body = ApiErrorBody),
+        (status = 503, description = "The hub has no administrator yet: `setup_required`", body = ApiErrorBody)
+    )
+)]
+async fn up_next(
+    State(state): State<AppState>,
+    ApiQuery(q): ApiQuery<UpNextQuery>,
+    axum::Extension(claims): axum::Extension<crate::auth::Claims>,
+) -> Result<Json<ItemsResponse>, ApiError> {
+    let limit = q.limit.unwrap_or(ITEMS_PAGE_DEFAULT).min(ITEMS_PAGE_MAX);
+    let offset = q.offset.unwrap_or(0);
+    let db = state.registry.db();
+
+    // HUB-10, resolved once and for the same reason the browse does it:
+    // an unrestricted account pays nothing for grants it does not have.
+    let restricted = crate::grants::restricted(db, &claims)
+        .await
+        .map_err(internal)?;
+    if restricted
+        && let Some(library) = &q.library
+        && !crate::grants::can_see_library(db, &claims, library)
+            .await
+            .map_err(internal)?
+    {
+        return Err(hidden("library"));
+    }
+    let member = match (&q.library, restricted) {
+        (Some(_), _) => {
+            "AND EXISTS(SELECT 1 FROM library_collections lc
+                          WHERE lc.library_id=?2
+                            AND (lc.module_id,lc.collection_id)=(c.module_id,c.collection_id))"
+        }
+        (None, true) => crate::grants::VISIBLE_C,
+        (None, false) => "",
+    };
+
+    // One clock for both cuts. They are two readings of the same "a
+    // month ago", and taking one from `SystemTime` and the other from
+    // `unixepoch()` would let them disagree for no reason at all.
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let since_ms = now_ms.saturating_sub(UP_NEXT_WINDOW_SECS * 1000);
+    let watched_since = (since_ms / 1000) as i64;
+    // The smallest ULID that could have been minted at the cut, so "added
+    // since" is a plain string comparison against ids that are already in
+    // that order. An id that is not a ULID — a fixture, or a row from
+    // before they were — is not being dated by this and does not pretend
+    // to be.
+    let added_since = ulid::Ulid::from_parts(since_ms, 0).to_string();
+
+    let body = up_next_from(member);
+    let sql = item_page_sql(
+        &format!(
+            "SELECT nx.id AS item_id, seen.last_watched AS last_watched {body}
+              ORDER BY seen.last_watched DESC, nx.id DESC LIMIT ?5 OFFSET ?6"
+        ),
+        // The SERIES' last viewing, which is the inner query's own
+        // column: the watch row the dressing join brings is the next
+        // episode's, and it has none — not having one is what makes it
+        // next. Ends in a unique column, so a tie cannot straddle a page
+        // boundary two different ways.
+        "page.last_watched DESC, i.id DESC",
+        restricted,
+        true,
+    );
+    let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
+        .bind(&claims.sub)
+        .bind(q.library.as_deref().unwrap_or(""))
+        .bind(watched_since)
+        .bind(&added_since)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(db)
+        .await
+        .map_err(internal)?;
+    let total: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) {body}")))
+        .bind(&claims.sub)
+        .bind(q.library.as_deref().unwrap_or(""))
+        .bind(watched_since)
+        .bind(&added_since)
+        .fetch_one(db)
+        .await
+        .map_err(internal)?;
+    let items = rows
+        .iter()
+        .map(|row| item_row(row, row.get::<i64, _>("sources")))
+        .collect();
+    Ok(Json(ItemsResponse {
+        items,
+        total,
+        limit,
+        offset,
+    }))
+}
+
 #[derive(Serialize, ToSchema)]
 #[schema(as = ItemRow<S>)]
 struct ItemRow<S> {
@@ -7216,6 +7431,7 @@ mod tests {
             ("get", "/api/v1/collections"),
             ("get", "/api/v1/libraries"),
             ("get", "/api/v1/items"),
+            ("get", "/api/v1/up-next"),
             ("get", "/api/v1/items/{id}"),
             ("query", "/api/v1/items/{id}"),
             ("get", "/api/v1/items/{id}/children"),
@@ -7323,6 +7539,9 @@ mod tests {
             ("/api/v1/items", "get", "in_progress"),
             ("/api/v1/items", "get", "limit"),
             ("/api/v1/items", "get", "offset"),
+            ("/api/v1/up-next", "get", "library"),
+            ("/api/v1/up-next", "get", "limit"),
+            ("/api/v1/up-next", "get", "offset"),
             ("/api/v1/items/{id}/artwork", "get", "size"),
             ("/api/v1/items/{id}/artwork", "get", "v"),
             ("/api/v1/items/{id}/subtitles/{file}", "get", "shift_ms"),

@@ -356,6 +356,25 @@ How something works and why it was built that way belong in
       it. Checked by `tests/browse_in_progress.rs`, including that a
       withheld library's item cannot appear even when the account has a
       position in it.
+      `GET /api/v1/up-next` is the row beside it: one episode per series,
+      the one after the last you FINISHED — not the first unwatched,
+      which is a different answer whenever an episode was skipped. A
+      series appears when this account has finished an episode of it, is
+      not part-way through one (the same `position_ms > 0 AND played = 0`
+      predicate continue watching is made of, so the two rows partition
+      the series between them instead of both claiming one), and is still
+      current: watched within the last month, OR the episode it would
+      offer was added within it — the second half is the season that
+      starts up again after a year off. "Added" is the item id, which is
+      a ULID and so already sorted by the moment it was minted; the cut
+      is the smallest ULID of that moment, which is the same thing
+      `sort=-added` orders by. Ordered by the series' last viewing, most
+      recent first (`kahawai-list.sh -n`). Same shape and same page as
+      the browse: `ItemsResponse`, `library` scopes it, grants bind it —
+      correlated on the SHOW, since an episode belongs to a library
+      through its parent. Checked by `tests/up_next.rs`, including a
+      series brought back by a new episode alone beside an otherwise
+      identical one that stays quiet.
 - [x] HUB-13 All hub state in embedded storage; survives restart without rescan
 - [x] HUB-14 Capability-profile negotiation: browser-probed profile with
       every play request, hub decides per stream (`negotiate.rs`,
