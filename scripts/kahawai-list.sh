@@ -23,7 +23,7 @@ while getopts "a:pnh" opt; do
         # Its own route rather than a flag on the browse: one row per
         # series is not a filter over items.
         n) PATH_="/api/v1/up-next" ;;
-        h|*) grep '^#' "$0" | sed 's/^# \{0,1\}//' | head -11; exit 0 ;;
+        h|*) grep '^#' "$0" | sed 's/^# \{0,1\}//' | head -12; exit 0 ;;
     esac
 done
 shift $((OPTIND - 1))
