@@ -269,6 +269,9 @@ impl TranscoderLink for TranscoderLinkService {
                                                 error = format!("{err:#}"),
                                                 "mid-session reschedule failed; ending"
                                             );
+                                            // Taken: the viewer is still
+                                            // there and their client will
+                                            // start again where it was.
                                             sessions.end(&e.session_id);
                                         }
                                     }

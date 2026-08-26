@@ -9,7 +9,7 @@
     },
     "version": "0.0.0-dev"
   },
-  "x-kahawai-source-sha256": "c58a213745f0b00563f1bc29900d58ed4eaa03211fa27a48c09b68c1a730590a",
+  "x-kahawai-source-sha256": "767fb6f84f3c347d536788f4ccbbf89e53ec4f8f9748346a02331a04aeefa6ca",
   "paths": {
     "/admin/v1/collections": {
       "get": {
@@ -5342,7 +5342,7 @@
           "Playback"
         ],
         "summary": "Report playback progress",
-        "description": "Stores the resume position, keeps the session alive and paces the\npipeline, marking the item played past 90 percent. An unknown or expired\nsession answers 404.",
+        "description": "Stores the resume position, keeps the session alive and paces the\npipeline, marking the item played past 90 percent. An unknown or expired\nsession answers 404.\n\n`played` is a boolean and not a high-water mark: it is what the last\nreport said — bar one at position zero, which says nothing and leaves\nit alone — so an item watched again stops being played as soon as its\nplayhead has moved at all. What makes that happen\nwithout any client knowing the rule is the other half — a played item\nis served with no `resume_position_ms` (see [`item_row`]), so the next\n`Play` on it begins at the beginning. `play_count` is the counter, and it\nrises once per watch that ENDED at the end — which this call cannot\nknow, so `sessions::Sessions::end` is what writes it.",
         "operationId": "post_progress",
         "parameters": [
           {
@@ -7812,7 +7812,8 @@
             "format": "int64"
           },
           "played": {
-            "type": "boolean"
+            "type": "boolean",
+            "description": "Whether this item is finished as of the last thing that happened to\nit. Not a high-water mark: starting it again clears it, and\n`play_count` — which only rises — is the record of how many times it\nhas been finished."
           },
           "premiered": {
             "type": [
@@ -7857,7 +7858,8 @@
               "integer",
               "null"
             ],
-            "format": "int64"
+            "format": "int64",
+            "description": "Where a `Play` on this item should begin, in milliseconds. Absent\nmeans the beginning — which is what a played item reports, so\nwatching something again starts it again rather than dropping the\nviewer into its last ten percent. Not \"the last position seen\":\nthat is the hub's own business and outlives this field."
           },
           "season": {
             "type": [
@@ -8062,7 +8064,8 @@
             "format": "int64"
           },
           "played": {
-            "type": "boolean"
+            "type": "boolean",
+            "description": "Whether this item is finished as of the last thing that happened to\nit. Not a high-water mark: starting it again clears it, and\n`play_count` — which only rises — is the record of how many times it\nhas been finished."
           },
           "premiered": {
             "type": [
@@ -8107,7 +8110,8 @@
               "integer",
               "null"
             ],
-            "format": "int64"
+            "format": "int64",
+            "description": "Where a `Play` on this item should begin, in milliseconds. Absent\nmeans the beginning — which is what a played item reports, so\nwatching something again starts it again rather than dropping the\nviewer into its last ten percent. Not \"the last position seen\":\nthat is the hub's own business and outlives this field."
           },
           "season": {
             "type": [

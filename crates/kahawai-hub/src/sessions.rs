@@ -434,6 +434,26 @@ pub struct Session {
     /// abort a restart midway (the executor task is detached).
     seek_done: tokio::sync::watch::Sender<(u64, Result<u64, String>)>,
     touched: Mutex<std::time::Instant>,
+    /// Is the playhead past the end threshold? Seeded from where this
+    /// watch BEGAN, then moved by every progress report.
+    ///
+    /// Per SESSION and not read back from `watch_state.played`, so
+    /// nothing else that writes that column — a mark by hand, another
+    /// device — can put a play in this session's name.
+    finished: std::sync::atomic::AtomicBool,
+    /// Did this watch take the item past the line ITSELF?
+    ///
+    /// With [`Session::finished`] it decides `play_count` at teardown, and
+    /// the pair is what keeps one sitting from counting twice. A session
+    /// that is taken away — a reaped pause, a dead transcoder, a lost
+    /// mediahost — is followed by one the client starts AT THE SAME
+    /// POSITION (`recovery.ts`), already past the line and so seeded
+    /// `finished`; it never sees the crossing, so the play stays with the
+    /// watch that did the watching, wherever that one happened to stop.
+    /// Asking instead who ended the session cannot work: the answer would
+    /// have to be "not the reaper", and a viewer who finishes something
+    /// and closes a laptop that never sends its `DELETE` is reaped too.
+    saw_finish: std::sync::atomic::AtomicBool,
 }
 
 /// A coalesced seek intent.
@@ -1149,6 +1169,25 @@ impl Session {
     /// progress pings) keeps the session alive (HUB-18).
     pub fn touch(&self) {
         *self.touched.lock().unwrap() = std::time::Instant::now();
+    }
+
+    /// Record what a progress report said, for the count that lands when
+    /// this watch stops. See [`Session::finished`].
+    pub fn report(&self, finished: bool) {
+        let was = self
+            .finished
+            .swap(finished, std::sync::atomic::Ordering::Relaxed);
+        if finished && !was {
+            self.saw_finish
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Is this watch a play? It ended past the line, and it is the one
+    /// that got the item there. Read once, at teardown.
+    pub fn earned_a_play(&self) -> bool {
+        self.finished.load(std::sync::atomic::Ordering::Relaxed)
+            && self.saw_finish.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn idle_for(&self) -> Duration {
@@ -2494,6 +2533,17 @@ impl Sessions {
         let mut sub_verdicts = negotiated.subtitles;
         fill_verdict_track_ids(registry, &parts, &mut sub_verdicts).await;
         let burn_pick = burn_sets.as_ref().and_then(|_| neg.pick_for(&parts));
+        let session_duration = if parts.len() > 1 {
+            Some(total_ms)
+        } else {
+            info.duration_ms
+        };
+        // Where this watch begins, on the same 90 percent rule progress
+        // uses. A session that opens PAST the line is a continuation —
+        // recovery restarts at the position that was lost — so its first
+        // report must not read as a crossing.
+        let started_finished =
+            session_duration.is_some_and(|d| d > 0 && start_ms.saturating_mul(10) >= d * 9);
         let session = Arc::new(Session {
             id,
             user_id: user_id.to_string(),
@@ -2501,11 +2551,7 @@ impl Sessions {
             module_id,
             size,
             container: info.container.clone(),
-            duration_ms: if parts.len() > 1 {
-                Some(total_ms)
-            } else {
-                info.duration_ms
-            },
+            duration_ms: session_duration,
             parts,
             current_part: std::sync::atomic::AtomicUsize::new(start_idx),
             mode: session_mode,
@@ -2528,6 +2574,8 @@ impl Sessions {
             needs: Mutex::new(session_needs),
             pace_class: session_class,
             touched: Mutex::new(std::time::Instant::now()),
+            finished: std::sync::atomic::AtomicBool::new(started_finished),
+            saw_finish: std::sync::atomic::AtomicBool::new(false),
         });
         self.active
             .lock()
@@ -3993,6 +4041,51 @@ impl Sessions {
                 }
             }
             Mode::Direct { .. } => {}
+        }
+        // HUB-10: a play is counted here and nowhere else on the playback
+        // path, because stopping is the only moment a watch is over.
+        // Counting the 90-percent crossing instead counted a second play
+        // for anyone who scrubbed back over the line and forward again,
+        // and counted one for a viewer who then abandoned the thing at
+        // half way. Whichever session took the item past the line is the
+        // one that counts, so a sitting split across two of them by a
+        // reaped pause or a dead transcoder is still one play.
+        if session.earned_a_play() {
+            match self.registry_for_teardown.lock().unwrap().clone() {
+                Some(registry) => {
+                    let db = registry.db().clone();
+                    let (user_id, item_id) = (session.user_id.clone(), session.item_id.clone());
+                    let session_id = id.to_string();
+                    tokio::spawn(async move {
+                        if let Err(e) = sqlx::query(
+                            "UPDATE watch_state SET play_count = play_count + 1
+                              WHERE user_id = ? AND item_id = ?",
+                        )
+                        .bind(&user_id)
+                        .bind(&item_id)
+                        .execute(&db)
+                        .await
+                        {
+                            tracing::warn!(
+                                session = %session_id,
+                                item = %item_id,
+                                error = %e,
+                                "finished watch not counted"
+                            );
+                        }
+                    });
+                }
+                // Only reachable in an embedding that never called
+                // `attach_registry` — `api::router` does. Said out loud
+                // rather than dropped, because a play that silently does
+                // not count is invisible until someone adds up a year of
+                // them.
+                None => tracing::warn!(
+                    session = id,
+                    item = %session.item_id,
+                    "no registry attached; finished watch not counted"
+                ),
+            }
         }
         tracing::info!(session = id, "session ended");
         true

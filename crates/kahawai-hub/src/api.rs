@@ -265,6 +265,11 @@ pub fn router(
 ) -> Router {
     let cors = cors_layer(&net.cors_origins);
     let web_dir = net.web_dir;
+    // Teardown work needs the registry: the session-ended event, and the
+    // play a finished watch earns when it stops. Attached here so every
+    // embedding of this router has it and not the hub binary alone — an
+    // uncounted play is invisible until someone adds up a year of them.
+    sessions.attach_registry(registry.clone());
     let state = AppState {
         registry,
         auth,
@@ -5653,6 +5658,11 @@ struct ItemRow<S> {
     sources: S,
     #[schema(required)]
     replay_gain: Option<kahawai_core::media::ReplayGain>,
+    /// Where a `Play` on this item should begin, in milliseconds. Absent
+    /// means the beginning — which is what a played item reports, so
+    /// watching something again starts it again rather than dropping the
+    /// viewer into its last ten percent. Not "the last position seen":
+    /// that is the hub's own business and outlives this field.
     #[schema(required)]
     resume_position_ms: Option<i64>,
     #[schema(required)]
@@ -5671,11 +5681,16 @@ struct ItemRow<S> {
     /// running time for every row of a page is a cost that buys nothing there.
     #[schema(required)]
     duration_ms: Option<i64>,
+    /// Whether this item is finished as of the last thing that happened to
+    /// it. Not a high-water mark: starting it again clears it, and
+    /// `play_count` — which only rises — is the record of how many times it
+    /// has been finished.
     played: bool,
     play_count: i64,
 }
 
 fn item_row<S>(r: &sqlx::sqlite::SqliteRow, sources: S) -> ItemRow<S> {
+    let played = r.get::<Option<i64>, _>("played").unwrap_or(0) != 0;
     ItemRow {
         id: r.get("id"),
         kind: r.get("kind"),
@@ -5708,9 +5723,16 @@ fn item_row<S>(r: &sqlx::sqlite::SqliteRow, sources: S) -> ItemRow<S> {
         // `try_get`, because the browse queries do not select it — only the
         // ones that reach `files`, which is where a running time lives.
         duration_ms: r.try_get("file_duration_ms").ok().flatten(),
-        resume_position_ms: r.get("position_ms"),
+        // A played item has nowhere to resume: the next Play starts at the
+        // beginning, which is what clears `played` on that watch's first
+        // progress report. Answered here rather than by storing a zero,
+        // because `watch_state.position_ms` is ALSO where a re-dispatched
+        // transcode picks the stream back up (AR-6, `sessions.rs`) — zeroing
+        // it would restart a failed-over film from the top for anyone in its
+        // last ten minutes.
+        resume_position_ms: (!played).then(|| r.get("position_ms")).flatten(),
         resume_duration_ms: r.try_get("duration_ms").ok().flatten(),
-        played: r.get::<Option<i64>, _>("played").unwrap_or(0) != 0,
+        played,
         play_count: r.get::<Option<i64>, _>("play_count").unwrap_or(0),
     }
 }
@@ -6751,6 +6773,16 @@ struct ProgressRequest {
 /// Stores the resume position, keeps the session alive and paces the
 /// pipeline, marking the item played past 90 percent. An unknown or expired
 /// session answers 404.
+///
+/// `played` is a boolean and not a high-water mark: it is what the last
+/// report said — bar one at position zero, which says nothing and leaves
+/// it alone — so an item watched again stops being played as soon as its
+/// playhead has moved at all. What makes that happen
+/// without any client knowing the rule is the other half — a played item
+/// is served with no `resume_position_ms` (see [`item_row`]), so the next
+/// `Play` on it begins at the beginning. `play_count` is the counter, and it
+/// rises once per watch that ENDED at the end — which this call cannot
+/// know, so `sessions::Sessions::end` is what writes it.
 #[utoipa::path(
     post, path = "/api/v1/playback/sessions/{id}/progress", tag = "Playback",
     security(("bearer_auth" = [])),
@@ -6800,14 +6832,42 @@ async fn post_progress(
         .flatten()
         .is_some_and(|k| k == "track");
     let stored_position = if is_track { 0 } else { body.position_ms };
+    // A report from the very start is not a statement that this has not
+    // been seen — and one arrives for something nobody has touched. The
+    // audio queue pings ZERO, every ten seconds, for the track it has
+    // preloaded for a gapless handover (`keepalive.ts`: "A position that
+    // never moves at all is the gapless preload — it pings zero"), and the
+    // video player answers with `resumeMs` — now 0 on a played item —
+    // until `loadedmetadata`. Letting either clear `played` erased seen
+    // marks a row ahead of the playhead through an album already heard.
+    // So zero leaves the mark alone, and the first position that is not
+    // zero decides: starting something again clears it within a ping.
+    let at_start = body.position_ms == 0;
+    // The watch remembers where it got to, for the play `Sessions::end`
+    // counts when it stops — under the same exception the column below
+    // gets, and for the same reason. A zero says nothing either way, and
+    // taking it as "not finished" left the two halves of one rule
+    // disagreeing: the item read as played while the session that played
+    // it had forgotten, so the play went uncounted.
+    if !at_start {
+        session.report(finished);
+    }
     let row = sqlx::query(
         "INSERT INTO watch_state (user_id, item_id, position_ms, duration_ms, played, play_count, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?5, unixepoch())
+         VALUES (?1, ?2, ?3, ?4, ?5, 0, unixepoch())
          ON CONFLICT (user_id, item_id) DO UPDATE SET
            position_ms = excluded.position_ms,
            duration_ms = excluded.duration_ms,
-           play_count = play_count + (excluded.played AND NOT played),
-           played = MAX(played, excluded.played),
+           -- Not MAX(): a high-water mark is what made this a counter
+           -- wearing a boolean's clothes. `played` is where the playhead
+           -- is now — past 90 percent or not — so watching again clears
+           -- it, and finishing sets it once more.
+           --
+           -- Except at zero, which is not an answer to the question: see
+           -- `at_start`. NOT `excluded.position_ms`, which is stored as 0
+           -- for every track and would freeze their marks in both
+           -- directions — this is what the report SAID.
+           played = CASE WHEN ?6 THEN played ELSE ?5 END,
            updated_at = unixepoch()
          RETURNING played, play_count",
     )
@@ -6816,6 +6876,7 @@ async fn post_progress(
     .bind(stored_position as i64)
     .bind(duration.map(|d| d as i64))
     .bind(finished)
+    .bind(at_start)
     .fetch_one(state.registry.db())
     .await
     .map_err(internal)?;

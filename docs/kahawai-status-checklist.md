@@ -304,6 +304,68 @@ How something works and why it was built that way belong in
       "watched, and also 40 minutes in" is not a state a card can draw.
       `play_count` only climbs — unmarking changes what is shown, not
       what happened.
+      Progress writes the same two fields on the same rule. `played` is a
+      boolean and NOT a high-water mark: it is what the last report said,
+      so watching something again clears it and finishing sets it once
+      more. With one exception, and it is load-bearing: a report at
+      position ZERO decides nothing and leaves the mark alone. Zero
+      arrives for things nobody has touched — the audio queue pings it
+      every ten seconds for the track it has preloaded for a gapless
+      handover (`keepalive.ts`), and the video player answers with the
+      resume position, now absent on a played item, until the media
+      element has its metadata. Letting those clear the mark wiped the
+      seen ticks one row ahead of the playhead through an album already
+      heard. So the first position that is NOT zero decides, which puts
+      the reset a ping behind a restart and off the path of anything that
+      never started. The exception covers BOTH halves of the rule — the
+      stored column and the session's own memory of where it got to — or
+      an item reads as played while the session that played it has
+      forgotten, and the play goes uncounted.
+      `play_count` is the record of how many times it was finished, and it
+      rises once per WATCH, written when the session stops (`sessions.rs`,
+      the one funnel every teardown goes through). Not when the 90 percent
+      line is crossed: that counted a second play for anyone who scrubbed
+      back over the line and forward again, and counted one for a viewer
+      who then abandoned the thing half way.
+      Which session counts is decided by which one did the watching, not
+      by who ended it. A session counts when it stops past the line AND it
+      is the one that took the item there — its flag is seeded from the
+      position it OPENED at, so a session that opens past the line never
+      sees a crossing. That is what keeps a sitting split in two by a
+      reaped pause, a dead transcoder or an admin from counting twice: the
+      client answers a lost session by starting again at the same position
+      (`recovery.ts`), and that continuation earns nothing while the watch
+      that crossed the line keeps its play, wherever it happened to stop.
+      Asking instead WHO stopped the session cannot work in either
+      direction — the answer would have to exclude the reaper, and a
+      viewer who finishes something and closes a laptop that never sends
+      its DELETE is reaped too.
+      Both flags are per SESSION and not read back from
+      `watch_state.played`, so nothing else writing that column — a mark
+      by hand, another device — can put a play in a session's name, and a
+      session that reported no position at all cannot bank the play a
+      previous watch left marked.
+      **Known gap, accepted:** that flag lives in memory, so a hub restart
+      while a finished watch is still open loses its play. Counting at the
+      90 percent crossing was durable and bought that at the price of the
+      two miscounts above; a durable version of this would need the
+      crossing written somewhere a restart survives, which no one has
+      wanted yet. A restart is not one of the teardown paths listed
+      above.
+      What makes "again" happen at all is that a played item is served with NO
+      `resume_position_ms`, so the next Play begins at the beginning
+      rather than dropping the viewer into the last tenth. That is
+      deliberately server-side: a client that had to know "ignore the
+      position when played" is a rule the API failed to express, and every
+      third-party client would have to carry it. Answered at read time and
+      NOT by storing a zero, because `watch_state.position_ms` is also
+      where a re-dispatched transcode picks the stream back up (AR-6) —
+      zeroing it restarts a failed-over film from the top for anyone in
+      its last ten minutes, which is what the first cut of this did.
+      The cost is named: a viewer who watches to the end and then rewinds
+      and stops half way has neither the mark nor the play — `played`
+      follows the playhead, and the count reads it where the watch
+      stopped.
       An `items` list marks a batch — a season, or a whole show — in one
       call and one statement, so it cannot half-apply; the client decides
       which episodes a season holds, because the season a viewer sees may
