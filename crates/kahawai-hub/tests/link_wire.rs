@@ -9,6 +9,7 @@ use kahawai_hub::pki::HubCa;
 use kahawai_hub::registry::Registry;
 use kahawai_transport::identity::SatelliteIdentity;
 use kahawai_transport::mtls::AllowedCerts;
+use prost::Message as _;
 
 struct Hub {
     addr: String,
@@ -101,7 +102,16 @@ async fn wait_until(mut cond: impl FnMut() -> bool, what: &str) {
 async fn enrolled_mediahost_links_and_disconnect_is_tracked() {
     let hub = spawn_hub().await;
     let id = enroll(&hub, "01LINK", "nas");
+    sqlx::query(
+        "INSERT INTO satellites(module_id,module_type,name,cert_fingerprint)
+         VALUES('01LINK','mediahost','nas',?)",
+    )
+    .bind(kahawai_transport::mtls::cert_fingerprint_pem(&id.cert_pem).unwrap())
+    .execute(hub.registry.db())
+    .await
+    .unwrap();
     let addr = hub.addr.clone();
+    let reconnect_id = id.clone();
 
     let link = tokio::spawn(async move {
         // run() loops forever; we only need it to connect once.
@@ -135,45 +145,97 @@ async fn enrolled_mediahost_links_and_disconnect_is_tracked() {
             first.msg,
             Some(kahawai_proto::v1::hub_to_host::Msg::HelloAck(_))
         ));
-        // Announce a collection and push one file record.
+        // Offer a local catalogue, receive the hub's durable cursor, then
+        // project one versioned current record.
+        let root_path = std::path::Path::new("/tank/movies");
+        let root_token = kahawai_core::media::root_token(root_path);
         tx.send(kahawai_proto::v1::HostToHub {
-            msg: Some(kahawai_proto::v1::host_to_hub::Msg::AnnounceCollection(
-                kahawai_proto::v1::AnnounceCollection {
-                    id: "movies".into(),
-                    media_type: "movies".into(),
-                    roots: vec![kahawai_proto::v1::CollectionRoot::new(
-                        kahawai_core::media::root_token(std::path::Path::new("/tank/movies")),
-                        "/tank/movies",
-                    )],
-                },
-            )),
-        })
-        .await
-        .unwrap();
-        tx.send(kahawai_proto::v1::HostToHub {
-            msg: Some(kahawai_proto::v1::host_to_hub::Msg::FileUpsert(
-                kahawai_proto::v1::FileUpsert {
-                    collection_id: "movies".into(),
-                    files: vec![kahawai_proto::v1::FileRecord {
-                        source: Some(kahawai_proto::v1::SourcePath::new(
-                            kahawai_core::media::root_token(std::path::Path::new("/tank/movies")),
-                            "Heat (1995)/Heat.mkv",
-                        )),
-                        size: 123,
-                        mtime_unix: 456,
-                        head_xxh3: 1,
-                        tail_xxh3: 2,
-                        oshash: 3,
-                        streams_json: "{}".into(),
+            msg: Some(kahawai_proto::v1::host_to_hub::Msg::CatalogOffer(
+                kahawai_proto::v1::CatalogOffer {
+                    collections: vec![kahawai_proto::v1::CatalogCollection {
+                        id: "movies".into(),
+                        media_type: "movies".into(),
+                        roots: vec![kahawai_proto::v1::CollectionRoot::new(
+                            root_token.clone(),
+                            root_path.display().to_string(),
+                        )],
+                        epoch: "epoch-a".into(),
+                        current_version: 1,
+                        oldest_replayable_version: 0,
+                        scanning: false,
                     }],
                 },
             )),
         })
         .await
         .unwrap();
+        let cursor = tokio::time::timeout(Duration::from_secs(5), inbound.message())
+            .await
+            .expect("catalogue cursor timeout")
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            cursor.msg,
+            Some(kahawai_proto::v1::hub_to_host::Msg::CatalogCursor(
+                kahawai_proto::v1::CatalogCursor {
+                    version: 0,
+                    snapshot: true,
+                    ..
+                }
+            ))
+        ));
+        let source = kahawai_proto::v1::SourcePath::new(root_token.clone(), "Heat (1995)/Heat.mkv");
+        let payload = kahawai_proto::v1::FileUpsert {
+            collection_id: "movies".into(),
+            files: vec![kahawai_proto::v1::FileRecord {
+                source: Some(source.clone()),
+                size: 123,
+                mtime_unix: 456,
+                head_xxh3: 1,
+                tail_xxh3: 2,
+                oshash: 3,
+                streams_json: "{}".into(),
+            }],
+        }
+        .encode_to_vec();
+        let mut key = root_token.into_bytes();
+        key.push(0);
+        key.extend_from_slice(source.path_rel.as_bytes());
+        tx.send(kahawai_proto::v1::HostToHub {
+            msg: Some(kahawai_proto::v1::host_to_hub::Msg::CatalogDelta(
+                kahawai_proto::v1::CatalogDelta {
+                    collection_id: "movies".into(),
+                    epoch: "epoch-a".into(),
+                    records: vec![kahawai_proto::v1::CatalogRecord {
+                        version: 1,
+                        kind: "file".into(),
+                        key,
+                        payload,
+                        deleted: false,
+                    }],
+                    through_version: 1,
+                    snapshot: true,
+                    done: true,
+                },
+            )),
+        })
+        .await
+        .unwrap();
+        let ack = tokio::time::timeout(Duration::from_secs(5), inbound.message())
+            .await
+            .expect("catalogue ACK timeout")
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            ack.msg,
+            Some(kahawai_proto::v1::hub_to_host::Msg::CatalogAck(
+                kahawai_proto::v1::CatalogAck { version: 1, .. }
+            ))
+        ));
         // Keep the link open until the test drops us.
         (tx, inbound)
     });
+    let (tx, mut inbound) = link.await.unwrap();
 
     let registry = hub.registry.clone();
     wait_until(
@@ -212,9 +274,236 @@ async fn enrolled_mediahost_links_and_disconnect_is_tracked() {
     .await
     .expect("collection with one file");
 
+    // A terminal hash result is current catalogue state, not merely a log
+    // message. In particular, it must clear a prior exact hash when a file was
+    // replaced with different bytes that retained the same stat stamp.
+    let root_token = kahawai_core::media::root_token(std::path::Path::new("/tank/movies"));
+    let source = kahawai_proto::v1::SourcePath::new(root_token.clone(), "Heat (1995)/Heat.mkv");
+    let mut hash_key = root_token.clone().into_bytes();
+    hash_key.push(0);
+    hash_key.extend_from_slice(source.path_rel.as_bytes());
+    for (version, hash) in [
+        (
+            2,
+            kahawai_proto::v1::FileHash {
+                source: Some(source.clone()),
+                size: 123,
+                ed2k_hex: "exact-hash".into(),
+                ..Default::default()
+            },
+        ),
+        (
+            3,
+            kahawai_proto::v1::FileHash {
+                source: Some(source.clone()),
+                error: "replacement could not be read".into(),
+                ..Default::default()
+            },
+        ),
+    ] {
+        tx.send(kahawai_proto::v1::HostToHub {
+            msg: Some(kahawai_proto::v1::host_to_hub::Msg::CatalogDelta(
+                kahawai_proto::v1::CatalogDelta {
+                    collection_id: "movies".into(),
+                    epoch: "epoch-a".into(),
+                    records: vec![kahawai_proto::v1::CatalogRecord {
+                        version,
+                        kind: "file_hashes".into(),
+                        key: hash_key.clone(),
+                        payload: kahawai_proto::v1::FileHashes {
+                            collection_id: "movies".into(),
+                            hashes: vec![hash],
+                        }
+                        .encode_to_vec(),
+                        deleted: false,
+                    }],
+                    through_version: version,
+                    snapshot: false,
+                    done: true,
+                },
+            )),
+        })
+        .await
+        .unwrap();
+        let ack = tokio::time::timeout(Duration::from_secs(5), inbound.message())
+            .await
+            .expect("hash catalogue ACK timeout")
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            ack.msg,
+            Some(kahawai_proto::v1::hub_to_host::Msg::CatalogAck(
+                kahawai_proto::v1::CatalogAck { version: acked, .. }
+            )) if acked == version
+        ));
+        let stored: Option<String> = sqlx::query_scalar(
+            "SELECT ed2k FROM files WHERE module_id='01LINK' AND collection_id='movies'",
+        )
+        .fetch_one(hub.registry.db())
+        .await
+        .unwrap();
+        assert_eq!(stored.as_deref(), (version == 2).then_some("exact-hash"));
+    }
+    let ed2k: Option<String> = sqlx::query_scalar(
+        "SELECT ed2k FROM files WHERE module_id='01LINK' AND collection_id='movies'",
+    )
+    .fetch_one(hub.registry.db())
+    .await
+    .unwrap();
+    assert!(
+        ed2k.is_none(),
+        "terminal current hash state retained stale ED2K"
+    );
+
+    // A new catalogue epoch is a physical refresh, not permission to erase
+    // hub-owned identity decisions. Stream the same current source through a
+    // forced snapshot and verify its stable item row (and manual pin) survive.
+    let item_id: String = sqlx::query_scalar(
+        "SELECT id FROM items WHERE module_id='01LINK' AND collection_id='movies' AND kind='movie'",
+    )
+    .fetch_one(hub.registry.db())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO manual_match(item_id,provider,provider_id,pinned_at)
+         VALUES(?,'tmdb','123',unixepoch())",
+    )
+    .bind(&item_id)
+    .execute(hub.registry.db())
+    .await
+    .unwrap();
+    let root_path = std::path::Path::new("/tank/movies");
+    let root_token = kahawai_core::media::root_token(root_path);
+    tx.send(kahawai_proto::v1::HostToHub {
+        msg: Some(kahawai_proto::v1::host_to_hub::Msg::CatalogOffer(
+            kahawai_proto::v1::CatalogOffer {
+                collections: vec![kahawai_proto::v1::CatalogCollection {
+                    id: "movies".into(),
+                    media_type: "movies".into(),
+                    roots: vec![kahawai_proto::v1::CollectionRoot::new(
+                        root_token.clone(),
+                        root_path.display().to_string(),
+                    )],
+                    epoch: "epoch-b".into(),
+                    current_version: 2,
+                    oldest_replayable_version: 0,
+                    scanning: false,
+                }],
+            },
+        )),
+    })
+    .await
+    .unwrap();
+    let cursor = tokio::time::timeout(Duration::from_secs(5), inbound.message())
+        .await
+        .expect("replacement snapshot cursor timeout")
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        cursor.msg,
+        Some(kahawai_proto::v1::hub_to_host::Msg::CatalogCursor(
+            kahawai_proto::v1::CatalogCursor {
+                version: 0,
+                snapshot: true,
+                ..
+            }
+        ))
+    ));
+    let source = kahawai_proto::v1::SourcePath::new(root_token.clone(), "Heat (1995)/Heat.mkv");
+    let payload = kahawai_proto::v1::FileUpsert {
+        collection_id: "movies".into(),
+        files: vec![kahawai_proto::v1::FileRecord {
+            source: Some(source.clone()),
+            size: 123,
+            mtime_unix: 457,
+            head_xxh3: 1,
+            tail_xxh3: 2,
+            oshash: 3,
+            streams_json: "{}".into(),
+        }],
+    }
+    .encode_to_vec();
+    let mut key = root_token.into_bytes();
+    key.push(0);
+    key.extend_from_slice(source.path_rel.as_bytes());
+    tx.send(kahawai_proto::v1::HostToHub {
+        msg: Some(kahawai_proto::v1::host_to_hub::Msg::CatalogDelta(
+            kahawai_proto::v1::CatalogDelta {
+                collection_id: "movies".into(),
+                epoch: "epoch-b".into(),
+                records: vec![kahawai_proto::v1::CatalogRecord {
+                    version: 1,
+                    kind: "file".into(),
+                    key,
+                    payload,
+                    deleted: false,
+                }],
+                through_version: 0,
+                snapshot: true,
+                done: false,
+            },
+        )),
+    })
+    .await
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let mtime: i64 = sqlx::query_scalar(
+                "SELECT mtime_unix FROM files
+                  WHERE module_id='01LINK' AND collection_id='movies'",
+            )
+            .fetch_one(hub.registry.db())
+            .await
+            .unwrap();
+            if mtime == 457 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("replacement snapshot first page was not applied");
+    let staged_cursor: i64 = sqlx::query_scalar(
+        "SELECT version FROM mediahost_catalog_cursors
+          WHERE module_id='01LINK' AND collection_id='movies'",
+    )
+    .fetch_one(hub.registry.db())
+    .await
+    .unwrap();
+    assert_eq!(
+        staged_cursor, 0,
+        "an incomplete snapshot became a durable resume point"
+    );
+    tx.send(kahawai_proto::v1::HostToHub {
+        msg: Some(kahawai_proto::v1::host_to_hub::Msg::CatalogDelta(
+            kahawai_proto::v1::CatalogDelta {
+                collection_id: "movies".into(),
+                epoch: "epoch-b".into(),
+                records: Vec::new(),
+                through_version: 2,
+                snapshot: false,
+                done: true,
+            },
+        )),
+    })
+    .await
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), inbound.message())
+        .await
+        .expect("replacement snapshot final ACK timeout")
+        .unwrap()
+        .unwrap();
+    let preserved: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM manual_match WHERE item_id=? AND provider_id='123'",
+    )
+    .bind(&item_id)
+    .fetch_one(hub.registry.db())
+    .await
+    .unwrap();
+    assert_eq!(preserved, 1, "catalogue replacement erased a manual pin");
+
     // Drop the client: AR-6 — satellite and collection marked unavailable,
     // nothing deleted.
-    let (tx, inbound) = link.await.unwrap();
     drop(tx);
     drop(inbound);
     let registry = hub.registry.clone();
@@ -235,46 +524,76 @@ async fn enrolled_mediahost_links_and_disconnect_is_tracked() {
         "collection must be unavailable after disconnect"
     );
     assert_eq!(col.file_count, 1, "files must survive a disconnect (AR-6)");
+
+    // The hub, not an in-memory ACK observation on the mediahost, supplies
+    // the durable resume point after reconnect.
+    let tls = kahawai_transport::mtls::mtls_client_config(&reconnect_id).unwrap();
+    let channel = kahawai_transport::tls::grpc_channel_with(&hub.addr, tls)
+        .await
+        .unwrap();
+    let mut client = kahawai_proto::v1::mediahost_link_client::MediahostLinkClient::new(channel);
+    let (tx, rx) = tokio::sync::mpsc::channel(4);
+    tx.send(kahawai_proto::v1::HostToHub {
+        msg: Some(kahawai_proto::v1::host_to_hub::Msg::Hello(
+            kahawai_proto::v1::Hello {
+                protocol_major: kahawai_proto::PROTOCOL_MAJOR,
+                protocol_minor: kahawai_proto::PROTOCOL_MINOR,
+                name: "nas".into(),
+                build: String::new(),
+                segment_detector_generation: 0,
+            },
+        )),
+    })
+    .await
+    .unwrap();
+    let mut inbound = client
+        .link(tokio_stream::wrappers::ReceiverStream::new(rx))
+        .await
+        .unwrap()
+        .into_inner();
+    inbound.message().await.unwrap().unwrap();
+    let root_path = std::path::Path::new("/tank/movies");
+    tx.send(kahawai_proto::v1::HostToHub {
+        msg: Some(kahawai_proto::v1::host_to_hub::Msg::CatalogOffer(
+            kahawai_proto::v1::CatalogOffer {
+                collections: vec![kahawai_proto::v1::CatalogCollection {
+                    id: "movies".into(),
+                    media_type: "movies".into(),
+                    roots: vec![kahawai_proto::v1::CollectionRoot::new(
+                        kahawai_core::media::root_token(root_path),
+                        root_path.display().to_string(),
+                    )],
+                    epoch: "epoch-b".into(),
+                    current_version: 2,
+                    oldest_replayable_version: 0,
+                    scanning: false,
+                }],
+            },
+        )),
+    })
+    .await
+    .unwrap();
+    let cursor = tokio::time::timeout(Duration::from_secs(5), inbound.message())
+        .await
+        .expect("resume cursor timeout")
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        cursor.msg,
+        Some(kahawai_proto::v1::hub_to_host::Msg::CatalogCursor(
+            kahawai_proto::v1::CatalogCursor {
+                version: 2,
+                snapshot: false,
+                ..
+            }
+        ))
+    ));
 }
 
 #[tokio::test]
-async fn root_adoption_suppresses_only_its_own_generation_mismatch() {
+async fn protocol_4_rejects_legacy_reconciliation_messages() {
     let hub = spawn_hub().await;
-    let id = enroll(&hub, "01ADOPT", "adopter");
-    hub.registry
-        .announce_collection("01ADOPT", "movies", "movies", &[])
-        .await
-        .unwrap();
-    sqlx::query(
-        "UPDATE collections SET sync_version = 7
-         WHERE module_id = '01ADOPT' AND collection_id = 'movies'",
-    )
-    .execute(hub.registry.db())
-    .await
-    .unwrap();
-    sqlx::query(
-        "INSERT INTO items(id,kind,title,norm_title,module_id,collection_id)
-         VALUES('legacy','movie','Legacy','legacy','01ADOPT','movies')",
-    )
-    .execute(hub.registry.db())
-    .await
-    .unwrap();
-    let file_id: i64 = sqlx::query_scalar(
-        "INSERT INTO files
-           (module_id,collection_id,path_rel,size,mtime_unix,
-            head_xxh3,tail_xxh3,oshash,streams_json)
-         VALUES('01ADOPT','movies','legacy.mkv',10,1,2,3,4,'{}') RETURNING id",
-    )
-    .fetch_one(hub.registry.db())
-    .await
-    .unwrap();
-    kahawai_hub::registry::bind_file_to_item(
-        &mut hub.registry.db().acquire().await.unwrap(),
-        file_id,
-        "legacy",
-    )
-    .await
-    .unwrap();
+    let id = enroll(&hub, "01LEGACY", "legacy-v4");
     let tls = kahawai_transport::mtls::mtls_client_config(&id).unwrap();
     let channel = kahawai_transport::tls::grpc_channel_with(&hub.addr, tls)
         .await
@@ -284,9 +603,9 @@ async fn root_adoption_suppresses_only_its_own_generation_mismatch() {
     tx.send(kahawai_proto::v1::HostToHub {
         msg: Some(kahawai_proto::v1::host_to_hub::Msg::Hello(
             kahawai_proto::v1::Hello {
-                protocol_major: 3,
-                protocol_minor: 0,
-                name: "adopter".into(),
+                protocol_major: kahawai_proto::PROTOCOL_MAJOR,
+                protocol_minor: kahawai_proto::PROTOCOL_MINOR,
+                name: "legacy-v4".into(),
                 build: String::new(),
                 segment_detector_generation: 0,
             },
@@ -301,89 +620,23 @@ async fn root_adoption_suppresses_only_its_own_generation_mismatch() {
         .into_inner();
     inbound.message().await.unwrap().unwrap();
 
-    let root_path = std::path::Path::new("/media/movies");
     tx.send(kahawai_proto::v1::HostToHub {
         msg: Some(kahawai_proto::v1::host_to_hub::Msg::AnnounceCollection(
             kahawai_proto::v1::AnnounceCollection {
                 id: "movies".into(),
                 media_type: "movies".into(),
                 roots: vec![kahawai_proto::v1::CollectionRoot::new(
-                    kahawai_core::media::root_token(root_path),
-                    root_path.display().to_string(),
+                    kahawai_core::media::root_token(std::path::Path::new("/media/movies")),
+                    "/media/movies",
                 )],
             },
         )),
     })
     .await
     .unwrap();
-    let request = || kahawai_proto::v1::HostToHub {
-        msg: Some(kahawai_proto::v1::host_to_hub::Msg::ManifestRequest(
-            kahawai_proto::v1::ManifestRequest {
-                collection_id: "movies".into(),
-                sync_version: 99,
-            },
-        )),
-    };
-    tx.send(request()).await.unwrap();
-
-    let first = inbound.message().await.unwrap().unwrap();
-    let Some(kahawai_proto::v1::hub_to_host::Msg::Manifest(first)) = first.msg else {
-        panic!("root adoption did not answer with a manifest")
-    };
-    assert!(first.in_sync);
-    assert!(first.entries.is_empty());
-    assert_eq!(
-        sqlx::query_scalar::<_, i64>(
-            "SELECT sync_version FROM collections
-             WHERE module_id = '01ADOPT' AND collection_id = 'movies'",
-        )
-        .fetch_one(hub.registry.db())
-        .await
-        .unwrap(),
-        7,
-        "adoption must not hide restore drift by changing the hub generation"
-    );
-    assert_ne!(
-        sqlx::query_scalar::<_, String>(
-            "SELECT r.root_token FROM files f JOIN collection_roots r ON r.id=f.root_id
-             WHERE f.module_id='01ADOPT' AND f.collection_id='movies'",
-        )
-        .fetch_one(hub.registry.db())
-        .await
-        .unwrap(),
-        ""
-    );
-    assert!(first.root_adoption);
-
-    tx.send(request()).await.unwrap();
-    let repeated = inbound.message().await.unwrap().unwrap();
-    let Some(kahawai_proto::v1::hub_to_host::Msg::Manifest(repeated)) = repeated.msg else {
-        panic!("unacknowledged adoption did not repeat its suppression")
-    };
-    assert!(repeated.in_sync);
-    assert!(repeated.root_adoption);
-    assert!(repeated.entries.is_empty());
-
-    tx.send(kahawai_proto::v1::HostToHub {
-        msg: Some(kahawai_proto::v1::host_to_hub::Msg::RootAdoptionAck(
-            kahawai_proto::v1::RootAdoptionAck {
-                collection_id: "movies".into(),
-            },
-        )),
-    })
-    .await
-    .unwrap();
-
-    tx.send(request()).await.unwrap();
-    let after_ack = inbound.message().await.unwrap().unwrap();
-    let Some(kahawai_proto::v1::hub_to_host::Msg::Manifest(after_ack)) = after_ack.msg else {
-        panic!("post-ack request did not receive the normal manifest")
-    };
-    assert!(!after_ack.in_sync, "acknowledgement must end suppression");
-    assert_eq!(after_ack.entries.len(), 1);
-    let source = after_ack.entries[0].source.as_ref().unwrap();
-    assert!(!source.root_token.is_empty());
-    assert_eq!(source.path_rel, "legacy.mkv");
+    let status = inbound.message().await.unwrap_err();
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+    assert!(status.message().contains("rejects legacy catalogue"));
 }
 
 #[tokio::test]
@@ -465,7 +718,7 @@ async fn try_link(addr: &str, id: &SatelliteIdentity) -> Result<(), Box<dyn std:
 }
 
 #[tokio::test]
-async fn protocol_3_rejects_a_missing_exact_source() {
+async fn protocol_4_rejects_a_missing_exact_source() {
     let hub = spawn_hub().await;
     let id = enroll(&hub, "01BADP3", "bad-p3");
     let tls = kahawai_transport::mtls::mtls_client_config(&id).unwrap();
@@ -477,8 +730,8 @@ async fn protocol_3_rejects_a_missing_exact_source() {
     tx.send(kahawai_proto::v1::HostToHub {
         msg: Some(kahawai_proto::v1::host_to_hub::Msg::Hello(
             kahawai_proto::v1::Hello {
-                protocol_major: 3,
-                protocol_minor: 0,
+                protocol_major: kahawai_proto::PROTOCOL_MAJOR,
+                protocol_minor: kahawai_proto::PROTOCOL_MINOR,
                 name: "bad-p3".into(),
                 build: String::new(),
                 segment_detector_generation: 0,
@@ -494,13 +747,11 @@ async fn protocol_3_rejects_a_missing_exact_source() {
         .into_inner();
     inbound.message().await.unwrap().unwrap();
     tx.send(kahawai_proto::v1::HostToHub {
-        msg: Some(kahawai_proto::v1::host_to_hub::Msg::FileUpsert(
-            kahawai_proto::v1::FileUpsert {
+        msg: Some(kahawai_proto::v1::host_to_hub::Msg::FileSubtitles(
+            kahawai_proto::v1::FileSubtitles {
                 collection_id: "movies".into(),
-                files: vec![kahawai_proto::v1::FileRecord {
-                    source: None,
-                    ..Default::default()
-                }],
+                source: None,
+                ..Default::default()
             },
         )),
     })
@@ -515,7 +766,7 @@ async fn protocol_3_rejects_a_missing_exact_source() {
 }
 
 #[tokio::test]
-async fn protocol_3_rejects_an_invalid_root_binding() {
+async fn protocol_4_rejects_an_invalid_root_binding() {
     let hub = spawn_hub().await;
     let id = enroll(&hub, "01BADROOT", "bad-root");
     let tls = kahawai_transport::mtls::mtls_client_config(&id).unwrap();
@@ -527,8 +778,8 @@ async fn protocol_3_rejects_an_invalid_root_binding() {
     tx.send(kahawai_proto::v1::HostToHub {
         msg: Some(kahawai_proto::v1::host_to_hub::Msg::Hello(
             kahawai_proto::v1::Hello {
-                protocol_major: 3,
-                protocol_minor: 0,
+                protocol_major: kahawai_proto::PROTOCOL_MAJOR,
+                protocol_minor: kahawai_proto::PROTOCOL_MINOR,
                 name: "bad-root".into(),
                 build: String::new(),
                 segment_detector_generation: 0,
@@ -544,14 +795,20 @@ async fn protocol_3_rejects_an_invalid_root_binding() {
         .into_inner();
     inbound.message().await.unwrap().unwrap();
     tx.send(kahawai_proto::v1::HostToHub {
-        msg: Some(kahawai_proto::v1::host_to_hub::Msg::AnnounceCollection(
-            kahawai_proto::v1::AnnounceCollection {
-                id: "movies".into(),
-                media_type: "movies".into(),
-                roots: vec![kahawai_proto::v1::CollectionRoot::new(
-                    "root-sha256-not-the-path-digest",
-                    "/media/movies",
-                )],
+        msg: Some(kahawai_proto::v1::host_to_hub::Msg::CatalogOffer(
+            kahawai_proto::v1::CatalogOffer {
+                collections: vec![kahawai_proto::v1::CatalogCollection {
+                    id: "movies".into(),
+                    media_type: "movies".into(),
+                    roots: vec![kahawai_proto::v1::CollectionRoot::new(
+                        "root-sha256-not-the-path-digest",
+                        "/media/movies",
+                    )],
+                    epoch: "epoch".into(),
+                    current_version: 0,
+                    oldest_replayable_version: 0,
+                    scanning: false,
+                }],
             },
         )),
     })
@@ -560,13 +817,13 @@ async fn protocol_3_rejects_an_invalid_root_binding() {
     let status = inbound.message().await.unwrap_err();
     assert_eq!(status.code(), tonic::Code::FailedPrecondition);
     assert!(
-        status.message().contains("invalid root token/path"),
+        status.message().contains("invalid root binding"),
         "{status}"
     );
 }
 
 #[tokio::test]
-async fn protocol_2_mediahost_is_rejected_during_hello() {
+async fn protocol_3_mediahost_is_rejected_during_hello() {
     let hub = spawn_hub().await;
     let id = enroll(&hub, "01OLD", "protocol-two");
     let tls = kahawai_transport::mtls::mtls_client_config(&id).unwrap();
@@ -578,8 +835,8 @@ async fn protocol_2_mediahost_is_rejected_during_hello() {
     tx.send(kahawai_proto::v1::HostToHub {
         msg: Some(kahawai_proto::v1::host_to_hub::Msg::Hello(
             kahawai_proto::v1::Hello {
-                protocol_major: 2,
-                protocol_minor: 4,
+                protocol_major: 3,
+                protocol_minor: 6,
                 name: "old".into(),
                 build: String::new(),
                 segment_detector_generation: 0,

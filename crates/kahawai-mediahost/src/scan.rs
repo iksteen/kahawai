@@ -47,6 +47,170 @@ where
     .await
 }
 
+/// Protocol-4 scan: reconcile the filesystem into the mediahost's own durable
+/// catalogue. Network links consume versions independently and are never on
+/// this I/O path, so reconnecting a second hub cannot start a second walker.
+pub(crate) async fn scan_local_collection(
+    cfg: CollectionConfig,
+    catalog: crate::catalog::Catalog,
+    force_dirs: std::collections::HashSet<std::path::PathBuf>,
+    blocking_guard: crate::BlockingActivityGuard,
+) -> Result<u64> {
+    let generation = catalog.begin_scan(&cfg.name).await?;
+    let known = std::sync::Arc::new(catalog.known_files(&cfg.name).await?);
+    let force_dirs = std::sync::Arc::new(force_dirs);
+    let include_audio = cfg.media_type == "music";
+    let mut unavailable_roots = std::collections::HashSet::new();
+    let (mut scanned, mut failed, mut skipped) = (0u32, 0u32, 0u32);
+
+    for configured_root in cfg.resolved_roots() {
+        let root_token = configured_root.token;
+        let root = configured_root.path;
+        let root_for_walk = root.clone();
+        let paths =
+            match scan_blocking(&blocking_guard, move || walk(&root_for_walk, include_audio))
+                .await?
+            {
+                Ok(paths) => paths,
+                Err(error) => {
+                    failed += 1;
+                    unavailable_roots.insert(root_token.clone());
+                    tracing::warn!(collection = %cfg.name, %root_token,
+                    error = format!("{error:#}"), "collection root unavailable");
+                    continue;
+                }
+            };
+        for batch in paths.chunks(250) {
+            let batch = batch.to_vec();
+            let known = known.clone();
+            let force_dirs = force_dirs.clone();
+            let batch_root_token = root_token.clone();
+            let verdicts = scan_blocking(&blocking_guard, move || {
+                batch
+                    .into_iter()
+                    .map(|(root_local, path)| {
+                        let rel = path
+                            .strip_prefix(&root_local)
+                            .unwrap_or(&path)
+                            .to_string_lossy()
+                            .into_owned();
+                        let unchanged = !path
+                            .parent()
+                            .is_some_and(|parent| force_dirs.contains(parent))
+                            && known
+                                .get(&(batch_root_token.clone(), rel.clone()))
+                                .is_some_and(|old| {
+                                    std::fs::metadata(&path).is_ok_and(|meta| {
+                                        meta.len() == old.size
+                                            && meta
+                                                .modified()
+                                                .ok()
+                                                .and_then(|time| {
+                                                    time.duration_since(std::time::UNIX_EPOCH).ok()
+                                                })
+                                                .map(|duration| duration.as_secs() as i64)
+                                                == Some(old.mtime_unix)
+                                            && sidecar_sig(&root_local, &path)
+                                                == stored_sidecar_sig(&old.streams_json)
+                                    })
+                                });
+                        (root_local, path, rel, unchanged)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .await?;
+            let mut seen_batch = Vec::new();
+            for (root_local, path, rel, unchanged) in verdicts {
+                if unchanged {
+                    skipped += 1;
+                    seen_batch.push((root_token.clone(), rel));
+                    continue;
+                }
+                let (root2, path2) = (root_local.clone(), path.clone());
+                match scan_blocking(&blocking_guard, move || inspect(&root2, &path2)).await? {
+                    Ok((size, mtime_unix, head_xxh3, tail_xxh3, oshash, info)) => {
+                        scanned += 1;
+                        catalog
+                            .upsert_file(
+                                &cfg.name,
+                                &FileRecord {
+                                    source: Some(kahawai_proto::v1::SourcePath {
+                                        root_token: root_token.clone(),
+                                        path_rel: rel,
+                                    }),
+                                    size,
+                                    mtime_unix,
+                                    head_xxh3,
+                                    tail_xxh3,
+                                    oshash,
+                                    streams_json: serde_json::to_string(&info)?,
+                                },
+                                generation,
+                            )
+                            .await?;
+                    }
+                    Err(error) => {
+                        failed += 1;
+                        tracing::warn!(path = %path.display(), error = format!("{error:#}"),
+                            "scan failed");
+                        catalog
+                            .record_error(
+                                &cfg.name,
+                                &FileError {
+                                    collection_id: cfg.name.clone(),
+                                    source: Some(kahawai_proto::v1::SourcePath {
+                                        root_token: root_token.clone(),
+                                        path_rel: rel,
+                                    }),
+                                    error: format!("{error:#}"),
+                                },
+                                generation,
+                            )
+                            .await?;
+                    }
+                }
+            }
+            catalog
+                .mark_seen_batch(&cfg.name, &seen_batch, generation)
+                .await?;
+            if (scanned + failed + skipped).is_multiple_of(500) {
+                catalog
+                    .scan_progress(&cfg.name, scanned, failed, skipped)
+                    .await?;
+            }
+        }
+    }
+    catalog
+        .scan_progress(&cfg.name, scanned, failed, skipped)
+        .await?;
+    let version = catalog
+        .finish_scan(&cfg.name, generation, &unavailable_roots)
+        .await?;
+    tracing::info!(collection = %cfg.name, scanned, failed, skipped, version,
+        "local catalogue scan complete");
+    Ok(version)
+}
+
+fn stored_sidecar_sig(streams_json: &str) -> String {
+    let Ok(info) = serde_json::from_str::<kahawai_core::media::MediaInfo>(streams_json) else {
+        return String::new();
+    };
+    let mut subtitles: Vec<String> = info
+        .external_subtitles
+        .into_iter()
+        .map(|subtitle| subtitle.path_rel)
+        .collect();
+    subtitles.sort();
+    subtitles.dedup();
+    let nfo = info.nfo.unwrap_or_default();
+    let artwork = info.artwork.unwrap_or_default();
+    if nfo.is_empty() && artwork.is_empty() && subtitles.is_empty() {
+        String::new()
+    } else {
+        format!("n:{nfo}|a:{artwork}|s:{}", subtitles.join(","))
+    }
+}
+
 /// Scan one collection, sending batches over the link. Errors only when the
 /// link is gone; per-file failures become FileError messages (MH-8).
 pub(crate) async fn scan_collection(

@@ -7,12 +7,23 @@ use anyhow::Result;
 use kahawai_runtime::config;
 
 pub async fn run_mediahost(cfg: config::MediahostConfig) -> Result<()> {
-    kahawai_mediahost::run(
-        &cfg.hub,
+    let hubs = cfg
+        .effective_hubs()
+        .into_iter()
+        .map(|hub| kahawai_mediahost::HubTarget {
+            id: hub.id,
+            address: hub.address,
+            collections: hub.collections,
+            legacy_identity: hub.legacy_identity,
+        })
+        .collect();
+    kahawai_mediahost::run_multi(
         &cfg.state_dir,
         &cfg.name,
         cfg.collections,
         cfg.rescan_minutes,
+        hubs,
+        cfg.detect_segments,
     )
     .await
 }

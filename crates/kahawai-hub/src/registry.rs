@@ -19,6 +19,22 @@
 //! placement requires the exact layout map. File deletion
 //! cascades both tables; nothing evicts them because rebuilding fully decodes
 //! the audio track.
+//!
+//! ## Protocol-4 projection cursors
+//!
+//! `mediahost_catalog_cursors` is one hub-owned durable
+//! `(epoch, version, consumer_generation)` per mediahost collection. The
+//! historical SQL column is still named `consumer_minor`; migrations are an
+//! immutable log, but its value is deliberately independent of the wire
+//! protocol minor. Version zero is intentionally not a completed resume point:
+//! it means a live snapshot is new or was interrupted before final
+//! reconciliation. Bump [`CATALOG_CONSUMER_GENERATION`] only when hub catalogue
+//! projection semantics change, because a bump deliberately forces every
+//! collection through a full current-state snapshot. Protocol features that do
+//! not change catalogue interpretation must preserve the durable cursor.
+//! Physical/source-derived rows are replayable projections; users, libraries,
+//! watch state, manual/provider matches and extracted subtitle payloads remain
+//! hub-owned and are never part of the cursor stream.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -31,6 +47,20 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use sqlx::{Row, SqlitePool};
 use utoipa::ToSchema;
+
+/// Generation of the hub's catalogue projection semantics.
+///
+/// Generation zero was written by pre-separation protocol-4.0 builds. It is
+/// equivalent to generation one: splitting this axis from the wire minor did
+/// not add a catalogue kind. A future bump to two will reject both generations
+/// and intentionally request a full current-state snapshot.
+pub const CATALOG_CONSUMER_GENERATION: i64 = 1;
+const COMPATIBLE_PROTOCOL_FOUR_ZERO_GENERATION: i64 = 0;
+
+fn catalog_consumer_is_compatible(stored: i64) -> bool {
+    stored == CATALOG_CONSUMER_GENERATION
+        || (CATALOG_CONSUMER_GENERATION == 1 && stored == COMPATIBLE_PROTOCOL_FOUR_ZERO_GENERATION)
+}
 
 /// A media type this hub has no meaning for.
 ///
@@ -363,8 +393,6 @@ pub struct DeletedSatellite {
     pub mediahost_link_generation: Option<u64>,
 }
 
-type LoudnessPathKey = (String, String, String, String);
-type LoudnessRevisionTransition = (u64, i64, u64, i64);
 type TcSender = tokio::sync::mpsc::Sender<Result<kahawai_proto::v1::HubToTc, tonic::Status>>;
 
 struct TcLink {
@@ -392,10 +420,6 @@ pub struct Registry {
     /// lightweight remux/audio worker is always available; only AIO may add
     /// video encode, tone-map and subtitle burn-in here.
     local_video_executor_enabled: bool,
-    /// Last stale-result → catalogue-revision retry sent for each loudness
-    /// path. One transition gets one targeted offer; repeated stale answers or
-    /// scan lag cannot form a control-link retry loop.
-    loudness_retries: Mutex<HashMap<LoudnessPathKey, LoudnessRevisionTransition>>,
     /// Sender and negotiated minor are one link fact. Keeping them in separate
     /// maps let a reconnect briefly pair the new sender with the old minor,
     /// defeating protocol-feature hard filters during exactly that window.
@@ -421,6 +445,7 @@ pub struct Registry {
     disabled: Mutex<std::collections::HashSet<String>>,
     /// Command senders and negotiated protocol minors for connected hosts.
     links: Mutex<HashMap<String, HostLink>>,
+    catalog_apply_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// Live per-collection scan progress (HUB-35): last report wins.
     scan_progress: Mutex<HashMap<(String, String), ScanState>>,
     /// Deep-refresh marks: the next manifest request for (module,
@@ -560,10 +585,10 @@ impl Registry {
             allowed,
             connected: Mutex::new(HashMap::new()),
             links: Mutex::new(HashMap::new()),
+            catalog_apply_locks: Mutex::new(HashMap::new()),
             transcoder_caps: Mutex::new(HashMap::new()),
             local_bench: Mutex::new(None),
             local_video_executor_enabled: false,
-            loudness_retries: Mutex::new(HashMap::new()),
             tc_links: Mutex::new(HashMap::new()),
             tc_load: Mutex::new(HashMap::new()),
             tc_pace: Mutex::new(HashMap::new()),
@@ -979,82 +1004,6 @@ impl Registry {
             .collect())
     }
 
-    /// Whether this exact current path still needs loudness work. Used after a
-    /// result loses the size/mtime race: the collection scan already offered
-    /// the replacement while the mediahost was suppressing duplicate path
-    /// work, so the rejected answer must trigger one targeted second offer.
-    pub(crate) async fn loudness_source_pending(
-        &self,
-        module_id: &str,
-        collection_id: &str,
-        root_token: &str,
-        path_rel: &str,
-    ) -> Result<Option<(u64, i64)>> {
-        let row = sqlx::query(
-            "SELECT f.size,f.mtime_unix FROM files f
-               JOIN collection_roots r ON r.id=f.root_id
-               JOIN collections c
-                 ON c.module_id=f.module_id AND c.collection_id=f.collection_id
-              WHERE f.module_id=? AND f.collection_id=? AND r.root_token=? AND f.path_rel=?
-                AND c.media_type != 'music'
-                AND json_array_length(json_extract(f.streams_json,'$.audio')) > 0
-                AND (SELECT COUNT(*) FROM audio_loudness l
-                      WHERE l.file_id=f.id AND l.analyzer=?
-                        AND l.size=f.size AND l.mtime_unix=f.mtime_unix)
-                    < json_array_length(json_extract(f.streams_json,'$.audio'))
-              LIMIT 1",
-        )
-        .bind(module_id)
-        .bind(collection_id)
-        .bind(root_token)
-        .bind(path_rel)
-        .bind(kahawai_media::loudness::ANALYZER)
-        .fetch_optional(&self.db)
-        .await?;
-        Ok(row.map(|row| {
-            (
-                row.get::<i64, _>("size").max(0) as u64,
-                row.get("mtime_unix"),
-            )
-        }))
-    }
-
-    pub(crate) fn claim_loudness_retry(
-        &self,
-        path: (&str, &str, &str, &str),
-        result_revision: (u64, i64),
-        current_revision: (u64, i64),
-    ) -> bool {
-        let key = (
-            path.0.to_string(),
-            path.1.to_string(),
-            path.2.to_string(),
-            path.3.to_string(),
-        );
-        let transition = (
-            result_revision.0,
-            result_revision.1,
-            current_revision.0,
-            current_revision.1,
-        );
-        let mut retries = self.loudness_retries.lock().unwrap();
-        if retries.get(&key) == Some(&transition) {
-            false
-        } else {
-            retries.insert(key, transition);
-            true
-        }
-    }
-
-    fn clear_loudness_retry(&self, path: (&str, &str, &str, &str)) {
-        self.loudness_retries.lock().unwrap().remove(&(
-            path.0.to_string(),
-            path.1.to_string(),
-            path.2.to_string(),
-            path.3.to_string(),
-        ));
-    }
-
     /// Persist every audio stream's measurement as one revision-guarded
     /// answer. Whole-file failures produce terminal rows for the same revision
     /// so a broken decoder cannot become a reconnect loop.
@@ -1228,12 +1177,6 @@ impl Registry {
             }
         }
         tx.commit().await?;
-        self.clear_loudness_retry((
-            module_id,
-            &result.collection_id,
-            &source.root_token,
-            &source.path_rel,
-        ));
         Ok(true)
     }
 
@@ -1757,6 +1700,48 @@ impl Registry {
             .map_err(|_| anyhow::anyhow!("link to {module_id} closed"))
     }
 
+    pub(crate) async fn send_to_host_generation(
+        &self,
+        module_id: &str,
+        generation: u64,
+        msg: kahawai_proto::v1::HubToHost,
+    ) -> Result<()> {
+        let link = self
+            .host_link(module_id)
+            .filter(|link| link.generation() == generation)
+            .with_context(|| format!("mediahost link generation {generation} was replaced"))?;
+        link.send(msg).await
+    }
+
+    /// Administrative wake only. Protocol-4 mediahosts own queue selection;
+    /// the hub broadcasts interest without naming a season or exact source.
+    pub async fn wake_discovery(&self, kind: &str) -> usize {
+        let links: Vec<_> = self
+            .links
+            .lock()
+            .unwrap()
+            .values()
+            .map(|link| link.tx.clone())
+            .collect();
+        let mut accepted = 0;
+        for link in links {
+            if link
+                .try_send(Ok(kahawai_proto::v1::HubToHost {
+                    msg: Some(kahawai_proto::v1::hub_to_host::Msg::DiscoveryWake(
+                        kahawai_proto::v1::DiscoveryWake {
+                            kind: kind.to_string(),
+                            collection_id: String::new(),
+                        },
+                    )),
+                }))
+                .is_ok()
+            {
+                accepted += 1;
+            }
+        }
+        accepted
+    }
+
     pub(crate) fn host_link(&self, module_id: &str) -> Option<HostLink> {
         self.links.lock().unwrap().get(module_id).cloned()
     }
@@ -1769,6 +1754,15 @@ impl Registry {
             .is_some_and(|link| {
                 link.generation == generation && link.current.load(Ordering::Acquire)
             })
+    }
+
+    pub(crate) fn catalog_apply_lock(&self, module_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.catalog_apply_locks
+            .lock()
+            .unwrap()
+            .entry(module_id.to_string())
+            .or_default()
+            .clone()
     }
 
     pub fn host_supports_segment_detection(&self, module_id: &str) -> bool {
@@ -3158,6 +3152,228 @@ impl Registry {
         tracing::info!(%module_id, collection = collection_id, removed = stale.len(),
             "reconciled files gone from disk");
         Ok(stale.len())
+    }
+
+    /// Protocol-4 cursor held by this hub for one mediahost catalogue epoch.
+    pub async fn catalog_cursor(
+        &self,
+        module_id: &str,
+        collection_id: &str,
+        epoch: &str,
+    ) -> Result<Option<u64>> {
+        let row: Option<(String, i64, i64)> = sqlx::query_as(
+            "SELECT epoch,version,consumer_minor FROM mediahost_catalog_cursors
+              WHERE module_id=? AND collection_id=?",
+        )
+        .bind(module_id)
+        .bind(collection_id)
+        .fetch_optional(&self.db)
+        .await?;
+        Ok(row
+            .filter(|(stored_epoch, _, consumer_generation)| {
+                stored_epoch == epoch && catalog_consumer_is_compatible(*consumer_generation)
+            })
+            .map(|(_, version, _)| version as u64))
+    }
+
+    pub async fn set_catalog_cursor(
+        &self,
+        module_id: &str,
+        collection_id: &str,
+        epoch: &str,
+        version: u64,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO mediahost_catalog_cursors
+                (module_id,collection_id,epoch,version,consumer_minor)
+             VALUES(?,?,?,?,?)
+             ON CONFLICT(module_id,collection_id) DO UPDATE SET
+               epoch=excluded.epoch,version=excluded.version,
+               consumer_minor=excluded.consumer_minor",
+        )
+        .bind(module_id)
+        .bind(collection_id)
+        .bind(epoch)
+        .bind(version as i64)
+        .bind(CATALOG_CONSUMER_GENERATION)
+        .execute(&self.db)
+        .await?;
+        Ok(())
+    }
+
+    /// Drop source-derived projections before a live protocol-4 snapshot while
+    /// retaining physical rows and stable logical item ids. Hub-owned subtitle
+    /// extraction state, provider data, manual matches and libraries are not
+    /// source catalogue facts and deliberately survive.
+    pub async fn reset_catalog_derived(&self, module_id: &str, collection_id: &str) -> Result<()> {
+        let mut tx = self.db.begin().await?;
+        sqlx::query(
+            "DELETE FROM audio_loudness WHERE file_id IN (
+               SELECT id FROM files WHERE module_id=? AND collection_id=?)",
+        )
+        .bind(module_id)
+        .bind(collection_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("UPDATE files SET ed2k=NULL WHERE module_id=? AND collection_id=?")
+            .bind(module_id)
+            .bind(collection_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            "DELETE FROM media_segments WHERE item_id IN (
+               SELECT id FROM items WHERE module_id=? AND collection_id=?)",
+        )
+        .bind(module_id)
+        .bind(collection_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "DELETE FROM media_segment_scans WHERE item_id IN (
+               SELECT id FROM items WHERE module_id=? AND collection_id=?)",
+        )
+        .bind(module_id)
+        .bind(collection_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("DELETE FROM media_segment_failures WHERE module_id=? AND collection_id=?")
+            .bind(module_id)
+            .bind(collection_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Remove a collection's physical projection when this hub is no longer a
+    /// subscriber. Snapshot replacement uses live reconciliation instead so
+    /// stable item ids and their hub-owned state survive.
+    pub async fn remove_catalog_projection(
+        &self,
+        module_id: &str,
+        collection_id: &str,
+    ) -> Result<usize> {
+        let removed = self
+            .reconcile_files(module_id, collection_id, &Default::default())
+            .await?;
+        sqlx::query("DELETE FROM mediahost_catalog_cursors WHERE module_id=? AND collection_id=?")
+            .bind(module_id)
+            .bind(collection_id)
+            .execute(&self.db)
+            .await?;
+        Ok(removed)
+    }
+
+    /// Reconcile the collection list itself from a protocol-4 offer. Removal
+    /// first archives physical-source user state through projection reset, then
+    /// drops only this hub's membership/cursor namespace.
+    pub async fn retain_catalog_collections(
+        &self,
+        module_id: &str,
+        offered: &std::collections::HashSet<String>,
+    ) -> Result<usize> {
+        let stale: Vec<String> =
+            sqlx::query_scalar("SELECT collection_id FROM collections WHERE module_id=?")
+                .bind(module_id)
+                .fetch_all(&self.db)
+                .await?
+                .into_iter()
+                .filter(|collection| !offered.contains(collection))
+                .collect();
+        for collection in &stale {
+            self.remove_catalog_projection(module_id, collection)
+                .await?;
+            let mut tx = self.db.begin().await?;
+            sqlx::query("DELETE FROM library_collections WHERE module_id=? AND collection_id=?")
+                .bind(module_id)
+                .bind(collection)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("DELETE FROM collections WHERE module_id=? AND collection_id=?")
+                .bind(module_id)
+                .bind(collection)
+                .execute(&mut *tx)
+                .await?;
+            tx.commit().await?;
+        }
+        Ok(stale.len())
+    }
+
+    /// Apply one delta's source tombstones without turning it into a collection
+    /// manifest. Reconciliation reads the collection and runs orphan cleanup
+    /// once, rather than once per removed file.
+    pub async fn remove_catalog_files(
+        &self,
+        module_id: &str,
+        collection_id: &str,
+        removed: &std::collections::HashSet<SourcePath>,
+    ) -> Result<usize> {
+        if removed.is_empty() {
+            return Ok(0);
+        }
+        let mut keep: std::collections::HashSet<SourcePath> = sqlx::query(
+            "SELECT r.root_token,f.path_rel FROM files f
+             JOIN collection_roots r ON r.id=f.root_id
+             WHERE f.module_id=? AND f.collection_id=?",
+        )
+        .bind(module_id)
+        .bind(collection_id)
+        .fetch_all(&self.db)
+        .await?
+        .into_iter()
+        .map(|row| SourcePath {
+            root_token: row.get("root_token"),
+            path_rel: row.get("path_rel"),
+        })
+        .collect();
+        keep.retain(|source| !removed.contains(source));
+        self.reconcile_files(module_id, collection_id, &keep).await
+    }
+
+    pub async fn remove_catalog_loudness(
+        &self,
+        module_id: &str,
+        collection_id: &str,
+        source: &SourcePath,
+    ) -> Result<u64> {
+        let result = sqlx::query(
+            "DELETE FROM audio_loudness WHERE file_id IN (
+               SELECT f.id FROM files f JOIN collection_roots r ON r.id=f.root_id
+                WHERE f.module_id=? AND f.collection_id=?
+                  AND r.root_token=? AND f.path_rel=?)",
+        )
+        .bind(module_id)
+        .bind(collection_id)
+        .bind(&source.root_token)
+        .bind(&source.path_rel)
+        .execute(&self.db)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    pub async fn remove_catalog_hashes(
+        &self,
+        module_id: &str,
+        collection_id: &str,
+        source: &SourcePath,
+    ) -> Result<u64> {
+        let result = sqlx::query(
+            "UPDATE files SET ed2k=NULL
+              WHERE module_id=? AND collection_id=? AND path_rel=?
+                AND root_id IN (
+                  SELECT id FROM collection_roots
+                   WHERE module_id=? AND collection_id=? AND root_token=?)
+                AND ed2k IS NOT NULL",
+        )
+        .bind(module_id)
+        .bind(collection_id)
+        .bind(&source.path_rel)
+        .bind(module_id)
+        .bind(collection_id)
+        .bind(&source.root_token)
+        .execute(&self.db)
+        .await?;
+        Ok(result.rows_affected())
     }
 
     pub fn set_transcoder_caps(&self, module_id: &str, caps: &kahawai_proto::v1::CapabilityReport) {

@@ -23,7 +23,9 @@ How something works and why it was built that way belong in
 - [x] AR-1 Three modules (hub, mediahost, transcoder) + shared core crates
 - [x] AR-2 Clients talk only to the hub
 - [x] AR-3 Satellites dial out to the hub
-- [x] AR-4 Multiple mediahosts/transcoders per hub; multiple collections per mediahost
+- [x] AR-4 Multiple mediahosts/transcoders per hub; multiple collections and
+      independently enrolled hubs per mediahost. One local engine scans and
+      discovers once; each hub link reconnects and renews independently
 - [x] AR-5 All-in-one: hub + in-process mediahost in one process — the
       module logic unchanged, the link transport replaced by channels
       (no gRPC/TLS/enrollment for the local module) and the byte plane
@@ -88,17 +90,19 @@ How something works and why it was built that way belong in
       and byte leases; equal relative filenames in separate roots stay distinct
 - [x] MH-2 Scan on start/demand + watching + sweeps; on-demand scans are
       collection-scoped only (the global rescan is gone), with interim
-      progress reports every 500 files
+      progress reports every 500 files. Files and failures commit to the local
+      SQLite catalogue before any hub observes them
 - [x] MH-3 GStreamer discovery for technical metadata, including exact PAR,
       normalized display orientation and resulting display dimensions. Legacy
-      rows use an exact-source idle worklist rather than scans/reconciliation;
-      results and terminal failures are source-owned and size-guarded, scan
+      rows use a bounded local exact-source idle worklist rather than
+      scans/reconciliation; results and terminal failures are source-owned and
+      catalogue-revision-guarded, scan
       generations remain unchanged, and changed source JSON retries only that
       physical revision
 - [x] MH-4 Sidecars + artwork + attachment declaration: embedded fonts are
       declared (name/mime/byte range, payload never read) in the file record
-      at scan via a sparse EBML walk; pre-existing records are backfilled by
-      an idle worklist (cheapest tier, SeekHead-guided early stop).
+      at scan via a sparse EBML walk; missing records are retried by one local
+      idle worklist shared across hubs (cheapest tier, SeekHead-guided early stop).
       VobSub sidecar pairs (.idx/.sub) are discovered at scan, one entry
       per track inside the .idx, and served through the image pipeline
       (extraction/OCR; no tap, so no overlay/burn).
@@ -106,30 +110,23 @@ How something works and why it was built that way belong in
       pair appearing next to an unchanged media file busts the fast-path
       and is discovered on the next scan
 - [x] MH-5 Content identity (size/mtime fast path; head/tail xxh3 + oshash) with
-      incremental rescan (manifest + FilesSeen reconciliation, sync-version handshake)
+      local seen-generation reconciliation and versioned projection replay
 - [x] MH-6 Byte-range lease serving (dedicated byte-plane connection); reads
       resolve the one root token carried by the source and never search roots
       in configuration order
 - [x] MH-7 Scan batching + incremental rescans keep large scans cheap
       *(no explicit rate-limit knob; stat batching + in-sync skip in practice)*
 - [x] MH-8 Unreadable files reported with diagnostics (FileError)
-- [x] MH-9 ED2K hashing: idle-priority background job, eMule/AniDB variant,
-      filename-CRC32 verify in the same pass, hub-side journal with
-      content-identity copy-forward (at-most-once per content)
-- [x] MH-10 Sync generation per collection: persisted mediahost-side, compared
-      on reconnect, in-sync = no manifest/no walk; FilesSeen reconciliation.
-      Direct migration 53 converts level 52 to collection-owned items, stable
-      source IDs and relational exact roots without changing generations.
-      Protocol 3 rejects protocol-2 satellites and has one exact source shape.
-      A single-root announcement adopts root-less file IDs with one indexed
-      transactional update; dependent subtitle/failure rows already follow the
-      source ID. A persisted acknowledgement bit repeats scan suppression across
-      crashes, then immediately retries the consumed startup trigger so real
-      generation drift enters normal reconciliation. Ambiguous multi-root rows
-      use a targeted content-identity worklist with no scan/rematch. Unavailable
-      roots preserve their manifest rows while other roots continue.
-- [x] MH-11 Three-tier job runner: urgent extraction > ED2K > subtitle
-      pre-warm, idle = no scan and no lease being served
+- [x] MH-9 ED2K hashing: locally selected idle-priority background job,
+      eMule/AniDB variant, filename-CRC32 verify in the same pass; exact-source
+      results persist locally and replicate to every subscribed hub
+- [x] MH-10 Protocol 4 local catalogue: per-collection epoch/version, current
+      rows plus tombstones, hub-supplied durable cursors, incremental replay or
+      full live snapshot. Hub ACKs are independent and reconnect never walks
+      the filesystem. Protocol 4 intentionally rejects protocol-3 satellites
+- [x] MH-11 Source-owned job scheduling: urgent hub-requested subtitle and
+      attachment extraction remains foreground; hashes, loudness and segment
+      discovery are local, shared across hubs, and idle-gated
 - [~] MH-12 WITHDRAWN 2026-08-02, false premise — see the amendment in
       the requirement. Built and reverted the same night: probing one
       host read 30 s for `movies` and 23 ms for `anime` on the same
@@ -138,12 +135,11 @@ How something works and why it was built that way belong in
       host too slow to walk an index is too slow to serve video and
       fails at playback, where the failure is
 
-- [x] MH-13 Source-local season analysis: the hub sends one ordered set of
-      playback-ranked exact sources; the mediahost size/mtime-guards them,
-      runs recap/intro/credits detection against local paths, and returns only
-      boundaries. Audio analysis stops video before decode, video analysis
-      stops audio, and keyframe inspection decodes neither. Protocol-minor
-      gating leaves old hosts playable/scannable without a lease fallback.
+- [x] MH-13 Source-local season analysis: the mediahost groups and selects
+      exact sources from its local catalogue, size/mtime-guards them, stores
+      boundaries locally and projects them to each hub. A hub can wake but not
+      schedule it. Audio stops video before decode, video stops audio, and
+      keyframe inspection decodes neither
 
 ## Hub — registry, resolution, enrichment
 
@@ -763,11 +759,10 @@ How something works and why it was built that way belong in
       unreachability, not quota: resized artwork whose size left the code
       list, or whose original is gone, dropped at startup.
 - [x] OPS-7 Cross-version satellite compatibility: protocol gated on major
-      version (Hello/HelloAck). Protocol 3 is a coordinated satellite upgrade:
-      every protocol-2 peer is refused with both versions and an upgrade
-      instruction. The clean exact-source wire shape does not force a catalogue
-      rescan or rematch; migration and bounded fact-specific worklists preserve
-      identity and fill facts absent from older scanner records.
+      version (Hello/HelloAck). Protocol 4 is a coordinated authority cutover:
+      protocol-3 peers are refused with both versions and an upgrade
+      instruction. A full mediahost rescan is explicitly accepted; hub-owned
+      user state survives while the physical projection is replaced.
 - [x] OPS-8 Reverse-proxy support: trusted_proxies (exact IPs and CIDR
       ranges — docker/traefik bridges) gate X-Forwarded-For for OPS-2
       throttling (rightmost-untrusted, spoof-safe), configurable CORS

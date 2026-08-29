@@ -17,6 +17,9 @@ use kahawai_proto::v1 as pb;
 use kahawai_transport::identity::SatelliteIdentity;
 use tower::ServiceExt;
 
+#[path = "common/catalog.rs"]
+mod catalog_fixture;
+
 fn test_router(
     registry: std::sync::Arc<kahawai_hub::registry::Registry>,
     auth: std::sync::Arc<kahawai_hub::auth::Auth>,
@@ -168,6 +171,10 @@ async fn negotiation_picks_cheapest_source_and_honors_caps() {
     let bundle = kahawai_core::pki::new_satellite_csr("mediahost", "01HOST", "nas").unwrap();
     let signed = ca.sign_satellite_csr(&bundle.csr_der, 90).unwrap();
     allowed.insert(&signed.fingerprint);
+    registry
+        .record_satellite("01HOST", "mediahost", "nas", &signed.fingerprint)
+        .await
+        .unwrap();
     let id = SatelliteIdentity {
         module_id: "01HOST".into(),
         key_pem: bundle.key_pem,
@@ -197,47 +204,43 @@ async fn negotiation_picks_cheapest_source_and_honors_caps() {
         .unwrap()
         .into_inner();
     inbound.message().await.unwrap().unwrap(); // HelloAck
-    for msg in [
-        pb::host_to_hub::Msg::AnnounceCollection(pb::AnnounceCollection {
-            id: "movies".into(),
-            media_type: "movies".into(),
-            roots: vec![pb::CollectionRoot::new(
-                kahawai_core::media::root_token(root.path()),
-                root.path().display().to_string(),
-            )],
-        }),
-        pb::host_to_hub::Msg::FileUpsert(pb::FileUpsert {
-            collection_id: "movies".into(),
-            files: vec![
-                pb::FileRecord {
-                    source: Some(pb::SourcePath::new(
-                        kahawai_core::media::root_token(root.path()),
-                        "Heat (1995).mp4",
-                    )),
-                    size: mp4_facts.0,
-                    mtime_unix: 1,
-                    head_xxh3: 1,
-                    tail_xxh3: 2,
-                    oshash: 3,
-                    streams_json: mp4_facts.1.clone(),
-                },
-                pb::FileRecord {
-                    source: Some(pb::SourcePath::new(
-                        kahawai_core::media::root_token(root.path()),
-                        "Heat (1995).mkv",
-                    )),
-                    size: mkv_facts.0,
-                    mtime_unix: 1,
-                    head_xxh3: 4,
-                    tail_xxh3: 5,
-                    oshash: 6,
-                    streams_json: mkv_facts.1.clone(),
-                },
-            ],
-        }),
-    ] {
-        tx.send(pb::HostToHub { msg: Some(msg) }).await.unwrap();
-    }
+    catalog_fixture::project_files(
+        &tx,
+        &mut inbound,
+        "movies",
+        "movies",
+        vec![pb::CollectionRoot::new(
+            kahawai_core::media::root_token(root.path()),
+            root.path().display().to_string(),
+        )],
+        vec![
+            pb::FileRecord {
+                source: Some(pb::SourcePath::new(
+                    kahawai_core::media::root_token(root.path()),
+                    "Heat (1995).mp4",
+                )),
+                size: mp4_facts.0,
+                mtime_unix: 1,
+                head_xxh3: 1,
+                tail_xxh3: 2,
+                oshash: 3,
+                streams_json: mp4_facts.1.clone(),
+            },
+            pb::FileRecord {
+                source: Some(pb::SourcePath::new(
+                    kahawai_core::media::root_token(root.path()),
+                    "Heat (1995).mkv",
+                )),
+                size: mkv_facts.0,
+                mtime_unix: 1,
+                head_xxh3: 4,
+                tail_xxh3: 5,
+                oshash: 6,
+                streams_json: mkv_facts.1.clone(),
+            },
+        ],
+    )
+    .await;
     // Heartbeats, like a real mediahost. Without them the hub's 35 s
     // liveness timeout fires mid-test and every later play answers
     // "no source is currently available (mediahost offline)" — a

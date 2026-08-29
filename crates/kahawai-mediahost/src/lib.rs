@@ -1,6 +1,7 @@
 //! Mediahost module: enroll once, then keep a control link to the hub
 //! (AR-3: always dials out) and scan collections up to it.
 
+pub mod catalog;
 pub mod ed2k;
 pub mod hasher;
 pub mod loudness;
@@ -14,14 +15,20 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use kahawai_proto::v1::mediahost_link_client::MediahostLinkClient;
 use kahawai_proto::v1::{
-    AnnounceCollection, Heartbeat, Hello, HostToHub, HubToHost, host_to_hub, hub_to_host,
+    AnnounceCollection, CatalogDelta, CatalogOffer, Heartbeat, Hello, HostToHub, HubToHost,
+    host_to_hub, hub_to_host,
 };
 use kahawai_proto::{PROTOCOL_MAJOR, PROTOCOL_MINOR};
+use prost::Message as _;
 use scan::CollectionConfig;
 use tokio_stream::wrappers::ReceiverStream;
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+#[cfg(not(test))]
 const RECONNECT_DELAY: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const RECONNECT_DELAY: Duration = Duration::from_millis(10);
+const LINK_SEND_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Shared mediahost work classes. Scans, viewer leases and urgent extraction
 /// pause every background task. Segment detection additionally preempts
@@ -169,6 +176,1094 @@ struct JobRuntime {
     activity: Activity,
     segment_serial: std::sync::Arc<tokio::sync::Mutex<()>>,
 }
+
+/// One independently enrolled hub. `legacy_identity` preserves the original
+/// single-hub credentials directly in the mediahost state directory.
+#[derive(Debug, Clone)]
+pub struct HubTarget {
+    pub id: String,
+    pub address: String,
+    pub collections: Vec<String>,
+    pub legacy_identity: bool,
+}
+
+/// Recreates the in-process transport after either side rejects a message.
+/// The local adapter follows the same fail-and-replay lifecycle as an mTLS
+/// link; keeping the factory here lets one `LocalRuntime` survive reconnects.
+pub type LocalLinkFactory = std::sync::Arc<
+    dyn Fn() -> (
+            tokio::sync::mpsc::Sender<HostToHub>,
+            tokio::sync::mpsc::Receiver<Result<HubToHost, tonic::Status>>,
+        ) + Send
+        + Sync,
+>;
+
+type CatalogVersionState = std::collections::HashMap<String, (String, u64, bool)>;
+
+/// The process-local half of protocol 4. It owns every filesystem watcher and
+/// scan task; links only request work through these coalescing triggers.
+#[derive(Clone)]
+struct LocalRuntime {
+    catalog: catalog::Catalog,
+    collections: Vec<CollectionConfig>,
+    triggers: std::collections::HashMap<String, TriggerSink>,
+    activity: Activity,
+    discovery_wake: std::sync::Arc<tokio::sync::Notify>,
+    catalog_versions: std::sync::Arc<std::sync::RwLock<CatalogVersionState>>,
+    discovery_status: std::sync::Arc<
+        std::sync::RwLock<std::collections::HashMap<String, kahawai_proto::v1::DiscoveryStatus>>,
+    >,
+    _guards: std::sync::Arc<AbortOnDrop>,
+}
+
+impl LocalRuntime {
+    async fn start(
+        state_dir: &Path,
+        collections: Vec<CollectionConfig>,
+        rescan_minutes: u64,
+        detect_segments: bool,
+    ) -> Result<Self> {
+        Self::start_with_activity(
+            state_dir,
+            collections,
+            rescan_minutes,
+            Activity::default(),
+            detect_segments,
+        )
+        .await
+    }
+
+    async fn start_with_activity(
+        state_dir: &Path,
+        collections: Vec<CollectionConfig>,
+        rescan_minutes: u64,
+        activity: Activity,
+        detect_segments: bool,
+    ) -> Result<Self> {
+        let catalog =
+            catalog::Catalog::open_with_segment_detection(state_dir, &collections, detect_segments)
+                .await?;
+        let mut triggers = std::collections::HashMap::new();
+        let mut guards = Vec::new();
+        let catalog_versions = std::sync::Arc::new(std::sync::RwLock::new(Default::default()));
+        let version_catalog = catalog.clone();
+        let version_state = catalog_versions.clone();
+        guards.push(tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(1));
+            loop {
+                ticker.tick().await;
+                match version_catalog.version_states().await {
+                    Ok(versions) => {
+                        *version_state.write().unwrap() = versions;
+                    }
+                    Err(error) => tracing::warn!(
+                        error = format!("{error:#}"),
+                        "reading local catalogue versions failed"
+                    ),
+                }
+            }
+        }));
+        let discovery_status: std::sync::Arc<
+            std::sync::RwLock<
+                std::collections::HashMap<String, kahawai_proto::v1::DiscoveryStatus>,
+            >,
+        > = std::sync::Arc::new(std::sync::RwLock::new(Default::default()));
+        let status_catalog = catalog.clone();
+        let status_collections = collections.clone();
+        let status_state = discovery_status.clone();
+        guards.push(tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(30));
+            loop {
+                ticker.tick().await;
+                for collection in &status_collections {
+                    match status_catalog.discovery_status(&collection.name).await {
+                        Ok(mut status) => {
+                            if !detect_segments {
+                                status.pending_segments = 0;
+                            }
+                            status_state
+                                .write()
+                                .unwrap()
+                                .insert(collection.name.clone(), status);
+                        }
+                        Err(error) => tracing::warn!(
+                            collection = %collection.name,
+                            error = format!("{error:#}"),
+                            "reading local discovery status failed"
+                        ),
+                    }
+                }
+            }
+        }));
+        for collection in &collections {
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<ScanTrigger>(8);
+            let sink = TriggerSink {
+                tx,
+                overflow: Default::default(),
+            };
+            triggers.insert(collection.name.clone(), sink.clone());
+            let collection = collection.clone();
+            let catalog = catalog.clone();
+            let activity = activity.clone();
+            let overflow = sink.overflow.clone();
+            guards.push(tokio::spawn(async move {
+                while let Some(mut trigger) = rx.recv().await {
+                    while let Ok(more) = rx.try_recv() {
+                        trigger.force_dirs.extend(more.force_dirs);
+                    }
+                    if let Some(more) = overflow.lock().unwrap().take() {
+                        trigger.force_dirs.extend(more.force_dirs);
+                    }
+                    let busy: BlockingActivityGuard = std::sync::Arc::new(activity.scan());
+                    if let Err(error) = scan::scan_local_collection(
+                        collection.clone(),
+                        catalog.clone(),
+                        trigger.force_dirs,
+                        busy,
+                    )
+                    .await
+                    {
+                        tracing::warn!(collection = %collection.name,
+                            error = format!("{error:#}"), "local catalogue scan failed");
+                    }
+                }
+            }));
+            sink.send(ScanTrigger {
+                initial: true,
+                ..Default::default()
+            });
+        }
+
+        if rescan_minutes > 0 {
+            let periodic = triggers.clone();
+            guards.push(tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(Duration::from_secs(rescan_minutes * 60));
+                ticker.tick().await;
+                loop {
+                    ticker.tick().await;
+                    for trigger in periodic.values() {
+                        trigger.send(ScanTrigger::default());
+                    }
+                }
+            }));
+        }
+
+        // Watch once for the whole process. Link churn never installs another
+        // recursive watch or repeats its potentially expensive mount walk.
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        match notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+            let Ok(event) = event else { return };
+            use notify::event::{EventKind, ModifyKind};
+            if !matches!(
+                event.kind,
+                EventKind::Create(_)
+                    | EventKind::Remove(_)
+                    | EventKind::Modify(ModifyKind::Data(_) | ModifyKind::Name(_))
+            ) {
+                return;
+            }
+            for path in event.paths {
+                let _ = event_tx.send(path);
+            }
+        }) {
+            Ok(watcher) => {
+                let routes: Vec<(String, std::path::PathBuf)> = collections
+                    .iter()
+                    .flat_map(|collection| {
+                        collection
+                            .roots
+                            .iter()
+                            .map(|root| (collection.name.clone(), root.clone()))
+                    })
+                    .collect();
+                let watch_roots = routes.clone();
+                let watch_triggers = triggers.clone();
+                guards.push(tokio::spawn(async move {
+                    // Installing recursive watches walks the mount. Keep that
+                    // network-filesystem latency away from catalogue startup
+                    // and every independently supervised hub link.
+                    let watcher = tokio::task::spawn_blocking(move || {
+                        use notify::Watcher as _;
+                        let mut watcher = watcher;
+                        for (_, root) in &watch_roots {
+                            if let Err(error) =
+                                watcher.watch(root, notify::RecursiveMode::Recursive)
+                            {
+                                tracing::warn!(root = %root.display(), %error,
+                                    "watch failed; periodic scan still covers this root");
+                            }
+                        }
+                        tracing::info!(roots = watch_roots.len(), "filesystem watches installed");
+                        watcher
+                    })
+                    .await;
+                    let Ok(watcher) = watcher else { return };
+                    let _watcher = watcher;
+                    let mut dirty: std::collections::HashMap<
+                        String,
+                        (
+                            std::collections::HashSet<std::path::PathBuf>,
+                            tokio::time::Instant,
+                        ),
+                    > = Default::default();
+                    let mut tick = tokio::time::interval(Duration::from_secs(1));
+                    loop {
+                        tokio::select! {
+                            event = event_rx.recv() => {
+                                let Some(path) = event else { return };
+                                let directory = path.parent().unwrap_or(&path).to_path_buf();
+                                for (collection, _) in routes.iter().filter(|(_, root)| path.starts_with(root)) {
+                                    let entry = dirty.entry(collection.clone()).or_insert_with(|| {
+                                        (Default::default(), tokio::time::Instant::now())
+                                    });
+                                    entry.0.insert(directory.clone());
+                                    entry.1 = tokio::time::Instant::now();
+                                }
+                            }
+                            _ = tick.tick() => {
+                                let quiet = Duration::from_secs(3);
+                                let ready: Vec<String> = dirty.iter()
+                                    .filter(|(_, (_, changed))| changed.elapsed() >= quiet)
+                                    .map(|(collection, _)| collection.clone())
+                                    .collect();
+                                for collection in ready {
+                                    if let Some((force_dirs, _)) = dirty.remove(&collection)
+                                        && let Some(trigger) = watch_triggers.get(&collection)
+                                    {
+                                        tracing::info!(%collection, dirs = force_dirs.len(),
+                                            "watcher triggered rescan");
+                                        trigger.send(ScanTrigger {
+                                            force_dirs,
+                                            initial: false,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }));
+            }
+            Err(error) => tracing::warn!(%error, "no filesystem watcher; using periodic scans"),
+        }
+
+        // Source-owned discovery workers publish into the catalogue, never to
+        // a particular hub. Every link later observes the same versioned fact.
+        let (fact_tx, mut fact_rx) = tokio::sync::mpsc::channel::<HostToHub>(32);
+        let (local_hash_tx, local_hash_rx) = tokio::sync::mpsc::channel(32);
+        let (retry_tx, mut retry_rx) = tokio::sync::mpsc::unbounded_channel();
+        guards.push(tokio::spawn(hasher::run(
+            local_hash_rx,
+            fact_tx.clone(),
+            collections.clone(),
+            activity.clone(),
+            Some(retry_tx),
+        )));
+        let (local_loudness_tx, local_loudness_rx) = tokio::sync::mpsc::unbounded_channel();
+        guards.push(tokio::spawn(loudness::run(
+            local_loudness_rx,
+            fact_tx,
+            collections.clone(),
+            activity.clone(),
+        )));
+        let segment_inflight = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let fact_catalog = catalog.clone();
+        guards.push(tokio::spawn(async move {
+            while let Some(message) = fact_rx.recv().await {
+                loop {
+                    match fact_catalog.store_fact(message.clone()).await {
+                        Ok(()) => break,
+                        Err(error) if catalog::is_stale_fact(&error) => {
+                            tracing::warn!(
+                                error = format!("{error:#}"),
+                                "discarding stale local discovery result"
+                            );
+                            break;
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                error = format!("{error:#}"),
+                                "persisting local discovery result failed; retrying"
+                            );
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                        }
+                    }
+                }
+            }
+        }));
+        let retry_catalog = catalog.clone();
+        guards.push(tokio::spawn(async move {
+            while let Some(retry) = retry_rx.recv().await {
+                if let Err(error) = retry_catalog
+                    .release_claims(
+                        &retry.collection_id,
+                        retry.kind,
+                        std::slice::from_ref(&retry.source),
+                    )
+                    .await
+                {
+                    tracing::warn!(collection = %retry.collection_id, kind = retry.kind,
+                        error = format!("{error:#}"),
+                        "releasing retryable local discovery claim failed");
+                }
+            }
+        }));
+        let local_segment_tx = if detect_segments {
+            let (segment_tx, segment_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (result_tx, mut result_rx) = tokio::sync::mpsc::channel::<HostToHub>(32);
+            let catalog_tx = catalog.clone();
+            let completed = segment_inflight.clone();
+            guards.push(tokio::spawn(async move {
+                while let Some(message) = result_rx.recv().await {
+                    let done = matches!(
+                        message.msg,
+                        Some(host_to_hub::Msg::SegmentDetectionResult(_))
+                    );
+                    loop {
+                        match catalog_tx.store_fact(message.clone()).await {
+                            Ok(()) => break,
+                            Err(error) if catalog::is_stale_fact(&error) => {
+                                tracing::warn!(
+                                    error = format!("{error:#}"),
+                                    "discarding stale local segment result"
+                                );
+                                break;
+                            }
+                            Err(error) => {
+                                tracing::warn!(
+                                    error = format!("{error:#}"),
+                                    "persisting local segment result failed; retrying"
+                                );
+                                tokio::time::sleep(Duration::from_secs(1)).await;
+                            }
+                        }
+                    }
+                    if done {
+                        completed.store(false, std::sync::atomic::Ordering::Release);
+                    }
+                }
+            }));
+            guards.push(tokio::spawn(segments::run(
+                segment_rx,
+                result_tx,
+                collections.clone(),
+                activity.clone(),
+                std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            )));
+            Some(segment_tx)
+        } else {
+            None
+        };
+        let schedule_catalog = catalog.clone();
+        let schedule_collections = collections.clone();
+        let schedule_segment = segment_inflight;
+        let discovery_wake = std::sync::Arc::new(tokio::sync::Notify::new());
+        let scheduler_wake = discovery_wake.clone();
+        guards.push(tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(15));
+            let mut segment_exhausted = std::collections::HashMap::<String, i64>::new();
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {}
+                    _ = scheduler_wake.notified() => {}
+                }
+                for collection in &schedule_collections {
+                    if collection.media_type == "anime" {
+                        match schedule_catalog
+                            .claim_sources(&collection.name, "file_hashes", 256)
+                            .await
+                        {
+                            Ok(sources) if !sources.is_empty() => {
+                                let job = hasher::JobMsg::Hashlist(kahawai_proto::v1::Hashlist {
+                                    collection_id: collection.name.clone(),
+                                    sources: sources.clone(),
+                                });
+                                if local_hash_tx.send(job).await.is_err() {
+                                    if let Err(error) = schedule_catalog.release_claims(
+                                        &collection.name, "file_hashes", &sources
+                                    ).await {
+                                        tracing::warn!(error = format!("{error:#}"),
+                                            "releasing abandoned hash claims failed");
+                                    }
+                                    tracing::error!("local hash worker stopped; discovery scheduler exiting");
+                                    return;
+                                }
+                            }
+                            Ok(_) => {}
+                            Err(error) => tracing::warn!(collection = %collection.name,
+                                error = format!("{error:#}"), "claiming local hash work failed"),
+                        }
+                    }
+                    for (kind, limit) in [
+                        ("file_attachments", 64),
+                        ("file_keyframe", 64),
+                        ("file_geometry", 8),
+                    ] {
+                        match schedule_catalog
+                            .claim_cheap_sources(&collection.name, kind, limit)
+                            .await
+                        {
+                            Ok(sources) if !sources.is_empty() => {
+                                let job = match kind {
+                                    "file_attachments" => hasher::JobMsg::AttachmentsWorklist(
+                                        kahawai_proto::v1::AttachmentsWorklist {
+                                            collection_id: collection.name.clone(),
+                                            sources: sources.clone(),
+                                        },
+                                    ),
+                                    "file_keyframe" => hasher::JobMsg::KeyframeWorklist(
+                                        kahawai_proto::v1::KeyframeWorklist {
+                                            collection_id: collection.name.clone(),
+                                            sources: sources.clone(),
+                                        },
+                                    ),
+                                    "file_geometry" => hasher::JobMsg::VideoGeometryWorklist(
+                                        kahawai_proto::v1::VideoGeometryWorklist {
+                                            collection_id: collection.name.clone(),
+                                            sources: sources.clone(),
+                                        },
+                                    ),
+                                    _ => unreachable!("fixed cheap discovery kind"),
+                                };
+                                if local_hash_tx.send(job).await.is_err() {
+                                    if let Err(error) = schedule_catalog
+                                        .release_claims(&collection.name, kind, &sources)
+                                        .await
+                                    {
+                                        tracing::warn!(error = format!("{error:#}"),
+                                            "releasing abandoned cheap discovery claims failed");
+                                    }
+                                    tracing::error!(kind,
+                                        "local discovery worker stopped; scheduler exiting");
+                                    return;
+                                }
+                            }
+                            Ok(_) => {}
+                            Err(error) => tracing::warn!(collection = %collection.name, kind,
+                                error = format!("{error:#}"),
+                                "claiming local cheap discovery work failed"),
+                        }
+                    }
+                    if collection.media_type != "music" {
+                        match schedule_catalog
+                            .claim_sources(&collection.name, "file_loudness", 128)
+                            .await
+                        {
+                            Ok(sources) if !sources.is_empty() => {
+                                let work = kahawai_proto::v1::LoudnessWorklist {
+                                    collection_id: collection.name.clone(),
+                                    analyzer: kahawai_media::loudness::ANALYZER,
+                                    sources: sources.clone(),
+                                };
+                                if local_loudness_tx.send(work).is_err() {
+                                    if let Err(error) = schedule_catalog.release_claims(
+                                        &collection.name, "file_loudness", &sources
+                                    ).await {
+                                        tracing::warn!(error = format!("{error:#}"),
+                                            "releasing abandoned loudness claims failed");
+                                    }
+                                    tracing::error!("local loudness worker stopped; discovery scheduler exiting");
+                                    return;
+                                }
+                            }
+                            Ok(_) => {}
+                            Err(error) => tracing::warn!(collection = %collection.name,
+                                error = format!("{error:#}"), "claiming local loudness work failed"),
+                        }
+                    }
+                    if matches!(collection.media_type.as_str(), "series" | "anime")
+                        && let Some(segment_tx) = &local_segment_tx
+                        && !schedule_segment.load(std::sync::atomic::Ordering::Acquire)
+                    {
+                        let (marker, scanning) = match schedule_catalog
+                            .segment_scan_state(&collection.name)
+                            .await
+                        {
+                            Ok(state) => state,
+                            Err(error) => {
+                                tracing::warn!(collection = %collection.name,
+                                    error = format!("{error:#}"),
+                                    "reading segment scan generation failed");
+                                continue;
+                            }
+                        };
+                        if !scanning && segment_exhausted.get(&collection.name) == Some(&marker) {
+                            continue;
+                        }
+                        match schedule_catalog
+                            .pending_sources(&collection.name, "file_segments", 1)
+                            .await
+                        {
+                            Ok(pending) if !pending.is_empty() => {
+                                match schedule_catalog
+                                    .next_segment_job(&collection.name, &collection.media_type)
+                                    .await
+                                {
+                                    Ok(Some(job))
+                                        if schedule_segment
+                                            .compare_exchange(
+                                                false,
+                                                true,
+                                                std::sync::atomic::Ordering::AcqRel,
+                                                std::sync::atomic::Ordering::Acquire,
+                                            )
+                                            .is_ok() =>
+                                    {
+                                        segment_exhausted.remove(&collection.name);
+                                        if segment_tx.send(job).is_err() {
+                                            schedule_segment.store(
+                                                false,
+                                                std::sync::atomic::Ordering::Release,
+                                            );
+                                            tracing::error!(
+                                                "local segment worker stopped; segment discovery disabled"
+                                            );
+                                        }
+                                    }
+                                    Ok(None) => {
+                                        if !scanning {
+                                            segment_exhausted
+                                                .insert(collection.name.clone(), marker);
+                                        }
+                                    }
+                                    Ok(Some(_)) => {}
+                                    Err(error) => tracing::warn!(collection = %collection.name,
+                                        error = format!("{error:#}"),
+                                        "selecting local segment work failed"),
+                                }
+                            }
+                            Ok(_) => {
+                                if !scanning {
+                                    segment_exhausted.insert(collection.name.clone(), marker);
+                                }
+                            }
+                            Err(error) => tracing::warn!(collection = %collection.name,
+                                error = format!("{error:#}"),
+                                "checking local segment work failed"),
+                        }
+                    }
+                }
+            }
+        }));
+
+        Ok(Self {
+            catalog,
+            collections,
+            triggers,
+            activity,
+            discovery_wake,
+            catalog_versions,
+            discovery_status,
+            _guards: std::sync::Arc::new(AbortOnDrop(guards)),
+        })
+    }
+
+    fn selected(&self, names: &[String]) -> Vec<CollectionConfig> {
+        self.collections
+            .iter()
+            .filter(|collection| names.contains(&collection.name))
+            .cloned()
+            .collect()
+    }
+
+    fn rescan(&self, collection: &str) {
+        for (name, trigger) in &self.triggers {
+            if collection.is_empty() || name == collection {
+                trigger.send(ScanTrigger::default());
+            }
+        }
+    }
+}
+
+async fn ready_catalog_offer(
+    runtime: &LocalRuntime,
+    selected: &[CollectionConfig],
+    tx: &tokio::sync::mpsc::Sender<HostToHub>,
+) -> Result<CatalogOffer> {
+    let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
+    // Consume Tokio's immediate first tick. Hello itself establishes
+    // liveness; subsequent ticks keep a genuinely long first scan alive.
+    heartbeat.tick().await;
+    loop {
+        let ready = {
+            let versions = runtime.catalog_versions.read().unwrap();
+            selected.iter().all(|collection| {
+                versions
+                    .get(&collection.name)
+                    .is_some_and(|(_, _, complete)| *complete)
+            })
+        };
+        if ready {
+            return Ok(CatalogOffer {
+                collections: runtime.catalog.offers(selected).await?,
+            });
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+            _ = heartbeat.tick() => {
+                send_link_message(tx, HostToHub {
+                    msg: Some(host_to_hub::Msg::Heartbeat(Heartbeat {})),
+                }).await?;
+            }
+        }
+    }
+}
+
+fn ensure_scoped_rescan(collections: &[CollectionConfig], requested: &str) -> Result<()> {
+    anyhow::ensure!(
+        !requested.is_empty(),
+        "hub requested an unscoped collection scan"
+    );
+    anyhow::ensure!(
+        collections
+            .iter()
+            .any(|collection| collection.name == requested),
+        "hub requested an unshared collection scan"
+    );
+    Ok(())
+}
+
+/// Protocol-4 standalone entrypoint: one local source engine, independently
+/// supervised outbound links. A pending first-time enrollment cannot prevent
+/// an already enrolled hub from receiving updates.
+pub async fn run_multi(
+    state_dir: &Path,
+    name: &str,
+    collections: Vec<CollectionConfig>,
+    rescan_minutes: u64,
+    hubs: Vec<HubTarget>,
+    detect_segments: bool,
+) -> Result<()> {
+    let runtime =
+        LocalRuntime::start(state_dir, collections, rescan_minutes, detect_segments).await?;
+    supervise_hubs(runtime, state_dir, name, hubs).await
+}
+
+async fn supervise_hubs(
+    runtime: LocalRuntime,
+    state_dir: &Path,
+    name: &str,
+    hubs: Vec<HubTarget>,
+) -> Result<()> {
+    let mut links = tokio::task::JoinSet::new();
+    for hub in hubs {
+        let runtime = runtime.clone();
+        let state_dir = state_dir.to_path_buf();
+        let name = name.to_string();
+        links.spawn(async move {
+            let identity_dir = if hub.legacy_identity {
+                state_dir
+            } else {
+                state_dir.join("hubs").join(&hub.id)
+            };
+            loop {
+                if let Err(error) = run_hub(
+                    runtime.clone(),
+                    hub.clone(),
+                    identity_dir.clone(),
+                    name.clone(),
+                )
+                .await
+                {
+                    tracing::warn!(hub = %hub.id, error = format!("{error:#}"),
+                        "hub supervisor failed; restarting independently");
+                    tokio::time::sleep(RECONNECT_DELAY).await;
+                }
+            }
+        });
+    }
+    match links.join_next().await {
+        Some(Ok(())) => anyhow::bail!("mediahost hub supervisor exited unexpectedly"),
+        Some(Err(error)) => anyhow::bail!("mediahost hub supervisor panicked: {error}"),
+        None => anyhow::bail!("mediahost has no hub supervisors"),
+    }
+}
+
+async fn run_hub(
+    runtime: LocalRuntime,
+    hub: HubTarget,
+    identity_dir: std::path::PathBuf,
+    name: String,
+) -> Result<()> {
+    loop {
+        let mut identity = match kahawai_transport::enroll::ensure_identity(
+            &hub.address,
+            &identity_dir,
+            "mediahost",
+            &name,
+        )
+        .await
+        {
+            Ok(identity) => identity,
+            Err(error) => {
+                tracing::warn!(hub = %hub.id, error = format!("{error:#}"),
+                    "hub enrollment unavailable; retrying independently");
+                tokio::time::sleep(RECONNECT_DELAY).await;
+                continue;
+            }
+        };
+        match kahawai_transport::renew::maybe_renew(&hub.address, &identity_dir, "mediahost", &name)
+            .await
+        {
+            Ok(Some(renewed)) => identity = renewed,
+            Ok(None) => {}
+            Err(error) => tracing::warn!(hub = %hub.id, error = format!("{error:#}"),
+                "certificate renewal failed; retrying later"),
+        }
+        let tls = kahawai_transport::mtls::mtls_client_config(&identity)?;
+        let renewal_due = kahawai_transport::renew::seconds_until_renewal_due(&identity.cert_pem)
+            .unwrap_or(i64::MAX)
+            .max(3600) as u64;
+        tokio::select! {
+            result = link_once_v4(&runtime, &hub, tls, &name) => match result {
+                Ok(()) => tracing::warn!(hub = %hub.id, "hub closed the link; reconnecting"),
+                Err(error) => tracing::warn!(hub = %hub.id, error = format!("{error:#}"),
+                    "hub link failed; reconnecting"),
+            },
+            _ = tokio::time::sleep(Duration::from_secs(renewal_due)) => {
+                tracing::info!(hub = %hub.id, "certificate renewal due; cycling the link");
+            }
+        }
+        tokio::time::sleep(RECONNECT_DELAY).await;
+    }
+}
+
+async fn link_once_v4(
+    runtime: &LocalRuntime,
+    hub: &HubTarget,
+    tls: std::sync::Arc<rustls::ClientConfig>,
+    name: &str,
+) -> Result<()> {
+    let channel = kahawai_transport::tls::grpc_channel_with(&hub.address, tls.clone()).await?;
+    let byte_channel = kahawai_transport::tls::grpc_channel_with(&hub.address, tls).await?;
+    let mut client = MediahostLinkClient::new(channel)
+        .max_decoding_message_size(64 * 1024 * 1024)
+        .max_encoding_message_size(64 * 1024 * 1024);
+    let (tx, rx) = tokio::sync::mpsc::channel::<HostToHub>(32);
+    send_link_message(
+        &tx,
+        HostToHub {
+            msg: Some(host_to_hub::Msg::Hello(Hello {
+                protocol_major: PROTOCOL_MAJOR,
+                protocol_minor: PROTOCOL_MINOR,
+                name: name.to_string(),
+                build: kahawai_core::build_stamp().into(),
+                segment_detector_generation: kahawai_core::segments::DETECTOR_GENERATION,
+            })),
+        },
+    )
+    .await?;
+    let mut inbound = client
+        .link(ReceiverStream::new(rx))
+        .await
+        .context("opening mediahost link")?
+        .into_inner();
+    match inbound.message().await.context("awaiting HelloAck")? {
+        Some(HubToHost {
+            msg: Some(hub_to_host::Msg::HelloAck(ack)),
+        }) if ack.protocol_major == PROTOCOL_MAJOR => {}
+        Some(HubToHost {
+            msg: Some(hub_to_host::Msg::HelloAck(ack)),
+        }) => anyhow::bail!(
+            "incompatible hub protocol {}.{}; this mediahost requires {}.{}",
+            ack.protocol_major,
+            ack.protocol_minor,
+            PROTOCOL_MAJOR,
+            PROTOCOL_MINOR
+        ),
+        _ => anyhow::bail!("hub did not open with HelloAck"),
+    }
+
+    let selected = runtime.selected(&hub.collections);
+    send_link_message(
+        &tx,
+        HostToHub {
+            msg: Some(host_to_hub::Msg::CatalogOffer(
+                ready_catalog_offer(runtime, &selected, &tx).await?,
+            )),
+        },
+    )
+    .await?;
+
+    // Extraction remains requester-owned. This worker receives only subtitle
+    // jobs on protocol 4; all catalogue discovery has one process-local owner.
+    let (job_tx, job_rx) = tokio::sync::mpsc::channel(32);
+    let _job_guard = AbortOnDrop(vec![tokio::spawn(hasher::run(
+        job_rx,
+        tx.clone(),
+        selected.clone(),
+        runtime.activity.clone(),
+        None,
+    ))]);
+    let sent: std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<String, (String, u64)>>> =
+        Default::default();
+    let mut syncing = std::collections::HashSet::new();
+    let mut syncs = tokio::task::JoinSet::new();
+    let link_syncs = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+    let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
+    let mut changes = tokio::time::interval(Duration::from_secs(1));
+    let mut status = tokio::time::interval(Duration::from_secs(30));
+    loop {
+        tokio::select! {
+            completed = syncs.join_next(), if !syncs.is_empty() => {
+                let (collection, result) = completed
+                    .context("catalogue sync task disappeared")?
+                    .context("catalogue sync task panicked")?;
+                syncing.remove(&collection);
+                let (epoch, through) = result?;
+                sent.lock().await.insert(collection, (epoch, through));
+            }
+            _ = heartbeat.tick() => {
+                send_link_message(&tx, HostToHub {
+                    msg: Some(host_to_hub::Msg::Heartbeat(Heartbeat {})),
+                }).await?;
+            }
+            _ = changes.tick() => {
+                let states = sent.lock().await.clone();
+                let advertised = runtime.catalog_versions.read().unwrap().clone();
+                for collection in &selected {
+                    let Some((epoch, cursor)) = states.get(&collection.name) else { continue };
+                    if !advertised.get(&collection.name).is_some_and(
+                        |(current_epoch, current, _)| current_epoch == epoch && current > cursor
+                    ) {
+                        continue;
+                    }
+                    if !syncing.insert(collection.name.clone()) {
+                        continue;
+                    }
+                    let catalog = runtime.catalog.clone();
+                    let outbound = tx.clone();
+                    let link_limit = link_syncs.clone();
+                    let collection_id = collection.name.clone();
+                    let cursor = *cursor;
+                    let expected_epoch = epoch.clone();
+                    syncs.spawn(async move {
+                        let result = send_catalog_pages(
+                            &catalog, &outbound, &collection_id, cursor, false, link_limit
+                        ).await.and_then(|(epoch, through)| {
+                            anyhow::ensure!(epoch == expected_epoch,
+                                "catalogue epoch changed under a live link");
+                            Ok((epoch, through))
+                        });
+                        (collection_id, result)
+                    });
+                }
+            }
+            _ = status.tick() => {
+                let statuses = runtime.discovery_status.read().unwrap().clone();
+                for collection in &selected {
+                    if let Some(status) = statuses.get(&collection.name) {
+                        send_link_message(&tx, HostToHub {
+                            msg: Some(host_to_hub::Msg::DiscoveryStatus(status.clone())),
+                        }).await?;
+                    }
+                }
+            }
+            message = inbound.message() => match message? {
+                Some(HubToHost { msg: Some(hub_to_host::Msg::CatalogCursor(cursor)) }) => {
+                    let config = selected.iter()
+                        .find(|collection| collection.name == cursor.collection_id)
+                        .with_context(|| format!("hub requested unshared collection {:?}", cursor.collection_id))?;
+                    let offer = runtime.catalog.offers(std::slice::from_ref(config)).await?
+                        .remove(0);
+                    let snapshot = cursor.snapshot
+                        || cursor.epoch != offer.epoch
+                        || cursor.version < offer.oldest_replayable_version
+                        || cursor.version > offer.current_version;
+                    let start = if snapshot { 0 } else { cursor.version };
+                    anyhow::ensure!(syncing.insert(cursor.collection_id.clone()),
+                        "hub requested a second concurrent catalogue sync");
+                    let catalog = runtime.catalog.clone();
+                    let outbound = tx.clone();
+                    let link_limit = link_syncs.clone();
+                    let collection_id = cursor.collection_id;
+                    syncs.spawn(async move {
+                        let result = send_catalog_pages(
+                            &catalog, &outbound, &collection_id, start, snapshot, link_limit
+                        ).await;
+                        (collection_id, result)
+                    });
+                }
+                Some(HubToHost { msg: Some(hub_to_host::Msg::CatalogAck(ack)) }) => {
+                    runtime.catalog.acknowledge(&hub.id, &ack.collection_id, &ack.epoch, ack.version).await?;
+                }
+                Some(HubToHost { msg: Some(hub_to_host::Msg::RescanRequest(request)) }) => {
+                    ensure_scoped_rescan(&selected, &request.collection_id)?;
+                    runtime.rescan(&request.collection_id);
+                }
+                Some(HubToHost { msg: Some(hub_to_host::Msg::ExtractSubs(request)) }) => {
+                    job_tx.try_send(hasher::JobMsg::Urgent(request))
+                        .context("hub overran the extraction queue")?;
+                }
+                Some(HubToHost { msg: Some(hub_to_host::Msg::ExtractImageSubs(request)) }) => {
+                    job_tx.try_send(hasher::JobMsg::UrgentImage(request))
+                        .context("hub overran the image extraction queue")?;
+                }
+                Some(HubToHost { msg: Some(hub_to_host::Msg::SubsWorklist(request)) }) => {
+                    job_tx.try_send(hasher::JobMsg::SubsWorklist(request))
+                        .context("hub overran the subtitle work queue")?;
+                }
+                Some(HubToHost { msg: Some(hub_to_host::Msg::OpenRead(request)) }) => {
+                    let path = serve::resolve_path(&selected, &request);
+                    let foreground = !request.background;
+                    let busy = foreground.then(|| runtime.activity.lease());
+                    let channel = byte_channel.clone();
+                    tokio::spawn(async move {
+                        let _busy = busy;
+                        if let Err(error) = serve::serve_lease(channel, request.lease_token, path).await {
+                            tracing::warn!(error = format!("{error:#}"), "byte channel failed");
+                        }
+                    });
+                }
+                Some(HubToHost { msg: Some(hub_to_host::Msg::DiscoveryWake(wake)) }) => {
+                    if wake.kind == "segments" {
+                        runtime.discovery_wake.notify_one();
+                    }
+                }
+                Some(_) => {}
+                None => break,
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn send_catalog_delta(
+    tx: &tokio::sync::mpsc::Sender<HostToHub>,
+    collection: &str,
+    delta: catalog::Delta,
+    first_snapshot_message: bool,
+    snapshot_stream: bool,
+) -> Result<u64> {
+    const RECORDS_PER_MESSAGE: usize = 256;
+    const PAYLOAD_BYTES_PER_MESSAGE: usize = 4 * 1024 * 1024;
+    if delta.records.is_empty() {
+        let through = if delta.done {
+            delta.current_version
+        } else if snapshot_stream {
+            0
+        } else {
+            delta.current_version
+        };
+        send_link_message(
+            tx,
+            HostToHub {
+                msg: Some(host_to_hub::Msg::CatalogDelta(CatalogDelta {
+                    collection_id: collection.to_string(),
+                    epoch: delta.epoch,
+                    records: Vec::new(),
+                    through_version: through,
+                    snapshot: first_snapshot_message,
+                    done: delta.done,
+                })),
+            },
+        )
+        .await?;
+        return Ok(through);
+    }
+    anyhow::ensure!(
+        delta
+            .records
+            .iter()
+            .all(|record| record.encoded_len() <= PAYLOAD_BYTES_PER_MESSAGE),
+        "one catalogue record exceeds the safe gRPC message budget"
+    );
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    while start < delta.records.len() {
+        let mut end = start;
+        let mut bytes = 0;
+        while end < delta.records.len() && end - start < RECORDS_PER_MESSAGE {
+            let next = delta.records[end].encoded_len();
+            if end > start && bytes + next > PAYLOAD_BYTES_PER_MESSAGE {
+                break;
+            }
+            bytes += next;
+            end += 1;
+        }
+        chunks.push(&delta.records[start..end]);
+        start = end;
+    }
+    let mut chunks = chunks.into_iter().peekable();
+    let mut first = true;
+    let mut sent_through = 0;
+    while let Some(chunk) = chunks.next() {
+        let last_chunk = chunks.peek().is_none();
+        let done = delta.done && last_chunk;
+        let through = if done {
+            delta.current_version
+        } else if snapshot_stream {
+            0
+        } else {
+            chunk.last().map_or(0, |record| record.version)
+        };
+        sent_through = through;
+        send_link_message(
+            tx,
+            HostToHub {
+                msg: Some(host_to_hub::Msg::CatalogDelta(CatalogDelta {
+                    collection_id: collection.to_string(),
+                    epoch: delta.epoch.clone(),
+                    records: chunk.to_vec(),
+                    through_version: through,
+                    snapshot: first_snapshot_message && first,
+                    done,
+                })),
+            },
+        )
+        .await?;
+        first = false;
+    }
+    Ok(sent_through)
+}
+
+pub(crate) async fn send_link_message(
+    tx: &tokio::sync::mpsc::Sender<HostToHub>,
+    message: HostToHub,
+) -> Result<()> {
+    send_link_message_with_timeout(tx, message, LINK_SEND_TIMEOUT).await
+}
+
+async fn send_link_message_with_timeout(
+    tx: &tokio::sync::mpsc::Sender<HostToHub>,
+    message: HostToHub,
+    timeout: Duration,
+) -> Result<()> {
+    match tokio::time::timeout(timeout, tx.send(message)).await {
+        Ok(result) => result.context("mediahost link outbound channel closed"),
+        Err(_) => bail!("mediahost link outbound channel stalled for {timeout:?}"),
+    }
+}
+
+async fn send_catalog_pages(
+    catalog: &catalog::Catalog,
+    tx: &tokio::sync::mpsc::Sender<HostToHub>,
+    collection: &str,
+    cursor: u64,
+    snapshot: bool,
+    link_limit: std::sync::Arc<tokio::sync::Semaphore>,
+) -> Result<(String, u64)> {
+    let _link_permit = link_limit.acquire_owned().await?;
+    let mut pages = catalog.delta_pages(collection, cursor, snapshot).await?;
+    let mut first = true;
+    let mut epoch = String::new();
+    let mut through = cursor;
+    while let Some(page) = pages.recv().await {
+        let page = page?;
+        epoch.clone_from(&page.epoch);
+        if !snapshot
+            && first
+            && page.done
+            && page.records.is_empty()
+            && page.current_version == cursor
+        {
+            return Ok((epoch, cursor));
+        }
+        through = send_catalog_delta(tx, collection, page, snapshot && first, snapshot).await?;
+        first = false;
+    }
+    anyhow::ensure!(!first, "catalogue page producer stopped without output");
+    Ok((epoch, through))
+}
 /// Enroll (or load identity) and keep the hub link up forever.
 pub async fn run(
     hub_addr: &str,
@@ -177,44 +1272,24 @@ pub async fn run(
     collections: Vec<CollectionConfig>,
     rescan_minutes: u64,
 ) -> Result<()> {
-    let mut id =
-        kahawai_transport::enroll::ensure_identity(hub_addr, state_dir, "mediahost", name).await?;
-    // Survives link engines: cancelled spawn_blocking work retains this permit
-    let jobs = JobRuntime::default();
-    loop {
-        // SEC-7: renew before (re)connecting when inside the window, and
-        // bound the link's lifetime so a long-lived link still renews.
-        match kahawai_transport::renew::maybe_renew(hub_addr, state_dir, "mediahost", name).await {
-            Ok(Some(renewed)) => id = renewed,
-            Ok(None) => {}
-            Err(e) => tracing::warn!(
-                error = format!("{e:#}"),
-                "certificate renewal failed; retrying later"
-            ),
-        }
-        let tls = kahawai_transport::mtls::mtls_client_config(&id)?;
-        let renewal_due = kahawai_transport::renew::seconds_until_renewal_due(&id.cert_pem)
-            .unwrap_or(i64::MAX)
-            .max(3600) as u64;
-        tokio::select! {
-            r = link_once(
-                hub_addr,
-                tls.clone(),
-                name,
-                &collections,
-                rescan_minutes,
-                state_dir,
-                jobs.clone(),
-            ) => match r {
-                Ok(()) => tracing::warn!("hub closed the link; reconnecting"),
-                Err(e) => tracing::warn!(error = format!("{e:#}"), "link failed; reconnecting"),
-            },
-            _ = tokio::time::sleep(std::time::Duration::from_secs(renewal_due)) => {
-                tracing::info!("certificate renewal due; cycling the link");
-            }
-        }
-        tokio::time::sleep(RECONNECT_DELAY).await;
-    }
+    let selected = collections
+        .iter()
+        .map(|collection| collection.name.clone())
+        .collect();
+    run_multi(
+        state_dir,
+        name,
+        collections,
+        rescan_minutes,
+        vec![HubTarget {
+            id: "default".into(),
+            address: hub_addr.to_string(),
+            collections: selected,
+            legacy_identity: true,
+        }],
+        true,
+    )
+    .await
 }
 
 /// AR-5 all-in-one: run the mediahost engine against in-process
@@ -225,35 +1300,208 @@ pub async fn run_local(
     rescan_minutes: u64,
     state_dir: &Path,
     activity: Activity,
+    detect_segments: bool,
+    tx: tokio::sync::mpsc::Sender<HostToHub>,
+    rx: tokio::sync::mpsc::Receiver<Result<HubToHost, tonic::Status>>,
+) -> Result<()> {
+    let runtime = LocalRuntime::start_with_activity(
+        state_dir,
+        collections.clone(),
+        rescan_minutes,
+        activity,
+        detect_segments,
+    )
+    .await?;
+    run_local_link(runtime, collections, tx, rx).await
+}
+
+/// All-in-one with additional remote hubs: one catalogue/watcher/discovery
+/// engine feeds both the intrinsic local link and independently supervised
+/// mTLS links. The caller passes only explicitly configured external hubs.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_local_multi(
+    collections: Vec<scan::CollectionConfig>,
+    rescan_minutes: u64,
+    state_dir: &Path,
+    name: &str,
+    activity: Activity,
+    detect_segments: bool,
+    hubs: Vec<HubTarget>,
+    local_link: LocalLinkFactory,
+) -> Result<()> {
+    let runtime = LocalRuntime::start_with_activity(
+        state_dir,
+        collections.clone(),
+        rescan_minutes,
+        activity,
+        detect_segments,
+    )
+    .await?;
+    let local_runtime = runtime.clone();
+    let local_supervisor = tokio::spawn(async move {
+        loop {
+            let (tx, rx) = local_link();
+            if let Err(error) =
+                run_local_link(local_runtime.clone(), collections.clone(), tx, rx).await
+            {
+                tracing::error!(
+                    error = format!("{error:#}"),
+                    "in-process hub link failed; reconnecting independently"
+                );
+            }
+            tokio::time::sleep(RECONNECT_DELAY).await;
+        }
+    });
+    if hubs.is_empty() {
+        local_supervisor
+            .await
+            .context("in-process hub link supervisor panicked")?;
+        return Ok(());
+    }
+    let result = supervise_hubs(runtime, state_dir, name, hubs).await;
+    local_supervisor.abort();
+    result
+}
+
+async fn run_local_link(
+    runtime: LocalRuntime,
+    collections: Vec<scan::CollectionConfig>,
     tx: tokio::sync::mpsc::Sender<HostToHub>,
     mut rx: tokio::sync::mpsc::Receiver<Result<HubToHost, tonic::Status>>,
 ) -> Result<()> {
-    let engine = Engine::start_with_activity(
-        &collections,
-        rescan_minutes,
-        state_dir,
+    send_link_message(
+        &tx,
+        HostToHub {
+            msg: Some(host_to_hub::Msg::CatalogOffer(
+                ready_catalog_offer(&runtime, &collections, &tx).await?,
+            )),
+        },
+    )
+    .await
+    .context("local link closed before catalogue offer")?;
+    let (job_tx, job_rx) = tokio::sync::mpsc::channel(32);
+    let _job_guard = AbortOnDrop(vec![tokio::spawn(hasher::run(
+        job_rx,
         tx.clone(),
-        activity,
-    );
+        collections,
+        runtime.activity.clone(),
+        None,
+    ))]);
+    let mut sent: std::collections::HashMap<String, (String, u64)> = Default::default();
+    let mut syncing = std::collections::HashSet::new();
+    let mut syncs = tokio::task::JoinSet::new();
+    let link_syncs = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
     let mut ticker = tokio::time::interval(HEARTBEAT_INTERVAL);
+    let mut changes = tokio::time::interval(Duration::from_secs(1));
+    let mut status = tokio::time::interval(Duration::from_secs(30));
     loop {
         tokio::select! {
+            completed = syncs.join_next(), if !syncs.is_empty() => {
+                let (collection, result) = completed
+                    .context("local catalogue sync task disappeared")?
+                    .context("local catalogue sync task panicked")?;
+                syncing.remove(&collection);
+                let (epoch, through) = result?;
+                sent.insert(collection, (epoch, through));
+            }
             _ = ticker.tick() => {
-                if tx.send(HostToHub { msg: Some(host_to_hub::Msg::Heartbeat(Heartbeat {})) })
-                    .await
-                    .is_err()
-                {
-                    bail!("local link closed");
+                send_link_message(&tx, HostToHub {
+                    msg: Some(host_to_hub::Msg::Heartbeat(Heartbeat {})),
+                }).await.context("local link heartbeat failed")?;
+            }
+            _ = changes.tick() => {
+                let states = sent.clone();
+                let advertised = runtime.catalog_versions.read().unwrap().clone();
+                for (collection, (epoch, cursor)) in states {
+                    if !advertised.get(&collection).is_some_and(
+                        |(current_epoch, current, _)| {
+                            current_epoch == &epoch && *current > cursor
+                        }
+                    ) {
+                        continue;
+                    }
+                    if !syncing.insert(collection.clone()) {
+                        continue;
+                    }
+                    let catalog = runtime.catalog.clone();
+                    let outbound = tx.clone();
+                    let link_limit = link_syncs.clone();
+                    syncs.spawn(async move {
+                        let result = send_catalog_pages(
+                            &catalog, &outbound, &collection, cursor, false, link_limit
+                        ).await.and_then(|(current_epoch, through)| {
+                            anyhow::ensure!(current_epoch == epoch,
+                                "local catalogue epoch changed under a live link");
+                            Ok((current_epoch, through))
+                        });
+                        (collection, result)
+                    });
+                }
+            }
+            _ = status.tick() => {
+                let statuses = runtime.discovery_status.read().unwrap().clone();
+                for collection in &runtime.collections {
+                    if let Some(status) = statuses.get(&collection.name) {
+                        send_link_message(&tx, HostToHub {
+                            msg: Some(host_to_hub::Msg::DiscoveryStatus(status.clone())),
+                        }).await?;
+                    }
                 }
             }
             msg = rx.recv() => {
                 match msg {
-                    Some(Ok(m)) => {
-                        if let Some(req) = engine.dispatch(m)? {
-                            tracing::warn!(token = %req.lease_token,
-                                "unexpected OpenRead on the in-process link (hub reads directly)");
+                    Some(Ok(HubToHost { msg: Some(hub_to_host::Msg::CatalogCursor(cursor)) })) => {
+                        let config = runtime.collections.iter()
+                            .find(|collection| collection.name == cursor.collection_id)
+                            .context("local hub requested unknown collection")?;
+                        let offer = runtime.catalog.offers(std::slice::from_ref(config)).await?
+                            .remove(0);
+                        let snapshot = cursor.snapshot || cursor.epoch != offer.epoch
+                            || cursor.version < offer.oldest_replayable_version
+                            || cursor.version > offer.current_version;
+                        anyhow::ensure!(syncing.insert(cursor.collection_id.clone()),
+                            "local hub requested a second concurrent catalogue sync");
+                        let catalog = runtime.catalog.clone();
+                        let outbound = tx.clone();
+                        let link_limit = link_syncs.clone();
+                        let collection = cursor.collection_id;
+                        let start = if snapshot { 0 } else { cursor.version };
+                        syncs.spawn(async move {
+                            let result = send_catalog_pages(
+                                &catalog, &outbound, &collection, start, snapshot, link_limit
+                            ).await;
+                            (collection, result)
+                        });
+                    }
+                    Some(Ok(HubToHost { msg: Some(hub_to_host::Msg::CatalogAck(ack)) })) => {
+                        runtime.catalog.acknowledge("local", &ack.collection_id, &ack.epoch, ack.version).await?;
+                    }
+                    Some(Ok(HubToHost { msg: Some(hub_to_host::Msg::RescanRequest(request)) })) => {
+                        ensure_scoped_rescan(&runtime.collections, &request.collection_id)?;
+                        runtime.rescan(&request.collection_id);
+                    }
+                    Some(Ok(HubToHost { msg: Some(hub_to_host::Msg::ExtractSubs(request)) })) => {
+                        job_tx.try_send(hasher::JobMsg::Urgent(request))
+                            .context("local hub overran the extraction queue")?;
+                    }
+                    Some(Ok(HubToHost { msg: Some(hub_to_host::Msg::ExtractImageSubs(request)) })) => {
+                        job_tx.try_send(hasher::JobMsg::UrgentImage(request))
+                            .context("local hub overran the image extraction queue")?;
+                    }
+                    Some(Ok(HubToHost { msg: Some(hub_to_host::Msg::SubsWorklist(request)) })) => {
+                        job_tx.try_send(hasher::JobMsg::SubsWorklist(request))
+                            .context("local hub overran the subtitle work queue")?;
+                    }
+                    Some(Ok(HubToHost { msg: Some(hub_to_host::Msg::OpenRead(request)) })) => {
+                        tracing::warn!(token = %request.lease_token,
+                            "unexpected OpenRead on the in-process link (hub reads directly)");
+                    }
+                    Some(Ok(HubToHost { msg: Some(hub_to_host::Msg::DiscoveryWake(wake)) })) => {
+                        if wake.kind == "segments" {
+                            runtime.discovery_wake.notify_one();
                         }
                     }
+                    Some(Ok(_)) => {}
                     Some(Err(_)) | None => bail!("local link closed"),
                 }
             }
@@ -391,6 +1639,7 @@ impl Engine {
             tx.clone(),
             collections.to_vec(),
             activity.clone(),
+            None,
         )));
         let (segment_tx, segment_rx) = tokio::sync::mpsc::unbounded_channel();
         guards.push(tokio::spawn(segments::run(
@@ -812,6 +2061,7 @@ async fn resolve_legacy_roots(
 /// orchestrators fed by three triggers — the filesystem watcher
 /// (primary; useless over sshfs where inotify never fires), the
 /// periodic backup sweep, and hub-sent RescanRequests (admin button).
+#[allow(dead_code)] // retained only for protocol-3 regression fixtures
 async fn link_once(
     hub_addr: &str,
     tls: std::sync::Arc<rustls::ClientConfig>,
@@ -1007,7 +2257,10 @@ async fn scan_cycle(
 
 #[cfg(test)]
 mod activity_tests {
-    use super::Activity;
+    use super::{
+        Activity, CollectionConfig, HubTarget, LocalLinkFactory, ensure_scoped_rescan,
+        run_local_multi, send_catalog_pages, send_link_message_with_timeout,
+    };
 
     #[test]
     fn urgent_work_is_foreground_and_background_is_exclusive() {
@@ -1025,6 +2278,156 @@ mod activity_tests {
         );
         drop(background);
         assert!(activity.try_background().is_some());
+    }
+
+    #[test]
+    fn hub_rescans_name_exactly_one_shared_collection() {
+        let collections = [CollectionConfig {
+            name: "movies".into(),
+            media_type: "movies".into(),
+            roots: Vec::new(),
+        }];
+        assert!(ensure_scoped_rescan(&collections, "movies").is_ok());
+        assert!(ensure_scoped_rescan(&collections, "").is_err());
+        assert!(ensure_scoped_rescan(&collections, "private").is_err());
+    }
+
+    #[tokio::test]
+    async fn a_stalled_outbound_link_send_is_bounded() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        tx.send(kahawai_proto::v1::HostToHub::default())
+            .await
+            .unwrap();
+        let error = send_link_message_with_timeout(
+            &tx,
+            kahawai_proto::v1::HostToHub::default(),
+            std::time::Duration::from_millis(1),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("link outbound channel stalled"));
+    }
+
+    #[tokio::test]
+    async fn two_stalled_catalog_links_do_not_hold_a_third_link() {
+        let state = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let collection = CollectionConfig {
+            name: "movies".into(),
+            media_type: "movies".into(),
+            roots: vec![root.path().to_path_buf()],
+        };
+        let catalog =
+            super::catalog::Catalog::open(state.path(), std::slice::from_ref(&collection))
+                .await
+                .unwrap();
+        let generation = catalog.begin_scan("movies").await.unwrap();
+        // Two records larger than half the wire chunk force two sends. A
+        // capacity-one outbound channel therefore pins each slow link on its
+        // second send without relying on timing inside the page producer.
+        let large_metadata = "x".repeat(3 * 1024 * 1024);
+        for path_rel in ["one.mkv", "two.mkv"] {
+            catalog
+                .upsert_file(
+                    "movies",
+                    &kahawai_proto::v1::FileRecord {
+                        source: Some(kahawai_proto::v1::SourcePath::new(
+                            kahawai_core::media::root_token(root.path()),
+                            path_rel,
+                        )),
+                        size: 1,
+                        mtime_unix: 1,
+                        streams_json: large_metadata.clone(),
+                        ..Default::default()
+                    },
+                    generation,
+                )
+                .await
+                .unwrap();
+        }
+        catalog
+            .finish_scan("movies", generation, &Default::default())
+            .await
+            .unwrap();
+
+        let mut stalled = Vec::new();
+        for _ in 0..2 {
+            let (tx, _rx) = tokio::sync::mpsc::channel(1);
+            let catalog = catalog.clone();
+            stalled.push(tokio::spawn(async move {
+                send_catalog_pages(
+                    &catalog,
+                    &tx,
+                    "movies",
+                    0,
+                    true,
+                    std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+                )
+                .await
+            }));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let (healthy_tx, mut healthy_rx) = tokio::sync::mpsc::channel(1);
+        let drain = tokio::spawn(async move { while healthy_rx.recv().await.is_some() {} });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            send_catalog_pages(
+                &catalog,
+                &healthy_tx,
+                "movies",
+                0,
+                true,
+                std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+            ),
+        )
+        .await
+        .expect("two slow hubs delayed an independent catalogue link")
+        .unwrap();
+        drop(healthy_tx);
+        drain.await.unwrap();
+        for task in stalled {
+            task.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn an_intrinsic_link_failure_keeps_external_hubs_supervised() {
+        let dir = tempfile::tempdir().unwrap();
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let factory_attempts = attempts.clone();
+        let local_link: LocalLinkFactory = std::sync::Arc::new(move || {
+            factory_attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let (outbound, _outbound_rx) = tokio::sync::mpsc::channel(4);
+            let (inbound_tx, inbound) = tokio::sync::mpsc::channel(1);
+            drop(inbound_tx);
+            (outbound, inbound)
+        });
+        let run = run_local_multi(
+            Vec::new(),
+            60,
+            dir.path(),
+            "test-host",
+            Activity::default(),
+            false,
+            vec![HubTarget {
+                id: "unavailable".into(),
+                address: "https://127.0.0.1:9".into(),
+                collections: Vec::new(),
+                legacy_identity: false,
+            }],
+            local_link,
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), run)
+                .await
+                .is_err(),
+            "the intrinsic link failure stopped external supervision"
+        );
+        assert!(
+            attempts.load(std::sync::atomic::Ordering::Relaxed) >= 2,
+            "the intrinsic link was not recreated after failure"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

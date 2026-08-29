@@ -77,8 +77,6 @@ pub struct AppState {
     pub metrics_token: Arc<Option<String>>,
     pub setup_url: Arc<Option<String>>,
     pub public_origin: Option<PublicOrigin>,
-    /// Mirrors `NetOptions::detect_segments` for the admin trigger's gate.
-    pub detect_segments: bool,
 }
 
 /// The bearer Prometheus scrapes `/metrics` with, kept beside `jwt.secret`
@@ -88,7 +86,7 @@ pub struct AppState {
 pub const METRICS_TOKEN_FILE: &str = "metrics.secret";
 
 /// Network and feature knobs, defaulting to what a bare hub ships with.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct NetOptions {
     /// Shared so a reload can swap its contents under a running
     /// router (NFR-6) instead of rebuilding one.
@@ -105,28 +103,8 @@ pub struct NetOptions {
     /// `--web-dir`: serve `/app/` from this directory instead of the bundle
     /// embedded at build time. None = embedded, which is what a release ships.
     pub web_dir: Option<std::path::PathBuf>,
-    /// `[hub] detect_segments`. Off means no source-local season reads or
-    /// decode work, so it gates the ADMIN trigger as well as the sweep — the
-    /// button must not bypass the operator's cost decision.
-    pub detect_segments: bool,
 }
 
-impl Default for NetOptions {
-    fn default() -> Self {
-        Self {
-            proxy_trust: Default::default(),
-            cors_origins: Default::default(),
-            metrics_token: None,
-            setup_url: None,
-            public_origin: None,
-            web_dir: None,
-            // The shipped config default. A derive would say false, and a
-            // test or embedder building Default would find the admin
-            // trigger answering 409 though nothing disabled anything.
-            detect_segments: true,
-        }
-    }
-}
 #[derive(OpenApi)]
 #[openapi(
     version = "3.2.0",
@@ -293,7 +271,6 @@ pub fn router(
         metrics_token: Arc::new(net.metrics_token),
         setup_url: Arc::new(net.setup_url),
         public_origin: net.public_origin,
-        detect_segments: net.detect_segments,
     };
     // Method/path membership is the cookie authority. Item/session ownership
     // remains inside authentication for both transport groups.
@@ -927,21 +904,15 @@ struct SegmentStatusResponse {
 
 #[derive(Serialize, ToSchema)]
 struct SegmentRunResponse {
-    /// The season now QUEUED for background analysis, absent when nothing
-    /// was pending. Queued, not necessarily started: runs serialize behind
-    /// whatever the sweep holds, and a repeat POST queues a task that will
-    /// no-op once it sees the season finished. Progress and completion are
-    /// `GET /admin/v1/segments`'s to report: a season is minutes of work,
-    /// and an answer held open that long dies with the first proxy timeout.
+    /// Kept for response compatibility; protocol 4 never names a season here
+    /// because each mediahost selects cohorts from its own catalogue.
     #[serde(skip_serializing_if = "Option::is_none")]
     series: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     season: Option<i64>,
-    /// Dispatched runs finished when this one was queued. Poll the status
-    /// until its `dispatched` count passes this mark; the
-    /// `dispatched_awaiting_host` / `dispatched_failed` flags then describe
-    /// THIS run — the shared pass flags describe whichever pass finished
-    /// last, which mid-sweep is usually not this one.
+    /// Completed wake attempts before this one. Poll status until its
+    /// `dispatched` count passes this mark; discovery completion itself is
+    /// reported by mediahost catalogue status and projected segment facts.
     follow: usize,
     /// The hub process the mark belongs to. A status whose `boot` differs
     /// answers for a restarted hub whose counter reset; the mark is void.
@@ -4723,9 +4694,8 @@ async fn admin_segments_status(
 
 /// Analyse the next pending season
 ///
-/// Admin only. Picks the next season awaiting intro detection and analyses it
-/// in the background, responding immediately with the season chosen. Returns
-/// 409 when segment detection is disabled.
+/// Admin only. Wakes connected protocol-4 mediahosts; each mediahost retains
+/// ownership of local cohort selection and priority.
 #[utoipa::path(
     post, path = "/admin/v1/segments", tag = "Admin segments",
     security(("bearer_auth" = [])),
@@ -4733,7 +4703,6 @@ async fn admin_segments_status(
         (status = 200, body = SegmentRunResponse),
         (status = 401, body = ApiErrorBody),
         (status = 403, body = ApiErrorBody),
-        (status = 409, description = "Segment detection is disabled on this hub", body = ApiErrorBody),
         (status = 500, body = ApiErrorBody),
         (status = 503, description = "The hub has no administrator yet: `setup_required`", body = ApiErrorBody)
     )
@@ -4741,55 +4710,19 @@ async fn admin_segments_status(
 async fn admin_segments_run(
     State(state): State<AppState>,
 ) -> Result<Json<SegmentRunResponse>, ApiError> {
-    if !state.detect_segments {
-        return Err(ApiError::new(
-            ErrorCode::Conflict,
-            "segment detection is disabled in the hub's config (detect_segments)",
-        ));
-    }
-    let db = state.registry.db();
-    // The detector's pick, not the pending head: the head can be a season
-    // the sweep has set aside as unfinishable, and the button must reach
-    // the seasons behind it.
-    let Some(next) = state.segments.next_season(db).await.map_err(internal)? else {
-        return Ok(Json(SegmentRunResponse {
-            series: None,
-            season: None,
-            follow: state.segments.dispatched_so_far(),
-            boot: state.segments.boot(),
+    let follow = state.segments.dispatched_so_far();
+    let accepted = state.registry.wake_discovery("segments").await;
+    state
+        .segments
+        .record_dispatched(&Ok(crate::segments::Analysis {
+            scanned: 0,
+            awaiting: usize::from(accepted == 0),
+            attempted: accepted,
         }));
-    };
-    let (registry, sessions, detector) = (
-        state.registry.clone(),
-        state.sessions.clone(),
-        state.segments.clone(),
-    );
-    let (series_id, season, title) = (next.series_id.clone(), next.season, next.title.clone());
-    let follow = detector.dispatched_so_far();
-    tokio::spawn(async move {
-        let outcome = detector
-            .analyze_season(&registry, &sessions, &series_id, season)
-            .await;
-        detector.record_dispatched(&outcome);
-        match outcome {
-            Ok(outcome) if outcome.awaiting > 0 => tracing::warn!(
-                series = %title, season,
-                scanned = outcome.scanned, awaiting = outcome.awaiting,
-                "intro detection (admin-triggered): episodes await their mediahost"
-            ),
-            Ok(outcome) => tracing::info!(
-                series = %title, season, episodes = outcome.scanned,
-                "intro detection (admin-triggered) finished"
-            ),
-            Err(e) => tracing::warn!(
-                series = %title, season, error = format!("{e:#}"),
-                "intro detection (admin-triggered) failed"
-            ),
-        }
-    });
+    tracing::info!(accepted, "local segment schedulers woken by administrator");
     Ok(Json(SegmentRunResponse {
-        series: Some(next.title),
-        season: Some(next.season),
+        series: None,
+        season: None,
         follow,
         boot: state.segments.boot(),
     }))

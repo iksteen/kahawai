@@ -119,6 +119,10 @@ pub async fn harness(file_name: &str, render: fn(&Path)) -> Harness {
     let bundle = kahawai_core::pki::new_satellite_csr("mediahost", "01HOST", "nas").unwrap();
     let signed = ca.sign_satellite_csr(&bundle.csr_der, 90).unwrap();
     allowed.insert(&signed.fingerprint);
+    registry
+        .record_satellite("01HOST", "mediahost", "nas", &signed.fingerprint)
+        .await
+        .unwrap();
     let id = SatelliteIdentity {
         module_id: "01HOST".into(),
         key_pem: bundle.key_pem,
@@ -148,33 +152,63 @@ pub async fn harness(file_name: &str, render: fn(&Path)) -> Harness {
         .unwrap()
         .into_inner();
     inbound.message().await.unwrap().unwrap(); // HelloAck
-    for msg in [
-        pb::host_to_hub::Msg::AnnounceCollection(pb::AnnounceCollection {
-            id: "movies".into(),
-            media_type: "movies".into(),
-            roots: vec![pb::CollectionRoot::new(
-                kahawai_core::media::root_token(root.path()),
-                root.path().display().to_string(),
-            )],
-        }),
-        pb::host_to_hub::Msg::FileUpsert(pb::FileUpsert {
-            collection_id: "movies".into(),
-            files: vec![pb::FileRecord {
-                source: Some(pb::SourcePath::new(
-                    kahawai_core::media::root_token(root.path()),
-                    file_name,
-                )),
-                size,
-                mtime_unix: 1,
-                head_xxh3: 1,
-                tail_xxh3: 2,
-                oshash: 3,
-                streams_json,
+    let root_token = kahawai_core::media::root_token(root.path());
+    tx.send(pb::HostToHub {
+        msg: Some(pb::host_to_hub::Msg::CatalogOffer(pb::CatalogOffer {
+            collections: vec![pb::CatalogCollection {
+                id: "movies".into(),
+                media_type: "movies".into(),
+                roots: vec![pb::CollectionRoot::new(
+                    root_token.clone(),
+                    root.path().display().to_string(),
+                )],
+                epoch: "fixture".into(),
+                current_version: 1,
+                oldest_replayable_version: 0,
+                scanning: false,
             }],
-        }),
-    ] {
-        tx.send(pb::HostToHub { msg: Some(msg) }).await.unwrap();
-    }
+        })),
+    })
+    .await
+    .unwrap();
+    let cursor = inbound.message().await.unwrap().unwrap();
+    let Some(pb::hub_to_host::Msg::CatalogCursor(cursor)) = cursor.msg else {
+        panic!("expected catalogue cursor")
+    };
+    let upsert = pb::FileUpsert {
+        collection_id: "movies".into(),
+        files: vec![pb::FileRecord {
+            source: Some(pb::SourcePath::new(root_token.clone(), file_name)),
+            size,
+            mtime_unix: 1,
+            head_xxh3: 1,
+            tail_xxh3: 2,
+            oshash: 3,
+            streams_json,
+        }],
+    };
+    let mut key = root_token.into_bytes();
+    key.push(0);
+    key.extend_from_slice(file_name.as_bytes());
+    tx.send(pb::HostToHub {
+        msg: Some(pb::host_to_hub::Msg::CatalogDelta(pb::CatalogDelta {
+            collection_id: "movies".into(),
+            epoch: "fixture".into(),
+            records: vec![pb::CatalogRecord {
+                version: 1,
+                kind: "file".into(),
+                key,
+                payload: prost::Message::encode_to_vec(&upsert),
+                deleted: false,
+            }],
+            through_version: 1,
+            snapshot: cursor.snapshot,
+            done: true,
+        })),
+    })
+    .await
+    .unwrap();
+    inbound.message().await.unwrap().unwrap(); // CatalogAck
     let serve_channel = channel.clone();
     tokio::spawn(async move {
         while let Ok(Some(m)) = inbound.message().await {

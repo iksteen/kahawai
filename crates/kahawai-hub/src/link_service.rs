@@ -12,11 +12,15 @@ use kahawai_proto::v1::{
 };
 use kahawai_proto::{PROTOCOL_MAJOR, PROTOCOL_MINOR};
 use kahawai_transport::mtls::peer_identity;
+use prost::Message as _;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::registry::Registry;
 use crate::sessions::Sessions;
+
+const LINK_LIVENESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(35);
+const WORK_QUEUE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// AR-6, the mediahost half. A transcoder that drops has its sessions moved
 /// to another box (`reschedule_for_transcoder`); a mediahost has nothing to
@@ -176,11 +180,18 @@ pub fn local_link(
         > = Default::default();
         let mut partial: std::collections::HashMap<(String, String, String, u32), PartialSets> =
             Default::default();
+        let mut catalog_delta_progress = std::collections::HashMap::new();
+        let mut catalog_removed_files = std::collections::HashMap::new();
+        let mut catalog_snapshots = std::collections::HashSet::new();
         while let Some(HostToHub { msg }) = host_rx.recv().await {
             let Some(msg) = msg else { continue };
             if matches!(msg, host_to_hub::Msg::Heartbeat(_)) {
                 registry.seen(&module_id);
                 continue;
+            }
+            if let Err(error) = validate_exact_host_msg(&msg) {
+                let _ = registered_tx.try_send(Err(Status::failed_precondition(error.to_string())));
+                break;
             }
             let Some(msg) = route_segment_reply(&segments, &module_id, generation, msg) else {
                 continue;
@@ -195,20 +206,21 @@ pub fn local_link(
                 msg,
                 &mut seen,
                 &mut partial,
+                &mut catalog_delta_progress,
+                &mut catalog_removed_files,
+                &mut catalog_snapshots,
             )
             .await
             {
                 tracing::error!(%module_id, error = format!("{e:#}"), "handling local link message");
+                let _ = registered_tx.try_send(Err(Status::failed_precondition(e.to_string())));
+                break;
             }
         }
         // Not `forget_link`: this path has no `Sessions` handle. Sessions are
-        // deliberately left alone — the in-process host's byte plane is
-        // `reads_locally`, so playback does not go through a link at all — but
-        // this is NOT only reached on shutdown: `run_local` returning an error
-        // logs and exits while the hub keeps serving, after which artwork,
-        // subtitle and scan paths that gate on `is_connected` stop working for
-        // the hub's own library with nothing to re-establish it. Recorded
-        // rather than fixed here. Both maps together, before the task returns.
+        // deliberately left alone because local playback does not use the link
+        // byte plane. The all-in-one local-link supervisor recreates this
+        // adapter after an error, replaying from the durable catalogue cursor.
         registry.unregister_link_if_current(&module_id, &registered_tx);
         segments.segment_link_disconnected(&module_id, generation);
     });
@@ -308,6 +320,7 @@ impl MediahostLink for MediahostLinkService {
                 let subtitles = outer_subtitles.clone();
                 let enricher = outer_enricher.clone();
                 let segments = outer_segments.clone();
+                let error_tx = tx.clone();
                 tokio::spawn(async move {
                     let mut seen: std::collections::HashMap<
                         String,
@@ -317,7 +330,25 @@ impl MediahostLink for MediahostLinkService {
                         (String, String, String, u32),
                         PartialSets,
                     > = std::collections::HashMap::new();
+                    let mut catalog_delta_progress = std::collections::HashMap::new();
+                    let mut catalog_removed_files = std::collections::HashMap::new();
+                    let mut catalog_snapshots = std::collections::HashSet::new();
                     while let Some(msg) = work_rx.recv().await {
+                        let catalog_message = matches!(
+                            msg,
+                            host_to_hub::Msg::CatalogOffer(_)
+                                | host_to_hub::Msg::CatalogDelta(_)
+                                | host_to_hub::Msg::DiscoveryStatus(_)
+                        );
+                        let _catalog_guard = if catalog_message {
+                            Some(registry.catalog_apply_lock(&module_id).lock_owned().await)
+                        } else {
+                            None
+                        };
+                        if catalog_message && !registry.host_link_is_current(&module_id, generation)
+                        {
+                            continue;
+                        }
                         if let Err(e) = handle_host_msg(
                             &registry,
                             &subtitles,
@@ -328,19 +359,24 @@ impl MediahostLink for MediahostLinkService {
                             msg,
                             &mut seen,
                             &mut partial,
+                            &mut catalog_delta_progress,
+                            &mut catalog_removed_files,
+                            &mut catalog_snapshots,
                         )
                         .await
                         {
                             tracing::error!(%module_id, error = format!("{e:#}"), "handling link message");
+                            let _ = error_tx
+                                .send(Err(Status::failed_precondition(e.to_string())))
+                                .await;
+                            break;
                         }
                     }
                 })
             };
             // Heartbeats arrive every 10 s; three missed = dead link.
             loop {
-                let msg =
-                    tokio::time::timeout(std::time::Duration::from_secs(35), inbound.message())
-                        .await;
+                let msg = tokio::time::timeout(LINK_LIVENESS_TIMEOUT, inbound.message()).await;
                 let msg = match msg {
                     Ok(m) => m,
                     Err(_) => {
@@ -367,8 +403,21 @@ impl MediahostLink for MediahostLinkService {
                             let kind = kind_name(&msg);
                             tracing::debug!(%module_id, kind, "link msg read");
                             let queued = tokio::time::Instant::now();
-                            if work_tx.send(msg).await.is_err() {
-                                break;
+                            match tokio::time::timeout(WORK_QUEUE_TIMEOUT, work_tx.send(msg)).await
+                            {
+                                Ok(Ok(())) => {}
+                                Ok(Err(_)) => break,
+                                Err(_) => {
+                                    // A protocol-4 sender can otherwise pin
+                                    // its catalogue read transaction and the
+                                    // mediahost WAL forever while this queue
+                                    // is full. Closing this generation makes
+                                    // it replay from the durable cursor.
+                                    tracing::warn!(%module_id, kind,
+                                        waited = ?queued.elapsed(),
+                                        "projection queue stalled; cycling link");
+                                    break;
+                                }
                             }
                             if queued.elapsed() > std::time::Duration::from_secs(2) {
                                 tracing::warn!(%module_id, kind, waited = ?queued.elapsed(),
@@ -385,25 +434,13 @@ impl MediahostLink for MediahostLinkService {
                 }
             }
             drop(work_tx);
-            // Every map mutation before the drain, and none after it.
-            //
-            // Ending before the drain is the point: the link is dead at the
-            // break and nothing in the queue can revive it, but that queue
-            // holds this host's upserts and reconciliation — deepest exactly
-            // when a mediahost dies mid-scan. Ending afterwards left its
-            // sessions stalling for as long as the backlog took, which is the
-            // stall AR-6 exists to turn into a prompt 404.
-            //
-            // But leaving `unregister_link` after the drain split the two maps
-            // apart, and a host that reconnects during it is clobbered in the
-            // worse direction: `connected` says yes while `links` has lost the
-            // live sender, so the host's files are still offered, `open_lease`
-            // fails with a plain error, and `session_refusal` answers 409 —
-            // "give up on this item" — for a host that is healthy. It also
-            // never receives another manifest, so it never scans again. With
-            // the old ordering the leftover was `connected: false`, which at
-            // least produced the 503 stand-by. Safe to move because nothing in
-            // the drained queue sends to the host; it only writes the DB.
+            // Protocol 4 can replay everything after the hub's durable cursor.
+            // Do not drain a dead generation: a reconnect may already be
+            // projecting a newer snapshot while this queue still contains an
+            // old reconciliation. Cancellation drops/rolls back the current
+            // SQL future; already committed records replay idempotently.
+            worker.abort();
+            let _ = worker.await;
             forget_link(
                 &registry,
                 &sessions,
@@ -413,7 +450,6 @@ impl MediahostLink for MediahostLinkService {
                 &tx,
             )
             .await;
-            let _ = worker.await; // then drain in order, touching no maps
         });
 
         Ok(Response::new(ReceiverStream::new(rx)))
@@ -526,6 +562,37 @@ fn exact_source(
     Ok(source)
 }
 
+fn split_catalog_source_key(key: &[u8]) -> anyhow::Result<(&str, &str)> {
+    let at = key
+        .iter()
+        .position(|byte| *byte == 0)
+        .context("catalogue source key has no separator")?;
+    Ok((
+        std::str::from_utf8(&key[..at])?,
+        std::str::from_utf8(&key[at + 1..])?,
+    ))
+}
+
+fn catalog_snapshot_required(stored: Option<u64>, oldest: u64, current: u64) -> bool {
+    stored.is_none_or(|version| version == 0 || version < oldest || version > current)
+}
+
+fn validate_catalog_source(
+    key: &[u8],
+    source: &Option<kahawai_proto::v1::SourcePath>,
+    kind: &str,
+) -> anyhow::Result<()> {
+    let (root_token, path_rel) = split_catalog_source_key(key)?;
+    let source = source
+        .as_ref()
+        .with_context(|| format!("catalogue {kind} payload has no source"))?;
+    anyhow::ensure!(
+        source.root_token == root_token && source.path_rel == path_rel,
+        "catalogue {kind} key does not match its payload source"
+    );
+    Ok(())
+}
+
 fn validate_exact_host_msg(m: &host_to_hub::Msg) -> anyhow::Result<()> {
     let valid = |source: &Option<kahawai_proto::v1::SourcePath>, kind: &str| {
         let source = source
@@ -538,82 +605,47 @@ fn validate_exact_host_msg(m: &host_to_hub::Msg) -> anyhow::Result<()> {
         Ok(())
     };
     match m {
-        host_to_hub::Msg::AnnounceCollection(announcement) => {
-            anyhow::ensure!(
-                !announcement.roots.is_empty(),
-                "AnnounceCollection has no roots"
-            );
-            let mut paths = Vec::with_capacity(announcement.roots.len());
-            for root in &announcement.roots {
-                let path = std::path::Path::new(&root.normalized_path);
-                let normalized =
-                    kahawai_core::media::normalize_root_path(path, std::path::Path::new("/"))
-                        .map_err(anyhow::Error::msg)?;
-                anyhow::ensure!(
-                    path.is_absolute()
-                        && normalized == path
-                        && !root.root_token.is_empty()
-                        && kahawai_core::media::root_token(path) == root.root_token,
-                    "AnnounceCollection has an invalid root token/path binding"
-                );
-                anyhow::ensure!(
-                    paths
-                        .iter()
-                        .all(|other: &&std::path::Path| !path.starts_with(other)
-                            && !other.starts_with(path)),
-                    "AnnounceCollection has duplicate or overlapping roots"
-                );
-                paths.push(path);
-            }
-        }
-        host_to_hub::Msg::RootResolutions(message) => {
-            for resolution in &message.resolutions {
-                if let Some(source) = &resolution.source {
-                    anyhow::ensure!(
-                        !source.root_token.is_empty(),
-                        "RootResolution has an empty root token"
-                    );
-                    anyhow::ensure!(
-                        source.path_rel == resolution.path_rel,
-                        "RootResolution source path does not match its legacy path"
-                    );
-                }
-            }
-        }
-        host_to_hub::Msg::FileUpsert(batch) => {
-            for file in &batch.files {
-                valid(&file.source, "FileRecord")?;
-            }
-        }
-        host_to_hub::Msg::FileError(message) => valid(&message.source, "FileError")?,
-        host_to_hub::Msg::FilesSeen(message) => {
-            anyhow::ensure!(
-                message
-                    .sources
-                    .iter()
-                    .all(|source| !source.root_token.is_empty()),
-                "FilesSeen has an empty root token"
-            );
-        }
-        host_to_hub::Msg::FileHashes(message) => {
-            for hash in &message.hashes {
-                valid(&hash.source, "FileHash")?;
-            }
+        host_to_hub::Msg::AnnounceCollection(_)
+        | host_to_hub::Msg::FileUpsert(_)
+        | host_to_hub::Msg::FileError(_)
+        | host_to_hub::Msg::ScanProgress(_)
+        | host_to_hub::Msg::ManifestRequest(_)
+        | host_to_hub::Msg::FilesSeen(_)
+        | host_to_hub::Msg::FileHashes(_)
+        | host_to_hub::Msg::FileAttachments(_)
+        | host_to_hub::Msg::FileKeyframeInterval(_)
+        | host_to_hub::Msg::RootResolutions(_)
+        | host_to_hub::Msg::RootAdoptionAck(_)
+        | host_to_hub::Msg::FileVideoGeometry(_)
+        | host_to_hub::Msg::SegmentDetectionAccepted(_)
+        | host_to_hub::Msg::SegmentDetectionResult(_)
+        | host_to_hub::Msg::FileLoudness(_) => {
+            anyhow::bail!("protocol 4 rejects legacy catalogue mutation messages")
         }
         host_to_hub::Msg::FileSubtitles(message) => valid(&message.source, "FileSubtitles")?,
-        host_to_hub::Msg::FileAttachments(message) => valid(&message.source, "FileAttachments")?,
-        host_to_hub::Msg::FileKeyframeInterval(message) => {
-            valid(&message.source, "FileKeyframeInterval")?
-        }
-        host_to_hub::Msg::FileVideoGeometry(message) => {
-            valid(&message.source, "FileVideoGeometry")?
-        }
-        host_to_hub::Msg::FileLoudness(message) => valid(&message.source, "FileLoudness")?,
         host_to_hub::Msg::ImageSubtitles(message) => valid(&message.source, "ImageSubtitles")?,
-        host_to_hub::Msg::SegmentDetectionResult(result) => {
-            for episode in &result.episodes {
-                valid(&episode.source, "SegmentEpisodeResult")?;
+        host_to_hub::Msg::CatalogOffer(offer) => {
+            for collection in &offer.collections {
+                anyhow::ensure!(
+                    !collection.id.is_empty(),
+                    "CatalogOffer has an empty collection id"
+                );
+                anyhow::ensure!(
+                    !collection.epoch.is_empty(),
+                    "CatalogOffer has an empty epoch"
+                );
+                anyhow::ensure!(
+                    !collection.roots.is_empty(),
+                    "CatalogOffer collection has no roots"
+                );
             }
+        }
+        host_to_hub::Msg::CatalogDelta(delta) => {
+            anyhow::ensure!(
+                !delta.collection_id.is_empty(),
+                "CatalogDelta has no collection"
+            );
+            anyhow::ensure!(!delta.epoch.is_empty(), "CatalogDelta has no epoch");
         }
         _ => {}
     }
@@ -660,7 +692,84 @@ fn kind_name(m: &host_to_hub::Msg) -> &'static str {
         host_to_hub::Msg::RootAdoptionAck(_) => "root_adoption_ack",
         host_to_hub::Msg::SegmentDetectionAccepted(_) => "segment_detection_accepted",
         host_to_hub::Msg::SegmentDetectionResult(_) => "segment_detection_result",
+        host_to_hub::Msg::CatalogOffer(_) => "catalog_offer",
+        host_to_hub::Msg::CatalogDelta(_) => "catalog_delta",
+        host_to_hub::Msg::DiscoveryStatus(_) => "discovery_status",
     }
+}
+
+async fn apply_file_upsert(
+    registry: &Registry,
+    module_id: &str,
+    upsert: kahawai_proto::v1::FileUpsert,
+    seen: &mut std::collections::HashMap<
+        String,
+        std::collections::HashSet<crate::registry::SourcePath>,
+    >,
+) -> anyhow::Result<()> {
+    use crate::registry::FileUpsertRecord;
+    anyhow::ensure!(
+        registry
+            .unresolved_legacy_sources(module_id, &upsert.collection_id)
+            .await?
+            .is_empty(),
+        "file upsert refused while legacy roots remain unresolved for {module_id}/{}",
+        upsert.collection_id
+    );
+    let mut files = Vec::with_capacity(upsert.files.len());
+    for file in upsert.files {
+        let source = exact_source(file.source, "FileRecord")?;
+        let root_token = registry
+            .resolve_root_token(module_id, &upsert.collection_id, &source.root_token)
+            .await?;
+        if let Some(paths) = seen.get_mut(&upsert.collection_id) {
+            paths.insert(crate::registry::SourcePath {
+                root_token: root_token.clone(),
+                path_rel: source.path_rel.clone(),
+            });
+        }
+        files.push(FileUpsertRecord {
+            root_token,
+            path_rel: source.path_rel,
+            size: file.size,
+            mtime_unix: file.mtime_unix,
+            head_xxh3: file.head_xxh3,
+            tail_xxh3: file.tail_xxh3,
+            oshash: file.oshash,
+            streams_json: file.streams_json,
+        });
+    }
+    let count = registry
+        .upsert_files(module_id, &upsert.collection_id, files)
+        .await?;
+    tracing::debug!(%module_id, collection = %upsert.collection_id, files = count,
+        "catalogue file upsert");
+    Ok(())
+}
+
+async fn flush_catalog_files(
+    registry: &Registry,
+    module_id: &str,
+    collection_id: &str,
+    files: &mut Vec<kahawai_proto::v1::FileRecord>,
+    seen: &mut std::collections::HashMap<
+        String,
+        std::collections::HashSet<crate::registry::SourcePath>,
+    >,
+) -> anyhow::Result<()> {
+    if files.is_empty() {
+        return Ok(());
+    }
+    apply_file_upsert(
+        registry,
+        module_id,
+        kahawai_proto::v1::FileUpsert {
+            collection_id: collection_id.to_string(),
+            files: std::mem::take(files),
+        },
+        seen,
+    )
+    .await
 }
 
 /// `seen` accumulates upserted paths per collection between its announce
@@ -680,8 +789,13 @@ async fn handle_host_msg(
         std::collections::HashSet<crate::registry::SourcePath>,
     >,
     partial: &mut std::collections::HashMap<(String, String, String, u32), PartialSets>,
+    catalog_delta_progress: &mut std::collections::HashMap<String, u64>,
+    catalog_removed_files: &mut std::collections::HashMap<
+        String,
+        std::collections::HashSet<crate::registry::SourcePath>,
+    >,
+    catalog_snapshots: &mut std::collections::HashSet<String>,
 ) -> anyhow::Result<()> {
-    use crate::registry::FileUpsertRecord;
     match msg {
         host_to_hub::Msg::Heartbeat(_) => registry.seen(module_id),
         host_to_hub::Msg::AnnounceCollection(a) => {
@@ -746,41 +860,458 @@ async fn handle_host_msg(
             }
         }
         host_to_hub::Msg::FileUpsert(u) => {
-            anyhow::ensure!(
+            apply_file_upsert(registry, module_id, u, seen).await?;
+        }
+        host_to_hub::Msg::CatalogOffer(offer) => {
+            let mut offered = std::collections::HashSet::new();
+            for collection in offer.collections {
+                anyhow::ensure!(!collection.id.is_empty(), "catalogue collection has no id");
+                anyhow::ensure!(
+                    !collection.epoch.is_empty(),
+                    "catalogue collection has no epoch"
+                );
+                anyhow::ensure!(
+                    collection.oldest_replayable_version <= collection.current_version,
+                    "catalogue collection has a replay floor beyond its current version"
+                );
+                anyhow::ensure!(
+                    offered.insert(collection.id.clone()),
+                    "catalogue offer repeats collection {}",
+                    collection.id
+                );
+                let roots: Vec<String> = collection
+                    .roots
+                    .iter()
+                    .map(|root| {
+                        let path = std::path::Path::new(&root.normalized_path);
+                        anyhow::ensure!(
+                            path.is_absolute()
+                                && kahawai_core::media::root_token(path) == root.root_token,
+                            "catalogue collection {} has invalid root binding",
+                            collection.id
+                        );
+                        Ok(root.normalized_path.clone())
+                    })
+                    .collect::<anyhow::Result<_>>()?;
                 registry
-                    .unresolved_legacy_sources(module_id, &u.collection_id)
-                    .await?
-                    .is_empty(),
-                "file upsert refused while legacy roots remain unresolved for {module_id}/{}",
-                u.collection_id
-            );
-            let mut files = Vec::with_capacity(u.files.len());
-            for f in u.files {
-                let source = exact_source(f.source, "FileRecord")?;
-                let root_token = registry
-                    .resolve_root_token(module_id, &u.collection_id, &source.root_token)
+                    .announce_collection(module_id, &collection.id, &collection.media_type, &roots)
                     .await?;
-                if let Some(paths) = seen.get_mut(&u.collection_id) {
-                    paths.insert(crate::registry::SourcePath {
-                        root_token: root_token.clone(),
-                        path_rel: source.path_rel.clone(),
-                    });
+                let stored = registry
+                    .catalog_cursor(module_id, &collection.id, &collection.epoch)
+                    .await?;
+                // Version zero is also the durable marker for a snapshot
+                // that started but did not reach its final page. Replaying it
+                // as an incremental delta would omit reconciliation against
+                // files that existed only in the previous epoch.
+                let snapshot = catalog_snapshot_required(
+                    stored,
+                    collection.oldest_replayable_version,
+                    collection.current_version,
+                );
+                let version = if snapshot { 0 } else { stored.unwrap_or(0) };
+                if snapshot {
+                    // Keep the existing projection in place while the full
+                    // current-state snapshot streams in. Upserts then reuse
+                    // stable item ids and preserve hub-owned matches,
+                    // metadata, subtitles and library membership. The seen
+                    // manifest is reconciled only after the final chunk.
+                    registry
+                        .reset_catalog_derived(module_id, &collection.id)
+                        .await?;
+                    registry
+                        .set_catalog_cursor(module_id, &collection.id, &collection.epoch, 0)
+                        .await?;
+                    seen.insert(collection.id.clone(), Default::default());
+                    catalog_delta_progress.insert(collection.id.clone(), 0);
+                    catalog_removed_files.remove(&collection.id);
+                    catalog_snapshots.insert(collection.id.clone());
+                } else {
+                    seen.remove(&collection.id);
+                    catalog_delta_progress.remove(&collection.id);
+                    catalog_removed_files.remove(&collection.id);
+                    catalog_snapshots.remove(&collection.id);
                 }
-                files.push(FileUpsertRecord {
-                    root_token,
-                    path_rel: source.path_rel,
-                    size: f.size,
-                    mtime_unix: f.mtime_unix,
-                    head_xxh3: f.head_xxh3,
-                    tail_xxh3: f.tail_xxh3,
-                    oshash: f.oshash,
-                    streams_json: f.streams_json,
-                });
+                registry
+                    .send_to_host_generation(
+                        module_id,
+                        generation,
+                        HubToHost {
+                            msg: Some(hub_to_host::Msg::CatalogCursor(
+                                kahawai_proto::v1::CatalogCursor {
+                                    collection_id: collection.id,
+                                    epoch: collection.epoch,
+                                    version,
+                                    snapshot,
+                                },
+                            )),
+                        },
+                    )
+                    .await?;
             }
-            let n = registry
-                .upsert_files(module_id, &u.collection_id, files)
+            let removed = registry
+                .retain_catalog_collections(module_id, &offered)
                 .await?;
-            tracing::debug!(%module_id, collection = %u.collection_id, files = n, "file upsert");
+            if removed > 0 {
+                tracing::info!(%module_id, removed, "unshared catalogue collections removed");
+            }
+        }
+        host_to_hub::Msg::CatalogDelta(delta) => {
+            anyhow::ensure!(
+                !delta.collection_id.is_empty(),
+                "catalogue delta has no collection"
+            );
+            anyhow::ensure!(!delta.epoch.is_empty(), "catalogue delta has no epoch");
+            let durable_cursor = registry
+                .catalog_cursor(module_id, &delta.collection_id, &delta.epoch)
+                .await?
+                .context("catalogue delta was not requested for this epoch")?;
+            let cursor = catalog_delta_progress
+                .get(&delta.collection_id)
+                .copied()
+                .unwrap_or(durable_cursor);
+            let active_snapshot = catalog_snapshots.contains(&delta.collection_id);
+            anyhow::ensure!(
+                delta.through_version >= cursor,
+                "catalogue delta moves cursor backwards"
+            );
+            anyhow::ensure!(
+                !active_snapshot || delta.done || delta.through_version == 0,
+                "intermediate catalogue snapshot advanced its durable cursor"
+            );
+            if delta.snapshot {
+                anyhow::ensure!(
+                    cursor == 0,
+                    "catalogue snapshot did not start at the requested cursor"
+                );
+            }
+            let mut previous = if active_snapshot { 0 } else { cursor };
+            let mut removed_files = std::collections::HashSet::new();
+            let mut file_upserts = Vec::new();
+            for record in delta.records {
+                anyhow::ensure!(
+                    record.version > previous
+                        && (active_snapshot || record.version <= delta.through_version),
+                    "catalogue records are not version ordered"
+                );
+                if !matches!((record.kind.as_str(), record.deleted), ("file", false)) {
+                    flush_catalog_files(
+                        registry,
+                        module_id,
+                        &delta.collection_id,
+                        &mut file_upserts,
+                        seen,
+                    )
+                    .await?;
+                }
+                previous = record.version;
+                match (record.kind.as_str(), record.deleted) {
+                    ("file", true) => {
+                        let (root, path) = split_catalog_source_key(&record.key)?;
+                        removed_files.insert(crate::registry::SourcePath {
+                            // A configured root may have been removed since
+                            // this source was catalogued. Historical bindings
+                            // remain valid deletion targets even though they
+                            // may no longer serve new reads/upserts.
+                            root_token: root.to_string(),
+                            path_rel: path.to_string(),
+                        });
+                    }
+                    ("file", false) => {
+                        let upsert =
+                            kahawai_proto::v1::FileUpsert::decode(record.payload.as_slice())
+                                .context("decoding catalogue file record")?;
+                        anyhow::ensure!(
+                            upsert.collection_id == delta.collection_id,
+                            "catalogue file record changed collection"
+                        );
+                        anyhow::ensure!(
+                            upsert.files.len() == 1,
+                            "catalogue file record must contain one source"
+                        );
+                        validate_catalog_source(&record.key, &upsert.files[0].source, "file")?;
+                        file_upserts.extend(upsert.files);
+                    }
+                    ("file_error", false) => {
+                        let error = kahawai_proto::v1::FileError::decode(record.payload.as_slice())
+                            .context("decoding catalogue file error")?;
+                        anyhow::ensure!(
+                            error.collection_id == delta.collection_id,
+                            "catalogue file error changed collection"
+                        );
+                        validate_catalog_source(&record.key, &error.source, "file error")?;
+                        let source = exact_source(error.source, "FileError")?;
+                        tracing::warn!(%module_id, collection = %delta.collection_id,
+                            root = %source.root_token, path = %source.path_rel,
+                            error = %error.error, "mediahost catalogue records unreadable source");
+                    }
+                    ("file_hashes", false) => {
+                        let value =
+                            kahawai_proto::v1::FileHashes::decode(record.payload.as_slice())
+                                .context("decoding catalogue hash record")?;
+                        anyhow::ensure!(
+                            value.hashes.len() == 1,
+                            "catalogue hash record must contain one source"
+                        );
+                        anyhow::ensure!(
+                            value.collection_id == delta.collection_id,
+                            "catalogue hash record changed collection"
+                        );
+                        validate_catalog_source(&record.key, &value.hashes[0].source, "hash")?;
+                        Box::pin(handle_host_msg(
+                            registry,
+                            subtitles,
+                            enricher,
+                            segments,
+                            module_id,
+                            generation,
+                            host_to_hub::Msg::FileHashes(value),
+                            seen,
+                            partial,
+                            catalog_delta_progress,
+                            catalog_removed_files,
+                            catalog_snapshots,
+                        ))
+                        .await?;
+                    }
+                    ("file_hashes", true) => {
+                        let (root_token, path_rel) = split_catalog_source_key(&record.key)?;
+                        registry
+                            .remove_catalog_hashes(
+                                module_id,
+                                &delta.collection_id,
+                                &crate::registry::SourcePath {
+                                    root_token: root_token.to_string(),
+                                    path_rel: path_rel.to_string(),
+                                },
+                            )
+                            .await?;
+                    }
+                    ("file_loudness", false) => {
+                        let value =
+                            kahawai_proto::v1::FileLoudness::decode(record.payload.as_slice())
+                                .context("decoding catalogue loudness record")?;
+                        anyhow::ensure!(
+                            value.collection_id == delta.collection_id,
+                            "catalogue loudness record changed collection"
+                        );
+                        validate_catalog_source(&record.key, &value.source, "loudness")?;
+                        Box::pin(handle_host_msg(
+                            registry,
+                            subtitles,
+                            enricher,
+                            segments,
+                            module_id,
+                            generation,
+                            host_to_hub::Msg::FileLoudness(value),
+                            seen,
+                            partial,
+                            catalog_delta_progress,
+                            catalog_removed_files,
+                            catalog_snapshots,
+                        ))
+                        .await?;
+                    }
+                    ("file_loudness", true) => {
+                        let (root_token, path_rel) = split_catalog_source_key(&record.key)?;
+                        registry
+                            .remove_catalog_loudness(
+                                module_id,
+                                &delta.collection_id,
+                                &crate::registry::SourcePath {
+                                    root_token: root_token.to_string(),
+                                    path_rel: path_rel.to_string(),
+                                },
+                            )
+                            .await?;
+                    }
+                    ("file_attachments", false) => {
+                        let value =
+                            kahawai_proto::v1::FileAttachments::decode(record.payload.as_slice())
+                                .context("decoding catalogue attachment record")?;
+                        anyhow::ensure!(
+                            value.collection_id == delta.collection_id,
+                            "catalogue attachment record changed collection"
+                        );
+                        validate_catalog_source(&record.key, &value.source, "attachments")?;
+                        Box::pin(handle_host_msg(
+                            registry,
+                            subtitles,
+                            enricher,
+                            segments,
+                            module_id,
+                            generation,
+                            host_to_hub::Msg::FileAttachments(value),
+                            seen,
+                            partial,
+                            catalog_delta_progress,
+                            catalog_removed_files,
+                            catalog_snapshots,
+                        ))
+                        .await?;
+                    }
+                    ("file_keyframe", false) => {
+                        let value = kahawai_proto::v1::FileKeyframeInterval::decode(
+                            record.payload.as_slice(),
+                        )
+                        .context("decoding catalogue keyframe record")?;
+                        anyhow::ensure!(
+                            value.collection_id == delta.collection_id,
+                            "catalogue keyframe record changed collection"
+                        );
+                        validate_catalog_source(&record.key, &value.source, "keyframe interval")?;
+                        Box::pin(handle_host_msg(
+                            registry,
+                            subtitles,
+                            enricher,
+                            segments,
+                            module_id,
+                            generation,
+                            host_to_hub::Msg::FileKeyframeInterval(value),
+                            seen,
+                            partial,
+                            catalog_delta_progress,
+                            catalog_removed_files,
+                            catalog_snapshots,
+                        ))
+                        .await?;
+                    }
+                    ("file_geometry", false) => {
+                        let value =
+                            kahawai_proto::v1::FileVideoGeometry::decode(record.payload.as_slice())
+                                .context("decoding catalogue geometry record")?;
+                        anyhow::ensure!(
+                            value.collection_id == delta.collection_id,
+                            "catalogue geometry record changed collection"
+                        );
+                        validate_catalog_source(&record.key, &value.source, "video geometry")?;
+                        Box::pin(handle_host_msg(
+                            registry,
+                            subtitles,
+                            enricher,
+                            segments,
+                            module_id,
+                            generation,
+                            host_to_hub::Msg::FileVideoGeometry(value),
+                            seen,
+                            partial,
+                            catalog_delta_progress,
+                            catalog_removed_files,
+                            catalog_snapshots,
+                        ))
+                        .await?;
+                    }
+                    ("file_segments", false) => {
+                        let value = kahawai_proto::v1::SegmentDetectionResult::decode(
+                            record.payload.as_slice(),
+                        )
+                        .context("decoding catalogue segment record")?;
+                        anyhow::ensure!(
+                            value.collection_id == delta.collection_id,
+                            "catalogue segment record changed collection"
+                        );
+                        anyhow::ensure!(
+                            value.episodes.len() == 1,
+                            "catalogue segment record must contain one source"
+                        );
+                        validate_catalog_source(
+                            &record.key,
+                            &value.episodes[0].source,
+                            "segments",
+                        )?;
+                        let stored = crate::segments::store_catalog_result(
+                            registry,
+                            module_id,
+                            &delta.collection_id,
+                            &value,
+                        )
+                        .await?;
+                        tracing::debug!(%module_id, collection = %delta.collection_id, stored,
+                            "source-owned segment result projected");
+                    }
+                    ("file_segments", true) => {
+                        let (root_token, path_rel) = split_catalog_source_key(&record.key)?;
+                        crate::segments::remove_catalog_result(
+                            registry,
+                            module_id,
+                            &delta.collection_id,
+                            &crate::registry::SourcePath {
+                                root_token: root_token.to_string(),
+                                path_rel: path_rel.to_string(),
+                            },
+                        )
+                        .await?;
+                    }
+                    (kind, _) => tracing::debug!(%module_id, kind,
+                        "catalogue record kind not yet consumed by hub"),
+                }
+            }
+            flush_catalog_files(
+                registry,
+                module_id,
+                &delta.collection_id,
+                &mut file_upserts,
+                seen,
+            )
+            .await?;
+            catalog_removed_files
+                .entry(delta.collection_id.clone())
+                .or_default()
+                .extend(removed_files);
+            if delta.done {
+                let removed_files = catalog_removed_files
+                    .remove(&delta.collection_id)
+                    .unwrap_or_default();
+                registry
+                    .remove_catalog_files(module_id, &delta.collection_id, &removed_files)
+                    .await?;
+                if catalog_snapshots.remove(&delta.collection_id) {
+                    let snapshot_seen = seen.remove(&delta.collection_id).unwrap_or_default();
+                    registry
+                        .reconcile_files(module_id, &delta.collection_id, &snapshot_seen)
+                        .await?;
+                }
+                catalog_delta_progress.remove(&delta.collection_id);
+                registry
+                    .set_catalog_cursor(
+                        module_id,
+                        &delta.collection_id,
+                        &delta.epoch,
+                        delta.through_version,
+                    )
+                    .await?;
+            } else {
+                catalog_delta_progress.insert(delta.collection_id.clone(), delta.through_version);
+            }
+            if delta.done {
+                registry
+                    .send_to_host_generation(
+                        module_id,
+                        generation,
+                        HubToHost {
+                            msg: Some(hub_to_host::Msg::CatalogAck(
+                                kahawai_proto::v1::CatalogAck {
+                                    collection_id: delta.collection_id.clone(),
+                                    epoch: delta.epoch,
+                                    version: delta.through_version,
+                                },
+                            )),
+                        },
+                    )
+                    .await?;
+            }
+            if delta.done {
+                enricher.scan_complete(registry.clone());
+            }
+        }
+        host_to_hub::Msg::DiscoveryStatus(status) => {
+            registry.update_scan_progress(
+                module_id,
+                &status.collection_id,
+                status.scanned,
+                status.failed,
+                status.skipped,
+                !status.scanning,
+            );
         }
         host_to_hub::Msg::FileError(e) => {
             let source = exact_source(e.source, "FileError")?;
@@ -1145,15 +1676,9 @@ async fn handle_host_msg(
                 path = %path_rel, tracks = loudness.tracks.len(), stored,
                 "audio loudness result received");
             if !stored {
-                push_loudness_retry(
-                    registry,
-                    module_id,
-                    &loudness.collection_id,
-                    &root_token,
-                    &path_rel,
-                    (loudness.size, loudness.mtime_unix),
-                )
-                .await;
+                tracing::debug!(%module_id, collection = %loudness.collection_id,
+                    path = %path_rel,
+                    "stale loudness projection dropped; mediahost owns retry scheduling");
             }
         }
         host_to_hub::Msg::FileSubtitles(fs) => {
@@ -1208,6 +1733,22 @@ async fn handle_host_msg(
                 let root_token = registry
                     .resolve_root_token(module_id, &fh.collection_id, &source.root_token)
                     .await?;
+                if !h.error.is_empty() {
+                    tracing::warn!(%module_id, collection = %fh.collection_id,
+                        root = %root_token, path = %source.path_rel,
+                        error = %h.error, "mediahost reported terminal ed2k failure");
+                    registry
+                        .remove_catalog_hashes(
+                            module_id,
+                            &fh.collection_id,
+                            &crate::registry::SourcePath {
+                                root_token,
+                                path_rel: source.path_rel,
+                            },
+                        )
+                        .await?;
+                    continue;
+                }
                 if h.crc_checked && !h.crc_ok {
                     tracing::warn!(%module_id, collection = %fh.collection_id,
                         path = %source.path_rel, "mediahost reports filename CRC32 mismatch");
@@ -1370,61 +1911,6 @@ async fn push_loudness_worklist(registry: &Registry, module_id: &str, collection
     }
 }
 
-/// Re-offer only the replacement that made an in-flight answer stale. A full
-/// collection worklist here would repeatedly ship thousands of paths; no send
-/// at all loses the scan-complete offer that the mediahost deduplicated while
-/// the old revision was active.
-async fn push_loudness_retry(
-    registry: &Registry,
-    module_id: &str,
-    collection_id: &str,
-    root_token: &str,
-    path_rel: &str,
-    result_revision: (u64, i64),
-) {
-    if !registry.host_supports_loudness_analysis(module_id) {
-        return;
-    }
-    let pending = match registry
-        .loudness_source_pending(module_id, collection_id, root_token, path_rel)
-        .await
-    {
-        Ok(pending) => pending,
-        Err(error) => {
-            tracing::warn!(%module_id, collection = collection_id, %path_rel,
-                error = format!("{error:#}"), "checking stale loudness source");
-            return;
-        }
-    };
-    let Some(current_revision) = pending else {
-        return;
-    };
-    if !registry.claim_loudness_retry(
-        (module_id, collection_id, root_token, path_rel),
-        result_revision,
-        current_revision,
-    ) {
-        tracing::debug!(%module_id, collection = collection_id, %path_rel,
-            "stale loudness transition already retried");
-        return;
-    }
-    let message = kahawai_proto::v1::HubToHost {
-        msg: Some(kahawai_proto::v1::hub_to_host::Msg::LoudnessWorklist(
-            kahawai_proto::v1::LoudnessWorklist {
-                collection_id: collection_id.to_string(),
-                analyzer: kahawai_media::loudness::ANALYZER,
-                sources: vec![kahawai_proto::v1::SourcePath::new(root_token, path_rel)],
-            },
-        )),
-    };
-    match registry.send_to_host(module_id, message).await {
-        Ok(()) => tracing::info!(%module_id, collection = collection_id, %path_rel,
-            "stale loudness result requeued current source"),
-        Err(error) => tracing::debug!(%module_id, collection = collection_id, %path_rel,
-            error = format!("{error:#}"), "stale loudness retry send stopped"),
-    }
-}
-
 /// HUB-17 backfill: which files still have no measured keyframe gap.
 /// Same cheapest tier as attachments — index reads, no decoding — and
 /// the same chunking, because a large collection's list is long and
@@ -1556,6 +2042,35 @@ async fn push_subs_worklist(
 mod chunk_tests {
     use super::*;
 
+    #[test]
+    fn zero_cursor_restarts_an_interrupted_snapshot() {
+        assert!(catalog_snapshot_required(Some(0), 0, 20));
+        assert!(!catalog_snapshot_required(Some(10), 0, 20));
+    }
+
+    #[test]
+    fn catalog_record_key_must_name_its_payload_source() {
+        let mut key = b"root".to_vec();
+        key.push(0);
+        key.extend_from_slice(b"one.mkv");
+        assert!(
+            validate_catalog_source(
+                &key,
+                &Some(kahawai_proto::v1::SourcePath::new("root", "one.mkv")),
+                "file",
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_catalog_source(
+                &key,
+                &Some(kahawai_proto::v1::SourcePath::new("root", "two.mkv")),
+                "file",
+            )
+            .is_err()
+        );
+    }
+
     fn msg(blocks: &[usize], done: Option<bool>) -> kahawai_proto::v1::ImageSubtitles {
         kahawai_proto::v1::ImageSubtitles {
             collection_id: "c".into(),
@@ -1655,7 +2170,7 @@ mod chunk_tests {
 
 #[cfg(test)]
 mod forget_link_tests {
-    use super::{forget_link, push_loudness_retry, register_host_link, route_segment_reply};
+    use super::{forget_link, register_host_link, route_segment_reply};
     use crate::registry::Registry;
     use crate::sessions::Sessions;
     use std::sync::Arc;
@@ -1705,98 +2220,6 @@ mod forget_link_tests {
                 .is_err(),
             "and the send side must be gone with it — a host reported present \
              with no way to reach it is answered 409 instead of 503"
-        );
-    }
-
-    #[tokio::test]
-    async fn stale_loudness_result_reoffers_only_the_current_source() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = crate::db::open(dir.path()).await.unwrap();
-        sqlx::raw_sql(
-            "INSERT INTO collections(module_id,collection_id,media_type)
-               VALUES('host','movies','movies');
-             INSERT INTO collection_roots(module_id,collection_id,root_token,normalized_path)
-               VALUES('host','movies','root','/movies');
-             INSERT INTO files(module_id,collection_id,root_id,path_rel,size,mtime_unix,
-                               head_xxh3,tail_xxh3,oshash,streams_json)
-               SELECT 'host','movies',id,'film.mkv',10,2,0,0,0,
-                      '{\"audio\":[{\"codec\":\"aac\",\"channels\":2,\"sample_rate\":48000,\"language\":null,\"bitrate_kbps\":null,\"layout\":\"0x3\"}]}'
-                 FROM collection_roots;",
-        )
-        .execute(&db)
-        .await
-        .unwrap();
-        let registry = Registry::new(db, Default::default());
-        let (tx, mut rx) = tokio::sync::mpsc::channel(2);
-        registry.register_link(
-            "host",
-            tx,
-            kahawai_proto::PROTOCOL_MINOR,
-            kahawai_core::segments::DETECTOR_GENERATION,
-        );
-
-        let stale = kahawai_proto::v1::FileLoudness {
-            collection_id: "movies".into(),
-            source: Some(kahawai_proto::v1::SourcePath::new("root", "film.mkv")),
-            size: 10,
-            mtime_unix: 1,
-            analyzer: kahawai_media::loudness::ANALYZER,
-            error: "source changed during measurement".into(),
-            ..Default::default()
-        };
-        assert!(!registry.record_file_loudness("host", &stale).await.unwrap());
-        push_loudness_retry(
-            &registry,
-            "host",
-            "movies",
-            "root",
-            "film.mkv",
-            (stale.size, stale.mtime_unix),
-        )
-        .await;
-
-        let message = rx.recv().await.unwrap().unwrap();
-        let Some(kahawai_proto::v1::hub_to_host::Msg::LoudnessWorklist(work)) = message.msg else {
-            panic!("stale result did not produce a loudness worklist");
-        };
-        assert_eq!(work.sources.len(), 1);
-        assert_eq!(work.sources[0].path_rel, "film.mkv");
-
-        push_loudness_retry(
-            &registry,
-            "host",
-            "movies",
-            "root",
-            "film.mkv",
-            (stale.size, stale.mtime_unix),
-        )
-        .await;
-        assert!(
-            rx.try_recv().is_err(),
-            "one stale revision transition was requeued repeatedly"
-        );
-
-        sqlx::query(
-            "INSERT INTO audio_loudness
-               (file_id,stream_index,analyzer,size,mtime_unix,error,measured_at)
-             SELECT id,0,?,size,mtime_unix,'terminal',unixepoch() FROM files",
-        )
-        .bind(kahawai_media::loudness::ANALYZER)
-        .execute(registry.db())
-        .await
-        .unwrap();
-        push_loudness_retry(
-            &registry,
-            "host",
-            "movies",
-            "root",
-            "film.mkv",
-            (stale.size, stale.mtime_unix),
-        )
-        .await;
-        assert!(
-            rx.try_recv().is_err(),
-            "a current terminal result was requeued"
         );
     }
 

@@ -139,9 +139,17 @@ A mediahost needs its own persistent state directory and read-only media roots:
 
 ```toml
 [mediahost]
-hub = "kahawai.example.lan:8421"
 name = "nas"
 state_dir = "/data/kahawai-mediahost"
+
+[[mediahost.hubs]]
+id = "home"
+address = "kahawai.example.lan:8421"
+
+[[mediahost.hubs]]
+id = "family"
+address = "family.example.lan:8421"
+collections = ["anime"] # omit to publish every collection
 
 [[mediahost.collections]]
 name = "anime"
@@ -154,6 +162,12 @@ Run it with:
 ```sh
 kahawai mediahost
 ```
+
+The mediahost scans and analyzes each file once into
+`/data/kahawai-mediahost/catalog.db`; every named hub has independent mTLS
+credentials under `state_dir/hubs/<id>/` and receives only catalogue versions
+newer than its durable cursor. The old single `hub = "…"` setting remains
+accepted and keeps its existing credentials directly in `state_dir`.
 
 A transcoder needs persistent state and access to its GPU:
 

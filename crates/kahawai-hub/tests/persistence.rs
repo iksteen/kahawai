@@ -302,7 +302,7 @@ fn test_router(
 /// via FilesSeen (no re-upsert) must NOT get them reconciled away, and
 /// the hub must answer ManifestRequest with what it knows.
 #[tokio::test]
-async fn manifest_and_files_seen_survive_rescan() {
+async fn catalog_cursor_and_projection_survive_reconnect() {
     use kahawai_proto::v1 as pb;
     let pki = tempfile::tempdir().unwrap();
     let ca = Arc::new(kahawai_hub::pki::HubCa::load_or_create(pki.path()).unwrap());
@@ -343,6 +343,10 @@ async fn manifest_and_files_seen_survive_rescan() {
     let bundle = kahawai_core::pki::new_satellite_csr("mediahost", "01HOST", "nas").unwrap();
     let signed = ca.sign_satellite_csr(&bundle.csr_der, 90).unwrap();
     allowed.insert(&signed.fingerprint);
+    registry
+        .record_satellite("01HOST", "mediahost", "nas", &signed.fingerprint)
+        .await
+        .unwrap();
     let id = kahawai_transport::identity::SatelliteIdentity {
         module_id: "01HOST".into(),
         key_pem: bundle.key_pem,
@@ -377,102 +381,69 @@ async fn manifest_and_files_seen_survive_rescan() {
                 .unwrap()
                 .into_inner();
             inbound.message().await.unwrap().unwrap(); // HelloAck
+            let root = std::path::Path::new("/srv/movies");
+            let root_token = kahawai_core::media::root_token(root);
             tx.send(pb::HostToHub {
-                msg: Some(pb::host_to_hub::Msg::AnnounceCollection(
-                    pb::AnnounceCollection {
+                msg: Some(pb::host_to_hub::Msg::CatalogOffer(pb::CatalogOffer {
+                    collections: vec![pb::CatalogCollection {
                         id: "movies".into(),
                         media_type: "movies".into(),
-                        roots: vec![pb::CollectionRoot::new(
-                            kahawai_core::media::root_token(std::path::Path::new("/srv/movies")),
-                            "/srv/movies",
-                        )],
-                    },
-                )),
-            })
-            .await
-            .unwrap();
-            // Round 3 handshakes with the version stored in round 2:
-            // the hub must answer in_sync and send no entries.
-            tx.send(pb::HostToHub {
-                msg: Some(pb::host_to_hub::Msg::ManifestRequest(pb::ManifestRequest {
-                    collection_id: "movies".into(),
-                    sync_version: if round == 3 { 7 } else { 0 },
+                        roots: vec![pb::CollectionRoot::new(root_token.clone(), "/srv/movies")],
+                        epoch: "persistent-fixture".into(),
+                        current_version: 1,
+                        oldest_replayable_version: 0,
+                        scanning: false,
+                    }],
                 })),
             })
             .await
             .unwrap();
-            // Collect the manifest.
-            let mut entries = vec![];
-            let mut in_sync = false;
-            loop {
-                match inbound.message().await.unwrap().unwrap().msg {
-                    Some(pb::hub_to_host::Msg::Manifest(m)) => {
-                        entries.extend(m.entries);
-                        in_sync |= m.in_sync;
-                        if m.done {
-                            break;
-                        }
-                    }
-                    other => panic!("expected manifest, got {other:?}"),
-                }
-            }
-            if round == 3 {
-                assert!(in_sync, "matching sync_version must short-circuit");
-                assert!(entries.is_empty());
-                return; // handshake skips the scan entirely
-            }
-            assert!(!in_sync);
-            if round == 1 {
-                assert!(entries.is_empty(), "fresh hub knows nothing: {entries:?}");
+            let cursor = inbound.message().await.unwrap().unwrap();
+            let Some(pb::hub_to_host::Msg::CatalogCursor(cursor)) = cursor.msg else {
+                panic!("expected catalogue cursor")
+            };
+            if matches!(round, 1 | 5) {
+                assert_eq!(cursor.version, 0);
+                assert!(cursor.snapshot);
+                let file = pb::FileRecord {
+                    source: Some(pb::SourcePath::new(root_token.clone(), "Heat (1995).mkv")),
+                    size: 100,
+                    mtime_unix: 42,
+                    head_xxh3: 1,
+                    tail_xxh3: 2,
+                    oshash: 3,
+                    streams_json: "{}".into(),
+                };
+                let mut key = root_token.into_bytes();
+                key.push(0);
+                key.extend_from_slice(b"Heat (1995).mkv");
                 tx.send(pb::HostToHub {
-                    msg: Some(pb::host_to_hub::Msg::FileUpsert(pb::FileUpsert {
+                    msg: Some(pb::host_to_hub::Msg::CatalogDelta(pb::CatalogDelta {
                         collection_id: "movies".into(),
-                        files: vec![pb::FileRecord {
-                            source: Some(pb::SourcePath::new(
-                                kahawai_core::media::root_token(std::path::Path::new(
-                                    "/srv/movies",
-                                )),
-                                "Heat (1995).mkv",
-                            )),
-                            size: 100,
-                            mtime_unix: 42,
-                            head_xxh3: 1,
-                            tail_xxh3: 2,
-                            oshash: 3,
-                            streams_json: "{}".into(),
+                        epoch: "persistent-fixture".into(),
+                        records: vec![pb::CatalogRecord {
+                            version: 1,
+                            kind: "file".into(),
+                            key,
+                            payload: prost::Message::encode_to_vec(&pb::FileUpsert {
+                                collection_id: "movies".into(),
+                                files: vec![file],
+                            }),
+                            deleted: false,
                         }],
+                        through_version: 1,
+                        snapshot: true,
+                        done: true,
                     })),
                 })
                 .await
                 .unwrap();
+                let ack = inbound.message().await.unwrap().unwrap();
+                assert!(matches!(ack.msg, Some(pb::hub_to_host::Msg::CatalogAck(_))));
             } else {
-                // Round 2: hub knows the file; report it seen, upsert nothing.
-                assert_eq!(entries.len(), 1, "{entries:?}");
-                let source = entries[0].source.as_ref().unwrap();
-                assert_eq!(source.path_rel, "Heat (1995).mkv");
-                assert_eq!(entries[0].size, 100);
-                assert_eq!(entries[0].mtime_unix, 42);
-                tx.send(pb::HostToHub {
-                    msg: Some(pb::host_to_hub::Msg::FilesSeen(pb::FilesSeen {
-                        collection_id: "movies".into(),
-                        sources: vec![source.clone()],
-                    })),
-                })
-                .await
-                .unwrap();
+                assert_eq!(cursor.version, 1);
+                assert!(!cursor.snapshot);
             }
-            tx.send(pb::HostToHub {
-                msg: Some(pb::host_to_hub::Msg::ScanProgress(pb::ScanProgress {
-                    collection_id: "movies".into(),
-                    scanned: (round == 1) as u32,
-                    failed: 0,
-                    complete: true,
-                    skipped: (round == 2) as u32,
-                    sync_version: 7, // the generation both rounds report
-                })),
-            })
-            .await
-            .unwrap();
             // Give the hub a beat to reconcile before the link drops.
             tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         }
@@ -492,20 +463,54 @@ async fn manifest_and_files_seen_survive_rescan() {
         .unwrap();
     assert_eq!(
         n, 1,
-        "FilesSeen must protect unchanged files from reconciliation"
+        "a cursor-only reconnect must preserve the projected file"
     );
     let items: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM items")
         .fetch_one(&db)
         .await
         .unwrap();
     assert_eq!(items, 1, "resolved item survives the incremental rescan");
-    // Round 3: reconnect with the stored generation → in_sync short-circuit.
+    // A second cursor-only reconnect remains idempotent.
     scan(3).await;
     let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM files")
         .fetch_one(&db)
         .await
         .unwrap();
-    assert_eq!(n, 1, "in-sync reconnect must leave state untouched");
+    assert_eq!(n, 1, "cursor reconnect must leave state untouched");
+
+    // Protocol-4.0 builds wrote the wire minor into this column. Separating the
+    // catalogue consumer generation introduced no new record kind, so those
+    // already-deployed cursors remain valid and must not pay for a snapshot.
+    sqlx::query(
+        "UPDATE mediahost_catalog_cursors SET consumer_minor=0
+          WHERE module_id='01HOST' AND collection_id='movies'",
+    )
+    .execute(&db)
+    .await
+    .unwrap();
+    scan(4).await;
+
+    // A genuinely unknown consumer generation does force current-state replay:
+    // an older consumer may have advanced past additive kinds it did not know.
+    sqlx::query(
+        "UPDATE mediahost_catalog_cursors SET consumer_minor=-1
+          WHERE module_id='01HOST' AND collection_id='movies'",
+    )
+    .execute(&db)
+    .await
+    .unwrap();
+    scan(5).await;
+    let consumer_minor: i64 = sqlx::query_scalar(
+        "SELECT consumer_minor FROM mediahost_catalog_cursors
+          WHERE module_id='01HOST' AND collection_id='movies'",
+    )
+    .fetch_one(&db)
+    .await
+    .unwrap();
+    assert_eq!(
+        consumer_minor,
+        kahawai_hub::registry::CATALOG_CONSUMER_GENERATION
+    );
 }
 
 #[tokio::test]

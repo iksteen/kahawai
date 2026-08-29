@@ -23,6 +23,9 @@ rustls = { workspace = true }
 walkdir = { workspace = true }
 xxhash-rust = { workspace = true }
 notify = { workspace = true }
+sqlx = { workspace = true }
+prost = { workspace = true }
+ulid = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

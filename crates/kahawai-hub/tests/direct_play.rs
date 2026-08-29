@@ -15,6 +15,9 @@ use kahawai_proto::v1 as pb;
 use kahawai_transport::identity::SatelliteIdentity;
 use tower::ServiceExt;
 
+#[path = "common/catalog.rs"]
+mod catalog_fixture;
+
 const FILE_LEN: usize = 5 * 1024 * 1024 + 123;
 
 fn pattern(len: usize) -> Vec<u8> {
@@ -89,6 +92,10 @@ async fn direct_play_ranges_end_to_end() {
     let bundle = kahawai_core::pki::new_satellite_csr("mediahost", "01HOST", "nas").unwrap();
     let signed = ca.sign_satellite_csr(&bundle.csr_der, 90).unwrap();
     allowed.insert(&signed.fingerprint);
+    registry
+        .record_satellite("01HOST", "mediahost", "nas", &signed.fingerprint)
+        .await
+        .unwrap();
     let id = SatelliteIdentity {
         module_id: "01HOST".into(),
         key_pem: bundle.key_pem,
@@ -119,26 +126,22 @@ async fn direct_play_ranges_end_to_end() {
         .unwrap()
         .into_inner();
     inbound.message().await.unwrap().unwrap(); // HelloAck
-    send(pb::host_to_hub::Msg::AnnounceCollection(
-        pb::AnnounceCollection {
-            id: "movies".into(),
-            media_type: "movies".into(),
-            roots: vec![
-                pb::CollectionRoot::new(
-                    kahawai_core::media::root_token(root.path()),
-                    root.path().display().to_string(),
-                ),
-                pb::CollectionRoot::new(
-                    kahawai_core::media::root_token(preferred.path()),
-                    preferred.path().display().to_string(),
-                ),
-            ],
-        },
-    ))
-    .await;
-    send(pb::host_to_hub::Msg::FileUpsert(pb::FileUpsert {
-        collection_id: "movies".into(),
-        files: vec![
+    catalog_fixture::project_files(
+        &tx,
+        &mut inbound,
+        "movies",
+        "movies",
+        vec![
+            pb::CollectionRoot::new(
+                kahawai_core::media::root_token(root.path()),
+                root.path().display().to_string(),
+            ),
+            pb::CollectionRoot::new(
+                kahawai_core::media::root_token(preferred.path()),
+                preferred.path().display().to_string(),
+            ),
+        ],
+        vec![
             pb::FileRecord {
                 source: Some(pb::SourcePath::new(
                     kahawai_core::media::root_token(root.path()),
@@ -164,7 +167,7 @@ async fn direct_play_ranges_end_to_end() {
                 streams_json: r#"{"container":"matroska"}"#.into(),
             },
         ],
-    }))
+    )
     .await;
     // OpenRead responder — the real mediahost serving path.
     let serve_channel = channel.clone();

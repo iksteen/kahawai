@@ -537,12 +537,10 @@ async fn run_hub_inner(
         cfg.data_dir.join("artwork"),
         enricher.clone(),
     ));
-    // HUB-37: the hub orders and persists season analysis; the owning
-    // mediahost executes it against local exact sources.
+    // Protocol 4: the mediahost owns ordering and persistence of source facts.
+    // This object remains the hub-side status/projection adapter; it no longer
+    // runs the old hub-owned sweep.
     let segments = Arc::new(kahawai_hub::segments::Detector::new());
-    if cfg.detect_segments {
-        segments.spawn_sweep(registry.clone(), sessions.clone());
-    }
     // Enrich whatever resolution has produced since last time.
     {
         let enricher = enricher.clone();
@@ -558,14 +556,21 @@ async fn run_hub_inner(
     if let Some(mh) = local_mediahost {
         const LOCAL_ID: &str = "local";
         registry.ensure_local_satellite(LOCAL_ID, &mh.name).await?;
-        let (tx, rx) = kahawai_hub::link_service::local_link(
-            registry.clone(),
-            subtitles.clone(),
-            enricher.clone(),
-            segments.clone(),
-            LOCAL_ID,
-            &mh.name,
-        );
+        let local_registry = registry.clone();
+        let local_subtitles = subtitles.clone();
+        let local_enricher = enricher.clone();
+        let local_segments = segments.clone();
+        let local_name = mh.name.clone();
+        let local_link: kahawai_mediahost::LocalLinkFactory = Arc::new(move || {
+            kahawai_hub::link_service::local_link(
+                local_registry.clone(),
+                local_subtitles.clone(),
+                local_enricher.clone(),
+                local_segments.clone(),
+                LOCAL_ID,
+                &local_name,
+            )
+        });
         let cols = mh.collections.clone();
         sessions.set_local_source(LOCAL_ID, move |collection, root_token, path| {
             kahawai_mediahost::serve::resolve_rel(&cols, collection, root_token, path)
@@ -574,14 +579,31 @@ async fn run_hub_inner(
         let lease_activity = local_activity.clone();
         sessions.set_local_activity(move || Box::new(lease_activity.lease()));
         let state_dir = mh.state_dir.clone();
+        // AIO's in-process hub is intrinsic, not an implicit network target.
+        // Only explicit legacy/named entries become additional mTLS links.
+        let external_hubs = if mh.hub.is_none() && mh.hubs.is_empty() {
+            Vec::new()
+        } else {
+            mh.effective_hubs()
+                .into_iter()
+                .map(|hub| kahawai_mediahost::HubTarget {
+                    id: hub.id,
+                    address: hub.address,
+                    collections: hub.collections,
+                    legacy_identity: hub.legacy_identity,
+                })
+                .collect()
+        };
         tokio::spawn(async move {
-            if let Err(e) = kahawai_mediahost::run_local(
+            if let Err(e) = kahawai_mediahost::run_local_multi(
                 mh.collections,
                 mh.rescan_minutes,
                 &state_dir,
+                &mh.name,
                 local_activity,
-                tx,
-                rx,
+                mh.detect_segments,
+                external_hubs,
+                local_link,
             )
             .await
             {
@@ -603,7 +625,6 @@ async fn run_hub_inner(
         setup_url: Some(setup_url),
         public_origin,
         web_dir,
-        detect_segments: cfg.detect_segments,
     };
     match metrics_token {
         Some(_) => tracing::info!(
@@ -635,8 +656,7 @@ async fn run_hub_inner(
                     Ok((fresh, _)) => match proxy_trust.reload(&fresh.hub.trusted_proxies) {
                         Ok(n) => tracing::info!(
                             trusted_proxies = n,
-                            "config reloaded (listeners, data_dir, cert SANs and \
-                             detect_segments need a restart)"
+                            "config reloaded (listeners, data_dir and cert SANs need a restart)"
                         ),
                         Err(e) => tracing::warn!(
                             error = format!("{e:#}"),

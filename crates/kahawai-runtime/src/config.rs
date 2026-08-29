@@ -165,19 +165,6 @@ pub struct HubConfig {
     pub cors_origins: Vec<String>,
     #[serde(default)]
     pub subtitles: SubtitlesConfig,
-    /// HUB-37: hunt for recaps, openings and credits in the background.
-    /// On by default — the buttons only exist if something looks. Inferred
-    /// analysis reads and decodes the head and tail of every episode on the
-    /// owning mediahost: no media bytes cross the hub, but local disk/decode
-    /// work can contend with scans or playback until the worker yields at its
-    /// next checkpoint. Off is for an operator who does not want to spend that
-    /// source-local work or its latency.
-    #[serde(default = "yes")]
-    pub detect_segments: bool,
-}
-
-fn yes() -> bool {
-    true
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -211,7 +198,6 @@ impl Default for HubConfig {
             hostnames: vec!["localhost".into()],
             satellite_cert_days: 90,
             enrollment_ttl_minutes: 15,
-            detect_segments: true,
             max_sessions_per_user: 4,
             trusted_proxies: Vec::new(),
             cors_origins: Vec::new(),
@@ -220,14 +206,20 @@ impl Default for HubConfig {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct MediahostConfig {
-    /// Hub satellite address, `host:port`.
-    pub hub: String,
+    /// Legacy single-hub satellite address. It remains the implicit `default`
+    /// hub and keeps using identity files directly in `state_dir`.
+    pub hub: Option<String>,
+    /// Additional independently enrolled hubs. Omitted collection filters mean
+    /// every configured collection.
+    pub hubs: Vec<MediahostHubConfig>,
     pub state_dir: PathBuf,
     pub name: String,
     pub collections: Vec<kahawai_core::media::CollectionConfig>,
+    /// Expensive segment discovery is local policy in protocol 4.
+    pub detect_segments: bool,
     /// Backup sweep interval (minutes; 0 disables). The primary change
     /// detector is the filesystem watcher — which network mounts like
     /// sshfs can't serve, so the sweep catches what inotify can't see.
@@ -240,6 +232,55 @@ pub struct MediahostConfig {
     /// Discovery records whatever decoder GStreamer autoplugs, so `dtsdec`
     /// (lossy core only) must not file DTS-HD MA 7.1 as 5.1.
     pub demote_decoders: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MediahostHubConfig {
+    pub id: String,
+    pub address: String,
+    /// `None` means all; an explicit empty set is rejected as a likely config
+    /// mistake rather than maintaining a connection that can expose nothing.
+    #[serde(default)]
+    pub collections: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct EffectiveMediahostHub {
+    pub id: String,
+    pub address: String,
+    pub collections: Vec<String>,
+    pub legacy_identity: bool,
+}
+
+impl MediahostConfig {
+    pub fn effective_hubs(&self) -> Vec<EffectiveMediahostHub> {
+        let all = || self.collections.iter().map(|c| c.name.clone()).collect();
+        let mut hubs = Vec::new();
+        if let Some(address) = &self.hub {
+            hubs.push(EffectiveMediahostHub {
+                id: "default".into(),
+                address: address.clone(),
+                collections: all(),
+                legacy_identity: true,
+            });
+        }
+        hubs.extend(self.hubs.iter().map(|hub| EffectiveMediahostHub {
+            id: hub.id.clone(),
+            address: hub.address.clone(),
+            collections: hub.collections.clone().unwrap_or_else(&all),
+            legacy_identity: false,
+        }));
+        if hubs.is_empty() {
+            hubs.push(EffectiveMediahostHub {
+                id: "default".into(),
+                address: "localhost:8421".into(),
+                collections: all(),
+                legacy_identity: true,
+            });
+        }
+        hubs
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -302,10 +343,12 @@ impl Default for TranscoderConfig {
 impl Default for MediahostConfig {
     fn default() -> Self {
         Self {
-            hub: "localhost:8421".into(),
+            hub: None,
+            hubs: Vec::new(),
             state_dir: default_mediahost_state_dir(),
             name: "mediahost".into(),
             collections: Vec::new(),
+            detect_segments: true,
             rescan_minutes: 60,
             demote_decoders: Vec::new(),
         }
@@ -344,7 +387,70 @@ pub fn load(explicit: Option<&Path>) -> Result<(Config, Option<PathBuf>)> {
     };
     validate_hub_binds(&cfg.hub)?;
     normalize_and_validate_collections(&mut cfg.mediahost.collections, &base)?;
+    validate_mediahost_hubs(&cfg.mediahost)?;
     Ok((cfg, used))
+}
+
+fn validate_mediahost_hubs(cfg: &MediahostConfig) -> Result<()> {
+    let collections: std::collections::HashSet<&str> =
+        cfg.collections.iter().map(|c| c.name.as_str()).collect();
+    let mut ids = std::collections::HashSet::new();
+    let mut addresses = std::collections::HashSet::new();
+    if let Some(address) = &cfg.hub {
+        if address.trim().is_empty() {
+            bail!("mediahost.hub must not be empty");
+        }
+        ids.insert("default".to_string());
+        addresses.insert(address.clone());
+    }
+    for hub in &cfg.hubs {
+        if hub.id == "default" {
+            bail!("mediahost hub id 'default' is reserved for mediahost.hub");
+        }
+        if hub.id.is_empty()
+            || !hub
+                .id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            bail!(
+                "mediahost hub id {:?} must contain only letters, digits, '-' or '_'",
+                hub.id
+            );
+        }
+        if !ids.insert(hub.id.clone()) {
+            bail!("duplicate mediahost hub id {:?}", hub.id);
+        }
+        if hub.address.trim().is_empty() || !addresses.insert(hub.address.clone()) {
+            bail!("duplicate or empty mediahost hub address {:?}", hub.address);
+        }
+        if let Some(selected) = &hub.collections {
+            if selected.is_empty() {
+                bail!(
+                    "mediahost hub {:?} has an empty collections list; omit it for all",
+                    hub.id
+                );
+            }
+            let mut seen = std::collections::HashSet::new();
+            for collection in selected {
+                if !collections.contains(collection.as_str()) {
+                    bail!(
+                        "mediahost hub {:?} selects unknown collection {:?}",
+                        hub.id,
+                        collection
+                    );
+                }
+                if !seen.insert(collection) {
+                    bail!(
+                        "mediahost hub {:?} selects collection {:?} twice",
+                        hub.id,
+                        collection
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Validate listener separation by port rather than exact socket address.
@@ -478,7 +584,7 @@ mod tests {
                 cfg.mediahost.state_dir,
                 PathBuf::from("/home/test/.local/share/kahawai-mediahost")
             );
-            assert_eq!(cfg.mediahost.hub, "localhost:8421");
+            assert_eq!(cfg.mediahost.effective_hubs()[0].address, "localhost:8421");
             assert!(cfg.all_in_one.transcoder);
             Ok(())
         });
@@ -661,6 +767,44 @@ mod tests {
                 "[[mediahost.collections]]\nname='a'\nmedia_type='movies'\nroots=['/media']\n[[mediahost.collections]]\nname='b'\nmedia_type='series'\nroots=['/media/series']\n",
             )?;
             load(Some(Path::new("kahawai.toml"))).unwrap();
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn mediahost_hubs_filter_collections_and_legacy_hub_coexists() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_dir("media")?;
+            jail.create_file(
+                "kahawai.toml",
+                "[mediahost]\nhub='old:8421'\n\
+                 [[mediahost.hubs]]\nid='family'\naddress='new:8421'\ncollections=['movies']\n\
+                 [[mediahost.collections]]\nname='movies'\nmedia_type='movies'\nroots=['media']\n",
+            )?;
+            let (cfg, _) = load(Some(Path::new("kahawai.toml"))).unwrap();
+            let hubs = cfg.mediahost.effective_hubs();
+            assert_eq!(hubs.len(), 2);
+            assert_eq!(hubs[0].id, "default");
+            assert!(hubs[0].legacy_identity);
+            assert_eq!(hubs[1].collections, ["movies"]);
+            assert!(!hubs[1].legacy_identity);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn named_hubs_do_not_add_an_implicit_localhost() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_dir("media")?;
+            jail.create_file(
+                "kahawai.toml",
+                "[[mediahost.hubs]]\nid='only'\naddress='hub:8421'\n\
+                 [[mediahost.collections]]\nname='movies'\nmedia_type='movies'\nroots=['media']\n",
+            )?;
+            let (cfg, _) = load(Some(Path::new("kahawai.toml"))).unwrap();
+            let hubs = cfg.mediahost.effective_hubs();
+            assert_eq!(hubs.len(), 1);
+            assert_eq!(hubs[0].id, "only");
             Ok(())
         });
     }

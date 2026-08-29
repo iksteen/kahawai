@@ -9,7 +9,7 @@
     },
     "version": "0.0.0-dev"
   },
-  "x-kahawai-source-sha256": "768c579f1f1dbffabd14cf6f0f4d47f2f27e5a4ccf98ee538bcf2bf3c9022678",
+  "x-kahawai-source-sha256": "c6f7669bbf2b899d26e5ebbe7dc24ebdf84daa5479b9bada6c418ec41a1a004c",
   "paths": {
     "/admin/v1/collections": {
       "get": {
@@ -2278,7 +2278,7 @@
           "Admin segments"
         ],
         "summary": "Analyse the next pending season",
-        "description": "Admin only. Picks the next season awaiting intro detection and analyses it\nin the background, responding immediately with the season chosen. Returns\n409 when segment detection is disabled.",
+        "description": "Admin only. Wakes connected protocol-4 mediahosts; each mediahost retains\nownership of local cohort selection and priority.",
         "operationId": "admin_segments_run",
         "responses": {
           "200": {
@@ -2300,16 +2300,6 @@
             }
           },
           "403": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ApiErrorBody"
-                }
-              }
-            }
-          },
-          "409": {
-            "description": "Segment detection is disabled on this hub",
             "content": {
               "application/json": {
                 "schema": {
@@ -9336,7 +9326,7 @@
           },
           "follow": {
             "type": "integer",
-            "description": "Dispatched runs finished when this one was queued. Poll the status\nuntil its `dispatched` count passes this mark; the\n`dispatched_awaiting_host` / `dispatched_failed` flags then describe\nTHIS run — the shared pass flags describe whichever pass finished\nlast, which mid-sweep is usually not this one.",
+            "description": "Completed wake attempts before this one. Poll status until its\n`dispatched` count passes this mark; discovery completion itself is\nreported by mediahost catalogue status and projected segment facts.",
             "minimum": 0
           },
           "season": {
@@ -9351,7 +9341,7 @@
               "string",
               "null"
             ],
-            "description": "The season now QUEUED for background analysis, absent when nothing\nwas pending. Queued, not necessarily started: runs serialize behind\nwhatever the sweep holds, and a repeat POST queues a task that will\nno-op once it sees the season finished. Progress and completion are\n`GET /admin/v1/segments`'s to report: a season is minutes of work,\nand an answer held open that long dies with the first proxy timeout."
+            "description": "Kept for response compatibility; protocol 4 never names a season here\nbecause each mediahost selects cohorts from its own catalogue."
           }
         }
       },

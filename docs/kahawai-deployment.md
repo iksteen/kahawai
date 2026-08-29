@@ -190,6 +190,20 @@ same idle permit as hashing/segment analysis and backpressures whenever a scan
 or viewer lease becomes active. Music collections are not queued because their
 ReplayGain path remains authoritative.
 
+### Protocol 4 mediahost cutover
+
+Protocol 4 reverses catalogue and extended-discovery ownership. Upgrade hubs
+and mediahosts together: the major-version handshake rejects protocol-3 peers.
+No catalogue migration from a hub is attempted. Preserve the mediahost
+`state_dir`, start the new mediahost, and let its initial scan populate
+`catalog.db`; each connected hub then reconciles its physical projection
+from that live snapshot while stable item IDs retain hub-owned users, libraries,
+watch state, metadata, matches and subtitle payloads. Named multi-hub
+credentials live under `state_dir/hubs/<id>`;
+the legacy `[mediahost].hub` identity remains at the old state-directory root.
+Move `detect_segments` from `[hub]` to `[mediahost]`; the old hub key is rejected
+so an expensive local-analysis policy cannot silently change during upgrade.
+
 ## Capping what a transcode costs the box (TC-6)
 
 Each session's pipeline is a separate `remux-worker` process, and two

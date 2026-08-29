@@ -35,6 +35,15 @@ pub enum JobMsg {
     UrgentImage(kahawai_proto::v1::ExtractImageSubs),
 }
 
+/// A local, retryable discovery failure. This never crosses a hub link: the
+/// catalogue releases the still-running exact-source claim before scheduling
+/// the path again.
+pub struct RetryClaim {
+    pub collection_id: String,
+    pub kind: &'static str,
+    pub source: kahawai_proto::v1::SourcePath,
+}
+
 /// One deduped work queue (collection, root token, path_rel) per tier.
 #[derive(Default)]
 struct Tier {
@@ -151,6 +160,7 @@ pub async fn run(
     tx: tokio::sync::mpsc::Sender<HostToHub>,
     collections: Vec<CollectionConfig>,
     activity: Activity,
+    retry_tx: Option<tokio::sync::mpsc::UnboundedSender<RetryClaim>>,
 ) {
     let mut queues = Queues::default();
 
@@ -245,13 +255,28 @@ pub async fn run(
                             hashes: vec![fh],
                         })),
                     };
-                    if tx.send(msg).await.is_err() {
+                    if crate::send_link_message(&tx, msg).await.is_err() {
                         return; // link gone; the next session gets a fresh list
                     }
                 }
-                // Vanished or unreadable: the next scan reconciles.
-                Err(e) => tracing::debug!(collection = %collection_id, path = %path_rel,
-                    error = format!("{e:#}"), "ed2k skipped"),
+                Err(e) => {
+                    let error = format!("{e:#}");
+                    tracing::warn!(collection = %collection_id, path = %path_rel,
+                        %error, "ed2k failed for exact source revision");
+                    let msg = HostToHub {
+                        msg: Some(host_to_hub::Msg::FileHashes(FileHashes {
+                            collection_id: collection_id.clone(),
+                            hashes: vec![FileHash {
+                                source: source(&root_token, &path_rel),
+                                error,
+                                ..Default::default()
+                            }],
+                        })),
+                    };
+                    if crate::send_link_message(&tx, msg).await.is_err() {
+                        return;
+                    }
+                }
             }
             queues
                 .ed2k
@@ -339,6 +364,7 @@ pub async fn run(
                         &path_rel,
                         background,
                         &tx,
+                        retry_tx.as_ref(),
                     )
                     .await
                 }
@@ -350,6 +376,7 @@ pub async fn run(
                         &path_rel,
                         background,
                         &tx,
+                        retry_tx.as_ref(),
                     )
                     .await
                 }
@@ -382,6 +409,7 @@ async fn declare_and_send(
     path_rel: &str,
     background: BlockingGuard,
     tx: &tokio::sync::mpsc::Sender<HostToHub>,
+    retry_tx: Option<&tokio::sync::mpsc::UnboundedSender<RetryClaim>>,
 ) {
     let result: anyhow::Result<(u64, String, String)> = async {
         let path = crate::serve::resolve_rel(collections, collection_id, root_token, path_rel)?;
@@ -404,7 +432,14 @@ async fn declare_and_send(
         Err(e) => {
             tracing::debug!(collection = %collection_id, path = %path_rel,
                 error = format!("{e:#}"), "attachment declaration failed");
-            return; // vanished/unreadable: the next scan reconciles
+            retry_local_claim(
+                retry_tx,
+                collection_id,
+                "file_attachments",
+                root_token,
+                path_rel,
+            );
+            return;
         }
     };
     // Say which, because the one investigation this line shows up in is
@@ -427,7 +462,8 @@ async fn declare_and_send(
             chapters_json: Some(chapters_json),
         })),
     };
-    let _ = tx.send(msg).await;
+    drop(background);
+    let _ = crate::send_link_message(tx, msg).await;
 }
 
 /// HUB-17 backfill: measure one file's longest keyframe gap from the
@@ -441,6 +477,7 @@ async fn measure_keyframes_and_send(
     path_rel: &str,
     background: BlockingGuard,
     tx: &tokio::sync::mpsc::Sender<HostToHub>,
+    retry_tx: Option<&tokio::sync::mpsc::UnboundedSender<RetryClaim>>,
 ) {
     let result: anyhow::Result<(u64, Option<u32>)> = async {
         let path = crate::serve::resolve_rel(collections, collection_id, root_token, path_rel)?;
@@ -462,6 +499,13 @@ async fn measure_keyframes_and_send(
         Err(e) => {
             tracing::debug!(collection = %collection_id, path = %path_rel,
                 error = format!("{e:#}"), "keyframe measurement failed");
+            retry_local_claim(
+                retry_tx,
+                collection_id,
+                "file_keyframe",
+                root_token,
+                path_rel,
+            );
             return;
         }
     };
@@ -477,7 +521,27 @@ async fn measure_keyframes_and_send(
             },
         )),
     };
-    let _ = tx.send(msg).await;
+    drop(background);
+    let _ = crate::send_link_message(tx, msg).await;
+}
+
+fn retry_local_claim(
+    retry_tx: Option<&tokio::sync::mpsc::UnboundedSender<RetryClaim>>,
+    collection_id: &str,
+    kind: &'static str,
+    root_token: &str,
+    path_rel: &str,
+) {
+    if let Some(retry_tx) = retry_tx {
+        let _ = retry_tx.send(RetryClaim {
+            collection_id: collection_id.to_string(),
+            kind,
+            source: kahawai_proto::v1::SourcePath {
+                root_token: root_token.to_string(),
+                path_rel: path_rel.to_string(),
+            },
+        });
+    }
 }
 
 /// Source-owned PAR/orientation/display dimensions for one exact file. This is
@@ -494,8 +558,10 @@ async fn probe_geometry_and_send(
     let path = match crate::serve::resolve_rel(collections, collection_id, root_token, path_rel) {
         Ok(path) => path,
         Err(e) => {
-            let _ = tx
-                .send(HostToHub {
+            drop(background);
+            let _ = crate::send_link_message(
+                tx,
+                HostToHub {
                     msg: Some(host_to_hub::Msg::FileVideoGeometry(FileVideoGeometry {
                         collection_id: collection_id.to_string(),
                         source: source(root_token, path_rel),
@@ -503,8 +569,9 @@ async fn probe_geometry_and_send(
                         geometry_json: String::new(),
                         error: format!("{e:#}"),
                     })),
-                })
-                .await;
+                },
+            )
+            .await;
             return;
         }
     };
@@ -532,7 +599,8 @@ async fn probe_geometry_and_send(
             error,
         })),
     };
-    let _ = tx.send(msg).await;
+    drop(background);
+    let _ = crate::send_link_message(tx, msg).await;
 }
 
 /// HUB-32b: one image subtitle track's raw display-set blocks, read
@@ -613,6 +681,7 @@ async fn extract_image_and_send(
                     },
                 )
                 .collect();
+            drop(blocking_guard);
             send_chunked(
                 tx,
                 collection_id,
@@ -646,11 +715,14 @@ async fn extract_image_and_send(
             }
         }
     };
-    let _ = tx
-        .send(HostToHub {
+    drop(blocking_guard);
+    let _ = crate::send_link_message(
+        tx,
+        HostToHub {
             msg: Some(host_to_hub::Msg::ImageSubtitles(msg)),
-        })
-        .await;
+        },
+    )
+    .await;
 }
 
 /// Extract every text subtitle track of one local file (single demux
@@ -721,11 +793,14 @@ async fn extract_and_send(
             }
         }
     };
-    let _ = tx
-        .send(HostToHub {
+    drop(background);
+    let _ = crate::send_link_message(
+        tx,
+        HostToHub {
             msg: Some(host_to_hub::Msg::FileSubtitles(msg)),
-        })
-        .await;
+        },
+    )
+    .await;
 }
 
 async fn hash_one(
@@ -780,6 +855,7 @@ async fn hash_one(
         size,
         crc_checked: claimed_crc.is_some(),
         crc_ok: crc_ok.unwrap_or(false),
+        error: String::new(),
     })
 }
 
@@ -829,12 +905,14 @@ async fn send_chunked(
             done: Some(last),
         };
         bytes = 0;
-        if tx
-            .send(HostToHub {
+        if crate::send_link_message(
+            tx,
+            HostToHub {
                 msg: Some(host_to_hub::Msg::ImageSubtitles(msg)),
-            })
-            .await
-            .is_err()
+            },
+        )
+        .await
+        .is_err()
         {
             tracing::warn!(
                 collection = collection_id,
@@ -850,8 +928,9 @@ async fn send_chunked(
     // A track with no blocks at all still needs its one message, or the
     // hub waits for a transfer that never starts.
     if total == 0 {
-        let _ = tx
-            .send(HostToHub {
+        let _ = crate::send_link_message(
+            tx,
+            HostToHub {
                 msg: Some(host_to_hub::Msg::ImageSubtitles(
                     kahawai_proto::v1::ImageSubtitles {
                         collection_id: collection_id.into(),
@@ -863,7 +942,8 @@ async fn send_chunked(
                         ..Default::default()
                     },
                 )),
-            })
-            .await;
+            },
+        )
+        .await;
     }
 }

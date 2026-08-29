@@ -16,6 +16,9 @@ use kahawai_proto::v1 as pb;
 use kahawai_transport::identity::SatelliteIdentity;
 use tower::ServiceExt;
 
+#[path = "common/catalog.rs"]
+mod catalog_fixture;
+
 async fn body_bytes(resp: axum::response::Response) -> Vec<u8> {
     axum::body::to_bytes(resp.into_body(), 64 << 20)
         .await
@@ -155,6 +158,15 @@ async fn keeps_audio_encode_local_and_dispatches_video_encode() {
 
     // Fake mediahost: link, announce, upsert, serve OpenReads.
     let id = enroll(&ca, &allowed, "mediahost", "01HOST", "nas");
+    registry
+        .record_satellite(
+            "01HOST",
+            "mediahost",
+            "nas",
+            &kahawai_transport::mtls::cert_fingerprint_pem(&id.cert_pem).unwrap(),
+        )
+        .await
+        .unwrap();
     let client_tls = kahawai_transport::mtls::mtls_client_config(&id).unwrap();
     let channel = kahawai_transport::tls::grpc_channel_with(&hub_addr, client_tls)
         .await
@@ -178,33 +190,29 @@ async fn keeps_audio_encode_local_and_dispatches_video_encode() {
         .unwrap()
         .into_inner();
     inbound.message().await.unwrap().unwrap(); // HelloAck
-    for msg in [
-        pb::host_to_hub::Msg::AnnounceCollection(pb::AnnounceCollection {
-            id: "movies".into(),
-            media_type: "movies".into(),
-            roots: vec![pb::CollectionRoot::new(
+    catalog_fixture::project_files(
+        &tx,
+        &mut inbound,
+        "movies",
+        "movies",
+        vec![pb::CollectionRoot::new(
+            kahawai_core::media::root_token(root.path()),
+            root.path().display().to_string(),
+        )],
+        vec![pb::FileRecord {
+            source: Some(pb::SourcePath::new(
                 kahawai_core::media::root_token(root.path()),
-                root.path().display().to_string(),
-            )],
-        }),
-        pb::host_to_hub::Msg::FileUpsert(pb::FileUpsert {
-            collection_id: "movies".into(),
-            files: vec![pb::FileRecord {
-                source: Some(pb::SourcePath::new(
-                    kahawai_core::media::root_token(root.path()),
-                    "Concert (2020).mkv",
-                )),
-                size,
-                mtime_unix: 1,
-                head_xxh3: 1,
-                tail_xxh3: 2,
-                oshash: 3,
-                streams_json,
-            }],
-        }),
-    ] {
-        tx.send(pb::HostToHub { msg: Some(msg) }).await.unwrap();
-    }
+                "Concert (2020).mkv",
+            )),
+            size,
+            mtime_unix: 1,
+            head_xxh3: 1,
+            tail_xxh3: 2,
+            oshash: 3,
+            streams_json,
+        }],
+    )
+    .await;
     // Heartbeats, like a real mediahost: without them the hub's 35 s
     // liveness timeout drops this link partway through the test.
     {

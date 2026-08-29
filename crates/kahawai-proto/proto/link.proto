@@ -63,6 +63,12 @@ message HostToHub {
     SegmentDetectionResult segment_detection_result = 18;
     // Source-local EBU R128 measurements for every audio stream.
     FileLoudness file_loudness = 19;
+    // Protocol 4: the mediahost owns its durable catalogue. A link offers the
+    // selected collections once, then streams only versioned current-state
+    // records newer than the cursor the hub returned.
+    CatalogOffer catalog_offer = 20;
+    CatalogDelta catalog_delta = 21;
+    DiscoveryStatus discovery_status = 22;
   }
 }
 
@@ -99,6 +105,9 @@ message FileHash {
   // Filename-embedded CRC32 verified during the same read (MH-9).
   bool crc_checked = 4;
   bool crc_ok = 5;
+  // Terminal for this exact locally claimed source revision. A hub may expose
+  // the diagnostic, but must not interpret an empty ed2k_hex as a hash.
+  string error = 6;
 }
 
 message ManifestRequest {
@@ -237,7 +246,7 @@ message HubToHost {
     // ends when the hub closes the channel's request stream.
     OpenRead open_read = 2;
     Manifest manifest = 3;
-    // Admin-triggered incremental rescan ("" = every collection).
+    // Admin-triggered incremental rescan of exactly one collection.
     RescanRequest rescan_request = 4;
     // Files the hub wants ED2K hashes for (MH-9, anime collections).
     // Consumed by the host's idle hasher; chunked, no ordering contract.
@@ -266,7 +275,88 @@ message HubToHost {
     DetectSegments detect_segments = 13;
     // Full audio decode on the owning mediahost, idle-gated and cached.
     LoudnessWorklist loudness_worklist = 14;
+    // Protocol 4 catalogue synchronization. Cursors are hub-owned and ACKs
+    // become durable only after the corresponding projection transaction.
+    CatalogCursor catalog_cursor = 15;
+    CatalogAck catalog_ack = 16;
+    // Administrative wake-up only: the mediahost still chooses the work.
+    DiscoveryWake discovery_wake = 17;
   }
+}
+
+// The catalogue is partitioned by collection. `epoch` changes whenever local
+// catalogue identity is lost/reset; versions are meaningful only within it.
+message CatalogOffer {
+  repeated CatalogCollection collections = 1;
+}
+
+message CatalogCollection {
+  string id = 1;
+  string media_type = 2;
+  repeated CollectionRoot roots = 3;
+  string epoch = 4;
+  uint64 current_version = 5;
+  // A cursor below this cannot be replayed because acknowledged tombstones
+  // have been compacted; the hub must clear its projection and request a
+  // snapshot.
+  uint64 oldest_replayable_version = 6;
+  bool scanning = 7;
+}
+
+message CatalogCursor {
+  string collection_id = 1;
+  string epoch = 2;
+  uint64 version = 3;
+  // The hub will reconcile its projection from every current live record.
+  bool snapshot = 4;
+}
+
+message CatalogDelta {
+  string collection_id = 1;
+  string epoch = 2;
+  repeated CatalogRecord records = 3;
+  // Safe cursor after every record in this message has committed. It remains
+  // zero until a multi-page snapshot's final reconciliation; incremental
+  // versions may have gaps when a newer current row supersedes a mutation.
+  uint64 through_version = 4;
+  bool snapshot = 5;
+  bool done = 6;
+}
+
+message CatalogRecord {
+  uint64 version = 1;
+  string kind = 2;
+  // Stable within (collection, kind); file-derived records use
+  // `root_token\0path_rel`, with multi-track results encoded in one payload.
+  bytes key = 3;
+  // Encoded protocol payload for this kind. Keeping discovery payloads typed
+  // by `kind` lets their schemas evolve without a wide union here.
+  bytes payload = 4;
+  bool deleted = 5;
+}
+
+message CatalogAck {
+  string collection_id = 1;
+  string epoch = 2;
+  uint64 version = 3;
+}
+
+message DiscoveryStatus {
+  string collection_id = 1;
+  bool scanning = 2;
+  uint32 scanned = 3;
+  uint32 failed = 4;
+  uint32 skipped = 5;
+  uint64 pending_cheap = 6;
+  uint64 pending_hashes = 7;
+  uint64 pending_segments = 8;
+  uint64 pending_loudness = 9;
+}
+
+message DiscoveryWake {
+  // "segments" is currently the only administrative wake kind.
+  string kind = 1;
+  string collection_id = 2;
 }
 
 message KeyframeWorklist {
@@ -449,6 +539,9 @@ message SegmentDetectionResult {
   uint64 elapsed_ms = 3;
   repeated SegmentEpisodeResult episodes = 4;
   string error = 5;
+  // Explicit because collection identifiers are opaque; do not derive this
+  // from request_id delimiters.
+  string collection_id = 6;
 }
 
 message SegmentEpisodeResult {

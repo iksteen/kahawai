@@ -125,6 +125,182 @@ pub async fn for_item(db: &sqlx::SqlitePool, item_id: &str) -> Result<Vec<Segmen
         .collect())
 }
 
+/// Persist one protocol-4 source-owned segment fact by mapping its exact file
+/// into this hub's independent logical item graph. The mediahost scheduled and
+/// retained the analysis; this is projection only.
+pub async fn store_catalog_result(
+    registry: &Registry,
+    module_id: &str,
+    collection_id: &str,
+    result: &kahawai_proto::v1::SegmentDetectionResult,
+) -> Result<usize> {
+    let mut stored = 0usize;
+    for episode in &result.episodes {
+        if episode.retryable {
+            continue;
+        }
+        let source = episode
+            .source
+            .as_ref()
+            .context("catalogue segment missing source")?;
+        let item_ids: Vec<String> = sqlx::query_scalar(
+            "SELECT DISTINCT ps.item_id
+               FROM files f
+               JOIN collection_roots r ON r.id=f.root_id
+               JOIN playable_source_parts psp ON psp.file_id=f.id
+               JOIN playable_sources ps ON ps.id=psp.playable_source_id
+              WHERE f.module_id=? AND f.collection_id=?
+                AND r.root_token=? AND f.path_rel=?
+                AND f.size=? AND f.mtime_unix=?",
+        )
+        .bind(module_id)
+        .bind(collection_id)
+        .bind(&source.root_token)
+        .bind(&source.path_rel)
+        .bind(episode.observed_size as i64)
+        .bind(episode.observed_mtime_unix)
+        .fetch_all(registry.db())
+        .await?;
+        if item_ids.is_empty() {
+            tracing::debug!(%module_id, collection = collection_id,
+                path = %source.path_rel, "catalogue segment result is stale or unresolved");
+            continue;
+        }
+        let mut tx = registry.db().begin().await?;
+        for item_id in item_ids {
+            if episode.unreadable || !episode.error.is_empty() {
+                sqlx::query(
+                    "INSERT OR REPLACE INTO media_segment_failures
+                       (item_id,module_id,collection_id,root_token,path_rel,size,mtime_unix,
+                        detector,error,failed_at)
+                     VALUES(?,?,?,?,?,?,?,?,?,unixepoch())",
+                )
+                .bind(&item_id)
+                .bind(module_id)
+                .bind(collection_id)
+                .bind(&source.root_token)
+                .bind(&source.path_rel)
+                .bind(episode.observed_size as i64)
+                .bind(episode.observed_mtime_unix)
+                .bind(result.detector)
+                .bind(&episode.error)
+                .execute(&mut *tx)
+                .await?;
+                continue;
+            }
+            sqlx::query("DELETE FROM media_segments WHERE item_id=?")
+                .bind(&item_id)
+                .execute(&mut *tx)
+                .await?;
+            for segment in &episode.segments {
+                sqlx::query(
+                    "INSERT INTO media_segments(item_id,kind,start_ms,end_ms,source)
+                     VALUES(?,?,?,?,?)",
+                )
+                .bind(&item_id)
+                .bind(&segment.kind)
+                .bind(segment.start_ms as i64)
+                .bind(segment.end_ms as i64)
+                .bind(&segment.analyzer)
+                .execute(&mut *tx)
+                .await?;
+            }
+            sqlx::query(
+                "INSERT INTO media_segment_scans
+                   (item_id,detector,mtime_unix,module_id,collection_id,root_token,path_rel,size,error)
+                 VALUES(?,?,?,?,?,?,?,?, '')
+                 ON CONFLICT(item_id) DO UPDATE SET detector=excluded.detector,
+                   mtime_unix=excluded.mtime_unix,module_id=excluded.module_id,
+                   collection_id=excluded.collection_id,root_token=excluded.root_token,
+                   path_rel=excluded.path_rel,size=excluded.size,error=''",
+            )
+            .bind(&item_id)
+            .bind(result.detector)
+            .bind(episode.observed_mtime_unix)
+            .bind(module_id)
+            .bind(collection_id)
+            .bind(&source.root_token)
+            .bind(&source.path_rel)
+            .bind(episode.observed_size as i64)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "DELETE FROM media_segment_failures
+                  WHERE item_id=? AND module_id=? AND collection_id=?
+                    AND root_token=? AND path_rel=? AND size=? AND mtime_unix=?
+                    AND detector=?",
+            )
+            .bind(&item_id)
+            .bind(module_id)
+            .bind(collection_id)
+            .bind(&source.root_token)
+            .bind(&source.path_rel)
+            .bind(episode.observed_size as i64)
+            .bind(episode.observed_mtime_unix)
+            .bind(result.detector)
+            .execute(&mut *tx)
+            .await?;
+            stored += 1;
+        }
+        tx.commit().await?;
+    }
+    Ok(stored)
+}
+
+pub async fn remove_catalog_result(
+    registry: &Registry,
+    module_id: &str,
+    collection_id: &str,
+    source: &crate::registry::SourcePath,
+) -> Result<u64> {
+    let mut tx = registry.db().begin().await?;
+    // A logical episode can have several source renditions. Only remove the
+    // projected result when this tombstone names the source that produced the
+    // current scan; an older rendition's tombstone must not erase a newer one.
+    let item_ids: Vec<String> = sqlx::query_scalar(
+        "SELECT item_id FROM media_segment_scans
+          WHERE module_id=? AND collection_id=? AND root_token=? AND path_rel=?",
+    )
+    .bind(module_id)
+    .bind(collection_id)
+    .bind(&source.root_token)
+    .bind(&source.path_rel)
+    .fetch_all(&mut *tx)
+    .await?;
+    let mut removed = 0;
+    for item_id in item_ids {
+        removed += sqlx::query("DELETE FROM media_segments WHERE item_id=?")
+            .bind(&item_id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        sqlx::query(
+            "DELETE FROM media_segment_scans
+              WHERE item_id=? AND module_id=? AND collection_id=?
+                AND root_token=? AND path_rel=?",
+        )
+        .bind(&item_id)
+        .bind(module_id)
+        .bind(collection_id)
+        .bind(&source.root_token)
+        .bind(&source.path_rel)
+        .execute(&mut *tx)
+        .await?;
+    }
+    sqlx::query(
+        "DELETE FROM media_segment_failures
+          WHERE module_id=? AND collection_id=? AND root_token=? AND path_rel=?",
+    )
+    .bind(module_id)
+    .bind(collection_id)
+    .bind(&source.root_token)
+    .bind(&source.path_rel)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(removed)
+}
+
 /// A season worth analyzing: its show, its number, and how many of its episodes
 /// have never been looked at.
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -2767,5 +2943,60 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count, 1, "unrepresentable boundary was stored");
+    }
+
+    #[tokio::test]
+    async fn catalog_tombstone_only_removes_the_source_that_owns_the_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::open(dir.path()).await.unwrap();
+        sqlx::raw_sql(
+            "INSERT INTO collections(module_id,collection_id,media_type)
+               VALUES('m','c','series');
+             INSERT INTO items(id,kind,title,norm_title,sort_title,module_id,collection_id)
+               VALUES('e1','episode','One','one','one','m','c');
+             INSERT INTO media_segments(item_id,kind,start_ms,end_ms,source)
+               VALUES('e1','intro',1000,2000,'chromaprint');
+             INSERT INTO media_segment_scans
+               (item_id,detector,module_id,collection_id,root_token,path_rel,size,error)
+               VALUES('e1',4,'m','c','root','current.mkv',10,'');",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        let registry = Registry::new(db, Default::default());
+
+        remove_catalog_result(
+            &registry,
+            "m",
+            "c",
+            &crate::registry::SourcePath {
+                root_token: "root".into(),
+                path_rel: "old.mkv".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM media_segments")
+            .fetch_one(registry.db())
+            .await
+            .unwrap();
+        assert_eq!(remaining, 1, "an old rendition erased the current result");
+
+        remove_catalog_result(
+            &registry,
+            "m",
+            "c",
+            &crate::registry::SourcePath {
+                root_token: "root".into(),
+                path_rel: "current.mkv".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM media_segments")
+            .fetch_one(registry.db())
+            .await
+            .unwrap();
+        assert_eq!(remaining, 0);
     }
 }

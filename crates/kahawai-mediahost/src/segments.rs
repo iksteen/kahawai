@@ -1,8 +1,8 @@
 //! Season-wide segment detection on source-local paths.
 //!
-//! The hub owns catalogue grouping, ordering and persistence. The mediahost
-//! receives one exact-source season, performs the expensive decode work beside
-//! the bytes, and returns only boundaries.
+//! Protocol 4 makes the mediahost responsible for grouping exact sources,
+//! performing expensive decode beside the bytes, and persisting the resulting
+//! source facts before hubs project them.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -108,7 +108,9 @@ pub async fn run(
             "segment job starting"
         );
         let request_id = job.request_id.clone();
+        let collection_id = job.collection_id.clone();
         let detector = job.detector;
+        let retry_sources = job.episodes.clone();
         let tx2 = tx.clone();
         let collections2 = collections.clone();
         let activity2 = activity.clone();
@@ -126,11 +128,19 @@ pub async fn run(
 
         let result = match result {
             Ok(Ok(result)) => result,
-            Ok(Err(error)) => failed(&request_id, detector, format!("{error:#}")),
+            Ok(Err(error)) => failed(
+                &request_id,
+                &collection_id,
+                detector,
+                format!("{error:#}"),
+                &retry_sources,
+            ),
             Err(error) => failed(
                 &request_id,
+                &collection_id,
                 detector,
                 format!("segment analysis task failed: {error}"),
+                &retry_sources,
             ),
         };
         crate::release_background_memory("segment detection");
@@ -160,13 +170,32 @@ pub async fn run(
     }
 }
 
-fn failed(request_id: &str, detector: i64, error: String) -> SegmentDetectionResult {
+fn failed(
+    request_id: &str,
+    collection_id: &str,
+    detector: i64,
+    error: String,
+    requested: &[SegmentEpisode],
+) -> SegmentDetectionResult {
     SegmentDetectionResult {
         request_id: request_id.to_string(),
         detector,
         elapsed_ms: 0,
-        episodes: Vec::new(),
+        episodes: requested
+            .iter()
+            .map(|episode| SegmentEpisodeResult {
+                item_id: episode.item_id.clone(),
+                source: episode.source.clone(),
+                observed_size: episode.expected_size,
+                observed_mtime_unix: episode.expected_mtime_unix,
+                unreadable: true,
+                error: error.clone(),
+                retryable: true,
+                ..Default::default()
+            })
+            .collect(),
         error,
+        collection_id: collection_id.to_string(),
     }
 }
 
@@ -180,6 +209,7 @@ fn analyze(
         job.episodes.len() >= 2,
         "segment job needs at least two episodes"
     );
+    let collection_id = job.collection_id.clone();
     let mut prepared = Vec::with_capacity(job.episodes.len());
     let mut preflight_failures = Vec::new();
     for episode in job.episodes {
@@ -249,6 +279,7 @@ fn analyze(
             elapsed_ms: 0,
             episodes: preflight_failures,
             error: String::new(),
+            collection_id,
         });
     }
 
@@ -357,6 +388,7 @@ fn analyze(
         elapsed_ms: Milliseconds::from_seconds(report.seconds)?.0,
         episodes: results,
         error: String::new(),
+        collection_id,
     })
 }
 

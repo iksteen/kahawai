@@ -14,6 +14,9 @@ use kahawai_proto::v1 as pb;
 use kahawai_transport::identity::SatelliteIdentity;
 use tower::ServiceExt;
 
+#[path = "common/catalog.rs"]
+mod catalog_fixture;
+
 async fn body_json(resp: axum::response::Response) -> serde_json::Value {
     let b = axum::body::to_bytes(resp.into_body(), 1 << 20)
         .await
@@ -76,6 +79,10 @@ async fn progress_resume_played_caps_and_idle() {
     let bundle = kahawai_core::pki::new_satellite_csr("mediahost", "01HOST", "nas").unwrap();
     let signed = ca.sign_satellite_csr(&bundle.csr_der, 90).unwrap();
     allowed.insert(&signed.fingerprint);
+    registry
+        .record_satellite("01HOST", "mediahost", "nas", &signed.fingerprint)
+        .await
+        .unwrap();
     let id = SatelliteIdentity {
         module_id: "01HOST".into(),
         key_pem: bundle.key_pem,
@@ -105,33 +112,29 @@ async fn progress_resume_played_caps_and_idle() {
         .unwrap()
         .into_inner();
     inbound.message().await.unwrap().unwrap(); // HelloAck
-    for msg in [
-        pb::host_to_hub::Msg::AnnounceCollection(pb::AnnounceCollection {
-            id: "movies".into(),
-            media_type: "movies".into(),
-            roots: vec![pb::CollectionRoot::new(
+    catalog_fixture::project_files(
+        &tx,
+        &mut inbound,
+        "movies",
+        "movies",
+        vec![pb::CollectionRoot::new(
+            kahawai_core::media::root_token(root.path()),
+            root.path().display().to_string(),
+        )],
+        vec![pb::FileRecord {
+            source: Some(pb::SourcePath::new(
                 kahawai_core::media::root_token(root.path()),
-                root.path().display().to_string(),
-            )],
-        }),
-        pb::host_to_hub::Msg::FileUpsert(pb::FileUpsert {
-            collection_id: "movies".into(),
-            files: vec![pb::FileRecord {
-                source: Some(pb::SourcePath::new(
-                    kahawai_core::media::root_token(root.path()),
-                    "Heat (1995).mkv",
-                )),
-                size: 65536,
-                mtime_unix: 1,
-                head_xxh3: 1,
-                tail_xxh3: 2,
-                oshash: 3,
-                streams_json: r#"{"container":"matroska","duration_ms":100000}"#.into(),
-            }],
-        }),
-    ] {
-        tx.send(pb::HostToHub { msg: Some(msg) }).await.unwrap();
-    }
+                "Heat (1995).mkv",
+            )),
+            size: 65536,
+            mtime_unix: 1,
+            head_xxh3: 1,
+            tail_xxh3: 2,
+            oshash: 3,
+            streams_json: r#"{"container":"matroska","duration_ms":100000}"#.into(),
+        }],
+    )
+    .await;
     let serve_channel = channel.clone();
     tokio::spawn(async move {
         while let Ok(Some(m)) = inbound.message().await {

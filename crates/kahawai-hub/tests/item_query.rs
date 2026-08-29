@@ -648,14 +648,11 @@ async fn a_multi_part_film_is_tellable_from_alternative_encodes() {
     }
 }
 
-/// HUB-37's off switch is a promise: "off spends no byte". The admin
-/// trigger must refuse — a silent dispatch resumes full-season reads on a
-/// hub whose operator turned them off, and only this server-side pin
-/// notices (the web test mocks the client).
+/// Protocol 4 moved the cost switch to each mediahost. The hub endpoint is
+/// therefore always a harmless wake broadcast and never a hub policy gate.
 #[tokio::test]
-async fn a_disabled_hub_refuses_the_detection_trigger() {
+async fn the_detection_trigger_is_a_mediahost_wake() {
     let net = kahawai_hub::api::NetOptions {
-        detect_segments: false,
         ..Default::default()
     };
     let fx = fixture_net(rec("Heat (1995).mkv", 100), net).await;
@@ -670,7 +667,7 @@ async fn a_disabled_hub_refuses_the_detection_trigger() {
         )
         .await
         .unwrap();
-    assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
 }
 
 /// Nothing pending answers immediately with no season named — the shape
