@@ -236,6 +236,32 @@ async fn up_next_is_the_episode_after_the_last_finished_one_of_a_current_series(
     seed_episode(&db, "s_paused", "Paused E02", 1, 2, 200, Some((500, 0, 2))).await;
     seed_episode(&db, "s_paused", "Paused E03", 1, 3, 200, None).await;
 
+    // Exactly at the absolute threshold is meaningfully part-way through E02.
+    // This series belongs exclusively to Continue Watching, so neither its
+    // resumable E02 nor the unwatched E03 may leak into Up Next.
+    seed_show(&db, "s_resumable", "Resumable", None).await;
+    seed_episode(
+        &db,
+        "s_resumable",
+        "Resumable E01",
+        1,
+        1,
+        200,
+        Some((0, 1, 4)),
+    )
+    .await;
+    seed_episode(
+        &db,
+        "s_resumable",
+        "Resumable E02",
+        1,
+        2,
+        200,
+        Some((60_000, 0, 2)),
+    )
+    .await;
+    seed_episode(&db, "s_resumable", "Resumable E03", 1, 3, 200, None).await;
+
     // Nothing left to offer.
     seed_show(&db, "s_done", "Done", None).await;
     seed_episode(&db, "s_done", "Done E01", 1, 1, 200, Some((0, 1, 4))).await;
