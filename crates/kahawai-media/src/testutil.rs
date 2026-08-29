@@ -180,7 +180,9 @@ fn report(kind: &str, description: &str, report_path: Option<&Path>) {
 }
 
 /// 5.1 fixture: h264 + 6-channel AAC, for the HUB-15 channel ceiling
-/// (a stereo client must get stereo, not the range's mono).
+/// (a stereo client must get stereo, not the range's mono). Needs
+/// fdkaacenc by name — the fallback encoders are not multichannel — so
+/// callers must gate on it, not just on [`require_h264_aac_fixture`].
 pub fn render_h264_aac51_mkv(path: &Path) {
     render(&format!(
         "videotestsrc num-buffers=50 ! video/x-raw,format=I420,width=320,height=240,framerate=25/1 ! x264enc ! h264parse ! matroskamux name=m audiotestsrc num-buffers=90 ! audio/x-raw,channels=6,channel-mask=(bitmask)0x3f,rate=48000 ! audioconvert ! fdkaacenc ! aacparse ! m. m. ! filesink location=\"{}\"",
@@ -189,10 +191,12 @@ pub fn render_h264_aac51_mkv(path: &Path) {
 }
 
 /// HDR10 fixture (HUB-15a): HEVC Main-10, PQ colorimetry — probes as
-/// hdr10. Caller gates on `has_element("x265enc")`.
+/// hdr10. The audio is stereo, so any verified AAC encoder will do;
+/// callers gate on `x265enc` and [`require_h264_aac_fixture`].
 pub fn render_pq_hevc_mkv(path: &Path) {
+    let aac = crate::remux::aac_encoder().expect("fixture requires a verified AAC encoder");
     render(&format!(
-        "videotestsrc num-buffers=75 ! video/x-raw,format=I420_10LE,width=320,height=240,framerate=25/1,colorimetry=bt2100-pq ! x265enc bitrate=500 speed-preset=ultrafast key-int-max=25 ! h265parse ! matroskamux name=m audiotestsrc num-buffers=130 ! audioconvert ! fdkaacenc ! m. m. ! filesink location=\"{}\"",
+        "videotestsrc num-buffers=75 ! video/x-raw,format=I420_10LE,width=320,height=240,framerate=25/1,colorimetry=bt2100-pq ! x265enc bitrate=500 speed-preset=ultrafast key-int-max=25 ! h265parse ! matroskamux name=m audiotestsrc num-buffers=130 ! audioconvert ! {aac} ! m. m. ! filesink location=\"{}\"",
         path.display()
     ));
 }

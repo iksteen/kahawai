@@ -6727,7 +6727,9 @@ mod tests {
     #[test]
     fn fmp4_sink_carries_hevc_copy() {
         crate::init().unwrap();
-        if !crate::testutil::require_elements(&["isofmp4mux", "x265enc"]) {
+        if !crate::testutil::require_elements(&["isofmp4mux", "x265enc"])
+            || !crate::testutil::require_h264_aac_fixture()
+        {
             return;
         }
         let dir = tempfile::tempdir().unwrap();
@@ -7533,9 +7535,10 @@ mod tests {
         crate::init().unwrap();
         if !crate::testutil::require(
             h264_encoder().is_some()
+                && aac_encoder().is_some()
                 && tonemap_available()
                 && crate::testutil::elements_available(&["x265enc"]),
-            "verified H.264 encoder, GL tone-map segment, and x265enc",
+            "verified H.264 and AAC encoders, GL tone-map segment, and x265enc",
         ) {
             return;
         }

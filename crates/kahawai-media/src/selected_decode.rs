@@ -176,7 +176,7 @@ mod tests {
         }
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("video-and-audio.mkv");
-        crate::testutil::render_h264_aac51_mkv(&path);
+        crate::testutil::render_h264_aac_mkv(&path);
 
         let pipeline = gst::Pipeline::new();
         let factories: Arc<std::sync::Mutex<Vec<(String, String)>>> = Default::default();
