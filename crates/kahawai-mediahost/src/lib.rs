@@ -79,6 +79,62 @@ impl Activity {
     }
 }
 
+/// Full-file/season GStreamer jobs create short-lived decoder threads whose
+/// glibc arenas can retain hundreds of MiB after every pipeline has reached
+/// NULL and dropped. The allocation is no longer live; ask glibc to return
+/// whole free pages at that lifecycle boundary. `malloc_trim` is MT-safe and,
+/// since glibc 2.8, covers every arena.
+/// Source: https://man7.org/linux/man-pages/man3/malloc_trim.3.html
+pub fn release_background_memory(job: &'static str) -> bool {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    let released = {
+        unsafe extern "C" {
+            fn malloc_trim(pad: usize) -> std::ffi::c_int;
+        }
+        // SAFETY: malloc_trim(3) accepts every size_t, defines zero as retaining
+        // at most one top page, and is documented MT-Safe.
+        unsafe { malloc_trim(0) != 0 }
+    };
+    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+    let released = false;
+
+    if released {
+        tracing::debug!(job, "released free background-job memory");
+    }
+    released
+}
+
+#[derive(Clone)]
+pub(crate) struct BackgroundMemoryTrimmer {
+    next: std::sync::Arc<std::sync::Mutex<std::time::Instant>>,
+    interval: std::time::Duration,
+}
+
+impl BackgroundMemoryTrimmer {
+    pub(crate) fn every(interval: std::time::Duration) -> Self {
+        Self {
+            next: std::sync::Arc::new(std::sync::Mutex::new(std::time::Instant::now() + interval)),
+            interval,
+        }
+    }
+
+    /// Streaming decoders can fill freed arenas long before a multi-hour file
+    /// reaches its lifecycle boundary. Only one callback wins each interval;
+    /// the others avoid even waiting on this bookkeeping lock.
+    pub(crate) fn checkpoint(&self, job: &'static str) {
+        let Ok(mut next) = self.next.try_lock() else {
+            return;
+        };
+        let now = std::time::Instant::now();
+        if now < *next {
+            return;
+        }
+        *next = now + self.interval;
+        drop(next);
+        release_background_memory(job);
+    }
+}
+
 #[derive(Clone, Default)]
 struct JobRuntime {
     activity: Activity,

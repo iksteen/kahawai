@@ -127,6 +127,7 @@ pub async fn run(
                 format!("segment analysis task failed: {error}"),
             ),
         };
+        crate::release_background_memory("segment detection");
         if result.error.is_empty() {
             tracing::info!(
                 request = %result.request_id,
@@ -260,7 +261,9 @@ fn analyze(
         anime: job.anime,
         ..Default::default()
     };
+    let trimmer = crate::BackgroundMemoryTrimmer::every(Duration::from_secs(30));
     let between = || -> Result<()> {
+        trimmer.checkpoint("segment checkpoint");
         while activity.busy() {
             anyhow::ensure!(!cancelled.load(Ordering::Relaxed), "segment job cancelled");
             std::thread::sleep(Duration::from_secs(2));
