@@ -407,10 +407,13 @@ How something works and why it was built that way belong in
       and paging, item detail with stream info, artwork at named sizes,
       playback and admin endpoints. Client behaviour and the API shape
       are in implementation §4.4/§4.7.
-      `in_progress=true` narrows the same endpoint to what is started and
-      unfinished, most recently watched first — the continue-watching row
-      (`kahawai-list.sh -p`). Its own query shape, driven from
-      `watch_state` rather than from `items`, because the set is "rows
+      `in_progress=true` narrows the same endpoint to what is meaningfully
+      started and unfinished, most recently watched first — the
+      continue-watching row (`kahawai-list.sh -p`). Meaningful means both one
+      minute and one percent of the reported runtime; the larger threshold
+      wins, so a probe of a long film is not promoted while a short episode
+      does not inherit a film-sized fixed delay. Its own query shape, driven
+      from `watch_state` rather than from `items`, because the set is "rows
       this account has a position in": 3525 items answered as 19 without
       a candidate scan. It is not a `sort` name — the browse's watch join
       is in the outer dressing query, and pulling it into the candidate
@@ -423,10 +426,12 @@ How something works and why it was built that way belong in
       the one after the last you FINISHED — not the first unwatched,
       which is a different answer whenever an episode was skipped. A
       series appears when this account has finished an episode of it, is
-      not part-way through one (the same `position_ms > 0 AND played = 0`
-      predicate continue watching is made of, so the two rows partition
-      the series between them instead of both claiming one), and is still
-      current: watched within the last month, OR the episode it would
+      not meaningfully part-way through one (the same
+      one-minute-and-one-percent predicate continue watching is made of, so
+      the two rows partition the series between them instead of both claiming
+      one). A barely opened next episode therefore remains eligible in Up
+      Next. The series must also be still current: watched within the last
+      month, OR the episode it would
       offer was added within it — the second half is the season that
       starts up again after a year off. "Added" is the item id, which is
       a ULID and so already sorted by the moment it was minted; the cut

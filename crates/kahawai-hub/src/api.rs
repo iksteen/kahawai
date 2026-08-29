@@ -4927,7 +4927,8 @@ struct ItemsQuery {
     /// `title` (default), `year`, `added`. Prefixed with `-` for
     /// descending: `-year`.
     sort: Option<String>,
-    /// Started and not finished — what a "continue watching" row is made
+    /// Meaningfully started and not finished — at least one minute and 1%
+    /// of the runtime — which is what a "continue watching" row is made
     /// of. Ordered by when you last watched it, so `sort` and `q` do not
     /// apply; `library` still scopes it.
     in_progress: Option<bool>,
@@ -4942,6 +4943,24 @@ struct ItemsQuery {
 /// to scroll past the fold.
 const ITEMS_PAGE_DEFAULT: u32 = 200;
 const ITEMS_PAGE_MAX: u32 = 1000;
+
+/// An accidental start is not something to resume. Requiring both one minute
+/// and one percent keeps a long film out after a brief probe without making a
+/// short episode wait for a film-sized absolute cutoff.
+const CONTINUE_MIN_POSITION_MS: i64 = 60_000;
+const CONTINUE_MIN_RUNTIME_FRACTION: i64 = 100;
+
+/// The one authority for the partition between Continue Watching and Up Next.
+///
+/// `duration_ms` can be absent on imported or legacy state. In that case the
+/// absolute minute remains the honest criterion we can evaluate.
+fn meaningful_unfinished(alias: &str) -> String {
+    format!(
+        "{alias}.position_ms >= MAX({CONTINUE_MIN_POSITION_MS}, \
+         COALESCE({alias}.duration_ms, 0) / {CONTINUE_MIN_RUNTIME_FRACTION}) \
+         AND {alias}.played = 0"
+    )
+}
 
 /// `sort` → an ORDER BY the query can interpolate. Never the raw
 /// parameter: this is the one place a browse request touches SQL text.
@@ -5104,7 +5123,7 @@ fn item_page_sql(inner: &str, order_out: &str, restricted: bool, scoped: bool) -
 ///
 /// Returns one page of items with the caller's watch state, filtered by
 /// library or title search and sorted by title, year or date added. Pass
-/// in_progress=true to list started-but-unfinished items instead.
+/// `in_progress=true` to list meaningfully started, unfinished items instead.
 #[utoipa::path(
     get, path = "/api/v1/items", tag = "Browse",
     security(("bearer_auth" = [])),
@@ -5184,6 +5203,7 @@ async fn list_items(
     // true.
     let in_progress = q.in_progress.unwrap_or(false);
     let (rows, total) = if in_progress {
+        let meaningful = meaningful_unfinished("w2");
         // Tracks stay out: a resume position on a song is not something
         // anyone comes back to, and one would sit among the films.
         // Episodes very much stay in — they are most of this row.
@@ -5199,7 +5219,7 @@ async fn list_items(
             &format!(
                 "SELECT w2.item_id FROM watch_state w2
                    JOIN items c ON c.id = w2.item_id
-                  WHERE w2.user_id = ?1 AND w2.position_ms > 0 AND w2.played = 0
+                  WHERE w2.user_id = ?1 AND {meaningful}
                     AND c.kind <> 'track' {member}
                   ORDER BY w2.updated_at DESC, w2.item_id DESC
                   LIMIT ?3 OFFSET ?4"
@@ -5224,7 +5244,7 @@ async fn list_items(
         let count = format!(
             "SELECT COUNT(*) FROM watch_state w2
                JOIN items c ON c.id = w2.item_id
-              WHERE w2.user_id = ?1 AND w2.position_ms > 0 AND w2.played = 0
+              WHERE w2.user_id = ?1 AND {meaningful}
                 AND c.kind <> 'track' {member}"
         );
         let total: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(count))
@@ -5444,6 +5464,7 @@ struct UpNextQuery {
 /// small by construction, so this reads one key range of one user's rows
 /// instead of asking every show whether it has been started.
 fn up_next_from(member: &str) -> String {
+    let meaningful = meaningful_unfinished("pw");
     format!(
         "FROM (SELECT e.parent_id AS show_id, MAX(w.updated_at) AS last_watched
                  FROM watch_state w
@@ -5486,15 +5507,16 @@ fn up_next_from(member: &str) -> String {
                                    WHERE nw.user_id = ?1 AND nw.item_id = n.id
                                      AND nw.played = 1)
                 ORDER BY n.season, n.episode, n.id LIMIT 1)
-         -- Part-way through an episode of this series? Then the series
-         -- belongs to continue watching and not here. Deliberately the
-         -- same predicate that row is made of (`position_ms > 0 AND
-         -- played = 0`), so the two rows partition the series between
-         -- them instead of both claiming one or neither offering it.
+         -- Meaningfully part-way through an episode of this series? Then the
+         -- series belongs to continue watching and not here. Deliberately the
+         -- same one-minute-and-one-percent predicate that row is made of, so
+         -- the two rows partition the series between them instead of both
+         -- claiming one or neither offering it. A barely opened next episode
+         -- remains eligible here.
         WHERE NOT EXISTS (SELECT 1 FROM items pe
                             JOIN watch_state pw ON pw.item_id = pe.id AND pw.user_id = ?1
                            WHERE pe.parent_id = c.id
-                             AND pw.position_ms > 0 AND pw.played = 0)
+                             AND {meaningful})
           -- Still current, either way round: you watched one lately, or
           -- the one you would watch next arrived lately — the season
           -- that starts up again after a year off is the case the second
@@ -5510,9 +5532,9 @@ fn up_next_from(member: &str) -> String {
 /// What to watch next, per series
 ///
 /// One episode per series: the one after the last you finished. A series
-/// is here when you have finished an episode of it, are not part-way
-/// through one (that is continue watching's row, and the two never both
-/// claim a series), and it is still current — you watched an episode
+/// is here when you have finished an episode of it, are not meaningfully
+/// part-way through one (that is continue watching's row, and the two never
+/// both claim a series), and it is still current — you watched an episode
 /// within the last month, or the episode you would watch next was added
 /// within it. Most recently watched series first; `library` scopes it and
 /// grants bind it, as on the browse.

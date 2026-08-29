@@ -9,7 +9,7 @@
     },
     "version": "0.0.0-dev"
   },
-  "x-kahawai-source-sha256": "eaaca0d4de24d366e411372a4962057a3eba9bf086df62af2c3d295d0fc68e09",
+  "x-kahawai-source-sha256": "5dabdce3998f27d0075f07255d041a5abbf5877cbf16cd3f0f2fdeb2926df031",
   "paths": {
     "/admin/v1/collections": {
       "get": {
@@ -3808,7 +3808,7 @@
           "Browse"
         ],
         "summary": "Browse and search items",
-        "description": "Returns one page of items with the caller's watch state, filtered by\nlibrary or title search and sorted by title, year or date added. Pass\nin_progress=true to list started-but-unfinished items instead.",
+        "description": "Returns one page of items with the caller's watch state, filtered by\nlibrary or title search and sorted by title, year or date added. Pass\n`in_progress=true` to list meaningfully started, unfinished items instead.",
         "operationId": "list_items",
         "parameters": [
           {
@@ -3840,7 +3840,7 @@
           {
             "name": "in_progress",
             "in": "query",
-            "description": "Started and not finished — what a \"continue watching\" row is made\nof. Ordered by when you last watched it, so `sort` and `q` do not\napply; `library` still scopes it.",
+            "description": "Meaningfully started and not finished — at least one minute and 1%\nof the runtime — which is what a \"continue watching\" row is made\nof. Ordered by when you last watched it, so `sort` and `q` do not\napply; `library` still scopes it.",
             "required": false,
             "schema": {
               "type": "boolean"
@@ -6176,7 +6176,7 @@
           "Browse"
         ],
         "summary": "What to watch next, per series",
-        "description": "One episode per series: the one after the last you finished. A series\nis here when you have finished an episode of it, are not part-way\nthrough one (that is continue watching's row, and the two never both\nclaim a series), and it is still current — you watched an episode\nwithin the last month, or the episode you would watch next was added\nwithin it. Most recently watched series first; `library` scopes it and\ngrants bind it, as on the browse.",
+        "description": "One episode per series: the one after the last you finished. A series\nis here when you have finished an episode of it, are not meaningfully\npart-way through one (that is continue watching's row, and the two never\nboth claim a series), and it is still current — you watched an episode\nwithin the last month, or the episode you would watch next was added\nwithin it. Most recently watched series first; `library` scopes it and\ngrants bind it, as on the browse.",
         "operationId": "up_next",
         "parameters": [
           {

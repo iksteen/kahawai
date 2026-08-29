@@ -90,15 +90,16 @@ fn titles(page: &serde_json::Value) -> Vec<String> {
         .collect()
 }
 
-/// An item, optionally in a library, optionally with watch state.
-/// `watched_at` is an offset in seconds from now — bigger is more recent.
+/// An item, optionally in a library, optionally with watch state as
+/// `(position_ms, duration_ms, played, watched_at)`. `watched_at` is an
+/// offset in seconds from now — bigger is older.
 async fn seed(
     db: &sqlx::SqlitePool,
     id: &str,
     kind: &str,
     title: &str,
     library: Option<&str>,
-    watch: Option<(i64, i64, i64)>,
+    watch: Option<(i64, i64, i64, i64)>,
 ) {
     sqlx::query(
         "INSERT OR IGNORE INTO satellites(module_id,module_type,name,cert_fingerprint)
@@ -140,13 +141,15 @@ async fn seed(
     .execute(db)
     .await
     .unwrap();
-    if let Some((position_ms, played, age_secs)) = watch {
+    if let Some((position_ms, duration_ms, played, age_secs)) = watch {
         sqlx::query(
-            "INSERT INTO watch_state (user_id, item_id, position_ms, played, updated_at)
-             SELECT id, ?, ?, ?, unixepoch() - ? FROM users WHERE username = 'owner'",
+            "INSERT INTO watch_state
+                    (user_id, item_id, position_ms, duration_ms, played, updated_at)
+             SELECT id, ?, ?, ?, ?, unixepoch() - ? FROM users WHERE username = 'owner'",
         )
         .bind(id)
         .bind(position_ms)
+        .bind(duration_ms)
         .bind(played)
         .bind(age_secs)
         .execute(db)
@@ -156,7 +159,7 @@ async fn seed(
 }
 
 #[tokio::test]
-async fn continue_watching_is_started_unfinished_most_recent_first() {
+async fn continue_watching_is_meaningfully_started_unfinished_most_recent_first() {
     let (api, auth, db) = harness().await;
     auth.complete_setup("owner", "hunter22222hunter")
         .await
@@ -167,25 +170,101 @@ async fn continue_watching_is_started_unfinished_most_recent_first() {
         .unwrap()
         .access_token;
 
-    // Started, at three different times. Oldest first in the seed, so a
+    // Meaningfully started at different times. Oldest first in the seed, so a
     // query that forgot to order would return them the wrong way round.
-    seed(&db, "i1", "movie", "Oldest", None, Some((1000, 0, 300))).await;
-    seed(&db, "i2", "episode", "Middle", None, Some((2000, 0, 200))).await;
-    seed(&db, "i3", "movie", "Newest", None, Some((3000, 0, 100))).await;
+    seed(
+        &db,
+        "i1",
+        "movie",
+        "Oldest",
+        None,
+        Some((60_000, 1_200_000, 0, 300)),
+    )
+    .await;
+    seed(
+        &db,
+        "i2",
+        "episode",
+        "Middle",
+        None,
+        Some((70_000, 1_200_000, 0, 200)),
+    )
+    .await;
+    seed(
+        &db,
+        "i3",
+        "movie",
+        "Newest",
+        None,
+        Some((80_000, 1_200_000, 0, 100)),
+    )
+    .await;
     // Excluded, each for its own reason.
-    seed(&db, "i4", "movie", "Finished", None, Some((9000, 1, 50))).await;
+    seed(
+        &db,
+        "i4",
+        "movie",
+        "Finished",
+        None,
+        Some((9000, 1_200_000, 1, 50)),
+    )
+    .await;
     seed(&db, "i5", "movie", "Never started", None, None).await;
-    seed(&db, "i6", "movie", "Position zero", None, Some((0, 0, 10))).await;
-    seed(&db, "i7", "track", "A song", None, Some((5000, 0, 5))).await;
+    seed(
+        &db,
+        "i6",
+        "movie",
+        "Position zero",
+        None,
+        Some((0, 1_200_000, 0, 10)),
+    )
+    .await;
+    seed(
+        &db,
+        "i7",
+        "track",
+        "A song",
+        None,
+        Some((120_000, 180_000, 0, 5)),
+    )
+    .await;
+    seed(
+        &db,
+        "i8",
+        "movie",
+        "Under one minute",
+        None,
+        Some((59_999, 1_200_000, 0, 4)),
+    )
+    .await;
+    seed(
+        &db,
+        "i9",
+        "movie",
+        "Under one percent",
+        None,
+        Some((60_000, 10_800_000, 0, 3)),
+    )
+    .await;
+    seed(
+        &db,
+        "i10",
+        "movie",
+        "At one percent",
+        None,
+        Some((108_000, 10_800_000, 0, 150)),
+    )
+    .await;
 
     let page = browse(&api, &token, "/api/v1/items?in_progress=true").await;
     assert_eq!(
         titles(&page),
-        vec!["Newest", "Middle", "Oldest"],
-        "most recently watched first, and episodes belong here"
+        vec!["Newest", "At one percent", "Middle", "Oldest"],
+        "both progress thresholds are inclusive, accidental starts stay out, \
+         and episodes belong here"
     );
     assert_eq!(
-        page["total"], 3,
+        page["total"], 4,
         "the total counts the same rows it returns"
     );
 
@@ -228,7 +307,7 @@ async fn continue_watching_respects_library_grants() {
         "movie",
         "In granted",
         Some("LA"),
-        Some((10, 0, 20)),
+        Some((60_000, 1_200_000, 0, 20)),
     )
     .await;
     seed(
@@ -237,7 +316,7 @@ async fn continue_watching_respects_library_grants() {
         "movie",
         "In withheld",
         Some("LB"),
-        Some((10, 0, 10)),
+        Some((60_000, 1_200_000, 0, 10)),
     )
     .await;
 
@@ -267,8 +346,9 @@ async fn continue_watching_respects_library_grants() {
         .unwrap();
     for (item, age) in [("a1", 20), ("b1", 10)] {
         sqlx::query(
-            "INSERT INTO watch_state (user_id, item_id, position_ms, played, updated_at)
-             VALUES (?, ?, 10, 0, unixepoch() - ?)",
+            "INSERT INTO watch_state
+                    (user_id, item_id, position_ms, duration_ms, played, updated_at)
+             VALUES (?, ?, 60000, 1200000, 0, unixepoch() - ?)",
         )
         .bind(&uid)
         .bind(item)

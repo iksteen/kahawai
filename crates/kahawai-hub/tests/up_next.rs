@@ -161,6 +161,8 @@ async fn seed_show(db: &sqlx::SqlitePool, id: &str, title: &str, library: Option
 
 /// One episode of `show`, its id dated `added_days_ago`, optionally with
 /// this account's watch state: `(position_ms, played, watched_days_ago)`.
+/// Episodes use a twenty-minute runtime so unfinished rows exercise the
+/// Continue Watching threshold as well as the boolean mark.
 async fn seed_episode(
     db: &sqlx::SqlitePool,
     show: &str,
@@ -188,8 +190,10 @@ async fn seed_episode(
     .unwrap();
     if let Some((position_ms, played, days_ago)) = watch {
         sqlx::query(
-            "INSERT INTO watch_state (user_id, item_id, position_ms, played, updated_at)
-             SELECT id, ?, ?, ?, unixepoch() - ? FROM users WHERE username = 'owner'",
+            "INSERT INTO watch_state
+                    (user_id, item_id, position_ms, duration_ms, played, updated_at)
+             SELECT id, ?, ?, 1200000, ?, unixepoch() - ?
+               FROM users WHERE username = 'owner'",
         )
         .bind(&id)
         .bind(position_ms)
@@ -224,11 +228,11 @@ async fn up_next_is_the_episode_after_the_last_finished_one_of_a_current_series(
     seed_episode(&db, "s_recent", "Recent E02", 1, 2, 200, Some((0, 1, 5))).await;
     seed_episode(&db, "s_recent", "Recent E03", 1, 3, 200, None).await;
 
-    // Part-way through E02. Continue watching's row, not this one — even
-    // though E03 sits there unwatched and everything else about the
-    // series qualifies.
+    // Barely opened E02. It has not reached either meaningful-progress
+    // threshold, so it stays in Up Next rather than displacing itself into
+    // Continue Watching. The offered row retains the small resume position.
     seed_show(&db, "s_paused", "Paused", None).await;
-    seed_episode(&db, "s_paused", "Paused E01", 1, 1, 200, Some((0, 1, 3))).await;
+    seed_episode(&db, "s_paused", "Paused E01", 1, 1, 200, Some((0, 1, 6))).await;
     seed_episode(&db, "s_paused", "Paused E02", 1, 2, 200, Some((500, 0, 2))).await;
     seed_episode(&db, "s_paused", "Paused E03", 1, 3, 200, None).await;
 
@@ -266,10 +270,10 @@ async fn up_next_is_the_episode_after_the_last_finished_one_of_a_current_series(
     let page = get(&api, &token, "/api/v1/up-next").await;
     assert_eq!(
         titles(&page),
-        vec!["Recent E03", "Returned E02"],
+        vec!["Recent E03", "Paused E02", "Returned E02"],
         "one episode per eligible series, the series watched most recently first"
     );
-    assert_eq!(page["total"], 2, "the total counts the rows it returns");
+    assert_eq!(page["total"], 3, "the total counts the rows it returns");
 
     let row = &page["items"][0];
     assert_eq!(row["season"], 1);
@@ -281,6 +285,16 @@ async fn up_next_is_the_episode_after_the_last_finished_one_of_a_current_series(
     assert!(
         row["resume_position_ms"].is_null() && row["played"] == false,
         "an episode you have never opened has no position and is not played"
+    );
+    let paused = page["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["title"] == "Paused E02")
+        .unwrap();
+    assert_eq!(
+        paused["resume_position_ms"], 500,
+        "a barely opened episode can itself be the Up Next entry"
     );
 }
 

@@ -4,8 +4,8 @@
 #   kahawai-list.sh [-a host:port] [-p|-n] <username> <password> [filter]
 #
 #   -a host:port  API address (default: $KAHAWAI_API or localhost:8420)
-#   -p            only what is started and unfinished, most recent first
-#                 (what the web UI's "continue watching" row is made of)
+#   -p            meaningfully started and unfinished, most recent first
+#                 (at least one minute and 1%: the "continue watching" row)
 #   -n            what to watch next: one episode per series you are in,
 #                 the one after the last you finished ("up next")
 #   password "-"  prompt for it instead of passing on the command line
