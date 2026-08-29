@@ -109,6 +109,14 @@ api="localhost:${api##*:}"
 
 logs() { docker logs "$name" 2>&1 | sed 's/\x1b\[[0-9;]*m//g'; }
 
+# `grep -q` stops reading at the first match, and whatever is still writing
+# into it takes a SIGPIPE -- which `pipefail` then reports as the PIPELINE's
+# status. So `logs | grep -q X` fails exactly when X is PRESENT and the log is
+# long enough that sed has not finished: the assertion inverts itself, on a
+# race, and reads as "the hub never logged it". Match a captured string
+# instead. No pipe, no race, and `case` needs no regex quoting.
+logs_have() { case "$(logs)" in *"$1"*) return 0 ;; *) return 1 ;; esac; }
+
 # Discover the random published port before choosing the canonical browser
 # origin, then restart this exact container so the bind-mounted config is read.
 printf 'public_url = "http://localhost:%s"\n' "${api##*:}" >> "$work/kahawai.toml"
@@ -124,11 +132,10 @@ docker restart "$name" >/dev/null || fail "first exact-container restart"
 # anything about its own configuration, so this waits out a START, not a log
 # flush -- seconds on an idle box, and this runs on a shared runner.
 for _ in $(seq 120); do
-    logs 2>/dev/null | grep -q \
-        'browser authentication cookies and tokens cross the network in cleartext' && break
+    logs_have 'browser authentication cookies and tokens cross the network in cleartext' && break
     sleep 0.5
 done
-logs | grep -q 'browser authentication cookies and tokens cross the network in cleartext' \
+logs_have 'browser authentication cookies and tokens cross the network in cleartext' \
     || fail "configured HTTP public_url warning was not logged"
 for _ in $(seq 120); do
     curl -sf "http://$api/health" >/dev/null && break
@@ -162,9 +169,9 @@ setup_modes=$(docker exec "$name" sh -c '
     stat -c "%a %n" "$KAHAWAI_HUB__DATA_DIR/control" \
         "$KAHAWAI_HUB__DATA_DIR/control/bootstrap.sock"
 ') || fail "could not inspect setup control permissions"
-printf '%s\n' "$setup_modes" | grep -q '^700 .*/control$' \
+printf '%s\n' "$setup_modes" | grep '^700 .*/control$' >/dev/null \
     || fail "setup control directory is not mode 0700: $setup_modes"
-printf '%s\n' "$setup_modes" | grep -q '^600 .*/control/bootstrap.sock$' \
+printf '%s\n' "$setup_modes" | grep '^600 .*/control/bootstrap.sock$' >/dev/null \
     || fail "bootstrap socket is not mode 0600: $setup_modes"
 # Exercise the operator path exactly as documented. `init-admin` deliberately
 # reads passwords from a terminal, so give docker exec a real PTY and answer
@@ -221,7 +228,7 @@ sys.stdout.buffer.write(output)
 sys.exit(os.waitstatus_to_exitcode(status))
 PY
 ) || { printf '%s\n' "$setup_output" >&2; logs | tail -20 >&2; fail "init-admin failed"; }
-printf '%s' "$setup_output" | grep -q 'initial administrator created' \
+printf '%s' "$setup_output" | grep 'initial administrator created' >/dev/null \
     || { printf '%s\n' "$setup_output" >&2; fail "init-admin did not report success"; }
 case "$setup_output" in
     *smoke-password-1*) fail "init-admin echoed the password" ;;
@@ -334,7 +341,7 @@ assert db.execute(
 print("live auth database is current, bounded and hashed")
 PYDB
 
-if logs | grep -q 'supervisor already gone'; then
+if logs_have 'supervisor already gone'; then
     fail "the worker guard refused to start inside the container"
 fi
 
