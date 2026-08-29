@@ -10,6 +10,7 @@ pub mod fmp4sink;
 pub mod imagesubs;
 pub mod negotiate;
 pub mod remux;
+pub mod selected_decode;
 pub mod subindex;
 pub mod subtitles;
 #[doc(hidden)]

@@ -7,14 +7,12 @@
 //! ffmpeg) exercises two decoders, and a disagreement that traces back to
 //! decoding is a finding rather than a rounding error.
 //!
-//! Stream SELECTION diverges too, deliberately undramatically: the first
-//! exposed pad of the wanted type wins, where ffmpeg's default picks the
-//! highest-resolution video and most-channels audio. A file whose first
-//! audio track is a stereo commentary is fingerprinted on the commentary
-//! here and on the main 5.1 there — same season, different fingerprints,
-//! parity quietly off for that file. Known and accepted until a real
-//! library shows commentary-first muxes; ranking pads means buffering
-//! every pad until no-more-pads.
+//! Stream selection deliberately takes index zero of the wanted kind before
+//! decoder autoplugging, through `kahawai_media::selected_decode`. ffmpeg's
+//! default instead picks the highest-resolution video and most-channels audio.
+//! A commentary-first file can therefore still fingerprint differently, but
+//! unselected audio and every video stream are never decoded merely to discover
+//! that they lose.
 
 use std::str::FromStr;
 
@@ -89,61 +87,17 @@ impl From<&std::path::Path> for Media {
         Media::Path(path.to_path_buf())
     }
 }
-/// Caps that still describe a container rather than one elementary stream.
-/// `decodebin` must autoplug these far enough to expose the tracks before we
-/// can stop the tracks the current analyzer does not consume.
-fn is_container_caps(caps: &gst::CapsRef) -> bool {
-    caps.structure(0).is_some_and(|s| {
-        matches!(
-            s.name().as_str(),
-            "application/mxf"
-                | "application/ogg"
-                | "audio/x-matroska"
-                | "audio/webm"
-                | "video/quicktime"
-                | "video/webm"
-                | "video/x-flv"
-                | "video/x-matroska"
-                | "video/x-ms-asf"
-                | "video/x-msvideo"
-                | "video/mpegts"
-        ) || (s.name() == "video/mpeg" && s.get::<bool>("systemstream").unwrap_or(false))
-    })
-}
-
-/// Continue autoplugging this stream only when it can still reveal tracks or
-/// when it is a media type this analyzer requested. Returning false exposes an
-/// unwanted compressed elementary stream immediately, so parking it below
-/// does not first instantiate and run its decoder.
-fn should_autoplug(caps: &gst::CapsRef, want: &[&str]) -> bool {
-    if is_container_caps(caps) {
-        return true;
-    }
-    let Some(name) = caps.structure(0).map(|s| s.name()) else {
-        return true;
-    };
-    if name.starts_with("audio/") {
-        return want.iter().any(|w| w.starts_with("audio/"));
-    }
-    if name.starts_with("video/") || name.starts_with("image/") {
-        return want
-            .iter()
-            .any(|w| w.starts_with("video/") || w.starts_with("image/"));
-    }
-    true
-}
-
-/// Build `<source> ! <opener> ! <chain…> ! appsink`, linking only the streams
-/// whose caps start with one of `want` and parking the rest on fakesinks.
+/// Build `<source> ! selected decodebin3 ! <chain…> ! appsink`.
 ///
-/// Unwanted elementary streams stop autoplugging before their decoder. Parking
-/// only the decoded pad made an audio fingerprint decode the video's first
-/// quarter too (and made a luma probe decode audio); on Silence that turned a
-/// local 1080p season into six minutes of work.
+/// Selection happens against the stream collection, before decoder
+/// autoplugging. This is shared with loudness measurement: rejecting video
+/// only after its decoded pad appears already paid for the decoder and its
+/// surfaces.
 fn open(
     media: &Media,
+    kind: kahawai_media::selected_decode::StreamKind,
+    index: usize,
     stop_at: Option<gst::Caps>,
-    want: &'static [&'static str],
     chain: &[&str],
     caps: Option<gst::Caps>,
 ) -> Result<(
@@ -155,25 +109,11 @@ fn open(
 
     let pipeline = gst::Pipeline::new();
     let src = media.source_element()?;
-    // `decodebin` demuxes the container and, given `caps`, stops before the
-    // decoder — which is how the keyframe scan gets encoded buffers while
-    // still being able to seek by time.
-    let mut opener = gst::ElementFactory::make("decodebin");
-    if let Some(stop_at) = stop_at {
-        opener = opener.property("caps", stop_at);
-    }
-    let opener_element = opener.build().context("decodebin")?;
-    let autoplug_want = want;
-    opener_element.connect("autoplug-continue", false, move |args| {
-        let caps = args[2].get::<gst::Caps>().ok()?;
-        Some(should_autoplug(&caps, autoplug_want).to_value())
-    });
+    let decode = kahawai_media::selected_decode::SelectedDecode::new(kind, index, stop_at)?;
 
     // `max-buffers`: with sync=false nothing else throttles the decoder,
-    // and appsink's default queue is UNLIMITED — a consumer doing per-frame
-    // work (the luma scans) fell behind and the queue held raw video, tens
-    // of MB per 4K frame, inside the hub process. Four buffers block the
-    // producer instead: backpressure, no fidelity cost.
+    // and appsink's default queue is unlimited. Four buffers provide
+    // backpressure without changing any sample.
     let sink = match &caps {
         Some(caps) => AppSink::builder()
             .sync(false)
@@ -184,20 +124,16 @@ fn open(
     };
 
     pipeline
-        .add_many([&src, &opener_element, sink.upcast_ref::<gst::Element>()])
+        .add(sink.upcast_ref::<gst::Element>())
         .context("assembling the analysis pipeline")?;
-    src.link(&opener_element).context("source → decoder")?;
 
     let mut elements: Vec<gst::Element> = Vec::new();
     for name in chain {
         let mut builder = gst::ElementFactory::make(name);
         if *name == "videoconvert" {
             // Change the pixel format and nothing else. Left to itself,
-            // videoconvert also converts colorimetry, and on an HDR10 source
-            // (BT.2020, PQ) that would rewrite the very luma the black-frame
-            // threshold is a raw value of. Belt and braces: the caps below ask
-            // for formats a decoder already produces, so this is normally
-            // passthrough anyway.
+            // videoconvert also converts HDR colorimetry, rewriting the luma
+            // value the black-frame threshold is meant to inspect.
             builder = builder
                 .property_from_str("matrix-mode", "none")
                 .property_from_str("gamma-mode", "none")
@@ -220,57 +156,15 @@ fn open(
         .first()
         .cloned()
         .unwrap_or_else(|| sink.clone().upcast());
-    // Raised when the demuxer has shown every pad it has and none was the
-    // wanted type: a file with no such track NEVER prerolls (the appsink
-    // waits for data that cannot come), and without this signal the probe
-    // burned its full preroll timeout to learn it — per probe, eight times
-    // per black-frame search, for something a theme.mp3 in the season
-    // folder makes routine.
-    let no_wanted_track = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    {
-        let (head, flag) = (head.clone(), no_wanted_track.clone());
-        opener_element.connect_no_more_pads(move |_| {
-            let linked = head.static_pad("sink").is_some_and(|pad| pad.is_linked());
-            if !linked {
-                flag.store(true, std::sync::atomic::Ordering::Relaxed);
-            }
-        });
-    }
-    let weak = pipeline.downgrade();
-    opener_element.connect_pad_added(move |_, pad| {
-        let wanted = pad
-            .current_caps()
-            .and_then(|c| {
-                c.structure(0)
-                    .map(|s| want.iter().any(|w| s.name().starts_with(w)))
-            })
-            .unwrap_or(false);
-        let target = head.static_pad("sink").expect("chain head has a sink pad");
-        if wanted && !target.is_linked() {
-            let _ = pad.link(&target);
-            return;
-        }
-        // Everything else has to go somewhere or the pipeline stalls on an
-        // unlinked pad. `sync=false` because a sink that honours the clock
-        // throttles its branch to real time, and the demuxer feeding both
-        // branches then blocks: measured on a 22-minute episode, the audio
-        // stopped arriving after 28 seconds of video had been swallowed at
-        // playback speed. `async=false` so this sink is not part of preroll.
-        if let Some(pipeline) = weak.upgrade()
-            && let Ok(fake) = gst::ElementFactory::make("fakesink")
-                .property("sync", false)
-                .property("async", false)
-                .build()
-        {
-            let _ = pipeline.add(&fake);
-            let _ = fake.sync_state_with_parent();
-            if let Some(pad_sink) = fake.static_pad("sink") {
-                let _ = pad.link(&pad_sink);
-            }
-        }
-    });
+    decode
+        .install(
+            &pipeline,
+            &src,
+            &head.static_pad("sink").expect("chain head has a sink pad"),
+        )
+        .context("installing selected decoder")?;
 
-    Ok((pipeline, sink, no_wanted_track))
+    Ok((pipeline, sink, decode.missing_flag()))
 }
 
 /// Land exactly on the requested time. Right for audio and for reading buffer
@@ -430,7 +324,14 @@ pub fn audio_window(media: &Media, start: f64, end: f64) -> Result<AudioWindow> 
         .field("layout", "interleaved")
         .field("channels", 2i32)
         .build();
-    let (pipeline, sink, missing) = open(media, None, &["audio/"], &["audioconvert"], Some(caps))?;
+    let (pipeline, sink, missing) = open(
+        media,
+        kahawai_media::selected_decode::StreamKind::Audio,
+        0,
+        None,
+        &["audioconvert"],
+        Some(caps),
+    )?;
 
     let mut window = AudioWindow {
         rate: 0,
@@ -477,7 +378,14 @@ const ENCODED_VIDEO: &str = "video/x-h264; video/x-h265; video/mpeg; video/x-vp8
 pub fn keyframes_window(media: &Media, start: f64, end: f64) -> Result<Vec<f64>> {
     kahawai_media::init()?;
     let encoded = gst::Caps::from_str(ENCODED_VIDEO).context("keyframe caps")?;
-    let (pipeline, sink, missing) = open(media, Some(encoded), &["video/", "image/"], &[], None)?;
+    let (pipeline, sink, missing) = open(
+        media,
+        kahawai_media::selected_decode::StreamKind::Video,
+        0,
+        Some(encoded),
+        &[],
+        None,
+    )?;
 
     let mut times = Vec::new();
     let mut raw = false;
@@ -550,7 +458,14 @@ fn luma_shift(format: gstreamer_video::VideoFormat) -> (bool, u32) {
 pub fn luma_window(media: &Media, start: f64, end: f64, threshold: u8) -> Result<Vec<LumaFrame>> {
     kahawai_media::init()?;
     let caps = gst::Caps::from_str(LUMA_FORMATS).context("luma caps")?;
-    let (pipeline, sink, missing) = open(media, None, &["video/"], &["videoconvert"], Some(caps))?;
+    let (pipeline, sink, missing) = open(
+        media,
+        kahawai_media::selected_decode::StreamKind::Video,
+        0,
+        None,
+        &["videoconvert"],
+        Some(caps),
+    )?;
 
     let mut frames = Vec::new();
     drain(
@@ -610,44 +525,4 @@ pub fn luma_window(media: &Media, start: f64, end: f64, threshold: u8) -> Result
     )?;
 
     Ok(frames)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    fn init() {
-        kahawai_media::init().unwrap();
-    }
-
-    #[test]
-    fn an_audio_probe_stops_video_before_its_decoder() {
-        init();
-        let video = gst::Caps::builder("video/x-h265").build();
-        let audio = gst::Caps::builder("audio/x-eac3").build();
-        assert!(!should_autoplug(&video, &["audio/"]));
-        assert!(should_autoplug(&audio, &["audio/"]));
-    }
-
-    #[test]
-    fn a_video_probe_stops_audio_before_its_decoder() {
-        init();
-        let video = gst::Caps::builder("video/x-h264").build();
-        let audio = gst::Caps::builder("audio/x-ac3").build();
-        assert!(should_autoplug(&video, &["video/"]));
-        assert!(!should_autoplug(&audio, &["video/"]));
-    }
-
-    #[test]
-    fn container_caps_keep_autoplugging_until_tracks_exist() {
-        init();
-        for name in ["video/x-matroska", "video/quicktime", "application/ogg"] {
-            let caps = gst::Caps::builder(name).build();
-            assert!(should_autoplug(&caps, &["audio/"]), "{name}");
-            assert!(should_autoplug(&caps, &["video/"]), "{name}");
-        }
-        let mpeg = gst::Caps::builder("video/mpeg")
-            .field("systemstream", true)
-            .build();
-        assert!(should_autoplug(&mpeg, &["audio/"]));
-    }
 }
