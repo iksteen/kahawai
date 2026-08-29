@@ -101,7 +101,7 @@ pub struct WorkerArgs {
     pub native_gain_db: Option<f64>,
     #[arg(long)]
     pub loudness_source_channels: Option<u32>,
-    /// JSON `AudioLayoutGain[]`; absent for minor-4 supervisors.
+    /// JSON `AudioLayoutGain[]`; part of the protocol-4 baseline.
     #[arg(long)]
     pub loudness_gains: Option<String>,
     /// HUB-15a: tone-map HDR to SDR in the video encode chain.

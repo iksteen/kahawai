@@ -286,8 +286,8 @@ fn loudness_protocol_feature(
 fn wire_scalar_loudness(
     plan: &kahawai_media::remux::RemuxPlan,
 ) -> (Option<f64>, Option<f64>, Option<u32>) {
-    // Presence is authoritative to current workers. Explicit legacy sentinels
-    // keep minor-4/5 generated decoders from turning omission into 0 dB.
+    // Presence is authoritative in the protocol-4 baseline. Sentinels retain
+    // the worker argv's distinction between absent and an exact 0 dB value.
     (
         Some(plan.stereo_gain_db.unwrap_or(f64::NAN)),
         Some(plan.native_gain_db.unwrap_or(f64::NAN)),
@@ -4517,7 +4517,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn forced_video_encode_reprobes_for_a_layout_capable_worker() {
+    async fn forced_video_encode_uses_protocol_four_baseline_layout_gains() {
         use kahawai_core::media::{AudioStream, MediaInfo, VideoStream};
         use kahawai_proto::v1::{CapabilityReport, EncoderCap};
 
@@ -4556,8 +4556,8 @@ mod tests {
             );
             tx
         };
-        let _minor4 = connect("minor4", 4, true);
-        let minor5 = connect("minor5", 5, false);
+        let baseline_fast = connect("baseline-fast", 0, true);
+        let _baseline_slow = connect("baseline-slow", 0, false);
 
         let sessions = Sessions::new(dir.path().join("sessions"));
         let negotiation = Negotiation::new(
@@ -4618,11 +4618,11 @@ mod tests {
         };
 
         assert!(
-            !negotiation
+            negotiation
                 .probe(&info, false, None)
                 .full_protocol
                 .supports(kahawai_proto::ProtocolFeature::ExactAudioLoudnessGains),
-            "the ordinary probe must exercise the preferred minor-4 worker"
+            "protocol 4.0 did not expose inherited exact layout gains"
         );
         assert!(
             negotiation
@@ -4633,7 +4633,7 @@ mod tests {
                 )
                 .full_protocol
                 .supports(kahawai_proto::ProtocolFeature::ExactAudioLoudnessGains),
-            "the exact probe did not hard-filter protocol minor 4"
+            "the exact probe lost a protocol-4 baseline feature"
         );
         let normal = negotiation.plan_with_probe(&parts, &info, false, None);
         assert_eq!(normal.plan.video, kahawai_media::remux::StreamMode::Encode);
@@ -4643,7 +4643,7 @@ mod tests {
         assert_eq!(
             forced.plan.audio,
             kahawai_media::remux::StreamMode::Encode,
-            "force normalization was suppressed by the ordinary minor-4 probe"
+            "force normalization was suppressed at the protocol-4 baseline"
         );
 
         let mut direct_info = info.clone();
@@ -4660,13 +4660,13 @@ mod tests {
             "force capability did not break an ordinary-cost tie"
         );
 
-        assert!(registry.unregister_tc_link_if_current("minor5", &minor5));
+        assert!(registry.unregister_tc_link_if_current("baseline-fast", &baseline_fast));
         let fallback = negotiation.plan_with_probe(&parts, &info, false, Some(&measurement));
         assert_eq!(
-            fallback.plan.audio, normal.plan.audio,
-            "an unavailable exact-layout worker replaced the playable ordinary plan"
+            fallback.plan.audio,
+            kahawai_media::remux::StreamMode::Encode,
+            "another protocol-4 baseline worker lost exact layout gains"
         );
-        assert_eq!(fallback.cost, normal.cost);
 
         let mut stereo_info = info.clone();
         stereo_info.audio[0].channels = 2;
@@ -4681,11 +4681,13 @@ mod tests {
             }],
         };
         let stereo_normal = negotiation.plan_with_probe(&parts, &stereo_info, false, None);
-        let legacy = negotiation.plan_with_probe(&parts, &stereo_info, false, Some(&stereo));
+        let baseline = negotiation.plan_with_probe(&parts, &stereo_info, false, Some(&stereo));
         assert_eq!(
-            legacy.plan.audio, stereo_normal.plan.audio,
-            "a scalar-only worker admitted a force encode without exact gains"
+            baseline.plan.audio,
+            kahawai_media::remux::StreamMode::Encode,
+            "protocol 4.0 did not expose exact stereo gain support"
         );
+        assert_ne!(baseline.plan.audio, stereo_normal.plan.audio);
     }
 
     fn part(base_ms: u64, duration_ms: u64) -> PartSource {

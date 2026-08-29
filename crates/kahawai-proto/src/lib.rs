@@ -6,15 +6,16 @@ pub mod v1 {
     tonic::include_proto!("kahawai.v1");
 }
 
-/// Inter-module protocol version (AR-7). Protocol 3 deliberately rejects all
-/// protocol 2 satellites: exact-root identity has one authoritative wire shape.
-pub const PROTOCOL_MAJOR: u32 = 3;
-pub const PROTOCOL_MINOR: u32 = 6;
+/// Inter-module protocol version (AR-7). Protocol 4 makes the mediahost's
+/// durable local catalogue authoritative and deliberately rejects protocol 3
+/// peers, whose hub-owned manifest/worklist contract has the reverse meaning.
+pub const PROTOCOL_MAJOR: u32 = 4;
+pub const PROTOCOL_MINOR: u32 = 0;
 pub const SEGMENT_COMPARISON_INSUFFICIENT: &str = "fewer than two readable episodes remain";
 
-/// Additive protocol features whose minimum minor is part of the wire contract.
-/// Keep version knowledge here rather than scattering numeric comparisons
-/// through planners, registries, and satellites.
+/// Protocol features that may acquire minor-version gates after the 4.0
+/// baseline. Every feature inherited at the breaking cutover starts at zero;
+/// protocol-3 peers are rejected by the major handshake instead of degraded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProtocolFeature {
     SegmentDetection,
@@ -26,12 +27,7 @@ pub enum ProtocolFeature {
 
 impl ProtocolFeature {
     pub const fn minimum_minor(self) -> u32 {
-        match self {
-            Self::SegmentDetection => 1,
-            Self::AudioLoudnessScalars => 4,
-            Self::ExactAudioLoudnessGains | Self::AudioLoudnessAnalysis => 5,
-            Self::RetryableSegmentResults => 6,
-        }
+        0
     }
 }
 
@@ -79,12 +75,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn feature_thresholds_have_one_authority() {
-        let minor4 = ProtocolFeatures::new(4);
-        assert!(minor4.supports(ProtocolFeature::AudioLoudnessScalars));
-        assert!(!minor4.supports(ProtocolFeature::ExactAudioLoudnessGains));
-        assert!(ProtocolFeatures::new(5).supports(ProtocolFeature::ExactAudioLoudnessGains));
-        assert!(ProtocolFeatures::current().supports(ProtocolFeature::RetryableSegmentResults));
+    fn protocol_four_starts_at_zero_with_every_inherited_gate_open() {
+        assert_eq!(PROTOCOL_MINOR, 0);
+        for feature in [
+            ProtocolFeature::SegmentDetection,
+            ProtocolFeature::AudioLoudnessScalars,
+            ProtocolFeature::ExactAudioLoudnessGains,
+            ProtocolFeature::AudioLoudnessAnalysis,
+            ProtocolFeature::RetryableSegmentResults,
+        ] {
+            assert_eq!(feature.minimum_minor(), 0);
+            assert!(ProtocolFeatures::new(0).supports(feature));
+        }
     }
 
     #[test]

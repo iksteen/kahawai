@@ -71,37 +71,38 @@ fn connect_minor(reg: &Registry, id: &str, protocol_minor: u32, c: CapabilityRep
 }
 
 #[tokio::test]
-async fn exact_layout_gains_hard_filter_the_actual_placement() {
+async fn protocol_four_baseline_does_not_filter_exact_layout_gains() {
     let (_d, reg) = registry_with_local_video_executor(false).await;
     let class = "1080|hevc|h264";
-    connect_minor(&reg, "minor4", 4, caps(true, 9.0, 0.0));
-    connect_minor(&reg, "minor5", 5, caps(false, 2.0, 0.0));
-    reg.set_pace("minor4", class, 5.0);
-    reg.set_pace("minor5", class, 2.0);
+    connect_minor(&reg, "baseline-fast", 0, caps(true, 9.0, 0.0));
+    connect_minor(&reg, "future-slow", 9, caps(false, 2.0, 0.0));
+    reg.set_pace("baseline-fast", class, 5.0);
+    reg.set_pace("future-slow", class, 2.0);
 
     let mut exact = need(class);
     exact.required_protocol_feature = Some(kahawai_proto::ProtocolFeature::ExactAudioLoudnessGains);
-    assert_eq!(reg.place(&exact).target.as_deref(), Some("minor5"));
+    assert_eq!(reg.place(&exact).target.as_deref(), Some("baseline-fast"));
 
     let ordinary = need(class);
-    assert_eq!(reg.place(&ordinary).target.as_deref(), Some("minor4"));
+    assert_eq!(
+        reg.place(&ordinary).target.as_deref(),
+        Some("baseline-fast")
+    );
 }
 
 #[tokio::test]
 async fn dispatch_pairs_the_required_protocol_with_the_same_live_sender() {
     let (_d, reg) = registry_with_local_video_executor(false).await;
     let (old_tx, mut old_rx) = tokio::sync::mpsc::channel(2);
-    reg.register_tc_link("box", 4, old_tx);
+    reg.register_tc_link("box", 0, old_tx);
     let required = Some(kahawai_proto::ProtocolFeature::ExactAudioLoudnessGains);
-    assert!(
-        reg.send_to_tc_requiring("box", kahawai_proto::v1::HubToTc::default(), required)
-            .await
-            .is_err()
-    );
-    assert!(old_rx.try_recv().is_err());
+    reg.send_to_tc_requiring("box", kahawai_proto::v1::HubToTc::default(), required)
+        .await
+        .unwrap();
+    assert!(old_rx.recv().await.unwrap().is_ok());
 
     let (new_tx, mut new_rx) = tokio::sync::mpsc::channel(2);
-    reg.register_tc_link("box", 5, new_tx);
+    reg.register_tc_link("box", 0, new_tx);
     reg.send_to_tc_requiring("box", kahawai_proto::v1::HubToTc::default(), required)
         .await
         .unwrap();
@@ -110,23 +111,18 @@ async fn dispatch_pairs_the_required_protocol_with_the_same_live_sender() {
 }
 
 #[tokio::test]
-async fn exact_loudness_gains_exclude_scalar_only_workers() {
+async fn exact_loudness_gains_are_available_at_protocol_four_minor_zero() {
     let (_d, reg) = registry_with_local_video_executor(false).await;
     let class = "1080|hevc|h264";
-    connect_minor(&reg, "minor2", 2, caps(true, 9.0, 0.0));
-    connect_minor(&reg, "minor4", 4, caps(false, 2.0, 0.0));
-    reg.set_pace("minor2", class, 9.0);
-    reg.set_pace("minor4", class, 2.0);
+    connect_minor(&reg, "baseline", 0, caps(true, 9.0, 0.0));
+    reg.set_pace("baseline", class, 9.0);
 
     let mut gain = need(class);
     gain.required_protocol_feature = Some(kahawai_proto::ProtocolFeature::ExactAudioLoudnessGains);
-    assert!(
-        !reg.place(&gain).available,
-        "a scalar-only worker accepted an exact layout gain plan"
-    );
+    assert_eq!(reg.place(&gain).target.as_deref(), Some("baseline"));
 
     let ordinary = need(class);
-    assert_eq!(reg.place(&ordinary).target.as_deref(), Some("minor2"));
+    assert_eq!(reg.place(&ordinary).target.as_deref(), Some("baseline"));
 }
 
 #[tokio::test]

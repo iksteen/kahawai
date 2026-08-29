@@ -759,8 +759,8 @@ pub struct RemuxPlan {
     pub native_gain_db: Option<f64>,
     pub loudness_source_channels: Option<u32>,
     /// Static gains keyed by the exact post-conversion channel layout.
-    /// Current workers prefer this map; scalar fields above are minor-4
-    /// compatibility for stereo and untouched-native output.
+    /// Protocol-4 workers use this map; scalar fields cannot express a
+    /// downmix's exact layout-specific gain.
     pub loudness_gains: crate::loudness::AudioLayoutGains,
     /// HUB-15b: what the encode arms produce and which segment
     /// container carries the session. Defaults = the historical

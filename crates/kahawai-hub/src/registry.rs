@@ -334,10 +334,6 @@ impl HostLink {
     pub(crate) fn segment_detector_generation(&self) -> i64 {
         self.segment_detector_generation
     }
-    pub(crate) fn protocol_minor(&self) -> u32 {
-        self.protocol_minor
-    }
-
     pub(crate) fn supports_segment_detection(&self) -> bool {
         kahawai_proto::ProtocolFeatures::new(self.protocol_minor)
             .supports(kahawai_proto::ProtocolFeature::SegmentDetection)

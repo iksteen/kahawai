@@ -1857,26 +1857,19 @@ mod forget_link_tests {
     }
 
     #[tokio::test]
-    async fn segment_jobs_require_the_protocol_feature_and_detector_generation() {
+    async fn protocol_four_baseline_opens_discovery_but_detector_generation_still_matches() {
         let dir = tempfile::tempdir().unwrap();
         let db = crate::db::open(dir.path()).await.unwrap();
         let registry = Registry::new(db, Default::default());
-        let (old_tx, _old_rx) = tokio::sync::mpsc::channel(1);
+        let (baseline_tx, _baseline_rx) = tokio::sync::mpsc::channel(1);
         registry.register_link(
             "host",
-            old_tx,
+            baseline_tx,
             0,
             kahawai_core::segments::DETECTOR_GENERATION,
         );
-        assert!(!registry.host_supports_segment_detection("host"));
-        let (minor4_tx, _minor4_rx) = tokio::sync::mpsc::channel(1);
-        registry.register_link(
-            "host",
-            minor4_tx,
-            4,
-            kahawai_core::segments::DETECTOR_GENERATION,
-        );
-        assert!(!registry.host_supports_loudness_analysis("host"));
+        assert!(registry.host_supports_segment_detection("host"));
+        assert!(registry.host_supports_loudness_analysis("host"));
 
         let (mismatch_tx, _mismatch_rx) = tokio::sync::mpsc::channel(1);
         registry.register_link(
@@ -1886,6 +1879,7 @@ mod forget_link_tests {
             kahawai_core::segments::DETECTOR_GENERATION - 1,
         );
         assert!(!registry.host_supports_segment_detection("host"));
+        assert!(registry.host_supports_loudness_analysis("host"));
 
         let (new_tx, _new_rx) = tokio::sync::mpsc::channel(1);
         registry.register_link(

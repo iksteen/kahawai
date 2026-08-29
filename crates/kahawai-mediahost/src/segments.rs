@@ -38,7 +38,6 @@ pub async fn run(
     collections: Vec<CollectionConfig>,
     activity: Activity,
     segment_serial: Arc<tokio::sync::Mutex<()>>,
-    hub_protocol_minor: u32,
 ) {
     while let Some(job) = rx.recv().await {
         if job.detector != kahawai_core::segments::DETECTOR_GENERATION {
@@ -121,13 +120,7 @@ pub async fn run(
             let _serial_guard = serial_guard;
             let _background_guard = background_guard;
             let _priority_guard = priority_guard;
-            analyze(
-                job,
-                &collections2,
-                &activity2,
-                &cancelled,
-                hub_protocol_minor,
-            )
+            analyze(job, &collections2, &activity2, &cancelled)
         })
         .await;
 
@@ -182,7 +175,6 @@ fn analyze(
     collections: &[CollectionConfig],
     activity: &Activity,
     cancelled: &AtomicBool,
-    hub_protocol_minor: u32,
 ) -> Result<SegmentDetectionResult> {
     anyhow::ensure!(
         job.episodes.len() >= 2,
@@ -238,20 +230,6 @@ fn analyze(
         });
     }
     if prepared.len() < 2 {
-        if !kahawai_proto::ProtocolFeatures::new(hub_protocol_minor)
-            .supports(kahawai_proto::ProtocolFeature::RetryableSegmentResults)
-        {
-            // Pre-minor-6 hubs ignore the structured retryable flag. A
-            // job-level transient failure makes them persist nothing, which
-            // preserves the old pending behavior under inverted version skew.
-            return Ok(SegmentDetectionResult {
-                request_id: job.request_id,
-                detector: job.detector,
-                elapsed_ms: 0,
-                episodes: Vec::new(),
-                error: kahawai_proto::SEGMENT_COMPARISON_INSUFFICIENT.into(),
-            });
-        }
         preflight_failures.extend(prepared.into_iter().map(|prepared| {
             let mut result = preflight_failure(
                 &prepared.request,
@@ -552,7 +530,6 @@ mod tests {
             std::slice::from_ref(&collection),
             &Activity::default(),
             &AtomicBool::new(false),
-            kahawai_proto::PROTOCOL_MINOR,
         )
         .unwrap();
 
@@ -568,20 +545,6 @@ mod tests {
             .find(|episode| episode.item_id == "changed")
             .unwrap();
         assert!(changed.unreadable && !changed.retryable);
-
-        let legacy = analyze(
-            job(),
-            std::slice::from_ref(&collection),
-            &Activity::default(),
-            &AtomicBool::new(false),
-            kahawai_proto::ProtocolFeature::RetryableSegmentResults.minimum_minor() - 1,
-        )
-        .unwrap();
-        assert_eq!(legacy.error, kahawai_proto::SEGMENT_COMPARISON_INSUFFICIENT);
-        assert!(
-            legacy.episodes.is_empty(),
-            "an old hub could persist a per-source terminal answer"
-        );
     }
 
     #[tokio::test]
@@ -618,7 +581,6 @@ mod tests {
             vec![collection],
             Activity::default(),
             Arc::new(tokio::sync::Mutex::new(())),
-            kahawai_proto::PROTOCOL_MINOR,
         ));
         job_tx.send(job).unwrap();
 
@@ -657,7 +619,6 @@ mod tests {
             Vec::new(),
             Activity::default(),
             Arc::new(tokio::sync::Mutex::new(())),
-            kahawai_proto::PROTOCOL_MINOR,
         ));
         job_tx
             .send(DetectSegments {
@@ -743,7 +704,6 @@ mod tests {
             vec![collection],
             Activity::default(),
             Arc::new(tokio::sync::Mutex::new(())),
-            kahawai_proto::PROTOCOL_MINOR,
         ));
         job_tx.send(job).unwrap();
         assert!(matches!(

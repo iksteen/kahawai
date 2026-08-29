@@ -962,7 +962,6 @@ impl Detector {
             });
         }
         let generation = link.generation();
-        let host_protocol_minor = link.protocol_minor();
         let request_id = ulid::Ulid::generate().to_string();
         let mut reply_rx =
             self.wait_for_segment_result(&module_id, generation, link.current_token(), &request_id);
@@ -1071,11 +1070,10 @@ impl Detector {
                 if !registry.is_connected(&module_id) {
                     gone_mid_read.push(episode.item_id.clone());
                     None
-                } else if retryable_segment_result(host_protocol_minor, &episode) {
+                } else if episode.retryable {
                     // The source was readable, but too few siblings survived
-                    // preflight for a comparison. Minors before 6 expressed
-                    // this with the stable error text alone; neither form is a
-                    // terminal statement about this exact source revision.
+                    // preflight for a comparison. Protocol 4 carries that fact
+                    // explicitly; the error string has no wire semantics.
                     None
                 } else {
                     Some(episode.error.clone())
@@ -1400,16 +1398,6 @@ fn result_matches_request(
         "readable segment result changed source revision"
     );
     Ok(matches)
-}
-
-fn retryable_segment_result(
-    host_protocol_minor: u32,
-    result: &kahawai_proto::v1::SegmentEpisodeResult,
-) -> bool {
-    result.retryable
-        || (!kahawai_proto::ProtocolFeatures::new(host_protocol_minor)
-            .supports(kahawai_proto::ProtocolFeature::RetryableSegmentResults)
-            && result.error == kahawai_proto::SEGMENT_COMPARISON_INSUFFICIENT)
 }
 
 fn validate_result_set(
@@ -2621,22 +2609,18 @@ mod tests {
     }
 
     #[test]
-    fn legacy_comparison_insufficiency_remains_retryable() {
-        let legacy = kahawai_proto::v1::SegmentEpisodeResult {
+    fn comparison_insufficiency_requires_the_protocol_four_retryable_field() {
+        let incomplete = kahawai_proto::v1::SegmentEpisodeResult {
             unreadable: true,
             error: kahawai_proto::SEGMENT_COMPARISON_INSUFFICIENT.into(),
             ..Default::default()
         };
-        assert!(retryable_segment_result(5, &legacy));
-        assert!(
-            !retryable_segment_result(6, &legacy),
-            "a current host omitted the structured retryable state"
-        );
+        assert!(!incomplete.retryable);
         let current = kahawai_proto::v1::SegmentEpisodeResult {
             retryable: true,
-            ..legacy
+            ..incomplete
         };
-        assert!(retryable_segment_result(6, &current));
+        assert!(current.retryable);
     }
 
     #[test]
