@@ -286,12 +286,27 @@ async fn progress_resume_played_caps_and_idle() {
     // until the element has its metadata. Clearing the mark on those wiped
     // the seen ticks a row ahead of the playhead through an album already
     // heard.
+    sqlx::query("UPDATE watch_state SET updated_at = 123 WHERE item_id = ?")
+        .bind(&item_id)
+        .execute(&db)
+        .await
+        .unwrap();
     let resp = progress(0).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let v = body_json(resp).await;
     assert_eq!(
         v["played"], true,
         "a ping from a standing start does not unwatch anything"
+    );
+    let watched_at: i64 =
+        sqlx::query_scalar("SELECT updated_at FROM watch_state WHERE item_id = ?")
+            .bind(&item_id)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    assert_eq!(
+        watched_at, 123,
+        "a zero ping must not make an old finish look newly watched"
     );
 
     // Scrubbing back over the line and forward again. `played` is a
@@ -383,9 +398,8 @@ async fn progress_resume_played_caps_and_idle() {
 
     // Stopping is what counts the play, and being reaped IS stopping —
     // it is what a closed laptop looks like from here. ONE play, though
-    // the 90 percent line was crossed twice. Waited for rather than read
-    // straight after, because `Sessions::end` writes it from its own task:
-    // teardown is called from places that cannot await.
+    // the 90 percent line was crossed twice. The janitor owns this teardown,
+    // so observe its durable write rather than only the session disappearing.
     let count = || {
         let api = api.clone();
         let item_id = item_id.clone();
@@ -471,18 +485,11 @@ async fn progress_resume_played_caps_and_idle() {
             .status(),
         StatusCode::NO_CONTENT
     );
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let n = count().await;
-            if n == 2 {
-                return;
-            }
-            assert_eq!(n, 1, "a watch counts once, at its end");
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("the viewer's finished watch was never counted");
+    assert_eq!(
+        count().await,
+        2,
+        "the DELETE response waits until the finished watch is durable"
+    );
 
     // A session that OPENS past the line is a continuation, not a watch.
     // It is what the client starts after losing one — `recovery.ts` picks

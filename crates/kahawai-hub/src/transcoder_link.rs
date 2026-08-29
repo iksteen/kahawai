@@ -272,7 +272,7 @@ impl TranscoderLink for TranscoderLinkService {
                                             // Taken: the viewer is still
                                             // there and their client will
                                             // start again where it was.
-                                            sessions.end(&e.session_id);
+                                            sessions.end(&e.session_id).await;
                                         }
                                     }
                                 });

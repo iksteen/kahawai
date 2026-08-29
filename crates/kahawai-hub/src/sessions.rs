@@ -434,16 +434,20 @@ pub struct Session {
     /// abort a restart midway (the executor task is detached).
     seek_done: tokio::sync::watch::Sender<(u64, Result<u64, String>)>,
     touched: Mutex<std::time::Instant>,
+    /// Progress holds a read guard through its watch-state write; teardown
+    /// takes the write guard before deciding whether this session earned a
+    /// play. The gapless player deliberately sends final progress beside
+    /// teardown, so request scheduling must not decide whether the play exists.
+    ending: tokio::sync::RwLock<bool>,
     /// Is the playhead past the end threshold? Seeded from where this
     /// watch BEGAN, then moved by every progress report.
     ///
     /// Per SESSION and not read back from `watch_state.played`, so
     /// nothing else that writes that column — a mark by hand, another
     /// device — can put a play in this session's name.
-    finished: std::sync::atomic::AtomicBool,
     /// Did this watch take the item past the line ITSELF?
     ///
-    /// With [`Session::finished`] it decides `play_count` at teardown, and
+    /// With the current finished bit it decides `play_count` at teardown, and
     /// the pair is what keeps one sitting from counting twice. A session
     /// that is taken away — a reaped pause, a dead transcoder, a lost
     /// mediahost — is followed by one the client starts AT THE SAME
@@ -453,8 +457,16 @@ pub struct Session {
     /// Asking instead who ended the session cannot work: the answer would
     /// have to be "not the reaper", and a viewer who finishes something
     /// and closes a laptop that never sends its `DELETE` is reaped too.
-    saw_finish: std::sync::atomic::AtomicBool,
+    ///
+    /// The two facts are one atomic state rather than two booleans. Teardown
+    /// may race a final progress request; publishing `finished` and
+    /// `saw_finish` separately let it observe the first without the second and
+    /// silently lose the play.
+    watch_finish: std::sync::atomic::AtomicU8,
 }
+
+const WATCH_FINISHED: u8 = 1;
+const WATCH_SAW_FINISH: u8 = 2;
 
 /// A coalesced seek intent.
 #[derive(Debug, Clone, Copy)]
@@ -1171,23 +1183,37 @@ impl Session {
         *self.touched.lock().unwrap() = std::time::Instant::now();
     }
 
+    /// Enter a progress write, or refuse after teardown has won the race.
+    pub async fn begin_report(&self) -> Option<tokio::sync::RwLockReadGuard<'_, bool>> {
+        let guard = self.ending.read().await;
+        if *guard { None } else { Some(guard) }
+    }
+
     /// Record what a progress report said, for the count that lands when
-    /// this watch stops. See [`Session::finished`].
+    /// this watch stops. See [`Session::watch_finish`].
     pub fn report(&self, finished: bool) {
-        let was = self
-            .finished
-            .swap(finished, std::sync::atomic::Ordering::Relaxed);
-        if finished && !was {
-            self.saw_finish
-                .store(true, std::sync::atomic::Ordering::Relaxed);
-        }
+        self.watch_finish
+            .fetch_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+                |old| {
+                    if finished {
+                        let crossed = old & WATCH_FINISHED == 0;
+                        Some(old | WATCH_FINISHED | if crossed { WATCH_SAW_FINISH } else { 0 })
+                    } else {
+                        Some(old & !WATCH_FINISHED)
+                    }
+                },
+            )
+            .expect("the finish-state update never refuses");
     }
 
     /// Is this watch a play? It ended past the line, and it is the one
     /// that got the item there. Read once, at teardown.
     pub fn earned_a_play(&self) -> bool {
-        self.finished.load(std::sync::atomic::Ordering::Relaxed)
-            && self.saw_finish.load(std::sync::atomic::Ordering::Relaxed)
+        self.watch_finish.load(std::sync::atomic::Ordering::Acquire)
+            & (WATCH_FINISHED | WATCH_SAW_FINISH)
+            == (WATCH_FINISHED | WATCH_SAW_FINISH)
     }
 
     pub fn idle_for(&self) -> Duration {
@@ -1455,7 +1481,8 @@ pub struct Sessions {
     artifact_waiting: Mutex<
         HashMap<(String, String), tokio::sync::mpsc::Sender<kahawai_proto::v1::ArtifactData>>,
     >,
-    /// Registry handle for teardown messages from the sync `end()` path
+    /// Registry handle for teardown messages and watch-state writes from
+    /// `end()`.
     /// (set once at startup; None only in tests without dispatch).
     registry_for_teardown: Mutex<Option<Arc<Registry>>>,
 }
@@ -1761,7 +1788,7 @@ impl Sessions {
                     .collect();
                 for id in idle {
                     tracing::info!(session = %id, "ending idle session");
-                    sessions.end(&id);
+                    sessions.end(&id).await;
                 }
             }
         });
@@ -2574,8 +2601,12 @@ impl Sessions {
             needs: Mutex::new(session_needs),
             pace_class: session_class,
             touched: Mutex::new(std::time::Instant::now()),
-            finished: std::sync::atomic::AtomicBool::new(started_finished),
-            saw_finish: std::sync::atomic::AtomicBool::new(false),
+            ending: tokio::sync::RwLock::new(false),
+            watch_finish: std::sync::atomic::AtomicU8::new(if started_finished {
+                WATCH_FINISHED
+            } else {
+                0
+            }),
         });
         self.active
             .lock()
@@ -3813,7 +3844,7 @@ impl Sessions {
                 }
                 Err(e) => {
                     tracing::warn!(session = %id, error = format!("{e:#}"), "reschedule failed; ending");
-                    self.end(&id);
+                    self.end(&id).await;
                     ended += 1;
                 }
             }
@@ -3925,7 +3956,7 @@ impl Sessions {
     /// End every session belonging to one user — what deleting an
     /// account has to do before the account is gone, or the sessions
     /// outlive it with no owner to stop them.
-    pub fn end_for_user(&self, user_id: &str) -> usize {
+    pub async fn end_for_user(&self, user_id: &str) -> usize {
         let ids: Vec<String> = self
             .active
             .lock()
@@ -3936,7 +3967,7 @@ impl Sessions {
             .collect();
         let n = ids.len();
         for id in ids {
-            self.end(&id);
+            self.end(&id).await;
         }
         n
     }
@@ -3954,7 +3985,7 @@ impl Sessions {
     /// moved past a part still counts as reading from its host, because the
     /// viewer can seek back into it. Ending the session is the honest answer
     /// there — the alternative is a seek that fails later with no warning.
-    pub fn end_for_module(&self, module_id: &str) -> usize {
+    pub async fn end_for_module(&self, module_id: &str) -> usize {
         let ids: Vec<String> = self
             .active
             .lock()
@@ -3965,7 +3996,7 @@ impl Sessions {
             .collect();
         let n = ids.len();
         for id in ids {
-            self.end(&id);
+            self.end(&id).await;
         }
         n
     }
@@ -3985,13 +4016,20 @@ impl Sessions {
 
     /// Remove a session: direct leases drop (closing the byte channel);
     /// remux pipelines stop and their scratch dir is deleted.
-    pub fn end(&self, id: &str) -> bool {
+    pub async fn end(&self, id: &str) -> bool {
         // OPS-10: while the session still exists. Everything below this
         // line has already forgotten it.
         let header = self.log_header(id);
         let Some(session) = self.active.lock().unwrap().remove(id) else {
             return false;
         };
+        // A progress handler that already found this session finishes its DB
+        // write before teardown reads the result. One that arrives after the
+        // removal either fails its lookup or sees `ending` and writes nothing.
+        let mut ending = session.ending.write().await;
+        *ending = true;
+        let earned_a_play = session.earned_a_play();
+        drop(ending);
         {
             let mut kept = self.known_sessions.lock().unwrap();
             // Bounded like the bundles themselves: a header is only
@@ -4000,9 +4038,6 @@ impl Sessions {
                 kept.clear();
             }
             kept.insert(id.to_string(), header);
-        }
-        if let Some(registry) = self.registry_for_teardown.lock().unwrap().clone() {
-            registry.emit(crate::registry::RegistryEvent::Sessions { kind: "sessions" });
         }
         match &session.mode {
             Mode::Remux { dir, runner } => {
@@ -4050,30 +4085,26 @@ impl Sessions {
         // half way. Whichever session took the item past the line is the
         // one that counts, so a sitting split across two of them by a
         // reaped pause or a dead transcoder is still one play.
-        if session.earned_a_play() {
-            match self.registry_for_teardown.lock().unwrap().clone() {
+        if earned_a_play {
+            let registry = { self.registry_for_teardown.lock().unwrap().clone() };
+            match registry {
                 Some(registry) => {
-                    let db = registry.db().clone();
-                    let (user_id, item_id) = (session.user_id.clone(), session.item_id.clone());
-                    let session_id = id.to_string();
-                    tokio::spawn(async move {
-                        if let Err(e) = sqlx::query(
-                            "UPDATE watch_state SET play_count = play_count + 1
-                              WHERE user_id = ? AND item_id = ?",
-                        )
-                        .bind(&user_id)
-                        .bind(&item_id)
-                        .execute(&db)
-                        .await
-                        {
-                            tracing::warn!(
-                                session = %session_id,
-                                item = %item_id,
-                                error = %e,
-                                "finished watch not counted"
-                            );
-                        }
-                    });
+                    if let Err(e) = sqlx::query(
+                        "UPDATE watch_state SET play_count = play_count + 1
+                          WHERE user_id = ? AND item_id = ?",
+                    )
+                    .bind(&session.user_id)
+                    .bind(&session.item_id)
+                    .execute(registry.db())
+                    .await
+                    {
+                        tracing::warn!(
+                            session = id,
+                            item = %session.item_id,
+                            error = %e,
+                            "finished watch not counted"
+                        );
+                    }
                 }
                 // Only reachable in an embedding that never called
                 // `attach_registry` — `api::router` does. Said out loud
@@ -4086,6 +4117,13 @@ impl Sessions {
                     "no registry attached; finished watch not counted"
                 ),
             }
+        }
+        // The event is emitted only after the watch-state write settles. A
+        // client reacting to `sessions` must not refetch the item in the gap
+        // and observe the old play count. Callers that are about to archive or
+        // delete watch state likewise await this method before proceeding.
+        if let Some(registry) = self.registry_for_teardown.lock().unwrap().clone() {
+            registry.emit(crate::registry::RegistryEvent::Sessions { kind: "sessions" });
         }
         tracing::info!(session = id, "session ended");
         true

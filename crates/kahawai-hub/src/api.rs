@@ -2,6 +2,16 @@
 //! collections, items, item detail with full technical stream info.
 //! During setup mode (OPS-1) the public router is locked; initial-admin
 //! creation exists only on the separately bound trusted-local router.
+//!
+//! ## Watch-state meaning
+//!
+//! `watch_state.played` is the boolean answer from the latest non-zero
+//! progress report (or an explicit watched mark), not a historical high-water
+//! mark. A zero report changes neither it nor `updated_at`, because zero is also
+//! emitted by an untouched player and a gapless preload. `play_count` is the
+//! monotonic history: an explicit mark increments it on a false-to-true change,
+//! while playback increments it once at session teardown only when that
+//! session crossed and ultimately stopped beyond the finish threshold.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -2612,7 +2622,7 @@ async fn admin_delete_user(
     // After the committed delete, not before: a refused operation must not end
     // somebody's sessions. Authentication now rejects the missing user row on
     // every request, so no process-local tombstone is needed.
-    let sessions_ended = state.sessions.end_for_user(&id);
+    let sessions_ended = state.sessions.end_for_user(&id).await;
     Ok(Json(DeletedUserResponse {
         deleted: id,
         username,
@@ -2690,7 +2700,7 @@ async fn admin_delete_satellite(
             "the in-process mediahost cannot be deleted: it is the hub itself",
         ));
     }
-    let ended = state.sessions.end_for_module(&id);
+    let ended = state.sessions.end_for_module(&id).await;
     let deleted = state
         .registry
         .delete_satellite(&id)
@@ -3180,7 +3190,7 @@ async fn admin_end_session(
     State(state): State<AppState>,
     ApiPath(id): ApiPath<String>,
 ) -> Result<StatusCode, ApiError> {
-    if state.sessions.end(&id) {
+    if state.sessions.end(&id).await {
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err(session_gone())
@@ -4227,7 +4237,7 @@ async fn end_session(
     State(state): State<AppState>,
     ApiPath(id): ApiPath<String>,
 ) -> Result<StatusCode, ApiError> {
-    if state.sessions.end(&id) {
+    if state.sessions.end(&id).await {
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err(session_gone())
@@ -5467,7 +5477,11 @@ fn up_next_from(member: &str) -> String {
                          JOIN watch_state pw ON pw.item_id = p.id
                           AND pw.user_id = ?1 AND pw.played = 1
                         WHERE p.parent_id = c.id AND p.kind = 'episode'
-                        ORDER BY p.season DESC, p.episode DESC, p.id DESC LIMIT 1)
+                        -- Last is temporal. The sequence order is only the
+                        -- deterministic tie-breaker for a batch mark whose
+                        -- rows share one second-resolution timestamp.
+                        ORDER BY pw.updated_at DESC,
+                                 p.season DESC, p.episode DESC, p.id DESC LIMIT 1)
                   AND NOT EXISTS (SELECT 1 FROM watch_state nw
                                    WHERE nw.user_id = ?1 AND nw.item_id = n.id
                                      AND nw.played = 1)
@@ -6806,6 +6820,7 @@ async fn post_progress(
     ApiJson(body): ApiJson<ProgressRequest>,
 ) -> Result<Json<ProgressResponse>, ApiError> {
     let session = state.sessions.get(&id).ok_or_else(session_gone)?;
+    let report_guard = session.begin_report().await.ok_or_else(session_gone)?;
     session.touch();
     // Pacing (§4.6): the worker throttles its lead over this position.
     state
@@ -6849,9 +6864,6 @@ async fn post_progress(
     // taking it as "not finished" left the two halves of one rule
     // disagreeing: the item read as played while the session that played
     // it had forgotten, so the play went uncounted.
-    if !at_start {
-        session.report(finished);
-    }
     let row = sqlx::query(
         "INSERT INTO watch_state (user_id, item_id, position_ms, duration_ms, played, play_count, updated_at)
          VALUES (?1, ?2, ?3, ?4, ?5, 0, unixepoch())
@@ -6868,7 +6880,11 @@ async fn post_progress(
            -- for every track and would freeze their marks in both
            -- directions — this is what the report SAID.
            played = CASE WHEN ?6 THEN played ELSE ?5 END,
-           updated_at = unixepoch()
+           -- The up-next row reads this as the last time an episode was
+           -- finished. A zero report says nothing about `played`, so letting
+           -- it refresh the timestamp would make a preload or untouched
+           -- restarted player look like a newly completed watch.
+           updated_at = CASE WHEN ?6 THEN updated_at ELSE unixepoch() END
          RETURNING played, play_count",
     )
     .bind(&claims.sub)
@@ -6880,6 +6896,12 @@ async fn post_progress(
     .fetch_one(state.registry.db())
     .await
     .map_err(internal)?;
+    // Publish the per-session half only after the durable half succeeded, and
+    // while teardown is still excluded by `report_guard`.
+    if !at_start {
+        session.report(finished);
+    }
+    drop(report_guard);
     Ok(Json(ProgressResponse {
         position_ms: body.position_ms,
         played: row.get::<i64, _>("played") != 0,

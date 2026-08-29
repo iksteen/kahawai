@@ -1,5 +1,5 @@
-/// The home screen's data: your libraries, what you are part-way through, and
-/// a shelf of what arrived lately in each.
+/// The home screen's data: your libraries, what you are part-way through, what
+/// episode follows, and a shelf of what arrived lately in each.
 ///
 /// Every shelf is its own query, which is the whole shape of this screen. One
 /// request for all of them shows nothing until the slowest library answers;
@@ -11,7 +11,7 @@ import { computed, type Ref, ref } from 'vue'
 import { useQueries, useQuery, useQueryClient } from '@tanstack/vue-query'
 
 import type { ItemRowI64 } from '../api/generated/model/itemRowI64.ts'
-import { listItems, listLibraries } from '../api/generated/kahawai.ts'
+import { listItems, listLibraries, upNext } from '../api/generated/kahawai.ts'
 import {
   appendPage,
   hasMore,
@@ -29,6 +29,7 @@ export const PER_SHELF = 20
 /// Past this it is a list of abandoned evenings, and it pushes the shelves off
 /// the screen.
 export const CONTINUING = 12
+export const UP_NEXT = 12
 
 /// The libraries you can see. `enabled` because the shell asks for these as
 /// soon as it exists, and before the session is restored that is a guaranteed
@@ -50,6 +51,18 @@ export function useContinueWatching(enabled: Ref<boolean>) {
   return useQuery({
     queryKey: ['continuing'],
     queryFn: () => listItems({ in_progress: true, limit: CONTINUING }),
+    select: (r) => reachable(r.items),
+    enabled,
+  })
+}
+
+/// One episode per current series, cross-library for the same reason continue
+/// watching is: the server owns the temporal order, and the timestamp needed
+/// to merge per-library answers is deliberately not part of an item row.
+export function useUpNext(enabled: Ref<boolean>) {
+  return useQuery({
+    queryKey: ['up-next'],
+    queryFn: () => upNext({ limit: UP_NEXT }),
     select: (r) => reachable(r.items),
     enabled,
   })

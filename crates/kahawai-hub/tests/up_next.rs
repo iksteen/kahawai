@@ -298,6 +298,16 @@ async fn up_next_follows_the_last_finished_episode_and_not_the_first_unwatched_o
     seed_episode(&db, "s_gap", "Gap S01E03", 1, 3, 200, None).await;
     seed_episode(&db, "s_gap", "Gap S02E01", 2, 1, 200, None).await;
 
+    // Sequence order is not viewing order. E04 was finished first and E02
+    // most recently, so "after the last you finished" is E03. Anchoring at
+    // the highest finished number instead would incorrectly offer E05.
+    seed_show(&db, "s_rewatch", "Rewatch", None).await;
+    seed_episode(&db, "s_rewatch", "Rewatch E01", 1, 1, 200, None).await;
+    seed_episode(&db, "s_rewatch", "Rewatch E02", 1, 2, 200, Some((0, 1, 1))).await;
+    seed_episode(&db, "s_rewatch", "Rewatch E03", 1, 3, 200, None).await;
+    seed_episode(&db, "s_rewatch", "Rewatch E04", 1, 4, 200, Some((0, 1, 4))).await;
+    seed_episode(&db, "s_rewatch", "Rewatch E05", 1, 5, 200, None).await;
+
     // Finished a season: the next season's first episode, and the
     // ordering has to be by season THEN episode to get there — S01E09
     // sorts after S02E01 on episode number alone.
@@ -328,7 +338,12 @@ async fn up_next_follows_the_last_finished_episode_and_not_the_first_unwatched_o
     got.sort();
     assert_eq!(
         got,
-        vec!["Gap S01E03", "Season S02E01", "Special S01E01"],
+        vec![
+            "Gap S01E03",
+            "Rewatch E03",
+            "Season S02E01",
+            "Special S01E01",
+        ],
         "the episode after the last finished one, across a gap, a season \
          boundary and an unnumbered special"
     );

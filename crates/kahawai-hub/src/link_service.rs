@@ -28,8 +28,8 @@ use crate::sessions::Sessions;
 /// one signal the recovery contract defines. What the client does with it is
 /// its own business: start again, and find out from THAT whether the host is
 /// back.
-fn end_sessions_on(sessions: &Sessions, module_id: &str) {
-    let ended = sessions.end_for_module(module_id);
+async fn end_sessions_on(sessions: &Sessions, module_id: &str) {
+    let ended = sessions.end_for_module(module_id).await;
     if ended > 0 {
         tracing::warn!(%module_id, ended, "mediahost lost; its sessions ended");
     }
@@ -51,7 +51,7 @@ fn end_sessions_on(sessions: &Sessions, module_id: &str) {
 ///
 /// Called before any drain, so nothing after it touches registry state and a
 /// reconnect cannot be clobbered.
-pub(crate) fn forget_link(
+pub(crate) async fn forget_link(
     registry: &Registry,
     sessions: &Sessions,
     segments: &crate::segments::Detector,
@@ -68,7 +68,7 @@ pub(crate) fn forget_link(
         tracing::info!(%module_id, "link already replaced; leaving the new one alone");
         return;
     }
-    end_sessions_on(sessions, module_id);
+    end_sessions_on(sessions, module_id).await;
 }
 
 pub struct MediahostLinkService {
@@ -292,7 +292,8 @@ impl MediahostLink for MediahostLinkService {
                     &module_id,
                     generation,
                     &tx,
-                );
+                )
+                .await;
                 return;
             }
             // Heavy messages (upserts with resolution, reconciliation)
@@ -410,7 +411,8 @@ impl MediahostLink for MediahostLinkService {
                 &module_id,
                 generation,
                 &tx,
-            );
+            )
+            .await;
             let _ = worker.await; // then drain in order, touching no maps
         });
 
@@ -1689,7 +1691,8 @@ mod forget_link_tests {
             "01HOST",
             generation,
             &tx,
-        );
+        )
+        .await;
 
         assert!(
             !registry.is_connected("01HOST"),
@@ -1837,7 +1840,8 @@ mod forget_link_tests {
             "01HOST",
             old_generation,
             &old_tx,
-        );
+        )
+        .await;
 
         assert!(
             registry.is_connected("01HOST"),

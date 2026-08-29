@@ -1,5 +1,6 @@
 <script setup lang="ts">
-/// What you were part-way through, then what arrived lately in each library.
+/// What you were part-way through, what follows it, then what arrived lately
+/// in each library.
 ///
 /// Not skipped while searching: the results are a panel over this screen, so
 /// it stays where it is — which is what makes dismissing the panel free.
@@ -13,7 +14,7 @@ import { emptyHomeText, type Shelf as ShelfData, shown } from '../domain/shelves
 import { metaLine, targetOf, watchedPct } from '../domain/label.ts'
 import { notify } from '../composables/notices.ts'
 import { sentence } from '../domain/refusal.ts'
-import { useContinueWatching, useLibraries, useShelves } from '../composables/home.ts'
+import { useContinueWatching, useLibraries, useShelves, useUpNext } from '../composables/home.ts'
 import { whoAmI } from '../api/session.ts'
 
 const router = useRouter()
@@ -22,6 +23,7 @@ const router = useRouter()
 const signedIn = computed(() => true)
 const libraries = useLibraries(signedIn)
 const continuing = useContinueWatching(signedIn)
+const next = useUpNext(signedIn)
 const list = computed(() => libraries.data.value ?? [])
 const { shelves, more, retry } = useShelves(list)
 
@@ -40,6 +42,10 @@ function openItem(id: string, library: string) {
 watch(
   () => continuing.isError.value,
   (failed) => failed && notify('Could not load what you were watching.'),
+)
+watch(
+  () => next.isError.value,
+  (failed) => failed && notify('Could not load what is up next.'),
 )
 
 async function grow(shelf: ShelfData) {
@@ -102,6 +108,34 @@ async function grow(shelf: ShelfData) {
                   :style="{ width: `${watchedPct(item) ?? 0}%` }"
                 />
               </span>
+            </span>
+          </button>
+        </div>
+      </template>
+
+      <!-- The episode after the last one finished in each current series. As
+           with continue watching, absence means empty and failure must say so
+           rather than impersonating an empty row. -->
+      <template v-if="next.data.value?.length">
+        <h2 class="mb-2 text-[17px] font-[650]">Up next</h2>
+        <div class="mb-7 grid grid-cols-[repeat(auto-fill,minmax(260px,1fr))] gap-3">
+          <button
+            v-for="item in next.data.value"
+            :key="item.id"
+            class="flex cursor-pointer gap-3 rounded border border-line bg-surface p-2 text-left hover:border-dim"
+            type="button"
+            @click="openItem(targetOf(item), item.library_id as string)"
+          >
+            <Art
+              :item="item"
+              size="card"
+              class="w-[60px] shrink-0"
+              :progress="false"
+              :poster-of="item.parent_id"
+            />
+            <span class="flex min-w-0 flex-1 flex-col justify-center gap-1">
+              <span class="truncate">{{ item.title }}</span>
+              <span class="truncate font-mono text-[11px] text-dim">{{ metaLine(item) }}</span>
             </span>
           </button>
         </div>

@@ -15,11 +15,12 @@ import { ApiError } from '../src/api/errors.ts'
 vi.mock('../src/api/generated/kahawai.ts', () => ({
   listLibraries: vi.fn(),
   listItems: vi.fn(),
+  upNext: vi.fn(),
   getItemArtworkUrl: (id: string) => `/api/v1/items/${id}/artwork`,
 }))
 vi.mock('../src/api/session.ts', () => ({ whoAmI: vi.fn(() => ({ username: 'x', admin: false })) }))
 
-const { listItems, listLibraries } = await import('../src/api/generated/kahawai.ts')
+const { listItems, listLibraries, upNext } = await import('../src/api/generated/kahawai.ts')
 const { whoAmI } = await import('../src/api/session.ts')
 const { clearNotices, notice } = await import('../src/composables/notices.ts')
 const Home = (await import('../src/views/Home.vue')).default
@@ -102,6 +103,7 @@ function shelvesThat(answers: Record<string, ItemRowI64[] | 'fails'>, { pagesFai
 
 beforeEach(() => {
   vi.mocked(listLibraries).mockResolvedValue({ libraries: LIBS })
+  vi.mocked(upNext).mockResolvedValue(page([]))
   vi.mocked(whoAmI).mockReturnValue({ username: 'x', admin: false })
   clearNotices()
 })
@@ -263,6 +265,62 @@ describe('continue watching', () => {
     await flushPromises()
     expect(wrapper.text()).toContain('fine')
     expect(wrapper.text()).not.toContain('orphan')
+  })
+})
+
+describe('up next', () => {
+  test('is a row when a current series has another episode', async () => {
+    vi.mocked(upNext).mockResolvedValue(
+      page([
+        item('episode-2', {
+          kind: 'episode',
+          title: 'Second',
+          parent_id: 'show',
+          parent_title: 'A Show',
+          season: 1,
+          episode: 2,
+        }),
+      ]),
+    )
+    shelvesThat({ films: [], music: [] })
+    const { wrapper } = home()
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('Up next')
+    expect(wrapper.text()).toContain('Second')
+    expect(wrapper.text()).toContain('A Show S01E02')
+  })
+
+  test('has no row when no series has a next episode', async () => {
+    shelvesThat({ films: [], music: [] })
+    const { wrapper } = home()
+    await flushPromises()
+    expect(wrapper.text()).not.toContain('Up next')
+  })
+
+  test('reports a failed row instead of silently omitting it', async () => {
+    vi.mocked(upNext).mockRejectedValue(new ApiError(500, 'no'))
+    shelvesThat({ films: [], music: [] })
+    const { wrapper } = home()
+    await flushPromises()
+
+    expect(wrapper.text()).not.toContain('Up next')
+    expect(notice.value).toBe('Could not load what is up next.')
+  })
+
+  test('drops an episode with no library page to open', async () => {
+    vi.mocked(upNext).mockResolvedValue(
+      page([
+        item('orphan-next', { kind: 'episode', parent_id: 'show', library_id: null }),
+        item('reachable-next', { kind: 'episode', parent_id: 'show' }),
+      ]),
+    )
+    shelvesThat({ films: [], music: [] })
+    const { wrapper } = home()
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('reachable-next')
+    expect(wrapper.text()).not.toContain('orphan-next')
   })
 })
 

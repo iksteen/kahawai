@@ -736,6 +736,28 @@ describe('what a track boundary leaves behind', () => {
     expect(api.postProgress).toHaveBeenCalledWith('s-a', { position_ms: 180_000 })
   })
 
+  test('and its session ends only after that final report settles', async () => {
+    let finishReport!: () => void
+    vi.mocked(api.postProgress).mockReturnValue(
+      new Promise((resolve) => {
+        finishReport = () => resolve({} as never)
+      }),
+    )
+    const { wrapper } = await playing()
+    const element = audio(wrapper)[0]!.element as HTMLMediaElement
+    at(element, 160)
+    await flushPromises()
+    element.dispatchEvent(new Event('ended'))
+    await flushPromises()
+
+    expect(api.postProgress).toHaveBeenCalledWith('s-a', { position_ms: 180_000 })
+    expect(api.endSession).not.toHaveBeenCalledWith('s-a', expect.anything())
+
+    finishReport()
+    await flushPromises()
+    expect(api.endSession).toHaveBeenCalledWith('s-a', expect.anything())
+  })
+
   test('and pressing Next mid-track ends the one it left', async () => {
     const { wrapper, queue } = await playing()
     queue.jump(2)

@@ -308,7 +308,8 @@ How something works and why it was built that way belong in
       boolean and NOT a high-water mark: it is what the last report said,
       so watching something again clears it and finishing sets it once
       more. With one exception, and it is load-bearing: a report at
-      position ZERO decides nothing and leaves the mark alone. Zero
+      position ZERO decides nothing and leaves the mark and its viewing
+      timestamp alone. Zero
       arrives for things nobody has touched — the audio queue pings it
       every ten seconds for the track it has preloaded for a gapless
       handover (`keepalive.ts`), and the video player answers with the

@@ -125,7 +125,7 @@ const listing = ref(false)
 /// it was shorter than that.
 let resumeAt: { key: string; at: number } | null = null
 
-function release(slot: Slot, keepalive = false) {
+function release(slot: Slot, keepalive = false, after?: Promise<unknown>) {
   clearTimeout(slot.timer)
   slot.timer = undefined
   // Stopped by hand. Both elements always exist now — which is what stops the
@@ -137,7 +137,16 @@ function release(slot: Slot, keepalive = false) {
   if (which !== -1) elementOf(which as 0 | 1)?.pause()
   // keepalive: the page may be closing, and an unsent DELETE leaves a session
   // for the reaper.
-  if (slot.session) void endSession(slot.session.session_id, { keepalive }).catch(() => {})
+  if (slot.session) {
+    const id = slot.session.session_id
+    const close = () => endSession(id, { keepalive }).catch(() => {})
+    // At a natural track boundary, the final progress write owns the ordering
+    // but not the handover latency: clear this slot immediately so the warmed
+    // one can play gaplessly, and defer only its DELETE until that write has
+    // settled. The hub independently serialises both requests as the authority.
+    if (after) void after.then(close, close)
+    else void close()
+  }
   slot.session = null
   slot.key = null
   slot.trouble = null
@@ -457,18 +466,20 @@ function onEnded(which: 0 | 1) {
   if (which !== active.value) return
   const finished = slots[which]
   const element = elementOf(which)
-  if (finished.session && element) {
-    void postProgress(finished.session.session_id, {
-      position_ms: Math.round(element.duration * 1000),
-    }).catch(() => {})
-  }
+  const reported =
+    finished.session && element
+      ? postProgress(finished.session.session_id, {
+          position_ms: Math.round(element.duration * 1000),
+        })
+      : undefined
   const next = at.value + 1
   const warmed = other.value
   if (next >= entries.value.length) {
+    release(finished, false, reported)
     queue.clear()
     return
   }
-  release(finished)
+  release(finished, false, reported)
   // The warmed slot is the one already holding the next TRACK — with a session.
   // Keeping a failed claim made "claimed but unplayable" reachable for the
   // first time, and matching on the key alone handed playback to a slot with no
