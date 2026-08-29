@@ -789,15 +789,16 @@ message StartSession {
   // worker never sees the file, only the bytes it is fed. An old
   // transcoder ignoring this encodes fields, which is what it did before.
   bool deinterlace = 21;
-  // Gain measured on the exact stereo fold. NaN means unmeasured; applied
+  // Gain measured on the exact stereo fold; absent means unmeasured. Applied
   // only when the encoded output is stereo.
-  double stereo_gain_db = 22;
+  optional double stereo_gain_db = 22;
   // Gain measured on the untouched decoded layout. Applied only when the
   // encoded channel count still equals loudness_source_channels.
-  double native_gain_db = 23;
-  uint32 loudness_source_channels = 24;
+  optional double native_gain_db = 23;
+  optional uint32 loudness_source_channels = 24;
   // Exact layout-keyed gains. Minor-4 workers ignore this and retain the
-  // stereo/native fields above; placement gates layouts they cannot express.
+  // scalar fields for old-hub compatibility; current placement requires this
+  // feature because only the worker knows its actual post-conversion layout.
   repeated AudioLayoutGain loudness_gains = 25;
 }
 

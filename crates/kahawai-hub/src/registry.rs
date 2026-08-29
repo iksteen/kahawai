@@ -15,7 +15,8 @@
 //! a non-empty `error` is terminal for that revision. Successful rows own
 //! `audio_loudness_layouts`, keyed by exact `(channels, channel_mask)`, with one
 //! integrated-LUFS/true-peak pair per matrix playback may emit. The legacy
-//! stereo/native columns remain for protocol-minor-4 workers. File deletion
+//! stereo/native columns remain for old-hub wire compatibility; current remote
+//! placement requires the exact layout map. File deletion
 //! cascades both tables; nothing evicts them because rebuilding fully decodes
 //! the audio track.
 
@@ -237,6 +238,9 @@ pub struct PlacementNeed {
     /// `assrender` is genuinely absent on some boxes (macOS here), so
     /// this is a real constraint and not a formality.
     pub needs_ass_burn: bool,
+    /// Additive wire feature this plan requires. A HARD filter: choosing a
+    /// peer without it would silently drop behavior.
+    pub required_protocol_feature: Option<kahawai_proto::ProtocolFeature>,
     /// HUB-15b: the encode TARGET codec ("h264"/"hevc"/"av1", empty =
     /// any video encoder qualifies). A HARD filter, unlike tone-map: a
     /// box without the target's encoder cannot degrade gracefully.
@@ -335,11 +339,13 @@ impl HostLink {
     }
 
     pub(crate) fn supports_segment_detection(&self) -> bool {
-        self.protocol_minor >= 1
+        kahawai_proto::ProtocolFeatures::new(self.protocol_minor)
+            .supports(kahawai_proto::ProtocolFeature::SegmentDetection)
             && self.segment_detector_generation == kahawai_core::segments::DETECTOR_GENERATION
     }
     pub(crate) fn supports_loudness_analysis(&self) -> bool {
-        self.protocol_minor >= 5
+        kahawai_proto::ProtocolFeatures::new(self.protocol_minor)
+            .supports(kahawai_proto::ProtocolFeature::AudioLoudnessAnalysis)
     }
 
     pub(crate) async fn send(&self, msg: kahawai_proto::v1::HubToHost) -> Result<()> {
@@ -359,6 +365,15 @@ pub struct DeletedSatellite {
     /// Exact mediahost link generation removed with the row. The API retires
     /// this generation's segment waiter before returning to the administrator.
     pub mediahost_link_generation: Option<u64>,
+}
+
+type LoudnessPathKey = (String, String, String, String);
+type LoudnessRevisionTransition = (u64, i64, u64, i64);
+type TcSender = tokio::sync::mpsc::Sender<Result<kahawai_proto::v1::HubToTc, tonic::Status>>;
+
+struct TcLink {
+    sender: TcSender,
+    protocol_minor: u32,
 }
 
 pub struct Registry {
@@ -381,13 +396,14 @@ pub struct Registry {
     /// lightweight remux/audio worker is always available; only AIO may add
     /// video encode, tone-map and subtitle burn-in here.
     local_video_executor_enabled: bool,
-    tc_links: Mutex<
-        HashMap<
-            String,
-            tokio::sync::mpsc::Sender<Result<kahawai_proto::v1::HubToTc, tonic::Status>>,
-        >,
-    >,
-    tc_protocol_minor: Mutex<HashMap<String, u32>>,
+    /// Last stale-result → catalogue-revision retry sent for each loudness
+    /// path. One transition gets one targeted offer; repeated stale answers or
+    /// scan lag cannot form a control-link retry loop.
+    loudness_retries: Mutex<HashMap<LoudnessPathKey, LoudnessRevisionTransition>>,
+    /// Sender and negotiated minor are one link fact. Keeping them in separate
+    /// maps let a reconnect briefly pair the new sender with the old minor,
+    /// defeating protocol-feature hard filters during exactly that window.
+    tc_links: Mutex<HashMap<String, TcLink>>,
     /// Dispatched sessions per transcoder (inverse-load placement).
     tc_load: Mutex<HashMap<String, usize>>,
     /// HUB-36: measured pace per `(module_id, work_class)`, loaded from
@@ -551,8 +567,8 @@ impl Registry {
             transcoder_caps: Mutex::new(HashMap::new()),
             local_bench: Mutex::new(None),
             local_video_executor_enabled: false,
+            loudness_retries: Mutex::new(HashMap::new()),
             tc_links: Mutex::new(HashMap::new()),
-            tc_protocol_minor: Mutex::new(HashMap::new()),
             tc_load: Mutex::new(HashMap::new()),
             tc_pace: Mutex::new(HashMap::new()),
             tc_link_rate: Mutex::new(HashMap::new()),
@@ -967,6 +983,82 @@ impl Registry {
             .collect())
     }
 
+    /// Whether this exact current path still needs loudness work. Used after a
+    /// result loses the size/mtime race: the collection scan already offered
+    /// the replacement while the mediahost was suppressing duplicate path
+    /// work, so the rejected answer must trigger one targeted second offer.
+    pub(crate) async fn loudness_source_pending(
+        &self,
+        module_id: &str,
+        collection_id: &str,
+        root_token: &str,
+        path_rel: &str,
+    ) -> Result<Option<(u64, i64)>> {
+        let row = sqlx::query(
+            "SELECT f.size,f.mtime_unix FROM files f
+               JOIN collection_roots r ON r.id=f.root_id
+               JOIN collections c
+                 ON c.module_id=f.module_id AND c.collection_id=f.collection_id
+              WHERE f.module_id=? AND f.collection_id=? AND r.root_token=? AND f.path_rel=?
+                AND c.media_type != 'music'
+                AND json_array_length(json_extract(f.streams_json,'$.audio')) > 0
+                AND (SELECT COUNT(*) FROM audio_loudness l
+                      WHERE l.file_id=f.id AND l.analyzer=?
+                        AND l.size=f.size AND l.mtime_unix=f.mtime_unix)
+                    < json_array_length(json_extract(f.streams_json,'$.audio'))
+              LIMIT 1",
+        )
+        .bind(module_id)
+        .bind(collection_id)
+        .bind(root_token)
+        .bind(path_rel)
+        .bind(kahawai_media::loudness::ANALYZER)
+        .fetch_optional(&self.db)
+        .await?;
+        Ok(row.map(|row| {
+            (
+                row.get::<i64, _>("size").max(0) as u64,
+                row.get("mtime_unix"),
+            )
+        }))
+    }
+
+    pub(crate) fn claim_loudness_retry(
+        &self,
+        path: (&str, &str, &str, &str),
+        result_revision: (u64, i64),
+        current_revision: (u64, i64),
+    ) -> bool {
+        let key = (
+            path.0.to_string(),
+            path.1.to_string(),
+            path.2.to_string(),
+            path.3.to_string(),
+        );
+        let transition = (
+            result_revision.0,
+            result_revision.1,
+            current_revision.0,
+            current_revision.1,
+        );
+        let mut retries = self.loudness_retries.lock().unwrap();
+        if retries.get(&key) == Some(&transition) {
+            false
+        } else {
+            retries.insert(key, transition);
+            true
+        }
+    }
+
+    fn clear_loudness_retry(&self, path: (&str, &str, &str, &str)) {
+        self.loudness_retries.lock().unwrap().remove(&(
+            path.0.to_string(),
+            path.1.to_string(),
+            path.2.to_string(),
+            path.3.to_string(),
+        ));
+    }
+
     /// Persist every audio stream's measurement as one revision-guarded
     /// answer. Whole-file failures produce terminal rows for the same revision
     /// so a broken decoder cannot become a reconnect loop.
@@ -984,6 +1076,10 @@ impl Registry {
             .source
             .as_ref()
             .context("loudness result missing source")?;
+        // Revision validation and replacement are one write transaction. A
+        // concurrent scan must not replace the file after this SELECT and
+        // before stale measurements are committed under its old id.
+        let mut tx = self.db.begin_with("BEGIN IMMEDIATE").await?;
         let row = sqlx::query(
             "SELECT f.id,f.streams_json FROM files f
                JOIN collection_roots r ON r.id=f.root_id
@@ -996,7 +1092,7 @@ impl Registry {
         .bind(&source.path_rel)
         .bind(result.size as i64)
         .bind(result.mtime_unix)
-        .fetch_optional(&self.db)
+        .fetch_optional(&mut *tx)
         .await?;
         let Some(row) = row else {
             return Ok(false);
@@ -1005,75 +1101,69 @@ impl Registry {
         let info: kahawai_core::media::MediaInfo =
             serde_json::from_str(row.get::<String, _>("streams_json").as_str())?;
         let expected = info.audio.len();
+        let indexes = result
+            .tracks
+            .iter()
+            .map(|track| track.stream_index as usize)
+            .collect::<std::collections::HashSet<_>>();
+        anyhow::ensure!(
+            indexes.len() == result.tracks.len() && indexes.iter().all(|index| *index < expected),
+            "loudness result stream indexes are invalid or duplicated"
+        );
         if result.error.is_empty() {
             anyhow::ensure!(
-                result.tracks.len() == expected,
-                "loudness result returned {} of {} audio streams",
-                result.tracks.len(),
-                expected
+                indexes.len() == expected && (0..expected).all(|index| indexes.contains(&index)),
+                "loudness result stream indexes are incomplete"
             );
-            let indexes = result
-                .tracks
+        }
+        for track in &result.tracks {
+            let audio = &info.audio[track.stream_index as usize];
+            let declared = kahawai_media::loudness::AudioLayout::from_stream(
+                audio.channels,
+                audio.layout.as_deref(),
+            );
+            let source = kahawai_media::loudness::AudioLayout::new(
+                track.source_channels,
+                track.source_channel_mask,
+            );
+            anyhow::ensure!(
+                source.channels == declared.channels
+                    && (declared.channel_mask == 0 || source == declared),
+                "loudness result source layout does not match discovery"
+            );
+            let expected_layouts =
+                kahawai_media::loudness::resolved_measured_layouts(declared, source)
+                    .into_iter()
+                    .collect::<std::collections::HashSet<_>>();
+            let layouts = track
+                .layouts
                 .iter()
-                .map(|track| track.stream_index as usize)
+                .map(|layout| {
+                    kahawai_media::loudness::AudioLayout::new(layout.channels, layout.channel_mask)
+                })
                 .collect::<std::collections::HashSet<_>>();
             anyhow::ensure!(
-                indexes.len() == expected && (0..expected).all(|index| indexes.contains(&index)),
-                "loudness result stream indexes are incomplete or duplicated"
+                layouts == expected_layouts && layouts.len() == track.layouts.len(),
+                "loudness result layouts are incomplete or duplicated"
             );
-            for track in &result.tracks {
-                let audio = &info.audio[track.stream_index as usize];
-                let declared = kahawai_media::loudness::AudioLayout::from_stream(
-                    audio.channels,
-                    audio.layout.as_deref(),
-                );
-                let source = kahawai_media::loudness::AudioLayout::new(
-                    track.source_channels,
-                    track.source_channel_mask,
-                );
-                anyhow::ensure!(
-                    source.channels == declared.channels
-                        && (declared.channel_mask == 0 || source == declared),
-                    "loudness result source layout does not match discovery"
-                );
-                let expected_layouts =
-                    kahawai_media::loudness::resolved_measured_layouts(declared, source)
-                        .into_iter()
-                        .collect::<std::collections::HashSet<_>>();
-                let layouts = track
-                    .layouts
-                    .iter()
-                    .map(|layout| {
-                        kahawai_media::loudness::AudioLayout::new(
+            anyhow::ensure!(
+                track.layouts.iter().all(|layout| {
+                    layout.channels > 0
+                        && kahawai_media::loudness::AudioLayout::new(
                             layout.channels,
                             layout.channel_mask,
                         )
-                    })
-                    .collect::<std::collections::HashSet<_>>();
-                anyhow::ensure!(
-                    layouts == expected_layouts && layouts.len() == track.layouts.len(),
-                    "loudness result layouts are incomplete or duplicated"
-                );
-                anyhow::ensure!(
-                    track.layouts.iter().all(|layout| {
-                        layout.channels > 0
-                            && kahawai_media::loudness::AudioLayout::new(
-                                layout.channels,
-                                layout.channel_mask,
-                            )
-                            .channel_mask
-                                == layout.channel_mask
-                            && layout.integrated_lufs.is_finite()
-                            && layout.true_peak_dbtp.is_finite()
-                            && (-100.0..=10.0).contains(&layout.integrated_lufs)
-                            && (-100.0..=10.0).contains(&layout.true_peak_dbtp)
-                    }),
-                    "loudness result contains an invalid layout measurement"
-                );
-            }
+                        .channel_mask
+                            == layout.channel_mask
+                        && layout.integrated_lufs.is_finite()
+                        && layout.true_peak_dbtp.is_finite()
+                        && (-100.0..=10.0).contains(&layout.integrated_lufs)
+                        && (-100.0..=10.0).contains(&layout.true_peak_dbtp)
+                }),
+                "loudness result contains an invalid layout measurement"
+            );
         }
 
-        let mut tx = self.db.begin_with("BEGIN IMMEDIATE").await?;
         sqlx::query("DELETE FROM audio_loudness WHERE file_id=?")
             .bind(file_id)
             .execute(&mut *tx)
@@ -1083,26 +1173,21 @@ impl Registry {
                 .tracks
                 .iter()
                 .find(|track| track.stream_index as usize == stream_index);
-            let (stereo, native, source_layout, error) = if result.error.is_empty() {
-                let measured = measured.expect("validated complete result");
+            let (stereo, native, source_layout, error) = if let Some(measured) = measured {
                 let source = kahawai_media::loudness::AudioLayout::new(
                     measured.source_channels,
                     measured.source_channel_mask,
                 );
-                let native = measured
-                    .layouts
-                    .iter()
-                    .find(|layout| {
-                        (layout.channels, layout.channel_mask)
-                            == (source.channels, source.channel_mask)
-                    })
-                    .expect("validated native layout");
+                let native = measured.layouts.iter().find(|layout| {
+                    (layout.channels, layout.channel_mask) == (source.channels, source.channel_mask)
+                });
                 let stereo = measured
                     .layouts
                     .iter()
                     .find(|layout| (layout.channels, layout.channel_mask) == (2, 0x3))
-                    .unwrap_or(native);
-                (Some(stereo), Some(native), Some(source), "")
+                    .or(native)
+                    .or_else(|| measured.layouts.first());
+                (stereo, native, Some(source), "")
             } else {
                 (None, None, None, result.error.as_str())
             };
@@ -1147,6 +1232,12 @@ impl Registry {
             }
         }
         tx.commit().await?;
+        self.clear_loudness_retry((
+            module_id,
+            &result.collection_id,
+            &source.root_token,
+            &source.path_rel,
+        ));
         Ok(true)
     }
 
@@ -3200,28 +3291,37 @@ impl Registry {
         self.transcoder_caps.lock().unwrap().remove(module_id);
     }
 
-    pub fn register_tc_link(
-        &self,
-        module_id: &str,
-        protocol_minor: u32,
-        tx: tokio::sync::mpsc::Sender<Result<kahawai_proto::v1::HubToTc, tonic::Status>>,
-    ) {
+    pub fn register_tc_link(&self, module_id: &str, protocol_minor: u32, tx: TcSender) {
+        self.tc_links.lock().unwrap().insert(
+            module_id.to_string(),
+            TcLink {
+                sender: tx,
+                protocol_minor,
+            },
+        );
+    }
+
+    pub fn transcoder_protocol_minor(&self, module_id: &str) -> Option<u32> {
         self.tc_links
             .lock()
             .unwrap()
-            .insert(module_id.to_string(), tx);
-        self.tc_protocol_minor
-            .lock()
-            .unwrap()
-            .insert(module_id.to_string(), protocol_minor);
+            .get(module_id)
+            .map(|link| link.protocol_minor)
+    }
+
+    pub fn transcoder_protocol_features(
+        &self,
+        module_id: &str,
+    ) -> Option<kahawai_proto::ProtocolFeatures> {
+        self.transcoder_protocol_minor(module_id)
+            .map(kahawai_proto::ProtocolFeatures::new)
     }
 
     pub fn transcoder_supports_layout_gains(&self, module_id: &str) -> bool {
-        self.tc_protocol_minor
-            .lock()
-            .unwrap()
-            .get(module_id)
-            .is_some_and(|minor| *minor >= 5)
+        self.transcoder_protocol_features(module_id)
+            .is_some_and(|features| {
+                features.supports(kahawai_proto::ProtocolFeature::ExactAudioLoudnessGains)
+            })
     }
 
     /// Drop a transcoder link only if it is still the one the caller owns.
@@ -3233,18 +3333,13 @@ impl Registry {
     /// and its load accounting. Capabilities are sent once per connection, so
     /// `choose` — which requires both a link and caps — never saw that box
     /// again until the transcoder process itself restarted.
-    pub fn unregister_tc_link_if_current(
-        &self,
-        module_id: &str,
-        tx: &tokio::sync::mpsc::Sender<Result<kahawai_proto::v1::HubToTc, tonic::Status>>,
-    ) -> bool {
+    pub fn unregister_tc_link_if_current(&self, module_id: &str, tx: &TcSender) -> bool {
         let mut links = self.tc_links.lock().unwrap();
         match links.get(module_id) {
-            Some(current) if current.same_channel(tx) => {
+            Some(current) if current.sender.same_channel(tx) => {
                 links.remove(module_id);
                 drop(links);
                 self.tc_load.lock().unwrap().remove(module_id);
-                self.tc_protocol_minor.lock().unwrap().remove(module_id);
                 self.tc_link_rate.lock().unwrap().remove(module_id);
                 true
             }
@@ -3257,13 +3352,31 @@ impl Registry {
         module_id: &str,
         msg: kahawai_proto::v1::HubToTc,
     ) -> anyhow::Result<()> {
-        let tx = self
-            .tc_links
-            .lock()
-            .unwrap()
-            .get(module_id)
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("transcoder {module_id} not connected"))?;
+        self.send_to_tc_requiring(module_id, msg, None).await
+    }
+
+    pub async fn send_to_tc_requiring(
+        &self,
+        module_id: &str,
+        msg: kahawai_proto::v1::HubToTc,
+        required: Option<kahawai_proto::ProtocolFeature>,
+    ) -> anyhow::Result<()> {
+        let tx = {
+            let links = self.tc_links.lock().unwrap();
+            let link = links
+                .get(module_id)
+                .ok_or_else(|| anyhow::anyhow!("transcoder {module_id} not connected"))?;
+            anyhow::ensure!(
+                required.is_none_or(|feature| {
+                    kahawai_proto::ProtocolFeatures::new(link.protocol_minor).supports(feature)
+                }),
+                "transcoder {module_id} no longer supports the required protocol feature"
+            );
+            // The sender and minor came from one locked link entry. A
+            // reconnect after this clone can only close this compatible
+            // sender; it cannot redirect the message to an incompatible one.
+            link.sender.clone()
+        };
         tx.send(Ok(msg))
             .await
             .map_err(|_| anyhow::anyhow!("transcoder link closed"))
@@ -3410,6 +3523,13 @@ impl Registry {
                 }
                 // Rank hardware on the codec the session will actually
                 // run (empty need: any hw video encoder counts).
+                if need.required_protocol_feature.is_some_and(|feature| {
+                    !links.get(id).is_some_and(|link| {
+                        kahawai_proto::ProtocolFeatures::new(link.protocol_minor).supports(feature)
+                    })
+                }) {
+                    return None;
+                }
                 if need.needs_ass_burn && !c.ass_burn {
                     return None; // cannot burn ASS; not a candidate at all
                 }

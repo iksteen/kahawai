@@ -19,6 +19,22 @@ use kahawai_proto::v1::{
 use crate::Activity;
 use crate::scan::CollectionConfig;
 
+struct TrimOnDrop(&'static str);
+
+impl Drop for TrimOnDrop {
+    fn drop(&mut self) {
+        crate::release_background_memory(self.0);
+    }
+}
+
+struct CancelOnDrop(Arc<AtomicBool>);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
 struct PendingSource {
     collection_id: String,
     source: SourcePath,
@@ -43,10 +59,10 @@ fn enqueue(
     seen: &mut std::collections::HashSet<(String, String, String)>,
     pending: &mut Vec<PendingSource>,
 ) {
-    if !matches!(work.analyzer, 3 | kahawai_media::loudness::ANALYZER) {
+    if !matches!(work.analyzer, 3 | 4 | 5 | kahawai_media::loudness::ANALYZER) {
         tracing::warn!(
             offered = work.analyzer,
-            supported = ?[3, kahawai_media::loudness::ANALYZER],
+            supported = ?[3, 4, 5, kahawai_media::loudness::ANALYZER],
             "unsupported loudness analyzer worklist ignored"
         );
         return;
@@ -161,7 +177,10 @@ pub async fn run(
             "audio loudness measurement starting"
         );
         let collection2 = collection_id.clone();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let _cancel_on_drop = CancelOnDrop(cancelled.clone());
         let result = tokio::task::spawn_blocking(move || {
+            let _trim = TrimOnDrop("loudness analysis");
             let background = background;
             measure_source(
                 &collections2,
@@ -170,16 +189,17 @@ pub async fn run(
                 &source2.path_rel,
                 &activity2,
                 &background,
+                analyzer,
+                cancelled,
             )
         })
         .await;
         let (size, mtime_unix, tracks, error) = match result {
-            Ok(Ok((size, mtime, Ok(tracks)))) => (size, mtime, tracks, String::new()),
+            Ok(Ok((size, mtime, Ok((tracks, error))))) => (size, mtime, tracks, error),
             Ok(Ok((size, mtime, Err(error)))) => (size, mtime, Vec::new(), format!("{error:#}")),
             Ok(Err(error)) => (0, 0, Vec::new(), format!("{error:#}")),
             Err(error) => (0, 0, Vec::new(), format!("loudness task failed: {error}")),
         };
-        crate::release_background_memory("loudness analysis");
         if error.is_empty() {
             tracing::info!(
                 collection = %collection_id,
@@ -202,6 +222,10 @@ pub async fn run(
             source.root_token.clone(),
             source.path_rel.clone(),
         );
+        // Stop suppressing this path before publishing its result: the hub may
+        // immediately re-offer a replacement revision that made this answer
+        // stale, and that targeted retry must survive the round trip.
+        seen.remove(&seen_key);
         let sent = tx
             .send(HostToHub {
                 msg: Some(host_to_hub::Msg::FileLoudness(FileLoudness {
@@ -215,10 +239,6 @@ pub async fn run(
                 })),
             })
             .await;
-        // `seen` suppresses duplicate chunks only while work is pending or
-        // active. A later scan may invalidate the revision and legitimately
-        // queue this exact path again.
-        seen.remove(&seen_key);
         if sent.is_err() {
             return;
         }
@@ -226,6 +246,7 @@ pub async fn run(
 }
 
 type SharedBackground = Arc<Mutex<Option<crate::BackgroundGuard>>>;
+type MeasuredTracks = Result<(Vec<AudioLoudnessTrack>, String)>;
 
 /// Segment detection is watched-first and spans a season; loudness is a
 /// library backfill. Release the lower-priority permit at a GStreamer buffer
@@ -235,12 +256,14 @@ fn checkpoint(
     background: &SharedBackground,
     trimmer: &crate::BackgroundMemoryTrimmer,
     foreground_pause: &AtomicBool,
-) {
+    cancelled: &AtomicBool,
+) -> Result<()> {
+    anyhow::ensure!(!cancelled.load(Ordering::Acquire), "loudness job cancelled");
     trimmer.checkpoint("loudness checkpoint");
     let snapshot = activity.snapshot();
     if snapshot.segments == 0 {
         if !snapshot.foreground_busy() {
-            return;
+            return Ok(());
         }
         let report = foreground_pause
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -254,13 +277,14 @@ fn checkpoint(
             );
         }
         while activity.busy() {
-            std::thread::sleep(Duration::from_secs(2));
+            anyhow::ensure!(!cancelled.load(Ordering::Acquire), "loudness job cancelled");
+            std::thread::sleep(Duration::from_millis(100));
         }
         if report {
             foreground_pause.store(false, Ordering::Release);
             tracing::info!("audio loudness measurement resumed after foreground activity");
         }
-        return;
+        return Ok(());
     }
 
     let released = background.lock().unwrap().take().is_some();
@@ -268,9 +292,11 @@ fn checkpoint(
         tracing::info!("audio loudness measurement yielding to segment detection");
     }
     while activity.segment_pending() || activity.busy() {
+        anyhow::ensure!(!cancelled.load(Ordering::Acquire), "loudness job cancelled");
         std::thread::sleep(Duration::from_millis(100));
     }
     loop {
+        anyhow::ensure!(!cancelled.load(Ordering::Acquire), "loudness job cancelled");
         let mut held = background.lock().unwrap();
         if held.is_some() {
             break;
@@ -285,8 +311,10 @@ fn checkpoint(
         drop(held);
         std::thread::sleep(Duration::from_millis(100));
     }
+    Ok(())
 }
 
+#[allow(clippy::too_many_arguments)] // exact source + scheduling context
 fn measure_source(
     collections: &[CollectionConfig],
     collection_id: &str,
@@ -294,20 +322,35 @@ fn measure_source(
     path_rel: &str,
     activity: &Activity,
     background: &SharedBackground,
-) -> Result<(u64, i64, Result<Vec<AudioLoudnessTrack>>)> {
+    analyzer: i64,
+    cancelled: Arc<AtomicBool>,
+) -> Result<(u64, i64, MeasuredTracks)> {
+    anyhow::ensure!(!cancelled.load(Ordering::Acquire), "loudness job cancelled");
     let path = crate::serve::resolve_rel(collections, collection_id, root_token, path_rel)?;
     let metadata = std::fs::metadata(&path)
         .with_context(|| format!("reading metadata for {}", path.display()))?;
     let size = metadata.len();
     let mtime = mtime_unix(&metadata);
-    let measured = (|| -> Result<Vec<AudioLoudnessTrack>> {
+    if analyzer < kahawai_media::loudness::ANALYZER {
+        return Ok((
+            size,
+            mtime,
+            Err(anyhow::anyhow!(
+                "legacy loudness analyzer superseded by corrected channel weighting"
+            )),
+        ));
+    }
+    let measured = (|| -> Result<(Vec<AudioLoudnessTrack>, String)> {
         let info = kahawai_media::discover(&path, Duration::from_secs(30))?;
+        anyhow::ensure!(!cancelled.load(Ordering::Acquire), "loudness job cancelled");
         anyhow::ensure!(!info.audio.is_empty(), "source has no audio streams");
 
         let trimmer = crate::BackgroundMemoryTrimmer::every(Duration::from_secs(30));
         let foreground_pause = Arc::new(AtomicBool::new(false));
         let mut tracks = Vec::with_capacity(info.audio.len());
+        let mut failures = Vec::new();
         for stream_index in 0..info.audio.len() {
+            anyhow::ensure!(!cancelled.load(Ordering::Acquire), "loudness job cancelled");
             tracing::info!(
                 collection = collection_id,
                 path = path_rel,
@@ -315,54 +358,89 @@ fn measure_source(
                 streams = info.audio.len(),
                 "audio loudness track starting"
             );
-            let activity = activity.clone();
-            let background = background.clone();
-            let trimmer = trimmer.clone();
-            let foreground_pause = foreground_pause.clone();
-            let source_layout = kahawai_media::loudness::AudioLayout::from_stream(
-                info.audio[stream_index].channels,
-                info.audio[stream_index].layout.as_deref(),
-            );
-            let measured = kahawai_media::loudness::measure_file(
-                &path,
-                stream_index,
-                source_layout,
-                move || {
-                    checkpoint(&activity, &background, &trimmer, &foreground_pause);
-                },
-            )?;
-            let native = measured
-                .get(measured.source)
-                .context("native loudness layout missing")?;
-            let stereo = measured
-                .get(kahawai_media::loudness::AudioLayout::new(2, 0x3))
-                .unwrap_or(native);
-            tracks.push(AudioLoudnessTrack {
-                stream_index: stream_index as u32,
-                integrated_lufs: stereo.integrated_lufs,
-                true_peak_dbtp: stereo.true_peak_dbtp,
-                source_channels: measured.source.channels,
-                source_channel_mask: measured.source.channel_mask,
-                native_integrated_lufs: native.integrated_lufs,
-                native_true_peak_dbtp: native.true_peak_dbtp,
-                layouts: measured
-                    .layouts
-                    .into_iter()
-                    .map(|measurement| AudioLayoutLoudness {
-                        channels: measurement.layout.channels,
-                        channel_mask: measurement.layout.channel_mask,
-                        integrated_lufs: measurement.loudness.integrated_lufs,
-                        true_peak_dbtp: measurement.loudness.true_peak_dbtp,
-                    })
-                    .collect(),
-            });
+            let result = (|| -> Result<AudioLoudnessTrack> {
+                let activity = activity.clone();
+                let background = background.clone();
+                let trimmer = trimmer.clone();
+                let foreground_pause = foreground_pause.clone();
+                let cancelled = cancelled.clone();
+                let source_layout = kahawai_media::loudness::AudioLayout::from_stream(
+                    info.audio[stream_index].channels,
+                    info.audio[stream_index].layout.as_deref(),
+                );
+                let measured = kahawai_media::loudness::measure_file(
+                    &path,
+                    stream_index,
+                    source_layout,
+                    move || {
+                        checkpoint(
+                            &activity,
+                            &background,
+                            &trimmer,
+                            &foreground_pause,
+                            &cancelled,
+                        )
+                    },
+                )?;
+                // Positionless noncanonical input has no honest native gain
+                // key; exact canonical layouts remain usable. Legacy scalar
+                // fields fall back to the largest measured conversion only.
+                let native = measured.get(measured.source);
+                anyhow::ensure!(
+                    analyzer >= 5 || native.is_some(),
+                    "legacy analyzer cannot represent positionless native layout"
+                );
+                let stereo = measured
+                    .get(kahawai_media::loudness::AudioLayout::new(2, 0x3))
+                    .or_else(|| measured.layouts.first().map(|layout| layout.loudness))
+                    .context("loudness measurement has no output layouts")?;
+                // Legacy scalar hubs must not relabel a canonical conversion
+                // as positionless native. NaN is their historical unmeasured
+                // sentinel; current hubs consume the exact layout map.
+                let legacy_native = native.unwrap_or(kahawai_media::loudness::AudioLoudness {
+                    integrated_lufs: f64::NAN,
+                    true_peak_dbtp: f64::NAN,
+                });
+                Ok(AudioLoudnessTrack {
+                    stream_index: stream_index as u32,
+                    integrated_lufs: stereo.integrated_lufs,
+                    true_peak_dbtp: stereo.true_peak_dbtp,
+                    source_channels: measured.source.channels,
+                    source_channel_mask: measured.source.channel_mask,
+                    native_integrated_lufs: legacy_native.integrated_lufs,
+                    native_true_peak_dbtp: legacy_native.true_peak_dbtp,
+                    layouts: measured
+                        .layouts
+                        .into_iter()
+                        .map(|measurement| AudioLayoutLoudness {
+                            channels: measurement.layout.channels,
+                            channel_mask: measurement.layout.channel_mask,
+                            integrated_lufs: measurement.loudness.integrated_lufs,
+                            true_peak_dbtp: measurement.loudness.true_peak_dbtp,
+                        })
+                        .collect(),
+                })
+            })();
+            match result {
+                Ok(track) => tracks.push(track),
+                Err(error) => {
+                    tracing::warn!(
+                        collection = collection_id,
+                        path = path_rel,
+                        stream_index,
+                        error = format!("{error:#}"),
+                        "audio loudness track failed"
+                    );
+                    failures.push(format!("audio stream {stream_index}: {error:#}"));
+                }
+            }
         }
         let after = std::fs::metadata(&path)?;
         anyhow::ensure!(
             after.len() == size && mtime_unix(&after) == mtime,
             "source revision changed during loudness measurement"
         );
-        Ok(tracks)
+        Ok((tracks, failures.join("; ")))
     })();
     Ok((size, mtime, measured))
 }
@@ -433,6 +511,27 @@ mod tests {
     }
 
     #[test]
+    fn dropping_a_link_waiter_cancels_its_blocking_measurement() {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        drop(CancelOnDrop(cancelled.clone()));
+        assert!(cancelled.load(Ordering::Acquire));
+
+        let activity = Activity::default();
+        let background = Arc::new(Mutex::new(Some(
+            activity.try_background().expect("initial loudness permit"),
+        )));
+        let error = checkpoint(
+            &activity,
+            &background,
+            &crate::BackgroundMemoryTrimmer::every(Duration::from_secs(60)),
+            &AtomicBool::new(false),
+            &cancelled,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("cancelled"));
+    }
+
+    #[test]
     fn foreground_pause_exposes_its_owner_and_resumes() {
         let activity = Activity::default();
         let background = Arc::new(Mutex::new(Some(
@@ -451,7 +550,14 @@ mod tests {
         let background2 = background.clone();
         let worker = std::thread::spawn(move || {
             let trimmer = crate::BackgroundMemoryTrimmer::every(Duration::from_secs(60));
-            checkpoint(&activity2, &background2, &trimmer, &pause2);
+            checkpoint(
+                &activity2,
+                &background2,
+                &trimmer,
+                &pause2,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
         });
         let deadline = Instant::now() + Duration::from_secs(1);
         while !pause.load(Ordering::Acquire) {
@@ -481,7 +587,14 @@ mod tests {
         let trimmer2 = trimmer.clone();
         let pause = AtomicBool::new(false);
         let lower = std::thread::spawn(move || {
-            checkpoint(&activity2, &background2, &trimmer2, &pause);
+            checkpoint(
+                &activity2,
+                &background2,
+                &trimmer2,
+                &pause,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
             done_tx.send(()).unwrap();
         });
 
@@ -563,13 +676,17 @@ mod tests {
         assert!(result.tracks[0].integrated_lufs.is_finite());
         assert!(result.tracks[0].true_peak_dbtp.is_finite());
         assert_eq!(result.tracks[0].source_channels, 6);
-        assert!(result.tracks[0].native_integrated_lufs.is_finite());
-        assert!(result.tracks[0].native_true_peak_dbtp.is_finite());
+        assert!(
+            result.tracks[0].native_integrated_lufs.is_nan()
+                && result.tracks[0].native_true_peak_dbtp.is_nan(),
+            "positionless native is the legacy unmeasured sentinel"
+        );
         assert_eq!(result.tracks[0].layouts.len(), 3);
 
         // `seen` is pending/in-flight deduplication, not lifetime history. A
         // later scan can invalidate this revision and send the same path. The
-        // same pipeline also answers a minor-4 hub's analyzer-3 request.
+        // analyzer-3 request receives a terminal answer when its scalar-only
+        // schema cannot honestly represent this positionless native layout.
         let mut legacy = work;
         legacy.analyzer = 3;
         work_tx.send(legacy).unwrap();
@@ -582,7 +699,12 @@ mod tests {
         let host_to_hub::Msg::FileLoudness(repeated) = repeated else {
             panic!("wrong repeated result message");
         };
-        assert!(repeated.error.is_empty(), "{}", repeated.error);
+        assert!(
+            repeated.error.contains("legacy loudness"),
+            "{}",
+            repeated.error
+        );
+        assert!(repeated.tracks.is_empty());
         assert_eq!(repeated.analyzer, 3);
         drop(work_tx);
         worker.await.unwrap();

@@ -1407,7 +1407,8 @@ fn retryable_segment_result(
     result: &kahawai_proto::v1::SegmentEpisodeResult,
 ) -> bool {
     result.retryable
-        || (host_protocol_minor < kahawai_proto::SEGMENT_RETRYABLE_MINOR
+        || (!kahawai_proto::ProtocolFeatures::new(host_protocol_minor)
+            .supports(kahawai_proto::ProtocolFeature::RetryableSegmentResults)
             && result.error == kahawai_proto::SEGMENT_COMPARISON_INSUFFICIENT)
 }
 

@@ -16,7 +16,7 @@ use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
 use gstreamer_audio as gst_audio;
 
-pub const ANALYZER: i64 = 4;
+pub const ANALYZER: i64 = 6;
 
 /// EBU R 128 s2 (2023) permits a -20 to -16 LUFS distribution level for
 /// streaming devices with limited playback gain/headroom; -18 LUFS is the
@@ -127,7 +127,11 @@ pub fn measured_layouts(source: AudioLayout) -> Vec<AudioLayout> {
 /// built from discovery. An unpositioned 7.1 declaration, for example, probes
 /// both canonical 7.1 masks even when native decode resolves to one of them.
 pub fn resolved_measured_layouts(declared: AudioLayout, decoded: AudioLayout) -> Vec<AudioLayout> {
-    let mut layouts = vec![decoded];
+    let mut layouts = if decoded.channel_mask == 0 {
+        Vec::new()
+    } else {
+        vec![decoded]
+    };
     layouts.extend(measured_layouts(declared).into_iter().skip(1));
     layouts.sort_by_key(|layout| (std::cmp::Reverse(layout.channels), layout.channel_mask));
     layouts.dedup();
@@ -152,7 +156,7 @@ pub fn layout_from_caps(caps: &gst::CapsRef) -> Option<AudioLayout> {
 pub fn gain_db(measured: AudioLoudness) -> f64 {
     let loudness_gain = TARGET_LUFS - measured.integrated_lufs;
     let peak_gain = MAX_TRUE_PEAK_DBTP - measured.true_peak_dbtp;
-    loudness_gain.min(peak_gain).clamp(-24.0, 24.0)
+    loudness_gain.min(peak_gain)
 }
 
 pub fn gain_multiplier(gain_db: f64) -> f64 {
@@ -165,7 +169,7 @@ struct MeterState {
     channels: u32,
     layout: Option<AudioLayout>,
     error: Option<String>,
-    scratch: Vec<i16>,
+    scratch: Vec<f32>,
 }
 
 impl MeterState {
@@ -187,16 +191,13 @@ impl MeterState {
         if self.meter.is_none() {
             let mode = ebur128::Mode::I | ebur128::Mode::TRUE_PEAK | ebur128::Mode::HISTOGRAM;
             let mut meter = ebur128::EbuR128::new(info.channels(), info.rate(), mode)?;
-            let channel_map = info.positions().map_or_else(
-                || vec![ebur128::Channel::Center; info.channels() as usize],
-                |positions| {
-                    positions
-                        .iter()
-                        .copied()
-                        .map(channel_for_position)
-                        .collect()
-                },
-            );
+            let channel_map = info
+                .positions()
+                .context("loudness layout has no channel positions")?
+                .iter()
+                .copied()
+                .map(channel_for_position)
+                .collect::<Vec<_>>();
             meter.set_channel_map(&channel_map)?;
             self.channels = info.channels();
             self.layout = Some(layout);
@@ -219,26 +220,27 @@ impl MeterState {
         let map = buffer
             .map_readable()
             .context("mapping loudness audio buffer")?;
-        // The caps force native-endian S16. GStreamer buffers are normally
-        // aligned; retain a correct fallback for custom allocators.
-        let (prefix, aligned, suffix) = unsafe { map.as_slice().align_to::<i16>() };
+        // The caps force native-endian F32, matching playback's unclipped
+        // conversion matrix before its encoder-format conversion. GStreamer
+        // buffers are normally aligned; retain a custom-allocator fallback.
+        let (prefix, aligned, suffix) = unsafe { map.as_slice().align_to::<f32>() };
         if prefix.is_empty() && suffix.is_empty() {
             self.meter
                 .as_mut()
                 .expect("meter initialized above")
-                .add_frames_i16(aligned)?;
+                .add_frames_f32(aligned)?;
         } else {
             // Reuse one conversion buffer: allocating a Vec for every audio
             // buffer fills native streaming-thread arenas over a long file.
             self.scratch.clear();
             self.scratch.extend(
-                map.chunks_exact(2)
-                    .map(|bytes| i16::from_ne_bytes([bytes[0], bytes[1]])),
+                map.chunks_exact(4)
+                    .map(|bytes| f32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])),
             );
             self.meter
                 .as_mut()
                 .expect("meter initialized above")
-                .add_frames_i16(&self.scratch)?;
+                .add_frames_f32(&self.scratch)?;
         }
         Ok(())
     }
@@ -280,13 +282,18 @@ impl MeterState {
 fn channel_for_position(position: gst_audio::AudioChannelPosition) -> ebur128::Channel {
     use gst_audio::AudioChannelPosition as Position;
     match position {
-        Position::Mono => ebur128::Channel::DualMono,
+        // A mono programme is one centre channel. `DualMono` tells libebur128
+        // to count it twice and is intentionally about 3 LU louder.
+        Position::Mono => ebur128::Channel::Center,
         Position::FrontLeft => ebur128::Channel::Left,
         Position::FrontRight => ebur128::Channel::Right,
         Position::FrontCenter => ebur128::Channel::Center,
         Position::Lfe1 | Position::Lfe2 => ebur128::Channel::Unused,
-        Position::RearLeft => ebur128::Channel::Mp135,
-        Position::RearRight => ebur128::Channel::Mm135,
+        // BS.1770 applies the 1.41 surround energy weight to the standard
+        // 5.1 rear pair. The angular Mp135/Mm135 extensions are unweighted in
+        // libebur128 and therefore are not equivalent here.
+        Position::RearLeft => ebur128::Channel::LeftSurround,
+        Position::RearRight => ebur128::Channel::RightSurround,
         Position::FrontLeftOfCenter => ebur128::Channel::MpSC,
         Position::FrontRightOfCenter => ebur128::Channel::MmSC,
         Position::RearCenter => ebur128::Channel::Mp180,
@@ -300,12 +307,16 @@ fn channel_for_position(position: gst_audio::AudioChannelPosition) -> ebur128::C
         Position::TopRearRight => ebur128::Channel::Um135,
         Position::TopSideLeft => ebur128::Channel::Up090,
         Position::TopSideRight => ebur128::Channel::Um090,
+        Position::TopSurroundLeft => ebur128::Channel::Up110,
+        Position::TopSurroundRight => ebur128::Channel::Um110,
         Position::TopRearCenter => ebur128::Channel::Up180,
         Position::BottomFrontCenter => ebur128::Channel::Bp000,
         Position::BottomFrontLeft => ebur128::Channel::Bp045,
         Position::BottomFrontRight => ebur128::Channel::Bm045,
-        Position::WideLeft | Position::SurroundLeft => ebur128::Channel::Mp135,
-        Position::WideRight | Position::SurroundRight => ebur128::Channel::Mm135,
+        Position::WideLeft => ebur128::Channel::Mp060,
+        Position::WideRight => ebur128::Channel::Mm060,
+        Position::SurroundLeft => ebur128::Channel::LeftSurround,
+        Position::SurroundRight => ebur128::Channel::RightSurround,
         Position::Invalid | Position::None => ebur128::Channel::Unused,
         _ => ebur128::Channel::Unused,
     }
@@ -336,7 +347,7 @@ fn install_meter_callback(
     sink: &gst_app::AppSink,
     state: Arc<Mutex<MeterState>>,
     recording: Arc<AtomicBool>,
-    between: Arc<dyn Fn() + Send + Sync>,
+    between: Arc<dyn Fn() -> Result<()> + Send + Sync>,
     progress: Arc<MeterProgress>,
 ) {
     sink.set_callbacks(
@@ -347,9 +358,9 @@ fn install_meter_callback(
                     return Ok(gst::FlowSuccess::Ok);
                 }
                 progress.active_callbacks.fetch_add(1, Ordering::AcqRel);
-                between();
+                let checkpoint = between();
                 let mut state = state.lock().unwrap();
-                let result = match state.add_sample(&sample) {
+                let result = match checkpoint.and_then(|()| state.add_sample(&sample)) {
                     Ok(()) => {
                         *progress.last_buffer.lock().unwrap() = Instant::now();
                         Ok(gst::FlowSuccess::Ok)
@@ -410,34 +421,40 @@ impl MeterBranch {
 
 /// Decode one audio stream at disk speed and meter every bounded output layout
 /// that playback may choose. `between` runs on every output buffer; blocking it
-/// backpressures every branch so a mediahost can yield to playback and scans.
+/// backpressures every branch so a mediahost can yield to playback and scans,
+/// while returning an error cancels the measurement at that boundary.
 pub fn measure_file(
     path: &Path,
     audio_index: usize,
     source_layout: AudioLayout,
-    between: impl Fn() + Send + Sync + 'static,
+    between: impl Fn() -> Result<()> + Send + Sync + 'static,
 ) -> Result<AudioLoudnessMeasurement> {
     crate::init()?;
+    between()?;
     anyhow::ensure!(source_layout.channels > 0, "source audio has no channels");
     let raw_format = if cfg!(target_endian = "little") {
-        "S16LE"
+        "F32LE"
     } else {
-        "S16BE"
+        "F32BE"
     };
 
     let tee = gst::ElementFactory::make("tee").build()?;
     let targets = measured_layouts(source_layout);
     let mut branches = Vec::with_capacity(targets.len());
-    // Native is unconstrained so its caps record what the decoder actually
-    // produced. Every derived branch pins the exact matrix it measures.
-    branches.push(MeterBranch::new(None, raw_format)?);
+    // Native is unconstrained only when discovery supplied real positions.
+    // Positionless multichannel has no honest exact gain key; start with the
+    // canonical full-layout conversion instead of inventing centre channels.
+    if source_layout.channel_mask != 0 {
+        branches.push(MeterBranch::new(None, raw_format)?);
+    }
     for target in targets.into_iter().skip(1) {
         branches.push(MeterBranch::new(Some(target), raw_format)?);
     }
+    anyhow::ensure!(!branches.is_empty(), "no measurable audio layout");
 
     let recording = Arc::new(AtomicBool::new(false));
     let progress = Arc::new(MeterProgress::new());
-    let between: Arc<dyn Fn() + Send + Sync> = Arc::new(between);
+    let between: Arc<dyn Fn() -> Result<()> + Send + Sync> = Arc::new(between);
     for branch in &branches {
         install_meter_callback(
             &branch.sink,
@@ -494,6 +511,10 @@ pub fn measure_file(
                     gst::MessageType::Application,
                 ],
             ) else {
+                // Cancellation must not depend on a decoder producing another
+                // sample—the no-buffer stall is exactly when teardown needs
+                // this independent poll.
+                between()?;
                 if progress.stalled(NO_PROGRESS_TIMEOUT) {
                     anyhow::bail!(
                         "loudness pipeline produced no decoded audio for {} s",
@@ -526,19 +547,26 @@ pub fn measure_file(
     for branch in &branches {
         layouts.push(branch.state.lock().unwrap().finish()?);
     }
-    let source = layouts[0].layout;
-    anyhow::ensure!(
-        source.channels == source_layout.channels,
-        "discovered {} source channels but decoded {}",
-        source_layout.channels,
-        source.channels
-    );
-    anyhow::ensure!(
-        source_layout.channel_mask == 0 || source == source_layout,
-        "discovered source layout {:?} but decoded {:?}",
-        source_layout,
-        source
-    );
+    let source = if source_layout.channel_mask == 0 {
+        // Identity stays positionless while only honest canonical conversion
+        // keys are published. There is deliberately no fabricated native key.
+        source_layout
+    } else {
+        let decoded = layouts[0].layout;
+        anyhow::ensure!(
+            decoded.channels == source_layout.channels,
+            "discovered {} source channels but decoded {}",
+            source_layout.channels,
+            decoded.channels
+        );
+        anyhow::ensure!(
+            decoded == source_layout,
+            "discovered source layout {:?} but decoded {:?}",
+            source_layout,
+            decoded
+        );
+        decoded
+    };
     layouts.sort_by_key(|measurement| {
         (
             std::cmp::Reverse(measurement.layout.channels),
@@ -552,6 +580,24 @@ pub fn measure_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mono_and_standard_surround_positions_use_bs1770_weights() {
+        use gst_audio::AudioChannelPosition as Position;
+
+        assert_eq!(
+            channel_for_position(Position::Mono),
+            ebur128::Channel::Center
+        );
+        assert_eq!(
+            channel_for_position(Position::RearLeft),
+            ebur128::Channel::LeftSurround
+        );
+        assert_eq!(
+            channel_for_position(Position::RearRight),
+            ebur128::Channel::RightSurround
+        );
+    }
 
     #[test]
     fn no_progress_watchdog_ignores_an_active_callback() {
@@ -579,6 +625,18 @@ mod tests {
         };
         assert_eq!(gain_db(roomy), 6.0);
         assert!((gain_multiplier(6.0) - 1.995_262).abs() < 0.000_01);
+
+        let very_quiet = AudioLoudness {
+            integrated_lufs: -60.0,
+            true_peak_dbtp: -70.0,
+        };
+        assert_eq!(gain_db(very_quiet), 42.0);
+
+        let very_loud = AudioLoudness {
+            integrated_lufs: 8.0,
+            true_peak_dbtp: 9.0,
+        };
+        assert_eq!(gain_db(very_loud), -26.0);
     }
 
     #[test]
@@ -593,6 +651,10 @@ mod tests {
             ]
         );
         assert_eq!(
+            resolved_measured_layouts(AudioLayout::new(3, 0), AudioLayout::new(3, 0)),
+            [AudioLayout::new(2, 0x3), AudioLayout::new(1, 0x4)]
+        );
+        assert_eq!(
             resolved_measured_layouts(AudioLayout::new(8, 0), AudioLayout::new(8, 0xc3f),),
             [
                 AudioLayout::new(8, 0xff),
@@ -603,6 +665,35 @@ mod tests {
             ]
         );
     }
+    #[test]
+    fn a_tenth_scale_mono_sine_measures_as_one_channel() {
+        crate::init().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mono-reference.wav");
+        let pipeline = gst::parse::launch(&format!(
+            "audiotestsrc num-buffers=30 samplesperbuffer=4800 wave=sine freq=1000 volume=0.1 ! \
+             audio/x-raw,rate=48000,channels=1,channel-mask=(bitmask)0x4 ! \
+             audioconvert ! wavenc ! filesink location={}",
+            path.display()
+        ))
+        .unwrap();
+        pipeline.set_state(gst::State::Playing).unwrap();
+        let message = pipeline.bus().unwrap().timed_pop_filtered(
+            gst::ClockTime::from_seconds(10),
+            &[gst::MessageType::Eos, gst::MessageType::Error],
+        );
+        pipeline.set_state(gst::State::Null).unwrap();
+        assert!(message.is_some_and(|message| message.type_() == gst::MessageType::Eos));
+
+        let source = AudioLayout::new(1, 0x4);
+        let measured = measure_file(&path, 0, source, || Ok(())).unwrap();
+        let lufs = measured.get(source).unwrap().integrated_lufs;
+        assert!(
+            (-23.2..=-22.8).contains(&lufs),
+            "0.1-amplitude 1 kHz mono reference measured {lufs:.2} LUFS"
+        );
+    }
+
     #[test]
     fn measures_each_supported_output_layout_from_one_decode() {
         crate::init().unwrap();
@@ -624,7 +715,7 @@ mod tests {
         assert!(message.is_some_and(|message| message.type_() == gst::MessageType::Eos));
 
         let source = AudioLayout::new(6, 0x3f);
-        let measured = measure_file(&path, 0, source, || {}).unwrap();
+        let measured = measure_file(&path, 0, source, || Ok(())).unwrap();
         assert_eq!(measured.source, source);
         assert_eq!(
             measured
@@ -675,9 +766,9 @@ mod tests {
         pipeline.set_state(gst::State::Null).unwrap();
         assert!(message.is_some_and(|message| message.type_() == gst::MessageType::Eos));
 
-        let first = measure_file(&path, 0, AudioLayout::new(2, 0x3), || {}).unwrap();
-        let second = measure_file(&path, 1, AudioLayout::new(1, 0x4), || {}).unwrap();
-        let third = measure_file(&path, 2, AudioLayout::new(6, 0x3f), || {}).unwrap();
+        let first = measure_file(&path, 0, AudioLayout::new(2, 0x3), || Ok(())).unwrap();
+        let second = measure_file(&path, 1, AudioLayout::new(1, 0x4), || Ok(())).unwrap();
+        let third = measure_file(&path, 2, AudioLayout::new(6, 0x3f), || Ok(())).unwrap();
         assert_eq!(first.source.channels, 2);
         assert_eq!(second.source.channels, 1);
         assert_eq!(third.source.channels, 6);

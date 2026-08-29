@@ -245,9 +245,107 @@ async fn fill_audio_loudness_gains(
             .audio_loudness(parts[0].file_id, plan.audio_track)
             .await?
     };
+
     apply_audio_loudness_measurement(plan, preference, measured);
     Ok(())
 }
+fn same_video_path(
+    left: &kahawai_media::remux::RemuxPlan,
+    right: &kahawai_media::remux::RemuxPlan,
+) -> bool {
+    left.video == right.video
+        && left.video_track == right.video_track
+        && left.video_kbps == right.video_kbps
+        && left.max_height == right.max_height
+        && left.tone_map == right.tone_map
+        && left.deinterlace == right.deinterlace
+        && left.burn_subtitle == right.burn_subtitle
+        && left.burn_ass == right.burn_ass
+        && left.video_codec == right.video_codec
+        && left.segment_format == right.segment_format
+}
+
+fn replanned_verdict(
+    plan: &kahawai_media::remux::RemuxPlan,
+    video_verdict: &str,
+    audio_verdict: &str,
+) -> Result<(String, String)> {
+    anyhow::ensure!(plan.playable(), "selected track is not playable");
+    Ok((video_verdict.to_owned(), audio_verdict.to_owned()))
+}
+
+fn loudness_protocol_feature(
+    plan: &kahawai_media::remux::RemuxPlan,
+) -> Option<kahawai_proto::ProtocolFeature> {
+    plan.loudness_gains
+        .iter()
+        .any(Option::is_some)
+        .then_some(kahawai_proto::ProtocolFeature::ExactAudioLoudnessGains)
+}
+
+fn wire_scalar_loudness(
+    plan: &kahawai_media::remux::RemuxPlan,
+) -> (Option<f64>, Option<f64>, Option<u32>) {
+    // Presence is authoritative to current workers. Explicit legacy sentinels
+    // keep minor-4/5 generated decoders from turning omission into 0 dB.
+    (
+        Some(plan.stereo_gain_db.unwrap_or(f64::NAN)),
+        Some(plan.native_gain_db.unwrap_or(f64::NAN)),
+        Some(plan.loudness_source_channels.unwrap_or(0)),
+    )
+}
+
+fn placement_need(
+    plan: &kahawai_media::remux::RemuxPlan,
+    info: &kahawai_core::media::MediaInfo,
+    parts: &[PartSource],
+    burns_ass: bool,
+) -> (crate::registry::PlacementNeed, String) {
+    use kahawai_media::remux::StreamMode;
+
+    let class = if plan.video == StreamMode::Encode {
+        let video = info.video.first();
+        crate::pace::work_class(
+            video.map_or(0, |video| video.height),
+            video.map_or("", |video| video.codec.as_str()),
+            plan.video_codec.as_str(),
+            plan.tone_map,
+        )
+    } else {
+        String::new()
+    };
+    let need = crate::registry::PlacementNeed {
+        encode_video: plan.video == StreamMode::Encode,
+        encode_audio: plan.audio == StreamMode::Encode,
+        video_caps: kahawai_media::remux::source_caps_names("video", info),
+        audio_caps: kahawai_media::remux::source_caps_names("audio", info),
+        needs_tonemap: plan.tone_map,
+        needs_ass_burn: burns_ass,
+        // Audio-only sessions stay local (`Registry::place`), while a session
+        // already bound to a full transcoder remains remote even if a track
+        // switch changes video to copy. Preserve the feature for failover.
+        required_protocol_feature: loudness_protocol_feature(plan),
+        video_codec: if plan.video == StreamMode::Encode {
+            plan.video_codec.as_str().to_string()
+        } else {
+            String::new()
+        },
+        audio_codec: if plan.audio == StreamMode::Encode {
+            plan.audio_codec.as_str().to_string()
+        } else {
+            String::new()
+        },
+        work_class: (!class.is_empty()).then(|| class.clone()),
+        source_kbps: info
+            .duration_ms
+            .filter(|duration| *duration > 0)
+            .map(|duration| {
+                ((parts.iter().map(|part| part.size).sum::<u64>() * 8) / duration) as u32
+            }),
+    };
+    (need, class)
+}
+
 pub struct Session {
     pub id: String,
     pub user_id: String,
@@ -311,8 +409,9 @@ pub struct Session {
     /// The negotiated plan (remux/transcode) — reused on seek-restarts;
     /// mutable because audio-track switches re-plan (HUB-27).
     plan: Mutex<Option<kahawai_media::remux::RemuxPlan>>,
-    /// Placement requirements — reused when rescheduling (AR-6).
-    needs: crate::registry::PlacementNeed,
+    /// Placement requirements — reused when rescheduling (AR-6), and replaced
+    /// with the current plan after a track switch.
+    needs: Mutex<crate::registry::PlacementNeed>,
     /// HUB-36 work class this session's encode belongs to, or empty
     /// when there is no encode to learn from. Fixed at planning time:
     /// a track switch re-plans the AUDIO, which does not change what
@@ -384,11 +483,39 @@ pub(crate) struct ExecutorFacts {
     pub full_audio_targets: Vec<String>,
     /// Audio targets of the hub's lightweight local worker.
     pub local_audio_targets: Vec<String>,
-    /// The selected full executor understands exact layout-keyed gains.
-    pub full_layout_gains: bool,
+    /// Additive protocol features understood by the selected full executor.
+    pub full_protocol: kahawai_proto::ProtocolFeatures,
     /// HUB-32b: this source's display-set timeline is readable where
     /// the encode would run.
     pub burn_capable: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct SourceChoiceKey {
+    incomplete: bool,
+    ordinary_cost: kahawai_media::negotiate::Cost,
+    force_missed: bool,
+}
+
+/// Cross-rendition choice is based on what each source costs before an
+/// optional force preference changes its audio. Force capability breaks ties;
+/// it never promotes a source whose ordinary video path is more expensive.
+fn source_choice_key(
+    ordinary: &kahawai_media::negotiate::SourcePlan,
+    force_missed: bool,
+) -> SourceChoiceKey {
+    SourceChoiceKey {
+        incomplete: ordinary.incomplete,
+        ordinary_cost: ordinary.cost,
+        force_missed,
+    }
+}
+
+struct SourceChoice {
+    plan: kahawai_media::negotiate::SourcePlan,
+    index: usize,
+    measurement: Option<kahawai_media::loudness::AudioLoudnessMeasurement>,
+    key: SourceChoiceKey,
 }
 
 /// Everything a negotiation needs that does not change between
@@ -555,6 +682,7 @@ impl<'a> Negotiation<'a> {
         &self,
         info: &kahawai_core::media::MediaInfo,
         burn_capable: bool,
+        required_protocol_feature: Option<kahawai_proto::ProtocolFeature>,
     ) -> ExecutorFacts {
         // HUB-15a: would the box that runs a video encode of THIS
         // source tone-map? Same placement question the real dispatch
@@ -567,6 +695,11 @@ impl<'a> Negotiation<'a> {
             video_caps: kahawai_media::remux::source_caps_names("video", info),
             audio_caps: vec![],
             needs_tonemap: true,
+            // Gain fields are additive on the wire but cannot degrade to an
+            // old worker silently ignoring normalization. The ordinary probe
+            // stays broad and is repeated with the exact required feature only
+            // after the plan proves it needs gain.
+            required_protocol_feature,
             // Not yet known here: the probe runs before the plan picks
             // a subtitle tier, and asking for the burn would narrow the
             // pool that DECIDES it.
@@ -583,38 +716,29 @@ impl<'a> Negotiation<'a> {
             work_class: None,
             source_kbps: None,
         };
-        let (tonemap, full_targets, full_layout_gains) = match self.registry.pick_transcoder(&need)
-        {
+        let (tonemap, full_targets, full_protocol) = match self.registry.pick_transcoder(&need) {
             Some(tc) => (
                 self.registry.transcoder_reports_tonemap(&tc),
                 self.registry.transcoder_encoders(&tc),
-                self.registry.transcoder_supports_layout_gains(&tc),
+                self.registry
+                    .transcoder_protocol_features(&tc)
+                    .unwrap_or_default(),
             ),
             None if self.registry.local_video_executor_enabled() => (
-                kahawai_media::remux::tonemap_available(),
-                local_encoder_names(),
-                true,
+                local_tonemap_available(self.registry),
+                local_encoder_names(self.registry),
+                kahawai_proto::ProtocolFeatures::current(),
             ),
-            None => (false, Vec::new(), false),
+            None => (false, Vec::new(), Default::default()),
         };
         ExecutorFacts {
             tonemap,
             video_targets: video_encoder_names(&full_targets),
             full_audio_targets: audio_encoder_names(&full_targets),
-            full_layout_gains,
+            full_protocol,
             local_audio_targets: local_audio_encoder_names(),
             burn_capable,
         }
-    }
-
-    /// The plan for one source against one executor's capabilities.
-    pub(crate) fn plan(
-        &self,
-        parts: &[PartSource],
-        info: &kahawai_core::media::MediaInfo,
-        facts: &ExecutorFacts,
-    ) -> kahawai_media::negotiate::SourcePlan {
-        self.plan_with_force(parts, info, facts, self.force_audio_encode)
     }
 
     fn plan_with_force(
@@ -664,11 +788,77 @@ impl<'a> Negotiation<'a> {
         if !force_audio_encode {
             return normal;
         }
-        if normal.plan.video == kahawai_media::remux::StreamMode::Encode && !facts.full_layout_gains
-        {
-            return normal;
-        }
         negotiate(true)
+    }
+
+    fn plans_with_probe(
+        &self,
+        parts: &[PartSource],
+        info: &kahawai_core::media::MediaInfo,
+        burn_capable: bool,
+        measurement: Option<&kahawai_media::loudness::AudioLoudnessMeasurement>,
+    ) -> (
+        kahawai_media::negotiate::SourcePlan,
+        kahawai_media::negotiate::SourcePlan,
+    ) {
+        let ordinary_facts = self.probe(info, burn_capable, None);
+        let ordinary = self.plan_with_force(parts, info, &ordinary_facts, false);
+        let Some(measurement) = measurement else {
+            return (ordinary.clone(), ordinary);
+        };
+        let forced = self.plan_with_force(parts, info, &ordinary_facts, true);
+        let usable_force = |candidate: &kahawai_media::negotiate::SourcePlan| {
+            candidate.cost != kahawai_media::negotiate::Cost::Unplayable
+                && candidate.plan.audio == kahawai_media::remux::StreamMode::Encode
+                && candidate.plan.video == ordinary.plan.video
+        };
+        let selected = if !usable_force(&forced) {
+            ordinary.clone()
+        } else {
+            let mut measured_plan = forced.plan;
+            apply_audio_loudness_measurement(
+                &mut measured_plan,
+                LoudnessPreference::Force,
+                Some(measurement.clone()),
+            );
+            let required = (measured_plan.video == kahawai_media::remux::StreamMode::Encode)
+                .then(|| loudness_protocol_feature(&measured_plan))
+                .flatten();
+            if required.is_none_or(|feature| ordinary_facts.full_protocol.supports(feature)) {
+                forced
+            } else {
+                let exact_facts = self.probe(info, burn_capable, required);
+                let exact = self.plan_with_force(parts, info, &exact_facts, true);
+                if usable_force(&exact) {
+                    exact
+                } else {
+                    ordinary.clone()
+                }
+            }
+        };
+        (ordinary, selected)
+    }
+
+    fn plan_for_protocol(
+        &self,
+        parts: &[PartSource],
+        info: &kahawai_core::media::MediaInfo,
+        burn_capable: bool,
+        required_protocol_feature: Option<kahawai_proto::ProtocolFeature>,
+    ) -> kahawai_media::negotiate::SourcePlan {
+        let facts = self.probe(info, burn_capable, required_protocol_feature);
+        self.plan_with_force(parts, info, &facts, false)
+    }
+
+    fn plan_with_probe(
+        &self,
+        parts: &[PartSource],
+        info: &kahawai_core::media::MediaInfo,
+        burn_capable: bool,
+        measurement: Option<&kahawai_media::loudness::AudioLoudnessMeasurement>,
+    ) -> kahawai_media::negotiate::SourcePlan {
+        self.plans_with_probe(parts, info, burn_capable, measurement)
+            .1
     }
 
     /// Probe the fleet, then plan. The session-start form.
@@ -678,7 +868,7 @@ impl<'a> Negotiation<'a> {
         info: &kahawai_core::media::MediaInfo,
         burn_capable: bool,
     ) -> kahawai_media::negotiate::SourcePlan {
-        self.plan(parts, info, &self.probe(info, burn_capable))
+        self.plan_with_probe(parts, info, burn_capable, self.force_measurement.as_ref())
     }
 
     /// HUB-32b: the display-set timeline comes from the mediahost,
@@ -696,14 +886,21 @@ impl<'a> Negotiation<'a> {
         &self,
         parts: &[PartSource],
         info: &kahawai_core::media::MediaInfo,
-        force_audio_encode: bool,
+        measurement: Option<&kahawai_media::loudness::AudioLoudnessMeasurement>,
     ) -> kahawai_media::negotiate::SourcePlan {
-        self.plan_with_force(
-            parts,
-            info,
-            &self.probe(info, self.reads_sets_for(parts)),
-            force_audio_encode,
-        )
+        self.plans_auto_with_force(parts, info, measurement).1
+    }
+
+    fn plans_auto_with_force(
+        &self,
+        parts: &[PartSource],
+        info: &kahawai_core::media::MediaInfo,
+        measurement: Option<&kahawai_media::loudness::AudioLoudnessMeasurement>,
+    ) -> (
+        kahawai_media::negotiate::SourcePlan,
+        kahawai_media::negotiate::SourcePlan,
+    ) {
+        self.plans_with_probe(parts, info, self.reads_sets_for(parts), measurement)
     }
 
     async fn forced_measurement(
@@ -748,7 +945,7 @@ impl<'a> Negotiation<'a> {
                     self.forced_measurement(&parts, &info).await?
                 };
                 let force = measurement.is_some();
-                let sp = self.plan_auto_with_force(&parts, &info, force);
+                let sp = self.plan_auto_with_force(&parts, &info, measurement.as_ref());
                 self.force_audio_encode = force;
                 self.force_measurement = measurement;
                 Ok((parts, info, sp, m.to_string()))
@@ -788,33 +985,36 @@ impl<'a> Negotiation<'a> {
                         bail!("the picked subtitle track's source is not available");
                     }
                 }
-                // Completeness first, then cost — the same rule
-                // `negotiate` already uses to choose between TS and
-                // fMP4, applied across sources. A source whose audio
-                // this client cannot take plans "cheaper" than one that
-                // must encode, and picking it plays the film silently.
-                // A bill beats a defect.
-                let mut best: Option<(
-                    kahawai_media::negotiate::SourcePlan,
-                    usize,
-                    Option<kahawai_media::loudness::AudioLoudnessMeasurement>,
-                    bool,
-                )> = None;
+                // Completeness and the ORDINARY cost choose the rendition.
+                // Force may break that tie, then replace only the winner's
+                // audio plan. Ranking the forced plan itself made a measured
+                // HEVC encode beat an unmeasured H.264 direct source, which
+                // turned an audio-only preference into video transcoding.
+                let mut best: Option<SourceChoice> = None;
                 for (idx, (parts, info)) in candidates.iter().enumerate() {
                     let measurement = self.forced_measurement(parts, info).await?;
-                    let sp = self.plan_auto_with_force(parts, info, measurement.is_some());
+                    let (ordinary, sp) =
+                        self.plans_auto_with_force(parts, info, measurement.as_ref());
                     let normalized = measurement.is_some()
                         && sp.plan.audio == kahawai_media::remux::StreamMode::Encode;
                     let force_missed = self.loudness.force() && !normalized;
-                    let better = best.as_ref().is_none_or(|(cur, _, _, cur_missed)| {
-                        (sp.incomplete, force_missed, sp.cost)
-                            < (cur.incomplete, *cur_missed, cur.cost)
-                    });
+                    let key = source_choice_key(&ordinary, force_missed);
+                    let better = best.as_ref().is_none_or(|current| key < current.key);
                     if better {
-                        best = Some((sp, idx, measurement, force_missed));
+                        best = Some(SourceChoice {
+                            plan: sp,
+                            index: idx,
+                            measurement,
+                            key,
+                        });
                     }
                 }
-                let (sp, idx, measurement, _) = best.unwrap();
+                let SourceChoice {
+                    plan: sp,
+                    index: idx,
+                    measurement,
+                    ..
+                } = best.unwrap();
                 self.force_audio_encode = measurement.is_some();
                 self.force_measurement = measurement;
                 let mode = if sp.direct { "direct" } else { "remux" };
@@ -825,11 +1025,22 @@ impl<'a> Negotiation<'a> {
     }
 }
 
-fn local_encoder_names() -> Vec<String> {
+fn local_encoder_names(registry: &Registry) -> Vec<String> {
+    let Some(bench) = registry.local_bench() else {
+        return Vec::new();
+    };
     kahawai_media::remux::encoder_capabilities()
         .iter()
-        .map(|(c, _, _)| c.to_string())
+        .filter(|(_, element, _)| bench.encoder_ready(element))
+        .map(|(codec, _, _)| codec.to_string())
         .collect()
+}
+
+fn local_tonemap_available(registry: &Registry) -> bool {
+    registry
+        .local_bench()
+        .is_some_and(|bench| bench.tonemap_ready())
+        && kahawai_media::remux::tonemap_available()
 }
 
 fn local_audio_encoder_names() -> Vec<String> {
@@ -2008,7 +2219,7 @@ impl Sessions {
         // No refusal to raise: the ladder is a permutation and flatten
         // is always possible, so `AssPolicy::choose` is total and a burn
         // is only ever planned when some box can perform it.
-        let burns_ass = sp.plan.burn_ass.is_some() || sp.burn_ass_sidecar.is_some();
+        let mut burns_ass = sp.plan.burn_ass.is_some() || sp.burn_ass_sidecar.is_some();
         if sp.cost == kahawai_media::negotiate::Cost::Unplayable && mode != "direct" {
             // The verdict names the actual blocker — a client refusing
             // the encode target reads very differently from a fleet
@@ -2019,7 +2230,7 @@ impl Sessions {
                 sp.audio_verdict
             );
         }
-        let negotiated = sp;
+        let mut negotiated = sp;
         let mode = mode.as_str();
         if parts.len() > 1 && mode == "direct" {
             bail!("multi-part sources play via remux/transcode, not direct");
@@ -2056,6 +2267,11 @@ impl Sessions {
                 // The muxer stalls on unfed pads, so only claim what the
                 // plan will actually feed — the negotiated plan is the
                 // single source of truth with the pipeline's link logic.
+                let ordinary_negotiated = if neg.loudness.force() {
+                    neg.plan_for_protocol(&parts, &info, burn_capable, None)
+                } else {
+                    negotiated.clone()
+                };
                 let mut plan = negotiated.plan;
                 if !plan.playable() {
                     bail!(
@@ -2072,72 +2288,86 @@ impl Sessions {
                     neg.force_measurement.clone(),
                 )
                 .await?;
+                if !neg.loudness.force()
+                    && plan.video == kahawai_media::remux::StreamMode::Encode
+                    && let Some(required) = loudness_protocol_feature(&plan)
+                {
+                    let mut candidate =
+                        neg.plan_for_protocol(&parts, &info, burn_capable, Some(required));
+                    if !candidate.plan.playable()
+                        || candidate.incomplete != ordinary_negotiated.incomplete
+                        || candidate.plan.audio != plan.audio
+                        || !same_video_path(&candidate.plan, &plan)
+                        || candidate.burn_sidecar != ordinary_negotiated.burn_sidecar
+                        || candidate.burn_ass_sidecar != ordinary_negotiated.burn_ass_sidecar
+                    {
+                        // Default normalization is optional and must not alter
+                        // the video or subtitle path. If no exact-gain worker
+                        // can execute that path, preserve playback without gain.
+                        apply_audio_loudness_measurement(&mut plan, LoudnessPreference::Off, None);
+                    } else {
+                        fill_audio_loudness_gains(
+                            registry,
+                            &parts,
+                            &mut candidate.plan,
+                            neg.loudness,
+                            None,
+                        )
+                        .await?;
+                        plan = candidate.plan;
+                        burns_ass = candidate.plan.burn_ass.is_some()
+                            || candidate.burn_ass_sidecar.is_some();
+                        negotiated = candidate;
+                    }
+                }
                 verdict = Some((
                     negotiated.video_verdict.clone(),
                     negotiated.audio_verdict.clone(),
                 ));
                 session_plan = Some(plan);
-                use kahawai_media::remux::StreamMode;
-                session_needs = crate::registry::PlacementNeed {
-                    encode_video: plan.video == StreamMode::Encode,
-                    encode_audio: plan.audio == StreamMode::Encode,
-                    video_caps: kahawai_media::remux::source_caps_names("video", &info),
-                    audio_caps: kahawai_media::remux::source_caps_names("audio", &info),
-                    needs_tonemap: plan.tone_map,
-                    // HUB-32a: a HARD filter — see PlacementNeed. Both
-                    // arms count: an embedded index in the plan, and a
-                    // sidecar script shipped with the session.
-                    needs_ass_burn: burns_ass,
-                    // HUB-15b: the chosen TARGETS are hard placement
-                    // filters (empty when the stream doesn't encode).
-                    video_codec: if plan.video == StreamMode::Encode {
-                        plan.video_codec.as_str().to_string()
-                    } else {
-                        String::new()
-                    },
-                    audio_codec: if plan.audio == StreamMode::Encode {
-                        plan.audio_codec.as_str().to_string()
-                    } else {
-                        String::new()
-                    },
-                    // Filled in just below, once the class is derived.
-                    work_class: None,
-                    // Average over the whole source: the link term only
-                    // needs the order of magnitude, and a per-scene peak
-                    // would condemn a box for one busy minute.
-                    source_kbps: info
-                        .duration_ms
-                        .filter(|d| *d > 0)
-                        .map(|d| ((parts.iter().map(|p| p.size).sum::<u64>() * 8) / d) as u32),
-                };
-                // Only an ENCODE has a pace worth learning: a copy runs
-                // at whatever the link allows and says nothing about
-                // this box's compute.
-                if plan.video == StreamMode::Encode {
-                    let v = info.video.first();
-                    session_class = crate::pace::work_class(
-                        v.map_or(0, |v| v.height),
-                        v.map_or("", |v| v.codec.as_str()),
-                        plan.video_codec.as_str(),
-                        plan.tone_map,
-                    );
-                    session_needs.work_class = Some(session_class.clone());
-                }
+                (session_needs, session_class) = placement_need(&plan, &info, &parts, burns_ass);
                 // Encode work goes to the fleet when one is available
                 // (§4.5); pure remux — and encode with no fleet — stays
                 // in the local supervised worker.
                 // HUB-36 phase 5: the placement now carries what it is
                 // expected to sustain, so a session that will crawl says
                 // so instead of letting the viewer discover it.
-                let placement = if session_needs.encode_video || session_needs.encode_audio {
-                    registry.place(&session_needs)
-                } else {
-                    crate::registry::Placement {
-                        target: None,
-                        available: true,
-                        predicted: None,
+                let place = |need: &crate::registry::PlacementNeed| {
+                    if need.encode_video || need.encode_audio {
+                        registry.place(need)
+                    } else {
+                        crate::registry::Placement {
+                            target: None,
+                            available: true,
+                            predicted: None,
+                        }
                     }
                 };
+                let mut placement = place(&session_needs);
+                if !placement.available && session_needs.required_protocol_feature.is_some() {
+                    // Capacity and hard constraints can change after the
+                    // compatible probe. Retry the exact ordinary plan with no
+                    // protocol requirement rather than turning that race into
+                    // a playback failure or a force-only unity-gain encode.
+                    negotiated = ordinary_negotiated;
+                    plan = negotiated.plan;
+                    apply_audio_loudness_measurement(&mut plan, LoudnessPreference::Off, None);
+                    burns_ass = plan.burn_ass.is_some() || negotiated.burn_ass_sidecar.is_some();
+                    verdict = Some((
+                        negotiated.video_verdict.clone(),
+                        negotiated.audio_verdict.clone(),
+                    ));
+                    session_plan = Some(plan);
+                    (session_needs, session_class) =
+                        placement_need(&plan, &info, &parts, burns_ass);
+                    placement = place(&session_needs);
+                }
+                anyhow::ensure!(
+                    plan.playable(),
+                    "no playable streams after loudness protocol fallback: {} · {}",
+                    negotiated.video_verdict,
+                    negotiated.audio_verdict
+                );
                 anyhow::ensure!(
                     placement.available,
                     "video transcoding unavailable: no capable external transcoder or enabled all-in-one transcoder"
@@ -2295,7 +2525,7 @@ impl Sessions {
             seek_gen: std::sync::atomic::AtomicU64::new(0),
             seek_done: tokio::sync::watch::channel((0, Ok(0))).0,
             plan: Mutex::new(session_plan),
-            needs: session_needs,
+            needs: Mutex::new(session_needs),
             pace_class: session_class,
             touched: Mutex::new(std::time::Instant::now()),
         });
@@ -2702,6 +2932,8 @@ impl Sessions {
             .lock()
             .unwrap()
             .insert(session_id.to_string(), ready_tx);
+        let (stereo_gain_db, native_gain_db, loudness_source_channels) =
+            wire_scalar_loudness(&plan);
 
         let start = kahawai_proto::v1::HubToTc {
             msg: Some(kahawai_proto::v1::hub_to_tc::Msg::StartSession(
@@ -2718,9 +2950,9 @@ impl Sessions {
                     video_kbps: plan.video_kbps.unwrap_or(0),
                     max_height: plan.max_height.unwrap_or(0),
                     max_channels: plan.max_channels.unwrap_or(0),
-                    stereo_gain_db: plan.stereo_gain_db.unwrap_or(f64::NAN),
-                    native_gain_db: plan.native_gain_db.unwrap_or(f64::NAN),
-                    loudness_source_channels: plan.loudness_source_channels.unwrap_or(0),
+                    stereo_gain_db,
+                    native_gain_db,
+                    loudness_source_channels,
                     loudness_gains: plan
                         .loudness_gains
                         .iter()
@@ -2749,7 +2981,10 @@ impl Sessions {
             sessions.tc_leases.lock().unwrap().remove(session_id);
             sessions.pending_ready.lock().unwrap().remove(session_id);
         };
-        if let Err(e) = registry.send_to_tc(transcoder, start).await {
+        if let Err(e) = registry
+            .send_to_tc_requiring(transcoder, start, loudness_protocol_feature(&plan))
+            .await
+        {
             cleanup(self);
             return Err(e);
         }
@@ -3215,7 +3450,7 @@ impl Sessions {
                 }
                 _ => {
                     let video = if registry.local_video_executor_enabled() {
-                        video_encoder_names(&local_encoder_names())
+                        video_encoder_names(&local_encoder_names(registry))
                     } else {
                         Vec::new()
                     };
@@ -3238,69 +3473,105 @@ impl Sessions {
                     )
                 })
                 .unwrap_or_default();
-            let layout_gains_supported = match &session.mode {
+            let executor_protocol = match &session.mode {
                 Mode::Transcode { transcoder } => {
                     let tc = transcoder.lock().unwrap().clone();
-                    registry.transcoder_supports_layout_gains(&tc)
-                }
-                _ => true,
-            };
-            let force_measurement =
-                if session.force_loudness && layout_gains_supported && session.parts.len() == 1 {
                     registry
-                        .audio_loudness(session.parts[0].file_id, want_audio)
-                        .await?
-                } else {
-                    None
-                };
-            let force_audio_encode = force_measurement.is_some();
-            let sp = kahawai_media::negotiate::negotiate_for_executors(
-                &session.profile,
-                &info,
-                want_audio,
-                want_video,
-                session.parts.len() == 1,
-                None,
-                tonemap,
-                burn_capable,
-                &ocr_flags,
-                // The session's explicit burn keeps forcing across
-                // track switches — its sets are already in hand.
-                *session.burn_pick.lock().unwrap(),
-                // A seek cannot move boxes (HUB-15b), so the question is
-                // whether THIS executor burns ASS — not whether the
-                // fleet does.
-                &kahawai_media::negotiate::AssPolicy {
-                    burn_capable: match &session.mode {
-                        Mode::Transcode { transcoder } => {
-                            let tc = transcoder.lock().unwrap().clone();
-                            registry.transcoder_reports_ass_burn(&tc)
-                        }
-                        _ if registry.local_video_executor_enabled() => {
-                            kahawai_media::remux::ass_burn_available()
-                        }
-                        _ => false,
+                        .transcoder_protocol_features(&tc)
+                        .unwrap_or_default()
+                }
+                _ => kahawai_proto::ProtocolFeatures::current(),
+            };
+            let force_measurement = if session.force_loudness && session.parts.len() == 1 {
+                registry
+                    .audio_loudness(session.parts[0].file_id, want_audio)
+                    .await?
+            } else {
+                None
+            };
+            let negotiate = |force_audio_encode| {
+                kahawai_media::negotiate::negotiate_for_executors(
+                    &session.profile,
+                    &info,
+                    want_audio,
+                    want_video,
+                    session.parts.len() == 1,
+                    None,
+                    tonemap,
+                    burn_capable,
+                    &ocr_flags,
+                    // The session's explicit burn keeps forcing across
+                    // track switches — its sets are already in hand.
+                    *session.burn_pick.lock().unwrap(),
+                    // A seek cannot move boxes (HUB-15b), so the question is
+                    // whether THIS executor burns ASS — not whether the
+                    // fleet does.
+                    &kahawai_media::negotiate::AssPolicy {
+                        burn_capable: match &session.mode {
+                            Mode::Transcode { transcoder } => {
+                                let tc = transcoder.lock().unwrap().clone();
+                                registry.transcoder_reports_ass_burn(&tc)
+                            }
+                            _ if registry.local_video_executor_enabled() => {
+                                kahawai_media::remux::ass_burn_available()
+                            }
+                            _ => false,
+                        },
+                        ..session.ass.clone()
                     },
-                    ..session.ass.clone()
-                },
-                &video_targets,
-                &full_audio_targets,
-                &local_audio_targets,
-                force_audio_encode,
-            );
+                    &video_targets,
+                    &full_audio_targets,
+                    &local_audio_targets,
+                    force_audio_encode,
+                )
+            };
+            let mut sp = negotiate(force_measurement.is_some());
             plan = sp.plan;
             fill_audio_loudness_gains(
                 registry,
                 &session.parts,
                 &mut plan,
                 session.loudness,
-                force_measurement,
+                force_measurement.clone(),
             )
             .await?;
+            if loudness_protocol_feature(&plan)
+                .is_some_and(|feature| !executor_protocol.supports(feature))
+            {
+                // A track switch cannot move the session to a newer worker.
+                // Drop a force-only encode rather than paying for unity gain;
+                // an already-required encode remains playable without the
+                // optional normalization fields its worker cannot understand.
+                if force_measurement.is_some() {
+                    sp = negotiate(false);
+                    plan = sp.plan;
+                    fill_audio_loudness_gains(
+                        registry,
+                        &session.parts,
+                        &mut plan,
+                        session.loudness,
+                        force_measurement,
+                    )
+                    .await?;
+                }
+                if loudness_protocol_feature(&plan)
+                    .is_some_and(|feature| !executor_protocol.supports(feature))
+                {
+                    apply_audio_loudness_measurement(&mut plan, LoudnessPreference::Off, None);
+                }
+            }
+            let verdict = replanned_verdict(&plan, &sp.video_verdict, &sp.audio_verdict)?;
             let mut subs = sp.subtitles;
             fill_verdict_track_ids(registry, &session.parts, &mut subs).await;
+            *session.verdict.lock().unwrap() = Some(verdict);
             *session.sub_verdicts.lock().unwrap() = subs;
-            *session.plan.lock().unwrap() = Some(plan);
+            let burns_ass =
+                plan.burn_ass.is_some() || session.burn_ass_text.lock().unwrap().is_some();
+            let (needs, _) = placement_need(&plan, &info, &session.parts, burns_ass);
+            let mut plan_slot = session.plan.lock().unwrap();
+            let mut needs_slot = session.needs.lock().unwrap();
+            *plan_slot = Some(plan);
+            *needs_slot = needs;
         }
         // Map the absolute position onto the right part (single-part
         // sessions: part 0, local == absolute).
@@ -3530,14 +3801,19 @@ impl Sessions {
         reserved: &mut Option<String>,
     ) -> Result<String> {
         let session = self.get(id).context("no such session")?;
-        let plan = (*session.plan.lock().unwrap()).context("not a pipeline session")?;
+        let (plan, needs) = {
+            let plan_slot = session.plan.lock().unwrap();
+            let plan = (*plan_slot).context("not a pipeline session")?;
+            let needs = session.needs.lock().unwrap().clone();
+            (plan, needs)
+        };
         let Mode::Transcode { transcoder } = &session.mode else {
             bail!("not a dispatched session");
         };
         let old_tc = transcoder.lock().unwrap().clone();
         registry.tc_session_ended(&old_tc);
         let new_tc = registry
-            .reserve_transcoder(&session.needs)
+            .reserve_transcoder(&needs)
             .context("no capable transcoder left")?;
         *reserved = Some(new_tc.clone());
         // Resume where the viewer was: the player posts progress every
@@ -3885,8 +4161,9 @@ mod lease_purpose_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        LoudnessPreference, PartSource, Sessions, apply_audio_loudness_measurement, fold_facts,
-        part_index,
+        LoudnessPreference, Negotiation, PartSource, Sessions, apply_audio_loudness_measurement,
+        fold_facts, local_encoder_names, local_tonemap_available, part_index, replanned_verdict,
+        same_video_path, source_choice_key, wire_scalar_loudness,
     };
 
     /// The per-user cap has to hold when starts ARRIVE TOGETHER, which
@@ -3936,6 +4213,62 @@ mod tests {
         sessions.release(&admitted[0]);
         assert!(sessions.admit("again", "u1").is_ok());
         assert!(sessions.admit("once-more", "u1").is_err());
+    }
+
+    #[tokio::test]
+    async fn local_serving_capabilities_require_successful_benchmarks() {
+        let available = kahawai_media::remux::encoder_capabilities();
+        let Some((codec, element, _)) = available.first().copied() else {
+            eprintln!("skip: no verified encoder on this test host");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::open(dir.path()).await.unwrap();
+        let registry = crate::registry::Registry::new(db, Default::default());
+        assert!(
+            local_encoder_names(&registry).is_empty(),
+            "unmeasured local encoder was offered"
+        );
+
+        let cache = dir.path().join("benchmarks.json");
+        let mut measured = kahawai_media::bench::BenchResults {
+            gst: kahawai_media::bench::gst_version(),
+            tonemap: Some(kahawai_media::bench::Speeds {
+                s1080: Some(2.0),
+                s2160: Some(0.5),
+            }),
+            ..Default::default()
+        };
+        measured.encoders.insert(
+            element.into(),
+            kahawai_media::bench::Speeds {
+                s1080: Some(3.0),
+                s2160: Some(0.8),
+            },
+        );
+        kahawai_media::bench::store(&cache, &measured);
+        registry.set_local_bench(measured);
+        assert_eq!(local_encoder_names(&registry), [codec]);
+        assert_eq!(
+            local_tonemap_available(&registry),
+            kahawai_media::remux::tonemap_available()
+        );
+
+        kahawai_media::bench::record_crash(
+            &cache,
+            &kahawai_media::bench::BenchmarkJob::Encoder(element.into()),
+        );
+        registry.set_local_bench(kahawai_media::bench::load(&cache).unwrap());
+        assert!(
+            !local_encoder_names(&registry)
+                .iter()
+                .any(|candidate| candidate == codec),
+            "quarantined local encoder remained a serving capability"
+        );
+
+        kahawai_media::bench::record_crash(&cache, &kahawai_media::bench::BenchmarkJob::ToneMap);
+        registry.set_local_bench(kahawai_media::bench::load(&cache).unwrap());
+        assert!(!local_tonemap_available(&registry));
     }
 
     /// Facts amend the verdict by kind, exactly once — a seek-restart
@@ -4008,6 +4341,220 @@ mod tests {
         assert_eq!(plan.native_gain_db, None);
         assert_eq!(plan.loudness_source_channels, None);
         assert!(plan.loudness_gains.iter().all(Option::is_none));
+    }
+    #[test]
+    fn absent_scalar_gain_is_nonfinite_across_old_worker_decoders() {
+        let plan = kahawai_media::remux::RemuxPlan::default();
+        let (stereo, native, channels) = wire_scalar_loudness(&plan);
+        assert!(stereo.is_some_and(f64::is_nan));
+        assert!(native.is_some_and(f64::is_nan));
+        assert_eq!(channels, Some(0));
+    }
+
+    #[test]
+    fn optional_audio_gain_never_changes_the_video_path() {
+        let base = kahawai_media::remux::RemuxPlan {
+            video: kahawai_media::remux::StreamMode::Encode,
+            tone_map: true,
+            ..Default::default()
+        };
+        let mut gain_only = base;
+        gain_only.stereo_gain_db = Some(3.0);
+        assert!(same_video_path(&base, &gain_only));
+
+        let mut different_codec = base;
+        different_codec.video_codec = kahawai_media::remux::VideoTarget::Hevc;
+        different_codec.segment_format = kahawai_media::remux::SegmentFormat::Fmp4;
+        assert!(!same_video_path(&base, &different_codec));
+
+        let mut missing_tonemap = base;
+        missing_tonemap.tone_map = false;
+        assert!(!same_video_path(&base, &missing_tonemap));
+    }
+
+    #[test]
+    fn a_track_replan_refuses_empty_output_and_refreshes_its_verdict() {
+        let empty = kahawai_media::remux::RemuxPlan::default();
+        assert!(replanned_verdict(&empty, "new video verdict", "new audio verdict").is_err());
+
+        let mut playable = empty;
+        playable.audio = kahawai_media::remux::StreamMode::Copy;
+        assert_eq!(
+            replanned_verdict(&playable, "new video verdict", "new audio verdict").unwrap(),
+            ("new video verdict".into(), "new audio verdict".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn forced_video_encode_reprobes_for_a_layout_capable_worker() {
+        use kahawai_core::media::{AudioStream, MediaInfo, VideoStream};
+        use kahawai_proto::v1::{CapabilityReport, EncoderCap};
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::open(dir.path()).await.unwrap();
+        let registry =
+            crate::registry::Registry::new(db, Default::default()).with_local_video_executor(false);
+        let connect = |id: &str, minor: u32, hardware: bool| {
+            let (tx, rx) = tokio::sync::mpsc::channel(8);
+            std::mem::forget(rx);
+            registry.connected(id, "transcoder", id, "fp", "test");
+            registry.register_tc_link(id, minor, tx.clone());
+            registry.set_transcoder_caps(
+                id,
+                &CapabilityReport {
+                    encoders: vec![
+                        EncoderCap {
+                            codec: "h264".into(),
+                            element: if hardware { "nvh264enc" } else { "x264enc" }.into(),
+                            hardware,
+                            speed_1080: Some(if hardware { 9.0 } else { 2.0 }),
+                            speed_2160: Some(if hardware { 3.0 } else { 0.7 }),
+                        },
+                        EncoderCap {
+                            codec: "aac".into(),
+                            element: "avenc_aac".into(),
+                            hardware: false,
+                            speed_1080: None,
+                            speed_2160: None,
+                        },
+                    ],
+                    max_sessions: 2,
+                    decode_caps: vec!["video/x-h265".into(), "audio/mpeg".into()],
+                    ..Default::default()
+                },
+            );
+            tx
+        };
+        let _minor4 = connect("minor4", 4, true);
+        let minor5 = connect("minor5", 5, false);
+
+        let sessions = Sessions::new(dir.path().join("sessions"));
+        let negotiation = Negotiation::new(
+            &sessions,
+            &registry,
+            "user",
+            "item",
+            Some(Default::default()),
+            0,
+            0,
+            None,
+        )
+        .await
+        .unwrap();
+        let info = MediaInfo {
+            container: Some("matroska".into()),
+            duration_ms: Some(60_000),
+            video: vec![VideoStream {
+                codec: "hevc".into(),
+                width: 1920,
+                height: 1080,
+                ..Default::default()
+            }],
+            audio: vec![AudioStream {
+                codec: "aac".into(),
+                channels: 8,
+                sample_rate: 48_000,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let parts = [PartSource {
+            file_id: 1,
+            module_id: "mediahost".into(),
+            collection_id: "movies".into(),
+            root_token: "root".into(),
+            path_rel: "movie.mkv".into(),
+            size: 1_000_000,
+            mtime_unix: 1,
+            base_ms: 0,
+            duration_ms: 60_000,
+        }];
+
+        let measurement = kahawai_media::loudness::AudioLoudnessMeasurement {
+            source: kahawai_media::loudness::AudioLayout::new(8, 0xc3f),
+            layouts: vec![(8, 0xc3f), (6, 0x3f), (2, 0x3)]
+                .into_iter()
+                .map(
+                    |(channels, channel_mask)| kahawai_media::loudness::AudioLayoutLoudness {
+                        layout: kahawai_media::loudness::AudioLayout::new(channels, channel_mask),
+                        loudness: kahawai_media::loudness::AudioLoudness {
+                            integrated_lufs: -24.0,
+                            true_peak_dbtp: -8.0,
+                        },
+                    },
+                )
+                .collect(),
+        };
+
+        assert!(
+            !negotiation
+                .probe(&info, false, None)
+                .full_protocol
+                .supports(kahawai_proto::ProtocolFeature::ExactAudioLoudnessGains),
+            "the ordinary probe must exercise the preferred minor-4 worker"
+        );
+        assert!(
+            negotiation
+                .probe(
+                    &info,
+                    false,
+                    Some(kahawai_proto::ProtocolFeature::ExactAudioLoudnessGains),
+                )
+                .full_protocol
+                .supports(kahawai_proto::ProtocolFeature::ExactAudioLoudnessGains),
+            "the exact probe did not hard-filter protocol minor 4"
+        );
+        let normal = negotiation.plan_with_probe(&parts, &info, false, None);
+        assert_eq!(normal.plan.video, kahawai_media::remux::StreamMode::Encode);
+        assert_ne!(normal.plan.audio, kahawai_media::remux::StreamMode::Encode);
+        let forced = negotiation.plan_with_probe(&parts, &info, false, Some(&measurement));
+        assert_eq!(forced.plan.video, kahawai_media::remux::StreamMode::Encode);
+        assert_eq!(
+            forced.plan.audio,
+            kahawai_media::remux::StreamMode::Encode,
+            "force normalization was suppressed by the ordinary minor-4 probe"
+        );
+
+        let mut direct_info = info.clone();
+        direct_info.container = Some("mp4".into());
+        direct_info.video[0].codec = "h264".into();
+        let direct = negotiation.plan_with_probe(&parts, &direct_info, false, None);
+        assert_eq!(direct.cost, kahawai_media::negotiate::Cost::Direct);
+        assert!(
+            source_choice_key(&direct, true) < source_choice_key(&normal, false),
+            "measured video transcode outranked unmeasured direct play"
+        );
+        assert!(
+            source_choice_key(&direct, false) < source_choice_key(&direct, true),
+            "force capability did not break an ordinary-cost tie"
+        );
+
+        assert!(registry.unregister_tc_link_if_current("minor5", &minor5));
+        let fallback = negotiation.plan_with_probe(&parts, &info, false, Some(&measurement));
+        assert_eq!(
+            fallback.plan.audio, normal.plan.audio,
+            "an unavailable exact-layout worker replaced the playable ordinary plan"
+        );
+        assert_eq!(fallback.cost, normal.cost);
+
+        let mut stereo_info = info.clone();
+        stereo_info.audio[0].channels = 2;
+        let stereo = kahawai_media::loudness::AudioLoudnessMeasurement {
+            source: kahawai_media::loudness::AudioLayout::new(2, 0x3),
+            layouts: vec![kahawai_media::loudness::AudioLayoutLoudness {
+                layout: kahawai_media::loudness::AudioLayout::new(2, 0x3),
+                loudness: kahawai_media::loudness::AudioLoudness {
+                    integrated_lufs: -24.0,
+                    true_peak_dbtp: -8.0,
+                },
+            }],
+        };
+        let stereo_normal = negotiation.plan_with_probe(&parts, &stereo_info, false, None);
+        let legacy = negotiation.plan_with_probe(&parts, &stereo_info, false, Some(&stereo));
+        assert_eq!(
+            legacy.plan.audio, stereo_normal.plan.audio,
+            "a scalar-only worker admitted a force encode without exact gains"
+        );
     }
 
     fn part(base_ms: u64, duration_ms: u64) -> PartSource {

@@ -3024,7 +3024,7 @@ fn opus_output_layout(
     }
     layouts
         .into_iter()
-        .find(|layout| layout.channels <= bound)
+        .find(|layout| layout.channels <= bound && layout.channel_mask != 0)
         .unwrap_or_else(|| crate::loudness::AudioLayout::new(bound, 0))
 }
 
@@ -3052,7 +3052,7 @@ pub fn exact_audio_layout(
         }
         AudioTarget::Opus => opus_output_layout(source, plan.max_channels),
     };
-    crate::loudness::measured_layouts(source)
+    crate::loudness::resolved_measured_layouts(source, source)
         .contains(&output)
         .then_some(output)
 }
@@ -3198,6 +3198,13 @@ fn install_opus_layout_pin(
     });
 }
 
+fn set_loudness_volume(gain: &gst::Element, gain_db: Option<f64>) {
+    gain.set_property(
+        "volume-full-range",
+        gain_db.map_or(1.0, crate::loudness::gain_multiplier),
+    );
+}
+
 fn install_loudness_gain_pin(
     pad: &gst::Pad,
     gain: &gst::Element,
@@ -3217,10 +3224,7 @@ fn install_loudness_gain_pin(
             return gst::PadProbeReturn::Remove;
         };
         let applied = loudness.for_layout(layout);
-        gain.set_property(
-            "volume",
-            applied.map_or(1.0, crate::loudness::gain_multiplier),
-        );
+        set_loudness_volume(&gain, applied);
         if let Some(db) = applied {
             tracing::info!(
                 gain_db = db,
@@ -7138,6 +7142,19 @@ mod tests {
         println!("first segment -> {}", keep.display());
     }
 
+    #[test]
+    fn full_required_loudness_boost_fits_the_volume_property() {
+        crate::init().unwrap();
+        let volume = gst::ElementFactory::make("volume").build().unwrap();
+        set_loudness_volume(&volume, Some(82.0));
+        let applied = volume.property::<f64>("volume-full-range");
+        let expected = crate::loudness::gain_multiplier(82.0);
+        assert!(
+            ((applied - expected) / expected).abs() < 1e-6,
+            "the measured gain was rejected: {applied}"
+        );
+    }
+
     /// HUB-15 channel ceiling: a client that accepts stereo gets
     /// STEREO off a 5.1 source. Range caps fixated to their minimum
     /// and delivered mono — invisible until a browser could declare
@@ -7163,7 +7180,7 @@ mod tests {
             info.audio[0].layout.as_deref(),
         );
         let source_loudness =
-            crate::loudness::measure_file(&src_path, 0, source_layout, || {}).unwrap();
+            crate::loudness::measure_file(&src_path, 0, source_layout, || Ok(())).unwrap();
 
         let mut plan = RemuxPlan {
             video: StreamMode::Copy,
@@ -7213,7 +7230,8 @@ mod tests {
             seg_info.audio[0].channels,
             seg_info.audio[0].layout.as_deref(),
         );
-        let output_loudness = crate::loudness::measure_file(&seg, 0, output_layout, || {}).unwrap();
+        let output_loudness =
+            crate::loudness::measure_file(&seg, 0, output_layout, || Ok(())).unwrap();
         let raised = output_loudness.get(output_layout).unwrap().integrated_lufs
             - source_loudness
                 .get(crate::loudness::AudioLayout::new(2, 0x3))
@@ -7272,7 +7290,7 @@ mod tests {
         let source_layout = crate::loudness::AudioLayout::new(8, 0xc3f);
         let five_one = crate::loudness::AudioLayout::new(6, 0x3f);
         let source_loudness =
-            crate::loudness::measure_file(&src_path, 0, source_layout, || {}).unwrap();
+            crate::loudness::measure_file(&src_path, 0, source_layout, || Ok(())).unwrap();
         assert!(source_loudness.get(five_one).is_some());
 
         let mut plan = RemuxPlan {
@@ -7306,7 +7324,7 @@ mod tests {
             .expect("no segment produced");
         let output_info = crate::discover(&seg, Duration::from_secs(30)).unwrap();
         assert_eq!(output_info.audio[0].channels, 6);
-        let output_loudness = crate::loudness::measure_file(&seg, 0, five_one, || {}).unwrap();
+        let output_loudness = crate::loudness::measure_file(&seg, 0, five_one, || Ok(())).unwrap();
         let raised = output_loudness
             .get(output_loudness.source)
             .unwrap()
@@ -7336,7 +7354,7 @@ mod tests {
         crate::testutil::render_h264_aac51_mkv(&src_path);
         let source_layout = crate::loudness::AudioLayout::new(6, 0x3f);
         let source_loudness =
-            crate::loudness::measure_file(&src_path, 0, source_layout, || {}).unwrap();
+            crate::loudness::measure_file(&src_path, 0, source_layout, || Ok(())).unwrap();
         assert_eq!(source_loudness.source, source_layout);
 
         let mut plan = RemuxPlan {
@@ -7380,12 +7398,11 @@ mod tests {
             info.audio[0].channels,
             info.audio[0].layout.as_deref(),
         );
-        let output_loudness = crate::loudness::measure_file(&seg, 0, output_layout, || {}).unwrap();
-        let raised = output_loudness
-            .get(output_loudness.source)
-            .unwrap()
-            .integrated_lufs
-            - source_loudness.get(source_layout).unwrap().integrated_lufs;
+        let output_loudness =
+            crate::loudness::measure_file(&seg, 0, output_layout, || Ok(())).unwrap();
+        let five_one = crate::loudness::AudioLayout::new(6, 0x3f);
+        let raised = output_loudness.get(five_one).unwrap().integrated_lufs
+            - source_loudness.get(five_one).unwrap().integrated_lufs;
         assert!(
             (1.5..=4.5).contains(&raised),
             "native gain was {raised:.2} LU"

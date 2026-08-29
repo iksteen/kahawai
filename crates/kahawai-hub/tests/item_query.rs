@@ -367,7 +367,7 @@ async fn an_offline_sole_source_still_lists_its_chapters() {
 /// 4K HEVC; an h264-only client negotiates the 1080p — and the chapters
 /// follow the negotiation, not the rank.
 #[tokio::test]
-async fn query_chapters_follow_the_negotiated_source() {
+async fn query_chapters_and_force_follow_the_cheapest_source() {
     let fx = fixture_with(rendition(
         "Heat (1995).mkv",
         400,
@@ -424,6 +424,94 @@ async fn query_chapters_follow_the_negotiated_source() {
         "premise: negotiation picked the cheaper file"
     );
     assert_eq!(j["chapters"][0]["title"], "From the 1080p");
+
+    // Force is audio-bounded. Give only the HEVC source a measurement and
+    // make video encoding available: it still must not outrank the ordinary
+    // direct-play H.264 source.
+    let user_id: String = sqlx::query_scalar("SELECT id FROM users WHERE username='admin'")
+        .fetch_one(&fx.db)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO user_prefs(user_id,scope,key,value)
+         VALUES(?,'','loudness_normalization','force')",
+    )
+    .bind(user_id)
+    .execute(&fx.db)
+    .await
+    .unwrap();
+    let hevc_file: i64 =
+        sqlx::query_scalar("SELECT id FROM files WHERE path_rel='Heat (1995).mkv'")
+            .fetch_one(&fx.db)
+            .await
+            .unwrap();
+    sqlx::query(
+        "INSERT INTO audio_loudness
+           (file_id,stream_index,analyzer,size,mtime_unix,integrated_lufs,
+            true_peak_dbtp,source_channels,source_channel_mask,
+            native_integrated_lufs,native_true_peak_dbtp,error,measured_at)
+         VALUES(?,0,?,400,1,-24,-8,2,3,-24,-8,'',unixepoch())",
+    )
+    .bind(hevc_file)
+    .bind(kahawai_media::loudness::ANALYZER)
+    .execute(&fx.db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO audio_loudness_layouts
+           (file_id,stream_index,channels,channel_mask,integrated_lufs,true_peak_dbtp)
+         VALUES(?,0,2,3,-24,-8)",
+    )
+    .bind(hevc_file)
+    .execute(&fx.db)
+    .await
+    .unwrap();
+    let (tx, rx) = tokio::sync::mpsc::channel(4);
+    std::mem::forget(rx);
+    fx.reg.connected("tc", "transcoder", "tc", "fp", "test");
+    fx.reg
+        .register_tc_link("tc", kahawai_proto::PROTOCOL_MINOR, tx);
+    fx.reg.set_transcoder_caps(
+        "tc",
+        &kahawai_proto::v1::CapabilityReport {
+            encoders: vec![
+                kahawai_proto::v1::EncoderCap {
+                    codec: "h264".into(),
+                    element: "x264enc".into(),
+                    hardware: false,
+                    speed_1080: Some(2.0),
+                    speed_2160: Some(0.5),
+                },
+                kahawai_proto::v1::EncoderCap {
+                    codec: "aac".into(),
+                    element: "avenc_aac".into(),
+                    hardware: false,
+                    speed_1080: None,
+                    speed_2160: None,
+                },
+            ],
+            max_sessions: 1,
+            decode_caps: vec!["video/x-h265".into(), "audio/mpeg".into()],
+            ..Default::default()
+        },
+    );
+    let forced = fx
+        .api
+        .clone()
+        .oneshot(query(
+            &format!("/api/v1/items/{}", fx.id),
+            Some(&fx.bearer),
+            Some("application/json"),
+            profile,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(forced.status(), 200);
+    let forced = json_of(forced).await;
+    assert_eq!(
+        forced["negotiated"]["source"]["path_rel"], "Heat (1995) [1080p].mkv",
+        "force normalization promoted a measured video transcode over ordinary direct play"
+    );
 }
 
 fn test_router_with(

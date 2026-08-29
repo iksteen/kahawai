@@ -496,7 +496,7 @@ pub fn negotiate(
     )
 }
 
-fn encoded_audio_layout(
+pub fn encoded_audio_layout(
     info: &MediaInfo,
     plan: &RemuxPlan,
 ) -> Option<crate::loudness::AudioLayout> {
@@ -506,7 +506,7 @@ fn encoded_audio_layout(
         .max_channels
         .filter(|channels| *channels > 0)
         .map_or(source.channels, |channels| channels.min(source.channels));
-    crate::loudness::measured_layouts(source)
+    crate::loudness::resolved_measured_layouts(source, source)
         .into_iter()
         .find(|layout| layout.channels <= bound)
 }

@@ -238,7 +238,9 @@ fn analyze(
         });
     }
     if prepared.len() < 2 {
-        if hub_protocol_minor < kahawai_proto::SEGMENT_RETRYABLE_MINOR {
+        if !kahawai_proto::ProtocolFeatures::new(hub_protocol_minor)
+            .supports(kahawai_proto::ProtocolFeature::RetryableSegmentResults)
+        {
             // Pre-minor-6 hubs ignore the structured retryable flag. A
             // job-level transient failure makes them persist nothing, which
             // preserves the old pending behavior under inverted version skew.
@@ -572,7 +574,7 @@ mod tests {
             std::slice::from_ref(&collection),
             &Activity::default(),
             &AtomicBool::new(false),
-            kahawai_proto::SEGMENT_RETRYABLE_MINOR - 1,
+            kahawai_proto::ProtocolFeature::RetryableSegmentResults.minimum_minor() - 1,
         )
         .unwrap();
         assert_eq!(legacy.error, kahawai_proto::SEGMENT_COMPARISON_INSUFFICIENT);

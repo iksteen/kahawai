@@ -184,6 +184,73 @@ async fn measurements_are_complete_revision_guarded_source_facts() {
 }
 
 #[tokio::test]
+async fn positionless_source_keeps_exact_layouts_without_fabricating_native_loudness() {
+    let (_dir, registry) = fixture().await;
+    let mut measured = result(1);
+    measured.tracks[0].source_channel_mask = 0;
+    measured.tracks[0].native_integrated_lufs = f64::NAN;
+    measured.tracks[0].native_true_peak_dbtp = f64::NAN;
+
+    assert!(registry.record_file_loudness("m", &measured).await.unwrap());
+    let stored = registry.audio_loudness(1, 0).await.unwrap().unwrap();
+    assert_eq!(
+        stored.source,
+        kahawai_media::loudness::AudioLayout::new(8, 0)
+    );
+    assert!(
+        stored
+            .get(kahawai_media::loudness::AudioLayout::new(6, 0x3f))
+            .is_some(),
+        "canonical exact gains must remain available"
+    );
+    let native: Option<f64> = sqlx::query_scalar(
+        "SELECT native_integrated_lufs FROM audio_loudness
+          WHERE file_id=1 AND stream_index=0",
+    )
+    .fetch_one(registry.db())
+    .await
+    .unwrap();
+    assert_eq!(native, None, "positionless input has no exact native key");
+}
+
+#[tokio::test]
+async fn one_bad_audio_stream_preserves_its_successful_siblings() {
+    let (_dir, registry) = fixture().await;
+    let mut partial = result(1);
+    partial.tracks.retain(|track| track.stream_index == 0);
+    partial.error = "audio stream 1: decoder failed".into();
+
+    assert!(registry.record_file_loudness("m", &partial).await.unwrap());
+    assert!(
+        registry.audio_loudness(1, 0).await.unwrap().is_some(),
+        "the successful main track was discarded with its failed sibling"
+    );
+    assert!(registry.audio_loudness(1, 1).await.unwrap().is_none());
+    let errors: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT stream_index,error FROM audio_loudness
+          WHERE file_id=1 ORDER BY stream_index",
+    )
+    .fetch_all(registry.db())
+    .await
+    .unwrap();
+    assert_eq!(
+        errors,
+        vec![
+            (0, String::new()),
+            (1, "audio stream 1: decoder failed".into()),
+        ]
+    );
+    assert!(
+        registry
+            .loudness_worklist("m", "c")
+            .await
+            .unwrap()
+            .is_empty(),
+        "the terminal failed stream queued the whole file again"
+    );
+}
+
+#[tokio::test]
 async fn loudness_normalization_has_encoded_force_and_off_modes() {
     let (_dir, registry) = fixture().await;
     sqlx::query("INSERT INTO users(id,username,password_hash) VALUES('u','viewer','x')")

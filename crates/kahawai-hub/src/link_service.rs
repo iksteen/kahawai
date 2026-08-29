@@ -1127,7 +1127,7 @@ async fn handle_host_msg(
                 .await?;
             let path_rel = source.path_rel;
             loudness.source = Some(kahawai_proto::v1::SourcePath {
-                root_token,
+                root_token: root_token.clone(),
                 path_rel: path_rel.clone(),
             });
             let stored = registry
@@ -1142,6 +1142,17 @@ async fn handle_host_msg(
             tracing::info!(%module_id, collection = %loudness.collection_id,
                 path = %path_rel, tracks = loudness.tracks.len(), stored,
                 "audio loudness result received");
+            if !stored {
+                push_loudness_retry(
+                    registry,
+                    module_id,
+                    &loudness.collection_id,
+                    &root_token,
+                    &path_rel,
+                    (loudness.size, loudness.mtime_unix),
+                )
+                .await;
+            }
         }
         host_to_hub::Msg::FileSubtitles(fs) => {
             let source = exact_source(fs.source, "FileSubtitles")?;
@@ -1354,6 +1365,61 @@ async fn push_loudness_worklist(registry: &Registry, module_id: &str, collection
                 error = format!("{error:#}"), "loudness worklist send stopped");
             return;
         }
+    }
+}
+
+/// Re-offer only the replacement that made an in-flight answer stale. A full
+/// collection worklist here would repeatedly ship thousands of paths; no send
+/// at all loses the scan-complete offer that the mediahost deduplicated while
+/// the old revision was active.
+async fn push_loudness_retry(
+    registry: &Registry,
+    module_id: &str,
+    collection_id: &str,
+    root_token: &str,
+    path_rel: &str,
+    result_revision: (u64, i64),
+) {
+    if !registry.host_supports_loudness_analysis(module_id) {
+        return;
+    }
+    let pending = match registry
+        .loudness_source_pending(module_id, collection_id, root_token, path_rel)
+        .await
+    {
+        Ok(pending) => pending,
+        Err(error) => {
+            tracing::warn!(%module_id, collection = collection_id, %path_rel,
+                error = format!("{error:#}"), "checking stale loudness source");
+            return;
+        }
+    };
+    let Some(current_revision) = pending else {
+        return;
+    };
+    if !registry.claim_loudness_retry(
+        (module_id, collection_id, root_token, path_rel),
+        result_revision,
+        current_revision,
+    ) {
+        tracing::debug!(%module_id, collection = collection_id, %path_rel,
+            "stale loudness transition already retried");
+        return;
+    }
+    let message = kahawai_proto::v1::HubToHost {
+        msg: Some(kahawai_proto::v1::hub_to_host::Msg::LoudnessWorklist(
+            kahawai_proto::v1::LoudnessWorklist {
+                collection_id: collection_id.to_string(),
+                analyzer: kahawai_media::loudness::ANALYZER,
+                sources: vec![kahawai_proto::v1::SourcePath::new(root_token, path_rel)],
+            },
+        )),
+    };
+    match registry.send_to_host(module_id, message).await {
+        Ok(()) => tracing::info!(%module_id, collection = collection_id, %path_rel,
+            "stale loudness result requeued current source"),
+        Err(error) => tracing::debug!(%module_id, collection = collection_id, %path_rel,
+            error = format!("{error:#}"), "stale loudness retry send stopped"),
     }
 }
 
@@ -1587,7 +1653,7 @@ mod chunk_tests {
 
 #[cfg(test)]
 mod forget_link_tests {
-    use super::{forget_link, register_host_link, route_segment_reply};
+    use super::{forget_link, push_loudness_retry, register_host_link, route_segment_reply};
     use crate::registry::Registry;
     use crate::sessions::Sessions;
     use std::sync::Arc;
@@ -1636,6 +1702,98 @@ mod forget_link_tests {
                 .is_err(),
             "and the send side must be gone with it — a host reported present \
              with no way to reach it is answered 409 instead of 503"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_loudness_result_reoffers_only_the_current_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::open(dir.path()).await.unwrap();
+        sqlx::raw_sql(
+            "INSERT INTO collections(module_id,collection_id,media_type)
+               VALUES('host','movies','movies');
+             INSERT INTO collection_roots(module_id,collection_id,root_token,normalized_path)
+               VALUES('host','movies','root','/movies');
+             INSERT INTO files(module_id,collection_id,root_id,path_rel,size,mtime_unix,
+                               head_xxh3,tail_xxh3,oshash,streams_json)
+               SELECT 'host','movies',id,'film.mkv',10,2,0,0,0,
+                      '{\"audio\":[{\"codec\":\"aac\",\"channels\":2,\"sample_rate\":48000,\"language\":null,\"bitrate_kbps\":null,\"layout\":\"0x3\"}]}'
+                 FROM collection_roots;",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        let registry = Registry::new(db, Default::default());
+        let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+        registry.register_link(
+            "host",
+            tx,
+            kahawai_proto::PROTOCOL_MINOR,
+            kahawai_core::segments::DETECTOR_GENERATION,
+        );
+
+        let stale = kahawai_proto::v1::FileLoudness {
+            collection_id: "movies".into(),
+            source: Some(kahawai_proto::v1::SourcePath::new("root", "film.mkv")),
+            size: 10,
+            mtime_unix: 1,
+            analyzer: kahawai_media::loudness::ANALYZER,
+            error: "source changed during measurement".into(),
+            ..Default::default()
+        };
+        assert!(!registry.record_file_loudness("host", &stale).await.unwrap());
+        push_loudness_retry(
+            &registry,
+            "host",
+            "movies",
+            "root",
+            "film.mkv",
+            (stale.size, stale.mtime_unix),
+        )
+        .await;
+
+        let message = rx.recv().await.unwrap().unwrap();
+        let Some(kahawai_proto::v1::hub_to_host::Msg::LoudnessWorklist(work)) = message.msg else {
+            panic!("stale result did not produce a loudness worklist");
+        };
+        assert_eq!(work.sources.len(), 1);
+        assert_eq!(work.sources[0].path_rel, "film.mkv");
+
+        push_loudness_retry(
+            &registry,
+            "host",
+            "movies",
+            "root",
+            "film.mkv",
+            (stale.size, stale.mtime_unix),
+        )
+        .await;
+        assert!(
+            rx.try_recv().is_err(),
+            "one stale revision transition was requeued repeatedly"
+        );
+
+        sqlx::query(
+            "INSERT INTO audio_loudness
+               (file_id,stream_index,analyzer,size,mtime_unix,error,measured_at)
+             SELECT id,0,?,size,mtime_unix,'terminal',unixepoch() FROM files",
+        )
+        .bind(kahawai_media::loudness::ANALYZER)
+        .execute(registry.db())
+        .await
+        .unwrap();
+        push_loudness_retry(
+            &registry,
+            "host",
+            "movies",
+            "root",
+            "film.mkv",
+            (stale.size, stale.mtime_unix),
+        )
+        .await;
+        assert!(
+            rx.try_recv().is_err(),
+            "a current terminal result was requeued"
         );
     }
 

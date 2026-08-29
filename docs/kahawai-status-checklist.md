@@ -575,19 +575,19 @@ How something works and why it was built that way belong in
       detection preempts loudness at the next audio buffer; the same pipeline
       resumes afterward without re-decoding, and start/yield/resume/completion
       logs expose long-running files.
-       Foreground pauses log scan/lease/urgent counts and their resume; foreground
-       byte leases log collection/path at open and close, so a silent gate cannot
-       look like a decoder hang.
-       A 60-second no-buffer watchdog advances past decoders that produce neither
-       audio, EOS nor an error; active callbacks are exempt so intentional
-       foreground/segment pauses remain unbounded.
+      Foreground pauses log scan/lease/urgent counts and their resume; foreground
+      byte leases log collection/path at open and close, so a silent gate cannot
+      look like a decoder hang.
+      A 60-second no-buffer watchdog advances past decoders that produce neither
+      audio, EOS nor an error; active callbacks are exempt so intentional
+      foreground/segment pauses remain unbounded.
       One cross-collection queue chooses movie files before series/anime and
       newer source mtimes first within each category, re-evaluated after every
       file and after permit waits; the in-flight file is never interrupted.
       Long-running segment and loudness jobs trim glibc's freed decoder-thread
       arenas every 30 seconds and again at completion, so sequential full-file
-       work returns resident memory instead of retaining its high-water mark;
-       non-glibc targets are unchanged.
+      work returns resident memory instead of retaining its high-water mark;
+      non-glibc targets are unchanged.
 - [x] Chapters as a first-class fact: read at scan beside the attachment
       declaration, backfilled for older Matroska/WebM rows (other containers
       keep whatever the demuxer's TOC declared at discovery, so a

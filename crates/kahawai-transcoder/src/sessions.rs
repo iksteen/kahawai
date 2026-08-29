@@ -107,7 +107,7 @@ impl Runner {
         encode_params: (u32, u32, u32, bool, u32),
         // The source is interlaced; the encode chain deinterlaces.
         deinterlace: bool,
-        loudness: (f64, f64, u32),
+        loudness: (Option<f64>, Option<f64>, Option<u32>),
         layout_gains: Vec<kahawai_proto::v1::AudioLayoutGain>,
         // HUB-15b (video_codec, audio_codec, container); empty = legacy.
         targets: (String, String, String),
@@ -189,7 +189,11 @@ impl Runner {
         tail_sizes: &[u64],
         (video_kbps, max_height, max_channels, tone_map, burn_subtitle): (u32, u32, u32, bool, u32),
         deinterlace: bool,
-        (stereo_gain_db, native_gain_db, loudness_source_channels): (f64, f64, u32),
+        (stereo_gain_db, native_gain_db, loudness_source_channels): (
+            Option<f64>,
+            Option<f64>,
+            Option<u32>,
+        ),
         layout_gains: Vec<kahawai_proto::v1::AudioLayoutGain>,
         (video_codec, audio_codec, container): (String, String, String),
         burn_sets: Vec<u8>,
@@ -277,13 +281,15 @@ impl Runner {
                         cmd.args([flag, &v.to_string()]);
                     }
                 }
-                if stereo_gain_db.is_finite() {
+                if let Some(stereo_gain_db) = stereo_gain_db.filter(|gain| gain.is_finite()) {
                     cmd.args(["--stereo-gain-db", &stereo_gain_db.to_string()]);
                 }
-                if native_gain_db.is_finite() {
+                if let Some(native_gain_db) = native_gain_db.filter(|gain| gain.is_finite()) {
                     cmd.args(["--native-gain-db", &native_gain_db.to_string()]);
                 }
-                if loudness_source_channels > 0 {
+                if let Some(loudness_source_channels) =
+                    loudness_source_channels.filter(|channels| *channels > 0)
+                {
                     cmd.args([
                         "--loudness-source-channels",
                         &loudness_source_channels.to_string(),
@@ -360,10 +366,10 @@ impl Runner {
                     video_kbps: (video_kbps > 0).then_some(video_kbps),
                     max_height: (max_height > 0).then_some(max_height),
                     max_channels: (max_channels > 0).then_some(max_channels),
-                    stereo_gain_db: stereo_gain_db.is_finite().then_some(stereo_gain_db),
-                    native_gain_db: native_gain_db.is_finite().then_some(native_gain_db),
-                    loudness_source_channels: (loudness_source_channels > 0)
-                        .then_some(loudness_source_channels),
+                    stereo_gain_db: stereo_gain_db.filter(|gain| gain.is_finite()),
+                    native_gain_db: native_gain_db.filter(|gain| gain.is_finite()),
+                    loudness_source_channels: loudness_source_channels
+                        .filter(|channels| *channels > 0),
                     loudness_gains,
                     tone_map,
                     deinterlace,
