@@ -28,6 +28,7 @@ fn main() -> anyhow::Result<()> {
         stereo_gain_db: None,
         native_gain_db: None,
         loudness_source_channels: None,
+        loudness_gains: [None; kahawai_media::loudness::MAX_LAYOUT_GAINS],
         video_codec: VideoTarget::H264,
         audio_codec: AudioTarget::Aac,
         segment_format: std::env::var("PROBE_TS")

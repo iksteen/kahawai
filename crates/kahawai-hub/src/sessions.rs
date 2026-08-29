@@ -201,12 +201,28 @@ fn apply_audio_loudness_measurement(
     plan.stereo_gain_db = None;
     plan.native_gain_db = None;
     plan.loudness_source_channels = None;
+    plan.loudness_gains = [None; kahawai_media::loudness::MAX_LAYOUT_GAINS];
     if preference.enabled()
         && let Some(measured) = measured
     {
-        plan.stereo_gain_db = Some(kahawai_media::loudness::gain_db(measured.stereo));
-        plan.native_gain_db = Some(kahawai_media::loudness::gain_db(measured.native));
-        plan.loudness_source_channels = Some(measured.source_channels);
+        for (slot, measurement) in plan.loudness_gains.iter_mut().zip(&measured.layouts) {
+            *slot = Some(kahawai_media::loudness::AudioLayoutGain {
+                layout: measurement.layout,
+                gain_db: kahawai_media::loudness::gain_db(measurement.loudness),
+            });
+        }
+        plan.loudness_source_channels = Some(measured.source.channels);
+        plan.native_gain_db = measured
+            .get(measured.source)
+            .map(kahawai_media::loudness::gain_db);
+        plan.stereo_gain_db = measured
+            .get(kahawai_media::loudness::AudioLayout::new(2, 0x3))
+            .or_else(|| {
+                measured
+                    .get(measured.source)
+                    .filter(|_| measured.source.channels <= 2)
+            })
+            .map(kahawai_media::loudness::gain_db);
     }
 }
 
@@ -215,21 +231,23 @@ async fn fill_audio_loudness_gains(
     parts: &[PartSource],
     plan: &mut kahawai_media::remux::RemuxPlan,
     preference: LoudnessPreference,
+    known: Option<kahawai_media::loudness::AudioLoudnessMeasurement>,
 ) -> Result<()> {
-    let measured = if preference.enabled()
-        && plan.audio == kahawai_media::remux::StreamMode::Encode
-        && parts.len() == 1
+    let measured = if !preference.enabled()
+        || plan.audio != kahawai_media::remux::StreamMode::Encode
+        || parts.len() != 1
     {
+        None
+    } else if preference.force() {
+        known
+    } else {
         registry
             .audio_loudness(parts[0].file_id, plan.audio_track)
             .await?
-    } else {
-        None
     };
     apply_audio_loudness_measurement(plan, preference, measured);
     Ok(())
 }
-
 pub struct Session {
     pub id: String,
     pub user_id: String,
@@ -366,6 +384,8 @@ pub(crate) struct ExecutorFacts {
     pub full_audio_targets: Vec<String>,
     /// Audio targets of the hub's lightweight local worker.
     pub local_audio_targets: Vec<String>,
+    /// The selected full executor understands exact layout-keyed gains.
+    pub full_layout_gains: bool,
     /// HUB-32b: this source's display-set timeline is readable where
     /// the encode would run.
     pub burn_capable: bool,
@@ -402,6 +422,7 @@ pub(crate) struct Negotiation<'a> {
     /// The chosen source has a current measurement and force may therefore
     /// turn only its audio copy/direct path into an encode.
     force_audio_encode: bool,
+    force_measurement: Option<kahawai_media::loudness::AudioLoudnessMeasurement>,
 }
 
 impl<'a> Negotiation<'a> {
@@ -490,6 +511,7 @@ impl<'a> Negotiation<'a> {
             audio_track,
             video_track,
             force_audio_encode: false,
+            force_measurement: None,
         })
     }
 
@@ -561,21 +583,25 @@ impl<'a> Negotiation<'a> {
             work_class: None,
             source_kbps: None,
         };
-        let (tonemap, full_targets) = match self.registry.pick_transcoder(&need) {
+        let (tonemap, full_targets, full_layout_gains) = match self.registry.pick_transcoder(&need)
+        {
             Some(tc) => (
                 self.registry.transcoder_reports_tonemap(&tc),
                 self.registry.transcoder_encoders(&tc),
+                self.registry.transcoder_supports_layout_gains(&tc),
             ),
             None if self.registry.local_video_executor_enabled() => (
                 kahawai_media::remux::tonemap_available(),
                 local_encoder_names(),
+                true,
             ),
-            None => (false, Vec::new()),
+            None => (false, Vec::new(), false),
         };
         ExecutorFacts {
             tonemap,
             video_targets: video_encoder_names(&full_targets),
             full_audio_targets: audio_encoder_names(&full_targets),
+            full_layout_gains,
             local_audio_targets: local_audio_encoder_names(),
             burn_capable,
         }
@@ -602,35 +628,47 @@ impl<'a> Negotiation<'a> {
             .duration_ms
             .filter(|d| *d > 0)
             .map(|d| ((parts.iter().map(|p| p.size).sum::<u64>() * 8) / d) as u32);
-        kahawai_media::negotiate::negotiate_for_executors(
-            &self.profile,
-            info,
-            self.audio_track as usize,
-            self.video_track as usize,
-            parts.len() == 1,
-            est_kbps,
-            facts.tonemap,
-            facts.burn_capable,
-            &parts
-                .first()
-                .map(|p| {
-                    crate::subtitles::ocr_flags_for(
-                        &self.ocr_set,
-                        &p.module_id,
-                        &p.collection_id,
-                        &p.root_token,
-                        &p.path_rel,
-                        info.subtitles.len(),
-                    )
-                })
-                .unwrap_or_default(),
-            self.pick_for(parts),
-            &self.ass,
-            &facts.video_targets,
-            &facts.full_audio_targets,
-            &facts.local_audio_targets,
-            force_audio_encode,
-        )
+        let ocr_flags = parts
+            .first()
+            .map(|p| {
+                crate::subtitles::ocr_flags_for(
+                    &self.ocr_set,
+                    &p.module_id,
+                    &p.collection_id,
+                    &p.root_token,
+                    &p.path_rel,
+                    info.subtitles.len(),
+                )
+            })
+            .unwrap_or_default();
+        let negotiate = |force| {
+            kahawai_media::negotiate::negotiate_for_executors(
+                &self.profile,
+                info,
+                self.audio_track as usize,
+                self.video_track as usize,
+                parts.len() == 1,
+                est_kbps,
+                facts.tonemap,
+                facts.burn_capable,
+                &ocr_flags,
+                self.pick_for(parts),
+                &self.ass,
+                &facts.video_targets,
+                &facts.full_audio_targets,
+                &facts.local_audio_targets,
+                force,
+            )
+        };
+        let normal = negotiate(false);
+        if !force_audio_encode {
+            return normal;
+        }
+        if normal.plan.video == kahawai_media::remux::StreamMode::Encode && !facts.full_layout_gains
+        {
+            return normal;
+        }
+        negotiate(true)
     }
 
     /// Probe the fleet, then plan. The session-start form.
@@ -668,20 +706,18 @@ impl<'a> Negotiation<'a> {
         )
     }
 
-    async fn can_force_audio(
+    async fn forced_measurement(
         &self,
         parts: &[PartSource],
         info: &kahawai_core::media::MediaInfo,
-    ) -> Result<bool> {
+    ) -> Result<Option<kahawai_media::loudness::AudioLoudnessMeasurement>> {
         if !self.loudness.force() || parts.len() != 1 || info.audio.is_empty() {
-            return Ok(false);
+            return Ok(None);
         }
         let audio_track = (self.audio_track as usize).min(info.audio.len() - 1);
-        Ok(self
-            .registry
+        self.registry
             .audio_loudness(parts[0].file_id, audio_track)
-            .await?
-            .is_some())
+            .await
     }
 
     /// Which source to play and how, judged across every candidate.
@@ -706,9 +742,15 @@ impl<'a> Negotiation<'a> {
             // still means original bytes. An explicit remux may force gain.
             Some(m) => {
                 let (parts, info) = self.sessions.source_parts(self.registry, item_id).await?;
-                let force = m != "direct" && self.can_force_audio(&parts, &info).await?;
+                let measurement = if m == "direct" {
+                    None
+                } else {
+                    self.forced_measurement(&parts, &info).await?
+                };
+                let force = measurement.is_some();
                 let sp = self.plan_auto_with_force(&parts, &info, force);
                 self.force_audio_encode = force;
+                self.force_measurement = measurement;
                 Ok((parts, info, sp, m.to_string()))
             }
             // HUB-14/16: judge every candidate, cheapest sufficient
@@ -752,24 +794,29 @@ impl<'a> Negotiation<'a> {
                 // this client cannot take plans "cheaper" than one that
                 // must encode, and picking it plays the film silently.
                 // A bill beats a defect.
-                let mut best: Option<(kahawai_media::negotiate::SourcePlan, usize, bool, bool)> =
-                    None;
+                let mut best: Option<(
+                    kahawai_media::negotiate::SourcePlan,
+                    usize,
+                    Option<kahawai_media::loudness::AudioLoudnessMeasurement>,
+                    bool,
+                )> = None;
                 for (idx, (parts, info)) in candidates.iter().enumerate() {
-                    let force = self.can_force_audio(parts, info).await?;
-                    let sp = self.plan_auto_with_force(parts, info, force);
-                    let normalized =
-                        force && sp.plan.audio == kahawai_media::remux::StreamMode::Encode;
+                    let measurement = self.forced_measurement(parts, info).await?;
+                    let sp = self.plan_auto_with_force(parts, info, measurement.is_some());
+                    let normalized = measurement.is_some()
+                        && sp.plan.audio == kahawai_media::remux::StreamMode::Encode;
                     let force_missed = self.loudness.force() && !normalized;
                     let better = best.as_ref().is_none_or(|(cur, _, _, cur_missed)| {
                         (sp.incomplete, force_missed, sp.cost)
                             < (cur.incomplete, *cur_missed, cur.cost)
                     });
                     if better {
-                        best = Some((sp, idx, force, force_missed));
+                        best = Some((sp, idx, measurement, force_missed));
                     }
                 }
-                let (sp, idx, force, _) = best.unwrap();
-                self.force_audio_encode = force;
+                let (sp, idx, measurement, _) = best.unwrap();
+                self.force_audio_encode = measurement.is_some();
+                self.force_measurement = measurement;
                 let mode = if sp.direct { "direct" } else { "remux" };
                 let (parts, info) = candidates.into_iter().nth(idx).unwrap();
                 Ok((parts, info, sp, mode.to_string()))
@@ -2017,7 +2064,14 @@ impl Sessions {
                         negotiated.audio_verdict
                     );
                 }
-                fill_audio_loudness_gains(registry, &parts, &mut plan, neg.loudness).await?;
+                fill_audio_loudness_gains(
+                    registry,
+                    &parts,
+                    &mut plan,
+                    neg.loudness,
+                    neg.force_measurement.clone(),
+                )
+                .await?;
                 verdict = Some((
                     negotiated.video_verdict.clone(),
                     negotiated.audio_verdict.clone(),
@@ -2387,6 +2441,15 @@ impl Sessions {
                 if let Some(channels) = plan.loudness_source_channels {
                     cmd.args(["--loudness-source-channels", &channels.to_string()]);
                 }
+                if plan.loudness_gains.iter().any(Option::is_some) {
+                    let gains = plan
+                        .loudness_gains
+                        .iter()
+                        .flatten()
+                        .copied()
+                        .collect::<Vec<_>>();
+                    cmd.args(["--loudness-gains", &serde_json::to_string(&gains)?]);
+                }
                 if plan.deinterlace {
                     cmd.arg("--deinterlace");
                 }
@@ -2658,6 +2721,16 @@ impl Sessions {
                     stereo_gain_db: plan.stereo_gain_db.unwrap_or(f64::NAN),
                     native_gain_db: plan.native_gain_db.unwrap_or(f64::NAN),
                     loudness_source_channels: plan.loudness_source_channels.unwrap_or(0),
+                    loudness_gains: plan
+                        .loudness_gains
+                        .iter()
+                        .flatten()
+                        .map(|gain| kahawai_proto::v1::AudioLayoutGain {
+                            channels: gain.layout.channels,
+                            channel_mask: gain.layout.channel_mask,
+                            gain_db: gain.gain_db,
+                        })
+                        .collect(),
                     tone_map: plan.tone_map,
                     deinterlace: plan.deinterlace,
                     // 1-based on the wire: 0 means "burn nothing".
@@ -3165,14 +3238,22 @@ impl Sessions {
                     )
                 })
                 .unwrap_or_default();
-            let force_audio_encode = if session.force_loudness && session.parts.len() == 1 {
-                registry
-                    .audio_loudness(session.parts[0].file_id, want_audio)
-                    .await?
-                    .is_some()
-            } else {
-                false
+            let layout_gains_supported = match &session.mode {
+                Mode::Transcode { transcoder } => {
+                    let tc = transcoder.lock().unwrap().clone();
+                    registry.transcoder_supports_layout_gains(&tc)
+                }
+                _ => true,
             };
+            let force_measurement =
+                if session.force_loudness && layout_gains_supported && session.parts.len() == 1 {
+                    registry
+                        .audio_loudness(session.parts[0].file_id, want_audio)
+                        .await?
+                } else {
+                    None
+                };
+            let force_audio_encode = force_measurement.is_some();
             let sp = kahawai_media::negotiate::negotiate_for_executors(
                 &session.profile,
                 &info,
@@ -3208,8 +3289,14 @@ impl Sessions {
                 force_audio_encode,
             );
             plan = sp.plan;
-            fill_audio_loudness_gains(registry, &session.parts, &mut plan, session.loudness)
-                .await?;
+            fill_audio_loudness_gains(
+                registry,
+                &session.parts,
+                &mut plan,
+                session.loudness,
+                force_measurement,
+            )
+            .await?;
             let mut subs = sp.subtitles;
             fill_verdict_track_ids(registry, &session.parts, &mut subs).await;
             *session.sub_verdicts.lock().unwrap() = subs;
@@ -3885,24 +3972,42 @@ mod tests {
     fn loudness_opt_out_clears_every_gain() {
         let mut plan = kahawai_media::remux::RemuxPlan::default();
         let measured = kahawai_media::loudness::AudioLoudnessMeasurement {
-            source_channels: 6,
-            stereo: kahawai_media::loudness::AudioLoudness {
-                integrated_lufs: -26.0,
-                true_peak_dbtp: -8.0,
-            },
-            native: kahawai_media::loudness::AudioLoudness {
-                integrated_lufs: -24.0,
-                true_peak_dbtp: -10.0,
-            },
+            source: kahawai_media::loudness::AudioLayout::new(6, 0x3f),
+            layouts: vec![
+                kahawai_media::loudness::AudioLayoutLoudness {
+                    layout: kahawai_media::loudness::AudioLayout::new(6, 0x3f),
+                    loudness: kahawai_media::loudness::AudioLoudness {
+                        integrated_lufs: -24.0,
+                        true_peak_dbtp: -10.0,
+                    },
+                },
+                kahawai_media::loudness::AudioLayoutLoudness {
+                    layout: kahawai_media::loudness::AudioLayout::new(2, 0x3),
+                    loudness: kahawai_media::loudness::AudioLoudness {
+                        integrated_lufs: -26.0,
+                        true_peak_dbtp: -8.0,
+                    },
+                },
+            ],
         };
-        apply_audio_loudness_measurement(&mut plan, LoudnessPreference::Encoded, Some(measured));
+        apply_audio_loudness_measurement(
+            &mut plan,
+            LoudnessPreference::Encoded,
+            Some(measured.clone()),
+        );
         assert_eq!(plan.stereo_gain_db, Some(7.0));
         assert_eq!(plan.native_gain_db, Some(6.0));
         assert_eq!(plan.loudness_source_channels, Some(6));
+        assert_eq!(
+            plan.loudness_gains.iter().flatten().count(),
+            2,
+            "every exact layout gets a gain"
+        );
         apply_audio_loudness_measurement(&mut plan, LoudnessPreference::Off, Some(measured));
         assert_eq!(plan.stereo_gain_db, None);
         assert_eq!(plan.native_gain_db, None);
         assert_eq!(plan.loudness_source_channels, None);
+        assert!(plan.loudness_gains.iter().all(Option::is_none));
     }
 
     fn part(base_ms: u64, duration_ms: u64) -> PartSource {

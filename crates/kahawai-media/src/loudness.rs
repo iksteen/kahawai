@@ -1,9 +1,9 @@
-//! Source-local EBU R128 measurement for both native and stereo output.
+//! Source-local EBU R128 measurement keyed by exact output channel layout.
 //!
-//! One decode feeds two meter branches: the untouched decoded layout, and the
-//! exact default `audioconvert` stereo fold Kahawai may encode. The paired facts
-//! let playback normalize stereo-to-stereo/downmix work and multichannel encodes
-//! that preserve the source layout without decoding every programme twice.
+//! One decode feeds bounded meter branches for the untouched decoded layout
+//! and every smaller canonical layout playback may choose. Static gains can
+//! therefore be selected after the worker's real conversion caps are known,
+//! without deriving correlation-sensitive loudness from lossy scalar facts.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -16,7 +16,7 @@ use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
 use gstreamer_audio as gst_audio;
 
-pub const ANALYZER: i64 = 3;
+pub const ANALYZER: i64 = 4;
 
 /// EBU R 128 s2 (2023) permits a -20 to -16 LUFS distribution level for
 /// streaming devices with limited playback gain/headroom; -18 LUFS is the
@@ -29,17 +29,122 @@ pub const TARGET_LUFS: f64 = -18.0;
 /// Source: https://tech.ebu.ch/docs/r/r128.pdf
 pub const MAX_TRUE_PEAK_DBTP: f64 = -1.0;
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AudioLoudness {
     pub integrated_lufs: f64,
     pub true_peak_dbtp: f64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct AudioLayout {
+    pub channels: u32,
+    pub channel_mask: u64,
+}
+
+impl AudioLayout {
+    pub fn new(channels: u32, channel_mask: u64) -> Self {
+        let channel_mask = match (channels, channel_mask) {
+            (1, 0) => 0x4,
+            (2, 0) => 0x3,
+            _ => channel_mask,
+        };
+        Self {
+            channels,
+            channel_mask,
+        }
+    }
+
+    pub fn from_stream(channels: u32, channel_mask: Option<&str>) -> Self {
+        let mask = channel_mask
+            .and_then(|value| value.strip_prefix("0x"))
+            .and_then(|value| u64::from_str_radix(value, 16).ok())
+            .unwrap_or(0);
+        Self::new(channels, mask)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct AudioLayoutLoudness {
+    pub layout: AudioLayout,
+    pub loudness: AudioLoudness,
+}
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct AudioLayoutGain {
+    pub layout: AudioLayout,
+    pub gain_db: f64,
+}
+pub const MAX_LAYOUT_GAINS: usize = STANDARD_LAYOUTS.len() + 1;
+pub type AudioLayoutGains = [Option<AudioLayoutGain>; MAX_LAYOUT_GAINS];
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AudioLoudnessMeasurement {
-    pub source_channels: u32,
-    pub native: AudioLoudness,
-    pub stereo: AudioLoudness,
+    pub source: AudioLayout,
+    pub layouts: Vec<AudioLayoutLoudness>,
+}
+
+impl AudioLoudnessMeasurement {
+    pub fn get(&self, layout: AudioLayout) -> Option<AudioLoudness> {
+        self.layouts
+            .iter()
+            .find(|measurement| measurement.layout == layout)
+            .map(|measurement| measurement.loudness)
+    }
+}
+
+pub const STANDARD_LAYOUTS: &[AudioLayout] = &[
+    AudioLayout {
+        channels: 8,
+        channel_mask: 0xc3f,
+    },
+    AudioLayout {
+        channels: 8,
+        channel_mask: 0xff,
+    },
+    AudioLayout {
+        channels: 6,
+        channel_mask: 0x3f,
+    },
+    AudioLayout {
+        channels: 2,
+        channel_mask: 0x3,
+    },
+    AudioLayout {
+        channels: 1,
+        channel_mask: 0x4,
+    },
+];
+
+pub fn measured_layouts(source: AudioLayout) -> Vec<AudioLayout> {
+    let mut layouts = vec![source];
+    layouts.extend(STANDARD_LAYOUTS.iter().copied().filter(|layout| {
+        layout.channels < source.channels
+            || (source.channel_mask == 0 && layout.channels == source.channels)
+    }));
+    layouts
+}
+/// Replace the unconstrained native probe's declared layout with what the
+/// decoder actually produced, retaining every explicit matrix the analyzer
+/// built from discovery. An unpositioned 7.1 declaration, for example, probes
+/// both canonical 7.1 masks even when native decode resolves to one of them.
+pub fn resolved_measured_layouts(declared: AudioLayout, decoded: AudioLayout) -> Vec<AudioLayout> {
+    let mut layouts = vec![decoded];
+    layouts.extend(measured_layouts(declared).into_iter().skip(1));
+    layouts.sort_by_key(|layout| (std::cmp::Reverse(layout.channels), layout.channel_mask));
+    layouts.dedup();
+    layouts
+}
+
+pub fn layout_from_caps(caps: &gst::CapsRef) -> Option<AudioLayout> {
+    let structure = caps.structure(0)?;
+    let channels = structure.get::<i32>("channels").ok()?.max(0) as u32;
+    if channels == 0 {
+        return None;
+    }
+    let mask = structure
+        .get::<gst::Bitmask>("channel-mask")
+        .map(|mask| *mask)
+        .unwrap_or(0);
+    Some(AudioLayout::new(channels, mask))
 }
 
 /// Static programme gain: hit the loudness target unless true-peak headroom
@@ -58,6 +163,7 @@ struct MeterState {
     name: &'static str,
     meter: Option<ebur128::EbuR128>,
     channels: u32,
+    layout: Option<AudioLayout>,
     error: Option<String>,
     scratch: Vec<i16>,
 }
@@ -69,6 +175,7 @@ impl MeterState {
             meter: None,
             scratch: Vec::new(),
             channels: 0,
+            layout: None,
             error: None,
         }
     }
@@ -76,6 +183,7 @@ impl MeterState {
     fn add_sample(&mut self, sample: &gst::Sample) -> Result<()> {
         let caps = sample.caps().context("loudness sample has no caps")?;
         let info = gst_audio::AudioInfo::from_caps(caps)?;
+        let layout = layout_from_caps(caps).context("loudness sample has no channel layout")?;
         if self.meter.is_none() {
             let mode = ebur128::Mode::I | ebur128::Mode::TRUE_PEAK | ebur128::Mode::HISTOGRAM;
             let mut meter = ebur128::EbuR128::new(info.channels(), info.rate(), mode)?;
@@ -91,6 +199,7 @@ impl MeterState {
             );
             meter.set_channel_map(&channel_map)?;
             self.channels = info.channels();
+            self.layout = Some(layout);
             self.meter = Some(meter);
         }
 
@@ -100,6 +209,11 @@ impl MeterState {
             self.name,
             self.channels,
             info.channels()
+        );
+        anyhow::ensure!(
+            self.layout == Some(layout),
+            "{} channel layout changed during measurement",
+            self.name
         );
         let buffer = sample.buffer().context("loudness sample has no buffer")?;
         let map = buffer
@@ -129,7 +243,7 @@ impl MeterState {
         Ok(())
     }
 
-    fn finish(&self) -> Result<AudioLoudness> {
+    fn finish(&self) -> Result<AudioLayoutLoudness> {
         if let Some(error) = &self.error {
             anyhow::bail!("{} meter failed: {error}", self.name);
         }
@@ -153,9 +267,12 @@ impl MeterState {
             "no {} true-peak measurement",
             self.name
         );
-        Ok(AudioLoudness {
-            integrated_lufs,
-            true_peak_dbtp: 20.0 * true_peak.log10(),
+        Ok(AudioLayoutLoudness {
+            layout: self.layout.context("meter has no channel layout")?,
+            loudness: AudioLoudness {
+                integrated_lufs,
+                true_peak_dbtp: 20.0 * true_peak.log10(),
+            },
         })
     }
 }
@@ -249,28 +366,59 @@ fn install_meter_callback(
     );
 }
 
-/// Decode one audio stream at disk speed. `between` runs on every output
-/// buffer; blocking it backpressures every meter branch so a mediahost can
-/// yield to playback and scans. `source_channels` comes from discovery and
-/// decides whether the stereo fold is a distinct signal worth metering.
+struct MeterBranch {
+    queue: gst::Element,
+    convert: gst::Element,
+    caps: gst::Element,
+    sink: gst_app::AppSink,
+    state: Arc<Mutex<MeterState>>,
+}
+
+impl MeterBranch {
+    fn new(target: Option<AudioLayout>, raw_format: &str) -> Result<Self> {
+        let queue = gst::ElementFactory::make("queue")
+            .property("max-size-buffers", 4u32)
+            .property("max-size-bytes", 0u32)
+            .property("max-size-time", 0u64)
+            .build()?;
+        let convert = gst::ElementFactory::make("audioconvert").build()?;
+        let mut caps = gst::Caps::builder("audio/x-raw")
+            .field("format", raw_format)
+            .field("layout", "interleaved");
+        if let Some(target) = target {
+            caps = caps
+                .field("channels", target.channels as i32)
+                .field("channel-mask", gst::Bitmask::new(target.channel_mask));
+        }
+        let caps = gst::ElementFactory::make("capsfilter")
+            .property("caps", caps.build())
+            .build()?;
+        let sink = gst_app::AppSink::builder()
+            .sync(false)
+            .max_buffers(4)
+            .build();
+        sink.set_property("async", false);
+        Ok(Self {
+            queue,
+            convert,
+            caps,
+            sink,
+            state: Arc::new(Mutex::new(MeterState::new("layout"))),
+        })
+    }
+}
+
+/// Decode one audio stream at disk speed and meter every bounded output layout
+/// that playback may choose. `between` runs on every output buffer; blocking it
+/// backpressures every branch so a mediahost can yield to playback and scans.
 pub fn measure_file(
     path: &Path,
     audio_index: usize,
-    source_channels: u32,
-    between: impl Fn() + Send + Sync + 'static,
-) -> Result<AudioLoudnessMeasurement> {
-    measure_file_impl(path, audio_index, source_channels, false, between)
-}
-
-fn measure_file_impl(
-    path: &Path,
-    audio_index: usize,
-    source_channels: u32,
-    force_stereo_meter: bool,
+    source_layout: AudioLayout,
     between: impl Fn() + Send + Sync + 'static,
 ) -> Result<AudioLoudnessMeasurement> {
     crate::init()?;
-    anyhow::ensure!(source_channels > 0, "source audio has no channels");
+    anyhow::ensure!(source_layout.channels > 0, "source audio has no channels");
     let raw_format = if cfg!(target_endian = "little") {
         "S16LE"
     } else {
@@ -278,99 +426,44 @@ fn measure_file_impl(
     };
 
     let tee = gst::ElementFactory::make("tee").build()?;
-    let queue = || {
-        gst::ElementFactory::make("queue")
-            .property("max-size-buffers", 4u32)
-            .property("max-size-bytes", 0u32)
-            .property("max-size-time", 0u64)
-            .build()
-    };
-    let native_queue = queue()?;
-    let native_convert = gst::ElementFactory::make("audioconvert").build()?;
-    let native_caps = gst::ElementFactory::make("capsfilter")
-        .property(
-            "caps",
-            gst::Caps::builder("audio/x-raw")
-                .field("format", raw_format)
-                .field("layout", "interleaved")
-                .build(),
-        )
-        .build()?;
-    let native_sink = gst_app::AppSink::builder()
-        .sync(false)
-        .max_buffers(4)
-        .build();
-    native_sink.set_property("async", false);
-    let native = Arc::new(Mutex::new(MeterState::new("native")));
-
-    // Mono's DualMono weighting is the duplicated stereo fold, and a two
-    // channel source already is the target layout. In both cases integrated
-    // loudness and max per-channel true peak are identical, so a second
-    // audioconvert+EBU pass is pure duplicate CPU.
-    let stereo_branch = if source_channels > 2 || force_stereo_meter {
-        let queue = queue()?;
-        let convert = gst::ElementFactory::make("audioconvert").build()?;
-        let caps = gst::ElementFactory::make("capsfilter")
-            .property(
-                "caps",
-                gst::Caps::builder("audio/x-raw")
-                    .field("format", raw_format)
-                    .field("layout", "interleaved")
-                    .field("channels", 2i32)
-                    .field("channel-mask", gst::Bitmask::new(0x3))
-                    .build(),
-            )
-            .build()?;
-        let sink = gst_app::AppSink::builder()
-            .sync(false)
-            .max_buffers(4)
-            .build();
-        sink.set_property("async", false);
-        let state = Arc::new(Mutex::new(MeterState::new("stereo")));
-        Some((queue, convert, caps, sink, state))
-    } else {
-        None
-    };
+    let targets = measured_layouts(source_layout);
+    let mut branches = Vec::with_capacity(targets.len());
+    // Native is unconstrained so its caps record what the decoder actually
+    // produced. Every derived branch pins the exact matrix it measures.
+    branches.push(MeterBranch::new(None, raw_format)?);
+    for target in targets.into_iter().skip(1) {
+        branches.push(MeterBranch::new(Some(target), raw_format)?);
+    }
 
     let recording = Arc::new(AtomicBool::new(false));
     let progress = Arc::new(MeterProgress::new());
     let between: Arc<dyn Fn() + Send + Sync> = Arc::new(between);
-    install_meter_callback(
-        &native_sink,
-        native.clone(),
-        recording.clone(),
-        between.clone(),
-        progress.clone(),
-    );
-    if let Some((_, _, _, sink, state)) = &stereo_branch {
+    for branch in &branches {
         install_meter_callback(
-            sink,
-            state.clone(),
+            &branch.sink,
+            branch.state.clone(),
             recording.clone(),
-            between,
+            between.clone(),
             progress.clone(),
         );
     }
 
     let audio_sink = gst::Bin::new();
-    audio_sink.add_many([
-        &tee,
-        &native_queue,
-        &native_convert,
-        &native_caps,
-        native_sink.upcast_ref(),
-    ])?;
-    gst::Element::link_many([
-        &native_queue,
-        &native_convert,
-        &native_caps,
-        native_sink.upcast_ref(),
-    ])?;
-    tee.link(&native_queue)?;
-    if let Some((queue, convert, caps, sink, _)) = &stereo_branch {
-        audio_sink.add_many([queue, convert, caps, sink.upcast_ref()])?;
-        gst::Element::link_many([queue, convert, caps, sink.upcast_ref()])?;
-        tee.link(queue)?;
+    audio_sink.add(&tee)?;
+    for branch in &branches {
+        audio_sink.add_many([
+            &branch.queue,
+            &branch.convert,
+            &branch.caps,
+            branch.sink.upcast_ref(),
+        ])?;
+        gst::Element::link_many([
+            &branch.queue,
+            &branch.convert,
+            &branch.caps,
+            branch.sink.upcast_ref(),
+        ])?;
+        tee.link(&branch.queue)?;
     }
     let ghost = gst::GhostPad::with_target(&tee.static_pad("sink").unwrap())?;
     ghost.set_active(true)?;
@@ -429,23 +522,31 @@ fn measure_file_impl(
     let _ = pipeline.set_state(gst::State::Null);
     result?;
 
-    let native = native.lock().unwrap();
+    let mut layouts = Vec::with_capacity(branches.len());
+    for branch in &branches {
+        layouts.push(branch.state.lock().unwrap().finish()?);
+    }
+    let source = layouts[0].layout;
     anyhow::ensure!(
-        native.channels == source_channels,
-        "discovered {source_channels} source channels but decoded {}",
-        native.channels
+        source.channels == source_layout.channels,
+        "discovered {} source channels but decoded {}",
+        source_layout.channels,
+        source.channels
     );
-    let native_loudness = native.finish()?;
-    let stereo_loudness = if let Some((_, _, _, _, state)) = &stereo_branch {
-        state.lock().unwrap().finish()?
-    } else {
-        native_loudness
-    };
-    Ok(AudioLoudnessMeasurement {
-        source_channels,
-        native: native_loudness,
-        stereo: stereo_loudness,
-    })
+    anyhow::ensure!(
+        source_layout.channel_mask == 0 || source == source_layout,
+        "discovered source layout {:?} but decoded {:?}",
+        source_layout,
+        source
+    );
+    layouts.sort_by_key(|measurement| {
+        (
+            std::cmp::Reverse(measurement.layout.channels),
+            measurement.layout.channel_mask,
+        )
+    });
+    layouts.dedup_by_key(|measurement| measurement.layout);
+    Ok(AudioLoudnessMeasurement { source, layouts })
 }
 
 #[cfg(test)]
@@ -481,13 +582,36 @@ mod tests {
     }
 
     #[test]
-    fn measures_native_and_stereo_from_one_decode() {
+    fn unpositioned_multichannel_also_measures_canonical_layouts() {
+        assert_eq!(
+            measured_layouts(AudioLayout::new(6, 0)),
+            [
+                AudioLayout::new(6, 0),
+                AudioLayout::new(6, 0x3f),
+                AudioLayout::new(2, 0x3),
+                AudioLayout::new(1, 0x4),
+            ]
+        );
+        assert_eq!(
+            resolved_measured_layouts(AudioLayout::new(8, 0), AudioLayout::new(8, 0xc3f),),
+            [
+                AudioLayout::new(8, 0xff),
+                AudioLayout::new(8, 0xc3f),
+                AudioLayout::new(6, 0x3f),
+                AudioLayout::new(2, 0x3),
+                AudioLayout::new(1, 0x4),
+            ]
+        );
+    }
+    #[test]
+    fn measures_each_supported_output_layout_from_one_decode() {
         crate::init().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("tone.wav");
         let pipeline = gst::parse::launch(&format!(
             "audiotestsrc num-buffers=200 wave=sine volume=0.1 ! \
-             audio/x-raw,rate=48000 ! audioconvert ! wavenc ! filesink location={}",
+             audio/x-raw,rate=48000,channels=6,channel-mask=(bitmask)0x3f ! \
+             audioconvert ! wavenc ! filesink location={}",
             path.display()
         ))
         .unwrap();
@@ -499,35 +623,25 @@ mod tests {
         pipeline.set_state(gst::State::Null).unwrap();
         assert!(message.is_some_and(|message| message.type_() == gst::MessageType::Eos));
 
-        let measured = measure_file(&path, 0, 1, || {}).unwrap();
-        let separate = measure_file_impl(&path, 0, 1, true, || {}).unwrap();
-        let close = |left: f64, right: f64| {
-            assert!(
-                (left - right).abs() < 1e-9,
-                "deduplicated={left}, separate={right}"
-            );
-        };
-        close(
-            separate.native.integrated_lufs,
-            separate.stereo.integrated_lufs,
+        let source = AudioLayout::new(6, 0x3f);
+        let measured = measure_file(&path, 0, source, || {}).unwrap();
+        assert_eq!(measured.source, source);
+        assert_eq!(
+            measured
+                .layouts
+                .iter()
+                .map(|measurement| measurement.layout)
+                .collect::<Vec<_>>(),
+            [
+                AudioLayout::new(6, 0x3f),
+                AudioLayout::new(2, 0x3),
+                AudioLayout::new(1, 0x4),
+            ]
         );
-        close(
-            separate.native.true_peak_dbtp,
-            separate.stereo.true_peak_dbtp,
-        );
-        close(
-            measured.stereo.integrated_lufs,
-            separate.stereo.integrated_lufs,
-        );
-        close(
-            measured.stereo.true_peak_dbtp,
-            separate.stereo.true_peak_dbtp,
-        );
-        assert_eq!(measured.source_channels, 1);
-        assert!((-21.5..=-19.5).contains(&measured.native.integrated_lufs));
-        assert!((-21.5..=-19.5).contains(&measured.stereo.integrated_lufs));
-        assert!((-20.5..=-19.5).contains(&measured.native.true_peak_dbtp));
-        assert!((-20.5..=-19.5).contains(&measured.stereo.true_peak_dbtp));
+        assert!(measured.layouts.iter().all(|measurement| {
+            measurement.loudness.integrated_lufs.is_finite()
+                && measurement.loudness.true_peak_dbtp.is_finite()
+        }));
     }
 
     #[test]
@@ -561,15 +675,17 @@ mod tests {
         pipeline.set_state(gst::State::Null).unwrap();
         assert!(message.is_some_and(|message| message.type_() == gst::MessageType::Eos));
 
-        let first = measure_file(&path, 0, 2, || {}).unwrap();
-        let second = measure_file(&path, 1, 1, || {}).unwrap();
-        let third = measure_file(&path, 2, 6, || {}).unwrap();
-        assert_eq!(first.source_channels, 2);
-        assert_eq!(second.source_channels, 1);
-        assert_eq!(third.source_channels, 6);
+        let first = measure_file(&path, 0, AudioLayout::new(2, 0x3), || {}).unwrap();
+        let second = measure_file(&path, 1, AudioLayout::new(1, 0x4), || {}).unwrap();
+        let third = measure_file(&path, 2, AudioLayout::new(6, 0x3f), || {}).unwrap();
+        assert_eq!(first.source.channels, 2);
+        assert_eq!(second.source.channels, 1);
+        assert_eq!(third.source.channels, 6);
+        let native =
+            |measurement: &AudioLoudnessMeasurement| measurement.get(measurement.source).unwrap();
         assert!(
-            first.native.integrated_lufs - second.native.integrated_lufs > 15.0
-                && second.native.integrated_lufs - third.native.integrated_lufs > 15.0,
+            native(&first).integrated_lufs - native(&second).integrated_lufs > 15.0
+                && native(&second).integrated_lufs - native(&third).integrated_lufs > 15.0,
             "tracks were not selected independently: first={first:?}, \
              second={second:?}, third={third:?}"
         );

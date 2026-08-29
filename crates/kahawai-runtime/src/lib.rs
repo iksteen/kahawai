@@ -101,6 +101,9 @@ pub struct WorkerArgs {
     pub native_gain_db: Option<f64>,
     #[arg(long)]
     pub loudness_source_channels: Option<u32>,
+    /// JSON `AudioLayoutGain[]`; absent for minor-4 supervisors.
+    #[arg(long)]
+    pub loudness_gains: Option<String>,
     /// HUB-15a: tone-map HDR to SDR in the video encode chain.
     #[arg(long)]
     pub tone_map: bool,
@@ -239,6 +242,21 @@ pub fn run_remux_worker(cfg: &config::Config, w: WorkerArgs) -> Result<()> {
         let (sock, sz) = p.rsplit_once(':').context("--part wants <socket>:<size>")?;
         all.push((PathBuf::from(sock), sz.parse().context("--part size")?));
     }
+    let parsed_gains: Vec<kahawai_media::loudness::AudioLayoutGain> = w
+        .loudness_gains
+        .as_deref()
+        .map(serde_json::from_str)
+        .transpose()
+        .context("parsing --loudness-gains")?
+        .unwrap_or_default();
+    anyhow::ensure!(
+        parsed_gains.len() <= kahawai_media::loudness::MAX_LAYOUT_GAINS,
+        "too many --loudness-gains entries"
+    );
+    let mut loudness_gains = [None; kahawai_media::loudness::MAX_LAYOUT_GAINS];
+    for (slot, gain) in loudness_gains.iter_mut().zip(parsed_gains) {
+        *slot = Some(gain);
+    }
     let plan = kahawai_media::remux::RemuxPlan {
         video: kahawai_media::worker::parse_mode(&w.video),
         audio: kahawai_media::worker::parse_mode(&w.audio),
@@ -250,6 +268,7 @@ pub fn run_remux_worker(cfg: &config::Config, w: WorkerArgs) -> Result<()> {
         stereo_gain_db: w.stereo_gain_db,
         native_gain_db: w.native_gain_db,
         loudness_source_channels: w.loudness_source_channels,
+        loudness_gains,
         tone_map: w.tone_map,
         deinterlace: w.deinterlace,
         burn_subtitle: w.burn_sub,

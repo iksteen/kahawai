@@ -8,14 +8,16 @@
 //! dependent row. Protocol values still use `(root_token, path_rel)` and are
 //! translated only at the database boundary.
 //!
-//! ## `audio_loudness` schema (authority for migration 0067)
+//! ## Loudness schema (authority for migrations 0067–0069)
 //!
-//! One row per physical file/audio-stream index. `analyzer`, `size` and
-//! `mtime_unix` bind the measurement to both algorithm and bytes. Successful
-//! rows carry the integrated LUFS and stereo-fold true peak; null metrics plus a
-//! non-empty `error` are a terminal answer for that revision, preventing a
-//! broken decoder from becoming a reconnect loop. File deletion cascades the
-//! rows; nothing evicts them because rebuilding fully decodes the audio track.
+//! `audio_loudness` is one revision/status row per physical file/audio stream:
+//! `analyzer`, `size` and `mtime_unix` bind the answer to algorithm and bytes;
+//! a non-empty `error` is terminal for that revision. Successful rows own
+//! `audio_loudness_layouts`, keyed by exact `(channels, channel_mask)`, with one
+//! integrated-LUFS/true-peak pair per matrix playback may emit. The legacy
+//! stereo/native columns remain for protocol-minor-4 workers. File deletion
+//! cascades both tables; nothing evicts them because rebuilding fully decodes
+//! the audio track.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -334,7 +336,7 @@ impl HostLink {
             && self.segment_detector_generation == kahawai_core::segments::DETECTOR_GENERATION
     }
     pub(crate) fn supports_loudness_analysis(&self) -> bool {
-        self.protocol_minor >= 4
+        self.protocol_minor >= 5
     }
 
     pub(crate) async fn send(&self, msg: kahawai_proto::v1::HubToHost) -> Result<()> {
@@ -382,6 +384,7 @@ pub struct Registry {
             tokio::sync::mpsc::Sender<Result<kahawai_proto::v1::HubToTc, tonic::Status>>,
         >,
     >,
+    tc_protocol_minor: Mutex<HashMap<String, u32>>,
     /// Dispatched sessions per transcoder (inverse-load placement).
     tc_load: Mutex<HashMap<String, usize>>,
     /// HUB-36: measured pace per `(module_id, work_class)`, loaded from
@@ -546,6 +549,7 @@ impl Registry {
             local_bench: Mutex::new(None),
             local_video_executor_enabled: false,
             tc_links: Mutex::new(HashMap::new()),
+            tc_protocol_minor: Mutex::new(HashMap::new()),
             tc_load: Mutex::new(HashMap::new()),
             tc_pace: Mutex::new(HashMap::new()),
             tc_link_rate: Mutex::new(HashMap::new()),
@@ -923,10 +927,10 @@ impl Registry {
         tx.commit().await?;
         Ok(updated)
     }
-    /// Non-music files with audio streams whose current bytes have not been
-    /// measured by the source-local native-and-stereo loudness analyzer.
-    /// Music remains owned by its ReplayGain path. A terminal measurement error
-    /// also counts as an answer until the file revision changes.
+    /// Non-music files with audio streams whose current bytes lack the
+    /// source-local exact-layout loudness analyzer. Music remains owned by its
+    /// ReplayGain path. A terminal measurement error also counts as an answer
+    /// until the file revision changes.
     pub async fn loudness_worklist(
         &self,
         module_id: &str,
@@ -1014,24 +1018,56 @@ impl Registry {
                 indexes.len() == expected && (0..expected).all(|index| indexes.contains(&index)),
                 "loudness result stream indexes are incomplete or duplicated"
             );
-            anyhow::ensure!(
-                result.tracks.iter().all(|track| {
-                    let source_matches = info
-                        .audio
-                        .get(track.stream_index as usize)
-                        .is_some_and(|audio| audio.channels == track.source_channels);
-                    source_matches
-                        && track.integrated_lufs.is_finite()
-                        && track.true_peak_dbtp.is_finite()
-                        && track.native_integrated_lufs.is_finite()
-                        && track.native_true_peak_dbtp.is_finite()
-                        && (-100.0..=10.0).contains(&track.integrated_lufs)
-                        && (-100.0..=10.0).contains(&track.true_peak_dbtp)
-                        && (-100.0..=10.0).contains(&track.native_integrated_lufs)
-                        && (-100.0..=10.0).contains(&track.native_true_peak_dbtp)
-                }),
-                "loudness result contains an invalid measurement"
-            );
+            for track in &result.tracks {
+                let audio = &info.audio[track.stream_index as usize];
+                let declared = kahawai_media::loudness::AudioLayout::from_stream(
+                    audio.channels,
+                    audio.layout.as_deref(),
+                );
+                let source = kahawai_media::loudness::AudioLayout::new(
+                    track.source_channels,
+                    track.source_channel_mask,
+                );
+                anyhow::ensure!(
+                    source.channels == declared.channels
+                        && (declared.channel_mask == 0 || source == declared),
+                    "loudness result source layout does not match discovery"
+                );
+                let expected_layouts =
+                    kahawai_media::loudness::resolved_measured_layouts(declared, source)
+                        .into_iter()
+                        .collect::<std::collections::HashSet<_>>();
+                let layouts = track
+                    .layouts
+                    .iter()
+                    .map(|layout| {
+                        kahawai_media::loudness::AudioLayout::new(
+                            layout.channels,
+                            layout.channel_mask,
+                        )
+                    })
+                    .collect::<std::collections::HashSet<_>>();
+                anyhow::ensure!(
+                    layouts == expected_layouts && layouts.len() == track.layouts.len(),
+                    "loudness result layouts are incomplete or duplicated"
+                );
+                anyhow::ensure!(
+                    track.layouts.iter().all(|layout| {
+                        layout.channels > 0
+                            && kahawai_media::loudness::AudioLayout::new(
+                                layout.channels,
+                                layout.channel_mask,
+                            )
+                            .channel_mask
+                                == layout.channel_mask
+                            && layout.integrated_lufs.is_finite()
+                            && layout.true_peak_dbtp.is_finite()
+                            && (-100.0..=10.0).contains(&layout.integrated_lufs)
+                            && (-100.0..=10.0).contains(&layout.true_peak_dbtp)
+                    }),
+                    "loudness result contains an invalid layout measurement"
+                );
+            }
         }
 
         let mut tx = self.db.begin_with("BEGIN IMMEDIATE").await?;
@@ -1044,46 +1080,68 @@ impl Registry {
                 .tracks
                 .iter()
                 .find(|track| track.stream_index as usize == stream_index);
-            let (
-                integrated_lufs,
-                true_peak_dbtp,
-                source_channels,
-                native_integrated_lufs,
-                native_true_peak_dbtp,
-                error,
-            ) = if result.error.is_empty() {
+            let (stereo, native, source_layout, error) = if result.error.is_empty() {
                 let measured = measured.expect("validated complete result");
-                (
-                    Some(measured.integrated_lufs),
-                    Some(measured.true_peak_dbtp),
-                    Some(measured.source_channels as i64),
-                    Some(measured.native_integrated_lufs),
-                    Some(measured.native_true_peak_dbtp),
-                    "",
-                )
+                let source = kahawai_media::loudness::AudioLayout::new(
+                    measured.source_channels,
+                    measured.source_channel_mask,
+                );
+                let native = measured
+                    .layouts
+                    .iter()
+                    .find(|layout| {
+                        (layout.channels, layout.channel_mask)
+                            == (source.channels, source.channel_mask)
+                    })
+                    .expect("validated native layout");
+                let stereo = measured
+                    .layouts
+                    .iter()
+                    .find(|layout| (layout.channels, layout.channel_mask) == (2, 0x3))
+                    .unwrap_or(native);
+                (Some(stereo), Some(native), Some(source), "")
             } else {
-                (None, None, None, None, None, result.error.as_str())
+                (None, None, None, result.error.as_str())
             };
             sqlx::query(
                 "INSERT INTO audio_loudness
                    (file_id,stream_index,analyzer,size,mtime_unix,
-                    integrated_lufs,true_peak_dbtp,source_channels,
+                    integrated_lufs,true_peak_dbtp,source_channels,source_channel_mask,
                     native_integrated_lufs,native_true_peak_dbtp,error,measured_at)
-                 VALUES(?,?,?,?,?,?,?,?,?,?,?,unixepoch())",
+                 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,unixepoch())",
             )
             .bind(file_id)
             .bind(stream_index as i64)
             .bind(result.analyzer)
             .bind(result.size as i64)
             .bind(result.mtime_unix)
-            .bind(integrated_lufs)
-            .bind(true_peak_dbtp)
-            .bind(source_channels)
-            .bind(native_integrated_lufs)
-            .bind(native_true_peak_dbtp)
+            .bind(stereo.map(|layout| layout.integrated_lufs))
+            .bind(stereo.map(|layout| layout.true_peak_dbtp))
+            .bind(source_layout.map(|layout| layout.channels as i64))
+            .bind(source_layout.map(|layout| layout.channel_mask as i64))
+            .bind(native.map(|layout| layout.integrated_lufs))
+            .bind(native.map(|layout| layout.true_peak_dbtp))
             .bind(error)
             .execute(&mut *tx)
             .await?;
+            if let Some(measured) = measured {
+                for layout in &measured.layouts {
+                    sqlx::query(
+                        "INSERT INTO audio_loudness_layouts
+                           (file_id,stream_index,channels,channel_mask,
+                            integrated_lufs,true_peak_dbtp)
+                         VALUES(?,?,?,?,?,?)",
+                    )
+                    .bind(file_id)
+                    .bind(stream_index as i64)
+                    .bind(layout.channels as i64)
+                    .bind(layout.channel_mask as i64)
+                    .bind(layout.integrated_lufs)
+                    .bind(layout.true_peak_dbtp)
+                    .execute(&mut *tx)
+                    .await?;
+                }
+            }
         }
         tx.commit().await?;
         Ok(true)
@@ -1112,35 +1170,49 @@ impl Registry {
         file_id: i64,
         stream_index: usize,
     ) -> Result<Option<kahawai_media::loudness::AudioLoudnessMeasurement>> {
-        let row = sqlx::query(
-            "SELECT l.source_channels,l.integrated_lufs,l.true_peak_dbtp,
-                    l.native_integrated_lufs,l.native_true_peak_dbtp
+        let rows = sqlx::query(
+            "SELECT l.source_channels,l.source_channel_mask,
+                    ll.channels,ll.channel_mask,ll.integrated_lufs,ll.true_peak_dbtp
                FROM audio_loudness l
+               JOIN audio_loudness_layouts ll
+                 ON ll.file_id=l.file_id AND ll.stream_index=l.stream_index
                JOIN files f ON f.id=l.file_id
                JOIN collections c
                  ON c.module_id=f.module_id AND c.collection_id=f.collection_id
               WHERE l.file_id=? AND l.stream_index=? AND l.analyzer=?
                 AND c.media_type != 'music'
-                AND l.size=f.size AND l.mtime_unix=f.mtime_unix AND l.error=''",
+                AND l.size=f.size AND l.mtime_unix=f.mtime_unix AND l.error=''
+              ORDER BY ll.channels DESC,ll.channel_mask",
         )
         .bind(file_id)
         .bind(stream_index as i64)
         .bind(kahawai_media::loudness::ANALYZER)
-        .fetch_optional(&self.db)
+        .fetch_all(&self.db)
         .await?;
-        Ok(
-            row.map(|row| kahawai_media::loudness::AudioLoudnessMeasurement {
-                source_channels: row.get::<i64, _>("source_channels") as u32,
-                stereo: kahawai_media::loudness::AudioLoudness {
+        let Some(first) = rows.first() else {
+            return Ok(None);
+        };
+        let source = kahawai_media::loudness::AudioLayout::new(
+            first.get::<i64, _>("source_channels") as u32,
+            first.get::<i64, _>("source_channel_mask") as u64,
+        );
+        let layouts = rows
+            .into_iter()
+            .map(|row| kahawai_media::loudness::AudioLayoutLoudness {
+                layout: kahawai_media::loudness::AudioLayout::new(
+                    row.get::<i64, _>("channels") as u32,
+                    row.get::<i64, _>("channel_mask") as u64,
+                ),
+                loudness: kahawai_media::loudness::AudioLoudness {
                     integrated_lufs: row.get("integrated_lufs"),
                     true_peak_dbtp: row.get("true_peak_dbtp"),
                 },
-                native: kahawai_media::loudness::AudioLoudness {
-                    integrated_lufs: row.get("native_integrated_lufs"),
-                    true_peak_dbtp: row.get("native_true_peak_dbtp"),
-                },
-            }),
-        )
+            })
+            .collect();
+        Ok(Some(kahawai_media::loudness::AudioLoudnessMeasurement {
+            source,
+            layouts,
+        }))
     }
 
     /// Files whose longest keyframe gap was never measured — rows
@@ -3128,12 +3200,25 @@ impl Registry {
     pub fn register_tc_link(
         &self,
         module_id: &str,
+        protocol_minor: u32,
         tx: tokio::sync::mpsc::Sender<Result<kahawai_proto::v1::HubToTc, tonic::Status>>,
     ) {
         self.tc_links
             .lock()
             .unwrap()
             .insert(module_id.to_string(), tx);
+        self.tc_protocol_minor
+            .lock()
+            .unwrap()
+            .insert(module_id.to_string(), protocol_minor);
+    }
+
+    pub fn transcoder_supports_layout_gains(&self, module_id: &str) -> bool {
+        self.tc_protocol_minor
+            .lock()
+            .unwrap()
+            .get(module_id)
+            .is_some_and(|minor| *minor >= 5)
     }
 
     /// Drop a transcoder link only if it is still the one the caller owns.
@@ -3156,6 +3241,7 @@ impl Registry {
                 links.remove(module_id);
                 drop(links);
                 self.tc_load.lock().unwrap().remove(module_id);
+                self.tc_protocol_minor.lock().unwrap().remove(module_id);
                 self.tc_link_rate.lock().unwrap().remove(module_id);
                 true
             }

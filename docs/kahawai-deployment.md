@@ -182,12 +182,13 @@ see the same patched demuxers as scans and playback workers.
 Source-local loudness measurement is built into Kahawai; mediahosts need their
 ordinary audio decoders and `audioconvert`, not the optional `rsaudiofx`
 `ebur128level` plugin. The first backfill decodes every non-music audio track in
-full. Multichannel input feeds capped native-layout and stereo appsinks; mono
-and stereo input uses one equivalent meter result for both facts. Every
-streaming histogram meter has constant history. The job holds the same idle permit as
-hashing/segment analysis and backpressures whenever a scan or viewer lease
-becomes active. Music collections are not queued because their ReplayGain path
-remains authoritative.
+full. One decode feeds capped appsinks for the untouched channel layout and
+every smaller canonical layout playback can emit; each streaming histogram
+meter has constant history. This costs more meter CPU during the one-time
+backfill and makes every later gain an exact indexed lookup. The job holds the
+same idle permit as hashing/segment analysis and backpressures whenever a scan
+or viewer lease becomes active. Music collections are not queued because their
+ReplayGain path remains authoritative.
 
 ## Capping what a transcode costs the box (TC-6)
 

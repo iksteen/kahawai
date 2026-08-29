@@ -1125,13 +1125,23 @@ async fn handle_host_msg(
             let root_token = registry
                 .resolve_root_token(module_id, &loudness.collection_id, &source.root_token)
                 .await?;
+            let path_rel = source.path_rel;
             loudness.source = Some(kahawai_proto::v1::SourcePath {
                 root_token,
-                path_rel: source.path_rel,
+                path_rel: path_rel.clone(),
             });
-            let stored = registry.record_file_loudness(module_id, &loudness).await?;
+            let stored = registry
+                .record_file_loudness(module_id, &loudness)
+                .await
+                .with_context(|| {
+                    format!(
+                        "recording loudness result for {}/{}",
+                        loudness.collection_id, path_rel
+                    )
+                })?;
             tracing::info!(%module_id, collection = %loudness.collection_id,
-                tracks = loudness.tracks.len(), stored, "audio loudness result received");
+                path = %path_rel, tracks = loudness.tracks.len(), stored,
+                "audio loudness result received");
         }
         host_to_hub::Msg::FileSubtitles(fs) => {
             let source = exact_source(fs.source, "FileSubtitles")?;
@@ -1697,6 +1707,14 @@ mod forget_link_tests {
             kahawai_core::segments::DETECTOR_GENERATION,
         );
         assert!(!registry.host_supports_segment_detection("host"));
+        let (minor4_tx, _minor4_rx) = tokio::sync::mpsc::channel(1);
+        registry.register_link(
+            "host",
+            minor4_tx,
+            4,
+            kahawai_core::segments::DETECTOR_GENERATION,
+        );
+        assert!(!registry.host_supports_loudness_analysis("host"));
 
         let (mismatch_tx, _mismatch_rx) = tokio::sync::mpsc::channel(1);
         registry.register_link(
@@ -1715,6 +1733,7 @@ mod forget_link_tests {
             kahawai_core::segments::DETECTOR_GENERATION,
         );
         assert!(registry.host_supports_segment_detection("host"));
+        assert!(registry.host_supports_loudness_analysis("host"));
     }
 
     #[tokio::test]

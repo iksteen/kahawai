@@ -374,7 +374,11 @@ async fn capacity_holds_when_placements_arrive_together() {
     // the fourth caller must be refused.
     for (id, max) in [("box-a", 2u32), ("box-b", 1)] {
         registry.connected(id, "transcoder", id, "fp", "build");
-        registry.register_tc_link(id, tokio::sync::mpsc::channel(1).0);
+        registry.register_tc_link(
+            id,
+            kahawai_proto::PROTOCOL_MINOR,
+            tokio::sync::mpsc::channel(1).0,
+        );
         registry.set_transcoder_caps(
             id,
             &CapabilityReport {

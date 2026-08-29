@@ -400,6 +400,7 @@ async fn link_loop(
                                     (s.video_kbps, s.max_height, s.max_channels, s.tone_map, s.burn_subtitle),
                                     s.deinterlace,
                                     (s.stereo_gain_db, s.native_gain_db, s.loudness_source_channels),
+                                    s.loudness_gains,
                                     (s.video_codec, s.audio_codec, s.container),
                                     s.burn_sets, (s.burn_ass, s.burn_ass_file),
                                 ).await;

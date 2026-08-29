@@ -552,20 +552,20 @@ How something works and why it was built that way belong in
       implementation §4.9; detector parity remains measured against
       intro-skipper in `docs/intro-detection-results.md`.
 - [x] HUB-38 Measured audio loudness normalization: the mediahost idle-decodes
-      every non-music audio stream once and meters both its native layout and
-      GStreamer's actual stereo fold, storing revision-guarded EBU R128
-      integrated loudness/true peak pairs on the hub. Audio encodes apply one
-      static gain toward −18 LUFS, capped at −1 dBTP: stereo uses the folded
-      measurement, while a multichannel encode preserving the source channel
-      count uses the native measurement. Mono/stereo input meters once and
-      reuses the mathematically equivalent result for both facts; only
-      multichannel pays for the second folded meter. An account-global
-      three-state setting defaults to applying gain only when audio already
-      encodes, can disable gain, or can force a measured direct/copied audio
-      stream through an encode. Force retains the ordinary video mode and
-      falls back unchanged without a current single-part measurement or
-      compatible audio-only route. Music stays untouched; ReplayGain owns it.
-      Session facts state the applied dB gain.
+      every non-music audio stream once and meters the untouched decoded layout
+      plus every smaller canonical output matrix playback may choose. The hub
+      stores revision-guarded EBU R128 integrated-loudness/true-peak pairs keyed
+      by exact channel count and mask. Workers select gain only after their
+      post-conversion caps are known, apply one static move toward −18 LUFS
+      capped at −1 dBTP, and never derive a fold from native scalar facts.
+      An account-global setting defaults to gains on existing encodes, can
+      disable gain, or can force measured direct/copied audio through an encode.
+      Force retains the ordinary video mode and falls back before transcoding
+      when the source is multipart, the measurement is stale/missing, the
+      executor lacks layout-map support, or its exact output layout is not
+      measured and locally preflighted. Music remains owned by ReplayGain.
+      Full-file work stays source-local, revision retry remains possible after
+      later scans, and session facts state the exact applied dB gain.
       Full-file rebuild work is source-local, serialized with other background
       jobs, and yields to scans and viewer leases. Watched-first segment
       detection preempts loudness at the next audio buffer; the same pipeline

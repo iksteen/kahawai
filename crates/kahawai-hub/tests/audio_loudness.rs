@@ -1,5 +1,5 @@
 use kahawai_hub::registry::{LoudnessPreference, Registry};
-use kahawai_proto::v1::{AudioLoudnessTrack, FileLoudness, SourcePath};
+use kahawai_proto::v1::{AudioLayoutLoudness, AudioLoudnessTrack, FileLoudness, SourcePath};
 
 async fn fixture() -> (tempfile::TempDir, Registry) {
     let dir = tempfile::tempdir().unwrap();
@@ -13,7 +13,7 @@ async fn fixture() -> (tempfile::TempDir, Registry) {
         INSERT INTO files(module_id,collection_id,root_id,path_rel,size,mtime_unix,
                           head_xxh3,tail_xxh3,oshash,streams_json)
           SELECT 'm','c',id,'movie.mkv',10,1,0,0,0,
-                 '{"audio":[{"codec":"dts","channels":6,"sample_rate":48000,"language":null,"bitrate_kbps":null,"layout":"0x3f"},{"codec":"aac","channels":2,"sample_rate":48000,"language":null,"bitrate_kbps":null,"layout":"0x3"}]}'
+                 '{"audio":[{"codec":"dts","channels":8,"sample_rate":48000,"language":null,"bitrate_kbps":null,"layout":null},{"codec":"aac","channels":2,"sample_rate":48000,"language":null,"bitrate_kbps":null,"layout":"0x3"}]}'
             FROM collection_roots;
         "#,
     )
@@ -35,9 +35,42 @@ fn result(mtime_unix: i64) -> FileLoudness {
                 stream_index: 0,
                 integrated_lufs: -27.0,
                 true_peak_dbtp: -6.0,
-                source_channels: 6,
+                source_channels: 8,
+                source_channel_mask: 0xc3f,
                 native_integrated_lufs: -24.0,
                 native_true_peak_dbtp: -5.0,
+                layouts: vec![
+                    AudioLayoutLoudness {
+                        channels: 8,
+                        channel_mask: 0xc3f,
+                        integrated_lufs: -24.0,
+                        true_peak_dbtp: -5.0,
+                    },
+                    AudioLayoutLoudness {
+                        channels: 8,
+                        channel_mask: 0xff,
+                        integrated_lufs: -23.0,
+                        true_peak_dbtp: -4.0,
+                    },
+                    AudioLayoutLoudness {
+                        channels: 6,
+                        channel_mask: 0x3f,
+                        integrated_lufs: -25.0,
+                        true_peak_dbtp: -5.5,
+                    },
+                    AudioLayoutLoudness {
+                        channels: 2,
+                        channel_mask: 0x3,
+                        integrated_lufs: -27.0,
+                        true_peak_dbtp: -6.0,
+                    },
+                    AudioLayoutLoudness {
+                        channels: 1,
+                        channel_mask: 0x4,
+                        integrated_lufs: -30.0,
+                        true_peak_dbtp: -9.0,
+                    },
+                ],
             },
             AudioLoudnessTrack {
                 stream_index: 1,
@@ -46,6 +79,21 @@ fn result(mtime_unix: i64) -> FileLoudness {
                 source_channels: 2,
                 native_integrated_lufs: -19.0,
                 native_true_peak_dbtp: -2.0,
+                source_channel_mask: 0x3,
+                layouts: vec![
+                    AudioLayoutLoudness {
+                        channels: 2,
+                        channel_mask: 0x3,
+                        integrated_lufs: -19.0,
+                        true_peak_dbtp: -2.0,
+                    },
+                    AudioLayoutLoudness {
+                        channels: 1,
+                        channel_mask: 0x4,
+                        integrated_lufs: -22.0,
+                        true_peak_dbtp: -5.0,
+                    },
+                ],
             },
         ],
         error: String::new(),
@@ -73,15 +121,44 @@ async fn measurements_are_complete_revision_guarded_source_facts() {
     assert_eq!(
         registry.audio_loudness(1, 0).await.unwrap(),
         Some(kahawai_media::loudness::AudioLoudnessMeasurement {
-            source_channels: 6,
-            stereo: kahawai_media::loudness::AudioLoudness {
-                integrated_lufs: -27.0,
-                true_peak_dbtp: -6.0,
-            },
-            native: kahawai_media::loudness::AudioLoudness {
-                integrated_lufs: -24.0,
-                true_peak_dbtp: -5.0,
-            },
+            source: kahawai_media::loudness::AudioLayout::new(8, 0xc3f),
+            layouts: vec![
+                kahawai_media::loudness::AudioLayoutLoudness {
+                    layout: kahawai_media::loudness::AudioLayout::new(8, 0xff),
+                    loudness: kahawai_media::loudness::AudioLoudness {
+                        integrated_lufs: -23.0,
+                        true_peak_dbtp: -4.0,
+                    },
+                },
+                kahawai_media::loudness::AudioLayoutLoudness {
+                    layout: kahawai_media::loudness::AudioLayout::new(8, 0xc3f),
+                    loudness: kahawai_media::loudness::AudioLoudness {
+                        integrated_lufs: -24.0,
+                        true_peak_dbtp: -5.0,
+                    },
+                },
+                kahawai_media::loudness::AudioLayoutLoudness {
+                    layout: kahawai_media::loudness::AudioLayout::new(6, 0x3f),
+                    loudness: kahawai_media::loudness::AudioLoudness {
+                        integrated_lufs: -25.0,
+                        true_peak_dbtp: -5.5,
+                    },
+                },
+                kahawai_media::loudness::AudioLayoutLoudness {
+                    layout: kahawai_media::loudness::AudioLayout::new(2, 0x3),
+                    loudness: kahawai_media::loudness::AudioLoudness {
+                        integrated_lufs: -27.0,
+                        true_peak_dbtp: -6.0,
+                    },
+                },
+                kahawai_media::loudness::AudioLayoutLoudness {
+                    layout: kahawai_media::loudness::AudioLayout::new(1, 0x4),
+                    loudness: kahawai_media::loudness::AudioLoudness {
+                        integrated_lufs: -30.0,
+                        true_peak_dbtp: -9.0,
+                    },
+                },
+            ],
         })
     );
 

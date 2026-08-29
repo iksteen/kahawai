@@ -80,7 +80,7 @@ impl TranscoderLink for TranscoderLinkService {
         // Sender first, then "present" — the same reason as the mediahost link:
         // the renewal settlement below is DB work, and a box announced as
         // present without a way to reach it is a placement target that fails.
-        registry.register_tc_link(&module_id, tx.clone());
+        registry.register_tc_link(&module_id, hello.protocol_minor, tx.clone());
         registry.connected(
             &module_id,
             &peer.module_type,

@@ -308,13 +308,29 @@ message FileLoudness {
 
 message AudioLoudnessTrack {
   uint32 stream_index = 1;
+  // Legacy analyzer-3 fields retained for mixed-minor peers.
   double integrated_lufs = 2;
   double true_peak_dbtp = 3;
   uint32 source_channels = 4;
   double native_integrated_lufs = 5;
   double native_true_peak_dbtp = 6;
+  // Exact post-conversion layouts measured by analyzer 4 and later.
+  repeated AudioLayoutLoudness layouts = 7;
+  uint64 source_channel_mask = 8;
 }
 
+message AudioLayoutLoudness {
+  uint32 channels = 1;
+  uint64 channel_mask = 2;
+  double integrated_lufs = 3;
+  double true_peak_dbtp = 4;
+}
+
+message AudioLayoutGain {
+  uint32 channels = 1;
+  uint64 channel_mask = 2;
+  double gain_db = 3;
+}
 
 message ExtractSubs {
   string collection_id = 1;
@@ -777,6 +793,9 @@ message StartSession {
   // encoded channel count still equals loudness_source_channels.
   double native_gain_db = 23;
   uint32 loudness_source_channels = 24;
+  // Exact layout-keyed gains. Minor-4 workers ignore this and retain the
+  // stereo/native fields above; placement gates layouts they cannot express.
+  repeated AudioLayoutGain loudness_gains = 25;
 }
 
 message EndSession {

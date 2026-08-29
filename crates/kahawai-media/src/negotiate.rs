@@ -496,6 +496,21 @@ pub fn negotiate(
     )
 }
 
+fn encoded_audio_layout(
+    info: &MediaInfo,
+    plan: &RemuxPlan,
+) -> Option<crate::loudness::AudioLayout> {
+    let audio = info.audio.get(plan.audio_track)?;
+    let source = crate::loudness::AudioLayout::from_stream(audio.channels, audio.layout.as_deref());
+    let bound = plan
+        .max_channels
+        .filter(|channels| *channels > 0)
+        .map_or(source.channels, |channels| channels.min(source.channels));
+    crate::loudness::measured_layouts(source)
+        .into_iter()
+        .find(|layout| layout.channels <= bound)
+}
+
 /// Negotiate against the two execution classes in the topology.
 ///
 /// A copied-video/audio-encode plan runs in the hub, while a video encode
@@ -553,7 +568,13 @@ pub fn negotiate_for_executors(
     } else {
         forced.plan.video == normal.plan.video
     };
-    if forced.plan.audio == StreamMode::Encode && video_unchanged {
+    let exact_layout_supported = normal.plan.video == StreamMode::Encode
+        || crate::remux::exact_audio_layout(info, &forced.plan).is_some();
+    if forced.plan.audio == StreamMode::Encode
+        && video_unchanged
+        && encoded_audio_layout(info, &forced.plan).is_some()
+        && exact_layout_supported
+    {
         forced
     } else {
         normal
@@ -924,6 +945,7 @@ fn negotiate_for_executors_impl(
         stereo_gain_db: None,
         native_gain_db: None,
         loudness_source_channels: None,
+        loudness_gains: [None; crate::loudness::MAX_LAYOUT_GAINS],
         tone_map,
         // Fields only matter where the pixels get rewritten; a copy
         // carries them out as they came in.
@@ -1514,6 +1536,69 @@ mod tests {
 
         let no_audio_encoder = plan(&info, &[], true);
         assert!(no_audio_encoder.direct, "force must fall back to direct");
+        let mut mono_ceiling = p.clone();
+        mono_ceiling.max_audio_channels = 1;
+        let mono_normal = super::negotiate_for_executors(
+            &mono_ceiling,
+            &info,
+            0,
+            0,
+            true,
+            None,
+            false,
+            true,
+            &[],
+            None,
+            &AssPolicy::default(),
+            &targets,
+            &targets,
+            &targets,
+            false,
+        );
+        let unsupported_layout = super::negotiate_for_executors(
+            &mono_ceiling,
+            &info,
+            0,
+            0,
+            true,
+            None,
+            false,
+            true,
+            &[],
+            None,
+            &AssPolicy::default(),
+            &targets,
+            &targets,
+            &targets,
+            true,
+        );
+        assert_eq!(unsupported_layout.cost, mono_normal.cost);
+        assert_eq!(unsupported_layout.plan.audio, mono_normal.plan.audio);
+        assert_eq!(unsupported_layout.plan.video, mono_normal.plan.video);
+
+        let mut surround_client = p.clone();
+        surround_client.max_audio_channels = 6;
+        let mut surround = media("mp4", Some(vs("h264")), Some(au("aac", 8)));
+        surround.audio[0].layout = Some("0xc3f".into());
+        let surround_force = super::negotiate_for_executors(
+            &surround_client,
+            &surround,
+            0,
+            0,
+            true,
+            None,
+            false,
+            true,
+            &[],
+            None,
+            &AssPolicy::default(),
+            &targets,
+            &targets,
+            &targets,
+            true,
+        );
+        assert_eq!(surround_force.plan.audio, StreamMode::Encode);
+        assert_eq!(surround_force.plan.max_channels, Some(6));
 
         let mut webm_client = p.clone();
         webm_client.video.push(VideoCap {

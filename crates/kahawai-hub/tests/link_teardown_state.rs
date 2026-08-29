@@ -118,14 +118,19 @@ async fn a_replaced_transcoder_link_is_left_alone() {
     let (old_tx, _old_rx) = tokio::sync::mpsc::channel(4);
     let (new_tx, _new_rx) = tokio::sync::mpsc::channel(4);
 
-    reg.register_tc_link("01TC", old_tx.clone());
+    reg.register_tc_link("01TC", 4, old_tx.clone());
     // The box comes back and registers afresh while the old task is still
     // sitting in its heartbeat window.
-    reg.register_tc_link("01TC", new_tx.clone());
+    reg.register_tc_link("01TC", 5, new_tx.clone());
+    assert!(reg.transcoder_supports_layout_gains("01TC"));
 
     assert!(
         !reg.unregister_tc_link_if_current("01TC", &old_tx),
         "the dead task must not claim a link it no longer owns"
+    );
+    assert!(
+        reg.transcoder_supports_layout_gains("01TC"),
+        "old teardown must not remove the live link's protocol capabilities"
     );
     // The live one is still registered — which is the whole point, and is
     // observable precisely because ITS teardown still succeeds.

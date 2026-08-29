@@ -1,4 +1,4 @@
-//! Idle source-local native and stereo loudness measurement.
+//! Idle source-local loudness measurement for exact playback layouts.
 //!
 //! Separate from the general hasher queue: a programme decode can run for
 //! minutes, while urgent subtitle extraction must remain able to enter and mark
@@ -12,7 +12,8 @@ use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result};
 use kahawai_proto::v1::{
-    AudioLoudnessTrack, FileLoudness, HostToHub, LoudnessWorklist, SourcePath, host_to_hub,
+    AudioLayoutLoudness, AudioLoudnessTrack, FileLoudness, HostToHub, LoudnessWorklist, SourcePath,
+    host_to_hub,
 };
 
 use crate::Activity;
@@ -23,6 +24,7 @@ struct PendingSource {
     source: SourcePath,
     movie: bool,
     mtime_unix: i64,
+    analyzer: i64,
 }
 
 /// Ascending for `sort_by`; the worker pops the greatest priority. Paths are
@@ -41,10 +43,10 @@ fn enqueue(
     seen: &mut std::collections::HashSet<(String, String, String)>,
     pending: &mut Vec<PendingSource>,
 ) {
-    if work.analyzer != kahawai_media::loudness::ANALYZER {
+    if !matches!(work.analyzer, 3 | kahawai_media::loudness::ANALYZER) {
         tracing::warn!(
             offered = work.analyzer,
-            supported = kahawai_media::loudness::ANALYZER,
+            supported = ?[3, kahawai_media::loudness::ANALYZER],
             "unsupported loudness analyzer worklist ignored"
         );
         return;
@@ -78,6 +80,7 @@ fn enqueue(
             source,
             movie,
             mtime_unix,
+            analyzer: work.analyzer,
         });
         accepted += 1;
     }
@@ -143,6 +146,7 @@ pub async fn run(
             source,
             movie,
             mtime_unix: queued_mtime,
+            analyzer,
         } = pending.pop().expect("queue was nonempty before permit");
 
         let source2 = source.clone();
@@ -193,21 +197,29 @@ pub async fn run(
                 "audio loudness measurement failed"
             );
         }
-        if tx
+        let seen_key = (
+            collection_id.clone(),
+            source.root_token.clone(),
+            source.path_rel.clone(),
+        );
+        let sent = tx
             .send(HostToHub {
                 msg: Some(host_to_hub::Msg::FileLoudness(FileLoudness {
                     collection_id,
                     source: Some(source),
                     size,
                     mtime_unix,
-                    analyzer: kahawai_media::loudness::ANALYZER,
+                    analyzer,
                     tracks,
                     error,
                 })),
             })
-            .await
-            .is_err()
-        {
+            .await;
+        // `seen` suppresses duplicate chunks only while work is pending or
+        // active. A later scan may invalidate the revision and legitimately
+        // queue this exact path again.
+        seen.remove(&seen_key);
+        if sent.is_err() {
             return;
         }
     }
@@ -307,21 +319,42 @@ fn measure_source(
             let background = background.clone();
             let trimmer = trimmer.clone();
             let foreground_pause = foreground_pause.clone();
+            let source_layout = kahawai_media::loudness::AudioLayout::from_stream(
+                info.audio[stream_index].channels,
+                info.audio[stream_index].layout.as_deref(),
+            );
             let measured = kahawai_media::loudness::measure_file(
                 &path,
                 stream_index,
-                info.audio[stream_index].channels,
+                source_layout,
                 move || {
                     checkpoint(&activity, &background, &trimmer, &foreground_pause);
                 },
             )?;
+            let native = measured
+                .get(measured.source)
+                .context("native loudness layout missing")?;
+            let stereo = measured
+                .get(kahawai_media::loudness::AudioLayout::new(2, 0x3))
+                .unwrap_or(native);
             tracks.push(AudioLoudnessTrack {
                 stream_index: stream_index as u32,
-                integrated_lufs: measured.stereo.integrated_lufs,
-                true_peak_dbtp: measured.stereo.true_peak_dbtp,
-                source_channels: measured.source_channels,
-                native_integrated_lufs: measured.native.integrated_lufs,
-                native_true_peak_dbtp: measured.native.true_peak_dbtp,
+                integrated_lufs: stereo.integrated_lufs,
+                true_peak_dbtp: stereo.true_peak_dbtp,
+                source_channels: measured.source.channels,
+                source_channel_mask: measured.source.channel_mask,
+                native_integrated_lufs: native.integrated_lufs,
+                native_true_peak_dbtp: native.true_peak_dbtp,
+                layouts: measured
+                    .layouts
+                    .into_iter()
+                    .map(|measurement| AudioLayoutLoudness {
+                        channels: measurement.layout.channels,
+                        channel_mask: measurement.layout.channel_mask,
+                        integrated_lufs: measurement.loudness.integrated_lufs,
+                        true_peak_dbtp: measurement.loudness.true_peak_dbtp,
+                    })
+                    .collect(),
             });
         }
         let after = std::fs::metadata(&path)?;
@@ -354,6 +387,7 @@ mod tests {
             source: SourcePath::new("root", path),
             movie,
             mtime_unix,
+            analyzer: kahawai_media::loudness::ANALYZER,
         };
         let mut pending = vec![
             item(false, 100, "new-series.mkv"),
@@ -374,6 +408,28 @@ mod tests {
                 "old-series.mkv",
             ]
         );
+    }
+    #[test]
+    fn minor_four_worklists_keep_the_legacy_analyzer() {
+        let collection = CollectionConfig {
+            name: "movies".into(),
+            media_type: "movies".into(),
+            roots: Vec::new(),
+        };
+        let mut seen = std::collections::HashSet::new();
+        let mut pending = Vec::new();
+        enqueue(
+            LoudnessWorklist {
+                collection_id: "movies".into(),
+                analyzer: 3,
+                sources: vec![SourcePath::new("root", "film.mkv")],
+            },
+            &[collection],
+            &mut seen,
+            &mut pending,
+        );
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].analyzer, 3);
     }
 
     #[test]
@@ -475,16 +531,15 @@ mod tests {
         let (work_tx, work_rx) = tokio::sync::mpsc::unbounded_channel();
         let (result_tx, mut result_rx) = tokio::sync::mpsc::channel(2);
         let worker = tokio::spawn(run(work_rx, result_tx, vec![collection], activity));
-        work_tx
-            .send(LoudnessWorklist {
-                collection_id: "series".into(),
-                analyzer: kahawai_media::loudness::ANALYZER,
-                sources: vec![kahawai_proto::v1::SourcePath::new(
-                    root_token,
-                    "episode.mkv",
-                )],
-            })
-            .unwrap();
+        let work = LoudnessWorklist {
+            collection_id: "series".into(),
+            analyzer: kahawai_media::loudness::ANALYZER,
+            sources: vec![kahawai_proto::v1::SourcePath::new(
+                root_token,
+                "episode.mkv",
+            )],
+        };
+        work_tx.send(work.clone()).unwrap();
 
         assert!(
             tokio::time::timeout(Duration::from_millis(200), result_rx.recv())
@@ -510,6 +565,25 @@ mod tests {
         assert_eq!(result.tracks[0].source_channels, 6);
         assert!(result.tracks[0].native_integrated_lufs.is_finite());
         assert!(result.tracks[0].native_true_peak_dbtp.is_finite());
+        assert_eq!(result.tracks[0].layouts.len(), 3);
+
+        // `seen` is pending/in-flight deduplication, not lifetime history. A
+        // later scan can invalidate this revision and send the same path. The
+        // same pipeline also answers a minor-4 hub's analyzer-3 request.
+        let mut legacy = work;
+        legacy.analyzer = 3;
+        work_tx.send(legacy).unwrap();
+        let repeated = tokio::time::timeout(Duration::from_secs(30), result_rx.recv())
+            .await
+            .expect("requeued measurement timed out")
+            .unwrap()
+            .msg
+            .unwrap();
+        let host_to_hub::Msg::FileLoudness(repeated) = repeated else {
+            panic!("wrong repeated result message");
+        };
+        assert!(repeated.error.is_empty(), "{}", repeated.error);
+        assert_eq!(repeated.analyzer, 3);
         drop(work_tx);
         worker.await.unwrap();
     }

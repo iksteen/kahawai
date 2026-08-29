@@ -108,6 +108,7 @@ impl Runner {
         // The source is interlaced; the encode chain deinterlaces.
         deinterlace: bool,
         loudness: (f64, f64, u32),
+        layout_gains: Vec<kahawai_proto::v1::AudioLayoutGain>,
         // HUB-15b (video_codec, audio_codec, container); empty = legacy.
         targets: (String, String, String),
         burn_sets: Vec<u8>,
@@ -128,6 +129,7 @@ impl Runner {
                 encode_params,
                 deinterlace,
                 loudness,
+                layout_gains,
                 targets,
                 burn_sets,
                 ass_burn,
@@ -188,6 +190,7 @@ impl Runner {
         (video_kbps, max_height, max_channels, tone_map, burn_subtitle): (u32, u32, u32, bool, u32),
         deinterlace: bool,
         (stereo_gain_db, native_gain_db, loudness_source_channels): (f64, f64, u32),
+        layout_gains: Vec<kahawai_proto::v1::AudioLayoutGain>,
         (video_codec, audio_codec, container): (String, String, String),
         burn_sets: Vec<u8>,
         (burn_ass, burn_ass_file): (u32, Vec<u8>),
@@ -235,6 +238,22 @@ impl Runner {
         let sock = socks[0].0.clone();
         let bridge = bridges.remove(0);
 
+        anyhow::ensure!(
+            layout_gains.len() <= kahawai_media::loudness::MAX_LAYOUT_GAINS,
+            "too many layout gains"
+        );
+        let exact_gains = layout_gains
+            .iter()
+            .map(|gain| kahawai_media::loudness::AudioLayoutGain {
+                layout: kahawai_media::loudness::AudioLayout::new(gain.channels, gain.channel_mask),
+                gain_db: gain.gain_db,
+            })
+            .collect::<Vec<_>>();
+        let mut loudness_gains = [None; kahawai_media::loudness::MAX_LAYOUT_GAINS];
+        for (slot, gain) in loudness_gains.iter_mut().zip(exact_gains.iter().copied()) {
+            *slot = Some(gain);
+        }
+
         let worker = match &self.worker_exe {
             Some(exe) => {
                 let log = std::fs::File::create(dir.join("worker.log"))?;
@@ -269,6 +288,9 @@ impl Runner {
                         "--loudness-source-channels",
                         &loudness_source_channels.to_string(),
                     ]);
+                }
+                if !exact_gains.is_empty() {
+                    cmd.args(["--loudness-gains", &serde_json::to_string(&exact_gains)?]);
                 }
                 if deinterlace {
                     cmd.arg("--deinterlace");
@@ -342,6 +364,7 @@ impl Runner {
                     native_gain_db: native_gain_db.is_finite().then_some(native_gain_db),
                     loudness_source_channels: (loudness_source_channels > 0)
                         .then_some(loudness_source_channels),
+                    loudness_gains,
                     tone_map,
                     deinterlace,
                     burn_subtitle: (burn_subtitle > 0).then(|| (burn_subtitle - 1) as usize),

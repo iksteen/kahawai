@@ -363,10 +363,10 @@ async function disconnect() {
           </select>
         </div>
         <p class="mt-[-2px] ml-[86px] max-w-[480px] text-[12px] text-dim">
-          Uses measured programme loudness to apply one fixed gain. “When encoding” changes only
-          audio Kahawai already re-encodes. “Always” may replace direct or copied audio with an
-          encoded track, but never forces a video encode; playback stays unchanged when no measured
-          audio-only route exists. Music is unchanged.
+          Uses measured programme loudness to apply one fixed gain for the exact output layout.
+          “When encoding” changes only audio Kahawai already re-encodes. “Always” may replace direct
+          or copied audio with an encoded track, but never forces video encoding or an unmeasured
+          channel layout. Music is unchanged.
         </p>
 
         <div class="flex flex-wrap items-center gap-x-2.5 gap-y-2">

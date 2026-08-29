@@ -61,7 +61,7 @@ fn connect(reg: &Registry, id: &str, c: CapabilityReport) {
     let (tx, rx) = tokio::sync::mpsc::channel(8);
     std::mem::forget(rx); // keep the link "up" for the test's lifetime
     reg.connected(id, "transcoder", id, "fp", "test");
-    reg.register_tc_link(id, tx);
+    reg.register_tc_link(id, kahawai_proto::PROTOCOL_MINOR, tx);
     reg.set_transcoder_caps(id, &c);
 }
 
