@@ -123,6 +123,26 @@ async fn negotiation_picks_cheapest_source_and_honors_caps() {
     let db = kahawai_hub::db::open_in_memory().await.unwrap();
     let registry =
         Arc::new(Registry::new(db.clone(), allowed.clone()).with_local_video_executor(true));
+    let mut local_bench = kahawai_media::bench::BenchResults {
+        gst: kahawai_media::bench::gst_version(),
+        tonemap: kahawai_media::remux::tonemap_available().then_some(
+            kahawai_media::bench::Speeds {
+                s1080: Some(1.0),
+                s2160: Some(1.0),
+            },
+        ),
+        ..Default::default()
+    };
+    for (_, element, _) in kahawai_media::remux::encoder_capabilities() {
+        local_bench.encoders.insert(
+            element.into(),
+            kahawai_media::bench::Speeds {
+                s1080: Some(1.0),
+                s2160: Some(1.0),
+            },
+        );
+    }
+    registry.set_local_bench(local_bench);
     let sessions = Arc::new(kahawai_hub::sessions::Sessions::new(
         tempfile::tempdir().unwrap().keep(),
     ));

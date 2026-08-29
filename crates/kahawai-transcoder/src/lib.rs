@@ -82,9 +82,8 @@ pub async fn run(
         kahawai_transport::enroll::ensure_identity(hub_addr, state_dir, "transcoder", name).await?;
 
     let capabilities = probe_capabilities(max_sessions, state_dir)?;
-    // HUB-36: the report is live state, not a constant — the background
-    // benchmark republishes it when measured speeds drift, and every
-    // reconnect picks up the freshest one.
+    // HUB-36: the report is live state, not a constant — missing benchmark
+    // results publish capabilities as their isolated children succeed.
     let (caps_tx, caps_rx) = tokio::sync::watch::channel(capabilities);
     spawn_benchmark(state_dir, max_sessions, caps_tx);
     let scratch = state_dir.join("sessions");
@@ -122,30 +121,28 @@ fn bench_cache(state_dir: &Path) -> std::path::PathBuf {
     state_dir.join("benchmarks.json")
 }
 
-/// TC-1 capability probe: what this machine can verifiably encode, and
-/// HUB-36: how fast, from the on-disk benchmark cache. A cache miss
-/// reports zeros — "unmeasured", which every consumer reads as "no
-/// data, assume sufficient" — and the background re-measure fills them
-/// in a minute later. Link-up is never delayed by benchmarking.
+/// TC-1 capability probe: only benchmark-proven work is advertised. A cache
+/// miss connects with no encoders, then the background children publish each
+/// capability after the current fingerprint has measured it successfully.
 fn probe_capabilities(max_sessions: u32, state_dir: &Path) -> Result<CapabilityReport> {
     let bench = kahawai_media::bench::load(&bench_cache(state_dir)).unwrap_or_default();
-    let encoders: Vec<EncoderCap> = kahawai_media::remux::encoder_capabilities()
+    let available = kahawai_media::remux::encoder_capabilities();
+    if available.is_empty() {
+        bail!("no working encoders on this machine — see `kahawai doctor`");
+    }
+    let encoders: Vec<EncoderCap> = available
         .into_iter()
-        // An element that CRASHED the benchmark is not a capability.
-        // The startup dry-run only proves it loads: svtav1enc passes at
-        // 320x240 on the J5005 and segfaults at 1080p, so without this
-        // the box advertises av1 and takes a real session down with it.
         .filter(|(codec, element, _)| {
-            let dead = bench.crashed(element);
-            if dead {
+            let ready = bench.encoder_ready(element);
+            if !ready {
                 tracing::warn!(
                     codec,
                     element,
-                    "not advertising: this element crashed the benchmark, so it \
-                     cannot be trusted with a session"
+                    quarantined = bench.quarantined(element),
+                    "not advertising: encoder has no successful current-fingerprint benchmark"
                 );
             }
-            !dead
+            ready
         })
         .map(|(codec, element, hardware)| {
             let s = bench.encoders.get(element).copied().unwrap_or_default();
@@ -167,11 +164,11 @@ fn probe_capabilities(max_sessions: u32, state_dir: &Path) -> Result<CapabilityR
         })
         .collect();
     if encoders.is_empty() {
-        bail!("no working encoders on this machine — see `kahawai doctor`");
+        tracing::warn!("no benchmarked encoders yet; connecting idle until measurement succeeds");
     }
     let decode_caps = kahawai_media::remux::decoder_caps_names();
     tracing::info!(decoders = decode_caps.len(), "decoder inventory");
-    let tonemap = kahawai_media::remux::tonemap_available();
+    let tonemap = bench.tonemap_ready() && kahawai_media::remux::tonemap_available();
     let ass_burn = kahawai_media::remux::ass_burn_available();
     let tm = bench.tonemap.unwrap_or_default();
     tracing::info!(
@@ -192,11 +189,9 @@ fn probe_capabilities(max_sessions: u32, state_dir: &Path) -> Result<CapabilityR
     })
 }
 
-/// HUB-36 cache-but-verify: measure in the background, store, and
-/// publish a refreshed report when reality has drifted from what the
-/// cache claimed. Runs once per process, after a settle delay so a
-/// session started right at boot is not fighting the benchmark for the
-/// encoder.
+/// HUB-36: fill missing benchmark results in isolated children and publish the
+/// newly proven capabilities. Runs once per process, after a settle delay so a
+/// session started right at boot is not fighting the benchmark for the encoder.
 /// ponytail: fixed settle instead of gating on Runner idleness —
 /// sessions in the first minute of a satellite's life are rare; gate
 /// on idleness if one ever gets starved.
@@ -221,17 +216,12 @@ fn spawn_benchmark(
         let Ok(exe) = std::env::current_exe() else {
             return;
         };
-        // ONE CHILD PER PIECE. A segfault then costs exactly that
-        // measurement: silence's svtav1enc dies at 1080p (exit 139) and
-        // everything else on the box is still measured, in any order.
-        let mut jobs: Vec<Vec<String>> = vec![vec!["--tonemap".into()]];
-        jobs.extend(
-            kahawai_media::remux::encoder_capabilities()
-                .iter()
-                .filter(|(c, _, _)| ["h264", "hevc", "av1"].contains(c))
-                .map(|(_, el, _)| vec!["--only".into(), (*el).to_string()]),
-        );
-        for args in jobs {
+        // One child per piece. A crash costs exactly that measurement, and a
+        // cache entry saying it crashed suppresses repeats until the
+        // GStreamer version changes and invalidates the cache.
+        let jobs = kahawai_media::bench::benchmark_jobs(cached.as_ref());
+        for job in jobs {
+            let args = job.args();
             let child = tokio::process::Command::new(&exe)
                 .arg("benchmark")
                 .arg("--cache")
@@ -241,33 +231,39 @@ fn spawn_benchmark(
                 .status();
             match tokio::time::timeout(BENCH_BUDGET, child).await {
                 Ok(Ok(st)) if st.success() => {}
-                Ok(Ok(st)) => tracing::warn!(
-                    ?args,
-                    status = ?st,
-                    "benchmark child died; continuing with the rest"
-                ),
-                Ok(Err(e)) => tracing::warn!(?args, error = %e, "benchmark child failed to run"),
-                Err(_) => tracing::warn!(
-                    ?args,
-                    budget_s = BENCH_BUDGET.as_secs(),
-                    "benchmark child exceeded its budget; continuing"
-                ),
+                Ok(Ok(st)) => {
+                    kahawai_media::bench::record_crash(&path, &job);
+                    tracing::warn!(
+                        ?args,
+                        status = ?st,
+                        "benchmark child died; continuing with the rest"
+                    );
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!(?args, error = %e, "benchmark child failed to run");
+                }
+                Err(_) => {
+                    kahawai_media::bench::record_crash(&path, &job);
+                    tracing::warn!(
+                        ?args,
+                        budget_s = BENCH_BUDGET.as_secs(),
+                        "benchmark child exceeded its budget; continuing"
+                    );
+                }
             }
         }
         let Some(measured) = kahawai_media::bench::load(&path) else {
             tracing::warn!("benchmark child wrote no usable cache");
             return;
         };
-        let news = cached
-            .as_ref()
-            .is_none_or(|c| kahawai_media::bench::drifted(c, &measured));
+        let news = cached.as_ref() != Some(&measured);
         if !news {
             tracing::debug!("benchmarks unchanged; cached report stands");
             return;
         }
         match probe_capabilities(max_sessions, &state_dir) {
             Ok(fresh) => {
-                tracing::info!("measured speeds changed; refreshing the capability report");
+                tracing::info!("benchmark state changed; refreshing the capability report");
                 let _ = tx.send(fresh);
             }
             Err(e) => tracing::warn!(error = format!("{e:#}"), "re-probe after benchmark failed"),
@@ -455,5 +451,65 @@ async fn link_loop(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn serving_capabilities_require_successful_current_benchmarks() {
+        let available = kahawai_media::remux::encoder_capabilities();
+        let Some((codec, element, _)) = available.first().copied() else {
+            eprintln!("skip: no verified encoder on this test host");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let cache = bench_cache(dir.path());
+        let mut measured = kahawai_media::bench::BenchResults {
+            gst: kahawai_media::bench::gst_version(),
+            tonemap: Some(kahawai_media::bench::Speeds {
+                s1080: Some(2.0),
+                s2160: Some(0.5),
+            }),
+            ..Default::default()
+        };
+        measured.encoders.insert(
+            element.into(),
+            kahawai_media::bench::Speeds {
+                s1080: Some(3.0),
+                s2160: Some(0.8),
+            },
+        );
+        kahawai_media::bench::store(&cache, &measured);
+
+        let report = probe_capabilities(1, dir.path()).unwrap();
+        assert_eq!(report.encoders.len(), 1);
+        assert_eq!(
+            (
+                report.encoders[0].codec.as_str(),
+                report.encoders[0].element.as_str()
+            ),
+            (codec, element)
+        );
+
+        kahawai_media::bench::record_crash(
+            &cache,
+            &kahawai_media::bench::BenchmarkJob::Encoder(element.into()),
+        );
+        let quarantined = probe_capabilities(1, dir.path()).unwrap();
+        assert!(
+            quarantined
+                .encoders
+                .iter()
+                .all(|encoder| encoder.element != element),
+            "quarantined encoder remained a serving capability"
+        );
+
+        // Tone-map is independently quarantined even when its dry run still
+        // reports the GL elements as available.
+        kahawai_media::bench::record_crash(&cache, &kahawai_media::bench::BenchmarkJob::ToneMap);
+        assert!(!probe_capabilities(1, dir.path()).unwrap().tonemap);
     }
 }

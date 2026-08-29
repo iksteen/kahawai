@@ -137,41 +137,38 @@ pub struct WorkerArgs {
 /// outright mid-benchmark, silently, taking a serving satellite with
 /// it. A dead child is a missing measurement; a dead satellite is an
 /// outage.
+fn selected_benchmark_elements<'a>(
+    only: Option<&'a str>,
+    tonemap: bool,
+    available: &[&'a str],
+) -> Vec<&'a str> {
+    match only {
+        Some(element) => vec![element],
+        // `benchmark --tonemap` is one isolated piece. Measuring every
+        // encoder here made a known-crashing SVT-AV1 probe dump core once in
+        // this child and then again in its own `--only` child.
+        None if tonemap => Vec::new(),
+        None => available.to_vec(),
+    }
+}
+
 pub fn run_benchmark(
     _cfg: &config::Config,
     cache: PathBuf,
     only: Option<String>,
     tonemap: bool,
 ) -> Result<()> {
-    let elements: Vec<&str> = match &only {
-        // One element per process: a segfault costs that measurement,
-        // never the ones after it.
-        Some(el) => vec![el.as_str()],
-        None => [
-            kahawai_media::remux::h264_encoder(),
-            kahawai_media::remux::hevc_encoder(),
-            kahawai_media::remux::av1_encoder(),
-        ]
-        .into_iter()
-        .flatten()
-        .collect(),
-    };
-    kahawai_media::bench::measure_into(&elements, tonemap, &cache);
-    Ok(())
-}
-
-/// The elements a benchmark run would measure, in order — the parent
-/// needs the list to spawn one child each.
-pub fn benchmark_elements() -> Vec<String> {
-    [
+    let available: Vec<&str> = [
         kahawai_media::remux::h264_encoder(),
         kahawai_media::remux::hevc_encoder(),
         kahawai_media::remux::av1_encoder(),
     ]
     .into_iter()
     .flatten()
-    .map(str::to_string)
-    .collect()
+    .collect();
+    let elements = selected_benchmark_elements(only.as_deref(), tonemap, &available);
+    kahawai_media::bench::measure_into(&elements, tonemap, &cache);
+    Ok(())
 }
 
 pub fn run_remux_worker(cfg: &config::Config, w: WorkerArgs) -> Result<()> {
@@ -477,4 +474,23 @@ pub fn startup_checks(
         anyhow::bail!("environment not usable — run `kahawai doctor` for details");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod benchmark_tests {
+    use super::*;
+
+    #[test]
+    fn tonemap_child_never_runs_encoders() {
+        let available = ["h264", "av1"];
+        assert!(selected_benchmark_elements(None, true, &available).is_empty());
+        assert_eq!(
+            selected_benchmark_elements(None, false, &available),
+            available
+        );
+        assert_eq!(
+            selected_benchmark_elements(Some("av1"), true, &available),
+            ["av1"]
+        );
+    }
 }

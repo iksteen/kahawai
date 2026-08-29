@@ -66,13 +66,12 @@
 //! against a 24 fps reference (the film rate that dominates this
 //! library). The clock starts at the FIRST encoded buffer, not at
 //! pipeline construction: preroll and context creation are one-off
-//! costs, while sustain is the question placement asks. `0.0` means
-//! unmeasured, never "infinitely slow" — every consumer treats it as
-//! "no data, assume sufficient".
+//! costs, while sustain is the question placement asks. No timing means the
+//! benchmark is incomplete and the capability stays out of serving.
 //!
-//! Results cache on disk keyed by the GStreamer version (a plugin
-//! upgrade invalidates them); the caller re-measures in the background
-//! and overwrites when reality drifts.
+//! Results cache on disk keyed by the GStreamer version. Missing jobs measure
+//! in background; a parent-observed crash quarantines that capability for this
+//! fingerprint until an explicit successful benchmark clears it.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -139,11 +138,10 @@ const POOL: usize = 6;
 /// Realtime multiples for one element at the two resolutions that
 /// matter.
 ///
-/// `None` = UNMEASURED: no data, which every consumer reads as "assume
-/// sufficient". `Some(v)` with a tiny v is the OPPOSITE conclusion —
-/// measured, and catastrophically slow. Those two must never share an
-/// inhabitant: under a 0.0 sentinel the one box that cannot transcode
-/// 4K AV1 looked exactly like a box nobody had asked yet.
+/// `None` means this bucket was not measured successfully; an element becomes
+/// a serving capability only when both buckets are present. `Some(v)` with a
+/// tiny value is the opposite conclusion—measured and catastrophically slow—
+/// and remains useful placement evidence rather than collapsing into absence.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct Speeds {
     pub s1080: Option<f32>,
@@ -160,11 +158,25 @@ impl Speeds {
             self.s1080
         }
     }
+
+    fn complete(&self) -> bool {
+        [self.s1080, self.s2160]
+            .into_iter()
+            .all(|speed| speed.is_some_and(|speed| speed > 0.0 && speed.is_finite()))
+    }
 }
 
 /// Everything one box measured about itself, cached on disk.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+const BENCH_CACHE_VERSION: u32 = 2;
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BenchResults {
+    /// Cache semantics version. Version 1 briefly mixed normal incomplete
+    /// measurements into `crashes`; loading it retries those isolated jobs once
+    /// so only parent-observed failures become authoritative under version 2.
+    #[doc(hidden)]
+    #[serde(default)]
+    pub cache_version: u32,
     /// GStreamer version these numbers were taken with — a plugin
     /// upgrade can change them completely, so it keys the cache.
     pub gst: String,
@@ -174,31 +186,154 @@ pub struct BenchResults {
     pub encoders: BTreeMap<String, Speeds>,
     /// The GL tone-map segment, measured through the real chain.
     pub tonemap: Option<Speeds>,
-    /// Elements this run STARTED measuring, written before each attempt.
-    /// One listed here with no entry in `encoders` took the process
-    /// down — which is a capability fact, not a gap: svtav1enc
-    /// segfaults at 1080p on the J5005 while passing its 320x240
-    /// startup dry-run, so a report built from dry runs alone
-    /// advertises an encoder that crashes in session.
+    /// Parent-observed child crashes by Unix timestamp. Presence means durable
+    /// quarantine under this cache fingerprint; the timestamp is diagnostic,
+    /// never an automatic recovery signal. Only successful explicit
+    /// measurement or cache invalidation clears it.
     #[serde(default)]
-    pub attempted: Vec<String>,
+    pub crashes: BTreeMap<String, i64>,
+}
+
+impl Default for BenchResults {
+    fn default() -> Self {
+        Self {
+            cache_version: BENCH_CACHE_VERSION,
+            gst: String::new(),
+            encoders: BTreeMap::new(),
+            tonemap: None,
+            crashes: BTreeMap::new(),
+        }
+    }
+}
+
+const TONEMAP_JOB_KEY: &str = "@tonemap";
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 impl BenchResults {
-    /// Did measuring this element kill the benchmark? True only when it
-    /// was attempted and produced nothing.
-    pub fn crashed(&self, element: &str) -> bool {
-        self.attempted.iter().any(|e| e == element) && !self.encoders.contains_key(element)
+    pub fn quarantined(&self, key: &str) -> bool {
+        self.crashes.contains_key(key)
     }
+
+    /// A serving encoder is one this exact benchmark fingerprint measured and
+    /// has not subsequently quarantined.
+    pub fn encoder_ready(&self, element: &str) -> bool {
+        self.encoders.get(element).is_some_and(Speeds::complete) && !self.quarantined(element)
+    }
+
+    /// Tone-map follows the same authority as encoders; element presence alone
+    /// is only the startup dry run, not evidence that the real chain survived.
+    pub fn tonemap_ready(&self) -> bool {
+        self.tonemap.is_some_and(|speeds| speeds.complete()) && !self.quarantined(TONEMAP_JOB_KEY)
+    }
+
+    fn quarantine(&mut self, key: &str) {
+        self.crashes.insert(key.to_string(), unix_now());
+    }
+
+    fn clear_quarantine(&mut self, key: &str) {
+        self.crashes.remove(key);
+    }
+}
+
+/// One isolated benchmark child. Identity is carried separately from argv so
+/// measurement, quarantine, and serving all name the same capability.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BenchmarkJob {
+    ToneMap,
+    Encoder(String),
+}
+
+impl BenchmarkJob {
+    pub fn args(&self) -> Vec<String> {
+        match self {
+            Self::ToneMap => vec!["--tonemap".into()],
+            Self::Encoder(element) => vec!["--only".into(), element.clone()],
+        }
+    }
+
+    fn key(&self) -> &str {
+        match self {
+            Self::ToneMap => TONEMAP_JOB_KEY,
+            Self::Encoder(element) => element,
+        }
+    }
+
+    fn needed(&self, cache: &BenchResults) -> bool {
+        if cache.quarantined(self.key()) {
+            return false;
+        }
+        match self {
+            Self::ToneMap => !cache.tonemap_ready(),
+            Self::Encoder(element) => !cache.encoder_ready(element),
+        }
+    }
+}
+
+/// Missing, non-quarantined pieces that still need child processes. Successful
+/// measurements are authoritative for this cache fingerprint and are not
+/// repeated at every service start.
+fn benchmark_jobs_for<'a>(
+    elements: impl IntoIterator<Item = &'a str>,
+    cached: Option<&BenchResults>,
+) -> Vec<BenchmarkJob> {
+    let mut offered = vec![BenchmarkJob::ToneMap];
+    offered.extend(
+        elements
+            .into_iter()
+            .map(|element| BenchmarkJob::Encoder(element.to_string())),
+    );
+    match cached {
+        Some(cache) => offered
+            .into_iter()
+            .filter(|job| job.needed(cache))
+            .collect(),
+        None => offered,
+    }
+}
+
+pub fn benchmark_jobs(cached: Option<&BenchResults>) -> Vec<BenchmarkJob> {
+    benchmark_jobs_for(
+        [
+            crate::remux::h264_encoder(),
+            crate::remux::hevc_encoder(),
+            crate::remux::av1_encoder(),
+        ]
+        .into_iter()
+        .flatten(),
+        cached,
+    )
+}
+
+/// Persist a negative result only after the supervising parent observed the
+/// isolated child fail. An interrupted parent writes nothing, so a routine
+/// service restart cannot masquerade as a benchmark crash.
+pub fn record_crash(cache: &Path, job: &BenchmarkJob) {
+    let mut out = load(cache).unwrap_or(BenchResults {
+        gst: gst_version(),
+        ..Default::default()
+    });
+    out.quarantine(job.key());
+    match job {
+        BenchmarkJob::ToneMap => out.tonemap = None,
+        BenchmarkJob::Encoder(element) => {
+            out.encoders.remove(element);
+        }
+    }
+    store(cache, &out);
 }
 
 /// The floor a completed-but-barely-productive run reports. A box that
 /// ran the full window and produced fewer than two frames has no
-/// interval to time, but it is NOT unmeasured — it is catastrophically
-/// slow, and 0.0 would read as "no data, assume sufficient" and send
-/// it 4K work. Measured live: silence encodes 2160p AV1 in software at
-/// under one frame per five seconds. Reported as `Some(_)` — measured
-/// and dreadful, which is the opposite conclusion from `None`.
+/// interval to time, but it is not unmeasured—it is catastrophically slow.
+/// A positive floor preserves that evidence while still ranking it last;
+/// zero is not a complete serving measurement. Measured live: silence encodes
+/// 2160p AV1 in software at under one frame per five seconds.
 const SPEED_FLOOR: f32 = 1.0 / (5.0 * REFERENCE_FPS);
 
 /// Speed of `frames` buffers over `wall`, as a realtime multiple.
@@ -224,8 +359,19 @@ pub fn gst_version() -> String {
 /// measure again).
 pub fn load(path: &Path) -> Option<BenchResults> {
     let raw = std::fs::read_to_string(path).ok()?;
-    let r: BenchResults = serde_json::from_str(&raw).ok()?;
-    (r.gst == gst_version()).then_some(r)
+    let mut r: BenchResults = serde_json::from_str(&raw).ok()?;
+    if r.gst != gst_version() || r.cache_version > BENCH_CACHE_VERSION {
+        return None;
+    }
+    if r.cache_version < BENCH_CACHE_VERSION {
+        // Version 1 used the same map for parent-observed crashes and normal
+        // incomplete child exits. Retrying every isolated entry once is the
+        // only safe migration; a real crash is re-quarantined by the parent.
+        r.crashes.clear();
+        r.cache_version = BENCH_CACHE_VERSION;
+        store(path, &r);
+    }
+    Some(r)
 }
 
 /// Best-effort persist — a box that cannot write its cache simply
@@ -245,41 +391,24 @@ pub fn store(path: &Path, r: &BenchResults) {
     }
 }
 
-/// Has reality moved enough to be worth telling the hub about? Any
-/// element appearing or disappearing counts (a driver came back, a
-/// package was installed); so does a ≥25% relative change on any
-/// measured speed — below that it is measurement noise, above it the
-/// box is genuinely a different placement candidate.
-pub fn drifted(old: &BenchResults, new: &BenchResults) -> bool {
-    if old.gst != new.gst {
-        return true;
-    }
-    let keys: std::collections::BTreeSet<&String> =
-        old.encoders.keys().chain(new.encoders.keys()).collect();
-    for k in keys {
-        match (old.encoders.get(k), new.encoders.get(k)) {
-            (Some(a), Some(b)) => {
-                if moved(a.s1080, b.s1080) || moved(a.s2160, b.s2160) {
-                    return true;
-                }
-            }
-            _ => return true, // appeared or vanished
-        }
-    }
-    match (old.tonemap, new.tonemap) {
-        (Some(a), Some(b)) => moved(a.s1080, b.s1080) || moved(a.s2160, b.s2160),
-        (None, None) => false,
-        _ => true,
+fn merge_encoder_measurement(out: &mut BenchResults, element: &str, measured: Speeds) {
+    if measured.complete() {
+        out.clear_quarantine(element);
+        out.encoders.insert(element.to_string(), measured);
+    } else {
+        // A normally exiting child can still encounter a transient pipeline
+        // setup failure. Leave the job missing so startup retries it; only the
+        // supervising parent can turn a crash or timeout into quarantine.
+        out.encoders.remove(element);
     }
 }
 
-fn moved(a: Option<f32>, b: Option<f32>) -> bool {
-    match (a, b) {
-        // Gaining or losing a measurement is always news.
-        (Some(_), None) | (None, Some(_)) => true,
-        (None, None) => false,
-        (Some(a), Some(b)) if a > 0.0 => ((a - b).abs() / a) >= 0.25,
-        (Some(a), Some(b)) => a != b,
+fn merge_tonemap_measurement(out: &mut BenchResults, measured: Speeds) {
+    if measured.complete() {
+        out.clear_quarantine(TONEMAP_JOB_KEY);
+        out.tonemap = Some(measured);
+    } else {
+        out.tonemap = None;
     }
 }
 
@@ -315,17 +444,12 @@ pub fn measure_into(elements: &[&str], tonemap: bool, cache: &Path) -> BenchResu
             s2160: measure_tonemap(3840, 2160),
         };
         tracing::info!(at_1080 = ?s.s1080, at_2160 = ?s.s2160, "tone-map speed measured");
-        out.tonemap = Some(s);
+        merge_tonemap_measurement(&mut out, s);
         store(cache, &out);
     }
     for el in elements {
-        // Record the attempt BEFORE making it: if this element takes the
-        // process down, the next run can tell "crashed" from "never
-        // asked".
-        out.attempted.push((*el).to_string());
-        store(cache, &out);
-        out.encoders
-            .insert((*el).to_string(), measure_one(el, &tmp));
+        let measured = measure_one(el, &tmp);
+        merge_encoder_measurement(&mut out, el, measured);
         store(cache, &out);
     }
     out
@@ -377,8 +501,8 @@ pub fn measure(elements: &[&str], tonemap: bool) -> BenchResults {
     let tmp = std::env::temp_dir().join("kahawai-bench");
     let _ = std::fs::create_dir_all(&tmp);
     for el in elements {
-        out.encoders
-            .insert((*el).to_string(), measure_one(el, &tmp));
+        let measured = measure_one(el, &tmp);
+        merge_encoder_measurement(&mut out, el, measured);
     }
     if tonemap {
         let s = Speeds {
@@ -386,7 +510,7 @@ pub fn measure(elements: &[&str], tonemap: bool) -> BenchResults {
             s2160: measure_tonemap(3840, 2160),
         };
         tracing::info!(at_1080 = ?s.s1080, at_2160 = ?s.s2160, "tone-map speed measured");
-        out.tonemap = Some(s);
+        merge_tonemap_measurement(&mut out, s);
     }
     out
 }
@@ -854,10 +978,9 @@ mod tests {
         near(speed(25, Duration::from_secs(4), true), 0.25);
         near(speed(241, Duration::from_secs(1), true), 10.0);
 
-        // Ran but produced one lonely frame: MEASURED and dreadful, not
-        // unmeasured. The two must stay distinguishable — downstream
-        // reads absence as "assume sufficient", which would send 4K AV1
-        // to the J5005, the one box that cannot do it (measured live).
+        // Ran but produced one lonely frame: measured and dreadful, not
+        // incomplete. The positive floor keeps the job serving-safe while
+        // placement ranks it behind every useful encoder.
         assert_eq!(speed(1, Duration::from_secs(5), true), Some(SPEED_FLOOR));
         const { assert!(SPEED_FLOOR > 0.0 && SPEED_FLOOR < 0.01) };
 
@@ -877,7 +1000,7 @@ mod tests {
         assert_eq!(s.at(720), Some(6.0));
         assert_eq!(s.at(2160), Some(2.0));
         assert_eq!(s.at(1600), Some(2.0)); // scope 4K
-        // Unmeasured reads as "no data", never as zero speed.
+        // An incomplete bucket stays absent and prevents serving readiness.
         assert_eq!(Speeds::default().at(1080), None);
     }
 
@@ -917,18 +1040,72 @@ mod tests {
         assert_eq!(load(&path), None);
     }
 
-    /// A crash is a capability fact: attempted, produced nothing.
-    /// Distinguishing it from "never asked" is what stops a box
-    /// advertising an encoder that segfaults in session (silence,
-    /// svtav1enc at 1080p — its 320x240 dry-run passes).
     #[test]
-    fn crashed_distinguishes_attempted_from_unasked() {
+    fn mixed_provenance_quarantine_cache_retries_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("benchmarks.json");
+        let mut old = serde_json::to_value(BenchResults {
+            gst: gst_version(),
+            crashes: BTreeMap::from([("transientenc".into(), 1)]),
+            ..Default::default()
+        })
+        .unwrap();
+        old.as_object_mut().unwrap().remove("cache_version");
+        std::fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
+
+        let migrated = load(&path).unwrap();
+        assert_eq!(migrated.cache_version, BENCH_CACHE_VERSION);
+        assert!(!migrated.quarantined("transientenc"));
+        assert!(
+            benchmark_jobs_for(["transientenc"], Some(&migrated))
+                .contains(&BenchmarkJob::Encoder("transientenc".into()))
+        );
+        assert_eq!(load(&path), Some(migrated), "migration was not durable");
+    }
+
+    #[test]
+    fn incomplete_normal_results_remain_retryable() {
         let mut r = BenchResults {
             gst: gst_version(),
             ..Default::default()
         };
-        r.attempted.push("svtav1enc".into());
-        r.attempted.push("vah264enc".into());
+        merge_encoder_measurement(
+            &mut r,
+            "transientenc",
+            Speeds {
+                s1080: Some(2.0),
+                s2160: None,
+            },
+        );
+        merge_tonemap_measurement(
+            &mut r,
+            Speeds {
+                s1080: None,
+                s2160: None,
+            },
+        );
+
+        assert!(!r.quarantined("transientenc"));
+        assert!(!r.quarantined(TONEMAP_JOB_KEY));
+        assert_eq!(
+            benchmark_jobs_for(["transientenc"], Some(&r)),
+            [
+                BenchmarkJob::ToneMap,
+                BenchmarkJob::Encoder("transientenc".into()),
+            ],
+            "a normally exiting incomplete child was suppressed permanently"
+        );
+    }
+
+    /// A parent-observed crash is durable quarantine. Merely starting a child
+    /// records nothing, and elapsed time never turns failure into capability.
+    #[test]
+    fn quarantine_requires_success_or_fingerprint_change() {
+        let mut r = BenchResults {
+            gst: gst_version(),
+            ..Default::default()
+        };
+        r.quarantine("svtav1enc");
         r.encoders.insert(
             "vah264enc".into(),
             Speeds {
@@ -936,47 +1113,69 @@ mod tests {
                 s2160: Some(1.4),
             },
         );
-        assert!(r.crashed("svtav1enc"), "attempted, no result => crashed");
-        assert!(!r.crashed("vah264enc"), "attempted and measured");
-        assert!(!r.crashed("nvh264enc"), "never attempted is not a crash");
-    }
+        r.encoders.insert(
+            "half-measured".into(),
+            Speeds {
+                s1080: Some(2.0),
+                s2160: None,
+            },
+        );
+        assert!(r.quarantined("svtav1enc"));
+        assert!(!r.encoder_ready("svtav1enc"));
+        assert!(r.encoder_ready("vah264enc"));
+        assert!(!r.encoder_ready("nvh264enc"), "unmeasured is not serving");
+        assert!(
+            !r.encoder_ready("half-measured"),
+            "partial measurement became a serving capability"
+        );
+        assert_eq!(
+            benchmark_jobs_for(["vah264enc", "svtav1enc", "half-measured"], Some(&r)),
+            [
+                BenchmarkJob::ToneMap,
+                BenchmarkJob::Encoder("half-measured".into()),
+            ],
+            "only missing work should run; measured and quarantined jobs stay out"
+        );
 
-    #[test]
-    fn drift_threshold() {
-        let base = |v: f32| {
-            let mut r = BenchResults {
-                gst: gst_version(),
-                ..Default::default()
-            };
-            r.encoders.insert(
-                "x265enc".into(),
-                Speeds {
-                    s1080: Some(v),
-                    s2160: Some(v / 3.0),
-                },
-            );
-            r
-        };
-        assert!(!drifted(&base(1.0), &base(1.0)));
-        assert!(!drifted(&base(1.0), &base(1.2)), "20% is noise");
-        assert!(drifted(&base(1.0), &base(1.3)), "30% is news");
-        assert!(drifted(&base(1.0), &base(0.5)), "halved is news");
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("benchmarks.json");
+        record_crash(&cache, &BenchmarkJob::Encoder("svtav1enc".into()));
+        let persisted = load(&cache).expect("crash record");
+        assert!(persisted.quarantined("svtav1enc"));
+        assert!(
+            !benchmark_jobs_for(["svtav1enc"], Some(&persisted))
+                .contains(&BenchmarkJob::Encoder("svtav1enc".into())),
+            "quarantine changed merely because time passed"
+        );
 
-        // An element appearing (driver installed) is always news.
-        let mut gained = base(1.0);
-        gained
-            .encoders
-            .insert("nvh265enc".into(), Speeds::default());
-        assert!(drifted(&base(1.0), &gained));
-
-        // So is the tone-map tier appearing or vanishing.
-        let mut tm = base(1.0);
-        tm.tonemap = Some(Speeds {
-            s1080: Some(2.0),
-            s2160: Some(0.6),
+        let mut tone = persisted;
+        tone.tonemap = Some(Speeds {
+            s1080: Some(3.0),
+            s2160: Some(0.7),
         });
-        assert!(drifted(&base(1.0), &tm));
-        assert!(drifted(&tm, &base(1.0)));
+        store(&cache, &tone);
+        record_crash(&cache, &BenchmarkJob::ToneMap);
+        let tone = load(&cache).expect("tone-map crash record");
+        assert!(tone.tonemap.is_none(), "stale tone-map speed survived");
+        assert!(tone.quarantined(TONEMAP_JOB_KEY));
+        assert!(!tone.tonemap_ready());
+        assert!(
+            !benchmark_jobs_for(std::iter::empty(), Some(&tone)).contains(&BenchmarkJob::ToneMap),
+            "quarantined tone-map was scheduled automatically"
+        );
+
+        // A different fingerprint invalidates the whole cache, which makes
+        // every present job missing and eligible again.
+        let stale = BenchResults {
+            gst: "different-gstreamer".into(),
+            ..tone
+        };
+        store(&cache, &stale);
+        assert!(load(&cache).is_none());
+        assert_eq!(
+            benchmark_jobs_for(std::iter::empty(), None),
+            [BenchmarkJob::ToneMap]
+        );
     }
 
     /// The real thing on whatever this box has: every verified encoder

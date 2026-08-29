@@ -290,15 +290,15 @@ pub async fn run_all_in_one(
     .await
 }
 
-/// HUB-36: measure this box's encoders in the background and hand the
-/// results to the registry, so local execution competes for placement
-/// on the same measured footing as the fleet. Cached on disk, keyed by
-/// GStreamer version; a drifted measurement simply overwrites it.
+/// HUB-36: measure this box's missing capabilities in the background and hand
+/// results to the registry, so all-in-one competes on the same measured footing
+/// as the fleet. The GStreamer-fingerprinted cache never re-runs successes.
 fn spawn_local_benchmark(cache: PathBuf, registry: Arc<kahawai_hub::registry::Registry>) {
     const SETTLE: Duration = Duration::from_secs(60);
     const BENCH_BUDGET: Duration = Duration::from_secs(300);
-    if let Some(cached) = kahawai_media::bench::load(&cache) {
-        registry.set_local_bench(cached);
+    let cached = kahawai_media::bench::load(&cache);
+    if let Some(cached) = cached.as_ref() {
+        registry.set_local_bench(cached.clone());
     }
     tokio::spawn(async move {
         tokio::time::sleep(SETTLE).await;
@@ -308,14 +308,11 @@ fn spawn_local_benchmark(cache: PathBuf, registry: Arc<kahawai_hub::registry::Re
         let Ok(exe) = std::env::current_exe() else {
             return;
         };
-        // One child per piece: a crash costs that measurement alone.
-        let mut jobs: Vec<Vec<String>> = vec![vec!["--tonemap".into()]];
-        jobs.extend(
-            kahawai_runtime::benchmark_elements()
-                .into_iter()
-                .map(|el| vec!["--only".into(), el]),
-        );
-        for args in jobs {
+        // One child per piece; known crash results remain authoritative until
+        // a GStreamer upgrade invalidates their cache.
+        let jobs = kahawai_media::bench::benchmark_jobs(cached.as_ref());
+        for job in jobs {
+            let args = job.args();
             let child = tokio::process::Command::new(&exe)
                 .arg("benchmark")
                 .arg("--cache")
@@ -325,7 +322,17 @@ fn spawn_local_benchmark(cache: PathBuf, registry: Arc<kahawai_hub::registry::Re
                 .status();
             match tokio::time::timeout(BENCH_BUDGET, child).await {
                 Ok(Ok(st)) if st.success() => {}
-                other => tracing::warn!(?args, ?other, "benchmark child did not finish cleanly"),
+                Ok(Ok(st)) => {
+                    kahawai_media::bench::record_crash(&cache, &job);
+                    tracing::warn!(?args, status = ?st, "benchmark child died");
+                }
+                Ok(Err(error)) => {
+                    tracing::warn!(?args, %error, "benchmark child failed to run");
+                }
+                Err(_) => {
+                    kahawai_media::bench::record_crash(&cache, &job);
+                    tracing::warn!(?args, "benchmark child exceeded its budget");
+                }
             }
         }
         match kahawai_media::bench::load(&cache) {

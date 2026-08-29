@@ -564,11 +564,13 @@ How something works and why it was built that way belong in
       real.
 - [x] HUB-36 Pace-aware video placement, on measured capability. Full
       external/AIO transcoders benchmark video encoders and GL tone-map;
-      plain hub does neither. Workers meter the
-      un-throttled phase of real sessions into a persisted per-(box,
-      work class) EWMA; placement ranks on it and states a
-      below-realtime prediction in the verdict rather than letting a
-      viewer discover it. Design in implementation §4.5.
+      plain hub does neither. Only successful current-fingerprint benchmarks
+      become serving capabilities; a crashed child durably quarantines its
+      capability until explicit successful remeasurement or fingerprint
+      invalidation. Workers meter the un-throttled phase of real sessions into
+      a persisted per-(box, work class) EWMA; placement ranks on it and states
+      a below-realtime prediction in the verdict rather than letting a viewer
+      discover it. Design in implementation §4.5.
       NOTE this requirement's original text asserted that TC-4 "already
       reports a realtime multiple per session". It did not — nothing
       measured pace before this work. Corrected at TC-4.

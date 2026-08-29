@@ -3251,6 +3251,7 @@ impl Registry {
         let best = bench
             .encoders
             .iter()
+            .filter(|(element, _)| bench.encoder_ready(element))
             .filter(|(element, _)| match need.video_codec.as_str() {
                 "" => true,
                 c => element_encodes(element, c),
@@ -3258,7 +3259,7 @@ impl Registry {
             .filter_map(|(_, s)| pick(s))
             .fold(None::<f32>, |acc, v| Some(acc.map_or(v, |a| a.max(v))));
         terms.extend(best);
-        if need.needs_tonemap {
+        if need.needs_tonemap && bench.tonemap_ready() {
             terms.extend(bench.tonemap.as_ref().and_then(pick));
         }
         terms
