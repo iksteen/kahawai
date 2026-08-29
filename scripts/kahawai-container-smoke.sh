@@ -119,14 +119,18 @@ docker restart "$name" >/dev/null || fail "first exact-container restart"
     || fail "first restart replaced the container"
 [ "$(docker inspect -f '{{.State.Pid}}' "$name")" != "$before_pid" ] \
     || fail "first restart did not replace the hub process"
-for _ in $(seq 30); do
+# Every wait that spans a hub start gets a full minute. Loading the config
+# now initializes GStreamer and probes decoder ranks before the hub logs
+# anything about its own configuration, so this waits out a START, not a log
+# flush -- seconds on an idle box, and this runs on a shared runner.
+for _ in $(seq 120); do
     logs 2>/dev/null | grep -q \
         'browser authentication cookies and tokens cross the network in cleartext' && break
-    sleep 0.2
+    sleep 0.5
 done
 logs | grep -q 'browser authentication cookies and tokens cross the network in cleartext' \
     || fail "configured HTTP public_url warning was not logged"
-for _ in $(seq 60); do
+for _ in $(seq 120); do
     curl -sf "http://$api/health" >/dev/null && break
     sleep 0.5
 done
@@ -287,7 +291,7 @@ docker restart "$name" >/dev/null || fail "second exact-container restart"
     || fail "second restart replaced the container"
 [ "$(docker inspect -f '{{.State.Pid}}' "$name")" != "$before_pid" ] \
     || fail "second restart did not replace the hub process"
-for _ in $(seq 30); do
+for _ in $(seq 120); do
     curl -sf "http://$api/health" >/dev/null && break
     sleep 0.5
 done
