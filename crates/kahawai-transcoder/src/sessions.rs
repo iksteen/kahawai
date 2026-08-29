@@ -107,6 +107,7 @@ impl Runner {
         encode_params: (u32, u32, u32, bool, u32),
         // The source is interlaced; the encode chain deinterlaces.
         deinterlace: bool,
+        loudness: (f64, f64, u32),
         // HUB-15b (video_codec, audio_codec, container); empty = legacy.
         targets: (String, String, String),
         burn_sets: Vec<u8>,
@@ -126,6 +127,7 @@ impl Runner {
                 &tail_sizes,
                 encode_params,
                 deinterlace,
+                loudness,
                 targets,
                 burn_sets,
                 ass_burn,
@@ -185,6 +187,7 @@ impl Runner {
         tail_sizes: &[u64],
         (video_kbps, max_height, max_channels, tone_map, burn_subtitle): (u32, u32, u32, bool, u32),
         deinterlace: bool,
+        (stereo_gain_db, native_gain_db, loudness_source_channels): (f64, f64, u32),
         (video_codec, audio_codec, container): (String, String, String),
         burn_sets: Vec<u8>,
         (burn_ass, burn_ass_file): (u32, Vec<u8>),
@@ -255,6 +258,18 @@ impl Runner {
                         cmd.args([flag, &v.to_string()]);
                     }
                 }
+                if stereo_gain_db.is_finite() {
+                    cmd.args(["--stereo-gain-db", &stereo_gain_db.to_string()]);
+                }
+                if native_gain_db.is_finite() {
+                    cmd.args(["--native-gain-db", &native_gain_db.to_string()]);
+                }
+                if loudness_source_channels > 0 {
+                    cmd.args([
+                        "--loudness-source-channels",
+                        &loudness_source_channels.to_string(),
+                    ]);
+                }
                 if deinterlace {
                     cmd.arg("--deinterlace");
                 }
@@ -323,6 +338,10 @@ impl Runner {
                     video_kbps: (video_kbps > 0).then_some(video_kbps),
                     max_height: (max_height > 0).then_some(max_height),
                     max_channels: (max_channels > 0).then_some(max_channels),
+                    stereo_gain_db: stereo_gain_db.is_finite().then_some(stereo_gain_db),
+                    native_gain_db: native_gain_db.is_finite().then_some(native_gain_db),
+                    loudness_source_channels: (loudness_source_channels > 0)
+                        .then_some(loudness_source_channels),
                     tone_map,
                     deinterlace,
                     burn_subtitle: (burn_subtitle > 0).then(|| (burn_subtitle - 1) as usize),

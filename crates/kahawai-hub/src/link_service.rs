@@ -606,6 +606,7 @@ fn validate_exact_host_msg(m: &host_to_hub::Msg) -> anyhow::Result<()> {
         host_to_hub::Msg::FileVideoGeometry(message) => {
             valid(&message.source, "FileVideoGeometry")?
         }
+        host_to_hub::Msg::FileLoudness(message) => valid(&message.source, "FileLoudness")?,
         host_to_hub::Msg::ImageSubtitles(message) => valid(&message.source, "ImageSubtitles")?,
         host_to_hub::Msg::SegmentDetectionResult(result) => {
             for episode in &result.episodes {
@@ -651,6 +652,7 @@ fn kind_name(m: &host_to_hub::Msg) -> &'static str {
         host_to_hub::Msg::FileAttachments(_) => "file_attachments",
         host_to_hub::Msg::FileKeyframeInterval(_) => "file_keyframe_interval",
         host_to_hub::Msg::FileVideoGeometry(_) => "file_video_geometry",
+        host_to_hub::Msg::FileLoudness(_) => "file_loudness",
         host_to_hub::Msg::ImageSubtitles(_) => "image_subtitles",
         host_to_hub::Msg::RootResolutions(_) => "root_resolutions",
         host_to_hub::Msg::RootAdoptionAck(_) => "root_adoption_ack",
@@ -907,6 +909,7 @@ async fn handle_host_msg(
                 push_attachments_worklist(registry, module_id, &r.collection_id).await;
                 push_keyframe_worklist(registry, module_id, &r.collection_id).await;
                 push_video_geometry_worklist(registry, module_id, &r.collection_id).await;
+                push_loudness_worklist(registry, module_id, &r.collection_id).await;
                 return Ok(());
             }
             // Incremental rescan (MH-5): what we already know, so the
@@ -1042,6 +1045,7 @@ async fn handle_host_msg(
             push_attachments_worklist(registry, module_id, &p.collection_id).await;
             push_keyframe_worklist(registry, module_id, &p.collection_id).await;
             push_video_geometry_worklist(registry, module_id, &p.collection_id).await;
+            push_loudness_worklist(registry, module_id, &p.collection_id).await;
             enricher.scan_complete(registry.clone());
         }
         host_to_hub::Msg::FileAttachments(fa) => {
@@ -1115,6 +1119,19 @@ async fn handle_host_msg(
                     path = %source.path_rel, stored, error = %g.error,
                     "targeted video geometry probe failed");
             }
+        }
+        host_to_hub::Msg::FileLoudness(mut loudness) => {
+            let source = exact_source(loudness.source.take(), "FileLoudness")?;
+            let root_token = registry
+                .resolve_root_token(module_id, &loudness.collection_id, &source.root_token)
+                .await?;
+            loudness.source = Some(kahawai_proto::v1::SourcePath {
+                root_token,
+                path_rel: source.path_rel,
+            });
+            let stored = registry.record_file_loudness(module_id, &loudness).await?;
+            tracing::info!(%module_id, collection = %loudness.collection_id,
+                tracks = loudness.tracks.len(), stored, "audio loudness result received");
         }
         host_to_hub::Msg::FileSubtitles(fs) => {
             let source = exact_source(fs.source, "FileSubtitles")?;
@@ -1282,6 +1299,49 @@ async fn push_attachments_worklist(
         };
         if let Err(e) = registry.send_to_host(module_id, msg).await {
             tracing::warn!(%module_id, error = format!("{e:#}"), "attachments worklist send failed");
+            return;
+        }
+    }
+}
+
+/// Source-local full-audio measurement. Sent only to protocol-minor peers that
+/// implement the analyzer; old mediahosts keep the rows pending without seeing
+/// an unknown, expensive worklist.
+async fn push_loudness_worklist(registry: &Registry, module_id: &str, collection_id: &str) {
+    if !registry.host_supports_loudness_analysis(module_id) {
+        return;
+    }
+    let paths = match registry.loudness_worklist(module_id, collection_id).await {
+        Ok(paths) => paths,
+        Err(error) => {
+            tracing::warn!(%module_id, collection = collection_id,
+                error = format!("{error:#}"), "loudness worklist failed");
+            return;
+        }
+    };
+    if paths.is_empty() {
+        return;
+    }
+    tracing::info!(%module_id, collection = collection_id, files = paths.len(),
+        "sending loudness worklist");
+    for chunk in paths.chunks(128) {
+        let message = kahawai_proto::v1::HubToHost {
+            msg: Some(kahawai_proto::v1::hub_to_host::Msg::LoudnessWorklist(
+                kahawai_proto::v1::LoudnessWorklist {
+                    collection_id: collection_id.to_string(),
+                    analyzer: kahawai_media::loudness::ANALYZER,
+                    sources: chunk
+                        .iter()
+                        .map(|source| {
+                            kahawai_proto::v1::SourcePath::new(&source.root_token, &source.path_rel)
+                        })
+                        .collect(),
+                },
+            )),
+        };
+        if let Err(error) = registry.send_to_host(module_id, message).await {
+            tracing::debug!(%module_id, collection = collection_id,
+                error = format!("{error:#}"), "loudness worklist send stopped");
             return;
         }
     }

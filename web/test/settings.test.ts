@@ -173,6 +173,37 @@ describe('the bandwidth ceiling', () => {
   })
 })
 
+describe('loudness normalization', () => {
+  test('defaults to encoded audio and stores force mode', async () => {
+    const wrapper = await open()
+    const field = wrapper.get('#loudness-normalization')
+    expect((field.element as HTMLSelectElement).value).toBe('')
+
+    await field.setValue('force')
+    await flushPromises()
+    expect(putPref).toHaveBeenCalledWith({
+      scope: '',
+      key: 'loudness_normalization',
+      value: 'force',
+    })
+  })
+
+  test('shows a stored opt-out and clears it back to the default', async () => {
+    vi.mocked(getPrefs).mockResolvedValue(prefs({ loudness_normalization: 'off' }) as never)
+    const wrapper = await open()
+    const field = wrapper.get('#loudness-normalization')
+    expect((field.element as HTMLSelectElement).value).toBe('off')
+
+    await field.setValue('')
+    await flushPromises()
+    expect(putPref).toHaveBeenCalledWith({
+      scope: '',
+      key: 'loudness_normalization',
+      value: '',
+    })
+  })
+})
+
 describe('the styled-subtitle ladder', () => {
   test('is every rung, and reordering saves the whole order', async () => {
     const wrapper = await open()

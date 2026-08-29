@@ -3,6 +3,7 @@
 
 pub mod ed2k;
 pub mod hasher;
+pub mod loudness;
 pub mod scan;
 pub mod segments;
 pub mod serve;
@@ -22,14 +23,30 @@ use tokio_stream::wrappers::ReceiverStream;
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 const RECONNECT_DELAY: Duration = Duration::from_secs(5);
 
-/// What the ED2K hasher must yield to (MH-9): scans and lease serving.
-/// Busy while either count is nonzero; the hasher pauses between chunks.
+/// Shared mediahost work classes. Scans, viewer leases and urgent extraction
+/// pause every background task. Segment detection additionally preempts
+/// loudness, while the one `background` permit keeps their decoders disjoint.
 #[derive(Clone, Default)]
 pub struct Activity {
     scans: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     leases: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     urgent: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    segments: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     background: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ActivitySnapshot {
+    pub scans: usize,
+    pub leases: usize,
+    pub urgent: usize,
+    pub segments: usize,
+}
+
+impl ActivitySnapshot {
+    pub(crate) fn foreground_busy(self) -> bool {
+        self.scans != 0 || self.leases != 0 || self.urgent != 0
+    }
 }
 
 pub struct ActivityGuard(std::sync::Arc<std::sync::atomic::AtomicUsize>);
@@ -61,6 +78,20 @@ impl Activity {
     pub fn urgent(&self) -> ActivityGuard {
         Self::enter(&self.urgent)
     }
+    pub(crate) fn segment_priority(&self) -> ActivityGuard {
+        Self::enter(&self.segments)
+    }
+    pub(crate) fn snapshot(&self) -> ActivitySnapshot {
+        ActivitySnapshot {
+            scans: self.scans.load(std::sync::atomic::Ordering::Relaxed),
+            leases: self.leases.load(std::sync::atomic::Ordering::Relaxed),
+            urgent: self.urgent.load(std::sync::atomic::Ordering::Relaxed),
+            segments: self.segments.load(std::sync::atomic::Ordering::Relaxed),
+        }
+    }
+    pub(crate) fn segment_pending(&self) -> bool {
+        self.snapshot().segments != 0
+    }
     pub fn try_background(&self) -> Option<BackgroundGuard> {
         self.background
             .compare_exchange(
@@ -73,9 +104,7 @@ impl Activity {
             .map(|_| BackgroundGuard(self.background.clone()))
     }
     pub fn busy(&self) -> bool {
-        self.scans.load(std::sync::atomic::Ordering::Relaxed) != 0
-            || self.leases.load(std::sync::atomic::Ordering::Relaxed) != 0
-            || self.urgent.load(std::sync::atomic::Ordering::Relaxed) != 0
+        self.snapshot().foreground_busy()
     }
 }
 
@@ -296,6 +325,7 @@ pub struct Engine {
     >,
     hash_tx: tokio::sync::mpsc::Sender<hasher::JobMsg>,
     segment_tx: tokio::sync::mpsc::UnboundedSender<kahawai_proto::v1::DetectSegments>,
+    loudness_tx: tokio::sync::mpsc::UnboundedSender<kahawai_proto::v1::LoudnessWorklist>,
     collections: Vec<CollectionConfig>,
     tx: tokio::sync::mpsc::Sender<HostToHub>,
     pub activity: Activity,
@@ -369,6 +399,13 @@ impl Engine {
             collections.to_vec(),
             activity.clone(),
             segment_serial,
+        )));
+        let (loudness_tx, loudness_rx) = tokio::sync::mpsc::unbounded_channel();
+        guards.push(tokio::spawn(loudness::run(
+            loudness_rx,
+            tx.clone(),
+            collections.to_vec(),
+            activity.clone(),
         )));
         for c in collections {
             let (ttx, mut trx) = tokio::sync::mpsc::channel::<ScanTrigger>(8);
@@ -564,6 +601,7 @@ impl Engine {
             manifest_waiters,
             hash_tx,
             segment_tx,
+            loudness_tx,
             collections: collections.to_vec(),
             tx,
             activity,
@@ -633,6 +671,18 @@ impl Engine {
             hub_to_host::Msg::SubsWorklist(w) => {
                 validate_sources("SubsWorklist", &w.sources)?;
                 let _ = self.hash_tx.try_send(hasher::JobMsg::SubsWorklist(w));
+                Ok(None)
+            }
+            hub_to_host::Msg::LoudnessWorklist(work) => {
+                anyhow::ensure!(
+                    work.sources
+                        .iter()
+                        .all(|source| !source.root_token.is_empty()),
+                    "LoudnessWorklist contains an empty root token"
+                );
+                self.loudness_tx
+                    .send(work)
+                    .map_err(|_| anyhow::anyhow!("loudness worker stopped"))?;
                 Ok(None)
             }
             hub_to_host::Msg::ExtractSubs(e) => {
@@ -863,12 +913,33 @@ async fn link_once(
                             // does not make this box busy: the hub's own sweeps
                             // must not shut the gate on the work only this box
                             // can do.
+                            let foreground = !req.background;
+                            let collection_id = req.collection_id.clone();
+                            let path_rel = req
+                                .source
+                                .as_ref()
+                                .map(|source| source.path_rel.clone())
+                                .unwrap_or_default();
+                            if foreground {
+                                tracing::info!(
+                                    collection = %collection_id,
+                                    path = %path_rel,
+                                    "foreground read lease opened"
+                                );
+                            }
                             let busy = (!req.background).then(|| engine.activity.lease());
                             tokio::spawn(async move {
                                 let _busy = busy;
-                                if let Err(e) =
-                                    serve::serve_lease(ch, req.lease_token, path).await
-                                {
+                                let result =
+                                    serve::serve_lease(ch, req.lease_token, path).await;
+                                if foreground {
+                                    tracing::info!(
+                                        collection = %collection_id,
+                                        path = %path_rel,
+                                        "foreground read lease closed"
+                                    );
+                                }
+                                if let Err(e) = result {
                                     tracing::warn!(error = format!("{e:#}"), "byte channel failed");
                                 }
                             });

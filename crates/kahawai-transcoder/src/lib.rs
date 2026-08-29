@@ -393,7 +393,16 @@ async fn link_loop(
                         Some(hub_to_tc::Msg::StartSession(s)) => {
                             let runner = runner.clone();
                             tokio::spawn(async move {
-                                runner.start(s.session_id, s.size, &s.video, &s.audio, s.audio_track, s.video_track, s.start_ms, &s.sink, s.tail_sizes, (s.video_kbps, s.max_height, s.max_channels, s.tone_map, s.burn_subtitle), s.deinterlace, (s.video_codec, s.audio_codec, s.container), s.burn_sets, (s.burn_ass, s.burn_ass_file)).await;
+                                runner.start(
+                                    s.session_id, s.size, &s.video, &s.audio,
+                                    s.audio_track, s.video_track, s.start_ms, &s.sink,
+                                    s.tail_sizes,
+                                    (s.video_kbps, s.max_height, s.max_channels, s.tone_map, s.burn_subtitle),
+                                    s.deinterlace,
+                                    (s.stereo_gain_db, s.native_gain_db, s.loudness_source_channels),
+                                    (s.video_codec, s.audio_codec, s.container),
+                                    s.burn_sets, (s.burn_ass, s.burn_ass_file),
+                                ).await;
                             });
                         }
                         // Inline, not spawned: EndSession→StartSession

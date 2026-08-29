@@ -61,6 +61,8 @@ message HostToHub {
     // Season-wide recap/intro/credits analysis performed against local paths.
     SegmentDetectionAccepted segment_detection_accepted = 17;
     SegmentDetectionResult segment_detection_result = 18;
+    // Source-local EBU R128 measurements for every audio stream.
+    FileLoudness file_loudness = 19;
   }
 }
 
@@ -262,6 +264,8 @@ message HubToHost {
     VideoGeometryWorklist video_geometry_worklist = 12;
     // HUB-37: analyze one ordered season against exact local sources.
     DetectSegments detect_segments = 13;
+    // Full audio decode on the owning mediahost, idle-gated and cached.
+    LoudnessWorklist loudness_worklist = 14;
   }
 }
 
@@ -286,6 +290,31 @@ message FileVideoGeometry {
   // by the next FileUpsert for changed physical content.
   string error = 5;
 }
+message LoudnessWorklist {
+  string collection_id = 1;
+  int64 analyzer = 2;
+  repeated SourcePath sources = 3;
+}
+
+message FileLoudness {
+  string collection_id = 1;
+  SourcePath source = 2;
+  uint64 size = 3;
+  int64 mtime_unix = 4;
+  int64 analyzer = 5;
+  repeated AudioLoudnessTrack tracks = 6;
+  string error = 7;
+}
+
+message AudioLoudnessTrack {
+  uint32 stream_index = 1;
+  double integrated_lufs = 2;
+  double true_peak_dbtp = 3;
+  uint32 source_channels = 4;
+  double native_integrated_lufs = 5;
+  double native_true_peak_dbtp = 6;
+}
+
 
 message ExtractSubs {
   string collection_id = 1;
@@ -741,6 +770,13 @@ message StartSession {
   // worker never sees the file, only the bytes it is fed. An old
   // transcoder ignoring this encodes fields, which is what it did before.
   bool deinterlace = 21;
+  // Gain measured on the exact stereo fold. NaN means unmeasured; applied
+  // only when the encoded output is stereo.
+  double stereo_gain_db = 22;
+  // Gain measured on the untouched decoded layout. Applied only when the
+  // encoded channel count still equals loudness_source_channels.
+  double native_gain_db = 23;
+  uint32 loudness_source_channels = 24;
 }
 
 message EndSession {

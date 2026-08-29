@@ -13,7 +13,7 @@ use kahawai_proto::v1::{HubToHost, OpenRead, hub_to_host};
 use sqlx::Row;
 
 use crate::leases::{Lease, Leases, new_lease_token};
-use crate::registry::Registry;
+use crate::registry::{LoudnessPreference, Registry};
 
 /// Who a read lease is for. It travels to the mediahost, which serves both
 /// identically and schedules its OWN local work — hashes, declarations,
@@ -180,6 +180,7 @@ impl RemuxRunner {
 /// timeline; part boundaries are ordinary seek-restarts.
 #[derive(Debug, Clone)]
 pub struct PartSource {
+    pub file_id: i64,
     pub module_id: String,
     pub collection_id: String,
     pub root_token: String,
@@ -191,6 +192,42 @@ pub struct PartSource {
     pub mtime_unix: i64,
     pub base_ms: u64,
     pub duration_ms: u64,
+}
+fn apply_audio_loudness_measurement(
+    plan: &mut kahawai_media::remux::RemuxPlan,
+    preference: LoudnessPreference,
+    measured: Option<kahawai_media::loudness::AudioLoudnessMeasurement>,
+) {
+    plan.stereo_gain_db = None;
+    plan.native_gain_db = None;
+    plan.loudness_source_channels = None;
+    if preference.enabled()
+        && let Some(measured) = measured
+    {
+        plan.stereo_gain_db = Some(kahawai_media::loudness::gain_db(measured.stereo));
+        plan.native_gain_db = Some(kahawai_media::loudness::gain_db(measured.native));
+        plan.loudness_source_channels = Some(measured.source_channels);
+    }
+}
+
+async fn fill_audio_loudness_gains(
+    registry: &Registry,
+    parts: &[PartSource],
+    plan: &mut kahawai_media::remux::RemuxPlan,
+    preference: LoudnessPreference,
+) -> Result<()> {
+    let measured = if preference.enabled()
+        && plan.audio == kahawai_media::remux::StreamMode::Encode
+        && parts.len() == 1
+    {
+        registry
+            .audio_loudness(parts[0].file_id, plan.audio_track)
+            .await?
+    } else {
+        None
+    };
+    apply_audio_loudness_measurement(plan, preference, measured);
+    Ok(())
 }
 
 pub struct Session {
@@ -217,6 +254,12 @@ pub struct Session {
     /// The effective capability profile (client's or fallback, cap
     /// merged) — re-plans on track switches negotiate against IT.
     profile: kahawai_core::media::CapabilityProfile,
+    /// The global loudness preference resolved at session start. A track
+    /// switch re-plans against the same user decision as the initial stream.
+    loudness: LoudnessPreference,
+    /// This session started on a measured force-capable source. Explicit
+    /// direct and fallback sessions keep their original-byte contract.
+    force_loudness: bool,
     /// What this session's playlist declares as EXT-X-TARGETDURATION.
     ///
     /// Decided ONCE, at session start, and deliberately not a Mutex
@@ -342,6 +385,8 @@ pub(crate) struct Negotiation<'a> {
     /// The client's profile, already tightened by the user's standing
     /// bandwidth cap (HUB-15).
     profile: kahawai_core::media::CapabilityProfile,
+    /// Default-on measured loudness normalization policy.
+    loudness: LoudnessPreference,
     /// HUB-32a/d: the user's ASS ladder. `pub` because the overlay rung
     /// only becomes real once something has been rasterised, and the
     /// caller flips `overlay_ready` before re-planning.
@@ -354,6 +399,9 @@ pub(crate) struct Negotiation<'a> {
     burn_row: Option<crate::tracks::Track>,
     audio_track: u32,
     video_track: u32,
+    /// The chosen source has a current measurement and force may therefore
+    /// turn only its audio copy/direct path into an encode.
+    force_audio_encode: bool,
 }
 
 impl<'a> Negotiation<'a> {
@@ -386,6 +434,7 @@ impl<'a> Negotiation<'a> {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
         };
+        let loudness = registry.loudness_normalization(user_id).await?;
         // HUB-32a: burn ASS or flatten it? A fleet fact and this user's
         // standing choice. Fleet-wide rather than per-box on purpose —
         // the tier is decided before placement, which then hard-filters
@@ -434,11 +483,13 @@ impl<'a> Negotiation<'a> {
             registry,
             sessions,
             profile,
+            loudness,
             ass,
             ocr_set,
             burn_row,
             audio_track,
             video_track,
+            force_audio_encode: false,
         })
     }
 
@@ -537,6 +588,16 @@ impl<'a> Negotiation<'a> {
         info: &kahawai_core::media::MediaInfo,
         facts: &ExecutorFacts,
     ) -> kahawai_media::negotiate::SourcePlan {
+        self.plan_with_force(parts, info, facts, self.force_audio_encode)
+    }
+
+    fn plan_with_force(
+        &self,
+        parts: &[PartSource],
+        info: &kahawai_core::media::MediaInfo,
+        facts: &ExecutorFacts,
+        force_audio_encode: bool,
+    ) -> kahawai_media::negotiate::SourcePlan {
         let est_kbps = info
             .duration_ms
             .filter(|d| *d > 0)
@@ -568,6 +629,7 @@ impl<'a> Negotiation<'a> {
             &facts.video_targets,
             &facts.full_audio_targets,
             &facts.local_audio_targets,
+            force_audio_encode,
         )
     }
 
@@ -592,14 +654,34 @@ impl<'a> Negotiation<'a> {
         })
     }
 
-    /// Plan against the source's own reachability — the form used while
-    /// choosing between candidates.
-    pub(crate) fn plan_auto(
+    fn plan_auto_with_force(
         &self,
         parts: &[PartSource],
         info: &kahawai_core::media::MediaInfo,
+        force_audio_encode: bool,
     ) -> kahawai_media::negotiate::SourcePlan {
-        self.plan_probed(parts, info, self.reads_sets_for(parts))
+        self.plan_with_force(
+            parts,
+            info,
+            &self.probe(info, self.reads_sets_for(parts)),
+            force_audio_encode,
+        )
+    }
+
+    async fn can_force_audio(
+        &self,
+        parts: &[PartSource],
+        info: &kahawai_core::media::MediaInfo,
+    ) -> Result<bool> {
+        if !self.loudness.force() || parts.len() != 1 || info.audio.is_empty() {
+            return Ok(false);
+        }
+        let audio_track = (self.audio_track as usize).min(info.audio.len() - 1);
+        Ok(self
+            .registry
+            .audio_loudness(parts[0].file_id, audio_track)
+            .await?
+            .is_some())
     }
 
     /// Which source to play and how, judged across every candidate.
@@ -610,7 +692,7 @@ impl<'a> Negotiation<'a> {
     /// error. The two failures here are different: they mean there is
     /// no source to negotiate against at all.
     pub(crate) async fn best_source(
-        &self,
+        &mut self,
         item_id: &str,
         mode: Option<&str>,
     ) -> Result<(
@@ -620,12 +702,13 @@ impl<'a> Negotiation<'a> {
         String,
     )> {
         match mode {
-            // Operator override (scripts, pipeline debugging): the mode
-            // is forced on the rank-best source; the PLAN still comes
-            // from negotiation.
+            // Operator override (scripts, pipeline debugging): explicit direct
+            // still means original bytes. An explicit remux may force gain.
             Some(m) => {
                 let (parts, info) = self.sessions.source_parts(self.registry, item_id).await?;
-                let sp = self.plan_auto(&parts, &info);
+                let force = m != "direct" && self.can_force_audio(&parts, &info).await?;
+                let sp = self.plan_auto_with_force(&parts, &info, force);
+                self.force_audio_encode = force;
                 Ok((parts, info, sp, m.to_string()))
             }
             // HUB-14/16: judge every candidate, cheapest sufficient
@@ -669,17 +752,24 @@ impl<'a> Negotiation<'a> {
                 // this client cannot take plans "cheaper" than one that
                 // must encode, and picking it plays the film silently.
                 // A bill beats a defect.
-                let mut best: Option<(kahawai_media::negotiate::SourcePlan, usize)> = None;
+                let mut best: Option<(kahawai_media::negotiate::SourcePlan, usize, bool, bool)> =
+                    None;
                 for (idx, (parts, info)) in candidates.iter().enumerate() {
-                    let sp = self.plan_auto(parts, info);
-                    let better = best.as_ref().is_none_or(|(cur, _)| {
-                        (sp.incomplete, sp.cost) < (cur.incomplete, cur.cost)
+                    let force = self.can_force_audio(parts, info).await?;
+                    let sp = self.plan_auto_with_force(parts, info, force);
+                    let normalized =
+                        force && sp.plan.audio == kahawai_media::remux::StreamMode::Encode;
+                    let force_missed = self.loudness.force() && !normalized;
+                    let better = best.as_ref().is_none_or(|(cur, _, _, cur_missed)| {
+                        (sp.incomplete, force_missed, sp.cost)
+                            < (cur.incomplete, *cur_missed, cur.cost)
                     });
                     if better {
-                        best = Some((sp, idx));
+                        best = Some((sp, idx, force, force_missed));
                     }
                 }
-                let (sp, idx) = best.unwrap();
+                let (sp, idx, force, _) = best.unwrap();
+                self.force_audio_encode = force;
                 let mode = if sp.direct { "direct" } else { "remux" };
                 let (parts, info) = candidates.into_iter().nth(idx).unwrap();
                 Ok((parts, info, sp, mode.to_string()))
@@ -1450,6 +1540,7 @@ impl Sessions {
                     info.duration_ms.unwrap_or(0)
                 };
                 parts.push(PartSource {
+                    file_id: r.get("file_id"),
                     module_id: r.get("module_id"),
                     collection_id: r.get("collection_id"),
                     root_token: r.get("root_token"),
@@ -1477,7 +1568,7 @@ impl Sessions {
     ) -> Result<Vec<sqlx::sqlite::SqliteRow>> {
         Ok(sqlx::query(
             "SELECT ps.id AS playable_source_id,ps.expected_parts,
-                    p.ordinal AS part,f.module_id,f.collection_id,r.root_token,
+                    p.ordinal AS part,f.id AS file_id,f.module_id,f.collection_id,r.root_token,
                     f.path_rel AS source_path,f.size,f.mtime_unix,f.streams_json
              FROM playable_sources ps
              JOIN playable_source_parts p ON p.playable_source_id=ps.id
@@ -1544,6 +1635,7 @@ impl Sessions {
                     info.duration_ms.unwrap_or(0)
                 };
                 parts.push(PartSource {
+                    file_id: r.get("file_id"),
                     module_id: r.get("module_id"),
                     collection_id: r.get("collection_id"),
                     root_token: r.get("root_token"),
@@ -1917,7 +2009,7 @@ impl Sessions {
                 // The muxer stalls on unfed pads, so only claim what the
                 // plan will actually feed — the negotiated plan is the
                 // single source of truth with the pipeline's link logic.
-                let plan = negotiated.plan;
+                let mut plan = negotiated.plan;
                 if !plan.playable() {
                     bail!(
                         "no playable streams: {} · {}",
@@ -1925,6 +2017,7 @@ impl Sessions {
                         negotiated.audio_verdict
                     );
                 }
+                fill_audio_loudness_gains(registry, &parts, &mut plan, neg.loudness).await?;
                 verdict = Some((
                     negotiated.video_verdict.clone(),
                     negotiated.audio_verdict.clone(),
@@ -2134,12 +2227,14 @@ impl Sessions {
             mode: session_mode,
             verdict: Mutex::new(verdict),
             sub_verdicts: Mutex::new(sub_verdicts),
+            profile: neg.profile().clone(),
             target_duration_secs: negotiated.target_duration_secs,
             burn_sets: Mutex::new(burn_sets.clone()),
             burn_pick: Mutex::new(burn_pick),
             ass: neg.ass.clone(),
             burn_ass_text: Mutex::new(burn_ass_text),
-            profile: neg.profile().clone(),
+            loudness: neg.loudness,
+            force_loudness: neg.force_audio_encode,
             sink: Mutex::new(chosen_sink),
             seek_lock: tokio::sync::Mutex::new(()),
             pending_seek: Mutex::new(None),
@@ -2282,6 +2377,15 @@ impl Sessions {
                     if let Some(v) = v {
                         cmd.args([flag, &v.to_string()]);
                     }
+                }
+                if let Some(gain) = plan.stereo_gain_db {
+                    cmd.args(["--stereo-gain-db", &gain.to_string()]);
+                }
+                if let Some(gain) = plan.native_gain_db {
+                    cmd.args(["--native-gain-db", &gain.to_string()]);
+                }
+                if let Some(channels) = plan.loudness_source_channels {
+                    cmd.args(["--loudness-source-channels", &channels.to_string()]);
                 }
                 if plan.deinterlace {
                     cmd.arg("--deinterlace");
@@ -2551,6 +2655,9 @@ impl Sessions {
                     video_kbps: plan.video_kbps.unwrap_or(0),
                     max_height: plan.max_height.unwrap_or(0),
                     max_channels: plan.max_channels.unwrap_or(0),
+                    stereo_gain_db: plan.stereo_gain_db.unwrap_or(f64::NAN),
+                    native_gain_db: plan.native_gain_db.unwrap_or(f64::NAN),
+                    loudness_source_channels: plan.loudness_source_channels.unwrap_or(0),
                     tone_map: plan.tone_map,
                     deinterlace: plan.deinterlace,
                     // 1-based on the wire: 0 means "burn nothing".
@@ -3058,6 +3165,14 @@ impl Sessions {
                     )
                 })
                 .unwrap_or_default();
+            let force_audio_encode = if session.force_loudness && session.parts.len() == 1 {
+                registry
+                    .audio_loudness(session.parts[0].file_id, want_audio)
+                    .await?
+                    .is_some()
+            } else {
+                false
+            };
             let sp = kahawai_media::negotiate::negotiate_for_executors(
                 &session.profile,
                 &info,
@@ -3090,11 +3205,11 @@ impl Sessions {
                 &video_targets,
                 &full_audio_targets,
                 &local_audio_targets,
+                force_audio_encode,
             );
             plan = sp.plan;
-            anyhow::ensure!(plan.playable(), "selected track is not playable");
-            *session.verdict.lock().unwrap() =
-                Some((sp.video_verdict.clone(), sp.audio_verdict.clone()));
+            fill_audio_loudness_gains(registry, &session.parts, &mut plan, session.loudness)
+                .await?;
             let mut subs = sp.subtitles;
             fill_verdict_track_ids(registry, &session.parts, &mut subs).await;
             *session.sub_verdicts.lock().unwrap() = subs;
@@ -3544,6 +3659,7 @@ mod reads_from_tests {
 
     fn part(host: &str) -> PartSource {
         PartSource {
+            file_id: 0,
             module_id: host.into(),
             collection_id: "movies".into(),
             root_token: "root".into(),
@@ -3681,7 +3797,10 @@ mod lease_purpose_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::{PartSource, Sessions, fold_facts, part_index};
+    use super::{
+        LoudnessPreference, PartSource, Sessions, apply_audio_loudness_measurement, fold_facts,
+        part_index,
+    };
 
     /// The per-user cap has to hold when starts ARRIVE TOGETHER, which
     /// is the only time it matters. It used to count `active`, drop the
@@ -3762,8 +3881,33 @@ mod tests {
         assert_eq!(none, None);
     }
 
+    #[test]
+    fn loudness_opt_out_clears_every_gain() {
+        let mut plan = kahawai_media::remux::RemuxPlan::default();
+        let measured = kahawai_media::loudness::AudioLoudnessMeasurement {
+            source_channels: 6,
+            stereo: kahawai_media::loudness::AudioLoudness {
+                integrated_lufs: -26.0,
+                true_peak_dbtp: -8.0,
+            },
+            native: kahawai_media::loudness::AudioLoudness {
+                integrated_lufs: -24.0,
+                true_peak_dbtp: -10.0,
+            },
+        };
+        apply_audio_loudness_measurement(&mut plan, LoudnessPreference::Encoded, Some(measured));
+        assert_eq!(plan.stereo_gain_db, Some(7.0));
+        assert_eq!(plan.native_gain_db, Some(6.0));
+        assert_eq!(plan.loudness_source_channels, Some(6));
+        apply_audio_loudness_measurement(&mut plan, LoudnessPreference::Off, Some(measured));
+        assert_eq!(plan.stereo_gain_db, None);
+        assert_eq!(plan.native_gain_db, None);
+        assert_eq!(plan.loudness_source_channels, None);
+    }
+
     fn part(base_ms: u64, duration_ms: u64) -> PartSource {
         PartSource {
+            file_id: 0,
             module_id: "m".into(),
             collection_id: "c".into(),
             root_token: "root".into(),

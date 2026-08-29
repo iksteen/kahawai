@@ -6329,7 +6329,7 @@ async fn item_query(
     ))?;
 
     let mut out = item_body(&state, &id, &claims.sub, true).await?;
-    let neg = crate::sessions::Negotiation::new(
+    let mut neg = crate::sessions::Negotiation::new(
         &state.sessions,
         &state.registry,
         &claims.sub,

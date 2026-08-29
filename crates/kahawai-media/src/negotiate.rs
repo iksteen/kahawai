@@ -492,6 +492,7 @@ pub fn negotiate(
         targets,
         targets,
         targets,
+        false,
     )
 }
 
@@ -503,6 +504,64 @@ pub fn negotiate(
 /// promised on work that will run on the other.
 #[allow(clippy::too_many_arguments)]
 pub fn negotiate_for_executors(
+    profile: &CapabilityProfile,
+    info: &MediaInfo,
+    audio_track: usize,
+    video_track: usize,
+    single_part: bool,
+    est_kbps: Option<u32>,
+    tonemap: bool,
+    burn_capable: bool,
+    ocr_text: &[bool],
+    burn_pick: Option<BurnPick>,
+    ass: &AssPolicy,
+    video_targets: &[String],
+    full_audio_targets: &[String],
+    local_audio_targets: &[String],
+    force_audio_encode: bool,
+) -> SourcePlan {
+    let plan = |force| {
+        negotiate_for_executors_impl(
+            profile,
+            info,
+            audio_track,
+            video_track,
+            single_part,
+            est_kbps,
+            tonemap,
+            burn_capable,
+            ocr_text,
+            burn_pick,
+            ass,
+            video_targets,
+            full_audio_targets,
+            local_audio_targets,
+            force,
+        )
+    };
+    let normal = plan(false);
+    if !force_audio_encode {
+        return normal;
+    }
+    let forced = plan(true);
+    let video_unchanged = if normal.direct {
+        if info.video.is_empty() {
+            forced.plan.video == StreamMode::Off
+        } else {
+            forced.plan.video == StreamMode::Copy
+        }
+    } else {
+        forced.plan.video == normal.plan.video
+    };
+    if forced.plan.audio == StreamMode::Encode && video_unchanged {
+        forced
+    } else {
+        normal
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn negotiate_for_executors_impl(
     profile: &CapabilityProfile,
     info: &MediaInfo,
     audio_track: usize,
@@ -532,6 +591,7 @@ pub fn negotiate_for_executors(
     // Audio targets of the hub's lightweight worker, used when video is
     // copied and only audio needs encoding (AR-10/HUB-16).
     local_audio_targets: &[String],
+    force_audio_encode: bool,
 ) -> SourcePlan {
     let audio_track = audio_track.min(info.audio.len().saturating_sub(1));
     let video_track = video_track.min(info.video.len().saturating_sub(1));
@@ -598,10 +658,11 @@ pub fn negotiate_for_executors(
         && (v.is_none() || v_client_ok)
         && (a.is_none() || a_client_ok)
         && (v.is_some() || a.is_some())
-        // Serving the file as-is cannot burn anything into it.
+        // Serving the file as-is cannot burn or change audio.
         && !burn_wanted(profile, info, burn_capable, ocr_text)
         && !ass_burn_wanted(profile, info, ass)
-        && forced_burn.is_none();
+        && forced_burn.is_none()
+        && !force_audio_encode;
 
     // HUB-32b last resort: an image subtitle a client cannot composite
     // is burned into the picture. The policy is fidelity-first — the
@@ -725,7 +786,9 @@ pub fn negotiate_for_executors(
                 profile.audio.iter().any(|c| c == t.as_str())
                     && audio_targets.iter().any(|e| e == t.as_str())
             });
-            let audio = if a.is_some_and(|s| a_client_ok && muxable("audio", &s.codec)) {
+            let audio = if !force_audio_encode
+                && a.is_some_and(|s| a_client_ok && muxable("audio", &s.codec))
+            {
                 StreamMode::Copy
             } else if client_takes_audio_target
                 && a.is_some_and(|s| codec_to_caps_name("audio", &s.codec).is_some_and(can_decode))
@@ -858,6 +921,9 @@ pub fn negotiate_for_executors(
                     c.min(profile.max_audio_channels)
                 })
         }),
+        stereo_gain_db: None,
+        native_gain_db: None,
+        loudness_source_channels: None,
         tone_map,
         // Fields only matter where the pixels get rewritten; a copy
         // carries them out as they came in.
@@ -1407,6 +1473,75 @@ mod tests {
         assert_eq!(sp.cost, Cost::VideoEncode);
         assert_eq!(sp.plan.video_codec, VideoTarget::H264);
         assert_eq!(sp.plan.segment_format, SegmentFormat::Ts);
+    }
+
+    #[test]
+    fn forced_loudness_encodes_only_audio_or_keeps_the_normal_plan() {
+        crate::init().unwrap();
+        if !crate::testutil::require_elements(&["mpegtsmux"]) {
+            return;
+        }
+        let p = chrome();
+        let info = media("mp4", Some(vs("h264")), Some(au("aac", 2)));
+        let targets = fleet();
+        let plan = |info: &MediaInfo, local_audio_targets: &[String], force| {
+            super::negotiate_for_executors(
+                &p,
+                info,
+                0,
+                0,
+                true,
+                None,
+                false,
+                true,
+                &[],
+                None,
+                &AssPolicy::default(),
+                &targets,
+                &targets,
+                local_audio_targets,
+                force,
+            )
+        };
+
+        let normal = plan(&info, &targets, false);
+        assert!(normal.direct);
+        let forced = plan(&info, &targets, true);
+        assert!(!forced.direct);
+        assert_eq!(forced.cost, Cost::AudioEncode);
+        assert_eq!(forced.plan.video, StreamMode::Copy);
+        assert_eq!(forced.plan.audio, StreamMode::Encode);
+
+        let no_audio_encoder = plan(&info, &[], true);
+        assert!(no_audio_encoder.direct, "force must fall back to direct");
+
+        let mut webm_client = p.clone();
+        webm_client.video.push(VideoCap {
+            codec: "vp8".into(),
+            ..Default::default()
+        });
+        let webm = media("webm", Some(vs("vp8")), Some(au("opus", 2)));
+        let cannot_copy_video = super::negotiate_for_executors(
+            &webm_client,
+            &webm,
+            0,
+            0,
+            true,
+            None,
+            false,
+            true,
+            &[],
+            None,
+            &AssPolicy::default(),
+            &targets,
+            &targets,
+            &targets,
+            true,
+        );
+        assert!(
+            cannot_copy_video.direct,
+            "loudness alone must not introduce a video encode: {cannot_copy_video:?}"
+        );
     }
 
     #[test]

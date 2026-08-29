@@ -7,6 +7,15 @@
 //! Exact-root adoption assigns that reference without rewriting paths or any
 //! dependent row. Protocol values still use `(root_token, path_rel)` and are
 //! translated only at the database boundary.
+//!
+//! ## `audio_loudness` schema (authority for migration 0067)
+//!
+//! One row per physical file/audio-stream index. `analyzer`, `size` and
+//! `mtime_unix` bind the measurement to both algorithm and bytes. Successful
+//! rows carry the integrated LUFS and stereo-fold true peak; null metrics plus a
+//! non-empty `error` are a terminal answer for that revision, preventing a
+//! broken decoder from becoming a reconnect loop. File deletion cascades the
+//! rows; nothing evicts them because rebuilding fully decodes the audio track.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -28,6 +37,22 @@ use utoipa::ToSchema;
 #[derive(Debug, thiserror::Error)]
 #[error("media type must be one of movies, series, anime, music, not {0:?}")]
 pub struct UnknownMediaType(pub String);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoudnessPreference {
+    Off,
+    Encoded,
+    Force,
+}
+
+impl LoudnessPreference {
+    pub fn enabled(self) -> bool {
+        self != Self::Off
+    }
+
+    pub fn force(self) -> bool {
+        self == Self::Force
+    }
+}
 
 /// Why an attach was refused, as three answers rather than one sentence.
 ///
@@ -307,6 +332,9 @@ impl HostLink {
     pub(crate) fn supports_segment_detection(&self) -> bool {
         self.protocol_minor >= 1
             && self.segment_detector_generation == kahawai_core::segments::DETECTOR_GENERATION
+    }
+    pub(crate) fn supports_loudness_analysis(&self) -> bool {
+        self.protocol_minor >= 4
     }
 
     pub(crate) async fn send(&self, msg: kahawai_proto::v1::HubToHost) -> Result<()> {
@@ -895,6 +923,225 @@ impl Registry {
         tx.commit().await?;
         Ok(updated)
     }
+    /// Non-music files with audio streams whose current bytes have not been
+    /// measured by the source-local native-and-stereo loudness analyzer.
+    /// Music remains owned by its ReplayGain path. A terminal measurement error
+    /// also counts as an answer until the file revision changes.
+    pub async fn loudness_worklist(
+        &self,
+        module_id: &str,
+        collection_id: &str,
+    ) -> Result<Vec<SourcePath>> {
+        let rows = sqlx::query(
+            "SELECT r.root_token,f.path_rel
+               FROM files f
+               JOIN collection_roots r ON r.id=f.root_id
+               JOIN collections c
+                 ON c.module_id=f.module_id AND c.collection_id=f.collection_id
+              WHERE f.module_id=? AND f.collection_id=? AND c.media_type != 'music'
+                AND json_array_length(json_extract(f.streams_json,'$.audio')) > 0
+                AND (SELECT COUNT(*) FROM audio_loudness l
+                      WHERE l.file_id=f.id AND l.analyzer=?
+                        AND l.size=f.size AND l.mtime_unix=f.mtime_unix)
+                    < json_array_length(json_extract(f.streams_json,'$.audio'))
+              ORDER BY r.root_token,f.path_rel",
+        )
+        .bind(module_id)
+        .bind(collection_id)
+        .bind(kahawai_media::loudness::ANALYZER)
+        .fetch_all(&self.db)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| SourcePath {
+                root_token: row.get("root_token"),
+                path_rel: row.get("path_rel"),
+            })
+            .collect())
+    }
+
+    /// Persist every audio stream's measurement as one revision-guarded
+    /// answer. Whole-file failures produce terminal rows for the same revision
+    /// so a broken decoder cannot become a reconnect loop.
+    pub async fn record_file_loudness(
+        &self,
+        module_id: &str,
+        result: &kahawai_proto::v1::FileLoudness,
+    ) -> Result<bool> {
+        anyhow::ensure!(
+            result.analyzer == kahawai_media::loudness::ANALYZER,
+            "unsupported loudness analyzer {}",
+            result.analyzer
+        );
+        let source = result
+            .source
+            .as_ref()
+            .context("loudness result missing source")?;
+        let row = sqlx::query(
+            "SELECT f.id,f.streams_json FROM files f
+               JOIN collection_roots r ON r.id=f.root_id
+              WHERE f.module_id=? AND f.collection_id=? AND r.root_token=?
+                AND f.path_rel=? AND f.size=? AND f.mtime_unix=?",
+        )
+        .bind(module_id)
+        .bind(&result.collection_id)
+        .bind(&source.root_token)
+        .bind(&source.path_rel)
+        .bind(result.size as i64)
+        .bind(result.mtime_unix)
+        .fetch_optional(&self.db)
+        .await?;
+        let Some(row) = row else {
+            return Ok(false);
+        };
+        let file_id: i64 = row.get("id");
+        let info: kahawai_core::media::MediaInfo =
+            serde_json::from_str(row.get::<String, _>("streams_json").as_str())?;
+        let expected = info.audio.len();
+        if result.error.is_empty() {
+            anyhow::ensure!(
+                result.tracks.len() == expected,
+                "loudness result returned {} of {} audio streams",
+                result.tracks.len(),
+                expected
+            );
+            let indexes = result
+                .tracks
+                .iter()
+                .map(|track| track.stream_index as usize)
+                .collect::<std::collections::HashSet<_>>();
+            anyhow::ensure!(
+                indexes.len() == expected && (0..expected).all(|index| indexes.contains(&index)),
+                "loudness result stream indexes are incomplete or duplicated"
+            );
+            anyhow::ensure!(
+                result.tracks.iter().all(|track| {
+                    let source_matches = info
+                        .audio
+                        .get(track.stream_index as usize)
+                        .is_some_and(|audio| audio.channels == track.source_channels);
+                    source_matches
+                        && track.integrated_lufs.is_finite()
+                        && track.true_peak_dbtp.is_finite()
+                        && track.native_integrated_lufs.is_finite()
+                        && track.native_true_peak_dbtp.is_finite()
+                        && (-100.0..=10.0).contains(&track.integrated_lufs)
+                        && (-100.0..=10.0).contains(&track.true_peak_dbtp)
+                        && (-100.0..=10.0).contains(&track.native_integrated_lufs)
+                        && (-100.0..=10.0).contains(&track.native_true_peak_dbtp)
+                }),
+                "loudness result contains an invalid measurement"
+            );
+        }
+
+        let mut tx = self.db.begin_with("BEGIN IMMEDIATE").await?;
+        sqlx::query("DELETE FROM audio_loudness WHERE file_id=?")
+            .bind(file_id)
+            .execute(&mut *tx)
+            .await?;
+        for stream_index in 0..expected {
+            let measured = result
+                .tracks
+                .iter()
+                .find(|track| track.stream_index as usize == stream_index);
+            let (
+                integrated_lufs,
+                true_peak_dbtp,
+                source_channels,
+                native_integrated_lufs,
+                native_true_peak_dbtp,
+                error,
+            ) = if result.error.is_empty() {
+                let measured = measured.expect("validated complete result");
+                (
+                    Some(measured.integrated_lufs),
+                    Some(measured.true_peak_dbtp),
+                    Some(measured.source_channels as i64),
+                    Some(measured.native_integrated_lufs),
+                    Some(measured.native_true_peak_dbtp),
+                    "",
+                )
+            } else {
+                (None, None, None, None, None, result.error.as_str())
+            };
+            sqlx::query(
+                "INSERT INTO audio_loudness
+                   (file_id,stream_index,analyzer,size,mtime_unix,
+                    integrated_lufs,true_peak_dbtp,source_channels,
+                    native_integrated_lufs,native_true_peak_dbtp,error,measured_at)
+                 VALUES(?,?,?,?,?,?,?,?,?,?,?,unixepoch())",
+            )
+            .bind(file_id)
+            .bind(stream_index as i64)
+            .bind(result.analyzer)
+            .bind(result.size as i64)
+            .bind(result.mtime_unix)
+            .bind(integrated_lufs)
+            .bind(true_peak_dbtp)
+            .bind(source_channels)
+            .bind(native_integrated_lufs)
+            .bind(native_true_peak_dbtp)
+            .bind(error)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    /// Default is normalization when audio is already encoded. `off` disables
+    /// it; `force` may turn a direct/copy audio path into an encode while
+    /// retaining the video mode. Unknown values preserve the default.
+    pub async fn loudness_normalization(&self, user_id: &str) -> Result<LoudnessPreference> {
+        let value: Option<String> = sqlx::query_scalar(
+            "SELECT value FROM user_prefs
+              WHERE user_id=? AND scope='' AND key='loudness_normalization'",
+        )
+        .bind(user_id)
+        .fetch_optional(&self.db)
+        .await?;
+        Ok(match value.as_deref() {
+            Some("off") => LoudnessPreference::Off,
+            Some("force") => LoudnessPreference::Force,
+            _ => LoudnessPreference::Encoded,
+        })
+    }
+
+    pub async fn audio_loudness(
+        &self,
+        file_id: i64,
+        stream_index: usize,
+    ) -> Result<Option<kahawai_media::loudness::AudioLoudnessMeasurement>> {
+        let row = sqlx::query(
+            "SELECT l.source_channels,l.integrated_lufs,l.true_peak_dbtp,
+                    l.native_integrated_lufs,l.native_true_peak_dbtp
+               FROM audio_loudness l
+               JOIN files f ON f.id=l.file_id
+               JOIN collections c
+                 ON c.module_id=f.module_id AND c.collection_id=f.collection_id
+              WHERE l.file_id=? AND l.stream_index=? AND l.analyzer=?
+                AND c.media_type != 'music'
+                AND l.size=f.size AND l.mtime_unix=f.mtime_unix AND l.error=''",
+        )
+        .bind(file_id)
+        .bind(stream_index as i64)
+        .bind(kahawai_media::loudness::ANALYZER)
+        .fetch_optional(&self.db)
+        .await?;
+        Ok(
+            row.map(|row| kahawai_media::loudness::AudioLoudnessMeasurement {
+                source_channels: row.get::<i64, _>("source_channels") as u32,
+                stereo: kahawai_media::loudness::AudioLoudness {
+                    integrated_lufs: row.get("integrated_lufs"),
+                    true_peak_dbtp: row.get("true_peak_dbtp"),
+                },
+                native: kahawai_media::loudness::AudioLoudness {
+                    integrated_lufs: row.get("native_integrated_lufs"),
+                    true_peak_dbtp: row.get("native_true_peak_dbtp"),
+                },
+            }),
+        )
+    }
 
     /// Files whose longest keyframe gap was never measured — rows
     /// scanned before it existed. Any container: the mediahost decides
@@ -1365,6 +1612,10 @@ impl Registry {
     pub fn host_supports_segment_detection(&self, module_id: &str) -> bool {
         self.host_link(module_id)
             .is_some_and(|link| link.supports_segment_detection())
+    }
+    pub fn host_supports_loudness_analysis(&self, module_id: &str) -> bool {
+        self.host_link(module_id)
+            .is_some_and(|link| link.supports_loudness_analysis())
     }
 
     pub fn db(&self) -> &SqlitePool {

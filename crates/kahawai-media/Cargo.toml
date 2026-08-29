@@ -12,10 +12,12 @@ kahawai-core = { workspace = true }
 anyhow = { workspace = true }
 gstreamer = { workspace = true }
 gstreamer-pbutils = { workspace = true }
+gstreamer-audio = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
 tempfile = { workspace = true }
 gstreamer-app = "0.25.2"
+ebur128 = { workspace = true }
 gstreamer-video = "0.25"
 flate2 = { workspace = true }
 zstd = { workspace = true }

@@ -751,6 +751,13 @@ pub struct RemuxPlan {
     /// on `start_parts`) and has no fonts to attach.
     pub burn_ass: Option<usize>,
     pub max_channels: Option<u32>,
+    /// Static EBU R128 gain measured on the exact stereo fold. `None` means
+    /// unmeasured; applied only when the selected encoder layout is stereo.
+    pub stereo_gain_db: Option<f64>,
+    /// Static gain measured on the untouched decoded layout. Applied only
+    /// when the encoded output preserves `loudness_source_channels`.
+    pub native_gain_db: Option<f64>,
+    pub loudness_source_channels: Option<u32>,
     /// HUB-15b: what the encode arms produce and which segment
     /// container carries the session. Defaults = the historical
     /// h264/aac/TS behavior.
@@ -1548,6 +1555,11 @@ fn route_stream(
                     gate,
                     plan.audio_codec,
                     plan.max_channels,
+                    AudioLoudnessGains {
+                        stereo_db: plan.stereo_gain_db,
+                        native_db: plan.native_gain_db,
+                        source_channels: plan.loudness_source_channels,
+                    },
                     facts_dir,
                 );
             }
@@ -2994,6 +3006,26 @@ fn aac_input_layout(
         .find(|(n, m)| aac_accepts(enc, (channels, mask), *n, *m))
 }
 
+#[derive(Clone, Copy)]
+struct AudioLoudnessGains {
+    stereo_db: Option<f64>,
+    native_db: Option<f64>,
+    source_channels: Option<u32>,
+}
+
+impl AudioLoudnessGains {
+    fn for_channels(self, channels: u32) -> Option<f64> {
+        let candidate = if channels == 2 {
+            self.stereo_db
+        } else if self.source_channels == Some(channels) {
+            self.native_db
+        } else {
+            None
+        };
+        candidate.filter(|value| value.is_finite())
+    }
+}
+
 /// Pin the encoder's input layout from the decoded caps, on the caps
 /// event that precedes the first buffer — i.e. before the encoder
 /// negotiates, which is the whole point (see [`aac_accepts`]).
@@ -3002,10 +3034,13 @@ fn install_layout_pin(
     filter: &gst::Element,
     ceiling: Option<u32>,
     enc: &str,
+    gain: &gst::Element,
+    loudness: AudioLoudnessGains,
     facts_dir: &std::path::Path,
 ) {
     let filter = filter.clone();
     let enc = enc.to_string();
+    let gain = gain.clone();
     let facts_dir = facts_dir.to_path_buf();
     pad.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |_, info| {
         let Some(gst::PadProbeData::Event(ev)) = &info.data else {
@@ -3032,8 +3067,7 @@ fn install_layout_pin(
                     b = b.field("channel-mask", gst::Bitmask::new(m));
                 }
                 filter.set_property("caps", b.build());
-                // Logged unconditionally: the one thing this bug proved is
-                // that a silent audio path is an unverifiable one.
+                apply_loudness_gain(n, &gain, loudness, &facts_dir);
                 tracing::info!(
                     source_channels = channels,
                     source_mask = format!("0x{mask:x}"),
@@ -3042,7 +3076,6 @@ fn install_layout_pin(
                     encoder = %enc,
                     "AAC input layout pinned"
                 );
-                // A fold is a fact the verdict promised nothing about.
                 if n != channels {
                     crate::facts::report(
                         &facts_dir,
@@ -3069,6 +3102,70 @@ fn install_layout_pin(
     });
 }
 
+fn install_opus_layout_pin(
+    pad: &gst::Pad,
+    filter: &gst::Element,
+    ceiling: Option<u32>,
+    gain: &gst::Element,
+    loudness: AudioLoudnessGains,
+    facts_dir: &std::path::Path,
+) {
+    let filter = filter.clone();
+    let gain = gain.clone();
+    let facts_dir = facts_dir.to_path_buf();
+    pad.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |_, info| {
+        let Some(gst::PadProbeData::Event(event)) = &info.data else {
+            return gst::PadProbeReturn::Ok;
+        };
+        let gst::EventView::Caps(caps) = event.view() else {
+            return gst::PadProbeReturn::Ok;
+        };
+        let Some(structure) = caps.caps().structure(0) else {
+            return gst::PadProbeReturn::Remove;
+        };
+        let source_channels = structure.get::<i32>("channels").unwrap_or(0).max(0) as u32;
+        if source_channels == 0 {
+            return gst::PadProbeReturn::Remove;
+        }
+        let channels = source_channels.min(ceiling.unwrap_or(8).max(1)).min(8);
+        let mut caps = gst::Caps::builder("audio/x-raw").field("channels", channels as i32);
+        if channels == 2 {
+            caps = caps.field("channel-mask", gst::Bitmask::new(0x3));
+        }
+        filter.set_property("caps", caps.build());
+        apply_loudness_gain(channels, &gain, loudness, &facts_dir);
+        if channels != source_channels {
+            crate::facts::report(
+                &facts_dir,
+                "audio",
+                format!(
+                    "{} → {}",
+                    layout_label(source_channels),
+                    layout_label(channels)
+                ),
+            );
+        }
+        gst::PadProbeReturn::Remove
+    });
+}
+
+fn apply_loudness_gain(
+    channels: u32,
+    gain: &gst::Element,
+    loudness: AudioLoudnessGains,
+    facts_dir: &std::path::Path,
+) {
+    let applied = loudness.for_channels(channels);
+    gain.set_property(
+        "volume",
+        applied.map_or(1.0, crate::loudness::gain_multiplier),
+    );
+    if let Some(db) = applied {
+        tracing::info!(gain_db = db, channels, "audio loudness gain applied");
+        crate::facts::report(facts_dir, "audio", format!("loudness {db:+.2} dB"));
+    }
+}
+
 #[allow(clippy::too_many_arguments)] // one plan, spelled out
 fn build_audio_encode_chain(
     pipe: &gst::Pipeline,
@@ -3078,6 +3175,7 @@ fn build_audio_encode_chain(
     gate: &Option<Arc<SeekGate>>,
     target: AudioTarget,
     max_channels: Option<u32>,
+    loudness: AudioLoudnessGains,
     facts_dir: &std::path::Path,
 ) {
     let encoder = match target {
@@ -3116,6 +3214,7 @@ fn build_audio_encode_chain(
             &[setter, dec],
             gate,
             max_channels,
+            loudness,
             facts_dir,
         );
         return;
@@ -3128,6 +3227,7 @@ fn build_audio_encode_chain(
     // accepted layouts the other).
     let limiter = gst::ElementFactory::make("capsfilter").build().unwrap();
     let resample = gst::ElementFactory::make("audioresample").build().unwrap();
+    let gain = gst::ElementFactory::make("volume").build().unwrap();
     let enc = gst::ElementFactory::make(enc_name).build().unwrap();
     // 192000: bit/s on fdkaacenc/avenc_aac AND opusenc — same string.
     set_prop_str_if_present(&enc, "bitrate", "192000");
@@ -3144,7 +3244,7 @@ fn build_audio_encode_chain(
         }
     };
 
-    let mut chain: Vec<&gst::Element> = vec![&convert, &limiter, &resample, &enc];
+    let mut chain: Vec<&gst::Element> = vec![&convert, &limiter, &resample, &gain, &enc];
     chain.extend(parse.iter());
     pipe.add(&decode).unwrap();
     pipe.add_many(chain.iter().copied()).unwrap();
@@ -3162,13 +3262,31 @@ fn build_audio_encode_chain(
     let convert_sink = convert.static_pad("sink").unwrap();
     let pin_target = limiter.clone();
     let pin_enc = enc_name.to_string();
+    let pin_gain = gain.clone();
     let pin_dir = facts_dir.to_path_buf();
     decode.connect_pad_added(move |_, pad| {
         if convert_sink.is_linked() {
             return; // first decoded stream wins
         }
         if target == AudioTarget::Aac {
-            install_layout_pin(pad, &pin_target, max_channels, &pin_enc, &pin_dir);
+            install_layout_pin(
+                pad,
+                &pin_target,
+                max_channels,
+                &pin_enc,
+                &pin_gain,
+                loudness,
+                &pin_dir,
+            );
+        } else {
+            install_opus_layout_pin(
+                pad,
+                &pin_target,
+                max_channels,
+                &pin_gain,
+                loudness,
+                &pin_dir,
+            );
         }
         if let Err(e) = pad.link(&convert_sink) {
             tracing::warn!(error = %e, "remux: decodebin → encode chain link failed");
@@ -3206,11 +3324,13 @@ fn build_audio_tail(
     front: &[gst::Element],
     gate: &Option<Arc<SeekGate>>,
     max_channels: Option<u32>,
+    loudness: AudioLoudnessGains,
     facts_dir: &std::path::Path,
 ) {
     let convert = gst::ElementFactory::make("audioconvert").build().unwrap();
     let limiter = gst::ElementFactory::make("capsfilter").build().unwrap();
     let resample = gst::ElementFactory::make("audioresample").build().unwrap();
+    let gain = gst::ElementFactory::make("volume").build().unwrap();
     let enc = gst::ElementFactory::make(enc_name).build().unwrap();
     set_prop_str_if_present(&enc, "bitrate", "192000");
     let parse: Option<gst::Element> = match target {
@@ -3222,15 +3342,25 @@ fn build_audio_tail(
     };
 
     // The explicit decoder's own src pad carries the decoded caps, so the
-    // layout is pinned from there instead of a decodebin pad-added.
-    if target == AudioTarget::Aac
-        && let Some(src) = front.last().and_then(|el| el.static_pad("src"))
-    {
-        install_layout_pin(&src, &limiter, max_channels, enc_name, facts_dir);
+    // layout and loudness gain are pinned before the first buffer.
+    if let Some(src) = front.last().and_then(|el| el.static_pad("src")) {
+        if target == AudioTarget::Aac {
+            install_layout_pin(
+                &src,
+                &limiter,
+                max_channels,
+                enc_name,
+                &gain,
+                loudness,
+                facts_dir,
+            );
+        } else {
+            install_opus_layout_pin(&src, &limiter, max_channels, &gain, loudness, facts_dir);
+        }
     }
 
     let mut chain: Vec<&gst::Element> = front.iter().collect();
-    chain.extend([&convert, &limiter, &resample, &enc]);
+    chain.extend([&convert, &limiter, &resample, &gain, &enc]);
     chain.extend(parse.iter());
     pipe.add_many(chain.iter().copied()).unwrap();
     if !link_and_start(&chain, None) {
@@ -5581,6 +5711,9 @@ mod tests {
         video_kbps: None,
         max_height: None,
         max_channels: None,
+        stereo_gain_db: None,
+        native_gain_db: None,
+        loudness_source_channels: None,
         tone_map: false,
         deinterlace: false,
         burn_ass: None,
@@ -6964,6 +7097,8 @@ mod tests {
         crate::testutil::render_h264_aac51_mkv(&src_path);
         let info = crate::discover(&src_path, Duration::from_secs(30)).unwrap();
         assert_eq!(info.audio[0].channels, 6, "fixture must be 5.1: {info:?}");
+        let source_loudness =
+            crate::loudness::measure_file(&src_path, 0, info.audio[0].channels, || {}).unwrap();
 
         let plan = RemuxPlan {
             video: StreamMode::Copy,
@@ -6973,6 +7108,7 @@ mod tests {
             video_kbps: None,
             max_height: None,
             max_channels: Some(2),
+            stereo_gain_db: Some(6.0),
             tone_map: false,
             burn_subtitle: None,
             ..Default::default()
@@ -7005,17 +7141,96 @@ mod tests {
             seg_info.audio[0].channels, 2,
             "stereo ceiling must produce stereo, not mono"
         );
+        let output_loudness =
+            crate::loudness::measure_file(&seg, 0, seg_info.audio[0].channels, || {}).unwrap();
+        let raised =
+            output_loudness.stereo.integrated_lufs - source_loudness.stereo.integrated_lufs;
+        assert!((4.0..=7.5).contains(&raised), "gain was {raised:.2} LU");
         // The fold is also a session fact (AR-13): the supervisor reads
         // these at ready and amends the verdict with what actually
         // happened to the channel count.
         let facts = crate::facts::read(out.path());
-        assert_eq!(
-            facts,
-            vec![crate::facts::Fact {
-                kind: "audio".into(),
-                detail: "5.1 → stereo".into()
-            }],
-            "the downmix must be reported as a fact"
+        assert!(
+            facts
+                .iter()
+                .any(|fact| fact.kind == "audio" && fact.detail == "5.1 → stereo"),
+            "the downmix must be reported: {facts:?}"
+        );
+        assert!(
+            facts
+                .iter()
+                .any(|fact| fact.kind == "audio" && fact.detail == "loudness +6.00 dB"),
+            "the loudness gain must be reported: {facts:?}"
+        );
+    }
+
+    #[test]
+    fn preserved_multichannel_encode_uses_native_loudness_gain() {
+        crate::init().unwrap();
+        if !crate::testutil::require(
+            h264_encoder().is_some()
+                && aac_encoder().is_some()
+                && crate::testutil::elements_available(&["fdkaacenc"]),
+            "verified H.264/AAC encoders and fdkaacenc",
+        ) {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let src_path = dir.path().join("in51.mkv");
+        crate::testutil::render_h264_aac51_mkv(&src_path);
+        let source_loudness = crate::loudness::measure_file(&src_path, 0, 6, || {}).unwrap();
+        assert_eq!(source_loudness.source_channels, 6);
+
+        let plan = RemuxPlan {
+            video: StreamMode::Copy,
+            audio: StreamMode::Encode,
+            audio_track: 0,
+            video_track: 0,
+            max_channels: Some(6),
+            stereo_gain_db: Some(-12.0),
+            native_gain_db: Some(3.0),
+            loudness_source_channels: Some(6),
+            ..Default::default()
+        };
+        let out = tempfile::tempdir().unwrap();
+        let job = start_at(
+            out.path(),
+            plan,
+            Box::new(FileSource::open(&src_path).unwrap()),
+            0,
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !job.finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(job.finished(), "5.1 encode did not finish");
+        assert!(
+            job.failed().is_none(),
+            "5.1 encode failed: {:?}",
+            job.failed()
+        );
+        let seg = std::fs::read_dir(out.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .find(|path| path.extension().is_some_and(|extension| extension == "ts"))
+            .expect("no segment produced");
+        let info = crate::discover(&seg, Duration::from_secs(30)).unwrap();
+        assert_eq!(info.audio[0].channels, 6, "encode must preserve 5.1");
+        let output_loudness =
+            crate::loudness::measure_file(&seg, 0, info.audio[0].channels, || {}).unwrap();
+        let raised =
+            output_loudness.native.integrated_lufs - source_loudness.native.integrated_lufs;
+        assert!(
+            (1.5..=4.5).contains(&raised),
+            "native gain was {raised:.2} LU"
+        );
+        let facts = crate::facts::read(out.path());
+        assert!(
+            facts
+                .iter()
+                .any(|fact| fact.kind == "audio" && fact.detail == "loudness +3.00 dB"),
+            "the native loudness gain must be reported: {facts:?}"
         );
     }
 

@@ -93,6 +93,14 @@ pub struct WorkerArgs {
     pub max_height: Option<u32>,
     #[arg(long)]
     pub max_channels: Option<u32>,
+    // Supervisors pass the value as a separate argv token; attenuation
+    // therefore starts with `-` and must remain a value, not a new flag.
+    #[arg(long, allow_negative_numbers = true)]
+    pub stereo_gain_db: Option<f64>,
+    #[arg(long, allow_negative_numbers = true)]
+    pub native_gain_db: Option<f64>,
+    #[arg(long)]
+    pub loudness_source_channels: Option<u32>,
     /// HUB-15a: tone-map HDR to SDR in the video encode chain.
     #[arg(long)]
     pub tone_map: bool,
@@ -239,6 +247,9 @@ pub fn run_remux_worker(cfg: &config::Config, w: WorkerArgs) -> Result<()> {
         video_kbps: w.video_kbps,
         max_height: w.max_height,
         max_channels: w.max_channels,
+        stereo_gain_db: w.stereo_gain_db,
+        native_gain_db: w.native_gain_db,
+        loudness_source_channels: w.loudness_source_channels,
         tone_map: w.tone_map,
         deinterlace: w.deinterlace,
         burn_subtitle: w.burn_sub,
@@ -477,9 +488,33 @@ pub fn startup_checks(
 }
 
 #[cfg(test)]
-mod benchmark_tests {
+mod tests {
     use super::*;
 
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct WorkerCli {
+        #[command(flatten)]
+        worker: WorkerArgs,
+    }
+
+    #[test]
+    fn worker_accepts_negative_loudness_gains() {
+        let cli = WorkerCli::try_parse_from([
+            "kahawai",
+            "worker.sock",
+            "out",
+            "1",
+            "--stereo-gain-db",
+            "-0.9352540408427",
+            "--native-gain-db",
+            "-1.25",
+        ])
+        .unwrap();
+        assert_eq!(cli.worker.stereo_gain_db, Some(-0.9352540408427));
+        assert_eq!(cli.worker.native_gain_db, Some(-1.25));
+    }
     #[test]
     fn tonemap_child_never_runs_encoders() {
         let available = ["h264", "av1"];

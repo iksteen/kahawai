@@ -341,6 +341,35 @@ async function disconnect() {
         </p>
 
         <div class="flex flex-wrap items-center gap-x-2.5 gap-y-2">
+          <label
+            class="w-[76px] shrink-0 font-mono text-[12px] text-dim"
+            for="loudness-normalization"
+          >
+            loudness
+          </label>
+          <select
+            id="loudness-normalization"
+            class="rounded border border-line bg-bg px-2 py-1 text-[12.5px]"
+            :value="
+              ['off', 'force'].includes(values['loudness_normalization'] ?? '')
+                ? values['loudness_normalization']
+                : ''
+            "
+            @change="save('loudness_normalization', ($event.target as HTMLSelectElement).value)"
+          >
+            <option value="">When encoding</option>
+            <option value="force">Always when possible</option>
+            <option value="off">Off</option>
+          </select>
+        </div>
+        <p class="mt-[-2px] ml-[86px] max-w-[480px] text-[12px] text-dim">
+          Uses measured programme loudness to apply one fixed gain. “When encoding” changes only
+          audio Kahawai already re-encodes. “Always” may replace direct or copied audio with an
+          encoded track, but never forces a video encode; playback stays unchanged when no measured
+          audio-only route exists. Music is unchanged.
+        </p>
+
+        <div class="flex flex-wrap items-center gap-x-2.5 gap-y-2">
           <label class="w-[76px] shrink-0 font-mono text-[12px] text-dim" for="introdb">
             skip data
           </label>

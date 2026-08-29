@@ -25,6 +25,9 @@ fn main() -> anyhow::Result<()> {
         burn_subtitle: None,
         burn_ass: None,
         max_channels: None,
+        stereo_gain_db: None,
+        native_gain_db: None,
+        loudness_source_channels: None,
         video_codec: VideoTarget::H264,
         audio_codec: AudioTarget::Aac,
         segment_format: std::env::var("PROBE_TS")

@@ -551,6 +551,39 @@ How something works and why it was built that way belong in
       chapter lists without hiding genuinely complete named seasons. Design in
       implementation §4.9; detector parity remains measured against
       intro-skipper in `docs/intro-detection-results.md`.
+- [x] HUB-38 Measured audio loudness normalization: the mediahost idle-decodes
+      every non-music audio stream once and meters both its native layout and
+      GStreamer's actual stereo fold, storing revision-guarded EBU R128
+      integrated loudness/true peak pairs on the hub. Audio encodes apply one
+      static gain toward −18 LUFS, capped at −1 dBTP: stereo uses the folded
+      measurement, while a multichannel encode preserving the source channel
+      count uses the native measurement. Mono/stereo input meters once and
+      reuses the mathematically equivalent result for both facts; only
+      multichannel pays for the second folded meter. An account-global
+      three-state setting defaults to applying gain only when audio already
+      encodes, can disable gain, or can force a measured direct/copied audio
+      stream through an encode. Force retains the ordinary video mode and
+      falls back unchanged without a current single-part measurement or
+      compatible audio-only route. Music stays untouched; ReplayGain owns it.
+      Session facts state the applied dB gain.
+      Full-file rebuild work is source-local, serialized with other background
+      jobs, and yields to scans and viewer leases. Watched-first segment
+      detection preempts loudness at the next audio buffer; the same pipeline
+      resumes afterward without re-decoding, and start/yield/resume/completion
+      logs expose long-running files.
+       Foreground pauses log scan/lease/urgent counts and their resume; foreground
+       byte leases log collection/path at open and close, so a silent gate cannot
+       look like a decoder hang.
+       A 60-second no-buffer watchdog advances past decoders that produce neither
+       audio, EOS nor an error; active callbacks are exempt so intentional
+       foreground/segment pauses remain unbounded.
+      One cross-collection queue chooses movie files before series/anime and
+      newer source mtimes first within each category, re-evaluated after every
+      file and after permit waits; the in-flight file is never interrupted.
+      Long-running segment and loudness jobs trim glibc's freed decoder-thread
+      arenas every 30 seconds and again at completion, so sequential full-file
+       work returns resident memory instead of retaining its high-water mark;
+       non-glibc targets are unchanged.
 - [x] Chapters as a first-class fact: read at scan beside the attachment
       declaration, backfilled for older Matroska/WebM rows (other containers
       keep whatever the demuxer's TOC declared at discovery, so a

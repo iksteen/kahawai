@@ -80,6 +80,11 @@ pub async fn run(
         {
             return;
         }
+        // Announcing this before waiting on the shared permit makes queued
+        // watched-first work preempt an in-flight loudness decode at its next
+        // buffer checkpoint. The guard follows the blocking analyzer so a
+        // dropped link cannot resume loudness while the old job still runs.
+        let priority_guard = activity.segment_priority();
         tracing::info!(
             request = %job.request_id,
             collection = %job.collection_id,
@@ -114,6 +119,7 @@ pub async fn run(
             // link cannot admit replacement work until this analysis exits.
             let _serial_guard = serial_guard;
             let _background_guard = background_guard;
+            let _priority_guard = priority_guard;
             analyze(job, &collections2, &activity2, &cancelled)
         })
         .await;
